@@ -1,12 +1,16 @@
 import { spawnSync } from "node:child_process";
 import {
+  closeSync,
   cpSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -19,7 +23,7 @@ const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
 // Immutable stack base integrated immediately before final validation. Update
 // this SHA only when a newer parent head is merged into this branch.
-const baselineRef = "0ae89670cdf4ae291a326e40ecc7daaadef09de0";
+const baselineRef = "fd770ee84b188ed8a3e3360f2d9e9828dc3b4d8d";
 const mainWorktree = join(runRoot, "stacked-parent");
 const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
@@ -42,9 +46,22 @@ const testFiles = [
   "cloudflare.test.mjs",
   "paloalto.test.mjs",
   "zscaler.test.mjs",
+  "crowdstrike.test.mjs",
+  "tenable.test.mjs",
+  "qualys.test.mjs",
+  "veracode.test.mjs",
+  "knowbe4.test.mjs",
 ];
 const fixtureClasses = ["boundary", "compliant", "denied", "export", "missing-null", "partial", "representative"];
 const batch2Integrations = ["azure", "cloudflare", "gcp", "oci", "paloalto", "zscaler"];
+const representativeDistinctIntegrations = [...batch2Integrations, "crowdstrike", "qualys", "veracode"];
+const branchOnlyRuntimeFactTests = [
+  "CrowdStrike assessors emit every metadata rule-driving fact from runtime records",
+  "Tenable assessors emit every metadata rule-driving fact from runtime records",
+  "Qualys assessors emit every metadata rule-driving fact from runtime records",
+  "Veracode assessors emit every runtime-observable metadata rule-driving fact",
+  "KnowBe4 assessors emit every metadata rule-driving fact from runtime records",
+];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -61,7 +78,7 @@ function run(command, args, options = {}) {
 }
 
 function instrumentedMainTest(source) {
-  return source
+  let instrumented = source
     .replace(/assertBundlePathsMatchSpec, /g, "")
     .replace(/^import \{ OKTA_SPEC \} from .*okta\.spec\.js";\n/m, "")
     .replace(/^import \{ DUO_SPEC \} from .*duo\.spec\.js";\n/m, "")
@@ -79,6 +96,9 @@ function instrumentedMainTest(source) {
     .replace(/^import \{ PALOALTO_COMPLETENESS_SOURCES, PALOALTO_SPEC \} from .*paloalto\.spec\.js";\n/m, "")
     .replace(/^import \{ ZSCALER_COMPLETENESS_SOURCES, ZSCALER_SPEC \} from .*zscaler\.spec\.js";\n/m, "")
     .replace(/^import \{ captureBatchDecisionFacts \} from .*batch-spec-builder\.js";\n/m, "")
+    .replace(/^import \{ BATCH3_RUNTIME_FACTS \} from .*batch3-spec-helpers\.js";\n/m, "")
+    .replace(/^import \{ certifyRuntimeRuleDecisiveness \} from "\.\/helpers\/batch3-rule-certification\.mjs";\n/m, "")
+    .replace(/^import \{ (?:CROWDSTRIKE|TENABLE|QUALYS|VERACODE|KNOWBE4)_SPEC \} from .*\.spec\.js";\n/gm, "")
     .replace(/^import \{\n  captureBatchDecisionFacts,\n  evaluateBatchCheckVerdict,\n\} from .*batch-spec-builder\.js";\n/m, "")
     .replace(
       'import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";',
@@ -86,6 +106,11 @@ function instrumentedMainTest(source) {
     )
     .replace(/^import \{ assertBundlePathsMatchSpec \} from "\.\/helpers\/bundle-contents\.mjs";\n/m, "")
     .replace(/^  assertBundlePathsMatchSpec\(assert, .*;\n/gm, "");
+  for (const title of branchOnlyRuntimeFactTests) {
+    const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    instrumented = instrumented.replace(new RegExp(`test\\("${escapedTitle}"[\\s\\S]*?\\n\\}\\);\\n`), "");
+  }
+  return instrumented;
 }
 
 function copyDifferentialTestsToMain() {
@@ -156,8 +181,14 @@ const __corpusSweepFunctions = new Set([
   "assessZoomIdentityFromSnapshot", "assessZoomCollaborationGovernanceFromSnapshot", "assessZoomMeetingSecurityFromSnapshot",
   "assessSalesforcePlatformData", "assessSalesforceIdentityData", "assessSalesforceDataProtectionData", "assessSalesforceMonitoringData",
   "assessServicenowIdentityAccessData", "assessServicenowPlatformHardeningData", "assessServicenowAccessControlData", "assessServicenowOperationsGovernanceData",
+  "assessCrowdstrikePreventionPolicies", "assessCrowdstrikeResponseReadiness", "assessCrowdstrikeDeviceFirewall", "assessCrowdstrikeSensorCoverage", "assessCrowdstrikeAccessGovernance",
+  "assessTenableScanProgram", "assessTenableSensorCoverage", "assessTenableAccessControl", "assessTenableVulnerabilityManagement",
+  "assessQualysScanCoverage", "assessQualysAssetInventory", "assessQualysVulnerabilityManagement", "assessQualysAdministration",
+  "assessVeracodeScanCoverage", "assessVeracodePolicyCompliance", "assessVeracodeFindingsHygiene", "assessVeracodeScaPosture", "assessVeracodeAccessControls",
+  "assessKnowbe4PhishingProgram", "assessKnowbe4TrainingProgram", "assessKnowbe4UserRisk", "assessKnowbe4AccountGovernance",
 ]);
 const __corpusSweptInputs = new Set();
+const __corpusSweptAsyncInputs = new Set();
 function __corpusSweep(name, args, original) {
   if (!__corpusSweepFunctions.has(name) || !args[0] || typeof args[0] !== "object") return;
   const signature = name + ":" + JSON.stringify(args[0]);
@@ -209,6 +240,110 @@ function __corpusSweep(name, args, original) {
     }
   }
 }
+function __corpusClientMethods(client) {
+  const domainReadMethod = /^(?:list|search|get(?:Device|Dynamic|Firewall|Sca|Self|Summary|User|Users))/;
+  const transportMethods = new Set([
+    "get",
+    "getByIds",
+    "getJson",
+    "getResources",
+    "getText",
+    "getTotal",
+    "getXml",
+    "listAfter",
+    "listHal",
+    "listOffset",
+    "listXml",
+    "postJson",
+    "postQps",
+    "searchQps",
+  ]);
+  const methods = new Set();
+  for (let value = client; value && value !== Object.prototype; value = Object.getPrototypeOf(value)) {
+    for (const name of Object.getOwnPropertyNames(value)) {
+      if (
+        name !== "constructor"
+        && name !== "getResolvedConfig"
+        && domainReadMethod.test(name)
+        && !transportMethods.has(name)
+        && typeof client[name] === "function"
+      ) methods.add(name);
+    }
+  }
+  return [...methods].sort();
+}
+function __corpusMutateCollection(value, mode) {
+  if (Array.isArray(value)) {
+    if (mode === "empty") return [];
+    return value;
+  }
+  if (!value || typeof value !== "object" || !Array.isArray(value.items)) return mode === "empty" ? {} : value;
+  if (mode === "empty") {
+    return { ...value, items: [], truncated: false, complete: true, total: 0, totalElements: 0, totalPages: 1 };
+  }
+  return {
+    ...value,
+    truncated: true,
+    truncationReason: "independent differential truncation",
+    complete: false,
+    total: Math.max(value.items.length + 1, Number(value.total) || 0),
+    totalElements: Math.max(value.items.length + 1, Number(value.totalElements) || 0),
+    totalPages: Math.max(2, Number(value.totalPages) || 0),
+  };
+}
+async function __corpusAsyncSweep(name, args, original) {
+  if (!__corpusSweepFunctions.has(name) || !args[0] || typeof args[0] !== "object") return;
+  const signature = name + ":" + JSON.stringify(args.slice(1));
+  if (__corpusSweptAsyncInputs.has(signature)) return;
+  __corpusSweptAsyncInputs.add(signature);
+  const client = args[0];
+  const methodNames = __corpusClientMethods(client);
+  const modes = ["truncated", "denied", "empty"];
+  const override = (proxy, methodName, mode) => {
+    proxy[methodName] = async (...methodArgs) => {
+      if (mode === "denied") throw new Error("403 Forbidden from independent differential " + methodName);
+      return __corpusMutateCollection(await client[methodName](...methodArgs), mode);
+    };
+  };
+  for (const methodName of methodNames) {
+    for (const mode of modes) {
+      const proxy = Object.create(client);
+      override(proxy, methodName, mode);
+      const mutatedArgs = [proxy, ...args.slice(1)];
+      try {
+        __corpusRecord(name + "::sweep::" + mode + "::" + methodName, "result", await original(...mutatedArgs));
+      } catch (error) {
+        __corpusRecord(name + "::sweep::" + mode + "::" + methodName, "error", {
+          name: error instanceof Error ? error.name : typeof error,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+  for (let left = 0; left < methodNames.length; left += 1) {
+    for (let right = left + 1; right < methodNames.length; right += 1) {
+      for (const leftMode of modes) {
+        for (const rightMode of modes) {
+          const leftMethod = methodNames[left];
+          const rightMethod = methodNames[right];
+          const proxy = Object.create(client);
+          override(proxy, leftMethod, leftMode);
+          override(proxy, rightMethod, rightMode);
+          const mutatedArgs = [proxy, ...args.slice(1)];
+          const recordName = name + "::pairwise::" + leftMode + "::" + leftMethod + "::" + rightMode + "::" + rightMethod;
+          try {
+            __corpusRecord(recordName, "result", await original(...mutatedArgs));
+          } catch (error) {
+            __corpusRecord(recordName, "error", {
+              name: error instanceof Error ? error.name : typeof error,
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
+    }
+  }
+}
 `;
     const wrapperSource = wrappers.map(({ async, functionName, originalName }) => async
       ? `
@@ -216,6 +351,7 @@ export async function ${functionName}(...args) {
   try {
     const result = await ${originalName}(...args);
     __corpusRecord(${JSON.stringify(functionName)}, "result", result);
+    await __corpusAsyncSweep(${JSON.stringify(functionName)}, args, ${originalName});
     return result;
   } catch (error) {
     __corpusRecord(${JSON.stringify(functionName)}, "error", {
@@ -246,12 +382,15 @@ export function ${functionName}(...args) {
 
 function runCorpusSuite(root, fixtureDirectory) {
   mkdirSync(fixtureDirectory, { recursive: true });
+  const branchOnlyPattern = branchOnlyRuntimeFactTests
+    .map((title) => title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
   const result = run(process.execPath, [
     "--import",
     join(root, "cli", "tests", "helpers", "freeze-time.mjs"),
     "--test",
     "--test-concurrency=1",
-    "--test-skip-pattern=^(?:all 25 (?:Palo Alto|Zscaler) checks replay|SNOW-08 counts an active non-IdP integration TLS certificate|AZURE-SUB-04 network-watcher truncation|CF-IAM-06 treats token-list 404|CF-TRF-06 preserves the unpaginated|OCI prerequisite and nested-read failures)",
+    `--test-skip-pattern=^(?:all 25 (?:Palo Alto|Zscaler) checks replay|SNOW-08 counts an active non-IdP integration TLS certificate|AZURE-SUB-04 network-watcher truncation|CF-IAM-06 treats token-list 404|CF-TRF-06 preserves the unpaginated|OCI prerequisite and nested-read failures|${branchOnlyPattern})`,
     ...testFiles.map((testFile) => join(root, "cli", "tests", testFile)),
   ], {
     cwd: root,
@@ -271,6 +410,65 @@ function filesUnder(root, relativePath = "") {
   }).sort();
 }
 
+const COMPARE_CHUNK_BYTES = 1024 * 1024;
+
+function firstByteMismatch(expectedPath, actualPath) {
+  const expectedSize = statSync(expectedPath).size;
+  const actualSize = statSync(actualPath).size;
+  const expectedDescriptor = openSync(expectedPath, "r");
+  const actualDescriptor = openSync(actualPath, "r");
+  const expectedBuffer = Buffer.allocUnsafe(COMPARE_CHUNK_BYTES);
+  const actualBuffer = Buffer.allocUnsafe(COMPARE_CHUNK_BYTES);
+  let offset = 0;
+  try {
+    while (offset < Math.min(expectedSize, actualSize)) {
+      const length = Math.min(COMPARE_CHUNK_BYTES, expectedSize - offset, actualSize - offset);
+      const expectedRead = readSync(expectedDescriptor, expectedBuffer, 0, length, offset);
+      const actualRead = readSync(actualDescriptor, actualBuffer, 0, length, offset);
+      if (expectedRead !== actualRead) return { actualSize, expectedSize, offset };
+      const expectedChunk = expectedBuffer.subarray(0, expectedRead);
+      const actualChunk = actualBuffer.subarray(0, actualRead);
+      if (!expectedChunk.equals(actualChunk)) {
+        for (let index = 0; index < expectedRead; index += 1) {
+          if (expectedChunk[index] !== actualChunk[index]) {
+            return { actualSize, expectedSize, offset: offset + index };
+          }
+        }
+      }
+      offset += expectedRead;
+    }
+  } finally {
+    closeSync(expectedDescriptor);
+    closeSync(actualDescriptor);
+  }
+  return expectedSize === actualSize ? undefined : { actualSize, expectedSize, offset };
+}
+
+function readFileRange(path, start, length) {
+  const descriptor = openSync(path, "r");
+  const buffer = Buffer.alloc(length);
+  try {
+    const bytesRead = readSync(descriptor, buffer, 0, length, start);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function readJsonlRecordAt(path, offset) {
+  const size = statSync(path).size;
+  const windowStart = Math.max(0, offset - COMPARE_CHUNK_BYTES);
+  const windowLength = Math.min(size - windowStart, COMPARE_CHUNK_BYTES * 2);
+  const window = readFileRange(path, windowStart, windowLength);
+  const relativeOffset = offset - windowStart;
+  const precedingNewline = window.lastIndexOf(0x0a, Math.max(0, relativeOffset - 1));
+  const followingNewline = window.indexOf(0x0a, relativeOffset);
+  if (followingNewline === -1) return undefined;
+  const lineStart = precedingNewline + 1;
+  if (lineStart === 0 && windowStart !== 0) return undefined;
+  return window.subarray(lineStart, followingNewline);
+}
+
 function compareTrees(expectedRoot, actualRoot, label) {
   const expectedPaths = filesUnder(expectedRoot);
   const actualPaths = filesUnder(actualRoot);
@@ -278,17 +476,34 @@ function compareTrees(expectedRoot, actualRoot, label) {
     throw new Error(`${label} path mismatch\nmain: ${expectedPaths.join(", ")}\nbranch: ${actualPaths.join(", ")}`);
   }
   for (const path of expectedPaths) {
-    const expected = readFileSync(join(expectedRoot, path));
-    const actual = readFileSync(join(actualRoot, path));
-    if (!actual.equals(expected)) {
-      let offset = 0;
-      while (offset < expected.length && offset < actual.length && expected[offset] === actual[offset]) offset += 1;
+    const expectedPath = join(expectedRoot, path);
+    const actualPath = join(actualRoot, path);
+    const mismatch = firstByteMismatch(expectedPath, actualPath);
+    if (mismatch) {
+      const { actualSize, expectedSize, offset } = mismatch;
       const contextStart = Math.max(0, offset - 160);
-      const contextEnd = offset + 320;
-      const mainContext = expected.subarray(contextStart, contextEnd).toString("utf8");
-      const branchContext = actual.subarray(contextStart, contextEnd).toString("utf8");
+      const mainContext = readFileRange(expectedPath, contextStart, 480).toString("utf8");
+      const branchContext = readFileRange(actualPath, contextStart, 480).toString("utf8");
+      let recordName = "";
+      let statusChanges = "";
+      if (path.endsWith(".jsonl")) {
+        try {
+          const expectedRecord = JSON.parse(readJsonlRecordAt(expectedPath, offset).toString("utf8"));
+          const actualRecord = JSON.parse(readJsonlRecordAt(actualPath, offset).toString("utf8"));
+          recordName = `, record=${expectedRecord.name}`;
+          const expectedStatuses = new Map((expectedRecord.value?.findings ?? []).map((finding) => [finding.id, finding.status]));
+          const actualStatuses = new Map((actualRecord.value?.findings ?? []).map((finding) => [finding.id, finding.status]));
+          const changes = [...new Set([...expectedStatuses.keys(), ...actualStatuses.keys()])]
+            .filter((id) => expectedStatuses.get(id) !== actualStatuses.get(id))
+            .map((id) => `${id}:${expectedStatuses.get(id) ?? "<missing>"}->${actualStatuses.get(id) ?? "<missing>"}`);
+          if (changes.length > 0) statusChanges = `\nstatus changes: ${changes.join(", ")}`;
+        } catch {
+          recordName = ", record=<unparseable>";
+        }
+      }
       throw new Error(
-        `${label} byte mismatch for ${path} (main=${expected.length} bytes, branch=${actual.length} bytes, first offset=${offset})`
+        `${label} byte mismatch for ${path} (main=${expectedSize} bytes, branch=${actualSize} bytes, first offset=${offset}${recordName})`
+        + statusChanges
         + `\nmain context: ${JSON.stringify(mainContext)}`
         + `\nbranch context: ${JSON.stringify(branchContext)}`,
       );
@@ -297,19 +512,46 @@ function compareTrees(expectedRoot, actualRoot, label) {
   return expectedPaths;
 }
 
+function countBufferOccurrences(path, needle) {
+  const descriptor = openSync(path, "r");
+  const chunk = Buffer.allocUnsafe(COMPARE_CHUNK_BYTES);
+  const needleBuffer = Buffer.from(needle);
+  let count = 0;
+  let overlap = Buffer.alloc(0);
+  let position = 0;
+  try {
+    while (true) {
+      const bytesRead = readSync(descriptor, chunk, 0, chunk.length, position);
+      if (bytesRead === 0) break;
+      const haystack = overlap.length === 0
+        ? chunk.subarray(0, bytesRead)
+        : Buffer.concat([overlap, chunk.subarray(0, bytesRead)]);
+      let index = haystack.indexOf(needleBuffer);
+      while (index !== -1) {
+        count += 1;
+        index = haystack.indexOf(needleBuffer, index + needleBuffer.length);
+      }
+      overlap = haystack.subarray(Math.max(0, haystack.length - needleBuffer.length + 1));
+      position += bytesRead;
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  return count;
+}
+
 function corpusCallCount(root, paths) {
-  return paths.reduce((total, path) => total + readFileSync(join(root, path), "utf8").trim().split("\n").filter(Boolean).length, 0);
+  return paths.reduce((total, path) => total + countBufferOccurrences(join(root, path), "\n"), 0);
 }
 
 function corpusSweepCounts(root, paths) {
-  const counts = { truncated: 0, denied: 0, empty: 0 };
+  const counts = { truncated: 0, denied: 0, empty: 0, pairwise: 0 };
   for (const path of paths) {
-    for (const line of readFileSync(join(root, path), "utf8").trim().split("\n").filter(Boolean)) {
-      const name = JSON.parse(line).name;
-      for (const mode of Object.keys(counts)) {
-        if (name.includes(`::sweep::${mode}::`)) counts[mode] += 1;
-      }
+    const corpusPath = join(root, path);
+    for (const mode of ["truncated", "denied", "empty"]) {
+      counts[mode] += countBufferOccurrences(corpusPath, `::sweep::${mode}::`);
     }
+    counts.pairwise += countBufferOccurrences(corpusPath, "::pairwise::");
   }
   return counts;
 }
@@ -323,22 +565,21 @@ try {
   }
   run("git", ["merge-base", "--is-ancestor", baselineSha, headSha], { capture: true });
   const batchSpecificPaths = [
-    "cli/extensions/grc-tools/azure.ts",
-    "cli/extensions/grc-tools/cloudflare.ts",
-    "cli/extensions/grc-tools/gcp.ts",
-    "cli/extensions/grc-tools/oci.ts",
-    "cli/extensions/grc-tools/paloalto.ts",
-    "cli/extensions/grc-tools/zscaler.ts",
+    "cli/extensions/grc-tools/crowdstrike.ts",
+    "cli/extensions/grc-tools/tenable.ts",
+    "cli/extensions/grc-tools/qualys.ts",
+    "cli/extensions/grc-tools/veracode.ts",
+    "cli/extensions/grc-tools/knowbe4.ts",
   ];
   const batchDiff = spawnSync("git", ["diff", "--quiet", baselineSha, headSha, "--", ...batchSpecificPaths], {
     cwd: repoRoot,
     stdio: "ignore",
   });
   if (batchDiff.status === 0) {
-    throw new Error(`No batch-2 runtime diff exists between immutable base ${baselineSha} and HEAD ${headSha}`);
+    throw new Error(`No batch-3 runtime diff exists between immutable base ${baselineSha} and HEAD ${headSha}`);
   }
   if (batchDiff.status !== 1) {
-    throw new Error(`Unable to inspect batch-2 diff between ${baselineSha} and ${headSha}`);
+    throw new Error(`Unable to inspect batch-3 diff between ${baselineSha} and ${headSha}`);
   }
   run("git", ["worktree", "add", "--detach", mainWorktree, baselineRef]);
   worktreeAdded = true;
@@ -373,16 +614,21 @@ try {
     throw new Error(`stacked-parent fixture registry mismatch\nexpected: ${expectedFixturePaths.join(", ")}\nactual: ${mainFixturePaths.join(", ")}`);
   }
   const compared = compareTrees(mainFixtures, branchFixtures, "curated fixture");
-  for (const integration of batch2Integrations) {
+  for (const integration of representativeDistinctIntegrations) {
     const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
     const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
+    const partial = readFileSync(join(branchFixtures, integration, "partial.json"));
     if (representative.equals(compliant)) {
       throw new Error(`${integration}: representative fixture is byte-identical to compliant`);
+    }
+    if (representative.equals(partial)) {
+      throw new Error(`${integration}: representative fixture is byte-identical to partial`);
     }
   }
   const classes = [...new Set(compared.map((path) => path.split("/").at(-1).replace(/\.json$/, "")))].sort();
   console.log(`Whole-corpus replay passed against immutable stack base ${baselineSha}: ${mainCorpusTests.executed}/${mainCorpusTests.total} non-skipped tests and ${corpusCalls} exact serialized assessment calls matched the stacked parent.`);
   console.log(`Realistic single-dataset sweeps matched the stacked parent: ${sweepCounts.truncated} truncated, ${sweepCounts.denied} denied, ${sweepCounts.empty} empty.`);
+  console.log(`Realistic pairwise source-state sweeps matched the stacked parent: ${sweepCounts.pairwise} exact serialized assessment calls.`);
   console.log(`Byte differential passed: ${compared.length} exact fixtures across ${testFiles.length} integrations.`);
   console.log(`Fixture classes: ${classes.join(", ")}.`);
 } finally {

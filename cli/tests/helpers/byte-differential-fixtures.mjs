@@ -16,7 +16,9 @@ export function writeByteDifferentialFixture(integration, fixtureClass, value) {
   if (!fixtureRoot) return;
   const directory = join(fixtureRoot, integration);
   mkdirSync(directory, { recursive: true });
-  writeFileSync(join(directory, `${fixtureClass}.json`), `${JSON.stringify(value, null, 2)}\n`);
+  const serialized = JSON.stringify(value, null, 2)
+    .replace(/\/tmp\/tenable-empty-config-[^/]+\/tenable\.yaml/g, "<ephemeral-tenable-config>/tenable.yaml");
+  writeFileSync(join(directory, `${fixtureClass}.json`), `${serialized}\n`);
 }
 
 export function prepareByteDifferentialExportRoot(integration) {

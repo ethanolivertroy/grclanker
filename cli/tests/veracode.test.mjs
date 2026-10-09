@@ -25,8 +25,17 @@ import {
   scrubDataText,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/veracode.js";
+import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
+import { VERACODE_SPEC } from "../dist/extensions/grc-tools/veracode.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { certifyRuntimeRuleDecisiveness } from "./helpers/batch3-rule-certification.mjs";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const API_ID = "dbb6f2a2ed0b6890bbd32e949f72c8c8";
@@ -229,6 +238,23 @@ function partialClient() {
     async listScaWorkspaces() { return partialList(fixture.workspaces); },
     async listDynamicAnalyses() { return partialList(fixture.analyses); },
   });
+}
+
+function representativeClient() {
+  const fixture = healthyFixture();
+  fixture.applications[0].last_completed_scan_date = daysAgo(200);
+  fixture.applications[0].scans[0].modified_date = daysAgo(200);
+  fixture.applications[0].profile.policies = [{ guid: "pol-builtin", name: "Veracode Recommended", is_default: true, policy_compliance_status: "DID_NOT_PASS" }];
+  fixture.applications[1].profile.policies = [];
+  fixture.policies = [{ guid: "pol-builtin", name: "Veracode Recommended", type: "BUILTIN", finding_rules: [] }];
+  fixture.findings = [
+    { issue_id: 1, finding_status: { status: "OPEN", resolution: "UNRESOLVED", resolution_status: "NONE", first_found_date: daysAgo(120) }, finding_details: { severity: 5 }, annotations: [] },
+    { issue_id: 2, finding_status: { status: "OPEN", resolution_status: "PROPOSED" }, finding_details: { severity: 4 }, annotations: [{ action: "FP", comment: "" }] },
+  ];
+  fixture.vulnerabilityIssues = [{ id: "i1", issue_type: "vulnerability", severity: 9.8, library: { name: "log4j" }, vulnerability: { cve: "CVE-2021-44228", cvss3_score: 10 } }];
+  fixture.licenseIssues = [{ id: "i2", issue_type: "license", license: { name: "GPL-3.0", risk: "HIGH" }, library: { name: "gpl-lib" } }];
+  fixture.sandboxes = [];
+  return mockClient(fixture);
 }
 
 async function runAllAssessments(client) {
@@ -477,6 +503,43 @@ test("VeracodeApiClient signs requests, paginates HAL pages to completion, retri
   assert.equal(truncated.items.length, 2);
 });
 
+test("VeracodeApiClient sends exact findings parameters and no pagination on object endpoints", async () => {
+  const seen = [];
+  const client = new VeracodeApiClient(sampleConfig(), { fetchImpl: async (input) => {
+    const url = new URL(input);
+    seen.push(url);
+    if (url.pathname === "/api/authn/v2/users/self") {
+      return jsonResponse({ user_id: "u-1" });
+    }
+    if (url.pathname.endsWith("/findings")) {
+      return jsonResponse({ _embedded: { findings: [] }, page: { number: 0, size: 500, total_elements: 0, total_pages: 1 } });
+    }
+    return jsonResponse({ scan_id: "scan-1" });
+  } });
+
+  await client.listFindings("app-1", { include_annot: "TRUE" });
+  await client.getSelf();
+  await client.getSummaryReport("app-1");
+  await client.getScaApplicationProjects("app-1");
+  await client.getDynamicScanConfiguration("scan-1");
+
+  const findings = seen.find((url) => url.pathname === "/appsec/v2/applications/app-1/findings");
+  assert.deepEqual(
+    Object.fromEntries(findings.searchParams),
+    { include_annot: "TRUE", page: "0", size: "500" },
+  );
+  for (const path of [
+    "/api/authn/v2/users/self",
+    "/appsec/v2/applications/app-1/summary_report",
+    "/srcclr/v3/applications/app-1/projects",
+    "/was/configservice/v1/scans/scan-1/configuration",
+  ]) {
+    const objectRequest = seen.find((url) => url.pathname === path);
+    assert.ok(objectRequest, `${path} was requested`);
+    assert.equal(objectRequest.search, "", `${path} has no page or size query`);
+  }
+});
+
 test("checkVeracodeAccess reports healthy access and names missing roles when degraded", async () => {
   const healthy = await checkVeracodeAccess(mockClient());
   assert.equal(healthy.status, "healthy");
@@ -655,6 +718,19 @@ test("assessVeracodePolicyCompliance flags failing, unassigned, and default poli
   conditional.applications[1].profile.policies[0].policy_compliance_status = "NOT_ASSESSED";
   const conditionalResult = await assessVeracodePolicyCompliance(mockClient(conditional));
   assert.equal(statusOf(conditionalResult.findings, 2), "warn");
+});
+
+test("flaw aging passes when complete finding lists contain only resolved findings", async () => {
+  const fixture = healthyFixture();
+  fixture.findings = fixture.findings.map((item) => ({
+    ...item,
+    finding_status: { ...item.finding_status, status: "CLOSED", resolution_status: "APPROVED" },
+  }));
+  const result = await assessVeracodeFindingsHygiene(mockClient(fixture), { now: NOW });
+  const finding = result.findings.find((item) => item.id === "VERACODE-03");
+  assert.equal(finding.status, "pass");
+  assert.equal(finding.evidence.open_findings_evaluated, 0);
+  assert.match(finding.summary, /All 0 open unmitigated findings/);
 });
 
 test("assessVeracodeFindingsHygiene fails on aged flaws, unreviewed mitigations, and density and warns on missing dates", async () => {
@@ -2990,4 +3066,68 @@ test("class 10: a single object carrying a documented member is kept whatever el
   const [, , , , accessControls] = await runVeracodeAssessments(client);
   assert.deepEqual(accessControls.rawData.self, fixture.self, "the record is kept whole");
   assert.equal(accessControls.rawData.api_credentials_by_user["u-2"].api_id, "abc123", "the credential record is projected, not marked");
+});
+
+test("Veracode assessors emit every runtime-observable metadata rule-driving fact", async () => {
+  const severityFixture = healthyFixture();
+  severityFixture.findings = [5, 4, 3, 2].map((severity, index) => ({
+    issue_id: 200 + index,
+    finding_status: { status: "OPEN", resolution: "UNRESOLVED", first_found_date: daysAgo(5 + index) },
+    finding_details: { severity },
+    annotations: [],
+  }));
+  const runs = [
+    await runVeracodeAssessments(mockClient()),
+    await runVeracodeAssessments(representativeClient()),
+    await runVeracodeAssessments(mockClient(severityFixture)),
+  ];
+  const findings = runs.flatMap((run) => run.flatMap((assessment) => assessment.findings));
+  const expected = new Set(VERACODE_SPEC.checks.flatMap((check) =>
+    check.evidenceFields.filter((name) =>
+      name.endsWith("_observed_value")
+      || name.endsWith("_observed_values")
+      || name.endsWith("_configured_value"))));
+  assert.equal(expected.size, 25);
+  const observed = new Map();
+  for (const finding of findings) {
+    const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
+    for (const name of expected) {
+      if (facts[name] !== null && facts[name] !== undefined) observed.set(name, facts[name]);
+    }
+  }
+  assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+  assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
+  assert.deepEqual(certifyRuntimeRuleDecisiveness(VERACODE_SPEC, findings, { numeric: 15, collections: 0 }), {
+    numeric: 15,
+    collections: 0,
+    decisive: 15,
+  });
+  const prescan = findings.find((finding) => finding.id === "VERACODE-11");
+  assert.deepEqual(
+    Object.keys(prescan[BATCH3_RUNTIME_FACTS]).filter((name) => name.endsWith("_observed_value")),
+    [],
+    "manual-only XML prescan evidence is not represented as a dead REST-derived fact",
+  );
+  assert.equal(prescan.status, "manual");
+});
+
+test("byte differential fixtures: Veracode assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("veracode", "representative", await runVeracodeAssessments(representativeClient()));
+  writeByteDifferentialFixture("veracode", "compliant", await runVeracodeAssessments(mockClient()));
+  writeByteDifferentialFixture("veracode", "denied", await runVeracodeAssessments(forbiddenClient()));
+  writeByteDifferentialFixture("veracode", "missing-null", await runVeracodeAssessments(emptyClient()));
+  writeByteDifferentialFixture("veracode", "partial", await runVeracodeAssessments(partialClient()));
+  writeByteDifferentialFixture("veracode", "boundary", {
+    scanAge: await assessVeracodeScanCoverage(mockClient(), { now: NOW, maxScanAgeDays: 90 }),
+    falsePositiveRate: await assessVeracodeFindingsHygiene(mockClient(), { now: NOW, maxFpRatePercent: 20 }),
+    administrators: await assessVeracodeAccessControls(mockClient(), { now: NOW, maxAdmins: 5 }),
+  });
+  const config = sampleConfig();
+  const exported = await exportVeracodeAuditBundle(
+    mockClient(),
+    config,
+    prepareByteDifferentialExportRoot("veracode"),
+    { now: NOW },
+  );
+  writeByteDifferentialFixture("veracode", "export", snapshotExportBundle(exported));
 });

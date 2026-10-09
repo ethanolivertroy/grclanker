@@ -18,6 +18,8 @@ import {
   type IntegrationSpecContract,
   type PermissionKind,
   type PortableValue,
+  type RequestParameterContract,
+  renderVerdictCondition,
   type VerdictCondition,
   type VerdictOperand,
   type VerdictRule,
@@ -44,6 +46,10 @@ export interface BatchSurfaceDefinition {
   service: string;
   documentationUrl: string;
   fields: readonly string[];
+  clientRegion?: string;
+  headers?: readonly string[];
+  parameters?: readonly RequestParameterContract[];
+  responseShape?: string;
 }
 
 export interface BatchCheckDefinition {
@@ -63,6 +69,7 @@ export interface BatchCheckDefinition {
   derivedFactRules?: Readonly<Record<string, DerivedFactRule>>;
   completeness?: Readonly<Record<string, BatchCompletenessDefinition>>;
   decision: string;
+  specificCriteria?: boolean;
   outcomes?: {
     fail?: boolean;
     warn?: boolean;
@@ -136,6 +143,11 @@ export interface BatchOutputDefinition {
   jsonFormatting?: string;
 }
 
+function isBatch3CheckId(checkId: string): boolean {
+  return ["CS-", "TENABLE-", "QUALYS-", "VERACODE-", "KNOWBE4-"]
+    .some((prefix) => checkId.startsWith(prefix));
+}
+
 export function deriveDecisionRules(
   checkId: string,
   rules: readonly VerdictRule[],
@@ -146,7 +158,9 @@ export function deriveDecisionRules(
   const rewritten = reachableRules.map((entry, index) => {
     const name = `${checkId.toLowerCase().replaceAll("-", "_")}_branch_${String(index + 1).padStart(2, "0")}_matches`;
     derivedFactRules[name] = {
-      description: `${checkId} ordered branch ${index + 1} (${entry.status}) is true exactly when its portable evidence condition matches.`,
+      description: isBatch3CheckId(checkId)
+        ? `${checkId} ordered branch ${index + 1} selects ${entry.status} when ${renderVerdictCondition(entry.condition)}.`
+        : `${checkId} ordered branch ${index + 1} (${entry.status}) is true exactly when its portable evidence condition matches.`,
       condition: entry.condition,
     };
     return {
@@ -248,13 +262,122 @@ function factEquals(check: BatchCheckDefinition, suffix: string, value: Portable
   };
 }
 
+function exampleOperandValue(
+  operand: VerdictOperand,
+  constants: Readonly<Record<string, PortableValue>>,
+  fallback: PortableValue,
+): PortableValue {
+  if (operand.kind === "value") return operand.value;
+  if (operand.kind === "subtract") return fallback;
+  return constants[operand.path] ?? fallback;
+}
+
+function renderExampleAssignment(
+  condition: VerdictCondition,
+  constants: Readonly<Record<string, PortableValue>>,
+): string {
+  const operandName = (operand: VerdictOperand): string => {
+    switch (operand.kind) {
+      case "path":
+      case "length":
+        return operand.path;
+      case "value":
+        return JSON.stringify(operand.value);
+      case "subtract":
+        return `(${operandName(operand.left)} - ${operandName(operand.right)})`;
+      default: {
+        const exhaustive: never = operand;
+        return String(exhaustive);
+      }
+    }
+  };
+  const compared = (
+    left: VerdictOperand,
+    right: VerdictOperand,
+    relation: "eq" | "ne" | "gt" | "gte" | "lt" | "lte",
+  ): string => {
+    const rightValue = exampleOperandValue(right, constants, 1);
+    const leftName = operandName(left);
+    const rightName = operandName(right);
+    if (left.kind !== "path" && left.kind !== "length") return `${leftName} ${relation} ${rightName}`;
+    if (relation === "eq") return `${leftName}=${JSON.stringify(rightValue)}`;
+    if (relation === "ne") {
+      const unequal = typeof rightValue === "boolean"
+        ? !rightValue
+        : typeof rightValue === "number"
+          ? rightValue + 1
+          : `${String(rightValue)}-different`;
+      return `${leftName}=${JSON.stringify(unequal)} (not ${JSON.stringify(rightValue)})`;
+    }
+    if (typeof rightValue === "number") {
+      const value = relation === "gt" ? rightValue + 1
+        : relation === "gte" ? rightValue
+          : relation === "lt" ? rightValue - 1
+            : rightValue;
+      return `${leftName}=${value}; ${rightName}=${rightValue}`;
+    }
+    return `${leftName} ${relation} ${rightName}`;
+  };
+  switch (condition.op) {
+    case "always":
+      return "all earlier ordered branch conditions are false";
+    case "and":
+      return condition.conditions.map((child) => renderExampleAssignment(child, constants)).join("; ");
+    case "or":
+      return renderExampleAssignment(condition.conditions[0] ?? { op: "always" }, constants);
+    case "not":
+      return `the following condition is false: ${renderExampleAssignment(condition.condition, constants)}`;
+    case "eq":
+    case "ne":
+    case "gt":
+    case "gte":
+    case "lt":
+    case "lte":
+      return compared(condition.left, condition.right, condition.op);
+    case "ratio": {
+      const threshold = exampleOperandValue(condition.threshold, constants, 1);
+      const thresholdNumber = typeof threshold === "number" ? threshold : 1;
+      const scale = condition.scale ?? 1;
+      const denominator = 100;
+      const boundary = thresholdNumber * denominator / scale;
+      const numerator = condition.comparator === "gt" ? boundary + 1
+        : condition.comparator === "gte" ? boundary
+          : condition.comparator === "lt" ? Math.max(0, boundary - 1)
+            : boundary;
+      return `${operandName(condition.numerator)}=${numerator}; ${operandName(condition.denominator)}=${denominator}; ${operandName(condition.threshold)}=${thresholdNumber}`;
+    }
+    case "matches":
+      return `${operandName(condition.operand)}="matching-value" matching /${condition.pattern}/${condition.flags ?? ""}`;
+    case "in":
+      return `${operandName(condition.candidate)}="matching-value"; ${operandName(condition.collection)}=["matching-value"]`;
+    case "intersects":
+      return `${operandName(condition.left)}=["matching-value"]; ${operandName(condition.right)}=["matching-value"]`;
+    case "matchesAny":
+      return `${operandName(condition.candidates)}=["matching-value"]; ${operandName(condition.patterns)}=["matching.*"]`;
+    case "defined":
+      return `${operandName(condition.operand)}=0 (defined)`;
+    case "null":
+      return `${operandName(condition.operand)}=null`;
+    case "some":
+      return `${condition.path}=[one record satisfying ${renderExampleAssignment(condition.condition, constants)}]`;
+    case "every":
+      return `${condition.path}=[records each satisfying ${renderExampleAssignment(condition.condition, constants)}]`;
+    default: {
+      const exhaustive: never = condition;
+      return String(exhaustive);
+    }
+  }
+}
+
 function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
+  const checkSpecificExamples = isBatch3CheckId(check.id);
   const manualOnly = /^always return manual\b/i.test(check.decision)
     && !/\b(?:pass|warn|fail)\b/i.test(check.decision.replace(/^always return manual\b/i, ""));
+  const declaredStatuses = new Set(check.decisionRules?.map((rule) => rule.status) ?? []);
   const outcomes = {
-    fail: check.outcomes?.fail ?? (!manualOnly && /\bfail\b/i.test(check.decision)),
-    warn: check.outcomes?.warn ?? (!manualOnly && /\bwarn\b/i.test(check.decision)),
-    pass: check.outcomes?.pass ?? (!manualOnly && /\bpass\b/i.test(check.decision)),
+    fail: check.outcomes?.fail ?? (check.decisionRules ? declaredStatuses.has("fail") : !manualOnly && /\bfail\b/i.test(check.decision)),
+    warn: check.outcomes?.warn ?? (check.decisionRules ? declaredStatuses.has("warn") : !manualOnly && /\bwarn\b/i.test(check.decision)),
+    pass: check.outcomes?.pass ?? (check.decisionRules ? declaredStatuses.has("pass") : !manualOnly && /\bpass\b/i.test(check.decision)),
   };
   const rules: VerdictRule[] = [];
   if (outcomes.fail) {
@@ -307,42 +430,100 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
     condition: { op: "always" },
     note: "Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual.",
   });
+  const renderedRules = check.decisionRules ?? rules;
+  if (!check.specificCriteria) {
+    return {
+      pass: `Complete readable evidence satisfies the compliant branch of this derivation: ${check.decision}`,
+      warn: `Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: ${check.decision}`,
+      fail: `Complete readable evidence satisfies the violation branch, which has first-match precedence: ${check.decision}`,
+      manual: `The required evidence for ${check.title} is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict.`,
+      constants: check.decisionConstants ?? {
+        requiredEvidenceReadable: true,
+        requiredEvidenceComplete: true,
+      },
+      examples: [
+        {
+          kind: "compliant",
+          input: `All required source reads are complete and this derivation returns pass: ${check.decision}`,
+          expected: "pass",
+          reason: "A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence.",
+        },
+        {
+          kind: "noncompliant",
+          input: `A complete source read satisfies the fail branch of this derivation: ${check.decision}`,
+          expected: "fail",
+          reason: "A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence.",
+        },
+        {
+          kind: "partial",
+          input: "At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists.",
+          expected: "warn",
+          reason: "Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime.",
+        },
+        {
+          kind: "unreadable",
+          input: "A required value is null, missing, denied, never requested, malformed, or unreadable.",
+          expected: "manual",
+          reason: "Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes.",
+        },
+      ],
+      rules: renderedRules,
+    };
+  }
+  const sourceConditionFor = (status: EvaluatedFindingStatus): string => {
+    const rendered = renderedRules.find((entry) => entry.status === status);
+    if (!rendered) return `No ${status} branch exists for this check.`;
+    if (rendered.condition.op === "eq" && rendered.condition.left.kind === "path") {
+      const derivation = check.derivedFactRules?.[rendered.condition.left.path];
+      if (derivation) return renderVerdictCondition(derivation.condition);
+    }
+    return renderVerdictCondition(rendered.condition);
+  };
+  const noncompliantStatus: EvaluatedFindingStatus = outcomes.fail
+    ? "fail"
+    : outcomes.warn
+      ? "warn"
+      : "manual";
+  const partialStatus: EvaluatedFindingStatus = outcomes.warn ? "warn" : "manual";
+  const compliantStatus: EvaluatedFindingStatus = outcomes.pass ? "pass" : "manual";
+  const constants = check.decisionConstants ?? {};
+  const conditionFor = (status: EvaluatedFindingStatus): VerdictCondition => {
+    const rendered = renderedRules.find((entry) => entry.status === status);
+    if (!rendered) return { op: "always" };
+    if (rendered.condition.op === "eq" && rendered.condition.left.kind === "path") {
+      return check.derivedFactRules?.[rendered.condition.left.path]?.condition ?? rendered.condition;
+    }
+    return rendered.condition;
+  };
+  const exampleFor = (
+    kind: "compliant" | "noncompliant" | "partial" | "unreadable",
+    status: EvaluatedFindingStatus,
+  ) => ({
+    kind,
+    input: checkSpecificExamples
+      ? `${check.id} ${check.title}: ${renderExampleAssignment(conditionFor(status), constants)}; all earlier ordered branches are false.`
+      : `${check.id} concrete primitive assignment: ${renderExampleAssignment(conditionFor(status), constants)}; all earlier ordered branches are false.`,
+    expected: status,
+    reason: checkSpecificExamples
+      ? `${check.id} returns ${status} because ${sourceConditionFor(status)} is the first matching ordered condition.`
+      : `${check.id} reaches the first ${status} rule under this named primitive assignment.`,
+  });
   return {
-    pass: `Complete readable evidence satisfies the compliant branch of this derivation: ${check.decision}`,
-    warn: `Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: ${check.decision}`,
-    fail: `Complete readable evidence satisfies the violation branch, which has first-match precedence: ${check.decision}`,
-    manual: `The required evidence for ${check.title} is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict.`,
+    pass: `${check.id} returns pass at the first ordered pass condition ${sourceConditionFor("pass")}. Decision predicate: ${check.decision}`,
+    warn: `${check.id} returns warn at the first ordered warn condition ${sourceConditionFor("warn")}. Decision predicate: ${check.decision}`,
+    fail: `${check.id} returns fail at the first ordered fail condition ${sourceConditionFor("fail")}. Decision predicate: ${check.decision}`,
+    manual: `${check.id} returns manual at the first ordered manual condition ${sourceConditionFor("manual")}; absent, null, denied, unreadable, not-requested, and malformed primitives cannot pass.`,
     constants: check.decisionConstants ?? {
       requiredEvidenceReadable: true,
       requiredEvidenceComplete: true,
     },
     examples: [
-      {
-        kind: "compliant",
-        input: `All required source reads are complete and this derivation returns pass: ${check.decision}`,
-        expected: "pass",
-        reason: "A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence.",
-      },
-      {
-        kind: "noncompliant",
-        input: `A complete source read satisfies the fail branch of this derivation: ${check.decision}`,
-        expected: "fail",
-        reason: "A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence.",
-      },
-      {
-        kind: "partial",
-        input: "At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists.",
-        expected: "warn",
-        reason: "Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime.",
-      },
-      {
-        kind: "unreadable",
-        input: "A required value is null, missing, denied, never requested, malformed, or unreadable.",
-        expected: "manual",
-        reason: "Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes.",
-      },
+      exampleFor(checkSpecificExamples && !outcomes.pass ? "unreadable" : "compliant", compliantStatus),
+      exampleFor("noncompliant", noncompliantStatus),
+      exampleFor("partial", partialStatus),
+      exampleFor("unreadable", "manual"),
     ],
-    rules: check.decisionRules ?? rules,
+    rules: renderedRules,
   };
 }
 
@@ -444,6 +625,18 @@ function collectPortableInputUsage(
     case "matches":
       recordOperandUsage(usage, condition.operand, derivedFact, "string");
       return;
+    case "in":
+      recordOperandUsage(usage, condition.candidate, derivedFact);
+      recordOperandUsage(usage, condition.collection, derivedFact, "array");
+      return;
+    case "intersects":
+      recordOperandUsage(usage, condition.left, derivedFact, "array");
+      recordOperandUsage(usage, condition.right, derivedFact, "array");
+      return;
+    case "matchesAny":
+      recordOperandUsage(usage, condition.candidates, derivedFact, "array");
+      recordOperandUsage(usage, condition.patterns, derivedFact, "array");
+      return;
     case "defined":
     case "null":
       recordOperandUsage(usage, condition.operand, derivedFact);
@@ -520,8 +713,11 @@ function renderCompletenessSemantics(
 ): string {
   if (!contract) throw new Error(`${check.id} input ${inputName} requires an explicit completeness contract`);
   if (!contract.semantics.trim()) throw new Error(`${check.id} input ${inputName} completeness semantics are empty`);
+  const semantics = contract.semantics
+    .replace(new RegExp(`^For ${check.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")},\\s*`, "i"), "")
+    .trim();
   if (contract.sources.length === 0) {
-    return `For ${check.id}, this fact has no vendor dataset dependency. ${contract.semantics}`;
+    return `For ${check.id}, this fact has no vendor dataset dependency. ${semantics}`;
   }
   const sourceText = contract.sources.map((source) => {
     if (!source.scope && !source.aggregate) {
@@ -542,7 +738,7 @@ function renderCompletenessSemantics(
     }
     return `\`${source.surfaceId}\`${scope}: false on ${source.falseWhen.join(", ")}; other failure modes do not change this fact${aggregate}`;
   }).join("; ");
-  return `For ${check.id}, ${contract.semantics} Exact source-state effects: ${sourceText}`;
+  return `For ${check.id}, ${semantics} Exact source-state effects: ${sourceText}`;
 }
 
 export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): IntegrationSpecContract {
@@ -608,10 +804,10 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
     fieldsConsumed: surface.fields,
     projectionStage: "The collector projects the response to the listed verdict fields before evidence export.",
     request: {
-      clientRegion: `Use the configured ${surface.service} origin; never follow a server link to a different origin.`,
-      headers: ["Authorization appropriate to the selected authentication mode", "Accept: application/json"],
-      parameters: [],
-      responseShape: `A JSON object or list containing only the documented ${surface.fields.join(", ")} members consumed by verdicts.`,
+      clientRegion: surface.clientRegion ?? `Use the configured ${surface.service} origin; never follow a server link to a different origin.`,
+      headers: surface.headers ?? ["Authorization appropriate to the selected authentication mode", "Accept: application/json"],
+      parameters: surface.parameters ?? [],
+      responseShape: surface.responseShape ?? `A JSON object or list containing only the documented ${surface.fields.join(", ")} members consumed by verdicts.`,
     },
     intent: "read" as const,
   }));
@@ -736,20 +932,30 @@ export function evaluateBatchCheckVerdict(
   return evaluateCheckVerdict(checkContract(spec, checkId), rawFacts);
 }
 
+const STRICT_RUNTIME_FACT_SPECS = new Set([
+  "crowdstrike-sec-inspector",
+  "knowbe4-sec-inspector",
+  "qualys-sec-inspector",
+  "tenable-sec-inspector",
+  "veracode-sec-inspector",
+]);
+
 export function evaluateBatchRuntimeCheckVerdict(
   spec: IntegrationSpecContract,
   checkId: string,
   collectedFacts: Readonly<Record<string, unknown>>,
 ): EvaluatedFindingStatus {
   const check = checkContract(spec, checkId);
-  const declaredFacts = Object.fromEntries(
-    Object.entries(collectedFacts).filter(([name]) => check.evidenceFields.includes(name)),
-  );
+  const decisionFacts = STRICT_RUNTIME_FACT_SPECS.has(spec.identity.slug)
+    ? collectedFacts
+    : Object.fromEntries(
+        Object.entries(collectedFacts).filter(([name]) => check.evidenceFields.includes(name)),
+      );
   BATCH_DECISION_CAPTURE.getStore()?.push({
     integration: spec.identity.slug,
-    checks: new Map([[checkId, declaredFacts]]),
+    checks: new Map([[checkId, decisionFacts]]),
   });
-  return evaluateCheckVerdict(check, declaredFacts);
+  return evaluateCheckVerdict(check, decisionFacts);
 }
 
 export function assertBatchCheckVerdict<T extends string>(

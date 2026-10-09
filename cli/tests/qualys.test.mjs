@@ -6,6 +6,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { inflateRawSync } from "node:zlib";
+import { createHash } from "node:crypto";
 
 import { assertNoCanaryWindows } from "./helpers/error-canaries.mjs";
 import {
@@ -38,6 +39,15 @@ import {
   xmlToRecord,
 } from "../dist/extensions/grc-tools/qualys.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
+import { QUALYS_SPEC } from "../dist/extensions/grc-tools/qualys.spec.js";
+import { certifyRuntimeRuleDecisiveness } from "./helpers/batch3-rule-certification.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date();
 const daysAgo = (days) => new Date(NOW.getTime() - days * 86_400_000).toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -985,6 +995,34 @@ const failingFixtures = {
   searchWasAuthRecords: async () => [documentedWasAuthRecord({ name: "old-login", updatedDate: daysAgo(400) })],
   searchWasSchedules: async () => [],
 };
+
+test("Qualys assessors emit every metadata rule-driving fact from runtime records", async () => {
+  const runs = [
+    await runAllAssessments(createFakeClient(healthyFixtures)),
+    await runAllAssessments(createFakeClient(failingFixtures)),
+  ];
+  const findings = runs.flatMap(allFindings);
+  const expected = new Set(QUALYS_SPEC.checks.flatMap((check) =>
+    check.evidenceFields.filter((name) =>
+      name.endsWith("_observed_value")
+      || name.endsWith("_observed_values")
+      || name.endsWith("_configured_value"))));
+  assert.equal(expected.size, 14);
+  const observed = new Map();
+  for (const finding of findings) {
+    const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
+    for (const name of expected) {
+      if (facts[name] !== null && facts[name] !== undefined) observed.set(name, facts[name]);
+    }
+  }
+  assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+  assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
+  assert.deepEqual(certifyRuntimeRuleDecisiveness(QUALYS_SPEC, findings, { numeric: 9, collections: 0 }), {
+    numeric: 9,
+    collections: 0,
+    decisive: 9,
+  });
+});
 
 const EMPTY_LIST_XML = '<?xml version="1.0" encoding="UTF-8"?><LIST_OUTPUT><RESPONSE><DATETIME>2026-09-21T00:00:00Z</DATETIME></RESPONSE></LIST_OUTPUT>';
 const EMPTY_USER_LIST_XML = '<?xml version="1.0" encoding="UTF-8"?><USER_LIST_OUTPUT><USER_LIST></USER_LIST></USER_LIST_OUTPUT>';
@@ -2113,6 +2151,61 @@ test("assessQualysScanCoverage: empty fixture never passes and states the emptin
   assert.equal(findingById(noGroups, "QUALYS-C01").status, "manual");
 });
 
+test("QUALYS-C16 preserves exact proved-failure bytes across one denied source and 45 independent second-source failures", async () => {
+  const deniedProfiles = failing("Qualys request failed (403) for listOptionProfiles: code 2010: Forbidden, module not subscribed for this user");
+  const broadRange = async () => [{ type: "range", value: "10.0.0.0-10.0.255.255" }];
+  const baseOverrides = {
+    ...healthyFixtures,
+    listOptionProfiles: deniedProfiles,
+    listExcludedIps: broadRange,
+  };
+  const project = (results) => {
+    const finding = allFindings(results).find((item) => item.id === "QUALYS-C16");
+    assert.ok(finding);
+    return JSON.stringify({ status: finding.status, summary: finding.summary, evidence: finding.evidence });
+  };
+  const baselineBytes = project(await runAllAssessments(createFakeClient(baseOverrides)));
+  assert.equal(
+    createHash("sha256").update(baselineBytes).digest("hex"),
+    "82faed1dbab2b63e3503d2da18761af6d651c987686f3d7d28fd750c07f51a98",
+    "the status, summary, and evidence snapshot is intentionally byte-pinned",
+  );
+  assert.match(baselineBytes, /^{"status":"fail","summary":"1 excluded IP ranges span more than 256 addresses\. Additional evidence was not readable:/);
+
+  const secondSources = [
+    "listAppliances",
+    "listAuthRecordSummary",
+    "listCompliancePolicies",
+    "listDetections",
+    "listKnowledgeBase",
+    "listScheduledReports",
+    "listReports",
+    "listActivityLog",
+    "searchCloudAgents",
+    "searchConnectors",
+    "searchTags",
+    "searchWebApps",
+    "searchWasScans",
+    "searchWasAuthRecords",
+    "searchWasSchedules",
+  ];
+  let cases = 1;
+  for (const methodName of secondSources) {
+    for (const mode of ["denied", "empty", "truncated"]) {
+      const original = healthyFixtures[methodName];
+      const override = mode === "denied"
+        ? failing(`Qualys request failed (403) for ${methodName}: code 2010: Forbidden`)
+        : mode === "empty"
+          ? async () => []
+          : async (...args) => truncated(normalizeList(await original(...args)).items, `${methodName} pairwise truncation`);
+      const bytes = project(await runAllAssessments(createFakeClient({ ...baseOverrides, [methodName]: override })));
+      assert.equal(bytes, baselineBytes, `${methodName}/${mode}: unrelated second-source failure must not alter QUALYS-C16 bytes`);
+      cases += 1;
+    }
+  }
+  assert.equal(cases, 46);
+});
+
 test("assessQualysScanCoverage: partial fixture never passes and reports seen versus cap", async () => {
   const partial = await assessQualysScanCoverage(createFakeClient(partialFixtures(healthyFixtures)));
   assert.ok(partial.findings.every((item) => item.status !== "pass"));
@@ -2255,6 +2348,13 @@ test("assessQualysVulnerabilityManagement: empty fixture never passes, and zero 
   assert.match(findingById(cleanHosts, "QUALYS-C10").summary, /Zero open severity 3 to 5 detections across 2 hosts with the detection list read completely; emptiness is compliant/);
   assert.equal(findingById(cleanHosts, "QUALYS-C11").status, "pass");
   assert.equal(findingById(cleanHosts, "QUALYS-C17").status, "manual");
+
+  const cleanDetectionsWithPartialHosts = await assessQualysVulnerabilityManagement(createFakeClient({
+    ...healthyFixtures,
+    listDetections: async () => [],
+    listHosts: async () => truncated(await healthyFixtures.listHosts(), "host cap reached"),
+  }));
+  assert.equal(findingById(cleanDetectionsWithPartialHosts, "QUALYS-C10").status, "warn");
 
   const cleanTruncated = await assessQualysVulnerabilityManagement(createFakeClient({
     ...healthyFixtures,
@@ -4312,4 +4412,29 @@ test("Qualys tools are registered in the tool catalog under the Qualys group", (
   assert.ok(tools.every((tool) => tool.group === "Qualys"));
   assert.ok(tools.every((tool) => tool.kind === "domain"));
   assert.ok(tools.every((tool) => typeof tool.description === "string" && tool.description.length > 40));
+});
+
+test("byte differential fixtures: Qualys assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("qualys", "representative", await runAllAssessments(createFakeClient(failingFixtures)));
+  writeByteDifferentialFixture("qualys", "compliant", await runAllAssessments(createFakeClient(healthyFixtures)));
+  writeByteDifferentialFixture("qualys", "denied", await runAllAssessments(createFakeClient(forbiddenFixtures())));
+  writeByteDifferentialFixture("qualys", "missing-null", await runAllAssessments(createFakeClient({
+    ...healthyFixtures,
+    listHosts: async () => [],
+    listAssetGroups: async () => [],
+    listDetections: async () => [],
+  })));
+  writeByteDifferentialFixture("qualys", "partial", await runAllAssessments(createFakeClient(partialFixtures(healthyFixtures))));
+  writeByteDifferentialFixture("qualys", "boundary", {
+    authenticated: await runAllAssessments(createFakeClient(healthyFixtures), { minAuthScanPercent: 80 }),
+    agents: await runAllAssessments(createFakeClient(healthyFixtures), { minAgentCoveragePercent: 50 }),
+    managers: await runAllAssessments(createFakeClient(healthyFixtures), { maxManagers: 5 }),
+  });
+  const config = sampleConfig();
+  const exported = await exportQualysAuditBundle(
+    createFakeClient(healthyFixtures, config),
+    config,
+    prepareByteDifferentialExportRoot("qualys"),
+  );
+  writeByteDifferentialFixture("qualys", "export", snapshotExportBundle(exported));
 });

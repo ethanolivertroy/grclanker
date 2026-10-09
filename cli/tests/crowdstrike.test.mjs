@@ -31,7 +31,10 @@ import {
   resolveSecureOutputPath,
   runAllCrowdstrikeAssessments,
 } from "../dist/extensions/grc-tools/crowdstrike.js";
+import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
+import { CROWDSTRIKE_SPEC } from "../dist/extensions/grc-tools/crowdstrike.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { certifyRuntimeRuleDecisiveness } from "./helpers/batch3-rule-certification.mjs";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
@@ -40,6 +43,12 @@ import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, inj
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const ALL_CONTROL_IDS = Array.from({ length: 25 }, (_, index) => `CS-${String(index + 1).padStart(2, "0")}`);
 const EXPECTED_TOOLS = [
@@ -447,6 +456,78 @@ function createPartialClient() {
   });
 }
 
+test("CrowdStrike assessors emit every metadata rule-driving fact from runtime records", async () => {
+  const runtimeRuns = [
+    await runAllCrowdstrikeAssessments(createFakeClient()),
+    await runAllCrowdstrikeAssessments(createFakeClient({
+      listApiClients: async () => [{
+        id: "api-write",
+        name: "write integration",
+        scopes: [apiScope("prevention-policies", "write")],
+        last_used_timestamp: isoDaysAgo(120),
+      }],
+      countZtaAssessments: async (filter) => filter.startsWith("score:<") ? 1 : 3,
+      listZtaAssessments: async () => [{ device_id: "aid-low", score: 59 }],
+    })),
+    await runAllCrowdstrikeAssessments(createFakeClient({
+      listHosts: async (_limit, filter) => filter
+        ? [host({ hostname: "contained-01", status: "contained", modified_timestamp: isoHoursAgo(73) })]
+        : [host()],
+    })),
+  ];
+  const findings = runtimeRuns.flatMap((run) => run.flatMap((assessment) => assessment.findings));
+  const expected = new Set(CROWDSTRIKE_SPEC.checks.flatMap((check) =>
+    check.evidenceFields.filter((name) =>
+      name.endsWith("_observed_value")
+      || name.endsWith("_observed_values")
+      || name.endsWith("_configured_value"))));
+  assert.equal(expected.size, 41);
+  const observed = new Map();
+  for (const finding of findings) {
+    const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
+    for (const name of expected) {
+      if (facts[name] !== null && facts[name] !== undefined) observed.set(name, facts[name]);
+    }
+  }
+  assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+  assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
+  assert.deepEqual(certifyRuntimeRuleDecisiveness(CROWDSTRIKE_SPEC, findings, { numeric: 22, collections: 13 }), {
+    numeric: 22,
+    collections: 13,
+    decisive: 35,
+  });
+});
+
+function createRepresentativeClient() {
+  return createFakeClient({
+    listPreventionPolicies: async () => [
+      preventionPolicy({ detection: "CAUTIOUS", prevention: "DISABLED", exploitEnabled: false, scriptEnabled: false, tamperEnabled: false, detectOnWrite: false }),
+    ],
+    listResponsePolicies: async () => [responsePolicy({ rtr: false })],
+    listAlerts: async () => [
+      { composite_id: "a-old", severity: 90, severity_name: "Critical", status: "new", created_timestamp: isoHoursAgo(100) },
+    ],
+    getDeviceControlPoliciesV2: async () => [{
+      id: "dc-1",
+      usb_settings: {
+        enforcement_mode: "MONITOR_ONLY",
+        pcie_enforcement_mode: "MONITOR_ONLY",
+        classes: [{ id: "MASS_STORAGE", action: "FULL_ACCESS", exceptions: [] }],
+      },
+    }],
+    listSensorUpdatePolicies: async () => [
+      sensorUpdatePolicy({ name: "Updates Off", settings: { build: "", uninstall_protection: "DISABLED" } }),
+    ],
+    listHosts: async (_limit, filter) => filter
+      ? [host({ hostname: "contained-01", status: "contained", modified_timestamp: isoHoursAgo(200) })]
+      : [host({ last_seen: isoDaysAgo(30), groups: [], reduced_functionality_mode: "yes" })],
+    countDiscoverHosts: async (filter) => (filter.includes("unmanaged") ? 2 : 1),
+    listDiscoverHosts: async () => [{ hostname: "rogue-01", platform_name: "Linux", last_seen_timestamp: isoDaysAgo(1) }],
+    countZtaAssessments: async (filter) => (filter.startsWith("score:<") ? 1 : 1),
+    listZtaAssessments: async () => [{ aid: "aid-1", score: 22 }],
+  });
+}
+
 test("resolveCrowdstrikeConfiguration prefers explicit args over environment and config file values", () => {
   const home = createTempBase("grclanker-cs-home-");
   mkdirSync(join(home, ".crowdstrike"), { recursive: true });
@@ -629,6 +710,90 @@ test("CrowdstrikeApiClient follows after cursors, opaque offset tokens, and POST
   const alerts = await client.listAlerts("severity:>=70", 10);
   assert.deepEqual(alerts.items.map((item) => item.composite_id), ["a-1", "a-2"]);
   assert.equal(alerts.truncated, false);
+});
+
+test("CrowdstrikeApiClient sends exact device, RTR, and zero-trust filters, fields, sorts, and caps", async () => {
+  const seen = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/oauth2/token") {
+      return jsonResponse({ access_token: "token-1", expires_in: 1799 });
+    }
+    seen.push(url);
+    return jsonResponse({ resources: [], meta: { pagination: { total: 0 } } });
+  };
+  const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl });
+
+  await client.listHosts(200, "status:'normal'");
+  await client.listRtrSessions("created_at:>'now-30d'", 500);
+  await client.listZtaAssessments("score:<60", 1000);
+
+  const devices = seen.find((url) => url.pathname === "/devices/combined/devices/v1");
+  assert.equal(devices.searchParams.get("filter"), "status:'normal'");
+  assert.equal(devices.searchParams.get("sort"), "device_id.asc");
+  assert.equal(devices.searchParams.get("fields"), "device_id,hostname,platform_name,os_version,agent_version,last_seen,first_seen,status,groups,product_type_desc,reduced_functionality_mode,modified_timestamp");
+  assert.equal(devices.searchParams.get("limit"), "200");
+
+  const rtr = seen.find((url) => url.pathname === "/real-time-response-audit/combined/sessions/v1");
+  assert.equal(rtr.searchParams.get("filter"), "created_at:>'now-30d'");
+  assert.equal(rtr.searchParams.get("sort"), "created_at|desc");
+  assert.equal(rtr.searchParams.get("limit"), "500");
+
+  const zta = seen.find((url) => url.pathname === "/zero-trust-assessment/queries/assessments/v1");
+  assert.equal(zta.searchParams.get("filter"), "score:<60");
+  assert.equal(zta.searchParams.get("sort"), "score|asc");
+  assert.equal(zta.searchParams.get("limit"), "1000");
+});
+
+test("CrowdstrikeApiClient issues every query and entity lookup with exact paging semantics", async () => {
+  const seen = [];
+  const entityPaths = new Set([
+    "/fwmgr/entities/rule-groups/v1",
+    "/fwmgr/entities/rules/v1",
+    "/user-management/entities/roles/v1",
+    "/api-clients/entities/api-clients/v1",
+    "/policy/entities/ioa-exclusions/v1",
+    "/policy/entities/ml-exclusions/v1",
+    "/policy/entities/sv-exclusions/v1",
+    "/identity-protection/entities/policy-rules/v1",
+  ]);
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: "token-1", expires_in: 1799 });
+    seen.push({ method: init.method ?? "GET", url });
+    if (entityPaths.has(url.pathname)) {
+      return jsonResponse({ resources: [{ id: "record-1", name: "record" }], meta: { pagination: { total: 1 } } });
+    }
+    return jsonResponse({ resources: ["record-1"], meta: { pagination: { total: 1 } } });
+  };
+  const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl });
+
+  await client.listFirewallRuleGroups(10);
+  await client.listFirewallRules(10);
+  await client.listRoles();
+  await client.listApiClients(10);
+  await client.listIoaExclusions(10);
+  await client.listMlExclusions(10);
+  await client.listSensorVisibilityExclusions(10);
+  await client.listIdentityProtectionRules();
+  await client.listDiscoverHosts("entity_type:'unmanaged'", 100);
+
+  for (const path of entityPaths) {
+    const request = seen.find((entry) => entry.url.pathname === path);
+    assert.ok(request, path);
+    assert.equal(request.method, "GET");
+    assert.deepEqual(request.url.searchParams.getAll("ids"), ["record-1"]);
+    assert.equal(request.url.searchParams.has("limit"), false);
+    assert.equal(request.url.searchParams.has("offset"), false);
+  }
+  for (const path of ["/user-management/queries/roles/v1", "/identity-protection/queries/policy-rules/v1"]) {
+    const request = seen.find((entry) => entry.url.pathname === path);
+    assert.ok(request, path);
+    assert.equal(request.url.search, "", `${path} is one unpaged query`);
+  }
+  const discover = seen.find((entry) => entry.url.pathname === "/discover/combined/hosts/v1");
+  assert.equal(discover.url.searchParams.get("filter"), "entity_type:'unmanaged'");
+  assert.equal(discover.url.searchParams.get("limit"), "100");
 });
 
 test("CrowdstrikeApiClient records truncation instead of treating a first page as the whole population", async () => {
@@ -1394,6 +1559,15 @@ test("verdict safety rule 7: truncated pages downgrade the assessments that depe
     assert.match(item.summary, /3 of an unknown total of prevention policies/);
   }
   assert.equal(prevention.summary.policies_truncated, true);
+
+  const emptyPrevention = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => ({ items: [], total: 3, truncated: true }),
+  }));
+  for (const item of emptyPrevention.findings) {
+    assert.equal(item.status, "manual", `${item.id} cannot infer an absence violation from zero visible rows of a truncated policy list`);
+    assert.equal(item.evidence.absence_claim, true, `${item.id} marks the unavailable absence predicate`);
+    assert.match(item.summary, /0 of 3 prevention policies/);
+  }
 });
 
 test("verdict safety rule 8: re-running an export pairs each bundle directory with its own zip", async () => {
@@ -3021,4 +3195,23 @@ test("CrowdStrike tools are registered in the tool catalog under the CrowdStrike
   }
   const exportTool = tools.find((entry) => entry.name === "crowdstrike_export_audit_bundle");
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "output_dir"));
+});
+
+test("byte differential fixtures: CrowdStrike assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("crowdstrike", "representative", await runAllCrowdstrikeAssessments(createRepresentativeClient()));
+  writeByteDifferentialFixture("crowdstrike", "compliant", await runAllCrowdstrikeAssessments(createFakeClient()));
+  writeByteDifferentialFixture("crowdstrike", "denied", await runAllCrowdstrikeAssessments(createForbiddenClient()));
+  writeByteDifferentialFixture("crowdstrike", "missing-null", await runAllCrowdstrikeAssessments(createEmptyClient()));
+  writeByteDifferentialFixture("crowdstrike", "partial", await runAllCrowdstrikeAssessments(createPartialClient()));
+  writeByteDifferentialFixture("crowdstrike", "boundary", {
+    administrators: await runAllCrowdstrikeAssessments(createFakeClient(), { maxAdmins: 5 }),
+    sessions: await runAllCrowdstrikeAssessments(createFakeClient(), { maxSessionMinutes: 30, maxConcurrentSessions: 3 }),
+    zeroTrust: await runAllCrowdstrikeAssessments(createFakeClient(), { minZtaScore: 60 }),
+  });
+  const exported = await exportCrowdstrikeAuditBundle(
+    createFakeClient(),
+    sampleConfig(),
+    prepareByteDifferentialExportRoot("crowdstrike"),
+  );
+  writeByteDifferentialFixture("crowdstrike", "export", snapshotExportBundle(exported));
 });

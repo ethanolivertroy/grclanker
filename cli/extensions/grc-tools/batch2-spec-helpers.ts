@@ -31,6 +31,7 @@ export interface Batch2CheckRow {
   decisionInputs?: Readonly<Record<string, string>>;
   decisionRules?: readonly VerdictRule[];
   completeness?: Readonly<Record<string, BatchCompletenessDefinition>>;
+  specificCriteria?: boolean;
 }
 
 export const batch2Value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
@@ -169,6 +170,18 @@ function collectConditionPaths(condition: VerdictCondition, paths: Set<string>):
     case "null":
       collectOperandPaths(condition.operand, paths);
       return;
+    case "in":
+      collectOperandPaths(condition.candidate, paths);
+      collectOperandPaths(condition.collection, paths);
+      return;
+    case "intersects":
+      collectOperandPaths(condition.left, paths);
+      collectOperandPaths(condition.right, paths);
+      return;
+    case "matchesAny":
+      collectOperandPaths(condition.candidates, paths);
+      collectOperandPaths(condition.patterns, paths);
+      return;
     case "some":
     case "every":
       paths.add(condition.path);
@@ -250,6 +263,7 @@ export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinit
       derivedFactRules: executable.derivedFactRules,
       completeness: row.completeness,
       decision: row.decision,
+      specificCriteria: row.specificCriteria,
     };
   });
 }
@@ -261,6 +275,7 @@ export function restSurface(
   documentationUrl: string,
   fields: readonly string[],
   method: "GET" | "POST" = "GET",
+  request: Partial<Pick<BatchSurfaceDefinition, "clientRegion" | "headers" | "parameters" | "responseShape">> = {},
 ): BatchSurfaceDefinition {
-  return { id, path: pathValue, service, documentationUrl, fields, method };
+  return { id, path: pathValue, service, documentationUrl, fields, method, ...request };
 }
