@@ -15,7 +15,7 @@ Inside a grclanker session, put the subject after the command:
 
 From the shell, `grclanker investigate "<subject>"` opens a session that starts with the same prompt and the subject filled in. Run `grclanker investigate` on its own to name the subject in your first message instead.
 
-In the older `v0.0.1` release bundle, text after `/investigate` and arguments after `grclanker investigate` are dropped, so upgrade to `v0.1.0` or send the subject in its own message there.
+In the older `v0.0.1` release bundle, text after `/investigate` and arguments after `grclanker investigate` are dropped, so upgrade to `v0.1.1` or send the subject in its own message there.
 
 ## What the prompt asks for
 

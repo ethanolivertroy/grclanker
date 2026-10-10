@@ -1,6 +1,6 @@
 {
   "name": "@grclanker/cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Experimental local-first AI GRC CLI built on Pi, with native tools for cloud, identity, SaaS, and compliance framework assessments",
   "license": "Apache-2.0",

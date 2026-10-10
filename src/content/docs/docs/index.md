@@ -18,7 +18,7 @@ The same workflow prompts, personas, and domain tools can run in three ways:
 3. Choose local-first or hosted.
 4. Use a workflow, call a native integration tool, or hand the agent a repository spec.
 
-The one-line installer ships the `v0.1.0` release bundle, which registers all 241 domain tools and includes `grclanker tools` and `grclanker flue run`.
+The one-line installer ships the `v0.1.1` release bundle, which registers all 241 domain tools and includes `grclanker tools` and `grclanker flue run`.
 
 The [Quick Start](/docs/getting-started/quick-start/) covers the shortest path. [Configuration](/docs/getting-started/configuration/) and [Compute Backends](/docs/getting-started/compute-backends/) cover runtime settings and execution environments.
 
@@ -29,7 +29,7 @@ The [Quick Start](/docs/getting-started/quick-start/) covers the shortest path. 
 
 ## What's new
 
-[What's New](/docs/changelog/) lists what `v0.1.0` adds on top of the `v0.0.1` bundle.
+[What's New](/docs/changelog/) lists what `v0.1.0` added on top of the `v0.0.1` bundle and what `v0.1.1` changed since.
 
 ## Shipped surface
 

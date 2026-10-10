@@ -22,7 +22,7 @@ Inside a grclanker session, put the subject after the command:
 
 From the shell, `grclanker assess "<subject>"` opens a session that starts with the same prompt and the subject filled in. Run `grclanker assess` on its own to name the system in your first message instead.
 
-In the older `v0.0.1` release bundle, text after `/assess` and arguments after `grclanker assess` are dropped, so upgrade to `v0.1.0` or send the subject in its own message there.
+In the older `v0.0.1` release bundle, text after `/assess` and arguments after `grclanker assess` are dropped, so upgrade to `v0.1.1` or send the subject in its own message there.
 
 ## What the prompt does
 

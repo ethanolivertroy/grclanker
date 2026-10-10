@@ -2,7 +2,7 @@
 
 `grclanker` is an experimental open source AI GRC CLI built on top of [Pi](https://github.com/earendil-works/pi). It runs on Pi 1.1 (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.1.0).
 
-`v0.1.0` is the first full release. It ships 241 domain tools across cloud, identity, SaaS, and compliance frameworks (see [What ships](#what-ships)), up from the CMVP, KEV, and EPSS lookups in the `v0.0.1` experimental prerelease. [What's New](https://grclanker.com/docs/changelog/) lists the changes.
+`v0.1.1` is the current release: security and dependency updates on top of `v0.1.0`, the first full release. It ships 241 domain tools across cloud, identity, SaaS, and compliance frameworks (see [What ships](#what-ships)), up from the CMVP, KEV, and EPSS lookups in the `v0.0.1` experimental prerelease. [What's New](https://grclanker.com/docs/changelog/) lists the changes.
 
 grclanker is still early: expect breaking changes between minor versions before 1.0.
 
@@ -22,10 +22,10 @@ Windows PowerShell (best effort):
 powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
 ```
 
-The installers download the newest GitHub release bundle, which today is `v0.1.0`. The bundle carries its own Node.js runtime. To pin a version, pass it to the installer:
+The installers download the newest GitHub release bundle, which today is `v0.1.1`. The bundle carries its own Node.js runtime. To pin a version, pass it to the installer:
 
 ```bash
-curl -fsSL https://grclanker.com/install | bash -s -- 0.1.0
+curl -fsSL https://grclanker.com/install | bash -s -- 0.1.1
 ```
 
 `@grclanker/cli` is not published to npm yet, so `npm install -g @grclanker/cli` and `bun install -g @grclanker/cli` do not work.
@@ -167,7 +167,7 @@ Built-in workflow rails, as slash commands inside a session or as `grclanker inv
 
 ### What ships
 
-In the `v0.1.0` release bundle:
+In the `v0.1.1` release bundle:
 
 - 241 domain tools across AWS, Azure, GCP, OCI, Cloudflare, Webex, Zoom, Ansible AAP, CMVP, KEV/EPSS, FedRAMP, SCF, OSCAL, GitHub, Google Workspace, Slack, Okta, Duo, Vanta, Box, CrowdStrike, Datadog, Elastic, KnowBe4, LaunchDarkly, MuleSoft, New Relic, PagerDuty, Palo Alto Networks, Qualys, Salesforce, ServiceNow, Snowflake, Splunk, Sumo Logic, Tenable, Veracode, Zendesk, Zscaler, and operator evidence workflows
 - 7 compute backend tools (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) routed through the selected compute backend
