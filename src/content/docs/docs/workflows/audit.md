@@ -21,7 +21,7 @@ Inside a grclanker session, put the scope after the command:
 
 From the shell, `grclanker audit "<scope>"` opens a session that starts with the same prompt and the scope filled in. Run `grclanker audit` on its own to describe the scope in your first message instead.
 
-In the older `v0.0.1` release bundle, text after `/audit` and arguments after `grclanker audit` are dropped, so upgrade to `v0.1.0` or send the scope in its own message there.
+In the older `v0.0.1` release bundle, text after `/audit` and arguments after `grclanker audit` are dropped, so upgrade to `v0.1.1` or send the scope in its own message there.
 
 ## What the prompt does
 

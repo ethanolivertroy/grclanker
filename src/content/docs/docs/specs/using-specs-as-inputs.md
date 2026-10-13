@@ -19,7 +19,7 @@ Each spec in `/specs` is a build plan for a GRC automation tool. The file descri
 
 ## Start with the shipped implementation
 
-Use `grclanker tools` or the [tool catalog](/docs/tools/catalog/) to find the native tool family, and `grclanker tools <tool_name>` for one tool's parameters. Each integration guide documents authentication, collected surfaces, findings, export behavior, and limitations. `grclanker tools` ships in `v0.1.0`; the older `v0.0.1` release bundle does not have it, so use the catalog page there.
+Use `grclanker tools` or the [tool catalog](/docs/tools/catalog/) to find the native tool family, and `grclanker tools <tool_name>` for one tool's parameters. Each integration guide documents authentication, collected surfaces, findings, export behavior, and limitations. `grclanker tools` ships in `v0.1.0` and later; the older `v0.0.1` release bundle does not have it, so use the catalog page there.
 
 ## Extend from a repository spec
 

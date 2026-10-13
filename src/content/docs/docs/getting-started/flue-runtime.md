@@ -31,7 +31,7 @@ export ANTHROPIC_API_KEY=...
 grclanker flue run --message "Is BoringCrypto FIPS validated?"
 ```
 
-`grclanker flue --help` prints the options and environment variables. The runner ships in the `v0.1.0` release bundle; the older `v0.0.1` bundle predates the Flue adapter and answers `Unknown command: flue`. From a source checkout, with Node.js 22.19 or newer:
+`grclanker flue --help` prints the options and environment variables. The runner ships in the `v0.1.1` release bundle; the older `v0.0.1` bundle predates the Flue adapter and answers `Unknown command: flue`. From a source checkout, with Node.js 22.19 or newer:
 
 ```bash
 npm --prefix cli ci
