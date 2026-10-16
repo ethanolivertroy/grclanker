@@ -99,7 +99,7 @@ The scrub follows one boundary.
   - A credential word (`password`, `token`, `skey`).
   - A key that sets a credential word off with `_`, `-`, or `.` (`DB_PASSWORD`, `AZURE_CLIENT_SECRET`, `x-api-key`).
   - A lowerCamelCase or lowercase compound ending in a credential word (`accessToken`).
-- **Credential values:** As a result, `password=letmein`, `DB_PASSWORD=Sunshine`, and `AZURE_CLIENT_SECRET: abc12` lose their values unquoted as well as quoted, whatever the value's length or shape.
+- **Credential values:** `password=letmein`, `DB_PASSWORD=Sunshine`, and `AZURE_CLIENT_SECRET: abc12` lose their values unquoted as well as quoted, whatever the value's length or shape.
 - **Key position:** The key counts wherever it stands: after a flag prefix, a path segment, a parenthesis, or a comma. So a spawned CLI's echoed command line loses the value and keeps the rest.
   - Flag prefix examples: `--password=v`, `--password v`, `-Dspring.datasource.password=v`.
   - Path segment example: `kv/password: v`. A `path: status` line whose last segment is a credential word loses the status, so the modules join such a status with `returned`.
@@ -262,7 +262,7 @@ Otherwise it runs the access check and one zone security assessment on up to thr
 - **DDoS (3):** When no `ddos_l7` override ruleset exists, the finding passes only if the zone ruleset list shows the managed `ddos_l7` ruleset (default sensitivity).
   - If the list cannot be read or lacks that ruleset, the finding is manual.
   - Per-rule overrides require Enterprise with Advanced DDoS Protection.
-- **Bot management (4):** Enterprise Bot Management enforcement lives in WAF custom rules using bot scores. So Enterprise Bot Management is reported manual and names the current plan from `/zones/{zone_id}/subscription` `rate_plan.public_name`.
+- **Bot management (4):** Enterprise Bot Management enforcement lives in WAF custom rules using bot scores, so it is reported manual and names the current plan from `/zones/{zone_id}/subscription` `rate_plan.public_name`.
   - `zones[].plan` is deprecated and is not read.
   - Bot Fight Mode and Super Bot Fight Mode are judged automatically.
 - **Authenticated Origin Pulls (18):** Zone-level enablement and every per-hostname certificate association are automated.

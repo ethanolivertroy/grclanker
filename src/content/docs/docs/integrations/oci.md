@@ -80,12 +80,9 @@ A surface the principal cannot read renders its control as MANUAL, with the fail
 ## Status semantics
 
 - `pass`: Judged from a readable, complete inventory using documented fields.
-- `warn`: Judged, but the view is incomplete or a lower-risk issue exists.
-  - Incomplete view: Compartment or item cap hit, a compartment denied, undated items, failed sub-reads such as a denied `key get`.
+- `warn`: Judged, but the view is incomplete (compartment or item cap hit, a compartment denied, undated items, or failed sub-reads such as a denied `key get`) or a lower-risk issue exists.
 - `fail`: A documented field contradicts the control.
-- `manual`: The surface was unreadable, out of scope, or the setting is not exposed by the API. Never treat manual as compliant.
-  - Unreadable: For example, the documented `NotAuthorizedOrNotFound` response.
-  - Out of scope: Nothing to inspect.
+- `manual`: The surface was unreadable (for example, the documented `NotAuthorizedOrNotFound` response), out of scope because there was nothing to inspect, or the setting is not exposed by the API. Never treat manual as compliant.
 
 Compartment-scoped resources (policies, event rules, networking, bastions, vaults, buckets, instances, volumes) are listed per accessible compartment, up to `max_compartments`. Hitting the cap or losing a compartment withholds `pass` and reports seen versus total counts.
 
@@ -142,7 +139,7 @@ Bundle contents:
 Nothing credential-bearing is written. Redaction rules:
 
 - Findings redact sensitive fields at creation. `accessUri`, `keyValue`, `token`, `key`, `secret*`, `*password*`, `privateKey`, `keyMaterial`, `wrappedKey`, `plaintext`, `ciphertext`, `authorization`, `userData`, and similar names keep the field name with a `[redacted]` marker.
-- The following are scrubbed from every string, including CLI error text:
+- Every string, including CLI error text, is scrubbed of:
   - PEM blocks
   - `/p/<token>/n/` PAR URIs
   - The OCI request-signing `Signature` header parameter list

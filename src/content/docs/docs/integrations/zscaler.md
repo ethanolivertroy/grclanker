@@ -102,9 +102,7 @@ Optional tuning:
 
 ### Findings and verdict rules
 
-Findings are normalized as `{id, control, title, severity, status, summary, evidence, mappings, manualEvidence}` with `status` in `pass`, `warn`, `fail`, `manual`.
-
-Verdict rules:
+Findings are normalized as `{id, control, title, severity, status, summary, evidence, mappings, manualEvidence}`. `status` is `pass`, `warn`, `fail`, or `manual`.
 
 - A 401, 403, or errored endpoint never yields `pass`.
   - When it is the finding's primary inventory, the finding is `manual` and names the cause.

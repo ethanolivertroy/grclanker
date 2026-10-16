@@ -291,7 +291,7 @@ A second export plants a shapeless configured token and an `AIza` key in the org
 npm --prefix cli run test:gcp:live
 ```
 
-The script prints a skip message and exits 0 when no credential hint exists. That means no organization or project variable, no token, no credentials file, and no ADC file.
+The script prints a skip message and exits 0 when no credential hint exists: no organization or project variable, no token, no credentials file, and no ADC file.
 
 Otherwise it runs `gcp_check_access` followed by every assess tool with a small project and asset cap.
 

@@ -3,11 +3,7 @@ title: Elastic
 description: Read-only Elasticsearch and Kibana security posture assessment mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP.
 ---
 
-The Elastic integration inspects Elasticsearch and Kibana security configuration through their public REST APIs.
-
-It never writes to the cluster or to Kibana. Every tool uses read-only endpoints. The only POST requests are the documented query and privilege-check endpoints.
-
-Findings implement the 23 numbered controls in `specs/elastic-sec-inspector.spec.md` and carry that spec's compliance mappings.
+The Elastic integration inspects Elasticsearch and Kibana security configuration through their public REST APIs. It never writes to the cluster or to Kibana. Every tool uses read-only endpoints. The only POST requests are the documented query and privilege-check endpoints. Findings implement the 23 numbered controls in `specs/elastic-sec-inspector.spec.md` and carry that spec's compliance mappings.
 
 ## What it inspects
 
@@ -24,7 +20,7 @@ Findings implement the 23 numbered controls in `specs/elastic-sec-inspector.spec
 
 ## Setup and authentication
 
-Configuration resolves in this order of precedence: explicit tool arguments, then environment variables, then the config file.
+Configuration precedence is explicit tool arguments, then environment variables, then the config file.
 
 A higher-precedence source that supplies credentials replaces credentials of a different type from a lower-precedence source. For example, passing `username` and `password` to a tool wins over `ELASTIC_API_KEY` in the environment.
 
@@ -43,7 +39,7 @@ A higher-precedence source that supplies credentials replaces credentials of a d
 
 The same Elasticsearch credential is sent to Kibana, which accepts Elasticsearch API keys and basic credentials.
 
-Every Kibana request carries the `kbn-xsrf: true` header. Kibana enforces that header on non-GET requests for basic authentication. The integration only issues GET requests to Kibana, so the header is included for consistency across authentication schemes.
+Every Kibana request carries the `kbn-xsrf: true` header. Kibana enforces that header on non-GET requests for basic authentication. Although the integration issues only GET requests to Kibana, it includes the header for consistency across authentication schemes.
 
 Config file example (`~/.elastic-sec-inspector/config.yaml`):
 
@@ -299,7 +295,7 @@ A `SyntaxError` raised by the transport is recorded as its class name plus a fix
 
 #### Credential carriers
 
-Every recorded error string is produced by a single function. That function passes the thrown message through the module scrubber, which also removes the value of every credential carrier, whatever the value's shape:
+Every recorded error string is produced by a single function. It passes the thrown message through the module scrubber, which also removes the value of every credential carrier, whatever the value's shape:
 
 - A `key=value`, `key: value`, or `"key": "value"` pair loses its value when its key carries a credential word (`ELASTIC_PASSWORD`, `ELASTIC_API_KEY`, `bind_password`, `secure_password`, and the bearer ids `secret_id`, `session_id`, and `token_id`).
   - The pair also loses its value when the key follows a JSON escape (`\"password\": \"v\"`) or a command-line flag (`--password v`, `--password=v`, `-Dpassword=v`).

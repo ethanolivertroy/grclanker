@@ -3,7 +3,7 @@ title: Zoom
 description: Read-only Zoom account inspection for identity posture, collaboration governance, meeting security, and audit bundle export.
 ---
 
-The Zoom integration inspects a Zoom Workplace or Zoom for Government account through the public Zoom REST API v2. It renders the 25 controls in `specs/zoom-sec-inspector.spec.md` as pass, warn, fail, or manual findings. The findings carry FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP mappings.
+The Zoom integration inspects a Zoom Workplace or Zoom for Government account through the public Zoom REST API v2. It renders the 25 controls in `specs/zoom-sec-inspector.spec.md` as pass, warn, fail, or manual findings. They carry FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP mappings.
 
 Every request is a read. The tools never change account settings.
 
@@ -198,7 +198,7 @@ Status semantics for every finding:
 | 24 | Admin operation log retention verified | collaboration_governance | ZOOM-COLLAB-05 | entries with a parseable `time` inside the fixed 30-day window; undated entries cap at warn |
 | 25 | PMI usage restricted | meeting_security | ZOOM-MTG-07 | `schedule_meeting.personal_meeting` false, or `use_pmi_for_scheduled_meetings` and `use_pmi_for_instant_meetings` false and locked |
 
-Coverage: 25 of 25 spec controls have a finding, and 23 are automatable. The other 2 (controls 8 and 13) are manual by design. Their finding summaries cite the reference page proving the absence.
+Coverage: 25 of 25 spec controls have a finding. Of these, 23 are automatable, while the other 2 (controls 8 and 13) are manual by design, with summaries that cite the reference page proving the absence.
 
 Self-check fixtures are encoded as tests in `cli/tests/zoom.test.mjs`:
 

@@ -74,10 +74,8 @@ The client retries 429 and 5xx responses, waiting for the `ratelimit-reset` or `
 
 The export tool writes the following under `output_dir` (default `./export/pagerduty`):
 
-- `core_data/`: projected and redacted API snapshots, each carrying `complete`, `total`, and `truncation`
-  - A dataset that was denied, errored, or never requested is written as a `{ collected: false, status, endpoint, error }` marker instead of an empty list.
-- `analysis/`: `findings.json`, one result per category, and `metadata.json`
-  - The summary in each category result carries an `inventories` map naming each source as complete, partial, unread, or not requested.
+- `core_data/`: projected and redacted API snapshots, each carrying `complete`, `total`, and `truncation`. A dataset that was denied, errored, or never requested is written as a `{ collected: false, status, endpoint, error }` marker instead of an empty list.
+- `analysis/`: `findings.json`, one result per category, and `metadata.json`. The summary in each category result carries an `inventories` map naming each source as complete, partial, unread, or not requested.
 - `compliance/`
 - `QUICK_REFERENCE.md`
 - `_errors.log`, when part of the collection failed

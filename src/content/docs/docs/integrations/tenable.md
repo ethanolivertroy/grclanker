@@ -73,7 +73,7 @@ A documented list is recognised by its records as well as its shape. An array is
 
 A foreign list is described as `200 OK with a JSON array of 2 records none of which carries any of the documented members "id", "uuid", ... (194 bytes, not echoed)`.
 
-On an export chunk, a foreign list is a failed download. So an export whose only chunk was foreign is unreadable, and one that lost a chunk among several is partial.
+On an export chunk, a foreign list is a failed download, so an export whose only chunk was foreign is unreadable and one that lost a chunk among several is partial.
 
 A record carrying none of those members inside an otherwise documented chunk is unevaluable:
 
@@ -361,12 +361,12 @@ Verdicts are additionally capped at `warn` whenever any of these holds:
 
 ### Partial inventories
 
-A finding that reads a paginated list (controls 5, 6, 7, 8, 9, 12, and 13) states the population it rests on whenever the list is partial. It does so on its `fail` and `warn` branches as well as the capped pass:
+A finding that reads a paginated list (controls 5, 6, 7, 8, 9, 12, and 13) states the population it rests on whenever the list is partial, on its `fail` and `warn` branches as well as the capped pass:
 
 - The summary carries `Only <seen> of <pagination.total, or unknown> records were retrieved (<reason>)`, followed by the cap or by "the verdict rests on the records retrieved".
 - The evidence carries `inventory_truncated`, `records_seen`, and `records_total`. They hold `false` and the counts for a complete walk, and `null` for a list that was not read.
 
-A partial list is an incomplete inventory. So is an export some of whose records were kept out as unevaluable (the same export the bundle writes under a partial marker). The evidence over an incomplete inventory is rendered as a lower bound:
+A partial list is an incomplete inventory, as is an export some of whose records were kept out as unevaluable (the same export the bundle writes under a partial marker). The evidence over an incomplete inventory is rendered as a lower bound:
 
 - A positive count is the observed count.
 - A count of zero renders `null` (the unread or unevaluated remainder may hold what the seen records did not).

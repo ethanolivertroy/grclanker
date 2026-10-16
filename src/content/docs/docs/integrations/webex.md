@@ -75,7 +75,7 @@ Tokens, secrets, passwords, and host PINs are redacted from every bundle file.
 
 `core_data/` never holds a raw response. Each surface is projected to a per-surface allowlist of the documented fields the findings read (the "Fields read" column below plus the identifiers that make a row citable). An undocumented or newly added property is therefore dropped before anything is written.
 
-On top of that, secret-named keys are replaced with `[REDACTED]`. URL-valued fields keep host and path only:
+Secret-named keys are also replaced with `[REDACTED]`. URL-valued fields keep host and path only:
 
 - The recording `downloadUrl` and `playbackUrl` lose their `RCID` access token.
 - The meeting `webLink` loses its `MTID` join token.
@@ -161,7 +161,7 @@ The verdict is the worst site. A passing verdict downgrades to `warn` when any o
 
 Automatable controls: 3, 9, 10, 13, 14, 15, 16, 19 (inventory), 20, 24, 25.
 
-All 25 controls have a finding. There are 22 findings in total.
+All 25 controls are covered by 22 findings.
 
 ## Framework mappings
 

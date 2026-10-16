@@ -32,11 +32,7 @@ Only then does the adapter run the tool's `prepareArguments` normalizer, drop an
 
 ### Tool results
 
-Pi tool results map onto Flue's result envelope:
-
-- Text content becomes the tool output.
-- `terminate` is forwarded.
-- A Pi `errorResult()` becomes a Flue tool error the model can react to.
+Pi tool results map onto Flue's result envelope: text content becomes the tool output, `terminate` is forwarded, and a Pi `errorResult()` becomes a Flue tool error the model can react to.
 
 ## Run with the bundled runner
 
@@ -94,7 +90,7 @@ API tokens and client secrets therefore never reach terminal scrollback or CI lo
 
 Exit codes follow `flue run`: `0` completed, `1` failed, `130` aborted.
 
-The conversation database is different. Flue persists conversation records that include tool arguments, tool results, and user messages.
+The conversation database is different: Flue persists conversation records that include tool arguments, tool results, and user messages.
 
 `session.shell()` redacts environment values before persistence, and image data is stored through attachment references. Credentials embedded in commands, messages, or text results can still be retained, so treat `~/.grclanker/flue/conversations.db` like a credential store and use `--db :memory:` in CI.
 

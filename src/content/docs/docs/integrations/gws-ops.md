@@ -7,9 +7,7 @@ The operator bridge (`gws_ops_*` tools) shells out to the external [`gws` CLI](h
 
 The bridge never accepts arbitrary `gws` arguments and never runs a write method. It does not replace the native [Google Workspace inspector](/docs/integrations/gws), which remains the framework-mapped assessment path.
 
-- Spec: `specs/gws-operator-bridge.spec.md`
-- Implementation: `cli/extensions/grc-tools/gws-ops.ts`
-- Tests: `cli/tests/gws-ops.test.mjs`
+Spec: `specs/gws-operator-bridge.spec.md`. Implementation: `cli/extensions/grc-tools/gws-ops.ts`. Tests: `cli/tests/gws-ops.test.mjs`.
 
 ## Setup
 

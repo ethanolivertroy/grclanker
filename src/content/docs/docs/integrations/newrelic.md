@@ -3,9 +3,7 @@ title: New Relic
 description: Read-only New Relic security inspector covering identity, API keys, access grants, alerting, and data governance, mapped to eight frameworks including FedRAMP.
 ---
 
-The New Relic integration implements the [New Relic Security Inspector spec](https://github.com/ethanolivertroy/grclanker/blob/main/specs/newrelic-sec-inspector.spec.md) as native grclanker tools. It reads organization, user, role, API key, alerting, and data governance configuration through NerdGraph (GraphQL) and the REST API v2.
-
-It evaluates the 20 numbered controls from the spec and emits normalized findings that carry the spec's compliance mappings.
+The New Relic integration implements the [New Relic Security Inspector spec](https://github.com/ethanolivertroy/grclanker/blob/main/specs/newrelic-sec-inspector.spec.md) as native grclanker tools. It reads organization, user, role, API key, alerting, and data governance configuration through NerdGraph (GraphQL) and the REST API v2. It evaluates the 20 numbered controls from the spec and emits normalized findings that carry the spec's compliance mappings.
 
 Every tool is read-only. No mutation is ever sent to New Relic.
 
@@ -299,7 +297,7 @@ Every finding follows the same evidence rules. `cli/tests/newrelic.test.mjs` car
     A failed NerdGraph or REST exchange becomes an error at one point per protocol: the client's failure constructors. Each records the status and the endpoint or query path, then one of these:
 
     - The documented error fields. For NerdGraph, these are `errors[].message`, `errors[].extensions.errorClass`, and `path`. For REST v2, it is `error.title`.
-    - For a non-JSON or undocumented body, only its content type and byte length. For example: `NerdGraph request failed (502 Bad Gateway) at POST /graphql: non-JSON error body (text/html; 412 bytes)`.
+    - Only the content type and byte length for a non-JSON or undocumented body. For example: `NerdGraph request failed (502 Bad Gateway) at POST /graphql: non-JSON error body (text/html; 412 bytes)`.
 
     Every message passes through `scrubErrorText`, which removes:
 

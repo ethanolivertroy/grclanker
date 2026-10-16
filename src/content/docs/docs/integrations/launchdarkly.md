@@ -60,9 +60,7 @@ projects = ["web", "mobile"]
 
 - **Reader base role:** Enough for members, teams, custom roles, projects, environments, flags, flag statuses, webhooks, Relay Proxy configurations, and integration subscriptions.
 - **Admin or Owner base role:** Required for `GET /api/v2/tokens?showAll=true` to return every member's personal tokens (controls 8 through 11). Recommended for full audit log depth.
-- **Custom role alternative:** An audit custom role needs `basePermissions: reader` plus `viewProject` on each audited project.
-  - It needs both because the role actions reference defines `viewProject` and `viewTeam` but no dedicated member, role, or audit log view actions.
-  - The spec's `viewMembers`, `viewRoles`, and `viewAuditLog` actions do not exist.
+- **Custom role alternative:** An audit custom role needs `basePermissions: reader` plus `viewProject` on each audited project, because the role actions reference defines `viewProject` and `viewTeam` but no dedicated member, role, or audit log view actions. The spec's `viewMembers`, `viewRoles`, and `viewAuditLog` actions do not exist.
 
 The SDK keys endpoint (`/api/v2/projects/{projectKey}/environments/{environmentKey}/sdk-keys`) is beta and may not be available on every plan. When it is unreadable, control 19 is reported as `manual` with the evidence a human needs to collect.
 
@@ -327,10 +325,9 @@ The `core_data/` snapshots record the same `truncated`, `seen`, and `total` fiel
 
 ## Framework mappings
 
-Each finding carries the eight framework references from the spec compliance table:
+Each finding carries the eight framework references from the spec compliance table as `mappings` and as a `frameworks` object keyed by `fedramp`, `cmmc`, `soc2`, `cis`, `pci_dss`, `stig`, `irap`, and `ismap`.
 
-- As `mappings`. For example, control 1 carries `FedRAMP IA-2(1)`, `CMMC L2 3.5.3`, `SOC 2 CC6.1`, `CIS 16.2`, `PCI-DSS 8.4.1`, `STIG SRG-APP-000148`, `IRAP ISM-1546`, and `ISMAP CPS-7.1`.
-- As a `frameworks` object keyed by `fedramp`, `cmmc`, `soc2`, `cis`, `pci_dss`, `stig`, `irap`, and `ismap`.
+For example, control 1 carries `FedRAMP IA-2(1)`, `CMMC L2 3.5.3`, `SOC 2 CC6.1`, `CIS 16.2`, `PCI-DSS 8.4.1`, `STIG SRG-APP-000148`, `IRAP ISM-1546`, and `ISMAP CPS-7.1`.
 
 The export bundle renders one report per framework plus a unified matrix.
 
@@ -347,7 +344,7 @@ Otherwise it runs `launchdarkly_check_access` and the access control assessment,
 ## Limitations and manual controls
 
 - Control 1 is always `manual`. LaunchDarkly does not expose the account SSO or Require SSO setting through the REST API. Confirm it in Organization settings > Security and capture a screenshot or IdP configuration.
-- Control 2 evaluates per-member `mfa` status. The account level "Require MFA" toggle is not exposed by the API. So the finding asks you to confirm it in Organization settings, even when every member has MFA enabled.
+- Control 2 evaluates per-member `mfa` status. The account level "Require MFA" toggle is not exposed by the API, so the finding asks you to confirm it in Organization settings, even when every member has MFA enabled.
 - Control 19 depends on the beta SDK keys endpoint. When it is unavailable, record the creation date of each active server-side SDK key from Organization settings > SDK keys.
 - Control 20 probes a default list of integration keys, because the API has no endpoint that enumerates every integration subscription.
   - Default keys: `datadog`, `dynatrace`, `elastic`, `honeycomb`, `logdna`, `msteams`, `new-relic-apm`, `signalfx`, `splunk`.

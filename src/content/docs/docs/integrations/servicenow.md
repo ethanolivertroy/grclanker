@@ -50,9 +50,7 @@ Tables read:
 
 Create a dedicated audit account. The `admin` role reads every table above.
 
-A scoped read role must at minimum grant read on the listed tables. `sys_audit` requires `admin`, and `sys_dictionary` normally requires `personalize_dictionary`.
-
-Forbidden or ACL-filtered tables render as `manual` findings instead of silently passing.
+A scoped read role must at minimum grant read on the listed tables. `sys_audit` requires `admin`, and `sys_dictionary` normally requires `personalize_dictionary`. Forbidden or ACL-filtered tables render as `manual` findings instead of silently passing.
 
 Configuration precedence is explicit tool arguments, then environment variables, then a YAML config file (`SERVICENOW_CONFIG_FILE`, `./.servicenow.yaml`, or `~/.servicenow-sec-inspector/config.yaml`). The config file accepts a top-level `servicenow:` section.
 
@@ -97,7 +95,7 @@ Set `SERVICENOW_INSTANCE`, `SERVICENOW_USERNAME`, and `SERVICENOW_PASSWORD`. Req
 
 Tokens are exchanged at `POST https://<instance>.service-now.com/oauth_token.do` with an `application/x-www-form-urlencoded` body and cached until they expire.
 
-- **Client credentials grant**
+- **Client credentials grant:**
   - Create an application registry entry ("Create an OAuth API endpoint for external clients").
   - Set the OAuth Application User to the audit account.
   - Set the system property `glide.oauth.inbound.client.credential.grant_type.enabled` to `true`.

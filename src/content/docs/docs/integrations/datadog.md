@@ -28,7 +28,7 @@ The integration implements the 20 controls in `specs/datadog-sec-inspector.spec.
 
 Every request carries two headers, `DD-API-KEY` and `DD-APPLICATION-KEY`, as described in the [Datadog authentication reference](https://docs.datadoghq.com/api/latest/authentication/).
 
-The API key identifies the organization. The application key inherits the permissions of the user or service account that created it. So create the application key from a principal that holds the read permissions listed below, or scope the key to exactly those permissions.
+The API key identifies the organization. The application key inherits the permissions of the user or service account that created it. Create the application key from a principal that holds the read permissions listed below, or scope the key to exactly those permissions.
 
 ### Credential sources and precedence
 
@@ -111,7 +111,7 @@ Permission names come from the [Datadog RBAC permissions list](https://docs.data
 - `total` is the server-reported count when the endpoint exposes one (`meta.page.total_filtered_count` or `meta.page.total_count`).
 - Every truncation entry in `errors` includes the inventory, limit, seen count, total when known, stop reason, and an actionable next step.
   - User, role, key, rule, signal, monitor, and posture finding messages can name their exposed `*_limit` argument.
-  - Shared dashboards use a fixed collector cap of 2,000 and org connections use a fixed collector cap of 10,000. So their messages direct the user to inspect the full inventory manually in Dashboards > Shared Dashboards or Organization Settings > Org Connections.
+  - Shared dashboards use a fixed collector cap of 2,000 and org connections use a fixed collector cap of 10,000. Their messages direct the user to inspect the full inventory manually in Dashboards > Shared Dashboards or Organization Settings > Org Connections.
 - `429` responses are retried after the number of seconds in `X-RateLimit-Reset` (capped at 60 seconds), and `5xx` responses are retried with exponential backoff, up to `max_retries` times, following the [rate limits reference](https://docs.datadoghq.com/api/latest/rate-limits/).
 - Requests time out after `timeout_seconds`.
 - API and application key values are redacted from every error message and from the exported bundle.
@@ -377,7 +377,7 @@ The script prints a skip message and exits 0 when `DD_API_KEY` or `DD_APP_KEY` i
 
 - Session timeout (control 16) and integration permissions (control 18) always produce `manual` findings. Datadog does not expose the session duration, cloud-side IAM policies, or webhook URLs through the public API.
 - Audit Trail retention (control 7) is inferred from the oldest event returned within the `min_audit_retention_days` window. The retention setting itself is not exposed by the API.
-- The dashboards list endpoint reports whether a dashboard is shared but not whether the share is public or invite-only. So shared dashboards produce `warn` rather than `fail`.
+- The dashboards list endpoint reports whether a dashboard is shared but not whether the share is public or invite-only, so shared dashboards produce `warn` rather than `fail`.
 - Security signal review (control 9) queries `status:(critical OR high) -@workflow.triage.state:archived` over the lookback window. Signals resolved in the UI but not archived still count as open.
 - Compliance framework coverage (control 13) relies on `framework:`, `compliance_framework:`, or `requirement_framework:` tags on enabled `cloud_configuration` and `infrastructure_configuration` rules.
 - MFA status (control 2) can only observe Datadog-native MFA (`mfa_enabled`).

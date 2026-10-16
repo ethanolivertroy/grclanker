@@ -16,7 +16,7 @@ Every tool is read-only. No PUT, POST, or DELETE requests are ever issued.
 
 ## Setup and authentication
 
-1. In Sumo Logic, open Administration > Security > Access Keys. Create an access key for a dedicated audit user (or service account). Copy the key once. It is not shown again.
+1. In Sumo Logic, open Administration > Security > Access Keys and create an access key for a dedicated audit user (or service account). Copy the key once; it is not shown again.
 2. Give that user a role with the read capabilities the surfaces need. For each unreadable surface, `sumologic_check_access` reports which of these capabilities is likely missing:
    - `viewAccountOverview`
    - `manageUsersAndRoles` (users and roles)

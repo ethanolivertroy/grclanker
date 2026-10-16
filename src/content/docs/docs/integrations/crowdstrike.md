@@ -5,7 +5,7 @@ description: Read-only CrowdStrike Falcon inspector covering prevention, respons
 
 The CrowdStrike integration inspects a Falcon tenant through the public Falcon API. It maps what it finds to the 25 controls in `specs/crowdstrike-sec-inspector.spec.md` (CS-01 through CS-25).
 
-Every tool is read-only. The tools never create, update, or delete anything in the tenant.
+Every tool is read-only: the tools never create, update, or delete anything in the tenant.
 
 ## What it inspects
 
@@ -68,7 +68,7 @@ The client:
   - Any value inside a credential carrier: `Authorization` and cookie headers; auth schemes; credential-named fields, assignments, and command-line flags; URL userinfo and query strings.
   - Bare values with a real token shape.
 
-The boundary is spelled out under "Limitations and manual controls" below.
+See "Limitations and manual controls" below for the full boundary.
 
 Required API client scopes (all Read):
 
@@ -176,7 +176,7 @@ The verdicts follow these safety rules, each covered by a regression test in `cl
   - Single-page queries with no documented pagination parameters (the role catalog and Identity Protection rule ids) still compare the returned ids against the reported total.
   - Count-only reads (Discover and ZTA totals) treat a missing total as unknown rather than zero.
   - An id query followed by an entity lookup is also recorded as truncated when the lookup returns fewer records than the ids listed. This applies to firewall rule groups and rules, the role catalog, API clients, the three exclusion types, and Identity Protection rules.
-  - So a shortfall of deleted or forbidden entities demotes the verdict instead of passing on the subset.
+  - A shortfall of deleted or forbidden entities demotes the verdict instead of passing on the subset.
 - A `fail` that rests on the absence of something among the visible rows (no enabled and host-assigned prevention or response policy, no firewall policy container) is provable only against the rows that were read.
   - On a partial inventory, it renders `manual` with "the absence this verdict rests on cannot be asserted for the unread rows" instead of `fail`.
   - A `fail` observed on a visible row (a disabled slider, a `default_inbound` that is not `DENY`, a stale admin) stands.
@@ -260,7 +260,7 @@ Error strings never quote a response body.
 
 A body without Falcon's documented `errors[].message`, `error_description`, `error`, or `message` field is described as "non-JSON body (text/html, 5120 bytes)" or "JSON body without a documented error field (...)". Such bodies include a proxy or WAF page, whatever its content type claims, and JSON of another shape. The rule holds on every surface, including `POST /oauth2/token`.
 
-Every error string is passed through one redaction pass when `CrowdstrikeHttpError` is constructed and again when the error is recorded. So these carry status, path, and shape only:
+Every error string is passed through one redaction pass when `CrowdstrikeHttpError` is constructed and again when the error is recorded. These outputs retain only status, path, and shape:
 
 - `access_check.json`
 - Dataset `error` fields
@@ -299,7 +299,7 @@ Config file errors are fixed text.
   - The default `~/.crowdstrike/config.json` is skipped when absent.
 - A file that cannot be parsed fails with "Unable to parse CrowdStrike config file: invalid JSON in \<path> at line N". The line appears only when `JSON.parse` reports a position.
 
-Neither `JSON.parse`'s message, which quotes a window of the source, nor the filesystem's wording is ever included. So an unquoted `client_secret` value is never echoed.
+Neither `JSON.parse`'s message, which quotes a window of the source, nor the filesystem's wording is ever included, so an unquoted `client_secret` value is never echoed.
 
 ## Official documentation consulted
 

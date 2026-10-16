@@ -88,7 +88,7 @@ Set `BOX_CLIENT_ID`, `BOX_CLIENT_SECRET`, and `BOX_ENTERPRISE_ID`.
 
 grclanker posts `grant_type=client_credentials` with `box_subject_type=enterprise` and `box_subject_id=<enterprise_id>`, or with `box_subject_type=user` when `BOX_SUBJECT_TYPE=user`.
 
-Tokens are cached until shortly before `expires_in` elapses, and re-requested on 401.
+Tokens are cached until shortly before `expires_in` elapses and re-requested on 401.
 
 ### OAuth 2.0
 
@@ -379,7 +379,7 @@ The script exits 0 with a skip message when no Box credentials are present. With
 - Controls 8, 19, and 23 are always `manual`. The Box API does not expose the open shared link password requirement, the app approval policy, or enterprise IP allowlisting.
 - Controls 10 and 18 are `manual` whenever device pins or co-admins exist, because the device trust policy and co-admin permission sets are not exposed.
 - Inactive user detection correlates `admin_logs` activity events (`LOGIN`, `ADMIN_LOGIN`, `DOWNLOAD`, `UPLOAD`, and similar), because the user object has no last login field.
-  - `FAILED_LOGIN` events are recorded in the evidence (`failed_login_events`, `inactive_candidates_with_failed_logins`) but do not make an account active. So a user who only receives credential-stuffing attempts still counts as inactive.
+  - `FAILED_LOGIN` events are recorded in the evidence (`failed_login_events`, `inactive_candidates_with_failed_logins`) but do not make an account active, so a user who only receives credential-stuffing attempts still counts as inactive.
   - Raise `event_limit` for large enterprises. A sample that hit the cap while a `next_stream_position` remained is reported as `warn`. A sample that happens to contain exactly `event_limit` events with nothing left on the stream is complete.
 - Enterprise configuration, Shield lists, and Shield rules come from the versioned `2025.0` endpoints and require Manage enterprise properties.
 - Retention and legal hold endpoints require Box Governance, and Shield endpoints require Box Shield. Missing licenses surface as `manual` findings with the reason.
