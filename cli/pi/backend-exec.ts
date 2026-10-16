@@ -161,17 +161,25 @@ function isIgnoredPath(relativePath: string, ignorePatterns: string[]): boolean 
   );
 }
 
+// rg and find type each entry by its directory entry, which is the host file beneath a mount, so
+// the /dev/null mounts sandbox-runtime places over absent protected files (.bashrc, .gitconfig,
+// ...) are listed as regular files. `test -f` stats through the mount and drops them.
 function buildBackendFindCommand(pattern: string): string {
   return [
     "if command -v rg >/dev/null 2>&1; then",
-    `  rg --files --hidden -g '!**/.git/**' -g '!**/node_modules/**' -g ${quoteForBash(pattern)} .`,
+    `  files=$(rg --files --hidden -g '!**/.git/**' -g '!**/node_modules/**' -g ${quoteForBash(pattern)} .)`,
     "  status=$?",
     "else",
-    "  find . \\( -name .git -o -name node_modules \\) -prune -o -type f -print",
+    "  files=$(find . \\( -name .git -o -name node_modules \\) -prune -o -type f -print)",
     "  status=$?",
     "fi",
-    "if [ \"$status\" -eq 0 ] || [ \"$status\" -eq 1 ]; then exit 0; fi",
-    "exit \"$status\"",
+    "if [ \"$status\" -ne 0 ] && [ \"$status\" -ne 1 ]; then exit \"$status\"; fi",
+    "set -f",
+    "IFS='\n'",
+    "for file in $files; do",
+    "  [ -f \"$file\" ] && printf '%s\\n' \"$file\"",
+    "done",
+    "exit 0",
   ].join("\n");
 }
 

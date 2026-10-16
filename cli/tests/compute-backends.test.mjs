@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -2496,6 +2496,47 @@ test("grep keeps rg's matches when the only errors are entries it could not read
     rg = { exitCode: 2, stdout: `${rgSummary}\n`, stderr: denied("secret.txt") };
     await assertFails("an unreadable file passed as the search path", "/repo/secret.txt");
   }, { runner });
+});
+
+test("find drops entries that are not regular files once stat'd, the way sandbox-runtime's placeholders appear", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "grclanker-find-filter-"));
+  try {
+    for (const file of ["notes.md", "src/[id].ts", "src/i.ts", "docs/read me.md"]) plant(repo, file, "x\n");
+    // sandbox-runtime mounts /dev/null over each absent protected file; a symlink to it stats the same.
+    symlinkSync("/dev/null", join(repo, ".bashrc"));
+    const listing = ["./notes.md", "./.bashrc", "./src/[id].ts", "./src/i.ts", "./docs/read me.md"];
+    let rgStatus = 0;
+    const fakeRg = () => [
+      "rg() {",
+      `  printf '%s\\n' ${listing.map(quoteForBash).join(" ")}`,
+      ...(rgStatus === 2 ? ["  echo 'rg: ./private: Permission denied (os error 13)' >&2"] : []),
+      `  return ${rgStatus}`,
+      "}",
+    ].join("\n");
+    const { runner } = createFakeRunner(async (_executable, args) => {
+      const script = String(args.at(-1));
+      if (args[0] === "info") return { exitCode: 0, stdout: "ok" };
+      if (!script.includes("rg --files")) return { exitCode: 0 };
+      const run = spawnSync("sh", ["-c", `${fakeRg()}\n${script}`], { cwd: repo, encoding: "utf8" });
+      return { exitCode: run.status, stdout: run.stdout, stderr: run.stderr };
+    });
+
+    await withComputeBackendExecution(repo, { computeBackend: "docker" }, async (execution) => {
+      const glob = () => execution.findOperations.glob("**/*", repo, { ignore: [], limit: 10 });
+      assert.deepEqual(
+        await glob(),
+        ["notes.md", "src/[id].ts", "src/i.ts", "docs/read me.md"].map((file) => join(repo, file)),
+      );
+
+      rgStatus = 2;
+      await assert.rejects(
+        glob,
+        (error) => error instanceof ExecutionBackendError && error.message.includes("rg: ./private: Permission denied"),
+      );
+    }, { runner });
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test("parallels mount wait reports the deadline exit as a typed timeout and destroys the clone", async () => {
