@@ -116,7 +116,7 @@ Scrubbing runs as `scrubErrorText` in the `WebexApiError` constructor, in the su
 - `warn`: The population was truncated, partially visible (bot token), undated, or above a review threshold.
 - `fail`: A documented field shows the control unmet.
 - `manual`: Any of the following applies. The summary names the cause and the evidence to collect.
-  - The endpoint the verdict is computed from was denied or errored. Two failures only cap a passing verdict at `warn` instead: a denied site while another site answers, and an unreadable secondary probe listed under [Limitations and manual controls](#limitations-and-manual-controls).
+  - The endpoint the verdict is computed from was denied or errored. Only two failures cap a passing verdict at `warn` instead. One is a denied site while another site answers. The other is an unreadable secondary probe listed under [Limitations and manual controls](#limitations-and-manual-controls).
   - The population was empty where emptiness is inconclusive.
   - A documented field was absent from the response.
   - The setting is only visible in Control Hub.
