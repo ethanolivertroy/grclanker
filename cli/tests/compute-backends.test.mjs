@@ -2010,7 +2010,7 @@ test("every backend output path redacts credentials echoed by the remote under e
       }
       const sandboxStream = await runExec(
         `sandbox-runtime (${strategy})`,
-        createSandboxRuntimeBackend({ runner, wrapCommand: async (command) => command }),
+        createSandboxRuntimeBackend({ runner, wrapCommand: async (command) => ({ command }) }),
       );
       assert.equal(sandboxStream, expectedStream, `sandbox-runtime (${strategy})`);
 
@@ -2356,7 +2356,7 @@ test("provider error bodies never reach thrown messages, results, streams, or lo
           assert.equal(channels.streamed, channels.stderr, `${kind} ${shape}`);
         }
         const sandbox = await observe("sandbox-runtime", "CLI stderr", shape, (onData) =>
-          createSandboxRuntimeBackend({ runner: cliRunner(text), wrapCommand: async (command) => command })
+          createSandboxRuntimeBackend({ runner: cliRunner(text), wrapCommand: async (command) => ({ command }) })
             .exec({ sessionId: "s", command: ["env"], cwd: "/repo", onData }));
         assert.equal(sandbox.streamed, sandbox.stderr);
 
@@ -2537,6 +2537,36 @@ test("find drops entries that are not regular files once stat'd, the way sandbox
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
+});
+
+test("sandbox-runtime releases each wrapped command once it has exited, whatever the outcome", async () => {
+  const events = [];
+  const { runner } = createFakeRunner(async (_executable, args) => {
+    const command = String(args.at(-1));
+    events.push(`start ${command}`);
+    await new Promise((resolve) => setImmediate(resolve));
+    events.push(`exit ${command}`);
+    if (command === "wrapped:boom") throw new Error("spawn failed");
+    return { exitCode: command === "wrapped:false" ? 1 : 0 };
+  });
+  const backend = createSandboxRuntimeBackend({
+    runner,
+    wrapCommand: async (command) => {
+      events.push(`wrap ${command}`);
+      return { command: `wrapped:${command}`, release: () => events.push(`release ${command}`) };
+    },
+  });
+  const exec = (command) => backend.exec({ sessionId: "s", command: [command], cwd: "/repo" });
+
+  assert.equal((await exec("true")).exitCode, 0);
+  assert.equal((await exec("false")).exitCode, 1);
+  await assert.rejects(() => exec("boom"), /spawn failed/);
+  assert.deepEqual(events, ["true", "false", "boom"].flatMap((command) => [
+    `wrap ${command}`,
+    `start wrapped:${command}`,
+    `exit wrapped:${command}`,
+    `release ${command}`,
+  ]));
 });
 
 test("parallels mount wait reports the deadline exit as a typed timeout and destroys the clone", async () => {

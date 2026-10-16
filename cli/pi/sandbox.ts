@@ -204,10 +204,21 @@ export async function resetSandboxRuntime(): Promise<void> {
   }
 }
 
-export async function wrapCommandWithSandbox(command: string, cwd: string): Promise<string> {
+export type SandboxedCommand = {
+  command: string;
+  release: () => void;
+};
+
+export async function wrapCommandWithSandbox(command: string, cwd: string): Promise<SandboxedCommand> {
   const config = await ensureSandboxReady(cwd);
-  if (!config.enabled) return command;
-  return SandboxManager.wrapWithSandbox(command);
+  if (!config.enabled) return { command, release: () => undefined };
+  return {
+    command: await SandboxManager.wrapWithSandbox(command),
+    // bwrap leaves an empty file on the host for each absent path the sandbox protects (.bashrc,
+    // .gitconfig, .vscode, ...), where the host-local read, write, and ls tools would trip over it.
+    // sandbox-runtime removes them once no other wrapped command is still running.
+    release: () => SandboxManager.cleanupAfterCommand(),
+  };
 }
 
 export function createSandboxReadOperations(cwd: string) {
