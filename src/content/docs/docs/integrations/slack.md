@@ -31,7 +31,7 @@ Required user-token scopes:
 - `users:read`
 - `team.preferences:read`
 
-The Admin API and Audit Logs API require an Enterprise Grid plan. An `ok:false` response with one of these errors is rendered as a manual finding that names the cause, never as an empty or passing result:
+The Admin API and Audit Logs API require an Enterprise Grid plan. An `ok:false` response with one of these errors is never rendered as an empty or passing result. On a finding's primary inventory, it renders a manual finding that names the cause. On a second inventory, or on one workspace among several, it caps a `pass` at `warn` instead (see [Multi-inventory findings](#multi-inventory-findings)). The errors are:
 
 - `not_allowed_token_type`
 - `missing_scope`

@@ -265,7 +265,7 @@ Every finding has the shape `{ id, title, severity, status, summary, evidence, m
 
 Every finding follows the same rules so that a `pass` always rests on data that was actually read:
 
-1. An unreadable, forbidden (401 or 403), or errored endpoint never yields `pass`. It yields `manual` with the cause and the evidence to collect.
+1. An unreadable, forbidden (401 or 403), or errored endpoint never yields `pass`. It yields `manual` with the cause and the evidence to collect, except in the `fail` and `warn` cases below.
 
    That holds for every inventory a control reads, not only its primary one. The controls that read several inventories are:
 

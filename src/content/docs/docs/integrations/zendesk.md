@@ -339,7 +339,7 @@ Every finding has the shape `{id, control, title, severity, status, summary, evi
 - `pass`: Verified from documented API fields, read to completion, by an admin credential.
 - `warn`: Verified but needs review, or the evidence was partial (truncated inventory, undated items, non-admin credential).
 - `fail`: A verified gap.
-- `manual`: The API does not expose the setting, the endpoint was forbidden or unavailable on the plan, or the inventory was suspiciously empty. The summary names the cause and the exact Admin Center evidence a reviewer must collect. Manual never counts as passing.
+- `manual`: The API does not expose the setting, the primary endpoint was forbidden or unavailable on the plan, or the inventory was suspiciously empty. The summary names the cause and the exact Admin Center evidence a reviewer must collect. Manual never counts as passing. An unreadable secondary inventory caps a `pass` at `warn` instead, and a verified gap still yields `fail`.
 
 ## Control coverage
 
