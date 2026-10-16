@@ -21,6 +21,7 @@
     "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
+    "@astrojs/markdown-satteri": "^0.4.3",
     "@astrojs/sitemap": "^3.7.4",
     "@monaco-editor/loader": "^1.7.0",
     "@tailwindcss/vite": "^4.3.3",

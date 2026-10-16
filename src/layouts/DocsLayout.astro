@@ -14,7 +14,7 @@ const docsSections = buildDocsSections(await getCollection('docs'));
 ---
 
 <Base title={title} description={description} footerVariant="default">
-  <section class="px-6 py-8 md:py-10">
+  <section class="px-4 py-8 sm:px-6 md:py-10">
     <div class="mx-auto max-w-6xl">
       <div class="docs-layout">
         <aside class="docs-sidebar">
@@ -102,8 +102,19 @@ const docsSections = buildDocsSections(await getCollection('docs'));
         });
       }
 
+      function initMobileNav() {
+        const menu = document.querySelector('.docs-mobile-nav');
+        if (!menu) return;
+        menu.addEventListener('toggle', () => {
+          const list = menu.querySelector('nav');
+          const active = list.querySelector('.is-active');
+          if (menu.open && active) list.scrollTop = active.offsetTop - list.clientHeight / 2;
+        });
+      }
+
       function initDocs() {
         initDocsCopyButtons();
+        initMobileNav();
       }
 
       initDocs();
