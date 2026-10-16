@@ -9,14 +9,14 @@ grclanker ships as a Pi-based CLI. The same GRC agent can also run as a [Flue Fr
 
 The adapter lives in `cli/flue/` and is additive. Nothing in the Pi CLI path changes.
 
-Each entry gives a grclanker asset, then its Flue surface.
-
-- 241 native domain tools from `cli/extensions/grc-tools/`: `useTool()` definitions built with `defineTool()`.
-- `.grclanker/SYSTEM.md`: The agent function's returned instructions, plus a short Flue runtime note.
-- `prompts/investigate.md`, `audit.md`, `assess.md`, `validate.md`: Skills named `investigate`, `audit`, `assess`, `validate` (activated through Flue's `activate_skill` tool).
-- `skills/crypto-validation/SKILL.md`: A skill named `crypto-validation`.
-- `.grclanker/agents/auditor.md` and `verifier.md`: Subagents reachable through Flue's `task` tool. Each mounts only the tools its persona allows.
-- Pi compute backends (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`): Not mapped. Flue's own `local()` sandbox provides file and shell tools instead.
+| grclanker asset | Flue surface |
+| --- | --- |
+| 241 native domain tools from `cli/extensions/grc-tools/` | `useTool()` definitions built with `defineTool()` |
+| `.grclanker/SYSTEM.md` | The agent function's returned instructions, plus a short Flue runtime note |
+| `prompts/investigate.md`, `audit.md`, `assess.md`, `validate.md` | Skills named `investigate`, `audit`, `assess`, `validate` (activated through Flue's `activate_skill` tool) |
+| `skills/crypto-validation/SKILL.md` | A skill named `crypto-validation` |
+| `.grclanker/agents/auditor.md` and `verifier.md` | Subagents reachable through Flue's `task` tool, each mounting only the tools its persona allows |
+| Pi compute backends (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) | Not mapped. Flue's own `local()` sandbox provides file and shell tools instead |
 
 ### Schemas and validation
 
@@ -125,11 +125,13 @@ Keep the devDependency, or install `@flue/cli` into the same `node_modules` befo
 
 ## Configuration
 
-- `GRCLANKER_FLUE_MODEL`: `provider/model` specifier, for example `anthropic/claude-sonnet-4-6`, `openai/gpt-5.5`, or `ollama/gemma4`. Without it, the `grclanker setup` provider and model are reused (hosted or local-first). With no setup at all, `anthropic/claude-sonnet-4-6` is used.
-- Provider API keys: Read from the environment by the Flue runtime for hosted providers (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and so on). `flue run` also loads a project `.env`.
-- `GRCLANKER_FLUE_SANDBOX`: `local` (default) attaches Flue's local sandbox for the current directory. `none` runs with domain tools only.
-- `--db <path>` (default `~/.grclanker/flue/conversations.db`): SQLite file for conversation records. Shell environment values are redacted and images use attachment references, but credentials in commands, messages, text arguments, or text results may persist. `:memory:` keeps nothing and is the right choice for CI.
-- `GRCLANKER_HOME`: Honored as in the Pi CLI, both for reading settings and for the default database location.
+| Setting | Effect |
+| --- | --- |
+| `GRCLANKER_FLUE_MODEL` | `provider/model` specifier, for example `anthropic/claude-sonnet-4-6`, `openai/gpt-5.5`, or `ollama/gemma4`. Without it, the `grclanker setup` provider and model are reused (hosted or local-first); with no setup at all, `anthropic/claude-sonnet-4-6` is used. |
+| Provider API keys | Read from the environment by the Flue runtime for hosted providers (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and so on). `flue run` also loads a project `.env`. |
+| `GRCLANKER_FLUE_SANDBOX` | `local` (default) attaches Flue's local sandbox for the current directory. `none` runs with domain tools only. |
+| `--db <path>` | SQLite file for conversation records. Shell environment values are redacted and images use attachment references, but credentials in commands, messages, text arguments, or text results may persist. Defaults to `~/.grclanker/flue/conversations.db`; `:memory:` keeps nothing and is the right choice for CI. |
+| `GRCLANKER_HOME` | Honored as in the Pi CLI, both for reading settings and for the default database location. |
 
 ## Local-first models
 

@@ -84,9 +84,11 @@ powershell -ExecutionPolicy Bypass -c "& ([scriptblock]::Create((irm https://grc
 
 Both installers also read these environment variables:
 
-- `GRCLANKER_VERSION` (default `latest`): Release to install, with or without the leading `v`. A positional version or `-Version` wins over it.
-- `GRCLANKER_INSTALL_DIR` (default `~/.local/share/grclanker`): Where the bundle is unpacked. The installer deletes and recreates this directory.
-- `GRCLANKER_BIN_DIR` (default `~/.local/bin`): Where the `grclanker` launcher is linked.
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `GRCLANKER_VERSION` | `latest` | Release to install, with or without the leading `v`. A positional version or `-Version` wins over it. |
+| `GRCLANKER_INSTALL_DIR` | `~/.local/share/grclanker` | Where the bundle is unpacked. The installer deletes and recreates this directory. |
+| `GRCLANKER_BIN_DIR` | `~/.local/bin` | Where the `grclanker` launcher is linked. |
 
 For example:
 

@@ -28,73 +28,19 @@ Model/provider settings still decide which LLM answers questions. Compute backen
 
 ## Backend matrix
 
-Each kind shows its bucket, then its state, runtime path, snapshot and restore support, GPU support, workspace staging, and artifact sync-back.
+| Kind | Bucket | State | Runtime path | Snapshot / restore | GPU | Workspace staging | Artifact sync-back |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `host` | host | shipped | Pi's native local shell operations wrapped in the output redaction guard (the `createHostBackend` contract adapter is exercised by tests and `env list` only) | no | no | in place | in place |
+| `sandbox-runtime` | sandboxed | shipped | contract adapter for bash, grep, and find; file tools stay local with the same FS policy | no | no | in place | in place |
+| `docker` | sandboxed | shipped | contract adapter (`docker run` args unchanged from phase 1) | no | no | bind mount | bind mount |
+| `parallels-vm` | sandboxed | shipped | contract adapter (disposable clone, `prlctl exec`) | yes (`prlctl snapshot`, `prlctl snapshot-switch`), exercised by `env smoke-test` | no | shared folder | shared folder |
+| `modal` | gpu-burst | shipped (CLI) | contract adapter over `modal shell`, one-shot: bash only, file tools stay local | no | yes | `--add-local` copy per command | not available |
+| `runpod-pod` | persistent-remote | shipped | contract adapter over the REST API plus `ssh`/`scp` | no | yes | `scp` of the git index (tracked files minus the deny list) into a per-session directory | `scp` (manual) |
+| `runpod-serverless` | gpu-burst | shipped | contract adapter over the serverless HTTP API, one-shot: bash only, file tools stay local | no | yes | worker image must contain the workspace | artifact paths reported by the worker |
+| `vercel-sandbox` | sandboxed | stub | fails fast | no | no | no | no |
+| `cloudflare-sandbox` | sandboxed | stub | fails fast | no | no | no | no |
 
-- `host` (host bucket)
-  - State: Shipped
-  - Runtime path: Pi's native local shell operations wrapped in the output redaction guard. The `createHostBackend` contract adapter is exercised by tests and `env list` only.
-  - Snapshot / restore: No
-  - GPU: No
-  - Workspace staging: In place
-  - Artifact sync-back: In place
-- `sandbox-runtime` (sandboxed bucket)
-  - State: Shipped
-  - Runtime path: Contract adapter for bash, grep, and find. File tools stay local with the same FS policy.
-  - Snapshot / restore: No
-  - GPU: No
-  - Workspace staging: In place
-  - Artifact sync-back: In place
-- `docker` (sandboxed bucket)
-  - State: Shipped
-  - Runtime path: Contract adapter (`docker run` args unchanged from phase 1)
-  - Snapshot / restore: No
-  - GPU: No
-  - Workspace staging: Bind mount
-  - Artifact sync-back: Bind mount
-- `parallels-vm` (sandboxed bucket)
-  - State: Shipped
-  - Runtime path: Contract adapter (disposable clone, `prlctl exec`)
-  - Snapshot / restore: Yes (`prlctl snapshot`, `prlctl snapshot-switch`), exercised by `env smoke-test`
-  - GPU: No
-  - Workspace staging: Shared folder
-  - Artifact sync-back: Shared folder
-- `modal` (gpu-burst bucket)
-  - State: Shipped (CLI)
-  - Runtime path: Contract adapter over `modal shell`. One-shot: bash only, file tools stay local.
-  - Snapshot / restore: No
-  - GPU: Yes
-  - Workspace staging: `--add-local` copy per command
-  - Artifact sync-back: Not available
-- `runpod-pod` (persistent-remote bucket)
-  - State: Shipped
-  - Runtime path: Contract adapter over the REST API plus `ssh`/`scp`
-  - Snapshot / restore: No
-  - GPU: Yes
-  - Workspace staging: `scp` of the git index (tracked files minus the deny list) into a per-session directory
-  - Artifact sync-back: `scp` (manual)
-- `runpod-serverless` (gpu-burst bucket)
-  - State: Shipped
-  - Runtime path: Contract adapter over the serverless HTTP API. One-shot: bash only, file tools stay local.
-  - Snapshot / restore: No
-  - GPU: Yes
-  - Workspace staging: Worker image must contain the workspace
-  - Artifact sync-back: Artifact paths reported by the worker
-- `vercel-sandbox` (sandboxed bucket)
-  - State: Stub
-  - Runtime path: Fails fast
-  - Snapshot / restore: No
-  - GPU: No
-  - Workspace staging: No
-  - Artifact sync-back: No
-- `cloudflare-sandbox` (sandboxed bucket)
-  - State: Stub
-  - Runtime path: Fails fast
-  - Snapshot / restore: No
-  - GPU: No
-  - Workspace staging: No
-  - Artifact sync-back: No
-
-`grclanker env list` lists every kind with its bucket, its readiness on this machine right now, and a one-line detail. The state, snapshot, GPU, and staging lines above are reference only and are not part of its output.
+`grclanker env list` lists every kind with its bucket, its readiness on this machine right now, and a one-line detail. The state, snapshot, GPU, and staging columns above are reference only and are not part of its output.
 
 ### Session lifecycle and teardown
 

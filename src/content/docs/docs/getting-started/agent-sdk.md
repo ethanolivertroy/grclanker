@@ -9,13 +9,13 @@ The project is built on [`@cursor/bdk`](https://www.npmjs.com/package/@cursor/bd
 
 ## What the agent exposes
 
-Each item pairs a grclanker asset with its Agent SDK surface:
-
-- 241 domain tools from `cli/extensions/grc-tools/`: Server tools under their native names (`cmvp_search_modules`, `fedramp_check_sources`, `aws_check_access`, ...).
-- `cli/.grclanker/SYSTEM.md`: Always-on instructions, followed by a short runtime note.
-- `cli/prompts/{investigate,audit,assess,validate}.md`: On-demand skills named `investigate`, `audit`, `assess`, and `validate`.
-- `cli/skills/crypto-validation/SKILL.md`: Skill named `crypto-validation`.
-- `cli/.grclanker/agents/{auditor,verifier}.md`: Subagents named `auditor` and `verifier`.
+| grclanker asset | Agent SDK surface |
+|---|---|
+| 241 domain tools from `cli/extensions/grc-tools/` | Server tools under their native names (`cmvp_search_modules`, `fedramp_check_sources`, `aws_check_access`, ...) |
+| `cli/.grclanker/SYSTEM.md` | Always-on instructions, followed by a short runtime note |
+| `cli/prompts/{investigate,audit,assess,validate}.md` | On-demand skills named `investigate`, `audit`, `assess`, and `validate` |
+| `cli/skills/crypto-validation/SKILL.md` | Skill named `crypto-validation` |
+| `cli/.grclanker/agents/{auditor,verifier}.md` | Subagents named `auditor` and `verifier` |
 
 Pi's compute-backend tools (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) are not exposed. The Cursor harness supplies its own shell and file tools, so the `docker`, `sandbox-runtime`, and `parallels-vm` compute backends do not apply to this run mode.
 
