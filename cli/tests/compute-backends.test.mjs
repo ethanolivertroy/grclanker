@@ -852,6 +852,48 @@ test("session_shutdown tears down a staged runpod-pod session regardless of the 
   });
 });
 
+function runCliWithSandboxRuntimeStub(args, env = {}) {
+  const cliRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const hooksUrl = pathToFileURL(join(cliRoot, "tests", "helpers", "sandbox-runtime-mock-hooks.mjs")).href;
+  const preload = `data:text/javascript,${encodeURIComponent(`import { register } from "node:module"; register(${JSON.stringify(hooksUrl)});`)}`;
+  const base = mkdtempSync(join(tmpdir(), "grclanker-env-sandbox-exit-"));
+  const recordPath = join(base, "sandbox-runtime.log");
+  try {
+    const run = spawnSync(process.execPath, ["--import", preload, join(cliRoot, "dist", "index.js"), ...args], {
+      encoding: "utf8",
+      timeout: 20_000,
+      cwd: base,
+      env: { ...process.env, GRCLANKER_HOME: base, GRCLANKER_TEST_SANDBOX_RUNTIME_RECORD: recordPath, ...env },
+    });
+    return { run, record: existsSync(recordPath) ? readFileSync(recordPath, "utf8") : "" };
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+test("env exec and env smoke-test reset sandbox-runtime so the CLI exits once they finish", () => {
+  for (const args of [
+    ["env", "exec", "--backend", "sandbox-runtime", "--", "true"],
+    ["env", "smoke-test", "--backend", "sandbox-runtime"],
+  ]) {
+    const { run, record } = runCliWithSandboxRuntimeStub(args);
+    const label = `grclanker ${args.join(" ")}`;
+    assert.equal(run.signal, null, `${label} was still running after 20s: ${run.stdout}${run.stderr}`);
+    assert.equal(run.status, 0, `${label} exited ${run.status}: ${run.stdout}${run.stderr}`);
+    assert.equal(record, "initialize\nreset\n", label);
+  }
+});
+
+test("env exec keeps the command failure when the sandbox-runtime reset also fails", () => {
+  const { run, record } = runCliWithSandboxRuntimeStub(
+    ["env", "exec", "--backend", "sandbox-runtime", "--", "sh", "-c", "exit 3"],
+    { GRCLANKER_TEST_SANDBOX_RUNTIME_RESET_ERROR: "bridge did not stop" },
+  );
+  assert.equal(run.status, 1, `${run.stdout}${run.stderr}`);
+  assert.match(run.stderr, /^Command failed with exit code 3\.\nCleanup also failed: bridge did not stop$/m);
+  assert.equal(record, "initialize\nreset\n");
+});
+
 test("parseParallelsSnapshotId round-trips braced and bare ids verbatim", () => {
   const uuid = "a1b2c3d4-0000-1111-2222-333344445555";
   assert.equal(parseParallelsSnapshotId(`Snapshot {${uuid}} has been created`), `{${uuid}}`);

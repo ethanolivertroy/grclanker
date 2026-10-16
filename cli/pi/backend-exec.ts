@@ -913,7 +913,7 @@ export async function withComputeBackendExecution<T>(
 
 // The run's own failure stays the primary error and keeps its type (a GrclankerUserError still
 // prints as one); the cleanup failure is appended to its message so neither is lost.
-function appendCleanupFailure(error: unknown, teardownError: unknown): unknown {
+export function appendCleanupFailure(error: unknown, teardownError: unknown): unknown {
   const cleanupMessage = teardownError instanceof Error ? teardownError.message : String(teardownError);
   if (error instanceof Error) {
     error.message = `${error.message}\nCleanup also failed: ${cleanupMessage}`;
