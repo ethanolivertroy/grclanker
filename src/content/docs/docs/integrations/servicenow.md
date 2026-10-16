@@ -3,24 +3,56 @@ title: ServiceNow
 description: Read-only ServiceNow security inspector covering identity, ACLs, platform hardening, and operations governance, with evidence-gated verdicts and audit bundles.
 ---
 
-grclanker ships six native ServiceNow tools that inspect an instance through the Table API and the Aggregate API. They never write to the instance. Every verdict is evidence-gated: a forbidden, ACL-filtered, truncated, or empty read never produces a pass on its own.
+grclanker ships six native ServiceNow tools that inspect an instance through the Table API and the Aggregate API. They never write to the instance.
+
+Every verdict is evidence-gated: a forbidden, ACL-filtered, truncated, or empty read never produces a pass on its own.
 
 ## What it inspects
 
 The tools cover the twenty security controls in `specs/servicenow-sec-inspector.spec.md`:
 
-- Identity and access: role hierarchy, user access review, password policy, MFA, LDAP and SSO integration, integration user permissions
-- Platform hardening: instance security properties, session timeout, script execution restrictions, instance hardening, debug mode, IP access restrictions, email security
-- Access control: ACL rule completeness (wildcard, unrestricted, and public page exposure) and table-level ACL coverage for sensitive tables
-- Operations governance: encryption at rest, audit logging, update set management, MID Server security, plugin inventory
+- **Identity and access:** Role hierarchy, user access review, password policy, MFA, LDAP and SSO integration, integration user permissions.
+- **Platform hardening:** Instance security properties, session timeout, script execution restrictions, instance hardening, debug mode, IP access restrictions, email security.
+- **Access control:** ACL rule completeness (wildcard, unrestricted, and public page exposure) and table-level ACL coverage for sensitive tables.
+- **Operations governance:** Encryption at rest, audit logging, update set management, MID Server security, plugin inventory.
 
-Tables read: `sys_user`, `sys_user_has_role`, `sys_user_role`, `sys_user_role_contains`, `sys_properties`, `password_policy`, `sso_properties`, `ldap_server_config`, `sys_certificate`, `oauth_entity`, `multi_factor_criteria`, `sys_security_acl`, `sys_security_acl_role`, `sys_public`, `sys_script`, `ip_access` (IP Address Access Controls, present once `com.snc.ipauthenticator` is active), `sys_email_account`, `sys_kmf_crypto_module`, `sys_encryption_context` (legacy Column Level Encryption contexts; treated as absent when the instance reports the table as invalid), `sys_dictionary`, `sys_audit` (count only), `syslog_transaction` (count only), `sys_update_set`, `sys_update_xml`, `sys_user_session` (access probe), `ecc_agent`, and `sys_plugins`.
+Tables read:
+
+- `sys_user`
+- `sys_user_has_role`
+- `sys_user_role`
+- `sys_user_role_contains`
+- `sys_properties`
+- `password_policy`
+- `sso_properties`
+- `ldap_server_config`
+- `sys_certificate`
+- `oauth_entity`
+- `multi_factor_criteria`
+- `sys_security_acl`
+- `sys_security_acl_role`
+- `sys_public`
+- `sys_script`
+- `ip_access` (IP Address Access Controls): Present once `com.snc.ipauthenticator` is active.
+- `sys_email_account`
+- `sys_kmf_crypto_module`
+- `sys_encryption_context` (legacy Column Level Encryption contexts): Treated as absent when the instance reports the table as invalid.
+- `sys_dictionary`
+- `sys_audit` (count only)
+- `syslog_transaction` (count only)
+- `sys_update_set`
+- `sys_update_xml`
+- `sys_user_session` (access probe)
+- `ecc_agent`
+- `sys_plugins`
 
 ## Setup and authentication
 
-Create a dedicated audit account. The `admin` role reads every table above; a scoped read role must at minimum grant read on the listed tables (note that `sys_audit` requires `admin` and `sys_dictionary` normally requires `personalize_dictionary`). Forbidden or ACL-filtered tables render as `manual` findings instead of silently passing.
+Create a dedicated audit account. The `admin` role reads every table above.
 
-Configuration precedence is explicit tool arguments, then environment variables, then a YAML config file (`SERVICENOW_CONFIG_FILE`, `./.servicenow.yaml`, or `~/.servicenow-sec-inspector/config.yaml`; a top-level `servicenow:` section is accepted).
+A scoped read role must at minimum grant read on the listed tables. `sys_audit` requires `admin`, and `sys_dictionary` normally requires `personalize_dictionary`. Forbidden or ACL-filtered tables render as `manual` findings instead of silently passing.
+
+Configuration precedence is explicit tool arguments, then environment variables, then a YAML config file (`SERVICENOW_CONFIG_FILE`, `./.servicenow.yaml`, or `~/.servicenow-sec-inspector/config.yaml`). The config file accepts a top-level `servicenow:` section.
 
 | Variable | Purpose |
 | --- | --- |
@@ -34,7 +66,26 @@ Configuration precedence is explicit tool arguments, then environment variables,
 | `SERVICENOW_CONFIG_FILE` | YAML config file path |
 | `SERVICENOW_TIMEOUT`, `SERVICENOW_MAX_RETRIES`, `SERVICENOW_PAGE_SIZE` | HTTP timeout in seconds (default 30, clamped to 1-300), retries for 429 and 5xx (default 3, clamped to 0-10), Table API page size (default 500, clamped to 1-10000) |
 
-Only the first config file found is read: `SERVICENOW_CONFIG_FILE` (or `config_file`) when set, which must exist, otherwise `./.servicenow.yaml`, otherwise `~/.servicenow-sec-inspector/config.yaml`. Its keys are `instance` (or `instance_name`, `instanceName`), `instance_url` (or `url`, `instanceUrl`, `base_url`), `auth_method` (or `authMethod`, `auth_mode`), `username` (or `user`), `password`, `client_id` (or `clientId`), `client_secret` (or `clientSecret`), `access_token` (or `accessToken`, `token`), `refresh_token` (or `refreshToken`), `timeout_seconds` (or `timeout`; `timeoutSeconds` is not read), `max_retries` (or `maxRetries`), and `page_size` (or `pageSize`).
+Only the first config file found is read:
+
+- `SERVICENOW_CONFIG_FILE` (or `config_file`) when set, which must exist.
+- Otherwise `./.servicenow.yaml`.
+- Otherwise `~/.servicenow-sec-inspector/config.yaml`.
+
+The config file's keys are:
+
+- `instance` (or `instance_name`, `instanceName`)
+- `instance_url` (or `url`, `instanceUrl`, `base_url`)
+- `auth_method` (or `authMethod`, `auth_mode`)
+- `username` (or `user`)
+- `password`
+- `client_id` (or `clientId`)
+- `client_secret` (or `clientSecret`)
+- `access_token` (or `accessToken`, `token`)
+- `refresh_token` (or `refreshToken`)
+- `timeout_seconds` (or `timeout`). `timeoutSeconds` is not read.
+- `max_retries` (or `maxRetries`)
+- `page_size` (or `pageSize`)
 
 ### Basic authentication
 
@@ -44,10 +95,17 @@ Set `SERVICENOW_INSTANCE`, `SERVICENOW_USERNAME`, and `SERVICENOW_PASSWORD`. Req
 
 Tokens are exchanged at `POST https://<instance>.service-now.com/oauth_token.do` with an `application/x-www-form-urlencoded` body and cached until they expire.
 
-- Client credentials grant: create an application registry entry ("Create an OAuth API endpoint for external clients"), set the OAuth Application User to the audit account, and set the system property `glide.oauth.inbound.client.credential.grant_type.enabled` to `true`. Provide `SERVICENOW_CLIENT_ID` and `SERVICENOW_CLIENT_SECRET`.
-- Password grant: provide the client ID and secret plus `SERVICENOW_USERNAME` and `SERVICENOW_PASSWORD`; the client sends `grant_type=password` and refreshes with `refresh_token` when one is issued.
-- Refresh token grant: provide the client ID and secret plus `SERVICENOW_REFRESH_TOKEN` (`refresh_token` in the config file, or the `refresh_token` argument; argument over environment over file, like every other credential); the first exchange sends `grant_type=refresh_token` and no password. The token is a configured secret: it is removed from every error string, row, and evidence text the tools keep.
-- Pre-issued token: provide `SERVICENOW_ACCESS_TOKEN`.
+- **Client credentials grant:**
+  - Create an application registry entry ("Create an OAuth API endpoint for external clients").
+  - Set the OAuth Application User to the audit account.
+  - Set the system property `glide.oauth.inbound.client.credential.grant_type.enabled` to `true`.
+  - Provide `SERVICENOW_CLIENT_ID` and `SERVICENOW_CLIENT_SECRET`.
+- **Password grant:** Provide the client ID and secret plus `SERVICENOW_USERNAME` and `SERVICENOW_PASSWORD`. The client sends `grant_type=password` and refreshes with `refresh_token` when one is issued.
+- **Refresh token grant:** Provide the client ID and secret plus `SERVICENOW_REFRESH_TOKEN`.
+  - The token can also come from `refresh_token` in the config file or the `refresh_token` argument. Precedence is argument over environment over file, like every other credential.
+  - The first exchange sends `grant_type=refresh_token` and no password.
+  - The token is a configured secret: it is removed from every error string, row, and evidence text the tools keep.
+- **Pre-issued token:** Provide `SERVICENOW_ACCESS_TOKEN`.
 
 ### Mutual TLS
 
@@ -62,16 +120,35 @@ Tokens are exchanged at `POST https://<instance>.service-now.com/oauth_token.do`
 | `servicenow_assess_platform_hardening` | Controls 1, 5, 12, 13, 16, 17, 18. Options: `max_session_timeout_minutes` (60), `record_limit`. |
 | `servicenow_assess_access_control` | Controls 2 and 11. Option: `record_limit`. |
 | `servicenow_assess_operations_governance` | Controls 9, 10, 15, 19, 20. Option: `record_limit`. |
-| `servicenow_export_audit_bundle` | Runs the access check and all four assessments, then writes `core_data/` (Table API and Aggregate API snapshots projected to the requested `sysparm_fields`, with `truncated`, `total_unknown`, and `partial` flags per table; a table or aggregate that was forbidden, errored, or never requested is written as a `{ collected: false, table, query, status, endpoint, error }` marker instead of an empty list), `analysis/` (`findings.json`, per-area results with an `inventories` map that reports each table as read, `unread (...)`, or `not requested (...)`, `summary.json`), `compliance/` (`executive_summary.md`, `unified_compliance_matrix.md`, one report per framework), `QUICK_REFERENCE.md`, `metadata.json`, `_errors.log` when collection partially failed, and a zip archive named after the allocated output directory. The directory is `<instance>-audit-bundle`, where the instance is the configured instance name or the first label of the instance host. Reruns allocate `-2` through `-9` instead of overwriting, skipping any name whose directory or zip already exists, and fail once all nine are taken. Default output root: `./export/servicenow`. |
+| `servicenow_export_audit_bundle` | Runs the access check and all four assessments, then writes an audit bundle and a zip archive. |
 
-All tools accept the authentication arguments (`instance`, `instance_url`, `auth_method`, `username`, `password`, `client_id`, `client_secret`, `access_token`, `refresh_token`, `config_file`, `timeout_seconds`, `max_retries`, `page_size`).
+`servicenow_export_audit_bundle` writes these outputs under the output root (default `./export/servicenow`):
+
+- `core_data/`: Table API and Aggregate API snapshots projected to the requested `sysparm_fields`.
+  - Snapshots carry `truncated`, `total_unknown`, and `partial` flags per table.
+  - A table or aggregate that was forbidden, errored, or never requested is written as a `{ collected: false, table, query, status, endpoint, error }` marker instead of an empty list.
+- `analysis/`: `findings.json`, per-area results, and `summary.json`. The per-area results carry an `inventories` map that reports each table as read, `unread (...)`, or `not requested (...)`.
+- `compliance/`: `executive_summary.md`, `unified_compliance_matrix.md`, and one report per framework.
+- `QUICK_REFERENCE.md`.
+- `metadata.json`.
+- `_errors.log`, when collection partially failed.
+- A zip archive named after the allocated output directory.
+
+The bundle directory is `<instance>-audit-bundle`, where the instance is the configured instance name or the first label of the instance host. Reruns allocate `-2` through `-9` instead of overwriting, skipping any name whose directory or zip already exists. A rerun fails once all nine are taken.
+
+All tools accept the authentication arguments: `instance`, `instance_url`, `auth_method`, `username`, `password`, `client_id`, `client_secret`, `access_token`, `refresh_token`, `config_file`, `timeout_seconds`, `max_retries`, and `page_size`.
 
 ## Verdict semantics
 
-- `pass`: complete, readable evidence shows the compliant configuration. Pagination ran to completion and X-Total-Count (or an Aggregate count) matched the rows returned.
-- `warn`: the visible evidence is compliant but the view is partial or truncated (seen and total counts are reported), a documented property has no `sys_properties` row (its default is never assumed), or a hygiene gap remains.
-- `fail`: a verified non-compliant setting or record.
-- `manual`: the read was forbidden (401/403), ACL-filtered, or errored; the inventory was empty where emptiness cannot be trusted; the control is out of scope or not exposed through the API. The summary names the cause and `manualEvidence` states exactly what a human must collect.
+- `pass`: Complete, readable evidence shows the compliant configuration. Pagination ran to completion and X-Total-Count (or an Aggregate count) matched the rows returned.
+- `warn`: The visible evidence is compliant but the view is partial or truncated (seen and total counts are reported), a documented property has no `sys_properties` row (its default is never assumed), or a hygiene gap remains.
+- `fail`: A verified non-compliant setting or record.
+- `manual`: Any of these holds:
+  - The read was forbidden (401/403), ACL-filtered, or errored.
+  - The inventory was empty where emptiness cannot be trusted.
+  - The control is out of scope or not exposed through the API.
+
+For a `manual` finding, the summary names the cause and `manualEvidence` states exactly what a human must collect.
 
 Rows without a date (`last_login_time`, `expires`) are bucketed separately and never counted as active or valid.
 
@@ -79,10 +156,19 @@ Rows without a date (`last_login_time`, `expires`) are bucketed separately and n
 
 Every finding is gated on the tables it reads (the `Inputs` column below), in this order:
 
-- Unread input: when any input was forbidden (401/403), ACL-filtered, or errored, the finding is `manual`, its summary names the table and the observed status ("Verdict unknown: sys_user read was forbidden (403)"), and `manualEvidence` states what to collect. Nothing is evaluated on the remaining inputs.
-- Truncated input: when an input stopped at `record_limit`, returned fewer rows than `X-Total-Count`, or has no total, the finding's summary carries "Partial view: ..." and a `pass` becomes `warn`. An absence-driven `fail` (a property, ACL, identity provider, access rule, or plugin not found among the visible rows: SNOW-07, SNOW-08, SNOW-11, SNOW-17, SNOW-20) is capped at `manual` and the names of the things not seen are dropped, because an unseen row may sit in the unread remainder; a `fail` observed on a visible row (a non-compliant value, an inactive plugin row, an unvalidated MID Server) stands.
-- Named principals: user, admin, and integration account names and the counts derived from them are rendered `null` with a `principals_withheld` note whenever `sys_user` or `sys_user_has_role` is partial (SNOW-04, SNOW-07, SNOW-14).
-- Evidence: every finding carries `inputs[]` with one entry per table read (`table`, `state`, `visible_rows`, `total_rows`, `pages`, `truncated`, `total_unknown`, `partial`), each `null` when the read was not answered. Area summaries render every count derived from an unread table as `null` and carry an `inventories` map naming each table as read, `unread (<status>)`, or `not requested (<reason>)`.
+- **Unread input:** The finding is `manual` when any input was forbidden (401/403), ACL-filtered, or errored.
+  - Its summary names the table and the observed status ("Verdict unknown: sys_user read was forbidden (403)").
+  - `manualEvidence` states what to collect.
+  - Nothing is evaluated on the remaining inputs.
+- **Truncated input:** When an input stopped at `record_limit`, returned fewer rows than `X-Total-Count`, or has no total, the finding's summary carries "Partial view: ..." and a `pass` becomes `warn`.
+  - An absence-driven `fail` is capped at `manual`, and the names of the things not seen are dropped, because an unseen row may sit in the unread remainder.
+  - Such a `fail` rests on a property, ACL, identity provider, access rule, or plugin not found among the visible rows (SNOW-07, SNOW-08, SNOW-11, SNOW-17, SNOW-20).
+  - A `fail` observed on a visible row (a non-compliant value, an inactive plugin row, an unvalidated MID Server) stands.
+- **Named principals:** User, admin, and integration account names and the counts derived from them are rendered `null` with a `principals_withheld` note whenever `sys_user` or `sys_user_has_role` is partial (SNOW-04, SNOW-07, SNOW-14).
+- **Evidence**
+  - Every finding carries `inputs[]` with one entry per table read (`table`, `state`, `visible_rows`, `total_rows`, `pages`, `truncated`, `total_unknown`, `partial`), each `null` when the read was not answered.
+  - Area summaries render every count derived from an unread table as `null`.
+  - Area summaries carry an `inventories` map naming each table as read, `unread (<status>)`, or `not requested (<reason>)`.
 
 ## Control coverage
 
@@ -113,7 +199,18 @@ Controls 9, 10, 18, 19, and 20 never pass because part of their evidence is not 
 
 ## Framework mappings
 
-Every finding carries eight mappings from the spec's compliance table: FedRAMP / NIST 800-53, CMMC 2.0, SOC 2, CIS Controls, PCI-DSS, DISA STIG, IRAP / ISM, and ISMAP. The audit bundle writes one report per framework under `compliance/` plus a unified matrix.
+Every finding carries eight mappings from the spec's compliance table:
+
+- FedRAMP / NIST 800-53
+- CMMC 2.0
+- SOC 2
+- CIS Controls
+- PCI-DSS
+- DISA STIG
+- IRAP / ISM
+- ISMAP
+
+The audit bundle writes one report per framework under `compliance/`, plus a unified matrix.
 
 ## Live smoke test
 
@@ -121,21 +218,113 @@ Every finding carries eight mappings from the spec's compliance table: FedRAMP /
 npm --prefix cli run test:servicenow:live
 ```
 
-The script prints a skip message and exits 0 when no ServiceNow configuration is present. Otherwise it runs `servicenow_check_access`, stops if any core table is unreadable, and runs the platform hardening assessment.
+The script prints a skip message and exits 0 when no ServiceNow configuration is present.
+
+Otherwise it:
+
+1. Runs `servicenow_check_access`.
+2. Stops if any core table is unreadable.
+3. Runs the platform hardening assessment.
 
 ## Limitations and manual controls
 
-- ServiceNow ACLs can hide rows without returning 403, and `X-Total-Count` is computed before ACL evaluation. The client compares the total against the rows returned and treats a mismatch as a partial view; `sysparm_no_count` is never sent so the header stays available. A response with zero rows and no `X-Total-Count` header is reported as "visibility unproven" and never supports a pass, even when an Aggregate API count for the table is above zero.
+- ServiceNow ACLs can hide rows without returning 403, and `X-Total-Count` is computed before ACL evaluation.
+  - The client compares the total against the rows returned and treats a mismatch as a partial view.
+  - `sysparm_no_count` is never sent, so the header stays available.
+  - A response with zero rows and no `X-Total-Count` header is reported as "visibility unproven". It never supports a pass, even when an Aggregate API count for the table is above zero.
 - `sysparm_limit` is applied before ACL evaluation, so a page can legitimately return fewer rows than requested. Pagination follows `Link rel="next"` to completion or records truncation at `record_limit` and downgrades the verdict.
-- Every table read sends an explicit `sysparm_fields` list and the client projects the returned rows to those columns before they are stored, so password hashes, client secrets, bind and mailbox passwords, keystore material, and `sys_update_xml` payloads never land in `core_data/`; ACL `condition` and `script` bodies are reduced to `has_condition` and `has_script`. A `Link rel="next"` that arrives with an empty page or a non-advancing offset, or a non-empty read without `X-Total-Count`, is reported as truncated or "total unknown" (`total_rows` is reported only when the header was returned and is `null` otherwise) and counts as a partial input under Partial and unread inputs above: a would-be `pass` on it becomes `warn`, and an absence-driven `fail` is capped at `manual` with the names of the things not seen dropped; a `fail` observed on a visible row stands, and a finding that reads several inventories stays `manual` while any one of them is forbidden.
-- Pagination follows the Table API's `Link rel=next` header on the instance's own origin only, and never through a link that carries userinfo: a link whose origin (scheme, host, port) differs from the configured instance URL, or that embeds credentials before the host, is refused before it reaches `fetch` (the Authorization header would otherwise travel with it, and a credentialed URL is never handed to the transport), and the read is reported `truncated` with a `truncation_reason` that names the configured origin and the rejected origin only, never the link's path, query, or userinfo: "Link rel=next pointed at another origin, `https://evil.example.test`, than the configured instance `https://dev12345.service-now.com`; not followed" or "Link rel=next carried embedded credentials (userinfo) and pointed at the configured instance `https://dev12345.service-now.com`; not followed" (a link that does not parse is refused as "Link rel=next was not a valid URL (configured instance ...); not followed"), as a stuck or empty next page is with its own reason. The same check guards the table request itself: a URL off the configured origin or carrying userinfo is refused with "ServiceNow request URL ...; the request was not sent." before the header is attached.
+- Every table read sends an explicit `sysparm_fields` list, and the client projects the returned rows to those columns before they are stored.
+  - Password hashes, client secrets, bind and mailbox passwords, keystore material, and `sys_update_xml` payloads therefore never land in `core_data/`.
+  - ACL `condition` and `script` bodies are reduced to `has_condition` and `has_script`.
+- A `Link rel="next"` that arrives with an empty page or a non-advancing offset, or a non-empty read without `X-Total-Count`, is reported as truncated or "total unknown".
+  - `total_rows` is reported only when the header was returned, and is `null` otherwise.
+  - Such a read counts as a partial input under Partial and unread inputs above. A would-be `pass` on it becomes `warn`, and an absence-driven `fail` is capped at `manual` with the names of the things not seen dropped.
+  - A `fail` observed on a visible row stands.
+  - A finding that reads several inventories stays `manual` while any one of them is forbidden.
 - Rate limiting (429 with `Retry-After`) and 5xx responses are retried with backoff up to `max_retries`.
-- Every string a snapshot, an evidence list, or a summary keeps from a ServiceNow response passes the data-side pass at the collector (`readTable`, the one path every table read takes): the client's remembered credentials in every form and every carrier (`Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare; URL userinfo and query strings, which go whole; credential-named assignments and fields; auth schemes; JWTs; PEM blocks) and, bare, the vendor-prefixed token shapes (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest) are removed from a description, a note, a name, or a comment: JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too, while the generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay. A row value nested deeper than 32 levels is replaced by `[REDACTED]` at that depth rather than passed through (the payload is server-controlled).
-- Error strings never quote a response body. An error body that is not JSON (a proxy or gateway page, whatever its content type claims) or JSON without ServiceNow's documented `error.message`, `error.detail`, `status`, or `error_description` fields is described as "non-JSON body (text/html, 5120 bytes)" or "JSON body without documented error fields (...)". Every error string is passed through one redaction pass when it is built and again when it is recorded, so `access_check.json`, `analysis/*.json` `errors` arrays, `_errors.log`, and tool results carry the status, the request path, the body shape, and ServiceNow's documented error fields with every credential and token-shaped value removed; the guarantee is that no configured or obtained credential, no carrier-borne value, and no real token shape survives, not that every other word is gone (see the name-shaped exception at the end of this bullet). The pass removes the configured and obtained credentials whatever their shape and in their base64, base64url, URL-encoded, and JSON-escaped forms; any value inside a carrier whatever its shape (`Authorization`, `Cookie`, `Set-Cookie`, and API key headers, cookie and session assignments, URL userinfo and query pairs, the `Bearer`, `Basic`, `Digest`, `Token`, and `ApiKey` schemes, credential-named fields and assignments, SOAP credential elements, command-line flags); and bare values only when they have a real token shape (JWTs, PEM blocks, hex digests, vendor-prefixed keys, and runs of 16 or more characters with base64 symbols, scattered digits, or token casing, including a run standing after `=` under a non-credential pair name such as `theme=`). A carrier or token shape standing right after a literal JSON escape (`\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them) is treated exactly as one after a real newline, tab, or space. A bare name-shaped value standing alone in prose, such as a table name or `prod-us-east-2026`, is indistinguishable from a resource name and stays.
-- Config file errors are fixed text. A file that cannot be read fails with "Unable to read ServiceNow config file <path> (<CODE>)" (the Node error code only, `ENOENT` included when the path was given explicitly); a file that cannot be parsed fails with "Unable to parse ServiceNow config file: invalid YAML in <path> at line N" (the line only when the parser reports one); a file that parses but is not a YAML mapping (a scalar, a sequence, or an empty document) fails with "Unable to parse ServiceNow config file: <path> must contain a YAML mapping" at any candidate, the default `.servicenow.yaml` and `~/.servicenow-sec-inspector/config.yaml` included, rather than falling through to the environment credentials. Neither the parser's message, which quotes the offending line or an unresolved alias value, nor the filesystem's wording is ever included.
-- Instance Security Center hardening scores, Instance Scan results, Edge Encryption, DKIM configuration, MID Server mutual authentication, and audit retention are not read; the corresponding findings state the evidence to collect.
-- MFA enforcement is read from the Role-based multi-factor authentication record in `multi_factor_criteria` (Active flag and its Multi-factor Roles list, when the Table API returns it) plus `sys_user.enable_multifactor_authn`. Adaptive authentication MFA policies are not read; when the roles list is not returned, enforcement falls back to the per-user flags and the finding says so.
+- Instance Security Center hardening scores, Instance Scan results, Edge Encryption, DKIM configuration, MID Server mutual authentication, and audit retention are not read. The corresponding findings state the evidence to collect.
+- MFA enforcement is read from the Role-based multi-factor authentication record in `multi_factor_criteria` (Active flag and its Multi-factor Roles list, when the Table API returns it) plus `sys_user.enable_multifactor_authn`.
+  - Adaptive authentication MFA policies are not read.
+  - When the roles list is not returned, enforcement falls back to the per-user flags and the finding says so.
 - Mutual TLS is not supported by the runtime's HTTP client.
+
+### Link and request origins
+
+Pagination follows the Table API's `Link rel=next` header on the instance's own origin only, and never through a link that carries userinfo.
+
+A link is refused before it reaches `fetch` when its origin (scheme, host, port) differs from the configured instance URL, or when it embeds credentials before the host. Otherwise the Authorization header would travel with the link. A credentialed URL is never handed to the transport.
+
+The read is then reported `truncated` with a `truncation_reason` that names the configured origin and the rejected origin only, never the link's path, query, or userinfo:
+
+- "Link rel=next pointed at another origin, `https://evil.example.test`, than the configured instance `https://dev12345.service-now.com`; not followed"
+- "Link rel=next carried embedded credentials (userinfo) and pointed at the configured instance `https://dev12345.service-now.com`; not followed"
+
+A link that does not parse is refused as "Link rel=next was not a valid URL (configured instance ...); not followed". A stuck or empty next page is also reported `truncated`, with its own reason.
+
+The same check guards the table request itself. A URL off the configured origin or carrying userinfo is refused with "ServiceNow request URL ...; the request was not sent." before the Authorization header is attached.
+
+### Data-side redaction
+
+Every string a snapshot, an evidence list, or a summary keeps from a ServiceNow response passes the data-side pass at the collector (`readTable`, the one path every table read takes). The pass removes these from a description, a note, a name, or a comment:
+
+- The client's remembered credentials in every form and every carrier:
+  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare
+  - URL userinfo and query strings, which go whole
+  - Credential-named assignments and fields
+  - Auth schemes
+  - JWTs
+  - PEM blocks
+- Bare vendor-prefixed token shapes: `sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest.
+
+JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too. The generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay.
+
+A row value nested deeper than 32 levels is replaced by `[REDACTED]` at that depth rather than passed through (the payload is server-controlled).
+
+### Error strings
+
+Error strings never quote a response body. These error bodies are described instead:
+
+- A body that is not JSON (a proxy or gateway page, whatever its content type claims).
+- JSON without ServiceNow's documented `error.message`, `error.detail`, `status`, or `error_description` fields.
+
+The descriptions read "non-JSON body (text/html, 5120 bytes)" or "JSON body without documented error fields (...)".
+
+Every error string is passed through one redaction pass when it is built and again when it is recorded. As a result, `access_check.json`, `analysis/*.json` `errors` arrays, `_errors.log`, and tool results carry the status, the request path, the body shape, and ServiceNow's documented error fields with every credential and token-shaped value removed.
+
+The guarantee is that no configured or obtained credential, no carrier-borne value, and no real token shape survives, not that every other word is gone (see the name-shaped exception at the end of this section).
+
+The pass removes:
+
+- The configured and obtained credentials, whatever their shape, and in their base64, base64url, URL-encoded, and JSON-escaped forms.
+- Any value inside one of these carriers, whatever its shape:
+  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers
+  - Cookie and session assignments
+  - URL userinfo and query pairs
+  - The `Bearer`, `Basic`, `Digest`, `Token`, and `ApiKey` schemes
+  - Credential-named fields and assignments
+  - SOAP credential elements
+  - Command-line flags
+- Bare values only when they have a real token shape:
+  - JWTs
+  - PEM blocks
+  - Hex digests
+  - Vendor-prefixed keys
+  - Runs of 16 or more characters with base64 symbols, scattered digits, or token casing, including a run standing after `=` under a non-credential pair name such as `theme=`
+
+A carrier or token shape standing right after a literal JSON escape (`\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them) is treated exactly as one after a real newline, tab, or space.
+
+A bare name-shaped value standing alone in prose, such as a table name or `prod-us-east-2026`, is indistinguishable from a resource name and stays.
+
+### Config file errors
+
+Config file errors are fixed text.
+
+- A file that cannot be read fails with "Unable to read ServiceNow config file \<path> (\<CODE>)". The parentheses carry the Node error code only, `ENOENT` included when the path was given explicitly.
+- A file that cannot be parsed fails with "Unable to parse ServiceNow config file: invalid YAML in \<path> at line N". The line appears only when the parser reports one.
+- A file that parses but is not a YAML mapping (a scalar, a sequence, or an empty document) fails with "Unable to parse ServiceNow config file: \<path> must contain a YAML mapping".
+  - Such a file fails this way at any candidate, the default `.servicenow.yaml` and `~/.servicenow-sec-inspector/config.yaml` included, rather than falling through to the environment credentials.
+
+Neither the parser's message, which quotes the offending line or an unresolved alias value, nor the filesystem's wording is ever included.
 
 ## Official documentation
 

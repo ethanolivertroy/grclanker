@@ -3,23 +3,27 @@ title: CrowdStrike Falcon
 description: Read-only CrowdStrike Falcon inspector covering prevention, response, device control, firewall, sensors, RBAC, Identity Protection, and Zero Trust Assessment.
 ---
 
-The CrowdStrike integration inspects a Falcon tenant through the public Falcon API and maps what it finds to the 25 controls in `specs/crowdstrike-sec-inspector.spec.md` (CS-01 through CS-25). Every tool is read-only: the tools never create, update, or delete anything in the tenant.
+The CrowdStrike integration inspects a Falcon tenant through the public Falcon API. It maps what it finds to the 25 controls in `specs/crowdstrike-sec-inspector.spec.md` (CS-01 through CS-25).
+
+Every tool is read-only: the tools never create, update, or delete anything in the tenant.
 
 ## What it inspects
 
 - Prevention policies: ML detection and prevention sliders, exploit mitigation, script-based execution control, sensor tampering protection, on-write detection and quarantine
 - Response policies and Real Time Response (RTR) audit sessions
-- Device control policies (USB, Bluetooth, PCIe/Thunderbolt) and host firewall policies, containers, rule groups, and rules
+- Device control policies (USB, Bluetooth, PCIe/Thunderbolt)
+- Host firewall policies, containers, rule groups, and rules
 - Sensor update policies and the published sensor build catalog
 - Host inventory, host groups, Falcon Discover unmanaged assets, and Zero Trust Assessment scores
 - Users, role grants, API clients and their scopes
 - IOA, machine learning, and sensor visibility exclusions
 - Identity Protection policy rules
-- Critical and high alerts for response SLA measurement and network-contained hosts
+- Critical and high alerts for response SLA measurement
+- Network-contained hosts
 
 ## Setup and authentication
 
-Create a Falcon API client (Falcon console > Support and resources > API clients and keys) with read scopes only, then pass its credentials to the tools.
+Create a Falcon API client with read scopes only, then pass its credentials to the tools. The console path is Falcon console > Support and resources > API clients and keys.
 
 Environment variables:
 
@@ -33,7 +37,15 @@ Environment variables:
 | `CS_CONFIG_FILE` | Optional JSON config file path (defaults to `~/.crowdstrike/config.json`) |
 | `CS_TIMEOUT` | HTTP timeout in seconds (default 30) |
 
-Precedence is explicit tool arguments, then environment variables, then the JSON config file. The config file accepts `client_id`, `client_secret`, `base_url`, `cloud`, `member_cid`, and `timeout_seconds`, plus the camelCase spellings `clientId`, `clientSecret`, `baseUrl`, and `memberCid` and `region` as an alias of `cloud`; keep it outside the repository.
+Precedence is explicit tool arguments, then environment variables, then the JSON config file.
+
+The config file accepts:
+
+- `client_id`, `client_secret`, `base_url`, `cloud`, `member_cid`, and `timeout_seconds`
+- The camelCase spellings `clientId`, `clientSecret`, `baseUrl`, and `memberCid`
+- `region` as an alias of `cloud`
+
+Keep the config file outside the repository.
 
 Regional clouds:
 
@@ -45,7 +57,18 @@ Regional clouds:
 | `us-gov-1` | `https://api.laggar.gcw.crowdstrike.com` |
 | `us-gov-2` | `https://api.us-gov-2.crowdstrike.mil` |
 
-The client exchanges the credentials with `POST /oauth2/token` (form-encoded `client_id`, `client_secret`, optional `member_cid`), caches the bearer token until shortly before `expires_in`, refreshes once on a 401, retries 429 and 5xx responses with exponential backoff while honoring `X-RateLimit-RetryAfter` and `Retry-After`, and passes every error message through a redaction pass that removes the client secret and every bearer token obtained (in their encoded forms too), any value inside a credential carrier (`Authorization` and cookie headers, auth schemes, credential-named fields, assignments, and command-line flags, URL userinfo and query strings), and bare values with a real token shape; the boundary is spelled out under "Limitations and manual controls" below.
+The client:
+
+- Exchanges the credentials with `POST /oauth2/token` (form-encoded `client_id`, `client_secret`, optional `member_cid`).
+- Caches the bearer token until shortly before `expires_in`.
+- Refreshes once on a 401.
+- Retries 429 and 5xx responses with exponential backoff while honoring `X-RateLimit-RetryAfter` and `Retry-After`.
+- Passes every error message through a redaction pass. The pass removes:
+  - The client secret and every bearer token obtained, in their encoded forms too.
+  - Any value inside a credential carrier: `Authorization` and cookie headers; auth schemes; credential-named fields, assignments, and command-line flags; URL userinfo and query strings.
+  - Bare values with a real token shape.
+
+See "Limitations and manual controls" below for the full boundary.
 
 Required API client scopes (all Read):
 
@@ -57,7 +80,7 @@ Required API client scopes (all Read):
 - Alerts
 - IOA Exclusions, Machine Learning Exclusions, Sensor Visibility Exclusions
 - Real time response audit
-- Assets (Falcon Discover), Zero Trust Assessment, Identity Protection Policy Rules: optional; when the module is not licensed the related controls become `manual` findings
+- Assets (Falcon Discover), Zero Trust Assessment, Identity Protection Policy Rules: optional. When the module is not licensed, the related controls become `manual` findings.
 
 `crowdstrike_check_access` probes each of these surfaces and lists the scopes that returned 403.
 
@@ -73,39 +96,110 @@ Required API client scopes (all Read):
 | `crowdstrike_assess_access_governance` | CS-16 to CS-21 and CS-24 from users, roles, API clients, exclusions, and Identity Protection rules |
 | `crowdstrike_export_audit_bundle` | Run every assessment and write an evidence bundle plus zip archive |
 
-Every tool accepts `client_id`, `client_secret`, `base_url`, `cloud`, `member_cid`, `config_file`, and `timeout_seconds`. Assessment tools also accept thresholds such as `lookback_days`, `stale_sensor_days`, `max_admins`, `max_roles_per_user`, `max_usb_exceptions`, `max_write_clients`, `min_zta_score`, `max_session_minutes`, and `max_concurrent_sessions`, and sample limits such as `host_limit`, `user_limit`, `alert_limit`, `exclusion_limit`, and `rule_limit`.
+Every tool accepts `client_id`, `client_secret`, `base_url`, `cloud`, `member_cid`, `config_file`, and `timeout_seconds`.
+
+Assessment tools also accept:
+
+- Thresholds such as `lookback_days`, `stale_sensor_days`, `max_admins`, `max_roles_per_user`, `max_usb_exceptions`, `max_write_clients`, `min_zta_score`, `max_session_minutes`, and `max_concurrent_sessions`
+- Sample limits such as `host_limit`, `user_limit`, `alert_limit`, `exclusion_limit`, and `rule_limit`
 
 ### Audit bundle layout
 
-`crowdstrike_export_audit_bundle` writes to `./export/crowdstrike/<cloud>[-<member_cid>]-audit-bundle/` by default (override with `output_dir`; when the base URL matches no known cloud alias, the base URL's hostname takes the place of `<cloud>`) and refuses traversal or symlinked parent paths:
+`crowdstrike_export_audit_bundle` writes to `./export/crowdstrike/<cloud>[-<member_cid>]-audit-bundle/` by default. Override the location with `output_dir`. When the base URL matches no known cloud alias, the base URL's hostname takes the place of `<cloud>`.
+
+The export refuses traversal or symlinked parent paths. It writes:
 
 - `QUICK_REFERENCE.md` and `metadata.json` (no credentials)
-- `core_data/<category>/*.json`: projected and redacted API snapshots. Alerts and RTR audit sessions keep verdict fields only (process command lines, file paths, and RTR command strings are never exported), and the free-text fields of every exclusion (`cl_regex`, `ifn_regex`, `value`, `name`, `description`, `comment`) pass through the credential redaction pass. Every string a snapshot, an evidence list, or a summary keeps from a Falcon response passes the data-side pass at the collector (`collectDataset`): the client's remembered credentials in every form and every carrier (`Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare; URL userinfo and query strings, which go whole; credential-named assignments and fields; auth schemes; JWTs; PEM blocks) and, bare, the vendor-prefixed token shapes (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest) are removed from a description, a note, a name, or a comment: JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too, while the generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay. A resource nested deeper than 32 levels is replaced by `[REDACTED]` at that depth rather than passed through (the payload is server-controlled). A dataset that was denied, errored, or never requested is written as `{ collected: false, dataset, status, endpoint, error }` instead of an empty array, so `[]` always means a readable list with no items; a dependent read that was skipped carries `not requested: <parent read>` in `error`
-- `analysis/findings.json`, `analysis/<category>.json` (summary counts and truncation flags derived from a dataset that was not read render `null`, and `summary.inventories` states each dataset as `read (N items)`, `read, truncated (N of M items)`, `unread (...)`, or `not requested (...)`), `analysis/access_check.json`
-- `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, `compliance/frameworks/<framework>.md`
+- `core_data/<category>/*.json`: Projected and redacted API snapshots.
+- `analysis/findings.json`
+- `analysis/<category>.json`: Summary counts and truncation flags derived from a dataset that was not read render `null`. `summary.inventories` states each dataset as `read (N items)`, `read, truncated (N of M items)`, `unread (...)`, or `not requested (...)`.
+- `analysis/access_check.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/frameworks/<framework>.md`
 - `_errors.log` only when some reads failed
-- a sibling `.zip` archive of the bundle
+- A sibling `.zip` archive of the bundle
+
+#### Snapshot projection and redaction
+
+Alerts and RTR audit sessions keep verdict fields only. Process command lines, file paths, and RTR command strings are never exported.
+
+The free-text fields of every exclusion (`cl_regex`, `ifn_regex`, `value`, `name`, `description`, `comment`) pass through the credential redaction pass.
+
+Every string a snapshot, an evidence list, or a summary keeps from a Falcon response passes the data-side pass at the collector (`collectDataset`). From a description, a note, a name, or a comment, the pass removes:
+
+- The client's remembered credentials in every form and every carrier:
+  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare
+  - URL userinfo and query strings, which go whole
+  - Credential-named assignments and fields
+  - Auth schemes
+  - JWTs
+  - PEM blocks
+- Bare vendor-prefixed token shapes (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest)
+
+JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too. The generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay.
+
+A resource nested deeper than 32 levels is replaced by `[REDACTED]` at that depth rather than passed through. The payload is server-controlled.
+
+#### Datasets that were not collected
+
+A dataset that was denied, errored, or never requested is written as `{ collected: false, dataset, status, endpoint, error }` instead of an empty array. So `[]` always means a readable list with no items.
+
+A dependent read that was skipped carries `not requested: <parent read>` in `error`.
 
 ## Control coverage
 
-Status semantics: `pass` means the API evidence satisfies the control across the complete inventory that was read, `warn` means partial or threshold-adjacent evidence, `fail` means the evidence contradicts the control or an inventory the control depends on is empty (for example zero prevention policies), and `manual` means the API cannot verify the control and the summary names the cause and exactly what to collect from the Falcon console.
+Status semantics:
+
+- `pass`: The API evidence satisfies the control across the complete inventory that was read.
+- `warn`: Partial or threshold-adjacent evidence.
+- `fail`: The evidence contradicts the control, or an inventory the control depends on is empty (for example zero prevention policies).
+- `manual`: The API cannot verify the control. The summary names the cause and exactly what to collect from the Falcon console.
+
+### Safety rules
 
 The verdicts follow these safety rules, each covered by a regression test in `cli/tests/crowdstrike.test.mjs`:
 
-- An unreadable, forbidden (401/403), or errored endpoint never yields `pass`; the affected control becomes `manual` and the summary names the failed read.
-- An empty inventory never yields `pass` by default. Zero policies, hosts, host groups, or identity rules `fail`; zero users, API clients, Discover assets, or ZTA scores are `manual` because a live tenant cannot be empty; zero exclusions, zero critical/high alerts in the stated window, and zero contained hosts `pass` because emptiness is compliant, and the summary says so. Each of those verdicts holds only when the read was complete: a truncated page with zero visible rows is a claim about rows that were not read, so CS-19, CS-20, CS-21, CS-22, and CS-23 say the property cannot be confirmed or ruled out from the visible rows and cap at `warn` instead of claiming emptiness, and CS-13, CS-14, and CS-24 set `absence_claim` and render `manual` instead of `fail`. A finding's summary counts over the rows it read (`N users reviewed; ...`), so a capped list never asserts an absence across rows it did not see.
+- An unreadable, forbidden (401/403), or errored endpoint never yields `pass`. The affected control becomes `manual`, and the summary names the failed read.
+- An empty inventory never yields `pass` by default.
+  - Zero policies, hosts, host groups, or identity rules `fail`.
+  - Zero users, API clients, Discover assets, or ZTA scores are `manual` because a live tenant cannot be empty.
+  - Zero exclusions, zero critical/high alerts in the stated window, and zero contained hosts `pass` because emptiness is compliant, and the summary says so.
+- Each of those empty-inventory verdicts holds only when the read was complete. A truncated page with zero visible rows is a claim about rows that were not read.
+  - CS-19, CS-20, CS-21, CS-22, and CS-23 say the property cannot be confirmed or ruled out from the visible rows. They cap at `warn` instead of claiming emptiness.
+  - CS-13, CS-14, and CS-24 set `absence_claim` and render `manual` instead of `fail`.
+  - A finding's summary counts over the rows it read (`N users reviewed; ...`), so a capped list never asserts an absence across rows it did not see.
 - Falcon Discover, Identity Protection, and Zero Trust Assessment responses of 401, 403, or 404 render as `manual` with an "unlicensed or not applicable" summary.
-- Records without a timestamp (`last_seen`, `created_timestamp`, `last_login_at`, `modified_timestamp`) are never counted as fresh or compliant; they are reported in an `undated_items` bucket and cap the verdict at `warn`.
-- Every sampled read compares the returned count against `meta.pagination.total`; a truncated or sampled inventory is reported as `partial_inventory` with seen and total counts and caps the verdict at `warn`. Pagination runs to completion within the configured limit, and the client records truncation instead of treating a first page as the population. Single-page queries with no documented pagination parameters (the role catalog and Identity Protection rule ids) still compare the returned ids against the reported total, and count-only reads (Discover and ZTA totals) treat a missing total as unknown rather than zero. An id query followed by an entity lookup that returns fewer records than the ids listed (firewall rule groups and rules, the role catalog, API clients, the three exclusion types, Identity Protection rules) is also recorded as truncated, so a shortfall of deleted or forbidden entities demotes the verdict instead of passing on the subset.
-- A `fail` that rests on the absence of something among the visible rows (no enabled and host-assigned prevention or response policy, no firewall policy container) is provable only against the rows that were read: on a partial inventory it renders `manual` with "the absence this verdict rests on cannot be asserted for the unread rows" instead of `fail`. A `fail` observed on a visible row (a disabled slider, a `default_inbound` that is not `DENY`, a stale admin) stands.
-- A dependent read is never requested when the read it depends on was denied or errored (device control v2 details, firewall policy containers, sensor build catalogs, Discover managed counts and samples, ZTA below-threshold queries, user details and role grants), and the three id lookups (device control v2 details, firewall policy containers, sensor build catalogs) are also not requested when the parent list was readable but returned no ids or platforms to look up. In every case the dependent's dataset carries `not requested: <reason>` naming the parent and the bundle writes a not-collected marker rather than an empty array. The two parent states lead to different verdicts: a denied or errored parent is the unreadable dataset, so the finding names the parent read as such and renders `manual`; a readable parent that returned no ids is a complete empty read, so the skipped dependent is not treated as unread and the finding takes the parent's complete-empty verdict (zero device control or firewall policies `fail` CS-08 through CS-11, and zero enabled, host-assigned sensor update policies `fail` CS-12 with the build catalogs left unrequested).
-- A finding whose primary dataset is unread names the dataset and the error ("The hosts read failed (...), so no API evidence supports this control.") and renders `manual` with `unreadable_dataset` in its evidence; a finding whose secondary dataset is unread (the sensor build catalog for CS-12, Discover unmanaged samples for CS-15, the role catalog for CS-16 and CS-17) keeps its verdict but cannot exceed `warn` and records the read under `unreadable_secondary_reads`.
-- Summary counts and truncation flags derived from a dataset that was not read render `null` rather than `0` or `false`, and every summary carries an `inventories` map naming each dataset's state.
-- Only policies that are enabled and assigned to host groups (or the `platform_default` policy) count as enforcement; an aggressive setting on a disabled or unassigned policy never supports `pass`, and an `mlslider` missing its `detection` or `prevention` value caps CS-01 at `warn`.
+- Records without a timestamp (`last_seen`, `created_timestamp`, `last_login_at`, `modified_timestamp`) are never counted as fresh or compliant. They are reported in an `undated_items` bucket and cap the verdict at `warn`.
+- Every sampled read compares the returned count against `meta.pagination.total`. A truncated or sampled inventory is reported as `partial_inventory` with seen and total counts, and it caps the verdict at `warn`.
+  - Pagination runs to completion within the configured limit. The client records truncation instead of treating a first page as the population.
+  - Single-page queries with no documented pagination parameters (the role catalog and Identity Protection rule ids) still compare the returned ids against the reported total.
+  - Count-only reads (Discover and ZTA totals) treat a missing total as unknown rather than zero.
+  - An id query followed by an entity lookup is also recorded as truncated when the lookup returns fewer records than the ids listed. This applies to firewall rule groups and rules, the role catalog, API clients, the three exclusion types, and Identity Protection rules.
+  - A shortfall of deleted or forbidden entities demotes the verdict instead of passing on the subset.
+- A `fail` that rests on the absence of something among the visible rows (no enabled and host-assigned prevention or response policy, no firewall policy container) is provable only against the rows that were read.
+  - On a partial inventory, it renders `manual` with "the absence this verdict rests on cannot be asserted for the unread rows" instead of `fail`.
+  - A `fail` observed on a visible row (a disabled slider, a `default_inbound` that is not `DENY`, a stale admin) stands.
+- A dependent read is never requested when the read it depends on was denied or errored. The dependent reads are device control v2 details, firewall policy containers, sensor build catalogs, Discover managed counts and samples, ZTA below-threshold queries, and user details and role grants.
+  - The three id lookups (device control v2 details, firewall policy containers, sensor build catalogs) are also not requested when the parent list was readable but returned no ids or platforms to look up.
+  - In every case, the dependent's dataset carries `not requested: <reason>` naming the parent, and the bundle writes a not-collected marker rather than an empty array.
+- The two parent states lead to different verdicts.
+  - A denied or errored parent is the unreadable dataset, so the finding names the parent read as such and renders `manual`.
+  - A readable parent that returned no ids is a complete empty read, so the skipped dependent is not treated as unread. The finding takes the parent's complete-empty verdict: zero device control or firewall policies `fail` CS-08 through CS-11, and zero enabled, host-assigned sensor update policies `fail` CS-12 with the build catalogs left unrequested.
+- A finding whose primary dataset is unread renders `manual` with `unreadable_dataset` in its evidence. It names the dataset and the error, as in "The hosts read failed (...), so no API evidence supports this control."
+- A finding whose secondary dataset is unread keeps its verdict but cannot exceed `warn`. It records the read under `unreadable_secondary_reads`. The secondary datasets are the sensor build catalog for CS-12, Discover unmanaged samples for CS-15, and the role catalog for CS-16 and CS-17.
+- Summary counts and truncation flags derived from a dataset that was not read render `null` rather than `0` or `false`. Every summary carries an `inventories` map naming each dataset's state.
+- Only policies that are enabled and assigned to host groups (or the `platform_default` policy) count as enforcement. An aggressive setting on a disabled or unassigned policy never supports `pass`. An `mlslider` missing its `detection` or `prevention` value caps CS-01 at `warn`.
 - Re-running an export allocates a new suffixed bundle directory and a zip with the same name (`<bundle>-2/` and `<bundle>-2.zip`) instead of overwriting a prior bundle.
 - With `member_cid` set, every summary states that results cover that member CID only.
 
-The `Inputs` column names the datasets each finding reads, using the labels of the summary's `inventories` map; an unread primary input renders the finding `manual`, an unread secondary input caps it at `warn`, and a truncated input caps a pass at `warn` and an absence-driven fail at `manual`.
+### Verdicts by control
+
+The `Inputs` column names the datasets each finding reads, using the labels of the summary's `inventories` map. When an input is unread or truncated:
+
+- An unread primary input renders the finding `manual`.
+- An unread secondary input caps it at `warn`.
+- A truncated input caps a pass at `warn` and an absence-driven fail at `manual`.
 
 | Control | Name | Tool | Finding | Inputs | Status semantics |
 |---|---|---|---|---|---|
@@ -137,7 +231,9 @@ The `Inputs` column names the datasets each finding reads, using the labels of t
 
 ## Framework mappings
 
-Every finding carries the framework mappings from the spec's compliance mapping table as strings such as `FedRAMP SI-3`, `CMMC SI.L2-3.14.2`, `SOC 2 CC6.8`, `CIS 10.1`, `PCI-DSS 5.2`, `DISA STIG V-256374`, `IRAP ISM-1417`, and `ISMAP 8.1.1`. The audit bundle writes one report per framework under `compliance/frameworks/` (`fedramp`, `cmmc`, `soc2`, `cis`, `pci_dss`, `disa_stig`, `irap`, `ismap`) plus a unified matrix.
+Every finding carries the framework mappings from the spec's compliance mapping table. The mappings are strings such as `FedRAMP SI-3`, `CMMC SI.L2-3.14.2`, `SOC 2 CC6.8`, `CIS 10.1`, `PCI-DSS 5.2`, `DISA STIG V-256374`, `IRAP ISM-1417`, and `ISMAP 8.1.1`.
+
+The audit bundle writes one report per framework under `compliance/frameworks/` (`fedramp`, `cmmc`, `soc2`, `cis`, `pci_dss`, `disa_stig`, `irap`, `ismap`) plus a unified matrix.
 
 ## Live smoke test
 
@@ -145,22 +241,69 @@ Every finding carries the framework mappings from the spec's compliance mapping 
 CS_CLIENT_ID=... CS_CLIENT_SECRET=... CS_CLOUD=us-1 npm --prefix cli run test:crowdstrike:live
 ```
 
-The script prints a skip message and exits 0 when credentials are absent. With credentials it runs `crowdstrike_check_access` and the prevention policy assessment against the tenant.
+The script prints a skip message and exits 0 when credentials are absent. With credentials, it runs `crowdstrike_check_access` and the prevention policy assessment against the tenant.
 
 ## Limitations and manual controls
 
-- CS-07 is always `manual` (or `warn` when audit data shows long or concurrent sessions): no Falcon API endpoint exposes the RTR session timeout or concurrent session limit, so capture them from the response policy in the console.
-- CS-15, CS-24, and CS-25 depend on Falcon Discover, Identity Protection, and Zero Trust Assessment licensing; a 403 or 404 from those collections produces a `manual` finding with the console evidence to collect.
-- CS-23 cannot read when containment started; the finding uses the host record's `modified_timestamp` as a proxy and asks for incident references.
-- Host, user, alert, exclusion, and rule reads are sampled up to the configured limits (5000 hosts, 500 users and API clients, 2000 alerts, 500 exclusions per type, 1000 firewall rules by default). When the reported total exceeds the sample, the finding records `partial_inventory` with seen and total counts and cannot exceed `warn`; raise the limit to read the full population.
+- CS-07 is always `manual` (or `warn` when audit data shows long or concurrent sessions). No Falcon API endpoint exposes the RTR session timeout or concurrent session limit, so capture them from the response policy in the console.
+- CS-15, CS-24, and CS-25 depend on Falcon Discover, Identity Protection, and Zero Trust Assessment licensing. A 403 or 404 from those collections produces a `manual` finding with the console evidence to collect.
+- CS-23 cannot read when containment started. The finding uses the host record's `modified_timestamp` as a proxy and asks for incident references.
+- Host, user, alert, exclusion, and rule reads are sampled up to the configured limits. The defaults are 5000 hosts, 500 users and API clients, 2000 alerts, 500 exclusions per type, and 1000 firewall rules.
+  - When the reported total exceeds the sample, the finding records `partial_inventory` with seen and total counts and cannot exceed `warn`.
+  - Raise the limit to read the full population.
 - Identity Protection GraphQL requires a write scope, so the tools use the REST policy-rules endpoints and parse `enabled`, `simulationMode`, and `action` defensively.
 - Thunderbolt and SD card restrictions are evaluated through the PCIe enforcement mode and the `MASS_STORAGE` class because the API exposes no dedicated Thunderbolt or SD card classes.
-- Error strings never quote a response body. A body without Falcon's documented `errors[].message`, `error_description`, `error`, or `message` field (a proxy or WAF page, whatever its content type claims, or JSON of another shape) is described as "non-JSON body (text/html, 5120 bytes)" or "JSON body without a documented error field (...)", on every surface including `POST /oauth2/token`. Every error string is passed through one redaction pass when `CrowdstrikeHttpError` is constructed and again when the error is recorded, so `access_check.json`, dataset `error` fields, `unreadable_dataset` and `unreadable_secondary_reads` evidence, `errors` arrays, `_errors.log`, and tool results carry status, path, and shape only. The pass removes the client secret and every bearer token obtained whatever their shape and in their base64, base64url, URL-encoded, and JSON-escaped forms; any value inside a carrier whatever its shape (`Authorization`, `Cookie`, `Set-Cookie`, and API key headers, cookie and session assignments, URL userinfo and query pairs, the `Bearer`, `Basic`, `Digest`, `Token`, and `ApiKey` schemes, credential-named fields and assignments, SOAP credential elements, command-line flags such as `--token VALUE`); and bare values only when they have a real token shape (JWTs, PEM blocks, hex digests, vendor-prefixed keys, and runs of 16 or more characters with base64 symbols, scattered digits, or token casing, including a run standing after `=` under a non-credential pair name such as `theme=`). A carrier or token shape standing right after a literal JSON escape (`\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them) is treated exactly as one after a real newline, tab, or space. A bare name-shaped value standing alone in prose, such as a host group name or `prod-us-east-2026`, is indistinguishable from a resource name and stays. The same pass runs over the operator-authored text of every exclusion (`cl_regex`, `ifn_regex`, `value`, `name`, `description`, `comment`) before it reaches a finding or the bundle; a credential inside a path pattern is removed up to the next path separator, so `D:\Builds\password=VALUE\*.pdb` is exported as `D:\Builds\password=[REDACTED]\*.pdb`.
-- Config file errors are fixed text. A file that cannot be read fails with "Unable to read CrowdStrike config file <path> (<CODE>)" (the Node error code only, `ENOENT` included when `config_file` or `CS_CONFIG_FILE` names the path; the default `~/.crowdstrike/config.json` is skipped when absent); a file that cannot be parsed fails with "Unable to parse CrowdStrike config file: invalid JSON in <path> at line N" (the line only when `JSON.parse` reports a position). Neither `JSON.parse`'s message, which quotes a window of the source, nor the filesystem's wording is ever included, so an unquoted `client_secret` value is never echoed.
+
+### Error string redaction
+
+Error strings never quote a response body.
+
+A body without Falcon's documented `errors[].message`, `error_description`, `error`, or `message` field is described as "non-JSON body (text/html, 5120 bytes)" or "JSON body without a documented error field (...)". Such bodies include a proxy or WAF page, whatever its content type claims, and JSON of another shape. The rule holds on every surface, including `POST /oauth2/token`.
+
+Every error string is passed through one redaction pass when `CrowdstrikeHttpError` is constructed and again when the error is recorded. These outputs retain only status, path, and shape:
+
+- `access_check.json`
+- Dataset `error` fields
+- `unreadable_dataset` and `unreadable_secondary_reads` evidence
+- `errors` arrays
+- `_errors.log`
+- Tool results
+
+The pass removes:
+
+- The client secret and every bearer token obtained, whatever their shape, and in their base64, base64url, URL-encoded, and JSON-escaped forms.
+- Any value inside a carrier, whatever its shape:
+  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers
+  - Cookie and session assignments
+  - URL userinfo and query pairs
+  - The `Bearer`, `Basic`, `Digest`, `Token`, and `ApiKey` schemes
+  - Credential-named fields and assignments
+  - SOAP credential elements
+  - Command-line flags such as `--token VALUE`
+- Bare values only when they have a real token shape:
+  - JWTs, PEM blocks, hex digests, and vendor-prefixed keys
+  - Runs of 16 or more characters with base64 symbols, scattered digits, or token casing, including a run standing after `=` under a non-credential pair name such as `theme=`
+
+A carrier or token shape standing right after a literal JSON escape is treated exactly as one after a real newline, tab, or space. The escapes are `\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them.
+
+A bare name-shaped value standing alone in prose, such as a host group name or `prod-us-east-2026`, is indistinguishable from a resource name and stays.
+
+The same pass runs over the operator-authored text of every exclusion (`cl_regex`, `ifn_regex`, `value`, `name`, `description`, `comment`) before it reaches a finding or the bundle. A credential inside a path pattern is removed up to the next path separator, so `D:\Builds\password=VALUE\*.pdb` is exported as `D:\Builds\password=[REDACTED]\*.pdb`.
+
+### Config file errors
+
+Config file errors are fixed text.
+
+- A file that cannot be read fails with "Unable to read CrowdStrike config file \<path> (\<CODE>)". The code in parentheses is the Node error code only.
+  - `ENOENT` is included when `config_file` or `CS_CONFIG_FILE` names the path.
+  - The default `~/.crowdstrike/config.json` is skipped when absent.
+- A file that cannot be parsed fails with "Unable to parse CrowdStrike config file: invalid JSON in \<path> at line N". The line appears only when `JSON.parse` reports a position.
+
+Neither `JSON.parse`'s message, which quotes a window of the source, nor the filesystem's wording is ever included, so an unquoted `client_secret` value is never echoed.
 
 ## Official documentation consulted
 
-The Falcon console documentation requires a login, so endpoint paths, parameters, and response fields were verified against CrowdStrike's public API reference and the public SDKs that mirror the official operation names:
+The Falcon console documentation requires a login. Endpoint paths, parameters, and response fields were therefore verified against CrowdStrike's public API reference and the public SDKs that mirror the official operation names:
 
 - [API reference collections index](https://developer.crowdstrike.com/api-reference/collections)
 - [OAuth2](https://developer.crowdstrike.com/api-reference/collections/oauth2)

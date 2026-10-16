@@ -3,20 +3,34 @@ title: Zoom
 description: Read-only Zoom account inspection for identity posture, collaboration governance, meeting security, and audit bundle export.
 ---
 
-The Zoom integration inspects a Zoom Workplace or Zoom for Government account through the public Zoom REST API v2 and renders the 25 controls in `specs/zoom-sec-inspector.spec.md` as pass, warn, fail, or manual findings with FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP mappings. Every request is a read; the tools never change account settings.
+The Zoom integration inspects a Zoom Workplace or Zoom for Government account through the public Zoom REST API v2. It renders the 25 controls in `specs/zoom-sec-inspector.spec.md` as pass, warn, fail, or manual findings. They carry FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP mappings.
+
+Every request is a read. The tools never change account settings.
 
 ## What it inspects
 
-- Identity posture: SSO enforcement, blocked personal and social sign-in methods, admin two-factor authentication, managed (associated) domain verification, admin privilege concentration, session inactivity timeouts, and the vanity URL control (manual).
-- Collaboration governance: trusted domains, in-meeting file transfer, cloud recording auto-delete retention, Zoom Phone recording policies, admin operation log recency, IM group restrictions, external contact restrictions, and Team Chat encryption (manual).
-- Meeting security: passcode enforcement and account lock, waiting room, host-only screen sharing, local recording, end-to-end encryption, join-link passcode embedding, PMI usage, authenticated join, data center regions, and the recording consent disclaimer, each checked for group-level overrides.
+- **Identity posture:** SSO enforcement, blocked personal and social sign-in methods, admin two-factor authentication, managed (associated) domain verification, admin privilege concentration, session inactivity timeouts, and the vanity URL control (manual).
+- **Collaboration governance:** trusted domains, in-meeting file transfer, cloud recording auto-delete retention, Zoom Phone recording policies, admin operation log recency, IM group restrictions, external contact restrictions, and Team Chat encryption (manual).
+- **Meeting security:** passcode enforcement and account lock, waiting room, host-only screen sharing, local recording, end-to-end encryption, join-link passcode embedding, PMI usage, authenticated join, data center regions, and the recording consent disclaimer, each checked for group-level overrides.
 
-Account settings are collected once per run from `GET /accounts/{accountId}/settings` (default view plus the documented `option` views `security`, `meeting_authentication`, and `meeting_security`) and `GET /accounts/{accountId}/lock_settings` (default view plus `option=meeting_security`), merged into a single nested settings object. Controls that require enforcement read the matching `lock_settings` key and report a compliant but unlocked setting as warn.
+Account settings are collected once per run from these endpoints and merged into a single nested settings object:
+
+- `GET /accounts/{accountId}/settings`: The default view plus the documented `option` views `security`, `meeting_authentication`, and `meeting_security`.
+- `GET /accounts/{accountId}/lock_settings`: The default view plus `option=meeting_security`.
+
+Controls that require enforcement read the matching `lock_settings` key and report a compliant but unlocked setting as warn.
 
 ## Setup and authentication
 
 1. In the Zoom App Marketplace, create a Server-to-Server OAuth app ([Zoom S2S OAuth guide](https://developers.zoom.us/docs/internal-apps/s2s-oauth/)). User-level OAuth and the deprecated JWT app type are not supported.
-2. Add the read scopes listed in the endpoint table below. Classic scopes: `account:read:admin`, `user:read:admin`, `role:read:admin`, `group:read:admin`, `report:read:admin`, `imgroup:read:admin`, and `phone:read:admin` (only if Zoom Phone is licensed). Granular equivalents are listed per endpoint.
+2. Add the read scopes listed in the endpoint table below. Granular equivalents are listed per endpoint. Classic scopes:
+   - `account:read:admin`
+   - `user:read:admin`
+   - `role:read:admin`
+   - `group:read:admin`
+   - `report:read:admin`
+   - `imgroup:read:admin`
+   - `phone:read:admin` (only if Zoom Phone is licensed)
 3. Activate the app and copy the Account ID, Client ID, and Client Secret.
 4. Provide credentials through any of the following, resolved in this order: tool arguments, environment variables, then a JSON config file.
 
@@ -37,9 +51,29 @@ Config file example (`~/.zoom.json`):
 }
 ```
 
-The client exchanges the credentials for a bearer token by posting an `application/x-www-form-urlencoded` body with `grant_type=account_credentials` and `account_id` to `{oauth_base_url}/oauth/token` under basic auth (no query parameters), as the S2S OAuth page documents, refreshes it before expiry, and sends `Authorization: Bearer` on every call. For Zoom for Government set `base_url` to `https://api.zoomgov.com/v2`; the OAuth host is derived from it unless `oauth_base_url` is set. A pre-issued token can be supplied with `ZOOM_TOKEN` instead of the client credentials.
+The client exchanges the credentials for a bearer token. It posts an `application/x-www-form-urlencoded` body with `grant_type=account_credentials` and `account_id` to `{oauth_base_url}/oauth/token` under basic auth (no query parameters), as the S2S OAuth page documents. The client refreshes the token before expiry and sends `Authorization: Bearer` on every call.
 
-Pagination follows the [documented `next_page_token` contract](https://developers.zoom.us/docs/api/pagination/) and runs to completion or records truncation on every cap exit: a caller limit (users default 1000, groups 50, operation logs 300, role members 3000), the 500-page cap, a `next_page_token` that repeats or stops yielding items, or a `total_records` above the collected count. The single-response lists (`/roles`, `/im/groups`, managed domains) are complete only when `total_records` is present and matches; a missing total is reported as an unknown total. `/trusted_domains` documents a single array with no total, so it is complete by contract. Every truncated list demotes its dependent findings to warn with seen versus total counts. `429` responses are retried up to three times ([rate limits](https://developers.zoom.us/docs/api/rate-limits/)). That page documents the 429 status and asks clients to wait before retrying but names no header, so the `Retry-After` read is a defensive fallback: the header is honored when present (delta-seconds or HTTP-date, capped at 30 seconds per wait) and the wait otherwise defaults to one second.
+For Zoom for Government, set `base_url` to `https://api.zoomgov.com/v2`. The OAuth host is derived from `base_url` unless `oauth_base_url` is set.
+
+A pre-issued token can be supplied with `ZOOM_TOKEN` instead of the client credentials.
+
+### Pagination and retries
+
+Pagination follows the [documented `next_page_token` contract](https://developers.zoom.us/docs/api/pagination/). It runs to completion or records truncation on every cap exit:
+
+- A caller limit (users default 1000, groups 50, operation logs 300, role members 3000).
+- The 500-page cap.
+- A `next_page_token` that repeats or stops yielding items.
+- A `total_records` above the collected count.
+
+The single-response lists (`/roles`, `/im/groups`, managed domains) are complete only when `total_records` is present and matches. A missing total is reported as an unknown total. `/trusted_domains` documents a single array with no total, so that list is complete by contract.
+
+Every truncated list demotes its dependent findings to warn with seen versus total counts.
+
+`429` responses are retried up to three times ([rate limits](https://developers.zoom.us/docs/api/rate-limits/)). The rate limits page documents the 429 status and asks clients to wait before retrying, but it names no header. The `Retry-After` read is therefore a defensive fallback:
+
+- The header is honored when present (delta-seconds or HTTP-date, capped at 30 seconds per wait).
+- The wait otherwise defaults to one second.
 
 ## Tools
 
@@ -64,15 +98,77 @@ Pagination follows the [documented `next_page_token` contract](https://developer
 <accountId>-audit-bundle[-N].zip
 ```
 
-Reruns allocate `-2`, `-3`, and so on; a prior bundle is never overwritten, and the zip name always derives from the allocated directory. Output paths are resolved through `resolveSecureOutputPath`, which rejects traversal outside the output root and symlinked parents.
+Reruns allocate `-2`, `-3`, and so on. A prior bundle is never overwritten, and the zip name always derives from the allocated directory.
 
-Secret hygiene: the bundle never contains credential-bearing values. Every collected surface is sanitized once at collection time, so the tool output, the findings evidence, and the bundle all see the same view: keys that carry credential material (`host_key`, `pmi_password`, tokens, secrets, certificates, API keys) keep their name with a `[REDACTED]` marker, passcode and token query parameters in URLs are blanked, and the Server-to-Server OAuth client id, client secret, and token values are scrubbed from every string and error message. `core_data/account_settings.json` and `account_lock_settings.json` hold only the setting paths a verdict read (listed under `fields_read`), never the full configuration dump; list snapshots hold only the record fields a verdict read, and operation log `operation_detail` free text is dropped. Every written file is scrubbed again before it lands on disk.
+Output paths are resolved through `resolveSecureOutputPath`, which rejects traversal outside the output root and symlinked parents.
 
-Error-body hygiene: a failing response body is never copied into an error string. The client describes a failure by HTTP status, method and endpoint, content type, and body length (`Zoom request failed for GET /v2/users (502 Bad Gateway): non-JSON text/html body of 236 bytes omitted`), echoes only the documented JSON error fields (`message`, `error`, `reason`, `errors[]`), and passes every error string through one exported scrub, `scrubErrorText`, at three points: the `ZoomApiError` constructor, the error-to-text helper every collector uses, and the bundle write sink. The scrub drops the query and any `name=value` fragment of every embedded URL, redacts `Bearer` and `Basic` values, `Cookie` and `Set-Cookie` header values, and quoted or unquoted assignments of API keys, session ids, access, refresh, and id tokens, client secrets, and passwords, and (in error text only) any 16-character-plus run that looks like a token. The failing `POST /oauth/token` exchange is covered by the same path. A table-driven test derives every request the collectors make from the client itself and fails each one in three body shapes (502 HTML carrying bearer, session, and API key values; 403 JSON with a tokenised URL; 403 JSON free text with header values and a long token), asserting that no value reaches a finding, summary, errors array, bundle file, zip entry, or thrown error, and that each failure is disclosed with status, endpoint, content type, and length. The config file loader follows the same rule: a read failure is reported as `Unable to read Zoom config file <path> (<code>)` with only a validated Node error code such as `EISDIR` or `EACCES`, and a malformed file as `Unable to parse Zoom config file: invalid JSON in <path>`, never the parser message (which quotes a 10-character source window, the start of an unquoted credential value) or the filesystem wording. The assignment scrub covers `client_id` and `clientId` as well, matching the resolver, which treats the client id as a secret.
+### Secret hygiene
+
+The bundle never contains credential-bearing values. Every collected surface is sanitized once at collection time, so the tool output, the findings evidence, and the bundle all see the same view:
+
+- Keys that carry credential material (`host_key`, `pmi_password`, tokens, secrets, certificates, API keys) keep their name with a `[REDACTED]` marker.
+- Passcode and token query parameters in URLs are blanked.
+- The Server-to-Server OAuth client id, client secret, and token values are scrubbed from every string and error message.
+
+`core_data/account_settings.json` and `account_lock_settings.json` hold only the setting paths a verdict read (listed under `fields_read`), never the full configuration dump. List snapshots hold only the record fields a verdict read, and operation log `operation_detail` free text is dropped.
+
+Every written file is scrubbed again before it lands on disk.
+
+### Error-body hygiene
+
+A failing response body is never copied into an error string. The client:
+
+- Describes a failure by HTTP status, method and endpoint, content type, and body length (`Zoom request failed for GET /v2/users (502 Bad Gateway): non-JSON text/html body of 236 bytes omitted`).
+- Echoes only the documented JSON error fields (`message`, `error`, `reason`, `errors[]`).
+- Passes every error string through one exported scrub, `scrubErrorText`, at three points:
+  - The `ZoomApiError` constructor.
+  - The error-to-text helper every collector uses.
+  - The bundle write sink.
+
+The scrub:
+
+- Drops the query and any `name=value` fragment of every embedded URL.
+- Redacts:
+  - `Bearer` and `Basic` values.
+  - `Cookie` and `Set-Cookie` header values.
+  - Quoted or unquoted assignments of API keys, session ids, access, refresh, and id tokens, client secrets, and passwords. The assignment scrub covers `client_id` and `clientId` as well, matching the resolver, which treats the client id as a secret.
+  - In error text only, any 16-character-plus run that looks like a token.
+
+The failing `POST /oauth/token` exchange is covered by the same path.
+
+A table-driven test derives every request the collectors make from the client itself. The test fails each request in three body shapes:
+
+- 502 HTML carrying bearer, session, and API key values.
+- 403 JSON with a tokenised URL.
+- 403 JSON free text with header values and a long token.
+
+The test asserts that no value reaches a finding, summary, errors array, bundle file, zip entry, or thrown error. It also asserts that each failure is disclosed with status, endpoint, content type, and length.
+
+#### Config file errors
+
+The config file loader follows the same rule:
+
+- A read failure is reported as `Unable to read Zoom config file <path> (<code>)`, with only a validated Node error code such as `EISDIR` or `EACCES`.
+- A malformed file is reported as `Unable to parse Zoom config file: invalid JSON in <path>`.
+
+The loader never reports the parser message or the filesystem wording. The parser message quotes a 10-character source window, the start of an unquoted credential value.
 
 ## Control coverage
 
-Status semantics for every finding: `pass` means the documented setting is compliant and, where the control requires enforcement, locked with no sampled group override; `warn` means compliant but unlocked, overridden by a sampled group, judged on a partial inventory, or only provable for items carrying a date; `fail` means the documented value is non-compliant; `manual` means the surface was denied or errored, the documented key was absent from the response, the inventory was empty where emptiness is not compliant, or the API does not expose the setting (with the reference page cited in the summary).
+Status semantics for every finding:
+
+- `pass` means the documented setting is compliant and, where the control requires enforcement, locked with no sampled group override.
+- `warn` means any of these:
+  - Compliant but unlocked.
+  - Overridden by a sampled group.
+  - Judged on a partial inventory.
+  - Only provable for items carrying a date.
+- `fail` means the documented value is non-compliant.
+- `manual` means any of these:
+  - The surface was denied or errored.
+  - The documented key was absent from the response.
+  - The inventory was empty where emptiness is not compliant.
+  - The API does not expose the setting (with the reference page cited in the summary).
 
 | # | Spec control | Tool | Finding | Verdict basis |
 |---|--------------|------|---------|---------------|
@@ -102,13 +198,20 @@ Status semantics for every finding: `pass` means the documented setting is compl
 | 24 | Admin operation log retention verified | collaboration_governance | ZOOM-COLLAB-05 | entries with a parseable `time` inside the fixed 30-day window; undated entries cap at warn |
 | 25 | PMI usage restricted | meeting_security | ZOOM-MTG-07 | `schedule_meeting.personal_meeting` false, or `use_pmi_for_scheduled_meetings` and `use_pmi_for_instant_meetings` false and locked |
 
-Coverage: 25 of 25 spec controls have a finding; 23 are automatable and 2 (controls 8 and 13) are manual by design with the reference page proving the absence cited in the finding summary.
+Coverage: 25 of 25 spec controls have a finding. Of these, 23 are automatable, while the other 2 (controls 8 and 13) are manual by design, with summaries that cite the reference page proving the absence.
 
-Self-check fixtures (encoded as tests in `cli/tests/zoom.test.mjs`, fixture (d) built strictly from documented field names and shapes): (a) every endpoint 403: 25 manual, 0 pass; (b) every list empty and every settings object `{}`: 24 manual, 1 warn (ZOOM-COLLAB-05, an empty operation log is a retention warning by intent), 0 pass; (c) partial inventory (user cap, truncated pages, one surface denied): 19 warn, 6 manual, 0 pass; (d) documented compliant account: 23 pass, 2 manual (ZOOM-ID-07 and ZOOM-COLLAB-08).
+Self-check fixtures are encoded as tests in `cli/tests/zoom.test.mjs`:
+
+- **(a) Every endpoint 403:** 25 manual, 0 pass.
+- **(b) Every list empty and every settings object `{}`:** 24 manual, 1 warn, 0 pass. The warn is ZOOM-COLLAB-05: an empty operation log is a retention warning by intent.
+- **(c) Partial inventory** (user cap, truncated pages, one surface denied): 19 warn, 6 manual, 0 pass.
+- **(d) Documented compliant account:** 23 pass, 2 manual (ZOOM-ID-07 and ZOOM-COLLAB-08). This fixture is built strictly from documented field names and shapes.
 
 ## Framework mappings
 
-Each finding carries the mapping row for its spec controls across FedRAMP (NIST 800-53), CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP, taken from section 5 of the spec. The bundle writes `compliance/unified_compliance_matrix.md` with all eight columns and one `compliance/<framework>.md` report per framework listing the framework reference, the spec control, the findings, and their status.
+Each finding carries the mapping row for its spec controls, taken from section 5 of the spec. The row spans FedRAMP (NIST 800-53), CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP.
+
+The bundle writes `compliance/unified_compliance_matrix.md` with all eight columns. It also writes one `compliance/<framework>.md` report per framework, listing the framework reference, the spec control, the findings, and their status.
 
 ## Live smoke test
 
@@ -116,16 +219,26 @@ Each finding carries the mapping row for its spec controls across FedRAMP (NIST 
 npm --prefix cli run test:zoom:live
 ```
 
-The script prints a skip message and exits 0 when no Zoom credentials or config file are present. With credentials it runs `zoom_check_access` and all three assessments against the real account and stops with a non-zero exit if the core surfaces are not readable.
+The script prints a skip message and exits 0 when no Zoom credentials or config file are present.
+
+With credentials, the script runs `zoom_check_access` and all three assessments against the real account. It stops with a non-zero exit if the core surfaces are not readable.
 
 ## Limitations and manual controls
 
-- Control 8 (chat encryption): the account settings reference documents no Team Chat encryption setting under the `chat` object; encryption indicators exist only as per-message metadata in the Team Chat API. Confirm Advanced Chat Encryption in the admin portal.
-- Control 13 (vanity URL): the account settings reference exposes no account vanity URL field; only per-user personal meeting room URLs (`vanity_url` on `GET /users/{userId}`) are documented. Review the account profile in the admin portal.
-- Zoom Phone (control 19): `GET /phone/account_settings` requires a Zoom Phone license; without it the finding is manual and names the requirement.
-- Managed and trusted domains use master-account granular scopes (`account:read:managed_domains:master`, `account:read:trusted_domains:master`); a sub-account credential renders those findings manual.
-- Group override detection samples up to `group_limit` groups and reads two views per group (`GET /groups/{groupId}/settings` and `?option=meeting_security`). When the group inventory is truncated, `GET /groups` is unreadable, or any sampled group's settings view is denied, all 13 group-dependent findings (ZOOM-MTG-01 to 10, ZOOM-COLLAB-02, 03, 07) downgrade to warn and name the group and endpoint; the unreadable view is also listed in the assessment `errors` array and in `_errors.log`. Group lock views are collected and disclosed but do not demote because no verdict reads group lock state yet.
-- A finding that depends on more than one inventory demotes when any of them is unreadable: ZOOM-ID-02 warns and names `GET /roles` when the admin role inventory behind its evidence is denied or truncated, even when `sign_in_with_two_factor_auth` is `all`. Lock notes name the exact `lock_settings` view that was denied.
+- **Control 8 (chat encryption):** The account settings reference documents no Team Chat encryption setting under the `chat` object. Encryption indicators exist only as per-message metadata in the Team Chat API. Confirm Advanced Chat Encryption in the admin portal.
+- **Control 13 (vanity URL):** The account settings reference exposes no account vanity URL field. Only per-user personal meeting room URLs (`vanity_url` on `GET /users/{userId}`) are documented. Review the account profile in the admin portal.
+- **Zoom Phone (control 19):** `GET /phone/account_settings` requires a Zoom Phone license. Without the license, the finding is manual and names the requirement.
+- Managed and trusted domains use master-account granular scopes (`account:read:managed_domains:master`, `account:read:trusted_domains:master`). A sub-account credential renders those findings manual.
+- Group override detection samples up to `group_limit` groups and reads two views per group (`GET /groups/{groupId}/settings` and `?option=meeting_security`).
+  - All 13 group-dependent findings (ZOOM-MTG-01 to 10, ZOOM-COLLAB-02, 03, 07) downgrade to warn and name the group and endpoint when any of these holds:
+    - The group inventory is truncated.
+    - `GET /groups` is unreadable.
+    - Any sampled group's settings view is denied.
+  - The unreadable view is also listed in the assessment `errors` array and in `_errors.log`.
+  - Group lock views are collected and disclosed but do not demote, because no verdict reads group lock state yet.
+- A finding that depends on more than one inventory demotes when any of them is unreadable.
+  - ZOOM-ID-02 warns and names `GET /roles` when the admin role inventory behind its evidence is denied or truncated, even when `sign_in_with_two_factor_auth` is `all`.
+  - Lock notes name the exact `lock_settings` view that was denied.
 - User-level OAuth flows, JWT apps, and SARIF, CSV, and HTML reporters are out of scope for this integration.
 
 ## Endpoints

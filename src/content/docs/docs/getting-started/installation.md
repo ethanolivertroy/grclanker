@@ -22,7 +22,12 @@ The `v0.1.1` bundle gives you:
 - `grclanker flue run`, which runs the same agent under the [Flue runtime](/docs/getting-started/flue-runtime/)
 - `grclanker env list`, `env doctor`, `env smoke-test`, and `env exec`
 - `grclanker "<prompt>"` for a free-form prompt, and a subject after `investigate`, `audit`, `assess`, or `validate`
-- `--compute <kind>` to pick a compute backend: for one run of `investigate`, `audit`, `assess`, `validate`, or a `"<prompt>"`; with `grclanker setup --compute <kind>` to save it as the preferred backend; and as an alias for `--backend` on `env smoke-test` and `env exec`. A bare `grclanker --compute <kind>` is rejected as an unknown command.
+- `--compute <kind>` to pick a compute backend:
+  - for one run of `investigate`, `audit`, `assess`, `validate`, or a `"<prompt>"`
+  - with `grclanker setup --compute <kind>`, to save it as the preferred backend
+  - as an alias for `--backend` on `env smoke-test` and `env exec`
+
+A bare `grclanker --compute <kind>` is rejected as an unknown command.
 
 [What's New](/docs/changelog/) lists everything that changed since `v0.0.1`.
 
@@ -50,9 +55,13 @@ That setup step is where you choose the local-first or hosted model path.
 
 ## What the installer does
 
-- Detects your OS and architecture. Bundles exist for `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64` (glibc), `win32-arm64`, and `win32-x64`. Linux musl hosts (such as Alpine) are not supported; use a [source checkout](#install-from-source) there.
+- Detects your OS and architecture. Bundles exist for `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64` (glibc), `win32-arm64`, and `win32-x64`. Linux musl hosts (such as Alpine) are not supported. Use a [source checkout](#install-from-source) there.
 - Downloads the bundle for your platform from the newest full release, skipping prereleases such as `v0.2.0-rc.1`. If the GitHub API is unavailable or rate limited, it follows the `releases/latest` link on github.com instead.
-- Checks the archive against the release's `SHA256SUMS.txt` when it can, and aborts on a mismatch. If the checksum file cannot be fetched, has no entry for the archive, or no SHA-256 tool is available, or if `GRCLANKER_ASSET_URL` points at a custom archive, it prints a warning and installs without verification.
+- Checks the archive against the release's `SHA256SUMS.txt` when it can, and aborts on a mismatch. It prints a warning and installs without verification if any of these is true:
+  - The checksum file cannot be fetched.
+  - The checksum file has no entry for the archive.
+  - No SHA-256 tool is available.
+  - `GRCLANKER_ASSET_URL` points at a custom archive.
 - Replaces `~/.local/share/grclanker` with the unpacked bundle. The bundle includes its own Node.js runtime, so you do not need Node installed.
 - Links `grclanker` into `~/.local/bin`. On Windows it writes a `grclanker.cmd` launcher there instead.
 - Warns if `~/.local/bin` is not on your `PATH`. On macOS and Linux it prints the `export PATH=...` line to add to your shell profile.
@@ -118,9 +127,13 @@ npm --prefix cli run build:bundle
 bash public/install
 ```
 
-When run from a checkout, the installer uses the newest matching bundle in `cli/release/` instead of downloading one, and checks it against the `SHA256SUMS.txt` that `build:bundle` writes next to it. The install banner shows the version in `cli/package.json`.
+When run from a checkout, the installer uses the newest matching bundle in `cli/release/` instead of downloading one. It checks that bundle against the `SHA256SUMS.txt` that `build:bundle` writes next to it. The install banner shows the version in `cli/package.json`.
 
-To update a source install, run `git pull`, then repeat `npm --prefix cli ci` and `npm --prefix cli run build` (and `build:bundle` plus `bash public/install` if you use the bundle layout).
+To update a source install:
+
+1. Run `git pull`.
+2. Repeat `npm --prefix cli ci` and `npm --prefix cli run build`.
+3. If you use the bundle layout, also repeat `build:bundle` plus `bash public/install`.
 
 ## Configure grclanker for local-only use
 
@@ -147,7 +160,9 @@ Choose `Local-first` when prompted. The defaults are:
 - provider kind: `ollama`
 - model example: `gemma4`
 
-If the endpoint is unreachable, setup stops and prints the commands to fix it. If the model you name is not installed, setup offers another installed local model or asks you to pull one. It does not fall back to a hosted model. See [Setup](/docs/getting-started/setup/) for the full wizard.
+If the endpoint is unreachable, setup stops and prints the commands to fix it. If the model you name is not installed, setup offers another installed local model or asks you to pull one. It does not fall back to a hosted model.
+
+See [Setup](/docs/getting-started/setup/) for the full wizard.
 
 ## Skills only
 

@@ -3,14 +3,16 @@ title: MuleSoft Anypoint Platform
 description: Read-only MuleSoft Anypoint Platform security inspector covering identity and access, API Manager policies, runtime infrastructure, and audit logging.
 ---
 
-The MuleSoft integration inspects an Anypoint Platform organization through the public Anypoint Platform APIs and reports framework-mapped findings for the 25 controls in `specs/mulesoft-sec-inspector.spec.md`. It never mutates the organization: every request is a `GET`, except the token exchange and the audit log query, which the Audit Log Query API exposes as a `POST`.
+The MuleSoft integration inspects an Anypoint Platform organization through the public Anypoint Platform APIs. It reports framework-mapped findings for the 25 controls in `specs/mulesoft-sec-inspector.spec.md`.
+
+It never mutates the organization. Every request is a `GET`, except the token exchange and the audit log query, which the Audit Log Query API exposes as a `POST`.
 
 ## What it inspects
 
-- **Access Management**: external identity providers, MFA exemptions, Organization Administrator membership, role groups and environment scoping, environments, connected apps, business groups
-- **API Manager and Exchange**: API instance policies (client ID enforcement, JWT, OAuth, basic auth, rate limiting, spike control), active contracts, Exchange asset publication status
-- **Runtime infrastructure**: CloudHub applications (runtime version, workers, persistent queues, properties), Anypoint VPC firewall rules, dedicated load balancer TLS settings and certificates, hybrid servers, Anypoint MQ queues and clients, Secrets Manager secret groups
-- **Audit and monitoring**: Audit Log Query API availability, CloudHub and Runtime Manager alerts for production applications
+- **Access Management:** external identity providers, MFA exemptions, Organization Administrator membership, role groups and environment scoping, environments, connected apps, business groups.
+- **API Manager and Exchange:** API instance policies (client ID enforcement, JWT, OAuth, basic auth, rate limiting, spike control), active contracts, Exchange asset publication status.
+- **Runtime infrastructure:** CloudHub applications (runtime version, workers, persistent queues, properties), Anypoint VPC firewall rules, dedicated load balancer TLS settings and certificates, hybrid servers, Anypoint MQ queues and clients, Secrets Manager secret groups.
+- **Audit and monitoring:** Audit Log Query API availability, CloudHub and Runtime Manager alerts for production applications.
 
 ## Setup and authentication
 
@@ -32,7 +34,14 @@ Auth mode is chosen in this order: pre-issued token, connected app client creden
 
 - Connected apps exchange credentials with `POST /accounts/api/v2/oauth2/token` using `grant_type=client_credentials`.
 - Username and password log in with `POST /accounts/login`.
-- Tokens are held in memory only and refreshed before `expires_in` elapses. Secrets, bearer tokens, and every secret-bearing response field (`client_secret`, `clientSecret`, `password`, tokens, authorization values, API and access keys, VPN `presharedKey` values, hybrid server `registrationKey` values, signing and text keys, SNMP `community` strings, hashes, and `name`/`value` property pairs whose name matches) are redacted from errors, tool output, and bundle snapshots; URL-valued fields (alert and webhook `url`/`uri` values) are reduced to scheme and host.
+- Tokens are held in memory only and refreshed before `expires_in` elapses.
+- Secrets, bearer tokens, and every secret-bearing response field are redacted from errors, tool output, and bundle snapshots. The secret-bearing fields are:
+  - `client_secret`, `clientSecret`, `password`, and tokens.
+  - Authorization values, and API and access keys.
+  - VPN `presharedKey` values and hybrid server `registrationKey` values.
+  - Signing and text keys, SNMP `community` strings, and hashes.
+  - `name`/`value` property pairs whose name matches.
+- URL-valued fields (alert and webhook `url`/`uri` values) are reduced to scheme and host.
 
 ### Control planes
 
@@ -42,7 +51,7 @@ Auth mode is chosen in this order: pre-issued token, connected app client creden
 | `eu` | `https://eu1.anypoint.mulesoft.com` |
 | `gov` | `https://gov.anypoint.mulesoft.com` |
 
-Pass `base_url` for any other hostname; the control plane is then reported as `custom`.
+Pass `base_url` for any other hostname. The control plane is then reported as `custom`.
 
 ### Example `config.toml`
 
@@ -57,7 +66,11 @@ timeout = 30
 
 ### Connected app permissions
 
-Create a connected app that acts on its own behalf (client credentials) and grant it read-only scopes in the organization and each environment you want inspected. `mulesoft_check_access` probes every surface and names the connected-app scope for any `401` or `403`. Scope IDs come from the Anypoint OpenID discovery document. When MuleSoft publicly documents a scope display name, both the display name and API ID are shown.
+Create a connected app that acts on its own behalf (client credentials). Grant it read-only scopes in the organization and in each environment you want inspected.
+
+`mulesoft_check_access` probes every surface and names the connected-app scope for any `401` or `403`.
+
+Scope IDs come from the Anypoint OpenID discovery document. When MuleSoft publicly documents a scope display name, both the display name and API ID are shown.
 
 | Surface | Read scope or permission |
 | --- | --- |
@@ -76,7 +89,7 @@ Create a connected app that acts on its own behalf (client credentials) and gran
 | Anypoint MQ regions, queues, clients | Anypoint MQ: View destinations (`view:destinations`) and View clients (`view:clients`). View clients exposes client IDs and client secrets. |
 | Secrets Manager secret groups | Secrets Manager: Read secrets metadata (`read:secrets_metadata`) |
 
-Because Anypoint scopes are environment-specific for most products, grant them for each environment the assessment should sample.
+Grant the scopes for each environment the assessment should sample, because Anypoint scopes are environment-specific for most products.
 
 ## Tools
 
@@ -87,25 +100,67 @@ Because Anypoint scopes are environment-specific for most products, grant them f
 | `mulesoft_assess_api_gateway` | Controls 7-9, 20: authentication and rate limiting policies on API instances (production first), client credential rotation evidence, Exchange asset governance. |
 | `mulesoft_assess_runtime_infrastructure` | Controls 10-16, 21-23: runtime versions, worker sizing, persistent queue encryption, VPC firewall rules and open ingress, DLB TLS versions and certificate expiry, MQ, Secrets Manager, hybrid servers. |
 | `mulesoft_assess_audit_monitoring` | Controls 17, 24: audit log entries in the lookback window and alert coverage for production applications. |
-| `mulesoft_export_audit_bundle` | Runs the access check and all four assessments and writes a bundle plus `.zip` under `output_dir` (default `./export/mulesoft`): `core_data/` holds projected and redacted snapshots (a denied, errored, or never-requested dataset is written as a `{ collected: false, dataset, status, endpoint, error }` marker, and a dataset assembled from several reads of which some failed as `{ collected: "partial", failed_reads, items }`), `analysis/` holds the findings and per-category summaries with an `inventories` map naming each source as complete, partial, unread, or not requested, and `compliance/` holds the executive summary, unified matrix, and eight framework reports. |
+| `mulesoft_export_audit_bundle` | Runs the access check and all four assessments, then writes a bundle and a zip archive. |
 
-All tools accept the authentication arguments above. Assessment tools also accept limits and thresholds (defaults in parentheses): `mulesoft_assess_identity_access` takes `user_limit` (1000), `max_admins` (5), `max_roles_per_group` (15), `max_connected_app_scopes` (10), and `stale_connected_app_days` (90); `mulesoft_assess_api_gateway` takes `environment_limit` (10) and `api_limit` (100); `mulesoft_assess_runtime_infrastructure` takes `environment_limit`, `application_limit` (200), `runtime_support_warning_days` (90), and `certificate_warning_days` (60); `mulesoft_assess_audit_monitoring` takes `environment_limit` and `audit_lookback_hours` (24). The export accepts all of them. Environments are sampled production first, so a low `environment_limit` still covers production.
+`mulesoft_export_audit_bundle` writes the bundle plus `.zip` under `output_dir` (default `./export/mulesoft`):
 
-Each finding has the shape `{ id, control, title, severity, status, summary, evidence, mappings }` where `severity` is `critical`, `high`, `medium`, `low`, or `info` and `status` is `pass`, `warn`, `fail`, or `manual`. A `manual` finding states exactly what evidence a human must collect from Anypoint Platform. When a read failed or the credential saw only part of the inventory, `evidence.unreadable_sources` and `evidence.partial_view` list the causes.
+- `core_data/` holds projected and redacted snapshots.
+  - A denied, errored, or never-requested dataset is written as a `{ collected: false, dataset, status, endpoint, error }` marker.
+  - A dataset assembled from several reads, some of which failed, is written as `{ collected: "partial", failed_reads, items }`.
+- `analysis/` holds the findings and per-category summaries, with an `inventories` map naming each source as complete, partial, unread, or not requested.
+- `compliance/` holds the executive summary, unified matrix, and eight framework reports.
+
+All tools accept the authentication arguments above. Assessment tools also accept these limits and thresholds, with defaults in parentheses:
+
+- `mulesoft_assess_identity_access`: `user_limit` (1000), `max_admins` (5), `max_roles_per_group` (15), `max_connected_app_scopes` (10), and `stale_connected_app_days` (90).
+- `mulesoft_assess_api_gateway`: `environment_limit` (10) and `api_limit` (100).
+- `mulesoft_assess_runtime_infrastructure`: `environment_limit`, `application_limit` (200), `runtime_support_warning_days` (90), and `certificate_warning_days` (60).
+- `mulesoft_assess_audit_monitoring`: `environment_limit` and `audit_lookback_hours` (24).
+
+The export accepts all of them. Environments are sampled production first, so a low `environment_limit` still covers production.
+
+Each finding has the shape `{ id, control, title, severity, status, summary, evidence, mappings }`.
+
+- `severity` is `critical`, `high`, `medium`, `low`, or `info`.
+- `status` is `pass`, `warn`, `fail`, or `manual`.
+
+A `manual` finding states exactly what evidence a human must collect from Anypoint Platform. When a read failed or the credential saw only part of the inventory, `evidence.unreadable_sources` and `evidence.partial_view` list the causes.
 
 ### Verdict safety
 
 Every finding follows the same rules so that missing or partial evidence never produces a `pass`:
 
-- An unreadable, forbidden (401/403), or errored primary source yields `manual` with a summary that starts `Could not evaluate:`, names the source and HTTP cause, and states the evidence to collect. A failed secondary source turns a would-be pass into `manual` with `Could not confirm:`.
-- An empty inventory never passes by default. Each control states whether emptiness is `fail` (no identity provider, zero audit events in 7 days, a production environment with no alerts) or `manual` (zero role groups, environments, connected apps, API instances, applications, VPCs, or Exchange assets).
-- Controls that do not apply (no dedicated load balancer, no Anypoint MQ region, no hybrid server, no persistent queues, `createSubOrgs` entitlement false) and endpoints that return 404 on the control plane render as `manual` with a not-applicable or unavailable summary.
-- Items without a date (connected apps without `last_used`, applications without `endOfSupportDate` or a runtime version, certificates without `validTo`) are reported in their own bucket and yield at most `warn`.
-- A partial view (environment filter or `environment_limit` that excludes environments, `api_limit` or `application_limit` caps, truncated pages, per-item reads that were truncated or failed, a credential scoped to a business group) is recorded with seen and total counts, and a would-be pass becomes `warn` with a `Partial view:` prefix and the sentence "The unseen items were not evaluated, so the control cannot pass on this sample."
-- Verdicts read the documented flags they depend on (`isFederated`, `allow_new_non_sso_users`, `mfaVerificationExcluded`, policy `disabled`, `tlsv1`, `httpMode` and `defaultCipherSuite`, `persistentQueuesEncrypted`, property `secure`, alert `enabled`, `entitlements.createSubOrgs`, hierarchy `isRoot`); an absent flag never supports `pass`.
-- Pagination runs to the requested limit and every list reports whether it was truncated; a first page is never treated as the whole population.
-- A read that depends on a list which was not read (role group roles and members, connected app scopes, API instances and policies, applications, servers, MQ regions, queues, and clients, secret groups, VPC and load balancer details, the load balancer certificate probes, alerts) is never requested; it is recorded as `not requested` naming the parent read, and the finding reports the parent failure once instead of an empty child read. When some parents were read and others were not, the children of the unread parents are reported as a partial failure.
-- Evidence and summaries derived from an unread or unrequested source render `null` rather than `0` or `[]`: `evidence.partial_view` is `null` (not `[]`) when a source was never read, and every category summary carries an `inventories` map naming each source as `complete (N items)`, `partial (N of M)`, `unread (<error>)`, or `not requested (<reason>)`.
+- An unreadable, forbidden (401/403), or errored primary source yields `manual`. Its summary starts `Could not evaluate:`, names the source and HTTP cause, and states the evidence to collect.
+- A failed secondary source turns a would-be pass into `manual` with `Could not confirm:`.
+- An empty inventory never passes by default. Each control states whether emptiness is `fail` or `manual`.
+  - `fail`: No identity provider, zero audit events in 7 days, a production environment with no alerts.
+  - `manual`: Zero role groups, environments, connected apps, API instances, applications, VPCs, or Exchange assets.
+- These render as `manual` with a not-applicable or unavailable summary:
+  - Controls that do not apply (no dedicated load balancer, no Anypoint MQ region, no hybrid server, no persistent queues, `createSubOrgs` entitlement false).
+  - Endpoints that return 404 on the control plane.
+- Items without a date are reported in their own bucket and yield at most `warn`. That covers connected apps without `last_used`, applications without `endOfSupportDate` or a runtime version, and certificates without `validTo`.
+- A partial view is recorded with seen and total counts. These count as a partial view:
+  - An environment filter or `environment_limit` that excludes environments.
+  - `api_limit` or `application_limit` caps.
+  - Truncated pages.
+  - Per-item reads that were truncated or failed.
+  - A credential scoped to a business group.
+- On a partial view, a would-be pass becomes `warn` with a `Partial view:` prefix and the sentence "The unseen items were not evaluated, so the control cannot pass on this sample."
+- Verdicts read the documented flags they depend on. An absent flag never supports `pass`. The flags are `isFederated`, `allow_new_non_sso_users`, `mfaVerificationExcluded`, policy `disabled`, `tlsv1`, `httpMode` and `defaultCipherSuite`, `persistentQueuesEncrypted`, property `secure`, alert `enabled`, `entitlements.createSubOrgs`, and hierarchy `isRoot`.
+- Pagination runs to the requested limit, and every list reports whether it was truncated. A first page is never treated as the whole population.
+- A read that depends on a list which was not read is never requested. It is recorded as `not requested`, naming the parent read. The finding reports the parent failure once instead of an empty child read. These reads depend on a parent list:
+  - Role group roles and members.
+  - Connected app scopes.
+  - API instances and policies.
+  - Applications and servers.
+  - MQ regions, queues, and clients.
+  - Secret groups.
+  - VPC and load balancer details, and the load balancer certificate probes.
+  - Alerts.
+- When some parents were read and others were not, the children of the unread parents are reported as a partial failure.
+- Evidence and summaries derived from an unread or unrequested source render `null` rather than `0` or `[]`.
+  - `evidence.partial_view` is `null` (not `[]`) when a source was never read.
+  - Every category summary carries an `inventories` map naming each source as `complete (N items)`, `partial (N of M)`, `unread (<error>)`, or `not requested (<reason>)`.
 - Re-running the export allocates a new directory (`-2` up to `-50`, then it fails) and derives the `.zip` name from it, so no prior bundle or archive is overwritten.
 
 ### Bundle layout
@@ -125,11 +180,18 @@ Every finding follows the same rules so that missing or partial evidence never p
 <org>-audit-bundle.zip
 ```
 
-Output paths are resolved inside `output_dir`; traversal outside the root and symlinked parent directories are rejected, and files are written with `0600` permissions.
+Output paths are resolved inside `output_dir`. Traversal outside the root and symlinked parent directories are rejected. Files are written with `0600` permissions.
 
 ## Control coverage
 
-The `Inputs` column names the sources each finding reads, using the keys of the category summary's `inventories` map. A primary input that is unread makes the finding `manual` with `Could not evaluate:`; a secondary input that is unread turns a would-be pass or warn into `manual` with `Could not confirm:` (a fail keeps its verdict and adds a note); an input that is truncated, capped, filtered, or only partly read adds a `Partial view:` note and turns a would-be pass into `warn`. Per-item reads (`role_group_roles`, `connected_app_scopes`, `api_policies`, `vpc_details`, `load_balancer_details`, and the per-environment inventories) are `not requested` when their parent list was not read, and the finding reports the parent.
+The `Inputs` column names the sources each finding reads, using the keys of the category summary's `inventories` map.
+
+Input rules:
+
+- An unread primary input makes the finding `manual` with `Could not evaluate:`.
+- An unread secondary input turns a would-be pass or warn into `manual` with `Could not confirm:`. A fail keeps its verdict and adds a note.
+- An input that is truncated, capped, filtered, or only partly read adds a `Partial view:` note and turns a would-be pass into `warn`.
+- Per-item reads are `not requested` when their parent list was not read, and the finding reports the parent. The per-item reads are `role_group_roles`, `connected_app_scopes`, `api_policies`, `vpc_details`, `load_balancer_details`, and the per-environment inventories.
 
 | # | Spec control | Tool | Finding | Inputs | Status semantics |
 | --- | --- | --- | --- | --- | --- |
@@ -159,11 +221,21 @@ The `Inputs` column names the sources each finding reads, using the keys of the 
 | 24 | Alerts configured for production applications | audit_monitoring | `MULESOFT-AUD-24` | `environments`, `alerts`, `cloudhub_applications` | fail: production environment with no enabled CloudHub or Runtime Manager alert; warn: alerts without an `enabled` flag or applications not covered; manual: no production environment sampled or zero production applications; pass: `enabled=true` alerts cover every sampled production application. Partial view: environments excluded |
 | 25 | Business groups separate tenants | identity_access | `MULESOFT-IAM-25` | `organization_hierarchy`; secondary `organization` | pass: business groups exist and `entitlements.createSubOrgs` is true; warn: the entitlement flag was not exposed; manual: the organization is itself a business group (`isRoot=false`; this control's own verdict, checked before the pass and warn conditions, so the general business-group rule below never applies to it), zero business groups, the entitlement is false (not applicable), or the hierarchy is unread |
 
-Every assessment reads `GET /accounts/api/organizations/{orgId}/hierarchy` and adds a partial-view note (a would-be pass becomes `warn`) when the configured organization is a business group (`isRoot=false`), because root organization administrators, role groups, environments, connected apps, VPCs, dedicated load balancers, Exchange assets, and audit entries of the root and sibling groups are outside the view. Control 25 is the one exception: the tenant structure it judges is the root organization's, which a business group cannot see at all, so it renders `manual` in that case and there is no would-be pass for the note to demote. Root scope is only established by `isRoot=true` on a readable hierarchy: a forbidden hierarchy read or a response without the flag also records the scope as unknown instead of assuming the root organization.
+### Business group scope
+
+Every assessment reads `GET /accounts/api/organizations/{orgId}/hierarchy`. When the configured organization is a business group (`isRoot=false`), the assessment adds a partial-view note, and a would-be pass becomes `warn`.
+
+The note is added because root organization administrators, role groups, environments, connected apps, VPCs, dedicated load balancers, Exchange assets, and audit entries of the root and sibling groups are outside the view.
+
+Control 25 is the one exception. The tenant structure it judges is the root organization's, which a business group cannot see at all. Control 25 therefore renders `manual` in that case, and there is no would-be pass for the note to demote.
+
+Root scope is only established by `isRoot=true` on a readable hierarchy. A forbidden hierarchy read or a response without the flag also records the scope as unknown instead of assuming the root organization.
 
 ## Framework mappings
 
-Every finding carries the eight mappings from the spec's compliance table as `mappings` strings such as `FedRAMP IA-2(1)`, `CMMC L2 3.5.3`, `SOC 2 CC6.1`, `CIS 16.2`, `PCI-DSS 8.4.1`, `DISA STIG SRG-APP-000148`, `IRAP ISM-1546`, and `ISMAP CPS-7.1`. The bundle writes one report per framework under `compliance/` and a unified matrix with every mapping side by side.
+Every finding carries the eight mappings from the spec's compliance table as `mappings` strings. Examples are `FedRAMP IA-2(1)`, `CMMC L2 3.5.3`, `SOC 2 CC6.1`, `CIS 16.2`, `PCI-DSS 8.4.1`, `DISA STIG SRG-APP-000148`, `IRAP ISM-1546`, and `ISMAP CPS-7.1`.
+
+The bundle writes one report per framework under `compliance/`, and a unified matrix with every mapping side by side.
 
 ## Live smoke test
 
@@ -171,20 +243,88 @@ Every finding carries the eight mappings from the spec's compliance table as `ma
 ANYPOINT_ORG_ID=... ANYPOINT_CLIENT_ID=... ANYPOINT_CLIENT_SECRET=... npm --prefix cli run test:mulesoft:live
 ```
 
-The script exits 0 with a skip message when no credentials are present. With credentials it runs `mulesoft_check_access` and the identity and access assessment against the real organization.
+The script exits 0 with a skip message when no credentials are present. With credentials, it runs `mulesoft_check_access` and the identity and access assessment against the real organization.
 
 ## Limitations and manual controls
 
-- Organization-wide MFA enforcement is not exposed by the Access Management API; control 2 only fails when MFA-exempt users exist and is otherwise manual.
-- Client secret rotation dates (control 9) and Exchange governance approvals (control 20) are not exposed by any public API; both are manual with the exact evidence to collect.
-- Connected app last-used timestamps (control 19) are not part of the organization-level connected apps response, so control 19 warns in practice and never passes without a timestamp; the tool still reads `last_used` variants when a tenant returns them.
-- Anypoint Monitoring advanced alerts have no published public API, so control 24 uses CloudHub alerts (`/cloudhub/api/v2/alerts`) and Runtime Manager alerts (`/hybrid/api/v1/alerts`) and asks for Anypoint Monitoring exports as manual evidence.
-- The dedicated load balancer API does not return certificate validity, so control 16 performs a live TLS handshake with `node:tls` against each DLB domain, once per SSL endpoint with the endpoint's `publicKeyCN` as the SNI name. The handshake deliberately runs with `rejectUnauthorized: false` so that a certificate with a self-signed, private-CA, or incomplete chain can still be read and dated; certificate verification is therefore off for the connection itself, and instead `socket.authorized` and `socket.authorizationError` are recorded per certificate as `authorized` and `authorization_error`. A chain that does not validate against the auditor host's trust store caps the verdict at warn. Hosts that cannot be probed from the auditor are reported as undated and yield warn, or manual when no certificate could be probed at all.
-- CloudHub 2.0 private spaces and Runtime Fabric are not inventoried; controls 13 and 14 become manual when no Anypoint VPC is visible.
-- Secure CloudHub properties are never returned in plaintext by the API; control 22 checks that sensitive-looking property keys are marked secure and that production environments have Secrets Manager secret groups.
-- Every snapshot is redacted before it is written to the bundle: values under keys that name a secret (`secret`, `password`, `token`, `privateKey`, `authorization`, `apiKey`, `accessKey`, `credential`, `textKey`, `signingKey`, `community`, `hash`, VPN `presharedKey`, hybrid server `registrationKey`, and their case and separator variants) and the `value` of any `name`/`value` pair whose name matches are replaced with `[REDACTED]`; values under `url`/`uri` keys (alert and webhook targets, callback URLs) are reduced to scheme and host; and any other URL string keeps its scheme, host, and path with its userinfo and query string removed whole. Every string a snapshot, an evidence list, or a summary keeps from a Anypoint response passes the data-side pass at the collector (`collect`, the TLS probe result, and `redactSnapshot`): the client's remembered credentials in every form and every carrier (`Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare; URL userinfo and query strings, which go whole; credential-named assignments and fields; auth schemes; JWTs; PEM blocks) and, bare, the vendor-prefixed token shapes (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest) are removed from a description, a note, a name, or a comment: JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too, while the generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay. A value nested deeper than 32 levels is replaced by `[REDACTED]` at that depth rather than passed through, in the collector pass and in `redactSnapshot` alike (the payload is server-controlled). CloudHub application properties, API policy configuration, and audit log entries are projected to the fields the verdicts read.
-- Error strings never quote a response body. A body without Anypoint's documented `message`, `error_description`, `error`, or `errors[0].message` field (a proxy or WAF page, whatever its content type claims, or JSON without those fields) is described as "non-JSON body (text/html, 5120 bytes)" or "JSON body without a recognized error field (...)", on every surface including the token exchange, `/accounts/login`, and the audit log query. Every error string is passed through one redaction pass when `MulesoftApiError` is constructed and again when the error is recorded, so `access_check.json`, `unreadable_sources`, `analysis/*.json` `errors` arrays, `_errors.log`, and tool results carry status, path, and shape only. The pass removes the configured client secret, password, and every token obtained whatever their shape and in their base64, base64url, URL-encoded, and JSON-escaped forms; any value inside a carrier whatever its shape (`Authorization`, `Cookie`, `Set-Cookie`, and API key headers, cookie and session assignments, URL userinfo and query pairs, the `Bearer`, `Basic`, `Digest`, `Token`, and `ApiKey` schemes, credential-named fields and assignments, SOAP credential elements, command-line flags); and bare values only when they have a real token shape (JWTs, PEM blocks, hex digests, vendor-prefixed keys, and runs of 16 or more characters with base64 symbols, scattered digits, or token casing, including a run standing after `=` under a non-credential pair name such as `theme=`). A carrier or token shape standing right after a literal JSON escape (`\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them) is treated exactly as one after a real newline, tab, or space. A bare name-shaped value standing alone in prose, such as an environment name or `prod-us-east-2026`, is indistinguishable from a resource name and stays.
-- Config file errors are fixed text. A file that cannot be read fails with "Unable to read MuleSoft config file <path> (<CODE>)" (the Node error code only, `ENOENT` included when `config_file`, `MULESOFT_SEC_INSPECTOR_CONFIG`, or `ANYPOINT_CONFIG_FILE` names the path; the default location is skipped when absent). The reader accepts only blank lines, `#` comments, `[table]` headers, and single-line `key = value` pairs whose value is a string closed on the same line, a single-line array, a boolean, a number, or a bare word; any other line (a value standing alone, an array of tables, a continued array or string) or a quote that does not close on its line fails with "Unable to parse MuleSoft config file: invalid TOML in <path> at line N (INVALID_TOML)". A malformed line that earlier releases skipped silently now stops the tool, and the line itself is never included, so a credential standing on it, after an unterminated quote, or inside a multi-line string is never echoed.
+- Organization-wide MFA enforcement is not exposed by the Access Management API. Control 2 only fails when MFA-exempt users exist, and is otherwise manual.
+- Client secret rotation dates (control 9) and Exchange governance approvals (control 20) are not exposed by any public API. Both are manual, with the exact evidence to collect.
+- Connected app last-used timestamps (control 19) are not part of the organization-level connected apps response. Control 19 therefore warns in practice and never passes without a timestamp. The tool still reads `last_used` variants when a tenant returns them.
+- Anypoint Monitoring advanced alerts have no published public API. Control 24 therefore uses CloudHub alerts (`/cloudhub/api/v2/alerts`) and Runtime Manager alerts (`/hybrid/api/v1/alerts`), and asks for Anypoint Monitoring exports as manual evidence.
+- The dedicated load balancer API does not return certificate validity. Control 16 therefore performs a live TLS handshake with `node:tls` against each DLB domain, once per SSL endpoint, with the endpoint's `publicKeyCN` as the SNI name.
+  - The handshake deliberately runs with `rejectUnauthorized: false` so that a certificate with a self-signed, private-CA, or incomplete chain can still be read and dated.
+  - Certificate verification is therefore off for the connection itself. Instead, `socket.authorized` and `socket.authorizationError` are recorded per certificate as `authorized` and `authorization_error`.
+  - A chain that does not validate against the auditor host's trust store caps the verdict at warn.
+  - Hosts that cannot be probed from the auditor are reported as undated and yield warn, or manual when no certificate could be probed at all.
+- CloudHub 2.0 private spaces and Runtime Fabric are not inventoried. Controls 13 and 14 become manual when no Anypoint VPC is visible.
+- Secure CloudHub properties are never returned in plaintext by the API. Control 22 checks that sensitive-looking property keys are marked secure and that production environments have Secrets Manager secret groups.
+
+### Snapshot redaction
+
+Every snapshot is redacted before it is written to the bundle:
+
+- Values under keys that name a secret are replaced with `[REDACTED]`. The keys are `secret`, `password`, `token`, `privateKey`, `authorization`, `apiKey`, `accessKey`, `credential`, `textKey`, `signingKey`, `community`, `hash`, VPN `presharedKey`, hybrid server `registrationKey`, and their case and separator variants.
+- The `value` of any `name`/`value` pair whose name matches is replaced with `[REDACTED]`.
+- Values under `url`/`uri` keys (alert and webhook targets, callback URLs) are reduced to scheme and host.
+- Any other URL string keeps its scheme, host, and path, with its userinfo and query string removed whole.
+
+Every string that a snapshot, an evidence list, or a summary keeps from an Anypoint response passes the data-side pass at the collector (`collect`, the TLS probe result, and `redactSnapshot`). That pass removes these from a description, a note, a name, or a comment:
+
+- The client's remembered credentials, in every form and every carrier:
+  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare.
+  - URL userinfo and query strings, which go whole.
+  - Credential-named assignments and fields.
+  - Auth schemes.
+  - JWTs.
+  - PEM blocks.
+- Vendor-prefixed token shapes standing bare (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest).
+
+JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too. The generic bare-run rule does not run on data. Identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header therefore stay.
+
+A value nested deeper than 32 levels is replaced by `[REDACTED]` at that depth rather than passed through. This applies in the collector pass and in `redactSnapshot` alike (the payload is server-controlled).
+
+CloudHub application properties, API policy configuration, and audit log entries are projected to the fields the verdicts read.
+
+### Error strings
+
+Error strings never quote a response body.
+
+A body without Anypoint's documented `message`, `error_description`, `error`, or `errors[0].message` field is described as "non-JSON body (text/html, 5120 bytes)" or "JSON body without a recognized error field (...)". Such bodies include a proxy or WAF page, whatever its content type claims, and JSON without those fields.
+
+Bodies are described this way on every surface, including the token exchange, `/accounts/login`, and the audit log query.
+
+Every error string is passed through one redaction pass when `MulesoftApiError` is constructed, and again when the error is recorded. As a result, `access_check.json`, `unreadable_sources`, `analysis/*.json` `errors` arrays, `_errors.log`, and tool results carry status, path, and shape only.
+
+The pass removes:
+
+- The configured client secret, password, and every token obtained, whatever their shape, and in their base64, base64url, URL-encoded, and JSON-escaped forms.
+- Any value inside one of these carriers, whatever its shape:
+  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers.
+  - Cookie and session assignments.
+  - URL userinfo and query pairs.
+  - The `Bearer`, `Basic`, `Digest`, `Token`, and `ApiKey` schemes.
+  - Credential-named fields and assignments.
+  - SOAP credential elements.
+  - Command-line flags.
+- Bare values, only when they have one of these real token shapes:
+  - JWTs, PEM blocks, hex digests, and vendor-prefixed keys.
+  - Runs of 16 or more characters with base64 symbols, scattered digits, or token casing, including a run standing after `=` under a non-credential pair name such as `theme=`.
+
+A carrier or token shape standing right after a literal JSON escape is treated exactly as one after a real newline, tab, or space. Such escapes are `\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them.
+
+A bare name-shaped value standing alone in prose, such as an environment name or `prod-us-east-2026`, is indistinguishable from a resource name and stays.
+
+### Config file errors
+
+Config file errors are fixed text.
+
+- A file that cannot be read fails with "Unable to read MuleSoft config file \<path> (\<CODE>)".
+  - The code is the Node error code only.
+  - `ENOENT` is included when `config_file`, `MULESOFT_SEC_INSPECTOR_CONFIG`, or `ANYPOINT_CONFIG_FILE` names the path.
+  - The default location is skipped when absent.
+- The reader accepts only blank lines, `#` comments, `[table]` headers, and single-line `key = value` pairs. An accepted pair's value is a string closed on the same line, a single-line array, a boolean, a number, or a bare word.
+- Any other line fails with "Unable to parse MuleSoft config file: invalid TOML in \<path> at line N (INVALID_TOML)". So does a quote that does not close on its line. Examples of other lines are a value standing alone, an array of tables, and a continued array or string.
+- A malformed line that earlier releases skipped silently now stops the tool. The line itself is never included, so a credential standing on it, after an unterminated quote, or inside a multi-line string is never echoed.
 
 ## Official documentation
 

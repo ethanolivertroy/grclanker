@@ -3,9 +3,17 @@ title: Datadog
 description: Read-only Datadog security inspector covering SAML, MFA, RBAC, keys, Audit Trail, Cloud SIEM, CSM, logs, and org settings across 20 controls.
 ---
 
-The Datadog integration audits a Datadog organization's own tenant configuration: who can sign in and how, which roles and keys exist, whether the Audit Trail and Cloud SIEM are active, how logs are retained and redacted, and which organization-level sharing and network settings are in place. It never mutates the org: every request is a `GET` against the documented v1 and v2 read endpoints.
+The Datadog integration audits a Datadog organization's own tenant configuration:
 
-It implements the 20 controls in `specs/datadog-sec-inspector.spec.md` and maps every finding to FedRAMP, CMMC 2.0, SOC 2, CIS, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP references from the spec's compliance table.
+- Who can sign in and how
+- Which roles and keys exist
+- Whether the Audit Trail and Cloud SIEM are active
+- How logs are retained and redacted
+- Which organization-level sharing and network settings are in place
+
+It never mutates the org. Every request is a `GET` against the documented v1 and v2 read endpoints.
+
+The integration implements the 20 controls in `specs/datadog-sec-inspector.spec.md`. It maps every finding to FedRAMP, CMMC 2.0, SOC 2, CIS, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP references from the spec's compliance table.
 
 ## What it inspects
 
@@ -18,7 +26,9 @@ It implements the 20 controls in `specs/datadog-sec-inspector.spec.md` and maps 
 
 ## Setup and authentication
 
-Every request carries two headers, `DD-API-KEY` and `DD-APPLICATION-KEY`, as described in the [Datadog authentication reference](https://docs.datadoghq.com/api/latest/authentication/). The API key identifies the organization; the application key inherits the permissions of the user or service account that created it, so create it from a principal that holds the read permissions listed below (or scope the key to exactly those permissions).
+Every request carries two headers, `DD-API-KEY` and `DD-APPLICATION-KEY`, as described in the [Datadog authentication reference](https://docs.datadoghq.com/api/latest/authentication/).
+
+The API key identifies the organization. The application key inherits the permissions of the user or service account that created it. Create the application key from a principal that holds the read permissions listed below, or scope the key to exactly those permissions.
 
 ### Credential sources and precedence
 
@@ -85,11 +95,29 @@ Permission names come from the [Datadog RBAC permissions list](https://docs.data
 
 ### Client behavior
 
-- Pagination follows each endpoint's documented style: `page[size]` and `page[number]` for users, roles, API keys, application keys, and rules; `page[limit]` plus `page[cursor]` with `meta.page.after` for audit events and signals; `page[limit]` plus `page[cursor]` from `meta.page.cursor` for posture findings; `page` and `page_size` for monitors; `count` and `start` for dashboards; `limit` and `offset` (documented default 1000) for org connections. Every paginated list runs to completion up to its limit, and the collector requests one item beyond the limit so it can tell a truncated inventory from a complete one.
-- Every list method returns `{ items, truncated, total?, truncationReason? }`. A listing is reported as truncated when the item cap stopped it while the last page was still full or dropped records from the same page, when the cap was reached while a next-page cursor was still present, when the server repeated the same page cursor, or when five consecutive empty pages arrived with a next-page cursor; `total` is the server-reported count when the endpoint exposes one (`meta.page.total_filtered_count` or `meta.page.total_count`). Every truncation entry in `errors` includes the inventory, limit, seen count, total when known, stop reason, and an actionable next step. User, role, key, rule, signal, monitor, and posture finding messages can name their exposed `*_limit` argument. Shared dashboards use a fixed collector cap of 2,000 and org connections use a fixed collector cap of 10,000, so their messages direct the user to inspect the full inventory manually in Dashboards > Shared Dashboards or Organization Settings > Org Connections.
+- Pagination follows each endpoint's documented style:
+  - Users, roles, API keys, application keys, and rules: `page[size]` and `page[number]`.
+  - Audit events and signals: `page[limit]` plus `page[cursor]` with `meta.page.after`.
+  - Posture findings: `page[limit]` plus `page[cursor]` from `meta.page.cursor`.
+  - Monitors: `page` and `page_size`.
+  - Dashboards: `count` and `start`.
+  - Org connections: `limit` and `offset` (documented default 1000).
+- Every paginated list runs to completion up to its limit. The collector requests one item beyond the limit so it can tell a truncated inventory from a complete one.
+- Every list method returns `{ items, truncated, total?, truncationReason? }`. A listing is reported as truncated in any of these cases:
+  - The item cap stopped it while the last page was still full or dropped records from the same page.
+  - The cap was reached while a next-page cursor was still present.
+  - The server repeated the same page cursor.
+  - Five consecutive empty pages arrived with a next-page cursor.
+- `total` is the server-reported count when the endpoint exposes one (`meta.page.total_filtered_count` or `meta.page.total_count`).
+- Every truncation entry in `errors` includes the inventory, limit, seen count, total when known, stop reason, and an actionable next step.
+  - User, role, key, rule, signal, monitor, and posture finding messages can name their exposed `*_limit` argument.
+  - Shared dashboards use a fixed collector cap of 2,000 and org connections use a fixed collector cap of 10,000. Their messages direct the user to inspect the full inventory manually in Dashboards > Shared Dashboards or Organization Settings > Org Connections.
 - `429` responses are retried after the number of seconds in `X-RateLimit-Reset` (capped at 60 seconds), and `5xx` responses are retried with exponential backoff, up to `max_retries` times, following the [rate limits reference](https://docs.datadoghq.com/api/latest/rate-limits/).
 - Requests time out after `timeout_seconds`.
-- API and application key values are redacted from every error message and from the exported bundle. Non-JSON error bodies are described by content type and length rather than echoed, JSON error messages are capped at 240 characters, and a `base_url` or `DD_HOST` that carries `user:password@` userinfo has it stripped before the URL is stored or logged.
+- API and application key values are redacted from every error message and from the exported bundle.
+  - Non-JSON error bodies are described by content type and length rather than echoed.
+  - JSON error messages are capped at 240 characters.
+  - A `base_url` or `DD_HOST` that carries `user:password@` userinfo has it stripped before the URL is stored or logged.
 
 ## Tools
 
@@ -97,27 +125,51 @@ All tools accept the credential arguments above (`api_key`, `app_key`, `site`, `
 
 ### `datadog_check_access`
 
-Validates the API key with `GET /api/v1/validate`, validates the API key and application key pair with `GET /api/v2/validate_keys`, then probes all 20 read surfaces (including `org_connections`) with a minimal request each. Returns `healthy` only when the key pair validates and every data surface is readable, `limited` when the pair does not validate or any surface returns 401, 403, or an error, and `failed` when the API key is invalid or nothing beyond validation is readable. Lists the missing permissions by name; 401 responses are treated like 403.
+Runs these checks in order:
+
+1. Validates the API key with `GET /api/v1/validate`.
+2. Validates the API key and application key pair with `GET /api/v2/validate_keys`.
+3. Probes all 20 read surfaces (including `org_connections`) with a minimal request each.
+
+Returns one of these statuses:
+
+- `healthy` only when the key pair validates and every data surface is readable.
+- `limited` when the pair does not validate or any surface returns 401, 403, or an error.
+- `failed` when the API key is invalid or nothing beyond validation is readable.
+
+Lists the missing permissions by name and treats 401 responses like 403.
 
 ### `datadog_assess_identity`
 
-Controls 1, 2, 3, 4, 16, and 19. Extra arguments: `user_limit`, `role_limit`, `key_limit` (caps the application keys read for the DD-19 key rotation check; defaults to 500, and a larger inventory is reported as truncated), `max_admins`, `inactive_days`, `pending_invite_days`, `key_rotation_days`, `service_account_pattern`.
+Controls 1, 2, 3, 4, 16, and 19.
+
+Extra arguments: `user_limit`, `role_limit`, `key_limit`, `max_admins`, `inactive_days`, `pending_invite_days`, `key_rotation_days`, `service_account_pattern`.
+
+`key_limit` caps the application keys read for the DD-19 key rotation check. It defaults to 500, and a larger inventory is reported as truncated.
 
 ### `datadog_assess_access_controls`
 
-Controls 5, 6, 14, 15, and 18. Extra arguments: `key_limit`, `key_rotation_days`, `key_unused_days`.
+Controls 5, 6, 14, 15, and 18.
+
+Extra arguments: `key_limit`, `key_rotation_days`, `key_unused_days`.
 
 ### `datadog_assess_security_monitoring`
 
-Controls 8, 9, 12, 13, and 17. Extra arguments: `rule_limit`, `signal_limit`, `signal_sla_hours`, `signal_lookback_days`, `monitor_limit`, `finding_limit`, `min_posture_pass_rate`, `required_frameworks`.
+Controls 8, 9, 12, 13, and 17.
+
+Extra arguments: `rule_limit`, `signal_limit`, `signal_sla_hours`, `signal_lookback_days`, `monitor_limit`, `finding_limit`, `min_posture_pass_rate`, `required_frameworks`.
 
 ### `datadog_assess_data_protection`
 
-Controls 7, 10, 11, and 20. Extra arguments: `min_audit_retention_days`, `min_log_retention_days`.
+Controls 7, 10, 11, and 20.
+
+Extra arguments: `min_audit_retention_days`, `min_log_retention_days`.
 
 ### `datadog_export_audit_bundle`
 
-Runs the access check plus all four assessments and writes an evidence bundle under `output_dir` (default `./export/datadog`). Accepts every assessment argument listed above. The bundle directory is named `<site>-audit-bundle` (suffixed with `-2`, `-3`, and so on if it already exists) and contains:
+Runs the access check plus all four assessments and writes an evidence bundle under `output_dir` (default `./export/datadog`). Accepts every assessment argument listed above.
+
+The bundle directory is named `<site>-audit-bundle`, suffixed with `-2`, `-3`, and so on if it already exists. It contains:
 
 ```text
 README.md
@@ -140,13 +192,63 @@ compliance/unified_compliance_matrix.md
 compliance/frameworks/{fedramp,cmmc,soc2,cis,pci-dss,disa-stig,irap,ismap}.md
 ```
 
-A zip archive named after the allocated directory (`<site>-audit-bundle.zip`, `<site>-audit-bundle-2.zip`, and so on) is written next to it, so a rerun never overwrites a prior bundle or its zip. Output paths are resolved with traversal and symlink-parent protection, so `output_dir` values that escape the output root are rejected.
+A zip archive named after the allocated directory is written next to it (`<site>-audit-bundle.zip`, `<site>-audit-bundle-2.zip`, and so on). A rerun therefore never overwrites a prior bundle or its zip.
+
+Output paths are resolved with traversal and symlink-parent protection, so `output_dir` values that escape the output root are rejected.
 
 ### Credential hygiene in the bundle
 
-Credential material never reaches `core_data/`, `analysis/`, or the zip. Sensitive surfaces are projected to the fields the assessments read at collection time: API and application key records lose their `key` attribute (the list endpoints return `last4`, which is all a finding needs); AWS, GCP, and Azure integration records keep identity and collection flags only, drop `access_key_id`, `secret_access_key`, `private_key`, `private_key_id`, `client_secret`, and any other credential-shaped field, record the dropped field names under `credential_fields_dropped`, and derive the AWS `authentication` method (`role_delegation`, `access_key`, or `unknown`) before the access key id is discarded; security signals keep the timestamp, message, status, tags, triage state, and rule identity and drop the captured log attributes; audit events keep the timestamp, service, action, and asset type; monitors drop the query, options, and creator; shared dashboards drop the author handle and URL; posture findings drop the captured resource configuration. Every JSON document is then passed through a redaction step before it is written: the value under any credential-shaped key (`token`, `secret`, `password`, `passphrase`, `authorization`, `credential`, `bearer`, `apikey`, and `key`, `keys`, or `key_id` qualified by `api`, `app`, `application`, `private`, `secret`, `signing`, `access`, `shared`, `session`, `master`, `client`, or `auth`, in snake_case or camelCase) becomes `[REDACTED]` whether it is a string, a list, or a nested object, with the key kept so an auditor can see the field existed; `{name, value}` pairs whose name is credential-shaped lose their value; and URL-shaped keys (`url`, `uri`, `endpoint`, `link`, `href`) keep only scheme and host so a signed link or webhook cannot carry a token into the bundle. This covers the verbatim configuration exports (org settings, org configs, security rules, log pipelines, indexes, archives, Sensitive Data Scanner) as well as the projected inventories.
+Credential material never reaches `core_data/`, `analysis/`, or the zip.
 
-Recorded error text follows one rule at one place: every collection error, access surface `error`, assessment `errors` entry, `_errors.log` line, and tool failure message is produced by a single function that passes the thrown message through the module scrubber, and a `SyntaxError` raised by the transport is recorded as its class name plus a fixed note because the parser's message quotes the body. The scrubber removes the configured API and application keys at full length in plain, base64, base64url, URL-encoded, form-encoded, and JSON-escaped form, and the value of every credential carrier whatever the value's shape: a `key=value`, `key: value`, or `"key": "value"` pair whose key carries a credential word (`DD_API_KEY`, `DD_APP_KEY`, the `DD-API-KEY` and `DD-APPLICATION-KEY` headers, `appkey` as `~/.dogrc` spells it, and the bearer ids `secret_id`, `session_id`, and `token_id`), also when the key follows a JSON escape (`\"api_key\": \"v\"`) or a command-line flag (`--api-key v`, `--api-key=v`, `-Dapi_key=v`); an authorization scheme word in any casing (`Bearer`, `bearer`, `Basic`, `Token`) loses the value after it, a bare token or a whole auth-param list (`Snowflake Token="v"`, `Digest username="v", nonce="v", response="v"`) alike, and the word itself stays only under `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate`, where a challenge's `realm="api"` stays as well, while an API-key or token header (`DD-API-KEY: token rejected`, `X-Api-Key: splunk rejected`) and a credential-named assignment (`token=Bearer v`) lose their whole value; a cookie header loses its value whole, its `;` separating pairs and attributes; the query of any URL becomes one marker, and a credential-named parameter of a relative path or bare query string loses its value whole, a `;` inside the value included (`?token=v;rest` renders `?token=[REDACTED]`, as URLSearchParams reads it); and a webhook or callback URL keeps its origin alone. A `webhook`-prefixed key is a URL carrier only when its last segment is `url` or `uri` or the key is the bare `webhook`; `webhook_secret`, `webhook_token`, and `webhookSecret` are credential keys and lose their value whatever its shape. A configured secret that is itself a carrier word (`password`, `Authorization`, `Bearer`) is removed after the carriers rather than before them, so the pair or header it names still loses its value. A name after a path slash (`GET /api/v2/api_keys: 403`) is a path segment, not a key, and a key whose last segment names a setting (`base_url`, `key_limit`, `key_rotation_days`, `key_unused_days`, `session_duration`) keeps a word value and loses only a token-shaped or registered one, so every fixed message and every finding summary, manual-evidence instruction, and bundle document survives the pass unchanged; the test suite sweeps the strings recorded by healthy and partially denied runs for alterations.
+At collection time, sensitive surfaces are projected to the fields the assessments read:
+
+- **API and application key records:** Lose their `key` attribute. The list endpoints return `last4`, which is all a finding needs.
+- **AWS, GCP, and Azure integration records:** Keep identity and collection flags only.
+  - They drop `access_key_id`, `secret_access_key`, `private_key`, `private_key_id`, `client_secret`, and any other credential-shaped field.
+  - They record the dropped field names under `credential_fields_dropped`.
+  - They derive the AWS `authentication` method (`role_delegation`, `access_key`, or `unknown`) before the access key id is discarded.
+- **Security signals:** Keep the timestamp, message, status, tags, triage state, and rule identity. They drop the captured log attributes.
+- **Audit events:** Keep the timestamp, service, action, and asset type.
+- **Monitors:** Drop the query, options, and creator.
+- **Shared dashboards:** Drop the author handle and URL.
+- **Posture findings:** Drop the captured resource configuration.
+
+Every JSON document then passes through a redaction step before it is written:
+
+- The value under any credential-shaped key becomes `[REDACTED]`, whether it is a string, a list, or a nested object. The key is kept so an auditor can see the field existed.
+  - Credential-shaped keys are `token`, `secret`, `password`, `passphrase`, `authorization`, `credential`, `bearer`, `apikey`, and `key`, `keys`, or `key_id` qualified by `api`, `app`, `application`, `private`, `secret`, `signing`, `access`, `shared`, `session`, `master`, `client`, or `auth`, in snake_case or camelCase.
+- `{name, value}` pairs whose name is credential-shaped lose their value.
+- URL-shaped keys (`url`, `uri`, `endpoint`, `link`, `href`) keep only scheme and host, so a signed link or webhook cannot carry a token into the bundle.
+
+The redaction step covers the verbatim configuration exports (org settings, org configs, security rules, log pipelines, indexes, archives, Sensitive Data Scanner) as well as the projected inventories.
+
+#### Recorded error text
+
+Recorded error text follows one rule at one place. Every collection error, access surface `error`, assessment `errors` entry, `_errors.log` line, and tool failure message is produced by a single function. That function passes the thrown message through the module scrubber.
+
+A `SyntaxError` raised by the transport is recorded as its class name plus a fixed note, because the parser's message quotes the body.
+
+The scrubber removes the configured API and application keys at full length in plain, base64, base64url, URL-encoded, form-encoded, and JSON-escaped form. It also removes the value of every credential carrier, whatever the value's shape:
+
+- **Pairs:** A `key=value`, `key: value`, or `"key": "value"` pair loses its value when its key carries a credential word (`DD_API_KEY`, `DD_APP_KEY`, the `DD-API-KEY` and `DD-APPLICATION-KEY` headers, `appkey` as `~/.dogrc` spells it, and the bearer ids `secret_id`, `session_id`, and `token_id`).
+  - The same applies when the key follows a JSON escape (`\"api_key\": \"v\"`) or a command-line flag (`--api-key v`, `--api-key=v`, `-Dapi_key=v`).
+- **Authorization schemes:** An authorization scheme word in any casing (`Bearer`, `bearer`, `Basic`, `Token`) loses the value after it.
+  - The rule applies alike to a bare token and a whole auth-param list (`Snowflake Token="v"`, `Digest username="v", nonce="v", response="v"`).
+  - The word itself stays only under `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate`, where a challenge's `realm="api"` stays as well.
+  - By contrast, an API-key or token header (`DD-API-KEY: token rejected`, `X-Api-Key: splunk rejected`) and a credential-named assignment (`token=Bearer v`) lose their whole value.
+- **Cookies:** A cookie header loses its value whole, its `;` separating pairs and attributes.
+- **Query strings:** The query of any URL becomes one marker.
+  - A credential-named parameter of a relative path or bare query string loses its whole value, including a `;` inside the value.
+  - For example, `?token=v;rest` renders `?token=[REDACTED]`, as URLSearchParams reads it.
+- **Webhook and callback URLs:** A webhook or callback URL keeps its origin alone.
+  - A `webhook`-prefixed key is a URL carrier only when its last segment is `url` or `uri`, or the key is the bare `webhook`.
+  - `webhook_secret`, `webhook_token`, and `webhookSecret` are credential keys and lose their value whatever its shape.
+
+A configured secret that is itself a carrier word (`password`, `Authorization`, `Bearer`) is removed after the carriers rather than before them, so the pair or header it names still loses its value.
+
+A name after a path slash (`GET /api/v2/api_keys: 403`) is a path segment, not a key. A key whose last segment names a setting (`base_url`, `key_limit`, `key_rotation_days`, `key_unused_days`, `session_duration`) keeps a word value and loses only a token-shaped or registered one. So every fixed message and every finding summary, manual-evidence instruction, and bundle document survives the pass unchanged.
+
+The test suite sweeps the strings recorded by healthy and partially denied runs for alterations.
 
 ## Findings
 
@@ -154,24 +256,69 @@ Every finding has the shape `{ id, title, severity, status, summary, evidence, m
 
 - `id` is `DD-NN` where `NN` is the spec control number.
 - `severity` is `critical`, `high`, `medium`, `low`, or `info` and is fixed per control.
-- `status` is `pass`, `warn`, `fail`, or `manual`. A finding is `manual` when the control cannot be verified through the API, either because Datadog does not expose the setting or because the surface returned 401, 403, or an error; its summary states exactly what evidence a human must collect.
+- `status` is `pass`, `warn`, `fail`, or `manual`.
+  - A finding is `manual` when the control cannot be verified through the API, either because Datadog does not expose the setting or because the surface returned 401, 403, or an error.
+  - A `manual` finding's summary states exactly what evidence a human must collect.
 - `mappings` lists the framework references from the spec's compliance table for that control, for example `FedRAMP IA-2(1)` or `PCI-DSS 8.4.1`.
 
 ### Verdict safety rules
 
 Every finding follows the same rules so that a `pass` always rests on data that was actually read:
 
-1. An unreadable, forbidden (401 or 403), or errored endpoint never yields `pass`; it yields `manual` with the cause and the evidence to collect. That holds for every inventory a control reads, not only its primary one. Controls that read several inventories are 2 (users plus organization settings), 3 (roles plus each custom role's permission list), 7 (oldest plus recent audit events), 9 (signals plus detection rules), 10 (indexes plus pipelines plus archives), 12 (rules plus the AWS, GCP, and Azure integration lists plus the failing and passing posture counts), 14 (organization settings plus shared dashboards), 18 (the three cloud integration lists), 19 (users plus application keys), and 20 (organization settings plus log indexes plus org connections). When any inventory a control reads is unreadable the finding is `manual`, except for 2 and 19 where the readable users still support a judgement and the finding is `warn` (native MFA coverage in 2, naming and interactive logins in 19) with the summary saying what was not checked; 18 stays `manual` as always but names the list it could not inventory. In every case the summary carries `Unreadable inventory: <inventory> (<endpoint>, <permission>: <error>), so <what was not checked>. Collect manually: <console evidence>.` and the evidence carries the same entries under `unreadable_inventories`. Failing verdicts on the readable inventories stay `fail`.
-2. An empty inventory never yields `pass` by default. Each control decides whether emptiness is `fail` or `manual` and says so in the summary: empty audit events (7), rules (8), scanning groups (11), and compliance rules (13) are `fail` with a note on recording the control as not applicable when the product is not licensed; empty users, roles, API keys, application keys, indexes, monitors, and cloud footprints (2, 3, 4, 5, 6, 10, 12, 17, 19) are `manual` because the list cannot be complete (the key in use must exist) or there is nothing to evaluate.
-3. Controls the API cannot observe (16, 18) render as `manual`, never `pass`.
-4. Items missing a date (users without `last_login_time` or `created_at`, keys without `created_at` or `last_used_at`, signals or audit events without `timestamp`) are never counted as fresh, recent, or active; they are reported in their own evidence bucket and cap the verdict at `warn`.
-5. A partial inventory (permission-limited role permissions, application keys without an owner record, scanning groups referenced but not returned) flags the partial view and never passes.
-6. Every flag the verdict depends on is read explicitly; a missing `saml`, `saml_strict_mode`, `private_widget_share`, `enabled`, or `is_enabled` value yields `manual`, not `pass`.
-7. Pagination runs to completion or records truncation: when an inventory reaches its configured cap, when the server repeats a page cursor, or when empty pages keep arriving with a cursor, the finding carries `<surface>_inventory_truncated: true`, the assessment records the truncation in `errors` with the seen and total counts and an actionable next step, `core_data/collection_status.json` marks the inventory `complete: false`, and a would-be `pass` is downgraded to `warn` because the verdict covers a partial view. Inventories with exposed limits name the real tool argument to raise. Shared dashboard and org connection truncation instead directs the user to inspect Dashboards > Shared Dashboards or Organization Settings > Org Connections manually because neither fixed collector cap is exposed as a tool argument. A population count derived from an inventory (`total_users`, `custom_roles`, the summary `users` and `roles`) renders `null` rather than `0` when that inventory was truncated or unreadable, while a count named for the read's own size (`users_returned`, `roles_returned`, `users_seen`, `api_keys_seen`, `rules_seen`) always renders; a finding that reads a second inventory carries that inventory's marker beside the count, so `DD-03` renders `total_users` beside `users_inventory_truncated` while its `inventory` object describes the roles read.
-8. Export reruns never overwrite a prior bundle or zip.
-9. Credential material is dropped or redacted at collection time and again when each JSON document is written, so no `core_data/` or `analysis/` file and no zip entry carries an API key, application key, cloud credential, webhook secret, or signed URL (see "Credential hygiene in the bundle").
+1. An unreadable, forbidden (401 or 403), or errored endpoint never yields `pass`. It yields `manual` with the cause and the evidence to collect.
 
-When a `pass` is downgraded under these rules, the summary ends with `Downgraded to warn: ...` (or, for an unreadable secondary inventory, the `Unreadable inventory:` sentence) and the evidence carries `verdict_caveats` or `unreadable_inventories`.
+   That holds for every inventory a control reads, not only its primary one. The controls that read several inventories are:
+
+   - **2:** Users plus organization settings.
+   - **3:** Roles plus each custom role's permission list.
+   - **7:** Oldest plus recent audit events.
+   - **9:** Signals plus detection rules.
+   - **10:** Indexes plus pipelines plus archives.
+   - **12:** Rules plus the AWS, GCP, and Azure integration lists plus the failing and passing posture counts.
+   - **14:** Organization settings plus shared dashboards.
+   - **18:** The three cloud integration lists.
+   - **19:** Users plus application keys.
+   - **20:** Organization settings plus log indexes plus org connections.
+
+   When any inventory a control reads is unreadable, the finding is `manual`, except for 2 and 19. In those controls, the readable users still support a judgement (native MFA coverage in 2, naming and interactive logins in 19). The finding is `warn`, and the summary says what was not checked.
+
+   Control 18 stays `manual` as always but names the list it could not inventory.
+
+   In every case, the summary carries `Unreadable inventory: <inventory> (<endpoint>, <permission>: <error>), so <what was not checked>. Collect manually: <console evidence>.` The evidence carries the same entries under `unreadable_inventories`.
+
+   Failing verdicts on the readable inventories stay `fail`.
+
+2. An empty inventory never yields `pass` by default. Each control decides whether emptiness is `fail` or `manual` and says so in the summary.
+
+   - Empty audit events (7), rules (8), scanning groups (11), and compliance rules (13) are `fail`, with a note on recording the control as not applicable when the product is not licensed.
+   - Empty users, roles, API keys, application keys, indexes, monitors, and cloud footprints (2, 3, 4, 5, 6, 10, 12, 17, 19) are `manual`, because the list cannot be complete (the key in use must exist) or there is nothing to evaluate.
+
+3. Controls the API cannot observe (16, 18) render as `manual`, never `pass`.
+
+4. Items missing a date are never counted as fresh, recent, or active. They are reported in their own evidence bucket and cap the verdict at `warn`. The rule covers users without `last_login_time` or `created_at`, keys without `created_at` or `last_used_at`, and signals or audit events without `timestamp`.
+
+5. A partial inventory flags the partial view and never passes. The rule covers permission-limited role permissions, application keys without an owner record, and scanning groups referenced but not returned.
+
+6. Every flag the verdict depends on is read explicitly. A missing `saml`, `saml_strict_mode`, `private_widget_share`, `enabled`, or `is_enabled` value yields `manual`, not `pass`.
+
+7. Pagination runs to completion or records truncation. Truncation is recorded when an inventory reaches its configured cap, when the server repeats a page cursor, or when empty pages keep arriving with a cursor. In those cases:
+
+   - The finding carries `<surface>_inventory_truncated: true`.
+   - The assessment records the truncation in `errors` with the seen and total counts and an actionable next step.
+   - `core_data/collection_status.json` marks the inventory `complete: false`.
+   - A would-be `pass` is downgraded to `warn`, because the verdict covers a partial view.
+
+   Inventories with exposed limits name the real tool argument to raise. Shared dashboard and org connection truncation instead directs the user to inspect Dashboards > Shared Dashboards or Organization Settings > Org Connections manually, because neither fixed collector cap is exposed as a tool argument.
+
+   A population count derived from an inventory (`total_users`, `custom_roles`, the summary `users` and `roles`) renders `null` rather than `0` when that inventory was truncated or unreadable. A count named for the read's own size (`users_returned`, `roles_returned`, `users_seen`, `api_keys_seen`, `rules_seen`) always renders.
+
+   A finding that reads a second inventory carries that inventory's marker beside the count. So `DD-03` renders `total_users` beside `users_inventory_truncated`, while its `inventory` object describes the roles read.
+
+8. Export reruns never overwrite a prior bundle or zip.
+
+9. Credential material is dropped or redacted at collection time and again when each JSON document is written. As a result, no `core_data/` or `analysis/` file and no zip entry carries an API key, application key, cloud credential, webhook secret, or signed URL (see "Credential hygiene in the bundle").
+
+When a `pass` is downgraded under these rules, the summary ends with `Downgraded to warn: ...`. For an unreadable secondary inventory, it ends with the `Unreadable inventory:` sentence instead. The evidence carries `verdict_caveats` or `unreadable_inventories`.
 
 ## Control coverage
 
@@ -198,11 +345,11 @@ When a `pass` is downgraded under these rules, the summary ends with `Downgraded
 | 19 | Service Account Audit | `datadog_assess_identity` | `DD-19` | `fail` when service accounts show login history or their application keys exceed `key_rotation_days`; `manual` when the user list is empty or no service accounts exist (not applicable rather than compliant); `warn` when names do not match `service_account_pattern`, keys lack `created_at`, the user or key list is truncated, or the application key list is unreadable (naming and interactive logins are still judged from the users; the summary names `application_keys` and states that key rotation was not checked); otherwise `pass`. |
 | 20 | Organization Settings (Retention and Sharing) | `datadog_assess_data_protection` | `DD-20` | `fail` when widget sharing outside the org is enabled; `manual` when org settings, log indexes, or org connections are unreadable, `private_widget_share` is absent, or the index list is empty; `warn` when indexes retain less than `min_log_retention_days` or lack `num_retention_days`, cross-org connections exist, or SAML auto-creation has no domain restriction; `pass` only when every input was read and the org connections list is empty. |
 
-Every control demotes when any surface it depends on is unreadable (`manual` in every case except the `warn` paths of controls 2 and 19 described above), and the finding summary names the unreadable inventory and the console page and setting to capture.
+Every control demotes when any surface it depends on is unreadable. The result is `manual` in every case except the `warn` paths of controls 2 and 19 described above. The finding summary names the unreadable inventory and the console page and setting to capture.
 
 ## Framework mappings
 
-Each finding carries the references below (from the spec's compliance mapping table), and the bundle writes one report per framework under `compliance/frameworks/`.
+Each finding carries the references below, from the spec's compliance mapping table. The bundle writes one report per framework under `compliance/frameworks/`.
 
 | Framework | Report file | Example references |
 |---|---|---|
@@ -228,15 +375,32 @@ The script prints a skip message and exits 0 when `DD_API_KEY` or `DD_APP_KEY` i
 
 ## Limitations and manual controls
 
-- Session timeout (control 16) and integration permissions (control 18) always produce `manual` findings because Datadog does not expose the session duration, cloud-side IAM policies, or webhook URLs through the public API.
-- Audit Trail retention (control 7) is inferred from the oldest event returned within the `min_audit_retention_days` window; the retention setting itself is not exposed by the API.
+- Session timeout (control 16) and integration permissions (control 18) always produce `manual` findings. Datadog does not expose the session duration, cloud-side IAM policies, or webhook URLs through the public API.
+- Audit Trail retention (control 7) is inferred from the oldest event returned within the `min_audit_retention_days` window. The retention setting itself is not exposed by the API.
 - The dashboards list endpoint reports whether a dashboard is shared but not whether the share is public or invite-only, so shared dashboards produce `warn` rather than `fail`.
-- Security signal review (control 9) queries `status:(critical OR high) -@workflow.triage.state:archived` over the lookback window; signals resolved in the UI but not archived still count as open.
+- Security signal review (control 9) queries `status:(critical OR high) -@workflow.triage.state:archived` over the lookback window. Signals resolved in the UI but not archived still count as open.
 - Compliance framework coverage (control 13) relies on `framework:`, `compliance_framework:`, or `requirement_framework:` tags on enabled `cloud_configuration` and `infrastructure_configuration` rules.
-- MFA status (control 2) can only observe Datadog-native MFA (`mfa_enabled`). SAML strict mode disables password login but does not tell the API whether the identity provider enforces a second factor, so a strict-mode org whose users lack native MFA is `manual` and the IdP authentication policy (for example an Okta authentication policy or Entra ID conditional access policy requiring MFA for the Datadog app) must be captured.
-- `GET /api/v2/posture_management/findings` is marked as a legacy endpoint in the OpenAPI definition. It remains the documented list endpoint with `filter[evaluation]`, so the inspector uses it for the CSPM passing rate. It reads `meta.page.total_filtered_count` when present and otherwise pages by `page[cursor]` up to `finding_limit`; if that limit is hit the count is marked truncated and the verdict is `warn`.
-- `GET /api/v1/integration/aws` and `GET /api/v1/integration/gcp` are marked deprecated in the OpenAPI definitions (the v2 replacements are `/api/v2/integration/aws/accounts` and `/api/v2/integration/gcp/accounts`). The inspector still reads the v1 endpoints because they remain documented and return the CSPM resource collection flags; switching to v2 is tracked in the spec.
-- User, role, key, rule, signal, monitor, and posture finding collection stop at their exposed `*_limit` arguments. Cursor-driven listings also stop when the server repeats a page cursor or keeps returning empty pages with a cursor. Shared dashboards and org connections have fixed collector caps of 2,000 and 10,000 rather than tool arguments. When a listing stops early the finding says so with the seen and total counts, the assessment records it in `errors`, `core_data/collection_status.json` marks the inventory incomplete with the reason, and a would-be `pass` becomes `warn`. Raise a named exposed limit when appropriate; for truncated shared dashboards or org connections, inspect the corresponding console inventory manually.
+- MFA status (control 2) can only observe Datadog-native MFA (`mfa_enabled`).
+  - SAML strict mode disables password login but does not tell the API whether the identity provider enforces a second factor.
+  - A strict-mode org whose users lack native MFA is therefore `manual`.
+  - The IdP authentication policy must be captured, for example an Okta authentication policy or Entra ID conditional access policy requiring MFA for the Datadog app.
+- `GET /api/v2/posture_management/findings` is marked as a legacy endpoint in the OpenAPI definition.
+  - It remains the documented list endpoint with `filter[evaluation]`, so the inspector uses it for the CSPM passing rate.
+  - The inspector reads `meta.page.total_filtered_count` when present, and otherwise pages by `page[cursor]` up to `finding_limit`.
+  - If that limit is hit, the count is marked truncated and the verdict is `warn`.
+- `GET /api/v1/integration/aws` and `GET /api/v1/integration/gcp` are marked deprecated in the OpenAPI definitions.
+  - The v2 replacements are `/api/v2/integration/aws/accounts` and `/api/v2/integration/gcp/accounts`.
+  - The inspector still reads the v1 endpoints because they remain documented and return the CSPM resource collection flags.
+  - Switching to v2 is tracked in the spec.
+- User, role, key, rule, signal, monitor, and posture finding collection stop at their exposed `*_limit` arguments.
+  - Cursor-driven listings also stop when the server repeats a page cursor or keeps returning empty pages with a cursor.
+  - Shared dashboards and org connections have fixed collector caps of 2,000 and 10,000 rather than tool arguments.
+  - When a listing stops early:
+    - The finding says so with the seen and total counts.
+    - The assessment records it in `errors`.
+    - `core_data/collection_status.json` marks the inventory incomplete with the reason.
+    - A would-be `pass` becomes `warn`.
+  - Raise a named exposed limit when appropriate. For truncated shared dashboards or org connections, inspect the corresponding console inventory manually.
 
 ## Official documentation
 

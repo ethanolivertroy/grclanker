@@ -5,20 +5,48 @@ description: "Read-only OCI security inspector covering IAM, Cloud Guard, audit 
 
 # Oracle Cloud Infrastructure (OCI)
 
-The OCI tool family inspects a tenancy read-only through the official OCI CLI and produces framework-mapped findings. It implements the `specs/oci-sec-inspector.spec.md` control set (23 of 25 controls automated or explicitly manual across 21 findings, see the coverage table).
+The OCI tool family inspects a tenancy read-only through the official OCI CLI and produces framework-mapped findings.
+
+It implements the `specs/oci-sec-inspector.spec.md` control set. Of its 25 controls, 23 are automated or explicitly manual, across 21 findings (see the coverage table).
 
 ## What it inspects
 
-- Identity: password policy, console MFA, API key / customer secret key / auth token age, broad IAM policies, compartment hierarchy
-- Logging and detection: Cloud Guard enablement, targets, open problems, responder recipes, audit log retention, audit event visibility, Events rules for identity, policy, and network changes
-- Tenancy guardrails: security list and NSG world ingress to sensitive ports, internet gateways, bastion TTL / CIDR allow lists and active sessions, vault key strength (algorithm, length, curve) and rotation, bucket public access and pre-authenticated requests
-- Compute and storage: IMDSv2-only instances, customer-managed keys on block and boot volumes
+- **Identity**
+  - Password policy
+  - Console MFA
+  - API key, customer secret key, and auth token age
+  - Broad IAM policies
+  - Compartment hierarchy
+- **Logging and detection**
+  - Cloud Guard enablement, targets, open problems, and responder recipes
+  - Audit log retention
+  - Audit event visibility
+  - Events rules for identity, policy, and network changes
+- **Tenancy guardrails**
+  - Security list and NSG world ingress to sensitive ports
+  - Internet gateways
+  - Bastion TTL, CIDR allow lists, and active sessions
+  - Vault key strength (algorithm, length, curve) and rotation
+  - Bucket public access and pre-authenticated requests
+- **Compute and storage**
+  - IMDSv2-only instances
+  - Customer-managed keys on block and boot volumes
 
 ## Setup and authentication
 
 1. Install the OCI CLI (`oci`) and confirm `oci --version` works. Installation guide: https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm
 2. Configure an API-key profile in `~/.oci/config` (`tenancy`, `user`, `fingerprint`, `key_file`, `region`). Config file reference: https://docs.oracle.com/en-us/iaas/Content/API/Concepts/sdkconfig.htm
-3. Optionally set `OCI_CONFIG_FILE`, `OCI_CLI_PROFILE`, `OCI_REGION`, `OCI_TENANCY_OCID`, or `OCI_COMPARTMENT_OCID`; tool arguments (`config_file`, `profile`, `region`, `tenancy_ocid`, `compartment_ocid`) override environment, which overrides the config profile. Without any of them the tools read `~/.oci/config` profile `DEFAULT`, take `region` and `tenancy` from that profile (region falls back to `us-ashburn-1`), and use the tenancy as the starting compartment. A tenancy OCID is required from one of the three sources.
+3. Optionally set `OCI_CONFIG_FILE`, `OCI_CLI_PROFILE`, `OCI_REGION`, `OCI_TENANCY_OCID`, or `OCI_COMPARTMENT_OCID`.
+
+Tool arguments (`config_file`, `profile`, `region`, `tenancy_ocid`, `compartment_ocid`) override environment, which overrides the config profile.
+
+Without any of these variables or arguments, the tools:
+
+- Read `~/.oci/config` profile `DEFAULT`.
+- Take `region` and `tenancy` from that profile. Region falls back to `us-ashburn-1`.
+- Use the tenancy as the starting compartment.
+
+A tenancy OCID is required from one of the three sources.
 
 Only API-key profiles are supported in this release. Session token (`security_token_file`), instance principal, resource principal, and delegation token modes are deferred (see Limitations).
 
@@ -36,7 +64,7 @@ Allow group SecurityInspectors to read volume-family in tenancy
 Allow group SecurityInspectors to read instance-family in tenancy
 ```
 
-A surface the principal cannot read renders its control as MANUAL with the failing command in the summary; it never passes.
+A surface the principal cannot read renders its control as MANUAL, with the failing command in the summary. The control never passes.
 
 ## Tools
 
@@ -51,12 +79,16 @@ A surface the principal cannot read renders its control as MANUAL with the faili
 
 ## Status semantics
 
-- `pass`: judged from a readable, complete inventory using documented fields.
-- `warn`: judged, but the view is incomplete (compartment or item cap hit, a compartment denied, undated items, failed sub-reads such as a denied `key get`) or a lower-risk issue exists.
-- `fail`: a documented field contradicts the control.
-- `manual`: the surface was unreadable (for example the documented `NotAuthorizedOrNotFound` response), out of scope (nothing to inspect), or the setting is not exposed by the API. Never treat manual as compliant.
+- `pass`: Judged from a readable, complete inventory using documented fields.
+- `warn`: Judged, but the view is incomplete (compartment or item cap hit, a compartment denied, undated items, or failed sub-reads such as a denied `key get`) or a lower-risk issue exists.
+- `fail`: A documented field contradicts the control.
+- `manual`: The surface was unreadable (for example, the documented `NotAuthorizedOrNotFound` response), out of scope because there was nothing to inspect, or the setting is not exposed by the API. Never treat manual as compliant.
 
-Compartment-scoped resources (policies, event rules, networking, bastions, vaults, buckets, instances, volumes) are listed per accessible compartment up to `max_compartments`; hitting the cap or losing a compartment withholds `pass` and reports seen versus total counts. A demoted summary names the CLI command that failed and the compartments it could not read (for example `Partial view: network security-list list denied or unreadable in 1 compartment(s): prod`), and a finding that reads more than one inventory demotes when any of them is incomplete, even if the failure is also listed in the errors array.
+Compartment-scoped resources (policies, event rules, networking, bastions, vaults, buckets, instances, volumes) are listed per accessible compartment, up to `max_compartments`. Hitting the cap or losing a compartment withholds `pass` and reports seen versus total counts.
+
+A demoted summary names the CLI command that failed and the compartments it could not read, for example `Partial view: network security-list list denied or unreadable in 1 compartment(s): prod`.
+
+A finding that reads more than one inventory demotes when any of them is incomplete, even if the failure is also listed in the errors array.
 
 ## Control coverage
 
@@ -92,21 +124,96 @@ Every finding carries the spec mapping table values for FedRAMP, CMMC L2, SOC 2,
 
 ## Evidence bundle
 
-`oci_export_audit_bundle` writes `<tenancy>-<region>-audit/` under the output root (reruns allocate `-2` through `-9`, never overwrite, and fail once all nine names are taken) and a zip named after that directory:
+`oci_export_audit_bundle` writes `<tenancy>-<region>-audit/` under the output root, plus a zip named after that directory. Reruns allocate `-2` through `-9`, never overwrite, and fail once all nine names are taken.
+
+Bundle contents:
 
 - `QUICK_REFERENCE.md`, `README.md`, `metadata.json`
 - `core_data/`: `access.json`, `compartments.json` (no credentials)
 - `analysis/`: `findings.json`, one JSON per assessment, `summary.md`
 - `compliance/`: `executive_summary.md`, `unified_compliance_matrix.md`, one report per framework
-- `_errors.log`: only when collection partially failed
+- `_errors.log`: Only when collection partially failed
 
-Secret hygiene: nothing credential-bearing is written. Findings redact sensitive fields at creation (`accessUri`, `keyValue`, `token`, `key`, `secret*`, `*password*`, `privateKey`, `keyMaterial`, `wrappedKey`, `plaintext`, `ciphertext`, `authorization`, `userData`, and similar names keep the field name with a `[redacted]` marker), PEM blocks, `/p/<token>/n/` PAR URIs, the OCI request-signing `Signature` header parameter list, standalone `keyId`/`signingKeyId`/`signature` values in assignment or JSON-colon form, and `token`, `secret`, `password`, `pass_phrase`, `key_file`, and `access_uri` assignments are scrubbed from every string including CLI error text (KMS `kmsKeyId` values and `--key-id` arguments are left readable because verdicts depend on them), `core_data/compartments.json` is projected to `id`, `compartmentId`, `name`, `lifecycleState`, and the config file path is replaced with `[redacted]` in `metadata.json` and `core_data/access.json`. A regression test writes a bundle from fixtures carrying `FAKE_` secrets in every collected object and asserts none appears in any bundle file or zip entry.
+### Secret hygiene
 
-Cap exits: every capped loop (`max_compartments`, `max_keys`, `max_policies`, `max_buckets`) records the cap hit, reports seen versus total in the summary and evidence (`credentials_total` is `null` when the credential cap stopped enumeration), and withholds `pass`.
+Nothing credential-bearing is written. Redaction rules:
 
-CLI error text: when an `oci` command fails, its stderr and stdout are never echoed into a finding, an errors array, or a bundle file. A documented `ServiceError` block contributes only its `status`, `code`, `opc-request-id`, and scrubbed `message` (for example `oci iam user list exited 1 with ServiceError status=404 code=NotAuthorizedOrNotFound opc-request-id=... message=...`); anything else (an HTML gateway page, a traceback, plain text) is described by the command words, exit code, and byte counts (`oci iam user list exited 1; 236 bytes of stderr and 0 bytes of stdout withheld (no documented ServiceError block)`). Every error string passes through `scrubErrorText` once, where it is created and before the message cap is applied; it drops embedded URL queries and fragments, Bearer, Basic, cookie, api key, session, access, refresh, and id token, client secret, password, `Signature`, and `keyId` values, and any unlabeled token of 16 or more characters that contains a digit or a `+` in free text, while OCIDs, `kmsKeyId`, `masterKeyId`, and `--key-id` stay readable. When the bundle is written, the sink applies a second, data-mode layer (`redactSensitiveText`: the same patterns with the long-token rule off) to every finding summary and errors array entry, so identifiers such as a compartment named `prod-us-east-2026` survive in `_errors.log` and the executive summary while `token=` shapes are still redacted there. An `opc-request-id` value is disclosed only when it matches a documented layout (the CLI's `32hex(/32hex){0,2}` form or the UUID form from `usingapi.htm`); anything else behind the label is dropped. Residuals: a value in a documented layout that is deliberately placed directly behind an `opc-request-id=` label stays readable (no OCI secret has the bare 32-hex shape; the identity-domain OAuth client secret has the UUID shape), which is exfiltration rather than accidental echo; a 16-plus character token with no digit or `+` is not caught by the long-token rule; the tool output's errors arrays and summary statuses carry compartment names (and, in one informational line, vault display names) verbatim as tenant data, with the sink redacting assignment shapes inside them for the bundle.
+- Findings redact sensitive fields at creation. `accessUri`, `keyValue`, `token`, `key`, `secret*`, `*password*`, `privateKey`, `keyMaterial`, `wrappedKey`, `plaintext`, `ciphertext`, `authorization`, `userData`, and similar names keep the field name with a `[redacted]` marker.
+- Every string, including CLI error text, is scrubbed of:
+  - PEM blocks
+  - `/p/<token>/n/` PAR URIs
+  - The OCI request-signing `Signature` header parameter list
+  - Standalone `keyId`/`signingKeyId`/`signature` values in assignment or JSON-colon form
+  - `token`, `secret`, `password`, `pass_phrase`, `key_file`, and `access_uri` assignments
+- KMS `kmsKeyId` values and `--key-id` arguments are left readable because verdicts depend on them.
+- `core_data/compartments.json` is projected to `id`, `compartmentId`, `name`, `lifecycleState`.
+- The config file path is replaced with `[redacted]` in `metadata.json` and `core_data/access.json`.
 
-Silent success: an `oci` command that exits 0 must print the documented `{ "data": ... }` JSON document. Empty stdout, whitespace-only stdout, non-JSON stdout (a gateway page passed through), and a JSON document without a `data` member are each recorded as an unreadable surface, never as an empty inventory: the marker names the command and the observed state (`oci iam compartment list exited 0 with empty stdout (no JSON document)`, `... exited 0 with whitespace-only stdout (6 bytes, no JSON document)`, `... exited 0 with a JSON document that has no data member (48 bytes)`, `... exited 0 but printed 236 bytes of non-JSON stdout (withheld)`), stdout is never echoed, no status code is named, the access check reports the surface `not_readable`, and dependent findings render `manual` or `warn` with `null` counts. The OCI CLI has printed nothing for an empty list on some versions (oracle/oci-cli issue 204), but no docs.oracle.com page documents that behaviour for any command, so no command's empty stdout is treated as a documented empty result; a tenancy whose list is genuinely empty on such a CLI version renders `manual` and the operator confirms the empty inventory by hand.
+A regression test writes a bundle from fixtures carrying `FAKE_` secrets in every collected object. The test asserts none appears in any bundle file or zip entry.
+
+### Cap exits
+
+Every capped loop (`max_compartments`, `max_keys`, `max_policies`, `max_buckets`):
+
+- Records the cap hit.
+- Reports seen versus total in the summary and evidence. `credentials_total` is `null` when the credential cap stopped enumeration.
+- Withholds `pass`.
+
+### CLI error text
+
+When an `oci` command fails, its stderr and stdout are never echoed into a finding, an errors array, or a bundle file.
+
+- A documented `ServiceError` block contributes only its `status`, `code`, `opc-request-id`, and scrubbed `message` (for example `oci iam user list exited 1 with ServiceError status=404 code=NotAuthorizedOrNotFound opc-request-id=... message=...`).
+- Anything else (an HTML gateway page, a traceback, plain text) is described by the command words, exit code, and byte counts (`oci iam user list exited 1; 236 bytes of stderr and 0 bytes of stdout withheld (no documented ServiceError block)`).
+
+Every error string passes through `scrubErrorText` once, where it is created and before the message cap is applied. `scrubErrorText` drops:
+
+- Embedded URL queries and fragments
+- Bearer, Basic, cookie, api key, session, access, refresh, and id token, client secret, password, `Signature`, and `keyId` values
+- Any unlabeled token of 16 or more characters that contains a digit or a `+` in free text
+
+OCIDs, `kmsKeyId`, `masterKeyId`, and `--key-id` stay readable.
+
+When the bundle is written, the sink applies a second, data-mode layer to every finding summary and errors array entry. That layer is `redactSensitiveText`: the same patterns with the long-token rule off.
+
+As a result, identifiers such as a compartment named `prod-us-east-2026` survive in `_errors.log` and the executive summary, while `token=` shapes are still redacted there.
+
+An `opc-request-id` value is disclosed only when it matches a documented layout: the CLI's `32hex(/32hex){0,2}` form or the UUID form from `usingapi.htm`. Anything else behind the label is dropped.
+
+Residuals:
+
+- A value in a documented layout that is deliberately placed directly behind an `opc-request-id=` label stays readable. Such placement is exfiltration rather than accidental echo.
+  - No OCI secret has the bare 32-hex shape.
+  - The identity-domain OAuth client secret has the UUID shape.
+- A 16-plus character token with no digit or `+` is not caught by the long-token rule.
+- The tool output's errors arrays and summary statuses carry compartment names (and, in one informational line, vault display names) verbatim as tenant data. For the bundle, the sink redacts assignment shapes inside them.
+
+### Silent success
+
+An `oci` command that exits 0 must print the documented `{ "data": ... }` JSON document.
+
+Each of these is recorded as an unreadable surface, never as an empty inventory:
+
+- Empty stdout
+- Whitespace-only stdout
+- Stdout that is non-JSON (a gateway page passed through)
+- A JSON document without a `data` member
+
+In each case:
+
+- The marker names the command and the observed state, for example:
+  - `oci iam compartment list exited 0 with empty stdout (no JSON document)`
+  - `... exited 0 with whitespace-only stdout (6 bytes, no JSON document)`
+  - `... exited 0 with a JSON document that has no data member (48 bytes)`
+  - `... exited 0 but printed 236 bytes of non-JSON stdout (withheld)`
+- Stdout is never echoed.
+- No status code is named.
+- The access check reports the surface `not_readable`.
+- Dependent findings render `manual` or `warn` with `null` counts.
+
+The OCI CLI has printed nothing for an empty list on some versions (oracle/oci-cli issue 204). But no docs.oracle.com page documents that behaviour for any command, so no command's empty stdout is treated as a documented empty result.
+
+A tenancy whose list is genuinely empty on such a CLI version renders `manual`, and the operator confirms the empty inventory by hand.
 
 ## Live smoke
 
@@ -114,15 +221,18 @@ Silent success: an `oci` command that exits 0 must print the documented `{ "data
 npm --prefix cli run test:oci:live
 ```
 
-Skips with exit 0 when no `~/.oci/config`, `OCI_CONFIG_FILE`, or `OCI_TENANCY_OCID` is present or the `oci` binary is missing; otherwise runs the access check and every assess tool against the configured profile.
+The smoke test skips with exit 0 when no `~/.oci/config`, `OCI_CONFIG_FILE`, or `OCI_TENANCY_OCID` is present, or when the `oci` binary is missing. Otherwise it runs the access check and every assess tool against the configured profile.
 
 ## Limitations and manual controls
 
 - Password expiration (control 1) is manual: not exposed by the IAM `PasswordPolicy` datatype.
-- Vault key strength (control 19) is judged from `Key.keyShape.length` in bytes (AES 16/24/32, RSA 256/384/512, ECDSA 32/48/66 per the `KeyShape` datatype). ECDSA keys pass on any documented `curveId` because the spec control names only the AES-256 and RSA-4096 floors; tighten `judgeKeyShape` if your baseline requires P-384 or above.
+- Vault key strength (control 19) is judged from `Key.keyShape.length` in bytes (AES 16/24/32, RSA 256/384/512, ECDSA 32/48/66 per the `KeyShape` datatype).
+  - ECDSA keys pass on any documented `curveId` because the spec control names only the AES-256 and RSA-4096 floors.
+  - Tighten `judgeKeyShape` if your baseline requires P-384 or above.
 - Controls 24 (budgets and alert rules) and 25 (OS Management Hub patching) are deferred.
-- Auth modes other than API-key profiles are deferred. Controls 3-5, 16-17, 18-19, and 20-21 stay folded into one finding each with per-kind evidence.
-- SARIF and JSON-CLI output formats from the spec are out of scope; findings are available as JSON in `analysis/findings.json`.
+- Auth modes other than API-key profiles are deferred.
+- Controls 3-5, 16-17, 18-19, and 20-21 stay folded into one finding each with per-kind evidence.
+- SARIF and JSON-CLI output formats from the spec are out of scope. Findings are available as JSON in `analysis/findings.json`.
 
 ## Surfaces
 

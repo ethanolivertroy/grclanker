@@ -3,9 +3,17 @@ title: AWS
 description: Read-only AWS security inspector covering IAM, Identity Center, CloudTrail, Security Hub, GuardDuty, Config, Organizations, S3, EBS, RDS, KMS, and VPCs.
 ---
 
-The AWS integration audits one AWS account's own security configuration: how the root user and IAM principals are protected, whether logging and detection services are on, which organization guardrails exist, whether data at rest and in transit is protected by default, and whether the network edge is closed on sensitive ports. It never mutates the account: every request is a `Get`, `List`, `Describe`, or `Lookup` call against the documented AWS service APIs through the AWS SDK for JavaScript v3.
+The AWS integration audits one AWS account's own security configuration:
 
-It implements the 25 controls in `specs/aws-sec-inspector.spec.md` and maps every finding to FedRAMP (NIST 800-53), CMMC 2.0, SOC 2, CIS AWS Foundations, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP references from the spec's compliance table.
+- How the root user and IAM principals are protected.
+- Whether logging and detection services are on.
+- Which organization guardrails exist.
+- Whether data at rest and in transit is protected by default.
+- Whether the network edge is closed on sensitive ports.
+
+It never mutates the account. Every request is a `Get`, `List`, `Describe`, or `Lookup` call against the documented AWS service APIs through the AWS SDK for JavaScript v3.
+
+It implements the 25 controls in `specs/aws-sec-inspector.spec.md`. It maps every finding to FedRAMP (NIST 800-53), CMMC 2.0, SOC 2, CIS AWS Foundations, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP references from the spec's compliance table.
 
 ## What it inspects
 
@@ -19,7 +27,15 @@ It implements the 25 controls in `specs/aws-sec-inspector.spec.md` and maps ever
 
 ## Setup and authentication
 
-Credentials come from the [AWS SDK default credential provider chain](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/setting-credentials-node.html): explicit environment variables, the shared `~/.aws/credentials` and `~/.aws/config` files (with `AWS_PROFILE` or the `profile` argument selecting a named profile through `fromIni`), web identity tokens, container credentials, and instance metadata, in the order documented in the [AWS SDKs and Tools reference](https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html). No credential value is ever written to a finding or a bundle.
+Credentials come from the [AWS SDK default credential provider chain](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/setting-credentials-node.html), in the order documented in the [AWS SDKs and Tools reference](https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html):
+
+- Explicit environment variables.
+- The shared `~/.aws/credentials` and `~/.aws/config` files. `AWS_PROFILE` or the `profile` argument selects a named profile through `fromIni`.
+- Web identity tokens.
+- Container credentials.
+- Instance metadata.
+
+No credential value is ever written to a finding or a bundle.
 
 ### Configuration precedence
 
@@ -31,15 +47,27 @@ Explicit tool arguments win, then environment variables, then SDK defaults.
 | Profile | `profile` | `AWS_PROFILE` | SDK default chain |
 | Account hint | `account_id` | `AWS_ACCOUNT_ID` | none (compared against `sts:GetCallerIdentity`) |
 
-The resolved source chain (for example `arguments-region -> environment-profile`) is reported by `aws_check_access` and recorded in `metadata.json`. `AWS_ROLE_ARN` and `AWS_EXTERNAL_ID` are honored only through the SDK's own `credential_process` and `role_arn` profile settings; the tools do not perform their own `AssumeRole` fan-out across accounts yet (see Limitations).
+The resolved source chain (for example `arguments-region -> environment-profile`) is reported by `aws_check_access` and recorded in `metadata.json`.
+
+`AWS_ROLE_ARN` and `AWS_EXTERNAL_ID` are honored only through the SDK's own `credential_process` and `role_arn` profile settings. The tools do not perform their own `AssumeRole` fan-out across accounts yet (see Limitations).
 
 ### Region scope
 
-`aws_assess_identity`, `aws_assess_logging_detection`, and `aws_assess_org_guardrails` read global services and the configured region. `aws_assess_data_protection` and `aws_assess_network_security` are multi-region: they call [EC2 `DescribeRegions`](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeRegions.html) with the `opt-in-status` filter (`opt-in-not-required`, `opted-in`) and assess every enabled region up to `region_limit` (default 30). Pass `regions` (comma-separated) to pin the scope. When `DescribeRegions` is unreadable the scope falls back to the configured region only, the fallback is recorded in `errors`, and every multi-region finding is capped at `warn` because only part of the estate was seen.
+`aws_assess_identity`, `aws_assess_logging_detection`, and `aws_assess_org_guardrails` read global services and the configured region.
+
+`aws_assess_data_protection` and `aws_assess_network_security` are multi-region. They call [EC2 `DescribeRegions`](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeRegions.html) with the `opt-in-status` filter (`opt-in-not-required`, `opted-in`) and assess every enabled region up to `region_limit` (default 30). Pass `regions` (comma-separated) to pin the scope.
+
+When `DescribeRegions` is unreadable:
+
+- The scope falls back to the configured region only.
+- The fallback is recorded in `errors`.
+- Every multi-region finding is capped at `warn`, because only part of the estate was seen.
 
 ### Required IAM permissions
 
-Attach a read-only policy with the actions below to the audit principal. Action names follow the [Service Authorization Reference](https://docs.aws.amazon.com/service-authorization/latest/reference/reference_policies_actions-resources-contextkeys.html). `aws_check_access` reports which surfaces return `AccessDenied`, and every unreadable surface renders a `manual` finding rather than a `pass`.
+Attach a read-only policy with the actions below to the audit principal. Action names follow the [Service Authorization Reference](https://docs.aws.amazon.com/service-authorization/latest/reference/reference_policies_actions-resources-contextkeys.html).
+
+`aws_check_access` reports which surfaces return `AccessDenied`. Every unreadable surface renders a `manual` finding rather than a `pass`.
 
 | Service | Actions |
 |---|---|
@@ -59,21 +87,260 @@ Attach a read-only policy with the actions below to the audit principal. Action 
 | Audit Manager | `auditmanager:ListAssessments` |
 | Account | `account:GetAlternateContact` |
 
-The AWS managed policies `SecurityAudit` and `ViewOnlyAccess` together cover most of this list; `account:GetAlternateContact` and `auditmanager:ListAssessments` may need to be added explicitly.
+The AWS managed policies `SecurityAudit` and `ViewOnlyAccess` together cover most of this list. `account:GetAlternateContact` and `auditmanager:ListAssessments` may need to be added explicitly.
 
 ### Client behavior
 
-- Every list operation follows its documented pagination token (`Marker`/`IsTruncated` for IAM, `NextToken` for CloudTrail, EC2, Access Analyzer, Organizations, Security Hub, GuardDuty, Identity Center, and Audit Manager, `ContinuationToken` for S3 `ListBuckets`, `Marker` for RDS, `Marker`/`Truncated`/`NextMarker` for KMS) through one shared walker. The walk runs to completion or until the configured `*_limit`, requesting one item beyond the limit so a truncated inventory is distinguishable from a complete one, and every list returns `{ items, truncated }`. The walk also stops and reports `truncated: true` when the service hands back the token it was just given or when 1000 pages have been read, so a stalled cursor can neither loop forever nor pass as a complete inventory.
-- Per-bucket, per-key, per-policy, per-trail, per-detector, per-SCP, and per-analyzer reads run with bounded concurrency (8) and per-region reads with concurrency 4. Each of these secondary reads is attempted individually and recorded on failure, so one denied item never hides behind its siblings.
-- `AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, `AuthorizationError`, and HTTP 403 responses are classified as denied; every denied or errored read is appended to the assessment's `errors` list with the operation name and, where relevant, the region or item (`cloudtrail:GetTrailStatus org-trail: AccessDenied (...)`). All five assessments carry an `errors` list and a `collection_errors` count in their summary.
-- Documented "not configured" responses are read as evidence, not errors: `NoSuchPublicAccessBlockConfiguration` (account or bucket block absent), `NoSuchBucketPolicy` (no bucket policy), `ServerSideEncryptionConfigurationNotFoundError` (no default encryption), `ResourceNotFoundException` from `GetAlternateContact` (no security contact), `NoSuchEntity` from `GetAccountPasswordPolicy` (no password policy), `InvalidAccessException` or `ResourceNotFoundException` from `DescribeHub` (Security Hub not enabled), and `AWSOrganizationsNotInUseException` from `DescribeOrganization` (standalone account). Any other failure from those calls, including a denial, propagates as an unreadable surface.
-- Credential-bearing values never reach findings or the bundle: access key ids are masked to their first and last four characters (`AKIA****MPLE`), the security contact is reduced to `has_name`, `has_title`, `has_phone`, and the email domain, and bucket policy documents are summarized rather than copied. Every JSON file the bundle writes also passes the snapshot walk first: each string at every depth goes through the data-side carrier scrub (the free-form header carriers, `Bearer` and `Basic` scheme values, cookies, URL userinfo, query, and fragment strings, credential-named pairs, and the resolved secret access key and session token in every encoded form; the only bare rule on this side is the vendor prefix (an AWS access key id or STS bearer id, `AKIA`, `ASIA`, `ABIA`, `ACCA`; a Stripe key; a GitHub token; a Slack token; a JWT; a PEM block), so ARNs, the unique ids of roles, users, groups, and policies (`AROA`, `AIDA`, `AGPA`, `ANPA`), and detector ids stay whole in structured fields, and the masked access key ids the evidence writes (`AKIA****MPLE`) never match the prefix), so a bearer inside a benign-named field of a nested value is scrubbed in place (`Authorization: Bearer [REDACTED]`) with its siblings kept, a value under a secret field name (`secret`, `secret_key`, `client_secret`, `password`, `private_key`, `access_token`, `authorization`, `cookie`, `api_key`, and their spelling variants) is `[REDACTED]` whatever its shape, and an object or array nested more than 32 containers below the file's root is written as `[REDACTED]`, so the depth of a server-supplied tree bounds what is copied. The SDK deserializer drops response members the service model does not declare, so the only server-supplied trees the code parses are the two policy documents (`iam:GetPolicyVersion` and `s3:GetBucketPolicy`); the export test plants a bearer-carrying statement and a 40-level tree inside both, keeps every finding's verdict, and finds neither in any file, zip entry, or tool result.
-- Error strings are scrubbed at one choke point. Every thrown SDK error becomes recorded text through exactly two helpers, `describeError` (every `attemptAwsRead` failure and every access probe) and `errorMessage` (tool-level failures), and both run `redactErrorText` over the message before it reaches a finding, a summary, an assessment `errors` array, `core_data/access.json`, `_errors.log`, or the zip. The pass replaces `Bearer` and `Basic` authorization values, JWT-shaped strings, AWS access key ids (`AKIA...`, `ASIA...`) and 40-character secret-shaped strings, `Set-Cookie` and `Cookie` values, key-value pairs whose key names a credential (`token`, `secret`, `password`, `api_key`, `session`, `signature`, and the like), and the userinfo, query string, and fragment of any URL wherever it sits in the message, so an SDK message that echoes request context keeps its error code, HTTP status, and host but not the values. A response the SDK could not parse as the service protocol (for example a proxy's 502 HTML page, which the SDK attaches as `$responseBodyText`) is never quoted: the recorded text is `<code> (HTTP <status>): non-JSON body (text/html, <n> bytes)`. A `SyntaxError` that arrives without an attached body is recorded by name only (`SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body`), because V8's parse message quotes a snippet of the text it rejected, and the whole text when it is 21 characters or shorter. The scrub follows one boundary. A value inside any carrier (an `Authorization`, `Cookie`, `Set-Cookie`, `X-Auth-Key`, `X-Auth-Email`, or `x-api-key` header, an authorization scheme value (`Bearer`, `Basic`, `Digest`, `Negotiate`, `NTLM`, `OAuth`, `SSWS`, `Token`, `ApiKey`, `Api-Key`, `Splunk`, `Snowflake`, `AWS4-HMAC-SHA256`), a session or cookie assignment, a URL's userinfo, a query pair, or a fragment, a key-value pair whose key names a credential) is removed whatever its shape; a URL whose authority is not a host with at most a numeric port, because a raw `?` or `#` sits inside its password, gives up everything to the `@` that follows as userinfo, while `https://h?e=a@x.com&token=v` keeps its host `h` and loses the query. A key names a credential when it is a credential word (`password`, `token`, `skey`), sets one off with `_`, `-`, or `.` (`DB_PASSWORD`, `AZURE_CLIENT_SECRET`, `x-api-key`), or is a lowerCamelCase or lowercase compound ending in one (`accessToken`), so `password=letmein`, `DB_PASSWORD=Sunshine`, and `AZURE_CLIENT_SECRET: abc12` lose their values unquoted as well as quoted, whatever the value's length or shape, and the key counts wherever it stands: after a flag prefix (`--password=v`, `--password v`, `-Dspring.datasource.password=v`), a path segment (`kv/password: v`; a `path: status` line whose last segment is a credential word loses the status, so the modules join such a status with `returned`), a parenthesis, or a comma, so a spawned CLI's echoed command line loses the value and keeps the rest; under an `Authorization` or `Proxy-Authorization` header a scheme word stays in front of the marker, and a parameter list after the scheme loses the value of every parameter that is a proof whatever its name, quoted or bare (`Authorization: Snowflake Token="..."`, `Authorization: Bearer value="..."`, Digest `response`, `nonce`, `cnonce`, and `opaque`, OAuth 1.0 `oauth_token`, `oauth_signature`, and `oauth_nonce`), while the parameters that describe the exchange stay (`realm`, `username`, `uri`, `qop`, `nc`, `algorithm`, and a SigV4 list's `Credential=..., SignedHeaders=...` scope, judged pair by pair as before) and a `WWW-Authenticate` challenge, which is not an `Authorization` header, keeps its `realm="api"`, `qop`, `algorithm`, `error`, and `error_description` with the rest of it, as does `Bearer realm="api"` in prose, but a parameter named as a proof (`response`, `signature`, `oauth_signature`, `mac`, `sig`) loses its value in a challenge as well, quoted or bare, before or after the `realm`, and so does one in a bare realm-led list (`realm="api", nonce="n", response="..."` as a data value), because a list shaped like a challenge is not exempt from the proof rule, while a `response` or `mac` field outside such a list (`"response": 403`, `mac=aa:bb:cc:dd:ee:ff`) is data and stays; under any other credential key the scheme word is the value (`db_password: token` loses `token`); `sid` is a session id key, so an IAM statement's `Sid: value` echoed in error prose loses its value as well; a PascalCase error code that merely ends in the word (`InvalidAuthenticationToken: Access token has expired`) is prose and stays, and an identifier-named key (`AWS_ACCESS_KEY_ID`, `AZURE_TENANT_ID`, `CLOUDFLARE_EMAIL`, `AAP_USERNAME`) keeps its value unless the value's own shape removes it (an `AKIA` access key id goes, a tenant UUID stays), with one override for the bearer ids: a key ending in `secret_id` or `token_id`, any prefix, casing, or separator (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `roleSecretId`, a Vault AppRole secret id; `token_id`, `tokenId`, a token id, which is the token), or naming a session id (`session_id`, `sid`, `sessid`, `jsessionid`, `PHPSESSID`) authenticates rather than identifies, so it is a credential key despite its `id` suffix and its value goes whatever its shape, a UUID included, in error text, in a data string, and as a snapshot key, while `client_id`, `tenant_id`, `role_id`, `access_key_id`, `key_id`, and `secret_name` keep theirs. A quoted header or pair value (`Authorization: Bearer "value"`, `X-Auth-Key: "value"`, `Cookie: sid='value'`, `X-Api-Key: "value"`, with or without spaces, single or double quotes, plain or JSON-escaped) is removed whole between its quotes, so a short or name-shaped value never survives inside quotes as prose; a `Cookie`, `Set-Cookie`, `X-Auth-Key`, or `X-Auth-Email` value is free form and follows the compound-line rule: a value that is itself quoted ends at its closing quote (a closed value holding `; Name:` is one value and the quotes stay around the marker), and an unquoted value, or a quoted one that is never closed, ends at the `;` or `,` that introduces the next `Name:` header token on the line or at the end of the line, so a following header (`Content-Type: "application/json"`, `Date: Tue, 22 Sep 2026 12:30:00 GMT`) keeps its name and value and a following credential header gets its own carrier treatment (`Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"`). The header name counts as a carrier after a JSON escape as it does at a line start: inside a serialized message a line follows `\n`, `\t`, `\r\n`, `\u000a`, `\u0009`, or `\u000d\u000a` as backslash text rather than a real line break, and the value is still removed whole (`\nCookie: theme=dark; my.tracker=hunter2` becomes `\nCookie: [REDACTED]`, `\u000aX-Auth-Key: prodkey` becomes `\u000aX-Auth-Key: [REDACTED]`), ending at an escaped line break or at the `"}` that closes the carrying JSON string so the next header keeps its name and value. A quoted value that names no credential (`Content-Type: "application/json"`) stays. The environment's static `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` are registered as configured secrets when the client is constructed, before any request is signed, and the secret access key and session token the guarded credential provider resolves are registered at that moment as well; each is removed whatever its shape and in its JSON-escaped, URL-encoded, base64, and base64url forms. A bare run of 16 or more characters shaped like a token (base64 symbols, digits scattered through letters, camelCase pieces of one or two letters, hex digests, AWS key ids, JWTs, PEM blocks) is removed. A bare value shaped like a name (hyphen- or underscore-joined words with at most one digit group each, such as `prod-us-east-2026`, uppercase codes, UUIDs, camelCase identifiers such as `GetAccessKeyLastUsed`) stays, because in prose it is indistinguishable from a resource name; opaque identifiers whose shape is a token's are therefore removed from error text and travel in structured fields (`command`, `region`, `error_code`, `http_status`). ARNs, bucket names, user names, regions, policy ids, and UUID key ids survive the scrub; an EC2-style id (`sg-` or `vpc-` followed by 17 hex characters) or a 32-hex GuardDuty detector id quoted inside an SDK message falls on the token side and is removed. A read label that names a server-assigned id (`guardduty:GetDetector <detector id>`) keeps the id whole when the scrub keeps it and otherwise masks it the way access key ids are masked (`12ab****89f0`), so the recorded line still names the detector instead of reading as though a secret had been recorded. Every fixed-text message the integration emits (the parse and non-JSON notes, every `AwsApiError`, `IncompleteResponse`, and `AwsCredentialProviderError` rendering, the region-scope, `not_readable`, and downgrade wordings) is held to the scrub by a test and survives it unchanged.
-- The client throws fixed text, not the SDK's error. Every SDK client the auditor holds is guarded so a failed `send()` surfaces as `AwsApiError`, whose message is `describeError`'s text (for example `SyntaxError (HTTP 200): non-JSON body (text/plain, 18 bytes)` for a 200 answer whose body is a short non-JSON page) and whose only structured fields are `code`, `httpStatus`, and a numbers-only `$metadata`; the SDK's `$response`, `$responseBodyText`, and cause are not retained. A caller that logs the thrown error therefore cannot re-emit a body or request context, and a scrub at the tool boundary is not what protects it. `AwsCredentialProviderError` passes through the guard unchanged, and `isAwsAccessDenied` classifies the wrapped error exactly as the original. An SDK error object that carries neither a name nor a message renders as its status alone (`HTTP 403`), never as `[object Object]`.
-- The error code is server-controlled text and is validated before it is recorded. The SDK error name comes from the response's `<Code>` element (XML services) or `__type` field (JSON services), so `code`, `error_code`, `isAwsAccessDenied`, and every rendering accept it only when it matches `^[A-Za-z][A-Za-z0-9._:-]{0,63}$` and survives the error-text scrub unchanged; anything else (a bearer value or a token in that slot, a code longer than 64 characters) renders as `UnknownError` and is never classified as a denial on the strength of the text.
-- A 2xx answer that is not a service response is an unreadable surface, never a default. The SDK resolves a 200 whose body is an HTML page, empty, or otherwise not the service protocol with an output that has no members, which would read as "no users", "no trails", `AccountMFAEnabled` unset, or a hub that is not enabled. Every command the client sends has its required top-level output member and that member's documented shape in `AWS_REQUIRED_OUTPUT_MEMBERS` (`Users` a list for `ListUsers`, `SummaryMap` a map for `GetAccountSummary`, `Account` a string for `GetCallerIdentity`, `IsLogging` a boolean for `GetTrailStatus`, `PublicAccessBlockConfiguration` a structure for both `GetPublicAccessBlock` operations, `Policy` a policy document for `GetBucketPolicy`, and so on; a list member is present, empty, even when the account holds nothing, and a map or structure member is never answered empty), and a middleware records the raw response's status, content type, byte length, and body before the deserializer consumes it (the body is inspected for that one send and never enters an error). A 2xx whose output carries none of the required members, whose body was empty, or whose content type is `text/html` is thrown as `AwsApiError` with code `IncompleteResponse` and the message `IncompleteResponse (HTTP 200): ListUsers answered without its Users member (body: text/html, 512 bytes)` (or `body: empty, 0 bytes`). A 2xx whose required member is present in another shape is the same failure: a JSON string where a list, map, or boolean is documented (`GetTrailStatus answered with its IsLogging member as a string where a boolean is documented`), an empty structure where the S3 REST-XML payload operations (`GetPublicAccessBlock`, `GetBucketPolicyStatus`, `GetBucketEncryption`) bind a foreign XML document or an HTML page without a content type to their payload member (`answered with its PublicAccessBlockConfiguration member as an empty structure where a structure is documented`), a `GetBucketPolicy` body that is not a JSON policy document carrying a `Statement` (`answered with its Policy member as a string where a policy document is documented`), and bare text inside an XML list, map, structure, or boolean element that the SDK's XML deserializer reads as an empty list, an empty structure, or `false` (`ListUsers answered with bare text in its Users element where a list is documented`, judged from the recorded body because the deserialized output cannot tell it from an empty inventory). A member the SDK's own deserializer refused to read as its documented type is recorded as `IncompleteResponse (HTTP 200): GetTrailStatus answered with a value outside its documented shape (body: application/x-amz-json-1.1, 37 bytes)`; the deserializer's `TypeError`, which quotes the value, is never recorded. Every such message is fixed words plus the observed status and body note: never the value, the body, or a `TypeError`. The read is then recorded like any other failure: the access probe marks the surface `not_readable` with `error_code: "IncompleteResponse"` and `http_status: 200`, dependent findings render `manual` or cap at `warn` with the count `null`, and no status code, error code, or configuration fact that the response did not carry appears in the output.
-- Credential provider errors name the provider and the SDK error only. The SDK parses the shared `config` and `credentials` files, SSO token caches, and `credential_process` output while it resolves credentials, and a provider's message can quote that text. The client wraps its provider (`fromIni` for a named profile, `fromNodeProviderChain` otherwise) so every failure surfaces as `AwsCredentialProviderError`, whose message is `credentials could not be resolved by fromIni (profile <name>) (<SDK error name>)` followed by the paths of the shared credentials and config files to check (`AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE`, or their `~/.aws` defaults); the SDK error name is validated against `^[A-Za-z]+(Error|Exception)$` and a filesystem code against `^E[A-Z]+$`, so no free text from the provider rides along. A credentials path that is a directory (`EISDIR`) or a file the process cannot read (`EACCES`) surfaces the same way (the installed SDK swallows the filesystem error and reports `CredentialsProviderError`); no filesystem wording and no path other than the two documented files is recorded, and shapes whose SDK message quotes the file's text (an unsupported `credential_source`, a `source_profile` naming a missing profile, the keys of an incomplete SSO profile) lose that text at the wrapper. None of the tools reads a configuration file itself: every setting comes from tool arguments and environment variables.
-- An unreadable dataset renders `null`, never `0`, `[]`, `{}`, or `false`. Every count, list, `*_truncated`, `*_configured`, `*_enabled`, and `*_visible` leaf in a summary or finding evidence that derives from a read which failed (denied, throttled, unavailable, or timed out) is `null`, an object that could not be read (`password_policy`, `organization`) is `null` rather than `{}`, the account-level S3 `account_flags` is a not-collected marker `{ collected: false, command, error_code, http_status, error }`, and `regions_total` is `null` when `DescribeRegions` failed and the scope fell back to the configured region. A count is `0` and a list `[]` only when the read completed and came back empty. When every per-item read under a readable list failed (trail status, event selectors, detector detail, SCP targets, analyzer findings, key metadata, access key lists), the derived count is `null` as well.
+#### Pagination
+
+Every list operation follows its documented pagination token through one shared walker:
+
+- `Marker`/`IsTruncated` for IAM.
+- `NextToken` for CloudTrail, EC2, Access Analyzer, Organizations, Security Hub, GuardDuty, Identity Center, and Audit Manager.
+- `ContinuationToken` for S3 `ListBuckets`.
+- `Marker` for RDS.
+- `Marker`/`Truncated`/`NextMarker` for KMS.
+
+The walk runs to completion or until the configured `*_limit`. It requests one item beyond the limit so a truncated inventory is distinguishable from a complete one. Every list returns `{ items, truncated }`.
+
+The walk also stops and reports `truncated: true` when the service hands back the token it was just given or when 1000 pages have been read. So a stalled cursor can neither loop forever nor pass as a complete inventory.
+
+#### Secondary reads
+
+Per-bucket, per-key, per-policy, per-trail, per-detector, per-SCP, and per-analyzer reads run with bounded concurrency (8). Per-region reads run with concurrency 4.
+
+Each of these secondary reads is attempted individually and recorded on failure, so one denied item never hides behind its siblings.
+
+#### Denied and errored reads
+
+`AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, `AuthorizationError`, and HTTP 403 responses are classified as denied.
+
+Every denied or errored read is appended to the assessment's `errors` list with the operation name and, where relevant, the region or item (`cloudtrail:GetTrailStatus org-trail: AccessDenied (...)`). All five assessments carry an `errors` list and a `collection_errors` count in their summary.
+
+#### Not-configured responses
+
+Documented "not configured" responses are read as evidence, not errors:
+
+- `NoSuchPublicAccessBlockConfiguration`: Account or bucket block absent.
+- `NoSuchBucketPolicy`: No bucket policy.
+- `ServerSideEncryptionConfigurationNotFoundError`: No default encryption.
+- `ResourceNotFoundException` from `GetAlternateContact`: No security contact.
+- `NoSuchEntity` from `GetAccountPasswordPolicy`: No password policy.
+- `InvalidAccessException` or `ResourceNotFoundException` from `DescribeHub`: Security Hub not enabled.
+- `AWSOrganizationsNotInUseException` from `DescribeOrganization`: Standalone account.
+
+Any other failure from those calls, including a denial, propagates as an unreadable surface.
+
+#### Bundle redaction
+
+Credential-bearing values never reach findings or the bundle:
+
+- Access key ids are masked to their first and last four characters (`AKIA****MPLE`).
+- The security contact is reduced to `has_name`, `has_title`, `has_phone`, and the email domain.
+- Bucket policy documents are summarized rather than copied.
+
+Every JSON file the bundle writes also passes the snapshot walk first. Each string at every depth goes through the data-side carrier scrub, which covers:
+
+- The free-form header carriers.
+- `Bearer` and `Basic` scheme values.
+- Cookies.
+- URL userinfo, query, and fragment strings.
+- Credential-named pairs.
+- The resolved secret access key and session token in every encoded form.
+
+The only bare rule on the data side is the vendor prefix: an AWS access key id or STS bearer id (`AKIA`, `ASIA`, `ABIA`, `ACCA`), a Stripe key, a GitHub token, a Slack token, a JWT, or a PEM block.
+
+So ARNs, the unique ids of roles, users, groups, and policies (`AROA`, `AIDA`, `AGPA`, `ANPA`), and detector ids stay whole in structured fields, and the masked access key ids the evidence writes (`AKIA****MPLE`) never match the prefix.
+
+The snapshot walk redacts these cases:
+
+- A bearer inside a benign-named field of a nested value is scrubbed in place (`Authorization: Bearer [REDACTED]`), with its siblings kept.
+- A value under a secret field name (`secret`, `secret_key`, `client_secret`, `password`, `private_key`, `access_token`, `authorization`, `cookie`, `api_key`, and their spelling variants) is `[REDACTED]` whatever its shape.
+- An object or array nested more than 32 containers below the file's root is written as `[REDACTED]`, so the depth of a server-supplied tree bounds what is copied.
+
+The SDK deserializer drops response members the service model does not declare. So the only server-supplied trees the code parses are the two policy documents (`iam:GetPolicyVersion` and `s3:GetBucketPolicy`). The export test plants a bearer-carrying statement and a 40-level tree inside both, keeps every finding's verdict, and finds neither in any file, zip entry, or tool result.
+
+#### Error text
+
+Error strings are scrubbed at one choke point. Every thrown SDK error becomes recorded text through exactly two helpers:
+
+- `describeError`: Every `attemptAwsRead` failure and every access probe.
+- `errorMessage`: Tool-level failures.
+
+Both run `redactErrorText` over the message before it reaches a finding, a summary, an assessment `errors` array, `core_data/access.json`, `_errors.log`, or the zip.
+
+The pass replaces:
+
+- `Bearer` and `Basic` authorization values.
+- JWT-shaped strings.
+- AWS access key ids (`AKIA...`, `ASIA...`) and 40-character secret-shaped strings.
+- `Set-Cookie` and `Cookie` values.
+- Key-value pairs whose key names a credential (`token`, `secret`, `password`, `api_key`, `session`, `signature`, and the like).
+- The userinfo, query string, and fragment of any URL, wherever it sits in the message.
+
+So an SDK message that echoes request context keeps its error code, HTTP status, and host, but not the values.
+
+A response the SDK could not parse as the service protocol (for example a proxy's 502 HTML page, which the SDK attaches as `$responseBodyText`) is never quoted. The recorded text is `<code> (HTTP <status>): non-JSON body (text/html, <n> bytes)`.
+
+A `SyntaxError` that arrives without an attached body is recorded by name only (`SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body`), because V8's parse message quotes a snippet of the text it rejected, and the whole text when it is 21 characters or shorter.
+
+#### Scrub boundary
+
+One boundary governs the scrub:
+
+- **Carriers:** A value inside any of these carriers is removed whatever its shape:
+  - An `Authorization`, `Cookie`, `Set-Cookie`, `X-Auth-Key`, `X-Auth-Email`, or `x-api-key` header.
+  - An authorization scheme value (`Bearer`, `Basic`, `Digest`, `Negotiate`, `NTLM`, `OAuth`, `SSWS`, `Token`, `ApiKey`, `Api-Key`, `Splunk`, `Snowflake`, `AWS4-HMAC-SHA256`).
+  - A session or cookie assignment.
+  - A URL's userinfo, a query pair, or a fragment.
+  - A key-value pair whose key names a credential.
+- **URL userinfo:** A URL whose authority is not a host with at most a numeric port, because a raw `?` or `#` sits inside its password, gives up everything to the `@` that follows as userinfo. By contrast, `https://h?e=a@x.com&token=v` keeps its host `h` and loses the query.
+- **Credential keys:** A key names a credential when it is any of these:
+  - A credential word (`password`, `token`, `skey`).
+  - A key that sets a credential word off with `_`, `-`, or `.` (`DB_PASSWORD`, `AZURE_CLIENT_SECRET`, `x-api-key`).
+  - A lowerCamelCase or lowercase compound ending in a credential word (`accessToken`).
+- **Credential values:** As a result, `password=letmein`, `DB_PASSWORD=Sunshine`, and `AZURE_CLIENT_SECRET: abc12` lose their values unquoted as well as quoted, whatever the value's length or shape.
+- **Key position:** The key counts wherever it stands: after a flag prefix, a path segment, a parenthesis, or a comma. So a spawned CLI's echoed command line loses the value and keeps the rest.
+  - Flag prefix examples: `--password=v`, `--password v`, `-Dspring.datasource.password=v`.
+  - Path segment example: `kv/password: v`. A `path: status` line whose last segment is a credential word loses the status, so the modules join such a status with `returned`.
+- **Authorization headers:** Under an `Authorization` or `Proxy-Authorization` header, a scheme word stays in front of the marker.
+  - A parameter list after the scheme loses the value of every parameter that is a proof, whatever its name, quoted or bare (`Authorization: Snowflake Token="..."`, `Authorization: Bearer value="..."`, Digest `response`, `nonce`, `cnonce`, and `opaque`, OAuth 1.0 `oauth_token`, `oauth_signature`, and `oauth_nonce`).
+  - The parameters that describe the exchange stay (`realm`, `username`, `uri`, `qop`, `nc`, `algorithm`, and a SigV4 list's `Credential=..., SignedHeaders=...` scope, judged pair by pair as before).
+- **Challenges:** A `WWW-Authenticate` challenge, which is not an `Authorization` header, keeps its `realm="api"`, `qop`, `algorithm`, `error`, and `error_description` with the rest of it. The same holds for `Bearer realm="api"` in prose.
+  - However, a parameter named as a proof (`response`, `signature`, `oauth_signature`, `mac`, `sig`) loses its value in a challenge as well, quoted or bare, before or after the `realm`.
+  - A parameter named as a proof in a bare realm-led list (`realm="api", nonce="n", response="..."` as a data value) loses its value too, because a list shaped like a challenge is not exempt from the proof rule.
+  - A `response` or `mac` field outside such a list (`"response": 403`, `mac=aa:bb:cc:dd:ee:ff`) is data and stays.
+- **Other credential keys:** Under any other credential key, the scheme word is the value (`db_password: token` loses `token`).
+- **IAM statements:** `sid` is a session id key, so an IAM statement's `Sid: value` echoed in error prose loses its value as well.
+- **Error codes:** A PascalCase error code that merely ends in the word (`InvalidAuthenticationToken: Access token has expired`) is prose and stays.
+- **Identifier keys:** An identifier-named key (`AWS_ACCESS_KEY_ID`, `AZURE_TENANT_ID`, `CLOUDFLARE_EMAIL`, `AAP_USERNAME`) keeps its value unless the value's own shape removes it. For example, an `AKIA` access key id goes, and a tenant UUID stays.
+- **Bearer ids:** The identifier-key rule has one override, for the bearer ids. These keys authenticate rather than identify, so each is a credential key despite its `id` suffix:
+  - A key ending in `secret_id` or `token_id`, any prefix, casing, or separator (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`, `roleSecretId`, a Vault AppRole secret id; `token_id`, `tokenId`, a token id, which is the token).
+  - A key naming a session id (`session_id`, `sid`, `sessid`, `jsessionid`, `PHPSESSID`).
+- **Bearer-id values:** The value under such a key goes in error text, in a data string, and as a snapshot key, whatever its shape, a UUID included. By contrast, `client_id`, `tenant_id`, `role_id`, `access_key_id`, `key_id`, and `secret_name` keep their values.
+- **Quoted values:** A quoted header or pair value is removed whole between its quotes, so a short or name-shaped value never survives inside quotes as prose.
+  - Examples: `Authorization: Bearer "value"`, `X-Auth-Key: "value"`, `Cookie: sid='value'`, `X-Api-Key: "value"`.
+  - This holds with or without spaces, single or double quotes, plain or JSON-escaped.
+- **Compound lines:** A `Cookie`, `Set-Cookie`, `X-Auth-Key`, or `X-Auth-Email` value is free form and follows the compound-line rule.
+  - A value that is itself quoted ends at its closing quote. A closed value holding `; Name:` is one value, and the quotes stay around the marker.
+  - An unquoted value, or a quoted one that is never closed, ends at the `;` or `,` that introduces the next `Name:` header token on the line, or at the end of the line.
+  - So a following header (`Content-Type: "application/json"`, `Date: Tue, 22 Sep 2026 12:30:00 GMT`) keeps its name and value, and a following credential header gets its own carrier treatment (`Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"`).
+- **JSON escapes:** The header name counts as a carrier after a JSON escape as it does at a line start.
+  - Inside a serialized message, a line follows `\n`, `\t`, `\r\n`, `\u000a`, `\u0009`, or `\u000d\u000a` as backslash text rather than a real line break.
+  - The value is still removed whole: `\nCookie: theme=dark; my.tracker=hunter2` becomes `\nCookie: [REDACTED]`, and `\u000aX-Auth-Key: prodkey` becomes `\u000aX-Auth-Key: [REDACTED]`.
+  - The value ends at an escaped line break or at the `"}` that closes the carrying JSON string, so the next header keeps its name and value.
+- **Quoted non-credential values:** A quoted value that names no credential (`Content-Type: "application/json"`) stays.
+- **Configured credentials:** Each of these secrets is removed whatever its shape, and in its JSON-escaped, URL-encoded, base64, and base64url forms:
+  - The environment's static `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, registered as configured secrets when the client is constructed, before any request is signed.
+  - The secret access key and session token the guarded credential provider resolves, registered at that moment as well.
+- **Token-shaped runs:** A bare run of 16 or more characters is removed when it is shaped like a token: base64 symbols, digits scattered through letters, camelCase pieces of one or two letters, hex digests, AWS key ids, JWTs, or PEM blocks.
+- **Name-shaped values:** A bare value shaped like a name stays, because in prose it is indistinguishable from a resource name. Name shapes are hyphen- or underscore-joined words with at most one digit group each (such as `prod-us-east-2026`), uppercase codes, UUIDs, and camelCase identifiers (such as `GetAccessKeyLastUsed`).
+- **Opaque identifiers:** Opaque identifiers whose shape is a token's are therefore removed from error text and travel in structured fields (`command`, `region`, `error_code`, `http_status`).
+- **AWS names and ids:** ARNs, bucket names, user names, regions, policy ids, and UUID key ids survive the scrub.
+  - An EC2-style id (`sg-` or `vpc-` followed by 17 hex characters) or a 32-hex GuardDuty detector id quoted inside an SDK message falls on the token side and is removed.
+  - A read label that names a server-assigned id (`guardduty:GetDetector <detector id>`) keeps the id whole when the scrub keeps it, and otherwise masks it the way access key ids are masked (`12ab****89f0`). So the recorded line still names the detector instead of reading as though a secret had been recorded.
+
+Tests run every fixed-text integration message through the scrub and verify that it survives unchanged:
+
+- The parse and non-JSON notes.
+- Every `AwsApiError`, `IncompleteResponse`, and `AwsCredentialProviderError` rendering.
+- The region-scope, `not_readable`, and downgrade wordings.
+
+#### Thrown errors
+
+The client throws fixed text, not the SDK's error. Every SDK client the auditor holds is guarded so a failed `send()` surfaces as `AwsApiError`:
+
+- **Message:** `describeError`'s text (for example `SyntaxError (HTTP 200): non-JSON body (text/plain, 18 bytes)` for a 200 answer whose body is a short non-JSON page).
+- **Structured fields:** Only `code`, `httpStatus`, and a numbers-only `$metadata`.
+- **Not retained:** The SDK's `$response`, `$responseBodyText`, and cause.
+
+A caller that logs the thrown error therefore cannot re-emit a body or request context, and a scrub at the tool boundary is not what protects it.
+
+`AwsCredentialProviderError` passes through the guard unchanged. `isAwsAccessDenied` classifies the wrapped error exactly as the original.
+
+An SDK error object that carries neither a name nor a message renders as its status alone (`HTTP 403`), never as `[object Object]`.
+
+#### Error code validation
+
+The error code is server-controlled text and is validated before it is recorded.
+
+The SDK error name comes from the response's `<Code>` element (XML services) or `__type` field (JSON services). So `code`, `error_code`, `isAwsAccessDenied`, and every rendering accept it only when it matches `^[A-Za-z][A-Za-z0-9._:-]{0,63}$` and survives the error-text scrub unchanged.
+
+Anything else (a bearer value or a token in that slot, a code longer than 64 characters) renders as `UnknownError` and is never classified as a denial on the strength of the text.
+
+#### Incomplete responses
+
+A 2xx answer that is not a service response is an unreadable surface, never a default.
+
+The SDK resolves a 200 with an output that has no members when its body is an HTML page, empty, or otherwise not the service protocol. That output would read as "no users", "no trails", `AccountMFAEnabled` unset, or a hub that is not enabled.
+
+Every command the client sends has its required top-level output member and that member's documented shape in `AWS_REQUIRED_OUTPUT_MEMBERS`:
+
+- `Users` a list for `ListUsers`.
+- `SummaryMap` a map for `GetAccountSummary`.
+- `Account` a string for `GetCallerIdentity`.
+- `IsLogging` a boolean for `GetTrailStatus`.
+- `PublicAccessBlockConfiguration` a structure for both `GetPublicAccessBlock` operations.
+- `Policy` a policy document for `GetBucketPolicy`, and so on.
+
+A list member is present, empty, even when the account holds nothing. A map or structure member is never answered empty.
+
+A middleware records the raw response's status, content type, byte length, and body before the deserializer consumes it. The body is inspected for that one send and never enters an error.
+
+A 2xx is thrown as `AwsApiError` with code `IncompleteResponse` in any of these cases:
+
+- Its output carries none of the required members.
+- Its body was empty.
+- Its content type is `text/html`.
+
+The message is `IncompleteResponse (HTTP 200): ListUsers answered without its Users member (body: text/html, 512 bytes)` (or `body: empty, 0 bytes`).
+
+A 2xx whose required member is present in another shape is the same failure:
+
+- A JSON string where a list, map, or boolean is documented (`GetTrailStatus answered with its IsLogging member as a string where a boolean is documented`).
+- An empty structure where the S3 REST-XML payload operations (`GetPublicAccessBlock`, `GetBucketPolicyStatus`, `GetBucketEncryption`) bind a foreign XML document or an HTML page without a content type to their payload member (`answered with its PublicAccessBlockConfiguration member as an empty structure where a structure is documented`).
+- A `GetBucketPolicy` body that is not a JSON policy document carrying a `Statement` (`answered with its Policy member as a string where a policy document is documented`).
+- Bare text inside an XML list, map, structure, or boolean element that the SDK's XML deserializer reads as an empty list, an empty structure, or `false` (`ListUsers answered with bare text in its Users element where a list is documented`).
+  - This case is judged from the recorded body, because the deserialized output cannot tell it from an empty inventory.
+
+A member the SDK's own deserializer refused to read as its documented type is recorded as `IncompleteResponse (HTTP 200): GetTrailStatus answered with a value outside its documented shape (body: application/x-amz-json-1.1, 37 bytes)`. The deserializer's `TypeError`, which quotes the value, is never recorded.
+
+Every such message is fixed words plus the observed status and body note: never the value, the body, or a `TypeError`.
+
+The read is then recorded like any other failure:
+
+- The access probe marks the surface `not_readable` with `error_code: "IncompleteResponse"` and `http_status: 200`.
+- Dependent findings render `manual` or cap at `warn` with the count `null`.
+- No status code, error code, or configuration fact that the response did not carry appears in the output.
+
+#### Credential provider errors
+
+Credential provider errors name the provider and the SDK error only.
+
+The SDK parses the shared `config` and `credentials` files, SSO token caches, and `credential_process` output while it resolves credentials. A provider's message can quote that text.
+
+The client wraps its provider (`fromIni` for a named profile, `fromNodeProviderChain` otherwise) so every failure surfaces as `AwsCredentialProviderError`. Its message is `credentials could not be resolved by fromIni (profile <name>) (<SDK error name>)`, followed by the paths of the shared credentials and config files to check (`AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE`, or their `~/.aws` defaults).
+
+The SDK error name is validated against `^[A-Za-z]+(Error|Exception)$`, and a filesystem code against `^E[A-Z]+$`. So no free text from the provider rides along.
+
+A credentials path that is a directory (`EISDIR`) or a file the process cannot read (`EACCES`) surfaces the same way. The installed SDK swallows the filesystem error and reports `CredentialsProviderError`. No filesystem wording and no path other than the two documented files is recorded.
+
+Shapes whose SDK message quotes the file's text (an unsupported `credential_source`, a `source_profile` naming a missing profile, the keys of an incomplete SSO profile) lose that text at the wrapper.
+
+None of the tools reads a configuration file itself. Every setting comes from tool arguments and environment variables.
+
+#### Unreadable datasets
+
+An unreadable dataset renders `null`, never `0`, `[]`, `{}`, or `false`.
+
+- Every count, list, `*_truncated`, `*_configured`, `*_enabled`, and `*_visible` leaf in a summary or finding evidence that derives from a read which failed (denied, throttled, unavailable, or timed out) is `null`.
+- An object that could not be read (`password_policy`, `organization`) is `null` rather than `{}`.
+- The account-level S3 `account_flags` is a not-collected marker `{ collected: false, command, error_code, http_status, error }`.
+- `regions_total` is `null` when `DescribeRegions` failed and the scope fell back to the configured region.
+
+A count is `0` and a list `[]` only when the read completed and came back empty.
+
+When every per-item read under a readable list failed (trail status, event selectors, detector detail, SCP targets, analyzer findings, key metadata, access key lists), the derived count is `null` as well.
 
 ## Tools
 
@@ -81,13 +348,49 @@ All tools accept `region`, `profile`, and `account_id`.
 
 ### `aws_check_access`
 
-Calls `sts:GetCallerIdentity`, then probes 15 read surfaces with a minimal request each: IAM summary, IAM users, CloudTrail trails, Security Hub standards, Config recorders, GuardDuty detectors, Access Analyzer analyzers, Organizations, Identity Center instances, EC2 regions, S3 buckets, KMS keys and RDS instances in the configured region, Audit Manager assessments, and the account security contact. Returns `healthy` only when every surface is readable and `limited` otherwise, naming the services to grant. A missing security contact is readable evidence (count 0), not a denial.
+Calls `sts:GetCallerIdentity`, then probes 15 read surfaces with a minimal request each:
 
-Every probe records the `command` it issued (`iam:ListUsers`) and the `region` it was sent to. A readable paged probe carries its `count` and `truncated: false`, or `truncated: true` beside a floor count when it stopped at its page cap (single-object and unpaged probes carry `truncated: null`); a failed probe is `{ status: "not_readable", count: null, truncated: null, command, region, error_code, http_status, error }`, where `error_code` is the validated SDK error name (`AccessDeniedException`, `ThrottlingException`, `TimeoutError`, `IncompleteResponse` for a 2xx whose body was not a service response, `UnknownError` when the served code is not code-shaped), `http_status` is the observed status or `null` when no response arrived, and `error` is the scrubbed message. A 200 HTML or empty answer on any probe, including the identity read, is `not_readable`, never a healthy surface with a zero count. Only the identity read fails the tool outright; its error is scrubbed the same way.
+- IAM summary
+- IAM users
+- CloudTrail trails
+- Security Hub standards
+- Config recorders
+- GuardDuty detectors
+- Access Analyzer analyzers
+- Organizations
+- Identity Center instances
+- EC2 regions
+- S3 buckets
+- KMS keys in the configured region
+- RDS instances in the configured region
+- Audit Manager assessments
+- The account security contact
+
+Returns `healthy` only when every surface is readable, and `limited` otherwise, naming the services to grant. A missing security contact is readable evidence (count 0), not a denial.
+
+Every probe records the `command` it issued (`iam:ListUsers`) and the `region` it was sent to. Other probe fields:
+
+- **Readable paged probe:** Carries its `count` and `truncated: false`. When it stopped at its page cap, it carries `truncated: true` beside a floor count.
+- **Single-object and unpaged probes:** Carry `truncated: null`.
+- **Failed probe:** `{ status: "not_readable", count: null, truncated: null, command, region, error_code, http_status, error }`, where:
+  - `error_code` is the validated SDK error name (`AccessDeniedException`, `ThrottlingException`, `TimeoutError`, `IncompleteResponse` for a 2xx whose body was not a service response, `UnknownError` when the served code is not code-shaped).
+  - `http_status` is the observed status, or `null` when no response arrived.
+  - `error` is the scrubbed message.
+
+A 200 HTML or empty answer on any probe, including the identity read, is `not_readable`. It is never a healthy surface with a zero count.
+
+Only the identity read fails the tool outright. Its error is scrubbed the same way.
 
 ### `aws_assess_identity`
 
-Controls 1, 2, 3, 4, 5, 17, and 18. Extra arguments: `user_limit` (500), `stale_days` (90), `role_limit` (500), `max_privileged_roles` (5), `lookback_days` (90, the CloudTrail `LookupEvents` retention), `policy_limit` (1000).
+Controls 1, 2, 3, 4, 5, 17, and 18. Extra arguments:
+
+- `user_limit` (500)
+- `stale_days` (90)
+- `role_limit` (500)
+- `max_privileged_roles` (5)
+- `lookback_days` (90, the CloudTrail `LookupEvents` retention)
+- `policy_limit` (1000)
 
 ### `aws_assess_logging_detection`
 
@@ -99,15 +402,28 @@ Controls 15, 16, 23, 24, and 25. Extra argument: `max_findings` (200 Access Anal
 
 ### `aws_assess_data_protection`
 
-Controls 11, 12, 13, and 22. Extra arguments: `regions`, `region_limit` (30), `bucket_limit` (1000), `key_limit` (1000 per region), `instance_limit` (500 per region).
+Controls 11, 12, 13, and 22. Extra arguments:
+
+- `regions`
+- `region_limit` (30)
+- `bucket_limit` (1000)
+- `key_limit` (1000 per region)
+- `instance_limit` (500 per region)
 
 ### `aws_assess_network_security`
 
-Controls 14, 20, and 21. Extra arguments: `regions`, `region_limit` (30), `resource_limit` (2000 VPCs, flow logs, NACLs, or security groups per region), `sensitive_ports` (default `21,22,23,445,1433,1521,3306,3389,5432,5900,6379,9200,27017`).
+Controls 14, 20, and 21. Extra arguments:
+
+- `regions`
+- `region_limit` (30)
+- `resource_limit` (2000 VPCs, flow logs, NACLs, or security groups per region)
+- `sensitive_ports` (default `21,22,23,445,1433,1521,3306,3389,5432,5900,6379,9200,27017`)
 
 ### `aws_export_audit_bundle`
 
-Runs the access check plus all five assessments and writes an evidence bundle under `output_dir` (default `./export/aws`). Accepts every assessment argument listed above. The bundle directory is named `<account-id>-<region>-audit` (suffixed with `-2`, `-3`, and so on if it already exists) and contains:
+Runs the access check plus all five assessments and writes an evidence bundle under `output_dir` (default `./export/aws`). Accepts every assessment argument listed above.
+
+The bundle directory is named `<account-id>-<region>-audit`. If that directory already exists, the name is suffixed with `-2`, `-3`, and so on. The directory contains:
 
 ```text
 README.md
@@ -123,33 +439,81 @@ compliance/unified_compliance_matrix.md
 compliance/frameworks/{fedramp,cmmc,soc2,cis,pci-dss,disa-stig,irap,ismap}.md
 ```
 
-A zip archive named after the allocated directory (`<account-id>-<region>-audit.zip`, `<account-id>-<region>-audit-2.zip`, and so on) is written next to it, so a rerun never overwrites a prior bundle or its zip. Output paths are resolved with traversal and symlink-parent protection, so `output_dir` values that escape the output root are rejected.
+A zip archive named after the allocated directory is written next to it (`<account-id>-<region>-audit.zip`, `<account-id>-<region>-audit-2.zip`, and so on). A rerun therefore never overwrites a prior bundle or its zip.
+
+Output paths are resolved with traversal and symlink-parent protection, so `output_dir` values that escape the output root are rejected.
 
 ## Findings
 
 Every finding has the shape `{ id, title, severity, status, summary, evidence, mappings[] }`.
 
-- `id` is `AWS-<AREA>-<NN>`. Findings added for controls 4, 11, 12, 13, 14, 18, 20, 21, 22, 24, and 25 carry the spec control number (`AWS-DATA-11`, `AWS-NET-21`); the original identity, logging, and organization findings keep their sequence numbers and map to controls through the coverage table below.
-- `severity` is `critical`, `high`, `medium`, `low`, or `info` and is fixed per finding (except `AWS-ORG-04`, which is `high` when active external-access findings exist and `low` otherwise).
-- `status` is `pass`, `warn`, `fail`, or `manual`. A finding is `manual` when the control cannot be verified through the API, either because the surface was denied or errored or because the inventory is empty in a way that leaves nothing to evaluate; its summary states exactly what evidence a human must collect.
-- `mappings` lists framework references prefixed with the framework label, for example `FedRAMP AC-3` or `CIS AWS 2.1.4`. Findings added for controls 4, 11, 12, 13, 14, 18, 20, 21, 22, 24, and 25 carry the complete row from the spec's compliance table across all eight frameworks; the original identity, logging, and organization findings carry a curated FedRAMP, CMMC, SOC 2, CIS, or PCI-DSS subset. The unified matrix and per-framework reports are built from these mappings.
+- `id` is `AWS-<AREA>-<NN>`.
+  - Findings added for controls 4, 11, 12, 13, 14, 18, 20, 21, 22, 24, and 25 carry the spec control number (`AWS-DATA-11`, `AWS-NET-21`).
+  - The original identity, logging, and organization findings keep their sequence numbers. They map to controls through the coverage table below.
+- `severity` is `critical`, `high`, `medium`, `low`, or `info`. It is fixed per finding, except `AWS-ORG-04`, which is `high` when active external-access findings exist and `low` otherwise.
+- `status` is `pass`, `warn`, `fail`, or `manual`.
+  - A finding is `manual` when the control cannot be verified through the API. That happens either because the surface was denied or errored, or because the inventory is empty in a way that leaves nothing to evaluate.
+  - The summary of a `manual` finding states exactly what evidence a human must collect.
+- `mappings` lists framework references prefixed with the framework label, for example `FedRAMP AC-3` or `CIS AWS 2.1.4`.
+  - Findings added for controls 4, 11, 12, 13, 14, 18, 20, 21, 22, 24, and 25 carry the complete row from the spec's compliance table across all eight frameworks.
+  - The original identity, logging, and organization findings carry a curated FedRAMP, CMMC, SOC 2, CIS, or PCI-DSS subset.
+  - The unified matrix and per-framework reports are built from these mappings.
 
 ### Verdict safety rules
 
 Every finding follows the same rules so that a `pass` always rests on data that was actually read:
 
-1. A denied (`AccessDenied`, `UnauthorizedOperation`, 403) or errored surface never yields `pass`. Findings whose only input is denied render `manual` naming the operation; findings with several inputs cap at `warn` and list the unreadable part. This holds for every secondary read as well: when a finding walks a primary list and then reads each item (trail status, event selectors, detector detail, SCP targets, Access Analyzer findings, member accounts, enabled standards), a denied item is named in the summary and evidence and caps a would-be `pass` at `warn`; when every item read fails, or the primary list itself is denied, the finding is `manual`. A denial is never reported as a configuration fact such as "no recorder" or "unattached".
-2. An empty inventory never yields `pass` by default. Each finding states its intent: empty Audit Manager assessments (24) and a missing security contact (25) are `fail`; empty buckets (13), VPCs (14), NACLs (20), security groups (21), customer-managed keys (22), and customer-managed policies (18) are `manual` with the reason and the not-applicable path spelled out.
+1. A denied (`AccessDenied`, `UnauthorizedOperation`, 403) or errored surface never yields `pass`.
+    - Findings whose only input is denied render `manual` naming the operation.
+    - Findings with several inputs cap at `warn` and list the unreadable part.
+    - The rule holds for every secondary read as well:
+      - When a finding walks a primary list and then reads each item (trail status, event selectors, detector detail, SCP targets, Access Analyzer findings, member accounts, enabled standards), a denied item is named in the summary and evidence. The denied item caps a would-be `pass` at `warn`.
+      - When every item read fails, or the primary list itself is denied, the finding is `manual`.
+    - A denial is never reported as a configuration fact such as "no recorder" or "unattached".
+2. An empty inventory never yields `pass` by default. Each finding states its intent:
+    - Empty Audit Manager assessments (24) and a missing security contact (25) are `fail`.
+    - Empty buckets (13), VPCs (14), NACLs (20), security groups (21), customer-managed keys (22), and customer-managed policies (18) are `manual`, with the reason and the not-applicable path spelled out.
 3. A service that is not set up (Audit Manager without assessments, Security Hub without a hub, Organizations on a standalone account) renders `manual` or `fail` naming the service, never `pass`.
 4. Items missing a date (root events without `EventTime`, assessments without `creationTime` or `lastUpdated`) never count as fresh and cap the verdict at `warn`.
-5. A partial view (region scope truncated or fallen back to one region, per-bucket or per-key reads denied, one region's list unreadable) flags seen versus total in the evidence and caps the verdict at `warn`. The cap names the operation and region that could not be read (`rds:DescribeDBInstances unreadable in 1 region(s) (us-east-1)`); when the scope fell back to the configured region because `DescribeRegions` failed, the cap says so and quotes that failure rather than reporting "1 of 1 regions".
-6. Every flag the verdict depends on is read explicitly from the documented response field: `BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`, `IsPublic`, `EbsEncryptionByDefault`, `StorageEncrypted`, `SSEAlgorithm`, `KeyManager`, `KeyState`, `KeySpec`, `Origin`, `KeyRotationEnabled`, `FlowLogStatus`, `IpProtocol`, `FromPort`, `ToPort`, `IpRanges[].CidrIp`, `Ipv6Ranges[].CidrIpv6`, `Protocol`, `RuleAction`, `Egress`, `CidrBlock`, `Ipv6CidrBlock`, `PortRange.From`, `PortRange.To`. A missing flag is "unknown", never "compliant".
-7. Pagination runs to completion or records truncation: when an inventory hits its `*_limit`, stalls on a repeated token, or exhausts the page budget, the finding evidence carries `*_truncated: true`, the assessment records it in `errors`, and a would-be `pass` becomes `warn`. This covers the IAM user and role inventories (`AWS-IAM-02`, `04`, `05`, `06`), Security Hub standards, GuardDuty detectors, Organizations accounts, SCPs and their targets, analyzers, and per-analyzer findings as well as the regional inventories.
+5. A partial view (region scope truncated or fallen back to one region, per-bucket or per-key reads denied, one region's list unreadable) flags seen versus total in the evidence and caps the verdict at `warn`.
+    - The cap names the operation and region that could not be read (`rds:DescribeDBInstances unreadable in 1 region(s) (us-east-1)`).
+    - When the scope fell back to the configured region because `DescribeRegions` failed, the cap says so. It quotes that failure rather than reporting "1 of 1 regions".
+6. Every flag the verdict depends on is read explicitly from the documented response field. A missing flag is "unknown", never "compliant".
+    - Fields read: `BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`, `IsPublic`, `EbsEncryptionByDefault`, `StorageEncrypted`, `SSEAlgorithm`, `KeyManager`, `KeyState`, `KeySpec`, `Origin`, `KeyRotationEnabled`, `FlowLogStatus`, `IpProtocol`, `FromPort`, `ToPort`, `IpRanges[].CidrIp`, `Ipv6Ranges[].CidrIpv6`, `Protocol`, `RuleAction`, `Egress`, `CidrBlock`, `Ipv6CidrBlock`, `PortRange.From`, `PortRange.To`
+7. Pagination runs to completion or records truncation.
+    - When an inventory hits its `*_limit`, stalls on a repeated token, or exhausts the page budget, the finding evidence carries `*_truncated: true`.
+    - The assessment records the truncation in `errors`, and a would-be `pass` becomes `warn`.
+    - The rule covers the IAM user and role inventories (`AWS-IAM-02`, `04`, `05`, `06`), Security Hub standards, GuardDuty detectors, Organizations accounts, SCPs and their targets, analyzers, and per-analyzer findings, as well as the regional inventories.
 8. Export reruns never overwrite a prior bundle or zip.
-9. The bundle never carries credential-bearing values: access key ids are masked, the security contact's name, title, email, and phone are reduced to presence flags and the email domain, and policy documents are summarized as flags. Error lines quote the AWS error code, the HTTP status, and the scrubbed message only; a non-JSON error body is replaced by its content type and byte length (see Client behavior).
-10. An unread dataset is rendered as unknown, not as empty: counts, lists, and flags that depend on a failed read are `null`, the account-level S3 flags become a not-collected marker, and a named principal or resource is never listed as a violator on the strength of a read that failed (a key whose last use could not be read is not stale, a bucket is not uncovered while the account block is unread, an SCP is not unattached while its target list is unread). The same rendering applies whether the read was denied, throttled, unavailable, or timed out.
-11. A count judged over a partially readable set is rendered beside the number judged and is `null` when nothing was judged: `stale_access_keys` sits beside `keys_judged`, `users_without_mfa` beside `users_mfa_judged`, and each is `null` rather than `0` when every last-use or MFA read failed, so "0 stale" never stands next to an unreadable remainder as if every item had been examined. Summary clauses are worded from what was read (`RDS instances could not be listed in any of 1 region(s) (...)`, `no RDS instances exist in the 1 readable region(s)`), never `all 0 RDS instances`.
-12. A 2xx answer that is not a service response (an HTML page, an empty body, an output without the command's required member, or that member present in another shape: a string where a list or boolean is documented, an empty structure where the S3 payload operations bind a foreign document or an interstitial without a content type, a `GetBucketPolicy` body that is not a policy document, bare text inside an XML container the deserializer reads as empty) is an unreadable surface with code `IncompleteResponse` and a fixed-text message, so a proxy interstitial or a malformed body can never render a `fail` such as `Root MFA enabled=false`, `EBS default encryption disabled`, `lack default server-side encryption`, or `NoSuchEntity`, a vacuous `pass`, a zero inventory, or a `TypeError`. Every finding that depends on the surface renders `manual` or caps at `warn` with the count `null`, and its access probe keeps `http_status: 200` (see Client behavior).
+9. The bundle never carries credential-bearing values.
+    - Access key ids are masked.
+    - The security contact's name, title, email, and phone are reduced to presence flags and the email domain.
+    - Policy documents are summarized as flags.
+    - Error lines quote the AWS error code, the HTTP status, and the scrubbed message only.
+    - A non-JSON error body is replaced by its content type and byte length (see Client behavior).
+10. An unread dataset is rendered as unknown, not as empty. The same rendering applies whether the read was denied, throttled, unavailable, or timed out.
+    - Counts, lists, and flags that depend on a failed read are `null`.
+    - The account-level S3 flags become a not-collected marker.
+    - A named principal or resource is never listed as a violator on the strength of a read that failed:
+      - A key whose last use could not be read is not stale.
+      - A bucket is not uncovered while the account block is unread.
+      - An SCP is not unattached while its target list is unread.
+11. A count judged over a partially readable set is rendered beside the number judged, and is `null` when nothing was judged.
+    - `stale_access_keys` sits beside `keys_judged`, and `users_without_mfa` beside `users_mfa_judged`.
+    - Each is `null` rather than `0` when every last-use or MFA read failed, so "0 stale" never stands next to an unreadable remainder as if every item had been examined.
+    - Summary clauses are worded from what was read (`RDS instances could not be listed in any of 1 region(s) (...)`, `no RDS instances exist in the 1 readable region(s)`), never `all 0 RDS instances`.
+12. A 2xx answer that is not a service response is an unreadable surface with code `IncompleteResponse` and a fixed-text message.
+    - Such an answer is an HTML page, an empty body, an output without the command's required member, or that member present in another shape:
+      - A string where a list or boolean is documented.
+      - An empty structure where the S3 payload operations bind a foreign document or an interstitial without a content type.
+      - A `GetBucketPolicy` body that is not a policy document.
+      - Bare text inside an XML container the deserializer reads as empty.
+    - A proxy interstitial or a malformed body can therefore never render:
+      - A `fail` such as `Root MFA enabled=false`, `EBS default encryption disabled`, `lack default server-side encryption`, or `NoSuchEntity`.
+      - A vacuous `pass`.
+      - A zero inventory.
+      - A `TypeError`.
+    - Every finding that depends on the surface renders `manual` or caps at `warn` with the count `null`, and its access probe keeps `http_status: 200` (see Client behavior).
 
 When a `pass` is downgraded under these rules, the summary ends with `Downgraded to warn: ...`.
 
@@ -183,7 +547,7 @@ When a `pass` is downgraded under these rules, the summary ends with `Downgraded
 | 24 | Audit Manager Evidence | `aws_assess_org_guardrails` | `AWS-ORG-06` | `manual` when `ListAssessments` is denied or Audit Manager is not set up in the region; `fail` when no assessment has `status=ACTIVE`; otherwise `pass`. Assessments without `creationTime` and `lastUpdated`, and a truncated list, cap at `warn`. |
 | 25 | Account Contacts | `aws_assess_org_guardrails` | `AWS-ORG-07` | `manual` when `GetAlternateContact` is denied; `fail` when it returns `ResourceNotFoundException` (no `SECURITY` contact); `warn` when the contact lacks `EmailAddress` or `PhoneNumber`; otherwise `pass`. Billing and operations contacts are not assessed. |
 
-Every control becomes `manual` when its only surface is unreadable, and the finding summary names the console page or CLI call to capture.
+Every control becomes `manual` when its only surface is unreadable. The finding summary then names the console page or CLI call to capture.
 
 ## API operations and response fields
 
@@ -239,7 +603,7 @@ Every operation and field the tools read is listed here with its official refere
 
 ## Framework mappings
 
-Each finding carries the references below (from the spec's compliance mapping table), and the bundle writes one report per framework under `compliance/frameworks/`.
+Each finding carries the references below, from the spec's compliance mapping table. The bundle writes one report per framework under `compliance/frameworks/`.
 
 | Framework | Report file | Example references |
 |---|---|---|
@@ -261,19 +625,56 @@ export AWS_SMOKE_REGIONS="us-east-1,us-west-2"   # optional: pin the multi-regio
 npm --prefix cli run test:aws:live
 ```
 
-The script prints a skip message and exits 0 when no credential hints are present (`AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_ROLE_ARN`, web identity or container credential variables, or `~/.aws/credentials` and `~/.aws/config`). Otherwise it runs `aws_check_access` and all five assessments against the real account, prints every surface and finding, reports spec control coverage, and fails if any `manual` finding lacks a summary that says what to collect.
+The script prints a skip message and exits 0 when no credential hints are present. The hints are:
+
+- `AWS_PROFILE`
+- `AWS_ACCESS_KEY_ID`
+- `AWS_ROLE_ARN`
+- Web identity or container credential variables
+- `~/.aws/credentials` and `~/.aws/config`
+
+Otherwise it:
+
+1. Runs `aws_check_access` and all five assessments against the real account.
+2. Prints every surface and finding.
+3. Reports spec control coverage.
+4. Fails if any `manual` finding lacks a summary that says what to collect.
 
 ## Limitations and manual controls
 
 - Control 7 checks log-file validation on the trail but not the public-access state of the trail's S3 bucket. Run `aws_assess_data_protection` to see whether account-level Block Public Access covers every bucket, and capture the trail bucket's policy manually.
-- Control 9 checks detector `Status` only; GuardDuty protection plans (S3, EKS, Malware Protection) from `GetDetector.Features` are not yet evaluated.
-- Control 12 does not assess EFS. Control 13 assesses S3 bucket policies only; load balancer and API Gateway TLS policies are not read.
-- Control 18 evaluates customer-managed policies only; inline user, group, and role policies are outside this check (privileged role inline policies are read separately for control 17).
-- Control 23 reports Identity Center instance visibility; permission sets, account assignments, and Identity Center MFA settings are not evaluated.
-- Root sign-in events are global CloudTrail events recorded in `us-east-1`, so `aws_assess_identity` issues the root `LookupEvents` call against `us-east-1` whatever `region` is configured and records the region used in the finding evidence. Grant `cloudtrail:LookupEvents` there; otherwise the finding caps at `warn`. `LookupEvents` keeps 90 days of history.
-- `aws_assess_logging_detection` and `aws_assess_org_guardrails` inspect the configured region only. Security Hub, GuardDuty, and Config are regional; assess each in-scope region separately.
-- Cross-account fan-out through `AssumeRole` (`AWS_ROLE_ARN`, `AWS_EXTERNAL_ID`) is not implemented; run the tools once per account with a profile that assumes the audit role.
-- User, role, policy, bucket, key, instance, VPC, NACL, and security group collection stop at their `*_limit` arguments, and Access Analyzer finding collection stops at `max_findings`; root CloudTrail event lookups stop at 500, Organizations accounts and SCP targets at 1000, analyzers and Identity Center instances at 100, Security Hub standards at 100, active Audit Manager assessments at 200, and GuardDuty detectors at 50, with no argument to raise these fixed caps. When a limit is hit (or a list stalls on a repeated token) the finding says so, the assessment records it in `errors`, and a would-be `pass` becomes `warn`. For very large accounts, raise the matching `*_limit` or `max_findings` argument; a fixed cap can only be raised by changing the code, so review the remaining items manually in the AWS console or CLI.
+- Control 9 checks detector `Status` only. GuardDuty protection plans (S3, EKS, Malware Protection) from `GetDetector.Features` are not yet evaluated.
+- Control 12 does not assess EFS.
+- Control 13 assesses S3 bucket policies only. Load balancer and API Gateway TLS policies are not read.
+- Control 18 evaluates customer-managed policies only. Inline user, group, and role policies are outside this check. Privileged role inline policies are read separately for control 17.
+- Control 23 reports Identity Center instance visibility. Permission sets, account assignments, and Identity Center MFA settings are not evaluated.
+- Root sign-in events are global CloudTrail events recorded in `us-east-1`, so `aws_assess_identity` issues the root `LookupEvents` call against `us-east-1` whatever `region` is configured.
+  - The finding evidence records the region used.
+  - Grant `cloudtrail:LookupEvents` in `us-east-1`. Otherwise the finding caps at `warn`.
+  - `LookupEvents` keeps 90 days of history.
+- `aws_assess_logging_detection` and `aws_assess_org_guardrails` inspect the configured region only. Security Hub, GuardDuty, and Config are regional. Assess each in-scope region separately.
+- Cross-account fan-out through `AssumeRole` (`AWS_ROLE_ARN`, `AWS_EXTERNAL_ID`) is not implemented. Run the tools once per account with a profile that assumes the audit role.
+
+### Collection limits
+
+User, role, policy, bucket, key, instance, VPC, NACL, and security group collection stop at their `*_limit` arguments. Access Analyzer finding collection stops at `max_findings`.
+
+These collections stop at fixed caps, with no argument to raise them:
+
+- Root CloudTrail event lookups: 500
+- Organizations accounts and SCP targets: 1000
+- Analyzers and Identity Center instances: 100
+- Security Hub standards: 100
+- Active Audit Manager assessments: 200
+- GuardDuty detectors: 50
+
+When a limit is hit (or a list stalls on a repeated token):
+
+- The finding says so.
+- The assessment records it in `errors`.
+- A would-be `pass` becomes `warn`.
+
+For very large accounts, raise the matching `*_limit` or `max_findings` argument. A fixed cap can only be raised by changing the code, so review the remaining items manually in the AWS console or CLI.
 
 ## Official documentation
 

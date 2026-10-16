@@ -21,7 +21,7 @@ Inside a grclanker session, put the scope after the command:
 
 From the shell, `grclanker audit "<scope>"` opens a session that starts with the same prompt and the scope filled in. Run `grclanker audit` on its own to describe the scope in your first message instead.
 
-In the older `v0.0.1` release bundle, text after `/audit` and arguments after `grclanker audit` are dropped, so upgrade to `v0.1.1` or send the scope in its own message there.
+In the older `v0.0.1` release bundle, text after `/audit` and arguments after `grclanker audit` are dropped. Upgrade to `v0.1.1`, or send the scope in its own message there.
 
 ## What the prompt does
 
@@ -29,7 +29,9 @@ In the older `v0.0.1` release bundle, text after `/audit` and arguments after `g
 2. Evidence collection:
    - CMVP and KEV/EPSS lookups, plus the FedRAMP source, readiness, and ADS tools when FedRAMP is in scope.
    - For the platform in scope, the integration's `*_check_access` tool, then its `*_assess_*` tools or `*_export_audit_bundle`.
-   - Two integrations differ. For operator-side Google Workspace investigation or raw evidence collection with the `gws` CLI installed, the prompt uses `gws_ops_check_cli`, then `gws_ops_investigate_alerts`, `gws_ops_trace_admin_activity`, or `gws_ops_review_tokens`, or `gws_ops_collect_evidence_bundle` for a separate operator evidence bundle. Vanta has no assessment tools: a Vanta audit starts with `vanta_check_access`, then uses `vanta_list_audits` and `vanta_export_audit` to pull an offline evidence package.
+   - Two integrations differ:
+     - For operator-side Google Workspace investigation or raw evidence collection with the `gws` CLI installed, the prompt starts with `gws_ops_check_cli`. It then uses `gws_ops_investigate_alerts`, `gws_ops_trace_admin_activity`, or `gws_ops_review_tokens`, or `gws_ops_collect_evidence_bundle` for a separate operator evidence bundle.
+     - Vanta has no assessment tools. A Vanta audit starts with `vanta_check_access`, then uses `vanta_list_audits` and `vanta_export_audit` to pull an offline evidence package.
    - The `scf_*` tools for control language and crosswalks, and the `oscal_*` tools when the deliverable must become OSCAL.
 3. Control mapping: at minimum SC-13, SC-12, SI-2, and RA-5, each with one of the four classifications above.
 4. Prioritization by exploitability, compliance impact, operational blast radius, and remediation effort, using EPSS and KEV status where vulnerability data exists.
@@ -43,4 +45,4 @@ The prompt asks for:
 - critical gaps, highest risk first
 - a remediation plan with concrete next actions and rough effort
 
-When evidence is missing, it should say exactly what is missing and which artifact would close the gap, and mark unknowns as unknowns rather than inferring compliance.
+When evidence is missing, it should say exactly what is missing and which artifact would close the gap. It should mark unknowns as unknowns rather than inferring compliance.

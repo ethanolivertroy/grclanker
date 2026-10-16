@@ -3,43 +3,201 @@ title: "Tenable"
 description: "Read-only Tenable Vulnerability Management and Tenable Security Center inspector covering scan programs, sensors, access control, and vulnerability management."
 ---
 
-The Tenable inspector audits a Tenable Vulnerability Management tenant (cloud.tenable.com or the FedRAMP cloud fedcloud.tenable.com) and, optionally, a Tenable Security Center deployment. It is read-only: the only POST calls are the documented asset and vulnerability export requests, and no scan, user, policy, or exclusion is ever modified.
+The Tenable inspector audits a Tenable Vulnerability Management tenant (cloud.tenable.com or the FedRAMP cloud fedcloud.tenable.com) and, optionally, a Tenable Security Center deployment.
+
+The inspector is read-only. The only POST calls are the documented asset and vulnerability export requests. No scan, user, policy, or exclusion is ever modified.
 
 ## What it inspects
 
-- Scan program: scan templates in use, recurring schedule discipline, credentialed scan ratio, scan exclusions, compliance audit templates, and legacy target groups.
-- Sensors and assets: asset discovery coverage, Nessus Agent deployment and grouping, linked scanner health, plugin currency, network objects, and asset tagging.
-- Access control: user roles and role counts, MFA and SAML enforcement, API key usage, permissions and legacy access groups, managed credential hygiene, and the activity log.
-- Vulnerability management: VPR prioritization coverage, severity SLA backlog and mean time to remediate, and export automation evidence, all driven by the bulk vulnerability and asset exports.
-- Tenable Security Center equivalents for scan schedules, scanner health and plugin feeds, and user hygiene, when a Security Center URL is configured.
+- **Scan program:** scan templates in use, recurring schedule discipline, credentialed scan ratio, scan exclusions, compliance audit templates, and legacy target groups.
+- **Sensors and assets:** asset discovery coverage, Nessus Agent deployment and grouping, linked scanner health, plugin currency, network objects, and asset tagging.
+- **Access control:** user roles and role counts, MFA and SAML enforcement, API key usage, permissions and legacy access groups, managed credential hygiene, and the activity log.
+- **Vulnerability management:** VPR prioritization coverage, severity SLA backlog and mean time to remediate, and export automation evidence, all driven by the bulk vulnerability and asset exports.
+- **Tenable Security Center:** equivalents for scan schedules, scanner health and plugin feeds, and user hygiene, when a Security Center URL is configured.
 
 ## Setup and authentication
 
 ### Tenable Vulnerability Management
 
-1. Sign in to Tenable Vulnerability Management as a user with the Administrator [64] role. Lower roles work but produce partial views: Scan Manager keys only see their own or shared scans, and any key below Administrator receives a reduced `GET /users` payload, so the inspector caps verdicts at warn and says so in the summary.
+1. Sign in to Tenable Vulnerability Management as a user with the Administrator [64] role. Lower roles work but produce partial views:
+   - Scan Manager keys only see their own or shared scans.
+   - Any key below Administrator receives a reduced `GET /users` payload, so the inspector caps verdicts at warn and says so in the summary.
 2. Generate an API key pair from Settings > My Account > API Keys.
-3. Export the keys: set `TENABLE_ACCESS_KEY` and `TENABLE_SECRET_KEY` in the environment from your secrets manager (their values are never shown here), and optionally the platform URL:
+3. Export the keys. Set `TENABLE_ACCESS_KEY` and `TENABLE_SECRET_KEY` in the environment from your secrets manager. Their values are never shown here. Optionally, set the platform URL:
 
-```bash
-export TENABLE_URL="https://cloud.tenable.com"      # default; use https://fedcloud.tenable.com for FedRAMP
-```
+   ```bash
+   export TENABLE_URL="https://cloud.tenable.com"      # default; use https://fedcloud.tenable.com for FedRAMP
+   ```
 
-Requests carry the documented `X-ApiKeys` header, whose two named parts (`accessKey` and `secretKey`) hold the access key and the secret key. Keys are never written to disk. A configured URL (`TENABLE_URL`, `TENABLE_SC_URL`) is reduced at configuration to its scheme, host, port, and path prefix: a user-and-secret prefix, query, or fragment is dropped before the first request, so it never leaves in a request URL, and everywhere a configured URL is written (the access check's `platform` label, `metadata.json`, and the executive summary's `Platform:` line) it is written as scheme and host only; the test suite configures both platforms with a user-and-secret prefix and requires every request, tool result, bundle file, and zip entry free of it. Every error string passes through one redacting sink before it reaches a finding, a tool result, or a bundle file, and a non-JSON error body (an HTML 502 page, a WAF block, an SSO interstitial) is never echoed; the message records only the status and the body length, for example `403; non-JSON text/html response body (1204 bytes, not echoed)`. JSON error bodies contribute their documented `error`, `error.message`, `message`, or `error_msg` fields only, scrubbed before they are shortened so a cut can never leave the head of a secret behind.
+#### API key header and configured URLs
 
-A 2xx answer that is not the documented JSON document is an unreadable surface, never an empty inventory (the silent-success class). A Vulnerability Management or Security Center 200 with an empty body, the HTML page a proxy or SSO portal serves in place of the API, a foreign JSON value, or a JSON object without the documented member (`scans`, `users`, `scanners`, `response`, and so on) is described by status, media type, and size only, for example `200 OK with a JSON response body without the documented "scans" array (2 bytes, not echoed)`, and recorded with the observed status as a surface that was not read: the access probe is not readable, the dataset carries the not-collected marker, and the findings that depend on it render manual or capped, never pass on a missing list. A documented list is recognised by its records as well as its shape: an array none of whose records carries a member that identifies a Tenable asset (`id`, `uuid`, `has_agent`, `last_seen`, `network_id`, `tags`), finding (`state`, `severity`, `plugin`, `asset`, `first_found`, `last_found`), or role (`uuid`, `id`, `name`, `type`, `privileges`) is a foreign list, described as `200 OK with a JSON array of 2 records none of which carries any of the documented members "id", "uuid", ... (194 bytes, not echoed)`; on an export chunk it is a failed download, so an export whose only chunk was foreign is unreadable and one that lost a chunk among several is partial. A record carrying none of those members inside an otherwise documented chunk is unevaluable: it is kept out of the export's records and counted, the count is written as `unevaluable_records` in the collection status, the dependent evidence, and `_errors.log`, and TENABLE-03, 04, 14, 15, and 16 are capped at `warn` with the count and the member list in their summaries, never passed on records the verdict could not read.
+Requests carry the documented `X-ApiKeys` header. Its two named parts (`accessKey` and `secretKey`) hold the access key and the secret key. Keys are never written to disk.
 
-The scrub draws one boundary. A value inside a carrier is replaced with `[REDACTED]` whatever its shape: `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Cookie`, `X-ApiKeys`, `x-apikey`, `X-SecurityCenter`, and similar header lines, each by its class: an `Authorization` or `Proxy-Authorization` value keeps its scheme word as spelled (`Bearer`, `Basic`, `Digest`, and the other schemes listed below, in any casing) and loses the one token, or the one quoted string, after it, so the operator still reads which scheme was replayed and prose after the token stays, while a parameter list after the scheme (`Digest username=..., realm=...`, `AWS4-HMAC-SHA256 Credential=...`) and a value that opens with anything but a listed scheme word (`GenieKey <token>`, `SharedKey <account>:<signature>`, `Bot <token>`, a bare token) goes whole to the end of the line, since an unknown first word may be a scheme with its credentials after it; a `Cookie`, `Set-Cookie`, or `X-Cookie` line, and an `X-ApiKeys` or `x-apikey` line (`accessKey=...; secretKey=...`), is a list of pairs and goes whole to the end of the line, so cookie attributes such as `Path` and `Expires` go with the cookie and both halves of the key pair go together; every other header (`X-SecurityCenter`, `X-Auth-Token`, and the like) carries one token and loses its first token, so a JSON fragment or prose after it on the same line is still read, or, when its value opens with a listed scheme word (`X-Auth-Token: Bearer <token>`), loses the word and the token after it together under one marker. In every class a quoted value (in double, single, or JSON-escaped quotes) ends at its closing quote and goes with its quotes whatever the name of the cookie or key pair that carries it, even when a `; Name:` sits inside the quotes, and a whole-line value ends at the `;` or `,` before the name of the next header on a compound line (several headers separated by `;` or `,`; a following header name may hold dots), at a line break the stringify left escaped (`\n`, `\r`, `\u000a`), or else at the end of the line, so a quoted value that nothing closes ends as an unquoted one does, the next header keeps its name and gets its own treatment, and a `Content-Type` or `Date` after a cookie keeps its name and value; a single-token header value, the token after a scheme word, an equals-sign pair value, and a `--flag` value end at whitespace or at any control character the stringify left escaped (`\t`, `\b`, `\f`, `\v`, `\0`, `\u0009` and the other `\u00XX` control codes, `\x09`), as they do at the raw character, so a credential pair chained after such an escape (`api_key=<value>\tpassword: <value>`) is read on its own and loses its own value, and a count under a plural credential word ends there too (`keys: 3\tcookies: 0` stays); quotes escaped to any depth (`\"` one level down, `\\\"` two) are read at their own depth, so a header pair, credential pair, quoted attribute, or quoted assignment inside a JSON body that was stringified into a string value loses its value and keeps its escaped quotes; a header name or pair key is read the same right after such an escape (`\nX-SecurityCenter: <value>`, `\tapi_key=<value>`) as at a word boundary; a quote inside a token is content of the value it sits in, in a header value, pair value, quoted attribute, or URL query value alike (RFC 6265 lets a cookie name or value carry an apostrophe, so `sid=O'<value>` and a pair named `my'pref` go with their cookie), and only a quote at the end of a token, or one after `=` with nothing but a delimiter or the end behind it (a base64 value ending in `=`), closes the text the line was quoted in, so the closing quote and the following members of an enclosing JSON string survive; a header line is read before the URL query rule, so a cookie pair whose name holds `&` or `#` goes with its cookie, and a bare query value never takes a backslash, so `?token=<value>\"` keeps the escaped quote and `?api_key=<value>\nstatus 502` keeps the text after the line break, and a `;` inside a query value is part of the value, as `URLSearchParams` reads it, so `?token=<value>;<rest>` loses the whole value with no tail while the `;` that ends a cookie pair belongs to the cookie and key-list header lines alone; cookie and session assignments; the user-and-secret prefix before the host in a URL, bare or with its slashes escaped by a stringify (`https:\/\/user:secret@host`), which ends where the authority does, at the first `/`, `?`, or `#`, so an `@` inside a query or fragment (`https://h?e=a@x.com&token=<value>`, `https://h#f@x.com`) is not such a prefix, the host `h` stays, the query is read pair by pair (`&token=` loses its value), and a `webhook_url` holding that URL reduces to `https://h/[REDACTED]`; the URL query parameters named `token`, `api_key`, `secret`, and `pass`; the path and query of a URL under a `webhook` or `webhook_url` key, whose origin stays; the values after the schemes `Bearer`, `Basic`, `Digest`, `Token`, `OAuth`, `Negotiate`, `NTLM`, `SSWS`, `ApiKey`, `Splunk`, `Snowflake`, and `AWS4-HMAC-SHA256` in any casing, where the scheme word itself stays and only a listed prose word after it (`Basic authentication`), an auth-param name (`Bearer realm=`), or, after the nouns `Token`, `OAuth`, `Splunk`, and `Snowflake`, a short plain lowercase word (`Token expired`) is read as prose and stays, and a parameter list after the scheme word (`Snowflake Token="<value>"`, `Token token="<value>", nonce="..."`, `Digest username="...", nonce="...", response="..."`) goes whole with the word kept, with or without a header name in front of it and at any escape depth, so a 401 body that echoes the header renders `Snowflake [REDACTED]`, while a list made only of challenge parameters (`Bearer realm="api", error="invalid_token"`, the value of a `WWW-Authenticate` header) stays with every value, the `nonce` of `Digest realm="api", qop="auth", nonce="n"` included; a parameter list without a scheme word (`realm="api", nonce="n", response="<proof>"`, the value of a `www_authenticate` field or a credential echoed without its scheme word) is not a challenge when one of its parameters is a proof (`response`, `signature`, `oauth_signature`, `mac`, `sig`): the proof values go whatever their shape and wherever they sit in the list, the challenge parameters beside them keep their values, a list that is a challenge (`realm="api", qop="auth", nonce="n"`) keeps every value, and a lone `nonce="..."` is no list and goes as a credential name; credential-named assignment pairs in their three spellings (equals sign, colon, and quoted JSON member), wherever the key starts (at a word boundary, after `--`, after a Java `-D`, or after a path slash) and as `--key value` flags (whose name may open with a letter or an underscore, so `--_zendesk_session <value>` is one), with `secret_id`, bearer ids such as `token_id`, and `connection_string` among the credential names, while a colon-terminated credential-named key that ends a path segment is a label whose value is at most one token: a singular label (`/etc/app/password: <value> was rejected`, `vault read secret/app/token: <value> has no policy`) takes that token whatever its shape, a random string or a plain word, and whatever follows it, so the text renders `/etc/app/password: [REDACTED] was rejected`, while a plural label names a collection (`GET /credentials: request failed`, `/api/v1/api-tokens: request failed with 403`), so prose continuing after the token means there was no value and the text stays, and a lone token after a plural label is removed; and XML attributes (`password`, `secret`, `token`, `api_key`, `access_key`, `secret_key`, `private_key`, `client_secret`, `registration_code`, `linking_key`, `session_id`, and their camelCase forms). A scheme word that starts the value of a credential-named key other than `Authorization` (`api_key: Bearer <value>`) is part of the value and goes with it. A configured secret (each half of the `X-ApiKeys` and `x-apikey` pairs, four characters or longer) is replaced wherever it appears, whatever its shape, in its base64, base64url, URL-encoded, and JSON-escaped forms too. Real token shapes go even when bare in prose: runs of sixteen or more characters with base64 symbols, scattered digits, or token casing, hex digests, JWTs, AWS access key ids, GitHub, Stripe, and Slack prefixed tokens, and PEM blocks. A bare value shaped like a name (words joined by hyphens or underscores with at most one numeric segment, such as `prod-us-east-2026` or `sc-scanner-01`) standing alone in prose is indistinguishable from a resource name and stays, as do template titles such as `Basic Network Scan`, this integration's own vocabulary (`credential_threshold`, `status_code`, `plugin_set`), and one value under a credential-named key: a count, that is a bare integer (digits alone, or digits followed by a space, as in `api_keys: 2 missing`) under a key whose last word is one of the plural words `tokens`, `secrets`, `keys`, `cookies`, `passwords`, or `credentials`, in the JSON member spelling (`"api_keys": 2`, `"api_keys": "2"`), the colon spelling (`api_keys: 2`), and the equals spelling (`api_keys=2`). A singular key keeps the rule (`pin: 1234` and `password=7` lose their values), and so does any other value under a plural key (`keys: rotate them` loses its value). The module's own fixed text is worded to cross that boundary intact: an `_errors.log` line reads `credentials dataset: <error>`, never `credentials: <error>`, which the pair rule would read as a credential and replace, and the access check says `credentials requires role Basic with Can Use on credentials; <cause>` rather than `needs the Basic role:`, since Basic is a Tenable role name as well as an authentication scheme. The test suite drives every fixed text the module emits on refused, unavailable, failed, capped, and silent-success paths through the scrub and requires it back unchanged.
+A configured URL (`TENABLE_URL`, `TENABLE_SC_URL`) is reduced at configuration to its scheme, host, port, and path prefix.
+
+- A user-and-secret prefix, query, or fragment is dropped before the first request, so it never leaves in a request URL.
+- Everywhere a configured URL is written, it is written as scheme and host only: the access check's `platform` label, `metadata.json`, and the executive summary's `Platform:` line.
+- The test suite configures both platforms with a user-and-secret prefix and requires every request, tool result, bundle file, and zip entry free of it.
+
+#### Error strings
+
+Every error string passes through one redacting sink before it reaches a finding, a tool result, or a bundle file.
+
+- A non-JSON error body (an HTML 502 page, a WAF block, an SSO interstitial) is never echoed. The message records only the status and the body length, for example `403; non-JSON text/html response body (1204 bytes, not echoed)`.
+- JSON error bodies contribute their documented `error`, `error.message`, `message`, or `error_msg` fields only. The fields are scrubbed before they are shortened, so a cut can never leave the head of a secret behind.
+
+#### Silent-success responses
+
+A 2xx answer that is not the documented JSON document is an unreadable surface, never an empty inventory (the silent-success class).
+
+A Vulnerability Management or Security Center 200 with any of the following is described by status, media type, and size only:
+
+- An empty body.
+- The HTML page a proxy or SSO portal serves in place of the API.
+- A foreign JSON value.
+- A JSON object without the documented member (`scans`, `users`, `scanners`, `response`, and so on).
+
+For example: `200 OK with a JSON response body without the documented "scans" array (2 bytes, not echoed)`.
+
+The answer is recorded with the observed status as a surface that was not read:
+
+- The access probe is not readable.
+- The dataset carries the not-collected marker.
+- The findings that depend on the dataset render manual or capped, never pass on a missing list.
+
+A documented list is recognised by its records as well as its shape. An array is a foreign list when none of its records carries a member that identifies a Tenable asset, finding, or role:
+
+- **Asset:** `id`, `uuid`, `has_agent`, `last_seen`, `network_id`, `tags`
+- **Finding:** `state`, `severity`, `plugin`, `asset`, `first_found`, `last_found`
+- **Role:** `uuid`, `id`, `name`, `type`, `privileges`
+
+A foreign list is described as `200 OK with a JSON array of 2 records none of which carries any of the documented members "id", "uuid", ... (194 bytes, not echoed)`.
+
+On an export chunk, a foreign list is a failed download, so an export whose only chunk was foreign is unreadable and one that lost a chunk among several is partial.
+
+A record carrying none of those members inside an otherwise documented chunk is unevaluable:
+
+- The record is kept out of the export's records and counted.
+- The count is written as `unevaluable_records` in the collection status, the dependent evidence, and `_errors.log`.
+- TENABLE-03, 04, 14, 15, and 16 are capped at `warn` with the count and the member list in their summaries. They are never passed on records the verdict could not read.
+
+#### Redaction boundary
+
+The scrub draws one boundary. A value inside a carrier is replaced with `[REDACTED]` whatever its shape.
+
+Header lines are carriers: `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Cookie`, `X-ApiKeys`, `x-apikey`, `X-SecurityCenter`, and similar header lines. Each line is redacted by its class:
+
+- **Authorization headers:** An `Authorization` or `Proxy-Authorization` value keeps its scheme word as spelled (`Bearer`, `Basic`, `Digest`, and the other schemes listed below, in any casing). The value loses the one token, or the one quoted string, after the scheme word, so the operator still reads which scheme was replayed. Prose after the token stays.
+  - A parameter list after the scheme (`Digest username=..., realm=...`, `AWS4-HMAC-SHA256 Credential=...`) goes whole to the end of the line.
+  - A value that opens with anything but a listed scheme word (`GenieKey <token>`, `SharedKey <account>:<signature>`, `Bot <token>`, a bare token) also goes whole to the end of the line, since an unknown first word may be a scheme with its credentials after it.
+- **Cookie and key-list headers:** A `Cookie`, `Set-Cookie`, or `X-Cookie` line, and an `X-ApiKeys` or `x-apikey` line (`accessKey=...; secretKey=...`), is a list of pairs and goes whole to the end of the line. Cookie attributes such as `Path` and `Expires` therefore go with the cookie, and both halves of the key pair go together.
+- **Other headers:** Every other header (`X-SecurityCenter`, `X-Auth-Token`, and the like) carries one token and loses its first token, so a JSON fragment or prose after it on the same line is still read. When its value opens with a listed scheme word (`X-Auth-Token: Bearer <token>`), the header loses the word and the token after it together under one marker.
+
+#### Where a value ends
+
+- In every class, a quoted value (in double, single, or JSON-escaped quotes) ends at its closing quote. It goes with its quotes whatever the name of the cookie or key pair that carries it, even when a `; Name:` sits inside the quotes.
+- A whole-line value ends at the `;` or `,` before the name of the next header on a compound line, at a line break the stringify left escaped (`\n`, `\r`, `\u000a`), or else at the end of the line. A compound line holds several headers separated by `;` or `,`, and a following header name may hold dots.
+  - A quoted value that nothing closes ends as an unquoted one does.
+  - The next header keeps its name and gets its own treatment.
+  - A `Content-Type` or `Date` after a cookie keeps its name and value.
+- A single-token header value, the token after a scheme word, an equals-sign pair value, and a `--flag` value end at whitespace. They also end at any control character the stringify left escaped (`\t`, `\b`, `\f`, `\v`, `\0`, `\u0009` and the other `\u00XX` control codes, `\x09`), as they do at the raw character.
+  - A credential pair chained after such an escape (`api_key=<value>\tpassword: <value>`) is read on its own and loses its own value.
+  - A count under a plural credential word ends there too (`keys: 3\tcookies: 0` stays).
+- Quotes escaped to any depth (`\"` one level down, `\\\"` two) are read at their own depth. A header pair, credential pair, quoted attribute, or quoted assignment inside a JSON body that was stringified into a string value therefore loses its value and keeps its escaped quotes.
+- A header name or pair key is read the same right after such an escape (`\nX-SecurityCenter: <value>`, `\tapi_key=<value>`) as at a word boundary.
+- A quote inside a token is content of the value it sits in, in a header value, pair value, quoted attribute, or URL query value alike.
+  - RFC 6265 lets a cookie name or value carry an apostrophe, so `sid=O'<value>` and a pair named `my'pref` go with their cookie.
+  - Only a quote at the end of a token, or one after `=` with nothing but a delimiter or the end behind it (a base64 value ending in `=`), closes the text the line was quoted in. The closing quote and the following members of an enclosing JSON string therefore survive.
+- A header line is read before the URL query rule, so a cookie pair whose name holds `&` or `#` goes with its cookie.
+- A bare query value never takes a backslash, so `?token=<value>\"` keeps the escaped quote and `?api_key=<value>\nstatus 502` keeps the text after the line break.
+- A `;` inside a query value is part of the value, as `URLSearchParams` reads it, so `?token=<value>;<rest>` loses the whole value with no tail. The `;` that ends a cookie pair belongs to the cookie and key-list header lines alone.
+
+#### Other carriers
+
+Values in these carriers are replaced too:
+
+- Cookie and session assignments.
+- The user-and-secret prefix before the host in a URL, bare or with its slashes escaped by a stringify (`https:\/\/user:secret@host`). The prefix ends where the authority does, at the first `/`, `?`, or `#`.
+  - An `@` inside a query or fragment (`https://h?e=a@x.com&token=<value>`, `https://h#f@x.com`) is not such a prefix.
+  - The host `h` stays, and the query is read pair by pair (`&token=` loses its value).
+  - A `webhook_url` holding that URL reduces to `https://h/[REDACTED]`.
+- The URL query parameters named `token`, `api_key`, `secret`, and `pass`.
+- The path and query of a URL under a `webhook` or `webhook_url` key. The URL's origin stays.
+- The values after the schemes `Bearer`, `Basic`, `Digest`, `Token`, `OAuth`, `Negotiate`, `NTLM`, `SSWS`, `ApiKey`, `Splunk`, `Snowflake`, and `AWS4-HMAC-SHA256`, in any casing. The scheme word itself stays.
+  - Only a listed prose word after the scheme word (`Basic authentication`), an auth-param name (`Bearer realm=`), or, after the nouns `Token`, `OAuth`, `Splunk`, and `Snowflake`, a short plain lowercase word (`Token expired`) is read as prose and stays.
+  - A parameter list after the scheme word (`Snowflake Token="<value>"`, `Token token="<value>", nonce="..."`, `Digest username="...", nonce="...", response="..."`) goes whole with the word kept, with or without a header name in front of it and at any escape depth. So a 401 body that echoes the header renders `Snowflake [REDACTED]`.
+  - A list made only of challenge parameters (`Bearer realm="api", error="invalid_token"`, the value of a `WWW-Authenticate` header) stays with every value, the `nonce` of `Digest realm="api", qop="auth", nonce="n"` included.
+- A parameter list without a scheme word (`realm="api", nonce="n", response="<proof>"`, the value of a `www_authenticate` field or a credential echoed without its scheme word). Such a list is not a challenge when one of its parameters is a proof (`response`, `signature`, `oauth_signature`, `mac`, `sig`).
+  - The proof values go whatever their shape and wherever they sit in the list.
+  - The challenge parameters beside them keep their values.
+  - A list that is a challenge (`realm="api", qop="auth", nonce="n"`) keeps every value.
+  - A lone `nonce="..."` is no list and goes as a credential name.
+- Credential-named assignment pairs in their three spellings: equals sign, colon, and quoted JSON member.
+  - A pair counts wherever the key starts: at a word boundary, after `--`, after a Java `-D`, or after a path slash.
+  - The rule also covers `--key value` flags, whose name may open with a letter or an underscore, so `--_zendesk_session <value>` is one.
+  - `secret_id`, bearer ids such as `token_id`, and `connection_string` are among the credential names.
+- A colon-terminated credential-named key that ends a path segment is a label whose value is at most one token.
+  - A singular label (`/etc/app/password: <value> was rejected`, `vault read secret/app/token: <value> has no policy`) takes that token whatever its shape, a random string or a plain word, and whatever follows it, so the text renders `/etc/app/password: [REDACTED] was rejected`.
+  - A plural label names a collection (`GET /credentials: request failed`, `/api/v1/api-tokens: request failed with 403`), so prose continuing after the token means there was no value and the text stays.
+  - A lone token after a plural label is removed.
+- XML attributes (`password`, `secret`, `token`, `api_key`, `access_key`, `secret_key`, `private_key`, `client_secret`, `registration_code`, `linking_key`, `session_id`, and their camelCase forms).
+
+A scheme word that starts the value of a credential-named key other than `Authorization` (`api_key: Bearer <value>`) is part of the value and goes with it.
+
+#### Configured secrets and token shapes
+
+A configured secret (each half of the `X-ApiKeys` and `x-apikey` pairs, four characters or longer) is replaced wherever it appears, whatever its shape. Its base64, base64url, URL-encoded, and JSON-escaped forms are replaced too.
+
+Real token shapes go even when bare in prose:
+
+- Runs of sixteen or more characters with base64 symbols, scattered digits, or token casing.
+- Hex digests.
+- JWTs.
+- AWS access key ids.
+- GitHub, Stripe, and Slack prefixed tokens.
+- PEM blocks.
+
+#### Values that stay
+
+These values stay:
+
+- A bare value shaped like a name (words joined by hyphens or underscores with at most one numeric segment, such as `prod-us-east-2026` or `sc-scanner-01`) standing alone in prose. It is indistinguishable from a resource name.
+- Template titles such as `Basic Network Scan`.
+- This integration's own vocabulary (`credential_threshold`, `status_code`, `plugin_set`).
+- One value under a credential-named key: a count. A count is a bare integer (digits alone, or digits followed by a space, as in `api_keys: 2 missing`) under a key whose last word is one of the plural words `tokens`, `secrets`, `keys`, `cookies`, `passwords`, or `credentials`. It stays in each of these spellings:
+  - The JSON member spelling (`"api_keys": 2`, `"api_keys": "2"`).
+  - The colon spelling (`api_keys: 2`).
+  - The equals spelling (`api_keys=2`).
+
+A singular key keeps the rule: `pin: 1234` and `password=7` lose their values. Any other value under a plural key keeps the rule too: `keys: rotate them` loses its value.
+
+#### Fixed text
+
+The module's own fixed text is worded to cross that boundary intact:
+
+- An `_errors.log` line reads `credentials dataset: <error>`, never `credentials: <error>`, which the pair rule would read as a credential and replace.
+- The access check says `credentials requires role Basic with Can Use on credentials; <cause>` rather than `needs the Basic role:`, since Basic is a Tenable role name as well as an authentication scheme.
+
+The test suite drives every fixed text the module emits on refused, unavailable, failed, capped, and silent-success paths through the scrub. It requires the text back unchanged.
 
 ### Tenable Security Center (optional)
 
-Security Center controls run when a Security Center URL is configured. Set `TENABLE_URL` to the Security Center host to inspect only Security Center, or set `TENABLE_SC_URL` alongside the cloud variables to inspect both.
+Security Center controls run when a Security Center URL is configured.
+
+- To inspect only Security Center, set `TENABLE_URL` to the Security Center host.
+- To inspect both, set `TENABLE_SC_URL` alongside the cloud variables.
 
 ```bash
 export TENABLE_SC_URL="https://securitycenter.example.internal"
 ```
 
-Set `TENABLE_SC_ACCESS_KEY` and `TENABLE_SC_SECRET_KEY` in the environment the same way. Requests use the documented `x-apikey` header, whose two named parts (`accesskey` and `secretkey`) hold the access key and the secret key, against `/rest/` resources. API keys must be enabled in Security Center (System > Configuration > Security) and generated per user. Session token authentication (`POST /rest/token`) requires a write call to log in and is not implemented; use API keys.
+Set `TENABLE_SC_ACCESS_KEY` and `TENABLE_SC_SECRET_KEY` in the environment the same way.
+
+Requests use the documented `x-apikey` header against `/rest/` resources. The header's two named parts (`accesskey` and `secretkey`) hold the access key and the secret key.
+
+API keys must be enabled in Security Center (System > Configuration > Security) and generated per user.
+
+Session token authentication (`POST /rest/token`) requires a write call to log in and is not implemented. Use API keys.
 
 ### Configuration file
 
@@ -54,11 +212,29 @@ sc_access_key: "..."
 sc_secret_key: "..."
 ```
 
-The file also accepts `base_url` for `url`, `accessKey` and `secretKey` for the cloud keys, and `timeout_seconds`. The matching environment variables are `TENABLE_URL` (or `TENABLE_BASE_URL`) and `TENABLE_TIMEOUT` (seconds, default 30, clamped to 1 through 600).
+The file also accepts:
+
+- `base_url` for `url`.
+- `accessKey` and `secretKey` for the cloud keys.
+- `timeout_seconds`.
+
+The matching environment variables are `TENABLE_URL` (or `TENABLE_BASE_URL`) and `TENABLE_TIMEOUT` (seconds, default 30, clamped to 1 through 600).
 
 Precedence is explicit tool arguments, then environment variables, then the config file.
 
-A file named explicitly (the `config_file` argument or `TENABLE_CONFIG_FILE`) must be readable and parse; the default path is skipped silently when absent, and an empty file contributes no settings. Loader errors use fixed text and never quote the file: a read failure reports `Unable to read Tenable config file <path> (<CODE>)` with only the errno code (`ENOENT`, `EACCES`, `EISDIR`), a parse failure reports `Unable to parse Tenable config file: invalid YAML in <path> at line N (INVALID_YAML)` with the line taken only from the parser's structured position (omitted when the parser throws something else, such as the plain error an unresolved alias `key: *value` produces), and a file that is not a mapping reports `INVALID_CONFIG_SHAPE`. Neither the filesystem message nor the parser message (which quotes the offending source line, or the alias value itself) is ever interpolated, so a misplaced key in a malformed file cannot leak through the error.
+Loading rules:
+
+- A file named explicitly (the `config_file` argument or `TENABLE_CONFIG_FILE`) must be readable and parse.
+- The default path is skipped silently when absent.
+- An empty file contributes no settings.
+
+Loader errors use fixed text and never quote the file:
+
+- A read failure reports `Unable to read Tenable config file <path> (<CODE>)` with only the errno code (`ENOENT`, `EACCES`, `EISDIR`).
+- A parse failure reports `Unable to parse Tenable config file: invalid YAML in <path> at line N (INVALID_YAML)`. The line is taken only from the parser's structured position. It is omitted when the parser throws something else, such as the plain error an unresolved alias `key: *value` produces.
+- A file that is not a mapping reports `INVALID_CONFIG_SHAPE`.
+
+Neither the filesystem message nor the parser message is ever interpolated, so a misplaced key in a malformed file cannot leak through the error. The parser message quotes the offending source line, or the alias value itself.
 
 ## Tools
 
@@ -69,17 +245,83 @@ A file named explicitly (the `config_file` argument or `TENABLE_CONFIG_FILE`) mu
 | `tenable_assess_sensor_coverage` | Spec controls 3, 5, 6, 7, 8, 9, 16 plus the Security Center scanner equivalent. |
 | `tenable_assess_access_control` | Spec controls 10, 11, 12, 18 plus the Security Center user equivalent. |
 | `tenable_assess_vulnerability_management` | Spec controls 14, 15, 19 using the bulk vulnerability and asset exports. |
-| `tenable_export_audit_bundle` | Runs everything above and writes into `<platform host>-audit-bundle` under `output_dir` (default `./export/tenable`): `core_data/` (API snapshots with credential-bearing values redacted, see below), `analysis/` (findings.json and per-category summaries), `compliance/` (executive summary, unified matrix, one report per framework), `QUICK_REFERENCE.md`, `_errors.log` when collection partially failed, and a `.zip` paired with the allocated output directory (a rerun never overwrites a prior bundle). |
+| `tenable_export_audit_bundle` | Runs everything above, then writes an audit bundle and a zip archive. |
 
-`core_data/` is not a verbatim dump. `policy_details.json` keeps only `uuid`, `name`, `settings`, and `plugins` from `GET /policies/{policy_id}`; the `credentials`, `audits`, and `scap` blocks are dropped before storage. `scanners.json` replaces each scanner's `key` (linking key), `registration_code`, and `license` block with `[REDACTED]`. Every collected dataset then passes through a property-name redaction that replaces the value of any property whose name denotes a credential (`password`, `secret`, `token`, `api_key`, `access_key`, `secret_key`, `private_key`, `client_secret`, `registration_code`, `authorization`, `cookie`, session ids, and their camelCase forms), the `value` of `{name, value}` pairs whose `name` matches in either the walker's vocabulary or the error-text rules' (activity log `fields`, for example; a header named `x-redlock-auth` or `X-Auth` loses its value whatever its `secure` flag says, while `X-Trace` or `X-Client-Id` keeps it), and every carrier embedded in a string value (the header, cookie, scheme, query, userinfo, credential-pair, and private PEM rules of the boundary above; a public certificate and an opaque identifier stay, because in evidence they are not secrets). A bare `key` property is not redacted: Tenable tags are `{key, value}` pairs and the tag key is evidence. The same redacted objects feed the findings and tool results, so nothing the assessments return can carry a value the bundle would not. Finally, every bundle file and every tool result passes through the configured-secret pass on its way out: each string is checked for the configured keys in every encoded form, so a key echoed by an upstream body cannot survive even where the general scrub would have left evidence alone.
+`tenable_export_audit_bundle` writes into `<platform host>-audit-bundle` under `output_dir` (default `./export/tenable`):
 
-A dataset that was refused, failed, or never requested is never written as an empty list or `null`. Its `core_data/` file holds a marker in its place, `{ "collected": false, "status": <observed HTTP status or null>, "dataset_status": "forbidden" | "error" | "not_configured", "endpoint": "GET /...", "error": "<scrubbed message>" }`, and the finding that depends on it carries `not_collected: true` beside the same `endpoint`, `dataset_status`, and `http_status` fields (the finding states the absence in the positive form, because a `false` leaf appearing under a refused read is the shape a disabled setting takes). An export that ran but is not the whole inventory (chunks lost to `max_chunks`, `chunks_failed`, or failed downloads, or records kept out as unevaluable) is written to `assets_export.json` or `vulns_export.json` as a partial marker around the records it did evaluate, `{ "collected": true, "complete": false, "truncated": <bool>, "total_chunks", "available_chunks", "fetched_chunks", "failed_chunks", "download_failures", "unevaluable_records", "reason": "<scrubbed message>", "records": [...] }`, never as a bare array that reads as complete; only an export that downloaded every available chunk and evaluated every record is written as its records. Every assessment summary carries a `collection` object with one entry per dataset it read (`status`, `endpoint`, `http_status`, `seen`, `total`, `truncated`, `unevaluable_records`, `error`); `unevaluable_records` is the count of export records kept out for carrying no documented member and is `null` for a dataset that is not an export or was not read; `truncated` is derived from the observed page walk (records seen against `pagination.total`, a page cap reached while pages were still full, or a replayed page), never from a default, and `seen`, `total`, and `truncated` render `null` for a dataset that was not read, and `seen` renders `null` for a truncated walk that delivered no record (`0` would read as an empty inventory). Every endpoint or status code named anywhere in a finding, summary, tool result, or `_errors.log` line is the request that was actually made and the status it actually returned; a platform that is not configured names no endpoint, because no request was sent.
+- `core_data/`: API snapshots with credential-bearing values redacted (see below).
+- `analysis/`: findings.json and per-category summaries.
+- `compliance/`: executive summary, unified matrix, one report per framework.
+- `QUICK_REFERENCE.md`.
+- `_errors.log` when collection partially failed.
+- A `.zip` paired with the allocated output directory (a rerun never overwrites a prior bundle).
 
-Every assessment accepts the shared authentication arguments plus thresholds such as `stale_scan_days` (30), `stale_asset_days` (30), `agent_offline_days` (7), `plugin_stale_hours` (24), `inactive_user_days` (90), `max_admins` (5), `credential_threshold` (0.8), `tagged_threshold` (0.9), `audit_lookback_days` (30), `vuln_lookback_days` (90), `sla_critical_days` (15), `sla_high_days` (30), `sla_medium_days` (90), `sla_low_days` (180), `expected_asset_count`, and `max_chunks` (50).
+### Bundle redaction
+
+`core_data/` is not a verbatim dump.
+
+- `policy_details.json` keeps only `uuid`, `name`, `settings`, and `plugins` from `GET /policies/{policy_id}`. The `credentials`, `audits`, and `scap` blocks are dropped before storage.
+- `scanners.json` replaces each scanner's `key` (linking key), `registration_code`, and `license` block with `[REDACTED]`.
+
+Every collected dataset then passes through a property-name redaction. It replaces:
+
+- The value of any property whose name denotes a credential: `password`, `secret`, `token`, `api_key`, `access_key`, `secret_key`, `private_key`, `client_secret`, `registration_code`, `authorization`, `cookie`, session ids, and their camelCase forms.
+- The `value` of `{name, value}` pairs whose `name` matches in either the walker's vocabulary or the error-text rules' (activity log `fields`, for example). A header named `x-redlock-auth` or `X-Auth` loses its value whatever its `secure` flag says, while `X-Trace` or `X-Client-Id` keeps it.
+- Every carrier embedded in a string value, under the header, cookie, scheme, query, userinfo, credential-pair, and private PEM rules of the boundary above. A public certificate and an opaque identifier stay, because in evidence they are not secrets.
+
+A bare `key` property is not redacted. Tenable tags are `{key, value}` pairs, and the tag key is evidence.
+
+The same redacted objects feed the findings and tool results, so nothing the assessments return can carry a value the bundle would not.
+
+Finally, every bundle file and every tool result passes through the configured-secret pass on its way out. Each string is checked for the configured keys in every encoded form, so a key echoed by an upstream body cannot survive even where the general scrub would have left evidence alone.
+
+### Missing and partial datasets
+
+A dataset that was refused, failed, or never requested is never written as an empty list or `null`. Its `core_data/` file holds a marker in its place: `{ "collected": false, "status": <observed HTTP status or null>, "dataset_status": "forbidden" | "error" | "not_configured", "endpoint": "GET /...", "error": "<scrubbed message>" }`.
+
+The finding that depends on the dataset carries `not_collected: true` beside the same `endpoint`, `dataset_status`, and `http_status` fields. The finding states the absence in the positive form, because a `false` leaf appearing under a refused read is the shape a disabled setting takes.
+
+An export that ran but is not the whole inventory is written to `assets_export.json` or `vulns_export.json` as a partial marker around the records it did evaluate. Such an export lost chunks to `max_chunks`, `chunks_failed`, or failed downloads, or kept records out as unevaluable. The partial marker is `{ "collected": true, "complete": false, "truncated": <bool>, "total_chunks", "available_chunks", "fetched_chunks", "failed_chunks", "download_failures", "unevaluable_records", "reason": "<scrubbed message>", "records": [...] }`.
+
+The export is never written as a bare array that reads as complete. Only an export that downloaded every available chunk and evaluated every record is written as its records.
+
+Every assessment summary carries a `collection` object with one entry per dataset it read (`status`, `endpoint`, `http_status`, `seen`, `total`, `truncated`, `unevaluable_records`, `error`).
+
+- `unevaluable_records`: The count of export records kept out for carrying no documented member. It is `null` for a dataset that is not an export or was not read.
+- `truncated`: Derived from the observed page walk (records seen against `pagination.total`, a page cap reached while pages were still full, or a replayed page), never from a default.
+- `seen`, `total`, and `truncated`: Render `null` for a dataset that was not read. `seen` also renders `null` for a truncated walk that delivered no record (`0` would read as an empty inventory).
+
+Every endpoint or status code named anywhere in a finding, summary, tool result, or `_errors.log` line is the request that was actually made and the status it actually returned. A platform that is not configured names no endpoint, because no request was sent.
+
+### Assessment arguments
+
+Every assessment accepts the shared authentication arguments plus thresholds such as these:
+
+- `stale_scan_days` (30)
+- `stale_asset_days` (30)
+- `agent_offline_days` (7)
+- `plugin_stale_hours` (24)
+- `inactive_user_days` (90)
+- `max_admins` (5)
+- `credential_threshold` (0.8)
+- `tagged_threshold` (0.9)
+- `audit_lookback_days` (30)
+- `vuln_lookback_days` (90)
+- `sla_critical_days` (15)
+- `sla_high_days` (30)
+- `sla_medium_days` (90)
+- `sla_low_days` (180)
+- `expected_asset_count`
+- `max_chunks` (50)
 
 ## Control coverage
 
-Status semantics: `pass` requires complete, readable evidence with every enabling flag confirmed; `warn` marks partial views, undated items, or minor drift; `fail` marks a verified deficiency; `manual` marks unknown, forbidden, unlicensed, or not applicable evidence and states what a human must collect.
+Status semantics:
+
+- `pass` requires complete, readable evidence with every enabling flag confirmed.
+- `warn` marks partial views, undated items, or minor drift.
+- `fail` marks a verified deficiency.
+- `manual` marks unknown, forbidden, unlicensed, or not applicable evidence and states what a human must collect.
 
 | # | Control | Tool | Finding | Semantics |
 |---|---------|------|---------|-----------|
@@ -104,7 +346,38 @@ Status semantics: `pass` requires complete, readable evidence with every enablin
 | 19 | Export and reporting automation | vulnerability_management | TENABLE-19 | Export jobs from `GET /vulns/export/status` and `GET /assets/export/status` within the previous three days (the documented window for completed jobs), excluding this tool's own runs by UUID and by export shape (`num_assets_per_chunk` 5000 with the open, reopened, fixed state filter; 10000 with no filters): jobs on two distinct days `pass`, jobs on one day `warn`, none `manual`; both lists unreadable `manual`. When one list is unreadable its count renders `null`, every summary names the read, and a pass is capped at `warn`; a key not confirmed as Administrator also caps at `warn`. Report schedules are not exposed by the API and remain a manual check. |
 | 20 | Target group management | scan_program | TENABLE-20 | Deprecated target groups: stale or overlapping members `warn`; an empty list passes because tags replaced target groups. |
 
-Every finding carries the FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP mappings from the spec table for that control. Verdicts are additionally capped at `warn` whenever the API key is not confirmed as Administrator, a paginated list returned fewer records than `pagination.total`, was still returning full pages when the page cap was reached (an endpoint that omits `pagination.total` is treated as partial rather than complete in that case), or replayed the same first record on consecutive pages (a stuck offset), an export timed out or downloaded fewer chunks than were available, or any secondary inventory the finding reads is unreadable (the summary names the endpoint and the affected evidence renders `null`). A finding that reads a paginated list (controls 5, 6, 7, 8, 9, 12, and 13) states the population it rests on whenever the list is partial, on its `fail` and `warn` branches as well as the capped pass: the summary carries `Only <seen> of <pagination.total, or unknown> records were retrieved (<reason>)` followed by the cap or by "the verdict rests on the records retrieved", and the evidence carries `inventory_truncated`, `records_seen`, and `records_total` (`false` and the counts for a complete walk, `null` for a list that was not read). A partial list is an incomplete inventory, and so is an export some of whose records were kept out as unevaluable (the same export the bundle writes under a partial marker); the evidence over it is rendered as a lower bound: a positive count is the observed count, a count of zero renders `null` (the unread or unevaluated remainder may hold what the seen records did not), and item-level detail (the names of exclusions, agents, networks, credentials, access groups, or tag categories, and the audit event samples) is withheld as `null` until the list is read to completion; the summary counts such items without naming them. Assessment-level summaries render `null` rather than `0` for the count of any dataset that could not be read or that a truncated walk delivered nothing of, and the `pass`, `warn`, `fail`, and `manual` status counts render `null` in place of `0` whenever any inventory the category read was unreadable, truncated, or an export with unevaluable records (a positive status count is rendered as observed), and the executive summary renders such a count as `none seen (not asserted: an inventory the findings read was incomplete)`.
+Every finding carries the FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP mappings from the spec table for that control.
+
+### Verdict caps
+
+Verdicts are additionally capped at `warn` whenever any of these holds:
+
+- The API key is not confirmed as Administrator.
+- A paginated list returned fewer records than `pagination.total`.
+- A paginated list was still returning full pages when the page cap was reached. In that case, an endpoint that omits `pagination.total` is treated as partial rather than complete.
+- A paginated list replayed the same first record on consecutive pages (a stuck offset).
+- An export timed out or downloaded fewer chunks than were available.
+- Any secondary inventory the finding reads is unreadable. The summary names the endpoint, and the affected evidence renders `null`.
+
+### Partial inventories
+
+A finding that reads a paginated list (controls 5, 6, 7, 8, 9, 12, and 13) states the population it rests on whenever the list is partial, on its `fail` and `warn` branches as well as the capped pass:
+
+- The summary carries `Only <seen> of <pagination.total, or unknown> records were retrieved (<reason>)`, followed by the cap or by "the verdict rests on the records retrieved".
+- The evidence carries `inventory_truncated`, `records_seen`, and `records_total`. They hold `false` and the counts for a complete walk, and `null` for a list that was not read.
+
+A partial list is an incomplete inventory, as is an export some of whose records were kept out as unevaluable (the same export the bundle writes under a partial marker). The evidence over an incomplete inventory is rendered as a lower bound:
+
+- A positive count is the observed count.
+- A count of zero renders `null` (the unread or unevaluated remainder may hold what the seen records did not).
+- Item-level detail is withheld as `null` until the list is read to completion. This covers the names of exclusions, agents, networks, credentials, access groups, or tag categories, and the audit event samples.
+- The summary counts such items without naming them.
+
+### Summary counts
+
+Assessment-level summaries render `null` rather than `0` for the count of any dataset that could not be read or that a truncated walk delivered nothing of.
+
+The `pass`, `warn`, `fail`, and `manual` status counts render `null` in place of `0` whenever any inventory the category read was unreadable, truncated, or an export with unevaluable records. The executive summary renders such a count as `none seen (not asserted: an inventory the findings read was incomplete)`. A positive status count is rendered as observed.
 
 ## Live smoke
 
@@ -112,15 +385,18 @@ Every finding carries the FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, a
 npm --prefix cli run test:tenable:live
 ```
 
-The script prints a skip message and exits 0 without credentials. With credentials it runs `tenable_check_access` and the scan program assessment against the configured tenant.
+The script prints a skip message and exits 0 without credentials. With credentials, it runs `tenable_check_access` and the scan program assessment against the configured tenant.
 
 ## Limitations and manual controls
 
-- Control 1 reads `GET /policies/{policy_id}` (documented `settings` and `plugins` objects) for every policy referenced by a scan, capped at 100 policies per run; the details read needs the Standard [32] role plus Can View on each scan template, and a refused read renders the control `manual`. Performance settings (`max_hosts_per_scan`, `max_checks_per_host`, `thorough_tests`, `report_paranoia`) are recorded as evidence, not judged.
-- Report schedules and Lumin exposure metrics have no documented read endpoint; control 19 relies on export job history, which the API returns for completed jobs only within the previous three days, so it is a point-in-time signal rather than proof of a recurring schedule.
-- Tenable Security Center controls are `manual` (not applicable) until `TENABLE_SC_URL` is configured; Security Center session token authentication is not implemented.
+- Control 1 reads `GET /policies/{policy_id}` (documented `settings` and `plugins` objects) for every policy referenced by a scan, capped at 100 policies per run.
+  - The details read needs the Standard [32] role plus Can View on each scan template. A refused read renders the control `manual`.
+  - Performance settings (`max_hosts_per_scan`, `max_checks_per_host`, `thorough_tests`, `report_paranoia`) are recorded as evidence, not judged.
+- Report schedules and Lumin exposure metrics have no documented read endpoint. Control 19 relies on export job history, which the API returns for completed jobs only within the previous three days, so it is a point-in-time signal rather than proof of a recurring schedule.
+- Tenable Security Center controls are `manual` (not applicable) until `TENABLE_SC_URL` is configured. Security Center session token authentication is not implemented.
 - Agents that are not licensed render controls 5 and 6 as `manual`.
-- Export chunk downloads stop at `max_chunks` (default 50) and the vulnerability export uses `num_assets=5000`; the resulting truncation downgrades verdicts to `warn` and is recorded in `_errors.log`. An export that does not reach FINISHED within the polling deadline is recorded as `TIMEOUT(<last status>)`, treated as unreadable (the dependent controls render `manual`), and its vendor-supplied `reason` is scrubbed like every other error string.
+- Export chunk downloads stop at `max_chunks` (default 50), and the vulnerability export uses `num_assets=5000`. The resulting truncation downgrades verdicts to `warn` and is recorded in `_errors.log`.
+- An export that does not reach FINISHED within the polling deadline is recorded as `TIMEOUT(<last status>)`. It is treated as unreadable (the dependent controls render `manual`), and its vendor-supplied `reason` is scrubbed like every other error string.
 
 ## Official documentation
 

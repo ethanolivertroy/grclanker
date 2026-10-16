@@ -36,7 +36,12 @@ Local-first setup adds these important fields:
 }
 ```
 
-Hosted setup writes the same `defaultProvider` and `defaultModel` pair, sets `providerKind` to the hosted provider, switches `modelMode` to `hosted`, and removes `providerBaseUrl`.
+Hosted setup:
+
+- writes the same `defaultProvider` and `defaultModel` pair
+- sets `providerKind` to the hosted provider
+- switches `modelMode` to `hosted`
+- removes `providerBaseUrl`
 
 `skillDiscoveryMode` controls whether grclanker stays limited to its bundled GRC skills or also allows Pi-style project skill discovery from `.agents/skills` and related paths. The recommended default is `bundled-only`.
 
@@ -55,7 +60,9 @@ Backend-related fields may also appear here:
 }
 ```
 
-Those fields are optional and only matter for the backend you actually choose. For Parallels, grclanker now prefers a dedicated template source and falls back to a stopped base VM source, then creates a disposable sandbox for the actual session so it does not touch your existing VM directly.
+Those fields are optional and only matter for the backend you actually choose.
+
+For Parallels, grclanker now prefers a dedicated template source and falls back to a stopped base VM source. It then creates a disposable sandbox for the actual session so it does not touch your existing VM directly.
 
 ## models.json
 
@@ -131,6 +138,6 @@ These are the `GRCLANKER_*` variables grclanker reads:
 | `GRCLANKER_VERSION` | Build-only. Version stamped on release bundles built with `npm --prefix cli run build:bundle` (default: the `cli/package.json` version). |
 | `GRCLANKER_NODE_VERSION` | Build-only. Node.js version that `npm --prefix cli run build:bundle` packages (default `22.20.0`). |
 
-grclanker sets `GRCLANKER_CODING_AGENT_DIR` and `GRCLANKER_COMPUTE_BACKEND` itself when it launches the embedded Pi runtime, and `GRCLANKER_COMPUTE_BACKEND_OVERRIDE` when you pass `--compute <kind>`. Leave them unset; use `grclanker setup` or a per-run `--compute <kind>` instead.
+grclanker sets `GRCLANKER_CODING_AGENT_DIR` and `GRCLANKER_COMPUTE_BACKEND` itself when it launches the embedded Pi runtime. It sets `GRCLANKER_COMPUTE_BACKEND_OVERRIDE` when you pass `--compute <kind>`. Leave them unset, and use `grclanker setup` or a per-run `--compute <kind>` instead.
 
-Provider and integration credentials use each vendor's own variable names (for example `ANTHROPIC_API_KEY`, `RUNPOD_API_KEY`, `MODAL_TOKEN_ID`); the integration and compute backend guides list them.
+Provider and integration credentials use each vendor's own variable names (for example `ANTHROPIC_API_KEY`, `RUNPOD_API_KEY`, `MODAL_TOKEN_ID`). The integration and compute backend guides list them.

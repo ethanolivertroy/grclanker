@@ -3,26 +3,50 @@ title: Salesforce
 description: Read-only Salesforce security inspector covering Health Check, session and password policy, MFA, permissions, sharing, connected apps, and audit trail.
 ---
 
-The Salesforce inspector audits one org through the REST API (SOQL), the Tooling API, and the Metadata API `listMetadata` and `readMetadata` calls. Every tool is read-only: nothing is created, updated, or deleted in the org.
+The Salesforce inspector audits one org through the REST API (SOQL), the Tooling API, and the Metadata API `listMetadata` and `readMetadata` calls.
+
+Every tool is read-only: nothing is created, updated, or deleted in the org.
 
 ## What it inspects
 
-- Security Health Check score and per-setting risks (`SecurityHealthCheck`, `SecurityHealthCheckRisks`)
-- `SecuritySettings` metadata: session timeout, forced logout, IP locking, password policies, trusted IP ranges, clickjack and CSRF flags, MFA for direct UI logins
-- `MyDomainSettings` metadata: login policy for `login.salesforce.com` and API logins
-- `Profile` metadata for sensitive profiles (System Administrator plus every profile with Modify All Data, View All Data, Manage Users, Author Apex, Customize Application, Manage Profiles and Permission Sets, or Password Never Expires): `loginHours` and `loginIpRanges`, resolved from SOQL profile IDs through `listMetadata(Profile)` and read with `readMetadata(Profile)` in batches of 10 (at most 50 profiles)
-- Users, profiles, permission sets, permission set assignments, and `TwoFactorMethodsInfo` enrollment. `Permissions*` fields on `Profile` and `PermissionSet` are probed through `describeSObject` first, so fields that do not exist in the org's edition (for example `PermissionsApiUserOnly`) are omitted instead of failing the query
-- The caller's own permission flags from `UserPermissionAccess` (`Customize Application`, `View All Users`, and the other permissions the inspector depends on)
-- `FieldPermissions` on fields whose names look sensitive, organization-wide defaults from `Organization`
-- `TenantSecret` (Shield Platform Encryption) and the Tooling API `Certificate` object (expiration, key size, CA-signed, exportable private key)
-- `ConnectedApplication`, `OauthToken`, `LoginHistory`, `SetupAuditTrail`, `EventLogFile`
+- Security Health Check score and per-setting risks (`SecurityHealthCheck`, `SecurityHealthCheckRisks`).
+- `SecuritySettings` metadata: session timeout, forced logout, IP locking, password policies, trusted IP ranges, clickjack and CSRF flags, MFA for direct UI logins.
+- `MyDomainSettings` metadata: login policy for `login.salesforce.com` and API logins.
+- `Profile` metadata for sensitive profiles: `loginHours` and `loginIpRanges`.
+  - Sensitive profiles are System Administrator plus every profile with Modify All Data, View All Data, Manage Users, Author Apex, Customize Application, Manage Profiles and Permission Sets, or Password Never Expires.
+  - The metadata is resolved from SOQL profile IDs through `listMetadata(Profile)` and read with `readMetadata(Profile)` in batches of 10 (at most 50 profiles).
+- Users, profiles, permission sets, permission set assignments, and `TwoFactorMethodsInfo` enrollment.
+  - `Permissions*` fields on `Profile` and `PermissionSet` are probed through `describeSObject` first, so fields that do not exist in the org's edition (for example `PermissionsApiUserOnly`) are omitted instead of failing the query.
+- The caller's own permission flags from `UserPermissionAccess` (`Customize Application`, `View All Users`, and the other permissions the inspector depends on).
+- `FieldPermissions` on fields whose names look sensitive.
+- Organization-wide defaults from `Organization`.
+- `TenantSecret` (Shield Platform Encryption) and the Tooling API `Certificate` object (expiration, key size, CA-signed, exportable private key).
+- `ConnectedApplication`, `OauthToken`, `LoginHistory`, `SetupAuditTrail`, `EventLogFile`.
 
-Every SOQL statement selects only fields listed in the Object Reference for that object. `OauthToken` is read without `CreatedDate`, `ConnectedApplication` without `CreatedDate` and `LastModifiedDate`, and `TwoFactorMethodsInfo` without `Id`, because those fields are not documented on those objects and an `INVALID_FIELD` error would take down the whole dataset.
+Every SOQL statement selects only fields listed in the Object Reference for that object.
+
+- `OauthToken` is read without `CreatedDate`.
+- `ConnectedApplication` is read without `CreatedDate` and `LastModifiedDate`.
+- `TwoFactorMethodsInfo` is read without `Id`.
+
+Those fields are left out because they are not documented on those objects and an `INVALID_FIELD` error would take down the whole dataset.
 
 ## Setup and authentication
 
-1. Create a connected app with OAuth enabled and the `api` scope (add `refresh_token` if you plan to use a refresh token). For the JWT bearer flow, upload the certificate whose private key the inspector will sign with and pre-authorize the auditing user's profile or permission set.
-2. Give the auditing user these permissions: `API Enabled`, `View Setup and Configuration`, `View Health Check`, `View All Users`, `Modify Metadata Through Metadata API Functions` (required by `listMetadata` and `readMetadata`), `Manage MFA in API` (required to query `TwoFactorMethodsInfo`), `Customize Application` (without it `OauthToken` returns only the caller's own tokens), and, when licensed, `View Event Log Files` and `Manage Encryption Keys`. `salesforce_check_access` reads the caller's flags from `UserPermissionAccess` and lists any that are false.
+1. Create a connected app with OAuth enabled and the `api` scope. Add `refresh_token` if you plan to use a refresh token. For the JWT bearer flow, upload the certificate whose private key the inspector will sign with, and pre-authorize the auditing user's profile or permission set.
+
+2. Give the auditing user these permissions:
+   - `API Enabled`
+   - `View Setup and Configuration`
+   - `View Health Check`
+   - `View All Users`
+   - `Modify Metadata Through Metadata API Functions`: Required by `listMetadata` and `readMetadata`.
+   - `Manage MFA in API`: Required to query `TwoFactorMethodsInfo`.
+   - `Customize Application`: Without it, `OauthToken` returns only the caller's own tokens.
+   - `View Event Log Files` and `Manage Encryption Keys`, when licensed
+
+   `salesforce_check_access` reads the caller's flags from `UserPermissionAccess` and lists any that are false.
+
 3. Export credentials for one of the supported flows.
 
 JWT bearer flow (recommended):
@@ -46,17 +70,23 @@ export SF_CONSUMER_SECRET=...
 
 Other inputs:
 
-- `SF_CREDENTIALS_FILE` (or the `credentials_file` argument; there is no default path): JSON file with `grant_type` (`jwt-bearer`, `password`, `access-token`, or `authorization_code` / `refresh-token` with a `refresh_token`) plus the matching fields (`instance_url`, `login_url`, `username`, `password`, `security_token`, `consumer_key` or `client_id`, `consumer_secret` or `client_secret`, `private_key_file`, `private_key`, `refresh_token`, `access_token`, `api_version`, `sandbox`); camelCase spellings such as `instanceUrl` and `consumerKey` are also accepted
-- `SF_ACCESS_TOKEN` with `SF_INSTANCE_URL`: reuse a token from `sf org display`
-- `SF_REFRESH_TOKEN` with `SF_CONSUMER_KEY` (plus `SF_CONSUMER_SECRET` unless the connected app skips the secret): refresh token flow
-- `SF_PRIVATE_KEY`: the PEM key inline, in place of `SF_PRIVATE_KEY_FILE`
-- `SF_CLIENT_ID` and `SF_CLIENT_SECRET`: aliases for `SF_CONSUMER_KEY` and `SF_CONSUMER_SECRET`
-- `SF_GRANT_TYPE`: forces a flow; otherwise the first complete set wins, in the order access token, JWT bearer, refresh token, username-password
-- `SF_LOGIN_URL`: explicit login host; otherwise `https://test.salesforce.com` is used when `SF_SANDBOX=true` or the instance URL is a sandbox host, and `https://login.salesforce.com` otherwise
-- `SF_API_VERSION`: defaults to `64.0`
-- `SF_TIMEOUT` (seconds, default 30, clamped to 1-300) and `SF_MAX_RETRIES` (default 3, clamped to 0-8)
+- `SF_CREDENTIALS_FILE` (or the `credentials_file` argument): JSON file with `grant_type` plus the matching fields. There is no default path.
+  - `grant_type` is `jwt-bearer`, `password`, `access-token`, or `authorization_code` / `refresh-token` with a `refresh_token`.
+  - The matching fields are `instance_url`, `login_url`, `username`, `password`, `security_token`, `consumer_key` or `client_id`, `consumer_secret` or `client_secret`, `private_key_file`, `private_key`, `refresh_token`, `access_token`, `api_version`, and `sandbox`.
+  - camelCase spellings such as `instanceUrl` and `consumerKey` are also accepted.
+- `SF_ACCESS_TOKEN` with `SF_INSTANCE_URL`: Reuse a token from `sf org display`.
+- `SF_REFRESH_TOKEN` with `SF_CONSUMER_KEY`: Refresh token flow. Also set `SF_CONSUMER_SECRET` unless the connected app skips the secret.
+- `SF_PRIVATE_KEY`: The PEM key inline, in place of `SF_PRIVATE_KEY_FILE`.
+- `SF_CLIENT_ID` and `SF_CLIENT_SECRET`: Aliases for `SF_CONSUMER_KEY` and `SF_CONSUMER_SECRET`.
+- `SF_GRANT_TYPE`: Forces a flow. Otherwise the first complete set wins, in the order access token, JWT bearer, refresh token, username-password.
+- `SF_LOGIN_URL`: Explicit login host. Otherwise `https://test.salesforce.com` is used when `SF_SANDBOX=true` or the instance URL is a sandbox host, and `https://login.salesforce.com` otherwise.
+- `SF_API_VERSION`: Defaults to `64.0`.
+- `SF_TIMEOUT` (default 30): Timeout in seconds, clamped to 1-300.
+- `SF_MAX_RETRIES` (default 3): Maximum retries, clamped to 0-8.
 
-`SF_SECURITY_TOKEN` is needed for the username-password flow only when the login IP is not trusted. Precedence is explicit tool arguments, then environment variables, then the credentials file.
+`SF_SECURITY_TOKEN` is needed for the username-password flow only when the login IP is not trusted.
+
+Precedence is explicit tool arguments, then environment variables, then the credentials file.
 
 ## Tools
 
@@ -67,26 +97,91 @@ Other inputs:
 | `salesforce_assess_identity_access` | Controls 4, 6, 7, 9, 10, 13 |
 | `salesforce_assess_data_protection` | Controls 8, 12, 16, 17 |
 | `salesforce_assess_monitoring_integrations` | Controls 11, 14, 15 |
-| `salesforce_export_audit_bundle` | Runs the access check and all four assessments, then writes `core_data/` (projected and redacted snapshots: `SecuritySettings`, `MyDomainSettings`, and `Profile` metadata reduced to the leaves the verdicts read, URL fields reduced to scheme, host, and path; each dataset wrapper carries `status`, `seen`, `total`, and `truncated`, and a dataset that was forbidden, unavailable, errored, or never requested is written as a `{ collected: false, dataset, status, http_status, endpoint, error }` marker instead of an empty list), `analysis/` (`findings.json`, per-area results with an `inventories` map naming each dataset as `complete`, `partial (seen of total rows)`, or `unread (status: error)`, `summary.json`), `compliance/` (executive summary, unified matrix, eight framework reports), `QUICK_REFERENCE.md`, `_errors.log` when collection partially failed, and a zip named after the allocated output directory |
+| `salesforce_export_audit_bundle` | Runs the access check and all four assessments, then writes an audit bundle and a zip archive |
 
-All tools accept the connection arguments (`instance_url`, `login_url`, `username`, `password`, `security_token`, `consumer_key`, `consumer_secret`, `private_key_file`, `refresh_token`, `access_token`, `credentials_file`, `api_version`, `sandbox`, `timeout_seconds`, default 30). The assessment and export tools add `record_limit` (default 2000 rows per SOQL dataset); identity access adds `max_admins` (5) and `stale_login_days` (90); data protection adds `certificate_expiry_warning_days` (30); monitoring adds `login_history_days` (30) and `audit_trail_days` (90, both clamped to 1-180). `salesforce_export_audit_bundle` accepts all of these plus `output_dir` (default `./export/salesforce`). The bundle directory is `<org name>-audit-bundle`, lowercased with other characters replaced by `-` (falling back to the org Id or instance host), and a repeat run takes the suffixes `-2` through `-50`, skipping any name whose directory or zip already exists.
+`salesforce_export_audit_bundle` writes these outputs:
+
+- `core_data/`: Projected and redacted snapshots.
+  - `SecuritySettings`, `MyDomainSettings`, and `Profile` metadata are reduced to the leaves the verdicts read.
+  - URL fields are reduced to scheme, host, and path.
+  - Each dataset wrapper carries `status`, `seen`, `total`, and `truncated`.
+  - A dataset that was forbidden, unavailable, errored, or never requested is written as a `{ collected: false, dataset, status, http_status, endpoint, error }` marker instead of an empty list.
+- `analysis/`: `findings.json`, per-area results, and `summary.json`. The per-area results carry an `inventories` map naming each dataset as `complete`, `partial (seen of total rows)`, or `unread (status: error)`.
+- `compliance/`: Executive summary, unified matrix, and eight framework reports.
+- `QUICK_REFERENCE.md`.
+- `_errors.log`, when collection partially failed.
+- A zip named after the allocated output directory.
+
+All tools accept the connection arguments: `instance_url`, `login_url`, `username`, `password`, `security_token`, `consumer_key`, `consumer_secret`, `private_key_file`, `refresh_token`, `access_token`, `credentials_file`, `api_version`, `sandbox`, and `timeout_seconds` (default 30).
+
+The assessment and export tools add `record_limit` (default 2000 rows per SOQL dataset). Tool-specific options:
+
+- Identity access adds `max_admins` (5) and `stale_login_days` (90).
+- Data protection adds `certificate_expiry_warning_days` (30).
+- Monitoring adds `login_history_days` (30) and `audit_trail_days` (90), both clamped to 1-180.
+- `salesforce_export_audit_bundle` accepts all of these plus `output_dir` (default `./export/salesforce`).
+
+The bundle directory is `<org name>-audit-bundle`, lowercased with other characters replaced by `-`. The org name falls back to the org Id or instance host. A repeat run takes the suffixes `-2` through `-50`, skipping any name whose directory or zip already exists.
 
 ## Verdict semantics
 
-Verdict rules that apply to every finding: unreadable, forbidden, or errored data yields `manual` with the cause and the Setup evidence to collect; empty inventories never pass unless emptiness is compliant (only control 13, and only when the user list itself is non-empty); partial or truncated inventories downgrade `pass` to `warn` with seen and total counts; items missing a date are reported separately and never counted as current.
+These verdict rules apply to every finding:
 
-Population sanity gate: every org has a System Administrator profile with Modify All Data and at least one active user on it. Controls 4, 7, 9, 10, and 13 therefore render `manual` when the visible profile list has no administrator-class profile, or when a non-empty user list shows zero active administrators, because that view can only come from a credential without `View All Users` or setup visibility. The `population_view_issue` field in the identity summary states the reason.
+- Unreadable, forbidden, or errored data yields `manual` with the cause and the Setup evidence to collect.
+- Empty inventories never pass unless emptiness is compliant. Emptiness is compliant only for control 13, and only when the user list itself is non-empty.
+- Partial or truncated inventories downgrade `pass` to `warn` with seen and total counts.
+- Items missing a date are reported separately and never counted as current.
+
+Population sanity gate: every org has a System Administrator profile with Modify All Data and at least one active user on it. Controls 4, 7, 9, 10, and 13 therefore render `manual` when either of these holds:
+
+- The visible profile list has no administrator-class profile.
+- A non-empty user list shows zero active administrators.
+
+These controls render `manual` because such a view can only come from a credential without `View All Users` or setup visibility. The `population_view_issue` field in the identity summary states the reason.
 
 ### Partial and unread inputs
 
 Every finding is gated on the datasets it reads (the `Inputs` column below):
 
-- Unread input: when the finding's primary dataset was forbidden (401/403 or `INSUFFICIENT_ACCESS`), unavailable (`INVALID_TYPE`, `INVALID_FIELD`), or errored, the finding is `manual`, its summary names the dataset and the observed status ("... could not be verified because the TwoFactorMethodsInfo query was forbidden (403 ...)"), and `manualEvidence` states what to collect. A finding that also reads a secondary dataset (the Health Check MFA setting for SF-04, `PermissionSetAssignment` for SF-09, `EventLogFile` for SF-15) stops at `warn` while that dataset is unread and says what was not checked.
-- Truncated input: a SOQL result that stopped at `record_limit`, returned fewer rows than `totalSize`, omitted `done` or `totalSize`, promised more rows without a `nextRecordsUrl`, whose cursor stopped advancing, or whose `nextRecordsUrl` pointed at another origin (scheme, host, port) than the instance URL or carried userinfo is `truncated` with a known or unknown total; the cursor is refused before it reaches `fetch`, and the dataset line then carries a reason that names the instance origin and the rejected origin only, never the cursor's path, query, or userinfo (`User read: partial (3 of 4000 rows; nextRecordsUrl pointed at another origin, https://evil.example.test, than the instance origin https://acme.my.salesforce.com; not followed)`, `User read: partial (3 of 4000 rows; nextRecordsUrl carried embedded credentials (userinfo) and pointed at the instance origin https://acme.my.salesforce.com; not followed)`; a cursor that does not parse is refused as `nextRecordsUrl was not a valid URL (instance origin ...); not followed`). Because the cursor never reaches the transport, no fetch error names it, and the dataset's `core_data` marker carries no `endpoint` built from its path. Every request resolves against the session's instance URL and is sent to that origin only, without userinfo: a server-supplied absolute URL elsewhere, or one with embedded credentials, is refused before any request with the same two-origin wording (`Salesforce request URL pointed at another origin, https://evil.example.test, than the instance origin https://acme.my.salesforce.com; the request was not sent.`) and records no endpoint. The finding's summary then carries "Only N of M ... records were read, so the verdict is downgraded" and a `pass` becomes `warn`. A claim over the rows not seen is not made from a partial read: SF-04 does not count or name users without a method, SF-07 renders the API Only absence and the users-on-API-profiles count `null` and caps at `warn`, SF-13 caps at `warn`, and SF-14 renders its failure ratio and every zero count (`brute_force_sources`, `legacy_tls_logins`, `rows_without_login_time`) `null` and caps at `warn`. A `fail` observed on a visible row (a stale administrator, an expired certificate, a public organization-wide default) stands.
-- Documented row caps: `TwoFactorMethodsInfo` and `OauthToken` stop at 2500 rows with `done=true`, so a result of 2500 or more rows is treated as truncated (`two_factor_methods_possibly_capped`, `oauth_tokens_possibly_capped`); the SF-04 summary states which signal was observed (the cap, a larger `totalSize`, or `done=false` or a stalled cursor).
-- Named principals: SF-04 renders `users_without_registered_mfa_method` and `sample_users_without_mfa` as `null` with a `principals_withheld` note whenever `User` or `TwoFactorMethodsInfo` is partial, and stops at `warn`; the visible users without an enrollment row are not named because the unread rows could hold their enrollments.
-- Dependent datasets: `Profile` metadata is only requested for the sensitive profiles found in the `Profile` list; when that list is unread the metadata dataset carries `not requested: the Profile list was not readable (...)` with the parent's status, and SF-05 and SF-06 render `manual` naming the parent.
-- Evidence and summaries: counts and lists derived from a dataset that was not read render `null` rather than `0` or `[]` (for example `active_users`, `users_seen`, `elevated_assignments`, `oauth_tokens`, `health_check_risks`); each finding's evidence carries the `*_truncated`, `seen`, and `total` values of the datasets it read; and every area summary carries an `inventories` map naming each dataset as `complete (N rows)`, `partial (N of M rows)`, or `unread (<status>: <error>)`.
+- **Unread input:** The finding is `manual` when its primary dataset was forbidden (401/403 or `INSUFFICIENT_ACCESS`), unavailable (`INVALID_TYPE`, `INVALID_FIELD`), or errored.
+  - Its summary names the dataset and the observed status ("... could not be verified because the TwoFactorMethodsInfo query was forbidden (403 ...)").
+  - `manualEvidence` states what to collect.
+  - A finding that also reads a secondary dataset (the Health Check MFA setting for SF-04, `PermissionSetAssignment` for SF-09, `EventLogFile` for SF-15) stops at `warn` while that dataset is unread. It says what was not checked.
+- **Truncated input:** The finding's summary carries "Only N of M ... records were read, so the verdict is downgraded", and a `pass` becomes `warn`. A SOQL result is `truncated`, with a known or unknown total, when any of these holds:
+  - It stopped at `record_limit`.
+  - It returned fewer rows than `totalSize`.
+  - It omitted `done` or `totalSize`.
+  - It promised more rows without a `nextRecordsUrl`.
+  - Its cursor stopped advancing.
+  - Its `nextRecordsUrl` pointed at another origin (scheme, host, port) than the instance URL, or carried userinfo. That cursor is refused before it reaches `fetch`.
+- **Partial reads:** A claim over the rows not seen is not made from a partial read.
+  - SF-04 does not count or name users without a method.
+  - SF-07 renders the API Only absence and the users-on-API-profiles count `null` and caps at `warn`.
+  - SF-13 caps at `warn`.
+  - SF-14 renders its failure ratio and every zero count (`brute_force_sources`, `legacy_tls_logins`, `rows_without_login_time`) `null` and caps at `warn`.
+  - A `fail` observed on a visible row (a stale administrator, an expired certificate, a public organization-wide default) stands.
+- **Documented row caps:** `TwoFactorMethodsInfo` and `OauthToken` stop at 2500 rows with `done=true`. A result of 2500 or more rows is therefore treated as truncated (`two_factor_methods_possibly_capped`, `oauth_tokens_possibly_capped`). The SF-04 summary states which signal was observed: the cap, a larger `totalSize`, or `done=false` or a stalled cursor.
+- **Named principals:** Whenever `User` or `TwoFactorMethodsInfo` is partial, SF-04 renders `users_without_registered_mfa_method` and `sample_users_without_mfa` as `null` with a `principals_withheld` note, and stops at `warn`. The visible users without an enrollment row are not named, because the unread rows could hold their enrollments.
+- **Dependent datasets:** `Profile` metadata is only requested for the sensitive profiles found in the `Profile` list. When that list is unread, the metadata dataset carries `not requested: the Profile list was not readable (...)` with the parent's status, and SF-05 and SF-06 render `manual` naming the parent.
+- **Evidence and summaries**
+  - Counts and lists derived from a dataset that was not read render `null` rather than `0` or `[]`, for example `active_users`, `users_seen`, `elevated_assignments`, `oauth_tokens`, and `health_check_risks`.
+  - Each finding's evidence carries the `*_truncated`, `seen`, and `total` values of the datasets it read.
+  - Every area summary carries an `inventories` map naming each dataset as `complete (N rows)`, `partial (N of M rows)`, or `unread (<status>: <error>)`.
+
+#### Cursor and request origins
+
+When a cursor is refused for its origin or its userinfo, the dataset line carries a reason. The reason names the instance origin and the rejected origin only, never the cursor's path, query, or userinfo:
+
+- `User read: partial (3 of 4000 rows; nextRecordsUrl pointed at another origin, https://evil.example.test, than the instance origin https://acme.my.salesforce.com; not followed)`
+- `User read: partial (3 of 4000 rows; nextRecordsUrl carried embedded credentials (userinfo) and pointed at the instance origin https://acme.my.salesforce.com; not followed)`
+
+A cursor that does not parse is refused as `nextRecordsUrl was not a valid URL (instance origin ...); not followed`.
+
+Because the cursor never reaches the transport, no fetch error names it, and the dataset's `core_data` marker carries no `endpoint` built from its path.
+
+Every request resolves against the session's instance URL and is sent to that origin only, without userinfo. A server-supplied absolute URL elsewhere, or one with embedded credentials, is refused before any request and records no endpoint. The refusal uses the same two-origin wording:
+
+`Salesforce request URL pointed at another origin, https://evil.example.test, than the instance origin https://acme.my.salesforce.com; the request was not sent.`
 
 ## Control coverage
 
@@ -115,7 +210,18 @@ Every finding is gated on the datasets it reads (the `Inputs` column below):
 
 ## Framework mappings
 
-Every finding carries the spec mapping for its control across FedRAMP, CMMC 2.0, SOC 2, CIS Salesforce, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP, for example `FedRAMP AC-12`, `CMMC 2.0 L2 AC.L2-3.1.10`, `SOC 2 CC6.1`, `CIS Salesforce 2.1`, `PCI-DSS 4.0 8.2.8`, `DISA STIG SRG-APP-000295`, `IRAP ISM-1164`, `ISMAP 8.2.8` for session timeout.
+Every finding carries the spec mapping for its control across FedRAMP, CMMC 2.0, SOC 2, CIS Salesforce, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP.
+
+For example, the mappings for session timeout are:
+
+- `FedRAMP AC-12`
+- `CMMC 2.0 L2 AC.L2-3.1.10`
+- `SOC 2 CC6.1`
+- `CIS Salesforce 2.1`
+- `PCI-DSS 4.0 8.2.8`
+- `DISA STIG SRG-APP-000295`
+- `IRAP ISM-1164`
+- `ISMAP 8.2.8`
 
 ## Live smoke test
 
@@ -123,24 +229,85 @@ Every finding carries the spec mapping for its control across FedRAMP, CMMC 2.0,
 npm --prefix cli run test:salesforce:live
 ```
 
-The script skips with exit code 0 when no credentials are present; otherwise it runs `salesforce_check_access` and the platform security assessment.
+The script skips with exit code 0 when no credentials are present. Otherwise it runs `salesforce_check_access` and the platform security assessment.
 
 ## Limitations and manual controls
 
-- Profile `loginHours` and `loginIpRanges` are read only for sensitive profiles (System Administrator plus profiles with elevated permissions), capped at 50 profiles; profiles that `listMetadata(Profile)` cannot map to a metadata `fullName` are listed as unresolved and keep controls 5 and 6 at `warn` or below.
-- `TwoFactorMethodsInfo` returns at most 2500 rows with `done=true`; a result of 2500 or more rows is treated as possibly truncated (`two_factor_methods_possibly_capped`), and on that or any other partial read of `TwoFactorMethodsInfo` or `User` control 4 stops at `warn`, withholds the count and names of users without a method (`principals_withheld`), and states which truncation signal was observed.
-- `OauthToken` returns only the caller's own tokens when the caller lacks `Customize Application`, and the API gives no truncation signal; the inspector reads the caller's flag from `UserPermissionAccess` and marks control 11 as a partial view when it is false or unknown.
-- `OauthToken` also has the same documented 2500-row hard cap as `TwoFactorMethodsInfo` (500 rows per query, `queryMore` up to 2500, then no more records, with `done=true`); an exactly 2500-row result is reported as possibly truncated in the control 11 evidence (`oauth_tokens_possibly_capped`) and summary, so a capped token count is never presented as complete.
+- Profile `loginHours` and `loginIpRanges` are read only for sensitive profiles (System Administrator plus profiles with elevated permissions), capped at 50 profiles. Profiles that `listMetadata(Profile)` cannot map to a metadata `fullName` are listed as unresolved and keep controls 5 and 6 at `warn` or below.
+- `TwoFactorMethodsInfo` returns at most 2500 rows with `done=true`. A result of 2500 or more rows is treated as possibly truncated (`two_factor_methods_possibly_capped`).
+  - On that or any other partial read of `TwoFactorMethodsInfo` or `User`, control 4 stops at `warn`.
+  - Control 4 then withholds the count and names of users without a method (`principals_withheld`) and states which truncation signal was observed.
+- `OauthToken` returns only the caller's own tokens when the caller lacks `Customize Application`, and the API gives no truncation signal. The inspector reads the caller's flag from `UserPermissionAccess` and marks control 11 as a partial view when the flag is false or unknown.
+- `OauthToken` also has the same documented 2500-row hard cap as `TwoFactorMethodsInfo`: 500 rows per query, `queryMore` up to 2500, then no more records, with `done=true`.
+  - An exactly 2500-row result is reported as possibly truncated in the control 11 evidence (`oauth_tokens_possibly_capped`) and summary.
+  - A capped token count is therefore never presented as complete.
 - Connected app OAuth scopes, IP relaxation, and per-app policies beyond `OptionsAllowAdminApprovedUsersOnly` and refresh token validity are not exposed by SOQL.
-- Custom object organization-wide defaults and sharing rules are not read; only the standard object defaults on `Organization` are evaluated.
-- `Certificate` is a Tooling API object; self-signed certificates are reported but not failed on their own, since Salesforce issues self-signed certificates for JWT connected apps and SAML signing by design. Certificates without a `KeySize` value are reported as unknown and never counted as compliant.
-- `listMetadata` and `readMetadata` require `Modify Metadata Through Metadata API Functions` or `Modify All Data`; without it, controls 2, 3, 5, 6, 18, 19, and 20 render as manual.
-- `SecuritySettings`, `MyDomainSettings`, and `Profile` metadata trees are projected to the leaves the verdicts read before they are stored in `core_data/` (dropped section names are listed under `_omittedSections`), and every exported URL field (`LoginHistory.LoginUrl`, `ConnectedApplication.StartUrl`, and any other `*Url`) keeps scheme, host, and path only, because Salesforce carries `?sid=` and `?key=` values there. SOQL results whose `nextRecordsUrl` stops advancing or that omit `done`/`totalSize` are reported as truncated with an unknown total, and a finding that also reads a secondary inventory (for example permission set assignments or `EventLogFile`) stops at `warn` or `manual` while that inventory is unreadable.
-- Every string a snapshot, an evidence list, or a summary keeps from a Salesforce response passes the data-side pass at the collector (`collectRecords`, `collectRecord`, and `collectProfileMetadata`): the client's remembered credentials in every form and every carrier (`Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare; URL userinfo and query strings, which go whole; credential-named assignments and fields; auth schemes; JWTs; PEM blocks) and, bare, the vendor-prefixed token shapes (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest) are removed from a description, a note, a name, or a comment: JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too, while the generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay. A record nested deeper than 32 levels is replaced by `[REDACTED]` at that depth rather than passed through (the payload is server-controlled).
-- Error strings never quote a response body. A body without Salesforce's documented `message`, `errorCode`, `error`, or `error_description` field (a proxy or gateway page, whatever its content type claims, or JSON without those fields) is described as "non-JSON body (text/html, 5120 bytes)" or "JSON body without a recognized error field (...)" on the REST, Tooling, and token endpoints, and as "non-SOAP body (...)" or "SOAP body without a fault string (...)" on the Metadata API and SOAP `login()` calls, where only `faultcode` and `faultstring` are quoted. Every error string is passed through one redaction pass when `SalesforceApiError` is constructed and again when the error is recorded, so `access_check.json`, dataset `error` fields, `analysis/*.json` `errors` arrays, `_errors.log`, and tool results carry status, path, and shape only. The pass removes the configured and obtained credentials whatever their shape and in their base64, base64url, URL-encoded, and JSON-escaped forms; any value inside a carrier whatever its shape (`Authorization`, `Cookie`, `Set-Cookie`, and API key headers, cookie and session assignments, URL userinfo and query pairs, the `Bearer`, `Basic`, `Digest`, `Token`, and `ApiKey` schemes, credential-named fields and assignments, SOAP `sessionId` and other credential elements, command-line flags); and bare values only when they have a real token shape (JWT-shaped assertions, PEM blocks, hex digests, vendor-prefixed keys, and runs of 16 or more characters with base64 symbols, scattered digits, or token casing, including a run standing after `=` under a non-credential pair name such as `theme=`). A carrier or token shape standing right after a literal JSON escape (`\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them) is treated exactly as one after a real newline, tab, or space. A bare name-shaped value standing alone in prose, such as an object name or `prod-us-east-2026`, is indistinguishable from a resource name and stays.
-- Credentials file errors are fixed text. A file that cannot be read fails with "Unable to read Salesforce credentials file <path> (<CODE>)" (the Node error code only, `ENOENT` included); a file that cannot be parsed fails with "Unable to parse Salesforce credentials file: invalid JSON in <path> at line N" (the line only when `JSON.parse` reports a position). Neither `JSON.parse`'s message, which quotes a window of the source, nor the filesystem's wording is ever included; the private key file takes the same read rule ("Unable to read Salesforce private key file <path> (<CODE>)").
-- Shield Event Monitoring and Platform Encryption are add-on licenses; unavailable objects render as manual not-applicable, never pass.
+- Custom object organization-wide defaults and sharing rules are not read. Only the standard object defaults on `Organization` are evaluated.
+- `Certificate` is a Tooling API object. Self-signed certificates are reported but not failed on their own, since Salesforce issues self-signed certificates for JWT connected apps and SAML signing by design. Certificates without a `KeySize` value are reported as unknown and never counted as compliant.
+- `listMetadata` and `readMetadata` require `Modify Metadata Through Metadata API Functions` or `Modify All Data`. Without it, controls 2, 3, 5, 6, 18, 19, and 20 render as manual.
+- `SecuritySettings`, `MyDomainSettings`, and `Profile` metadata trees are projected to the leaves the verdicts read before they are stored in `core_data/`. Dropped section names are listed under `_omittedSections`.
+- Every exported URL field (`LoginHistory.LoginUrl`, `ConnectedApplication.StartUrl`, and any other `*Url`) keeps scheme, host, and path only, because Salesforce carries `?sid=` and `?key=` values there.
+- SOQL results whose `nextRecordsUrl` stops advancing or that omit `done`/`totalSize` are reported as truncated with an unknown total.
+- A finding that also reads a secondary inventory (for example permission set assignments or `EventLogFile`) stops at `warn` or `manual` while that inventory is unreadable.
+- Shield Event Monitoring and Platform Encryption are add-on licenses. Unavailable objects render as manual not-applicable, never pass.
 - The username-password flow is disabled by default in newer orgs and is kept only for legacy compatibility.
+
+### Data-side redaction
+
+Every string a snapshot, an evidence list, or a summary keeps from a Salesforce response passes the data-side pass at the collector (`collectRecords`, `collectRecord`, and `collectProfileMetadata`). The pass removes these from a description, a note, a name, or a comment:
+
+- The client's remembered credentials in every form and every carrier:
+  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare
+  - URL userinfo and query strings, which go whole
+  - Credential-named assignments and fields
+  - Auth schemes
+  - JWTs
+  - PEM blocks
+- Bare vendor-prefixed token shapes: `sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest.
+
+JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too. The generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay.
+
+A record nested deeper than 32 levels is replaced by `[REDACTED]` at that depth rather than passed through (the payload is server-controlled).
+
+### Error strings
+
+Error strings never quote a response body. A body without Salesforce's documented `message`, `errorCode`, `error`, or `error_description` field (a proxy or gateway page, whatever its content type claims, or JSON without those fields) is described, not quoted:
+
+- On the REST, Tooling, and token endpoints: "non-JSON body (text/html, 5120 bytes)" or "JSON body without a recognized error field (...)".
+- On the Metadata API and SOAP `login()` calls: "non-SOAP body (...)" or "SOAP body without a fault string (...)". Only `faultcode` and `faultstring` are quoted there.
+
+Every error string is passed through one redaction pass when `SalesforceApiError` is constructed and again when the error is recorded. As a result, `access_check.json`, dataset `error` fields, `analysis/*.json` `errors` arrays, `_errors.log`, and tool results carry status, path, and shape only.
+
+The pass removes:
+
+- The configured and obtained credentials, whatever their shape, and in their base64, base64url, URL-encoded, and JSON-escaped forms.
+- Any value inside one of these carriers, whatever its shape:
+  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers
+  - Cookie and session assignments
+  - URL userinfo and query pairs
+  - The `Bearer`, `Basic`, `Digest`, `Token`, and `ApiKey` schemes
+  - Credential-named fields and assignments
+  - SOAP `sessionId` and other credential elements
+  - Command-line flags
+- Bare values only when they have a real token shape:
+  - JWT-shaped assertions
+  - PEM blocks
+  - Hex digests
+  - Vendor-prefixed keys
+  - Runs of 16 or more characters with base64 symbols, scattered digits, or token casing, including a run standing after `=` under a non-credential pair name such as `theme=`
+
+A carrier or token shape standing right after a literal JSON escape (`\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them) is treated exactly as one after a real newline, tab, or space.
+
+A bare name-shaped value standing alone in prose, such as an object name or `prod-us-east-2026`, is indistinguishable from a resource name and stays.
+
+### Credentials file errors
+
+Credentials file errors are fixed text.
+
+- A file that cannot be read fails with "Unable to read Salesforce credentials file \<path> (\<CODE>)". The parentheses carry the Node error code only, `ENOENT` included.
+- A file that cannot be parsed fails with "Unable to parse Salesforce credentials file: invalid JSON in \<path> at line N". The line appears only when `JSON.parse` reports a position.
+
+Neither `JSON.parse`'s message, which quotes a window of the source, nor the filesystem's wording is ever included. The private key file takes the same read rule ("Unable to read Salesforce private key file \<path> (\<CODE>)").
 
 ## Official documentation
 

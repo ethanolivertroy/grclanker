@@ -3,32 +3,48 @@ title: Veracode
 description: Read-only Veracode security inspector covering scan coverage, policy compliance, finding hygiene, SCA posture, and identity hygiene with framework mappings.
 ---
 
-The Veracode tools inspect a Veracode Application Security Platform account through the HMAC-signed REST APIs. They never mutate the platform: every call is a GET, and results are normalized into findings with FedRAMP, CMMC, SOC 2, CIS Controls v8, PCI-DSS, STIG, IRAP, and ISMAP mappings from `specs/veracode-sec-inspector.spec.md`.
+The Veracode tools inspect a Veracode Application Security Platform account through the HMAC-signed REST APIs. They never mutate the platform: every call is a GET.
+
+Results are normalized into findings with FedRAMP, CMMC, SOC 2, CIS Controls v8, PCI-DSS, STIG, IRAP, and ISMAP mappings from `specs/veracode-sec-inspector.spec.md`.
 
 ## What it inspects
 
-- Application inventory: latest static scan status and publish date, business criticality, team assignment, and policy assignment from the Applications API
-- Policy compliance: `policy_compliance_status` per application, custom policy adoption, finding rules, scan frequency rules, and grace periods from the Policy API
-- Finding hygiene: open flaw aging against severity SLAs, mitigation proposal and approval state, potential false positive rate, and Very High/High flaw density from the Findings API and Summary Report API
-- SCA posture: open high-CVSS vulnerability issues and HIGH risk license issues per workspace, plus application coverage through upload-and-scan SCA or linked agent projects (SCA Agent API)
-- Dynamic Analysis configuration: authentication and crawl settings per scan (Dynamic Analysis API)
-- Identity hygiene: team-unrestricted roles, Administrator counts, inactive users, SAML usage, API accounts without teams, and API credential age and expiration (Identity API, users listed with `include_roles=true` and `include_teams=true`, teams with `all_for_org=true`)
+- **Application inventory:** latest static scan status and publish date, business criticality, team assignment, and policy assignment from the Applications API.
+- **Policy compliance:** `policy_compliance_status` per application, custom policy adoption, finding rules, scan frequency rules, and grace periods from the Policy API.
+- **Finding hygiene:** open flaw aging against severity SLAs, mitigation proposal and approval state, potential false positive rate, and Very High/High flaw density from the Findings API and Summary Report API.
+- **SCA posture:** open high-CVSS vulnerability issues and HIGH risk license issues per workspace, plus application coverage through upload-and-scan SCA or linked agent projects (SCA Agent API).
+- **Dynamic Analysis configuration:** authentication and crawl settings per scan (Dynamic Analysis API).
+- **Identity hygiene:** team-unrestricted roles, Administrator counts, inactive users, SAML usage, API accounts without teams, and API credential age and expiration (Identity API, users listed with `include_roles=true` and `include_teams=true`, teams with `all_for_org=true`).
 
 ## Setup and authentication
 
-1. In the Veracode Platform, create an API service account (or use your user) and generate API credentials (API ID and API key secret). The secret is a hex string; store it outside the repository.
+1. In the Veracode Platform, create an API service account (or use your user). Generate API credentials (API ID and API key secret). The secret is a hex string. Store it outside the repository.
 2. Grant the roles the inspector needs:
-   - Security Insights or Reviewer for applications, policies, findings, and summary reports
-   - Administrator for users, teams, roles, and other users' API credentials
-   - Workspace Administrator or Workspace Editor when agent-based SCA is licensed
-   - Dynamic Analysis visibility (Security Insights covers the analyses list) when Dynamic Analysis is licensed
+   - Security Insights or Reviewer for applications, policies, findings, and summary reports.
+   - Administrator for users, teams, roles, and other users' API credentials.
+   - Workspace Administrator or Workspace Editor when agent-based SCA is licensed.
+   - Dynamic Analysis visibility (Security Insights covers the analyses list) when Dynamic Analysis is licensed.
 3. Provide credentials with one of these mechanisms (explicit tool arguments win, then environment variables, then the credentials file):
-   - Tool arguments `api_key_id` and `api_key_secret`
-   - Environment variables `VERACODE_API_KEY_ID` and `VERACODE_API_KEY_SECRET`
-   - `~/.veracode/credentials` INI file with `veracode_api_key_id` and `veracode_api_key_secret` under a profile; `VERACODE_API_PROFILE` or the `profile` argument selects the profile (default `default`), and `credentials_file` or `VERACODE_API_CREDENTIALS_FILE` overrides the path. A missing file is skipped; one that cannot be read stops the tool with `Unable to read Veracode credentials file <path> (<errno code>)`. INI lines without `=` are ignored, and no message ever repeats a line from the file
-4. Pick the region with `region` or `VERACODE_REGION`: `us` (api.veracode.com, default), `eu` (api.veracode.eu), or `us-fed` (api.veracode.us). `base_url` or `VERACODE_API_BASE_URL` overrides the host explicitly. `timeout_seconds` or `VERACODE_TIMEOUT` sets the request timeout in seconds (default 30, clamped to 1 through 300).
+   - Tool arguments `api_key_id` and `api_key_secret`.
+   - Environment variables `VERACODE_API_KEY_ID` and `VERACODE_API_KEY_SECRET`.
+   - A `~/.veracode/credentials` INI file with `veracode_api_key_id` and `veracode_api_key_secret` under a profile.
+     - `VERACODE_API_PROFILE` or the `profile` argument selects the profile (default `default`).
+     - `credentials_file` or `VERACODE_API_CREDENTIALS_FILE` overrides the path.
+     - A missing file is skipped. One that cannot be read stops the tool with `Unable to read Veracode credentials file <path> (<errno code>)`.
+     - INI lines without `=` are ignored, and no message ever repeats a line from the file.
+4. Pick the region with `region` or `VERACODE_REGION`: `us` (api.veracode.com, default), `eu` (api.veracode.eu), or `us-fed` (api.veracode.us).
+   - `base_url` or `VERACODE_API_BASE_URL` overrides the host explicitly.
+   - `timeout_seconds` or `VERACODE_TIMEOUT` sets the request timeout in seconds (default 30, clamped to 1 through 300).
 
-Requests are signed per the documented `VERACODE-HMAC-SHA-256` scheme: the data string `id=...&host=...&url=<path and query>&method=GET`, a 16-byte random nonce, a millisecond timestamp, the key chain `HMAC(key, nonce) -> HMAC(., timestamp) -> HMAC(., "vcode_request_version_1")`, and a final HMAC over the data string. The key ID and secret are removed from error messages as described under Export bundle and never written into bundles.
+Requests are signed per the documented `VERACODE-HMAC-SHA-256` scheme:
+
+- The data string `id=...&host=...&url=<path and query>&method=GET`.
+- A 16-byte random nonce.
+- A millisecond timestamp.
+- The key chain `HMAC(key, nonce) -> HMAC(., timestamp) -> HMAC(., "vcode_request_version_1")`.
+- A final HMAC over the data string.
+
+The key ID and secret are removed from error messages as described under Export bundle. They are never written into bundles.
 
 ## Tools
 
@@ -42,19 +58,234 @@ Requests are signed per the documented `VERACODE-HMAC-SHA-256` scheme: the data 
 | `veracode_assess_access_controls` | Controls 7, 8, 9 |
 | `veracode_export_audit_bundle` | Runs everything into `<API host>-audit-bundle` under `output_dir` (default `./export/veracode`) and writes `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a paired zip |
 
-Every finding is `{ id, title, severity, status, summary, evidence, mappings }` where `status` is `pass`, `warn`, `fail`, or `manual`.
+Every finding is `{ id, title, severity, status, summary, evidence, mappings }`, where `status` is `pass`, `warn`, `fail`, or `manual`.
 
 ### Pagination and truncation reporting
 
-Every HAL list (`/appsec/v1/applications`, `/appsec/v1/policies`, `/appsec/v2/applications/{guid}/findings`, `/api/authn/v2/users`, `/api/authn/v2/teams`, `/api/authn/v2/roles`, `/srcclr/v3/workspaces`, workspace issues and libraries, `/was/configservice/v1/analyses`, per-analysis scans, per-application sandboxes) is walked with `page` and `size` against the configured base URL until the last page; the payload's `_links` (`next`, `last`, `self`) are never followed, so a server-supplied link cannot send the signed HMAC header to another origin. The walk finishes when the payload's `page.total_pages` is reached or, without page metadata, when a page comes back shorter than the page size. Every other exit reports `complete: false`: the page cap (50 pages by default; 10 for sandboxes, 20 for workspace issues, 5 for workspace libraries and per-analysis scans) reached with more pages promised or with no page metadata at all, a page whose items repeat the previous page (the server ignored `page`, recorded as `<path> returned the same page twice, so pagination stopped after N items`), and a `total_elements` larger than the items read. A capped walk without metadata leaves `totalElements` undefined, so the finding states `Only N of an unknown total of <items> were read (P/? pages), so the verdict reflects a partial inventory`; with metadata it states seen versus total and pages fetched versus `total_pages`. A finding that reads an incomplete list never passes: `pass` drops to `warn` and the note is appended to the summary. Per-item sampling caps (`max_applications`, `max_workspaces`, `max_analyses`, ten scans per analysis, 200 API accounts) are stated the same way (`Only S of T <items> were sampled, so the verdict reflects a partial view`) and demote `pass` to `warn`.
+Every HAL list below is walked with `page` and `size` against the configured base URL until the last page:
+
+- `/appsec/v1/applications`
+- `/appsec/v1/policies`
+- `/appsec/v2/applications/{guid}/findings`
+- `/api/authn/v2/users`
+- `/api/authn/v2/teams`
+- `/api/authn/v2/roles`
+- `/srcclr/v3/workspaces`
+- Workspace issues and libraries
+- `/was/configservice/v1/analyses`
+- Per-analysis scans
+- Per-application sandboxes
+
+The payload's `_links` (`next`, `last`, `self`) are never followed, so a server-supplied link cannot send the signed HMAC header to another origin.
+
+The walk finishes when the payload's `page.total_pages` is reached or, without page metadata, when a page comes back shorter than the page size. Every other exit reports `complete: false`:
+
+- The page cap, reached with more pages promised or with no page metadata at all. The cap is 50 pages by default, 10 for sandboxes, 20 for workspace issues, and 5 for workspace libraries and per-analysis scans.
+- A page whose items repeat the previous page (the server ignored `page`). The exit is recorded as `<path> returned the same page twice, so pagination stopped after N items`.
+- A `total_elements` larger than the items read.
+
+A capped walk without metadata leaves `totalElements` undefined, so the finding states `Only N of an unknown total of <items> were read (P/? pages), so the verdict reflects a partial inventory`. With metadata, it states seen versus total and pages fetched versus `total_pages`.
+
+A finding that reads an incomplete list never passes: `pass` drops to `warn` and the note is appended to the summary.
+
+Per-item sampling caps (`max_applications`, `max_workspaces`, `max_analyses`, ten scans per analysis, 200 API accounts) are stated the same way: `Only S of T <items> were sampled, so the verdict reflects a partial view`. They demote `pass` to `warn`.
 
 ### Export bundle
 
-`core_data/<assessment>.json` (`scan-coverage`, `policy-compliance`, `findings-hygiene`, `sca-posture`, `access-controls`) holds the raw snapshot each assess tool also returns as `rawData`; `analysis/<assessment>.json` holds the title, `summary`, findings, and errors; `analysis/findings.json` merges every finding; `analysis/summary.md` renders the access check and every assessment as text; `core_data/access.json` is the access check result. Every JSON document passes through the same redaction before it is written: the value of every credential-named key is replaced by `[REDACTED]` (the key is normalized to lowercase with spaces, dots, underscores, and hyphens removed and matched on the suffixes `password`, `passwd`, `passphrase`, `secret`, `token`, `scriptdata`, `scriptbody`, `certificate`, and `apikey`, `privatekey`, `secretkey`, `accesskey`, `authkey`, `signingkey`, `encryptionkey`, `sessionkey`, so `api_token`, `client_secret`, `login_script_data`, `secret_key`, and `access_key` are caught while `credentials_readable` and `api_id` stay legible), `{name, value}` and `{key, value}` pairs whose name is credential-shaped (application profile `custom_fields`) have their value replaced, JWT-shaped strings are replaced, and every URL keeps only scheme, host, and path with userinfo and query string replaced and the fragment dropped (`git_repo_url` with `user:token@`, target URLs with session parameters, single-page targets whose `#` fragment carries a token). Dynamic scan configurations are not stored verbatim: each is projected to `analysis_id`, `scan_id`, a scrubbed `target_url`, `authentication_types` (the keys of `auth_configuration.authentications`), `authentication_details: "[REDACTED]"` when any authentication exists, `crawl_disabled`, `crawl_script_present`, and `allowed_host_count`. Per-user API credential records keep only `api_id`, `created_ts`, `expiration_ts`, `revocation_ts`, and `last_used_ts`; per-analysis scan lists keep `scan_id` and a scrubbed `target_url`.
+- `core_data/<assessment>.json` (`scan-coverage`, `policy-compliance`, `findings-hygiene`, `sca-posture`, `access-controls`) holds the raw snapshot each assess tool also returns as `rawData`.
+- `analysis/<assessment>.json` holds the title, `summary`, findings, and errors.
+- `analysis/findings.json` merges every finding.
+- `analysis/summary.md` renders the access check and every assessment as text.
+- `core_data/access.json` is the access check result.
 
-A surface that was denied, errored, or timed out is written as the marker `{ collected: false, status, endpoint, error }`, where `status` and `endpoint` are the HTTP status and path of the request that actually failed (both `null` when the failure carried none), never as `[]` or `{}`; a per-parent dataset whose requests were never issued because the inventory it depends on was unreadable or empty (sandboxes, findings, summary reports, SCA projects, workspace issues and libraries, dynamic scans and configurations, API credentials) is written as `{ collected: false, status: null, endpoint: null, error: "Not requested: ..." }` naming that cause; `sca_projects_by_application` carries the same marker when no list was needed at all (`Not requested: every sampled application has upload_and_scan_sca_enabled, so no linked project list was requested.`), so `{}` never stands for zero requests. A readable but empty list stays `[]`. Assessment summaries render `null`, never `0`, for every count derived from a surface that was not read (`applications_seen`, `applications_total`, `applications_sampled`, `policies_seen`, `workspaces_seen`, `workspaces_sampled`, `users_seen`, `teams_seen`, `roles_seen`), and evidence counters derived from an unread inventory render `null` too: `libraries_seen` when no library list was readable; `applications_on_custom_policies`, `applications_on_default_policies` (VERACODE-15), and `applications_without_team` (VERACODE-07) when the application inventory was unreadable; `applications_with_sandboxes` and `applications_without_sandboxes` (VERACODE-10) when no sandbox list was readable; `scan_coverage` when no scan list was readable and `configured_scans`, `unauthenticated_scans`, `crawl_disabled_scans` (VERACODE-13) when no requested scan configuration was readable (a readable but empty scan inventory keeps its real zeros); `credentials_current`, `credentials_over_max_age`, `credentials_over_max_age_count`, `credentials_expired`, `credentials_missing_dates` (VERACODE-09) when no credential record was readable, beside the honest `credentials_readable: 0`; `uncovered_applications` and `linked_projects_by_application` (VERACODE-18) when the SCA Agent API was unavailable. Every HTTP status, path, and error string in a finding, a summary, the access check, or `_errors.log` comes from a request the run made: `manual` verdicts name the failed surface's own status (`was forbidden (<401 or 403>)`, `returned an error (<status>)`, or `could not be read` when no status was observed).
+#### JSON document redaction
 
-Error text follows its own rule, applied when an API error is constructed and again wherever an error string is recorded (marker objects, `_errors.log`, finding evidence, the access check, and tool error payloads). A value inside a carrier is removed whatever its shape: the value of a credential-named header (`Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, and similar), a cookie or session assignment, URL userinfo and query pairs (the query string collapses to `?[REDACTED]`), the value after a scheme word (`Bearer`, `Basic`, `Digest`, `Token`, `OAuth`, `Negotiate`, `NTLM`, `SSWS`, `ApiKey`, `Splunk`, `Snowflake`, `HMAC`, and `VERACODE-HMAC-SHA-256`, in any casing; the scheme word stays), and the value of every credential-named `key=value` or `key: value` pair. The credential-named pair is read before any scheme word: a key that names a credential loses its value whatever word it starts with, so `VERACODE_API_KEY_SECRET=VERACODE-HMAC-SHA-256 rejected` renders `VERACODE_API_KEY_SECRET=[REDACTED] rejected`, `sslPassword=splunk rejected` renders `sslPassword=[REDACTED] rejected`, and `db_password: token` renders `db_password: [REDACTED]`. A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Authorization`, `WWW-Authenticate`), where the run after it goes whatever its shape or the scheme's casing (`Authorization: VERACODE-HMAC-SHA-256 <run>` renders `Authorization: VERACODE-HMAC-SHA-256 [REDACTED]`, `Authorization: SSWS prod-us-east-2026` renders `Authorization: SSWS [REDACTED]`, `Authorization: bearer <token>` renders `Authorization: bearer [REDACTED]`) while a pair list after the scheme, under a request header or a challenge, is read pair by pair as described below (`WWW-Authenticate: Bearer realm="api"` stays), and bare in prose, where the word after it is ordinary text when it is a mechanism word (`authentication`, `credentials`, `challenge`), a version (`OAuth 2.0`), an auth-param (`realm="api"`), or one plain word after a lowercase spelling or a product name (`Basic authentication failed`, `the bearer presented an expired token`, `Splunk Enterprise rejected the request`, and `Snowflake statement failed` stay), while a header-cased pure scheme followed by a run of 8 or more characters loses the run whatever its shape (`Bearer abcdefghijkl rejected` renders `Bearer [REDACTED] rejected`, `replayed BASIC <token> upstream` renders `replayed BASIC [REDACTED] upstream`). The pair rule holds whatever the value's shape and length and wherever the pair sits, in the `=`, `: `, `:`, and JSON forms, in prose and inside a JSON string alike (`upstream echoed DB_PASSWORD: monkey while proxying` renders `DB_PASSWORD: [REDACTED] while proxying`, and `InvalidAuthenticationToken: Access token has expired` renders `InvalidAuthenticationToken: [REDACTED] token has expired`); a credential word anywhere in the key makes it a pair key (`DB_PASSWORD`, `SPLUNK_PASSWORD`, `OKTA_CLIENT_TOKEN`). Three key classes refine that, tested in this order: a key ending in `secret_id`, `session_id`, or `token_id` in any prefix, casing, or separator (`VAULT_SECRET_ID`, `role_secret_id`, `token_id`, `tokenId`) or naming a session id (`sid`, `jsessionid`) carries a bearer credential and loses its value whatever the shape, a UUID included; a URL-valued webhook key (the bare word `webhook` or `hook`, or a `webhook*`, `*hook_*`, or `callback_*` key whose final segment is `url`, `uri`, or `endpoint`) keeps its origin and loses its path and query, while a webhook key that is not URL-valued follows the rule for its own final segment (`webhook_count=3` stays, `webhook_secret=<value>` goes whole); and a credential-named key whose final segment is `url`, `uri`, `endpoint`, `method`, `algorithm`, `audience`, `issuer`, `shape`, `type`, `mode`, `path`, `file`, `dir`, `limit`, `count`, `id`, `name`, `policy`, `policies`, `ttl`, `uses`, `cidrs`, or `accessor` names a setting (`token_endpoint`, `auth_method`, `token_type`, `api_key_id`, `access_key_id`, `key_id`, `private_key_id`, `secret_name`, `secret_id_ttl`, `token_max_ttl`, `secret_id_num_uses`, `token_bound_cidrs`, `secret_id_accessor`) and keeps a value that is neither token-shaped nor a configured secret (`secret_id_ttl=3600`, `key_id=kid-primary`, and `secret_name=db-credentials-prod` stay; `token_type=<token>` goes). A key without a credential word (`OKTA_CLIENT_ID`, `client_id`, `tenant_id`, `SUMO_ACCESS_ID`, `SNOWFLAKE_ACCOUNT`, `X-Request-Id`) is an identifier rather than a pair key, so its value is judged by shape alone. A credential-named command-line flag is a pair too, with a space or `=` before its value (`psql --password <value> -h db` renders `psql --password [REDACTED] -h db`, `helm --set db.password=<value> upgrade` renders `helm --set db.password=[REDACTED] upgrade`, `-Dspring.datasource.password=<value>` renders `-Dspring.datasource.password=[REDACTED]`). The signed header renders as `VERACODE-HMAC-SHA-256 [REDACTED],ts=<ms>,nonce=[REDACTED],sig=[REDACTED]` wherever it appears, bare or inside an `Authorization:` carrier: the `id=` run goes under the scheme rule, `nonce=` and `sig=` as credential-named pairs, the `ts=` timestamp stays, and a run the scheme rule does not cover goes whole. A quoted value in any of these carriers (plain, single, or JSON-escaped quotes, as in `Cookie: sid="..."`, `Authorization: Bearer "..."`, or `\"Authorization\": \"Bearer ...\"`) is removed with its quotes kept, and a quote alone never makes a header value a credential (`Content-Type: "application/json"` stays). On a compound header line the reader is quote-aware at every JSON depth: a quoted value ends at the closing quote that matches its opener (the same quote character behind the same run of backslashes), so an escaped inner quote is inner content and goes with the value (`{"Cookie": "sid=\"...\""}` renders `{"Cookie": "[REDACTED]"}` and `{"X-Api-Key": "\"...\""}` renders `{"X-Api-Key": "[REDACTED]"}`, at the top level and inside a double-escaped raw JSON string alike); a quoted value that opens with a scheme word keeps the scheme and loses the rest (`{"Authorization": "Bearer \"...\""}` renders `{"Authorization": "Bearer [REDACTED]"}`), except that a scheme followed by a pair list is read pair by pair, under `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate` alike: a quoted value in the list is the credential and goes whatever its key, unless the key is a descriptive parameter (`realm`, `qop`, `algorithm`, `charset`, `error`, `error_description`, `error_uri`, `scope`), and a bare value follows its key's own rule, so `Authorization: Snowflake Token="<token>"` renders `Authorization: Snowflake Token="[REDACTED]"`, any other `<Scheme> <Key>="..."` pair renders the same way (`Authorization: Bearer blob="<token>"` renders `Authorization: Bearer blob="[REDACTED]"`), a Digest header keeps `realm="api"`, `qop=auth`, and `nc=00000001` and loses `username`, `nonce`, `uri`, `cnonce`, `response`, and `opaque`, a challenge's `WWW-Authenticate: Bearer realm="api", error="invalid_token"` stays whole, and `"VERACODE-HMAC-SHA-256 id=...,ts=...,nonce=...,sig=..."` renders `"VERACODE-HMAC-SHA-256 [REDACTED],ts=...,nonce=[REDACTED],sig=[REDACTED]"` (an unquoted first run after the scheme goes whole, and the pairs after it follow their keys). The same list rule reads a pair list after a scheme word in prose, bare, JSON-escaped, and inside a JSON string alike (`upstream said Bearer blob="<token>"` renders `upstream said Bearer blob="[REDACTED]"`, and `{"headers":{"Authorization":"Snowflake Token=\"<token>\""}}` renders `{"headers":{"Authorization":"Snowflake Token=\"[REDACTED]\""}}`). A proof parameter (`response`, `signature`, `oauth_signature`, `mac`, `sig`) loses its value wherever its pair sits in a list with a challenge parameter (`realm`, `nonce`, `cnonce`, `opaque`, `qop`, or an `oauth_*` name), with or without a scheme word or a header in front of the list and whatever the value's shape, so a data value such as `realm="api", nonce="n", response="<proof>"` is never read as a bare challenge: it renders `realm="api", nonce="[REDACTED]", response="[REDACTED]"` bare, after a literal escape, and inside a JSON string alike, `realm=api, nonce=n, mac=<proof>` loses its `mac` the same way, and inside a scheme word's list a bare proof goes whatever its neighbours (`Authorization: Digest username="u", response=<proof>` renders `Authorization: Digest username="[REDACTED]", response=[REDACTED]`), while a proof-free challenge keeps its descriptive values (`WWW-Authenticate: Bearer realm="api"` stays whole, and `Digest realm="api", qop="auth", nonce="n"` keeps `realm="api"` and `qop="auth"`; its nonce goes as a credential-named pair does everywhere) and a pair list of another kind keeps its values (`status=500 response=slow` stays). An unquoted cookie or header value ends at a `;` or `,` before the next `Name:` token (or at the end of the line), and an unterminated quote ends the same way rather than swallowing the following header, so that header keeps its name and gets its own carrier treatment: `Cookie: sid=...; X-Api-Key: ...; Content-Type: application/json` renders `Cookie: [REDACTED]; X-Api-Key: [REDACTED]; Content-Type: application/json`, and `Cookie: sid="...; X-Api-Key: "..."; Content-Type: "application/json"` renders `Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"`. A `;` inside a URL query value is part of the value (URLSearchParams semantics), so a relative `/api/v1/things?token=hunter2;restofsecret` renders `/api/v1/things?token=[REDACTED]` with no tail and an absolute URL's query collapses to `?[REDACTED]` as before, in the plain, JSON-escaped, and slash-escaped spellings alike; the `;` separator belongs to `Cookie` and `Set-Cookie` parsing alone, and the cookie reader runs before the query pass, so `Cookie: &sid=a; pref=b` still renders `Cookie: [REDACTED]`. An apostrophe is a cookie character, so `Cookie: sid=O'<value>; X-Api-Key: <value>` renders `Cookie: [REDACTED]; X-Api-Key: [REDACTED]` and `Cookie: theme=dark; my'pref=<value>` renders `Cookie: [REDACTED]`. The next header's name may carry any RFC 7230 token character, so a dotted or underscored name (`X.Api.Key:`, `X_Api_Key:`) is recognised as the next header and its value is judged by its own key. A literal JSON escape (`\n`, `\r`, `\t`, `\b`, `\f`, `\/`, `\uXXXX`: the two- or six-character sequence as it sits inside a JSON string, not the control character) is a boundary before every carrier opener: a header name, scheme word, pair key, URL, or token that begins right after one is read on its own and never as the value of the word before the escape, so `request headers:\u000aAuthorization: Splunk <key>` renders `request headers:\u000aAuthorization: Splunk [REDACTED]` and `proxy:\tpassword: hunter2` renders `proxy:\tpassword: [REDACTED]`; the escape sequence itself stays, a token glued to an escape never takes the escape letter as its first character, a value, URL, or query pair ends at the backslash that opens the next escape, and a `\/` escape is a boundary rather than a path separator, so a key or token after it is judged on its own. A URL whose slashes are JSON-escaped (`https:\/\/hooks.example.com\/a?token=<value>`) is still read as a URL, so its userinfo and query go the same way (`note https:\/\/hooks.example.com\/a?[REDACTED] next`). The userinfo of a URL ends at the first `/`, `?`, or `#`, so an `@` inside a query or fragment never turns the query into the host: `https://h?e=a@x.com&token=s3cr3t` renders `https://h?[REDACTED]` and `https://h#f@x.com` renders `https://h#[REDACTED]`, in the plain and the slash-escaped spelling alike, and a bare `?` or `#` left before an earlier marker stays as it is, so a second pass adds no second marker. A configured secret (the API key ID and the API key secret) is removed whatever its shape, in its raw, JSON-escaped, URL-encoded, base64, and base64url forms. A secret handed to the scrub call is also removed wherever it stands, glued into a longer run included, so a short passphrase does not survive inside another value; a value under four characters is ignored. A value with a real token shape is removed bare: PEM blocks, JWTs, AWS key IDs and secrets, other vendor-prefixed tokens, hex digests of 32 or more characters, and runs of 16 or more characters that carry a base64 symbol, more than one digit group, or token casing. A bare value shaped like a name (words joined by hyphens or underscores with at most one digit group, such as `prod-us-east-2026`, or a camelCase identifier whose words average three or more letters) is indistinguishable from a resource name and stays, and so does a token-shaped segment of a bare request path or file path (`/appsec/v2/applications/<guid>/findings`, the `credentials` file path), so the endpoint or file an error names is the one the run used; inside a URL with a scheme every path segment keeps the rule. The last segment of a bare path used as a label (`/api/authn/v2/api_credentials: <detail>`, `/oauth/token-request: invalid_client`, `/api/v1/api-tokens: request failed with 403`) is a request target rather than a pair key, so the text after it stays, unless that segment itself names a credential (it ends in `password`, `passwd`, `passphrase`, `pwd`, `secret`, `token`, `key`, or `assertion`, alone or followed by an encoding word such as `pem` or `base64` as in `privateKeyPem`, or is a bearer id) and the value stands alone on the line, in which case the label is a pair (`kv/password: <value>` renders `kv/password: [REDACTED]`); inside a URL with a scheme the pair rule still applies. Data written to the bundle follows the data-side rule: every string leaf of a `core_data/` snapshot, an assess payload, and the access check passes through the same carrier and shape rules with the generic long-run and hex-digest rules left off, so a vendor-prefixed token (`sk_live_`, `xox*-`, `ghp_`, `AKIA`, and the rest of the vendor set), a JWT, a PEM block, or a credential carrier inside a free-text field (an application description, a custom field value, a team name) is removed there too (`key sk_live_<24 characters> end` renders `key [REDACTED] end`), while an identifier such as `prod-us-east-2026-cluster` or a bare random run survives as evidence.
+Every JSON document passes through the same redaction before it is written:
+
+- The value of every credential-named key is replaced by `[REDACTED]`.
+  - The key is normalized to lowercase with spaces, dots, underscores, and hyphens removed.
+  - The normalized key is matched on the suffixes `password`, `passwd`, `passphrase`, `secret`, `token`, `scriptdata`, `scriptbody`, `certificate`, and `apikey`, `privatekey`, `secretkey`, `accesskey`, `authkey`, `signingkey`, `encryptionkey`, `sessionkey`.
+  - So `api_token`, `client_secret`, `login_script_data`, `secret_key`, and `access_key` are caught, while `credentials_readable` and `api_id` stay legible.
+- `{name, value}` and `{key, value}` pairs whose name is credential-shaped (application profile `custom_fields`) have their value replaced.
+- JWT-shaped strings are replaced.
+- Every URL keeps only scheme, host, and path. Its userinfo and query string are replaced and its fragment dropped (`git_repo_url` with `user:token@`, target URLs with session parameters, single-page targets whose `#` fragment carries a token).
+
+Dynamic scan configurations are not stored verbatim. Each is projected to:
+
+- `analysis_id`, `scan_id`, and a scrubbed `target_url`.
+- `authentication_types` (the keys of `auth_configuration.authentications`).
+- `authentication_details: "[REDACTED]"` when any authentication exists.
+- `crawl_disabled`, `crawl_script_present`, and `allowed_host_count`.
+
+Per-user API credential records keep only `api_id`, `created_ts`, `expiration_ts`, `revocation_ts`, and `last_used_ts`. Per-analysis scan lists keep `scan_id` and a scrubbed `target_url`.
+
+#### Unread surfaces
+
+- A surface that was denied, errored, or timed out is written as the marker `{ collected: false, status, endpoint, error }`, never as `[]` or `{}`.
+  - `status` and `endpoint` are the HTTP status and path of the request that actually failed (both `null` when the failure carried none).
+- When a per-parent dataset's requests were never issued because the inventory it depends on was unreadable or empty (sandboxes, findings, summary reports, SCA projects, workspace issues and libraries, dynamic scans and configurations, API credentials), the dataset is written as `{ collected: false, status: null, endpoint: null, error: "Not requested: ..." }` naming that cause.
+  - `sca_projects_by_application` carries the same marker when no list was needed at all (`Not requested: every sampled application has upload_and_scan_sca_enabled, so no linked project list was requested.`), so `{}` never stands for zero requests.
+- A readable but empty list stays `[]`.
+
+Assessment summaries render `null`, never `0`, for every count derived from a surface that was not read (`applications_seen`, `applications_total`, `applications_sampled`, `policies_seen`, `workspaces_seen`, `workspaces_sampled`, `users_seen`, `teams_seen`, `roles_seen`).
+
+Evidence counters derived from an unread inventory render `null` too:
+
+- `libraries_seen` when no library list was readable.
+- `applications_on_custom_policies`, `applications_on_default_policies` (VERACODE-15), and `applications_without_team` (VERACODE-07) when the application inventory was unreadable.
+- `applications_with_sandboxes` and `applications_without_sandboxes` (VERACODE-10) when no sandbox list was readable.
+- `scan_coverage` when no scan list was readable, and `configured_scans`, `unauthenticated_scans`, `crawl_disabled_scans` (VERACODE-13) when no requested scan configuration was readable (a readable but empty scan inventory keeps its real zeros).
+- `credentials_current`, `credentials_over_max_age`, `credentials_over_max_age_count`, `credentials_expired`, `credentials_missing_dates` (VERACODE-09) when no credential record was readable, beside the honest `credentials_readable: 0`.
+- `uncovered_applications` and `linked_projects_by_application` (VERACODE-18) when the SCA Agent API was unavailable.
+
+Every HTTP status, path, and error string in a finding, a summary, the access check, or `_errors.log` comes from a request the run made. `manual` verdicts name the failed surface's own status (`was forbidden (<401 or 403>)`, `returned an error (<status>)`, or `could not be read` when no status was observed).
+
+#### Error text carriers
+
+Error text follows its own rule, applied when an API error is constructed and again wherever an error string is recorded: marker objects, `_errors.log`, finding evidence, the access check, and tool error payloads.
+
+- A value inside a carrier is removed whatever its shape:
+  - The value of a credential-named header (`Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, and similar).
+  - A cookie or session assignment.
+  - URL userinfo and query pairs. The query string collapses to `?[REDACTED]`.
+  - The value after a scheme word (`Bearer`, `Basic`, `Digest`, `Token`, `OAuth`, `Negotiate`, `NTLM`, `SSWS`, `ApiKey`, `Splunk`, `Snowflake`, `HMAC`, and `VERACODE-HMAC-SHA-256`, in any casing). The scheme word stays.
+  - The value of every credential-named `key=value` or `key: value` pair.
+- The credential-named pair is read before any scheme word. A key that names a credential loses its value whatever word it starts with:
+  - `VERACODE_API_KEY_SECRET=VERACODE-HMAC-SHA-256 rejected` renders `VERACODE_API_KEY_SECRET=[REDACTED] rejected`.
+  - `sslPassword=splunk rejected` renders `sslPassword=[REDACTED] rejected`.
+  - `db_password: token` renders `db_password: [REDACTED]`.
+
+#### Scheme words
+
+A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Authorization`, `WWW-Authenticate`) and bare in prose.
+
+- Under an Authorization-style key, the run after the scheme word goes whatever its shape or the scheme's casing:
+  - `Authorization: VERACODE-HMAC-SHA-256 <run>` renders `Authorization: VERACODE-HMAC-SHA-256 [REDACTED]`.
+  - `Authorization: SSWS prod-us-east-2026` renders `Authorization: SSWS [REDACTED]`.
+  - `Authorization: bearer <token>` renders `Authorization: bearer [REDACTED]`.
+- Under such a key, a pair list after the scheme (under a request header or a challenge) is read pair by pair as described below. `WWW-Authenticate: Bearer realm="api"` stays.
+- Bare in prose, the word after a scheme word is ordinary text when it is a mechanism word (`authentication`, `credentials`, `challenge`), a version (`OAuth 2.0`), an auth-param (`realm="api"`), or one plain word after a lowercase spelling or a product name.
+  - `Basic authentication failed`, `the bearer presented an expired token`, `Splunk Enterprise rejected the request`, and `Snowflake statement failed` stay.
+- Bare in prose, a header-cased pure scheme followed by a run of 8 or more characters loses the run whatever its shape:
+  - `Bearer abcdefghijkl rejected` renders `Bearer [REDACTED] rejected`.
+  - `replayed BASIC <token> upstream` renders `replayed BASIC [REDACTED] upstream`.
+
+#### Credential-named pairs
+
+- The pair rule holds whatever the value's shape and length and wherever the pair sits. It holds in the `=`, `: `, `:`, and JSON forms, in prose and inside a JSON string alike:
+  - `upstream echoed DB_PASSWORD: monkey while proxying` renders `DB_PASSWORD: [REDACTED] while proxying`.
+  - `InvalidAuthenticationToken: Access token has expired` renders `InvalidAuthenticationToken: [REDACTED] token has expired`.
+- A credential word anywhere in the key makes it a pair key (`DB_PASSWORD`, `SPLUNK_PASSWORD`, `OKTA_CLIENT_TOKEN`).
+- Three key classes refine that rule, tested in this order:
+  - **Bearer ids:** A key carries a bearer credential, and loses its value whatever the shape (a UUID included), when it does either of these:
+    - Ends in `secret_id`, `session_id`, or `token_id` in any prefix, casing, or separator (`VAULT_SECRET_ID`, `role_secret_id`, `token_id`, `tokenId`).
+    - Names a session id (`sid`, `jsessionid`).
+  - **Webhook keys:** A URL-valued webhook key keeps its origin and loses its path and query.
+    - A URL-valued webhook key is the bare word `webhook` or `hook`, or a `webhook*`, `*hook_*`, or `callback_*` key whose final segment is `url`, `uri`, or `endpoint`.
+    - A webhook key that is not URL-valued follows the rule for its own final segment. `webhook_count=3` stays, and `webhook_secret=<value>` goes whole.
+  - **Setting keys:** A credential-named key names a setting when its final segment is one of the segments listed below. It keeps a value that is neither token-shaped nor a configured secret.
+    - The final segments are `url`, `uri`, `endpoint`, `method`, `algorithm`, `audience`, `issuer`, `shape`, `type`, `mode`, `path`, `file`, `dir`, `limit`, `count`, `id`, `name`, `policy`, `policies`, `ttl`, `uses`, `cidrs`, and `accessor`.
+    - Setting keys include `token_endpoint`, `auth_method`, `token_type`, `api_key_id`, `access_key_id`, `key_id`, `private_key_id`, `secret_name`, `secret_id_ttl`, `token_max_ttl`, `secret_id_num_uses`, `token_bound_cidrs`, and `secret_id_accessor`.
+    - `secret_id_ttl=3600`, `key_id=kid-primary`, and `secret_name=db-credentials-prod` stay. `token_type=<token>` goes.
+- A key without a credential word (`OKTA_CLIENT_ID`, `client_id`, `tenant_id`, `SUMO_ACCESS_ID`, `SNOWFLAKE_ACCOUNT`, `X-Request-Id`) is an identifier rather than a pair key, so its value is judged by shape alone.
+- A credential-named command-line flag is a pair too, with a space or `=` before its value:
+  - `psql --password <value> -h db` renders `psql --password [REDACTED] -h db`.
+  - `helm --set db.password=<value> upgrade` renders `helm --set db.password=[REDACTED] upgrade`.
+  - `-Dspring.datasource.password=<value>` renders `-Dspring.datasource.password=[REDACTED]`.
+
+#### Signed header
+
+The signed header renders as `VERACODE-HMAC-SHA-256 [REDACTED],ts=<ms>,nonce=[REDACTED],sig=[REDACTED]` wherever it appears, bare or inside an `Authorization:` carrier:
+
+- The `id=` run goes under the scheme rule.
+- `nonce=` and `sig=` go as credential-named pairs.
+- The `ts=` timestamp stays.
+- A run the scheme rule does not cover goes whole.
+
+#### Quoted values and pair lists
+
+- A quoted value in any of the carriers above is removed with its quotes kept. The rule holds for plain, single, or JSON-escaped quotes, as in `Cookie: sid="..."`, `Authorization: Bearer "..."`, or `\"Authorization\": \"Bearer ...\"`.
+- A quote alone never makes a header value a credential. `Content-Type: "application/json"` stays.
+- On a compound header line the reader is quote-aware at every JSON depth. A quoted value ends at the closing quote that matches its opener (the same quote character behind the same run of backslashes). An escaped inner quote is therefore inner content and goes with the value.
+  - At the top level and inside a double-escaped raw JSON string alike, `{"Cookie": "sid=\"...\""}` renders `{"Cookie": "[REDACTED]"}`, and `{"X-Api-Key": "\"...\""}` renders `{"X-Api-Key": "[REDACTED]"}`.
+- A quoted value that opens with a scheme word keeps the scheme and loses the rest. `{"Authorization": "Bearer \"...\""}` renders `{"Authorization": "Bearer [REDACTED]"}`.
+- The exception is a scheme followed by a pair list, which is read pair by pair, under `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate` alike:
+  - A quoted value in the list is the credential and goes whatever its key, unless the key is a descriptive parameter (`realm`, `qop`, `algorithm`, `charset`, `error`, `error_description`, `error_uri`, `scope`).
+  - A bare value follows its key's own rule.
+  - `Authorization: Snowflake Token="<token>"` renders `Authorization: Snowflake Token="[REDACTED]"`.
+  - Any other `<Scheme> <Key>="..."` pair renders the same way. `Authorization: Bearer blob="<token>"` renders `Authorization: Bearer blob="[REDACTED]"`.
+  - A Digest header keeps `realm="api"`, `qop=auth`, and `nc=00000001`. It loses `username`, `nonce`, `uri`, `cnonce`, `response`, and `opaque`.
+  - A challenge's `WWW-Authenticate: Bearer realm="api", error="invalid_token"` stays whole.
+  - `"VERACODE-HMAC-SHA-256 id=...,ts=...,nonce=...,sig=..."` renders `"VERACODE-HMAC-SHA-256 [REDACTED],ts=...,nonce=[REDACTED],sig=[REDACTED]"`. An unquoted first run after the scheme goes whole, and the pairs after it follow their keys.
+- The same list rule reads a pair list after a scheme word in prose, bare, JSON-escaped, and inside a JSON string alike:
+  - `upstream said Bearer blob="<token>"` renders `upstream said Bearer blob="[REDACTED]"`.
+  - `{"headers":{"Authorization":"Snowflake Token=\"<token>\""}}` renders `{"headers":{"Authorization":"Snowflake Token=\"[REDACTED]\""}}`.
+- A proof parameter (`response`, `signature`, `oauth_signature`, `mac`, `sig`) loses its value wherever its pair sits in a list with a challenge parameter (`realm`, `nonce`, `cnonce`, `opaque`, `qop`, or an `oauth_*` name). The rule holds with or without a scheme word or a header in front of the list, and whatever the value's shape.
+  - As a result, a data value such as `realm="api", nonce="n", response="<proof>"` is never read as a bare challenge. It renders `realm="api", nonce="[REDACTED]", response="[REDACTED]"` bare, after a literal escape, and inside a JSON string alike.
+  - `realm=api, nonce=n, mac=<proof>` loses its `mac` the same way.
+  - Inside a scheme word's list, a bare proof goes whatever its neighbours. `Authorization: Digest username="u", response=<proof>` renders `Authorization: Digest username="[REDACTED]", response=[REDACTED]`.
+- A proof-free challenge keeps its descriptive values:
+  - `WWW-Authenticate: Bearer realm="api"` stays whole.
+  - `Digest realm="api", qop="auth", nonce="n"` keeps `realm="api"` and `qop="auth"`. Its nonce goes as a credential-named pair does everywhere.
+- A pair list of another kind keeps its values. `status=500 response=slow` stays.
+
+#### Header and cookie boundaries
+
+- An unquoted cookie or header value ends at a `;` or `,` before the next `Name:` token (or at the end of the line). An unterminated quote ends the same way rather than swallowing the following header, so that header keeps its name and gets its own carrier treatment:
+  - `Cookie: sid=...; X-Api-Key: ...; Content-Type: application/json` renders `Cookie: [REDACTED]; X-Api-Key: [REDACTED]; Content-Type: application/json`.
+  - `Cookie: sid="...; X-Api-Key: "..."; Content-Type: "application/json"` renders `Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"`.
+- A `;` inside a URL query value is part of the value (URLSearchParams semantics). So a relative `/api/v1/things?token=hunter2;restofsecret` renders `/api/v1/things?token=[REDACTED]` with no tail, and an absolute URL's query collapses to `?[REDACTED]` as before, in the plain, JSON-escaped, and slash-escaped spellings alike.
+- The `;` separator belongs to `Cookie` and `Set-Cookie` parsing alone. The cookie reader runs before the query pass, so `Cookie: &sid=a; pref=b` still renders `Cookie: [REDACTED]`.
+- An apostrophe is a cookie character:
+  - `Cookie: sid=O'<value>; X-Api-Key: <value>` renders `Cookie: [REDACTED]; X-Api-Key: [REDACTED]`.
+  - `Cookie: theme=dark; my'pref=<value>` renders `Cookie: [REDACTED]`.
+- The next header's name may carry any RFC 7230 token character, so a dotted or underscored name (`X.Api.Key:`, `X_Api_Key:`) is recognised as the next header and its value is judged by its own key.
+
+#### JSON escapes and URLs
+
+- A literal JSON escape is a boundary before every carrier opener. The escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\/`, and `\uXXXX`: the two- or six-character sequence as it sits inside a JSON string, not the control character.
+  - A header name, scheme word, pair key, URL, or token that begins right after one is read on its own, and never as the value of the word before the escape.
+  - `request headers:\u000aAuthorization: Splunk <key>` renders `request headers:\u000aAuthorization: Splunk [REDACTED]`, and `proxy:\tpassword: hunter2` renders `proxy:\tpassword: [REDACTED]`.
+  - The escape sequence itself stays.
+  - A token glued to an escape never takes the escape letter as its first character.
+  - A value, URL, or query pair ends at the backslash that opens the next escape.
+  - A `\/` escape is a boundary rather than a path separator, so a key or token after it is judged on its own.
+- A URL whose slashes are JSON-escaped (`https:\/\/hooks.example.com\/a?token=<value>`) is still read as a URL, so its userinfo and query go the same way (`note https:\/\/hooks.example.com\/a?[REDACTED] next`).
+- The userinfo of a URL ends at the first `/`, `?`, or `#`, so an `@` inside a query or fragment never turns the query into the host. In the plain and the slash-escaped spelling alike:
+  - `https://h?e=a@x.com&token=s3cr3t` renders `https://h?[REDACTED]`.
+  - `https://h#f@x.com` renders `https://h#[REDACTED]`.
+- A bare `?` or `#` left before an earlier marker stays as it is, so a second pass adds no second marker.
+
+#### Configured secrets and value shapes
+
+- A configured secret (the API key ID and the API key secret) is removed whatever its shape, in its raw, JSON-escaped, URL-encoded, base64, and base64url forms.
+- A secret handed to the scrub call is also removed wherever it stands, glued into a longer run included, so a short passphrase does not survive inside another value. A value under four characters is ignored.
+- A value with a real token shape is removed bare:
+  - PEM blocks
+  - JWTs
+  - AWS key IDs and secrets
+  - Other vendor-prefixed tokens
+  - Hex digests of 32 or more characters
+  - Runs of 16 or more characters that carry a base64 symbol, more than one digit group, or token casing
+- A bare value shaped like a name is indistinguishable from a resource name and stays:
+  - Words joined by hyphens or underscores with at most one digit group, such as `prod-us-east-2026`.
+  - A camelCase identifier whose words average three or more letters.
+
+#### Paths and path labels
+
+- A token-shaped segment of a bare request path or file path (`/appsec/v2/applications/<guid>/findings`, the `credentials` file path) also stays, so the endpoint or file an error names is the one the run used.
+- Inside a URL with a scheme, every path segment keeps the rule.
+- The last segment of a bare path used as a label (`/api/authn/v2/api_credentials: <detail>`, `/oauth/token-request: invalid_client`, `/api/v1/api-tokens: request failed with 403`) is a request target rather than a pair key.
+  - The text after that segment stays, unless that segment itself names a credential and the value stands alone on the line. In that case the label is a pair: `kv/password: <value>` renders `kv/password: [REDACTED]`.
+  - That segment names a credential when it ends in `password`, `passwd`, `passphrase`, `pwd`, `secret`, `token`, `key`, or `assertion`, alone or followed by an encoding word such as `pem` or `base64` (as in `privateKeyPem`), or when it is a bearer id.
+  - Inside a URL with a scheme, the pair rule still applies.
+
+#### Data-side rule
+
+Data written to the bundle follows the data-side rule. Every string leaf of a `core_data/` snapshot, an assess payload, and the access check passes through the same carrier and shape rules, with the generic long-run and hex-digest rules left off.
+
+- A vendor-prefixed token (`sk_live_`, `xox*-`, `ghp_`, `AKIA`, and the rest of the vendor set), a JWT, a PEM block, or a credential carrier inside a free-text field (an application description, a custom field value, a team name) is removed there too. `key sk_live_<24 characters> end` renders `key [REDACTED] end`.
+- An identifier such as `prod-us-east-2026-cluster` or a bare random run survives as evidence.
 
 ## Control coverage
 
@@ -81,11 +312,33 @@ Error text follows its own rule, applied when an API error is constructed and ag
 | 19 | Scan completion rate | scan_coverage | VERACODE-19 | latest scans in `ANALYSIS_ERRORS`, `SCAN_CANCELED`, `PRE_SCAN_FAILED`, `INCOMPLETE`, or similar statuses fail; applications without scan records warn |
 | 20 | Collections compliance posture | policy_compliance | VERACODE-20 | manual: the Collections API is not in the published REST reference; business-unit grouping is provided as evidence |
 
-Verdict safety rules apply to every control: forbidden or errored endpoints yield `manual` naming the surface and the HTTP status the failed request observed, empty inventories never pass, items missing dates never count as fresh, and every list a finding reads must have been walked to its last page or the verdict is downgraded: a page-cap exit (with or without page metadata), a repeated page, or a `total_elements` that outruns the items reports `complete: false`, the summary states seen versus total or `an unknown total`, and `pass` drops to `warn` for the application list (controls 1, 2, 3, 4, 7, 10, 12, 15, 16, 17, 18, 19), the policy list (4, 15), the user, role, and team lists (7, 8, 9), the workspace, issue, and library lists (5, 6), the analyses and per-analysis scan lists (13), and the per-application finding lists (3, 12, 16). Any sampled or team-scoped partial view downgrades `pass` to `warn` with seen and total counts. Bundle JSON has credential-named fields, JWT-shaped values, and URL userinfo or query strings replaced by `[REDACTED]`, dynamic scan configurations are projected to their non-secret settings, and every surface that was not collected is written as a marker object rather than an empty list (see Export bundle).
+### Verdict safety rules
+
+Verdict safety rules apply to every control:
+
+- Forbidden or errored endpoints yield `manual` naming the surface and the HTTP status the failed request observed.
+- Empty inventories never pass.
+- Items missing dates never count as fresh.
+- Every list a finding reads must have been walked to its last page, or the verdict is downgraded.
+
+A page-cap exit (with or without page metadata), a repeated page, or a `total_elements` that outruns the items reports `complete: false`. The summary states seen versus total or `an unknown total`. `pass` drops to `warn` for these lists:
+
+- The application list (controls 1, 2, 3, 4, 7, 10, 12, 15, 16, 17, 18, 19).
+- The policy list (4, 15).
+- The user, role, and team lists (7, 8, 9).
+- The workspace, issue, and library lists (5, 6).
+- The analyses and per-analysis scan lists (13).
+- The per-application finding lists (3, 12, 16).
+
+Any sampled or team-scoped partial view downgrades `pass` to `warn` with seen and total counts.
+
+Bundle JSON has credential-named fields, JWT-shaped values, and URL userinfo or query strings replaced by `[REDACTED]`. Dynamic scan configurations are projected to their non-secret settings. Every surface that was not collected is written as a marker object rather than an empty list (see Export bundle).
 
 ## Framework mappings
 
-Each finding carries the spec's mapping row, for example control 1: FedRAMP SA-11, CMMC L2 3.14.1, SOC 2 CC7.1, CIS Controls v8 16.12, PCI-DSS 6.5, STIG SRG-APP-000456, IRAP ISM-1143, ISMAP VM-01. The export bundle writes `compliance/unified_compliance_matrix.md` plus one report per framework (`fedramp.md`, `cmmc.md`, `soc2.md`, `cis-controls-v8.md`, `pci-dss.md`, `stig.md`, `irap.md`, `ismap.md`).
+Each finding carries the spec's mapping row. For example, control 1 maps to FedRAMP SA-11, CMMC L2 3.14.1, SOC 2 CC7.1, CIS Controls v8 16.12, PCI-DSS 6.5, STIG SRG-APP-000456, IRAP ISM-1143, and ISMAP VM-01.
+
+The export bundle writes `compliance/unified_compliance_matrix.md` plus one report per framework: `fedramp.md`, `cmmc.md`, `soc2.md`, `cis-controls-v8.md`, `pci-dss.md`, `stig.md`, `irap.md`, and `ismap.md`.
 
 ## Live smoke
 
@@ -99,8 +352,8 @@ The script skips with exit code 0 when no credentials are configured. Otherwise 
 
 - Controls 11 (prescan module coverage), 14 (pipeline integration), and 20 (collections posture) always render as `manual` with the evidence a human must collect.
 - SCA (controls 5, 6, 18) and Dynamic Analysis (control 13) render as `manual` with an unlicensed or not applicable summary when the APIs return 401, 403, or 404 or return empty inventories.
-- Per-application calls (sandboxes, findings, summary reports, SCA projects) are capped by `max_applications` (100); when the cap is below the inventory the verdict flags the partial view.
-- The business criticality cadence for control 4 (VERY_HIGH weekly, every other tier monthly) is the spec's organizational default; adjust `critical_scan_interval_days` and `standard_scan_interval_days` to match the organization's scanning standard.
+- Per-application calls (sandboxes, findings, summary reports, SCA projects) are capped by `max_applications` (100). When the cap is below the inventory, the verdict flags the partial view.
+- The business criticality cadence for control 4 (VERY_HIGH weekly, every other tier monthly) is the spec's organizational default. Adjust `critical_scan_interval_days` and `standard_scan_interval_days` to match the organization's scanning standard.
 - The `scans[]` array on an application profile exposes only the latest scan per type, so an application whose latest static scan is still in progress is reported as unconfirmed (warn) rather than stale.
 - The Reporting API is not called because report generation requires a POST.
 

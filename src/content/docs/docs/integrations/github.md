@@ -3,15 +3,17 @@ title: GitHub
 description: Read-only GitHub organization security inspector covering identity, repository protection, Actions, code security, integrations, and audit bundle export.
 ---
 
-The GitHub inspector reviews one GitHub organization (github.com, GitHub Enterprise Cloud, or GitHub Enterprise Server) through the REST and GraphQL APIs. Every tool is read-only; nothing is written back to the tenant.
+The GitHub inspector reviews one GitHub organization through the REST and GraphQL APIs. It covers github.com, GitHub Enterprise Cloud, and GitHub Enterprise Server.
+
+Every tool is read-only. Nothing is written back to the tenant.
 
 ## What it inspects
 
-- Identity and access: 2FA requirement and members without 2FA, SAML SSO and identity linkage, Enterprise Managed Users, IP allow list, base permission, public repository creation, private fork policy, outside collaborators, privileged access, audit log visibility.
-- Repository protection: effective branch rules for every active default branch (rulesets plus legacy branch protection), approving review detail, status checks, signed commits, force push and deletion, web commit signoff.
-- Actions: allowed actions policy, workflow token defaults, workflow pull request approval, Actions enablement scope, self-hosted runner and runner group exposure.
-- Code security: code security configurations, secret scanning and push protection defaults, Dependabot defaults, code scanning default setup.
-- Integrations: webhook transport security across org and repository hooks, deploy key scope and age, GitHub App installation permissions.
+- **Identity and access:** 2FA requirement and members without 2FA, SAML SSO and identity linkage, Enterprise Managed Users, IP allow list, base permission, public repository creation, private fork policy, outside collaborators, privileged access, audit log visibility.
+- **Repository protection:** effective branch rules for every active default branch (rulesets plus legacy branch protection), approving review detail, status checks, signed commits, force push and deletion, web commit signoff.
+- **Actions:** allowed actions policy, workflow token defaults, workflow pull request approval, Actions enablement scope, self-hosted runner and runner group exposure.
+- **Code security:** code security configurations, secret scanning and push protection defaults, Dependabot defaults, code scanning default setup.
+- **Integrations:** webhook transport security across org and repository hooks, deploy key scope and age, GitHub App installation permissions.
 
 ## Setup and authentication
 
@@ -27,7 +29,11 @@ Set the organization and one credential family. Explicit tool arguments win over
 | `GITHUB_ENTERPRISE` | Enterprise slug for the EMU and enterprise identity queries |
 | `GITHUB_LOOKBACK_DAYS` | Audit log window, default 30 |
 
-Required read access for a complete run: organization owner (or an App with organization administration, members, webhooks, and Actions read plus repository administration read) so that `members?filter=2fa_disabled`, outside collaborators, org webhooks, App installations, runner groups, deploy keys, and repository hooks are readable. For SAML-protected organizations a PAT must be authorized for SSO. Surfaces the principal cannot read produce Manual findings that name the missing permission; they never pass.
+A complete run needs read access as an organization owner, or as an App with organization administration, members, webhooks, and Actions read plus repository administration read. That access makes these readable: `members?filter=2fa_disabled`, outside collaborators, org webhooks, App installations, runner groups, deploy keys, and repository hooks.
+
+For SAML-protected organizations, a PAT must be authorized for SSO.
+
+Surfaces the principal cannot read produce Manual findings that name the missing permission. They never pass.
 
 ## Tools
 
@@ -41,7 +47,7 @@ Required read access for a complete run: organization owner (or an App with orga
 | `github_assess_integrations` | Webhook, deploy key, App installation, OAuth, and package findings GITHUB-INTEG-001 to GITHUB-INTEG-005 |
 | `github_export_audit_bundle` | Runs every collector once and writes an evidence bundle under `output_dir` |
 
-All tools accept `organization`, `auth_mode` (`pat` or `app`), `api_token`, `app_id`, `app_private_key`, `app_private_key_path`, `installation_id`, `enterprise`, `api_base_url`, `graphql_url`, and `lookback_days`; the export tool adds `output_dir`.
+All tools accept `organization`, `auth_mode` (`pat` or `app`), `api_token`, `app_id`, `app_private_key`, `app_private_key_path`, `installation_id`, `enterprise`, `api_base_url`, `graphql_url`, and `lookback_days`. The export tool adds `output_dir`.
 
 ## Control coverage
 
@@ -73,21 +79,34 @@ All tools accept `organization`, `auth_mode` (`pat` or `app`), `api_token`, `app
 | 24 GitHub App Permissions Audit | integrations | GITHUB-INTEG-003 | Fail on admin or write-to-all permissions |
 | 25 Package Registry Access | integrations | GITHUB-INTEG-005 | Manual (deferred packages sweep) |
 
-Extra findings: GITHUB-ORG-004 (privileged access ratio, mapping row 5), GITHUB-ORG-005 (audit log visibility, row 19), GITHUB-REPO-005 (web commit signoff, row 13), and GITHUB-CODE-001 (code security configurations exist, union of rows 15 to 17).
+Extra findings and their mapping rows:
+
+- GITHUB-ORG-004: Privileged access ratio, mapping row 5.
+- GITHUB-ORG-005: Audit log visibility, row 19.
+- GITHUB-REPO-005: Web commit signoff, row 13.
+- GITHUB-CODE-001: Code security configurations exist, union of rows 15 to 17.
 
 ## Verdict rules
 
 - A forbidden, missing, or errored endpoint renders Manual with the HTTP status and the evidence a reviewer must collect.
-- Partial inventories (truncated GraphQL connections, per-repository 403s, an audit log sample capped at 200 events) render Partial, or Pass only for the visibility-only audit log control with the cap stated.
-- Empty inventories pass only where the summary says emptiness is compliant (outside collaborators, App installations, webhooks and deploy keys with a non-empty repository inventory). Empty repository inventories render Info or Partial because the sweep covered nothing.
+- Partial inventories (truncated GraphQL connections, per-repository 403s, an audit log sample capped at 200 events) render Partial. Only the visibility-only audit log control renders Pass instead, with the cap stated.
+- Empty inventories pass only where the summary says emptiness is compliant: outside collaborators, App installations, and webhooks and deploy keys with a non-empty repository inventory. Empty repository inventories render Info or Partial because the sweep covered nothing.
 - Deploy keys without `created_at` never count as fresh.
-- REST pagination follows `Link` headers to completion and reports truncation when a record cap stops it; GraphQL connections page on `endCursor` and report truncation when `hasNextPage` is true without a cursor, when the cursor repeats, at the page cap, and whenever `totalCount` exceeds the collected nodes. Truncated inventories never pass.
-- Collected records are projected to the documented fields the verdicts read before they are persisted: webhook secrets become a `[redacted]` presence marker, deploy key material, `token_last_eight`, `openssh_public_key`, and the unconstrained audit event bags are dropped, and every JSON file in the bundle passes a key-name redaction belt. A test exports a canary-laden tenant and walks every bundle file and zip entry.
+- Truncated inventories never pass.
+  - REST pagination follows `Link` headers to completion and reports truncation when a record cap stops it.
+  - GraphQL connections page on `endCursor`. They report truncation when `hasNextPage` is true without a cursor, when the cursor repeats, at the page cap, and whenever `totalCount` exceeds the collected nodes.
+- Before collected records are persisted, they are projected to the documented fields the verdicts read.
+  - Webhook secrets become a `[redacted]` presence marker.
+  - Deploy key material, `token_last_eight`, `openssh_public_key`, and the unconstrained audit event bags are dropped.
+  - Every JSON file in the bundle passes a key-name redaction belt.
+  - A test exports a canary-laden tenant and walks every bundle file and zip entry.
 - A rerun of the export allocates a new directory and a zip with the same stem, so prior bundles are never overwritten.
 
 ## Framework mappings
 
-Each finding carries the FedRAMP (800-53 r5), CMMC 2.0, SOC 2, CIS GitHub Benchmark, PCI DSS 4.0, DISA STIG, IRAP (ISM), and ISMAP references from the spec mapping table for its control, and the export writes one report per framework under `compliance/frameworks/`.
+Each finding carries the references from the spec mapping table for its control: FedRAMP (800-53 r5), CMMC 2.0, SOC 2, CIS GitHub Benchmark, PCI DSS 4.0, DISA STIG, IRAP (ISM), and ISMAP.
+
+The export writes one report per framework under `compliance/frameworks/`.
 
 ## Audit bundle layout
 
@@ -110,15 +129,21 @@ Each finding carries the FedRAMP (800-53 r5), CMMC 2.0, SOC 2, CIS GitHub Benchm
 GITHUB_ORG=my-org GITHUB_TOKEN=ghp_... npm --prefix cli run test:github:live
 ```
 
-The script exits 0 with a skip message unless `GITHUB_ORG` (or `GH_ORG`) and either a PAT or the full GitHub App variable set are present. Otherwise it runs the access check, stops with exit 1 unless the access status is `healthy`, then runs all five assessments and prints the per-status counts and every Fail summary.
+The script exits 0 with a skip message unless `GITHUB_ORG` (or `GH_ORG`) is set along with either a PAT or the full GitHub App variable set.
+
+Otherwise it:
+
+1. Runs the access check.
+2. Stops with exit 1 unless the access status is `healthy`.
+3. Runs all five assessments and prints the per-status counts and every Fail summary.
 
 ## Limitations and manual controls
 
-- OAuth application access restriction (control 9) is Manual because neither the REST `organization-full` schema nor the GraphQL `Organization` type exposes the policy.
-- Audit log streaming (19), security policy presence (18), and package registry visibility (25) are Manual in this release; the findings cite the exact endpoint or GraphQL field a reviewer or a follow-on collector should use.
-- Open alert counts for code scanning, secret scanning, and Dependabot are not collected yet; controls 15 to 17 check defaults and configurations only.
+- OAuth application access restriction (control 9) is Manual. Neither the REST `organization-full` schema nor the GraphQL `Organization` type exposes the policy.
+- Audit log streaming (19), security policy presence (18), and package registry visibility (25) are Manual in this release. The findings cite the exact endpoint or GraphQL field a reviewer or a follow-on collector should use.
+- Open alert counts for code scanning, secret scanning, and Dependabot are not collected yet. Controls 15 to 17 check defaults and configurations only.
 - The org runners endpoint does not enumerate repository-level self-hosted runners.
-- The interactive OAuth App flow from the spec is not implemented; use a PAT or a GitHub App.
+- The interactive OAuth App flow from the spec is not implemented. Use a PAT or a GitHub App.
 
 ## Official documentation
 

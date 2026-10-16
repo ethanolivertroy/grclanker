@@ -3,11 +3,13 @@ title: Vanta Auditor API
 description: Validate Vanta auditor access, list visible audits, and export one audit into an offline evidence package.
 ---
 
-The Vanta integration uses the read-only Auditor API. It validates an auditor OAuth client, lists audits visible to that client, and exports evidence for one audit. API calls do not change the Vanta tenant. The exporter writes only to the local output directory.
+The Vanta integration uses the read-only Auditor API. It validates an auditor OAuth client, lists audits visible to that client, and exports evidence for one audit.
+
+API calls do not change the Vanta tenant. The exporter writes only to the local output directory.
 
 ## Setup
 
-Create Auditor API credentials in Vanta with the audit and auditor read scopes (the token request asks for `auditor-api.audit:read auditor-api.auditor:read`), then set:
+Create Auditor API credentials in Vanta with the audit and auditor read scopes. The token request asks for `auditor-api.audit:read auditor-api.auditor:read`. Then set:
 
 ```bash
 export VANTA_CLIENT_ID="..."
@@ -17,7 +19,9 @@ printf '\n'
 export VANTA_CLIENT_SECRET
 ```
 
-The silent `read` keeps the secret value out of interactive Bash and Zsh history. A protected environment file or secret manager that injects the variable into the process is also appropriate. The tools accept `client_id` and `client_secret` arguments, but passing the secret as a tool argument can expose it to prompts, traces, or session storage.
+The silent `read` keeps the secret value out of interactive Bash and Zsh history. A protected environment file or secret manager that injects the variable into the process is also appropriate.
+
+The tools accept `client_id` and `client_secret` arguments, but passing the secret as a tool argument can expose it to prompts, traces, or session storage.
 
 ## Tools
 
@@ -37,7 +41,9 @@ vanta_export_audit {"audit_id":"audit_123"}
 
 ## Export layout
 
-The default output root is `./export/vanta`. The base audit directory name is deterministic: customer, framework, and the first eight characters of the audit ID. Each export atomically claims the first available directory, adding a unique numeric suffix such as `_1` or `_2` when needed. The paired zip is created exclusively, so sequential or concurrent exports do not reuse or overwrite prior packages.
+The default output root is `./export/vanta`. The base audit directory name is deterministic: customer, framework, and the first eight characters of the audit ID.
+
+Each export atomically claims the first available directory, adding a unique numeric suffix such as `_1` or `_2` when needed. The paired zip is created exclusively, so sequential or concurrent exports do not reuse or overwrite prior packages.
 
 An export contains:
 

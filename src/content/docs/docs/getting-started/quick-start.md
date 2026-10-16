@@ -15,7 +15,7 @@ This installs the newest release bundle, currently `v0.1.1`, with all 241 domain
 
 ## 2. Prepare the local-first path
 
-The recommended first local backend is Ollama with Gemma 4. Install Ollama from [ollama.com/download](https://ollama.com/download); the grclanker installer does not install it.
+The recommended first local backend is Ollama with Gemma 4. Install Ollama from [ollama.com/download](https://ollama.com/download). The grclanker installer does not install it.
 
 If the Ollama app or background service is already running, skip this command. Otherwise start the server in its own terminal and leave it running:
 

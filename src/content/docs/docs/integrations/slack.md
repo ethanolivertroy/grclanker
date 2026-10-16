@@ -3,7 +3,9 @@ title: Slack
 description: Read-only Slack Enterprise Grid security inspector covering identity, admin access, integrations, channel governance, monitoring, and evidence export.
 ---
 
-The Slack tool family inspects a Slack Enterprise Grid organization (or a single workspace when only a workspace token is available) against the 25 controls in `specs/slack-sec-inspector.spec.md`. Every method call is read-only, and every field the tools read is traceable to a public Slack reference page listed in the method table below.
+The Slack tool family inspects a Slack Enterprise Grid organization against the 25 controls in `specs/slack-sec-inspector.spec.md`. When only a workspace token is available, it inspects a single workspace.
+
+Every method call is read-only. Every field the tools read is traceable to a public Slack reference page listed in the method table below.
 
 ## Setup and authentication
 
@@ -17,15 +19,130 @@ The Slack tool family inspects a Slack Enterprise Grid organization (or a single
 | `SLACK_WEB_API_BASE_URL`, `SLACK_SCIM_BASE_URL`, `SLACK_AUDIT_BASE_URL` | Optional API base overrides. Defaults are `https://slack.com/api`, `https://api.slack.com/scim/v2`, and `https://api.slack.com/audit/v1`. |
 | `SLACK_CONFIG_FILE` | Optional JSON file with `user_token` (or `token`), `bot_token`, `scim_token`, and `org_id`. Defaults to `~/.config/grclanker/slack.json` when present. Arguments override environment variables, which override the file. A file that cannot be read reports `Unable to read Slack config file <path> (<code>)` with only the system error code (for example `EISDIR` or `EACCES`); a file that is not valid JSON reports a fixed `Unable to parse Slack config file <path>: the file is not valid JSON` message, so neither the file contents nor a library message can appear in the error. |
 
-Required user-token scopes: `admin.teams:read`, `admin.users:read`, `admin.apps:read`, `admin.barriers:read`, `admin.conversations:read`, `admin.analytics:read` (optional probe), `auditlogs:read`, `users:read`, and `team.preferences:read`. The Admin API and Audit Logs API require an Enterprise Grid plan; an `ok:false` response of `not_allowed_token_type`, `missing_scope`, `not_an_enterprise`, or `feature_not_enabled` is rendered as a manual finding that names the cause, never as an empty or passing result.
+Required user-token scopes:
 
-Multi-inventory findings: a finding that compares two inventories demotes below pass when any of them is unreadable, even if the primary inventory is complete. `SLACK-ADMIN-08` compares emoji uploaders with the admin roster built from `admin.users.list`, `admin.teams.list`, and `admin.teams.admins.list`; if any workspace's admin list is unreadable the roster is incomplete, the finding caps at `warn` (`manual` when every workspace is unreadable), no upload is classified as non-admin, and the summary names the endpoint and workspace ids. `SLACK-APP-06` caps at `warn` when `auth.test` fails, because the workspace the preference applies to cannot be identified. `SLACK-CHAN-02` derives its announcement channel set from the channel search, so a denied `#general` is reported as unreadable rather than missing. Counts and lists derived from an unreadable inventory are rendered as `null` beside a `*_status` field (for example `workspace_id: null` with `workspace_id_status`, `non_admin_uploads: null` with `non_admin_uploads_status`), never as `0`, `[]`, or a placeholder, in findings and in the per-area summaries alike. The same applies to reads that were never issued because their input inventory failed or was empty (for example `admin.users.session.getSettings` without a readable `admin.users.list`, `admin.teams.admins.list` without `admin.teams.list`, the per-channel preference and retention reads without a channel search, SCIM `/Users` without `/ServiceProviderConfig`): the count is `null` and the status reads `not collected: <upstream> was unreadable (<reason>), so <read> was not called`.
+- `admin.teams:read`
+- `admin.users:read`
+- `admin.apps:read`
+- `admin.barriers:read`
+- `admin.conversations:read`
+- `admin.analytics:read` (optional probe)
+- `auditlogs:read`
+- `users:read`
+- `team.preferences:read`
 
-Rate limits: the client honors `429` responses by sleeping for the `Retry-After` value (capped at 60 seconds) and retrying twice. Pagination follows `response_metadata.next_cursor` (or the top-level `next_cursor` on `admin.conversations.search`) up to each method's documented `limit` maximum. Every early exit is recorded as truncation and demotes the dependent verdict to `warn`: an item cap (`user_limit`, `workspace_limit`, `app_limit`, `channel_limit`, or a page that carried more items than the cap allowed), the page cap of 50 requests per list, a cursor that returns an empty page, a missing SCIM `totalResults`, or an audit log page that ends with a `next_cursor`. The name-keyed `admin.emoji.list` map follows the same rules: an empty page with a cursor outstanding stops the listing as a stalled cursor and `SLACK-ADMIN-08` states the truncation instead of reporting no custom emoji. The finding summary states seen versus total and the reason, for example `2 seen of unknown total (partial view, item limit reached)`.
+The Admin API and Audit Logs API require an Enterprise Grid plan. An `ok:false` response with one of these errors is rendered as a manual finding that names the cause, never as an empty or passing result:
 
-Credential hygiene: every Web API, SCIM, and Audit Logs response is redacted when it is parsed, before any verdict logic or bundle file sees it. Fields named like credentials (`token`, `secret`, `password`, `webhook`, `signing`, `private_key`, `api_key`, `authorization`, `cookie`, `credential`) keep their name and receive the value `[REDACTED]`; Slack token shapes (`xoxb-`, `xoxp-`, `xoxe-`, `xapp-`), `hooks.slack.com` webhook URLs, `Bearer` headers, and credential query parameters are replaced inside any string, including JSON error bodies (`error`, `response_metadata.messages`, SCIM `detail`). Error strings pass through one scrub, `redactErrorText`, at the point they are created (the `SlackApiError` constructor and the helpers that turn a thrown error into a finding summary, an errors entry, or the tool error text), which adds header- and assignment-style credentials (`Cookie`, `Authorization`, `X-Api-Key`, `session_id`, `client_secret`, and similar names followed by `:` or `=`); a response body that is not a JSON object (an HTML error page from a proxy or gateway, plain text) is never quoted in an error string at all and is described instead as `non-JSON text/html body (N characters) withheld` beside the HTTP status and endpoint. A vendor error code copied from a body is scrubbed and validated before it is rendered: the value is first passed through the token scrub with the configured secrets (a configured credential returned as a code renders the placeholder whatever its shape), then it must have Slack's snake_case code shape, and then it must be one of Slack's documented error codes (the common errors every Web API method page lists, the method-specific errors of the methods the module calls, the JSON-body errors of the Web API overview, and the Audit Logs API errors table); a value outside that vocabulary, for example a 32-character hex credential an endpoint or proxy returns in the `error` field, renders the fixed `UnknownError`. The scope lists in `needed` and `provided` render entries with the documented scope grammar only (lowercase words joined by `.`, `_`, or `-` with at most two `:` groups and no digits), the code list in `warning` renders the documented charset warnings and error codes only, each entry scrubbed with the configured secrets first, and a JSON error body is never echoed. The fields read from an error body are chosen by the API that was called, not by the fields the body happens to carry: a Web API or Audit Logs body renders only `error`, `needed`, `provided`, and `warning`, so a `detail`, `status`, or `scimType` a gateway adds beside them is dropped; a SCIM body renders only when it carries the SCIM 2.0 error schema (`schemas` naming `urn:ietf:params:scim:api:messages:2.0:Error`, RFC 7644 section 3.12), and then only its documented `status` (validated integer), `scimType` (one of the RFC 7644 Table 9 keywords, else dropped), and `detail` (scrubbed and cut); a SCIM body without that schema is withheld, and undocumented fields such as `code` or `response_metadata.messages` are dropped. `token_type` and `token_kinds` are kept because they describe a token without carrying one. The scrub is name- and shape-based, so ordinary-looking data (user names, channel names, email addresses, IDs, timestamps) is preserved by design; only credential-named fields and credential-shaped values are replaced. Configured token values shorter than 8 characters are not scrubbed by exact match, so a degenerate token cannot blank unrelated text.
+- `not_allowed_token_type`
+- `missing_scope`
+- `not_an_enterprise`
+- `feature_not_enabled`
 
-Token format evidence: `SLACK-APP-07` records `token_format` (`prefix` and `rotating_format`) from the configured token only when its prefix, the text before the first `-`, is one of the five documented `xox` prefixes: `xoxb` (bot) and `xoxp` (user) from https://docs.slack.dev/authentication/tokens, and `xoxe.xoxb` and `xoxe.xoxp` (rotating access tokens, `rotating_format: true`) and standalone `xoxe` (refresh token) from https://docs.slack.dev/authentication/using-token-rotation/. Any other value (an undocumented letter such as `xoxz-` or `xoxa-`, `xoxe.` followed by anything but `xoxb` or `xoxp`, an `xapp-` or `xwfp-` token, a misconfigured value, a proxy or gateway token, a pasted OAuth code) renders the fixed prefix `unknown` with `rotating_format: false`, and no part of the value is echoed in evidence.
+### Multi-inventory findings
+
+A finding that compares two inventories demotes below pass when any of them is unreadable, even if the primary inventory is complete.
+
+- `SLACK-ADMIN-08` compares emoji uploaders with the admin roster built from `admin.users.list`, `admin.teams.list`, and `admin.teams.admins.list`. If any workspace's admin list is unreadable:
+  - The roster is incomplete.
+  - The finding caps at `warn` (`manual` when every workspace is unreadable).
+  - No upload is classified as non-admin.
+  - The summary names the endpoint and workspace ids.
+- `SLACK-APP-06` caps at `warn` when `auth.test` fails, because the workspace the preference applies to cannot be identified.
+- `SLACK-CHAN-02` derives its announcement channel set from the channel search, so a denied `#general` is reported as unreadable rather than missing.
+
+Counts and lists derived from an unreadable inventory are rendered as `null` beside a `*_status` field, never as `0`, `[]`, or a placeholder. The rule holds in findings and in the per-area summaries alike. Examples are `workspace_id: null` with `workspace_id_status` and `non_admin_uploads: null` with `non_admin_uploads_status`.
+
+The same applies to reads that were never issued because their input inventory failed or was empty. The count is `null`, and the status reads `not collected: <upstream> was unreadable (<reason>), so <read> was not called`. Examples of such reads:
+
+- `admin.users.session.getSettings` without a readable `admin.users.list`.
+- `admin.teams.admins.list` without `admin.teams.list`.
+- The per-channel preference and retention reads without a channel search.
+- SCIM `/Users` without `/ServiceProviderConfig`.
+
+### Rate limits and pagination
+
+The client honors `429` responses by sleeping for the `Retry-After` value (capped at 60 seconds) and retrying twice.
+
+Pagination follows `response_metadata.next_cursor` (or the top-level `next_cursor` on `admin.conversations.search`) up to each method's documented `limit` maximum.
+
+Every early exit is recorded as truncation and demotes the dependent verdict to `warn`:
+
+- An item cap (`user_limit`, `workspace_limit`, `app_limit`, `channel_limit`, or a page that carried more items than the cap allowed).
+- The page cap of 50 requests per list.
+- A cursor that returns an empty page.
+- A missing SCIM `totalResults`.
+- An audit log page that ends with a `next_cursor`.
+
+The name-keyed `admin.emoji.list` map follows the same rules. An empty page with a cursor outstanding stops the listing as a stalled cursor, and `SLACK-ADMIN-08` states the truncation instead of reporting no custom emoji.
+
+The finding summary states seen versus total and the reason, for example `2 seen of unknown total (partial view, item limit reached)`.
+
+### Credential hygiene
+
+Every Web API, SCIM, and Audit Logs response is redacted when it is parsed, before any verdict logic or bundle file sees it.
+
+Fields named like credentials keep their name and receive the value `[REDACTED]`. The credential-like names are `token`, `secret`, `password`, `webhook`, `signing`, `private_key`, `api_key`, `authorization`, `cookie`, and `credential`.
+
+The following are replaced inside any string, including JSON error bodies (`error`, `response_metadata.messages`, SCIM `detail`):
+
+- Slack token shapes (`xoxb-`, `xoxp-`, `xoxe-`, `xapp-`).
+- `hooks.slack.com` webhook URLs.
+- `Bearer` headers.
+- Credential query parameters.
+
+Error strings pass through one scrub, `redactErrorText`, at the point they are created:
+
+- The `SlackApiError` constructor.
+- The helpers that turn a thrown error into a finding summary, an errors entry, or the tool error text.
+
+`redactErrorText` adds header- and assignment-style credentials (`Cookie`, `Authorization`, `X-Api-Key`, `session_id`, `client_secret`, and similar names followed by `:` or `=`).
+
+A response body that is not a JSON object (an HTML error page from a proxy or gateway, plain text) is never quoted in an error string at all. It is described instead as `non-JSON text/html body (N characters) withheld` beside the HTTP status and endpoint.
+
+A vendor error code copied from a body is scrubbed and validated before it is rendered:
+
+1. The value is first passed through the token scrub with the configured secrets. A configured credential returned as a code renders the placeholder whatever its shape.
+2. Then it must have Slack's snake_case code shape.
+3. Then it must be one of Slack's documented error codes:
+   - The common errors every Web API method page lists.
+   - The method-specific errors of the methods the module calls.
+   - The JSON-body errors of the Web API overview.
+   - The Audit Logs API errors table.
+
+A value outside that vocabulary renders the fixed `UnknownError`. An example is a 32-character hex credential that an endpoint or proxy returns in the `error` field.
+
+The scope lists in `needed` and `provided` render entries with the documented scope grammar only, and the code list in `warning` renders the documented charset warnings and error codes only, each entry scrubbed with the configured secrets first. The documented scope grammar is lowercase words joined by `.`, `_`, or `-` with at most two `:` groups and no digits.
+
+A JSON error body is never echoed. The fields read from an error body are chosen by the API that was called, not by the fields the body happens to carry:
+
+- A Web API or Audit Logs body renders only `error`, `needed`, `provided`, and `warning`, so a `detail`, `status`, or `scimType` a gateway adds beside them is dropped.
+- A SCIM body renders only when it carries the SCIM 2.0 error schema (`schemas` naming `urn:ietf:params:scim:api:messages:2.0:Error`, RFC 7644 section 3.12). It then renders only its documented fields:
+  - `status` (validated integer).
+  - `scimType` (one of the RFC 7644 Table 9 keywords, else dropped).
+  - `detail` (scrubbed and cut).
+- A SCIM body without that schema is withheld, and undocumented fields such as `code` or `response_metadata.messages` are dropped.
+
+`token_type` and `token_kinds` are kept because they describe a token without carrying one.
+
+The scrub is name- and shape-based, so ordinary-looking data (user names, channel names, email addresses, IDs, timestamps) is preserved by design. Only credential-named fields and credential-shaped values are replaced.
+
+Configured token values shorter than 8 characters are not scrubbed by exact match, so a degenerate token cannot blank unrelated text.
+
+### Token format evidence
+
+`SLACK-APP-07` records `token_format` (`prefix` and `rotating_format`) from the configured token only when its prefix, the text before the first `-`, is one of the five documented `xox` prefixes:
+
+- `xoxb` (bot) and `xoxp` (user), from https://docs.slack.dev/authentication/tokens.
+- `xoxe.xoxb` and `xoxe.xoxp` (rotating access tokens, `rotating_format: true`) and standalone `xoxe` (refresh token), from https://docs.slack.dev/authentication/using-token-rotation/.
+
+Any other value renders the fixed prefix `unknown` with `rotating_format: false`, and no part of the value is echoed in evidence. Such values include:
+
+- An undocumented letter such as `xoxz-` or `xoxa-`.
+- `xoxe.` followed by anything but `xoxb` or `xoxp`.
+- An `xapp-` or `xwfp-` token.
+- A misconfigured value.
+- A proxy or gateway token.
+- A pasted OAuth code.
 
 ## Tools
 
@@ -41,12 +158,15 @@ Token format evidence: `SLACK-APP-07` records `token_format` (`prefix` and `rota
 
 ## Status semantics
 
-- `pass`: documented evidence was read completely and is compliant.
-- `warn`: compliant on the seen data, but the inventory was partial or empty, or items need review.
-- `fail`: documented evidence shows a gap.
-- `manual`: the API cannot prove the control. The summary names the cause (method, missing scope or plan, or the reference page proving the setting is absent) and the evidence a human must collect.
+- `pass`: Documented evidence was read completely and is compliant.
+- `warn`: Compliant on the seen data, but the inventory was partial or empty, or items need review.
+- `fail`: Documented evidence shows a gap.
+- `manual`: The API cannot prove the control. The summary names the cause (method, missing scope or plan, or the reference page proving the setting is absent) and the evidence a human must collect.
 
-Empty inventories never pass by default. The only exceptions, stated in the finding summary, are `SLACK-ID-02` (no guests in a complete inventory) and `SLACK-CHAN-01` (no externally shared channels in a complete search).
+Empty inventories never pass by default. The only exceptions, stated in the finding summary, are:
+
+- `SLACK-ID-02`: No guests in a complete inventory.
+- `SLACK-CHAN-01`: No externally shared channels in a complete search.
 
 ## Control coverage
 
@@ -78,21 +198,24 @@ Empty inventories never pass by default. The only exceptions, stated in the find
 | 24 Workspace analytics access | admin_access | `SLACK-ADMIN-09` | manual: `admin.analytics.getFile` is a capability probe only; a `200` with `Content-type: application/gzip` is a successful probe (the file is never downloaded) and an `ok:false` JSON body is the failure path. |
 | 25 Token rotation and revocation | integrations | `SLACK-APP-07` | manual with `auth.test` identity and token format evidence. |
 
-Coverage: 25 of 25 spec controls are represented; 17 are automated and 8 are manual by design (controls 4, 5, 11, 13, 20, 21, 24, 25).
+Coverage: 25 of 25 spec controls are represented. Of these, 17 are automated and 8 are manual by design (controls 4, 5, 11, 13, 20, 21, 24, 25).
 
 ## Framework mappings
 
-Every finding carries the FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP references from the spec mapping table. The export bundle writes one report per framework under `compliance/`.
+Every finding carries the references from the spec mapping table: FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP. The export bundle writes one report per framework under `compliance/`.
 
 ## Export bundle
 
-`slack_export_audit_bundle` allocates `export/slack/<org>-audit`, then `-2`, `-3` on reruns, and never overwrites a prior bundle. The zip is named after the allocated directory. Layout:
+`slack_export_audit_bundle` allocates `export/slack/<org>-audit`, then `-2`, `-3` on reruns, and never overwrites a prior bundle. The zip is named after the allocated directory.
 
-- `core_data/`: `access.json` plus per-area snapshots (redacted at collection time; the configured tokens and any credential-shaped value are replaced with `[REDACTED]` again when each file is written, so the zip inherits the redaction)
-- `analysis/findings.json` and per-area summaries
-- `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, and `fedramp.md`, `cmmc.md`, `soc-2.md`, `cis.md`, `pci-dss.md`, `stig.md`, `irap.md`, `ismap.md`
-- `reports/<area>.md`, `QUICK_REFERENCE.md`, `README.md`, `metadata.json`
-- `_errors.log` only when collection partially failed
+Layout:
+
+- `core_data/`: `access.json` plus per-area snapshots, redacted at collection time.
+  - The configured tokens and any credential-shaped value are replaced with `[REDACTED]` again when each file is written, so the zip inherits the redaction.
+- `analysis/findings.json` and per-area summaries.
+- `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, and one report per framework: `fedramp.md`, `cmmc.md`, `soc-2.md`, `cis.md`, `pci-dss.md`, `stig.md`, `irap.md`, `ismap.md`.
+- `reports/<area>.md`, `QUICK_REFERENCE.md`, `README.md`, `metadata.json`.
+- `_errors.log` only when collection partially failed.
 
 ## Live smoke
 
@@ -100,7 +223,7 @@ Every finding carries the FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and IS
 npm --prefix cli run test:slack:live
 ```
 
-The script prints a skip message and exits 0 when no token is configured; otherwise it runs `slack_check_access` and every assess tool.
+The script prints a skip message and exits 0 when no token is configured. Otherwise, it runs `slack_check_access` and every assess tool.
 
 ## Method table
 
@@ -129,6 +252,19 @@ The script prints a skip message and exits 0 when no token is configured; otherw
 ## Limitations
 
 - The TUI, `--controls`, and SARIF surfaces described in the spec are not part of this CLI pass.
-- Org-level policy toggles (SSO required, session default, Slack Connect permission, retention default, email ingestion, link previews, analytics roles, emoji upload permission) are not exposed by any documented read method; the corresponding findings report the evidence that is readable and name the manual artifact to collect. File upload permission is the exception: `team.preferences.list` documents `disable_file_uploads` for the token's workspace.
+
+- These org-level policy toggles are not exposed by any documented read method:
+  - SSO required.
+  - Session default.
+  - Slack Connect permission.
+  - Retention default.
+  - Email ingestion.
+  - Link previews.
+  - Analytics roles.
+  - Emoji upload permission.
+
+  The corresponding findings report the evidence that is readable and name the manual artifact to collect. File upload permission is the exception: `team.preferences.list` documents `disable_file_uploads` for the token's workspace.
+
 - The Discovery API is not publicly documented (no reference page and no `discovery.*` method in the methods index), so Discovery entitlement and DLP scanning status are never read.
+
 - `admin.conversations.restrictAccess.listGroups` (IDP group channel restrictions) and guest expiration dates from `admin.users.list only_guests=true` are deferred.

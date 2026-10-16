@@ -3,7 +3,9 @@ title: PagerDuty
 description: Read-only PagerDuty security inspector covering access control, incident response, on-call coverage, audit logging, and integration security across 25 controls.
 ---
 
-The PagerDuty integration inspects a PagerDuty account through the REST API v2 and maps what it finds to the 25 controls in `specs/pagerduty-sec-inspector.spec.md`. Every tool is read-only: nothing is created, updated, or deleted in the account.
+The PagerDuty integration inspects a PagerDuty account through the REST API v2. It maps what it finds to the 25 controls in `specs/pagerduty-sec-inspector.spec.md`.
+
+Every tool is read-only. Nothing is created, updated, or deleted in the account.
 
 ## What it inspects
 
@@ -15,9 +17,17 @@ The PagerDuty integration inspects a PagerDuty account through the REST API v2 a
 
 ## Setup and authentication
 
-Create a read-only API key in the PagerDuty web app (Integrations > API Access Keys, requires the Account Owner or Global Admin role) or use a user API key from User Settings > API Access. A user key only sees what that user can see; account keys see the whole account. Audit records additionally require an admin, account owner, or global API key on a pricing plan with the Audit Trail feature.
+Create a read-only API key in the PagerDuty web app under Integrations > API Access Keys (requires the Account Owner or Global Admin role). Or use a user API key from User Settings > API Access.
 
-Credentials resolve in this order: explicit tool arguments, then environment variables, then the JSON config file at `~/.config/grclanker/pagerduty.json` (override the path with `PAGERDUTY_CONFIG_FILE`).
+A user key only sees what that user can see. Account keys see the whole account.
+
+Audit records also require an admin, account owner, or global API key on a pricing plan with the Audit Trail feature.
+
+Credentials resolve in this order:
+
+1. Explicit tool arguments.
+2. Environment variables.
+3. The JSON config file at `~/.config/grclanker/pagerduty.json`. Override the path with `PAGERDUTY_CONFIG_FILE`.
 
 | Auth mode | Environment variables | Header sent |
 |-----------|----------------------|-------------|
@@ -36,9 +46,19 @@ Optional settings:
 | `PAGERDUTY_IDENTITY_TOKEN_URL` | Overrides the OAuth token endpoint (default `https://identity.pagerduty.com/oauth/token`) |
 | `PAGERDUTY_CONFIG_FILE` | JSON file with `api_token` (or `api_key`, `token`), `access_token`, `client_id`, `client_secret`, `subdomain`, `region`, `base_url`, `from_email` (or `email`), `timeout_seconds` |
 
-The `api_key` and `token` aliases for `api_token` are also accepted as tool arguments; the `email` alias for `from_email` is read from the config file only. When more than one credential resolves, the REST API key wins, then the OAuth bearer token, then client credentials.
+The `api_key` and `token` aliases for `api_token` are also accepted as tool arguments. The `email` alias for `from_email` is read from the config file only.
 
-Every request carries `Accept: application/vnd.pagerduty+json;version=2`. The client follows classic `limit`/`offset` pagination using the `more` flag (100 per page, capped at the documented 10,000 record ceiling) and cursor pagination (`cursor`, `next_cursor`) on audit records and incident workflow triggers. `GET /change_events` declares no `more` or `total` field, so the client keeps reading offset pages until a page comes back shorter than requested; a full final page at the requested limit is recorded as incomplete. It retries 429 and 5xx responses, waiting for the `ratelimit-reset` or `Retry-After` value when present, and redacts tokens from error messages.
+When more than one credential resolves, the REST API key wins, then the OAuth bearer token, then client credentials.
+
+### Request handling
+
+Every request carries `Accept: application/vnd.pagerduty+json;version=2`.
+
+The client follows classic `limit`/`offset` pagination using the `more` flag (100 per page, capped at the documented 10,000 record ceiling). It follows cursor pagination (`cursor`, `next_cursor`) on audit records and incident workflow triggers.
+
+`GET /change_events` declares no `more` or `total` field. So the client keeps reading offset pages until a page comes back shorter than requested. A full final page at the requested limit is recorded as incomplete.
+
+The client retries 429 and 5xx responses, waiting for the `ratelimit-reset` or `Retry-After` value when present. It redacts tokens from error messages.
 
 ## Tools
 
@@ -50,9 +70,20 @@ Every request carries `Accept: application/vnd.pagerduty+json;version=2`. The cl
 | `pagerduty_assess_oncall_coverage` | Controls 8, 9, 17, 18: final-schedule coverage gaps over `coverage_days`, single-participant schedules, responder notification rules, contact methods of current on-call users |
 | `pagerduty_assess_audit_logging` | Controls 11, 12, 13: recent audit records, 11-to-12 month retention probe against `min_retention_days`, API tokens observed in audit records with the `api_key_max_age_days` rotation target |
 | `pagerduty_assess_integration_security` | Controls 14, 15, 16, 21, 25: HTTPS webhook endpoints, legacy versus signed v3 webhooks, legacy and unfiltered service integrations, business service dependencies, change events |
-| `pagerduty_export_audit_bundle` | Runs the access check and all five assessments, then writes `core_data/` (projected and redacted API snapshots, each carrying `complete`, `total`, and `truncation`; a dataset that was denied, errored, or never requested is written as a `{ collected: false, status, endpoint, error }` marker instead of an empty list), `analysis/` (`findings.json`, one result per category whose summary carries an `inventories` map naming each source as complete, partial, unread, or not requested, `metadata.json`), `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` when part of the collection failed, and a `.zip` under `output_dir` (default `./export/pagerduty`) |
+| `pagerduty_export_audit_bundle` | Runs the access check and all five assessments, then writes an audit bundle and a zip archive |
 
-All tools accept the auth parameters (`api_token`, `access_token`, `client_id`, `client_secret`, `subdomain`, `region`, `base_url`, `from_email`, `config_file`, `timeout_seconds`, default 30). Each assessment tool adds its own sampling limits and thresholds, all optional numbers; `pagerduty_export_audit_bundle` accepts every one of them plus `output_dir`:
+The export tool writes the following under `output_dir` (default `./export/pagerduty`):
+
+- `core_data/`: projected and redacted API snapshots, each carrying `complete`, `total`, and `truncation`. A dataset that was denied, errored, or never requested is written as a `{ collected: false, status, endpoint, error }` marker instead of an empty list.
+- `analysis/`: `findings.json`, one result per category, and `metadata.json`. The summary in each category result carries an `inventories` map naming each source as complete, partial, unread, or not requested.
+- `compliance/`
+- `QUICK_REFERENCE.md`
+- `_errors.log`, when part of the collection failed
+- a `.zip`
+
+All tools accept the auth parameters: `api_token`, `access_token`, `client_id`, `client_secret`, `subdomain`, `region`, `base_url`, `from_email`, `config_file`, and `timeout_seconds` (default 30).
+
+Each assessment tool adds its own sampling limits and thresholds, all optional numbers. `pagerduty_export_audit_bundle` accepts every one of them plus `output_dir`:
 
 | Tool | Parameters (default) |
 |------|----------------------|
@@ -83,31 +114,142 @@ pagerduty-<region>-audit-bundle/
 pagerduty-<region>-audit-bundle.zip
 ```
 
-A repeat run takes the suffixes `-2` through `-10`, skipping any name whose directory or zip already exists, and fails once all ten names are taken. Output paths are resolved inside `output_dir`; traversal outside it and symlinked parent directories are rejected. Files are written with mode `0600` and directories with `0700`.
+A repeat run takes the suffixes `-2` through `-10`. It skips any name whose directory or zip already exists, and fails once all ten names are taken.
+
+Output paths are resolved inside `output_dir`. Traversal outside it and symlinked parent directories are rejected.
+
+Files are written with mode `0600` and directories with `0700`.
 
 ## Control coverage
 
-Finding ids are `PD-01` through `PD-25`, one per spec control. Status semantics: `pass` means complete API evidence satisfies the control, `warn` means partial or degraded evidence that should be reviewed, `fail` means the API evidence contradicts the control, and `manual` means the API cannot prove the control (or the endpoint was unreadable) and the finding summary states exactly which evidence to collect from the PagerDuty web app.
+Finding ids are `PD-01` through `PD-25`, one per spec control.
+
+Status semantics:
+
+- `pass`: Complete API evidence satisfies the control.
+- `warn`: Partial or degraded evidence that should be reviewed.
+- `fail`: The API evidence contradicts the control.
+- `manual`: The API cannot prove the control, or the endpoint was unreadable. The finding summary states exactly which evidence to collect from the PagerDuty web app.
 
 ### Verdict safety rules
 
-Every finding follows these rules so that a `pass` is never issued on missing or partial evidence:
+Every finding follows these rules so that a `pass` is never issued on missing or partial evidence.
 
-- An unreadable, forbidden (401/403), or errored endpoint yields `manual`; the summary names the failing endpoint and the web app evidence to collect.
-- An empty inventory never yields `pass`. Zero users, services, escalation policies, schedules, or on-call entries yield `manual` (the credential is probably not seeing the directory); zero teams on a complete, readable `GET /teams` yield `fail` on `PD-04`, the only finding that reads the team list (an account whose team list is readable and empty has no team-based access configured, so it is treated like an unused feature rather than a hidden directory); zero incident workflows, priorities, or business services on a complete read yield `fail` (the feature is readable but unused); zero webhooks make controls 14 and 15 `manual` (not applicable). Emptiness is a verdict only for a complete read: a page truncated before any item was visible (an empty page served with `more: true` or a `next_cursor`, or a zero limit) yields `manual` on `PD-04`, `PD-20`, and `PD-21` with a sentence that names the truncation, because the unread items could contradict the absence, and the emptiness sentences of `PD-10` (services still referencing response plays), `PD-11`, and `PD-12` are stated bare only from a complete read and otherwise carry the partial view.
-- Plan-gated features (HTTP 402 or a plan message from Audit Trail, Incident Workflows, Priorities, Business Services) yield `manual` with a plan summary, and controls the API cannot observe (1, 13, 24) are always `manual`.
-- Records without a date (`execution_time`, change event `timestamp`, schedule entry `start` or `end`) are never counted as recent or as coverage; they are reported in their own evidence bucket and cap the verdict at `warn`.
-- The client requests `total=true`, follows `more` and `next_cursor` to completion, and records truncation when a `*_limit` or the 10,000 record ceiling stops it. An empty page served with `more: true` or with a `next_cursor`, a `next_cursor` the API already served, a `more: false` page that leaves the declared `total` unreached, a full page without a `more` flag, and per-team member lists that stop short are all recorded as truncated rather than complete. Any finding that would pass on a truncated inventory is downgraded to `warn` with seen and total counts (or "total unknown") in the summary and `evidence.partial_view`.
-- Credentials never reach the bundle: integration keys and inbound integration emails, extension `config` objects, webhook `custom_headers` values, and any secret-named field are replaced with `[REDACTED]`; extension and webhook URLs are reduced to scheme and host (including in `PD-14` evidence); users, services, workflows, change events, and audit records are projected to the fields the findings read; and every error string passes through one redaction pass (`PagerdutyRequestError` scrubs its message when constructed, and `errorMessage` scrubs again wherever an error is recorded), carrying PagerDuty's documented `error.message`, `error.code`, and `error.errors[]` or a status-and-length note such as `non-JSON body (text/html, 5120 bytes)`, never the raw response body. Every string a snapshot, an evidence list, or a summary keeps from a PagerDuty response passes the data-side pass at the collector (`redactSnapshot`, which every captured dataset passes through, with URL query strings removed whole): the client's remembered credentials in every form and every carrier (`Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare; URL userinfo and query strings, which go whole; credential-named assignments and fields; auth schemes; JWTs; PEM blocks) and, bare, the vendor-prefixed token shapes (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest) are removed from a description, a note, a name, or a comment: JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too, while the generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay. A value nested deeper than 32 levels, container or leaf, is replaced by `[REDACTED]` at that depth rather than passed through (the payload is server-controlled).
-- A finding that depends on a secondary read stops below `pass` while that read fails and names it: `PD-04` is capped at `warn` when `GET /abilities` cannot confirm the `teams` ability, `PD-10` is capped at `warn` (and drops its response play count) when `GET /services` is unreadable, `PD-12` is capped at `warn` when the retention probe fails, and `PD-21` is capped at `warn` when a dependency read fails.
-- A per-item read is never requested when the list it keys on was not read: team member lists (`GET /teams/{id}/members`) wait on `/teams`, schedule detail reads (`GET /schedules/{id}`) on `/schedules`, and business service dependency reads on `/business_services`. The dependent snapshot carries `not requested: the <parent> list was not read (...)`, the finding gates on the parent's failure, the summary's `inventories` map says `not requested (...)`, and the bundle writes a not-collected marker with `status: null` and `endpoint: null` rather than `{}` or `[]`.
-- No evidence field or summary renders `0`, an empty list, or `false` for an inventory that was not read: `users_seen`, `teams_seen`, `active_services`, `enabled_triggers`, `records_dated_in_window`, `change_events_complete`, and every other derived count, list, flag, or map is `null` when its source was unread, and `null` when its source is partial and the value would assert absence (`0`, `[]`, `{}`), because a partly read inventory cannot prove that nothing exists. Every category summary carries an `inventories` map that states each source as `complete (N seen)`, `<label>: N of M seen (<truncation>)`, `unread (<error>)`, or `not requested (<reason>)`.
-- Lists that name principals as holding or lacking a property (`privileged_users`, `owners`, `users_without_role`, `users_without_teams`, `users_not_created_via_sso`, `responders_without_rules`, `responders_without_high_urgency_rule`, `oncall_without_contact_methods`, `oncall_email_only`, `oncall_unverifiable_methods`, `api_tokens_observed`) and the counts derived from them (`users_created_via_sso`, `privileged_users`, `owners`, `users_without_teams`, `api_tokens_observed`) are emitted only from inventories read to completion; when the proving inventory is unread or partial they render `null` and `principals_withheld` names the inventory that was not fully read.
-- `pagerduty_check_access` and every assessment call `GET /users/me`: a 400 identifies an account-level key (full visibility); a user-level key or OAuth user token with a role other than `owner` or `admin` only sees its own teams, so passing findings are downgraded to `warn` until an account-level key is used.
-- Enabling flags must be present and true: `is_enabled` on workflows, an enabled state on workflow triggers (the parent workflow's `is_enabled` resolved through `trigger.workflow.id`, or `is_disabled: false` while that deprecated field is still served), `active` on webhook subscriptions, `enabled` and `blacklisted` on phone and SMS methods, `blacklisted` on push methods (the push schema has no `enabled` flag), `enabled` on email methods, `num_loops` and rule `targets` on escalation policies, `role` on users, `extension_schema` on extensions, and ability names in `/abilities`. An absent or false flag never supports `pass`.
-- Re-running the export never overwrites: the bundle directory and the zip share the same allocated name (`pagerduty-us-audit-bundle-2/` and `pagerduty-us-audit-bundle-2.zip`).
+#### Unreadable, empty, and undated data
 
-The `Inputs` column names the datasets each finding reads, using the labels of the summary's `inventories` map; an unread primary input renders the finding `manual` and names the endpoint and error, an unread secondary input caps it at `warn`, a partial input downgrades `pass` to `warn` with `evidence.partial_view`, and a dataset that was `not requested` because its parent list was unread is treated as unread.
+- An unreadable, forbidden (401/403), or errored endpoint yields `manual`. The summary names the failing endpoint and the web app evidence to collect.
+- An empty inventory never yields `pass`.
+  - Zero users, services, escalation policies, schedules, or on-call entries yield `manual`. The credential is probably not seeing the directory.
+  - Zero teams on a complete, readable `GET /teams` yield `fail` on `PD-04`, the only finding that reads the team list. An account whose team list is readable and empty has no team-based access configured, so it is treated like an unused feature rather than a hidden directory.
+  - Zero incident workflows, priorities, or business services on a complete read yield `fail`. The feature is readable but unused.
+  - Zero webhooks make controls 14 and 15 `manual` (not applicable).
+- Emptiness is a verdict only for a complete read.
+  - A page truncated before any item was visible (an empty page served with `more: true` or a `next_cursor`, or a zero limit) yields `manual` on `PD-04`, `PD-20`, and `PD-21`, because the unread items could contradict the absence. Each of those findings carries a sentence that names the truncation.
+  - The emptiness sentences of `PD-10` (services still referencing response plays), `PD-11`, and `PD-12` are stated bare only from a complete read. Otherwise they carry the partial view.
+- Plan-gated features (HTTP 402 or a plan message from Audit Trail, Incident Workflows, Priorities, Business Services) yield `manual` with a plan summary.
+- Controls the API cannot observe (1, 13, 24) are always `manual`.
+- Records without a date (`execution_time`, change event `timestamp`, schedule entry `start` or `end`) are never counted as recent or as coverage. They are reported in their own evidence bucket and cap the verdict at `warn`.
+
+#### Pagination and truncation
+
+- The client requests `total=true`, follows `more` and `next_cursor` to completion, and records truncation when a `*_limit` or the 10,000 record ceiling stops it.
+- These are all recorded as truncated rather than complete:
+  - An empty page served with `more: true` or with a `next_cursor`
+  - A `next_cursor` the API already served
+  - A `more: false` page that leaves the declared `total` unreached
+  - A full page without a `more` flag
+  - Per-team member lists that stop short
+- Any finding that would pass on a truncated inventory is downgraded to `warn`, with seen and total counts (or "total unknown") in the summary and `evidence.partial_view`.
+
+#### Redaction
+
+Credentials never reach the bundle.
+
+- Integration keys and inbound integration emails, extension `config` objects, webhook `custom_headers` values, and any secret-named field are replaced with `[REDACTED]`.
+- Extension and webhook URLs are reduced to scheme and host, including in `PD-14` evidence.
+- Users, services, workflows, change events, and audit records are projected to the fields the findings read.
+- Every error string passes through one redaction pass.
+  - `PagerdutyRequestError` scrubs its message when constructed, and `errorMessage` scrubs again wherever an error is recorded.
+  - The error string carries PagerDuty's documented `error.message`, `error.code`, and `error.errors[]`, or a status-and-length note such as `non-JSON body (text/html, 5120 bytes)`. It never carries the raw response body.
+
+Every string that a snapshot, an evidence list, or a summary keeps from a PagerDuty response passes the data-side pass at the collector. That pass is `redactSnapshot`, which every captured dataset passes through, with URL query strings removed whole.
+
+The data-side pass removes these from a description, a note, a name, or a comment:
+
+- The client's remembered credentials, in every form and every carrier:
+  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare
+  - URL userinfo and query strings, which go whole
+  - Credential-named assignments and fields
+  - Auth schemes
+  - JWTs
+  - PEM blocks
+- Bare vendor-prefixed token shapes (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest)
+
+JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too. But the generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay.
+
+A value nested deeper than 32 levels, container or leaf, is replaced by `[REDACTED]` at that depth rather than passed through (the payload is server-controlled).
+
+#### Secondary and per-item reads
+
+- A finding that depends on a secondary read stops below `pass` while that read fails, and names that read.
+  - `PD-04` is capped at `warn` when `GET /abilities` cannot confirm the `teams` ability.
+  - `PD-10` is capped at `warn`, and drops its response play count, when `GET /services` is unreadable.
+  - `PD-12` is capped at `warn` when the retention probe fails.
+  - `PD-21` is capped at `warn` when a dependency read fails.
+- A per-item read is never requested when the list it keys on was not read.
+  - Team member lists (`GET /teams/{id}/members`) wait on `/teams`.
+  - Schedule detail reads (`GET /schedules/{id}`) wait on `/schedules`.
+  - Business service dependency reads wait on `/business_services`.
+- When a per-item read is not requested:
+  - The dependent snapshot carries `not requested: the <parent> list was not read (...)`.
+  - The finding gates on the parent's failure.
+  - The summary's `inventories` map says `not requested (...)`.
+  - The bundle writes a not-collected marker with `status: null` and `endpoint: null` rather than `{}` or `[]`.
+
+#### Unread and partial inventories
+
+- No evidence field or summary renders `0`, an empty list, or `false` for an inventory that was not read.
+  - `users_seen`, `teams_seen`, `active_services`, `enabled_triggers`, `records_dated_in_window`, `change_events_complete`, and every other derived count, list, flag, or map is `null` when its source was unread.
+  - Each of these is also `null` when its source is partial and the value would assert absence (`0`, `[]`, `{}`), because a partly read inventory cannot prove that nothing exists.
+- Every category summary carries an `inventories` map. The map states each source as one of:
+  - `complete (N seen)`
+  - `<label>: N of M seen (<truncation>)`
+  - `unread (<error>)`
+  - `not requested (<reason>)`
+- Lists that name principals as holding or lacking a property, and the counts derived from them, are emitted only from inventories read to completion.
+  - Lists: `privileged_users`, `owners`, `users_without_role`, `users_without_teams`, `users_not_created_via_sso`, `responders_without_rules`, `responders_without_high_urgency_rule`, `oncall_without_contact_methods`, `oncall_email_only`, `oncall_unverifiable_methods`, `api_tokens_observed`
+  - Derived counts: `users_created_via_sso`, `privileged_users`, `owners`, `users_without_teams`, `api_tokens_observed`
+  - When the proving inventory is unread or partial, these lists and counts render `null`, and `principals_withheld` names the inventory that was not fully read.
+
+#### Credential scope, enabling flags, and re-runs
+
+- `pagerduty_check_access` and every assessment call `GET /users/me`.
+  - A 400 identifies an account-level key (full visibility).
+  - A user-level key or OAuth user token with a role other than `owner` or `admin` only sees its own teams, so passing findings are downgraded to `warn` until an account-level key is used.
+- Enabling flags must be present and true:
+  - `is_enabled` on workflows
+  - An enabled state on workflow triggers: the parent workflow's `is_enabled` resolved through `trigger.workflow.id`, or `is_disabled: false` while that deprecated field is still served
+  - `active` on webhook subscriptions
+  - `enabled` and `blacklisted` on phone and SMS methods
+  - `blacklisted` on push methods (the push schema has no `enabled` flag)
+  - `enabled` on email methods
+  - `num_loops` and rule `targets` on escalation policies
+  - `role` on users
+  - `extension_schema` on extensions
+  - Ability names in `/abilities`
+- An absent or false flag never supports `pass`.
+- Re-running the export never overwrites. The bundle directory and the zip share the same allocated name (`pagerduty-us-audit-bundle-2/` and `pagerduty-us-audit-bundle-2.zip`).
+
+### Status semantics by control
+
+The `Inputs` column names the datasets each finding reads, using the labels of the summary's `inventories` map.
+
+Input rules:
+
+- An unread primary input renders the finding `manual` and names the endpoint and error.
+- An unread secondary input caps the finding at `warn`.
+- A partial input downgrades `pass` to `warn` with `evidence.partial_view`.
+- A dataset that was `not requested` because its parent list was unread is treated as unread.
 
 | # | Control | Tool | Finding | Inputs | Status semantics |
 |---|---------|------|---------|--------|------------------|
@@ -137,11 +279,17 @@ The `Inputs` column names the datasets each finding reads, using the labels of t
 | 24 | Analytics access restricted | `pagerduty_assess_access_control` | `PD-24` | `abilities`, `users` | Always `manual` (per-role analytics permissions are not exposed); `analytics_abilities` is `null` when `/abilities` is unread and `role_counts` is `null` when `users` is unread |
 | 25 | Change events tracking enabled | `pagerduty_assess_integration_security` | `PD-25` | `change events`, `services` | `pass` when change events with a `timestamp` inside `change_event_days` arrived and the collection is complete, `warn` when events are undated, when Events API v2 integrations exist but no events arrived, or when the change event pages stopped at the limit (`evidence.change_events_complete` is false and `partial_view` names the truncation), `fail` when neither exists, `manual` when `change events` or `services` is unread or `services` is empty. `change_events_complete`, `change_events_dated_in_window`, `change_events_missing_timestamp`, and `services_with_change_events` are `null` when `change events` is unread; `events_v2_services` is `null` when `services` is unread |
 
-Any control whose source endpoint cannot be read becomes `manual` with the collection error in the summary and the error recorded in the assessment `errors` list and the bundle `_errors.log`. Every `pass` listed above is downgraded to `warn` when the underlying inventory is partial or the credential is a non-admin user-level key.
+Any control whose source endpoint cannot be read becomes `manual`. The summary carries the collection error, which is also recorded in the assessment `errors` list and the bundle `_errors.log`.
+
+Every `pass` listed above is downgraded to `warn` when the underlying inventory is partial or the credential is a non-admin user-level key.
 
 ## Framework mappings
 
-Each finding carries eight mappings from the spec's compliance table, labelled `FedRAMP`, `CMMC`, `SOC 2`, `CIS`, `PCI-DSS`, `STIG`, `IRAP`, and `ISMAP` (for example `PD-01` maps to `FedRAMP IA-2`, `CMMC IA.L2-3.5.1`, `SOC 2 CC6.1`, `CIS 4.1`, `PCI-DSS 8.3.1`, `STIG SRG-APP-000148`, `IRAP ISM-1557`, `ISMAP 8.2.1`). The audit bundle groups them into `compliance/unified_compliance_matrix.md` and one report per framework.
+Each finding carries eight mappings from the spec's compliance table. They are labelled `FedRAMP`, `CMMC`, `SOC 2`, `CIS`, `PCI-DSS`, `STIG`, `IRAP`, and `ISMAP`.
+
+For example, `PD-01` maps to `FedRAMP IA-2`, `CMMC IA.L2-3.5.1`, `SOC 2 CC6.1`, `CIS 4.1`, `PCI-DSS 8.3.1`, `STIG SRG-APP-000148`, `IRAP ISM-1557`, and `ISMAP 8.2.1`.
+
+The audit bundle groups the mappings into `compliance/unified_compliance_matrix.md` and one report per framework.
 
 ## Live smoke test
 
@@ -149,19 +297,84 @@ Each finding carries eight mappings from the spec's compliance table, labelled `
 PAGERDUTY_API_TOKEN=... npm --prefix cli run test:pagerduty:live
 ```
 
-The script skips with exit code 0 when no credentials are present. With credentials it runs `pagerduty_check_access`, stops if the core abilities, users, services, and escalation policy surfaces are unreadable, and then runs the incident response assessment against up to 100 services.
+The script skips with exit code 0 when no credentials are present.
+
+With credentials it:
+
+1. Runs `pagerduty_check_access`.
+2. Stops if the core abilities, users, services, and escalation policy surfaces are unreadable.
+3. Runs the incident response assessment against up to 100 services.
 
 ## Limitations and manual controls
 
-- Controls 1, 13, and 24 always produce `manual` findings: the REST API exposes the `sso` ability but not SSO enforcement, has no endpoint listing API keys or their creation dates, and does not expose per-role analytics permissions.
+- Controls 1, 13, and 24 always produce `manual` findings, because the REST API:
+  - Exposes the `sso` ability but not SSO enforcement.
+  - Has no endpoint listing API keys or their creation dates.
+  - Does not expose per-role analytics permissions.
 - Contact method verification status is not exposed, so control 18 checks for enabled, non-blocked phone, SMS, or push methods instead.
-- Response plays are no longer in the published REST API reference; control 10 evaluates incident workflows and triggers and only reports legacy `response_play` references on services.
-- Webhook signature verification happens on the receiving side; control 15 confirms only that unsigned legacy generic webhook extensions are gone.
-- Audit records need the Audit Trail plan feature and an admin, owner, or global API key. PagerDuty retains them for 12 months, so longer retention requirements need SIEM or archive evidence.
-- Users and services are read up to `user_limit` and `service_limit` (default 1000 each), audit records up to `audit_limit` (default 2000), all within the classic pagination ceiling of 10,000 records. When a limit stops the collection, the finding records seen and total counts and cannot pass; raise the limit or narrow the window to obtain a complete inventory.
+- Response plays are no longer in the published REST API reference. Control 10 evaluates incident workflows and triggers and only reports legacy `response_play` references on services.
+- Webhook signature verification happens on the receiving side. Control 15 confirms only that unsigned legacy generic webhook extensions are gone.
+- Audit records need the Audit Trail plan feature and an admin, owner, or global API key. PagerDuty retains audit records for 12 months, so longer retention requirements need SIEM or archive evidence.
+- Users and services are read up to `user_limit` and `service_limit` (default 1000 each), and audit records up to `audit_limit` (default 2000). All are within the classic pagination ceiling of 10,000 records.
+  - When a limit stops the collection, the finding records seen and total counts and cannot pass.
+  - Raise the limit or narrow the window to obtain a complete inventory.
 - A user-level API key with a role below `admin` only returns the objects that user can see, so its passing findings are downgraded to `warn`. Use an account-level read-only key for a complete assessment.
-- Error strings never quote a response body. A REST response without PagerDuty's documented `error.message`, `error.code`, or `error.errors[]` fields, and a token response from `identity.pagerduty.com` without the RFC 6749 `error` or `error_description` fields (a proxy or WAF page, whatever its content type claims, or JSON of another shape), is described as "non-JSON body (text/html, 5120 bytes)" or "JSON body without documented error fields (...)"; a timeout is reported as "PagerDuty request timed out after Nms: <path>" with the path only. `PagerdutyRequestError` is the one error class the client throws for HTTP failures and its constructor runs the redaction pass over the message it was given; `errorMessage` runs the same pass again wherever an error is recorded (`capture` for every dataset, `pagerduty_check_access` surfaces, and each tool's error result), so no throw site can bypass it. The pass replaces with `[REDACTED]` the configured API key, OAuth access token, client secret, and every bearer token obtained during the run, whatever their shape and in their base64, base64url, URL-encoded, and JSON-escaped forms; any value inside a carrier whatever its shape (`Authorization`, `Cookie`, `Set-Cookie`, and API key headers, cookie and session assignments, URL userinfo and query pairs, the `Bearer`, `Basic`, `Digest`, `Token`, and `ApiKey` schemes including PagerDuty's `Token token=`, credential-named fields and assignments, SOAP credential elements, command-line flags); and bare values only when they have a real token shape (JWTs, PEM blocks, hex digests, vendor-prefixed keys, and runs of 16 or more characters with base64 symbols, scattered digits, or token casing, including a run standing after `=` under a non-credential pair name such as `theme=`). A carrier or token shape standing right after a literal JSON escape (`\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them) is treated exactly as one after a real newline, tab, or space. A bare name-shaped value standing alone in prose, such as a schedule name or `prod-us-east-2026`, is indistinguishable from a resource name and stays. So `core_data/access_check.json`, dataset `error` fields, `errors` arrays, `inventories` entries, finding summaries, compliance markdown, `_errors.log`, and tool results carry status, path, and shape only.
-- Config file errors are fixed text. A file that cannot be read fails with "Unable to read PagerDuty config file <path> (<CODE>)" (the Node error code only, `ENOENT` included when `config_file` or `PAGERDUTY_CONFIG_FILE` names the path; the default `~/.config/grclanker/pagerduty.json` is skipped when absent); a file that cannot be parsed fails with "Unable to parse PagerDuty config file: invalid JSON in <path> at line N" (the line only when `JSON.parse` reports a position). Neither `JSON.parse`'s message, which quotes a window of the source, nor the filesystem's wording is ever included, so an unquoted `api_token` or `client_secret` value is never echoed.
+
+### Error strings
+
+Error strings never quote a response body.
+
+These responses are described as "non-JSON body (text/html, 5120 bytes)" or "JSON body without documented error fields (...)":
+
+- A REST response without PagerDuty's documented `error.message`, `error.code`, or `error.errors[]` fields.
+- A token response from `identity.pagerduty.com` without the RFC 6749 `error` or `error_description` fields.
+
+Such a response is a proxy or WAF page, whatever its content type claims, or JSON of another shape.
+
+A timeout is reported as "PagerDuty request timed out after Nms: \<path>" with the path only.
+
+`PagerdutyRequestError` is the one error class the client throws for HTTP failures. Its constructor runs the redaction pass over the message it was given.
+
+`errorMessage` runs the same pass again wherever an error is recorded: `capture` for every dataset, `pagerduty_check_access` surfaces, and each tool's error result. So no throw site can bypass the redaction pass.
+
+The pass replaces these with `[REDACTED]`:
+
+- The configured API key, OAuth access token, client secret, and every bearer token obtained during the run. They are replaced whatever their shape, and in their base64, base64url, URL-encoded, and JSON-escaped forms.
+- Any value inside a carrier, whatever its shape:
+  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers
+  - Cookie and session assignments
+  - URL userinfo and query pairs
+  - The `Bearer`, `Basic`, `Digest`, `Token`, and `ApiKey` schemes, including PagerDuty's `Token token=`
+  - Credential-named fields and assignments
+  - SOAP credential elements
+  - Command-line flags
+- Bare values, only when they have a real token shape:
+  - JWTs, PEM blocks, hex digests, and vendor-prefixed keys
+  - Runs of 16 or more characters with base64 symbols, scattered digits, or token casing, including a run standing after `=` under a non-credential pair name such as `theme=`
+
+A carrier or token shape standing right after a literal JSON escape is treated exactly as one after a real newline, tab, or space. Such escapes are `\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them.
+
+A bare name-shaped value standing alone in prose, such as a schedule name or `prod-us-east-2026`, is indistinguishable from a resource name and stays.
+
+So these carry status, path, and shape only:
+
+- `core_data/access_check.json`
+- Dataset `error` fields
+- `errors` arrays
+- `inventories` entries
+- Finding summaries
+- Compliance markdown
+- `_errors.log`
+- Tool results
+
+### Config file errors
+
+Config file errors are fixed text.
+
+- A file that cannot be read fails with "Unable to read PagerDuty config file \<path> (\<CODE>)". Only the Node error code is included. `ENOENT` is included when `config_file` or `PAGERDUTY_CONFIG_FILE` names the path. The default `~/.config/grclanker/pagerduty.json` is skipped when absent.
+- A file that cannot be parsed fails with "Unable to parse PagerDuty config file: invalid JSON in \<path> at line N". The line appears only when `JSON.parse` reports a position.
+
+Neither `JSON.parse`'s message, which quotes a window of the source, nor the filesystem's wording is ever included. So an unquoted `api_token` or `client_secret` value is never echoed.
 
 ## Official documentation
 

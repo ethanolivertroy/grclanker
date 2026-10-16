@@ -3,7 +3,7 @@ title: Elastic
 description: Read-only Elasticsearch and Kibana security posture assessment mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP.
 ---
 
-The Elastic integration inspects Elasticsearch and Kibana security configuration through their public REST APIs. It never writes to the cluster or to Kibana: every tool uses read-only endpoints (the only POST requests are the documented query and privilege-check endpoints). Findings implement the 23 numbered controls in `specs/elastic-sec-inspector.spec.md` and carry that spec's compliance mappings.
+The Elastic integration inspects Elasticsearch and Kibana security configuration through their public REST APIs. It never writes to the cluster or to Kibana. Every tool uses read-only endpoints. The only POST requests are the documented query and privilege-check endpoints. Findings implement the 23 numbered controls in `specs/elastic-sec-inspector.spec.md` and carry that spec's compliance mappings.
 
 ## What it inspects
 
@@ -20,7 +20,9 @@ The Elastic integration inspects Elasticsearch and Kibana security configuration
 
 ## Setup and authentication
 
-Configuration resolves with the precedence explicit tool arguments, then environment variables, then the config file. A higher-precedence source that supplies credentials replaces credentials of a different type from a lower-precedence source, so passing `username` and `password` to a tool wins over `ELASTIC_API_KEY` in the environment.
+Configuration precedence is explicit tool arguments, then environment variables, then the config file.
+
+A higher-precedence source that supplies credentials replaces credentials of a different type from a lower-precedence source. For example, passing `username` and `password` to a tool wins over `ELASTIC_API_KEY` in the environment.
 
 | Environment variable | Purpose |
 |----------------------|---------|
@@ -35,7 +37,9 @@ Configuration resolves with the precedence explicit tool arguments, then environ
 | `ELASTIC_TIMEOUT` | HTTP timeout in seconds, default 30 |
 | `ELASTIC_SEC_INSPECTOR_CONFIG` | Path to a YAML config file, default `~/.elastic-sec-inspector/config.yaml` |
 
-The same Elasticsearch credential is sent to Kibana, which accepts Elasticsearch API keys and basic credentials. Every Kibana request carries the `kbn-xsrf: true` header. Kibana enforces that header on non-GET requests for basic authentication, and the integration only issues GET requests to Kibana, so the header is included for consistency across authentication schemes.
+The same Elasticsearch credential is sent to Kibana, which accepts Elasticsearch API keys and basic credentials.
+
+Every Kibana request carries the `kbn-xsrf: true` header. Kibana enforces that header on non-GET requests for basic authentication. Although the integration issues only GET requests to Kibana, it includes the header for consistency across authentication schemes.
 
 Config file example (`~/.elastic-sec-inspector/config.yaml`):
 
@@ -67,7 +71,15 @@ Create a dedicated read-only auditing role. `elastic_check_access` probes these 
 | `read_slm` (or `manage_slm`) | `/_slm/status`, `/_slm/policy` |
 | `monitor_watcher` | `/_watcher/_query/watches` |
 
-For Kibana, grant read access to the Spaces, Fleet, Security (detection rules), Stack Management (alerting rules, connectors, roles), and Stack Monitoring features across the spaces you intend to audit. Elastic Cloud deployment inventory needs an organization-level Cloud API key with viewer access.
+For Kibana, grant read access to these features across the spaces you intend to audit:
+
+- Spaces
+- Fleet
+- Security (detection rules)
+- Stack Management (alerting rules, connectors, roles)
+- Stack Monitoring
+
+Elastic Cloud deployment inventory needs an organization-level Cloud API key with viewer access.
 
 ## Tools
 
@@ -81,7 +93,21 @@ For Kibana, grant read access to the Spaces, Fleet, Security (detection rules), 
 | `elastic_assess_kibana` | Controls 15, 16, 21: Kibana spaces, Kibana roles, Fleet |
 | `elastic_export_audit_bundle` | Run every assessment and write `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a `.zip` |
 
-All tools accept the connection arguments (`elasticsearch_url`, `kibana_url`, `space_id`, `api_key`, `username`, `password`, `bearer_token`, `cloud_api_key`, `cloud_api_url`, `config_file`, `timeout_seconds`). Assessment tools add thresholds: `api_key_limit`, `max_api_key_age_days` (90), `max_superusers` (2), `sensitive_index_patterns`, `tenant_index_patterns`, `cert_expiry_warning_days` (30), `watch_limit`, `kibana_limit`, and `max_enrollment_keys_per_policy` (3). The export tool adds `output_dir` (default `./export/elastic`).
+All tools accept the connection arguments: `elasticsearch_url`, `kibana_url`, `space_id`, `api_key`, `username`, `password`, `bearer_token`, `cloud_api_key`, `cloud_api_url`, `config_file`, and `timeout_seconds`.
+
+Assessment tools add these thresholds:
+
+- `api_key_limit`
+- `max_api_key_age_days` (90)
+- `max_superusers` (2)
+- `sensitive_index_patterns`
+- `tenant_index_patterns`
+- `cert_expiry_warning_days` (30)
+- `watch_limit`
+- `kibana_limit`
+- `max_enrollment_keys_per_policy` (3)
+
+The export tool adds `output_dir` (default `./export/elastic`).
 
 Example prompts:
 
@@ -93,18 +119,70 @@ Export an Elastic audit bundle to ./export/elastic.
 
 ## Control coverage
 
-Status semantics: `pass` means API evidence shows the control is satisfied, `warn` means it is partially satisfied or not fully confirmable from the visible data, `fail` means API evidence shows a violation, and `manual` means the API cannot verify it and the summary states exactly what evidence a human must collect.
+Status semantics:
+
+- `pass`: API evidence shows the control is satisfied.
+- `warn`: The control is partially satisfied or not fully confirmable from the visible data.
+- `fail`: API evidence shows a violation.
+- `manual`: The API cannot verify the control, and the summary states exactly what evidence a human must collect.
+
+### Evidence rules
 
 Every verdict follows the same evidence rules, so a `pass` is never produced from missing or partial data:
 
-- A forbidden (401/403), timed out, or errored source endpoint yields `manual`; the summary names the endpoint and error and lists what to collect. Observed violations still `fail` (for example too many superusers) even when a secondary source is unreadable.
-- An empty inventory never passes by default. Each control states how emptiness is judged: zero users, roles, spaces, certificates, or ingest pipelines is `manual` because Elasticsearch and Kibana always return built-in entries; zero ILM policies, repositories, or SLM policies is `fail`; zero role mappings for an SSO realm is `fail`; zero Fleet policies is `manual` (not applicable); zero API keys passes only because controls 9 and 10 concern existing keys, and only with full inventory visibility.
-- Controls that are scoped out (Kibana not configured), disabled by configuration (no SSO realm), or unavailable on the license tier (FLS, DLS, Watcher on Basic) render as `manual` with a "Not applicable" or "Scoped out" summary. Features in use without a covering license `fail`.
-- Items without a date (API keys with no `creation`, certificates with no `expiry`, SLM policies with no `last_success`, a license with no expiry or status) are bucketed separately, reported in the evidence, and cap the verdict at `warn`.
-- Partial inventories cap the verdict at `warn` or `manual` and report seen and total counts: an API key query limited to the caller's own keys (no `read_security`, `manage_api_key`, or `manage_security`), a truncated page set, node settings from only some nodes, `GET /_ssl/certificates` on a multi-node cluster (it reports only the responding node), and Kibana inventories read from a single space when other spaces exist.
-- Every enabling flag is read before a `pass`: `xpack.security.enabled`, `xpack.security.transport.ssl.enabled` and `verification_mode`, `xpack.security.http.ssl.enabled`, `xpack.security.audit.enabled`, realm `enabled` flags, anonymous role settings, and license type and status. An absent or false flag never supports `pass`, and settings resolve as transient over persistent over node-level over cluster defaults.
-- Pagination runs to the configured limit; when the total exceeds what was read, the dataset is marked truncated and the verdict is downgraded. An inventory count in a finding or a tool summary (`watches`, `connectors`, `alerting_rules`, `detection_rules`, `rules_with_actions`) renders `null` rather than `0` when the listing behind it stopped before any record was read, and the rows read as a lower bound when some were, with the dataset's `inventories` row (`complete`, `seen`, `total`) beside it; `ELASTIC-20` asserts that no alerting destination exists only from complete empty reads, and says the listing stopped otherwise.
-- A success status is not a success by itself. Every 2xx body is checked against the documented container of that endpoint before it is accepted (an object carrying its documented keys, a map whose entries carry the documented entry keys, an array of objects, or an object with an array under its documented key); an empty body, a non-JSON body (a portal or proxy page), or JSON of another shape is recorded as a failed read of that request with the status the server sent (`http_status: 200`) and a fixed status-and-length note that never echoes the body, in the access check, the dataset's `core_data/` marker, and `_errors.log`. Dependent verdicts then move only to `manual` or `warn`: ELASTIC-09 and ELASTIC-10 do not pass on an empty 2xx from the API key query, ELASTIC-06 does not pass and ELASTIC-07 and ELASTIC-08 do not warn over a foreign-JSON 2xx, and ELASTIC-17, ELASTIC-18, and ELASTIC-23 do not fail on a body that was never a documented answer.
+- A forbidden (401/403), timed out, or errored source endpoint yields `manual`. The summary names the endpoint and error and lists what to collect.
+- Observed violations (for example too many superusers) still `fail` even when a secondary source is unreadable.
+- An empty inventory never passes by default. Each control states how emptiness is judged:
+  - Zero users, roles, spaces, certificates, or ingest pipelines is `manual`, because Elasticsearch and Kibana always return built-in entries.
+  - Zero ILM policies, repositories, or SLM policies is `fail`.
+  - Zero role mappings for an SSO realm is `fail`.
+  - Zero Fleet policies is `manual` (not applicable).
+  - Zero API keys passes only because controls 9 and 10 concern existing keys, and only with full inventory visibility.
+- Controls render as `manual`, with a "Not applicable" or "Scoped out" summary, when they are:
+  - Scoped out (Kibana not configured).
+  - Disabled by configuration (no SSO realm).
+  - Unavailable on the license tier (FLS, DLS, Watcher on Basic).
+- Features in use without a covering license `fail`.
+- Items without a date are bucketed separately, reported in the evidence, and cap the verdict at `warn`. These items are:
+  - API keys with no `creation`.
+  - Certificates with no `expiry`.
+  - SLM policies with no `last_success`.
+  - A license with no expiry or status.
+- Partial inventories cap the verdict at `warn` or `manual` and report seen and total counts:
+  - An API key query limited to the caller's own keys (no `read_security`, `manage_api_key`, or `manage_security`).
+  - A truncated page set.
+  - Node settings from only some nodes.
+  - `GET /_ssl/certificates` on a multi-node cluster (it reports only the responding node).
+  - Kibana inventories read from a single space when other spaces exist.
+- Every enabling flag is read before a `pass`:
+  - `xpack.security.enabled`
+  - `xpack.security.transport.ssl.enabled` and `verification_mode`
+  - `xpack.security.http.ssl.enabled`
+  - `xpack.security.audit.enabled`
+  - Realm `enabled` flags
+  - Anonymous role settings
+  - License type and status
+- An absent or false flag never supports `pass`.
+- Settings resolve as transient over persistent over node-level over cluster defaults.
+- Pagination runs to the configured limit. When the total exceeds what was read, the dataset is marked truncated and the verdict is downgraded.
+- An inventory count in a finding or a tool summary renders `null` rather than `0` when the listing behind it stopped before any record was read, and the rows read as a lower bound when some were, with the dataset's `inventories` row beside it.
+  - Inventory counts: `watches`, `connectors`, `alerting_rules`, `detection_rules`, `rules_with_actions`.
+  - `inventories` row fields: `complete`, `seen`, `total`.
+- `ELASTIC-20` asserts that no alerting destination exists only from complete empty reads. Otherwise it says the listing stopped.
+- A success status is not a success by itself. Every 2xx body is checked against the documented container of that endpoint before it is accepted. The container is one of:
+  - An object carrying its documented keys.
+  - A map whose entries carry the documented entry keys.
+  - An array of objects.
+  - An object with an array under its documented key.
+- An empty body, a non-JSON body (a portal or proxy page), or JSON of another shape is recorded as a failed read of that request.
+  - The record carries the status the server sent (`http_status: 200`) and a fixed status-and-length note that never echoes the body.
+  - The failed read is recorded in the access check, the dataset's `core_data/` marker, and `_errors.log`.
+- Dependent verdicts then move only to `manual` or `warn`:
+  - ELASTIC-09 and ELASTIC-10 do not pass on an empty 2xx from the API key query.
+  - ELASTIC-06 does not pass and ELASTIC-07 and ELASTIC-08 do not warn over a foreign-JSON 2xx.
+  - ELASTIC-17, ELASTIC-18, and ELASTIC-23 do not fail on a body that was never a documented answer.
+
+### Verdicts by control
 
 | # | Control | Tool | Finding | Status semantics |
 |---|---------|------|---------|------------------|
@@ -132,11 +210,24 @@ Every verdict follows the same evidence rules, so a `pass` is never produced fro
 | 22 | Ingest pipeline security | `elastic_assess_cluster_hardening` | `ELASTIC-22` | fail when a custom pipeline `set` processor assigns a literal sensitive-looking value; warn when custom pipelines use `script` processors; manual when the pipeline list is empty (Elasticsearch ships managed pipelines) or unreadable |
 | 23 | License level verification | `elastic_assess_cluster_hardening` | `ELASTIC-23` | fail when the license tier does not cover configured features (SAML, OIDC, Kerberos, JWT, FLS, DLS need Platinum; LDAP, AD, PKI, audit logging, Watcher need Gold), the license status is `invalid` or `expired` (`active` and `valid` both count as active per the documented `LicenseStatus` values), or no license type is returned; warn for trial, expiry within 30 days, a missing expiry date, a missing status field, or when only some nodes responded. The requirement set is built from the realms, roles, audit setting, and watches actually read: a truncated watches listing (rows read, or a server total above zero, at a cap) still counts Watcher as in use, names `watches` under `partial_sources`, reports `requirements_complete: false`, and caps a clean verdict at warn; a `fail` on the features read stays `fail` |
 
-Because Elasticsearch never returns secure settings and the API cannot observe log shipping, control 12 is a permanent `manual` finding whenever auditing is enabled. Controls 15, 16, and 21 are `manual` when `KIBANA_URL` is not set, and control 20 cannot pass on watches alone in that case.
+Control 12 is a permanent `manual` finding whenever auditing is enabled, because Elasticsearch never returns secure settings and the API cannot observe log shipping.
+
+Controls 15, 16, and 21 are `manual` when `KIBANA_URL` is not set. In that case, control 20 cannot pass on watches alone.
 
 ## Framework mappings
 
-Every finding carries the eight mappings from the spec's compliance table for its control, for example `ELASTIC-01` maps to FedRAMP IA-2, CMMC AC.L2-3.1.1, SOC 2 CC6.1, CIS 1.1, PCI-DSS 8.3.1, STIG SRG-APP-000148, IRAP ISM-1557, and ISMAP CPS-04. The audit bundle renders them in `compliance/unified_compliance_matrix.md` and in one report per framework under `compliance/frameworks/` (`fedramp.md`, `cmmc.md`, `soc2.md`, `cis.md`, `pci-dss.md`, `stig.md`, `irap.md`, `ismap.md`).
+Every finding carries the eight mappings from the spec's compliance table for its control. For example, `ELASTIC-01` maps to:
+
+- FedRAMP IA-2
+- CMMC AC.L2-3.1.1
+- SOC 2 CC6.1
+- CIS 1.1
+- PCI-DSS 8.3.1
+- STIG SRG-APP-000148
+- IRAP ISM-1557
+- ISMAP CPS-04
+
+The audit bundle renders the mappings in `compliance/unified_compliance_matrix.md` and in one report per framework under `compliance/frameworks/`. The per-framework reports are `fedramp.md`, `cmmc.md`, `soc2.md`, `cis.md`, `pci-dss.md`, `stig.md`, `irap.md`, and `ismap.md`.
 
 ## Audit bundle layout
 
@@ -155,11 +246,74 @@ Every finding carries the eight mappings from the spec's compliance table for it
 <host>-audit-bundle.zip
 ```
 
-Output paths are resolved inside `output_dir` with traversal and symlinked-parent protection, and files are written with owner-only permissions. Re-running the export never overwrites a prior bundle: the directory name is allocated first (`<host>-audit-bundle`, then `-2` through `-9`, skipping any name whose directory or `.zip` already exists) and the archive name is derived from it, so directory and archive stay paired. Paginated datasets under `core_data/` carry a `page` block with `seen`, `total`, `pages`, and `truncated`.
+Output paths are resolved inside `output_dir` with traversal and symlinked-parent protection. Files are written with owner-only permissions.
 
-Credentials are never written into the bundle, an assess payload, or the access check. Every dataset the client collects is projected at the collection boundary to the fields its verdicts read (users to `username`, `roles`, `enabled`, `metadata`; API keys to their id, name, dates, `invalidated`, `realm`, and the privilege names of `role_descriptors` and `limited_by`; role mappings, ILM and SLM policies, repositories, pipelines, watches, connectors, Fleet policies, outputs, and hosts to their documented settings with every `url`, `endpoint`, `hosts`, and `host_urls` value reduced to scheme and host; any other string value that is one URL is reduced to scheme and host as well, while a URL inside free text keeps its scheme, host, and path and loses its userinfo and query), and the projection runs through one data-side scrub: the whole subtree under a credential-shaped key (`password`, `bind_password`, `secure_password`, `client_secret`, `api_key`, `token`, `credentials`, `private_key`, `hmac_key`, `shared_secret`, a bare `key` under `ssl`, `tls`, `keystore`, or `secrets`, and the flat `xpack.security.http.ssl.key` spelling) becomes `[REDACTED]` whether it is a string, a list, or a nested object, and every other string, free text included (descriptions, watch metadata, pipeline processor values, connector names), gets the shared pattern pass (URL queries and userinfo, bearer, cookie, and assignment carriers, webhook-style paths, and high-entropy or hex tokens are removed). A healthy run therefore writes no credential material into any `core_data/` file, and the export runs the same scrub again over the snapshots it writes as defense in depth.
+Re-running the export never overwrites a prior bundle. The directory name is allocated first (`<host>-audit-bundle`, then `-2` through `-9`), skipping any name whose directory or `.zip` already exists. The archive name is derived from the directory name, so directory and archive stay paired.
 
-Error text follows the same rule before any cut: the configured API key and its decoded secret half, the cloud API key, the password (alone and as `username:password`), and the bearer token are removed from every error detail at full length, in plain, base64, base64url, URL-encoded, form-encoded, and JSON-escaped form, before the detail is cut to 240 characters, so a secret straddling the cut leaves no fragment in an error string, `_errors.log`, `elastic_check_access`, or an assess payload. Non-JSON error bodies and JSON bodies without a documented error field are described by status, media type, and length only, never echoed, and a `SyntaxError` raised by the transport is recorded as its class name plus a fixed note because the parser's message quotes the body. Every recorded error string is produced by a single function that passes the thrown message through the module scrubber, which also removes the value of every credential carrier whatever the value's shape: a `key=value`, `key: value`, or `"key": "value"` pair whose key carries a credential word (`ELASTIC_PASSWORD`, `ELASTIC_API_KEY`, `bind_password`, `secure_password`, and the bearer ids `secret_id`, `session_id`, and `token_id`), also when the key follows a JSON escape (`\"password\": \"v\"`) or a command-line flag (`--password v`, `--password=v`, `-Dpassword=v`); an authorization scheme word in any casing (`ApiKey`, `Bearer`, `bearer`, `Basic`) loses the value after it, a bare token or a whole auth-param list (`Snowflake Token="v"`, `Digest username="v", nonce="v", response="v"`) alike, and the word itself stays only under `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate`, where a challenge's `realm="api"` stays as well, while an API-key or token header (`X-Api-Key: splunk rejected`) and a credential-named assignment (`token=Bearer v`) lose their whole value; a cookie header loses its value whole, its `;` separating pairs and attributes; the query of any URL becomes one marker, and a credential-named parameter of a relative path or bare query string loses its value whole, a `;` inside the value included (`?token=v;rest` renders `?token=[REDACTED]`, as URLSearchParams reads it); and a webhook or callback URL keeps its origin alone. A `webhook`-prefixed key is a URL carrier only when its last segment is `url` or `uri` or the key is the bare `webhook`; `webhook_secret`, `webhook_token`, and `webhookSecret` are credential keys and lose their value whatever its shape. A configured secret that is itself a carrier word (`password`, `Authorization`, `Bearer`) is removed after the carriers rather than before them, so the pair or header it names still loses its value. A name after a path slash (`GET /_security/api_key: 403`) is a path segment, not a key, and a key whose last segment names a setting (`ELASTIC_URL`, `ELASTIC_USERNAME`, `api_key_limit`, `max_api_key_age_days`) keeps a word value and loses only a token-shaped or registered one, so every fixed message and every finding summary, manual-evidence instruction, and bundle document survives the pass unchanged; the test suite sweeps the strings recorded by healthy and partially denied runs for alterations.
+Paginated datasets under `core_data/` carry a `page` block with `seen`, `total`, `pages`, and `truncated`.
+
+### Credentials in collected data
+
+Credentials are never written into the bundle, an assess payload, or the access check.
+
+Every dataset the client collects is projected at the collection boundary to the fields its verdicts read:
+
+- Users are projected to `username`, `roles`, `enabled`, and `metadata`.
+- API keys are projected to their id, name, dates, `invalidated`, `realm`, and the privilege names of `role_descriptors` and `limited_by`.
+- Role mappings, ILM and SLM policies, repositories, pipelines, watches, connectors, Fleet policies, outputs, and hosts are projected to their documented settings. Every `url`, `endpoint`, `hosts`, and `host_urls` value is reduced to scheme and host.
+- Any other string value that is one URL is reduced to scheme and host as well.
+- A URL inside free text keeps its scheme, host, and path, and loses its userinfo and query.
+
+The projection runs through one data-side scrub:
+
+- The whole subtree under a credential-shaped key becomes `[REDACTED]`, whether it is a string, a list, or a nested object. Credential-shaped keys:
+  - `password`, `bind_password`, `secure_password`, `client_secret`, `api_key`, `token`, `credentials`, `private_key`, `hmac_key`, and `shared_secret`.
+  - A bare `key` under `ssl`, `tls`, `keystore`, or `secrets`.
+  - The flat `xpack.security.http.ssl.key` spelling.
+- Every other string, free text included (descriptions, watch metadata, pipeline processor values, connector names), gets the shared pattern pass. The pass removes:
+  - URL queries and userinfo.
+  - Bearer, cookie, and assignment carriers.
+  - Webhook-style paths.
+  - High-entropy or hex tokens.
+
+A healthy run therefore writes no credential material into any `core_data/` file. As defense in depth, the export runs the same scrub again over the snapshots it writes.
+
+### Credentials in error text
+
+Error text follows the same rule before any cut. These values are removed from every error detail at full length:
+
+- The configured API key and its decoded secret half.
+- The cloud API key.
+- The password, alone and as `username:password`.
+- The bearer token.
+
+Each is removed in plain, base64, base64url, URL-encoded, form-encoded, and JSON-escaped form. Removal happens before the detail is cut to 240 characters. A secret straddling the cut therefore leaves no fragment in an error string, `_errors.log`, `elastic_check_access`, or an assess payload.
+
+Non-JSON error bodies and JSON bodies without a documented error field are described by status, media type, and length only. They are never echoed.
+
+A `SyntaxError` raised by the transport is recorded as its class name plus a fixed note, because the parser's message quotes the body.
+
+#### Credential carriers
+
+Every recorded error string is produced by a single function. It passes the thrown message through the module scrubber, which also removes the value of every credential carrier, whatever the value's shape:
+
+- A `key=value`, `key: value`, or `"key": "value"` pair loses its value when its key carries a credential word (`ELASTIC_PASSWORD`, `ELASTIC_API_KEY`, `bind_password`, `secure_password`, and the bearer ids `secret_id`, `session_id`, and `token_id`).
+  - The pair also loses its value when the key follows a JSON escape (`\"password\": \"v\"`) or a command-line flag (`--password v`, `--password=v`, `-Dpassword=v`).
+- An authorization scheme word in any casing (`ApiKey`, `Bearer`, `bearer`, `Basic`) loses the value after it. The value is removed whether it is a bare token or a whole auth-param list (`Snowflake Token="v"`, `Digest username="v", nonce="v", response="v"`).
+  - The word itself stays only under `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate`. Under those headers, a challenge's `realm="api"` stays as well.
+  - By contrast, an API-key or token header (`X-Api-Key: splunk rejected`) and a credential-named assignment (`token=Bearer v`) lose their whole value.
+- A cookie header loses its value whole, its `;` separating pairs and attributes.
+- The query of any URL becomes one marker.
+- A credential-named parameter of a relative path or bare query string loses its value whole, a `;` inside the value included. For example, `?token=v;rest` renders `?token=[REDACTED]`, as URLSearchParams reads it.
+- A webhook or callback URL keeps its origin alone.
+
+A `webhook`-prefixed key is a URL carrier only when its last segment is `url` or `uri`, or the key is the bare `webhook`. `webhook_secret`, `webhook_token`, and `webhookSecret` are credential keys and lose their value whatever its shape.
+
+A configured secret that is itself a carrier word (`password`, `Authorization`, `Bearer`) is removed after the carriers rather than before them, so the pair or header it names still loses its value.
+
+A name after a path slash (`GET /_security/api_key: 403`) is a path segment, not a key. A key whose last segment names a setting (`ELASTIC_URL`, `ELASTIC_USERNAME`, `api_key_limit`, `max_api_key_age_days`) keeps a word value and loses only a token-shaped or registered one. As a result, every fixed message and every finding summary, manual-evidence instruction, and bundle document survives the pass unchanged.
+
+The test suite sweeps the strings recorded by healthy and partially denied runs for alterations.
 
 ## Live smoke test
 
@@ -168,37 +322,46 @@ ELASTIC_URL=https://es.example.com:9200 ELASTIC_API_KEY=... KIBANA_URL=https://k
   npm --prefix cli run test:elastic:live
 ```
 
-The script prints a skip message and exits 0 when no credentials or config file are present. Otherwise it runs `elastic_check_access`, stops if core surfaces are unreadable, and then runs the transport security assessment. Mocked API coverage lives in `cli/tests/elastic.test.mjs` and runs with `npm --prefix cli run test:cli`.
+The script prints a skip message and exits 0 when no credentials or config file are present.
+
+Otherwise it:
+
+1. Runs `elastic_check_access`.
+2. Stops if core surfaces are unreadable.
+3. Runs the transport security assessment.
+
+Mocked API coverage lives in `cli/tests/elastic.test.mjs` and runs with `npm --prefix cli run test:cli`.
 
 ## Limitations and manual controls
 
-- Control 12 (audit log output) is always `manual` when auditing is enabled: collect evidence that `<cluster>_audit.json` is shipped to a tamper-resistant store.
-- Control 18 is `manual` for repository types whose encryption is not visible through the API: collect bucket or filesystem encryption evidence.
+- Control 12 (audit log output) is always `manual` when auditing is enabled. Collect evidence that `<cluster>_audit.json` is shipped to a tamper-resistant store.
+- Control 18 is `manual` for repository types whose encryption is not visible through the API. Collect bucket or filesystem encryption evidence.
 - Secure settings (bind passwords, client secrets, keystore entries) are never returned by Elasticsearch, so SSO checks rely on non-secret realm settings and role mappings.
 - Controls 7 and 8 report `warn` rather than `pass` when no index patterns are supplied, because the API cannot know which indices hold sensitive or tenant data.
-- Cluster-level defaults come from `GET /_cluster/settings?include_defaults=true` and per-node values from `GET /_nodes/settings`; settings that differ between nodes are reported per node, and when some nodes fail to respond every settings-based verdict is capped at `warn` with the responding and total node counts.
-- Without `read_security`, `manage_api_key`, or `manage_security`, `POST /_security/_query/api_key` returns only the caller's own keys; controls 9 and 10 then report a partial view and cannot pass.
-- `GET /_ssl/certificates` describes only the node that served the request; on multi-node clusters control 5 is capped at `warn` until certificates from every node are collected.
-- Kibana connectors, alerting rules, detection rules, and Fleet policies are read from the configured `space_id` (the default space unless set); when other spaces exist, control 20 is capped at `warn` and names the spaces still to inspect, and an empty Fleet inventory is reported for the inspected space only.
-- `GET /api/spaces/space` returns only the spaces the auditing credential is authorized to access and gives no signal that others exist, so controls 15 and 16 can pass on a partial space list; grant the credential read access to every space (or confirm the space count against a Kibana administrator's view) before relying on those verdicts.
-- List collection stops at `api_key_limit`, `watch_limit`, and `kibana_limit`; a truncated dataset is recorded in `core_data/` and downgrades the dependent verdicts rather than being treated as the full population.
-- Elastic Cloud is used only for deployment inventory (`GET /api/v1/deployments`); the per-deployment detail and activity endpoints listed in the spec are not collected, and deployment configuration is assessed through the cluster and Kibana APIs instead.
+- Cluster-level defaults come from `GET /_cluster/settings?include_defaults=true` and per-node values from `GET /_nodes/settings`. Settings that differ between nodes are reported per node. When some nodes fail to respond, every settings-based verdict is capped at `warn` with the responding and total node counts.
+- Without `read_security`, `manage_api_key`, or `manage_security`, `POST /_security/_query/api_key` returns only the caller's own keys. Controls 9 and 10 then report a partial view and cannot pass.
+- `GET /_ssl/certificates` describes only the node that served the request. On multi-node clusters, control 5 is capped at `warn` until certificates from every node are collected.
+- Kibana connectors, alerting rules, detection rules, and Fleet policies are read from the configured `space_id` (the default space unless set). When other spaces exist, control 20 is capped at `warn` and names the spaces still to inspect, and an empty Fleet inventory is reported for the inspected space only.
+- `GET /api/spaces/space` returns only the spaces the auditing credential is authorized to access and gives no signal that others exist. As a result, controls 15 and 16 can pass on a partial space list.
+  - Before relying on those verdicts, grant the credential read access to every space (or confirm the space count against a Kibana administrator's view).
+- List collection stops at `api_key_limit`, `watch_limit`, and `kibana_limit`. A truncated dataset is recorded in `core_data/` and downgrades the dependent verdicts rather than being treated as the full population.
+- Elastic Cloud is used only for deployment inventory (`GET /api/v1/deployments`). The per-deployment detail and activity endpoints listed in the spec are not collected. Deployment configuration is assessed through the cluster and Kibana APIs instead.
 - The integration does not evaluate CIS Elasticsearch Benchmark line items beyond the spec's 23 controls.
 
 ## Official documentation
 
 Endpoint paths, headers, pagination parameters, and response fields were verified against these Elastic documentation pages:
 
-- Elasticsearch authenticate: [Authenticate API](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-authenticate)
-- Privilege probe: [Has privileges API](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-has-privileges)
-- Users, roles, role mappings: [Get users](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-get-user), [Get roles](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-get-role), [Get role mappings](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-get-role-mapping)
-- API keys (`search_after` pagination, `with_limited_by`): [Query API keys](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-query-api-keys)
-- License and features: [Get license](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-license-get), [X-Pack info](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-xpack-info), [X-Pack usage](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-xpack-usage)
-- Settings: [Cluster get settings](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-cluster-get-settings), [Nodes info](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-nodes-info), [Security settings reference](https://www.elastic.co/docs/reference/elasticsearch/configuration-reference/security-settings), [Auditing settings reference](https://www.elastic.co/docs/reference/elasticsearch/configuration-reference/auding-settings), [Audit events](https://www.elastic.co/docs/reference/elasticsearch/elasticsearch-audit-events)
-- TLS: [SSL certificates API](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-ssl-certificates), [Secure cluster communications](https://www.elastic.co/docs/deploy-manage/security/secure-cluster-communications)
-- Data lifecycle: [Get ILM status](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-ilm-get-status), [Get ILM policy](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-ilm-get-lifecycle), [Get SLM status](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-slm-get-status), [Get SLM policy](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-slm-get-lifecycle), [Get snapshot repository](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-snapshot-get-repository)
-- Watcher and ingest: [Query watches](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-watcher-query-watches), [Get pipelines](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-ingest-get-pipeline)
-- Kibana conventions (`kbn-xsrf`, API key and basic authentication): [Kibana APIs](https://www.elastic.co/docs/api/doc/kibana/), [Kibana general settings](https://www.elastic.co/docs/reference/kibana/configuration-reference/general-settings)
-- Kibana endpoints: [Get spaces](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-spaces-space), [Get roles](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-security-role), [Get agent policies](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-fleet-agent-policies), [Get outputs](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-fleet-outputs), [Get enrollment API keys](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-fleet-enrollment-api-keys), [Get Fleet Server hosts](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-fleet-fleet-server-hosts), [Find detection rules](https://www.elastic.co/docs/api/doc/kibana/operation/operation-findrules), [Find alerting rules](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-alerting-rules-find), [Get connectors](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-actions-connectors), [Kibana status](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-status)
-- Elastic Cloud: [List deployments](https://www.elastic.co/docs/api/doc/cloud/operation/operation-list-deployments)
-- Credentials and privileges: [Elasticsearch API keys](https://www.elastic.co/docs/deploy-manage/api-keys/elasticsearch-api-keys), [Elasticsearch privileges](https://www.elastic.co/docs/deploy-manage/users-roles/cluster-or-deployment-auth/elasticsearch-privileges), [Subscriptions](https://www.elastic.co/subscriptions)
+- **Elasticsearch authenticate:** [Authenticate API](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-authenticate)
+- **Privilege probe:** [Has privileges API](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-has-privileges)
+- **Users, roles, role mappings:** [Get users](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-get-user), [Get roles](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-get-role), [Get role mappings](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-get-role-mapping)
+- **API keys** (`search_after` pagination, `with_limited_by`): [Query API keys](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-query-api-keys)
+- **License and features:** [Get license](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-license-get), [X-Pack info](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-xpack-info), [X-Pack usage](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-xpack-usage)
+- **Settings:** [Cluster get settings](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-cluster-get-settings), [Nodes info](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-nodes-info), [Security settings reference](https://www.elastic.co/docs/reference/elasticsearch/configuration-reference/security-settings), [Auditing settings reference](https://www.elastic.co/docs/reference/elasticsearch/configuration-reference/auding-settings), [Audit events](https://www.elastic.co/docs/reference/elasticsearch/elasticsearch-audit-events)
+- **TLS:** [SSL certificates API](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-ssl-certificates), [Secure cluster communications](https://www.elastic.co/docs/deploy-manage/security/secure-cluster-communications)
+- **Data lifecycle:** [Get ILM status](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-ilm-get-status), [Get ILM policy](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-ilm-get-lifecycle), [Get SLM status](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-slm-get-status), [Get SLM policy](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-slm-get-lifecycle), [Get snapshot repository](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-snapshot-get-repository)
+- **Watcher and ingest:** [Query watches](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-watcher-query-watches), [Get pipelines](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-ingest-get-pipeline)
+- **Kibana conventions** (`kbn-xsrf`, API key and basic authentication): [Kibana APIs](https://www.elastic.co/docs/api/doc/kibana/), [Kibana general settings](https://www.elastic.co/docs/reference/kibana/configuration-reference/general-settings)
+- **Kibana endpoints:** [Get spaces](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-spaces-space), [Get roles](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-security-role), [Get agent policies](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-fleet-agent-policies), [Get outputs](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-fleet-outputs), [Get enrollment API keys](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-fleet-enrollment-api-keys), [Get Fleet Server hosts](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-fleet-fleet-server-hosts), [Find detection rules](https://www.elastic.co/docs/api/doc/kibana/operation/operation-findrules), [Find alerting rules](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-alerting-rules-find), [Get connectors](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-actions-connectors), [Kibana status](https://www.elastic.co/docs/api/doc/kibana/operation/operation-get-status)
+- **Elastic Cloud:** [List deployments](https://www.elastic.co/docs/api/doc/cloud/operation/operation-list-deployments)
+- **Credentials and privileges:** [Elasticsearch API keys](https://www.elastic.co/docs/deploy-manage/api-keys/elasticsearch-api-keys), [Elasticsearch privileges](https://www.elastic.co/docs/deploy-manage/users-roles/cluster-or-deployment-auth/elasticsearch-privileges), [Subscriptions](https://www.elastic.co/subscriptions)

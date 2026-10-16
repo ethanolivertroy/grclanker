@@ -3,7 +3,14 @@ title: Qualys
 description: Read-only Qualys subscription inspector covering scan coverage, asset inventory, vulnerability management, and administration, with an exportable audit bundle.
 ---
 
-The Qualys integration audits the health of a Qualys subscription itself: whether scans are scheduled and authenticated, whether the asset inventory is complete and tagged, whether vulnerabilities are remediated inside SLA, and whether users, reports, and activity logs are managed. It never launches scans, edits configuration, or modifies the subscription.
+The Qualys integration audits the health of a Qualys subscription itself:
+
+- Whether scans are scheduled and authenticated.
+- Whether the asset inventory is complete and tagged.
+- Whether vulnerabilities are remediated inside SLA.
+- Whether users, reports, and activity logs are managed.
+
+The integration never launches scans, edits configuration, or modifies the subscription.
 
 Spec: `specs/qualys-sec-inspector.spec.md` (20 numbered security controls).
 
@@ -20,8 +27,11 @@ Spec: `specs/qualys-sec-inspector.spec.md` (20 numbered security controls).
 
 ### Required Qualys account
 
-- A dedicated API user with the **Manager** or **Unit Manager** role and the **API access** permission enabled.
-- Subscriptions for the modules you want assessed: VM/VMDR is required; PC, WAS, Cloud Agent, and Asset Management (CSAM or GAV) are optional. Controls that depend on an unsubscribed module are reported with status `manual`.
+- A dedicated API user with the Manager or Unit Manager role and the API access permission enabled.
+- Subscriptions for the modules you want assessed:
+  - VM/VMDR is required.
+  - PC, WAS, Cloud Agent, and Asset Management (CSAM or GAV) are optional.
+  - Controls that depend on an unsubscribed module are reported with status `manual`.
 - Every request carries the mandatory `X-Requested-With` header that the Qualys API requires from non-browser clients.
 
 ### Credentials and platform
@@ -42,7 +52,9 @@ Configuration precedence is explicit tool arguments, then environment variables,
 | Retries | `QUALYS_MAX_RETRIES` | n/a | Defaults to 3, clamped to 0-10 |
 | Lookback window | `QUALYS_LOOKBACK_DAYS` | n/a | Defaults to 30, clamped to 1-365 |
 
-A pre-issued token wins over OAuth and basic modes whenever one resolves. `base_url` (from any source) takes precedence over `platform`. Config file keys are case-insensitive; `#`, `;`, and `[section]` lines are skipped.
+A pre-issued token wins over OAuth and basic modes whenever one resolves. `base_url` (from any source) takes precedence over `platform`.
+
+Config file keys are case-insensitive. `#`, `;`, and `[section]` lines are skipped.
 
 Example:
 
@@ -77,19 +89,78 @@ A hostname such as `qualysapi.qg2.apps.qualys.com` is accepted in place of the I
 
 ### Rate limits and retries
 
-The client records `X-RateLimit-Limit`, `X-RateLimit-Window-Sec`, `X-RateLimit-Remaining`, `X-RateLimit-ToWait-Sec`, `X-Concurrency-Limit-Limit`, and `X-Concurrency-Limit-Running` from every response. On HTTP 409 or 429 it waits for `X-RateLimit-ToWait-Sec` (capped at 30 seconds, exponential backoff when the header is absent) and retries up to `QUALYS_MAX_RETRIES` times.
+The client records these headers from every response:
+
+- `X-RateLimit-Limit`
+- `X-RateLimit-Window-Sec`
+- `X-RateLimit-Remaining`
+- `X-RateLimit-ToWait-Sec`
+- `X-Concurrency-Limit-Limit`
+- `X-Concurrency-Limit-Running`
+
+On HTTP 409 or 429 it waits for `X-RateLimit-ToWait-Sec` (capped at 30 seconds, exponential backoff when the header is absent) and retries up to `QUALYS_MAX_RETRIES` times.
 
 ### Error messages and secrets
 
-A failed request is reported with its HTTP status and endpoint path, never with the response body. A documented error envelope contributes only its documented fields: `SIMPLE_RETURN` `CODE` and `TEXT`, the `/msp/` `ERROR` number and text, or a QPS `responseCode` and `responseErrorDetails.errorMessage`. The code itself is scrubbed and validated before it is rendered: the value is first passed through the error scrub with the configured password, token, and basic auth string (a configured credential returned as a code renders the placeholder, even when it collides with a documented value), and then it must be one of the codes Qualys documents. A `CODE`, `ERROR` number, or `RETURN` number renders only when it is one of the three- or four-digit codes of Appendix D of the Qualys API (VM, PC) user guide plus the sample codes the guide shows (`999`, `1901`, `1903`, `1904`, `1905`, `1907`, `1908`, `1920`, `1922`, `1960`, `1965`, `1980`, `1981`, `1982`, `1999`, `2000`, `2002`, `2003`, `2010`, `2011`, `2012`); a `responseCode` renders only when it is one of the `ResponseCode` enumeration values of the published QPS XSDs (for example `INVALID_REQUEST`, `INVALID_CREDENTIALS`, `UNAUTHORIZED`, `NOT_FOUND`); anything else, including a six-digit passcode, a letters-only base32 fragment, or an undocumented constant, renders as the fixed `UnknownError`. Any other body (an HTML gateway page, CSV, unexpected JSON) is described by content type and byte length only, for example `non-XML error body (text/html; 236 bytes)`. Every error string passes through one scrub before it exists: the configured password, token, and basic auth string are removed, and so are embedded URL queries and fragments, `Bearer` and `Basic` values, `Cookie` and `Set-Cookie` values, credential name-value pairs (api key, session, access, refresh, and id tokens, client secret, password), and any 16-character or longer run with a digit or mixed case that a Qualys server echoes in free text. Every bundle file is scrubbed again on write with the same rules minus the long-token rule, so QIDs, asset ids, and tag ids survive as evidence.
+A failed request is reported with its HTTP status and endpoint path, never with the response body.
+
+A documented error envelope contributes only its documented fields:
+
+- `SIMPLE_RETURN` `CODE` and `TEXT`.
+- The `/msp/` `ERROR` number and text.
+- A QPS `responseCode` and `responseErrorDetails.errorMessage`.
+
+The code itself is scrubbed and validated before it is rendered. The value is first passed through the error scrub with the configured password, token, and basic auth string. A configured credential returned as a code renders the placeholder, even when it collides with a documented value.
+
+Then the value must be one of the codes Qualys documents:
+
+- A `CODE`, `ERROR` number, or `RETURN` number renders only when it is one of these:
+  - The three- or four-digit codes of Appendix D of the Qualys API (VM, PC) user guide.
+  - The sample codes the guide shows: `999`, `1901`, `1903`, `1904`, `1905`, `1907`, `1908`, `1920`, `1922`, `1960`, `1965`, `1980`, `1981`, `1982`, `1999`, `2000`, `2002`, `2003`, `2010`, `2011`, `2012`.
+- A `responseCode` renders only when it is one of the `ResponseCode` enumeration values of the published QPS XSDs. Examples are `INVALID_REQUEST`, `INVALID_CREDENTIALS`, `UNAUTHORIZED`, and `NOT_FOUND`.
+- Anything else renders as the fixed `UnknownError`, including a six-digit passcode, a letters-only base32 fragment, or an undocumented constant.
+
+Any other body (an HTML gateway page, CSV, unexpected JSON) is described by content type and byte length only, for example `non-XML error body (text/html; 236 bytes)`.
+
+Every error string passes through one scrub before it exists. The scrub removes:
+
+- The configured password, token, and basic auth string.
+- Embedded URL queries and fragments.
+- `Bearer` and `Basic` values.
+- `Cookie` and `Set-Cookie` values.
+- Credential name-value pairs (api key, session, access, refresh, and id tokens, client secret, password).
+- Any 16-character or longer run with a digit or mixed case that a Qualys server echoes in free text.
+
+Every bundle file is scrubbed again on write with the same rules minus the long-token rule, so QIDs, asset ids, and tag ids survive as evidence.
 
 ## Tools
 
-All tools accept the same connection arguments (`username`, `password`, `token`, `platform`, `base_url`, `gateway_url`, `use_oauth`, `config_file`, `timeout_seconds`, `lookback_days`). Assessment tools add `host_limit` (default 5000), `detection_limit` (5000), `min_auth_scan_percent` (80), `min_agent_coverage_percent` (50), `max_managers` (5), `sla_critical_days` (15), `sla_high_days` (30), and `sla_medium_days` (90); `qualys_export_audit_bundle` also takes `output_dir` (default `./export/qualys`).
+All tools accept the same connection arguments: `username`, `password`, `token`, `platform`, `base_url`, `gateway_url`, `use_oauth`, `config_file`, `timeout_seconds`, and `lookback_days`.
+
+Assessment tools add these arguments, with defaults in parentheses:
+
+- `host_limit` (5000)
+- `detection_limit` (5000)
+- `min_auth_scan_percent` (80)
+- `min_agent_coverage_percent` (50)
+- `max_managers` (5)
+- `sla_critical_days` (15)
+- `sla_high_days` (30)
+- `sla_medium_days` (90)
+
+`qualys_export_audit_bundle` also takes `output_dir` (default `./export/qualys`).
 
 ### `qualys_check_access`
 
-Probes 15 read surfaces across VM, VMDR, PC, Administration, Asset Management, Cloud Agent, and WAS and reports each as `readable`, `not_readable`, or `module_unavailable`. Overall status is `healthy` (everything readable), `degraded` (core VM/VMDR readable, some optional modules missing), or `limited` (core VM/VMDR surfaces not readable). The response lists unavailable modules, the API user's view scope, and the last observed rate limit headers.
+Probes 15 read surfaces across VM, VMDR, PC, Administration, Asset Management, Cloud Agent, and WAS. Each surface is reported as `readable`, `not_readable`, or `module_unavailable`.
+
+Overall status:
+
+- `healthy`: Everything readable.
+- `degraded`: Core VM/VMDR readable, some optional modules missing.
+- `limited`: Core VM/VMDR surfaces not readable.
+
+The response lists unavailable modules, the API user's view scope, and the last observed rate limit headers.
 
 | Surface | Module | Endpoint |
 |---------|--------|----------|
@@ -109,40 +180,85 @@ Probes 15 read surfaces across VM, VMDR, PC, Administration, Asset Management, C
 | `connectors` | Asset Management | `POST /qps/rest/2.0/search/am/assetdataconnector` |
 | `was_webapps` | WAS | `POST /qps/rest/3.0/search/was/webapp` |
 
-The assessments additionally read `GET /api/2.0/fo/scan/?action=list` (finished scans), `GET /api/2.0/fo/asset/excluded_ip/?action=list`, `GET /api/2.0/fo/knowledge_base/vuln/?action=list&details=Basic`, `GET /api/2.0/fo/schedule/report/?action=list&is_active=1`, `GET /api/2.0/fo/report/?action=list`, `POST /qps/rest/3.0/search/was/wasscan` (scan dates, bounded to the lookback window and then unbounded by `webApp.id` for web apps still unresolved), `POST /qps/rest/3.0/search/was/webappauthrecord`, and `POST /qps/rest/3.0/search/was/wasscanschedule`. Every XML list follows its `WARNING/URL` continuation and every QPS search pages with `hasMoreRecords` and `lastId`; a page that fills `limitResults` without `hasMoreRecords` is treated as a possible continuation and recorded as truncated when it cannot be followed.
+The assessments additionally read:
+
+- `GET /api/2.0/fo/scan/?action=list` (finished scans)
+- `GET /api/2.0/fo/asset/excluded_ip/?action=list`
+- `GET /api/2.0/fo/knowledge_base/vuln/?action=list&details=Basic`
+- `GET /api/2.0/fo/schedule/report/?action=list&is_active=1`
+- `GET /api/2.0/fo/report/?action=list`
+- `POST /qps/rest/3.0/search/was/wasscan` (scan dates, bounded to the lookback window and then unbounded by `webApp.id` for web apps still unresolved)
+- `POST /qps/rest/3.0/search/was/webappauthrecord`
+- `POST /qps/rest/3.0/search/was/wasscanschedule`
+
+Pagination rules:
+
+- Every XML list follows its `WARNING/URL` continuation.
+- Every QPS search pages with `hasMoreRecords` and `lastId`.
+- A page that fills `limitResults` without `hasMoreRecords` is treated as a possible continuation and recorded as truncated when it cannot be followed.
 
 ### `qualys_assess_scan_coverage`
 
-Controls 1, 2, 3, 14, 16, 20: schedule coverage against asset groups, authenticated scan ratio from host `LAST_VM_AUTH_SCANNED_DATE`, option profile authentication settings, external scanner perimeter schedules, excluded host ranges and QID exclusions, and segment-specific scanning.
+Controls 1, 2, 3, 14, 16, 20:
+
+- Schedule coverage against asset groups.
+- Authenticated scan ratio from host `LAST_VM_AUTH_SCANNED_DATE`.
+- Option profile authentication settings.
+- External scanner perimeter schedules.
+- Excluded host ranges and QID exclusions.
+- Segment-specific scanning.
 
 ### `qualys_assess_asset_inventory`
 
-Controls 4, 5, 6, 7, 18: asset group and never-scanned host evidence for CMDB reconciliation, Asset Management connector state and last sync, scanner appliance status, heartbeat, and version currency, Cloud Agent coverage and staleness, and tag coverage across hosts.
+Controls 4, 5, 6, 7, 18:
+
+- Asset group and never-scanned host evidence for CMDB reconciliation.
+- Asset Management connector state and last sync.
+- Scanner appliance status, heartbeat, and version currency.
+- Cloud Agent coverage and staleness.
+- Tag coverage across hosts.
 
 ### `qualys_assess_vulnerability_management`
 
-Controls 8, 9, 10, 11, 17: authentication record types compared against the OS mix of scanned hosts, Policy Compliance policy assignment and status, open severity 3 to 5 detection age against 15/30/90 day SLAs, patch availability and patch age from the KnowledgeBase, and Qualys Detection Score coverage.
+Controls 8, 9, 10, 11, 17:
+
+- Authentication record types compared against the OS mix of scanned hosts.
+- Policy Compliance policy assignment and status.
+- Open severity 3 to 5 detection age against 15/30/90 day SLAs.
+- Patch availability and patch age from the KnowledgeBase.
+- Qualys Detection Score coverage.
 
 ### `qualys_assess_administration`
 
-Controls 12, 13, 15, 19: active scheduled reports and recent report output, user role concentration, shared and generic accounts, and inactive users, WAS web application scan freshness and authentication record age, and activity log volume with sensitive actions flagged for reviewer sign-off.
+Controls 12, 13, 15, 19:
+
+- Active scheduled reports and recent report output.
+- User role concentration, shared and generic accounts, and inactive users.
+- WAS web application scan freshness and authentication record age.
+- Activity log volume with sensitive actions flagged for reviewer sign-off.
 
 ### `qualys_export_audit_bundle`
 
 Runs the access check and all four assessments, then writes `qualys-<platform>-audit-bundle/` under `output_dir`, with the platform lowercased (for example `./export/qualys/qualys-us1-audit-bundle/`). A repeat run takes the suffixes `-2` through `-99`, skipping any name whose directory or zip already exists. The directory contains:
 
 - `QUICK_REFERENCE.md` and `metadata.json`
-- `core_data/access.json` and `core_data/<category>/<dataset>.json`, one status wrapper per collected surface carrying `name`, `endpoint`, `status` (`readable`, `truncated`, `unreadable`, or `not_collected`), `count` with a `count_status` of `complete` or `partial`, and `records`, a per-record projection (identifiers, names, statuses, dates, counts, and the documented fields the verdicts read). A denied or never-issued read carries `count: null` and `records: null` with a `reason`, never `[]`. Option profile configuration, authentication record values, connector ARNs and external IDs, agent activation IDs, report distribution settings, and notification recipients are never written
+- `core_data/access.json` and `core_data/<category>/<dataset>.json`, one status wrapper per collected surface:
+  - Each wrapper carries `name`, `endpoint`, `status` (`readable`, `truncated`, `unreadable`, or `not_collected`), `count` with a `count_status` of `complete` or `partial`, and `records`.
+  - `records` is a per-record projection (identifiers, names, statuses, dates, counts, and the documented fields the verdicts read).
+  - A denied or never-issued read carries `count: null` and `records: null` with a `reason`, never `[]`.
+  - Option profile configuration, authentication record values, connector ARNs and external IDs, agent activation IDs, report distribution settings, and notification recipients are never written.
 - `analysis/findings.json` plus one `analysis/<category>.json` summary per assessment
 - `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, and one report per framework under `compliance/fedramp/`, `compliance/cmmc/`, `compliance/soc2/`, `compliance/cis/`, `compliance/pci_dss/`, `compliance/disa_stig/`, `compliance/irap/`, and `compliance/ismap/`
 - `_errors.log` when any collection step failed
-- a sibling `.zip` archive of the whole directory
+- A sibling `.zip` archive of the whole directory
 
-`output_dir` is resolved against the working directory and may be any path, including a symlink; the bundle is written under its resolved target. Paths below that resolved root are checked for traversal and symlinked parents and rejected when either check fails.
+`output_dir` is resolved against the working directory and may be any path, including a symlink. The bundle is written under its resolved target. Paths below that resolved root are checked for traversal and symlinked parents and rejected when either check fails.
 
 ## Control coverage
 
-Finding IDs are `QUALYS-C01` through `QUALYS-C20`. Every finding carries the framework mappings from the spec table for that control. Any control whose API surface is unreadable (missing module, missing role, or API error) is downgraded to `manual` with a summary that states exactly what evidence to collect.
+Finding IDs are `QUALYS-C01` through `QUALYS-C20`. Every finding carries the framework mappings from the spec table for that control.
+
+Any control whose API surface is unreadable (missing module, missing role, or API error) is downgraded to `manual`. Its summary states exactly what evidence to collect.
 
 | # | Control | Tool | Finding | Status semantics |
 |---|---------|------|---------|------------------|
@@ -171,14 +287,14 @@ Finding IDs are `QUALYS-C01` through `QUALYS-C20`. Every finding carries the fra
 
 Each finding's `mappings` array follows the spec compliance table and feeds the per-framework reports in the audit bundle:
 
-- FedRAMP / NIST 800-53: RA-5 and enhancements, CM-8 and enhancements, CM-6(1), SI-2 and SI-2(2), AC-6(5), AU-6
-- CMMC: 3.11.1, 3.11.2, 3.11.3, 3.4.1, 3.4.2, 3.14.1, 3.1.5, 3.3.5
-- SOC 2: CC6.1, CC6.3, CC7.1, CC7.2, CC8.1
-- CIS Controls: 1.1, 4.1, 7.1 to 7.6, 8.2
-- PCI-DSS: 2.2.1, 2.4, 6.1, 6.3.3, 6.4.1, 7.1.1, 10.6.1, 11.3.1, 11.3.2, 11.3.4
-- DISA STIG: SRG-APP-000340, SRG-APP-000383, SRG-APP-000384, SRG-APP-000456, SRG-APP-000516
-- IRAP / ISM: ISM-0109, ISM-0580, ISM-1143, ISM-1163, ISM-1507, ISM-1599, ISM-1624, ISM-1690
-- ISMAP: CPS.RA-5, CPS.CM-8, CPS.CM-6, CPS.SI-2, CPS.AC-6, CPS.AU-6
+- **FedRAMP / NIST 800-53:** RA-5 and enhancements, CM-8 and enhancements, CM-6(1), SI-2 and SI-2(2), AC-6(5), AU-6
+- **CMMC:** 3.11.1, 3.11.2, 3.11.3, 3.4.1, 3.4.2, 3.14.1, 3.1.5, 3.3.5
+- **SOC 2:** CC6.1, CC6.3, CC7.1, CC7.2, CC8.1
+- **CIS Controls:** 1.1, 4.1, 7.1 to 7.6, 8.2
+- **PCI-DSS:** 2.2.1, 2.4, 6.1, 6.3.3, 6.4.1, 7.1.1, 10.6.1, 11.3.1, 11.3.2, 11.3.4
+- **DISA STIG:** SRG-APP-000340, SRG-APP-000383, SRG-APP-000384, SRG-APP-000456, SRG-APP-000516
+- **IRAP / ISM:** ISM-0109, ISM-0580, ISM-1143, ISM-1163, ISM-1507, ISM-1599, ISM-1624, ISM-1690
+- **ISMAP:** CPS.RA-5, CPS.CM-8, CPS.CM-6, CPS.SI-2, CPS.AC-6, CPS.AU-6
 
 ## Live smoke test
 
@@ -186,19 +302,31 @@ Each finding's `mappings` array follows the spec compliance table and feeds the 
 npm --prefix cli run test:qualys:live
 ```
 
-The script skips with exit code 0 when no credentials are present. With `QUALYS_USERNAME`, `QUALYS_PASSWORD`, and `QUALYS_PLATFORM` (or `QUALYS_TOKEN`, or a `~/.qcrc` file) it runs `qualys_check_access` followed by the scan coverage assessment against the real subscription.
+The script skips with exit code 0 when no credentials are present. With `QUALYS_USERNAME`, `QUALYS_PASSWORD`, and `QUALYS_PLATFORM` (or `QUALYS_TOKEN`, or a `~/.qcrc` file), it runs `qualys_check_access` followed by the scan coverage assessment against the real subscription.
 
 ## Limitations and manual controls
 
 - Control 4 is always `manual`: Qualys has no view of the authoritative CMDB or IPAM. The finding supplies the asset groups without targets and never-scanned hosts to reconcile.
 - Controls 12 and 19 pass or warn on API evidence but still require a human to confirm report recipients, log retention, and review cadence.
-- Controls 9 and 15 become `manual` when the PC or WAS module is not subscribed; controls 5, 7, and 18 fall back to `manual` when the Asset Management or Cloud Agent QPS endpoints are not licensed for the account.
+- Controls 9 and 15 become `manual` when the PC or WAS module is not subscribed. Controls 5, 7, and 18 fall back to `manual` when the Asset Management or Cloud Agent QPS endpoints are not licensed for the account.
 - Cloud connectors are read from the Asset Management `assetdataconnector` search, which returns AWS, Azure, and GCP connectors together. The CloudView API listed in the spec is not used.
-- Users are read from two documented surfaces. The VM/PC User List API (`GET /msp/user_list.php`, `user_list_output.dtd`) supplies `USER_STATUS`, `USER_ROLE`, `CONTACT_INFO/EMAIL`, and `LAST_LOGIN_DATE`, the last of which Qualys returns only to Manager and Unit Manager callers, so a lower-privileged API user demotes control 13 to `warn` with the affected users in `users_without_last_login`. The Administration API (`POST /qps/rest/2.0/search/am/user/`) supplies `roleList` and `scopeTags` and establishes the API user's view scope; it returns Active users only and hides other Managers, so it is never used for status. Control 13 reads both and demotes when either is unreadable. Under the documented Restricted view, `USER_LOGIN` and `USER_ID` are hidden for users outside the caller's business unit; those rows are labeled by `CONTACT_INFO/EMAIL`, counted in `restricted_view_users_without_login`, and disclosed because generic-account and shared-email checks under-report for them.
-- Any finding that reads more than one inventory demotes when any of them is unreadable (401, 403, or a `SIMPLE_RETURN` error) and names the dataset and endpoint in its summary.
-- Unreadable or never-collected data renders `null` beside a `<field>_status` that names the read, never `0`, `[]`, or `{}`, even where no verdict depends on it. This covers counts, derived lists and maps (for example `option_profiles`, `stale_login_users`, `breaches_by_severity`), percentages, `unknown_buckets`, and the API user scope's `roles` and `scope_tags` when the role could not be verified. Each entry in `collection.sources` carries `endpoint`, `status`, and `count` (`null` with a `reason` when `unreadable` or `not_collected`, otherwise marked `complete` or `partial`). A call skipped because its input was denied, such as the knowledge base lookup without readable detections or the WAS scan history search without a readable bounded scan search, is recorded as `not_collected` with the skipped call and its cause, never as `readable` with count `0`. A ratio whose denominator is `0` renders `null` with an `unknown` status. Control 13 discloses in `active_users_status` whether its population came from the User List API or from the Administration API fallback, which returns Active users only.
+- Users are read from two documented surfaces. Control 13 reads both and demotes when either is unreadable.
+  - The VM/PC User List API (`GET /msp/user_list.php`, `user_list_output.dtd`) supplies `USER_STATUS`, `USER_ROLE`, `CONTACT_INFO/EMAIL`, and `LAST_LOGIN_DATE`. Qualys returns `LAST_LOGIN_DATE` only to Manager and Unit Manager callers. A lower-privileged API user therefore demotes control 13 to `warn`, with the affected users in `users_without_last_login`.
+  - The Administration API (`POST /qps/rest/2.0/search/am/user/`) supplies `roleList` and `scopeTags` and establishes the API user's view scope. It returns Active users only and hides other Managers, so it is never used for status.
+  - Under the documented Restricted view, `USER_LOGIN` and `USER_ID` are hidden for users outside the caller's business unit. Those rows are labeled by `CONTACT_INFO/EMAIL` and counted in `restricted_view_users_without_login`. They are disclosed because generic-account and shared-email checks under-report for them.
+- Any finding that reads more than one inventory demotes when any of them is unreadable (401, 403, or a `SIMPLE_RETURN` error). Its summary names the dataset and endpoint.
+- Unreadable or never-collected data renders `null` beside a `<field>_status` that names the read, never `0`, `[]`, or `{}`, even where no verdict depends on it. This covers:
+  - Counts.
+  - Derived lists and maps (for example `option_profiles`, `stale_login_users`, `breaches_by_severity`).
+  - Percentages.
+  - `unknown_buckets`.
+  - The API user scope's `roles` and `scope_tags` when the role could not be verified.
+- Each entry in `collection.sources` carries `endpoint`, `status`, and `count` (`null` with a `reason` when `unreadable` or `not_collected`, otherwise marked `complete` or `partial`).
+- A call skipped because its input was denied is recorded as `not_collected` with the skipped call and its cause, never as `readable` with count `0`. Examples are the knowledge base lookup without readable detections, and the WAS scan history search without a readable bounded scan search.
+- A ratio whose denominator is `0` renders `null` with an `unknown` status.
+- Control 13 discloses in `active_users_status` whether its population came from the User List API or from the Administration API fallback, which returns Active users only.
 - Host and detection sampling is capped by `host_limit` and `detection_limit` (default 5000 each, up to 25 pages per list). Very large subscriptions should raise these limits or scope with asset groups.
-- Option profile exclusion counts are the `VULNERABILITY_DETECTION/DETECTION_EXCLUDE` custom search lists in `option_profile_info.dtd`; QID exclusion semantics vary by profile type.
+- Option profile exclusion counts are the `VULNERABILITY_DETECTION/DETECTION_EXCLUDE` custom search lists in `option_profile_info.dtd`. QID exclusion semantics vary by profile type.
 - The integration is read-only. It never launches scans, changes schedules, or edits users, tags, or policies.
 
 ## Official documentation

@@ -3,17 +3,26 @@ title: Zscaler
 description: Read-only ZIA and ZPA security inspector covering the 25 controls in the Zscaler spec with verdict-safe findings and audit bundles.
 ---
 
-The Zscaler integration inspects Zscaler Internet Access (ZIA) and Zscaler Private Access (ZPA) tenants through their documented read APIs and evaluates the 25 controls in `specs/zscaler-sec-inspector.spec.md`. Every tool is read-only: the only non-GET calls are the ZIA session login and logout and the ZPA OAuth sign-in.
+The Zscaler integration inspects Zscaler Internet Access (ZIA) and Zscaler Private Access (ZPA) tenants through their documented read APIs. It evaluates the 25 controls in `specs/zscaler-sec-inspector.spec.md`.
+
+Every tool is read-only. The only non-GET calls are the ZIA session login and logout and the ZPA OAuth sign-in.
 
 ## What it inspects
 
-- ZIA administration: administrator accounts and roles, password login bypasses, password expiry, the admin audit log report interface, and NSS feeds that export admin audit logs.
-- ZIA policy: URL filtering, cloud firewall, DNS control, DLP engines, dictionaries and web DLP rules, SSL inspection rules and exemptions, sandbox rules, bandwidth control, browser isolation profiles, locations and sub-locations with GRE tunnels and VPN credentials, cloud app control, and the ATP and malware protection baseline.
-- ZPA: application segments and segment groups, access, timeout, client forwarding and isolation policy rules, posture profiles, trusted networks, app connectors and groups, private service edges and groups, IdP controllers, SAML attributes, SCIM groups, enrollment and browser access certificates, emergency access users, and ZPA administrators.
+- **ZIA administration:** administrator accounts and roles, password login bypasses, password expiry, the admin audit log report interface, and NSS feeds that export admin audit logs.
+- **ZIA policy:** URL filtering, cloud firewall, DNS control, DLP engines, dictionaries and web DLP rules, SSL inspection rules and exemptions, sandbox rules, bandwidth control, browser isolation profiles, locations and sub-locations with GRE tunnels and VPN credentials, cloud app control, and the ATP and malware protection baseline.
+- **ZPA:** application segments and segment groups, access, timeout, client forwarding and isolation policy rules, posture profiles, trusted networks, app connectors and groups, private service edges and groups, IdP controllers, SAML attributes, SCIM groups, enrollment and browser access certificates, emergency access users, and ZPA administrators.
 
 ## Setup and authentication
 
-Credentials resolve with the precedence explicit tool arguments, then environment variables, then a YAML config file (`ZSCALER_CONFIG_FILE` or `~/.zscaler/zscaler.yaml` with `zia.client` and `zpa.client` blocks using `cloud`, `baseUrl`, `apiKey`, `username`, `password`, `clientId`, `clientSecret`, and `customerId` keys, plus an optional `zscaler.client` block whose OneAPI `clientId` and `clientSecret` are only detected). A config file path that does not exist is skipped. Configure either product or both; controls for a product without credentials render as `manual` findings that name the missing variables.
+Configure either product or both. Controls for a product without credentials render as `manual` findings that name the missing variables.
+
+Credentials resolve with this precedence: explicit tool arguments, then environment variables, then a YAML config file.
+
+The config file is `ZSCALER_CONFIG_FILE` or `~/.zscaler/zscaler.yaml`. A config file path that does not exist is skipped. The file holds:
+
+- `zia.client` and `zpa.client` blocks using `cloud`, `baseUrl`, `apiKey`, `username`, `password`, `clientId`, `clientSecret`, and `customerId` keys
+- An optional `zscaler.client` block whose OneAPI `clientId` and `clientSecret` are only detected
 
 ### ZIA (legacy API key plus session)
 
@@ -24,9 +33,21 @@ Credentials resolve with the precedence explicit tool arguments, then environmen
 | `ZIA_API_KEY` | Cloud Service API key (Administration > Cloud Service API Security) |
 | `ZIA_USERNAME`, `ZIA_PASSWORD` | Administrator login used for `POST /api/v1/authenticatedSession` |
 
-The API key is obfuscated exactly as documented in the ZIA API Getting Started guide: the last six digits of the millisecond timestamp select characters from the key, then the same six digits shifted right by one bit (zero padded) select characters offset by two. The session is a `JSESSIONID` cookie and is closed with `DELETE /api/v1/authenticatedSession` when a tool finishes. The admin needs a role that can view the policy areas above; unreadable areas produce manual findings, never passes.
+The API key is obfuscated exactly as documented in the ZIA API Getting Started guide. The last six digits of the millisecond timestamp select characters from the key. Then the same six digits, shifted right by one bit (zero padded), select characters offset by two.
 
-ZIA list endpoints that document `page` and `pageSize` are paged to completion: `/adminUsers`, `/locations`, `/greTunnels`, and `/vpnCredentials` at the documented maximum of 1000 per page, `/urlFilteringRules` at the documented default of 100 (no maximum is published), and `/firewallFilteringRules` at the documented default of 5000. A read that reaches the internal ceiling of 50 pages is recorded as partial and caps the dependent verdicts at `warn`. Endpoints without documented paging parameters return the whole array in one call. Sub-locations are fetched for at most 100 parent locations; beyond that, control 18 reports how many parents were read versus the total and caps at `warn`.
+The session is a `JSESSIONID` cookie. It is closed with `DELETE /api/v1/authenticatedSession` when a tool finishes.
+
+The admin needs a role that can view the policy areas above. Unreadable areas produce manual findings, never passes.
+
+ZIA list endpoints that document `page` and `pageSize` are paged to completion:
+
+- `/adminUsers`, `/locations`, `/greTunnels`, and `/vpnCredentials` at the documented maximum of 1000 per page
+- `/urlFilteringRules` at the documented default of 100 (no maximum is published)
+- `/firewallFilteringRules` at the documented default of 5000
+
+A read that reaches the internal ceiling of 50 pages is recorded as partial and caps the dependent verdicts at `warn`. Endpoints without documented paging parameters return the whole array in one call.
+
+Sub-locations are fetched for at most 100 parent locations. Beyond that, control 18 reports how many parents were read versus the total and caps at `warn`.
 
 ### ZPA (client credentials)
 
@@ -37,9 +58,28 @@ ZIA list endpoints that document `page` and `pageSize` are paged to completion: 
 | `ZPA_CLOUD` | `PRODUCTION` (`https://config.private.zscaler.com`, default), `ZPATWO` (`https://config.zpatwo.net`), `BETA` (`https://config.zpabeta.net`), `GOV` (`https://config.zpagov.net`), `GOVUS` (`https://config.zpagov.us`), `PREVIEW` (`https://config.zpapreview.net`) |
 | `ZPA_BASE_URL` | Optional explicit base URL |
 
-The client posts `client_id` and `client_secret` as a form body to `POST /signin`, sends the returned bearer token, and pages every list with `page` and `pagesize` (documented maximum 500) until the response `totalPages` is reached. A response that omits `totalPages` (or returns a bare array) leaves the total unknown: the client keeps paging while pages are full, stops on a short page, and treats a page identical to the previous one as a server that stopped advancing. `GET /emergencyAccess/users` is the one surface documented with a `pageId` cursor and an `items`/`nextPage` wrapper; the client follows `nextPage`, deduplicates users by `userId` or `emailId`, and treats a cursor that repeats or cycles as the end of what can be read. Every one of these exits, plus the 200-page ceiling, is recorded as partial with the pages read versus the total (or "total unknown") and caps the dependent verdicts at `warn`.
+The client posts `client_id` and `client_secret` as a form body to `POST /signin` and sends the returned bearer token. It pages every list with `page` and `pagesize` (documented maximum 500) until the response `totalPages` is reached.
 
-`ZSCALER_CLIENT_ID`, `ZSCALER_CLIENT_SECRET` (OneAPI) and `ZDX_CLIENT_ID`, `ZDX_CLIENT_SECRET` are detected and reported by `zscaler_check_access`, but OneAPI OAuth mode and ZDX enrichment are not implemented in this release. Optional tuning: `ZSCALER_TIMEOUT` (seconds, default 30) and `ZSCALER_MAX_RETRIES` (default 3, honoring `Retry-After` on 429 and 5xx responses).
+A response that omits `totalPages` (or returns a bare array) leaves the total unknown. In that case, the client:
+
+- Keeps paging while pages are full.
+- Stops on a short page.
+- Treats a page identical to the previous one as a server that stopped advancing.
+
+`GET /emergencyAccess/users` is the one surface documented with a `pageId` cursor and an `items`/`nextPage` wrapper. For that surface, the client:
+
+- Follows `nextPage`.
+- Deduplicates users by `userId` or `emailId`.
+- Treats a cursor that repeats or cycles as the end of what can be read.
+
+Every one of these exits, plus the 200-page ceiling, is recorded as partial with the pages read versus the total (or "total unknown") and caps the dependent verdicts at `warn`.
+
+`zscaler_check_access` detects and reports `ZSCALER_CLIENT_ID`, `ZSCALER_CLIENT_SECRET` (OneAPI) and `ZDX_CLIENT_ID`, `ZDX_CLIENT_SECRET`. OneAPI OAuth mode and ZDX enrichment are not implemented in this release.
+
+Optional tuning:
+
+- `ZSCALER_TIMEOUT` (seconds, default 30)
+- `ZSCALER_MAX_RETRIES` (default 3, honoring `Retry-After` on 429 and 5xx responses)
 
 ## Tools
 
@@ -49,13 +89,54 @@ The client posts `client_id` and `client_secret` as a form body to `POST /signin
 | `zscaler_assess_zia_access_control` | Controls 6, 7, 14 (admin MFA evidence, RBAC, audit log export) |
 | `zscaler_assess_zia_policy` | Controls 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 25 |
 | `zscaler_assess_zpa` | Controls 8, 9, 10, 11, 12, 13, 15, 21, 22, 23, 24 |
-| `zscaler_export_audit_bundle` | Runs everything into `zscaler-audit-<ZIA cloud or ZPA customer ID>-<YYYY-MM-DD>` under `output_dir` (default `./export/zscaler`) and writes `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework), `QUICK_REFERENCE.md`, `_errors.log` when collection partially failed, and a zip named after the allocated directory (reruns allocate a new directory) |
+| `zscaler_export_audit_bundle` | Runs everything, then writes an audit bundle and a zip archive |
 
-Findings are normalized as `{id, control, title, severity, status, summary, evidence, mappings, manualEvidence}` with `status` in `pass`, `warn`, `fail`, `manual`. Verdict rules: a 401, 403, or errored endpoint never yields `pass`: when it is the finding's primary inventory the finding is `manual` and names the cause, and when it is a secondary inventory the finding also reads (for example ZPA `GET /serviceEdgeGroup` for control 21, or `GET /dlpDictionaries` for control 3) the finding caps at `warn`, names the inventory and endpoint with the HTTP status in its summary, and lists it under `evidence.unreadable_inventories`; an empty inventory fails or is `manual` per the control's intent (the summary says which); products that are not configured or not licensed render `manual`; undated items (no last connect time, no certificate validity) never count as healthy and cap at `warn`; every inventory a finding reads, primary or secondary, that came back partial caps that finding at `warn`, sets `evidence.partial_inventory`, and names the partial inventory with the records read over the pages read versus the total pages, or "total unknown" when the API published no total (or parents read versus total for sub-locations).
+`zscaler_export_audit_bundle` writes into `zscaler-audit-<ZIA cloud or ZPA customer ID>-<YYYY-MM-DD>` under `output_dir` (default `./export/zscaler`):
+
+- `core_data/`
+- `analysis/`
+- `compliance/` (executive summary, unified matrix, one report per framework)
+- `QUICK_REFERENCE.md`
+- `_errors.log` when collection partially failed
+- A zip named after the allocated directory (reruns allocate a new directory)
+
+### Findings and verdict rules
+
+Findings are normalized as `{id, control, title, severity, status, summary, evidence, mappings, manualEvidence}`. `status` is `pass`, `warn`, `fail`, or `manual`.
+
+- A 401, 403, or errored endpoint never yields `pass`.
+  - When it is the finding's primary inventory, the finding is `manual` and names the cause.
+  - When it is a secondary inventory the finding also reads, the finding caps at `warn`. It names the inventory and endpoint with the HTTP status in its summary, and lists it under `evidence.unreadable_inventories`.
+  - Examples of secondary inventories are ZPA `GET /serviceEdgeGroup` for control 21 and `GET /dlpDictionaries` for control 3.
+- An empty inventory fails or is `manual` per the control's intent. The summary says which.
+- Products that are not configured or not licensed render `manual`.
+- Undated items (no last connect time, no certificate validity) never count as healthy and cap at `warn`.
+- Every inventory a finding reads, primary or secondary, that came back partial caps that finding at `warn`. The finding also:
+  - Sets `evidence.partial_inventory`.
+  - Names the partial inventory with the records read over the pages read versus the total pages, or "total unknown" when the API published no total.
+  - For sub-locations, names parents read versus total.
 
 ### Bundle secret hygiene
 
-Every object written to the bundle, including `core_data/access_check.json` and `analysis/findings.json`, passes through export redaction. Redaction replaces the value with `[REDACTED]` for the credential fields the published schemas document (`kerberosPwd` on `GET /authSettings`, `scimSharedSecret` on `GET .../idp`, `preSharedKey`, `authenticationToken`, `password`, `tmpPassword`, `privateKey`, `zrsaencryptedprivatekey`, `zrsaencryptedsessionkey`), for the free-text `comment` and `comments` fields on GRE tunnels and VPN credentials (where operators record pre-shared keys), and for any other key whose normalized name contains `password`, `passwd`, `pwd`, `secret`, `token`, `passphrase`, `credential`, `private`, `community`, `preshared`, `apikey`, or ends in `key`, with a short exception list for benign schema fields (`isPasswordLoginAllowed`, `passwordExpirationEnabled`, `passwordExpiryDays`, `passwordStrength`, `publicKey`, `privateIp`, `tokenType`, and the module's own `passwordExpiry` and `vpnCredentials` datasets). Booleans are never redacted. API error text is scrubbed at the client: raw non-JSON bodies are never echoed (only their byte count), the documented `message`, `code`, `reason`, and `error` fields are capped at 160 characters, secret-named `key=value` pairs lose their value, and any token of 16 or more characters that is not an uppercase error code is dropped. The regression suite seeds 32 canaries across the configured secrets, every documented credential field, credential-shaped undocumented fields, comment fields, and echoed error bodies, then walks every bundle file and every zip entry.
+Every object written to the bundle, including `core_data/access_check.json` and `analysis/findings.json`, passes through export redaction.
+
+Redaction replaces the value with `[REDACTED]` for:
+
+- The credential fields the published schemas document: `kerberosPwd` on `GET /authSettings`, `scimSharedSecret` on `GET .../idp`, `preSharedKey`, `authenticationToken`, `password`, `tmpPassword`, `privateKey`, `zrsaencryptedprivatekey`, `zrsaencryptedsessionkey`.
+- The free-text `comment` and `comments` fields on GRE tunnels and VPN credentials, where operators record pre-shared keys.
+- Any other key whose normalized name contains `password`, `passwd`, `pwd`, `secret`, `token`, `passphrase`, `credential`, `private`, `community`, `preshared`, `apikey`, or ends in `key`.
+  - This rule has a short exception list for benign schema fields: `isPasswordLoginAllowed`, `passwordExpirationEnabled`, `passwordExpiryDays`, `passwordStrength`, `publicKey`, `privateIp`, `tokenType`, and the module's own `passwordExpiry` and `vpnCredentials` datasets.
+
+Booleans are never redacted.
+
+API error text is scrubbed at the client:
+
+- Raw non-JSON bodies are never echoed (only their byte count).
+- The documented `message`, `code`, `reason`, and `error` fields are capped at 160 characters.
+- Secret-named `key=value` pairs lose their value.
+- Any token of 16 or more characters that is not an uppercase error code is dropped.
+
+The regression suite seeds 32 canaries across the configured secrets, every documented credential field, credential-shaped undocumented fields, comment fields, and echoed error bodies. It then walks every bundle file and every zip entry.
 
 ## Control coverage
 
@@ -89,7 +170,9 @@ Every object written to the bundle, including `core_data/access_check.json` and 
 
 ## Framework mappings
 
-Every finding carries the eight mappings from the spec table for its control: FedRAMP (NIST 800-53), CMMC 2.0, SOC 2, CIS Controls, PCI-DSS 4.0, DISA STIG, IRAP (ISM), and ISMAP. The bundle writes one report per framework under `compliance/`.
+Every finding carries the eight mappings from the spec table for its control: FedRAMP (NIST 800-53), CMMC 2.0, SOC 2, CIS Controls, PCI-DSS 4.0, DISA STIG, IRAP (ISM), and ISMAP.
+
+The bundle writes one report per framework under `compliance/`.
 
 ## Live smoke
 
@@ -97,11 +180,17 @@ Every finding carries the eight mappings from the spec table for its control: Fe
 npm --prefix cli run test:zscaler:live
 ```
 
-The script skips with exit code 0 when no ZIA or ZPA credentials are present; otherwise it runs `zscaler_check_access` and one assessment against the real tenant.
+The script skips with exit code 0 when no ZIA or ZPA credentials are present. Otherwise it runs `zscaler_check_access` and one assessment against the real tenant.
 
 ## Endpoints and official documentation
 
-Every endpoint, query parameter, and field below was verified against the OpenAPI documents published on the [Zscaler Automation Hub](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia) (ZIA and ZPA API reference; the Hub serves the OneAPI base URL `https://api.zsapi.net/zia/api/v1`, and the resource paths, parameters, and schemas are shared with the legacy `/api/v1` and `config.private.zscaler.com` surfaces this integration calls). The legacy authentication flows are documented on help.zscaler.com ([ZIA API getting started](https://help.zscaler.com/zia/getting-started-zia-api), [ZPA API getting started](https://help.zscaler.com/zpa/getting-started-zpa-api)) and implemented identically in [zscaler-sdk-go](https://github.com/zscaler/zscaler-sdk-go) (`zscaler/zia/v2_client.go`, `zscaler/zpa/v2_client.go`). Rows marked "SDK only" name surfaces or fields that the published reference does not document; the dependent findings state that and never rest a `pass` on them.
+Every endpoint, query parameter, and field below was verified against the OpenAPI documents published on the [Zscaler Automation Hub](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia) (ZIA and ZPA API reference).
+
+The Hub serves the OneAPI base URL `https://api.zsapi.net/zia/api/v1`. The resource paths, parameters, and schemas are shared with the legacy `/api/v1` and `config.private.zscaler.com` surfaces this integration calls.
+
+The legacy authentication flows are documented on help.zscaler.com ([ZIA API getting started](https://help.zscaler.com/zia/getting-started-zia-api), [ZPA API getting started](https://help.zscaler.com/zpa/getting-started-zpa-api)). They are implemented identically in [zscaler-sdk-go](https://github.com/zscaler/zscaler-sdk-go) (`zscaler/zia/v2_client.go`, `zscaler/zpa/v2_client.go`).
+
+Rows marked "SDK only" name surfaces or fields that the published reference does not document. The dependent findings state that and never rest a `pass` on them.
 
 Reference links below are relative to `https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/`.
 
@@ -155,10 +244,18 @@ Reference links below are relative to `https://automate.zscaler.com/docs/api-ref
 
 ## Limitations and manual controls
 
-- Control 6 cannot reach `pass`: the ZIA API does not expose per-administrator MFA state, so the finding reports password-login bypasses and asks for portal evidence.
-- Control 13 covers ZPA timeout policy only; the ZIA administrator session timeout is not exposed by the API and is listed as manual evidence in the finding.
-- Control 14 verifies the audit report interface and NSS export feeds; retention is enforced by the receiving SIEM and must be documented separately. The published reference marks `statusId` as a required query parameter on `GET /auditlogEntryReport` (it names an export task created by `POST`, which this read-only inspector never issues) while both official SDKs send a bare `GET`; the inspector sends the bare `GET` and, if a tenant enforces the documented shape and returns `400`, control 14 renders `manual` naming that cause rather than passing.
-- Control 24 covers ZPA enrollment and browser access certificates; the ZIA intermediate CA chain is manual evidence.
-- Surfaces documented only by the official SDKs are treated as supplementary evidence: ZPA `GET /administrators` (control 12 says so in its summary and caps at `warn` when it is unreadable), `enableFullLogging` on firewall rules, and the legacy `adminScopeType` and `fileHashesToBeBlocked` keys. ZPA admin roles are not read because neither `/admin/roles` nor `/roles` appears in the published reference.
+- Control 6 cannot reach `pass`. The ZIA API does not expose per-administrator MFA state, so the finding reports password-login bypasses and asks for portal evidence.
+- Control 13 covers ZPA timeout policy only. The ZIA administrator session timeout is not exposed by the API and is listed as manual evidence in the finding.
+- Control 14 verifies the audit report interface and NSS export feeds. Retention is enforced by the receiving SIEM and must be documented separately.
+  - The published reference marks `statusId` as a required query parameter on `GET /auditlogEntryReport` (it names an export task created by `POST`, which this read-only inspector never issues).
+  - Both official SDKs send a bare `GET`. The inspector sends the bare `GET` as well.
+  - If a tenant enforces the documented shape and returns `400`, control 14 renders `manual` naming that cause rather than passing.
+- Control 24 covers ZPA enrollment and browser access certificates. The ZIA intermediate CA chain is manual evidence.
+- Surfaces documented only by the official SDKs are treated as supplementary evidence:
+  - ZPA `GET /administrators`. Control 12 says so in its summary and caps at `warn` when it is unreadable.
+  - `enableFullLogging` on firewall rules.
+  - The legacy `adminScopeType` and `fileHashesToBeBlocked` keys.
+- ZPA admin roles are not read because neither `/admin/roles` nor `/roles` appears in the published reference.
 - Cloud Service API key inventory, ZDX metrics, and OneAPI OAuth mode are not implemented in this release.
-- Empty inventories that are plausibly intentional (no sandbox rules, no bandwidth rules, no isolation profiles, no locations, no trusted networks, no private service edges, no forwarding rules, no emergency access users) render `manual` and say what to confirm; inventories that must never be empty (URL, firewall, DNS, DLP, SSL, cloud app rules, segments, access rules, posture profiles, connectors, IdPs, timeout rules) fail.
+- Empty inventories that are plausibly intentional render `manual` and say what to confirm. The cases are no sandbox rules, no bandwidth rules, no isolation profiles, no locations, no trusted networks, no private service edges, no forwarding rules, and no emergency access users.
+- Inventories that must never be empty fail. They are URL, firewall, DNS, DLP, SSL, cloud app rules, segments, access rules, posture profiles, connectors, IdPs, and timeout rules.

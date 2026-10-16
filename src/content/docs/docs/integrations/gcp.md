@@ -3,15 +3,17 @@ title: Google Cloud Platform
 description: Read-only GCP security inspector covering IAM, logging, organization guardrails, data protection, and network security with multi-framework mappings.
 ---
 
-The GCP integration implements the `gcp-sec-inspector` spec as native grclanker tools. It inspects an organization (or a single project) through documented Google Cloud REST APIs, scores 23 controls, and maps every finding to FedRAMP, CMMC 2.0, SOC 2, CIS GCP, PCI-DSS, DISA STIG, IRAP, and ISMAP. Every request is read-only.
+The GCP integration implements the `gcp-sec-inspector` spec as native grclanker tools. It inspects an organization (or a single project) through documented Google Cloud REST APIs and scores 23 controls.
+
+Every finding maps to FedRAMP, CMMC 2.0, SOC 2, CIS GCP, PCI-DSS, DISA STIG, IRAP, and ISMAP. Every request is read-only.
 
 ## What it inspects
 
-- IAM: privileged bindings, service account key age and count, cross-project service account access, default service account privilege
-- Logging and detection: Admin Activity and Data Access audit visibility, log sinks, log bucket retention, Security Command Center visibility (reported for context, never scored)
-- Organization guardrails: domain-restricted sharing, service account key constraints, serial port and Shielded VM policies, OS Login, Binary Authorization, instance hardening
-- Data protection: uniform bucket-level access, public IAM exposure, KMS rotation, CMEK on buckets and disks, Cloud DNS DNSSEC, API key restrictions, VPC Service Controls
-- Network security: internet-open firewall rules on administrative ports, VPC flow logs, Private Google Access, Cloud NAT and external IPs, load balancer SSL policies, Cloud Armor coverage
+- **IAM:** privileged bindings, service account key age and count, cross-project service account access, default service account privilege.
+- **Logging and detection:** Admin Activity and Data Access audit visibility, log sinks, log bucket retention, Security Command Center visibility (reported for context, never scored).
+- **Organization guardrails:** domain-restricted sharing, service account key constraints, serial port and Shielded VM policies, OS Login, Binary Authorization, instance hardening.
+- **Data protection:** uniform bucket-level access, public IAM exposure, KMS rotation, CMEK on buckets and disks, Cloud DNS DNSSEC, API key restrictions, VPC Service Controls.
+- **Network security:** internet-open firewall rules on administrative ports, VPC flow logs, Private Google Access, Cloud NAT and external IPs, load balancer SSL policies, Cloud Armor coverage.
 
 ## Setup and authentication
 
@@ -30,10 +32,17 @@ The credential chain is evaluated in this order:
 
 1. `access_token` argument, then `GCP_ACCESS_TOKEN` (also `GOOGLE_OAUTH_ACCESS_TOKEN` or `GOOGLE_ACCESS_TOKEN`)
 2. `credentials_file` argument, then `GCP_CREDENTIALS_FILE`, then `GOOGLE_APPLICATION_CREDENTIALS`
-3. The Application Default Credentials file (`~/.config/gcloud/application_default_credentials.json`, honoring `CLOUDSDK_CONFIG`; `%APPDATA%\gcloud\application_default_credentials.json` on Windows)
+3. The Application Default Credentials file:
+   - `~/.config/gcloud/application_default_credentials.json`, honoring `CLOUDSDK_CONFIG`
+   - `%APPDATA%\gcloud\application_default_credentials.json` on Windows
 4. `gcloud auth print-access-token`
 
-Credential files may be a service account key (`type: service_account`) or an authorized user ADC file (`type: authorized_user`). Service account keys are exchanged with the documented OAuth 2.0 service account JWT flow: an RS256 assertion signed with `node:crypto` and posted to the key's `token_uri` with `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and the `https://www.googleapis.com/auth/cloud-platform` scope. Authorized user files use the refresh token grant. No SDK or extra dependency is required.
+Credential files may be a service account key (`type: service_account`) or an authorized user ADC file (`type: authorized_user`).
+
+- **Service account key:** Exchanged with the documented OAuth 2.0 service account JWT flow. An RS256 assertion is signed with `node:crypto` and posted to the key's `token_uri` with `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and the `https://www.googleapis.com/auth/cloud-platform` scope.
+- **Authorized user file:** Uses the refresh token grant.
+
+No SDK or extra dependency is required.
 
 ```bash
 export GCP_ORGANIZATION_ID=123456789012
@@ -42,7 +51,7 @@ export GCP_CREDENTIALS_FILE=/path/to/audit-sa-key.json
 
 ### Required IAM roles
 
-Grant the audit principal at the organization node so every project is covered:
+Grant the audit principal these roles at the organization node so every project is covered:
 
 | Role | Surfaces |
 |------|----------|
@@ -61,7 +70,22 @@ Grant the audit principal at the organization node so every project is covered:
 
 ### Enabled APIs
 
-The projects you inventory must have the relevant APIs enabled: `cloudasset`, `cloudresourcemanager`, `iam`, `logging`, `compute`, `storage`, `dns`, `apikeys`, `accesscontextmanager`, `binaryauthorization`, `cloudkms`, and optionally `securitycenter`. When an API is disabled in a project the dependent finding is rendered `manual` for that project, never `pass`.
+The projects you inventory must have the relevant APIs enabled:
+
+- `cloudasset`
+- `cloudresourcemanager`
+- `iam`
+- `logging`
+- `compute`
+- `storage`
+- `dns`
+- `apikeys`
+- `accesscontextmanager`
+- `binaryauthorization`
+- `cloudkms`
+- `securitycenter` (optional)
+
+When an API is disabled in a project, the dependent finding is rendered `manual` for that project, never `pass`.
 
 ## Tools
 
@@ -75,13 +99,49 @@ The projects you inventory must have the relevant APIs enabled: `cloudasset`, `c
 | `gcp_assess_network_security` | Controls 4, 9, 10, 18, 19, 22 | `max_assets` (2000), `project_limit` |
 | `gcp_export_audit_bundle` | Run everything and write the shared bundle layout | `output_dir` (`./export/gcp`) plus every option above |
 
+### Project cap and pagination
+
 `project_limit` (alias `max_projects`, default 20) caps how many projects are inventoried. When the cap truncates the inventory, every dependent finding is downgraded to `warn` with seen and total counts, so a partial view can never pass.
 
-Every paginated list follows `nextPageToken` until the API stops returning one. A list that exits early for any other reason is recorded as truncated and downgrades its findings the same way: the per-list item cap was reached, the cursor repeated itself, or the page budget of 250 pages was spent. The summary then reads `N seen, total unknown`.
+Every paginated list follows `nextPageToken` until the API stops returning one. A list that exits early for any other reason is recorded as truncated and downgrades its findings the same way:
 
-Every finding also tracks each inventory it depends on. When any of them is unreadable (403, 401, or an error), for the whole scope or for one project, the finding drops below `pass` even if its primary inventory was read completely: `manual` when the unreadable inventory is the one the finding scores, `warn` otherwise. The summary names the dataset and the endpoint, for example `Partial view: Cloud Routers unreadable for 1 of 2 projects (second-project) via compute.googleapis.com/compute/v1/projects/{project}/aggregated/routers (403 Forbidden)`, and `evidence.unreadable_inventories` lists every entry with its scope and error. A count or list that would have been derived from the unreadable inventory is rendered as `null`, never as zero or an empty list, whether that inventory is the one the finding scores or a dependent one; the same rule applies to the assessment-level `summary` counters (`sampled_projects` is `null` when the project inventory itself was unreadable), and a summary sentence names the unreadable dataset instead of counting it (`instance overrides could not be checked because Compute Engine instances were unreadable`, never `none of 0 instances overrides it`).
+- The per-list item cap was reached.
+- The cursor repeated itself.
+- The page budget of 250 pages was spent.
 
-The collection-status fields follow the same rule. `evidence.truncated`, `denied_projects`, and `unreachable_scopes` on a finding, and `projects_truncated`, `sources_truncated`, and `findings_truncated` in the assessment summaries, are `null` whenever the scan they describe was denied or never ran; `false`, `0`, or `[]` is written only when that scan ran to completion, so no status ever says complete about a call that did not happen. A read that was skipped because its upstream discovery failed is recorded with `status: "not_collected"` rather than `"unreadable"`, and its wording names the upstream call with the status that call actually returned: with no project to resolve an effective org policy against, GCP-ORG-02 through GCP-ORG-05 read `effective org policy constraints/iam.allowedPolicyMemberDomains not collected for the scope (cloudresourcemanager.googleapis.com/v1/projects/{project}:getEffectiveOrgPolicy was not called): no project could be enumerated because project inventory was unreadable via cloudasset.googleapis.com/v1/{scope}:searchAllResources (403 Forbidden)`. An HTTP status is never attributed to an endpoint that was not requested. In `core_data/`, a dataset that was denied or never collected is written as a `{status, dataset, endpoint, scope, error, data: null}` marker in place of the rows, never as `[]`, and the same entry appears in the snapshot's `unreadable_inventories`.
+The summary then reads `N seen, total unknown`.
+
+### Unreadable inventories
+
+Every finding also tracks each inventory it depends on. When any of them is unreadable (403, 401, or an error), for the whole scope or for one project, the finding drops below `pass`. This happens even if its primary inventory was read completely.
+
+- The finding is `manual` when the unreadable inventory is the one the finding scores, and `warn` otherwise.
+- The summary names the dataset and the endpoint, for example:
+  - `Partial view: Cloud Routers unreadable for 1 of 2 projects (second-project) via compute.googleapis.com/compute/v1/projects/{project}/aggregated/routers (403 Forbidden)`
+- `evidence.unreadable_inventories` lists every entry with its scope and error.
+
+A count or list that would have been derived from an unreadable inventory is rendered as `null`, never as zero or an empty list.
+
+- The rule holds whether that inventory is the one the finding scores or a dependent one.
+- The same rule applies to the assessment-level `summary` counters: `sampled_projects` is `null` when the project inventory itself was unreadable.
+- A summary sentence names the unreadable dataset instead of counting it: `instance overrides could not be checked because Compute Engine instances were unreadable`, never `none of 0 instances overrides it`.
+
+### Collection-status fields
+
+The collection-status fields follow the same rule. These fields are `null` whenever the scan they describe was denied or never ran:
+
+- On a finding: `evidence.truncated`, `denied_projects`, and `unreachable_scopes`.
+- In the assessment summaries: `projects_truncated`, `sources_truncated`, and `findings_truncated`.
+
+`false`, `0`, or `[]` is written only when that scan ran to completion, so no status ever says complete about a call that did not happen.
+
+A read that was skipped because its upstream discovery failed is recorded with `status: "not_collected"` rather than `"unreadable"`. Its wording names the upstream call with the status that call actually returned. For example, with no project to resolve an effective org policy against, GCP-ORG-02 through GCP-ORG-05 read:
+
+`effective org policy constraints/iam.allowedPolicyMemberDomains not collected for the scope (cloudresourcemanager.googleapis.com/v1/projects/{project}:getEffectiveOrgPolicy was not called): no project could be enumerated because project inventory was unreadable via cloudasset.googleapis.com/v1/{scope}:searchAllResources (403 Forbidden)`
+
+An HTTP status is never attributed to an endpoint that was not requested.
+
+In `core_data/`, a dataset that was denied or never collected is written as a `{status, dataset, endpoint, scope, error, data: null}` marker in place of the rows, never as `[]`. The same entry appears in the snapshot's `unreadable_inventories`.
 
 ## Status semantics
 
@@ -92,7 +152,12 @@ The collection-status fields follow the same rule. `evidence.truncated`, `denied
 | `fail` | A documented violation was found in a complete inventory. |
 | `manual` | The inventory the finding scores was forbidden or errored, the inventory was empty where emptiness is not compliant by intent, the API is disabled, or the control is outside the configured scope. The summary names the dataset, the endpoint, and the evidence to collect. |
 
-Emptiness passes only for two findings: `GCP-IAM-02` (no user-managed keys across a non-empty set of service accounts whose key lists were all readable) and `GCP-DATA-06` (no API keys in projects where the API Keys API answered). `GCP-DATA-07` fails on emptiness (no access policy means no perimeter). Every other finding renders `manual` on an empty inventory.
+Emptiness passes only for two findings:
+
+- `GCP-IAM-02`: No user-managed keys across a non-empty set of service accounts whose key lists were all readable.
+- `GCP-DATA-06`: No API keys in projects where the API Keys API answered.
+
+`GCP-DATA-07` fails on emptiness (no access policy means no perimeter). Every other finding renders `manual` on an empty inventory.
 
 ## Control coverage
 
@@ -152,11 +217,73 @@ Every finding carries the spec mapping table entries for its controls. The expor
 <org-or-project>-audit.zip
 ```
 
-Reruns allocate `-2`, `-3`, and so on; the zip name derives from the allocated directory so nothing is overwritten. Output paths are resolved with traversal and symlink-parent protection.
+Reruns allocate `-2`, `-3`, and so on. The zip name derives from the allocated directory, so nothing is overwritten. Output paths are resolved with traversal and symlink-parent protection.
 
-Snapshots and finding evidence never contain whole API resources. Each collected object is projected to its identifiers and the documented fields the verdict reads (for example a Compute instance becomes its name, the resolved `enable-oslogin` and `serial-port-enable` flags, and the three `shieldedInstanceConfig` booleans), so metadata values such as `startup-script` or `ssh-keys`, labels, annotations, descriptions, filters, API key `keyString` values, IAP client secrets, and disk `rawKey` material are never written. A regression test seeds a distinct fake secret into every collected object, exports a bundle, and asserts that none of them appears in any file under the output directory or in any entry of the zip.
+### Projected snapshots
 
-Error text follows the same rule. A failed request is described by its HTTP status, method, and endpoint (without the query string) plus either the documented `google.rpc.Status` fields (`error.status`, a scrubbed `error.message`, and each `error.details[]` entry's `@type` name and `reason`) or, for any other body, `non-JSON error body (<content type>; N bytes)`; the body itself is never copied into an error. A 2xx whose body is not a JSON object is an unreadable surface, never an empty inventory: an HTML page renders `200 OK: non-JSON response body (<content type>; N bytes) (GET <endpoint>)` and an empty or whitespace body `200 OK: empty response body (<content type>; N bytes) (GET <endpoint>)`, so dependent findings are manual or warn and the access probe reports the surface not readable (every surface this client reads documents a JSON object body; the proto3 JSON mapping encodes an all-default response and `google.protobuf.Empty` as `{}`). Every error string is built at one point (`GcpApiError`, with `describeError` covering anything thrown outside the client) and scrubbed there of the configured credentials and exchanged token by exact match, `Bearer` and `Basic` values, `ya29.`, `AIza`, `GOCSPX-`, and `1//` shapes, JWT assertions, `Cookie` and `Set-Cookie` values, credential name-value pairs (api key, access, refresh, and id tokens, client secret, private key, password, session), embedded URL query strings and fragments, and, in error text only, bare 16+ character runs with a digit or mixed case that are not made of words (snake_case, camelCase, and PascalCase identifiers such as `PreconditionFailure` and `LocalizedMessage` survive). Credential files follow the same rule: a malformed service account or ADC file is reported as `invalid JSON in <path>` and a read failure as `unable to read <path> (<code>)` with the Node system error code, never the parser or filesystem message, since V8 quotes the characters around a fault and for a broken `private_key` line those are key material. The bundle writer applies the same rules once more to every file, `.md` files and `_errors.log` included, without the long-token rule so project IDs, key names, and resource names survive as evidence. A regression walk fails every `GCP_INVENTORIES` surface in turn with a `502 text/html` page carrying bearer, session-cookie, and API-key canaries, a `403` whose `error.message` embeds a tokenised URL, a `500` whose message carries a long token, and a thrown network error carrying request headers, and asserts that no canary reaches any finding, summary, `unreadable_inventories` entry, `core_data` marker, errors array, bundle file, zip entry, or thrown error while every failure is still disclosed with its status, endpoint, and content type and length or documented fields. A second export plants a shapeless configured token and an `AIza` key in the organization display name and asserts neither reaches any bundle file or zip entry, which binds the writer's second layer.
+Snapshots and finding evidence never contain whole API resources. Each collected object is projected to its identifiers and the documented fields the verdict reads. For example, a Compute instance becomes its name, the resolved `enable-oslogin` and `serial-port-enable` flags, and the three `shieldedInstanceConfig` booleans.
+
+As a result, these are never written:
+
+- Metadata values such as `startup-script` or `ssh-keys`
+- Labels, annotations, descriptions, and filters
+- API key `keyString` values
+- IAP client secrets
+- Disk `rawKey` material
+
+A regression test seeds a distinct fake secret into every collected object and exports a bundle. It asserts that none of those secrets appears in any file under the output directory or in any entry of the zip.
+
+### Error text
+
+Error text follows the same rule as snapshots and finding evidence. A failed request is described by its HTTP status, method, and endpoint (without the query string), plus one of these:
+
+- The documented `google.rpc.Status` fields: `error.status`, a scrubbed `error.message`, and each `error.details[]` entry's `@type` name and `reason`.
+- For any other body, `non-JSON error body (<content type>; N bytes)`.
+
+The body itself is never copied into an error.
+
+A 2xx whose body is not a JSON object is an unreadable surface, never an empty inventory:
+
+- An HTML page renders `200 OK: non-JSON response body (<content type>; N bytes) (GET <endpoint>)`.
+- An empty or whitespace body renders `200 OK: empty response body (<content type>; N bytes) (GET <endpoint>)`.
+
+Dependent findings are then manual or warn, and the access probe reports the surface not readable. Every surface this client reads documents a JSON object body. The proto3 JSON mapping encodes an all-default response and `google.protobuf.Empty` as `{}`.
+
+### Error scrubbing
+
+Every error string is built at one point, `GcpApiError`, and scrubbed there. `describeError` covers anything thrown outside the client. The scrub removes:
+
+- The configured credentials and exchanged token, by exact match.
+- `Bearer` and `Basic` values.
+- `ya29.`, `AIza`, `GOCSPX-`, and `1//` shapes.
+- JWT assertions.
+- `Cookie` and `Set-Cookie` values.
+- Credential name-value pairs (api key, access, refresh, and id tokens, client secret, private key, password, session).
+- Embedded URL query strings and fragments.
+- In error text only, bare 16+ character runs with a digit or mixed case that are not made of words.
+  - Identifiers in snake_case, camelCase, and PascalCase, such as `PreconditionFailure` and `LocalizedMessage`, survive.
+
+Credential files follow the same rule:
+
+- A malformed service account or ADC file is reported as `invalid JSON in <path>`.
+- A read failure is reported as `unable to read <path> (<code>)` with the Node system error code.
+
+The parser or filesystem message is never reported, since V8 quotes the characters around a fault. For a broken `private_key` line, those characters are key material.
+
+The bundle writer applies the same rules once more to every file, `.md` files and `_errors.log` included. This pass runs without the long-token rule so project IDs, key names, and resource names survive as evidence.
+
+### Leak tests
+
+A regression walk fails every `GCP_INVENTORIES` surface in turn with:
+
+- A `502 text/html` page carrying bearer, session-cookie, and API-key canaries.
+- A `403` whose `error.message` embeds a tokenised URL.
+- A `500` whose message carries a long token.
+- A thrown network error carrying request headers.
+
+It asserts that no canary reaches any finding, summary, `unreadable_inventories` entry, `core_data` marker, errors array, bundle file, zip entry, or thrown error while every failure is still disclosed with its status, endpoint, and content type and length or documented fields.
+
+A second export plants a shapeless configured token and an `AIza` key in the organization display name. It asserts that neither reaches any bundle file or zip entry, which binds the writer's second layer.
 
 ## Live smoke test
 
@@ -164,17 +291,25 @@ Error text follows the same rule. A failed request is described by its HTTP stat
 npm --prefix cli run test:gcp:live
 ```
 
-The script prints a skip message and exits 0 when no credential hint exists (no organization or project variable, no token, no credentials file, no ADC file). Otherwise it runs `gcp_check_access` followed by every assess tool with a small project and asset cap.
+The script prints a skip message and exits 0 when no credential hint exists: no organization or project variable, no token, no credentials file, and no ADC file.
+
+Otherwise it runs `gcp_check_access` followed by every assess tool with a small project and asset cap.
 
 ## Limitations and manual controls
 
-- All 23 spec controls have automated findings. Sub-aspects that are not evaluated and remain manual: unused permission analysis (control 2), unused firewall rules (control 4), Binary Authorization attestor configuration (control 8), and OS Login 2FA (control 11).
-- Security Command Center is visibility only. `GCP-LOG-05` never scores a control and the findings feed is sampled, not exhaustive.
-- KMS keys are read from Cloud Asset Inventory (`cloudkms.googleapis.com/CryptoKey`) rather than per-location Cloud KMS list calls, so the Cloud Asset API must be enabled and the asset feed reflects its documented freshness.
-- Public exposure relies on the Cloud Asset Inventory IAM policy search at organization scope (`policy:(allUsers OR allAuthenticatedUsers)`), which covers every asset type CAI indexes; object ACLs on non-uniform buckets are not inspected.
-- Compute `aggregatedList` responses that report `unreachables[]` or a scope with `warning.code` `UNREACHABLE` mark the inventory as partial: every compute-backed finding downgrades to `warn` and names the unreachable scopes.
-- Effective organization policies are computed against the first inventoried project. When the project cap truncates the inventory, or the project inventory itself is unreadable while a project ID is configured, org-policy findings are downgraded to `warn` and name the project inventory endpoint; an unreadable constraint renders its finding `manual`.
-- Security Command Center visibility (`GCP-LOG-05`) is `manual` when the source list is unreadable and `warn` when the findings feed is unreadable or truncated; the findings count is then rendered as `null`, never as zero.
+- All 23 spec controls have automated findings. These sub-aspects are not evaluated and remain manual:
+  - Unused permission analysis (control 2)
+  - Unused firewall rules (control 4)
+  - Binary Authorization attestor configuration (control 8)
+  - OS Login 2FA (control 11)
+- Security Command Center is visibility only. `GCP-LOG-05` never scores a control, and the findings feed is sampled, not exhaustive.
+- KMS keys are read from Cloud Asset Inventory (`cloudkms.googleapis.com/CryptoKey`) rather than per-location Cloud KMS list calls. As a result, the Cloud Asset API must be enabled and the asset feed reflects its documented freshness.
+- Public exposure relies on the Cloud Asset Inventory IAM policy search at organization scope (`policy:(allUsers OR allAuthenticatedUsers)`). The search covers every asset type CAI indexes. Object ACLs on non-uniform buckets are not inspected.
+- Compute `aggregatedList` responses that report `unreachables[]` or a scope with `warning.code` `UNREACHABLE` mark the inventory as partial. Every compute-backed finding then downgrades to `warn` and names the unreachable scopes.
+- Effective organization policies are computed against the first inventoried project.
+  - When the project cap truncates the inventory, or the project inventory itself is unreadable while a project ID is configured, org-policy findings are downgraded to `warn` and name the project inventory endpoint.
+  - An unreadable constraint renders its finding `manual`.
+- Security Command Center visibility (`GCP-LOG-05`) is `manual` when the source list is unreadable, and `warn` when the findings feed is unreadable or truncated. The findings count is then rendered as `null`, never as zero.
 - Single-project scope (no organization ID) renders `GCP-ORG-01` and `GCP-DATA-07` as `manual` because organization metadata and access policies are organization resources.
 
 ## Endpoint reference
