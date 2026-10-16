@@ -9,7 +9,8 @@
  *   node --import <data URL that calls register(<this file>)> dist/index.js env exec --backend sandbox-runtime -- true
  *
  * The stub appends `initialize` and `reset` lines to the path in
- * `GRCLANKER_TEST_SANDBOX_RUNTIME_RECORD`.
+ * `GRCLANKER_TEST_SANDBOX_RUNTIME_RECORD`. When `GRCLANKER_TEST_SANDBOX_RUNTIME_RESET_ERROR` is set,
+ * `reset()` releases the bridge and then rejects with that message.
  */
 const SANDBOX_RUNTIME_SPECIFIER = "@anthropic-ai/sandbox-runtime";
 const MOCK_URL = "grclanker-sandbox-runtime-mock:index";
@@ -30,6 +31,8 @@ const MOCK_SOURCE = [
   "  async reset() {",
   '    record("reset");',
   "    clearInterval(bridge);",
+  "    const resetError = process.env.GRCLANKER_TEST_SANDBOX_RUNTIME_RESET_ERROR;",
+  "    if (resetError) throw new Error(resetError);",
   "  },",
   "};",
   "",

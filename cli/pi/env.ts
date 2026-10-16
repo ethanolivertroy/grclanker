@@ -2,6 +2,7 @@ import { unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { getGrclankerSettingsPath } from "../config/paths.js";
 import {
+  appendCleanupFailure,
   withComputeBackendExecution,
   type ResolvedComputeBackendExecution,
 } from "./backend-exec.js";
@@ -260,23 +261,29 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// sandbox-runtime's network bridge keeps the process alive until the sandbox is reset.
 async function withEnvExecution<T>(
   options: EnvCommandOptions,
   run: (execution: ResolvedComputeBackendExecution) => Promise<T>,
 ): Promise<T> {
   const settings = getEffectiveSettings(options);
   ensureBackendIsRunnable(settings);
+  let result: T;
   try {
-    return await withComputeBackendExecution(options.cwd, settings, run);
+    result = await withComputeBackendExecution(options.cwd, settings, run);
   } catch (error) {
     // A remnant the backend could not remove is an operator message (pod id, path, and the
     // delete command), not a stack trace.
-    if (error instanceof ExecutionBackendCleanupError) throw new GrclankerUserError(error.message);
-    throw error;
-  } finally {
-    // sandbox-runtime's network bridge keeps the process alive until the sandbox is reset.
-    await resetSandboxRuntime();
+    const failure = error instanceof ExecutionBackendCleanupError ? new GrclankerUserError(error.message) : error;
+    try {
+      await resetSandboxRuntime();
+    } catch (resetError) {
+      throw appendCleanupFailure(failure, resetError);
+    }
+    throw failure;
   }
+  await resetSandboxRuntime();
+  return result;
 }
 
 async function executeOnBackend(
