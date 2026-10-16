@@ -67,7 +67,7 @@ When `DescribeRegions` is unreadable:
 
 Attach a read-only policy with the actions below to the audit principal. Action names follow the [Service Authorization Reference](https://docs.aws.amazon.com/service-authorization/latest/reference/reference_policies_actions-resources-contextkeys.html).
 
-`aws_check_access` reports which surfaces return `AccessDenied`. An unreadable surface never yields a `pass`. The finding is `manual` when a primary input is unreadable or every item read fails. Any other unreadable read caps a would-be `pass` at `warn`.
+`aws_check_access` reports which surfaces return `AccessDenied`. An unreadable surface never yields a `pass`. The finding is `manual` when its primary input is unreadable, or when every item read in a walk such as trail status or Access Analyzer findings fails. Other unreadable reads, such as per-bucket S3 reads, cap a would-be `pass` at `warn` even when every one fails (see [Verdict safety rules](#verdict-safety-rules)).
 
 | Service | Actions |
 |---|---|

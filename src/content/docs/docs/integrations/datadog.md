@@ -280,13 +280,13 @@ Every finding follows the same rules so that a `pass` always rests on data that 
    - **19:** Users plus application keys.
    - **20:** Organization settings plus log indexes plus org connections.
 
-   When any inventory a control reads is unreadable, the finding is `manual`, except for 2 and 19. In those controls, the readable users still support a judgement (native MFA coverage in 2, naming and interactive logins in 19). The finding is `warn`, and the summary says what was not checked.
+   When any inventory a control reads is unreadable, the finding is `manual`, except for 2 when every active human user has native MFA, and for 19. In those cases, the readable users still support a judgement (native MFA coverage in 2, naming and interactive logins in 19). The finding is `warn`, and the summary says what was not checked.
 
    Control 18 stays `manual` as always but names the list it could not inventory.
 
    In every case, the summary carries `Unreadable inventory: <inventory> (<endpoint>, <permission>: <error>), so <what was not checked>. Collect manually: <console evidence>.` The evidence carries the same entries under `unreadable_inventories`.
 
-   Failing verdicts on the readable inventories stay `fail`.
+   Failing verdicts on the readable inventories stay `fail`. Control 9 also stays `warn` when unresolved signals are open within the SLA.
 
 2. An empty inventory never yields `pass` by default. Each control decides whether emptiness is `fail` or `manual` and says so in the summary.
 
@@ -325,7 +325,7 @@ When a `pass` is downgraded under these rules, the summary ends with `Downgraded
 | # | Control | Tool | Finding | Status semantics |
 |---|---|---|---|---|
 | 1 | SAML SSO Enforcement | `datadog_assess_identity` | `DD-01` | `fail` when SAML is disabled; `warn` when SAML is on but strict mode is off; `pass` when strict mode is enforced. `manual` if `/api/v1/org` is unreadable or the response omits `saml` or `saml_strict_mode`. |
-| 2 | MFA Status | `datadog_assess_identity` | `DD-02` | `pass` only when `mfa_enabled` was read as `true` for every active human user; `fail` when password-capable users lack MFA; `manual` when SAML strict mode is on but users lack native MFA (the API cannot observe IdP MFA, so the IdP authentication policy must be captured), when `mfa_enabled` is absent, or when the user list is empty; `warn` when no active human users remain, the list is truncated, or organization settings are unreadable (native MFA is still judged from the users, but whether SAML strict mode disables password login was not checked, and the summary names `organization settings`). |
+| 2 | MFA Status | `datadog_assess_identity` | `DD-02` | `pass` only when `mfa_enabled` was read as `true` for every active human user; `fail` when password-capable users lack MFA; `manual` when SAML strict mode is on but users lack native MFA (the API cannot observe IdP MFA, so the IdP authentication policy must be captured), when organization settings are unreadable and users lack native MFA, when `mfa_enabled` is absent, or when the user list is empty; `warn` when no active human users remain, the list is truncated, or organization settings are unreadable while every active human user has native MFA (whether SAML strict mode disables password login was not checked, and the summary names `organization settings`). |
 | 3 | RBAC Configuration (Custom Roles) | `datadog_assess_identity` | `DD-03` | `fail` when a custom role grants `org_management`, `user_access_manage`, `api_keys_write`, `org_app_keys_write`, or `service_account_write`; `manual` when any custom role's permissions could not be read (the summary names `role_permissions` with the count and the failing roles, and the evidence lists them under `unreadable_inventories`) or the role list is empty; `warn` when Datadog Admin Role membership exceeds `max_admins`, its `user_count` is missing, or the role list is truncated; otherwise `pass`. |
 | 4 | User Access Review | `datadog_assess_identity` | `DD-04` | `fail` when active users have not signed in within `inactive_days`; `warn` when invitations are pending longer than `pending_invite_days`, users have neither `last_login_time` nor `created_at`, or the list is truncated; `manual` when the user list is empty; otherwise `pass`. |
 | 5 | API Key Rotation | `datadog_assess_access_controls` | `DD-05` | `fail` when keys are older than `key_rotation_days`; `warn` when keys are unused beyond `key_unused_days`, carry placeholder names, lack `created_at`, or the list is truncated; `manual` when the key list is empty; otherwise `pass`. |

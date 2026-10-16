@@ -33,7 +33,7 @@ A complete run needs read access as an organization owner, or as an App with org
 
 For SAML-protected organizations, a PAT must be authorized for SSO.
 
-Surfaces the principal cannot read never pass. Most produce Manual findings that name the missing permission. Partial reads, such as per-repository 403s or a forbidden owner-only 2FA filter, produce Partial findings instead, or Fail when the readable part already proves a failure.
+Surfaces the principal cannot read never pass. Most produce Manual findings that name the missing permission. Some partial reads, such as a 403 on one repository among several or a forbidden owner-only 2FA filter, produce Partial findings instead, or Fail when the readable part already proves a failure.
 
 ## Tools
 
@@ -88,7 +88,7 @@ Extra findings and their mapping rows:
 
 ## Verdict rules
 
-- A forbidden, missing, or errored endpoint that a finding rests on renders Manual with the HTTP status and the evidence a reviewer must collect. An endpoint that feeds only part of a finding, such as the owner-only 2FA filter, caps a Pass at Partial. A Fail proven by the readable part stays Fail.
+- A forbidden, missing, or errored endpoint that a finding rests on renders Manual with the HTTP status and the evidence a reviewer must collect. Some endpoints that feed only part of a finding, such as the owner-only 2FA filter, cap a Pass at Partial instead. A Fail proven by the readable part stays Fail.
 - Partial inventories (truncated GraphQL connections, per-repository 403s, an audit log sample capped at 200 events) render Partial. Only the visibility-only audit log control renders Pass instead, with the cap stated.
 - Empty inventories pass only where the summary says emptiness is compliant: outside collaborators, App installations, and webhooks and deploy keys with a non-empty repository inventory. Empty repository inventories render Info or Partial because the sweep covered nothing.
 - Deploy keys without `created_at` never count as fresh.
