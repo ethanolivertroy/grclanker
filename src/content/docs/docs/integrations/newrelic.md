@@ -267,7 +267,7 @@ Every finding follows the same evidence rules. `cli/tests/newrelic.test.mjs` car
 
 11. **Secondary inventories (the rule 1 corollary):** A finding that reads more than one inventory is limited below `pass` when any of them is unreadable. This holds even when its verdict was computed from a complete primary inventory and the failure is already disclosed in the errors array or `_errors.log`.
     - A denied query, a NerdGraph field returned as null beside an `errors` entry, and a denial for one account or authentication domain among several all count.
-    - The finding is `warn`, except in the cases that rule 1 names as `manual`.
+    - Outside the cases that rule 1 names as `manual`, a would-be `pass` becomes `warn` and a verdict already below `pass` keeps its status.
     - The summary names the dataset and its query path, for example "alerts.policiesSearch: unreadable (account 111: NerdGraph returned errors: Not authorized (at actor.account.alerts.policiesSearch); ...)".
     - Every count or list derived from the unreadable or partly readable inventory is rendered as `null` beside a `*_status` evidence field, never as `0` or `[]`.
     - A count from the readable scopes only appears in the summary text after the `Partial view:` clause, never as the evidence value.
