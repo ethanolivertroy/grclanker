@@ -5,7 +5,7 @@
  * credentials) collectors that evaluate the 25 controls in
  * specs/zscaler-sec-inspector.spec.md. Every endpoint and field used here is
  * documented in the ZIA and ZPA API references on help.zscaler.com; see
- * src/content/docs/docs/integrations/zscaler.md for the endpoint citations.
+ * src/content/docs/docs/integrations/zscaler.md for the citation table.
  */
 import {
   createWriteStream,
