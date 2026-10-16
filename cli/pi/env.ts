@@ -23,6 +23,7 @@ import {
   type ComputeDetectionOptions,
 } from "./compute.js";
 import { ExecutionBackendCleanupError, redactErrorMessage, redactSecrets } from "./execution-backend.js";
+import { resetSandboxRuntime } from "./sandbox.js";
 import { joinBashArgs, quoteForBash } from "./shell.js";
 import { GrclankerUserError } from "./setup.js";
 import {
@@ -272,6 +273,9 @@ async function withEnvExecution<T>(
     // delete command), not a stack trace.
     if (error instanceof ExecutionBackendCleanupError) throw new GrclankerUserError(error.message);
     throw error;
+  } finally {
+    // sandbox-runtime's network bridge keeps the process alive until the sandbox is reset.
+    await resetSandboxRuntime();
   }
 }
 
