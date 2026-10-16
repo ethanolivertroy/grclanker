@@ -95,7 +95,8 @@ The sync compiles the registry without the generated entries (`cli/tsconfig.agen
 ## Limitations
 
 - Source checkout only: The release bundles do not include the Agent SDK project or `@cursor/bdk`, and `@grclanker/cli` is not published to npm.
-- `@cursor/bdk` is pre-1.0 and pinned to an exact version (`0.2.21`) in `cli/package.json`. Expect to bump it deliberately.
+- `@cursor/bdk` is pre-1.0 and pinned to an exact version (`0.2.26`) in `cli/package.json`. Expect to bump it deliberately.
+- `zod` is a peer dependency of BDK, so the CLI lists it as a devDependency too.
 - BDK's "architecture v2" applies to agents deployed on Cursor hosting. This project only runs locally and is not deployed, so the v2 hosting changes do not affect it.
 - Turns run on the local Cursor harness, BDK's default runtime, so `bot/agent.ts` does not set `runtime`. In-process server tools only run on local turns.
 - Node 22.19 or newer, the CLI package's `engines` floor, and never Bun. `@cursor/bdk` itself accepts 22.13, but the grclanker tools it loads require 22.19.
