@@ -1484,7 +1484,35 @@ details[open] > .agent-group-toggle::before {
 .docs-prose ul,
 .docs-prose ol {
   margin: 0 0 1rem;
+}
+
+/* Tailwind preflight strips list markers. */
+.docs-prose ul {
   padding-left: 1.4rem;
+  list-style-type: disc;
+}
+
+/* 4ch fits a two-digit marker such as "10. " in the monospace font. */
+.docs-prose ol {
+  padding-left: 4ch;
+  list-style-type: decimal;
+}
+
+.docs-prose li ul {
+  list-style-type: circle;
+}
+
+.docs-prose li li ul {
+  list-style-type: square;
+}
+
+.docs-prose ol ol {
+  list-style-type: lower-alpha;
+}
+
+.docs-prose li > ul,
+.docs-prose li > ol {
+  margin-bottom: 0;
 }
 
 .docs-prose li {
