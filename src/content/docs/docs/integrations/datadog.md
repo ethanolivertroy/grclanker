@@ -280,7 +280,7 @@ Every finding follows the same rules so that a `pass` always rests on data that 
    - **19:** Users plus application keys.
    - **20:** Organization settings plus log indexes plus org connections.
 
-   When any inventory a control reads is unreadable, the finding is `manual`, except for 2 when every active human user has native MFA, and for 19. In those cases, the readable users still support a judgement (native MFA coverage in 2, naming and interactive logins in 19). The finding is `warn`, and the summary says what was not checked.
+   The finding is `manual` when any inventory a control reads is unreadable. Control 2 is an exception when every active human user has native MFA, as is control 19. In those cases, the readable users still support a judgement (native MFA coverage in 2, naming and interactive logins in 19). The finding is `warn`, and the summary says what was not checked.
 
    Control 18 stays `manual` as always but names the list it could not inventory.
 

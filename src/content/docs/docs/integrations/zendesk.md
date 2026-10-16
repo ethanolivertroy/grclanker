@@ -405,7 +405,7 @@ The script prints a skip message and exits 0 when no credentials are present. Wi
 - Controls 1, 3, 4, 5, 12, and 21 are verified from the Security Settings and Deletion Schedules endpoints. They render `manual` only when those admin-only endpoints are forbidden. The "Anybody can submit tickets" portion of control 21 stays manual because neither reference publishes it.
 - Controls 13, 15, 16, and 23 are `manual` whenever the inventory is non-empty: reviewing token ownership, app permissions, or sharing partners is a human activity. The finding carries the inventory as evidence.
 - The API token inventory endpoint is not part of the published API reference and is not called. Token creation and deletion events are reconstructed from the audit log (`filter[source_type]=apitoken`), which needs an Enterprise plan and cannot prove that zero tokens exist.
-- Audit logs and custom roles require an Enterprise plan. A 403 or 404 on them never yields a pass: the finding is `manual` with a plan or permission cause, or capped at `warn` where they are a secondary inventory listed below.
+- Audit logs and custom roles require an Enterprise plan. A 403 or 404 on them never yields a pass. The finding is `manual` with a plan or permission cause, or capped at `warn` where they are a secondary inventory listed below.
 - Help Center article visibility, Talk, Chat, and Sell settings are not inspected.
 - Non-admin credentials cap every verdict at `warn`.
 - A finding that reads several inventories never passes on a partial view.
