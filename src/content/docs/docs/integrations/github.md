@@ -33,7 +33,7 @@ A complete run needs read access as an organization owner, or as an App with org
 
 For SAML-protected organizations, a PAT must be authorized for SSO.
 
-Surfaces the principal cannot read produce Manual findings that name the missing permission. They never pass.
+Surfaces the principal cannot read never pass. Most produce Manual findings that name the missing permission. Partial reads, such as per-repository 403s or a forbidden owner-only 2FA filter, produce Partial findings instead, or Fail when the readable part already proves a failure.
 
 ## Tools
 

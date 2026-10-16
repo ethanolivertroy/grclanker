@@ -130,7 +130,7 @@ Status semantics:
 
 Every verdict follows the same evidence rules, so a `pass` is never produced from missing or partial data:
 
-- A forbidden (401/403), timed out, or errored source endpoint yields `manual`. The summary names the endpoint and error and lists what to collect.
+- A forbidden (401/403), timed out, or errored source endpoint never yields `pass`. Without an observed violation, the verdict becomes `manual` or `warn`. The summary names the endpoint and error. A `manual` summary also lists what to collect.
 - Observed violations (for example too many superusers) still `fail` even when a secondary source is unreadable.
 - An empty inventory never passes by default. Each control states how emptiness is judged:
   - Zero users, roles, spaces, certificates, or ingest pipelines is `manual`, because Elasticsearch and Kibana always return built-in entries.

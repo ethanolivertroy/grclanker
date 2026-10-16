@@ -210,7 +210,7 @@ Findings use four statuses:
 
 Every finding follows the same evidence rules. `cli/tests/newrelic.test.mjs` carries a regression test for each:
 
-1. An unreadable, forbidden, or errored NerdGraph field or REST endpoint never yields `pass`. This includes GraphQL `errors` alongside partial `data`. The finding is `manual`, and its summary names the failing surface, the error, and the evidence to collect.
+1. An unreadable, forbidden, or errored NerdGraph field or REST endpoint never yields `pass`. This includes GraphQL `errors` alongside partial `data`. When the unreadable surface is the finding's primary inventory, the finding is `manual`. Its summary names the failing surface, the error, and the evidence to collect. An unreadable secondary inventory, or an unreadable account or authentication domain among several, instead limits a would-be `pass` to `warn` (rules 5 and 11).
 
 2. An empty inventory never yields `pass` by default.
    - Each summary states whether emptiness is unknown (`manual`) or a violation (`fail`, for example zero destinations while alert policies exist).

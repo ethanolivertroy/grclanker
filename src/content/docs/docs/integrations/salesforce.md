@@ -127,7 +127,7 @@ The bundle directory is `<org name>-audit-bundle`, lowercased with other charact
 
 These verdict rules apply to every finding:
 
-- Unreadable, forbidden, or errored data yields `manual` with the cause and the Setup evidence to collect.
+- An unreadable, forbidden, or errored primary dataset yields `manual` with the cause and the Setup evidence to collect. An unread secondary dataset caps a `pass` at `warn` instead (see [Partial and unread inputs](#partial-and-unread-inputs)).
 - Empty inventories never pass unless emptiness is compliant. Emptiness is compliant only for control 13, and only when the user list itself is non-empty.
 - Partial or truncated inventories downgrade `pass` to `warn` with seen and total counts.
 - Items missing a date are reported separately and never counted as current.
