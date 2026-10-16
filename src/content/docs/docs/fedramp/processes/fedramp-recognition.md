@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the REC FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# FedRAMP Recognition of Independent Assessment Services
-
 Short name: `REC` · Process ID: `REC` · Web slug: `fedramp-recognition`
 
 Applies to: `both`

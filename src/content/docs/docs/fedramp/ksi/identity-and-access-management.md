@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the IAM FedRAMP key securi
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Identity and Access Management
-
 Domain code: `IAM` · Domain ID: `KSI-IAM` · Web slug: `identity-and-access-management`
 
 ## Indicators

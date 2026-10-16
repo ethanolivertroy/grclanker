@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the IVV FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Independent Verification and Validation
-
 Short name: `IVV` · Process ID: `IVV` · Web slug: `independent-verification-and-validation`
 
 Applies to: `both`, `20x`, `rev5`

@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the MAS FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Minimum Assessment Scope
-
 Short name: `MAS` · Process ID: `MAS` · Web slug: `minimum-assessment-scope`
 
 Applies to: `both`

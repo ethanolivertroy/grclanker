@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the CCM FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Collaborative Continuous Monitoring
-
 Short name: `CCM` · Process ID: `CCM` · Web slug: `collaborative-continuous-monitoring`
 
 Applies to: `both`

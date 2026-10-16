@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the FRC FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# FedRAMP Certification
-
 Short name: `FRC` · Process ID: `FRC` · Web slug: `fedramp-certification`
 
 Applies to: `both`, `20x`, `rev5`

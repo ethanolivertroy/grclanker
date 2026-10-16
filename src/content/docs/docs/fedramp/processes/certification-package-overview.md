@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the CPO FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Certification Package Overview
-
 Short name: `CPO` · Process ID: `CPO` · Web slug: `certification-package-overview`
 
 Applies to: `both`, `20x`, `rev5`

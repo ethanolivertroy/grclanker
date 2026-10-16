@@ -132,8 +132,6 @@ function processPage(
     "",
     sourceBanner(primary, secondary),
     "",
-    `# ${process.name}`,
-    "",
     `Short name: \`${process.shortName}\` · Process ID: \`${process.id}\` · Web slug: \`${process.webName}\``,
     "",
     `Applies to: ${process.applicability.map((value) => `\`${value}\``).join(", ")}`,
@@ -218,17 +216,15 @@ function ksiDomainPage(
     "",
     sourceBanner(primary, secondary),
     "",
-    `# ${domain.name}`,
-    "",
     `Domain code: \`${domain.code}\` · Domain ID: \`${domain.id}\` · Web slug: \`${domain.webName}\``,
-    "",
-    "## Indicators",
     "",
   ];
 
   if (domain.theme) {
-    lines.splice(8, 0, "## Theme", "", paragraphs(domain.theme), "");
+    lines.push("## Theme", "", paragraphs(domain.theme), "");
   }
+
+  lines.push("## Indicators", "");
 
   for (const indicator of indicators) {
     const former = indicator.fka ? ` (formerly \`${indicator.fka}\`)` : "";
@@ -296,8 +292,6 @@ export function buildFedrampDocsSnapshot(
     "",
     sourceBanner(primary, secondary),
     "",
-    "# FedRAMP Official Sources",
-    "",
     "This section is generated from the official FedRAMP GitHub organization. grclanker uses these machine-readable materials for both CLI lookups and reviewed docs snapshots so the public site stays fast without drifting away from upstream.",
     "",
     "## Current Grounding",
@@ -325,8 +319,6 @@ export function buildFedrampDocsSnapshot(
     "",
     sourceBanner(primary, secondary),
     "",
-    "# FedRAMP Processes",
-    "",
     processRows,
     "",
   ].join("\n");
@@ -338,8 +330,6 @@ export function buildFedrampDocsSnapshot(
     ),
     "",
     sourceBanner(primary, secondary),
-    "",
-    "# FedRAMP KSI Domains",
     "",
     ksiRows,
     "",

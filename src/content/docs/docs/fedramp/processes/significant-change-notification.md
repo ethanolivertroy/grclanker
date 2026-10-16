@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the SCN FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Significant Change Notification
-
 Short name: `SCN` · Process ID: `SCN` · Web slug: `significant-change-notification`
 
 Applies to: `both`

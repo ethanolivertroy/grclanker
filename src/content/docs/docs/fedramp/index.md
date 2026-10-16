@@ -11,8 +11,6 @@ description: "Official GitHub-grounded FedRAMP 20x and Rev5 reference material g
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# FedRAMP Official Sources
-
 This section is generated from the official FedRAMP GitHub organization. grclanker uses these machine-readable materials for both CLI lookups and reviewed docs snapshots so the public site stays fast without drifting away from upstream.
 
 ## Current Grounding

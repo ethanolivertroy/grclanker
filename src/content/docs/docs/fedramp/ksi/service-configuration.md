@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the SVC FedRAMP key securi
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Service Configuration
-
 Domain code: `SVC` · Domain ID: `KSI-SVC` · Web slug: `service-configuration`
 
 ## Indicators

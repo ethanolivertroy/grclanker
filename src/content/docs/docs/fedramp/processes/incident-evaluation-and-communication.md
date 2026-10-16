@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the IEC FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Incident Evaluation and Communication
-
 Short name: `IEC` · Process ID: `IEC` · Web slug: `incident-evaluation-and-communication`
 
 Applies to: `both`

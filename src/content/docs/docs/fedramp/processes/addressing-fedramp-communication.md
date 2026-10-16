@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the AFC FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Addressing FedRAMP Communication
-
 Short name: `AFC` · Process ID: `AFC` · Web slug: `addressing-fedramp-communication`
 
 Applies to: `both`

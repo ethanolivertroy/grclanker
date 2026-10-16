@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the MLA FedRAMP key securi
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Monitoring, Logging, and Auditing
-
 Domain code: `MLA` · Domain ID: `KSI-MLA` · Web slug: `monitoring-logging-and-auditing`
 
 ## Indicators

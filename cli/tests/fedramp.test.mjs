@@ -510,6 +510,30 @@ test("buildFedrampDocsSnapshot puts banner lines, status, and each note in separ
   assert.match(page, /\nNote: Agencies rely on this information\.\n\nKeep both formats in sync\.\n/);
 });
 
+test("buildFedrampDocsSnapshot leaves the H1 to the docs page title", () => {
+  const fixture = structuredClone(consolidatedRulesFixture);
+  fixture.KSI.CNA.theme = "Cloud services are built to keep their intended state.";
+
+  const files = buildFedrampDocsSnapshot(
+    normalizeFedrampConsolidatedRules(fixture),
+    docsSnapshotSources,
+  );
+  const processPage =
+    files.find((file) => file.path === "fedramp/processes/certification-data-sharing.md")
+      ?.content ?? "";
+  const ksiPage =
+    files.find((file) => file.path === "fedramp/ksi/cloud-native-architecture.md")?.content ?? "";
+
+  for (const file of files) {
+    assert.doesNotMatch(file.content, /^# /m, file.path);
+  }
+  assert.match(processPage, /repository\.\n\nShort name: /);
+  assert.match(
+    ksiPage,
+    /repository\.\n\nDomain code: [^\n]+\n\n## Theme\n\nCloud services are built to keep their intended state\.\n\n## Indicators\n/,
+  );
+});
+
 test("readiness helper prioritizes official MUST items and infers provider-facing artifacts", () => {
   const catalog = normalizeFedrampConsolidatedRules(consolidatedRulesFixture);
   const loaded = {

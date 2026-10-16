@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the CDS FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Certification Data Sharing
-
 Short name: `CDS` · Process ID: `CDS` · Web slug: `certification-data-sharing`
 
 Applies to: `both`, `rev5`

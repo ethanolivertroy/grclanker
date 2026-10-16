@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the INR FedRAMP key securi
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Incident Response
-
 Domain code: `INR` · Domain ID: `KSI-INR` · Web slug: `incident-response`
 
 ## Indicators

@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the SCG FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Secure Configuration Guide
-
 Short name: `SCG` · Process ID: `SCG` · Web slug: `secure-configuration-guide`
 
 Applies to: `both`

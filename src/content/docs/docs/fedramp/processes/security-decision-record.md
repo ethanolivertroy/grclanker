@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the SDR FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Security Decision Record
-
 Short name: `SDR` · Process ID: `SDR` · Web slug: `security-decision-record`
 
 Applies to: `both`, `20x`, `rev5`

@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the RPL FedRAMP key securi
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Recovery Planning
-
 Domain code: `RPL` · Domain ID: `KSI-RPL` · Web slug: `recovery-planning`
 
 ## Indicators

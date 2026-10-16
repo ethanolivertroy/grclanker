@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the MKT FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Marketplace Listing
-
 Short name: `MKT` · Process ID: `MKT` · Web slug: `marketplace-listing`
 
 Applies to: `both`

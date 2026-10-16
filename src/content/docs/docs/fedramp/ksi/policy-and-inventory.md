@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the PIY FedRAMP key securi
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Policy and Inventory
-
 Domain code: `PIY` · Domain ID: `KSI-PIY` · Web slug: `policy-and-inventory`
 
 ## Indicators

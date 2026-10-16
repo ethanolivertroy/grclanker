@@ -11,8 +11,6 @@ description: "Browse official Consolidated Rules key security indicator domains 
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# FedRAMP KSI Domains
-
 - [Cybersecurity Education](/docs/fedramp/ksi/cybersecurity-education/) · `CED` · 1 indicator
 - [Change Management](/docs/fedramp/ksi/change-management/) · `CMT` · 4 indicators
 - [Cloud Native Architecture](/docs/fedramp/ksi/cloud-native-architecture/) · `CNA` · 8 indicators

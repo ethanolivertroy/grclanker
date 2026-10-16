@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the CMT FedRAMP key securi
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Change Management
-
 Domain code: `CMT` · Domain ID: `KSI-CMT` · Web slug: `change-management`
 
 ## Indicators

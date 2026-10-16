@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the CNA FedRAMP key securi
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Cloud Native Architecture
-
 Domain code: `CNA` · Domain ID: `KSI-CNA` · Web slug: `cloud-native-architecture`
 
 ## Indicators

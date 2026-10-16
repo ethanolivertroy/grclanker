@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the CMU FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Cryptographic Module Use
-
 Short name: `CMU` · Process ID: `CMU` · Web slug: `cryptographic-module-use`
 
 Applies to: `both`

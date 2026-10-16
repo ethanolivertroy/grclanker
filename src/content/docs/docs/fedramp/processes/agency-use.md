@@ -11,8 +11,6 @@ description: "Official Consolidated Rules summary for the AGU FedRAMP process, i
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# Agency Use of FedRAMP Certified Cloud Services
-
 Short name: `AGU` · Process ID: `AGU` · Web slug: `agency-use`
 
 Applies to: `both`

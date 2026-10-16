@@ -11,8 +11,6 @@ description: "Browse official Consolidated Rules process documents such as CDS, 
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
-# FedRAMP Processes
-
 - [Addressing FedRAMP Communication](/docs/fedramp/processes/addressing-fedramp-communication/) · `AFC` · applies to `both` · requirements: `both 16`, `20x 0`, `rev5 0`
 - [Agency Use of FedRAMP Certified Cloud Services](/docs/fedramp/processes/agency-use/) · `AGU` · applies to `both` · requirements: `both 20`, `20x 0`, `rev5 0`
 - [Collaborative Continuous Monitoring](/docs/fedramp/processes/collaborative-continuous-monitoring/) · `CCM` · applies to `both` · requirements: `both 19`, `20x 0`, `rev5 0`
