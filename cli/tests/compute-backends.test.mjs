@@ -2432,6 +2432,72 @@ test("search caps through the contract adapters are reported instead of silently
   }, { runner });
 });
 
+test("grep keeps rg's matches when the only errors are entries it could not read", async () => {
+  const rgMatch = (path, line) => JSON.stringify({ type: "match", data: { path: { text: path }, line_number: line } });
+  const rgSummary = JSON.stringify({ type: "summary", data: { stats: { searches: 3 } } });
+  const denied = (path) => `rg: ${path}: Permission denied (os error 13)`;
+  let kind = "dir";
+  let rg;
+  const { runner } = createFakeRunner(async (_executable, args) => {
+    const script = String(args.at(-1));
+    if (args[0] === "info") return { exitCode: 0, stdout: "ok" };
+    if (script.includes("printf yes")) return { exitCode: 0, stdout: "yes" };
+    if (script.includes("printf dir")) return { exitCode: 0, stdout: kind };
+    if (script.includes("rg '--json'")) return rg;
+    return { exitCode: 0, stdout: "" };
+  });
+
+  await withComputeBackendExecution("/repo", { computeBackend: "docker" }, async (execution) => {
+    const search = (searchPath = "/repo") =>
+      execution.grepOperations.searchMatches({ pattern: "needle", searchPath, limit: 10 });
+    const assertFails = async (label, searchPath) => {
+      const firstError = rg.stderr.split("\n")[0];
+      await assert.rejects(
+        () => search(searchPath),
+        (error) => error instanceof ExecutionBackendError && error.message.includes(firstError),
+        label,
+      );
+    };
+
+    rg = {
+      exitCode: 2,
+      stdout: `${rgMatch("./a.md", 1)}\n${rgMatch("./src/b.ts", 4)}\n${rgSummary}\n`,
+      stderr: [
+        denied("./.bashrc"),
+        denied("./.claude/commands"),
+        denied("./.vscode"),
+        "rg: ./private: Operation not permitted (os error 1)",
+      ].join("\n"),
+    };
+    const found = await search();
+    assert.deepEqual(
+      found.matches.map(({ filePath, lineNumber }) => `${filePath}:${lineNumber}`),
+      ["/repo/a.md:1", "/repo/src/b.ts:4"],
+    );
+
+    const failures = {
+      "a bad pattern": { exitCode: 2, stdout: "", stderr: "rg: regex parse error:\n    (?:needle()\n    ^\nerror: unclosed group" },
+      "a run cut off before its summary": { exitCode: 2, stdout: `${rgMatch("./a.md", 1)}\n`, stderr: denied("./.bashrc") },
+      "an ignore file rg could not parse": {
+        exitCode: 2,
+        stdout: `${rgSummary}\n`,
+        stderr: `rg: ./.gitignore: line 1: error parsing glob 'a{b': unclosed alternate group; missing '}'\n${denied("./.bashrc")}`,
+      },
+      "an unreadable search root": { exitCode: 2, stdout: `${rgSummary}\n`, stderr: denied(".") },
+      "a run stopped by a signal after its summary": { exitCode: 143, stdout: `${rgSummary}\n`, stderr: denied("./.bashrc") },
+      "a missing rg": { exitCode: 127, stdout: "", stderr: "bash: line 1: rg: command not found" },
+    };
+    for (const [label, result] of Object.entries(failures)) {
+      rg = result;
+      await assertFails(label);
+    }
+
+    kind = "file";
+    rg = { exitCode: 2, stdout: `${rgSummary}\n`, stderr: denied("secret.txt") };
+    await assertFails("an unreadable file passed as the search path", "/repo/secret.txt");
+  }, { runner });
+});
+
 test("parallels mount wait reports the deadline exit as a typed timeout and destroys the clone", async () => {
   const { runner, calls } = createFakeRunner(async (_executable, args) => {
     if (args[0] === "exec") return { exitCode: 0, stdout: "missing" };
