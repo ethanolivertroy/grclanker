@@ -2465,7 +2465,6 @@ test("grep keeps rg's matches when the only errors are entries it could not read
       stderr: [
         denied("./.bashrc"),
         denied("./.claude/commands"),
-        denied("./.vscode"),
         "rg: ./private: Operation not permitted (os error 1)",
       ].join("\n"),
     };
@@ -2498,11 +2497,11 @@ test("grep keeps rg's matches when the only errors are entries it could not read
   }, { runner });
 });
 
-test("find drops entries that are not regular files once stat'd, the way sandbox-runtime's placeholders appear", async () => {
+test("find excludes sandbox placeholders without expanding glob characters in paths", async () => {
   const repo = mkdtempSync(join(tmpdir(), "grclanker-find-filter-"));
   try {
     for (const file of ["notes.md", "src/[id].ts", "src/i.ts", "docs/read me.md"]) plant(repo, file, "x\n");
-    // sandbox-runtime mounts /dev/null over each absent protected file; a symlink to it stats the same.
+    // A /dev/null symlink has the same stat result as a protected mount.
     symlinkSync("/dev/null", join(repo, ".bashrc"));
     const listing = ["./notes.md", "./.bashrc", "./src/[id].ts", "./src/i.ts", "./docs/read me.md"];
     let rgStatus = 0;

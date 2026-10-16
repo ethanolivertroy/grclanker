@@ -161,9 +161,8 @@ function isIgnoredPath(relativePath: string, ignorePatterns: string[]): boolean 
   );
 }
 
-// rg and find type each entry by its directory entry, which is the host file beneath a mount, so
-// the /dev/null mounts sandbox-runtime places over absent protected files (.bashrc, .gitconfig,
-// ...) are listed as regular files. `test -f` stats through the mount and drops them.
+// sandbox-runtime's protected-path mounts still appear in rg/find's directory listing.
+// `test -f` stats through each mount and drops entries backed by /dev/null.
 function buildBackendFindCommand(pattern: string): string {
   return [
     "if command -v rg >/dev/null 2>&1; then",
@@ -210,10 +209,8 @@ function buildRipgrepJsonCommand({
   ].join("\n");
 }
 
-// rg exits 2 after searching everything it could read when some entries were unreadable: files
-// without read permission, or the /dev/null mounts sandbox-runtime places over absent protected
-// files such as .bashrc. It names entries below a searched directory "./<path>", so an unreadable
-// search target, a bad pattern, or a run cut off before its summary still fails.
+// A directory search may return matches and a summary with exit 2 for unreadable descendants.
+// Their diagnostics use "./<path>", unlike an unreadable search root or single-file target.
 const RIPGREP_UNREADABLE_ENTRY = /^rg: \.\/.+: .+ \(os error \d+\)$/;
 
 function ripgrepSkippedOnlyUnreadableEntries({ exitCode, stdout, stderr }: ExecutionResult): boolean {

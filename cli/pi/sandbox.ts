@@ -214,9 +214,7 @@ export async function wrapCommandWithSandbox(command: string, cwd: string): Prom
   if (!config.enabled) return { command, release: () => undefined };
   return {
     command: await SandboxManager.wrapWithSandbox(command),
-    // bwrap leaves an empty file on the host for each absent path the sandbox protects (.bashrc,
-    // .gitconfig, .vscode, ...), where the host-local read, write, and ls tools would trip over it.
-    // sandbox-runtime removes them once no other wrapped command is still running.
+    // Protected-path mounts leave host placeholders until the last wrapped command releases them.
     release: () => SandboxManager.cleanupAfterCommand(),
   };
 }
