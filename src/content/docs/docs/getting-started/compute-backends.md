@@ -48,7 +48,7 @@ Every shipped backend except `host` stages a session lazily on the first command
 
 Cleanup paths:
 
-- `grclanker env smoke-test` and `grclanker env exec` await that teardown in a `finally` block, on success and on failure, so a RunPod pod session directory or a Parallels clone is removed before the command returns.
+- `grclanker env smoke-test` and `grclanker env exec` await that teardown in a `finally` block, on success and on failure. The teardown tries to remove the RunPod pod session directory or Parallels clone before the command returns. If the RunPod removal fails, the command reports the remnant (see [Confirmed removal](#confirmed-removal)).
 - The interactive agent session tears every active backend session down on `session_shutdown` through `shutdownComputeSessions`, regardless of which backend `settings.json` prefers.
   - A run started with a per-run `--compute runpod-pod` override is therefore cleaned up even when the saved preference is `host`.
   - The sandbox-runtime reset still runs only when that backend is preferred.
