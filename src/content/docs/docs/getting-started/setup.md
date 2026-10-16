@@ -9,7 +9,7 @@ Run the setup wizard any time you want to configure or reconfigure the companion
 grclanker setup
 ```
 
-On first launch, grclanker runs setup automatically if no model configuration exists yet. That needs an interactive terminal; without one, grclanker exits and asks you to run `grclanker setup` first.
+On first launch, grclanker runs setup automatically if no model configuration exists yet. Automatic setup needs an interactive terminal. Without one, grclanker exits and asks you to run `grclanker setup` first.
 
 Setup covers three separate decisions:
 
@@ -17,7 +17,11 @@ Setup covers three separate decisions:
 - compute backend selection
 - skill visibility
 
-That split is intentional. The model decides who answers. The compute backend decides where `bash`, file tools, and search tools execute. Skill visibility decides whether grclanker stays limited to its bundled GRC skills or also discovers project/local Pi skill directories.
+That split is intentional:
+
+- The model decides who answers.
+- The compute backend decides where `bash`, file tools, and search tools execute.
+- Skill visibility decides whether grclanker stays limited to its bundled GRC skills or also discovers project/local Pi skill directories.
 
 ## Recommended path: local-first
 
@@ -54,7 +58,9 @@ For the local-first path, grclanker writes:
   - `defaultModel: "gemma4"`
 - `~/.grclanker/agent/models.json` with an Ollama-compatible `openai-completions` provider entry.
 
-Local-first is fail-closed during setup. If the endpoint is unreachable, setup stops and prints the `ollama serve` and `ollama pull` steps instead of silently falling back to a hosted model. If the endpoint answers but the model you picked is not installed there, setup offers one of the installed local models instead (Gemma tags first) or asks you to pull the model or enter another one. It never switches to a hosted provider.
+Local-first is fail-closed during setup. If the endpoint is unreachable, setup stops and prints the `ollama serve` and `ollama pull` steps instead of silently falling back to a hosted model.
+
+If the endpoint answers but the model you picked is not installed there, setup offers one of the installed local models instead (Gemma tags first) or asks you to pull the model or enter another one. It never switches to a hosted provider.
 
 ## Hosted path
 
@@ -70,7 +76,12 @@ Choose `Hosted` and pick one of the current hosted providers:
 - `anthropic` (default model `claude-sonnet-4-20250514`)
 - `google` (default model `gemini-2.5-pro`)
 
-The wizard saves the provider and default model explicitly so the session is not ambiguous. grclanker then uses the credentials the embedded Pi runtime already knows how to read: the provider's environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`), or a key stored with `/login` inside a grclanker session, which lands in `~/.grclanker/agent/auth.json`.
+The wizard saves the provider and default model explicitly so the session is not ambiguous.
+
+grclanker then uses the credentials the embedded Pi runtime already knows how to read, from either of these:
+
+- The provider's environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`).
+- A key stored with `/login` inside a grclanker session, which lands in `~/.grclanker/agent/auth.json`.
 
 ## Compute backend selection
 
@@ -85,7 +96,9 @@ After the model step, the wizard asks whether to configure advanced compute back
 - `runpod-serverless`
 - `cloudflare-sandbox` and `vercel-sandbox` (listed, but not yet available)
 
-Each entry shows whether the backend is detected on this machine. Picking one that is not detected asks before saving it anyway. That part is separate from local-first versus hosted. You can pair either model path with any supported compute backend.
+Each entry shows whether the backend is detected on this machine. Picking one that is not detected asks before saving it anyway.
+
+Compute backend selection is separate from local-first versus hosted. You can pair either model path with any supported compute backend.
 
 To save a backend without the interactive wizard, pass it directly:
 
@@ -112,7 +125,7 @@ grclanker env smoke-test
 
 If you need the backend-specific details, use the dedicated [Compute Backends](/docs/getting-started/compute-backends/) guide.
 
-The older `v0.0.1` release bundle predates the Modal and RunPod backends and `setup --compute`; its wizard offers only `host`, `sandbox-runtime`, `docker`, and `parallels-vm`. Rerun the installer to get `v0.1.1` and the full list.
+The older `v0.0.1` release bundle predates the Modal and RunPod backends and `setup --compute`. Its wizard offers only `host`, `sandbox-runtime`, `docker`, and `parallels-vm`. Rerun the installer to get `v0.1.1` and the full list.
 
 ## Skill visibility
 

@@ -15,7 +15,7 @@ Inside a grclanker session, put the subject after the command:
 
 From the shell, `grclanker investigate "<subject>"` opens a session that starts with the same prompt and the subject filled in. Run `grclanker investigate` on its own to name the subject in your first message instead.
 
-In the older `v0.0.1` release bundle, text after `/investigate` and arguments after `grclanker investigate` are dropped, so upgrade to `v0.1.1` or send the subject in its own message there.
+In the older `v0.0.1` release bundle, text after `/investigate` and arguments after `grclanker investigate` are dropped. Upgrade to `v0.1.1`, or send the subject in its own message there.
 
 ## What the prompt asks for
 
@@ -32,4 +32,4 @@ The prompt asks for:
 - critical gaps: expired certificates, overdue KEV remediations, high-EPSS CVEs
 - action items ordered by risk, with effort estimates
 
-Along the way it should report certificate numbers, validation status, FIPS standard, security level, sunset dates, CVE IDs, EPSS probabilities, ransomware association, and remediation due dates, and say plainly when a tool returned nothing.
+Along the way it should report certificate numbers, validation status, FIPS standard, security level, sunset dates, CVE IDs, EPSS probabilities, ransomware association, and remediation due dates. It should also say plainly when a tool returned nothing.
