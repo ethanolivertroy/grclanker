@@ -7,7 +7,7 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 export const defaultToolsDir = resolve(scriptDir, "../agent-sdk/bot/tools");
 
 /**
- * Source of one `agent/tools/<name>.ts` entry. The Cursor Agent SDK derives the
+ * Source of one `bot/tools/<name>.ts` entry. The Cursor Agent SDK derives the
  * tool name from the filename, so each file only binds that name to the shared
  * grclanker adapter.
  */
