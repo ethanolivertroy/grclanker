@@ -21,38 +21,27 @@ gws auth setup                            # one-time Google Cloud project and OA
 gws auth login                            # subsequent logins and scope selection
 ```
 
-The bridge inherits the CLI's credential precedence and adds only two grclanker knobs:
+The bridge inherits the CLI's credential precedence and adds only two knobs:
 
-- `gws_bin` argument, then `GRCLANKER_GWS_BIN`, then `PATH`: Which `gws` binary to run.
-- `config_dir` argument: Exported to the child as `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` for that command only.
-
-Inherited settings:
-
-- `GOOGLE_WORKSPACE_CLI_TOKEN`: Pre-obtained access token, highest priority in the CLI ([README, Environment Variables](https://github.com/googleworkspace/cli#readme)).
-- `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE`: OAuth or service-account credentials JSON, second priority.
-- Stored `gws auth login` credentials: Third priority, encrypted at rest by the CLI.
+| Setting | Source | Effect |
+| --- | --- | --- |
+| `gws_bin` argument, then `GRCLANKER_GWS_BIN`, then `PATH` | grclanker | Which `gws` binary to run |
+| `config_dir` argument | grclanker | Exported to the child as `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` for that command only |
+| `GOOGLE_WORKSPACE_CLI_TOKEN` | inherited | Pre-obtained access token, highest priority in the CLI ([README, Environment Variables](https://github.com/googleworkspace/cli#readme)) |
+| `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` | inherited | OAuth or service-account credentials JSON, second priority |
+| stored `gws auth login` credentials | inherited | Third priority, encrypted at rest by the CLI |
 
 Every other `GOOGLE_WORKSPACE_CLI_*` variable in grclanker's environment is passed through unchanged. `cli/tests/gws-ops.test.mjs` asserts this precedence.
 
 ## Workflows
 
-All five workflows are read-only.
-
-- `gws_ops_check_cli`
-  - Command: `gws --version`, then `gws admin-reports activities list --params '{"userKey":"all","applicationName":"admin","maxResults":1,"startTime":"<7 days ago>"}'`
-  - Output: Executable path, version, probe status
-- `gws_ops_investigate_alerts`
-  - Command: `gws alertcenter:v1beta1 alerts list --params '{"pageSize":<max_results>,"filter":"<filter>"}'`
-  - Output: Alert records (`alertId`, `type`, `source`, `createTime`, `metadata.status`, `metadata.severity`, `metadata.assignee`)
-- `gws_ops_trace_admin_activity`
-  - Command: `gws admin-reports activities list --params '{"userKey":"all","applicationName":"admin","maxResults":<n>,"startTime":"<lookback>"}'`
-  - Output: Activity records (`id.time`, `id.uniqueQualifier`, `actor.email`, `events[].name`, `ipAddress`)
-- `gws_ops_review_tokens`
-  - Command: Same as above with `"applicationName":"token"`
-  - Output: Token and OAuth activity records with `actor.applicationInfo.applicationName`
-- `gws_ops_collect_evidence_bundle`
-  - Command: Attempts the three commands above. An unsupported Alert Center command is recorded as unavailable.
-  - Output: `raw/`, `analysis/`, `commands.json`, `summary.md`, `README.md`, and a zip
+| Tool | Underlying command | Read-only? | Output |
+| --- | --- | --- | --- |
+| `gws_ops_check_cli` | `gws --version`, then `gws admin-reports activities list --params '{"userKey":"all","applicationName":"admin","maxResults":1,"startTime":"<7 days ago>"}'` | yes | Executable path, version, probe status |
+| `gws_ops_investigate_alerts` | `gws alertcenter:v1beta1 alerts list --params '{"pageSize":<max_results>,"filter":"<filter>"}'` | yes | Alert records (`alertId`, `type`, `source`, `createTime`, `metadata.status`, `metadata.severity`, `metadata.assignee`) |
+| `gws_ops_trace_admin_activity` | `gws admin-reports activities list --params '{"userKey":"all","applicationName":"admin","maxResults":<n>,"startTime":"<lookback>"}'` | yes | Activity records (`id.time`, `id.uniqueQualifier`, `actor.email`, `events[].name`, `ipAddress`) |
+| `gws_ops_review_tokens` | Same as above with `"applicationName":"token"` | yes | Token and OAuth activity records with `actor.applicationInfo.applicationName` |
+| `gws_ops_collect_evidence_bundle` | Attempts the three commands above; an unsupported Alert Center command is recorded as unavailable | yes | `raw/`, `analysis/`, `commands.json`, `summary.md`, `README.md`, and a zip |
 
 ### Dry runs and call status
 
@@ -170,19 +159,9 @@ When `gws` is not installed or not authenticated, the script prints a skip messa
 
 ## Command reference
 
-- `gws --version`
-  - Documentation: [README, Quick Start](https://github.com/googleworkspace/cli#readme) and `crates/google-workspace-cli/src/main.rs`
-  - Flags used: None
-  - Fields read: Two plain-text lines, `gws <version>` and then the fixed disclaimer added in 0.3.5
-- `gws admin-reports activities list --params <json>`
-  - Documentation: [README command shape](https://github.com/googleworkspace/cli#readme), with parameters from [activities.list](https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list)
-  - Flags used: `--params` with `userKey`, `applicationName`, `maxResults` (documented maximum 1000; the bridge caps at 250), and `startTime`
-  - Fields read: `items[].id.time`, `id.uniqueQualifier`, `actor.email`, `actor.callerType`, `actor.applicationInfo.applicationName`, `events[].name`, `ipAddress`, `nextPageToken`
-- `gws alertcenter:v1beta1 alerts list --params <json>`
-  - Documentation: The `<api>:<version>` form, with parameters from [alerts.list](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list). `parse_service_and_version` splits off the version suffix, but `resolve_service` still rejects any API absent from the `SERVICES` table. As a result, this command fails with exit 3 on a build without an `alertcenter` alias (see the Alert Center caveat above).
-  - Flags used: `--params` with `pageSize` and optional `filter`
-  - Fields read: `alerts[].alertId`, `type`, `source`, `createTime`, `updateTime`, `metadata.status`, `metadata.severity`, `metadata.assignee`, `nextPageToken`
-- `--page-all` (operator-run, parsed when present)
-  - Documentation: [README, Pagination](https://github.com/googleworkspace/cli#readme)
-  - Flags used: One JSON object per page (NDJSON)
-  - Fields read: Aggregated `items[]` or `alerts[]`, last page `nextPageToken`
+| Command | Documentation | Flags used | Fields read |
+| --- | --- | --- | --- |
+| `gws --version` | [README, Quick Start](https://github.com/googleworkspace/cli#readme); `crates/google-workspace-cli/src/main.rs` | none | two plain-text lines: `gws <version>`, then the fixed disclaimer added in 0.3.5 |
+| `gws admin-reports activities list --params <json>` | [README command shape](https://github.com/googleworkspace/cli#readme); parameters from [activities.list](https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list) | `--params` with `userKey`, `applicationName`, `maxResults` (documented maximum 1000; the bridge caps at 250), `startTime` | `items[].id.time`, `id.uniqueQualifier`, `actor.email`, `actor.callerType`, `actor.applicationInfo.applicationName`, `events[].name`, `ipAddress`, `nextPageToken` |
+| `gws alertcenter:v1beta1 alerts list --params <json>` | `<api>:<version>` form: `parse_service_and_version` splits off the version suffix, but `resolve_service` still rejects any API absent from the `SERVICES` table, so this command fails with exit 3 on a build without an `alertcenter` alias (see the Alert Center caveat above); parameters from [alerts.list](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list) | `--params` with `pageSize`, optional `filter` | `alerts[].alertId`, `type`, `source`, `createTime`, `updateTime`, `metadata.status`, `metadata.severity`, `metadata.assignee`, `nextPageToken` |
+| `--page-all` (operator-run, parsed when present) | [README, Pagination](https://github.com/googleworkspace/cli#readme) | one JSON object per page (NDJSON) | aggregated `items[]` or `alerts[]`, last page `nextPageToken` |

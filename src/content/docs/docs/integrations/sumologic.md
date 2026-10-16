@@ -73,31 +73,33 @@ The client also:
 
 ### Deployments
 
-Deployment codes and their API base URLs:
-
-- `us1`: `https://api.sumologic.com/api`
-- `us2`: `https://api.us2.sumologic.com/api`
-- `au`: `https://api.au.sumologic.com/api`
-- `ca`: `https://api.ca.sumologic.com/api`
-- `ch`: `https://api.ch.sumologic.com/api`
-- `de`: `https://api.de.sumologic.com/api`
-- `esc`: `https://api.esc.sumologic.com/api`
-- `eu`: `https://api.eu.sumologic.com/api`
-- `fed`: `https://api.fed.sumologic.com/api`
-- `in`: `https://api.in.sumologic.com/api`
-- `jp`: `https://api.jp.sumologic.com/api`
-- `kr`: `https://api.kr.sumologic.com/api`
+| Code | API base URL |
+|---|---|
+| `us1` | `https://api.sumologic.com/api` |
+| `us2` | `https://api.us2.sumologic.com/api` |
+| `au` | `https://api.au.sumologic.com/api` |
+| `ca` | `https://api.ca.sumologic.com/api` |
+| `ch` | `https://api.ch.sumologic.com/api` |
+| `de` | `https://api.de.sumologic.com/api` |
+| `esc` | `https://api.esc.sumologic.com/api` |
+| `eu` | `https://api.eu.sumologic.com/api` |
+| `fed` | `https://api.fed.sumologic.com/api` |
+| `in` | `https://api.in.sumologic.com/api` |
+| `jp` | `https://api.jp.sumologic.com/api` |
+| `kr` | `https://api.kr.sumologic.com/api` |
 
 A full URL such as `https://api.eu.sumologic.com` is normalized to end in `/api`.
 
 ## Tools
 
-- `sumologic_check_access`: Probe 18 read surfaces (including `/v1/serviceAllowlist/addresses`) and report unreadable ones with the likely missing role capability.
-- `sumologic_assess_identity`: Controls 1 to 5 (SAML SSO, SAML allowlist, password strength, password expiration, MFA).
-- `sumologic_assess_access_control`: Controls 6, 7, 8, 13, 14 (RBAC, key rotation, inactive keys, service allowlist, session timeout).
-- `sumologic_assess_data_governance`: Controls 9, 10, 12, 16, 17 (audit index, data forwarding, collectors, ingest budgets, retention).
-- `sumologic_assess_content_sharing`: Controls 11, 15, 18, 19, 20 (content sharing, scheduled search permissions, lookup tables, dashboard sharing, alert routing).
-- `sumologic_export_audit_bundle`: Run everything into `<deployment or API host>-sumologic-audit-bundle` under `output_dir` (default `./export/sumologic`). Write `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` (on partial collection), and a zip.
+| Tool | Purpose |
+|---|---|
+| `sumologic_check_access` | Probe 18 read surfaces (including `/v1/serviceAllowlist/addresses`) and report unreadable ones with the likely missing role capability. |
+| `sumologic_assess_identity` | Controls 1 to 5: SAML SSO, SAML allowlist, password strength, password expiration, MFA. |
+| `sumologic_assess_access_control` | Controls 6, 7, 8, 13, 14: RBAC, key rotation, inactive keys, service allowlist, session timeout. |
+| `sumologic_assess_data_governance` | Controls 9, 10, 12, 16, 17: audit index, data forwarding, collectors, ingest budgets, retention. |
+| `sumologic_assess_content_sharing` | Controls 11, 15, 18, 19, 20: content sharing, scheduled search permissions, lookup tables, dashboard sharing, alert routing. |
+| `sumologic_export_audit_bundle` | Run everything into `<deployment or API host>-sumologic-audit-bundle` under `output_dir` (default `./export/sumologic`) and write `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` (on partial collection), and a zip. |
 
 Every run allocates a fresh output directory and a zip with the same base name, so re-running never overwrites a prior bundle.
 
@@ -286,7 +288,7 @@ Unreadable endpoints, empty inventories, capability-limited views, and unfollowe
 - A finding that reads several inventories never passes while one of them is unreadable.
   - The summary appends `Not checked: the <inventory> could not be read because <cause>; collect manually: ...`.
   - `evidence.unreadable_inventories` names the inventory.
-  - The pass drops to `warn` when the control can still be judged from the readable inventories, or to `manual` when the unreadable inventory is essential (the control entries below say which).
+  - The pass drops to `warn` when the control can still be judged from the readable inventories, or to `manual` when the unreadable inventory is essential (the rows below say which).
   - Existing `warn`, `fail`, and `manual` verdicts keep their status and gain the note.
 - A list whose pagination stopped early (`complete: false`) drops a pass judged on it to `warn`.
   - The summary states how many items were seen and that the population is incomplete.
@@ -307,94 +309,28 @@ Unreadable endpoints, empty inventories, capability-limited views, and unfollowe
 
 ## Control coverage
 
-Each entry names the spec control, then the tool and finding that cover it, then the status semantics.
-
-- **1 SAML SSO Enforcement** (identity, SUMO-01): `fail` on zero IdPs. `warn` on debug mode or missing certificate. Otherwise `manual`, because the API does not expose the SAML lockdown (require SAML sign-in) state.
-- **2 SAML Allowlisted Users Minimized** (identity, SUMO-02)
-  - `manual` when the allowlist is unreadable, or when the IdP list was read and is empty (not applicable).
-  - `fail` above `max_allowlisted_users`.
-  - `warn` on inactive allowlisted users.
-  - `pass` at or below the threshold (zero is compliant) only while the SAML identity provider list was readable. With that list unreadable, the pass drops to `warn` and the summary names it under `Not checked:`.
-- **3 Password Policy Strength** (identity, SUMO-03): `fail` below `min_password_length` or without lockout. `warn` when complexity or weak-password rejection is incomplete.
-- **4 Password Expiration Policy** (identity, SUMO-04): `fail` when disabled or above `max_password_age_days`.
-- **5 MFA Enforcement** (identity, SUMO-05)
-  - `manual` when the password policy or the user list is unreadable (the summary says which and reports per-user coverage as unknown) or zero users were returned.
-  - `fail` when `requireMfa` is false or absent.
-  - `warn` when active users report `isMfaEnabled=false` or the user list stopped before its last page (seen count stated).
-  - `pass` only on a complete user list.
-  - Evidence lists locked users, dormant users, and users without a `lastLoginTimestamp` (never counted as active).
-- **6 Role-Based Access Control** (access control, SUMO-06)
-  - `manual` when the role list is unreadable or empty.
-  - `fail` when admin-capability role members exceed `max_admins`.
-  - `warn` on custom roles with admin capabilities.
-  - `warn` on custom roles without a `filterPredicate`.
-  - `warn` on admin members dormant beyond `user_inactive_days` or without a `lastLoginTimestamp`.
-  - `warn` on an unreadable user list, or a user list that stopped before its last page.
-  - `pass` only on a complete role list. A page-capped role list drops it to `warn` with the seen count.
-- **7 Access Key Rotation** (access control, SUMO-07)
-  - `manual` when the key inventory is unreadable, on personal-only scope, or on zero keys.
-  - `fail` on enabled keys older than `key_max_age_days`.
-  - `warn` on keys without `createdAt`, or when the access key lifetime policy is `0` (never expire), absent, or unreadable.
-  - `pass` only on a complete org-scope key list. A page-capped list drops it to `warn`.
-  - Every summary states the lifetime policy value.
-- **8 Inactive Access Keys** (access control, SUMO-08)
-  - `manual` when the key inventory is unreadable, on personal-only scope, or on zero keys.
-  - `fail` on keys idle beyond `key_inactive_days`.
-  - `warn` on keys without `lastUsed`.
-  - `pass` only on a complete org-scope key list. A page-capped list drops it to `warn`.
-- **9 Audit Index Enabled** (data governance, SUMO-09)
-  - `manual` when the audit policy is unreadable, when the partition list is unreadable (the summary names its error), or when no active AuditIndex partition is visible (plan limitation).
-  - `fail` when the audit policy is not enabled.
-  - `warn` when the search audit policy was read and is disabled.
-  - `pass` only when the audit policy, the search audit policy, and at least one active audit index partition were all read.
-  - With the search audit policy unreadable, the pass drops to `warn`. The summary names it under `Not checked:` instead of claiming both policies are enabled.
-  - A page-capped partition list drops the pass to `warn` with `Pagination stopped before the last page, so only N items were seen and the population is incomplete`.
-- **10 Data Forwarding Destinations Reviewed** (data governance, SUMO-10)
-  - `manual` when the connection list is unreadable.
-  - `pass` on zero connections and zero forwarding destinations only when the partition and scheduled view lists were both readable and the partition list is non-empty.
-  - `pass` when at least one connection exists and every connection host matches `approved_destination_domains`.
-  - `fail` on unapproved hosts.
-  - `manual` when an approved list was supplied but no connection exists to check. The summary counts the forwarding destinations on partitions and scheduled views that remain unchecked, or states that an empty partition inventory cannot confirm their absence.
-  - `manual` when no approved list was supplied.
-  - A page-capped connection, partition, or scheduled view list drops a pass to `warn`, naming the list and its seen count (`evidence.incomplete_inventories`).
-  - An unreadable partition or scheduled view list drops a pass to `manual`, naming that list under `Not checked:`.
-- **11 Content Sharing Permissions** (content sharing, SUMO-11)
-  - `manual` when the Data Access Level policy is unreadable.
-  - `fail` when the policy is off.
-  - `warn` on org-wide shares in the sampled folder, or when the personal folder holds more items than `content_sample` (total, sampled, and unsampled counts are recorded).
-  - `manual` when the personal folder could not be read (named under `Not checked:`) or any permission lookup failed (the failed items and their errors are listed).
-  - `pass` only when every folder item was evaluated.
-- **12 Collector Management** (data governance, SUMO-12): `fail` on installed collectors offline beyond `collector_offline_days` or without last-seen. `warn` on offline or mixed versions. `manual` on zero collectors.
-- **13 Service Allowlist Configured** (access control, SUMO-13): `fail` when `loginEnabled` is false or zero CIDRs. `warn` when content allowlisting is off.
-- **14 Session Timeout Policy** (access control, SUMO-14)
-  - `manual` when the session timeout policy is unreadable or has no parsable value.
-  - `fail` above `max_session_timeout_minutes`.
-  - `pass` when the concurrent sessions limit policy was read and is enabled.
-  - `warn` when that policy was read and is not enabled.
-  - With that policy unreadable, the pass drops to `warn` and the summary names it under `Not checked:`. A 403 is never reported as "not enabled".
-- **15 Scheduled Search Permissions** (content sharing, SUMO-15)
-  - Always `manual`, because role bindings are not exposed.
-  - The summary states monitors seen with `runAs` and scheduled searches in the sampled folder.
-  - The summary names the monitor list or the personal folder under `Not checked:` when either could not be read.
-- **16 Ingest Budget Controls** (data governance, SUMO-16): `fail` on zero budgets. `warn` when none use `stopCollecting`.
-- **17 Data Retention Policies** (data governance, SUMO-17): `fail` when an audit index retains less than `min_retention_days`. `warn` on other short or account-default (`-1`) partitions.
-- **18 Lookup Table Access** (content sharing, SUMO-18)
-  - `warn` on org-shared lookup tables in the sampled folder.
-  - Otherwise `manual`, because the API has no lookup table listing.
-  - The summary names the personal folder under `Not checked:` when it could not be read and lists failed permission lookups.
-- **19 Dashboard Sharing Restrictions** (content sharing, SUMO-19)
-  - `manual` when the policy is unreadable, has no `enabled` flag, or the dashboard list is unreadable or empty.
-  - `fail` when sharing outside the org is enabled. The summary states how many seen dashboards are public, or that the dashboard list could not be read.
-  - `warn` on `isPublic` dashboards.
-  - `pass` only on a complete dashboard list. A page-capped list drops it to `warn`.
-- **20 Monitor Alert Routing** (content sharing, SUMO-20)
-  - `manual` when the monitor list is unreadable, on zero monitors, or when no org email domain could be derived.
-  - `fail` on recipients outside org domains, or on notifications to connections missing from the connection inventory.
-  - `warn` on disabled monitors or zero notifications.
-  - `pass` only on a complete monitor list with the user and connection lists readable.
-  - A page-capped monitor list drops the pass to `warn`.
-  - An unreadable user list drops the pass to `warn` and names the list, even when `approved_email_domains` supplied the domains.
-  - An unreadable connection list drops the pass to `manual` when any webhook notification exists, and to `warn` when routing is email-only.
+| # | Spec control | Tool | Finding | Status semantics |
+|---|---|---|---|---|
+| 1 | SAML SSO Enforcement | identity | SUMO-01 | `fail` on zero IdPs; `warn` on debug mode or missing certificate; otherwise `manual` because the API does not expose the SAML lockdown (require SAML sign-in) state |
+| 2 | SAML Allowlisted Users Minimized | identity | SUMO-02 | `manual` when the allowlist is unreadable, or when the IdP list was read and is empty (not applicable); `fail` above `max_allowlisted_users`; `warn` on inactive allowlisted users; `pass` at or below the threshold (zero is compliant) only while the SAML identity provider list was readable: with that list unreadable the pass drops to `warn` and the summary names it under `Not checked:` |
+| 3 | Password Policy Strength | identity | SUMO-03 | `fail` below `min_password_length` or without lockout; `warn` when complexity or weak-password rejection is incomplete |
+| 4 | Password Expiration Policy | identity | SUMO-04 | `fail` when disabled or above `max_password_age_days` |
+| 5 | MFA Enforcement | identity | SUMO-05 | `manual` when the password policy or the user list is unreadable (the summary says which and reports per-user coverage as unknown) or zero users were returned; `fail` when `requireMfa` is false or absent; `warn` when active users report `isMfaEnabled=false` or the user list stopped before its last page (seen count stated); `pass` only on a complete user list; evidence lists locked users, dormant users, and users without a `lastLoginTimestamp` (never counted as active) |
+| 6 | Role-Based Access Control | access control | SUMO-06 | `manual` when the role list is unreadable or empty; `fail` when admin-capability role members exceed `max_admins`; `warn` on custom roles with admin capabilities, custom roles without a `filterPredicate`, admin members dormant beyond `user_inactive_days` or without a `lastLoginTimestamp`, an unreadable user list, or a user list that stopped before its last page; `pass` only on a complete role list (a page-capped role list drops it to `warn` with the seen count) |
+| 7 | Access Key Rotation | access control | SUMO-07 | `manual` when the key inventory is unreadable, on personal-only scope, or on zero keys; `fail` on enabled keys older than `key_max_age_days`; `warn` on keys without `createdAt` or when the access key lifetime policy is `0` (never expire), absent, or unreadable; `pass` only on a complete org-scope key list (a page-capped list drops it to `warn`); every summary states the lifetime policy value |
+| 8 | Inactive Access Keys | access control | SUMO-08 | `manual` when the key inventory is unreadable, on personal-only scope, or on zero keys; `fail` on keys idle beyond `key_inactive_days`; `warn` on keys without `lastUsed`; `pass` only on a complete org-scope key list (a page-capped list drops it to `warn`) |
+| 9 | Audit Index Enabled | data governance | SUMO-09 | `manual` when the audit policy is unreadable, when the partition list is unreadable (the summary names its error), or when no active AuditIndex partition is visible (plan limitation); `fail` when the audit policy is not enabled; `warn` when the search audit policy was read and is disabled; `pass` only when the audit policy, the search audit policy, and at least one active audit index partition were all read: with the search audit policy unreadable the pass drops to `warn` and the summary names it under `Not checked:` instead of claiming both policies are enabled; a page-capped partition list drops the pass to `warn` with `Pagination stopped before the last page, so only N items were seen and the population is incomplete` |
+| 10 | Data Forwarding Destinations Reviewed | data governance | SUMO-10 | `manual` when the connection list is unreadable; `pass` on zero connections and zero forwarding destinations only when the partition and scheduled view lists were both readable and the partition list is non-empty, or when at least one connection exists and every connection host matches `approved_destination_domains`; `fail` on unapproved hosts; `manual` when an approved list was supplied but no connection exists to check (the summary counts the forwarding destinations on partitions and scheduled views that remain unchecked, or states that an empty partition inventory cannot confirm their absence); `manual` when no approved list was supplied; a page-capped connection, partition, or scheduled view list drops a pass to `warn` naming the list and its seen count (`evidence.incomplete_inventories`); an unreadable partition or scheduled view list drops a pass to `manual` naming that list under `Not checked:` |
+| 11 | Content Sharing Permissions | content sharing | SUMO-11 | `manual` when the Data Access Level policy is unreadable; `fail` when it is off; `warn` on org-wide shares in the sampled folder or when the personal folder holds more items than `content_sample` (total, sampled, and unsampled counts are recorded); `manual` when the personal folder could not be read (named under `Not checked:`) or any permission lookup failed (the failed items and their errors are listed); `pass` only when every folder item was evaluated |
+| 12 | Collector Management | data governance | SUMO-12 | `fail` on installed collectors offline beyond `collector_offline_days` or without last-seen; `warn` on offline or mixed versions; `manual` on zero collectors |
+| 13 | Service Allowlist Configured | access control | SUMO-13 | `fail` when `loginEnabled` is false or zero CIDRs; `warn` when content allowlisting is off |
+| 14 | Session Timeout Policy | access control | SUMO-14 | `manual` when the session timeout policy is unreadable or has no parsable value; `fail` above `max_session_timeout_minutes`; `pass` when the concurrent sessions limit policy was read and is enabled; `warn` when it was read and is not enabled; with that policy unreadable the pass drops to `warn` and the summary names it under `Not checked:` (a 403 is never reported as "not enabled") |
+| 15 | Scheduled Search Permissions | content sharing | SUMO-15 | always `manual`: role bindings are not exposed; the summary states monitors seen with `runAs` and scheduled searches in the sampled folder, and names the monitor list or the personal folder under `Not checked:` when either could not be read |
+| 16 | Ingest Budget Controls | data governance | SUMO-16 | `fail` on zero budgets; `warn` when none use `stopCollecting` |
+| 17 | Data Retention Policies | data governance | SUMO-17 | `fail` when an audit index retains less than `min_retention_days`; `warn` on other short or account-default (`-1`) partitions |
+| 18 | Lookup Table Access | content sharing | SUMO-18 | `warn` on org-shared lookup tables in the sampled folder; otherwise `manual` because the API has no lookup table listing; the summary names the personal folder under `Not checked:` when it could not be read and lists failed permission lookups |
+| 19 | Dashboard Sharing Restrictions | content sharing | SUMO-19 | `manual` when the policy is unreadable, has no `enabled` flag, or the dashboard list is unreadable or empty; `fail` when sharing outside the org is enabled (the summary states how many seen dashboards are public, or that the dashboard list could not be read); `warn` on `isPublic` dashboards; `pass` only on a complete dashboard list (a page-capped list drops it to `warn`) |
+| 20 | Monitor Alert Routing | content sharing | SUMO-20 | `manual` when the monitor list is unreadable, on zero monitors, or when no org email domain could be derived; `fail` on recipients outside org domains or notifications to connections missing from the connection inventory; `warn` on disabled monitors or zero notifications; `pass` only on a complete monitor list with the user and connection lists readable: a page-capped monitor list drops it to `warn`; an unreadable user list drops it to `warn` and names the list even when `approved_email_domains` supplied the domains; an unreadable connection list drops it to `manual` when any webhook notification exists and to `warn` when routing is email-only |
 
 ## Framework mappings
 

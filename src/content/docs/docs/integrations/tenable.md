@@ -238,19 +238,23 @@ Neither the filesystem message nor the parser message is ever interpolated, so a
 
 ## Tools
 
-- `tenable_check_access`: Probes every read surface the assessments depend on. It reports whether the key holds the Administrator role and names the role each refused surface needs.
-  - Surfaces probed: scans, templates, export job lists, scanners, agents, networks, exclusions, credentials, users, groups, roles, permissions, audit log, tags, target groups, and Security Center current user, scans, scanners, users.
-- `tenable_assess_scan_program`: Spec controls 1, 2, 4, 13, 17, 20 plus the Security Center schedule equivalent.
-- `tenable_assess_sensor_coverage`: Spec controls 3, 5, 6, 7, 8, 9, 16 plus the Security Center scanner equivalent.
-- `tenable_assess_access_control`: Spec controls 10, 11, 12, 18 plus the Security Center user equivalent.
-- `tenable_assess_vulnerability_management`: Spec controls 14, 15, 19 using the bulk vulnerability and asset exports.
-- `tenable_export_audit_bundle`: Runs everything above and writes into `<platform host>-audit-bundle` under `output_dir` (default `./export/tenable`):
-  - `core_data/`: API snapshots with credential-bearing values redacted (see below).
-  - `analysis/`: findings.json and per-category summaries.
-  - `compliance/`: Executive summary, unified matrix, one report per framework.
-  - `QUICK_REFERENCE.md`.
-  - `_errors.log` when collection partially failed.
-  - A `.zip` paired with the allocated output directory. A rerun never overwrites a prior bundle.
+| Tool | Purpose |
+|------|---------|
+| `tenable_check_access` | Probes every read surface the assessments depend on (scans, templates, export job lists, scanners, agents, networks, exclusions, credentials, users, groups, roles, permissions, audit log, tags, target groups, and Security Center current user, scans, scanners, users), reports whether the key holds the Administrator role, and names the role each refused surface needs. |
+| `tenable_assess_scan_program` | Spec controls 1, 2, 4, 13, 17, 20 plus the Security Center schedule equivalent. |
+| `tenable_assess_sensor_coverage` | Spec controls 3, 5, 6, 7, 8, 9, 16 plus the Security Center scanner equivalent. |
+| `tenable_assess_access_control` | Spec controls 10, 11, 12, 18 plus the Security Center user equivalent. |
+| `tenable_assess_vulnerability_management` | Spec controls 14, 15, 19 using the bulk vulnerability and asset exports. |
+| `tenable_export_audit_bundle` | Runs everything above, then writes an audit bundle and a zip archive. |
+
+`tenable_export_audit_bundle` writes into `<platform host>-audit-bundle` under `output_dir` (default `./export/tenable`):
+
+- `core_data/`: API snapshots with credential-bearing values redacted (see below).
+- `analysis/`: findings.json and per-category summaries.
+- `compliance/`: executive summary, unified matrix, one report per framework.
+- `QUICK_REFERENCE.md`.
+- `_errors.log` when collection partially failed.
+- A `.zip` paired with the allocated output directory (a rerun never overwrites a prior bundle).
 
 ### Bundle redaction
 
@@ -319,127 +323,28 @@ Status semantics:
 - `fail` marks a verified deficiency.
 - `manual` marks unknown, forbidden, unlicensed, or not applicable evidence and states what a human must collect.
 
-Each entry names the spec control, then the tool and finding that cover it, then the semantics.
-
-- **1 Scan policy configuration** (scan_program, TENABLE-01)
-  - Reads `GET /scans`, `GET /editor/scan/templates` (to detect discovery-only templates), `GET /policies`, and `GET /policies/{policy_id}` for every policy a scan references.
-  - Judges `settings.safe_checks`, `settings.portscan_range`, and the `plugins` family map.
-  - `fail` when `safe_checks=no` or every family is disabled.
-  - `warn` on a custom port range or more than half of the families disabled.
-  - `pass` when every referenced policy enables safe checks on the default or full port range.
-  - `fail` on zero scans or discovery-only scans.
-  - `manual` on a refused details read (needs Standard [32] plus Can View), a policy exposing no settings, a capped details walk (100 policies), or every scan lacking `policy_id`.
-  - Some scans lacking `policy_id` cap a pass at `warn`.
-  - An unreadable template list disables discovery-only detection and caps the verdict at `warn` with the cause. `scan_templates_in_use`, `policy_templates`, and `discovery_only_scans` render `null`.
-  - An unreadable policy list caps at `warn` the same way.
-- **2 Scan schedule discipline** (scan_program, TENABLE-02, TENABLE-02-SC)
-  - `pass` when every scan with `enabled=true` and non-ONETIME `rrules` launched within `stale_scan_days`.
-  - Undated or never-run scans cap at `warn`.
-  - `fail` on zero scans or zero enabled recurring scans.
-  - The Security Center equivalent is `manual` when `GET /rest/scanResult` is unreadable and renders `sc_completed_results_in_window` as `null`.
-- **3 Asset discovery coverage** (sensor_coverage, TENABLE-03)
-  - `manual` unless `expected_asset_count` is supplied.
-  - Compares the completed asset export against `expected_asset_count` and flags stale or undated `last_seen`.
-  - `fail` on zero assets.
-  - `fail` on coverage below 95 percent.
-  - A truncated export, or one whose chunks carried records without a documented asset member (kept out and counted as `unevaluable_records`), caps at `warn`.
-  - `GET /networks` is read for the `networks_without_assets` evidence. When it is unreadable, the field renders `null`, the summary names the read, and a pass is capped at `warn`.
-- **4 Credentialed scan ratio** (scan_program, TENABLE-04)
-  - Ratio of exported assets with `last_authentication_scan_status=Success` or `has_agent=true`.
-  - `fail` below `credential_threshold`.
-  - `manual` on zero assets.
-  - A truncated export, or one with unevaluable records (no documented asset member), caps at `warn`.
-- **5 Agent deployment status** (sensor_coverage, TENABLE-05)
-  - Reads `status`, `last_connect`, and `core_version`.
-  - `fail` when more than 10 percent of agents are offline or stale.
-  - `warn` on undated or outdated agents, or a truncated agent list.
-  - `manual` on zero agents, with a license-aware message from `GET /server/properties` (`license.agents`).
-  - When `GET /server/properties` is unreadable, the license count renders `null`, the summary names the read, and a pass is capped at `warn`.
-- **6 Agent group organization** (sensor_coverage, TENABLE-06)
-  - `fail` on ungrouped agents above 10 percent or zero groups.
-  - `warn` on some ungrouped agents or a truncated agent list.
-  - `manual` on zero agents.
-  - `manual` on an unreadable `GET /scanners/null/agent-groups`, with `groups` and `agent_group_count` rendered `null`.
-- **7 Scanner health and version** (sensor_coverage, TENABLE-07, TENABLE-07-SC)
-  - Linked scanners must report `status=on`, `linked=1`, and a `last_connect` within 24 hours, otherwise `fail`.
-  - `warn` on undated `last_connect` or a version below the newest linked scanner.
-  - Cloud-only tenants are `manual` (not applicable).
-  - `manual` on zero scanners or an unreadable list.
-  - The pass is capped at `warn` by the scanner list itself (partial) and by a key not confirmed as Administrator. The agent list is not read.
-- **8 Plugin update currency** (sensor_coverage, TENABLE-08)
-  - Container `plugin_set` and the `loaded_plugin_set` of every scanner entry that exposes one (cloud scanners included) must be newer than `plugin_stale_hours`, otherwise `fail`.
-  - `warn` on scanner instances without a plugin set, or online agents loading a stale plugin set.
-  - `manual`, never `pass`, on an unreadable scanner list, zero scanners, or zero entries exposing a plugin set.
-  - A container plugin set older than `plugin_stale_hours` is `fail` on its own, whatever the scanner list holds. When that list was not read, the summary names the refused or failed read in place of a scanner count (never "0 of 0 scanner entries").
-  - `evaluated_scanners`, `stale_scanners`, and `undated_scanners` render `null` beside `scanners_status` on every branch when the scanner list was not read.
-  - Agent plugin currency is a verdict input, so an unreadable agent list caps the verdict at `warn` with the cause and renders `stale_online_agents` as `null`.
-- **9 Network zone configuration** (sensor_coverage, TENABLE-09)
-  - `warn` or `fail` on networks with `scanner_count=0`.
-  - `manual` on zero networks (the default network always exists).
-  - A partial list (page cap or an endpoint replaying the same page) caps at `warn`.
-- **10 User role and permission audit** (access_control, TENABLE-10, TENABLE-10-SC)
-  - Reads `enabled`, `permissions`, `lastlogin`, `two_factor`, `ui_saml_only`, `login_fail_count`, `locked`, and `last_apikey_access`.
-  - `fail` on excessive admins, admins without MFA or SAML, or inactive enabled users.
-  - Users without an `enabled` flag are not counted as enabled and cap at `warn`.
-  - `manual` on zero users, zero users with `enabled=true`, or a key below Administrator (reduced `GET /users` payload).
-  - Custom roles from `GET /access-control/v1/roles` are evidence only. When that list is unreadable, `custom_roles` renders `null`, the summary names the read, and a pass is capped at `warn`.
-- **11 Access group review** (access_control, TENABLE-11)
-  - `fail` on permissions that grant every user write-style actions (`CanEdit`, `CanScan`, `CanUse`) on `AllAssets`, `AllObjects`, or `AllTags`. Tenable's default All Assets permission is included when it still grants CanScan.
-  - "Every user" means subject type `AllUsers` or the tenant-wide `UserGroup` `00000000-0000-0000-0000-000000000000`, named All Users.
-  - `warn` on remaining legacy access groups.
-  - `warn` on an unreadable `GET /v2/access-groups`, with `legacy_access_groups` rendered `null`.
-  - An unreadable `GET /groups` caps a pass at `warn`, with `user_groups` rendered `null`.
-  - `manual` on zero permissions.
-- **12 Managed credential hygiene** (access_control, TENABLE-12)
-  - Credential type coverage, `created_date`, and `last_used_by`.
-  - `warn` on never-used or year-old credentials.
-  - `manual` on zero managed credentials.
-  - A truncated list caps at `warn`.
-  - Only metadata is stored: any `settings` block or credential-named property in the records is redacted.
-- **13 Scan exclusion audit** (scan_program, TENABLE-13)
-  - `fail` or `warn` on exclusions with `schedule.enabled=false`, no description, or /16 or wider members.
-  - A complete walk that delivered zero exclusions passes because nothing is excluded, with the observed `pagination.total` in the summary.
-  - Zero delivered exclusions under a larger reported total is an unread list, not compliant emptiness. It caps at `warn` stating seen versus total.
-- **14 Vulnerability prioritization (VPR)** (vulnerability_management, TENABLE-14)
-  - Share of rated open findings carrying `plugin.vpr.score`.
-  - `warn` on partial exports.
-  - `manual` on zero assets or zero open findings.
-  - A pass is capped at `warn` when either export carried records without a documented member. The summary counts them, and a chunk of only such records is a failed download.
-- **15 Vulnerability SLA tracking** (vulnerability_management, TENABLE-15)
-  - Open findings older than the per-severity SLA from `first_found`.
-  - MTTR from `time_taken_to_fix`.
-  - Zero findings pass only when the export FINISHED completely, every record carried a documented finding member, and assets are non-zero.
-  - Records without a documented member are unevaluable, never counted as findings or as an empty set. They cap a pass at `warn` with their count.
-  - A chunk of only such records is a failed download, so an export of one such chunk is unreadable and renders `manual`.
-- **16 Asset tagging strategy** (sensor_coverage, TENABLE-16)
-  - Ratio of exported assets with tags versus `tagged_threshold`.
-  - `fail` on zero tag categories or a ratio below the threshold.
-  - `manual` on zero assets or an unreadable `GET /tags/categories`.
-  - A truncated export, or one with unevaluable records (no documented asset member), caps at `warn`. So does a truncated category or value walk.
-  - Zero categories delivered under a truncated walk is an unread taxonomy and renders `warn`, not `fail`.
-  - `GET /tags/values` feeds `tag_value_count` only. When it is unreadable, the count renders `null`, the summary names the read, and a pass is capped at `warn`.
-- **17 Compliance audit templates** (scan_program, TENABLE-17)
-  - Enabled recurring scans whose template title looks like a compliance audit (CIS, STIG, PCI, SCAP, Audit).
-  - `fail` when there are none.
-  - `manual` on an unreadable template list.
-- **18 Audit log review** (access_control, TENABLE-18)
-  - Sensitive `action` values (deletes, user or permission changes, exclusion and policy edits) and `is_failure` events in the lookback window.
-  - `warn` on zero events, with the observed `pagination.total` (or "not reported").
-  - `warn` on a truncated event list, stating seen versus `pagination.total`.
-- **19 Export and reporting automation** (vulnerability_management, TENABLE-19)
-  - Export jobs from `GET /vulns/export/status` and `GET /assets/export/status` within the previous three days (the documented window for completed jobs).
-  - This tool's own runs are excluded by UUID and by export shape: `num_assets_per_chunk` 5000 with the open, reopened, fixed state filter, or 10000 with no filters.
-  - `pass` with jobs on two distinct days.
-  - `warn` with jobs on one day.
-  - `manual` with none.
-  - `manual` when both lists are unreadable.
-  - When one list is unreadable, its count renders `null`, every summary names the read, and a pass is capped at `warn`.
-  - A key not confirmed as Administrator also caps at `warn`.
-  - Report schedules are not exposed by the API and remain a manual check.
-- **20 Target group management** (scan_program, TENABLE-20)
-  - Deprecated target groups.
-  - `warn` on stale or overlapping members.
-  - An empty list passes because tags replaced target groups.
+| # | Control | Tool | Finding | Semantics |
+|---|---------|------|---------|-----------|
+| 1 | Scan policy configuration | scan_program | TENABLE-01 | Reads `GET /scans`, `GET /editor/scan/templates` (to detect discovery-only templates), `GET /policies`, and `GET /policies/{policy_id}` for every policy a scan references, and judges `settings.safe_checks`, `settings.portscan_range`, and the `plugins` family map: `safe_checks=no` or every family disabled `fail`; a custom port range or more than half of the families disabled `warn`; `pass` when every referenced policy enables safe checks on the default or full port range. Zero scans or discovery-only scans `fail`; a refused details read (needs Standard [32] plus Can View), a policy exposing no settings, a capped details walk (100 policies), or every scan lacking `policy_id` `manual`; some scans lacking `policy_id` cap a pass at `warn`. An unreadable template list disables discovery-only detection and caps the verdict at `warn` with the cause (`scan_templates_in_use`, `policy_templates`, and `discovery_only_scans` render `null`); an unreadable policy list caps at `warn` the same way. |
+| 2 | Scan schedule discipline | scan_program | TENABLE-02, TENABLE-02-SC | `pass` when every scan with `enabled=true` and non-ONETIME `rrules` launched within `stale_scan_days`; undated or never-run scans cap at `warn`; zero scans or zero enabled recurring scans `fail`. The Security Center equivalent is `manual` when `GET /rest/scanResult` is unreadable and renders `sc_completed_results_in_window` as `null`. |
+| 3 | Asset discovery coverage | sensor_coverage | TENABLE-03 | `manual` unless `expected_asset_count` is supplied; compares the completed asset export against it and flags stale or undated `last_seen`; zero assets `fail`; coverage below 95 percent `fail`; a truncated export, or one whose chunks carried records without a documented asset member (kept out and counted as `unevaluable_records`), caps at `warn`. `GET /networks` is read for the `networks_without_assets` evidence; when it is unreadable the field renders `null`, the summary names the read, and a pass is capped at `warn`. |
+| 4 | Credentialed scan ratio | scan_program | TENABLE-04 | Ratio of exported assets with `last_authentication_scan_status=Success` or `has_agent=true`; below `credential_threshold` `fail`; zero assets `manual`; a truncated export, or one with unevaluable records (no documented asset member), caps at `warn`. |
+| 5 | Agent deployment status | sensor_coverage | TENABLE-05 | Reads `status`, `last_connect`, and `core_version`; more than 10 percent of agents offline or stale `fail`; undated or outdated agents, or a truncated agent list, `warn`; zero agents `manual` with a license-aware message from `GET /server/properties` (`license.agents`). When `GET /server/properties` is unreadable the license count renders `null`, the summary names the read, and a pass is capped at `warn`. |
+| 6 | Agent group organization | sensor_coverage | TENABLE-06 | Ungrouped agents above 10 percent or zero groups `fail`, some ungrouped agents or a truncated agent list `warn`; zero agents `manual`; an unreadable `GET /scanners/null/agent-groups` `manual` with `groups` and `agent_group_count` rendered `null`. |
+| 7 | Scanner health and version | sensor_coverage | TENABLE-07, TENABLE-07-SC | Linked scanners must report `status=on`, `linked=1`, and a `last_connect` within 24 hours, otherwise `fail`; undated `last_connect` or a version below the newest linked scanner `warn`; cloud-only tenants are `manual` (not applicable); zero scanners or an unreadable list `manual`. The pass is capped at `warn` by the scanner list itself (partial) and by a key not confirmed as Administrator; the agent list is not read. |
+| 8 | Plugin update currency | sensor_coverage | TENABLE-08 | Container `plugin_set` and the `loaded_plugin_set` of every scanner entry that exposes one (cloud scanners included) newer than `plugin_stale_hours`, otherwise `fail`; scanner instances without a plugin set or online agents loading a stale plugin set `warn`; an unreadable scanner list, zero scanners, or zero entries exposing a plugin set `manual`, never `pass`. A container plugin set older than `plugin_stale_hours` is `fail` on its own, whatever the scanner list holds: when that list was not read, the summary names the refused or failed read in place of a scanner count (never "0 of 0 scanner entries"), and `evaluated_scanners`, `stale_scanners`, and `undated_scanners` render `null` beside `scanners_status`, as they do on every branch when the list was not read. Agent plugin currency is a verdict input, so an unreadable agent list caps the verdict at `warn` with the cause and renders `stale_online_agents` as `null`. |
+| 9 | Network zone configuration | sensor_coverage | TENABLE-09 | Networks with `scanner_count=0` `warn` or `fail`; zero networks `manual` (the default network always exists); a partial list (page cap or an endpoint replaying the same page) caps at `warn`. |
+| 10 | User role and permission audit | access_control | TENABLE-10, TENABLE-10-SC | Reads `enabled`, `permissions`, `lastlogin`, `two_factor`, `ui_saml_only`, `login_fail_count`, `locked`, and `last_apikey_access`; excessive admins, admins without MFA or SAML, or inactive enabled users `fail`; users without an `enabled` flag are not counted as enabled and cap at `warn`; zero users, zero users with `enabled=true`, or a key below Administrator (reduced `GET /users` payload) `manual`. Custom roles from `GET /access-control/v1/roles` are evidence only; when that list is unreadable `custom_roles` renders `null`, the summary names the read, and a pass is capped at `warn`. |
+| 11 | Access group review | access_control | TENABLE-11 | Permissions granting every user (subject type `AllUsers` or the tenant-wide `UserGroup` `00000000-0000-0000-0000-000000000000`, named All Users) write-style actions (`CanEdit`, `CanScan`, `CanUse`) on `AllAssets`, `AllObjects`, or `AllTags` `fail`, including Tenable's default All Assets permission when it still grants CanScan; remaining legacy access groups `warn`; an unreadable `GET /v2/access-groups` `warn` with `legacy_access_groups` rendered `null`; an unreadable `GET /groups` caps a pass at `warn` with `user_groups` rendered `null`; zero permissions `manual`. |
+| 12 | Managed credential hygiene | access_control | TENABLE-12 | Credential type coverage, `created_date`, and `last_used_by`; never-used or year-old credentials `warn`; zero managed credentials `manual`; a truncated list caps at `warn`. Only metadata is stored: any `settings` block or credential-named property in the records is redacted. |
+| 13 | Scan exclusion audit | scan_program | TENABLE-13 | Exclusions with `schedule.enabled=false`, no description, or /16 or wider members `fail` or `warn`; a complete walk that delivered zero exclusions passes because nothing is excluded, with the observed `pagination.total` in the summary; zero delivered exclusions under a larger reported total is an unread list, not compliant emptiness, and caps at `warn` stating seen versus total. |
+| 14 | Vulnerability prioritization (VPR) | vulnerability_management | TENABLE-14 | Share of rated open findings carrying `plugin.vpr.score`; partial exports `warn`; zero assets or zero open findings `manual`; a pass is capped at `warn` when either export carried records without a documented member (the summary counts them, and a chunk of only such records is a failed download). |
+| 15 | Vulnerability SLA tracking | vulnerability_management | TENABLE-15 | Open findings older than the per-severity SLA from `first_found`; MTTR from `time_taken_to_fix`; zero findings pass only when the export FINISHED completely, every record carried a documented finding member, and assets are non-zero; records without a documented member are unevaluable, never counted as findings or as an empty set, and cap a pass at `warn` with their count (a chunk of only such records is a failed download, so an export of one such chunk is unreadable and renders `manual`). |
+| 16 | Asset tagging strategy | sensor_coverage | TENABLE-16 | Ratio of exported assets with tags versus `tagged_threshold`; zero tag categories or a ratio below the threshold `fail`; zero assets or an unreadable `GET /tags/categories` `manual`; a truncated export, or one with unevaluable records (no documented asset member), caps at `warn`, as does a truncated category or value walk; zero categories delivered under a truncated walk is an unread taxonomy and renders `warn`, not `fail`. `GET /tags/values` feeds `tag_value_count` only; when it is unreadable the count renders `null`, the summary names the read, and a pass is capped at `warn`. |
+| 17 | Compliance audit templates | scan_program | TENABLE-17 | Enabled recurring scans whose template title looks like a compliance audit (CIS, STIG, PCI, SCAP, Audit); none `fail`; an unreadable template list `manual`. |
+| 18 | Audit log review | access_control | TENABLE-18 | Sensitive `action` values (deletes, user or permission changes, exclusion and policy edits) and `is_failure` events in the lookback window; zero events `warn` with the observed `pagination.total` (or "not reported"); a truncated event list `warn` stating seen versus `pagination.total`. |
+| 19 | Export and reporting automation | vulnerability_management | TENABLE-19 | Export jobs from `GET /vulns/export/status` and `GET /assets/export/status` within the previous three days (the documented window for completed jobs), excluding this tool's own runs by UUID and by export shape (`num_assets_per_chunk` 5000 with the open, reopened, fixed state filter; 10000 with no filters): jobs on two distinct days `pass`, jobs on one day `warn`, none `manual`; both lists unreadable `manual`. When one list is unreadable its count renders `null`, every summary names the read, and a pass is capped at `warn`; a key not confirmed as Administrator also caps at `warn`. Report schedules are not exposed by the API and remain a manual check. |
+| 20 | Target group management | scan_program | TENABLE-20 | Deprecated target groups: stale or overlapping members `warn`; an empty list passes because tags replaced target groups. |
 
 Every finding carries the FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP mappings from the spec table for that control.
 

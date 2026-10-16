@@ -26,13 +26,12 @@ The config file is `ZSCALER_CONFIG_FILE` or `~/.zscaler/zscaler.yaml`. A config 
 
 ### ZIA (legacy API key plus session)
 
-- `ZIA_CLOUD`: Cloud name.
-  - `zscaler`, `zscalerone`, `zscalertwo`, `zscalerthree`, `zscloud`, `zscalerbeta`, `zscalergov`, and `zscalerten` map to `https://zsapi.<cloud>.net/api/v1`.
-  - `zspreview` maps to `https://admin.zspreview.net/api/v1`.
-  - The cloud list and both host forms are documented in the legacy ZIA sections of the [zscaler-sdk-go README](https://github.com/zscaler/zscaler-sdk-go#readme) (`zscaler/zia/v2_config.go`) and the [zscaler-sdk-python README](https://github.com/zscaler/zscaler-sdk-python#readme) (`zscaler/zia/legacy.py`).
-- `ZIA_BASE_URL`: Optional explicit base URL instead of the cloud mapping.
-- `ZIA_API_KEY`: Cloud Service API key (Administration > Cloud Service API Security).
-- `ZIA_USERNAME`, `ZIA_PASSWORD`: Administrator login used for `POST /api/v1/authenticatedSession`.
+| Variable | Purpose |
+| --- | --- |
+| `ZIA_CLOUD` | Cloud name: `zscaler`, `zscalerone`, `zscalertwo`, `zscalerthree`, `zscloud`, `zscalerbeta`, `zscalergov`, `zscalerten` (maps to `https://zsapi.<cloud>.net/api/v1`; `zspreview` maps to `https://admin.zspreview.net/api/v1`). The cloud list and both host forms are documented in the legacy ZIA sections of the [zscaler-sdk-go README](https://github.com/zscaler/zscaler-sdk-go#readme) (`zscaler/zia/v2_config.go`) and the [zscaler-sdk-python README](https://github.com/zscaler/zscaler-sdk-python#readme) (`zscaler/zia/legacy.py`) |
+| `ZIA_BASE_URL` | Optional explicit base URL instead of the cloud mapping |
+| `ZIA_API_KEY` | Cloud Service API key (Administration > Cloud Service API Security) |
+| `ZIA_USERNAME`, `ZIA_PASSWORD` | Administrator login used for `POST /api/v1/authenticatedSession` |
 
 The API key is obfuscated exactly as documented in the ZIA API Getting Started guide. The last six digits of the millisecond timestamp select characters from the key. Then the same six digits, shifted right by one bit (zero padded), select characters offset by two.
 
@@ -52,16 +51,12 @@ Sub-locations are fetched for at most 100 parent locations. Beyond that, control
 
 ### ZPA (client credentials)
 
-- `ZPA_CLIENT_ID`, `ZPA_CLIENT_SECRET`: API client from Administration > API Keys. A read-only role is enough.
-- `ZPA_CUSTOMER_ID`: Customer ID shown with the API client.
-- `ZPA_CLOUD` values and their base URLs:
-  - `PRODUCTION` (default): `https://config.private.zscaler.com`
-  - `ZPATWO`: `https://config.zpatwo.net`
-  - `BETA`: `https://config.zpabeta.net`
-  - `GOV`: `https://config.zpagov.net`
-  - `GOVUS`: `https://config.zpagov.us`
-  - `PREVIEW`: `https://config.zpapreview.net`
-- `ZPA_BASE_URL`: Optional explicit base URL.
+| Variable | Purpose |
+| --- | --- |
+| `ZPA_CLIENT_ID`, `ZPA_CLIENT_SECRET` | API client from Administration > API Keys (a read-only role is enough) |
+| `ZPA_CUSTOMER_ID` | Customer ID shown with the API client |
+| `ZPA_CLOUD` | `PRODUCTION` (`https://config.private.zscaler.com`, default), `ZPATWO` (`https://config.zpatwo.net`), `BETA` (`https://config.zpabeta.net`), `GOV` (`https://config.zpagov.net`), `GOVUS` (`https://config.zpagov.us`), `PREVIEW` (`https://config.zpapreview.net`) |
+| `ZPA_BASE_URL` | Optional explicit base URL |
 
 The client posts `client_id` and `client_secret` as a form body to `POST /signin` and sends the returned bearer token. It pages every list with `page` and `pagesize` (documented maximum 500) until the response `totalPages` is reached.
 
@@ -88,17 +83,22 @@ Optional tuning:
 
 ## Tools
 
-- `zscaler_check_access`: Probes ten ZIA and seven ZPA read surfaces. Reports healthy, limited, or unavailable, plus which products are configured.
-- `zscaler_assess_zia_access_control`: Controls 6, 7, 14 (admin MFA evidence, RBAC, audit log export).
-- `zscaler_assess_zia_policy`: Controls 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 25.
-- `zscaler_assess_zpa`: Controls 8, 9, 10, 11, 12, 13, 15, 21, 22, 23, 24.
-- `zscaler_export_audit_bundle`: Runs everything into `zscaler-audit-<ZIA cloud or ZPA customer ID>-<YYYY-MM-DD>` under `output_dir` (default `./export/zscaler`). It writes:
-  - `core_data/`
-  - `analysis/`
-  - `compliance/` (executive summary, unified matrix, one report per framework)
-  - `QUICK_REFERENCE.md`
-  - `_errors.log` when collection partially failed
-  - A zip named after the allocated directory (reruns allocate a new directory)
+| Tool | Purpose |
+| --- | --- |
+| `zscaler_check_access` | Probes ten ZIA and seven ZPA read surfaces and reports healthy, limited, or unavailable plus which products are configured |
+| `zscaler_assess_zia_access_control` | Controls 6, 7, 14 (admin MFA evidence, RBAC, audit log export) |
+| `zscaler_assess_zia_policy` | Controls 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 25 |
+| `zscaler_assess_zpa` | Controls 8, 9, 10, 11, 12, 13, 15, 21, 22, 23, 24 |
+| `zscaler_export_audit_bundle` | Runs everything, then writes an audit bundle and a zip archive |
+
+`zscaler_export_audit_bundle` writes into `zscaler-audit-<ZIA cloud or ZPA customer ID>-<YYYY-MM-DD>` under `output_dir` (default `./export/zscaler`):
+
+- `core_data/`
+- `analysis/`
+- `compliance/` (executive summary, unified matrix, one report per framework)
+- `QUICK_REFERENCE.md`
+- `_errors.log` when collection partially failed
+- A zip named after the allocated directory (reruns allocate a new directory)
 
 ### Findings and verdict rules
 
@@ -142,111 +142,33 @@ The regression suite seeds 32 canaries across the configured secrets, every docu
 
 ## Control coverage
 
-Each entry names the control number and name, then the tool and finding, then the status semantics.
-
-- **1 URL Filtering Policy Audit** (`zscaler_assess_zia_policy`, ZS-01)
-  - Pass when enabled BLOCK rules cover ANONYMIZER, OTHER_SECURITY, ADULT_THEMES, PORNOGRAPHY, GAMBLING.
-  - Fail on zero, all-disabled, or no BLOCK rules.
-  - Warn on missing categories.
-- **2 Firewall Rule Audit** (`zscaler_assess_zia_policy`, ZS-02)
-  - Fail when the default rule allows or an enabled ALLOW rule has no scope.
-  - Zero rules fail.
-  - Warn when only the default rule exists or block rules skip full logging. `enableFullLogging` is SDK-documented only, so a missing field never supports pass.
-  - Partial rule reads cap at warn.
-- **3 DLP Engine Configuration** (`zscaler_assess_zia_policy`, ZS-03)
-  - Pass with engines plus enabled BLOCK or ICAP_RESPONSE web DLP rules referencing engines.
-  - Zero rules or engines fail.
-  - Monitor-only rules warn.
-- **4 SSL Inspection Coverage** (`zscaler_assess_zia_policy`, ZS-04)
-  - Pass with enabled DECRYPT rules, no blanket DO_NOT_DECRYPT rule, exemptions under the threshold, and SSL scanning on every location that was read.
-  - Zero rules fail.
-  - A partial location inventory caps at warn.
-- **5 Cloud Sandbox Analysis** (`zscaler_assess_zia_policy`, ZS-05)
-  - Pass with enabled BLOCK sandbox rules.
-  - Zero rules is manual (unlicensed or unconfigured).
-  - Allow-only warns.
-  - Blocked hashes are counted from the documented `md5HashValueList`, with the legacy `fileHashesToBeBlocked` recorded only as evidence.
-- **6 Admin MFA Enforcement** (`zscaler_assess_zia_access_control`, ZS-06)
-  - Always manual or warn.
-  - The ZIA API exposes `isPasswordLoginAllowed` but not per-admin MFA, so password-login admins warn and portal evidence is required.
-- **7 RBAC & Admin Role Audit** (`zscaler_assess_zia_access_control`, ZS-07)
-  - Pass when Super Admin count is within `max_super_admins` and least-privilege roles exist.
-  - Fail above the threshold.
-  - Admin scope is read from the documented `adminScope.Type`. The SDK-only `adminScopeType` is legacy evidence.
-  - A partial admin inventory caps at warn.
-- **8 Application Segmentation** (`zscaler_assess_zpa`, ZS-08)
-  - Fail for wildcard domain plus full port range or zero segments.
-  - Warn for wildcard, full range, or bypassType ALWAYS.
-  - Partial segment or segment group inventories cap at warn.
-- **9 Zero Trust Access Policies** (`zscaler_assess_zpa`, ZS-09)
-  - Fail for unconditional ALLOW rules or zero rules.
-  - Warn when ALLOW rules lack identity, posture, or network criteria. SCIM, SAML, IdP, user, and user group operands all count as identity.
-  - A partial rule inventory caps at warn.
-- **10 Posture Profile Enforcement** (`zscaler_assess_zpa`, ZS-10)
-  - Pass when every enabled ALLOW rule has a POSTURE condition.
-  - Fail with zero profiles or no posture conditions.
-  - Partial profile or rule inventories cap at warn.
-- **11 App Connector Health & Coverage** (`zscaler_assess_zpa`, ZS-11)
-  - Pass when every enabled connector reports ZPN_STATUS_AUTHENTICATED with a `lastBrokerConnectTime` within `stale_connector_days` (default 30) and each group has two or more connected.
-  - Authenticated connectors with a stale or missing timestamp warn.
-  - None authenticated fails.
-  - A partial connector inventory caps at warn.
-- **12 IdP Integration & SAML Config** (`zscaler_assess_zpa`, ZS-12)
-  - Pass with enabled USER IdP, SCIM, signed SAML requests, admin SSO, and no ZPA admin with local login and no 2FA.
-  - The finding states that `GET /administrators` is documented only by zscaler-sdk-go.
-  - The finding caps at warn when that surface or any IdP inventory is unreadable or partial.
-- **13 Session Timeout Configuration** (`zscaler_assess_zpa`, ZS-13)
-  - Pass when enabled TIMEOUT_POLICY rules reauthenticate within `max_timeout_hours`.
-  - Never-expire fails.
-  - ZIA admin session timeout is not exposed by the API.
-- **14 Audit Logging Enabled** (`zscaler_assess_zia_access_control`, ZS-14)
-  - Pass when the audit report interface is readable and an enabled NSS feed exports ADMIN_AUDIT logs.
-  - Zero feeds warn.
-  - A `400` from the bare `GET /auditlogEntryReport` renders manual naming that cause. The reference marks `statusId` required, and the SDKs send no parameter.
-- **15 Trusted Network Detection** (`zscaler_assess_zpa`, ZS-15)
-  - Pass when trusted networks read from `GET /mgmtconfig/v2/.../network` are referenced by enabled policy rules.
-  - Zero networks manual.
-  - Unreferenced networks warn.
-  - A partial network inventory caps at warn.
-- **16 Bandwidth Control Policies** (`zscaler_assess_zia_policy`, ZS-16)
-  - Pass with enabled rules.
-  - Zero rules manual (license or need must be confirmed).
-- **17 Browser Isolation Policies** (`zscaler_assess_zia_policy`, ZS-17)
-  - Pass when isolation profiles are applied by enabled ISOLATE URL rules.
-  - Zero profiles manual.
-- **18 Location & GRE/VPN Configuration** (`zscaler_assess_zia_policy`, ZS-18)
-  - Pass when every location and sub-location that was read has authRequired, sslScanEnabled, ofwEnabled.
-  - Zero locations manual.
-  - When sub-locations were read for fewer parents than exist (100-parent cap) or the location list is partial, the finding reports parents read versus total and caps at warn.
-- **19 Cloud Application Control** (`zscaler_assess_zia_policy`, ZS-19)
-  - Pass with enabled rules whose actions block, isolate, or caution.
-  - Zero rules fail.
-  - Unread rule types manual.
-- **20 DNS Security Configuration** (`zscaler_assess_zia_policy`, ZS-20)
-  - Pass with enabled BLOCK or REDIR DNS rules and dgaDomainsBlocked.
-  - Zero rules fail.
-- **21 Service Edge Deployment** (`zscaler_assess_zpa`, ZS-21)
-  - Pass when every enabled private service edge is authenticated with a `lastBrokerConnectTime` within `stale_connector_days`.
-  - Stale or missing timestamps warn.
-  - None authenticated fails.
-  - Zero edges manual (public service edges in use).
-- **22 Forwarding Policy Audit** (`zscaler_assess_zpa`, ZS-22)
-  - Fail for unconditional BYPASS rules.
-  - Conditional bypasses warn.
-  - Zero rules manual.
-- **23 Emergency Access Configuration** (`zscaler_assess_zpa`, ZS-23)
-  - Pass when break-glass users exist and none is active.
-  - Active users warn.
-  - Zero users manual.
-  - Users are read through the documented `pageId` cursor and deduplicated. An unfinished cursor caps at warn.
-- **24 Certificate Management** (`zscaler_assess_zpa`, ZS-24)
-  - Fail on expired enrollment or browser access certificates. Validity is read from `validToInEpochSec` or the `validTo` date-time.
-  - Expiring or undated warn.
-  - Partial or unreadable browser access certificate inventories cap at warn.
-  - The ZIA CA chain is manual evidence.
-- **25 Security Policy Baseline** (`zscaler_assess_zia_policy`, ZS-25)
-  - Pass when the required ATP and malware flags are true and unscannable files are blocked.
-  - Any false or absent flag fails.
+| # | Control | Tool | Finding | Status semantics |
+| --- | --- | --- | --- | --- |
+| 1 | URL Filtering Policy Audit | `zscaler_assess_zia_policy` | ZS-01 | pass when enabled BLOCK rules cover ANONYMIZER, OTHER_SECURITY, ADULT_THEMES, PORNOGRAPHY, GAMBLING; fail on zero, all-disabled, or no BLOCK rules; warn on missing categories |
+| 2 | Firewall Rule Audit | `zscaler_assess_zia_policy` | ZS-02 | fail when the default rule allows or an enabled ALLOW rule has no scope; zero rules fail; warn when only the default rule exists or block rules skip full logging (`enableFullLogging` is SDK-documented only, so a missing field never supports pass); partial rule reads cap at warn |
+| 3 | DLP Engine Configuration | `zscaler_assess_zia_policy` | ZS-03 | pass with engines plus enabled BLOCK or ICAP_RESPONSE web DLP rules referencing engines; zero rules or engines fail; monitor-only rules warn |
+| 4 | SSL Inspection Coverage | `zscaler_assess_zia_policy` | ZS-04 | pass with enabled DECRYPT rules, no blanket DO_NOT_DECRYPT rule, exemptions under the threshold, SSL scanning on every location that was read; zero rules fail; a partial location inventory caps at warn |
+| 5 | Cloud Sandbox Analysis | `zscaler_assess_zia_policy` | ZS-05 | pass with enabled BLOCK sandbox rules; zero rules is manual (unlicensed or unconfigured); allow-only warns; blocked hashes are counted from the documented `md5HashValueList`, with the legacy `fileHashesToBeBlocked` recorded only as evidence |
+| 6 | Admin MFA Enforcement | `zscaler_assess_zia_access_control` | ZS-06 | always manual or warn: the ZIA API exposes `isPasswordLoginAllowed` but not per-admin MFA, so password-login admins warn and portal evidence is required |
+| 7 | RBAC & Admin Role Audit | `zscaler_assess_zia_access_control` | ZS-07 | pass when Super Admin count is within `max_super_admins` and least-privilege roles exist; fail above the threshold; admin scope is read from the documented `adminScope.Type` (the SDK-only `adminScopeType` is legacy evidence); a partial admin inventory caps at warn |
+| 8 | Application Segmentation | `zscaler_assess_zpa` | ZS-08 | fail for wildcard domain plus full port range or zero segments; warn for wildcard, full range, or bypassType ALWAYS; partial segment or segment group inventories cap at warn |
+| 9 | Zero Trust Access Policies | `zscaler_assess_zpa` | ZS-09 | fail for unconditional ALLOW rules or zero rules; warn when ALLOW rules lack identity, posture, or network criteria (SCIM, SAML, IdP, user, and user group operands all count as identity); a partial rule inventory caps at warn |
+| 10 | Posture Profile Enforcement | `zscaler_assess_zpa` | ZS-10 | pass when every enabled ALLOW rule has a POSTURE condition; fail with zero profiles or no posture conditions; partial profile or rule inventories cap at warn |
+| 11 | App Connector Health & Coverage | `zscaler_assess_zpa` | ZS-11 | pass when every enabled connector reports ZPN_STATUS_AUTHENTICATED with a `lastBrokerConnectTime` within `stale_connector_days` (default 30) and each group has two or more connected; authenticated connectors with a stale or missing timestamp warn; none authenticated fails; a partial connector inventory caps at warn |
+| 12 | IdP Integration & SAML Config | `zscaler_assess_zpa` | ZS-12 | pass with enabled USER IdP, SCIM, signed SAML requests, admin SSO, and no ZPA admin with local login and no 2FA; the finding states that `GET /administrators` is documented only by zscaler-sdk-go and caps at warn when that surface or any IdP inventory is unreadable or partial |
+| 13 | Session Timeout Configuration | `zscaler_assess_zpa` | ZS-13 | pass when enabled TIMEOUT_POLICY rules reauthenticate within `max_timeout_hours`; never-expire fails; ZIA admin session timeout is not exposed by the API |
+| 14 | Audit Logging Enabled | `zscaler_assess_zia_access_control` | ZS-14 | pass when the audit report interface is readable and an enabled NSS feed exports ADMIN_AUDIT logs; zero feeds warn; a `400` from the bare `GET /auditlogEntryReport` (the reference marks `statusId` required, the SDKs send no parameter) renders manual naming that cause |
+| 15 | Trusted Network Detection | `zscaler_assess_zpa` | ZS-15 | pass when trusted networks read from `GET /mgmtconfig/v2/.../network` are referenced by enabled policy rules; zero networks manual; unreferenced networks warn; a partial network inventory caps at warn |
+| 16 | Bandwidth Control Policies | `zscaler_assess_zia_policy` | ZS-16 | pass with enabled rules; zero rules manual (license or need must be confirmed) |
+| 17 | Browser Isolation Policies | `zscaler_assess_zia_policy` | ZS-17 | pass when isolation profiles are applied by enabled ISOLATE URL rules; zero profiles manual |
+| 18 | Location & GRE/VPN Configuration | `zscaler_assess_zia_policy` | ZS-18 | pass when every location and sub-location that was read has authRequired, sslScanEnabled, ofwEnabled; zero locations manual; when sub-locations were read for fewer parents than exist (100-parent cap) or the location list is partial, the finding reports parents read versus total and caps at warn |
+| 19 | Cloud Application Control | `zscaler_assess_zia_policy` | ZS-19 | pass with enabled rules whose actions block, isolate, or caution; zero rules fail; unread rule types manual |
+| 20 | DNS Security Configuration | `zscaler_assess_zia_policy` | ZS-20 | pass with enabled BLOCK or REDIR DNS rules and dgaDomainsBlocked; zero rules fail |
+| 21 | Service Edge Deployment | `zscaler_assess_zpa` | ZS-21 | pass when every enabled private service edge is authenticated with a `lastBrokerConnectTime` within `stale_connector_days`; stale or missing timestamps warn; none authenticated fails; zero edges manual (public service edges in use) |
+| 22 | Forwarding Policy Audit | `zscaler_assess_zpa` | ZS-22 | fail for unconditional BYPASS rules; conditional bypasses warn; zero rules manual |
+| 23 | Emergency Access Configuration | `zscaler_assess_zpa` | ZS-23 | pass when break-glass users exist and none is active; active users warn; zero users manual; users are read through the documented `pageId` cursor and deduplicated, and an unfinished cursor caps at warn |
+| 24 | Certificate Management | `zscaler_assess_zpa` | ZS-24 | fail on expired enrollment or browser access certificates (validity read from `validToInEpochSec` or the `validTo` date-time); expiring or undated warn; partial or unreadable browser access certificate inventories cap at warn; the ZIA CA chain is manual evidence |
+| 25 | Security Policy Baseline | `zscaler_assess_zia_policy` | ZS-25 | pass when the required ATP and malware flags are true and unscannable files are blocked; any false or absent flag fails |
 
 ## Framework mappings
 
@@ -270,151 +192,57 @@ The Hub serves the OneAPI base URL `https://api.zsapi.net/zia/api/v1`. The resou
 
 The legacy authentication flows are documented on help.zscaler.com ([ZIA API getting started](https://help.zscaler.com/zia/getting-started-zia-api), [ZPA API getting started](https://help.zscaler.com/zpa/getting-started-zpa-api)). They are implemented identically in [zscaler-sdk-go](https://github.com/zscaler/zscaler-sdk-go) (`zscaler/zia/v2_client.go`, `zscaler/zpa/v2_client.go`).
 
-Entries marked "SDK only" name surfaces or fields that the published reference does not document. The dependent findings state that and never rest a `pass` on them.
+Rows marked "SDK only" name surfaces or fields that the published reference does not document. The dependent findings state that and never rest a `pass` on them.
 
 Reference links below are relative to `https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/`.
 
-Each entry names the product and the endpoint with its paging, then the fields read and the reference.
-
-- **ZIA** `POST /api/v1/authenticatedSession` (`apiKey`, `username`, `password`, `timestamp`)
-  - Fields read: `JSESSIONID` cookie
-  - Reference: [zia/api-authentication/post-authenticated-session-info](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/api-authentication/post-authenticated-session-info). Obfuscation per the getting started guide and `zscaler/zia/v2_client.go`.
-- **ZIA** `DELETE /api/v1/authenticatedSession`
-  - Fields read: None
-  - Reference: [zia/api-authentication/set-authenticated-session-info](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/api-authentication/set-authenticated-session-info)
-- **ZIA** `GET /adminUsers` (`includeAuditorUsers`, `includeAdminUsers`, `page`, `pageSize` 1000, documented max 1000)
-  - Fields read: `loginName`, `disabled`, `isPasswordLoginAllowed`, `adminScope.Type`, `role.id`, `role.name`. `adminScopeType` is SDK only and legacy evidence.
-  - Reference: [zia/admin-role-management/get-admin-users](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/admin-role-management/get-admin-users)
-- **ZIA** `GET /adminRoles/lite` (`includeAuditorRole`, `includePartnerRole`, `includeApiRole`; no paging documented)
-  - Fields read: `id`, `name`, `roleType`
-  - Reference: [zia/admin-role-management/get-role-summary](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/admin-role-management/get-role-summary)
-- **ZIA** `GET /passwordExpiry/settings`
-  - Fields read: `passwordExpirationEnabled`, `passwordExpiryDays`
-  - Reference: [zia/admin-role-management/password-expiry-resource-get-password-expiry-settings](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/admin-role-management/password-expiry-resource-get-password-expiry-settings)
-- **ZIA** `GET /authSettings`
-  - Fields read: `samlEnabled`
-  - Reference: [zia/authentication-settings/auth-settings-resource-get-auth-settings](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/authentication-settings/auth-settings-resource-get-auth-settings)
-- **ZIA** `GET /auditlogEntryReport` (bare, as both SDKs send it)
-  - The reference marks `statusId` required, so a `400` renders control 14 manual.
-  - Fields read: `status`
-  - Reference: [zia/admin-audit-logs/get-audit-report-entry-csv-export-status](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/admin-audit-logs/get-audit-report-entry-csv-export-status)
-- **ZIA** `GET /nssFeeds` (no paging documented)
-  - Fields read: `name`, `feedStatus`, `nssLogType`
-  - Reference: [zia/cloud-nanolog-streaming-service-nss/nss-feeds-resource-get-all-nss-feeds](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/cloud-nanolog-streaming-service-nss/nss-feeds-resource-get-all-nss-feeds)
-- **ZIA** `GET /urlFilteringRules` (`page`, `pageSize` 100, the documented default; no max published)
-  - Fields read: `name`, `state`, `action`, `urlCategories`
-  - Reference: [zia/url-filtering-policy/get-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/url-filtering-policy/get-rules)
-- **ZIA** `GET /firewallFilteringRules` (`page`, `pageSize` 5000, the documented default)
-  - Fields read: `name`, `state`, `action`, `defaultRule`, scope arrays. `enableFullLogging` is SDK only (`filteringrules.go`), and its absence never supports pass.
-  - Reference: [zia/firewall-policies/firewall-filtering-rules-resource-get-firewall-filtering-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/firewall-policies/firewall-filtering-rules-resource-get-firewall-filtering-rules)
-- **ZIA** `GET /firewallDnsRules` (no paging documented)
-  - Fields read: `name`, `state`, `action`, `defaultRule`
-  - Reference: [zia/dns-control-policy/firewall-dns-rules-resource-get-firewall-dns-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/dns-control-policy/firewall-dns-rules-resource-get-firewall-dns-rules)
-- **ZIA** `GET /dlpEngines` (no paging documented)
-  - Fields read: `id`, `name`
-  - Reference: [zia/data-loss-prevention/dlp-engine-resource-get-dlp-engines](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/data-loss-prevention/dlp-engine-resource-get-dlp-engines)
-- **ZIA** `GET /dlpDictionaries` (`search`; no paging documented)
-  - Fields read: `id`, `name`
-  - Reference: [zia/data-loss-prevention/dlp-dictionary-resource-get-dlp-dictionaries](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/data-loss-prevention/dlp-dictionary-resource-get-dlp-dictionaries)
-- **ZIA** `GET /webDlpRules` (no paging documented)
-  - Fields read: `name`, `state`, `action`, `dlpEngines`, `withoutContentInspection`
-  - Reference: [zia/data-loss-prevention/web-dlp-rule-resource-get-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/data-loss-prevention/web-dlp-rule-resource-get-rules)
-- **ZIA** `GET /sslInspectionRules` (no paging documented)
-  - Fields read: `name`, `state`, `action.type`, scope arrays
-  - Reference: [zia/ssl-inspection-policy/ssl-inspection-rule-resource-get-ssl-inspection-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/ssl-inspection-policy/ssl-inspection-rule-resource-get-ssl-inspection-rules)
-- **ZIA** `GET /sslSettings/exemptedUrls`
-  - Fields read: `urls`
-  - Reference: [zia/intermediate-ca-certificates/get-ssl-exempted-urls](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/intermediate-ca-certificates/get-ssl-exempted-urls)
-- **ZIA** `GET /sandboxRules` (no paging documented)
-  - Fields read: `name`, `state`, `baRuleAction`, `firstTimeEnable`, `firstTimeOperation`
-  - Reference: [zia/sandbox-policy-settings/ba-rule-resource-get-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/sandbox-policy-settings/ba-rule-resource-get-rules)
-- **ZIA** `GET /behavioralAnalysisAdvancedSettings`
-  - Fields read: `md5HashValueList`. The legacy `fileHashesToBeBlocked` (SDK only, `sandbox_settings.go`) is recorded as evidence when present.
-  - Reference: [zia/sandbox-policy-settings/ba-advanced-settings-resource-get-custom-file-hash](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/sandbox-policy-settings/ba-advanced-settings-resource-get-custom-file-hash)
-- **ZIA** `GET /cyberThreatProtection/advancedThreatSettings`
-  - Fields read: ATP flags listed in the control table, `riskTolerance`, `dgaDomainsBlocked`
-  - Reference: [zia/advanced-threat-protection-policy/cyber-threat-protection-resource-get-config](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/advanced-threat-protection-policy/cyber-threat-protection-resource-get-config)
-- **ZIA** `GET /cyberThreatProtection/malwarePolicy`, `GET /cyberThreatProtection/malwareSettings`
-  - Fields read: Malware flags listed in the control table, `blockUnscannableFiles`, `blockPasswordProtectedArchiveFiles`
-  - References: [zia/malware-protection-policy/cyber-threat-protection-resource-get-malware-policy-config](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/malware-protection-policy/cyber-threat-protection-resource-get-malware-policy-config), [.../cyber-threat-protection-resource-get-malware-settings-config](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/malware-protection-policy/cyber-threat-protection-resource-get-malware-settings-config)
-- **ZIA** `GET /security`, `GET /security/advanced`
-  - Fields read: `whitelistUrls`, `blacklistUrls`
-  - References: [zia/security-policy-settings/get-config](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/security-policy-settings/get-config), [zia/security-policy-settings/get-advanced-policy](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/security-policy-settings/get-advanced-policy)
-- **ZIA** `GET /locations` (`page`, `pageSize` 1000, documented max 1000)
-  - Fields read: `id`, `name`, `authRequired`, `sslScanEnabled`, `ofwEnabled`
-  - Reference: [zia/location-management/get-top-locations](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/location-management/get-top-locations)
-- **ZIA** `GET /locations/{locationId}/sublocations` (no paging documented; fetched for at most 100 parents)
-  - Fields read: `id`, `name`, `parentId`, `authRequired`, `sslScanEnabled`, `ofwEnabled`
-  - Reference: [zia/location-management/get-sub-locations](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/location-management/get-sub-locations)
-- **ZIA** `GET /greTunnels` (`page`, `pageSize` 1000, documented max 1000)
-  - Fields read: Counts only
-  - Reference: [zia/traffic-forwarding/gre-tunnel-resource-get-all-gre-tunnels](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/traffic-forwarding/gre-tunnel-resource-get-all-gre-tunnels)
-- **ZIA** `GET /vpnCredentials` (`includeOnlyWithoutLocation=false`, `page`, `pageSize` 1000, documented max 1000)
-  - Fields read: Counts only
-  - Reference: [zia/traffic-forwarding/get-vpn-credentials](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/traffic-forwarding/get-vpn-credentials)
-- **ZIA** `GET /bandwidthControlRules` (no paging documented)
-  - Fields read: `name`, `state`, `minBandwidth`, `maxBandwidth`
-  - Reference: [zia/bandwidth-control-classes/bandwidth-control-rule-resource-get-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/bandwidth-control-classes/bandwidth-control-rule-resource-get-rules)
-- **ZIA** `GET /browserIsolation/profiles` (no paging documented)
-  - Fields read: `id`, `name`
-  - Reference: [zia/browser-isolation/browser-isolation-resource-get-cloud-browser-isolation-profiles](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/browser-isolation/browser-isolation-resource-get-cloud-browser-isolation-profiles)
-- **ZIA** `GET /webApplicationRules/ruleTypeMapping`, `GET /webApplicationRules/{ruleType}`
-  - Fields read: Rule type keys; `name`, `state`, `actions`
-  - References: [zia/cloud-app-control-policy/web-application-rule-resource-get-rule-type-mapping](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/cloud-app-control-policy/web-application-rule-resource-get-rule-type-mapping), [.../web-application-rule-resource-get-rules-by-type](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/cloud-app-control-policy/web-application-rule-resource-get-rules-by-type)
-- **ZPA** `POST /signin` (form `client_id`, `client_secret`)
-  - Fields read: `access_token`, `expires_in`
-  - Reference (legacy ZPA authentication): [ZPA API getting started](https://help.zscaler.com/zpa/getting-started-zpa-api) and `zscaler/zpa/v2_client.go`. The Automation Hub documents only the OneAPI OAuth flow.
-- **ZPA** `GET /mgmtconfig/v1/admin/customers/{customerId}/application` (`page`, `pagesize` 500, documented max 500, to `totalPages`)
-  - Fields read: `enabled`, `domainNames`, `tcpPortRange`, `tcpPortRanges`, `udpPortRange`, `udpPortRanges`, `bypassType`, `segmentGroupId`
-  - Reference: [zpa/application-segment-management/gets-all-configured-application-segments-for-the-specified-customer](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/application-segment-management/gets-all-configured-application-segments-for-the-specified-customer)
-- **ZPA** `GET .../v1/.../segmentGroup` (`page`, `pagesize` 500)
-  - Fields read: Count only
-  - Reference: [zpa/segment-group-management/gets-all-configured-segment-groups-for-the-specified-customer](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/segment-group-management/gets-all-configured-segment-groups-for-the-specified-customer)
-- **ZPA** `GET .../v1/.../policySet/rules/policyType/{policyType}` (`page`, `pagesize` 500)
-  - Policy types: ACCESS_POLICY, TIMEOUT_POLICY, CLIENT_FORWARDING_POLICY, ISOLATION_POLICY
-  - Fields read: `name`, `action`, `disabled`, `conditions[].operands[].objectType`, `reauthTimeout`, `reauthIdleTimeout`
-  - Reference: [zpa/policy-management/gets-paginated-policy-rules-for-the-specified-policy-type](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/policy-management/gets-paginated-policy-rules-for-the-specified-policy-type)
-- **ZPA** `GET .../v1/.../appConnectorGroup` (`page`, `pagesize` 500)
-  - Fields read: `id`, `name`, `enabled`
-  - Reference: [zpa/app-connector-group/gets-all-configured-app-connector-groups-for-the-specified-customer](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/app-connector-group/gets-all-configured-app-connector-groups-for-the-specified-customer)
-- **ZPA** `GET .../v1/.../connector` (`page`, `pagesize` 500)
-  - Fields read: `name`, `enabled`, `controlChannelStatus`, `lastBrokerConnectTime`, `appConnectorGroupName`, `appConnectorGroupId`
-  - Reference: [zpa/app-connector-management/gets-all-configured-app-connector-details-for-the-specified-customer](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/app-connector-management/gets-all-configured-app-connector-details-for-the-specified-customer)
-- **ZPA** `GET .../v1/.../serviceEdgeGroup` (`page`, `pagesize` 500)
-  - Fields read: Count only
-  - Reference: [zpa/service-edge-group/get-private-broker-groups](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/service-edge-group/get-private-broker-groups)
-- **ZPA** `GET .../v1/.../serviceEdge` (`page`, `pagesize` 500)
-  - Fields read: `name`, `enabled`, `controlChannelStatus`, `lastBrokerConnectTime`
-  - Reference: [zpa/private-service-edge-management/gets-all-the-configured-service-edge-details-for-the-specified-customer](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/private-service-edge-management/gets-all-the-configured-service-edge-details-for-the-specified-customer)
-- **ZPA** `GET /mgmtconfig/v2/admin/customers/{customerId}/posture` (`page`, `pagesize` 500)
-  - Fields read: `name`, `postureType`
-  - Reference: [zpa/posture-profiles/get-all-attributes](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/posture-profiles/get-all-attributes)
-- **ZPA** `GET /mgmtconfig/v2/admin/customers/{customerId}/network` (`page`, `pagesize` 500)
-  - Fields read: `id`, `name`
-  - Reference: [zpa/trusted-networks/get-all-trusted-networks](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/trusted-networks/get-all-trusted-networks)
-- **ZPA** `GET .../v2/.../idp` (`page`, `pagesize` 500)
-  - Fields read: `name`, `enabled`, `ssoType`, `scimEnabled`, `signSamlRequest`
-  - Reference: [zpa/idp-management/get-all-idp](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/idp-management/get-all-idp)
-- **ZPA** `GET .../v2/.../samlAttribute` (`page`, `pagesize` 500)
-  - Fields read: Count only
-  - Reference: [zpa/saml-attributes/get-all-attributes-by-page](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/saml-attributes/get-all-attributes-by-page)
-- **ZPA** `GET /userconfig/v1/customers/{customerId}/scimgroup/idpId/{idpId}` (`page`, `pagesize` 500, documented max 500)
-  - Fields read: Count only
-  - Reference: [zpa/scim-groups/get-all-scim-groups](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/scim-groups/get-all-scim-groups)
-- **ZPA** `GET .../v2/.../enrollmentCert` (`page`, `pagesize` 500)
-  - Fields read: `name`, `validToInEpochSec`, `validTo` (date-time)
-  - Reference for field shapes: [zpa/enrollment-certificates/gets-the-enrollment-certificate-details-for-the-specified-id](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/enrollment-certificates/gets-the-enrollment-certificate-details-for-the-specified-id)
-  - Reference for the list operation: [zpa/signing-certificate/get-all-signing-cert](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/signing-certificate/get-all-signing-cert) (`search`, `page`, `pagesize` max 500). It is published under the signing-certificate category.
-- **ZPA** `GET .../v2/.../clientlessCertificate/issued` (`page`, `pagesize` 500)
-  - Fields read: `name`, `validToInEpochSec`, `validTo` (date-time)
-  - Reference: [zpa/certificate-management/get-all-issued-certs](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/certificate-management/get-all-issued-certs)
-- **ZPA** `GET .../v1/.../emergencyAccess/users` (`pageId` cursor from `nextPage`, `pageSize` 500, documented max 500; `items` wrapper)
-  - Fields read: `userId`, `emailId`, `userStatus`, `lastLoginTime`
-  - Reference: [zpa/emergency-access-management/get-all-emergency-access-group-users](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/emergency-access-management/get-all-emergency-access-group-users)
-- **ZPA** `GET .../v1/.../administrators` (`page`, `pagesize` 500)
-  - Fields read: `username`, `isEnabled`, `localLoginDisabled`, `twoFactorAuthEnabled`
-  - Reference (SDK only): `zscaler/zpa/services/administrator_controller/administrator_controller.go` and `tests/unit/zpa/services/administratorcontroller_test.go` in zscaler-sdk-go
-  - The endpoint is absent from the published ZPA reference, so control 12 states this and never passes on it alone.
+| Product | Endpoint and paging | Fields read | Reference |
+| --- | --- | --- | --- |
+| ZIA | `POST /api/v1/authenticatedSession` (`apiKey`, `username`, `password`, `timestamp`) | `JSESSIONID` cookie | [zia/api-authentication/post-authenticated-session-info](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/api-authentication/post-authenticated-session-info); obfuscation per the getting started guide and `zscaler/zia/v2_client.go` |
+| ZIA | `DELETE /api/v1/authenticatedSession` | none | [zia/api-authentication/set-authenticated-session-info](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/api-authentication/set-authenticated-session-info) |
+| ZIA | `GET /adminUsers` (`includeAuditorUsers`, `includeAdminUsers`, `page`, `pageSize` 1000, documented max 1000) | `loginName`, `disabled`, `isPasswordLoginAllowed`, `adminScope.Type`, `role.id`, `role.name`; `adminScopeType` is SDK only and legacy evidence | [zia/admin-role-management/get-admin-users](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/admin-role-management/get-admin-users) |
+| ZIA | `GET /adminRoles/lite` (`includeAuditorRole`, `includePartnerRole`, `includeApiRole`; no paging documented) | `id`, `name`, `roleType` | [zia/admin-role-management/get-role-summary](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/admin-role-management/get-role-summary) |
+| ZIA | `GET /passwordExpiry/settings` | `passwordExpirationEnabled`, `passwordExpiryDays` | [zia/admin-role-management/password-expiry-resource-get-password-expiry-settings](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/admin-role-management/password-expiry-resource-get-password-expiry-settings) |
+| ZIA | `GET /authSettings` | `samlEnabled` | [zia/authentication-settings/auth-settings-resource-get-auth-settings](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/authentication-settings/auth-settings-resource-get-auth-settings) |
+| ZIA | `GET /auditlogEntryReport` (bare, as both SDKs send it; the reference marks `statusId` required, so a `400` renders control 14 manual) | `status` | [zia/admin-audit-logs/get-audit-report-entry-csv-export-status](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/admin-audit-logs/get-audit-report-entry-csv-export-status) |
+| ZIA | `GET /nssFeeds` (no paging documented) | `name`, `feedStatus`, `nssLogType` | [zia/cloud-nanolog-streaming-service-nss/nss-feeds-resource-get-all-nss-feeds](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/cloud-nanolog-streaming-service-nss/nss-feeds-resource-get-all-nss-feeds) |
+| ZIA | `GET /urlFilteringRules` (`page`, `pageSize` 100, the documented default; no max published) | `name`, `state`, `action`, `urlCategories` | [zia/url-filtering-policy/get-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/url-filtering-policy/get-rules) |
+| ZIA | `GET /firewallFilteringRules` (`page`, `pageSize` 5000, the documented default) | `name`, `state`, `action`, `defaultRule`, scope arrays; `enableFullLogging` is SDK only (`filteringrules.go`) and its absence never supports pass | [zia/firewall-policies/firewall-filtering-rules-resource-get-firewall-filtering-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/firewall-policies/firewall-filtering-rules-resource-get-firewall-filtering-rules) |
+| ZIA | `GET /firewallDnsRules` (no paging documented) | `name`, `state`, `action`, `defaultRule` | [zia/dns-control-policy/firewall-dns-rules-resource-get-firewall-dns-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/dns-control-policy/firewall-dns-rules-resource-get-firewall-dns-rules) |
+| ZIA | `GET /dlpEngines` (no paging documented) | `id`, `name` | [zia/data-loss-prevention/dlp-engine-resource-get-dlp-engines](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/data-loss-prevention/dlp-engine-resource-get-dlp-engines) |
+| ZIA | `GET /dlpDictionaries` (`search`; no paging documented) | `id`, `name` | [zia/data-loss-prevention/dlp-dictionary-resource-get-dlp-dictionaries](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/data-loss-prevention/dlp-dictionary-resource-get-dlp-dictionaries) |
+| ZIA | `GET /webDlpRules` (no paging documented) | `name`, `state`, `action`, `dlpEngines`, `withoutContentInspection` | [zia/data-loss-prevention/web-dlp-rule-resource-get-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/data-loss-prevention/web-dlp-rule-resource-get-rules) |
+| ZIA | `GET /sslInspectionRules` (no paging documented) | `name`, `state`, `action.type`, scope arrays | [zia/ssl-inspection-policy/ssl-inspection-rule-resource-get-ssl-inspection-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/ssl-inspection-policy/ssl-inspection-rule-resource-get-ssl-inspection-rules) |
+| ZIA | `GET /sslSettings/exemptedUrls` | `urls` | [zia/intermediate-ca-certificates/get-ssl-exempted-urls](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/intermediate-ca-certificates/get-ssl-exempted-urls) |
+| ZIA | `GET /sandboxRules` (no paging documented) | `name`, `state`, `baRuleAction`, `firstTimeEnable`, `firstTimeOperation` | [zia/sandbox-policy-settings/ba-rule-resource-get-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/sandbox-policy-settings/ba-rule-resource-get-rules) |
+| ZIA | `GET /behavioralAnalysisAdvancedSettings` | `md5HashValueList`; the legacy `fileHashesToBeBlocked` (SDK only, `sandbox_settings.go`) is recorded as evidence when present | [zia/sandbox-policy-settings/ba-advanced-settings-resource-get-custom-file-hash](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/sandbox-policy-settings/ba-advanced-settings-resource-get-custom-file-hash) |
+| ZIA | `GET /cyberThreatProtection/advancedThreatSettings` | ATP flags listed in the control table, `riskTolerance`, `dgaDomainsBlocked` | [zia/advanced-threat-protection-policy/cyber-threat-protection-resource-get-config](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/advanced-threat-protection-policy/cyber-threat-protection-resource-get-config) |
+| ZIA | `GET /cyberThreatProtection/malwarePolicy`, `GET /cyberThreatProtection/malwareSettings` | malware flags listed in the control table, `blockUnscannableFiles`, `blockPasswordProtectedArchiveFiles` | [zia/malware-protection-policy/cyber-threat-protection-resource-get-malware-policy-config](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/malware-protection-policy/cyber-threat-protection-resource-get-malware-policy-config), [.../cyber-threat-protection-resource-get-malware-settings-config](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/malware-protection-policy/cyber-threat-protection-resource-get-malware-settings-config) |
+| ZIA | `GET /security`, `GET /security/advanced` | `whitelistUrls`, `blacklistUrls` | [zia/security-policy-settings/get-config](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/security-policy-settings/get-config), [zia/security-policy-settings/get-advanced-policy](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/security-policy-settings/get-advanced-policy) |
+| ZIA | `GET /locations` (`page`, `pageSize` 1000, documented max 1000) | `id`, `name`, `authRequired`, `sslScanEnabled`, `ofwEnabled` | [zia/location-management/get-top-locations](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/location-management/get-top-locations) |
+| ZIA | `GET /locations/{locationId}/sublocations` (no paging documented; fetched for at most 100 parents) | `id`, `name`, `parentId`, `authRequired`, `sslScanEnabled`, `ofwEnabled` | [zia/location-management/get-sub-locations](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/location-management/get-sub-locations) |
+| ZIA | `GET /greTunnels` (`page`, `pageSize` 1000, documented max 1000) | counts only | [zia/traffic-forwarding/gre-tunnel-resource-get-all-gre-tunnels](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/traffic-forwarding/gre-tunnel-resource-get-all-gre-tunnels) |
+| ZIA | `GET /vpnCredentials` (`includeOnlyWithoutLocation=false`, `page`, `pageSize` 1000, documented max 1000) | counts only | [zia/traffic-forwarding/get-vpn-credentials](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/traffic-forwarding/get-vpn-credentials) |
+| ZIA | `GET /bandwidthControlRules` (no paging documented) | `name`, `state`, `minBandwidth`, `maxBandwidth` | [zia/bandwidth-control-classes/bandwidth-control-rule-resource-get-rules](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/bandwidth-control-classes/bandwidth-control-rule-resource-get-rules) |
+| ZIA | `GET /browserIsolation/profiles` (no paging documented) | `id`, `name` | [zia/browser-isolation/browser-isolation-resource-get-cloud-browser-isolation-profiles](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/browser-isolation/browser-isolation-resource-get-cloud-browser-isolation-profiles) |
+| ZIA | `GET /webApplicationRules/ruleTypeMapping`, `GET /webApplicationRules/{ruleType}` | rule type keys; `name`, `state`, `actions` | [zia/cloud-app-control-policy/web-application-rule-resource-get-rule-type-mapping](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/cloud-app-control-policy/web-application-rule-resource-get-rule-type-mapping), [.../web-application-rule-resource-get-rules-by-type](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia/cloud-app-control-policy/web-application-rule-resource-get-rules-by-type) |
+| ZPA | `POST /signin` (form `client_id`, `client_secret`) | `access_token`, `expires_in` | Legacy ZPA authentication: [ZPA API getting started](https://help.zscaler.com/zpa/getting-started-zpa-api) and `zscaler/zpa/v2_client.go`; the Automation Hub documents only the OneAPI OAuth flow |
+| ZPA | `GET /mgmtconfig/v1/admin/customers/{customerId}/application` (`page`, `pagesize` 500, documented max 500, to `totalPages`) | `enabled`, `domainNames`, `tcpPortRange`, `tcpPortRanges`, `udpPortRange`, `udpPortRanges`, `bypassType`, `segmentGroupId` | [zpa/application-segment-management/gets-all-configured-application-segments-for-the-specified-customer](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/application-segment-management/gets-all-configured-application-segments-for-the-specified-customer) |
+| ZPA | `GET .../v1/.../segmentGroup` (`page`, `pagesize` 500) | count only | [zpa/segment-group-management/gets-all-configured-segment-groups-for-the-specified-customer](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/segment-group-management/gets-all-configured-segment-groups-for-the-specified-customer) |
+| ZPA | `GET .../v1/.../policySet/rules/policyType/{policyType}` for ACCESS_POLICY, TIMEOUT_POLICY, CLIENT_FORWARDING_POLICY, ISOLATION_POLICY (`page`, `pagesize` 500) | `name`, `action`, `disabled`, `conditions[].operands[].objectType`, `reauthTimeout`, `reauthIdleTimeout` | [zpa/policy-management/gets-paginated-policy-rules-for-the-specified-policy-type](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/policy-management/gets-paginated-policy-rules-for-the-specified-policy-type) |
+| ZPA | `GET .../v1/.../appConnectorGroup` (`page`, `pagesize` 500) | `id`, `name`, `enabled` | [zpa/app-connector-group/gets-all-configured-app-connector-groups-for-the-specified-customer](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/app-connector-group/gets-all-configured-app-connector-groups-for-the-specified-customer) |
+| ZPA | `GET .../v1/.../connector` (`page`, `pagesize` 500) | `name`, `enabled`, `controlChannelStatus`, `lastBrokerConnectTime`, `appConnectorGroupName`, `appConnectorGroupId` | [zpa/app-connector-management/gets-all-configured-app-connector-details-for-the-specified-customer](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/app-connector-management/gets-all-configured-app-connector-details-for-the-specified-customer) |
+| ZPA | `GET .../v1/.../serviceEdgeGroup` (`page`, `pagesize` 500) | count only | [zpa/service-edge-group/get-private-broker-groups](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/service-edge-group/get-private-broker-groups) |
+| ZPA | `GET .../v1/.../serviceEdge` (`page`, `pagesize` 500) | `name`, `enabled`, `controlChannelStatus`, `lastBrokerConnectTime` | [zpa/private-service-edge-management/gets-all-the-configured-service-edge-details-for-the-specified-customer](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/private-service-edge-management/gets-all-the-configured-service-edge-details-for-the-specified-customer) |
+| ZPA | `GET /mgmtconfig/v2/admin/customers/{customerId}/posture` (`page`, `pagesize` 500) | `name`, `postureType` | [zpa/posture-profiles/get-all-attributes](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/posture-profiles/get-all-attributes) |
+| ZPA | `GET /mgmtconfig/v2/admin/customers/{customerId}/network` (`page`, `pagesize` 500) | `id`, `name` | [zpa/trusted-networks/get-all-trusted-networks](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/trusted-networks/get-all-trusted-networks) |
+| ZPA | `GET .../v2/.../idp` (`page`, `pagesize` 500) | `name`, `enabled`, `ssoType`, `scimEnabled`, `signSamlRequest` | [zpa/idp-management/get-all-idp](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/idp-management/get-all-idp) |
+| ZPA | `GET .../v2/.../samlAttribute` (`page`, `pagesize` 500) | count only | [zpa/saml-attributes/get-all-attributes-by-page](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/saml-attributes/get-all-attributes-by-page) |
+| ZPA | `GET /userconfig/v1/customers/{customerId}/scimgroup/idpId/{idpId}` (`page`, `pagesize` 500, documented max 500) | count only | [zpa/scim-groups/get-all-scim-groups](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/scim-groups/get-all-scim-groups) |
+| ZPA | `GET .../v2/.../enrollmentCert` (`page`, `pagesize` 500) | `name`, `validToInEpochSec`, `validTo` (date-time) | Field shapes: [zpa/enrollment-certificates/gets-the-enrollment-certificate-details-for-the-specified-id](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/enrollment-certificates/gets-the-enrollment-certificate-details-for-the-specified-id). List operation: [zpa/signing-certificate/get-all-signing-cert](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/signing-certificate/get-all-signing-cert) (`search`, `page`, `pagesize` max 500; published under the signing-certificate category) |
+| ZPA | `GET .../v2/.../clientlessCertificate/issued` (`page`, `pagesize` 500) | `name`, `validToInEpochSec`, `validTo` (date-time) | [zpa/certificate-management/get-all-issued-certs](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/certificate-management/get-all-issued-certs) |
+| ZPA | `GET .../v1/.../emergencyAccess/users` (`pageId` cursor from `nextPage`, `pageSize` 500, documented max 500; `items` wrapper) | `userId`, `emailId`, `userStatus`, `lastLoginTime` | [zpa/emergency-access-management/get-all-emergency-access-group-users](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zpa/emergency-access-management/get-all-emergency-access-group-users) |
+| ZPA | `GET .../v1/.../administrators` (`page`, `pagesize` 500) | `username`, `isEnabled`, `localLoginDisabled`, `twoFactorAuthEnabled` | SDK only: `zscaler/zpa/services/administrator_controller/administrator_controller.go` and `tests/unit/zpa/services/administratorcontroller_test.go` in zscaler-sdk-go; absent from the published ZPA reference, so control 12 states this and never passes on it alone |
 
 ## Limitations and manual controls
 

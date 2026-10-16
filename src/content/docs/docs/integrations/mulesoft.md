@@ -18,42 +18,17 @@ It never mutates the organization. Every request is a `GET`, except the token ex
 
 Set the organization ID and one credential source. Explicit tool arguments win over environment variables, which win over the TOML config file.
 
-- **Organization (business group) ID**
-  - Argument: `organization_id`
-  - Environment variable: `ANYPOINT_ORG_ID` (or `ANYPOINT_ORGANIZATION_ID`)
-  - Config key: `org_id` (or `organization_id`)
-- **Connected app client credentials**
-  - Arguments: `client_id`, `client_secret`
-  - Environment variables: `ANYPOINT_CLIENT_ID`, `ANYPOINT_CLIENT_SECRET`
-  - Config keys: `client_id`, `client_secret`
-- **Username and password**
-  - Arguments: `username`, `password`
-  - Environment variables: `ANYPOINT_USERNAME`, `ANYPOINT_PASSWORD`
-  - Config keys: `username`, `password`
-- **Pre-issued bearer token**
-  - Argument: `token`
-  - Environment variable: `ANYPOINT_TOKEN` (or `ANYPOINT_ACCESS_TOKEN`)
-  - Config key: `token` (or `access_token`)
-- **Control plane**
-  - Argument: `control_plane` (`us`, `eu`, `gov`)
-  - Environment variable: `ANYPOINT_CONTROL_PLANE`
-  - Config key: `control_plane` (or `region`)
-- **Custom base URL**
-  - Argument: `base_url`
-  - Environment variable: `ANYPOINT_BASE_URL`
-  - Config key: `base_url`
-- **Environment filter**
-  - Argument: `environments` (comma-separated names or IDs)
-  - Environment variable: `ANYPOINT_ENVIRONMENTS` (or `ANYPOINT_ENVIRONMENT_IDS`)
-  - Config key: `environments` (array)
-- **Request timeout (seconds, default 30)**
-  - Argument: `timeout_seconds`
-  - Environment variable: `ANYPOINT_TIMEOUT`
-  - Config key: `timeout` (or `timeout_seconds`)
-- **Config file path**
-  - Argument: `config_file`
-  - Environment variable: `MULESOFT_SEC_INSPECTOR_CONFIG` (or `ANYPOINT_CONFIG_FILE`)
-  - Default: `~/.config/mulesoft-sec-inspector/config.toml`
+| Setting | Argument | Environment variable | `config.toml` key |
+| --- | --- | --- | --- |
+| Organization (business group) ID | `organization_id` | `ANYPOINT_ORG_ID` (or `ANYPOINT_ORGANIZATION_ID`) | `org_id` (or `organization_id`) |
+| Connected app client credentials | `client_id`, `client_secret` | `ANYPOINT_CLIENT_ID`, `ANYPOINT_CLIENT_SECRET` | `client_id`, `client_secret` |
+| Username and password | `username`, `password` | `ANYPOINT_USERNAME`, `ANYPOINT_PASSWORD` | `username`, `password` |
+| Pre-issued bearer token | `token` | `ANYPOINT_TOKEN` (or `ANYPOINT_ACCESS_TOKEN`) | `token` (or `access_token`) |
+| Control plane | `control_plane` (`us`, `eu`, `gov`) | `ANYPOINT_CONTROL_PLANE` | `control_plane` (or `region`) |
+| Custom base URL | `base_url` | `ANYPOINT_BASE_URL` | `base_url` |
+| Environment filter | `environments` (comma-separated names or IDs) | `ANYPOINT_ENVIRONMENTS` (or `ANYPOINT_ENVIRONMENT_IDS`) | `environments` (array) |
+| Request timeout (seconds, default 30) | `timeout_seconds` | `ANYPOINT_TIMEOUT` | `timeout` (or `timeout_seconds`) |
+| Config file path | `config_file` | `MULESOFT_SEC_INSPECTOR_CONFIG` (or `ANYPOINT_CONFIG_FILE`) | default `~/.config/mulesoft-sec-inspector/config.toml` |
 
 Auth mode is chosen in this order: pre-issued token, connected app client credentials, then username and password.
 
@@ -70,11 +45,11 @@ Auth mode is chosen in this order: pre-issued token, connected app client creden
 
 ### Control planes
 
-Base URL for each `control_plane` value:
-
-- `us` (default): `https://anypoint.mulesoft.com`
-- `eu`: `https://eu1.anypoint.mulesoft.com`
-- `gov`: `https://gov.anypoint.mulesoft.com`
+| `control_plane` | Base URL |
+| --- | --- |
+| `us` (default) | `https://anypoint.mulesoft.com` |
+| `eu` | `https://eu1.anypoint.mulesoft.com` |
+| `gov` | `https://gov.anypoint.mulesoft.com` |
 
 Pass `base_url` for any other hostname. The control plane is then reported as `custom`.
 
@@ -97,38 +72,43 @@ Create a connected app that acts on its own behalf (client credentials). Grant i
 
 Scope IDs come from the Anypoint OpenID discovery document. When MuleSoft publicly documents a scope display name, both the display name and API ID are shown.
 
-Read scope or permission for each surface:
-
-- **Current connected-app profile:** `profile`, assigned implicitly to client-credentials apps.
-- **Organization and hierarchy:** Access Management: View Organization (`read:organization`).
-- **Organization members and MFA-exempt users:** Access Management connected-app scope `read:orgusers`.
-- **Role groups:** Connected Apps: Read-only full access (`read:full`). MuleSoft does not publicly document a narrower role-group scope.
-- **Environments:** Access Management: View Environment (`read:orgenvironments`; `view:environment`).
-- **Connected applications:** Access Management connected-app scope `read:orgconnapps`.
-- **Identity providers:** Access Management connected-app scope `view:identityproviders`.
-- **API Manager APIs and policies:** API Manager: View APIs Configuration (`read:api_configuration`), View Policies (`read:api_policies`), View Contracts (`read:api_contracts`).
-- **Exchange assets:** Exchange: Exchange Viewer (`read:exchange`).
-- **CloudHub applications and alerts, hybrid servers:** Runtime Manager: Read Applications (`read:applications`), Read Alerts (`read:application_alerts`), Read Servers (`read:servers`).
-- **Anypoint VPCs and dedicated load balancers:** Runtime Manager: CloudHub Network Viewer (`read:cloudhub_networking`).
-- **Audit log platforms, queries, and retention settings:** Access Management: Audit Log Viewer (`read:audit_logs`).
-  - The retention settings read (`GET /audit/v2/organizations/{orgId}/retentionSettings`) is evidence only for control 17.
-  - A `403` on that read is recorded in the finding and `_errors.log` without changing the verdict.
-- **Anypoint MQ regions, queues, clients:** Anypoint MQ: View destinations (`view:destinations`) and View clients (`view:clients`). View clients exposes client IDs and client secrets.
-- **Secrets Manager secret groups:** Secrets Manager: Read secrets metadata (`read:secrets_metadata`).
+| Surface | Read scope or permission |
+| --- | --- |
+| Current connected-app profile | `profile`, assigned implicitly to client-credentials apps |
+| Organization and hierarchy | Access Management: View Organization (`read:organization`) |
+| Organization members and MFA-exempt users | Access Management connected-app scope `read:orgusers` |
+| Role groups | Connected Apps: Read-only full access (`read:full`). MuleSoft does not publicly document a narrower role-group scope. |
+| Environments | Access Management: View Environment (`read:orgenvironments`; `view:environment`) |
+| Connected applications | Access Management connected-app scope `read:orgconnapps` |
+| Identity providers | Access Management connected-app scope `view:identityproviders` |
+| API Manager APIs and policies | API Manager: View APIs Configuration (`read:api_configuration`), View Policies (`read:api_policies`), View Contracts (`read:api_contracts`) |
+| Exchange assets | Exchange: Exchange Viewer (`read:exchange`) |
+| CloudHub applications and alerts, hybrid servers | Runtime Manager: Read Applications (`read:applications`), Read Alerts (`read:application_alerts`), Read Servers (`read:servers`) |
+| Anypoint VPCs and dedicated load balancers | Runtime Manager: CloudHub Network Viewer (`read:cloudhub_networking`) |
+| Audit log platforms, queries, and retention settings | Access Management: Audit Log Viewer (`read:audit_logs`). The retention settings read (`GET /audit/v2/organizations/{orgId}/retentionSettings`) is evidence only for control 17; a `403` on it is recorded in the finding and `_errors.log` without changing the verdict. |
+| Anypoint MQ regions, queues, clients | Anypoint MQ: View destinations (`view:destinations`) and View clients (`view:clients`). View clients exposes client IDs and client secrets. |
+| Secrets Manager secret groups | Secrets Manager: Read secrets metadata (`read:secrets_metadata`) |
 
 Grant the scopes for each environment the assessment should sample, because Anypoint scopes are environment-specific for most products.
 
 ## Tools
 
-- `mulesoft_check_access`: Probes 20 read surfaces (Access Management, API Manager, Exchange, CloudHub, Runtime Manager, audit log, MQ, Secrets Manager). Reports `healthy` or `limited`, and lists missing permissions.
-- `mulesoft_assess_identity_access`: Controls 1-6, 18, 19, 25. Covers identity providers, MFA exemptions, admin count, role group least privilege and environment scoping, environment isolation, connected app scopes and staleness, and business groups.
-- `mulesoft_assess_api_gateway`: Controls 7-9, 20. Covers authentication and rate limiting policies on API instances (production first), client credential rotation evidence, and Exchange asset governance.
-- `mulesoft_assess_runtime_infrastructure`: Controls 10-16, 21-23. Covers runtime versions, worker sizing, persistent queue encryption, VPC firewall rules and open ingress, DLB TLS versions and certificate expiry, MQ, Secrets Manager, and hybrid servers.
-- `mulesoft_assess_audit_monitoring`: Controls 17, 24. Covers audit log entries in the lookback window and alert coverage for production applications.
-- `mulesoft_export_audit_bundle`: Runs the access check and all four assessments. Writes a bundle plus `.zip` under `output_dir` (default `./export/mulesoft`).
-  - `core_data/` holds projected and redacted snapshots. A denied, errored, or never-requested dataset is written as a `{ collected: false, dataset, status, endpoint, error }` marker. A dataset assembled from several reads, some of which failed, is written as `{ collected: "partial", failed_reads, items }`.
-  - `analysis/` holds the findings and per-category summaries, with an `inventories` map naming each source as complete, partial, unread, or not requested.
-  - `compliance/` holds the executive summary, unified matrix, and eight framework reports.
+| Tool | Purpose |
+| --- | --- |
+| `mulesoft_check_access` | Probes 20 read surfaces (Access Management, API Manager, Exchange, CloudHub, Runtime Manager, audit log, MQ, Secrets Manager), reports `healthy` or `limited`, and lists missing permissions. |
+| `mulesoft_assess_identity_access` | Controls 1-6, 18, 19, 25: identity providers, MFA exemptions, admin count, role group least privilege and environment scoping, environment isolation, connected app scopes and staleness, business groups. |
+| `mulesoft_assess_api_gateway` | Controls 7-9, 20: authentication and rate limiting policies on API instances (production first), client credential rotation evidence, Exchange asset governance. |
+| `mulesoft_assess_runtime_infrastructure` | Controls 10-16, 21-23: runtime versions, worker sizing, persistent queue encryption, VPC firewall rules and open ingress, DLB TLS versions and certificate expiry, MQ, Secrets Manager, hybrid servers. |
+| `mulesoft_assess_audit_monitoring` | Controls 17, 24: audit log entries in the lookback window and alert coverage for production applications. |
+| `mulesoft_export_audit_bundle` | Runs the access check and all four assessments, then writes a bundle and a zip archive. |
+
+`mulesoft_export_audit_bundle` writes the bundle plus `.zip` under `output_dir` (default `./export/mulesoft`):
+
+- `core_data/` holds projected and redacted snapshots.
+  - A denied, errored, or never-requested dataset is written as a `{ collected: false, dataset, status, endpoint, error }` marker.
+  - A dataset assembled from several reads, some of which failed, is written as `{ collected: "partial", failed_reads, items }`.
+- `analysis/` holds the findings and per-category summaries, with an `inventories` map naming each source as complete, partial, unread, or not requested.
+- `compliance/` holds the executive summary, unified matrix, and eight framework reports.
 
 All tools accept the authentication arguments above. Assessment tools also accept these limits and thresholds, with defaults in parentheses:
 
@@ -204,7 +184,7 @@ Output paths are resolved inside `output_dir`. Traversal outside the root and sy
 
 ## Control coverage
 
-Each entry names the spec control, then the tool and finding that cover it. The `Inputs` line names the sources the finding reads, using the keys of the category summary's `inventories` map.
+The `Inputs` column names the sources each finding reads, using the keys of the category summary's `inventories` map.
 
 Input rules:
 
@@ -213,190 +193,33 @@ Input rules:
 - An input that is truncated, capped, filtered, or only partly read adds a `Partial view:` note and turns a would-be pass into `warn`.
 - Per-item reads are `not requested` when their parent list was not read, and the finding reports the parent. The per-item reads are `role_group_roles`, `connected_app_scopes`, `api_policies`, `vpc_details`, `load_balancer_details`, and the per-environment inventories.
 
-The controls:
-
-- **1 SSO/SAML or OIDC external identity provider configured** (identity_access, `MULESOFT-IAM-01`)
-  - Inputs: `identity_providers`, `organization`. Secondary: `identity_provider_settings`.
-  - Fail: Zero identity providers on a complete read, or every visible provider disabled.
-  - Manual (not fail): An identity provider page truncated before any provider was visible, since the absence is a claim about the unread providers. The summary carries the partial view, and `identity_providers` and `active_identity_providers` render `null` in evidence.
-  - Warn: `isFederated` absent or false, `allow_new_non_sso_users` not exposed, or new non-SSO users allowed.
-  - Pass: An active provider, `isFederated=true`, and non-SSO user creation disabled.
-  - Partial view: Identity provider list truncated, or business group scope.
-  - `summary.identity_providers` is a bare count of the organization's providers and renders `null` under a truncated read. `identity_providers_seen` and `identity_providers_total` carry the sample beside `identity_providers_truncated`.
-- **2 MFA enforced for all organization members** (identity_access, `MULESOFT-IAM-02`)
-  - Inputs: `mfa_exempt_users` (plus the `members` count).
-  - Fail: Users listed with `mfaVerificationExcluded=true`.
-  - Warn: The exemption query returned users without the flag.
-  - Manual: Zero exemptions. The organization-wide MFA setting is not exposed, so capture it or the IdP MFA policy.
-  - `members_sampled` is context and renders `null` when the member list is unread.
-  - Partial view: Exempt-user or member list truncated.
-- **3 Organization Administrator membership minimized** (identity_access, `MULESOFT-IAM-03`)
-  - Inputs: `role_groups`, `role_group_roles`, `role_group_users`.
-  - Fail: Distinct members of admin role groups above `max_admins` (default 5).
-  - Manual: Zero role groups or no admin role group visible.
-  - Pass: Within the threshold.
-  - Partial view: Role group list truncated, role assignments truncated for named groups, or admin membership truncated at the seen count (the admin count is then a lower bound and a pass becomes warn).
-  - `members_sampled` renders `null` when the member list is unread.
-- **4 Role groups follow least privilege** (identity_access, `MULESOFT-IAM-04`)
-  - Inputs: `role_groups`, `role_group_roles`.
-  - Fail: Custom role group grants Organization Administrator or Owner.
-  - Warn: More than `max_roles_per_group` roles.
-  - Manual: Zero role groups.
-  - Pass otherwise.
-  - Partial view: Role group list or per-group role assignments truncated.
-- **5 Role groups scoped to specific environments** (identity_access, `MULESOFT-IAM-05`)
-  - Inputs: `role_groups`, `role_group_roles`.
-  - Fail: More than 5 org-wide environment roles.
-  - Warn: 1-5.
-  - Manual: Zero role groups or zero environment-level assignments.
-  - Pass: Every environment-level role carries `context_params.envId`.
-  - Partial view: As control 4.
-- **6 Production and sandbox environments isolated** (identity_access, `MULESOFT-IAM-06`)
-  - Inputs: `environments`.
-  - Fail: Environment names contradict their type.
-  - Warn: Environments without `isProduction` or `type`, or no production or no sandbox environment.
-  - Manual: Zero environments.
-  - Pass otherwise.
-  - Partial view: Environment list truncated.
-- **7 Authentication policies on production APIs** (api_gateway, `MULESOFT-API-07`)
-  - Inputs: `environments`, `api_manager_apis`, `api_policies`.
-  - Fail: A production API instance has no enabled authentication policy.
-  - Warn: A matching policy whose `disabled` flag was not returned, or only non-production instances lack one.
-  - Manual: Zero API instances or no production instance sampled.
-  - Pass: `disabled=false` confirmed on every instance.
-  - Partial view: Environments excluded by the filter or `environment_limit`, `api_limit` reached, an API list truncated, or a per-API policy read truncated.
-  - An API list that was read in some environments but not others is a partial failure that renders manual.
-- **8 Rate limiting policies applied** (api_gateway, `MULESOFT-API-08`)
-  - Inputs: `environments`, `api_manager_apis`, `api_policies`.
-  - Fail: Production instance without an enabled rate limiting or spike control policy.
-  - Warn: Unknown `disabled` state or non-production only.
-  - Manual: Zero instances or no production instance sampled.
-  - Pass: `disabled=false` confirmed on every instance.
-  - Partial view: As control 7.
-- **9 Client credentials rotated within policy period** (api_gateway, `MULESOFT-API-09`)
-  - Inputs: `environments`, `api_manager_apis` (contract counts).
-  - Manual: The API does not expose secret rotation timestamps.
-  - When the environment or API inventory could not be read, the summary names the HTTP cause, and `active_contracts` and `apis_sampled` render `null`.
-- **10 Supported Mule runtime versions** (runtime_infrastructure, `MULESOFT-RT-10`)
-  - Inputs: `environments`, `cloudhub_applications`.
-  - Fail: Mule 3 or `endOfSupportDate` in the past.
-  - Warn: End of support within `runtime_support_warning_days`, or the version or end of support date not exposed.
-  - Manual: Zero CloudHub applications.
-  - Pass otherwise.
-  - Partial view: Environments excluded, or `application_limit` left applications uninspected.
-- **11 Worker sizing reviewed** (runtime_infrastructure, `MULESOFT-RT-11`)
-  - Inputs: `environments`, `cloudhub_applications`.
-  - Warn: Multiple or large workers in non-production, four or more workers with CPU under 10 percent, worker data missing, or four or more workers without CPU statistics.
-  - Applications are listed with `retrieveStatistics=true` so `workers.recentStatistics.cpu` is populated.
-  - Manual: Zero applications.
-  - Pass otherwise.
-  - Partial view: As control 10.
-- **12 Persistent queues encrypted** (runtime_infrastructure, `MULESOFT-RT-12`)
-  - Inputs: `environments`, `cloudhub_applications`.
-  - Fail: `persistentQueues` enabled without `persistentQueuesEncrypted=true`.
-  - Manual: Zero applications or no application enables persistent queues (not applicable).
-  - Pass: Encryption confirmed on every queue-enabled application.
-  - Partial view: As control 10.
-- **13 VPC firewall rules restrictive** (runtime_infrastructure, `MULESOFT-RT-13`)
-  - Inputs: `vpcs`, `vpc_details`.
-  - Fail: Rule allows all protocols.
-  - Warn: Wide port ranges or CIDR broader than /16.
-  - Manual: Zero VPCs, a VPC without a `firewallRules` list, or a per-VPC detail read that failed.
-  - Pass otherwise.
-  - Partial view: VPC list truncated.
-- **14 No 0.0.0.0/0 VPC ingress** (runtime_infrastructure, `MULESOFT-RT-14`)
-  - Inputs: `vpcs`, `vpc_details`.
-  - Fail: Open ingress on any port other than 8081 and 8082. That includes the DLB back-end ports 8091 and 8092 that CloudHub scopes to the VPC CIDR by default.
-  - Warn: Open ingress only on 8081 or 8082, the ports the shared load balancer exposes.
-  - Manual: Zero VPCs, a VPC without a `firewallRules` list, or a per-VPC detail read that failed.
-  - Pass otherwise.
-  - Partial view: As control 13.
-- **15 DLB enforces TLS 1.2+ and strong cipher suites** (runtime_infrastructure, `MULESOFT-RT-15`)
-  - Inputs: `load_balancers`, `load_balancer_details`.
-  - Fail: `tlsv1=true`, or `defaultCipherSuite` offers RC4, DES/3DES, NULL, EXPORT, MD5, anonymous, or other weak ciphers.
-  - Warn: `httpMode` is `on`, the `tlsv1` or `httpMode` flags were not returned, `defaultCipherSuite` was not returned, or the suite includes non-forward-secret (static RSA) ciphers or broad OpenSSL groups such as `HIGH` (the documented OldDefault set).
-  - Manual: No dedicated load balancer (not applicable) or the per-DLB detail read failed.
-  - Pass: `tlsv1=false`, no plain HTTP, and a suite limited to ECDHE/DHE ciphers.
-  - `defaultCipherSuite` is read from the list (`shortFormat=false`) or, when absent, from `GET /cloudhub/api/organizations/{orgId}/vpcs/{vpcId}/loadbalancers/{dlbId}`.
-  - Partial view: Load balancer list truncated.
-- **16 DLB certificates valid beyond 30 days** (runtime_infrastructure, `MULESOFT-RT-16`)
-  - Inputs: `load_balancers`. Partial-view input: `load_balancer_details`, which supplies extra `sslEndpoints` and is neither a primary nor a secondary input of this control.
-  - Fail: Live TLS probe shows expiry within 30 days.
-  - Warn: Within `certificate_warning_days` (default 60), a certificate that could not be dated, or a dated certificate whose chain did not validate against the auditor's trust store (`authorized=false`, or validation not reported).
-  - Manual: No dedicated load balancer, or none of the probed certificates could be dated over TLS.
-  - Pass: Every certificate dated, chain validated, and beyond the warning window.
-  - One probe runs per `sslEndpoints` entry, using its `publicKeyCN` (or a concrete SAN) as the SNI name, so counts are per certificate, not per load balancer. When the record lists no endpoints, the SNI name is the load balancer's own domain.
-  - Partial view: Load balancer list truncated, or the per-DLB detail read failed ("so SSL endpoints carried only by the detail record were not probed").
-  - The failed detail read alone never renders this control manual, unlike control 15, where that read is a primary input. It only caps a pass at warn, while the domain probe from the list record still runs.
-- **17 Audit logging active and queryable** (audit_monitoring, `MULESOFT-AUD-17`)
-  - Inputs: `audit_query`, `audit_query_fallback`. Evidence only: `audit_platforms`, `audit_retention_settings`.
-  - Pass: Entries within `audit_lookback_hours` (default 24).
-  - Warn: Entries only within 7 days.
-  - Fail: Zero entries in 7 days.
-  - Manual: The audit query was forbidden or failed.
-  - The organization's audit log retention period (`retention_period_days`, plus any scheduled change) is read from `GET /audit/v2/organizations/{orgId}/retentionSettings` and recorded in the summary and evidence.
-  - The retention period does not change the verdict. An unreadable retention read is named in the summary instead.
-  - Partial view: Business group scope.
-- **18 Connected apps use minimum scopes** (identity_access, `MULESOFT-IAM-18`)
-  - Inputs: `connected_applications`, `connected_app_scopes`.
-  - Fail: Client credentials app holds `full`, admin, owner, or manage scopes.
-  - Warn: User-delegated app requests `full` or more than `max_connected_app_scopes`.
-  - Manual: Zero connected apps, or a per-app scope read that failed.
-  - Pass: Scopes read for every app with no administrative scopes.
-  - The inventory is requested with `hide_managed=false`, so MuleSoft-managed connected apps are included and the server `total` covers them.
-  - Partial view: Connected app list truncated, or scope lists truncated for named apps.
-- **19 Stale connected apps reviewed** (identity_access, `MULESOFT-IAM-19`)
-  - Inputs: `connected_applications`.
-  - Warn: Unused for `stale_connected_app_days` (default 90), disabled, or without a `last_used` timestamp.
-  - Manual: Zero connected apps.
-  - Pass: Every app used within the window.
-  - In practice this control warns on Anypoint Platform. The published `listOrganizationConnectedApplications` schema carries no `last_used`, `lastUsed`, `last_used_at`, or `usage` field, even with `includeUsage=true`. The portal exposes last-used only in the per-user `/connectedApplications/authorizations` view.
-  - The summary therefore states that the missing timestamps are expected, and asks for the usage review to be recorded manually.
-  - Partial view: Connected app list truncated.
-- **20 Exchange assets follow governance review** (api_gateway, `MULESOFT-API-20`)
-  - Inputs: `exchange_assets`.
-  - Warn: Assets published to the public portal.
-  - Manual otherwise, including zero assets (export the API Governance conformance report and publishing settings).
-  - Partial view: Asset search truncated.
-- **21 Anypoint MQ access restricted by environment** (runtime_infrastructure, `MULESOFT-RT-21`)
-  - Inputs: `environments`, `mq_regions`, `mq_queues`. Secondary: `mq_clients`.
-  - Warn: Unencrypted queues.
-  - Manual in any of these cases:
-    - Zero MQ regions (not applicable).
-    - The client list unread (`Could not confirm`, with `mq_clients[].clients` `null` and the summary stating an unread number of client apps).
-    - Inventory returned (confirm client apps are not shared across environments).
-  - Never pass.
-  - Partial view: Environments excluded.
-- **22 Secrets Manager used for sensitive configuration** (runtime_infrastructure, `MULESOFT-RT-22`)
-  - Inputs: `environments`, `cloudhub_applications`, `secret_groups`.
-  - Fail: Sensitive-looking CloudHub properties not marked secure.
-  - Warn: Production environment without secret groups, or applications without a `properties` object.
-  - Manual: Zero applications or no production environment sampled.
-  - Pass otherwise.
-  - Partial view: As control 10.
-- **23 Hybrid runtime servers registered and reporting** (runtime_infrastructure, `MULESOFT-RT-23`)
-  - Inputs: `environments`, `hybrid_servers`.
-  - Fail: All servers disconnected.
-  - Warn: Some not `RUNNING`.
-  - Manual: Zero servers registered (not applicable).
-  - Pass otherwise.
-  - Partial view: Environments excluded.
-- **24 Alerts configured for production applications** (audit_monitoring, `MULESOFT-AUD-24`)
-  - Inputs: `environments`, `alerts`, `cloudhub_applications`.
-  - Fail: Production environment with no enabled CloudHub or Runtime Manager alert.
-  - Warn: Alerts without an `enabled` flag or applications not covered.
-  - Manual: No production environment sampled or zero production applications.
-  - Pass: `enabled=true` alerts cover every sampled production application.
-  - Partial view: Environments excluded.
-- **25 Business groups separate tenants** (identity_access, `MULESOFT-IAM-25`)
-  - Inputs: `organization_hierarchy`. Secondary: `organization`.
-  - Pass: Business groups exist and `entitlements.createSubOrgs` is true.
-  - Warn: The entitlement flag was not exposed.
-  - Manual in any of these cases:
-    - The organization is itself a business group (`isRoot=false`). This is the control's own verdict, checked before the pass and warn conditions, so the general business-group rule below never applies to it.
-    - Zero business groups.
-    - The entitlement is false (not applicable).
-    - The hierarchy is unread.
+| # | Spec control | Tool | Finding | Inputs | Status semantics |
+| --- | --- | --- | --- | --- | --- |
+| 1 | SSO/SAML or OIDC external identity provider configured | identity_access | `MULESOFT-IAM-01` | `identity_providers`, `organization`; secondary `identity_provider_settings` | fail: zero identity providers on a complete read, or every visible provider disabled; manual (not fail): an identity provider page truncated before any provider was visible, since the absence is a claim about the unread providers (the summary carries the partial view and `identity_providers` and `active_identity_providers` render `null` in evidence); warn: `isFederated` absent or false, `allow_new_non_sso_users` not exposed, or new non-SSO users allowed; pass: an active provider, `isFederated=true`, and non-SSO user creation disabled. Partial view: identity provider list truncated, or business group scope. `summary.identity_providers` is a bare count of the organization's providers and renders `null` under a truncated read; `identity_providers_seen` and `identity_providers_total` carry the sample beside `identity_providers_truncated` |
+| 2 | MFA enforced for all organization members | identity_access | `MULESOFT-IAM-02` | `mfa_exempt_users` (plus the `members` count) | fail: users listed with `mfaVerificationExcluded=true`; warn: the exemption query returned users without the flag; manual: zero exemptions (the organization-wide MFA setting is not exposed, so capture it or the IdP MFA policy). `members_sampled` is context and renders `null` when the member list is unread. Partial view: exempt-user or member list truncated |
+| 3 | Organization Administrator membership minimized | identity_access | `MULESOFT-IAM-03` | `role_groups`, `role_group_roles`, `role_group_users` | fail: distinct members of admin role groups above `max_admins` (default 5); manual: zero role groups or no admin role group visible; pass: within the threshold. Partial view: role group list truncated, role assignments truncated for named groups, or admin membership truncated at the seen count (the admin count is then a lower bound and a pass becomes warn); `members_sampled` renders `null` when the member list is unread |
+| 4 | Role groups follow least privilege | identity_access | `MULESOFT-IAM-04` | `role_groups`, `role_group_roles` | fail: custom role group grants Organization Administrator or Owner; warn: more than `max_roles_per_group` roles; manual: zero role groups; pass otherwise. Partial view: role group list or per-group role assignments truncated |
+| 5 | Role groups scoped to specific environments | identity_access | `MULESOFT-IAM-05` | `role_groups`, `role_group_roles` | fail: more than 5 org-wide environment roles; warn: 1-5; manual: zero role groups or zero environment-level assignments; pass: every environment-level role carries `context_params.envId`. Partial view: as control 4 |
+| 6 | Production and sandbox environments isolated | identity_access | `MULESOFT-IAM-06` | `environments` | fail: environment names contradict their type; warn: environments without `isProduction` or `type`, or no production or no sandbox environment; manual: zero environments; pass otherwise. Partial view: environment list truncated |
+| 7 | Authentication policies on production APIs | api_gateway | `MULESOFT-API-07` | `environments`, `api_manager_apis`, `api_policies` | fail: a production API instance has no enabled authentication policy; warn: a matching policy whose `disabled` flag was not returned, or only non-production instances lack one; manual: zero API instances or no production instance sampled; pass: `disabled=false` confirmed on every instance. Partial view: environments excluded by the filter or `environment_limit`, `api_limit` reached, an API list truncated, or a per-API policy read truncated; an API list that was read in some environments but not others is a partial failure that renders manual |
+| 8 | Rate limiting policies applied | api_gateway | `MULESOFT-API-08` | `environments`, `api_manager_apis`, `api_policies` | fail: production instance without an enabled rate limiting or spike control policy; warn: unknown `disabled` state or non-production only; manual: zero instances or no production instance sampled; pass: `disabled=false` confirmed on every instance. Partial view: as control 7 |
+| 9 | Client credentials rotated within policy period | api_gateway | `MULESOFT-API-09` | `environments`, `api_manager_apis` (contract counts) | manual: the API does not expose secret rotation timestamps; when the environment or API inventory could not be read the summary names the HTTP cause and `active_contracts` and `apis_sampled` render `null` |
+| 10 | Supported Mule runtime versions | runtime_infrastructure | `MULESOFT-RT-10` | `environments`, `cloudhub_applications` | fail: Mule 3 or `endOfSupportDate` in the past; warn: end of support within `runtime_support_warning_days`, or the version or end of support date not exposed; manual: zero CloudHub applications; pass otherwise. Partial view: environments excluded, or `application_limit` left applications uninspected |
+| 11 | Worker sizing reviewed | runtime_infrastructure | `MULESOFT-RT-11` | `environments`, `cloudhub_applications` | warn: multiple or large workers in non-production, four or more workers with CPU under 10 percent (applications are listed with `retrieveStatistics=true` so `workers.recentStatistics.cpu` is populated), worker data missing, or four or more workers without CPU statistics; manual: zero applications; pass otherwise. Partial view: as control 10 |
+| 12 | Persistent queues encrypted | runtime_infrastructure | `MULESOFT-RT-12` | `environments`, `cloudhub_applications` | fail: `persistentQueues` enabled without `persistentQueuesEncrypted=true`; manual: zero applications or no application enables persistent queues (not applicable); pass: encryption confirmed on every queue-enabled application. Partial view: as control 10 |
+| 13 | VPC firewall rules restrictive | runtime_infrastructure | `MULESOFT-RT-13` | `vpcs`, `vpc_details` | fail: rule allows all protocols; warn: wide port ranges or CIDR broader than /16; manual: zero VPCs, a VPC without a `firewallRules` list, or a per-VPC detail read that failed; pass otherwise. Partial view: VPC list truncated |
+| 14 | No 0.0.0.0/0 VPC ingress | runtime_infrastructure | `MULESOFT-RT-14` | `vpcs`, `vpc_details` | fail: open ingress on any port other than 8081 and 8082, including the DLB back-end ports 8091 and 8092 that CloudHub scopes to the VPC CIDR by default; warn: open ingress only on 8081 or 8082, the ports the shared load balancer exposes; manual: zero VPCs, a VPC without a `firewallRules` list, or a per-VPC detail read that failed; pass otherwise. Partial view: as control 13 |
+| 15 | DLB enforces TLS 1.2+ and strong cipher suites | runtime_infrastructure | `MULESOFT-RT-15` | `load_balancers`, `load_balancer_details` | fail: `tlsv1=true`, or `defaultCipherSuite` offers RC4, DES/3DES, NULL, EXPORT, MD5, anonymous, or other weak ciphers; warn: `httpMode` is `on`, the `tlsv1` or `httpMode` flags were not returned, `defaultCipherSuite` was not returned, or the suite includes non-forward-secret (static RSA) ciphers or broad OpenSSL groups such as `HIGH` (the documented OldDefault set); manual: no dedicated load balancer (not applicable) or the per-DLB detail read failed; pass: `tlsv1=false`, no plain HTTP, and a suite limited to ECDHE/DHE ciphers. `defaultCipherSuite` is read from the list (`shortFormat=false`) or, when absent, from `GET /cloudhub/api/organizations/{orgId}/vpcs/{vpcId}/loadbalancers/{dlbId}`. Partial view: load balancer list truncated |
+| 16 | DLB certificates valid beyond 30 days | runtime_infrastructure | `MULESOFT-RT-16` | `load_balancers`; partial-view input `load_balancer_details` (it supplies extra `sslEndpoints` and is neither a primary nor a secondary input of this control) | fail: live TLS probe shows expiry within 30 days; warn: within `certificate_warning_days` (default 60), a certificate that could not be dated, or a dated certificate whose chain did not validate against the auditor's trust store (`authorized=false`, or validation not reported); manual: no dedicated load balancer, or none of the probed certificates could be dated over TLS; pass: every certificate dated, chain validated, and beyond the warning window. One probe runs per `sslEndpoints` entry using its `publicKeyCN` (or a concrete SAN) as the SNI name (the load balancer's own domain when the record lists no endpoints), so counts are per certificate, not per load balancer. Partial view: load balancer list truncated, or the per-DLB detail read failed ("so SSL endpoints carried only by the detail record were not probed"); the failed detail read alone never renders this control manual (unlike control 15, where that read is a primary input), it only caps a pass at warn while the domain probe from the list record still runs |
+| 17 | Audit logging active and queryable | audit_monitoring | `MULESOFT-AUD-17` | `audit_query`, `audit_query_fallback`; evidence only: `audit_platforms`, `audit_retention_settings` | pass: entries within `audit_lookback_hours` (default 24); warn: entries only within 7 days; fail: zero entries in 7 days; manual: the audit query was forbidden or failed. The organization's audit log retention period (`retention_period_days`, plus any scheduled change) is read from `GET /audit/v2/organizations/{orgId}/retentionSettings` and recorded in the summary and evidence; it does not change the verdict, and an unreadable retention read is named in the summary instead. Partial view: business group scope |
+| 18 | Connected apps use minimum scopes | identity_access | `MULESOFT-IAM-18` | `connected_applications`, `connected_app_scopes` | fail: client credentials app holds `full`, admin, owner, or manage scopes; warn: user-delegated app requests `full` or more than `max_connected_app_scopes`; manual: zero connected apps, or a per-app scope read that failed; pass: scopes read for every app with no administrative scopes. The inventory is requested with `hide_managed=false`, so MuleSoft-managed connected apps are included and the server `total` covers them. Partial view: connected app list truncated, or scope lists truncated for named apps |
+| 19 | Stale connected apps reviewed | identity_access | `MULESOFT-IAM-19` | `connected_applications` | warn: unused for `stale_connected_app_days` (default 90), disabled, or without a `last_used` timestamp; manual: zero connected apps; pass: every app used within the window. In practice this control warns on Anypoint Platform: the published `listOrganizationConnectedApplications` schema carries no `last_used`, `lastUsed`, `last_used_at`, or `usage` field even with `includeUsage=true` (the portal exposes last-used only in the per-user `/connectedApplications/authorizations` view), so the summary states that the missing timestamps are expected and asks for the usage review to be recorded manually. Partial view: connected app list truncated |
+| 20 | Exchange assets follow governance review | api_gateway | `MULESOFT-API-20` | `exchange_assets` | warn: assets published to the public portal; manual otherwise, including zero assets (export the API Governance conformance report and publishing settings). Partial view: asset search truncated |
+| 21 | Anypoint MQ access restricted by environment | runtime_infrastructure | `MULESOFT-RT-21` | `environments`, `mq_regions`, `mq_queues`; secondary `mq_clients` | warn: unencrypted queues; manual: zero MQ regions (not applicable), the client list unread (`Could not confirm`, with `mq_clients[].clients` `null` and the summary stating an unread number of client apps), or inventory returned (confirm client apps are not shared across environments); never pass. Partial view: environments excluded |
+| 22 | Secrets Manager used for sensitive configuration | runtime_infrastructure | `MULESOFT-RT-22` | `environments`, `cloudhub_applications`, `secret_groups` | fail: sensitive-looking CloudHub properties not marked secure; warn: production environment without secret groups, or applications without a `properties` object; manual: zero applications or no production environment sampled; pass otherwise. Partial view: as control 10 |
+| 23 | Hybrid runtime servers registered and reporting | runtime_infrastructure | `MULESOFT-RT-23` | `environments`, `hybrid_servers` | fail: all servers disconnected; warn: some not `RUNNING`; manual: zero servers registered (not applicable); pass otherwise. Partial view: environments excluded |
+| 24 | Alerts configured for production applications | audit_monitoring | `MULESOFT-AUD-24` | `environments`, `alerts`, `cloudhub_applications` | fail: production environment with no enabled CloudHub or Runtime Manager alert; warn: alerts without an `enabled` flag or applications not covered; manual: no production environment sampled or zero production applications; pass: `enabled=true` alerts cover every sampled production application. Partial view: environments excluded |
+| 25 | Business groups separate tenants | identity_access | `MULESOFT-IAM-25` | `organization_hierarchy`; secondary `organization` | pass: business groups exist and `entitlements.createSubOrgs` is true; warn: the entitlement flag was not exposed; manual: the organization is itself a business group (`isRoot=false`; this control's own verdict, checked before the pass and warn conditions, so the general business-group rule below never applies to it), zero business groups, the entitlement is false (not applicable), or the hierarchy is unread |
 
 ### Business group scope
 
@@ -487,7 +310,7 @@ The pass removes:
   - JWTs, PEM blocks, hex digests, and vendor-prefixed keys.
   - Runs of 16 or more characters with base64 symbols, scattered digits, or token casing, including a run standing after `=` under a non-credential pair name such as `theme=`.
 
-A carrier or token shape standing right after a literal JSON escape is treated exactly as one after a real newline, tab, or space. Such escapes include `\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them.
+A carrier or token shape standing right after a literal JSON escape is treated exactly as one after a real newline, tab, or space. Such escapes are `\n`, `\u000a`, `\/`, and the rest, as a doubly-encoded body carries them.
 
 A bare name-shaped value standing alone in prose, such as an environment name or `prod-us-east-2026`, is indistinguishable from a resource name and stays.
 

@@ -19,13 +19,15 @@ Every tool is read-only. Nothing is written back to the tenant.
 
 Set the organization and one credential family. Explicit tool arguments win over environment variables.
 
-- `GITHUB_ORG` or `GH_ORG`: Organization login. A `https://github.com/<org>` URL is accepted.
-- `GITHUB_TOKEN` or `GH_TOKEN`: Personal access token for PAT auth.
-- `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY` or `GITHUB_APP_PRIVATE_KEY_PATH`: GitHub App installation-token auth. The RS256 JWT is minted locally.
-- `GITHUB_API_URL` (alias `GITHUB_API_BASE_URL`): REST base URL, default `https://api.github.com`. Use `https://<host>/api/v3` for GHES.
-- `GITHUB_GRAPHQL_URL`: GraphQL endpoint. When unset, it is derived from the REST URL (`/graphql` on github.com, `/api/graphql` on GHES).
-- `GITHUB_ENTERPRISE`: Enterprise slug for the EMU and enterprise identity queries.
-- `GITHUB_LOOKBACK_DAYS`: Audit log window, default 30.
+| Variable | Purpose |
+|----------|---------|
+| `GITHUB_ORG` or `GH_ORG` | Organization login (a `https://github.com/<org>` URL is accepted) |
+| `GITHUB_TOKEN` or `GH_TOKEN` | Personal access token for PAT auth |
+| `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY` or `GITHUB_APP_PRIVATE_KEY_PATH` | GitHub App installation-token auth (RS256 JWT minted locally) |
+| `GITHUB_API_URL` (alias `GITHUB_API_BASE_URL`) | REST base URL, default `https://api.github.com`; use `https://<host>/api/v3` for GHES |
+| `GITHUB_GRAPHQL_URL` | GraphQL endpoint; derived from the REST URL when unset (`/graphql` on github.com, `/api/graphql` on GHES) |
+| `GITHUB_ENTERPRISE` | Enterprise slug for the EMU and enterprise identity queries |
+| `GITHUB_LOOKBACK_DAYS` | Audit log window, default 30 |
 
 A complete run needs read access as an organization owner, or as an App with organization administration, members, webhooks, and Actions read plus repository administration read. That access makes these readable: `members?filter=2fa_disabled`, outside collaborators, org webhooks, App installations, runner groups, deploy keys, and repository hooks.
 
@@ -35,45 +37,47 @@ Surfaces the principal cannot read produce Manual findings that name the missing
 
 ## Tools
 
-- `github_check_access`: Probes the org profile, repositories, audit log, organization roles, rulesets, Actions permissions, code security configurations, and the default code security configurations. Reports `healthy` when at least four of those eight probes are readable, otherwise `limited`.
-- `github_assess_org_access`: Identity and access findings GITHUB-ORG-001 to GITHUB-ORG-011.
-- `github_assess_repo_protection`: Repository protection findings GITHUB-REPO-001 to GITHUB-REPO-007.
-- `github_assess_actions_security`: Actions findings GITHUB-ACT-001 to GITHUB-ACT-005.
-- `github_assess_code_security`: Code security findings GITHUB-CODE-001 to GITHUB-CODE-006.
-- `github_assess_integrations`: Webhook, deploy key, App installation, OAuth, and package findings GITHUB-INTEG-001 to GITHUB-INTEG-005.
-- `github_export_audit_bundle`: Runs every collector once and writes an evidence bundle under `output_dir`.
+| Tool | What it does |
+|------|--------------|
+| `github_check_access` | Probes the org profile, repositories, audit log, organization roles, rulesets, Actions permissions, code security configurations, and the default code security configurations, and reports `healthy` when at least four of those eight probes are readable, otherwise `limited` |
+| `github_assess_org_access` | Identity and access findings GITHUB-ORG-001 to GITHUB-ORG-011 |
+| `github_assess_repo_protection` | Repository protection findings GITHUB-REPO-001 to GITHUB-REPO-007 |
+| `github_assess_actions_security` | Actions findings GITHUB-ACT-001 to GITHUB-ACT-005 |
+| `github_assess_code_security` | Code security findings GITHUB-CODE-001 to GITHUB-CODE-006 |
+| `github_assess_integrations` | Webhook, deploy key, App installation, OAuth, and package findings GITHUB-INTEG-001 to GITHUB-INTEG-005 |
+| `github_export_audit_bundle` | Runs every collector once and writes an evidence bundle under `output_dir` |
 
 All tools accept `organization`, `auth_mode` (`pat` or `app`), `api_token`, `app_id`, `app_private_key`, `app_private_key_path`, `installation_id`, `enterprise`, `api_base_url`, `graphql_url`, and `lookback_days`. The export tool adds `output_dir`.
 
 ## Control coverage
 
-Each entry names the spec control, then the tool and finding that cover it, then the status semantics.
-
-- **1 SAML SSO Enforcement** (org_access, GITHUB-ORG-006): Pass with a SAML provider and every member linked. Partial when identities are truncated. Fail without a provider.
-- **2 Two-Factor Authentication** (org_access, GITHUB-ORG-001): Pass on the org flag with an empty `2fa_disabled` list. Fail when members lack 2FA. Partial when the owner-only filter is forbidden.
-- **3 Enterprise Managed Users** (org_access, GITHUB-ORG-007): Pass on an enterprise OIDC provider. Partial for SAML-only enterprise IdP. Manual without `GITHUB_ENTERPRISE`.
-- **4 IP Allow List** (org_access, GITHUB-ORG-008): Pass when ENABLED with active entries and enforced for installed apps.
-- **5 Member Base Permissions** (org_access, GITHUB-ORG-002): Pass on `read` or `none`.
-- **6 Repository Visibility Defaults** (org_access, GITHUB-ORG-009): Pass when members cannot create public repositories.
-- **7 Fork Policy** (org_access, GITHUB-ORG-010): Pass when private forking is disabled.
-- **8 Outside Collaborator Policy** (org_access, GITHUB-ORG-003): Pass on zero outside collaborators (stated), Partial up to five, Fail above.
-- **9 OAuth App Restrictions** (integrations, GITHUB-INTEG-004): Manual, because the policy has no REST or GraphQL field.
-- **10 Branch Protection Rules** (repo_protection, GITHUB-REPO-002, GITHUB-REPO-004): Pass when every active default branch requires pull requests and blocks force pushes and deletions.
-- **11 Required Pull Request Reviews** (repo_protection, GITHUB-REPO-006): Pass when every active repository requires an approving review.
-- **12 Required Status Checks** (repo_protection, GITHUB-REPO-007): Pass when every active repository requires a status check.
-- **13 Signed Commit Requirement** (repo_protection, GITHUB-REPO-003): Pass when every active repository enforces signatures.
-- **14 Repository Rulesets** (repo_protection, GITHUB-REPO-001): Pass when active org rulesets reach every repository.
-- **15 Code Scanning Enabled** (code_security, GITHUB-CODE-005): Pass when every default code security configuration (public and private_and_internal, or all) enables default setup and is enforced. Partial on an unenforced default or a single-visibility default. Fail with no default.
-- **16 Secret Scanning Enabled** (code_security, GITHUB-CODE-002, GITHUB-CODE-003): Same defaults evaluation for secret scanning and push protection. The deprecated organization flags corroborate only.
-- **17 Dependabot Enabled** (code_security, GITHUB-CODE-004): Same defaults evaluation, with alerts and security updates both required.
-- **18 Security Policy** (code_security, GITHUB-CODE-006): Manual (deferred GraphQL sweep).
-- **19 Audit Log Streaming** (org_access, GITHUB-ORG-011): Manual (enterprise-level endpoint). GITHUB-ORG-005 covers visibility only. It reads the lookback window through `phrase=created:>=YYYY-MM-DD` and states when the 200-event sample was capped.
-- **20 Webhook Security** (integrations, GITHUB-INTEG-001): Fail on plain HTTP, `insecure_ssl = 1`, or a missing secret.
-- **21 Actions Permissions** (actions_security, GITHUB-ACT-001, 002, 003, 005): Pass on selected or local-only actions, read-only tokens, and no workflow approval.
-- **22 Runner Group Restrictions** (actions_security, GITHUB-ACT-004): Pass when no group is org-wide or open to public repositories. Info with no org-level runners.
-- **23 Deploy Key Management** (integrations, GITHUB-INTEG-002): Fail on write-capable or year-old keys. Partial on undated keys.
-- **24 GitHub App Permissions Audit** (integrations, GITHUB-INTEG-003): Fail on admin or write-to-all permissions.
-- **25 Package Registry Access** (integrations, GITHUB-INTEG-005): Manual (deferred packages sweep).
+| Spec control | Tool | Finding | Status semantics |
+|--------------|------|---------|------------------|
+| 1 SAML SSO Enforcement | org_access | GITHUB-ORG-006 | Pass with a SAML provider and every member linked; Partial when identities are truncated; Fail without a provider |
+| 2 Two-Factor Authentication | org_access | GITHUB-ORG-001 | Pass on the org flag with an empty `2fa_disabled` list; Fail when members lack 2FA; Partial when the owner-only filter is forbidden |
+| 3 Enterprise Managed Users | org_access | GITHUB-ORG-007 | Pass on an enterprise OIDC provider; Partial for SAML-only enterprise IdP; Manual without `GITHUB_ENTERPRISE` |
+| 4 IP Allow List | org_access | GITHUB-ORG-008 | Pass when ENABLED with active entries and enforced for installed apps |
+| 5 Member Base Permissions | org_access | GITHUB-ORG-002 | Pass on `read` or `none` |
+| 6 Repository Visibility Defaults | org_access | GITHUB-ORG-009 | Pass when members cannot create public repositories |
+| 7 Fork Policy | org_access | GITHUB-ORG-010 | Pass when private forking is disabled |
+| 8 Outside Collaborator Policy | org_access | GITHUB-ORG-003 | Pass on zero outside collaborators (stated), Partial up to five, Fail above |
+| 9 OAuth App Restrictions | integrations | GITHUB-INTEG-004 | Manual: the policy has no REST or GraphQL field |
+| 10 Branch Protection Rules | repo_protection | GITHUB-REPO-002, GITHUB-REPO-004 | Pass when every active default branch requires pull requests and blocks force pushes and deletions |
+| 11 Required Pull Request Reviews | repo_protection | GITHUB-REPO-006 | Pass when every active repository requires an approving review |
+| 12 Required Status Checks | repo_protection | GITHUB-REPO-007 | Pass when every active repository requires a status check |
+| 13 Signed Commit Requirement | repo_protection | GITHUB-REPO-003 | Pass when every active repository enforces signatures |
+| 14 Repository Rulesets | repo_protection | GITHUB-REPO-001 | Pass when active org rulesets reach every repository |
+| 15 Code Scanning Enabled | code_security | GITHUB-CODE-005 | Pass when every default code security configuration (public and private_and_internal, or all) enables default setup and is enforced; Partial on an unenforced default or a single-visibility default; Fail with no default |
+| 16 Secret Scanning Enabled | code_security | GITHUB-CODE-002, GITHUB-CODE-003 | Same defaults evaluation for secret scanning and push protection; the deprecated organization flags corroborate only |
+| 17 Dependabot Enabled | code_security | GITHUB-CODE-004 | Same defaults evaluation with alerts and security updates both required |
+| 18 Security Policy | code_security | GITHUB-CODE-006 | Manual (deferred GraphQL sweep) |
+| 19 Audit Log Streaming | org_access | GITHUB-ORG-011 | Manual (enterprise-level endpoint); GITHUB-ORG-005 covers visibility only, reads the lookback window through `phrase=created:>=YYYY-MM-DD`, and states when the 200-event sample was capped |
+| 20 Webhook Security | integrations | GITHUB-INTEG-001 | Fail on plain HTTP, `insecure_ssl = 1`, or a missing secret |
+| 21 Actions Permissions | actions_security | GITHUB-ACT-001, 002, 003, 005 | Pass on selected or local-only actions, read-only tokens, no workflow approval |
+| 22 Runner Group Restrictions | actions_security | GITHUB-ACT-004 | Pass when no group is org-wide or open to public repositories; Info with no org-level runners |
+| 23 Deploy Key Management | integrations | GITHUB-INTEG-002 | Fail on write-capable or year-old keys; Partial on undated keys |
+| 24 GitHub App Permissions Audit | integrations | GITHUB-INTEG-003 | Fail on admin or write-to-all permissions |
+| 25 Package Registry Access | integrations | GITHUB-INTEG-005 | Manual (deferred packages sweep) |
 
 Extra findings and their mapping rows:
 

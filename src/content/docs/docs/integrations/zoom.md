@@ -23,7 +23,7 @@ Controls that require enforcement read the matching `lock_settings` key and repo
 ## Setup and authentication
 
 1. In the Zoom App Marketplace, create a Server-to-Server OAuth app ([Zoom S2S OAuth guide](https://developers.zoom.us/docs/internal-apps/s2s-oauth/)). User-level OAuth and the deprecated JWT app type are not supported.
-2. Add the read scopes listed in the Endpoints section below. Granular equivalents are listed per endpoint. Classic scopes:
+2. Add the read scopes listed in the endpoint table below. Granular equivalents are listed per endpoint. Classic scopes:
    - `account:read:admin`
    - `user:read:admin`
    - `role:read:admin`
@@ -33,12 +33,12 @@ Controls that require enforcement read the matching `lock_settings` key and repo
    - `phone:read:admin` (only if Zoom Phone is licensed)
 3. Activate the app and copy the Account ID, Client ID, and Client Secret.
 4. Provide credentials through any of the following, resolved in this order: tool arguments, environment variables, then a JSON config file.
-   - **Tool arguments:** `account_id`, `client_id`, `client_secret` (or `token`), `base_url`, `oauth_base_url`, `timeout_seconds`, `config_file`
-   - **Environment:** `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET` (or `ZOOM_TOKEN` / `ZOOM_ACCESS_TOKEN`), `ZOOM_BASE_URL` (or `ZOOM_API_BASE_URL`), `ZOOM_OAUTH_BASE_URL`, `ZOOM_TIMEOUT`, `ZOOM_CONFIG_FILE`
-   - **Config file**
-     - Locations: `ZOOM_CONFIG_FILE` or `config_file` (must exist when named), then `./.zoom.json`, `./.grclanker-zoom.json`, `~/.zoom.json`, `~/.grclanker-zoom.json`, `~/.config/grclanker/zoom.json`
-     - Keys: `account_id`, `client_id`, `client_secret` (or `token` / `access_token`), `base_url`, `oauth_base_url`. The camelCase `accountId`, `clientId`, `clientSecret`, `baseUrl`, and `oauthBaseUrl` also work.
-     - The timeout is read only from `timeout_seconds` or `ZOOM_TIMEOUT`.
+
+| Source | Keys |
+|--------|------|
+| Tool arguments | `account_id`, `client_id`, `client_secret` (or `token`), `base_url`, `oauth_base_url`, `timeout_seconds`, `config_file` |
+| Environment | `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET` (or `ZOOM_TOKEN` / `ZOOM_ACCESS_TOKEN`), `ZOOM_BASE_URL` (or `ZOOM_API_BASE_URL`), `ZOOM_OAUTH_BASE_URL`, `ZOOM_TIMEOUT`, `ZOOM_CONFIG_FILE` |
+| Config file | `ZOOM_CONFIG_FILE` or `config_file` (must exist when named), then `./.zoom.json`, `./.grclanker-zoom.json`, `~/.zoom.json`, `~/.grclanker-zoom.json`, `~/.config/grclanker/zoom.json`. Keys: `account_id`, `client_id`, `client_secret` (or `token` / `access_token`), `base_url`, `oauth_base_url` (the camelCase `accountId`, `clientId`, `clientSecret`, `baseUrl`, and `oauthBaseUrl` also work). The timeout is read only from `timeout_seconds` or `ZOOM_TIMEOUT`. |
 
 Config file example (`~/.zoom.json`):
 
@@ -77,19 +77,13 @@ Every truncated list demotes its dependent findings to warn with seen versus tot
 
 ## Tools
 
-- `zoom_check_access`: Verifies every audit surface and reports readable, not readable (with the 403 or error cause), or not configured.
-  - Audit surfaces: Settings and lock settings for the option views the tool reads (`meeting_authentication`, `security`, and `meeting_security`), users, roles, groups, operation logs, IM groups, managed and trusted domains, and Zoom Phone settings.
-  - The documented `recording_authentication` view is not requested because no verdict reads it.
-  - `healthy` requires the settings, users, roles, and groups surfaces.
-  - Notable arguments: Auth arguments.
-- `zoom_assess_identity`: Findings ZOOM-ID-01 to ZOOM-ID-07.
-  - Notable arguments: `user_limit` (default 1000), `max_admins` (default 10), `max_session_inactivity_minutes` (default 120).
-- `zoom_assess_collaboration_governance`: Findings ZOOM-COLLAB-01 to ZOOM-COLLAB-08.
-  - Notable arguments: `max_recording_retention_days` (default 120), `operation_log_limit` (default 300, over a fixed 30-day window), `group_limit` (default 50).
-- `zoom_assess_meeting_security`: Findings ZOOM-MTG-01 to ZOOM-MTG-10 with group override detection.
-  - Notable arguments: `group_limit` (default 50).
-- `zoom_export_audit_bundle`: Runs all three assessments and writes the shared bundle layout plus a zip.
-  - Notable arguments: `output_dir` (default `./export/zoom`) plus the assessment arguments.
+| Tool | Purpose | Notable arguments |
+|------|---------|-------------------|
+| `zoom_check_access` | Verifies every audit surface (settings and lock settings for the option views the tool reads: `meeting_authentication`, `security`, and `meeting_security`; the documented `recording_authentication` view is not requested because no verdict reads it; users, roles, groups, operation logs, IM groups, managed and trusted domains, Zoom Phone settings) and reports readable, not readable (with the 403 or error cause), or not configured. `healthy` requires the settings, users, roles, and groups surfaces. | auth arguments |
+| `zoom_assess_identity` | ZOOM-ID-01 to ZOOM-ID-07. | `user_limit` (default 1000), `max_admins` (default 10), `max_session_inactivity_minutes` (default 120) |
+| `zoom_assess_collaboration_governance` | ZOOM-COLLAB-01 to ZOOM-COLLAB-08. | `max_recording_retention_days` (default 120), `operation_log_limit` (default 300, over a fixed 30-day window), `group_limit` (default 50) |
+| `zoom_assess_meeting_security` | ZOOM-MTG-01 to ZOOM-MTG-10 with group override detection. | `group_limit` (default 50) |
+| `zoom_export_audit_bundle` | Runs all three assessments and writes the shared bundle layout plus a zip. | `output_dir` (default `./export/zoom`) plus the assessment arguments |
 
 ### Bundle layout
 
@@ -176,49 +170,33 @@ Status semantics for every finding:
   - The inventory was empty where emptiness is not compliant.
   - The API does not expose the setting (with the reference page cited in the summary).
 
-Each entry names the spec control, then the tool and finding that cover it, then the verdict basis.
-
-- **1 Meeting password enforcement enabled** (meeting_security, ZOOM-MTG-01): `schedule_meeting.require_password_for_scheduling_new_meetings` true.
-- **2 Waiting room enabled by default** (meeting_security, ZOOM-MTG-02): `meeting_security.waiting_room` true and locked.
-- **3 Screen sharing restricted to host only** (meeting_security, ZOOM-MTG-03): `in_meeting.screen_sharing` with `in_meeting.who_can_share_screen` = `host`.
-- **4 Recording consent notification enabled** (meeting_security, ZOOM-MTG-10): `recording.recording_notification_for_zoom_client.disclaimer_to_participants` names all participants (deprecated `recording.recording_disclaimer` as fallback).
-- **5 SSO enforcement for all users** (identity, ZOOM-ID-01)
-  - Every listed user has `login_types` containing 101 (SSO).
-  - Users without `login_types` are bucketed and cap at warn.
-- **6 Two-factor authentication for admins** (identity, ZOOM-ID-02, ZOOM-ID-04)
-  - `security.sign_in_with_two_factor_auth` = `all`, or `sign_in_with_two_factor_auth_roles` covering every admin role.
-  - Admin count within `max_admins`.
-- **7 End-to-end encryption available and default** (meeting_security, ZOOM-MTG-05): `meeting_security.end_to_end_encrypted_meetings` true and `meeting_security.encryption_type` = `e2ee`.
-- **8 Chat encryption enabled** (collaboration_governance, ZOOM-COLLAB-08): Manual. No account-level Team Chat encryption setting is documented.
-- **9 File transfer in meetings restricted** (collaboration_governance, ZOOM-COLLAB-02): `in_meeting.file_transfer` false and locked.
-- **10 Cloud recording auto-delete policy configured** (collaboration_governance, ZOOM-COLLAB-03): `recording.auto_delete_cmr` true.
-- **11 Auto-delete days within retention policy** (collaboration_governance, ZOOM-COLLAB-03): `recording.auto_delete_cmr_days` within `max_recording_retention_days`, locked.
-- **12 External contacts restricted** (collaboration_governance, ZOOM-COLLAB-07, ZOOM-COLLAB-01)
-  - `chat.allow_users_to_add_contacts` and `chat.allow_users_to_chat_with_others` disabled or `selected_option` 2, 3, or 4.
-  - Trusted domains explicitly named.
-- **13 Vanity URL configured and secured** (identity, ZOOM-ID-07): Manual. No account vanity URL field is documented.
-- **14 Managed domains verified** (identity, ZOOM-ID-03): Every `domains[].status` = `verified` with `total_records` matching.
-- **15 IM group restrictions enforced** (collaboration_governance, ZOOM-COLLAB-06): Every IM group `type` is `normal` or `restricted` (no `shared` or undocumented type), and no group sets `search_by_ma_account`.
-- **16 Sign-in methods restricted** (identity, ZOOM-ID-05)
-  - Every user `login_types` code is documented and classified.
-  - Third-party OAuth codes 0, 1, 21, 23, 24, 27, 98 (Facebook, Google, WeChat, Alipay, Apple, Microsoft, RingCentral) and Zoom-held password codes 11, 100 fail.
-  - Documented codes that are neither SSO nor a personal provider (97 mobile device, 99 API user) and any undocumented code cap at warn.
-  - Only 101 (SSO) passes.
-- **17 Session timeout within policy** (identity, ZOOM-ID-06): `security.sign_again_period_for_inactivity_on_client` and `_on_web` present and within `max_session_inactivity_minutes`.
-- **18 Data routing control enabled** (meeting_security, ZOOM-MTG-09): `in_meeting.custom_data_center_regions` true with a non-empty `in_meeting.data_center_regions`, locked.
-- **19 Zoom Phone recording policies enforced** (collaboration_governance, ZOOM-COLLAB-04)
-  - Both `auto_call_recording` and `ad_hoc_call_recording` returned with an `enable` flag and `locked` true.
-  - The enable values are reported, not judged.
-- **20 Local recording disabled or restricted** (meeting_security, ZOOM-MTG-04): `recording.local_recording` false and locked.
-- **21 Meeting password locked at account level** (meeting_security, ZOOM-MTG-01): `lock_settings.schedule_meeting.require_password_for_scheduling_new_meetings` true.
-- **22 Embed password in join link disabled** (meeting_security, ZOOM-MTG-06)
-  - `meeting_security.embed_password_in_join_link` false (settings `option=meeting_security`) and the `meeting_security.embed_password_in_join_link` lock true.
-  - The settings response documents the key only under `meeting_security`.
-- **23 Only authenticated users can join** (meeting_security, ZOOM-MTG-08): `meeting_authentication` true (option view) and locked.
-- **24 Admin operation log retention verified** (collaboration_governance, ZOOM-COLLAB-05)
-  - Entries with a parseable `time` inside the fixed 30-day window.
-  - Undated entries cap at warn.
-- **25 PMI usage restricted** (meeting_security, ZOOM-MTG-07): `schedule_meeting.personal_meeting` false, or `use_pmi_for_scheduled_meetings` and `use_pmi_for_instant_meetings` false and locked.
+| # | Spec control | Tool | Finding | Verdict basis |
+|---|--------------|------|---------|---------------|
+| 1 | Meeting password enforcement enabled | meeting_security | ZOOM-MTG-01 | `schedule_meeting.require_password_for_scheduling_new_meetings` true |
+| 2 | Waiting room enabled by default | meeting_security | ZOOM-MTG-02 | `meeting_security.waiting_room` true and locked |
+| 3 | Screen sharing restricted to host only | meeting_security | ZOOM-MTG-03 | `in_meeting.screen_sharing` with `in_meeting.who_can_share_screen` = `host` |
+| 4 | Recording consent notification enabled | meeting_security | ZOOM-MTG-10 | `recording.recording_notification_for_zoom_client.disclaimer_to_participants` names all participants (deprecated `recording.recording_disclaimer` as fallback) |
+| 5 | SSO enforcement for all users | identity | ZOOM-ID-01 | every listed user has `login_types` containing 101 (SSO); users without `login_types` are bucketed and cap at warn |
+| 6 | Two-factor authentication for admins | identity | ZOOM-ID-02, ZOOM-ID-04 | `security.sign_in_with_two_factor_auth` = `all`, or `sign_in_with_two_factor_auth_roles` covering every admin role; admin count within `max_admins` |
+| 7 | End-to-end encryption available and default | meeting_security | ZOOM-MTG-05 | `meeting_security.end_to_end_encrypted_meetings` true and `meeting_security.encryption_type` = `e2ee` |
+| 8 | Chat encryption enabled | collaboration_governance | ZOOM-COLLAB-08 | manual: no account-level Team Chat encryption setting is documented |
+| 9 | File transfer in meetings restricted | collaboration_governance | ZOOM-COLLAB-02 | `in_meeting.file_transfer` false and locked |
+| 10 | Cloud recording auto-delete policy configured | collaboration_governance | ZOOM-COLLAB-03 | `recording.auto_delete_cmr` true |
+| 11 | Auto-delete days within retention policy | collaboration_governance | ZOOM-COLLAB-03 | `recording.auto_delete_cmr_days` within `max_recording_retention_days`, locked |
+| 12 | External contacts restricted | collaboration_governance | ZOOM-COLLAB-07, ZOOM-COLLAB-01 | `chat.allow_users_to_add_contacts` and `chat.allow_users_to_chat_with_others` disabled or `selected_option` 2, 3, or 4; trusted domains explicitly named |
+| 13 | Vanity URL configured and secured | identity | ZOOM-ID-07 | manual: no account vanity URL field is documented |
+| 14 | Managed domains verified | identity | ZOOM-ID-03 | every `domains[].status` = `verified` with `total_records` matching |
+| 15 | IM group restrictions enforced | collaboration_governance | ZOOM-COLLAB-06 | every IM group `type` is `normal` or `restricted` (no `shared` or undocumented type) and no group sets `search_by_ma_account` |
+| 16 | Sign-in methods restricted | identity | ZOOM-ID-05 | every user `login_types` code is documented and classified: third-party OAuth codes 0, 1, 21, 23, 24, 27, 98 (Facebook, Google, WeChat, Alipay, Apple, Microsoft, RingCentral) and Zoom-held password codes 11, 100 fail; documented codes that are neither SSO nor a personal provider (97 mobile device, 99 API user) and any undocumented code cap at warn; only 101 (SSO) passes |
+| 17 | Session timeout within policy | identity | ZOOM-ID-06 | `security.sign_again_period_for_inactivity_on_client` and `_on_web` present and within `max_session_inactivity_minutes` |
+| 18 | Data routing control enabled | meeting_security | ZOOM-MTG-09 | `in_meeting.custom_data_center_regions` true with a non-empty `in_meeting.data_center_regions`, locked |
+| 19 | Zoom Phone recording policies enforced | collaboration_governance | ZOOM-COLLAB-04 | both `auto_call_recording` and `ad_hoc_call_recording` returned with an `enable` flag and `locked` true; the enable values are reported, not judged |
+| 20 | Local recording disabled or restricted | meeting_security | ZOOM-MTG-04 | `recording.local_recording` false and locked |
+| 21 | Meeting password locked at account level | meeting_security | ZOOM-MTG-01 | `lock_settings.schedule_meeting.require_password_for_scheduling_new_meetings` true |
+| 22 | Embed password in join link disabled | meeting_security | ZOOM-MTG-06 | `meeting_security.embed_password_in_join_link` false (settings `option=meeting_security`) and the `meeting_security.embed_password_in_join_link` lock true; the settings response documents the key only under `meeting_security` |
+| 23 | Only authenticated users can join | meeting_security | ZOOM-MTG-08 | `meeting_authentication` true (option view) and locked |
+| 24 | Admin operation log retention verified | collaboration_governance | ZOOM-COLLAB-05 | entries with a parseable `time` inside the fixed 30-day window; undated entries cap at warn |
+| 25 | PMI usage restricted | meeting_security | ZOOM-MTG-07 | `schedule_meeting.personal_meeting` false, or `use_pmi_for_scheduled_meetings` and `use_pmi_for_instant_meetings` false and locked |
 
 Coverage: 25 of 25 spec controls have a finding, and 23 are automatable. The other 2 (controls 8 and 13) are manual by design. Their finding summaries cite the reference page proving the absence.
 
@@ -265,80 +243,20 @@ With credentials, the script runs `zoom_check_access` and all three assessments 
 
 ## Endpoints
 
-Each entry gives the endpoint's reference, scopes (classic / granular), constraints honored, and fields read.
-
-- `POST {oauth_base_url}/oauth/token`
-  - Reference: [Server-to-Server OAuth](https://developers.zoom.us/docs/internal-apps/s2s-oauth/)
-  - Scopes: n/a
-  - Constraints honored: `application/x-www-form-urlencoded` body with `grant_type=account_credentials` and `account_id`, basic auth with client id and secret, no query parameters
-  - Fields read: `access_token`, `expires_in`
-- `GET /users/me`
-  - Reference: [Get a user](https://developers.zoom.us/docs/api/users/#tag/users/GET/users/{userId})
-  - Scopes: `user:read:admin` / `user:read:user:admin`
-  - Constraints honored: None
-  - Fields read: `id`, `email`, `first_name`
-- `GET /accounts/{accountId}/settings`
-  - Reference: [Get account settings](https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/settings)
-  - Scopes: `account:read:admin` / `account:read:settings:admin`, `account:read:settings:master`
-  - Constraints honored: `option` in `security`, `meeting_authentication`, `meeting_security`
-  - Fields read: `schedule_meeting.*`, `in_meeting.*`, `recording.*`, `chat.*`, `security.*`, `meeting_security.*`, `meeting_authentication`, `authentication_options`
-- `GET /accounts/{accountId}/lock_settings`
-  - Reference: [Get locked settings](https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/lock_settings)
-  - Scopes: `account:read:admin` / `account:read:lock_settings:master`
-  - Constraints honored: `option=meeting_security`
-  - Fields read: Lock booleans under `schedule_meeting`, `in_meeting`, `recording`, `chat`, `meeting_security`
-- `GET /accounts/{accountId}/managed_domains`
-  - Reference: [Get managed domains](https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/managed_domains)
-  - Scopes: `account:read:admin` / `account:read:managed_domains:master`
-  - Constraints honored: Not paginated. `total_records` is compared to the list.
-  - Fields read: `domains[].domain`, `domains[].status`, `total_records`
-- `GET /accounts/{accountId}/trusted_domains`
-  - Reference: [Get trusted domains](https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/trusted_domains)
-  - Scopes: `account:read:admin` / `account:read:trusted_domains:master`
-  - Constraints honored: Not paginated
-  - Fields read: `trusted_domains[]`
-- `GET /users`
-  - Reference: [List users](https://developers.zoom.us/docs/api/users/#tag/users/GET/users)
-  - Scopes: `user:read:admin` / `user:read:list_users:admin`
-  - Constraints honored: `page_size` max 2000, `next_page_token`, default `status=active`
-  - Fields read: `users[].id`, `email`, `type`, `status`, `login_types` (codes classified from the List users page and [Get a user](https://developers.zoom.us/docs/api/users/#tag/users/GET/users/{userId})), `total_records`
-- `GET /roles`
-  - Reference: [List roles](https://developers.zoom.us/docs/api/accounts/#tag/roles/GET/roles)
-  - Scopes: `role:read:admin` / `role:read:list_roles:admin`
-  - Constraints honored: None
-  - Fields read: `roles[].id`, `name`, `total_members`
-- `GET /roles/{roleId}/members`
-  - Reference: [List role members](https://developers.zoom.us/docs/api/accounts/#tag/roles/GET/roles/{roleId}/members)
-  - Scopes: `role:read:admin` / `role:read:list_members:admin`
-  - Constraints honored: `page_size` max 300, `next_page_token`
-  - Fields read: `members[].id`, `email`, `total_records`
-- `GET /groups`
-  - Reference: [List groups](https://developers.zoom.us/docs/api/users/#tag/groups/GET/groups)
-  - Scopes: `group:read:admin` / `group:read:list_groups:admin`
-  - Constraints honored: `page_size` max 300, `next_page_token`
-  - Fields read: `groups[].id`, `name`, `total_members`, `total_records`
-- `GET /groups/{groupId}/settings`
-  - Reference: [Get group settings](https://developers.zoom.us/docs/api/users/#tag/groups/GET/groups/{groupId}/settings)
-  - Scopes: `group:read:admin` / `group:read:settings:admin`
-  - Constraints honored: `option=meeting_security`
-  - Fields read: The same setting paths as the account, for override detection
-- `GET /groups/{groupId}/lock_settings`
-  - Reference: [Get group locked settings](https://developers.zoom.us/docs/api/users/#tag/groups/GET/groups/{groupId}/lock_settings)
-  - Scopes: `group:read:admin` / `group:read:lock_settings:admin`
-  - Constraints honored: `option=meeting_security`
-  - Fields read: Group lock booleans
-- `GET /report/operationlogs`
-  - Reference: [Get operation logs report](https://developers.zoom.us/docs/api/meetings/#tag/reports/GET/report/operationlogs)
-  - Scopes: `report:read:admin` / `report:read:operation_logs:admin`
-  - Constraints honored: `from` and `to` (yyyy-mm-dd) required, `page_size` max 300, `next_page_token`
-  - Fields read: `operation_logs[].time`, `action`, `category_type`, `operator`, `operation_detail`
-- `GET /im/groups`
-  - Reference: [Team Chat API reference](https://developers.zoom.us/docs/api/chat/). Its OpenAPI document carries `GET /im/groups` and `imgroup:read:admin`.
-  - Scopes: `imgroup:read:admin` / `contact_group:read:list_groups:admin`
-  - Constraints honored: Not paginated. `total_records` is compared to the list.
-  - Fields read: `groups[].id`, `name`, `type`, `total_members`, `search_by_account`, `search_by_domain`, `search_by_ma_account`
-- `GET /phone/account_settings`
-  - Reference: [Get account phone settings](https://developers.zoom.us/docs/api/phone/#tag/accounts/GET/phone/account_settings)
-  - Scopes: `phone:read:admin` / `phone:read:list_account_settings:admin`
-  - Constraints honored: `setting_types=auto_call_recording,ad_hoc_call_recording`
-  - Fields read: `auto_call_recording.enable`, `locked`, `locked_by`, `recording_calls`; `ad_hoc_call_recording.enable`, `locked`, `locked_by`
+| Endpoint | Reference | Scopes (classic / granular) | Constraints honored | Fields read |
+|----------|-----------|-----------------------------|---------------------|-------------|
+| `POST {oauth_base_url}/oauth/token` | [Server-to-Server OAuth](https://developers.zoom.us/docs/internal-apps/s2s-oauth/) | n/a | `application/x-www-form-urlencoded` body with `grant_type=account_credentials` and `account_id`, basic auth with client id and secret, no query parameters | `access_token`, `expires_in` |
+| `GET /users/me` | [Get a user](https://developers.zoom.us/docs/api/users/#tag/users/GET/users/{userId}) | `user:read:admin` / `user:read:user:admin` | none | `id`, `email`, `first_name` |
+| `GET /accounts/{accountId}/settings` | [Get account settings](https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/settings) | `account:read:admin` / `account:read:settings:admin`, `account:read:settings:master` | `option` in `security`, `meeting_authentication`, `meeting_security` | `schedule_meeting.*`, `in_meeting.*`, `recording.*`, `chat.*`, `security.*`, `meeting_security.*`, `meeting_authentication`, `authentication_options` |
+| `GET /accounts/{accountId}/lock_settings` | [Get locked settings](https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/lock_settings) | `account:read:admin` / `account:read:lock_settings:master` | `option=meeting_security` | lock booleans under `schedule_meeting`, `in_meeting`, `recording`, `chat`, `meeting_security` |
+| `GET /accounts/{accountId}/managed_domains` | [Get managed domains](https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/managed_domains) | `account:read:admin` / `account:read:managed_domains:master` | not paginated; `total_records` compared to the list | `domains[].domain`, `domains[].status`, `total_records` |
+| `GET /accounts/{accountId}/trusted_domains` | [Get trusted domains](https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/trusted_domains) | `account:read:admin` / `account:read:trusted_domains:master` | not paginated | `trusted_domains[]` |
+| `GET /users` | [List users](https://developers.zoom.us/docs/api/users/#tag/users/GET/users) | `user:read:admin` / `user:read:list_users:admin` | `page_size` max 2000, `next_page_token`, default `status=active` | `users[].id`, `email`, `type`, `status`, `login_types` (codes classified from this page and [Get a user](https://developers.zoom.us/docs/api/users/#tag/users/GET/users/{userId})), `total_records` |
+| `GET /roles` | [List roles](https://developers.zoom.us/docs/api/accounts/#tag/roles/GET/roles) | `role:read:admin` / `role:read:list_roles:admin` | none | `roles[].id`, `name`, `total_members` |
+| `GET /roles/{roleId}/members` | [List role members](https://developers.zoom.us/docs/api/accounts/#tag/roles/GET/roles/{roleId}/members) | `role:read:admin` / `role:read:list_members:admin` | `page_size` max 300, `next_page_token` | `members[].id`, `email`, `total_records` |
+| `GET /groups` | [List groups](https://developers.zoom.us/docs/api/users/#tag/groups/GET/groups) | `group:read:admin` / `group:read:list_groups:admin` | `page_size` max 300, `next_page_token` | `groups[].id`, `name`, `total_members`, `total_records` |
+| `GET /groups/{groupId}/settings` | [Get group settings](https://developers.zoom.us/docs/api/users/#tag/groups/GET/groups/{groupId}/settings) | `group:read:admin` / `group:read:settings:admin` | `option=meeting_security` | the same setting paths as the account, for override detection |
+| `GET /groups/{groupId}/lock_settings` | [Get group locked settings](https://developers.zoom.us/docs/api/users/#tag/groups/GET/groups/{groupId}/lock_settings) | `group:read:admin` / `group:read:lock_settings:admin` | `option=meeting_security` | group lock booleans |
+| `GET /report/operationlogs` | [Get operation logs report](https://developers.zoom.us/docs/api/meetings/#tag/reports/GET/report/operationlogs) | `report:read:admin` / `report:read:operation_logs:admin` | `from` and `to` (yyyy-mm-dd) required, `page_size` max 300, `next_page_token` | `operation_logs[].time`, `action`, `category_type`, `operator`, `operation_detail` |
+| `GET /im/groups` | [Team Chat API reference](https://developers.zoom.us/docs/api/chat/) (its OpenAPI document carries `GET /im/groups` and `imgroup:read:admin`) | `imgroup:read:admin` / `contact_group:read:list_groups:admin` | not paginated; `total_records` compared to the list | `groups[].id`, `name`, `type`, `total_members`, `search_by_account`, `search_by_domain`, `search_by_ma_account` |
+| `GET /phone/account_settings` | [Get account phone settings](https://developers.zoom.us/docs/api/phone/#tag/accounts/GET/phone/account_settings) | `phone:read:admin` / `phone:read:list_account_settings:admin` | `setting_types=auto_call_recording,ad_hoc_call_recording` | `auto_call_recording.enable`, `locked`, `locked_by`, `recording_calls`; `ad_hoc_call_recording.enable`, `locked`, `locked_by` |

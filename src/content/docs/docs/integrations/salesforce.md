@@ -90,25 +90,16 @@ Precedence is explicit tool arguments, then environment variables, then the cred
 
 ## Tools
 
-- `salesforce_check_access`: Probes the OAuth session, Organization, limits, Health Check and its per-setting risks, SecuritySettings, users, profiles, Profile metadata (`listMetadata`), permission sets, `TwoFactorMethodsInfo`, login history, audit trail, connected apps, `OauthToken`, event log files, and the caller's `UserPermissionAccess` flags. Lists likely missing permissions, including any caller flag that is false.
-- `salesforce_assess_platform_security`: Controls 1, 2, 3, 5, 18, 19, 20.
-- `salesforce_assess_identity_access`: Controls 4, 6, 7, 9, 10, 13.
-- `salesforce_assess_data_protection`: Controls 8, 12, 16, 17.
-- `salesforce_assess_monitoring_integrations`: Controls 11, 14, 15.
-- `salesforce_export_audit_bundle`: Runs the access check and all four assessments, then writes the audit bundle described below.
+| Tool | Purpose |
+|---|---|
+| `salesforce_check_access` | Probes the OAuth session, Organization, limits, Health Check and its per-setting risks, SecuritySettings, users, profiles, Profile metadata (`listMetadata`), permission sets, `TwoFactorMethodsInfo`, login history, audit trail, connected apps, `OauthToken`, event log files, and the caller's `UserPermissionAccess` flags; lists likely missing permissions, including any caller flag that is false |
+| `salesforce_assess_platform_security` | Controls 1, 2, 3, 5, 18, 19, 20 |
+| `salesforce_assess_identity_access` | Controls 4, 6, 7, 9, 10, 13 |
+| `salesforce_assess_data_protection` | Controls 8, 12, 16, 17 |
+| `salesforce_assess_monitoring_integrations` | Controls 11, 14, 15 |
+| `salesforce_export_audit_bundle` | Runs the access check and all four assessments, then writes an audit bundle and a zip archive |
 
-All tools accept the connection arguments: `instance_url`, `login_url`, `username`, `password`, `security_token`, `consumer_key`, `consumer_secret`, `private_key_file`, `refresh_token`, `access_token`, `credentials_file`, `api_version`, `sandbox`, and `timeout_seconds` (default 30).
-
-The assessment and export tools add `record_limit` (default 2000 rows per SOQL dataset). Tool-specific options:
-
-- Identity access adds `max_admins` (5) and `stale_login_days` (90).
-- Data protection adds `certificate_expiry_warning_days` (30).
-- Monitoring adds `login_history_days` (30) and `audit_trail_days` (90), both clamped to 1-180.
-- `salesforce_export_audit_bundle` accepts all of these plus `output_dir` (default `./export/salesforce`).
-
-### Audit bundle contents
-
-The export writes these outputs:
+`salesforce_export_audit_bundle` writes these outputs:
 
 - `core_data/`: Projected and redacted snapshots.
   - `SecuritySettings`, `MyDomainSettings`, and `Profile` metadata are reduced to the leaves the verdicts read.
@@ -120,6 +111,15 @@ The export writes these outputs:
 - `QUICK_REFERENCE.md`.
 - `_errors.log`, when collection partially failed.
 - A zip named after the allocated output directory.
+
+All tools accept the connection arguments: `instance_url`, `login_url`, `username`, `password`, `security_token`, `consumer_key`, `consumer_secret`, `private_key_file`, `refresh_token`, `access_token`, `credentials_file`, `api_version`, `sandbox`, and `timeout_seconds` (default 30).
+
+The assessment and export tools add `record_limit` (default 2000 rows per SOQL dataset). Tool-specific options:
+
+- Identity access adds `max_admins` (5) and `stale_login_days` (90).
+- Data protection adds `certificate_expiry_warning_days` (30).
+- Monitoring adds `login_history_days` (30) and `audit_trail_days` (90), both clamped to 1-180.
+- `salesforce_export_audit_bundle` accepts all of these plus `output_dir` (default `./export/salesforce`).
 
 The bundle directory is `<org name>-audit-bundle`, lowercased with other characters replaced by `-`. The org name falls back to the org Id or instance host. A repeat run takes the suffixes `-2` through `-50`, skipping any name whose directory or zip already exists.
 
@@ -141,7 +141,7 @@ These controls render `manual` because such a view can only come from a credenti
 
 ### Partial and unread inputs
 
-Every finding is gated on the datasets it reads (the `Inputs` entry of each control below):
+Every finding is gated on the datasets it reads (the `Inputs` column below):
 
 - **Unread input:** The finding is `manual` when its primary dataset was forbidden (401/403 or `INSUFFICIENT_ACCESS`), unavailable (`INVALID_TYPE`, `INVALID_FIELD`), or errored.
   - Its summary names the dataset and the observed status ("... could not be verified because the TwoFactorMethodsInfo query was forbidden (403 ...)").
@@ -185,135 +185,28 @@ Every request resolves against the session's instance URL and is sent to that or
 
 ## Control coverage
 
-Each entry names the control, then the tool and finding that cover it. Its sub-bullets give the inputs and the status semantics.
-
-- **1 Health Check score** (platform_security, SF-01)
-  - Inputs: `SecurityHealthCheck`, `SecurityHealthCheckRisks`.
-  - Pass when score >= 90 with zero high risks. Warn >= 70. Fail below.
-  - Manual when `SecurityHealthCheck` is unread or exposes no `Score`.
-  - Manual when the risk list is unread. The score is still stated, and `high_risk_settings`, `medium_risk_settings`, `settings_evaluated`, and `risks_truncated` render `null`.
-  - A truncated risk list turns pass into warn and sets `risks_truncated`.
-- **2 Session timeout** (platform_security, SF-02)
-  - Inputs: `SecuritySettings` (`readMetadata`).
-  - Pass when `sessionTimeout` <= 2 hours, `forceLogoutOnSessionTimeout` true, and `lockSessionsToIp` true. Warn without IP lock. Fail otherwise.
-  - Manual when `SecuritySettings` is unread (`Modify Metadata Through Metadata API Functions`) or the flags are absent.
-- **3 Password policy** (platform_security, SF-03)
-  - Inputs: `SecuritySettings`.
-  - Pass when length >= 12, complexity includes upper, lower, numeric, expiration <= 90 days, history >= 12, and lockout enabled.
-  - Warn on one gap. Fail on two or more.
-  - Manual when `SecuritySettings` is unread or a policy field is absent.
-- **4 MFA enforcement** (identity_access, SF-04)
-  - Inputs: `SecuritySettings`, `SecurityHealthCheckRisks`, `User`, `Profile`, `TwoFactorMethodsInfo`.
-  - Fail when `enableMFADirectUILoginOptIn` is false or the Health Check MFA setting does not meet the standard.
-  - When MFA is required:
-    - Manual when `TwoFactorMethodsInfo` is forbidden (`Manage MFA in API`), the population gate trips, or zero active standard users are visible.
-    - Pass when both `User` and `TwoFactorMethodsInfo` were read to completion and every active standard user has a registered method. Warn instead when either is partial, or when the requirement's second source (`SecuritySettings` or the Health Check risk list) is unread.
-    - When users without a method are visible, fail when they exceed a quarter of the active standard users and warn otherwise, but only from a complete read.
-    - On a partial read (a 2500-row cap, a larger `totalSize`, `done=false`, or a stalled cursor), the finding stops at warn. The count and names render `null` with `principals_withheld`, and the summary states the observed signal.
-  - Manual when neither `SecuritySettings` nor Health Check exposes the MFA setting.
-- **5 IP range restrictions** (platform_security, SF-05)
-  - Inputs: `SecuritySettings`, `Profile`, `Profile` metadata (`listMetadata`, `readMetadata`).
-  - Pass when every sensitive profile defines `loginIpRanges`, every sensitive profile was resolved and read, and `enforceIpRangesEveryRequest` is true.
-  - Warn when some sensitive profiles lack ranges, a profile could not be resolved, only N of M sensitive profiles were read, or the flag is off.
-  - Fail when no read profile defines ranges and no org-wide trusted ranges exist.
-  - Manual when `SecuritySettings` is unread, the `Profile` list is unread or shows no administrator-class profile, `readMetadata(Profile)` is forbidden, or no sensitive profile could be resolved (the per-profile evidence renders `null`).
-- **6 Login hour restrictions** (identity_access, SF-06)
-  - Inputs: `Profile`, `Profile` metadata.
-  - Pass when every sensitive profile bounds `loginHours` on all seven days and every sensitive profile was resolved and read.
-  - Each `{weekday}Start`/`{weekday}End` pair is independent. A day with no start or end, or a 0 to 1440 window, is unrestricted.
-  - Warn when a profile bounds only some days (the unbounded days are named), some profiles restrict nothing, a profile could not be resolved, or only N of M sensitive profiles were read.
-  - Fail when no read profile bounds any day.
-  - Manual when the `Profile` list is unread or permission-limited, `readMetadata(Profile)` is forbidden, or no sensitive profile could be resolved.
-- **7 API access controls** (identity_access, SF-07)
-  - Inputs: `Profile`, `User`.
-  - Pass when <= 25 percent of profiles grant API Enabled. Warn up to 50 percent. Fail above.
-  - Manual when the population gate trips.
-  - The summary states when `PermissionsApiUserOnly` does not exist in the org.
-  - When `Profile` or `User` is truncated, the ratio is over the visible rows only and the verdict is capped at warn. In that case, `api_only_profiles` and `active_users_on_api_enabled_profiles` render `null` unless a row was seen.
-- **8 Field-level security** (data_protection, SF-08)
-  - Inputs: `FieldPermissions`.
-  - Pass when no sensitive field has more than 5 grants. Warn otherwise.
-  - Manual when `FieldPermissions` is unread or no field matches the sensitive-name patterns.
-  - A truncated read turns pass into warn.
-- **9 Permission set review** (identity_access, SF-09)
-  - Inputs: `PermissionSet`, `PermissionSetAssignment`, `User`, `Profile`.
-  - Pass when no permission set grants elevated permissions, or when elevated sets have zero active assignees.
-  - Warn when assignees exist up to `max_admins`. Fail above it.
-  - Manual when `PermissionSet` is unread or returns zero rows (standard sets always exist), or when the population gate trips.
-  - Manual when elevated sets exist while `PermissionSetAssignment` is unread. `elevated_assignments`, `distinct_assignees`, and `assignments_truncated` then render `null`.
-  - A pass with no elevated set is capped at warn while assignments are unread.
-  - A truncated set or assignment list turns pass into warn.
-- **10 Profile permissions** (identity_access, SF-10)
-  - Inputs: `User`, `Profile`.
-  - Pass when active admins <= `max_admins`, none stale, none undated.
-  - Warn when an admin has no `LastLoginDate`.
-  - Fail when admins exceed the threshold or any is stale. `stale_admins` are observed on visible rows and stand.
-  - Manual when the population gate trips.
-  - A truncated user or profile list turns pass into warn and carries `users_seen`, `users_total`, and `*_truncated`.
-- **11 Connected app OAuth** (monitoring_integrations, SF-11)
-  - Inputs: `ConnectedApplication`, `OauthToken`, `UserPermissionAccess`.
-  - Warn at best, because scopes are not exposed by SOQL.
-  - Fail when most apps allow self-authorization.
-  - Manual when `ConnectedApplication` is unread, returns zero apps, or no app exposes `OptionsAllowAdminApprovedUsersOnly`.
-  - Token usage is a partial view (`oauth_tokens_partial_view`) when the caller's `PermissionsCustomizeApplication` is false or unknown.
-  - `oauth_tokens_possibly_capped` marks a 2500-row result, and `oauth_tokens_truncated` a partial read.
-  - When `OauthToken` is unread, `oauth_tokens`, `tokens_by_app`, and the three `oauth_tokens_*` flags render `null`, and the summary says token usage was not checked.
-  - `connected_applications_truncated` names its own source.
-- **12 Sharing settings** (data_protection, SF-12)
-  - Inputs: `Organization`.
-  - Warn at best, because custom object defaults are not read.
-  - Fail when 3+ standard objects are public.
-  - Manual when `Organization` is unread or exposes no `Default*Access` field.
-- **13 Guest user access** (identity_access, SF-13)
-  - Inputs: `User`, `Profile`.
-  - Pass when a complete user list with at least one visible active administrator contains zero active guest users.
-  - Warn when the user list is truncated. Guest coverage is partial, and the active guests seen are listed.
-  - Fail when active guests sit on profiles with API Enabled or elevated permissions. Warn when guests exist without them.
-  - Manual when the population gate trips.
-- **14 Login forensics** (monitoring_integrations, SF-14)
-  - Inputs: `LoginHistory`.
-  - On a complete read, fail when any source has 10+ failures, failures exceed 25 percent, or a legacy TLS login exists.
-  - On a complete read, warn when failures exceed 10 percent, more than 5 countries appear, or rows lack `LoginTime`. Pass otherwise.
-  - On a truncated read, the verdict is capped at warn, `failure_ratio` renders `null`, and a zero count of brute-force sources, legacy TLS logins, or undated rows renders `null` ("unknown from the visible rows").
-  - Manual when `LoginHistory` is unread or returns zero rows in the window.
-- **15 Setup change tracking** (monitoring_integrations, SF-15)
-  - Inputs: `SetupAuditTrail`, `EventLogFile`.
-  - Pass when the trail is complete, every row is dated, no high-risk security change appears, and `EventLogFile` was readable.
-  - Warn when the trail is truncated, rows lack `CreatedDate`, or high-risk changes need review.
-  - Warn when `EventLogFile` is unread. `event_monitoring` then carries the status and error instead of a count.
-  - Manual when `SetupAuditTrail` is unread or returns zero rows in the window.
-  - The `EventLogFile` count is stated bare (`exposed N EventLogFile rows in 7 days`) only from a complete read.
-  - A truncated read says `exposed N of M EventLogFile rows ... (the read was truncated ...)`. When it showed none, it says that the read was truncated before any row was visible.
-  - `event_log_files_last_7_days` renders `null` for a zero from a truncated read.
-  - Under a partial read, `summary.event_log_files` is `null` and `event_log_status` reads `partial`. `event_log_files_seen` and `event_log_files_total` carry the sample.
-- **16 Data encryption** (data_protection, SF-16)
-  - Inputs: `TenantSecret`.
-  - Manual not-applicable when `TenantSecret` is forbidden or unavailable (never a pass). Manual when the query errored.
-  - Fail when a complete read returns no tenant secret, or none of the visible secrets is `Active`.
-  - Manual (not fail) when the `TenantSecret` read was truncated before any secret was visible, since the absence is a claim about the unread rows. The summary then carries the partial view, and `tenant_secrets` renders `null`.
-  - Warn when an active secret has no `CreatedDate` or the oldest is over 365 days old.
-  - A truncated read turns pass into warn.
-  - `summary.tenant_secrets` is a bare count of the org's secrets and renders `null` under a partial read. `tenant_secret_status` reads `partial` there (never `ok` beside a partial inventory line). `tenant_secrets_seen` and `tenant_secrets_total` carry the sample.
-- **17 Certificate management** (data_protection, SF-17)
-  - Inputs: `Certificate` (Tooling API).
-  - Fail when expired or key < 2048.
-  - Warn when expiring within 30 days, undated, `KeySize` absent (never assumed to be 2048), `OptionsIsCaSigned` absent, private key exportable, or awaiting a signed chain.
-  - Self-signed versus CA-signed counts are reported.
-  - Manual when `Certificate` is unread or returns zero rows.
-  - A truncated read turns pass into warn.
-- **18 My Domain enforcement** (platform_security, SF-18)
-  - Inputs: `MyDomainSettings`.
-  - Pass when `canOnlyLoginWithMyDomainUrl` and `doesApiLoginRequireOrgDomain` are true. Warn when only the API flag is off.
-  - Fail when no My Domain is configured or legacy login is still allowed.
-  - Manual when `MyDomainSettings` is unread or `canOnlyLoginWithMyDomainUrl` is absent.
-- **19 Clickjack protection** (platform_security, SF-19)
-  - Inputs: `SecuritySettings`.
-  - Pass when all four `enableClickjack*` flags are true. Warn when one is false. Fail when two or more are false.
-  - Manual when `SecuritySettings` is unread or a flag is absent.
-- **20 CSRF protection** (platform_security, SF-20)
-  - Inputs: `SecuritySettings`.
-  - Pass when `enableCSRFOnGet` and `enableCSRFOnPost` are true. Fail when either is false.
-  - Manual when `SecuritySettings` is unread or the flags are absent.
+| # | Control | Tool | Finding | Inputs | Status semantics |
+|---|---|---|---|---|---|
+| 1 | Health Check score | platform_security | SF-01 | `SecurityHealthCheck`, `SecurityHealthCheckRisks` | pass when score >= 90 with zero high risks; warn >= 70; fail below; manual when `SecurityHealthCheck` is unread or exposes no `Score`, or when the risk list is unread (the score is still stated; `high_risk_settings`, `medium_risk_settings`, `settings_evaluated`, and `risks_truncated` render `null`); a truncated risk list turns pass into warn and sets `risks_truncated` |
+| 2 | Session timeout | platform_security | SF-02 | `SecuritySettings` (`readMetadata`) | pass when `sessionTimeout` <= 2 hours, `forceLogoutOnSessionTimeout` true, and `lockSessionsToIp` true; warn without IP lock; fail otherwise; manual when `SecuritySettings` is unread (`Modify Metadata Through Metadata API Functions`) or the flags are absent |
+| 3 | Password policy | platform_security | SF-03 | `SecuritySettings` | pass when length >= 12, complexity includes upper, lower, numeric, expiration <= 90 days, history >= 12, lockout enabled; warn on one gap; fail on two or more; manual when `SecuritySettings` is unread or a policy field is absent |
+| 4 | MFA enforcement | identity_access | SF-04 | `SecuritySettings`, `SecurityHealthCheckRisks`, `User`, `Profile`, `TwoFactorMethodsInfo` | fail when `enableMFADirectUILoginOptIn` is false or the Health Check MFA setting does not meet the standard; when MFA is required: manual when `TwoFactorMethodsInfo` is forbidden (`Manage MFA in API`), the population gate trips, or zero active standard users are visible; pass when both `User` and `TwoFactorMethodsInfo` were read to completion and every active standard user has a registered method (warn instead when either is partial or the requirement's second source, `SecuritySettings` or the Health Check risk list, is unread); when users without a method are visible, fail when they exceed a quarter of the active standard users and warn otherwise, but only from a complete read: on a partial read (a 2500-row cap, a larger `totalSize`, `done=false`, or a stalled cursor) the finding stops at warn, the count and names render `null` with `principals_withheld`, and the summary states the observed signal. Manual when neither `SecuritySettings` nor Health Check exposes the MFA setting |
+| 5 | IP range restrictions | platform_security | SF-05 | `SecuritySettings`, `Profile`, `Profile` metadata (`listMetadata`, `readMetadata`) | pass when every sensitive profile defines `loginIpRanges`, every sensitive profile was resolved and read, and `enforceIpRangesEveryRequest` is true; warn when some sensitive profiles lack ranges, a profile could not be resolved, only N of M sensitive profiles were read, or the flag is off; fail when no read profile defines ranges and no org-wide trusted ranges exist; manual when `SecuritySettings` is unread, the `Profile` list is unread or shows no administrator-class profile, `readMetadata(Profile)` is forbidden, or no sensitive profile could be resolved (the per-profile evidence renders `null`) |
+| 6 | Login hour restrictions | identity_access | SF-06 | `Profile`, `Profile` metadata | pass when every sensitive profile bounds `loginHours` on all seven days (each `{weekday}Start`/`{weekday}End` pair is independent; a day with no start or end, or a 0 to 1440 window, is unrestricted) and every sensitive profile was resolved and read; warn when a profile bounds only some days (the unbounded days are named), some profiles restrict nothing, a profile could not be resolved, or only N of M sensitive profiles were read; fail when no read profile bounds any day; manual when the `Profile` list is unread or permission-limited, `readMetadata(Profile)` is forbidden, or no sensitive profile could be resolved |
+| 7 | API access controls | identity_access | SF-07 | `Profile`, `User` | pass when <= 25 percent of profiles grant API Enabled; warn up to 50 percent; fail above; manual when the population gate trips; the summary states when `PermissionsApiUserOnly` does not exist in the org. When `Profile` or `User` is truncated the ratio is over the visible rows only, the verdict is capped at warn, and `api_only_profiles` and `active_users_on_api_enabled_profiles` render `null` unless a row was seen |
+| 8 | Field-level security | data_protection | SF-08 | `FieldPermissions` | pass when no sensitive field has more than 5 grants; warn otherwise; manual when `FieldPermissions` is unread or no field matches the sensitive-name patterns; a truncated read turns pass into warn |
+| 9 | Permission set review | identity_access | SF-09 | `PermissionSet`, `PermissionSetAssignment`, `User`, `Profile` | pass when no permission set grants elevated permissions, or when elevated sets have zero active assignees; warn when assignees exist up to `max_admins`; fail above it; manual when `PermissionSet` is unread or returns zero rows (standard sets always exist), the population gate trips, or elevated sets exist while `PermissionSetAssignment` is unread (`elevated_assignments`, `distinct_assignees`, and `assignments_truncated` render `null`); a pass with no elevated set is capped at warn while assignments are unread; a truncated set or assignment list turns pass into warn |
+| 10 | Profile permissions | identity_access | SF-10 | `User`, `Profile` | pass when active admins <= `max_admins`, none stale, none undated; warn when an admin has no `LastLoginDate`; fail when admins exceed the threshold or any is stale (`stale_admins` are observed on visible rows and stand); manual when the population gate trips; a truncated user or profile list turns pass into warn and carries `users_seen`, `users_total`, and `*_truncated` |
+| 11 | Connected app OAuth | monitoring_integrations | SF-11 | `ConnectedApplication`, `OauthToken`, `UserPermissionAccess` | warn at best: scopes are not exposed by SOQL; fail when most apps allow self-authorization; manual when `ConnectedApplication` is unread, returns zero apps, or no app exposes `OptionsAllowAdminApprovedUsersOnly`. Token usage is a partial view (`oauth_tokens_partial_view`) when the caller's `PermissionsCustomizeApplication` is false or unknown; `oauth_tokens_possibly_capped` marks a 2500-row result and `oauth_tokens_truncated` a partial read; `oauth_tokens`, `tokens_by_app`, and the three `oauth_tokens_*` flags render `null` and the summary says token usage was not checked when `OauthToken` is unread; `connected_applications_truncated` names its own source |
+| 12 | Sharing settings | data_protection | SF-12 | `Organization` | warn at best: custom object defaults are not read; fail when 3+ standard objects are public; manual when `Organization` is unread or exposes no `Default*Access` field |
+| 13 | Guest user access | identity_access | SF-13 | `User`, `Profile` | pass when a complete user list with at least one visible active administrator contains zero active guest users; warn when the user list is truncated (guest coverage is partial, the active guests seen are listed); fail when active guests sit on profiles with API Enabled or elevated permissions; warn when guests exist without them; manual when the population gate trips |
+| 14 | Login forensics | monitoring_integrations | SF-14 | `LoginHistory` | on a complete read: fail when any source has 10+ failures, failures exceed 25 percent, or a legacy TLS login exists; warn when failures exceed 10 percent, more than 5 countries appear, or rows lack `LoginTime`; pass otherwise. On a truncated read the verdict is capped at warn, `failure_ratio` renders `null`, and a zero count of brute-force sources, legacy TLS logins, or undated rows renders `null` ("unknown from the visible rows"). Manual when `LoginHistory` is unread or returns zero rows in the window |
+| 15 | Setup change tracking | monitoring_integrations | SF-15 | `SetupAuditTrail`, `EventLogFile` | pass when the trail is complete, every row is dated, no high-risk security change appears, and `EventLogFile` was readable; warn when the trail is truncated, rows lack `CreatedDate`, high-risk changes need review, or `EventLogFile` is unread (`event_monitoring` then carries the status and error instead of a count); manual when `SetupAuditTrail` is unread or returns zero rows in the window. The `EventLogFile` count is stated bare (`exposed N EventLogFile rows in 7 days`) only from a complete read: a truncated read says `exposed N of M EventLogFile rows ... (the read was truncated ...)`, or that the read was truncated before any row was visible when it showed none, `event_log_files_last_7_days` renders `null` for a zero from a truncated read, and `summary.event_log_files` is `null` under a partial read with `event_log_status` reading `partial` (`event_log_files_seen` and `event_log_files_total` carry the sample) |
+| 16 | Data encryption | data_protection | SF-16 | `TenantSecret` | manual not-applicable when `TenantSecret` is forbidden or unavailable (never a pass); manual when the query errored; fail when a complete read returns no tenant secret, or none of the visible secrets is `Active`; manual (not fail) when the `TenantSecret` read was truncated before any secret was visible, since the absence is a claim about the unread rows (the summary carries the partial view and `tenant_secrets` renders `null`); warn when an active secret has no `CreatedDate` or the oldest is over 365 days old; a truncated read turns pass into warn. `summary.tenant_secrets` is a bare count of the org's secrets and renders `null` under a partial read, `tenant_secret_status` reads `partial` there (never `ok` beside a partial inventory line), and `tenant_secrets_seen` and `tenant_secrets_total` carry the sample |
+| 17 | Certificate management | data_protection | SF-17 | `Certificate` (Tooling API) | fail when expired or key < 2048; warn when expiring within 30 days, undated, `KeySize` absent (never assumed to be 2048), `OptionsIsCaSigned` absent, private key exportable, or awaiting a signed chain; self-signed versus CA-signed counts are reported; manual when `Certificate` is unread or returns zero rows; a truncated read turns pass into warn |
+| 18 | My Domain enforcement | platform_security | SF-18 | `MyDomainSettings` | pass when `canOnlyLoginWithMyDomainUrl` and `doesApiLoginRequireOrgDomain` are true; warn when only the API flag is off; fail when no My Domain is configured or legacy login is still allowed; manual when `MyDomainSettings` is unread or `canOnlyLoginWithMyDomainUrl` is absent |
+| 19 | Clickjack protection | platform_security | SF-19 | `SecuritySettings` | pass when all four `enableClickjack*` flags are true; warn when one is false; fail when two or more are false; manual when `SecuritySettings` is unread or a flag is absent |
+| 20 | CSRF protection | platform_security | SF-20 | `SecuritySettings` | pass when `enableCSRFOnGet` and `enableCSRFOnPost` are true; fail when either is false; manual when `SecuritySettings` is unread or the flags are absent |
 
 ## Framework mappings
 

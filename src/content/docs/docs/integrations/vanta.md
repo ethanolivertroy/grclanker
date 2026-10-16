@@ -25,9 +25,11 @@ The tools accept `client_id` and `client_secret` arguments, but passing the secr
 
 ## Tools
 
-- `vanta_check_access`: Validates credentials, probes the Auditor API, and reports whether any audits are visible.
-- `vanta_list_audits`: Lists visible audits and can filter locally by customer, organization, framework, or audit ID.
-- `vanta_export_audit`: Exports one audit into control folders, metadata, a CSV index, downloaded evidence files, and a zip archive.
+| Tool | Behavior |
+| --- | --- |
+| `vanta_check_access` | Validates credentials, probes the Auditor API, and reports whether any audits are visible. |
+| `vanta_list_audits` | Lists visible audits and can filter locally by customer, organization, framework, or audit ID. |
+| `vanta_export_audit` | Exports one audit into control folders, metadata, a CSV index, downloaded evidence files, and a zip archive. |
 
 Use the access check first, then list audits to obtain the `audit_id`:
 

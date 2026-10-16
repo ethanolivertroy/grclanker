@@ -38,48 +38,16 @@ Every tool is read-only. Nothing in this integration creates, changes, or delete
 
 Configuration resolves in this order: explicit tool arguments, then environment variables, then the config file.
 
-Each setting below lists its tool argument, environment variable, config file key, and default.
-
-- **Reporting API key (required)**
-  - Tool argument: `api_token`
-  - Environment variable: `KNOWBE4_API_TOKEN`
-  - Config file key: `api_token`
-  - Default: None
-- **Region (`us`, `eu`, `ca`, `uk`, `de`)**
-  - Tool argument: `region`
-  - Environment variable: `KNOWBE4_REGION`
-  - Config file key: `region`
-  - Default: `us`
-- **Reporting API base URL override**
-  - Tool argument: `base_url`
-  - Environment variable: `KNOWBE4_BASE_URL`
-  - Config file key: `base_url`
-  - Default: Derived from region, for example `https://us.api.knowbe4.com`
-- **PhishER Product API key (optional)**
-  - Tool argument: `phisher_api_token`
-  - Environment variable: `KNOWBE4_PHISHER_API_TOKEN`
-  - Config file key: `phisher_api_token`
-  - Default: None
-- **PhishER GraphQL URL override**
-  - Tool argument: `phisher_graphql_url`
-  - Environment variable: `KNOWBE4_PHISHER_GRAPHQL_URL`
-  - Config file key: `phisher_graphql_url`
-  - Default: Derived from region, for example `https://training.knowbe4.com/graphql`
-- **Config file path**
-  - Tool argument: `config_file`
-  - Environment variable: `KNOWBE4_CONFIG_FILE`
-  - Config file key: n/a
-  - Default: `~/.knowbe4-inspector/config.yaml`
-- **HTTP timeout in seconds**
-  - Tool argument: `timeout_seconds`
-  - Environment variable: `KNOWBE4_TIMEOUT`
-  - Config file key: `timeout_seconds`
-  - Default: `30`
-- **Redact user PII in findings and exports**
-  - Tool argument: `redact_pii`
-  - Environment variable: `KNOWBE4_REDACT_PII`
-  - Config file key: `redact_pii`
-  - Default: `false`
+| Setting | Tool argument | Environment variable | Config file key | Default |
+| --- | --- | --- | --- | --- |
+| Reporting API key (required) | `api_token` | `KNOWBE4_API_TOKEN` | `api_token` | none |
+| Region (`us`, `eu`, `ca`, `uk`, `de`) | `region` | `KNOWBE4_REGION` | `region` | `us` |
+| Reporting API base URL override | `base_url` | `KNOWBE4_BASE_URL` | `base_url` | derived from region, for example `https://us.api.knowbe4.com` |
+| PhishER Product API key (optional) | `phisher_api_token` | `KNOWBE4_PHISHER_API_TOKEN` | `phisher_api_token` | none |
+| PhishER GraphQL URL override | `phisher_graphql_url` | `KNOWBE4_PHISHER_GRAPHQL_URL` | `phisher_graphql_url` | derived from region, for example `https://training.knowbe4.com/graphql` |
+| Config file path | `config_file` | `KNOWBE4_CONFIG_FILE` | n/a | `~/.knowbe4-inspector/config.yaml` |
+| HTTP timeout in seconds | `timeout_seconds` | `KNOWBE4_TIMEOUT` | `timeout_seconds` | `30` |
+| Redact user PII in findings and exports | `redact_pii` | `KNOWBE4_REDACT_PII` | `redact_pii` | `false` |
 
 Example config file:
 
@@ -133,47 +101,14 @@ curl -s -X POST 'https://training.knowbe4.com/graphql?scope=phisher' \
 
 ## Tools
 
-Each tool is followed by its purpose and its notable parameters.
-
-- `knowbe4_check_access`: Probes `/v1/account`, users, groups, phishing campaigns, security tests, training campaigns, enrollments, store purchases, and policies, plus PhishER when a key is configured. Reports `healthy` or `limited`. Notable parameters: auth parameters only.
-- `knowbe4_assess_phishing_program`: Controls 1, 2, 6, 7, 9, 19, 20. Notable parameters:
-  - `lookback_days` (90)
-  - `user_limit` (5000)
-  - `max_campaign_gap_days` (30)
-  - `min_coverage_pct` (90)
-  - `max_phish_prone_pct` (15)
-  - `min_report_rate_pct` (50)
-  - `max_schedule_gap_days` (45)
-  - `require_full_targeting` (true)
-  - `security_test_sample_limit` (12)
-  - `phisher_message_limit` (1000)
-- `knowbe4_assess_training_program`: Controls 3, 4, 10, 11, 17. Notable parameters:
-  - `training_lookback_days` (365)
-  - `min_completion_pct` (90)
-  - `fail_completion_pct` (80)
-  - `enrollment_grace_days` (30)
-  - `remedial_window_days` (14)
-  - `max_content_age_days` (365)
-  - `required_compliance_topics`
-  - `enrollment_limit` (20000)
-  - `lookback_days` (90)
-  - `user_limit` (5000)
-  - `security_test_sample_limit` (12)
-- `knowbe4_assess_user_risk`: Controls 5, 8, 18. Notable parameters:
-  - `max_mean_risk_score` (50)
-  - `max_risk_score_stddev` (25)
-  - `inactive_days` (180)
-  - `lookback_days` (90)
-  - `user_limit` (5000)
-  - `enrollment_limit` (20000)
-  - `security_test_sample_limit` (12)
-- `knowbe4_assess_account_governance`: Controls 12, 13, 14, 15, 16. Notable parameters:
-  - `max_admin_count` (3)
-  - `require_usb_tests` (true)
-  - `require_vishing_tests` (true)
-  - `lookback_days` (90)
-  - `user_limit` (5000)
-- `knowbe4_export_audit_bundle`: Runs every assessment and writes an evidence bundle plus a `.zip`. Notable parameters: all of the above plus `output_dir` (default `./export/knowbe4`).
+| Tool | Purpose | Notable parameters |
+| --- | --- | --- |
+| `knowbe4_check_access` | Probes `/v1/account`, users, groups, phishing campaigns, security tests, training campaigns, enrollments, store purchases, and policies, plus PhishER when a key is configured. Reports `healthy` or `limited`. | auth parameters only |
+| `knowbe4_assess_phishing_program` | Controls 1, 2, 6, 7, 9, 19, 20. | `lookback_days` (90), `user_limit` (5000), `max_campaign_gap_days` (30), `min_coverage_pct` (90), `max_phish_prone_pct` (15), `min_report_rate_pct` (50), `max_schedule_gap_days` (45), `require_full_targeting` (true), `security_test_sample_limit` (12), `phisher_message_limit` (1000) |
+| `knowbe4_assess_training_program` | Controls 3, 4, 10, 11, 17. | `training_lookback_days` (365), `min_completion_pct` (90), `fail_completion_pct` (80), `enrollment_grace_days` (30), `remedial_window_days` (14), `max_content_age_days` (365), `required_compliance_topics`, `enrollment_limit` (20000), `lookback_days` (90), `user_limit` (5000), `security_test_sample_limit` (12) |
+| `knowbe4_assess_user_risk` | Controls 5, 8, 18. | `max_mean_risk_score` (50), `max_risk_score_stddev` (25), `inactive_days` (180), `lookback_days` (90), `user_limit` (5000), `enrollment_limit` (20000), `security_test_sample_limit` (12) |
+| `knowbe4_assess_account_governance` | Controls 12, 13, 14, 15, 16. | `max_admin_count` (3), `require_usb_tests` (true), `require_vishing_tests` (true), `lookback_days` (90), `user_limit` (5000) |
+| `knowbe4_export_audit_bundle` | Runs every assessment and writes an evidence bundle plus a `.zip`. | all of the above plus `output_dir` (default `./export/knowbe4`) |
 
 Every assessment returns findings shaped as `{ id, control, title, severity, status, summary, evidence, mappings, manualEvidence }`.
 
@@ -339,127 +274,28 @@ The test suite sweeps the strings recorded by healthy and partially denied runs 
 
 ## Control coverage
 
-Each entry names the spec control, then the tool and finding that cover it, then the status semantics.
-
-- **1. Phishing simulation frequency** (`knowbe4_assess_phishing_program`, `KNOWBE4-01`)
-  - Pass when the latest security test started within `max_campaign_gap_days`.
-  - Fail otherwise or when no test has ever run.
-  - Manual when security tests are unreadable.
-- **2. Phishing simulation coverage** (`knowbe4_assess_phishing_program`, `KNOWBE4-02`)
-  - Pass when at least `min_coverage_pct` of active users appear as recipients of tests in `lookback_days`.
-  - Warn when unsampled tests could hide coverage, some recipient results were unreadable, the user list hit `user_limit`, or the API returned no active users.
-  - Fail otherwise.
-  - Manual when security tests or users are unreadable.
-- **3. Training completion rates** (`knowbe4_assess_training_program`, `KNOWBE4-03`)
-  - Pass when every completed campaign in `training_lookback_days` is at or above `min_completion_pct`.
-  - Warn between `fail_completion_pct` and the target.
-  - Fail below `fail_completion_pct`.
-  - Manual when training campaigns are unreadable.
-  - A campaign reporting the `-1` completion sentinel is measured from its enrollments.
-    - When the enrollment list hit `enrollment_limit`, the campaign is listed as unmeasurable (`campaigns_with_truncated_enrollments`) and caps the verdict at warn.
-    - When the enrollment list is unreadable, the campaign lands in `campaigns_without_measurable_completion`, and the verdict is capped at warn with the unreadable inventory named.
-- **4. Training enrollment timeliness** (`knowbe4_assess_training_program`, `KNOWBE4-04`)
-  - Pass when users who joined in the window were enrolled within `enrollment_grace_days`.
-  - Warn when the late share is 5% or less, enrollment or user collection was capped, or the API returned no active users.
-  - Fail otherwise.
-  - Manual when users or enrollments are unreadable.
-- **5. User risk score distribution** (`knowbe4_assess_user_risk`, `KNOWBE4-05`)
-  - Fail when the mean `current_risk_score` exceeds `max_mean_risk_score`.
-  - Warn in any of these cases:
-    - The standard deviation exceeds `max_risk_score_stddev`.
-    - No scores exist.
-    - The API returned no active users.
-    - The user list hit `user_limit`.
-    - The account or its risk score history (comparison context) is unreadable.
-  - Pass otherwise.
-  - Manual when users are unreadable.
-- **6. Phish-prone percentage tracking** (`knowbe4_assess_phishing_program`, `KNOWBE4-06`)
-  - Evaluated only from the delivered-weighted phish-prone percentage of security tests in `lookback_days`.
-  - Fail above `max_phish_prone_pct`.
-  - Warn in any of these cases:
-    - Above the program baseline.
-    - No test ran in the window.
-    - Tests report no rate. The per-user average is shown as context only, because never-tested users report 0%.
-    - Users or the account (the context figures) are unreadable.
-  - Pass otherwise.
-  - Manual when security tests are unreadable.
-- **7. Phishing failure rate trending** (`knowbe4_assess_phishing_program`, `KNOWBE4-07`)
-  - Compares the older and newer halves of tests in twice `lookback_days`.
-  - Fail when the newer half is more than 2 points worse.
-  - Warn above 0.5 points, with fewer than four tests, or when the account risk score history is unreadable.
-  - Pass otherwise.
-  - Manual when security tests are unreadable.
-- **8. Group coverage analysis** (`knowbe4_assess_user_risk`, `KNOWBE4-08`)
-  - Pass when every active group with members was targeted by a phishing and a training campaign in `lookback_days` (All Users counts).
-  - Fail otherwise.
-  - Manual when groups, phishing campaigns, or training campaigns are unreadable.
-- **9. Campaign targeting completeness** (`knowbe4_assess_phishing_program`, `KNOWBE4-09`)
-  - Pass when an active campaign targets All Users or targeted groups cover `min_coverage_pct` of active users.
-  - Warn when the user list hit `user_limit`, or when security tests, users, or groups are unreadable while a campaign still targets All Users.
-  - Fail when `require_full_targeting` is true and coverage is short.
-  - Manual when phishing campaigns are unreadable, or when users or groups are unreadable and no campaign targets All Users (the coverage estimate needs both).
-- **10. Remedial training triggers** (`knowbe4_assess_training_program`, `KNOWBE4-10`)
-  - Pass when at least 90% of users who failed a sampled test more than `remedial_window_days` ago were enrolled afterwards and every test in the window was sampled. Auto-enroll campaigns are listed.
-  - Warn from 50%, whenever unsampled tests remain in the window, or when recipient results or training campaigns are unreadable. Sampled and unsampled counts are in the evidence.
-  - Fail below 50%.
-  - Manual when security tests or enrollments are unreadable.
-- **11. Training content currency** (`knowbe4_assess_training_program`, `KNOWBE4-11`)
-  - Fail when assigned ModStore modules are retired.
-  - Warn in any of these cases:
-    - Modules were published more than `max_content_age_days` ago.
-    - A module has no publish date in either the campaign content or the store catalog (listed as `undated_modules`).
-    - None are assigned.
-    - Store purchases are unreadable.
-  - Pass otherwise.
-  - Manual when training campaigns are unreadable.
-- **12. Admin role audit** (`knowbe4_assess_account_governance`, `KNOWBE4-12`)
-  - Fail when console admins exceed `max_admin_count`.
-  - Warn when an admin uses a domain outside the account's allowed domains.
-  - Pass otherwise.
-  - Manual when the account is unreadable.
-- **13. SSO integration status** (`knowbe4_assess_account_governance`, `KNOWBE4-13`): Manual, because the Reporting API does not expose SAML or admin MFA settings.
-- **14. Reporting frequency** (`knowbe4_assess_account_governance`, `KNOWBE4-14`): Manual, because there is no API record of generated or reviewed reports. Latest test and campaign dates are included as context.
-- **15. USB test campaign execution** (`knowbe4_assess_account_governance`, `KNOWBE4-15`): Always manual, because USB Drive Tests are not in the Reporting API. It never passes.
-  - With `require_usb_tests` true, the finding asks for the console campaign export.
-  - With `require_usb_tests` false, the finding states that the control was scoped out by configuration and asks for the policy or risk-acceptance record.
-- **16. Vishing campaign execution** (`knowbe4_assess_account_governance`, `KNOWBE4-16`)
-  - Pass when a callback phishing test (`campaign_type=callback`) started in `lookback_days`.
-  - Fail when none did.
-  - Manual in either of these cases:
-    - Callback tests are unreadable.
-    - `require_vishing_tests` is false. The control is scoped out by configuration, and the evidence is the policy or risk-acceptance record.
-- **17. Compliance training modules** (`knowbe4_assess_training_program`, `KNOWBE4-17`)
-  - Fail when a `required_compliance_topics` entry has no assigned module or is assigned but has zero training enrollments.
-  - Warn in any of these cases:
-    - Compliance modules are missing or unenrolled without a required list.
-    - Completion is below `min_completion_pct`.
-    - Zero enrollments coincide with truncated or unreadable enrollment data.
-    - Completion was computed over an enrollment list that hit `enrollment_limit` (`completion_data_partial`).
-    - Enrollments or uploaded policies are unreadable.
-  - Pass otherwise.
-  - Manual when training campaigns are unreadable.
-- **18. Inactive user cleanup** (`knowbe4_assess_user_risk`, `KNOWBE4-18`)
-  - Fail when active users show no delivered phishing test, training activity, or sign-in in `inactive_days`.
-  - Warn in any of these cases:
-    - Activity data was partial.
-    - The user list hit `user_limit`.
-    - The API returned no active users.
-    - The share is 5% or less.
-    - Security tests, recipient results, or enrollments (the activity signals) are unreadable.
-  - Pass otherwise.
-  - Manual when users are unreadable.
-- **19. Phishing report rate** (`knowbe4_assess_phishing_program`, `KNOWBE4-19`)
-  - Pass when `reported_count / delivered_count` across recent tests meets `min_report_rate_pct`.
-  - Warn above half the target or when the configured PhishER inbox is unreadable.
-  - Fail below.
-  - Manual when security tests are unreadable.
-  - PhishER message counts are attached when a PhishER key is configured.
-  - A PhishER listing truncated at `phisher_message_limit` is stated in the summary and evidence (messages loaded versus `totalCount`) without changing the verdict, because the rate comes from the security test counters.
-- **20. Campaign scheduling regularity** (`knowbe4_assess_phishing_program`, `KNOWBE4-20`)
-  - Measures gaps between consecutive tests in `lookback_days` (anchored on the last test before the window), plus the gap from the latest test to now.
-  - Pass when no gap exceeds `max_schedule_gap_days`.
-  - Fail otherwise, including when the program stopped running tests or never ran one.
-  - Manual when security tests are unreadable.
+| Spec control | Tool | Finding | Status semantics |
+| --- | --- | --- | --- |
+| 1. Phishing simulation frequency | `knowbe4_assess_phishing_program` | `KNOWBE4-01` | pass when the latest security test started within `max_campaign_gap_days`; fail otherwise or when no test has ever run; manual when security tests are unreadable |
+| 2. Phishing simulation coverage | `knowbe4_assess_phishing_program` | `KNOWBE4-02` | pass when at least `min_coverage_pct` of active users appear as recipients of tests in `lookback_days`; warn when unsampled tests could hide coverage, some recipient results were unreadable, the user list hit `user_limit`, or the API returned no active users; fail otherwise; manual when security tests or users are unreadable |
+| 3. Training completion rates | `knowbe4_assess_training_program` | `KNOWBE4-03` | pass when every completed campaign in `training_lookback_days` is at or above `min_completion_pct`; warn between `fail_completion_pct` and the target; fail below `fail_completion_pct`. A campaign reporting the `-1` completion sentinel is measured from its enrollments; when the enrollment list hit `enrollment_limit` it is listed as unmeasurable (`campaigns_with_truncated_enrollments`) and caps the verdict at warn, and when the enrollment list is unreadable it lands in `campaigns_without_measurable_completion` and the verdict is capped at warn with the unreadable inventory named; manual when training campaigns are unreadable |
+| 4. Training enrollment timeliness | `knowbe4_assess_training_program` | `KNOWBE4-04` | pass when users who joined in the window were enrolled within `enrollment_grace_days`; warn when the late share is 5% or less, enrollment or user collection was capped, or the API returned no active users; fail otherwise; manual when users or enrollments are unreadable |
+| 5. User risk score distribution | `knowbe4_assess_user_risk` | `KNOWBE4-05` | fail when the mean `current_risk_score` exceeds `max_mean_risk_score`; warn when the standard deviation exceeds `max_risk_score_stddev`, no scores exist, the API returned no active users, the user list hit `user_limit`, or the account or its risk score history (comparison context) is unreadable; pass otherwise; manual when users are unreadable |
+| 6. Phish-prone percentage tracking | `knowbe4_assess_phishing_program` | `KNOWBE4-06` | evaluated only from the delivered-weighted phish-prone percentage of security tests in `lookback_days`; fail above `max_phish_prone_pct`; warn when above the program baseline, when no test ran in the window, when tests report no rate (the per-user average is shown as context only, because never-tested users report 0%), or when users or the account (the context figures) are unreadable; pass otherwise; manual when security tests are unreadable |
+| 7. Phishing failure rate trending | `knowbe4_assess_phishing_program` | `KNOWBE4-07` | compares the older and newer halves of tests in twice `lookback_days`; fail when the newer half is more than 2 points worse, warn above 0.5 points, with fewer than four tests, or when the account risk score history is unreadable, pass otherwise; manual when security tests are unreadable |
+| 8. Group coverage analysis | `knowbe4_assess_user_risk` | `KNOWBE4-08` | pass when every active group with members was targeted by a phishing and a training campaign in `lookback_days` (All Users counts); fail otherwise; manual when groups, phishing campaigns, or training campaigns are unreadable |
+| 9. Campaign targeting completeness | `knowbe4_assess_phishing_program` | `KNOWBE4-09` | pass when an active campaign targets All Users or targeted groups cover `min_coverage_pct` of active users; warn when the user list hit `user_limit`, or when security tests, users, or groups are unreadable while a campaign still targets All Users; fail when `require_full_targeting` is true and coverage is short; manual when phishing campaigns are unreadable, or when users or groups are unreadable and no campaign targets All Users (the coverage estimate needs both) |
+| 10. Remedial training triggers | `knowbe4_assess_training_program` | `KNOWBE4-10` | pass when at least 90% of users who failed a sampled test more than `remedial_window_days` ago were enrolled afterwards and every test in the window was sampled (auto-enroll campaigns listed); warn from 50%, whenever unsampled tests remain in the window (sampled and unsampled counts are in the evidence), or when recipient results or training campaigns are unreadable; fail below 50%; manual when security tests or enrollments are unreadable |
+| 11. Training content currency | `knowbe4_assess_training_program` | `KNOWBE4-11` | fail when assigned ModStore modules are retired; warn when modules were published more than `max_content_age_days` ago, when a module has no publish date in either the campaign content or the store catalog (listed as `undated_modules`), when none are assigned, or when store purchases are unreadable; pass otherwise; manual when training campaigns are unreadable |
+| 12. Admin role audit | `knowbe4_assess_account_governance` | `KNOWBE4-12` | fail when console admins exceed `max_admin_count`; warn when an admin uses a domain outside the account's allowed domains; pass otherwise; manual when the account is unreadable |
+| 13. SSO integration status | `knowbe4_assess_account_governance` | `KNOWBE4-13` | manual: the Reporting API does not expose SAML or admin MFA settings |
+| 14. Reporting frequency | `knowbe4_assess_account_governance` | `KNOWBE4-14` | manual: no API record of generated or reviewed reports; latest test and campaign dates are included as context |
+| 15. USB test campaign execution | `knowbe4_assess_account_governance` | `KNOWBE4-15` | always manual: USB Drive Tests are not in the Reporting API. With `require_usb_tests` true the finding asks for the console campaign export; with it false the finding states that the control was scoped out by configuration and asks for the policy or risk-acceptance record. It never passes |
+| 16. Vishing campaign execution | `knowbe4_assess_account_governance` | `KNOWBE4-16` | pass when a callback phishing test (`campaign_type=callback`) started in `lookback_days`; fail when none did; manual when callback tests are unreadable, or when `require_vishing_tests` is false (scoped out by configuration, evidence is the policy or risk-acceptance record) |
+| 17. Compliance training modules | `knowbe4_assess_training_program` | `KNOWBE4-17` | fail when a `required_compliance_topics` entry has no assigned module or is assigned but has zero training enrollments; warn when compliance modules are missing or unenrolled without a required list, when completion is below `min_completion_pct`, when zero enrollments coincide with truncated or unreadable enrollment data, when completion was computed over an enrollment list that hit `enrollment_limit` (`completion_data_partial`), or when enrollments or uploaded policies are unreadable; pass otherwise; manual when training campaigns are unreadable |
+| 18. Inactive user cleanup | `knowbe4_assess_user_risk` | `KNOWBE4-18` | fail when active users show no delivered phishing test, training activity, or sign-in in `inactive_days`; warn when activity data was partial, the user list hit `user_limit`, the API returned no active users, the share is 5% or less, or security tests, recipient results, or enrollments (the activity signals) are unreadable; pass otherwise; manual when users are unreadable |
+| 19. Phishing report rate | `knowbe4_assess_phishing_program` | `KNOWBE4-19` | pass when `reported_count / delivered_count` across recent tests meets `min_report_rate_pct`; warn above half the target or when the configured PhishER inbox is unreadable; fail below; PhishER message counts are attached when a PhishER key is configured, and a PhishER listing truncated at `phisher_message_limit` is stated in the summary and evidence (messages loaded versus `totalCount`) without changing the verdict, because the rate comes from the security test counters; manual when security tests are unreadable |
+| 20. Campaign scheduling regularity | `knowbe4_assess_phishing_program` | `KNOWBE4-20` | measures gaps between consecutive tests in `lookback_days` (anchored on the last test before the window) plus the gap from the latest test to now; pass when no gap exceeds `max_schedule_gap_days`; fail otherwise, including when the program stopped running tests or never ran one; manual when security tests are unreadable |
 
 ## Framework mappings
 

@@ -27,13 +27,15 @@ Create a Falcon API client with read scopes only, then pass its credentials to t
 
 Environment variables:
 
-- `CS_CLIENT_ID`: Falcon API client ID. `FALCON_CLIENT_ID` is accepted as a fallback.
-- `CS_CLIENT_SECRET`: Falcon API client secret. `FALCON_CLIENT_SECRET` is accepted as a fallback.
-- `CS_BASE_URL`: Explicit API base URL. It overrides the cloud alias. `FALCON_BASE_URL` is accepted as a fallback.
-- `CS_CLOUD`: Regional cloud alias when `CS_BASE_URL` is not set. `FALCON_CLOUD` is accepted as a fallback.
-- `CS_MEMBER_CID`: Child CID for Falcon Flight Control (MSSP) tenants. `FALCON_MEMBER_CID` is accepted as a fallback.
-- `CS_CONFIG_FILE`: Optional JSON config file path. Defaults to `~/.crowdstrike/config.json`.
-- `CS_TIMEOUT`: HTTP timeout in seconds, default 30.
+| Variable | Purpose |
+|---|---|
+| `CS_CLIENT_ID` | Falcon API client ID (`FALCON_CLIENT_ID` is accepted as a fallback) |
+| `CS_CLIENT_SECRET` | Falcon API client secret (`FALCON_CLIENT_SECRET` is accepted as a fallback) |
+| `CS_BASE_URL` | Explicit API base URL; overrides the cloud alias (`FALCON_BASE_URL` is accepted as a fallback) |
+| `CS_CLOUD` | Regional cloud alias when `CS_BASE_URL` is not set (`FALCON_CLOUD` is accepted as a fallback) |
+| `CS_MEMBER_CID` | Child CID for Falcon Flight Control (MSSP) tenants (`FALCON_MEMBER_CID` is accepted as a fallback) |
+| `CS_CONFIG_FILE` | Optional JSON config file path (defaults to `~/.crowdstrike/config.json`) |
+| `CS_TIMEOUT` | HTTP timeout in seconds (default 30) |
 
 Precedence is explicit tool arguments, then environment variables, then the JSON config file.
 
@@ -45,13 +47,15 @@ The config file accepts:
 
 Keep the config file outside the repository.
 
-Regional cloud aliases and their base URLs:
+Regional clouds:
 
-- `us-1` (default): `https://api.crowdstrike.com`
-- `us-2`: `https://api.us-2.crowdstrike.com`
-- `eu-1`: `https://api.eu-1.crowdstrike.com`
-- `us-gov-1`: `https://api.laggar.gcw.crowdstrike.com`
-- `us-gov-2`: `https://api.us-gov-2.crowdstrike.mil`
+| Alias | Base URL |
+|---|---|
+| `us-1` (default) | `https://api.crowdstrike.com` |
+| `us-2` | `https://api.us-2.crowdstrike.com` |
+| `eu-1` | `https://api.eu-1.crowdstrike.com` |
+| `us-gov-1` | `https://api.laggar.gcw.crowdstrike.com` |
+| `us-gov-2` | `https://api.us-gov-2.crowdstrike.mil` |
 
 The client:
 
@@ -82,13 +86,15 @@ Required API client scopes (all Read):
 
 ## Tools
 
-- `crowdstrike_check_access`: Probe 19 read surfaces, report readable counts, and list missing API client scopes.
-- `crowdstrike_assess_prevention_policies`: CS-01 to CS-05 from prevention policy settings.
-- `crowdstrike_assess_response_readiness`: CS-06, CS-07, CS-22, CS-23 from response policies, RTR audit sessions, alerts, and contained hosts.
-- `crowdstrike_assess_device_firewall`: CS-08 to CS-11 from device control and firewall policies, containers, rule groups, and rules.
-- `crowdstrike_assess_sensor_coverage`: CS-12 to CS-15 and CS-25 from sensor update policies, builds, hosts, host groups, Discover, and ZTA.
-- `crowdstrike_assess_access_governance`: CS-16 to CS-21 and CS-24 from users, roles, API clients, exclusions, and Identity Protection rules.
-- `crowdstrike_export_audit_bundle`: Run every assessment and write an evidence bundle plus zip archive.
+| Tool | Purpose |
+|---|---|
+| `crowdstrike_check_access` | Probe 19 read surfaces, report readable counts, and list missing API client scopes |
+| `crowdstrike_assess_prevention_policies` | CS-01 to CS-05 from prevention policy settings |
+| `crowdstrike_assess_response_readiness` | CS-06, CS-07, CS-22, CS-23 from response policies, RTR audit sessions, alerts, and contained hosts |
+| `crowdstrike_assess_device_firewall` | CS-08 to CS-11 from device control and firewall policies, containers, rule groups, and rules |
+| `crowdstrike_assess_sensor_coverage` | CS-12 to CS-15 and CS-25 from sensor update policies, builds, hosts, host groups, Discover, and ZTA |
+| `crowdstrike_assess_access_governance` | CS-16 to CS-21 and CS-24 from users, roles, API clients, exclusions, and Identity Protection rules |
+| `crowdstrike_export_audit_bundle` | Run every assessment and write an evidence bundle plus zip archive |
 
 Every tool accepts `client_id`, `client_secret`, `base_url`, `cloud`, `member_cid`, `config_file`, and `timeout_seconds`.
 
@@ -189,181 +195,39 @@ The verdicts follow these safety rules, each covered by a regression test in `cl
 
 ### Verdicts by control
 
-Each entry's `Inputs` line names the datasets the finding reads, using the labels of the summary's `inventories` map. When an input is unread or truncated:
+The `Inputs` column names the datasets each finding reads, using the labels of the summary's `inventories` map. When an input is unread or truncated:
 
 - An unread primary input renders the finding `manual`.
 - An unread secondary input caps it at `warn`.
 - A truncated input caps a pass at `warn` and an absence-driven fail at `manual`.
 
-Each entry gives the control ID and name, then the tool, the inputs, and the status semantics. The finding ID matches the control ID.
-
-- **CS-01 Prevention Policy - ML Detection Levels** (`crowdstrike_assess_prevention_policies`)
-  - Inputs: `prevention policies`.
-  - Pass when `CloudAntiMalware` and `OnSensorMLSlider` detection and prevention are AGGRESSIVE or higher in every enabled, host-assigned policy and every platform (Windows, Mac, Linux) has one.
-  - Warn at MODERATE, or when a slider or its `detection` or `prevention` value is missing.
-  - Warn when at least one enabled, host-assigned policy exists but some platform has none. `platforms_without_policy` names them.
-  - Fail at CAUTIOUS or DISABLED on any enabled, host-assigned policy.
-  - Fail when no enabled, host-assigned prevention policy exists on any platform: the policy list is empty, or every policy is disabled or unassigned.
-  - Manual instead of that fail when the policy list is truncated, since the missing policy could be among the unread rows. The per-platform warn is likewise dropped on a truncated list.
-  - Manual when the policy list is unread.
-- **CS-02 Prevention Policy - Exploit Mitigation** (`crowdstrike_assess_prevention_policies`)
-  - Inputs: `prevention policies`.
-  - Fail when `ForceASLR`, `ForceDEP`, `HeapSprayPreallocation`, `NullPageAllocation`, or `SEHOverwriteProtection` is disabled.
-  - Warn when only extended mitigations are disabled.
-  - Manual when the list is unread.
-  - A truncated list caps pass at warn and the no-assigned-policy fail at manual.
-- **CS-03 Prevention Policy - Script-Based Execution Control** (`crowdstrike_assess_prevention_policies`)
-  - Inputs: `prevention policies`.
-  - Fail when `ScriptBasedExecutionMonitoring`, `InterpreterProtection`, or `EngineProtectionV2` is disabled.
-  - Manual when the list is unread.
-  - A truncated list caps pass at warn and the no-assigned-policy fail at manual.
-- **CS-04 Prevention Policy - Sensor Tamper Protection** (`crowdstrike_assess_prevention_policies`)
-  - Inputs: `prevention policies`.
-  - Fail when `SensorTamperingProtection` is disabled in any enabled, host-assigned policy.
-  - Manual when the list is unread.
-  - A truncated list caps pass at warn and the no-assigned-policy fail at manual.
-- **CS-05 Prevention Policy - On-Write Detection** (`crowdstrike_assess_prevention_policies`)
-  - Inputs: `prevention policies`.
-  - Fail when `DetectOnWrite` is disabled.
-  - Warn when `QuarantineOnWrite` is disabled.
-  - Manual when the list is unread.
-  - A truncated list caps pass at warn and the no-assigned-policy fail at manual.
-- **CS-06 Response Policy - RTR Enabled** (`crowdstrike_assess_response_readiness`)
-  - Inputs: `response policies`.
-  - Fail when `RealTimeFunctionality` is disabled in every enabled, host-assigned response policy or no such policy exists (manual instead when the list is truncated).
-  - Warn when `CustomScripts` is allowed.
-  - Manual when the list is unread.
-- **CS-07 Response Policy - Session Limits** (`crowdstrike_assess_response_readiness`)
-  - Inputs: `rtr audit sessions`.
-  - Manual, because the API does not expose timeout or concurrency settings.
-  - RTR audit sessions longer than `max_session_minutes` or above `max_concurrent_sessions` raise warn.
-  - When the session read is unread, the summary names that failure instead.
-  - A truncated session page is recorded as `partial_inventory`.
-- **CS-08 Device Control - USB Blocking** (`crowdstrike_assess_device_firewall`)
-  - Inputs: `device control policies`, `device control policy details`.
-  - Pass when USB `enforcement_mode` is `MONITOR_ENFORCE` and `MASS_STORAGE` is not `FULL_ACCESS` in every enabled, host-assigned policy.
-  - Warn above `max_usb_exceptions`.
-  - Fail otherwise.
-  - Manual when the policy list or the v2 policy details are unread. The details are not requested when the list was unread or returned no ids.
-  - A truncated list or detail lookup caps pass at warn.
-- **CS-09 Device Control - Peripheral Restrictions** (`crowdstrike_assess_device_firewall`)
-  - Inputs: `device control policies`, `device control policy details`.
-  - Pass when Bluetooth and PCIe/Thunderbolt enforce and mass storage (SD cards) is blocked.
-  - Warn when partially configured.
-  - Fail when none.
-  - Manual and truncation handling as CS-08.
-- **CS-10 Firewall - Host Firewall Enabled** (`crowdstrike_assess_device_firewall`)
-  - Inputs: `firewall policies`, `firewall policy containers`, `firewall rule groups`.
-  - Pass when every enabled, host-assigned firewall policy has `enforce` true, `test_mode` false, and at least one returned rule group that is enabled and non-empty.
-  - Warn when referenced rule groups were not returned.
-  - Manual when policies, containers, or rule groups are unread. Containers are not requested when the policy list was unread or held no enabled, host-assigned policy.
-  - A truncated policy list or rule group page caps pass at warn.
-- **CS-11 Firewall - Default Deny** (`crowdstrike_assess_device_firewall`)
-  - Inputs: `firewall policies`, `firewall policy containers`, `firewall rules`.
-  - Fail when a policy container `default_inbound` is not `DENY`, or when no container was returned for the applied policies (manual instead when the policy list or rule page is truncated).
-  - Warn when enabled allow rules lack descriptions or zero rules were returned.
-  - Manual when policies, containers, or rules are unread.
-- **CS-12 Sensor Update - Auto-Update Enabled** (`crowdstrike_assess_sensor_coverage`)
-  - Inputs: `sensor update policies`.
-  - Secondary input: `sensor update builds` per platform.
-  - Pass for `n`, `n-1`, `n-2` auto builds or pins inside the current N-2 window.
-  - Fail for updates off or older pins.
-  - Warn when uninstall protection is disabled.
-  - Warn when a platform's build catalog is unread. Pinned builds then cannot be verified, and pass is capped at warn.
-  - Manual when the policy list is unread.
-  - The catalogs are not requested when no enabled, host-assigned policy names a platform.
-- **CS-13 Sensor Coverage - Deployment Completeness** (`crowdstrike_assess_sensor_coverage`)
-  - Inputs: `hosts`.
-  - Pass when 95% or more dated hosts checked in within `stale_sensor_days`.
-  - Warn at 85%, when hosts lack `last_seen`, or when the host sample is truncated.
-  - Fail below 85% or with zero hosts on a complete read.
-  - Manual when the host read is unread.
-  - Manual when the truncated host page shows zero hosts (`absence_claim`). The summary says coverage cannot be confirmed or ruled out from the visible rows.
-- **CS-14 Sensor Coverage - Host Group Assignment** (`crowdstrike_assess_sensor_coverage`)
-  - Inputs: `hosts`, `host groups`.
-  - Pass when 95% or more sampled hosts belong to a host group.
-  - Warn at 80% or on a truncated host or group sample.
-  - Fail below or with zero hosts or host groups on a complete read of that list.
-  - Manual when hosts or host groups are unread, or when the list that came back empty was truncated (`absence_claim`).
-  - An empty complete group list still fails when only the host list is partial.
-- **CS-15 Unmanaged Asset Detection** (`crowdstrike_assess_sensor_coverage`)
-  - Inputs: `discover unmanaged hosts`, `discover managed hosts`.
-  - Secondary input: `discover unmanaged samples`.
-  - Pass with zero Discover unmanaged assets against a non-zero managed count (both server-side totals present).
-  - Warn at 5% or less of discovered assets, or when the sample list is unread.
-  - Fail above.
-  - Manual when Discover is unlicensed (401, 403, or 404), either count is unread, the tenant reports zero assets, or `meta.pagination.total` is omitted for either count.
-  - The managed count and samples are not requested when the unmanaged count was unread.
-- **CS-16 RBAC - Admin Count** (`crowdstrike_assess_access_governance`)
-  - Inputs: `user uuids`, `users`, `user roles`.
-  - Secondary input: `role catalog`.
-  - Warn above `max_admins` or with shared-looking accounts.
-  - Warn when some role lookups failed, a role grant page or the role catalog is truncated, the user list is truncated, or the role catalog is unread.
-  - Fail at double the threshold or shared admin accounts.
-  - Manual with zero users, or when the uuid list or user details are unread. Details and role grants are then not requested.
-  - Manual when every role lookup failed.
-- **CS-17 RBAC - Least Privilege** (`crowdstrike_assess_access_governance`)
-  - Inputs: `user uuids`, `users`, `user roles`.
-  - Secondary input: `role catalog`.
-  - Warn for users above `max_roles_per_user`, redundant roles on admins, or admins with no `last_login_at`.
-  - Warn when role grants or the role catalog are truncated or the catalog is unread.
-  - Fail for admins whose last login is older than 90 days.
-  - Manual as CS-16.
-  - The summary counts over the users that were read (`N users reviewed; M carry more than ... and S of A admin accounts ...`), so a truncated user list never asserts an absence over the unread rows.
-- **CS-18 RBAC - API Client Permissions** (`crowdstrike_assess_access_governance`)
-  - Inputs: `api clients`.
-  - Reads each scope object's `action` and `group`. The `id` alone carries no read or write verb.
-  - Warn when clients hold write-action scopes on sensitive groups, expose scopes without an `action`, omit the scopes array, or the client list is truncated.
-  - Fail above `max_write_clients`.
-  - Manual with zero clients or when the client list is unread.
-  - The public reference documents no last-used field, so the pass summary states that staleness was not evaluated from API data unless the tenant returns one.
-- **CS-19 Exclusion Review - IOA Exclusions** (`crowdstrike_assess_access_governance`)
-  - Inputs: `ioa exclusions`.
-  - Lists every exclusion.
-  - Warn for wildcard-only `ifn_regex` or `cl_regex`.
-  - Fail when such patterns apply globally.
-  - Manual when the list is unread.
-  - A truncated list caps pass at warn. With zero visible exclusions, the finding says suppression cannot be confirmed or ruled out from the visible rows instead of claiming emptiness.
-  - Exclusion regexes and notes pass through the redaction pass before export.
-- **CS-20 Exclusion Review - ML Exclusions** (`crowdstrike_assess_access_governance`)
-  - Inputs: `ml exclusions`.
-  - Warn for exclusions under system, program, user, or temp directories.
-  - Fail when applied globally.
-  - Manual when the list is unread.
-  - A truncated list caps pass at warn. With zero visible exclusions, the finding says suppression cannot be confirmed or ruled out from the visible rows.
-- **CS-21 Exclusion Review - Sensor Visibility** (`crowdstrike_assess_access_governance`)
-  - Inputs: `sensor visibility exclusions`.
-  - Warn for exclusions that hide whole directories.
-  - Fail when applied globally.
-  - Manual when the list is unread.
-  - A truncated list caps pass at warn. With zero visible exclusions, the finding says hidden paths cannot be confirmed or ruled out from the visible rows.
-- **CS-22 Detection Response SLA** (`crowdstrike_assess_response_readiness`)
-  - Inputs: `alerts`.
-  - Pass when 95% or more dated critical/high alerts in `lookback_days` are within 24h (critical) or 72h (high). Zero alerts also pass when the endpoint was readable and the read was complete.
-  - Warn at 80% or with undated alerts.
-  - Warn on a truncated alert page. With no dated alert visible, the summary says response within the SLA cannot be confirmed or ruled out from the visible rows instead of claiming emptiness.
-  - Fail below.
-  - Manual when the alert read is unread.
-- **CS-23 Containment Policy** (`crowdstrike_assess_response_readiness`)
-  - Inputs: `contained hosts`.
-  - Pass with no contained hosts when the Hosts API was readable and the containment read was complete.
-  - Warn when hosts are contained so each can be documented.
-  - Warn when the contained host read is truncated. With no visible match, the summary says active containment cannot be confirmed or ruled out from the visible rows instead of claiming emptiness.
-  - Manual when the read is unread.
-- **CS-24 Identity Protection** (`crowdstrike_assess_access_governance`)
-  - Inputs: `identity protection rules`.
-  - Pass when enabled, non-simulation rules enforce.
-  - Warn when rules exist only in simulation, or when the rule id query is truncated.
-  - Fail with no rules on a complete read.
-  - Manual when the truncated rule page shows zero rules (`absence_claim`), when the module is unlicensed (401, 403, or 404), or when the read errored.
-- **CS-25 Zero Trust Assessment** (`crowdstrike_assess_sensor_coverage`)
-  - Inputs: `zero trust assessment totals`, `zero trust assessments below threshold`, `zero trust assessment below-threshold totals`.
-  - Pass only when exactly zero hosts are below `min_zta_score` and both server-side totals are present.
-  - Warn when the below-threshold share is above 0% and at most 10% of scored hosts.
-  - Warn, as a separate condition, when the below-threshold query omits its total. The sampled count is then only a lower bound, so a would-be pass renders warn and a computed warn or fail stands.
-  - Fail above 10%.
-  - Manual when ZTA is unlicensed (401, 403, or 404), unread, reports zero scored hosts, or omits the scored-host total.
-  - The below-threshold query is not requested when the totals count was unread.
+| Control | Name | Tool | Finding | Inputs | Status semantics |
+|---|---|---|---|---|---|
+| CS-01 | Prevention Policy - ML Detection Levels | `crowdstrike_assess_prevention_policies` | CS-01 | `prevention policies` | pass when `CloudAntiMalware` and `OnSensorMLSlider` detection and prevention are AGGRESSIVE or higher in every enabled, host-assigned policy and every platform (Windows, Mac, Linux) has one; warn at MODERATE, when a slider or its `detection` or `prevention` value is missing, or when at least one enabled, host-assigned policy exists but some platform has none (`platforms_without_policy` names them); fail at CAUTIOUS or DISABLED on any enabled, host-assigned policy, or when no enabled, host-assigned prevention policy exists on any platform (the policy list is empty, or every policy is disabled or unassigned; manual instead when the policy list is truncated, since the missing policy could be among the unread rows, and the per-platform warn is likewise dropped on a truncated list); manual when the policy list is unread |
+| CS-02 | Prevention Policy - Exploit Mitigation | `crowdstrike_assess_prevention_policies` | CS-02 | `prevention policies` | fail when `ForceASLR`, `ForceDEP`, `HeapSprayPreallocation`, `NullPageAllocation`, or `SEHOverwriteProtection` is disabled; warn when only extended mitigations are disabled; manual when the list is unread; a truncated list caps pass at warn and the no-assigned-policy fail at manual |
+| CS-03 | Prevention Policy - Script-Based Execution Control | `crowdstrike_assess_prevention_policies` | CS-03 | `prevention policies` | fail when `ScriptBasedExecutionMonitoring`, `InterpreterProtection`, or `EngineProtectionV2` is disabled; manual when the list is unread; a truncated list caps pass at warn and the no-assigned-policy fail at manual |
+| CS-04 | Prevention Policy - Sensor Tamper Protection | `crowdstrike_assess_prevention_policies` | CS-04 | `prevention policies` | fail when `SensorTamperingProtection` is disabled in any enabled, host-assigned policy; manual when the list is unread; a truncated list caps pass at warn and the no-assigned-policy fail at manual |
+| CS-05 | Prevention Policy - On-Write Detection | `crowdstrike_assess_prevention_policies` | CS-05 | `prevention policies` | fail when `DetectOnWrite` is disabled; warn when `QuarantineOnWrite` is disabled; manual when the list is unread; a truncated list caps pass at warn and the no-assigned-policy fail at manual |
+| CS-06 | Response Policy - RTR Enabled | `crowdstrike_assess_response_readiness` | CS-06 | `response policies` | fail when `RealTimeFunctionality` is disabled in every enabled, host-assigned response policy or no such policy exists (manual instead when the list is truncated); warn when `CustomScripts` is allowed; manual when the list is unread |
+| CS-07 | Response Policy - Session Limits | `crowdstrike_assess_response_readiness` | CS-07 | `rtr audit sessions` | manual: the API does not expose timeout or concurrency settings; RTR audit sessions longer than `max_session_minutes` or above `max_concurrent_sessions` raise warn; when the session read is unread the summary names that failure instead, and a truncated session page is recorded as `partial_inventory` |
+| CS-08 | Device Control - USB Blocking | `crowdstrike_assess_device_firewall` | CS-08 | `device control policies`, `device control policy details` | pass when USB `enforcement_mode` is `MONITOR_ENFORCE` and `MASS_STORAGE` is not `FULL_ACCESS` in every enabled, host-assigned policy; warn above `max_usb_exceptions`; fail otherwise; manual when the policy list or the v2 policy details are unread (the details are not requested when the list was unread or returned no ids); a truncated list or detail lookup caps pass at warn |
+| CS-09 | Device Control - Peripheral Restrictions | `crowdstrike_assess_device_firewall` | CS-09 | `device control policies`, `device control policy details` | pass when Bluetooth and PCIe/Thunderbolt enforce and mass storage (SD cards) is blocked; warn when partially configured; fail when none; manual and truncation handling as CS-08 |
+| CS-10 | Firewall - Host Firewall Enabled | `crowdstrike_assess_device_firewall` | CS-10 | `firewall policies`, `firewall policy containers`, `firewall rule groups` | pass when every enabled, host-assigned firewall policy has `enforce` true, `test_mode` false, and at least one returned rule group that is enabled and non-empty; warn when referenced rule groups were not returned; manual when policies, containers, or rule groups are unread (containers are not requested when the policy list was unread or held no enabled, host-assigned policy); a truncated policy list or rule group page caps pass at warn |
+| CS-11 | Firewall - Default Deny | `crowdstrike_assess_device_firewall` | CS-11 | `firewall policies`, `firewall policy containers`, `firewall rules` | fail when a policy container `default_inbound` is not `DENY`, or when no container was returned for the applied policies (manual instead when the policy list or rule page is truncated); warn when enabled allow rules lack descriptions or zero rules were returned; manual when policies, containers, or rules are unread |
+| CS-12 | Sensor Update - Auto-Update Enabled | `crowdstrike_assess_sensor_coverage` | CS-12 | `sensor update policies`; secondary `sensor update builds` per platform | pass for `n`, `n-1`, `n-2` auto builds or pins inside the current N-2 window; fail for updates off or older pins; warn when uninstall protection is disabled, or when a platform's build catalog is unread (pinned builds then cannot be verified and pass is capped at warn); manual when the policy list is unread; the catalogs are not requested when no enabled, host-assigned policy names a platform |
+| CS-13 | Sensor Coverage - Deployment Completeness | `crowdstrike_assess_sensor_coverage` | CS-13 | `hosts` | pass when 95% or more dated hosts checked in within `stale_sensor_days`; warn at 85%, when hosts lack `last_seen`, or when the host sample is truncated; fail below 85% or with zero hosts on a complete read; manual when the host read is unread, or when the truncated host page shows zero hosts (`absence_claim`, the summary says coverage cannot be confirmed or ruled out from the visible rows) |
+| CS-14 | Sensor Coverage - Host Group Assignment | `crowdstrike_assess_sensor_coverage` | CS-14 | `hosts`, `host groups` | pass when 95% or more sampled hosts belong to a host group; warn at 80% or on a truncated host or group sample; fail below or with zero hosts or host groups on a complete read of that list; manual when hosts or host groups are unread, or when the list that came back empty was truncated (`absence_claim`); an empty complete group list still fails when only the host list is partial |
+| CS-15 | Unmanaged Asset Detection | `crowdstrike_assess_sensor_coverage` | CS-15 | `discover unmanaged hosts`, `discover managed hosts`; secondary `discover unmanaged samples` | pass with zero Discover unmanaged assets against a non-zero managed count (both server-side totals present); warn at 5% or less of discovered assets, or when the sample list is unread; fail above; manual when Discover is unlicensed (401, 403, or 404), either count is unread, the tenant reports zero assets, or `meta.pagination.total` is omitted for either count; the managed count and samples are not requested when the unmanaged count was unread |
+| CS-16 | RBAC - Admin Count | `crowdstrike_assess_access_governance` | CS-16 | `user uuids`, `users`, `user roles`; secondary `role catalog` | warn above `max_admins`, with shared-looking accounts, or when some role lookups failed, a role grant page or the role catalog is truncated, the user list is truncated, or the role catalog is unread; fail at double the threshold or shared admin accounts; manual with zero users, when the uuid list or user details are unread (details and role grants are then not requested), or when every role lookup failed |
+| CS-17 | RBAC - Least Privilege | `crowdstrike_assess_access_governance` | CS-17 | `user uuids`, `users`, `user roles`; secondary `role catalog` | warn for users above `max_roles_per_user`, redundant roles on admins, admins with no `last_login_at`, or when role grants or the role catalog are truncated or the catalog is unread; fail for admins whose last login is older than 90 days; manual as CS-16. The summary counts over the users that were read (`N users reviewed; M carry more than ... and S of A admin accounts ...`), so a truncated user list never asserts an absence over the unread rows |
+| CS-18 | RBAC - API Client Permissions | `crowdstrike_assess_access_governance` | CS-18 | `api clients` | reads each scope object's `action` and `group` (the `id` alone carries no read or write verb); warn when clients hold write-action scopes on sensitive groups, expose scopes without an `action`, omit the scopes array, or the client list is truncated; fail above `max_write_clients`; manual with zero clients or when the client list is unread. The public reference documents no last-used field, so the pass summary states that staleness was not evaluated from API data unless the tenant returns one |
+| CS-19 | Exclusion Review - IOA Exclusions | `crowdstrike_assess_access_governance` | CS-19 | `ioa exclusions` | lists every exclusion; warn for wildcard-only `ifn_regex` or `cl_regex`; fail when such patterns apply globally; manual when the list is unread; a truncated list caps pass at warn, and with zero visible exclusions it says suppression cannot be confirmed or ruled out from the visible rows instead of claiming emptiness; exclusion regexes and notes pass through the redaction pass before export |
+| CS-20 | Exclusion Review - ML Exclusions | `crowdstrike_assess_access_governance` | CS-20 | `ml exclusions` | warn for exclusions under system, program, user, or temp directories; fail when applied globally; manual when the list is unread; a truncated list caps pass at warn, and with zero visible exclusions it says suppression cannot be confirmed or ruled out from the visible rows |
+| CS-21 | Exclusion Review - Sensor Visibility | `crowdstrike_assess_access_governance` | CS-21 | `sensor visibility exclusions` | warn for exclusions that hide whole directories; fail when applied globally; manual when the list is unread; a truncated list caps pass at warn, and with zero visible exclusions it says hidden paths cannot be confirmed or ruled out from the visible rows |
+| CS-22 | Detection Response SLA | `crowdstrike_assess_response_readiness` | CS-22 | `alerts` | pass when 95% or more dated critical/high alerts in `lookback_days` are within 24h (critical) or 72h (high), including zero alerts when the endpoint was readable and the read was complete; warn at 80%, with undated alerts, or on a truncated alert page (with no dated alert visible the summary says response within the SLA cannot be confirmed or ruled out from the visible rows instead of claiming emptiness); fail below; manual when the alert read is unread |
+| CS-23 | Containment Policy | `crowdstrike_assess_response_readiness` | CS-23 | `contained hosts` | pass with no contained hosts when the Hosts API was readable and the containment read was complete; warn when hosts are contained so each can be documented, or when the contained host read is truncated (with no visible match the summary says active containment cannot be confirmed or ruled out from the visible rows instead of claiming emptiness); manual when the read is unread |
+| CS-24 | Identity Protection | `crowdstrike_assess_access_governance` | CS-24 | `identity protection rules` | pass when enabled, non-simulation rules enforce; warn when rules exist only in simulation, or when the rule id query is truncated; fail with no rules on a complete read; manual when the truncated rule page shows zero rules (`absence_claim`), when the module is unlicensed (401, 403, or 404) or the read errored |
+| CS-25 | Zero Trust Assessment | `crowdstrike_assess_sensor_coverage` | CS-25 | `zero trust assessment totals`, `zero trust assessments below threshold`, `zero trust assessment below-threshold totals` | pass only when exactly zero hosts are below `min_zta_score` and both server-side totals are present; warn when the below-threshold share is above 0% and at most 10% of scored hosts, or, as a separate condition, when the below-threshold query omits its total (the sampled count is then only a lower bound, so a would-be pass renders warn and a computed warn or fail stands); fail above 10%; manual when ZTA is unlicensed (401, 403, or 404), unread, reports zero scored hosts, or omits the scored-host total; the below-threshold query is not requested when the totals count was unread |
 
 ## Framework mappings
 

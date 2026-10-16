@@ -56,21 +56,17 @@ Forbidden or ACL-filtered tables render as `manual` findings instead of silently
 
 Configuration precedence is explicit tool arguments, then environment variables, then a YAML config file (`SERVICENOW_CONFIG_FILE`, `./.servicenow.yaml`, or `~/.servicenow-sec-inspector/config.yaml`). The config file accepts a top-level `servicenow:` section.
 
-Environment variables:
-
-- `SERVICENOW_INSTANCE`: Instance name, expanded to `https://<instance>.service-now.com`.
-- `SERVICENOW_URL` (or `SERVICENOW_INSTANCE_URL`): Full instance URL. It overrides the instance name.
-- `SERVICENOW_AUTH_METHOD`: `basic`, `oauth`, or `mtls`.
-  - `oauth` is also spelled `oauth2`, `client_credentials`, `oauth_client_credentials`, or `password`.
-  - When omitted, the method is inferred as `oauth` for an access token or a client ID and secret, else `basic` for a username and password.
-- `SERVICENOW_USERNAME` / `SERVICENOW_PASSWORD`: Basic auth, or the OAuth password grant when client credentials are also set.
-- `SERVICENOW_CLIENT_ID` / `SERVICENOW_CLIENT_SECRET`: OAuth application registry client (client credentials grant, or password grant with a user).
-- `SERVICENOW_ACCESS_TOKEN` (or `SERVICENOW_TOKEN`): Pre-issued bearer token.
-- `SERVICENOW_REFRESH_TOKEN`: Refresh token issued earlier to the OAuth client. With the client ID and secret, the first exchange uses the `refresh_token` grant.
-- `SERVICENOW_CONFIG_FILE`: YAML config file path.
-- `SERVICENOW_TIMEOUT` (default 30): HTTP timeout in seconds, clamped to 1-300.
-- `SERVICENOW_MAX_RETRIES` (default 3): Retries for 429 and 5xx, clamped to 0-10.
-- `SERVICENOW_PAGE_SIZE` (default 500): Table API page size, clamped to 1-10000.
+| Variable | Purpose |
+| --- | --- |
+| `SERVICENOW_INSTANCE` | Instance name, expanded to `https://<instance>.service-now.com` |
+| `SERVICENOW_URL` (or `SERVICENOW_INSTANCE_URL`) | Full instance URL (overrides the instance name) |
+| `SERVICENOW_AUTH_METHOD` | `basic`, `oauth` (also spelled `oauth2`, `client_credentials`, `oauth_client_credentials`, or `password`), or `mtls`; when omitted it is inferred as `oauth` for an access token or a client ID and secret, else `basic` for a username and password |
+| `SERVICENOW_USERNAME` / `SERVICENOW_PASSWORD` | Basic auth, or the OAuth password grant when client credentials are also set |
+| `SERVICENOW_CLIENT_ID` / `SERVICENOW_CLIENT_SECRET` | OAuth application registry client (client credentials grant, or password grant with a user) |
+| `SERVICENOW_ACCESS_TOKEN` (or `SERVICENOW_TOKEN`) | Pre-issued bearer token |
+| `SERVICENOW_REFRESH_TOKEN` | Refresh token issued earlier to the OAuth client; with the client ID and secret, the first exchange uses the `refresh_token` grant |
+| `SERVICENOW_CONFIG_FILE` | YAML config file path |
+| `SERVICENOW_TIMEOUT`, `SERVICENOW_MAX_RETRIES`, `SERVICENOW_PAGE_SIZE` | HTTP timeout in seconds (default 30, clamped to 1-300), retries for 429 and 5xx (default 3, clamped to 0-10), Table API page size (default 500, clamped to 1-10000) |
 
 Only the first config file found is read:
 
@@ -119,18 +115,16 @@ Tokens are exchanged at `POST https://<instance>.service-now.com/oauth_token.do`
 
 ## Tools
 
-- `servicenow_check_access`: Probes 27 audit tables with a one-row Table API read plus an Aggregate API count. Reports each table as `readable`, `forbidden`, `acl_filtered`, or `not_readable`. An aggregate count above zero with no rows returned is reported as ACL-filtered.
-- `servicenow_assess_identity_access`: Controls 3, 4, 6, 7, 8, 14. Options: `inactive_days` (90), `min_password_length` (12), `cert_expiry_warn_days` (30), `max_admins` (10), `record_limit` (10000).
-- `servicenow_assess_platform_hardening`: Controls 1, 5, 12, 13, 16, 17, 18. Options: `max_session_timeout_minutes` (60), `record_limit`.
-- `servicenow_assess_access_control`: Controls 2 and 11. Option: `record_limit`.
-- `servicenow_assess_operations_governance`: Controls 9, 10, 15, 19, 20. Option: `record_limit`.
-- `servicenow_export_audit_bundle`: Runs the access check and all four assessments, then writes the audit bundle described below.
+| Tool | Purpose |
+| --- | --- |
+| `servicenow_check_access` | Probes 27 audit tables with a one-row Table API read plus an Aggregate API count and reports each as `readable`, `forbidden`, `acl_filtered`, or `not_readable`. An aggregate count above zero with no rows returned is reported as ACL-filtered. |
+| `servicenow_assess_identity_access` | Controls 3, 4, 6, 7, 8, 14. Options: `inactive_days` (90), `min_password_length` (12), `cert_expiry_warn_days` (30), `max_admins` (10), `record_limit` (10000). |
+| `servicenow_assess_platform_hardening` | Controls 1, 5, 12, 13, 16, 17, 18. Options: `max_session_timeout_minutes` (60), `record_limit`. |
+| `servicenow_assess_access_control` | Controls 2 and 11. Option: `record_limit`. |
+| `servicenow_assess_operations_governance` | Controls 9, 10, 15, 19, 20. Option: `record_limit`. |
+| `servicenow_export_audit_bundle` | Runs the access check and all four assessments, then writes an audit bundle and a zip archive. |
 
-All tools accept the authentication arguments: `instance`, `instance_url`, `auth_method`, `username`, `password`, `client_id`, `client_secret`, `access_token`, `refresh_token`, `config_file`, `timeout_seconds`, `max_retries`, and `page_size`.
-
-### Audit bundle contents
-
-The export writes these outputs:
+`servicenow_export_audit_bundle` writes these outputs under the output root (default `./export/servicenow`):
 
 - `core_data/`: Table API and Aggregate API snapshots projected to the requested `sysparm_fields`.
   - Snapshots carry `truncated`, `total_unknown`, and `partial` flags per table.
@@ -142,9 +136,9 @@ The export writes these outputs:
 - `_errors.log`, when collection partially failed.
 - A zip archive named after the allocated output directory.
 
-The default output root is `./export/servicenow`. The bundle directory is `<instance>-audit-bundle`, where the instance is the configured instance name or the first label of the instance host.
+The bundle directory is `<instance>-audit-bundle`, where the instance is the configured instance name or the first label of the instance host. Reruns allocate `-2` through `-9` instead of overwriting, skipping any name whose directory or zip already exists. A rerun fails once all nine are taken.
 
-Reruns allocate `-2` through `-9` instead of overwriting, skipping any name whose directory or zip already exists. A rerun fails once all nine are taken.
+All tools accept the authentication arguments: `instance`, `instance_url`, `auth_method`, `username`, `password`, `client_id`, `client_secret`, `access_token`, `refresh_token`, `config_file`, `timeout_seconds`, `max_retries`, and `page_size`.
 
 ## Verdict semantics
 
@@ -162,7 +156,7 @@ Rows without a date (`last_login_time`, `expires`) are bucketed separately and n
 
 ### Partial and unread inputs
 
-Every finding is gated on the tables it reads (the `Inputs` entry of each control below), in this order:
+Every finding is gated on the tables it reads (the `Inputs` column below), in this order:
 
 - **Unread input:** The finding is `manual` when any input was forbidden (401/403), ACL-filtered, or errored.
   - Its summary names the table and the observed status ("Verdict unknown: sys_user read was forbidden (403)").
@@ -180,158 +174,28 @@ Every finding is gated on the tables it reads (the `Inputs` entry of each contro
 
 ## Control coverage
 
-Each entry names the control, then the tool and finding that cover it. Its sub-bullets give the inputs and the status semantics.
-
-- **1 Instance security properties** (platform_hardening, SNOW-01)
-  - Inputs: `sys_properties`.
-  - Pass when the five `glide.security.*` properties exist with compliant values. Warn when any row is absent. Fail on a non-compliant value.
-  - Manual when `sys_properties` is unread.
-  - A truncated read turns pass into warn and caps an absent-property fail at manual.
-- **2 ACL rule completeness** (access_control, SNOW-02)
-  - Inputs: `sys_security_acl`, `sys_security_acl_role`, `sys_public` (plus the `sys_security_acl` Aggregate count).
-  - Manual unless both hold:
-    - The Aggregate ACL count was returned and is above zero.
-    - The Table API read returned ACL rows.
-  - The count alone is never proof of visibility. A positive count with no visible rows is the ACL filtering described under Limitations, and stays manual ("none of the sensitive-table or wildcard ACLs were visible").
-    - That case is judged before the wildcard and public-page evaluation, so that active public pages beside an unseen ACL set never turn the case into warn.
-    - In that case `wildcard_acls`, `unrestricted_acls`, and `unrestricted_acl_count` render `null` rather than `0` or `[]`, because an absence claim about an unseen set is not a claim.
-    - `record_acl_total` beside `sensitive_acls_visible: 0` stays as the seen-versus-total form.
-    - The public pages that were seen are named as a presence claim, a zero rendering `null`.
-  - Fail on role-less, condition-less, script-less record ACLs.
-  - Warn on wildcard ACLs or active public pages.
-  - Pass only when the visible rows also match `X-Total-Count`.
-  - Manual when any input is unread.
-  - An ACL read that was truncated, lacks `X-Total-Count`, or returned fewer rows than the header reports turns pass into warn. A fail on a visible ACL stands.
-- **3 Role hierarchy audit** (identity_access, SNOW-03)
-  - Inputs: `sys_user_role_contains`.
-  - Manual unless `sys_user_role_contains` is proven visible.
-  - Warn when roles inherit `admin` or `security_admin`. Pass when none do.
-  - A truncated read turns pass into warn.
-- **4 User access review** (identity_access, SNOW-04)
-  - Inputs: `sys_user`, `sys_user_has_role`.
-  - Manual on zero users or zero admin assignments.
-  - Fail on stale admins or admin count above `max_admins`.
-  - Warn on inactive users, users without a login date, locked-out active accounts (`sys_user.locked_out`, admins listed separately), or stacked privileged roles.
-  - Manual when either input is unread.
-  - On a partial read:
-    - The summary switches to "Among the visible rows ...".
-    - Admin, inactive, and locked-out names and counts are `null` with `principals_withheld`.
-    - Pass becomes warn.
-- **5 Session timeout configuration** (platform_hardening, SNOW-05)
-  - Inputs: `sys_properties`.
-  - Fail above `max_session_timeout_minutes`.
-  - Warn when the property is absent (fallback of 30 minutes is not assumed) or rotation is off.
-  - Manual when `sys_properties` is unread.
-  - A truncated read turns pass into warn.
-- **6 Password policy enforcement** (identity_access, SNOW-06)
-  - Inputs: `sys_properties`, `password_policy`.
-  - Fail when any of these holds:
-    - `glide.enable.password_policy=false`.
-    - No policy row is visible on a complete read with zero rows.
-    - A visible policy is weaker than the threshold.
-  - Warn when the property row is absent.
-  - Manual when either input is unread.
-  - Manual (not fail) when a partial `password_policy` read (truncated, ACL-filtered rows behind `X-Total-Count`, or zero rows without the header) shows no row.
-    - The absence is a claim about the unread rows, so the summary carries the partial view and `policy_count` renders `null`.
-  - A truncated read turns pass into warn.
-  - A fail that rests on a visible weak policy stays fail under a partial read.
-- **7 MFA enforcement** (identity_access, SNOW-07)
-  - Inputs: `sys_properties`, `sys_user`, `sys_user_has_role`, `multi_factor_criteria`.
-  - Fail when either of these holds:
-    - `glide.authenticate.multifactor` is false, or absent from a complete `sys_properties` read (documented default is false).
-    - The Role-based multi-factor authentication record in `multi_factor_criteria` is inactive and admins lack `enable_multifactor_authn`.
-  - Manual when `multi_factor_criteria` is forbidden or returns no rows (the baseline record always exists).
-  - Manual when the property was not among the visible rows of a truncated `sys_properties` read.
-  - Warn when any of these holds:
-    - The active role-based record does not list `admin` and `security_admin` while admins lack the per-user flag.
-    - Only per-user flags enforce MFA.
-    - Email OTP is enabled.
-  - Pass when the role-based record is active and covers both roles (or every admin carries the per-user flag).
-  - Manual when any input is unread.
-  - Admins without the per-user flag are withheld when `sys_user` or `sys_user_has_role` is partial.
-- **8 LDAP/SSO integration** (identity_access, SNOW-08)
-  - Inputs: `sso_properties`, `ldap_server_config`, `sys_properties`, `sys_certificate`.
-  - Fail with no active SSO provider or LDAP server. That absence is asserted only when both `sso_properties` and `ldap_server_config` were read to completion.
-  - Fail with an expired certificate.
-  - Warn when Multi-Provider SSO or the default redirect IdP is not set, or when certificates expire soon.
-  - Manual when any input is unread, or when no active provider was among the visible rows of a partial read.
-  - A truncated read turns pass into warn.
-- **9 Encryption at rest** (operations_governance, SNOW-09)
-  - Inputs: `sys_encryption_context`, `sys_kmf_crypto_module`, `sys_dictionary`.
-  - Always manual, because coverage and licensing (CLE Enterprise, Cloud Encryption, Edge Encryption) are not exposed through the API.
-  - KMF cryptographic modules (`sys_kmf_crypto_module`, used by Column Level Encryption Enterprise), legacy encryption contexts, and encrypted dictionary fields are inventoried.
-  - An unread or truncated input is named in the summary.
-- **10 Audit logging configuration** (operations_governance, SNOW-10)
-  - Inputs: `sys_dictionary` (plus the `sys_audit` count).
-  - Fail when a critical table is not audited or `sys_audit` received zero rows in 7 days.
-  - Otherwise manual, because retention is not exposed through the API.
-  - Manual when `sys_dictionary` is unread or the `sys_audit` count failed.
-  - On a truncated dictionary read, the unseen tables "were not visible, so their audit flags cannot be verified" (manual).
-- **11 Table-level access controls** (access_control, SNOW-11)
-  - Inputs: `sys_security_acl`, `sys_security_acl_role`.
-  - Fail when a sensitive table has no active record ACL. Warn when read, write, or delete is missing. Pass when all three exist.
-  - Manual when either input is unread.
-  - On a truncated ACL read, the absence of an ACL is not asserted:
-    - The finding is manual.
-    - The tables and operations not seen are not named.
-    - Only ACL gaps observed on visible rows are reported.
-- **12 Script execution restrictions** (platform_hardening, SNOW-12)
-  - Inputs: `sys_properties`, `sys_script`.
-  - Fail on non-compliant `glide.script.*` values or active business rules calling `eval(`. Warn on absent properties.
-  - Manual when either input is unread.
-  - A truncated read turns pass into warn. An `eval(` observed in a visible script still fails.
-- **13 Instance hardening** (platform_hardening, SNOW-13)
-  - Inputs: `sys_properties`.
-  - Pass when the eleven hardening properties exist with compliant values. Warn on absent rows. Fail on non-compliant values.
-  - Manual when `sys_properties` is unread.
-  - A truncated read turns pass into warn.
-- **14 Integration user permissions** (identity_access, SNOW-14)
-  - Inputs: `sys_user`, `sys_user_has_role`, `oauth_entity`.
-  - Fail when an integration account holds `admin` or `security_admin`.
-  - Manual when no integration-flagged user exists.
-  - Warn on other privileged roles.
-  - Manual when any input is unread.
-  - On a partial user or role read, the integration account names and counts are `null` with `principals_withheld`, and pass becomes warn.
-- **15 Update set management** (operations_governance, SNOW-15)
-  - Inputs: `sys_update_set`, `sys_update_xml`.
-  - Manual unless the update set inventory is proven visible.
-  - Warn on in-progress sets or pending ACL, role, script, or property changes.
-  - A truncated read turns pass into warn.
-- **16 Debug mode verification** (platform_hardening, SNOW-16)
-  - Inputs: `sys_properties` (all rows and the `*debug*` query).
-  - Fail when any `*debug*` property is true.
-  - Manual when `sys_properties` visibility is unproven or either read is unread.
-  - A truncated read turns pass into warn.
-- **17 IP access restrictions** (platform_hardening, SNOW-17)
-  - Inputs: `sys_properties`, `ip_access`, `sys_plugins`.
-  - Fail when either of these holds:
-    - The IP Range Based Authentication plugin (`com.snc.ipauthenticator`) is inactive or absent from a complete `sys_plugins` read.
-    - No active `ip_access` rule exists. A missing `ip_access` table is treated as the plugin not being activated.
-  - Warn when the plugin row is not visible while active rules exist, or when `glide.ip.authenticate.strict` is not true.
-  - Manual when any of these holds:
-    - Any input is unread.
-    - No active rule was among the visible rows of a partial `ip_access` read.
-    - The plugin row was not among the visible rows of a partial `sys_plugins` read.
-  - A truncated read turns pass into warn.
-- **18 Email security** (platform_hardening, SNOW-18)
-  - Inputs: `sys_properties`, `sys_email_account`.
-  - Reads the Connection Security choice (`connection_security`, falling back to the legacy `enable_ssl` and `enable_tls` flags).
-  - Fail when an active SMTP account uses None or `glide.smtp.auth=false`.
-  - Warn on STARTTLS (the documentation warns it may expose data).
-  - Manual when the value is not returned (never assumed) or when every account uses SSL/TLS, because DKIM and notification headers are not exposed through the API.
-  - Manual when either input is unread.
-- **19 MID Server security** (operations_governance, SNOW-19)
-  - Inputs: `ecc_agent`, `sys_properties`.
-  - Fail on unvalidated MID Servers. Warn when `mid.version.override` pins upgrades.
-  - Manual for mutual authentication and allow lists, or "not applicable as observed" when no MID Server exists.
-  - Manual when either input is unread.
-  - A truncated `ecc_agent` read caps "not applicable" at manual. An unvalidated visible server still fails.
-- **20 Plugin inventory and licensing** (operations_governance, SNOW-20)
-  - Inputs: `sys_plugins`.
-  - Fail when High Security Settings, Contextual Security: Role Management V2, or Security Jump Start is observed inactive.
-  - Otherwise manual for necessity review.
-  - Manual when `sys_plugins` is unread.
-  - On a truncated read, a baseline plugin not among the visible rows is reported as unknown (`present: null`) rather than missing. Its name is not asserted as absent.
+| # | Control | Tool | Finding | Inputs | Status semantics |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Instance security properties | platform_hardening | SNOW-01 | `sys_properties` | pass when the five `glide.security.*` properties exist with compliant values; warn when any row is absent; fail on a non-compliant value. Manual when `sys_properties` is unread; a truncated read turns pass into warn and caps an absent-property fail at manual |
+| 2 | ACL rule completeness | access_control | SNOW-02 | `sys_security_acl`, `sys_security_acl_role`, `sys_public` (plus the `sys_security_acl` Aggregate count) | manual unless both hold: the Aggregate ACL count was returned and is above zero, and the Table API read returned ACL rows (the count alone is never proof of visibility: a positive count with no visible rows is the ACL filtering described under Limitations and stays manual, "none of the sensitive-table or wildcard ACLs were visible", judged before the wildcard and public-page evaluation so that active public pages beside an unseen ACL set never turn the case into warn; in that case `wildcard_acls`, `unrestricted_acls`, and `unrestricted_acl_count` render `null` rather than `0` or `[]`, because an absence claim about an unseen set is not a claim, while `record_acl_total` beside `sensitive_acls_visible: 0` stays as the seen-versus-total form and the public pages that were seen are named as a presence claim, a zero rendering `null`); fail on role-less, condition-less, script-less record ACLs; warn on wildcard ACLs or active public pages; pass only when the visible rows also match `X-Total-Count`. Manual when any input is unread; an ACL read that was truncated, lacks `X-Total-Count`, or returned fewer rows than the header reports turns pass into warn (a fail on a visible ACL stands) |
+| 3 | Role hierarchy audit | identity_access | SNOW-03 | `sys_user_role_contains` | manual unless `sys_user_role_contains` is proven visible; warn when roles inherit `admin` or `security_admin`; pass when none do. A truncated read turns pass into warn |
+| 4 | User access review | identity_access | SNOW-04 | `sys_user`, `sys_user_has_role` | manual on zero users or zero admin assignments; fail on stale admins or admin count above `max_admins`; warn on inactive users, users without a login date, locked-out active accounts (`sys_user.locked_out`, admins listed separately), or stacked privileged roles. Manual when either input is unread; on a partial read the summary switches to "Among the visible rows ...", admin, inactive, and locked-out names and counts are `null` with `principals_withheld`, and pass becomes warn |
+| 5 | Session timeout configuration | platform_hardening | SNOW-05 | `sys_properties` | fail above `max_session_timeout_minutes`; warn when the property is absent (fallback of 30 minutes is not assumed) or rotation is off. Manual when `sys_properties` is unread; a truncated read turns pass into warn |
+| 6 | Password policy enforcement | identity_access | SNOW-06 | `sys_properties`, `password_policy` | fail when `glide.enable.password_policy=false`, no policy row is visible on a complete read with zero rows, or a visible policy is weaker than the threshold; warn when the property row is absent. Manual when either input is unread, and manual (not fail) when a partial `password_policy` read (truncated, ACL-filtered rows behind `X-Total-Count`, or zero rows without the header) shows no row: the absence is a claim about the unread rows, so the summary carries the partial view and `policy_count` renders `null`. A truncated read turns pass into warn; a fail that rests on a visible weak policy stays fail under a partial read |
+| 7 | MFA enforcement | identity_access | SNOW-07 | `sys_properties`, `sys_user`, `sys_user_has_role`, `multi_factor_criteria` | fail when `glide.authenticate.multifactor` is false, or absent from a complete `sys_properties` read (documented default is false), or when the Role-based multi-factor authentication record in `multi_factor_criteria` is inactive and admins lack `enable_multifactor_authn`; manual when `multi_factor_criteria` is forbidden or returns no rows (the baseline record always exists), or when the property was not among the visible rows of a truncated `sys_properties` read; warn when the active role-based record does not list `admin` and `security_admin` while admins lack the per-user flag, when only per-user flags enforce MFA, or when email OTP is enabled; pass when the role-based record is active and covers both roles (or every admin carries the per-user flag). Manual when any input is unread; admins without the per-user flag are withheld when `sys_user` or `sys_user_has_role` is partial |
+| 8 | LDAP/SSO integration | identity_access | SNOW-08 | `sso_properties`, `ldap_server_config`, `sys_properties`, `sys_certificate` | fail with no active SSO provider or LDAP server (asserted only when both `sso_properties` and `ldap_server_config` were read to completion), or an expired certificate; warn when Multi-Provider SSO or the default redirect IdP is not set or certificates expire soon. Manual when any input is unread, or when no active provider was among the visible rows of a partial read; a truncated read turns pass into warn |
+| 9 | Encryption at rest | operations_governance | SNOW-09 | `sys_encryption_context`, `sys_kmf_crypto_module`, `sys_dictionary` | always manual: KMF cryptographic modules (`sys_kmf_crypto_module`, used by Column Level Encryption Enterprise), legacy encryption contexts, and encrypted dictionary fields are inventoried, but coverage and licensing (CLE Enterprise, Cloud Encryption, Edge Encryption) are not exposed through the API. An unread or truncated input is named in the summary |
+| 10 | Audit logging configuration | operations_governance | SNOW-10 | `sys_dictionary` (plus the `sys_audit` count) | fail when a critical table is not audited or `sys_audit` received zero rows in 7 days; otherwise manual because retention is not exposed through the API. Manual when `sys_dictionary` is unread or the `sys_audit` count failed; on a truncated dictionary read the unseen tables "were not visible, so their audit flags cannot be verified" (manual) |
+| 11 | Table-level access controls | access_control | SNOW-11 | `sys_security_acl`, `sys_security_acl_role` | fail when a sensitive table has no active record ACL; warn when read, write, or delete is missing; pass when all three exist. Manual when either input is unread; on a truncated ACL read the absence of an ACL is not asserted: the finding is manual, the tables and operations not seen are not named, and only ACL gaps observed on visible rows are reported |
+| 12 | Script execution restrictions | platform_hardening | SNOW-12 | `sys_properties`, `sys_script` | fail on non-compliant `glide.script.*` values or active business rules calling `eval(`; warn on absent properties. Manual when either input is unread; a truncated read turns pass into warn (an `eval(` observed in a visible script still fails) |
+| 13 | Instance hardening | platform_hardening | SNOW-13 | `sys_properties` | pass when the eleven hardening properties exist with compliant values; warn on absent rows; fail on non-compliant values. Manual when `sys_properties` is unread; a truncated read turns pass into warn |
+| 14 | Integration user permissions | identity_access | SNOW-14 | `sys_user`, `sys_user_has_role`, `oauth_entity` | fail when an integration account holds `admin` or `security_admin`; manual when no integration-flagged user exists; warn on other privileged roles. Manual when any input is unread; on a partial user or role read the integration account names and counts are `null` with `principals_withheld` and pass becomes warn |
+| 15 | Update set management | operations_governance | SNOW-15 | `sys_update_set`, `sys_update_xml` | manual unless the update set inventory is proven visible; warn on in-progress sets or pending ACL, role, script, or property changes. A truncated read turns pass into warn |
+| 16 | Debug mode verification | platform_hardening | SNOW-16 | `sys_properties` (all rows and the `*debug*` query) | fail when any `*debug*` property is true; manual when `sys_properties` visibility is unproven or either read is unread; a truncated read turns pass into warn |
+| 17 | IP access restrictions | platform_hardening | SNOW-17 | `sys_properties`, `ip_access`, `sys_plugins` | fail when the IP Range Based Authentication plugin (`com.snc.ipauthenticator`) is inactive or absent from a complete `sys_plugins` read, or when no active `ip_access` rule exists (a missing `ip_access` table is treated as the plugin not being activated); warn when the plugin row is not visible while active rules exist, or `glide.ip.authenticate.strict` is not true. Manual when any input is unread, when no active rule was among the visible rows of a partial `ip_access` read, or when the plugin row was not among the visible rows of a partial `sys_plugins` read; a truncated read turns pass into warn |
+| 18 | Email security | platform_hardening | SNOW-18 | `sys_properties`, `sys_email_account` | reads the Connection Security choice (`connection_security`, falling back to the legacy `enable_ssl` and `enable_tls` flags): fail when an active SMTP account uses None or `glide.smtp.auth=false`; warn on STARTTLS (the documentation warns it may expose data); manual when the value is not returned (never assumed) or when every account uses SSL/TLS, because DKIM and notification headers are not exposed through the API. Manual when either input is unread |
+| 19 | MID Server security | operations_governance | SNOW-19 | `ecc_agent`, `sys_properties` | fail on unvalidated MID Servers; warn when `mid.version.override` pins upgrades; manual for mutual authentication and allow lists, or "not applicable as observed" when no MID Server exists. Manual when either input is unread; a truncated `ecc_agent` read caps "not applicable" at manual (an unvalidated visible server still fails) |
+| 20 | Plugin inventory and licensing | operations_governance | SNOW-20 | `sys_plugins` | fail when High Security Settings, Contextual Security: Role Management V2, or Security Jump Start is observed inactive; otherwise manual for necessity review. Manual when `sys_plugins` is unread; on a truncated read a baseline plugin not among the visible rows is reported as unknown (`present: null`) rather than missing, and its name is not asserted as absent |
 
 Controls 9, 10, 18, 19, and 20 never pass because part of their evidence is not exposed through the Table API.
 

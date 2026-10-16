@@ -23,34 +23,15 @@ The inspector defaults to API version `20240415`. It switches to `beta` only for
 
 Configuration precedence is explicit tool arguments, then environment variables, then the TOML config file:
 
-- **Access token** (required)
-  - Tool argument: `token`
-  - Environment variable: `LAUNCHDARKLY_API_TOKEN` (fallback `LD_ACCESS_TOKEN`)
-  - Config file key: `token`, `api_token`, or `access_token`
-- **Base URL**
-  - Tool argument: `base_url`
-  - Environment variable: `LAUNCHDARKLY_BASE_URL` (fallback `LD_BASE_URI`)
-  - Config file key: `base_url` or `base_uri`
-- **API version**
-  - Tool argument: `api_version`
-  - Environment variable: `LAUNCHDARKLY_API_VERSION`
-  - Config file key: `api_version`
-- **Timeout** (seconds, default 30)
-  - Tool argument: `timeout_seconds`
-  - Environment variable: `LAUNCHDARKLY_TIMEOUT`
-  - Config file key: `timeout_seconds` or `timeout`
-- **Approved member domains**
-  - Tool argument: `allowed_domains`
-  - Environment variable: `LAUNCHDARKLY_ALLOWED_DOMAINS`
-  - Config file key: `allowed_domains` or `domains`
-- **Project scope**
-  - Tool argument: `project_keys`
-  - Environment variable: `LAUNCHDARKLY_PROJECTS`
-  - Config file key: `projects` or `project_keys`
-- **Config file path** (defaults to `~/.config/launchdarkly-sec-inspector/config.toml`)
-  - Tool argument: `config_path`
-  - Environment variable: `LAUNCHDARKLY_CONFIG`
-  - Config file key: none
+| Setting | Tool argument | Environment variable | Config file key |
+| --- | --- | --- | --- |
+| Access token (required) | `token` | `LAUNCHDARKLY_API_TOKEN` (fallback `LD_ACCESS_TOKEN`) | `token`, `api_token`, or `access_token` |
+| Base URL | `base_url` | `LAUNCHDARKLY_BASE_URL` (fallback `LD_BASE_URI`) | `base_url` or `base_uri` |
+| API version | `api_version` | `LAUNCHDARKLY_API_VERSION` | `api_version` |
+| Timeout (seconds, default 30) | `timeout_seconds` | `LAUNCHDARKLY_TIMEOUT` | `timeout_seconds` or `timeout` |
+| Approved member domains | `allowed_domains` | `LAUNCHDARKLY_ALLOWED_DOMAINS` | `allowed_domains` or `domains` |
+| Project scope | `project_keys` | `LAUNCHDARKLY_PROJECTS` | `projects` or `project_keys` |
+| Config file path | `config_path` | `LAUNCHDARKLY_CONFIG` | n/a (defaults to `~/.config/launchdarkly-sec-inspector/config.toml`) |
 
 Base URL defaults to `https://app.launchdarkly.com`. Use `https://app.launchdarkly.us` for the federal instance and `https://app.eu.launchdarkly.com` for the EU instance.
 
@@ -87,15 +68,15 @@ The SDK keys endpoint (`/api/v2/projects/{projectKey}/environments/{environmentK
 
 ## Tools
 
-- `launchdarkly_check_access`: Probes caller identity plus 11 read surfaces. Reports `healthy` only when every core surface is readable.
-  - Surfaces: members, teams, custom roles, projects, environments, flags, access tokens, audit log, webhooks, Relay Proxy configs, integration subscriptions.
-  - Webhooks, Relay Proxy configs, and integration subscriptions are optional.
-- `launchdarkly_assess_identity`: Controls 1, 2, 3, 6, 7, 24. Arguments: `member_limit`, `team_limit`, `max_owners`, `max_admins`, `allowed_domains`.
-- `launchdarkly_assess_access_control`: Controls 4, 5, 8, 9, 10, 11. Arguments: `role_limit`, `token_limit`, `stale_token_days`.
-- `launchdarkly_assess_environment_governance`: Controls 16, 17, 19, 22, 23. Arguments: `project_limit`, `environment_limit`, `project_keys`, `production_pattern`, `test_project_pattern`, `sdk_key_max_age_days`.
-- `launchdarkly_assess_flag_hygiene`: Controls 14, 15, 25. Arguments: `project_limit`, `flag_limit`, `project_keys`, `production_pattern`, `stale_flag_days`.
-- `launchdarkly_assess_monitoring_integrations`: Controls 12, 13, 18, 20, 21. Arguments: `retention_days`, `integration_keys`, `relay_config_max_age_days`, `production_pattern`.
-- `launchdarkly_export_audit_bundle`: Runs the access check and all five assessments, then writes a bundle plus zip under `output_dir` (default `./export/launchdarkly`).
+| Tool | Purpose |
+| --- | --- |
+| `launchdarkly_check_access` | Probe caller identity plus 11 read surfaces (members, teams, custom roles, projects, environments, flags, access tokens, audit log, webhooks, Relay Proxy configs, integration subscriptions). Reports `healthy` only when every core surface is readable; webhooks, Relay Proxy configs, and integration subscriptions are optional. |
+| `launchdarkly_assess_identity` | Controls 1, 2, 3, 6, 7, 24. Arguments: `member_limit`, `team_limit`, `max_owners`, `max_admins`, `allowed_domains`. |
+| `launchdarkly_assess_access_control` | Controls 4, 5, 8, 9, 10, 11. Arguments: `role_limit`, `token_limit`, `stale_token_days`. |
+| `launchdarkly_assess_environment_governance` | Controls 16, 17, 19, 22, 23. Arguments: `project_limit`, `environment_limit`, `project_keys`, `production_pattern`, `test_project_pattern`, `sdk_key_max_age_days`. |
+| `launchdarkly_assess_flag_hygiene` | Controls 14, 15, 25. Arguments: `project_limit`, `flag_limit`, `project_keys`, `production_pattern`, `stale_flag_days`. |
+| `launchdarkly_assess_monitoring_integrations` | Controls 12, 13, 18, 20, 21. Arguments: `retention_days`, `integration_keys`, `relay_config_max_age_days`, `production_pattern`. |
+| `launchdarkly_export_audit_bundle` | Runs the access check and all five assessments, then writes a bundle plus zip under `output_dir` (default `./export/launchdarkly`). |
 
 Every tool accepts the shared auth arguments `token`, `base_url`, `api_version`, `config_path`, and `timeout_seconds`.
 
@@ -316,68 +297,33 @@ The `core_data/` snapshots record the same `truncated`, `seen`, and `total` fiel
 
 ## Control coverage
 
-Each entry names the spec control, then the tool and finding that cover it, then the status semantics.
-
-- **1 SSO/SAML enforcement enabled for the account** (`launchdarkly_assess_identity`, LD-01): Always `manual`, because the API does not expose the account SSO setting. Evidence includes SCIM-provisioned member counts, members with passwords, and SAML/SCIM/MFA audit entries.
-- **2 MFA required for all members** (`launchdarkly_assess_identity`, LD-02): `pass` when every active member reports `mfa: enabled`. `fail` otherwise. `warn` when no members were readable.
-- **3 No members with Owner role beyond minimum required** (`launchdarkly_assess_identity`, LD-03): `fail` when Owners exceed `max_owners`. `warn` when Admins exceed `max_admins`.
-- **4 Custom roles follow least-privilege (no wildcard actions)** (`launchdarkly_assess_access_control`, LD-04): `fail` when any allow statement uses wildcard actions or open-ended `notActions`. `warn` when no custom roles exist.
-- **5 Custom role policies deny sensitive actions by default** (`launchdarkly_assess_access_control`, LD-05): `fail` when a role allows account, member, role, token, relay, webhook, or team administration actions without an explicit deny. `warn` when roles use reader base permissions.
-- **6 All members assigned to teams** (`launchdarkly_assess_identity`, LD-06): `fail` when active members have no team. `warn` when no teams exist.
-- **7 Team permissions use custom roles, not built-in admin** (`launchdarkly_assess_identity`, LD-07)
-  - `fail` when sampled teams have no custom roles.
-  - `warn` when no teams exist.
-  - `pass` only when every sampled team has a custom role and the members listing is complete, so the count of members still holding built-in Admin or Owner base roles is known.
-  - A truncated members listing demotes the clean verdict to `warn`. The built-in role holders are stated as unknown, and `built_in_admin_or_owner_members` is rendered `null`.
-  - `manual` when teams or members cannot be read.
-- **8 API access tokens have expiration dates set** (`launchdarkly_assess_access_control`, LD-08): `fail` when any visible token lacks `expiry`. `warn` when tokens were not readable or the inventory is partial (see below).
-- **9 No API tokens unused beyond 90 days** (`launchdarkly_assess_access_control`, LD-09): `fail` when `lastUsed` (or creation) is older than `stale_token_days`. `warn` on a partial inventory.
-- **10 Service tokens scoped to minimum required roles** (`launchdarkly_assess_access_control`, LD-10)
-  - `fail` for Owner/Admin base role or wildcard inline policies.
-  - `warn` for the Writer base role, or for a partial or unknown inventory (including an empty listing).
-  - `warn` when the only Admin service token is the one running the assessment (disclosed in the summary).
-- **11 Personal tokens limited to individual member scope** (`launchdarkly_assess_access_control`, LD-11)
-  - `fail` when personal tokens are not tied to a current member in a complete member listing.
-  - `warn` when a token's base role outranks its member's role.
-  - `warn` when the member listing is truncated, so unmatched tokens cannot be confirmed as orphaned.
-  - `warn` when the inventory is partial or unknown (including an empty listing).
-- **12 Audit log retention (>= 90 days queryable)** (`launchdarkly_assess_monitoring_integrations`, LD-12)
-  - `pass` when entries older than `retention_days` are returned and the recent audit log query was read.
-  - `warn` when the retention probe returned none but recent entries exist.
-  - `warn` when the probe returned entries while the recent audit log query was unreadable.
-  - `fail` when a readable audit log returned no entries at all (the retention probe and the recent query both empty).
-  - `manual` when the retention probe is unreadable (including when no audit log query is readable).
-  - `manual` when the probe returned nothing and the recent query was unreadable.
-  - The summary names each unreadable query with its request and error.
-- **13 Audit log events present for critical actions** (`launchdarkly_assess_monitoring_integrations`, LD-13)
-  - `pass` when member or role entries carry critical actions and both queries were read.
-  - `warn` when no critical actions were returned.
-  - `warn` when critical actions were seen but one of the two queries was unreadable.
-  - `manual` when both the member and the role query are unreadable (including when no audit log query is readable).
-  - The summary names each unreadable query with its request and error.
-- **14 Flag targeting rules do not expose individual user keys in production** (`launchdarkly_assess_flag_hygiene`, LD-14): `fail` when production flags carry `targets` or `contextTargets` values. `warn` when no production flags were readable.
-- **15 Stale flags identified (> 30 days)** (`launchdarkly_assess_flag_hygiene`, LD-15): `warn` when flags are inactive or unrequested beyond `stale_flag_days`.
-- **16 Environment-level access controls restrict production modifications** (`launchdarkly_assess_environment_governance`, LD-16)
-  - `pass` only when every production environment is restricted by a custom role statement: a `deny` or `notResources` entry whose resource specifier matches it, or a role whose environment-scoped allows never cover it.
-  - `warn` when the environment relies on the `critical` designation alone, which only enables safeguards.
-  - `fail` when a non-critical production environment has no role restriction.
-- **17 Approval workflows enabled for production changes** (`launchdarkly_assess_environment_governance`, LD-17)
-  - `fail` when `approvalSettings.required` is false.
-  - `warn` when the gate is weakened by `bypassApprovalsForPendingChanges` or `canReviewOwnRequest`.
-  - `warn` when the gate is weakened by `canApplyDeclinedChanges` (one approval is enough even when other reviewers declined).
-  - `warn` when the gate is weakened by a non-empty `requiredApprovalTags` list (untagged flags skip approval).
-  - The normalized `approval_settings` block, including `minNumApprovals`, is included in `production_environment_settings` evidence.
-- **18 Relay proxy configurations use secure mode** (`launchdarkly_assess_monitoring_integrations`, LD-18)
-  - `fail` for wildcard project or environment scope or referenced production environments without secure mode.
-  - `warn` when unmodified beyond `relay_config_max_age_days`.
-  - `manual` when no automatic configurations exist.
-- **19 SDK keys rotated within policy period (< 365 days)** (`launchdarkly_assess_environment_governance`, LD-19): `fail` when server-side keys exceed `sdk_key_max_age_days`. `manual` when the beta SDK keys endpoint is unreadable.
-- **20 Integrations use least-privilege scopes** (`launchdarkly_assess_monitoring_integrations`, LD-20): `fail` when enabled subscriptions allow all actions across all projects. `manual` when no subscriptions were found for the probed integration keys.
-- **21 Webhook endpoints use HTTPS and signing is enabled** (`launchdarkly_assess_monitoring_integrations`, LD-21): `fail` when an enabled webhook uses plain HTTP or has no secret. `warn` when only disabled webhooks are insecure or the endpoint was unreadable.
-- **22 No test/temporary projects in production account** (`launchdarkly_assess_environment_governance`, LD-22): `warn` when project keys, names, or tags match `test_project_pattern`.
-- **23 Environment critical settings (secure mode, default TTL) configured** (`launchdarkly_assess_environment_governance`, LD-23): `fail` when production lacks secure mode. `warn` for zero TTL or missing confirm changes / required comments.
-- **24 Member email domains match organization domain policy** (`launchdarkly_assess_identity`, LD-24): `fail` when active members use unapproved domains. `manual` when no `allowed_domains` policy is supplied (the observed domain distribution is included).
-- **25 Flag prerequisites do not create circular dependencies** (`launchdarkly_assess_flag_hygiene`, LD-25): `fail` when the prerequisite graph contains a cycle.
+| # | Spec control | Tool | Finding | Status semantics |
+| --- | --- | --- | --- | --- |
+| 1 | SSO/SAML enforcement enabled for the account | `launchdarkly_assess_identity` | LD-01 | Always `manual`: the API does not expose the account SSO setting. Evidence includes SCIM-provisioned member counts, members with passwords, and SAML/SCIM/MFA audit entries. |
+| 2 | MFA required for all members | `launchdarkly_assess_identity` | LD-02 | `pass` when every active member reports `mfa: enabled`; `fail` otherwise; `warn` when no members were readable. |
+| 3 | No members with Owner role beyond minimum required | `launchdarkly_assess_identity` | LD-03 | `fail` when Owners exceed `max_owners`; `warn` when Admins exceed `max_admins`. |
+| 4 | Custom roles follow least-privilege (no wildcard actions) | `launchdarkly_assess_access_control` | LD-04 | `fail` when any allow statement uses wildcard actions or open-ended `notActions`; `warn` when no custom roles exist. |
+| 5 | Custom role policies deny sensitive actions by default | `launchdarkly_assess_access_control` | LD-05 | `fail` when a role allows account, member, role, token, relay, webhook, or team administration actions without an explicit deny; `warn` when roles use reader base permissions. |
+| 6 | All members assigned to teams | `launchdarkly_assess_identity` | LD-06 | `fail` when active members have no team; `warn` when no teams exist. |
+| 7 | Team permissions use custom roles, not built-in admin | `launchdarkly_assess_identity` | LD-07 | `fail` when sampled teams have no custom roles; `warn` when no teams exist; `pass` only when every sampled team has a custom role and the members listing is complete, so the count of members still holding built-in Admin or Owner base roles is known. A truncated members listing demotes the clean verdict to `warn` with the built-in role holders stated as unknown and `built_in_admin_or_owner_members` rendered `null`; `manual` when teams or members cannot be read. |
+| 8 | API access tokens have expiration dates set | `launchdarkly_assess_access_control` | LD-08 | `fail` when any visible token lacks `expiry`; `warn` when tokens were not readable or the inventory is partial (see below). |
+| 9 | No API tokens unused beyond 90 days | `launchdarkly_assess_access_control` | LD-09 | `fail` when `lastUsed` (or creation) is older than `stale_token_days`; `warn` on a partial inventory. |
+| 10 | Service tokens scoped to minimum required roles | `launchdarkly_assess_access_control` | LD-10 | `fail` for Owner/Admin base role or wildcard inline policies; `warn` for the Writer base role, for a partial or unknown inventory (including an empty listing), or when the only Admin service token is the one running the assessment (disclosed in the summary). |
+| 11 | Personal tokens limited to individual member scope | `launchdarkly_assess_access_control` | LD-11 | `fail` when personal tokens are not tied to a current member in a complete member listing; `warn` when a token's base role outranks its member's role, when the member listing is truncated so unmatched tokens cannot be confirmed as orphaned, or when the inventory is partial or unknown (including an empty listing). |
+| 12 | Audit log retention (>= 90 days queryable) | `launchdarkly_assess_monitoring_integrations` | LD-12 | `pass` when entries older than `retention_days` are returned and the recent audit log query was read; `warn` when the retention probe returned none but recent entries exist, or when the probe returned entries while the recent audit log query was unreadable; `fail` when a readable audit log returned no entries at all (the retention probe and the recent query both empty); `manual` when the retention probe is unreadable (including when no audit log query is readable) or when the probe returned nothing and the recent query was unreadable. The summary names each unreadable query with its request and error. |
+| 13 | Audit log events present for critical actions | `launchdarkly_assess_monitoring_integrations` | LD-13 | `pass` when member or role entries carry critical actions and both queries were read; `warn` when no critical actions were returned, or when critical actions were seen but one of the two queries was unreadable; `manual` when both the member and the role query are unreadable (including when no audit log query is readable). The summary names each unreadable query with its request and error. |
+| 14 | Flag targeting rules do not expose individual user keys in production | `launchdarkly_assess_flag_hygiene` | LD-14 | `fail` when production flags carry `targets` or `contextTargets` values; `warn` when no production flags were readable. |
+| 15 | Stale flags identified (> 30 days) | `launchdarkly_assess_flag_hygiene` | LD-15 | `warn` when flags are inactive or unrequested beyond `stale_flag_days`. |
+| 16 | Environment-level access controls restrict production modifications | `launchdarkly_assess_environment_governance` | LD-16 | `pass` only when every production environment is restricted by a custom role statement (a `deny` or `notResources` entry whose resource specifier matches it, or a role whose environment-scoped allows never cover it); `warn` when the environment relies on the `critical` designation alone, which only enables safeguards; `fail` when a non-critical production environment has no role restriction. |
+| 17 | Approval workflows enabled for production changes | `launchdarkly_assess_environment_governance` | LD-17 | `fail` when `approvalSettings.required` is false; `warn` when the gate is weakened by `bypassApprovalsForPendingChanges`, `canReviewOwnRequest`, `canApplyDeclinedChanges` (one approval is enough even when other reviewers declined), or a non-empty `requiredApprovalTags` list (untagged flags skip approval). The normalized `approval_settings` block, including `minNumApprovals`, is included in `production_environment_settings` evidence. |
+| 18 | Relay proxy configurations use secure mode | `launchdarkly_assess_monitoring_integrations` | LD-18 | `fail` for wildcard project or environment scope or referenced production environments without secure mode; `warn` when unmodified beyond `relay_config_max_age_days`; `manual` when no automatic configurations exist. |
+| 19 | SDK keys rotated within policy period (< 365 days) | `launchdarkly_assess_environment_governance` | LD-19 | `fail` when server-side keys exceed `sdk_key_max_age_days`; `manual` when the beta SDK keys endpoint is unreadable. |
+| 20 | Integrations use least-privilege scopes | `launchdarkly_assess_monitoring_integrations` | LD-20 | `fail` when enabled subscriptions allow all actions across all projects; `manual` when no subscriptions were found for the probed integration keys. |
+| 21 | Webhook endpoints use HTTPS and signing is enabled | `launchdarkly_assess_monitoring_integrations` | LD-21 | `fail` when an enabled webhook uses plain HTTP or has no secret; `warn` when only disabled webhooks are insecure or the endpoint was unreadable. |
+| 22 | No test/temporary projects in production account | `launchdarkly_assess_environment_governance` | LD-22 | `warn` when project keys, names, or tags match `test_project_pattern`. |
+| 23 | Environment critical settings (secure mode, default TTL) configured | `launchdarkly_assess_environment_governance` | LD-23 | `fail` when production lacks secure mode; `warn` for zero TTL or missing confirm changes / required comments. |
+| 24 | Member email domains match organization domain policy | `launchdarkly_assess_identity` | LD-24 | `fail` when active members use unapproved domains; `manual` when no `allowed_domains` policy is supplied (the observed domain distribution is included). |
+| 25 | Flag prerequisites do not create circular dependencies | `launchdarkly_assess_flag_hygiene` | LD-25 | `fail` when the prerequisite graph contains a cycle. |
 
 ## Framework mappings
 

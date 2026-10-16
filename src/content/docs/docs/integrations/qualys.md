@@ -16,14 +16,12 @@ Spec: `specs/qualys-sec-inspector.spec.md` (20 numbered security controls).
 
 ## What it inspects
 
-- **Scan coverage:** scan schedules, scan history, option profiles, excluded hosts, asset groups.
-  - Protocol: VM/PC API v2 (XML).
-- **Asset inventory:** asset groups, host assets, scanner appliances, Asset Management connectors, Cloud Agent host assets, tags.
-  - Protocols: VM/PC API v2 (XML) and QPS 2.0 (JSON).
-- **Vulnerability management:** authentication records, Policy Compliance policies, VMDR host detections, KnowledgeBase patch data.
-  - Protocol: VM/PC API v2 (XML).
-- **Administration:** scheduled reports, report history, users, activity log, WAS web apps, WAS scans, WAS auth records, WAS schedules.
-  - Protocols: VM/PC API v2 (XML and CSV), Administration API (QPS 2.0), and WAS API (QPS 3.0).
+| Area | Qualys surfaces | Protocol |
+|------|-----------------|----------|
+| Scan coverage | Scan schedules, scan history, option profiles, excluded hosts, asset groups | VM/PC API v2 (XML) |
+| Asset inventory | Asset groups, host assets, scanner appliances, Asset Management connectors, Cloud Agent host assets, tags | VM/PC API v2 (XML) and QPS 2.0 (JSON) |
+| Vulnerability management | Authentication records, Policy Compliance policies, VMDR host detections, KnowledgeBase patch data | VM/PC API v2 (XML) |
+| Administration | Scheduled reports, report history, users, activity log, WAS web apps, WAS scans, WAS auth records, WAS schedules | VM/PC API v2 (XML and CSV), Administration API (QPS 2.0), WAS API (QPS 3.0) |
 
 ## Setup and authentication
 
@@ -40,39 +38,19 @@ Spec: `specs/qualys-sec-inspector.spec.md` (20 numbered security controls).
 
 Configuration precedence is explicit tool arguments, then environment variables, then the config file.
 
-- **Username:** Required for basic and OAuth modes.
-  - Environment variable: `QUALYS_USERNAME` (or `QUALYS_USER`)
-  - Config file key: `username` or `user`
-- **Password:** Required for basic and OAuth modes.
-  - Environment variable: `QUALYS_PASSWORD`
-  - Config file key: `password`
-- **Pre-issued bearer token:** Bearer mode, skips username and password.
-  - Environment variable: `QUALYS_TOKEN` (or `QUALYS_ACCESS_TOKEN`)
-  - Config file key: `token`
-- **OAuth mode:** Requests a JWT from the platform gateway `/auth` endpoint with `username`, `password`, and `token=true`, then sends `Authorization: Bearer`.
-  - Environment variable: `QUALYS_USE_OAUTH=true`
-  - Config file key: `use_oauth`
-- **Platform:** Platform ID, API server hostname, or https URL. Defaults to `US1`.
-  - Environment variable: `QUALYS_PLATFORM` (or `QUALYS_API_SERVER`)
-  - Config file key: `platform` or `hostname`
-- **Base URL override:** Bypasses the platform mapping.
-  - Environment variable: `QUALYS_BASE_URL` (or `QUALYS_API_URL`)
-  - Config file key: `base_url`
-- **Gateway URL override:** Only used for OAuth token requests.
-  - Environment variable: `QUALYS_GATEWAY_URL`
-  - Config file key: `gateway_url`
-- **Config file path:** Defaults to `~/.qcrc`, key=value or INI style.
-  - Environment variable: `QUALYS_CONFIG_FILE`
-  - Config file key: n/a
-- **Timeout:** Defaults to 60, clamped to 1-600.
-  - Environment variable: `QUALYS_TIMEOUT` (seconds)
-  - Config file key: `timeout`
-- **Retries:** Defaults to 3, clamped to 0-10.
-  - Environment variable: `QUALYS_MAX_RETRIES`
-  - Config file key: n/a
-- **Lookback window:** Defaults to 30, clamped to 1-365.
-  - Environment variable: `QUALYS_LOOKBACK_DAYS`
-  - Config file key: n/a
+| Setting | Environment variable | Config file key | Notes |
+|---------|---------------------|-----------------|-------|
+| Username | `QUALYS_USERNAME` (or `QUALYS_USER`) | `username` or `user` | Required for basic and OAuth modes |
+| Password | `QUALYS_PASSWORD` | `password` | Required for basic and OAuth modes |
+| Pre-issued bearer token | `QUALYS_TOKEN` (or `QUALYS_ACCESS_TOKEN`) | `token` | Bearer mode, skips username and password |
+| OAuth mode | `QUALYS_USE_OAUTH=true` | `use_oauth` | Requests a JWT from the platform gateway `/auth` endpoint with `username`, `password`, and `token=true`, then sends `Authorization: Bearer` |
+| Platform | `QUALYS_PLATFORM` (or `QUALYS_API_SERVER`) | `platform` or `hostname` | Platform ID, API server hostname, or https URL. Defaults to `US1` |
+| Base URL override | `QUALYS_BASE_URL` (or `QUALYS_API_URL`) | `base_url` | Bypasses the platform mapping |
+| Gateway URL override | `QUALYS_GATEWAY_URL` | `gateway_url` | Only used for OAuth token requests |
+| Config file path | `QUALYS_CONFIG_FILE` | n/a | Defaults to `~/.qcrc`, key=value or INI style |
+| Timeout | `QUALYS_TIMEOUT` (seconds) | `timeout` | Defaults to 60, clamped to 1-600 |
+| Retries | `QUALYS_MAX_RETRIES` | n/a | Defaults to 3, clamped to 0-10 |
+| Lookback window | `QUALYS_LOOKBACK_DAYS` | n/a | Defaults to 30, clamped to 1-365 |
 
 A pre-issued token wins over OAuth and basic modes whenever one resolves. `base_url` (from any source) takes precedence over `platform`.
 
@@ -90,48 +68,22 @@ export QUALYS_PLATFORM=US2
 
 The platform ID maps to the API server and API gateway published on the Qualys platform identification page.
 
-- `US1`
-  - API server: `https://qualysapi.qualys.com`
-  - API gateway (OAuth): `https://gateway.qg1.apps.qualys.com`
-- `US2`
-  - API server: `https://qualysapi.qg2.apps.qualys.com`
-  - API gateway (OAuth): `https://gateway.qg2.apps.qualys.com`
-- `US3`
-  - API server: `https://qualysapi.qg3.apps.qualys.com`
-  - API gateway (OAuth): `https://gateway.qg3.apps.qualys.com`
-- `US4`
-  - API server: `https://qualysapi.qg4.apps.qualys.com`
-  - API gateway (OAuth): `https://gateway.qg4.apps.qualys.com`
-- `GOV1`
-  - API server: `https://qualysapi.gov1.qualys.us`
-  - API gateway (OAuth): `https://gateway.gov1.qualys.us`
-- `EU1`
-  - API server: `https://qualysapi.qualys.eu`
-  - API gateway (OAuth): `https://gateway.qg1.apps.qualys.eu`
-- `EU2`
-  - API server: `https://qualysapi.qg2.apps.qualys.eu`
-  - API gateway (OAuth): `https://gateway.qg2.apps.qualys.eu`
-- `EU3`
-  - API server: `https://qualysapi.qg3.apps.qualys.it`
-  - API gateway (OAuth): `https://gateway.qg3.apps.qualys.it`
-- `IN1`
-  - API server: `https://qualysapi.qg1.apps.qualys.in`
-  - API gateway (OAuth): `https://gateway.qg1.apps.qualys.in`
-- `CA1`
-  - API server: `https://qualysapi.qg1.apps.qualys.ca`
-  - API gateway (OAuth): `https://gateway.qg1.apps.qualys.ca`
-- `AE1`
-  - API server: `https://qualysapi.qg1.apps.qualys.ae`
-  - API gateway (OAuth): `https://gateway.qg1.apps.qualys.ae`
-- `UK1`
-  - API server: `https://qualysapi.qg1.apps.qualys.co.uk`
-  - API gateway (OAuth): `https://gateway.qg1.apps.qualys.co.uk`
-- `AU1`
-  - API server: `https://qualysapi.qg1.apps.qualys.com.au`
-  - API gateway (OAuth): `https://gateway.qg1.apps.qualys.com.au`
-- `KSA1`
-  - API server: `https://qualysapi.qg1.apps.qualysksa.com`
-  - API gateway (OAuth): `https://gateway.qg1.apps.qualysksa.com`
+| Platform ID | API server | API gateway (OAuth) |
+|-------------|------------|---------------------|
+| `US1` | `https://qualysapi.qualys.com` | `https://gateway.qg1.apps.qualys.com` |
+| `US2` | `https://qualysapi.qg2.apps.qualys.com` | `https://gateway.qg2.apps.qualys.com` |
+| `US3` | `https://qualysapi.qg3.apps.qualys.com` | `https://gateway.qg3.apps.qualys.com` |
+| `US4` | `https://qualysapi.qg4.apps.qualys.com` | `https://gateway.qg4.apps.qualys.com` |
+| `GOV1` | `https://qualysapi.gov1.qualys.us` | `https://gateway.gov1.qualys.us` |
+| `EU1` | `https://qualysapi.qualys.eu` | `https://gateway.qg1.apps.qualys.eu` |
+| `EU2` | `https://qualysapi.qg2.apps.qualys.eu` | `https://gateway.qg2.apps.qualys.eu` |
+| `EU3` | `https://qualysapi.qg3.apps.qualys.it` | `https://gateway.qg3.apps.qualys.it` |
+| `IN1` | `https://qualysapi.qg1.apps.qualys.in` | `https://gateway.qg1.apps.qualys.in` |
+| `CA1` | `https://qualysapi.qg1.apps.qualys.ca` | `https://gateway.qg1.apps.qualys.ca` |
+| `AE1` | `https://qualysapi.qg1.apps.qualys.ae` | `https://gateway.qg1.apps.qualys.ae` |
+| `UK1` | `https://qualysapi.qg1.apps.qualys.co.uk` | `https://gateway.qg1.apps.qualys.co.uk` |
+| `AU1` | `https://qualysapi.qg1.apps.qualys.com.au` | `https://gateway.qg1.apps.qualys.com.au` |
+| `KSA1` | `https://qualysapi.qg1.apps.qualysksa.com` | `https://gateway.qg1.apps.qualysksa.com` |
 
 A hostname such as `qualysapi.qg2.apps.qualys.com` is accepted in place of the ID. Unknown hostnames are used as-is with platform `custom`.
 
@@ -210,23 +162,23 @@ Overall status:
 
 The response lists unavailable modules, the API user's view scope, and the last observed rate limit headers.
 
-Surfaces probed, with the module in parentheses:
-
-- `scheduled_scans` (VM): `GET /api/2.0/fo/schedule/scan/?action=list`
-- `hosts` (VM): `GET /api/2.0/fo/asset/host/?action=list&details=All&show_tags=1`
-- `asset_groups` (VM): `GET /api/2.0/fo/asset/group/?action=list`
-- `option_profiles` (VM): `GET /api/2.0/fo/subscription/option_profile/vm/?action=list`
-- `appliances` (VM): `GET /api/2.0/fo/appliance/?action=list&output_mode=full`
-- `auth_records` (VM): `GET /api/2.0/fo/auth/?action=list`
-- `detections` (VMDR): `GET /api/2.0/fo/asset/host/vm/detection/?action=list`
-- `compliance_policies` (PC): `GET /api/2.0/fo/compliance/policy/?action=list`
-- `activity_log` (Administration): `GET /api/2.0/fo/activity_log/?action=list` (CSV)
-- `users` (Administration): `POST /qps/rest/2.0/search/am/user/`
-- `user_list` (Administration): `GET /msp/user_list.php` (`user_list_output.dtd`)
-- `tags` (Asset Management): `POST /qps/rest/2.0/search/am/tag`
-- `cloud_agents` (Cloud Agent): `POST /qps/rest/2.0/search/am/hostasset`
-- `connectors` (Asset Management): `POST /qps/rest/2.0/search/am/assetdataconnector`
-- `was_webapps` (WAS): `POST /qps/rest/3.0/search/was/webapp`
+| Surface | Module | Endpoint |
+|---------|--------|----------|
+| `scheduled_scans` | VM | `GET /api/2.0/fo/schedule/scan/?action=list` |
+| `hosts` | VM | `GET /api/2.0/fo/asset/host/?action=list&details=All&show_tags=1` |
+| `asset_groups` | VM | `GET /api/2.0/fo/asset/group/?action=list` |
+| `option_profiles` | VM | `GET /api/2.0/fo/subscription/option_profile/vm/?action=list` |
+| `appliances` | VM | `GET /api/2.0/fo/appliance/?action=list&output_mode=full` |
+| `auth_records` | VM | `GET /api/2.0/fo/auth/?action=list` |
+| `detections` | VMDR | `GET /api/2.0/fo/asset/host/vm/detection/?action=list` |
+| `compliance_policies` | PC | `GET /api/2.0/fo/compliance/policy/?action=list` |
+| `activity_log` | Administration | `GET /api/2.0/fo/activity_log/?action=list` (CSV) |
+| `users` | Administration | `POST /qps/rest/2.0/search/am/user/` |
+| `user_list` | Administration | `GET /msp/user_list.php` (`user_list_output.dtd`) |
+| `tags` | Asset Management | `POST /qps/rest/2.0/search/am/tag` |
+| `cloud_agents` | Cloud Agent | `POST /qps/rest/2.0/search/am/hostasset` |
+| `connectors` | Asset Management | `POST /qps/rest/2.0/search/am/assetdataconnector` |
+| `was_webapps` | WAS | `POST /qps/rest/3.0/search/was/webapp` |
 
 The assessments additionally read:
 
@@ -308,28 +260,28 @@ Finding IDs are `QUALYS-C01` through `QUALYS-C20`. Every finding carries the fra
 
 Any control whose API surface is unreadable (missing module, missing role, or API error) is downgraded to `manual`. Its summary states exactly what evidence to collect.
 
-Each entry names the spec control, then the tool and finding that cover it, then the status semantics.
-
-- **1 Scan schedule coverage** (`qualys_assess_scan_coverage`, `QUALYS-C01`): `fail` with no active schedules. `warn` when asset groups lack a schedule or hosts were last scanned more than 30 days ago. Otherwise `pass`.
-- **2 Authenticated scan ratio** (`qualys_assess_scan_coverage`, `QUALYS-C02`): `pass` at or above `min_auth_scan_percent` (default 80). `fail` below. `warn` when no scanned hosts were returned.
-- **3 Scan option profile review** (`qualys_assess_scan_coverage`, `QUALYS-C03`): `fail` with no option profiles. `warn` when profiles have no authentication enabled. Otherwise `pass`.
-- **4 Asset group completeness** (`qualys_assess_asset_inventory`, `QUALYS-C04`): Always `manual`, because the API cannot see the CMDB or IPAM. Evidence lists empty asset groups and never-scanned hosts to reconcile.
-- **5 Cloud connector status** (`qualys_assess_asset_inventory`, `QUALYS-C05`): `fail` when a connector reports an error state. `warn` when none exist or the last sync is stale. Otherwise `pass`.
-- **6 Scanner appliance health** (`qualys_assess_asset_inventory`, `QUALYS-C06`): `fail` when appliances are offline. `warn` when heartbeats were missed, software or vulnerability signatures are behind the latest version, or no appliances exist. Otherwise `pass`.
-- **7 Agent deployment coverage** (`qualys_assess_asset_inventory`, `QUALYS-C07`): `pass` at or above `min_agent_coverage_percent` (default 50) with no inactive or stale agents. `warn` when coverage is met but agents are stale. `fail` below the threshold.
-- **8 Authentication record completeness** (`qualys_assess_vulnerability_management`, `QUALYS-C08`): `fail` when no records exist or scanned Windows or Unix-family hosts have no matching record type. Otherwise `pass`. The evidence lists every record type present so network device coverage and failing credentials can be confirmed against the Authentication Report.
-- **9 Policy compliance profile assignment** (`qualys_assess_vulnerability_management`, `QUALYS-C09`): `fail` when active policies have no asset group or tag assignment. `warn` when policies are inactive or none exist. `manual` when PC is not subscribed.
-- **10 Vulnerability SLA adherence** (`qualys_assess_vulnerability_management`, `QUALYS-C10`): `pass` at 95 percent or more of open severity 3 to 5 detections inside SLA. `warn` from 80 to 95. `fail` below 80.
-- **11 Patch management tracking** (`qualys_assess_vulnerability_management`, `QUALYS-C11`): `fail` when more than 25 percent of patchable detections are past SLA. `warn` when any are. Otherwise `pass`.
-- **12 Report template and distribution** (`qualys_assess_administration`, `QUALYS-C12`): `fail` with no active scheduled reports. `warn` when no report finished in the lookback window. Otherwise `pass`. Recipient appropriateness is manual evidence.
-- **13 User role and permission audit** (`qualys_assess_administration`, `QUALYS-C13`): `fail` when Manager accounts exceed `max_managers` (default 5) or emails are shared. `warn` for generic account names or inactive users. Otherwise `pass`.
-- **14 External scanner configuration** (`qualys_assess_scan_coverage`, `QUALYS-C14`): `pass` when an active schedule uses Qualys external scanners. `warn` when schedules exist but none are external. `fail` with no schedules.
-- **15 Web application inventory** (`qualys_assess_administration`, `QUALYS-C15`): `fail` when web apps lack a finished scan in the lookback window. `warn` for stale WAS auth records or an empty inventory. `manual` when WAS is not subscribed.
-- **16 Exclusion list review** (`qualys_assess_scan_coverage`, `QUALYS-C16`): `fail` for excluded ranges covering more than 256 addresses. `warn` when any host or QID exclusions exist. Otherwise `pass`.
-- **17 Vulnerability prioritization (QDS)** (`qualys_assess_vulnerability_management`, `QUALYS-C17`): `pass` when 90 percent or more of open detections carry a QDS. `warn` for partial coverage or no detections. `fail` when none do.
-- **18 Tag-based asset management** (`qualys_assess_asset_inventory`, `QUALYS-C18`): `fail` when no tags exist or more than 20 percent of hosts are untagged. `warn` for any untagged hosts. Otherwise `pass`.
-- **19 Activity log monitoring** (`qualys_assess_administration`, `QUALYS-C19`): `warn` when sensitive actions (user, policy, schedule, deletion) need reviewer sign-off or the log is empty. `pass` otherwise. Retention and review cadence are manual evidence.
-- **20 Network segmentation scanning** (`qualys_assess_scan_coverage`, `QUALYS-C20`): `pass` when active schedules span at least two target sets and two scanners. `warn` for a single flat target or scanner. `fail` with no schedules.
+| # | Control | Tool | Finding | Status semantics |
+|---|---------|------|---------|------------------|
+| 1 | Scan schedule coverage | `qualys_assess_scan_coverage` | `QUALYS-C01` | `fail` with no active schedules; `warn` when asset groups lack a schedule or hosts were last scanned more than 30 days ago; otherwise `pass` |
+| 2 | Authenticated scan ratio | `qualys_assess_scan_coverage` | `QUALYS-C02` | `pass` at or above `min_auth_scan_percent` (default 80); `fail` below; `warn` when no scanned hosts were returned |
+| 3 | Scan option profile review | `qualys_assess_scan_coverage` | `QUALYS-C03` | `fail` with no option profiles; `warn` when profiles have no authentication enabled; otherwise `pass` |
+| 4 | Asset group completeness | `qualys_assess_asset_inventory` | `QUALYS-C04` | Always `manual`: the API cannot see the CMDB or IPAM. Evidence lists empty asset groups and never-scanned hosts to reconcile |
+| 5 | Cloud connector status | `qualys_assess_asset_inventory` | `QUALYS-C05` | `fail` when a connector reports an error state; `warn` when none exist or the last sync is stale; otherwise `pass` |
+| 6 | Scanner appliance health | `qualys_assess_asset_inventory` | `QUALYS-C06` | `fail` when appliances are offline; `warn` when heartbeats were missed, software or vulnerability signatures are behind the latest version, or no appliances exist; otherwise `pass` |
+| 7 | Agent deployment coverage | `qualys_assess_asset_inventory` | `QUALYS-C07` | `pass` at or above `min_agent_coverage_percent` (default 50) with no inactive or stale agents; `warn` when coverage is met but agents are stale; `fail` below the threshold |
+| 8 | Authentication record completeness | `qualys_assess_vulnerability_management` | `QUALYS-C08` | `fail` when no records exist or scanned Windows or Unix-family hosts have no matching record type; otherwise `pass`. The evidence lists every record type present so network device coverage and failing credentials can be confirmed against the Authentication Report |
+| 9 | Policy compliance profile assignment | `qualys_assess_vulnerability_management` | `QUALYS-C09` | `fail` when active policies have no asset group or tag assignment; `warn` when policies are inactive or none exist; `manual` when PC is not subscribed |
+| 10 | Vulnerability SLA adherence | `qualys_assess_vulnerability_management` | `QUALYS-C10` | `pass` at 95 percent or more of open severity 3 to 5 detections inside SLA; `warn` from 80 to 95; `fail` below 80 |
+| 11 | Patch management tracking | `qualys_assess_vulnerability_management` | `QUALYS-C11` | `fail` when more than 25 percent of patchable detections are past SLA; `warn` when any are; otherwise `pass` |
+| 12 | Report template and distribution | `qualys_assess_administration` | `QUALYS-C12` | `fail` with no active scheduled reports; `warn` when no report finished in the lookback window; otherwise `pass`. Recipient appropriateness is manual evidence |
+| 13 | User role and permission audit | `qualys_assess_administration` | `QUALYS-C13` | `fail` when Manager accounts exceed `max_managers` (default 5) or emails are shared; `warn` for generic account names or inactive users; otherwise `pass` |
+| 14 | External scanner configuration | `qualys_assess_scan_coverage` | `QUALYS-C14` | `pass` when an active schedule uses Qualys external scanners; `warn` when schedules exist but none are external; `fail` with no schedules |
+| 15 | Web application inventory | `qualys_assess_administration` | `QUALYS-C15` | `fail` when web apps lack a finished scan in the lookback window; `warn` for stale WAS auth records or an empty inventory; `manual` when WAS is not subscribed |
+| 16 | Exclusion list review | `qualys_assess_scan_coverage` | `QUALYS-C16` | `fail` for excluded ranges covering more than 256 addresses; `warn` when any host or QID exclusions exist; otherwise `pass` |
+| 17 | Vulnerability prioritization (QDS) | `qualys_assess_vulnerability_management` | `QUALYS-C17` | `pass` when 90 percent or more of open detections carry a QDS; `warn` for partial coverage or no detections; `fail` when none do |
+| 18 | Tag-based asset management | `qualys_assess_asset_inventory` | `QUALYS-C18` | `fail` when no tags exist or more than 20 percent of hosts are untagged; `warn` for any untagged hosts; otherwise `pass` |
+| 19 | Activity log monitoring | `qualys_assess_administration` | `QUALYS-C19` | `warn` when sensitive actions (user, policy, schedule, deletion) need reviewer sign-off or the log is empty; `pass` otherwise. Retention and review cadence are manual evidence |
+| 20 | Network segmentation scanning | `qualys_assess_scan_coverage` | `QUALYS-C20` | `pass` when active schedules span at least two target sets and two scanners; `warn` for a single flat target or scanner; `fail` with no schedules |
 
 ## Framework mappings
 

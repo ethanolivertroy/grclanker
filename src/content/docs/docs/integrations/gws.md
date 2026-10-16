@@ -13,24 +13,14 @@ It is read-only. Every request is a GET against a documented Google API, and not
 
 ## What it inspects
 
-Each entry gives the area and its tool, then the Google surface.
-
-- **Identity** (`gws_assess_identity`)
-  - Directory users, roles, role assignments
-  - Reports login events
-  - Cloud Identity Policy API 2-step verification settings
-- **Admin access** (`gws_assess_admin_access`)
-  - Directory users, roles, role assignments
-  - Reports admin events
-- **Integrations** (`gws_assess_integrations`)
-  - Directory users and roles
-  - Per-user `tokens.list`
-  - Reports token events
-- **Monitoring** (`gws_assess_monitoring`)
-  - Alert Center alerts
-  - Reports login, admin, and token events
-- **Access probe** (`gws_check_access`): One read against each surface above.
-- **Evidence bundle** (`gws_export_audit_bundle`): Collects every surface once and writes the shared bundle layout.
+| Area | Tool | Google surface |
+| --- | --- | --- |
+| Identity | `gws_assess_identity` | Directory users, roles, role assignments; Reports login events; Cloud Identity Policy API 2-step verification settings |
+| Admin access | `gws_assess_admin_access` | Directory users, roles, role assignments; Reports admin events |
+| Integrations | `gws_assess_integrations` | Directory users and roles; per-user `tokens.list`; Reports token events |
+| Monitoring | `gws_assess_monitoring` | Alert Center alerts; Reports login, admin, and token events |
+| Access probe | `gws_check_access` | One read against each surface above |
+| Evidence bundle | `gws_export_audit_bundle` | Collects every surface once and writes the shared bundle layout |
 
 ## Setup and authentication
 
@@ -73,25 +63,27 @@ Explicit tool arguments override the environment: `auth_mode`, `credentials_file
 
 ### Scopes
 
-Each scope, what it is used for, and its reference:
-
-- `admin.directory.user.readonly`: Used for `users.list`. Reference: [users.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/users/list).
-- `admin.directory.rolemanagement.readonly`: Used for `roles.list` and `roleAssignments.list`. Reference: [roles.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/roles/list).
-- `admin.directory.user.security`: Used for `tokens.list`. Reference: [tokens.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/tokens/list).
-- `admin.reports.audit.readonly`: Used for `activities.list`. Reference: [activities.list](https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list).
-- `apps.alerts`: Used for `alerts.list`. Reference: [alerts.list](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list).
-- `cloud-identity.policies.readonly`: Used for `policies.list`. Reference: [policies.list](https://cloud.google.com/identity/docs/reference/rest/v1/policies/list).
+| Scope | Used for | Reference |
+| --- | --- | --- |
+| `admin.directory.user.readonly` | `users.list` | [users.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/users/list) |
+| `admin.directory.rolemanagement.readonly` | `roles.list`, `roleAssignments.list` | [roles.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/roles/list) |
+| `admin.directory.user.security` | `tokens.list` | [tokens.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/tokens/list) |
+| `admin.reports.audit.readonly` | `activities.list` | [activities.list](https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list) |
+| `apps.alerts` | `alerts.list` | [alerts.list](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list) |
+| `cloud-identity.policies.readonly` | `policies.list` | [policies.list](https://cloud.google.com/identity/docs/reference/rest/v1/policies/list) |
 
 The interactive installed-app OAuth mode described in the spec is not shipped. See Limitations.
 
 ## Tools
 
-- `gws_check_access`: Probes each surface, reports `healthy` or `limited`, and says whether GWS-ID-005 can be evaluated automatically.
-- `gws_assess_identity`: GWS-ID-001 to GWS-ID-005.
-- `gws_assess_admin_access`: GWS-ADMIN-001 to GWS-ADMIN-005.
-- `gws_assess_integrations`: GWS-INTEG-001 to GWS-INTEG-004.
-- `gws_assess_monitoring`: GWS-MON-001 to GWS-MON-005.
-- `gws_export_audit_bundle`: Runs all four assessments from one collection pass and writes the bundle. Accepts `output_dir` and a `frameworks` filter.
+| Tool | Purpose |
+| --- | --- |
+| `gws_check_access` | Probes each surface, reports `healthy` or `limited`, and says whether GWS-ID-005 can be evaluated automatically |
+| `gws_assess_identity` | GWS-ID-001 to GWS-ID-005 |
+| `gws_assess_admin_access` | GWS-ADMIN-001 to GWS-ADMIN-005 |
+| `gws_assess_integrations` | GWS-INTEG-001 to GWS-INTEG-004 |
+| `gws_assess_monitoring` | GWS-MON-001 to GWS-MON-005 |
+| `gws_export_audit_bundle` | Runs all four assessments from one collection pass and writes the bundle; accepts `output_dir` and a `frameworks` filter |
 
 ## Control coverage
 
@@ -104,65 +96,27 @@ Status semantics:
 - `Fail`: The documented flags contradict the control.
 - `Manual`: The verdict could not be reached automatically (unreadable endpoint, empty inventory, surface not collected). The summary names the evidence a human must collect.
 
-Each entry names the control, then its tool and finding, then the pass condition and when the finding is Manual.
-
-- **1 Privileged users enforce 2-step verification** (identity, GWS-ID-001)
-  - Pass condition: Every privileged user has `isEnforcedIn2Sv=true`.
-  - Manual when: Directory unreadable or no privileged user identified.
-- **2 Broad 2-step verification coverage for active users** (identity, GWS-ID-002)
-  - Pass condition: 98% or more of active users have `isEnforcedIn2Sv=true`.
-  - Manual when: Directory unreadable or zero active users.
-- **3 Dormant active accounts stay limited** (identity, GWS-ID-003)
-  - Pass condition: No active user has `lastLoginTime` older than 90 days. Users without a date cap the verdict at Partial.
-  - Manual when: Directory unreadable or zero active users.
-- **4 Super admins stay strongly protected** (identity, GWS-ID-004)
-  - Pass condition: Every super admin (`isAdmin=true` or `_SEED_ADMIN_ROLE` assignment) has `isEnforcedIn2Sv=true`.
-  - Manual when: Directory unreadable or no super admin identified.
-- **5 2-step verification is enforced by organization policy** (identity, GWS-ID-005)
-  - Pass condition: Every `security.two_step_verification_enforcement` policy has `enforcedFrom` in the past, and no enrollment policy sets `allowEnrollment=false`.
-  - Manual when: Policy API unreadable, not collected, or no enforcement policy returned.
-- **6 Super admin population stays constrained** (admin_access, GWS-ADMIN-001)
-  - Pass condition: 4 or fewer super admins.
-  - Manual when: Directory unreadable or no super admin identified.
-- **7 Suspended or archived privileged accounts are removed** (admin_access, GWS-ADMIN-002)
-  - Pass condition: No privileged user has `suspended=true` or `archived=true`.
-  - Manual when: Directory unreadable or no privileged user identified.
-- **8 Delegated roles reduce Super Admin dependence** (admin_access, GWS-ADMIN-003)
-  - Pass condition: At least one privileged user is not a super admin.
-  - Manual when: Directory unreadable or no delegated admin observed.
-- **9 Privileged activity stays observable** (admin_access, GWS-ADMIN-004)
-  - Pass condition: `activities.list` for `admin` returns at least one event in the window.
-  - Manual when: Reports unreadable or zero events.
-- **10 Group-based admin grants get explicit review** (admin_access, GWS-ADMIN-005)
-  - Pass condition: Non-empty role assignment list with zero `assigneeType=GROUP` entries.
-  - Manual when: Role assignments unreadable or empty. Any group grant needs membership review.
-- **11 Third-party token inventory is readable** (integrations, GWS-INTEG-001)
-  - Pass condition: `tokens.list` succeeded for every sampled user and returned at least one token. Partial when `roles.list` or `roleAssignments.list` was unreadable.
-  - Manual when: Directory unreadable, no users sampled, every read denied, or zero tokens.
-- **12 Privileged users avoid excessive third-party token exposure** (integrations, GWS-INTEG-002)
-  - Pass condition: Zero tokens on privileged users inside a non-empty inventory. Failed per-user reads are named and turn the counts into lower bounds.
-  - Manual when: Directory unreadable, no privileged users, empty inventory, or a failed read with no privileged token in sight.
-- **13 High-scope third-party apps stay limited** (integrations, GWS-INTEG-003)
-  - Pass condition: No token requests admin, Gmail, Drive, cloud-platform, groups, directory, Vault, Classroom, Sheets, or Docs scopes, and no token requests 6 or more scopes. Partial when `roles.list` or `roleAssignments.list` was unreadable.
-  - Manual when: Directory unreadable or empty inventory.
-- **14 Token activity telemetry stays available** (integrations, GWS-INTEG-004)
-  - Pass condition: `activities.list` for `token` returns at least one event.
-  - Manual when: Reports unreadable or zero events.
-- **15 Alert Center is available for the tenant** (monitoring, GWS-MON-001)
-  - Pass condition: `alerts.list` returns at least one alert.
-  - Manual when: Alert Center unreadable or zero alerts.
-- **16 Suspicious login backlog stays low** (monitoring, GWS-MON-002)
-  - Pass condition: Login events present and none match the suspicious event names from the login appendix.
-  - Manual when: Reports unreadable or zero events.
-- **17 Admin audit telemetry stays available** (monitoring, GWS-MON-003)
-  - Pass condition: `activities.list` for `admin` returns at least one event.
-  - Manual when: Reports unreadable or zero events.
-- **18 Token audit telemetry stays available** (monitoring, GWS-MON-004)
-  - Pass condition: `activities.list` for `token` returns at least one event.
-  - Manual when: Reports unreadable or zero events.
-- **19 Open alert backlog is manageable** (monitoring, GWS-MON-005)
-  - Pass condition: 3 or fewer alerts whose `metadata.status` is not `CLOSED`. Alerts without a status cap the verdict at Partial.
-  - Manual when: Alert Center unreadable or zero alerts.
+| # | Control | Tool | Finding | Pass condition | Manual when |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Privileged users enforce 2-step verification | identity | GWS-ID-001 | Every privileged user has `isEnforcedIn2Sv=true` | Directory unreadable or no privileged user identified |
+| 2 | Broad 2-step verification coverage for active users | identity | GWS-ID-002 | 98% or more of active users have `isEnforcedIn2Sv=true` | Directory unreadable or zero active users |
+| 3 | Dormant active accounts stay limited | identity | GWS-ID-003 | No active user has `lastLoginTime` older than 90 days; users without a date cap the verdict at Partial | Directory unreadable or zero active users |
+| 4 | Super admins stay strongly protected | identity | GWS-ID-004 | Every super admin (`isAdmin=true` or `_SEED_ADMIN_ROLE` assignment) has `isEnforcedIn2Sv=true` | Directory unreadable or no super admin identified |
+| 5 | 2-step verification is enforced by organization policy | identity | GWS-ID-005 | Every `security.two_step_verification_enforcement` policy has `enforcedFrom` in the past and no enrollment policy sets `allowEnrollment=false` | Policy API unreadable, not collected, or no enforcement policy returned |
+| 6 | Super admin population stays constrained | admin_access | GWS-ADMIN-001 | 4 or fewer super admins | Directory unreadable or no super admin identified |
+| 7 | Suspended or archived privileged accounts are removed | admin_access | GWS-ADMIN-002 | No privileged user has `suspended=true` or `archived=true` | Directory unreadable or no privileged user identified |
+| 8 | Delegated roles reduce Super Admin dependence | admin_access | GWS-ADMIN-003 | At least one privileged user is not a super admin | Directory unreadable or no delegated admin observed |
+| 9 | Privileged activity stays observable | admin_access | GWS-ADMIN-004 | `activities.list` for `admin` returns at least one event in the window | Reports unreadable or zero events |
+| 10 | Group-based admin grants get explicit review | admin_access | GWS-ADMIN-005 | Non-empty role assignment list with zero `assigneeType=GROUP` entries | Role assignments unreadable or empty; any group grant needs membership review |
+| 11 | Third-party token inventory is readable | integrations | GWS-INTEG-001 | `tokens.list` succeeded for every sampled user and returned at least one token; Partial when `roles.list` or `roleAssignments.list` was unreadable | Directory unreadable, no users sampled, every read denied, or zero tokens |
+| 12 | Privileged users avoid excessive third-party token exposure | integrations | GWS-INTEG-002 | Zero tokens on privileged users inside a non-empty inventory; failed per-user reads are named and turn the counts into lower bounds | Directory unreadable, no privileged users, empty inventory, or a failed read with no privileged token in sight |
+| 13 | High-scope third-party apps stay limited | integrations | GWS-INTEG-003 | No token requests admin, Gmail, Drive, cloud-platform, groups, directory, Vault, Classroom, Sheets, or Docs scopes or 6 or more scopes; Partial when `roles.list` or `roleAssignments.list` was unreadable | Directory unreadable or empty inventory |
+| 14 | Token activity telemetry stays available | integrations | GWS-INTEG-004 | `activities.list` for `token` returns at least one event | Reports unreadable or zero events |
+| 15 | Alert Center is available for the tenant | monitoring | GWS-MON-001 | `alerts.list` returns at least one alert | Alert Center unreadable or zero alerts |
+| 16 | Suspicious login backlog stays low | monitoring | GWS-MON-002 | Login events present and none match the suspicious event names from the login appendix | Reports unreadable or zero events |
+| 17 | Admin audit telemetry stays available | monitoring | GWS-MON-003 | `activities.list` for `admin` returns at least one event | Reports unreadable or zero events |
+| 18 | Token audit telemetry stays available | monitoring | GWS-MON-004 | `activities.list` for `token` returns at least one event | Reports unreadable or zero events |
+| 19 | Open alert backlog is manageable | monitoring | GWS-MON-005 | 3 or fewer alerts whose `metadata.status` is not `CLOSED`; alerts without a status cap the verdict at Partial | Alert Center unreadable or zero alerts |
 
 ## Verdict-safety rules
 
@@ -241,53 +195,15 @@ Each finding maps to these frameworks:
 
 The full matrix is written to `compliance/unified_compliance_matrix.md` in every bundle.
 
-Examples, one group per finding:
+Examples:
 
-- **GWS-ID-001**
-  - FedRAMP: IA-2, IA-2(1)
-  - CMMC: 3.5.3
-  - SOC 2: CC6.1
-  - CIS: 1.2
-  - PCI-DSS: 8.4.2
-  - DISA STIG: SRG-APP-000149
-  - IRAP: ISM-1504
-  - ISMAP: CPS.IA-2
-- **GWS-ID-005**
-  - FedRAMP: IA-2, IA-2(1), CM-6
-  - CMMC: 3.5.3
-  - SOC 2: CC6.1
-  - CIS: 1.1
-  - PCI-DSS: 8.4.2
-  - DISA STIG: SRG-APP-000149
-  - IRAP: ISM-1504
-  - ISMAP: CPS.IA-2
-- **GWS-ADMIN-001**
-  - FedRAMP: AC-5, AC-6
-  - CMMC: 3.1.5
-  - SOC 2: CC6.2
-  - CIS: 2.1
-  - PCI-DSS: 7.2.5
-  - DISA STIG: SRG-APP-000033
-  - IRAP: ISM-0414
-  - ISMAP: CPS.AC-6
-- **GWS-INTEG-002**
-  - FedRAMP: AC-6, SA-9
-  - CMMC: 3.1.5
-  - SOC 2: CC6.2
-  - CIS: 4.2
-  - PCI-DSS: 7.2.5
-  - DISA STIG: SRG-APP-000033
-  - IRAP: ISM-0414
-  - ISMAP: CPS.AC-6
-- **GWS-MON-005**
-  - FedRAMP: IR-5, SI-4
-  - CMMC: 3.6.2
-  - SOC 2: CC7.4
-  - CIS: 5.5
-  - PCI-DSS: 12.10.5
-  - DISA STIG: SRG-APP-000516
-  - IRAP: ISM-1807
-  - ISMAP: CPS.IR-5
+| Finding | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| GWS-ID-001 | IA-2, IA-2(1) | 3.5.3 | CC6.1 | 1.2 | 8.4.2 | SRG-APP-000149 | ISM-1504 | CPS.IA-2 |
+| GWS-ID-005 | IA-2, IA-2(1), CM-6 | 3.5.3 | CC6.1 | 1.1 | 8.4.2 | SRG-APP-000149 | ISM-1504 | CPS.IA-2 |
+| GWS-ADMIN-001 | AC-5, AC-6 | 3.1.5 | CC6.2 | 2.1 | 7.2.5 | SRG-APP-000033 | ISM-0414 | CPS.AC-6 |
+| GWS-INTEG-002 | AC-6, SA-9 | 3.1.5 | CC6.2 | 4.2 | 7.2.5 | SRG-APP-000033 | ISM-0414 | CPS.AC-6 |
+| GWS-MON-005 | IR-5, SI-4 | 3.6.2 | CC7.4 | 5.5 | 12.10.5 | SRG-APP-000516 | ISM-1807 | CPS.IR-5 |
 
 ## Audit bundle layout
 
@@ -347,40 +263,16 @@ Without `GWS_ACCESS_TOKEN` or a service-account file or inline JSON (any of the 
 
 ## Endpoint reference
 
-Each endpoint lists its documentation, the parameters sent, and the fields read.
-
-- `GET https://admin.googleapis.com/admin/directory/v1/users`
-  - Documentation: [users.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/users/list), [User](https://developers.google.com/workspace/admin/directory/reference/rest/v1/users)
-  - Parameters sent: `customer`, `maxResults=500` (documented maximum), `orderBy=email`, `sortOrder=ASCENDING`, `projection=basic`, `showDeleted=false`, `fields`, `pageToken`
-  - Fields read: `users[].id`, `primaryEmail`, `isAdmin`, `isDelegatedAdmin`, `suspended`, `archived`, `lastLoginTime`, `isEnrolledIn2Sv`, `isEnforcedIn2Sv`, `orgUnitPath`, `nextPageToken`
-- `GET .../admin/directory/v1/customer/{customer}/roles`
-  - Documentation: [roles.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/roles/list)
-  - Parameters sent: `maxResults=100` (documented maximum), `pageToken`
-  - Fields read: `items[].roleId`, `roleName`, `isSystemRole`, `isSuperAdminRole`, `rolePrivileges[].privilegeName`, `nextPageToken`
-- `GET .../admin/directory/v1/customer/{customer}/roleassignments`
-  - Documentation: [roleAssignments.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/roleAssignments/list)
-  - Parameters sent: `maxResults=200` (documented maximum), `pageToken`
-  - Fields read: `items[].roleId`, `assignedTo`, `assigneeType` (`USER` or `GROUP`), `nextPageToken`
-- `GET .../admin/directory/v1/users/{userKey}/tokens`
-  - Documentation: [tokens.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/tokens/list), [Token](https://developers.google.com/workspace/admin/directory/reference/rest/v1/tokens)
-  - Parameters sent: none
-  - Fields read: `items[].clientId`, `displayText`, `scopes[]`
-- `GET .../admin/reports/v1/activity/users/all/applications/{login,admin,token}`
-  - Documentation: [activities.list](https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list), [login events](https://developers.google.com/workspace/admin/reports/v1/appendix/activity/login)
-  - Parameters sent: `startTime` (RFC 3339), `maxResults=1000` (documented maximum), `pageToken`
-  - Fields read: `items[].events[].name`, `nextPageToken`
-- `GET https://alertcenter.googleapis.com/v1beta1/alerts`
-  - Documentation: [alerts.list](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list), [Alert](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts)
-  - Parameters sent: `pageSize=100`, `pageToken`
-  - Fields read: `alerts[].metadata.status` (`NOT_STARTED`, `IN_PROGRESS`, `CLOSED`), `nextPageToken`
-- `GET https://cloudidentity.googleapis.com/v1/policies`
-  - Documentation: [policies.list](https://cloud.google.com/identity/docs/reference/rest/v1/policies/list), [Policy](https://cloud.google.com/identity/docs/reference/rest/v1/policies), [settings catalog](https://cloud.google.com/identity/docs/concepts/supported-policy-api-settings)
-  - Parameters sent: `pageSize=100` (documented maximum), `filter=customer == "customers/{customer}" && setting.type.matches('^settings/security\\.two_step_verification.*$')`, `pageToken`
-  - Fields read: `policies[].type`, `policyQuery.orgUnit`, `policyQuery.group`, `setting.type`, `setting.value.enforcedFrom`, `setting.value.allowEnrollment`, `setting.value.allowedSignInFactorSet`, `nextPageToken`
-- `POST https://oauth2.googleapis.com/token`
-  - Documentation: [service account delegation](https://developers.google.com/identity/protocols/oauth2/service-account#delegatingauthority)
-  - Parameters sent: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`, `assertion`
-  - Fields read: `access_token`, `expires_in`
+| Endpoint | Documentation | Parameters sent | Fields read |
+| --- | --- | --- | --- |
+| `GET https://admin.googleapis.com/admin/directory/v1/users` | [users.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/users/list), [User](https://developers.google.com/workspace/admin/directory/reference/rest/v1/users) | `customer`, `maxResults=500` (documented maximum), `orderBy=email`, `sortOrder=ASCENDING`, `projection=basic`, `showDeleted=false`, `fields`, `pageToken` | `users[].id`, `primaryEmail`, `isAdmin`, `isDelegatedAdmin`, `suspended`, `archived`, `lastLoginTime`, `isEnrolledIn2Sv`, `isEnforcedIn2Sv`, `orgUnitPath`, `nextPageToken` |
+| `GET .../admin/directory/v1/customer/{customer}/roles` | [roles.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/roles/list) | `maxResults=100` (documented maximum), `pageToken` | `items[].roleId`, `roleName`, `isSystemRole`, `isSuperAdminRole`, `rolePrivileges[].privilegeName`, `nextPageToken` |
+| `GET .../admin/directory/v1/customer/{customer}/roleassignments` | [roleAssignments.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/roleAssignments/list) | `maxResults=200` (documented maximum), `pageToken` | `items[].roleId`, `assignedTo`, `assigneeType` (`USER` or `GROUP`), `nextPageToken` |
+| `GET .../admin/directory/v1/users/{userKey}/tokens` | [tokens.list](https://developers.google.com/workspace/admin/directory/reference/rest/v1/tokens/list), [Token](https://developers.google.com/workspace/admin/directory/reference/rest/v1/tokens) | none | `items[].clientId`, `displayText`, `scopes[]` |
+| `GET .../admin/reports/v1/activity/users/all/applications/{login,admin,token}` | [activities.list](https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list), [login events](https://developers.google.com/workspace/admin/reports/v1/appendix/activity/login) | `startTime` (RFC 3339), `maxResults=1000` (documented maximum), `pageToken` | `items[].events[].name`, `nextPageToken` |
+| `GET https://alertcenter.googleapis.com/v1beta1/alerts` | [alerts.list](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list), [Alert](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts) | `pageSize=100`, `pageToken` | `alerts[].metadata.status` (`NOT_STARTED`, `IN_PROGRESS`, `CLOSED`), `nextPageToken` |
+| `GET https://cloudidentity.googleapis.com/v1/policies` | [policies.list](https://cloud.google.com/identity/docs/reference/rest/v1/policies/list), [Policy](https://cloud.google.com/identity/docs/reference/rest/v1/policies), [settings catalog](https://cloud.google.com/identity/docs/concepts/supported-policy-api-settings) | `pageSize=100` (documented maximum), `filter=customer == "customers/{customer}" && setting.type.matches('^settings/security\\.two_step_verification.*$')`, `pageToken` | `policies[].type`, `policyQuery.orgUnit`, `policyQuery.group`, `setting.type`, `setting.value.enforcedFrom`, `setting.value.allowEnrollment`, `setting.value.allowedSignInFactorSet`, `nextPageToken` |
+| `POST https://oauth2.googleapis.com/token` | [service account delegation](https://developers.google.com/identity/protocols/oauth2/service-account#delegatingauthority) | `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`, `assertion` | `access_token`, `expires_in` |
 
 `core_data/` stores the fields read above plus these documented identifiers and timestamps from the same resource references, and nothing else:
 

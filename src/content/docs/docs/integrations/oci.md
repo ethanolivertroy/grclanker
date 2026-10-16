@@ -7,7 +7,7 @@ description: "Read-only OCI security inspector covering IAM, Cloud Guard, audit 
 
 The OCI tool family inspects a tenancy read-only through the official OCI CLI and produces framework-mapped findings.
 
-It implements the `specs/oci-sec-inspector.spec.md` control set. Of its 25 controls, 23 are automated or explicitly manual, across 21 findings (see Control coverage).
+It implements the `specs/oci-sec-inspector.spec.md` control set. Of its 25 controls, 23 are automated or explicitly manual, across 21 findings (see the coverage table).
 
 ## What it inspects
 
@@ -68,18 +68,14 @@ A surface the principal cannot read renders its control as MANUAL, with the fail
 
 ## Tools
 
-- `oci_check_access`: Probes ten read surfaces (compartments, users, authentication policy, audit configuration, audit events, Cloud Guard configuration, security lists, vaults, Object Storage, compute).
-  - Key arguments: `profile`, `region`, `tenancy_ocid`, `compartment_ocid`.
-- `oci_assess_identity`: Findings OCI-IAM-01..06.
-  - Key arguments: `stale_days` (90), `max_keys` (200), `max_policies` (500), `max_compartments` (25).
-- `oci_assess_logging_detection`: Findings OCI-LOG-01..06.
-  - Key arguments: `lookback_days` (7), `max_compartments`.
-- `oci_assess_tenancy_guardrails`: Findings OCI-GRD-01..06.
-  - Key arguments: `max_compartments`, `max_buckets` (100), `max_keys` (200, ENABLED vault keys fetched with `kms management key get`).
-- `oci_assess_compute_and_storage`: Findings OCI-CMP-01..03.
-  - Key arguments: `max_compartments`.
-- `oci_export_audit_bundle`: Runs everything and writes the evidence bundle plus zip.
-  - Key arguments: `output_dir` (`./export/oci`) plus the arguments above.
+| Tool | Purpose | Key arguments |
+|------|---------|---------------|
+| `oci_check_access` | Probes ten read surfaces (compartments, users, authentication policy, audit configuration, audit events, Cloud Guard configuration, security lists, vaults, Object Storage, compute) | `profile`, `region`, `tenancy_ocid`, `compartment_ocid` |
+| `oci_assess_identity` | Findings OCI-IAM-01..06 | `stale_days` (90), `max_keys` (200), `max_policies` (500), `max_compartments` (25) |
+| `oci_assess_logging_detection` | Findings OCI-LOG-01..06 | `lookback_days` (7), `max_compartments` |
+| `oci_assess_tenancy_guardrails` | Findings OCI-GRD-01..06 | `max_compartments`, `max_buckets` (100), `max_keys` (200, ENABLED vault keys fetched with `kms management key get`) |
+| `oci_assess_compute_and_storage` | Findings OCI-CMP-01..03 | `max_compartments` |
+| `oci_export_audit_bundle` | Runs everything and writes the evidence bundle plus zip | `output_dir` (`./export/oci`) plus the arguments above |
 
 ## Status semantics
 
@@ -99,53 +95,29 @@ A finding that reads more than one inventory demotes when any of them is incompl
 
 ## Control coverage
 
-Each entry names the spec control number and name, then the tool and finding that cover it, then the status semantics.
-
-- **1 IAM password policy** (identity, OCI-IAM-01): Pass when `minimumPasswordLength` >= 14 and all four character classes are required. Expiration is split into OCI-IAM-06.
-- **1 Password expiration** (identity, OCI-IAM-06): Always manual. The IAM `PasswordPolicy` datatype has no expiration field.
-- **2 MFA enforcement** (identity, OCI-IAM-02): Pass when every ACTIVE console-capable user has `isMfaActivated=true`. No users or no console users is manual.
-- **3, 4, 5 API key, customer secret key, auth token rotation** (identity, OCI-IAM-03)
-  - Fail on any ACTIVE credential older than `stale_days`.
-  - At most warn on undated items or a cap hit.
-  - Folded, with per-kind evidence.
-- **6 Policy least privilege** (identity, OCI-IAM-04): Warn on tenancy-wide `manage` statements. An empty policy list is manual.
-- **7 Compartment structure** (identity, OCI-IAM-05): Fail when no ACTIVE non-root compartment exists.
-- **8 Cloud Guard enabled** (logging, OCI-LOG-01): Pass when configuration `status=ENABLED` and at least one ACTIVE target exists.
-- **9 Cloud Guard open problems** (logging, OCI-LOG-02): Pass only when Cloud Guard is ENABLED and there are no OPEN problems. A CRITICAL or HIGH `riskLevel` fails.
-- **10 Responder recipe activation** (logging, OCI-LOG-03): Pass when an ACTIVE recipe has a rule with `details.isEnabled=true`.
-- **11 Audit log retention** (logging, OCI-LOG-06): Pass when `retentionPeriodDays` >= 365.
-- **12 Event rules** (logging, OCI-LOG-05): Pass when an enabled ACTIVE rule condition references identity, policy, or network event types. Empty fails.
-- **13 Security list ingress** (guardrails, OCI-GRD-01): Fail when a rule allows `0.0.0.0/0` or `::/0` to ports 22, 3389, 1433, 3306, 5432 (protocol 6 or all, range containment).
-- **14 NSG rules** (guardrails, OCI-GRD-02)
-  - Same test on INGRESS `SecurityRule`s, with `isValid` recorded per rule.
-  - No NSGs passes only beside a complete, readable security list inventory.
-    - A security list compartment denied or capped demotes to warn and names it.
-    - None readable is manual.
-- **15 Internet gateway exposure** (guardrails, OCI-GRD-03)
-  - Warn when any gateway has `isEnabled=true`.
-  - No gateways passes only beside a complete, readable security list inventory (same demotion as OCI-GRD-02).
-- **16, 17 Bastion controls and sessions** (guardrails, OCI-GRD-04)
-  - Fail when a bastion combines a world allow list (`0.0.0.0/0` or `::/0`) with TTL > 3h.
-  - Fail when an ACTIVE session is older than 8h.
-  - Warn on TTL > 3h or an empty/world allow list alone.
-  - Folded.
-- **18, 19 Vault key rotation and algorithm strength** (guardrails, OCI-GRD-05)
-  - Fail when the newest ENABLED key version is older than 365 days.
-  - Fail when `Key.keyShape` (from `kms management key get`) is:
-    - AES below 32 bytes (AES-256)
-    - RSA below 512 bytes (RSA-4096)
-    - ECDSA without a documented `curveId` (NIST_P256, NIST_P384, NIST_P521 all pass)
-    - Outside the AES/RSA/ECDSA enum
-  - A denied key get caps the verdict at warn (some keys read) or manual (none read).
-  - Folded.
-- **20, 21 Bucket public access and PARs** (guardrails, OCI-GRD-06)
-  - Fail on `publicAccessType` other than `NoPublicAccess`.
-  - PARs expiring more than 30 days out warn.
-  - Folded.
-- **22 Block and boot volume CMK** (compute and storage, OCI-CMP-02, OCI-CMP-03): Fail when a live volume has no `kmsKeyId`.
-- **23 IMDSv2** (compute and storage, OCI-CMP-01): Fail when a live instance lacks `instanceOptions.areLegacyImdsEndpointsDisabled=true`.
-- **24 Budget alert rules** (not shipped, none): Deferred.
-- **25 OS Management patching** (not shipped, none): Deferred.
+| # | Spec control | Tool | Finding | Semantics |
+|---|--------------|------|---------|-----------|
+| 1 | IAM password policy | identity | OCI-IAM-01 | pass when `minimumPasswordLength` >= 14 and all four character classes are required; expiration is split into OCI-IAM-06 |
+| 1 | Password expiration | identity | OCI-IAM-06 | always manual: the IAM `PasswordPolicy` datatype has no expiration field |
+| 2 | MFA enforcement | identity | OCI-IAM-02 | pass when every ACTIVE console-capable user has `isMfaActivated=true`; no users or no console users is manual |
+| 3, 4, 5 | API key, customer secret key, auth token rotation | identity | OCI-IAM-03 | fail on any ACTIVE credential older than `stale_days`; undated items or cap hit at most warn (folded, per-kind evidence) |
+| 6 | Policy least privilege | identity | OCI-IAM-04 | warn on tenancy-wide `manage` statements; empty policy list is manual |
+| 7 | Compartment structure | identity | OCI-IAM-05 | fail when no ACTIVE non-root compartment exists |
+| 8 | Cloud Guard enabled | logging | OCI-LOG-01 | pass when configuration `status=ENABLED` and at least one ACTIVE target |
+| 9 | Cloud Guard open problems | logging | OCI-LOG-02 | pass only when Cloud Guard is ENABLED and no OPEN problems; CRITICAL/HIGH `riskLevel` fails |
+| 10 | Responder recipe activation | logging | OCI-LOG-03 | pass when an ACTIVE recipe has a rule with `details.isEnabled=true` |
+| 11 | Audit log retention | logging | OCI-LOG-06 | pass when `retentionPeriodDays` >= 365 |
+| 12 | Event rules | logging | OCI-LOG-05 | pass when an enabled ACTIVE rule condition references identity, policy, or network event types; empty fails |
+| 13 | Security list ingress | guardrails | OCI-GRD-01 | fail when a rule allows `0.0.0.0/0` or `::/0` to ports 22, 3389, 1433, 3306, 5432 (protocol 6 or all, range containment) |
+| 14 | NSG rules | guardrails | OCI-GRD-02 | same test on INGRESS `SecurityRule`s with `isValid` recorded per rule; no NSGs passes only beside a complete, readable security list inventory (a security list compartment denied or capped demotes to warn and names it; none readable is manual) |
+| 15 | Internet gateway exposure | guardrails | OCI-GRD-03 | warn when any gateway has `isEnabled=true`; no gateways passes only beside a complete, readable security list inventory (same demotion as OCI-GRD-02) |
+| 16, 17 | Bastion controls and sessions | guardrails | OCI-GRD-04 | fail when a bastion combines a world allow list (`0.0.0.0/0` or `::/0`) with TTL > 3h or when an ACTIVE session is older than 8h; warn on TTL > 3h or an empty/world allow list alone (folded) |
+| 18, 19 | Vault key rotation and algorithm strength | guardrails | OCI-GRD-05 | fail when the newest ENABLED key version is older than 365 days, or `Key.keyShape` (from `kms management key get`) is AES below 32 bytes (AES-256), RSA below 512 bytes (RSA-4096), ECDSA without a documented `curveId` (NIST_P256, NIST_P384, NIST_P521 all pass), or outside the AES/RSA/ECDSA enum; a denied key get caps the verdict at warn (some keys read) or manual (none read) (folded) |
+| 20, 21 | Bucket public access and PARs | guardrails | OCI-GRD-06 | fail on `publicAccessType` other than `NoPublicAccess`; PARs expiring more than 30 days out warn (folded) |
+| 22 | Block and boot volume CMK | compute and storage | OCI-CMP-02, OCI-CMP-03 | fail when a live volume has no `kmsKeyId` |
+| 23 | IMDSv2 | compute and storage | OCI-CMP-01 | fail when a live instance lacks `instanceOptions.areLegacyImdsEndpointsDisabled=true` |
+| 24 | Budget alert rules | not shipped | none | deferred |
+| 25 | OS Management patching | not shipped | none | deferred |
 
 The audit event visibility finding OCI-LOG-04 is supporting evidence, not a spec control.
 
@@ -269,59 +241,25 @@ The smoke test skips with exit 0 when no `~/.oci/config`, `OCI_CONFIG_FILE`, or 
 
 Every CLI command and output field is cited in `OCI_SURFACE_DOCS` in `cli/extensions/grc-tools/oci.ts`. Summary:
 
-- `oci iam compartment list --compartment-id-in-subtree true --access-level ACCESSIBLE --include-root true --all`
-  - Fields read: `id`, `compartmentId`, `name`, `lifecycleState`
-  - Reference: [ListCompartments](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/Compartment/ListCompartments)
-- `oci iam user list --all`
-  - Fields read: `id`, `name`, `lifecycleState`, `isMfaActivated`, `capabilities.canUseConsolePassword`
-  - Reference: [ListUsers](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/User/ListUsers)
-- `oci iam authentication-policy get`
-  - Fields read: `passwordPolicy.*`
-  - Reference: [PasswordPolicy](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/datatypes/PasswordPolicy)
-- `oci iam user api-key list`, `oci iam customer-secret-key list`, `oci iam auth-token list`
-  - Fields read: `fingerprint`/`id`, `timeCreated`, `lifecycleState`
-  - References: [ApiKey](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/datatypes/ApiKey), [CustomerSecretKeySummary](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/datatypes/CustomerSecretKeySummary), [AuthToken](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/datatypes/AuthToken)
-- `oci iam policy list --all` (per compartment)
-  - Fields read: `name`, `statements`, `lifecycleState`
-  - Reference: [ListPolicies](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/Policy/ListPolicies)
-- `oci iam availability-domain list`
-  - Fields read: `name`
-  - Reference: [ListAvailabilityDomains](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/AvailabilityDomain/ListAvailabilityDomains)
-- `oci audit config get`
-  - Fields read: `retentionPeriodDays`
-  - Reference: [GetConfiguration](https://docs.oracle.com/en-us/iaas/api/#/en/audit/20190901/Configuration/GetConfiguration)
-- `oci audit event list --all`
-  - Fields read: `eventId`, `eventTime`
-  - Reference: [ListEvents](https://docs.oracle.com/en-us/iaas/api/#/en/audit/20190901/AuditEvent/ListEvents)
-- `oci cloud-guard configuration get`
-  - Fields read: `status`, `reportingRegion`
-  - Reference: [GetConfiguration](https://docs.oracle.com/en-us/iaas/api/#/en/cloud-guard/20200131/Configuration/GetConfiguration)
-- `oci cloud-guard target list`, `problem list --lifecycle-detail OPEN`, `responder-recipe list` (subtree, ACCESSIBLE, `--all`)
-  - Fields read: `lifecycleState`, `lifecycleDetail`, `riskLevel`, `responderRules[].details.isEnabled`
-  - References: [ListTargets](https://docs.oracle.com/en-us/iaas/api/#/en/cloud-guard/20200131/TargetSummary/ListTargets), [ListProblems](https://docs.oracle.com/en-us/iaas/api/#/en/cloud-guard/20200131/ProblemSummary/ListProblems), [ListResponderRecipes](https://docs.oracle.com/en-us/iaas/api/#/en/cloud-guard/20200131/ResponderRecipeSummary/ListResponderRecipes)
-- `oci events rule list --all` (per compartment)
-  - Fields read: `condition`, `isEnabled`, `lifecycleState`
-  - Reference: [ListRules](https://docs.oracle.com/en-us/iaas/api/#/en/events/20181201/RuleSummary/ListRules)
-- `oci network security-list list`, `nsg list`, `nsg rules list --nsg-id --direction INGRESS`, `internet-gateway list` (per compartment, `--all`)
-  - Fields read: `ingressSecurityRules[]`, `SecurityRule.direction/source/protocol/isValid/tcpOptions`, `isEnabled`
-  - References: [ListSecurityLists](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/SecurityList/ListSecurityLists), [ListNetworkSecurityGroupSecurityRules](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/SecurityRule/ListNetworkSecurityGroupSecurityRules), [ListInternetGateways](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/InternetGateway/ListInternetGateways)
-- `oci bastion bastion list`, `bastion get`, `session list`
-  - Fields read: `maxSessionTtlInSeconds`, `clientCidrBlockAllowList`, `SessionSummary.lifecycleState/timeCreated/sessionTtlInSeconds`
-  - References: [GetBastion](https://docs.oracle.com/en-us/iaas/api/#/en/bastion/20210331/Bastion/GetBastion), [ListSessions](https://docs.oracle.com/en-us/iaas/api/#/en/bastion/20210331/SessionSummary/ListSessions)
-- `oci kms management vault list`, `key list --endpoint`, `key-version list --endpoint`
-  - Fields read: `managementEndpoint`, `KeySummary.id/displayName/lifecycleState`, `KeyVersionSummary.timeCreated/lifecycleState`
-  - References: [ListVaults](https://docs.oracle.com/en-us/iaas/api/#/en/key/release/VaultSummary/ListVaults), [ListKeys](https://docs.oracle.com/en-us/iaas/api/#/en/key/release/KeySummary/ListKeys), [ListKeyVersions](https://docs.oracle.com/en-us/iaas/api/#/en/key/release/KeyVersionSummary/ListKeyVersions)
-- `oci kms management key get --key-id --endpoint` (per ENABLED key, capped by `max_keys`)
-  - Fields read: `Key.keyShape.algorithm`, `Key.keyShape.length` (bytes), `Key.keyShape.curveId`, `lifecycleState`
-  - References: [GetKey](https://docs.oracle.com/en-us/iaas/api/#/en/key/release/Key/GetKey), [KeyShape](https://docs.oracle.com/en-us/iaas/api/#/en/key/release/datatypes/KeyShape), [CLI key get](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/kms/management/key/get.html)
-- `oci os ns get`, `os bucket list`, `os bucket get`, `os preauth-request list`
-  - Fields read: `Bucket.publicAccessType`, `PreauthenticatedRequestSummary.timeExpires`
-  - References: [GetBucket](https://docs.oracle.com/en-us/iaas/api/#/en/objectstorage/20160918/Bucket/GetBucket), [ListPreauthenticatedRequests](https://docs.oracle.com/en-us/iaas/api/#/en/objectstorage/20160918/PreauthenticatedRequestSummary/ListPreauthenticatedRequests)
-- `oci compute instance list --all` (per compartment)
-  - Fields read: `lifecycleState`, `instanceOptions.areLegacyImdsEndpointsDisabled`
-  - Reference: [ListInstances](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/Instance/ListInstances)
-- `oci bv volume list --all`, `oci bv boot-volume list --availability-domain --all` (per compartment)
-  - Fields read: `lifecycleState`, `kmsKeyId`
-  - References: [ListVolumes](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/Volume/ListVolumes), [ListBootVolumes](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/BootVolume/ListBootVolumes)
+| Command | Fields read | Reference |
+|---------|-------------|-----------|
+| `oci iam compartment list --compartment-id-in-subtree true --access-level ACCESSIBLE --include-root true --all` | `id`, `compartmentId`, `name`, `lifecycleState` | [ListCompartments](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/Compartment/ListCompartments) |
+| `oci iam user list --all` | `id`, `name`, `lifecycleState`, `isMfaActivated`, `capabilities.canUseConsolePassword` | [ListUsers](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/User/ListUsers) |
+| `oci iam authentication-policy get` | `passwordPolicy.*` | [PasswordPolicy](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/datatypes/PasswordPolicy) |
+| `oci iam user api-key list`, `oci iam customer-secret-key list`, `oci iam auth-token list` | `fingerprint`/`id`, `timeCreated`, `lifecycleState` | [ApiKey](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/datatypes/ApiKey), [CustomerSecretKeySummary](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/datatypes/CustomerSecretKeySummary), [AuthToken](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/datatypes/AuthToken) |
+| `oci iam policy list --all` (per compartment) | `name`, `statements`, `lifecycleState` | [ListPolicies](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/Policy/ListPolicies) |
+| `oci iam availability-domain list` | `name` | [ListAvailabilityDomains](https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/AvailabilityDomain/ListAvailabilityDomains) |
+| `oci audit config get` | `retentionPeriodDays` | [GetConfiguration](https://docs.oracle.com/en-us/iaas/api/#/en/audit/20190901/Configuration/GetConfiguration) |
+| `oci audit event list --all` | `eventId`, `eventTime` | [ListEvents](https://docs.oracle.com/en-us/iaas/api/#/en/audit/20190901/AuditEvent/ListEvents) |
+| `oci cloud-guard configuration get` | `status`, `reportingRegion` | [GetConfiguration](https://docs.oracle.com/en-us/iaas/api/#/en/cloud-guard/20200131/Configuration/GetConfiguration) |
+| `oci cloud-guard target list`, `problem list --lifecycle-detail OPEN`, `responder-recipe list` (subtree, ACCESSIBLE, `--all`) | `lifecycleState`, `lifecycleDetail`, `riskLevel`, `responderRules[].details.isEnabled` | [ListTargets](https://docs.oracle.com/en-us/iaas/api/#/en/cloud-guard/20200131/TargetSummary/ListTargets), [ListProblems](https://docs.oracle.com/en-us/iaas/api/#/en/cloud-guard/20200131/ProblemSummary/ListProblems), [ListResponderRecipes](https://docs.oracle.com/en-us/iaas/api/#/en/cloud-guard/20200131/ResponderRecipeSummary/ListResponderRecipes) |
+| `oci events rule list --all` (per compartment) | `condition`, `isEnabled`, `lifecycleState` | [ListRules](https://docs.oracle.com/en-us/iaas/api/#/en/events/20181201/RuleSummary/ListRules) |
+| `oci network security-list list`, `nsg list`, `nsg rules list --nsg-id --direction INGRESS`, `internet-gateway list` (per compartment, `--all`) | `ingressSecurityRules[]`, `SecurityRule.direction/source/protocol/isValid/tcpOptions`, `isEnabled` | [ListSecurityLists](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/SecurityList/ListSecurityLists), [ListNetworkSecurityGroupSecurityRules](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/SecurityRule/ListNetworkSecurityGroupSecurityRules), [ListInternetGateways](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/InternetGateway/ListInternetGateways) |
+| `oci bastion bastion list`, `bastion get`, `session list` | `maxSessionTtlInSeconds`, `clientCidrBlockAllowList`, `SessionSummary.lifecycleState/timeCreated/sessionTtlInSeconds` | [GetBastion](https://docs.oracle.com/en-us/iaas/api/#/en/bastion/20210331/Bastion/GetBastion), [ListSessions](https://docs.oracle.com/en-us/iaas/api/#/en/bastion/20210331/SessionSummary/ListSessions) |
+| `oci kms management vault list`, `key list --endpoint`, `key-version list --endpoint` | `managementEndpoint`, `KeySummary.id/displayName/lifecycleState`, `KeyVersionSummary.timeCreated/lifecycleState` | [ListVaults](https://docs.oracle.com/en-us/iaas/api/#/en/key/release/VaultSummary/ListVaults), [ListKeys](https://docs.oracle.com/en-us/iaas/api/#/en/key/release/KeySummary/ListKeys), [ListKeyVersions](https://docs.oracle.com/en-us/iaas/api/#/en/key/release/KeyVersionSummary/ListKeyVersions) |
+| `oci kms management key get --key-id --endpoint` (per ENABLED key, capped by `max_keys`) | `Key.keyShape.algorithm`, `Key.keyShape.length` (bytes), `Key.keyShape.curveId`, `lifecycleState` | [GetKey](https://docs.oracle.com/en-us/iaas/api/#/en/key/release/Key/GetKey), [KeyShape](https://docs.oracle.com/en-us/iaas/api/#/en/key/release/datatypes/KeyShape), [CLI key get](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/kms/management/key/get.html) |
+| `oci os ns get`, `os bucket list`, `os bucket get`, `os preauth-request list` | `Bucket.publicAccessType`, `PreauthenticatedRequestSummary.timeExpires` | [GetBucket](https://docs.oracle.com/en-us/iaas/api/#/en/objectstorage/20160918/Bucket/GetBucket), [ListPreauthenticatedRequests](https://docs.oracle.com/en-us/iaas/api/#/en/objectstorage/20160918/PreauthenticatedRequestSummary/ListPreauthenticatedRequests) |
+| `oci compute instance list --all` (per compartment) | `lifecycleState`, `instanceOptions.areLegacyImdsEndpointsDisabled` | [ListInstances](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/Instance/ListInstances) |
+| `oci bv volume list --all`, `oci bv boot-volume list --availability-domain --all` (per compartment) | `lifecycleState`, `kmsKeyId` | [ListVolumes](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/Volume/ListVolumes), [ListBootVolumes](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/BootVolume/ListBootVolumes) |
 
 The CLI `--all` flag follows `opc-next-page` pagination to completion. No `--query` projections are used.

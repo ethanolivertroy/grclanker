@@ -28,18 +28,18 @@ Configuration resolves in this order of precedence: explicit tool arguments, the
 
 A higher-precedence source that supplies credentials replaces credentials of a different type from a lower-precedence source. For example, passing `username` and `password` to a tool wins over `ELASTIC_API_KEY` in the environment.
 
-Environment variables:
-
-- `ELASTIC_URL` (or `ELASTICSEARCH_URL`): Elasticsearch base URL, for example `https://es.example.com:9200` or `https://<deployment>.es.<region>.cloud.es.io:9243`.
-- `ELASTIC_API_KEY`: API key as `base64(id:api_key)`. An `id:api_key` pair is encoded automatically. The key is sent as `Authorization: ApiKey ...`.
-- `ELASTIC_USERNAME`, `ELASTIC_PASSWORD`: Basic authentication, sent as `Authorization: Basic ...`.
-- `ELASTIC_BEARER_TOKEN`: OAuth2, SAML, or OIDC access token, sent as `Authorization: Bearer ...`.
-- `KIBANA_URL`: Kibana base URL. Kibana controls become `manual` findings when omitted.
-- `KIBANA_SPACE_ID`: Kibana space for space-aware paths (`/s/{space}/api/...`). Omit for the default space.
-- `ELASTIC_CLOUD_API_KEY`: Elastic Cloud API key for deployment inventory (optional).
-- `ELASTIC_CLOUD_API_URL`: Elastic Cloud API base URL, default `https://api.elastic-cloud.com`.
-- `ELASTIC_TIMEOUT`: HTTP timeout in seconds, default 30.
-- `ELASTIC_SEC_INSPECTOR_CONFIG`: Path to a YAML config file, default `~/.elastic-sec-inspector/config.yaml`.
+| Environment variable | Purpose |
+|----------------------|---------|
+| `ELASTIC_URL` (or `ELASTICSEARCH_URL`) | Elasticsearch base URL, for example `https://es.example.com:9200` or `https://<deployment>.es.<region>.cloud.es.io:9243` |
+| `ELASTIC_API_KEY` | API key as `base64(id:api_key)`; an `id:api_key` pair is encoded automatically (sent as `Authorization: ApiKey ...`) |
+| `ELASTIC_USERNAME`, `ELASTIC_PASSWORD` | Basic authentication (sent as `Authorization: Basic ...`) |
+| `ELASTIC_BEARER_TOKEN` | OAuth2, SAML, or OIDC access token (sent as `Authorization: Bearer ...`) |
+| `KIBANA_URL` | Kibana base URL. Kibana controls become `manual` findings when omitted |
+| `KIBANA_SPACE_ID` | Kibana space for space-aware paths (`/s/{space}/api/...`); omit for the default space |
+| `ELASTIC_CLOUD_API_KEY` | Elastic Cloud API key for deployment inventory (optional) |
+| `ELASTIC_CLOUD_API_URL` | Elastic Cloud API base URL, default `https://api.elastic-cloud.com` |
+| `ELASTIC_TIMEOUT` | HTTP timeout in seconds, default 30 |
+| `ELASTIC_SEC_INSPECTOR_CONFIG` | Path to a YAML config file, default `~/.elastic-sec-inspector/config.yaml` |
 
 The same Elasticsearch credential is sent to Kibana, which accepts Elasticsearch API keys and basic credentials.
 
@@ -64,16 +64,16 @@ Flat keys such as `kibana_url`, `space_id`, `username`, `password`, `bearer_toke
 
 Create a dedicated read-only auditing role. `elastic_check_access` probes these privileges with `POST /_security/user/_has_privileges` and lists any that are missing.
 
-Each cluster privilege and the surfaces it unlocks:
-
-- `monitor`: `/_cluster/settings`, `/_nodes/settings`, `/_ssl/certificates`, `/_license`, `/_xpack`, `/_xpack/usage`.
-- `read_security` (or `manage_security`): `/_security/user`, `/_security/role`, `/_security/role_mapping`, `/_security/_query/api_key`.
-- `manage_api_key`: `with_limited_by=true` on the query API keys endpoint, which exposes owner privileges for keys that inherit them.
-- `read_pipeline` (or `manage_pipeline`): `/_ingest/pipeline`.
-- `monitor_snapshot`: `/_snapshot/_all`.
-- `read_ilm` (or `manage_ilm`): `/_ilm/status`, `/_ilm/policy`.
-- `read_slm` (or `manage_slm`): `/_slm/status`, `/_slm/policy`.
-- `monitor_watcher`: `/_watcher/_query/watches`.
+| Cluster privilege | Surfaces it unlocks |
+|-------------------|---------------------|
+| `monitor` | `/_cluster/settings`, `/_nodes/settings`, `/_ssl/certificates`, `/_license`, `/_xpack`, `/_xpack/usage` |
+| `read_security` (or `manage_security`) | `/_security/user`, `/_security/role`, `/_security/role_mapping`, `/_security/_query/api_key` |
+| `manage_api_key` | `with_limited_by=true` on the query API keys endpoint, which exposes owner privileges for keys that inherit them |
+| `read_pipeline` (or `manage_pipeline`) | `/_ingest/pipeline` |
+| `monitor_snapshot` | `/_snapshot/_all` |
+| `read_ilm` (or `manage_ilm`) | `/_ilm/status`, `/_ilm/policy` |
+| `read_slm` (or `manage_slm`) | `/_slm/status`, `/_slm/policy` |
+| `monitor_watcher` | `/_watcher/_query/watches` |
 
 For Kibana, grant read access to these features across the spaces you intend to audit:
 
@@ -87,13 +87,15 @@ Elastic Cloud deployment inventory needs an organization-level Cloud API key wit
 
 ## Tools
 
-- `elastic_check_access`: Probes every read surface (29 endpoints across Elasticsearch, Kibana, and Elastic Cloud). Reports readable, not readable, and not configured surfaces, and lists missing cluster and index privileges.
-- `elastic_assess_identity`: Controls 1, 9, 10, 13, 14 (realms, API key hygiene and scope, SSO mapping, anonymous access).
-- `elastic_assess_access_control`: Controls 6, 7, 8 (roles and users, field-level security, document-level security).
-- `elastic_assess_transport_security`: Controls 2, 3, 4, 5 (transport TLS, HTTP TLS, minimum TLS version, certificate expiration).
-- `elastic_assess_cluster_hardening`: Controls 11, 12, 17, 18, 19, 20, 22, 23 (audit logging and output, ILM, snapshots, cluster security settings, Watcher and alerting, ingest pipelines, license).
-- `elastic_assess_kibana`: Controls 15, 16, 21 (Kibana spaces, Kibana roles, Fleet).
-- `elastic_export_audit_bundle`: Runs every assessment and writes `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a `.zip`.
+| Tool | Purpose |
+|------|---------|
+| `elastic_check_access` | Probe every read surface (29 endpoints across Elasticsearch, Kibana, and Elastic Cloud), report readable, not readable, and not configured surfaces, and list missing cluster and index privileges |
+| `elastic_assess_identity` | Controls 1, 9, 10, 13, 14: realms, API key hygiene and scope, SSO mapping, anonymous access |
+| `elastic_assess_access_control` | Controls 6, 7, 8: roles and users, field-level security, document-level security |
+| `elastic_assess_transport_security` | Controls 2, 3, 4, 5: transport TLS, HTTP TLS, minimum TLS version, certificate expiration |
+| `elastic_assess_cluster_hardening` | Controls 11, 12, 17, 18, 19, 20, 22, 23: audit logging and output, ILM, snapshots, cluster security settings, Watcher and alerting, ingest pipelines, license |
+| `elastic_assess_kibana` | Controls 15, 16, 21: Kibana spaces, Kibana roles, Fleet |
+| `elastic_export_audit_bundle` | Run every assessment and write `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a `.zip` |
 
 All tools accept the connection arguments: `elasticsearch_url`, `kibana_url`, `space_id`, `api_key`, `username`, `password`, `bearer_token`, `cloud_api_key`, `cloud_api_url`, `config_file`, and `timeout_seconds`.
 
@@ -186,110 +188,31 @@ Every verdict follows the same evidence rules, so a `pass` is never produced fro
 
 ### Verdicts by control
 
-Each entry names the control, then the tool and finding that cover it, then the status semantics.
-
-- **1 Authentication realm configuration** (`elastic_assess_identity`, `ELASTIC-01`)
-  - Pass when an LDAP, Active Directory, PKI, SAML, Kerberos, OIDC, or JWT realm is enabled. Disabled realms do not count.
-  - Fail when only native or file realms are visible.
-  - Warn when `xpack.security.enabled` is not visible or node settings cover only some nodes.
-  - Manual when realm settings are unreadable.
-- **2 TLS enforcement on the transport layer** (`elastic_assess_transport_security`, `ELASTIC-02`)
-  - Fail when `xpack.security.transport.ssl.enabled` is false on any node or security is disabled.
-  - Warn when `verification_mode` is `none`, or when `xpack.security.transport.ssl.enabled` is unset (documented default false) and only usage statistics report TLS.
-  - Also warn when `xpack.security.enabled` is not visible or only some nodes responded.
-- **3 TLS enforcement on the HTTP layer** (`elastic_assess_transport_security`, `ELASTIC-03`)
-  - Fail when `xpack.security.http.ssl.enabled` is false or the configured URL is plain http.
-  - Warn when TLS terminates upstream of an https endpoint, the security flag is not visible, or only some nodes responded.
-- **4 Minimum TLS protocol version** (`elastic_assess_transport_security`, `ELASTIC-04`)
-  - Fail when `supported_protocols` includes anything below TLSv1.2.
-  - Warn when `xpack.security.transport.ssl.supported_protocols` or `xpack.security.http.ssl.supported_protocols` is unset on any node, regardless of version, because the documented default permits TLSv1.1. That default is `TLSv1.3,TLSv1.2,TLSv1.1`, or `TLSv1.2,TLSv1.1` when the JVM lacks TLSv1.3.
-  - Also warn when the security flag is not visible or only some nodes responded.
-  - Pass only when both layers are explicitly restricted to TLSv1.2 and newer on every node.
-- **5 Certificate expiration** (`elastic_assess_transport_security`, `ELASTIC-05`)
-  - Fail when any certificate has expired.
-  - Warn when a certificate expires within `cert_expiry_warning_days`, or a certificate reports no expiry date (not counted as valid).
-  - Also warn when the cluster has more nodes than the single node `GET /_ssl/certificates` reports on.
-  - Manual when the certificate list is empty.
-- **6 Role-based access control** (`elastic_assess_access_control`, `ELASTIC-06`)
-  - Fail when superuser holders exceed `max_superusers` or users hold custom roles granting cluster `all` or index `all` on `*` (still fails when roles are unreadable).
-  - Warn when such roles or mappings exist unused.
-  - Manual when the user or role inventory is empty or unreadable.
-- **7 Field-level security** (`elastic_assess_access_control`, `ELASTIC-07`)
-  - With `sensitive_index_patterns`, fail when a pattern has no FLS role.
-  - Without patterns, warn when no role uses FLS.
-  - On a license below Platinum, fail when patterns are supplied (they cannot be protected), and otherwise manual (not applicable).
-  - Manual when roles or the license are unreadable.
-  - Warn when patterns are covered but the tier cannot be confirmed.
-- **8 Document-level security** (`elastic_assess_access_control`, `ELASTIC-08`): Same semantics as control 7, using `tenant_index_patterns` and DLS queries.
-- **9 API key management** (`elastic_assess_identity`, `ELASTIC-09`)
-  - Fail when non-Fleet active keys lack expiration or exceed `max_api_key_age_days`.
-  - Warn when only Fleet-managed keys lack expiration or exceed `max_api_key_age_days`.
-  - Also warn when invalidated or expired keys linger, or active keys report no creation date.
-  - Also warn when the credential sees only its own keys, or the list is truncated (seen and total reported).
-  - Zero keys passes only with full inventory visibility, because the control concerns existing keys.
-- **10 API key privilege scope** (`elastic_assess_identity`, `ELASTIC-10`)
-  - Fail when active keys grant cluster `all` (or inherit superuser via `limited_by`).
-  - Warn when `limited_by` is not visible or the inventory is partial or truncated.
-- **11 Audit logging enabled** (`elastic_assess_cluster_hardening`, `ELASTIC-11`)
-  - `xpack.security.audit.enabled` is dynamic, so it resolves as transient over persistent cluster settings over each node's `elasticsearch.yml` over the documented default (false).
-  - Fail when the effective value is not true on every inspected node, or the license does not include audit logging.
-  - Warn when the effective include list omits `authentication_failed`, `access_denied`, or `security_config_change`. The effective include list is the explicit list, or the documented nine-event default including `access_granted`.
-  - Also warn when the security flag is not visible or only some nodes responded.
-- **12 Audit log output** (`elastic_assess_cluster_hardening`, `ELASTIC-12`)
-  - Fail when auditing is disabled.
-  - Otherwise always `manual`, because Elasticsearch only writes audit events to the local `logfile` output and forwarding cannot be observed through the API.
-- **13 SAML/OIDC SSO configuration** (`elastic_assess_identity`, `ELASTIC-13`)
-  - Pass when each enabled SAML or OIDC realm defines a principal attribute or claim and has enabled role mappings or authorization realms on an active Platinum or higher license.
-  - Fail when a realm has zero enabled role mappings and no authorization realms, or the license does not cover SSO.
-  - Warn when a realm is incomplete or the license or security flag cannot be confirmed.
-  - Manual (not applicable) when no enabled SAML or OIDC realm is configured.
-- **14 Anonymous access disabled** (`elastic_assess_identity`, `ELASTIC-14`)
-  - Pass when no anonymous roles are configured. Absence is the compliant state.
-  - Fail when anonymous roles include superuser or broad privileges.
-  - Warn when other roles are set, the security flag is not visible, or only some nodes responded.
-  - Transient settings override persistent ones.
-- **15 Kibana space isolation** (`elastic_assess_kibana`, `ELASTIC-15`)
-  - Pass when multiple spaces exist and custom roles are space-scoped, with no custom role granting `all` across `*`.
-  - Warn when only the default space exists.
-  - Manual when the space list is empty (the default space always exists) or spaces or roles are unreadable.
-- **16 Kibana role privileges** (`elastic_assess_kibana`, `ELASTIC-16`)
-  - Fail when a custom Kibana role grants base `all` across every space.
-  - Warn when only reserved roles exist (no privilege separation was implemented).
-  - Manual when roles are empty or unreadable.
-- **17 Index lifecycle policies** (`elastic_assess_cluster_hardening`, `ELASTIC-17`)
-  - Fail when no ILM policy exists or ILM is not `RUNNING`.
-  - Warn when an in-use policy has no delete phase.
-  - Manual when `GET /_ilm/status` or the policy list is unreadable.
-- **18 Snapshot encryption** (`elastic_assess_cluster_hardening`, `ELASTIC-18`)
-  - Fail when no repository or no SLM policy exists, or SLM is not `RUNNING`.
-  - Pass for GCS and Azure (platform encrypted) and S3 with `server_side_encryption`.
-  - Warn when an SLM policy reports no `last_success` (not counted as a working backup).
-  - `manual` for `fs`, `hdfs`, `url`, and S3 without `server_side_encryption`, or when `GET /_slm/status` is unreadable.
-- **19 Cluster security settings** (`elastic_assess_cluster_hardening`, `ELASTIC-19`)
-  - Fail when `xpack.security.enabled` is false.
-  - Warn when password hashing is not a bcrypt or pbkdf2 variant.
-  - Also warn when the security flag is not visible in node settings, cluster settings, usage statistics, or xpack info.
-  - Also warn when only some nodes responded.
-- **20 Watcher and alerting security** (`elastic_assess_cluster_hardening`, `ELASTIC-20`)
-  - Fail when watch webhooks or Kibana connectors target plain http.
-  - Warn when watch actions embed basic-auth credentials, connectors are missing secrets, a list is truncated, or connectors were read from one space while other spaces exist.
-  - Manual when watches or connectors are unreadable, Kibana is scoped out, or Watcher is unlicensed and Kibana is not configured.
-  - A confirmed unlicensed Watcher is reported as not applicable, and only connectors are assessed.
-- **21 Fleet agent policy security** (`elastic_assess_kibana`, `ELASTIC-21`)
-  - Fail when Fleet outputs or Fleet Server hosts use plain http.
-  - Warn when policies lack tamper protection (`is_protected` not true), outputs pin no CA trust, active enrollment keys exceed `max_enrollment_keys_per_policy`, or the policy list is truncated.
-  - Manual (not applicable) when zero policies exist in the inspected space, or when any Fleet endpoint is unreadable.
-- **22 Ingest pipeline security** (`elastic_assess_cluster_hardening`, `ELASTIC-22`)
-  - Fail when a custom pipeline `set` processor assigns a literal sensitive-looking value.
-  - Warn when custom pipelines use `script` processors.
-  - Manual when the pipeline list is empty (Elasticsearch ships managed pipelines) or unreadable.
-- **23 License level verification** (`elastic_assess_cluster_hardening`, `ELASTIC-23`)
-  - Fail when the license tier does not cover configured features. SAML, OIDC, Kerberos, JWT, FLS, and DLS need Platinum. LDAP, AD, PKI, audit logging, and Watcher need Gold.
-  - Also fail when the license status is `invalid` or `expired`, or no license type is returned. `active` and `valid` both count as active per the documented `LicenseStatus` values.
-  - Warn for trial, expiry within 30 days, a missing expiry date, a missing status field, or when only some nodes responded.
-  - The requirement set is built from the realms, roles, audit setting, and watches actually read.
-  - A truncated watches listing (rows read, or a server total above zero, at a cap) still counts Watcher as in use. It names `watches` under `partial_sources`, reports `requirements_complete: false`, and caps a clean verdict at warn.
-  - A `fail` on the features read stays `fail`.
+| # | Control | Tool | Finding | Status semantics |
+|---|---------|------|---------|------------------|
+| 1 | Authentication realm configuration | `elastic_assess_identity` | `ELASTIC-01` | pass when an LDAP, Active Directory, PKI, SAML, Kerberos, OIDC, or JWT realm is enabled (disabled realms do not count); fail when only native or file realms are visible; warn when `xpack.security.enabled` is not visible or node settings cover only some nodes; manual when realm settings are unreadable |
+| 2 | TLS enforcement on the transport layer | `elastic_assess_transport_security` | `ELASTIC-02` | fail when `xpack.security.transport.ssl.enabled` is false on any node or security is disabled; warn when `verification_mode` is `none`, the setting is unset (documented default false) and only usage statistics report TLS, `xpack.security.enabled` is not visible, or only some nodes responded |
+| 3 | TLS enforcement on the HTTP layer | `elastic_assess_transport_security` | `ELASTIC-03` | fail when `xpack.security.http.ssl.enabled` is false or the configured URL is plain http; warn when TLS terminates upstream of an https endpoint, the security flag is not visible, or only some nodes responded |
+| 4 | Minimum TLS protocol version | `elastic_assess_transport_security` | `ELASTIC-04` | fail when `supported_protocols` includes anything below TLSv1.2; warn when `xpack.security.transport.ssl.supported_protocols` or `xpack.security.http.ssl.supported_protocols` is unset on any node regardless of version, because the documented default is `TLSv1.3,TLSv1.2,TLSv1.1` (or `TLSv1.2,TLSv1.1` when the JVM lacks TLSv1.3) and permits TLSv1.1; also warn when the security flag is not visible or only some nodes responded; pass only when both layers are explicitly restricted to TLSv1.2 and newer on every node |
+| 5 | Certificate expiration | `elastic_assess_transport_security` | `ELASTIC-05` | fail when any certificate has expired; warn when one expires within `cert_expiry_warning_days`, a certificate reports no expiry date (not counted as valid), or the cluster has more nodes than the single node `GET /_ssl/certificates` reports on; manual when the certificate list is empty |
+| 6 | Role-based access control | `elastic_assess_access_control` | `ELASTIC-06` | fail when superuser holders exceed `max_superusers` or users hold custom roles granting cluster `all` or index `all` on `*` (still fails when roles are unreadable); warn when such roles or mappings exist unused; manual when the user or role inventory is empty or unreadable |
+| 7 | Field-level security | `elastic_assess_access_control` | `ELASTIC-07` | with `sensitive_index_patterns`, fail when a pattern has no FLS role; without patterns, warn when no role uses FLS; on a license below Platinum, fail when patterns are supplied (they cannot be protected) and otherwise manual (not applicable); manual when roles or the license are unreadable; warn when patterns are covered but the tier cannot be confirmed |
+| 8 | Document-level security | `elastic_assess_access_control` | `ELASTIC-08` | same semantics as control 7 using `tenant_index_patterns` and DLS queries |
+| 9 | API key management | `elastic_assess_identity` | `ELASTIC-09` | fail when non-Fleet active keys lack expiration or exceed `max_api_key_age_days`; warn when only Fleet-managed keys do, invalidated or expired keys linger, active keys report no creation date, the credential sees only its own keys, or the list is truncated (seen and total reported); zero keys passes only with full inventory visibility because the control concerns existing keys |
+| 10 | API key privilege scope | `elastic_assess_identity` | `ELASTIC-10` | fail when active keys grant cluster `all` (or inherit superuser via `limited_by`); warn when `limited_by` is not visible or the inventory is partial or truncated |
+| 11 | Audit logging enabled | `elastic_assess_cluster_hardening` | `ELASTIC-11` | `xpack.security.audit.enabled` is dynamic, so it resolves as transient over persistent cluster settings over each node's `elasticsearch.yml` over the documented default (false); fail when the effective value is not true on every inspected node or the license does not include audit logging; warn when the effective include list (explicit list, or the documented nine-event default including `access_granted`) omits `authentication_failed`, `access_denied`, or `security_config_change`, the security flag is not visible, or only some nodes responded |
+| 12 | Audit log output | `elastic_assess_cluster_hardening` | `ELASTIC-12` | fail when auditing is disabled; otherwise always `manual`, because Elasticsearch only writes audit events to the local `logfile` output and forwarding cannot be observed through the API |
+| 13 | SAML/OIDC SSO configuration | `elastic_assess_identity` | `ELASTIC-13` | pass when each enabled SAML or OIDC realm defines a principal attribute or claim and has enabled role mappings or authorization realms on an active Platinum or higher license; fail when a realm has zero enabled role mappings and no authorization realms, or the license does not cover SSO; warn when a realm is incomplete or the license or security flag cannot be confirmed; manual (not applicable) when no enabled SAML or OIDC realm is configured |
+| 14 | Anonymous access disabled | `elastic_assess_identity` | `ELASTIC-14` | pass when no anonymous roles are configured (absence is the compliant state); fail when anonymous roles include superuser or broad privileges; warn when other roles are set, the security flag is not visible, or only some nodes responded; transient settings override persistent ones |
+| 15 | Kibana space isolation | `elastic_assess_kibana` | `ELASTIC-15` | pass when multiple spaces exist and custom roles are space-scoped with no custom role granting `all` across `*`; warn when only the default space exists; manual when the space list is empty (the default space always exists) or spaces or roles are unreadable |
+| 16 | Kibana role privileges | `elastic_assess_kibana` | `ELASTIC-16` | fail when a custom Kibana role grants base `all` across every space; warn when only reserved roles exist (no privilege separation was implemented); manual when roles are empty or unreadable |
+| 17 | Index lifecycle policies | `elastic_assess_cluster_hardening` | `ELASTIC-17` | fail when no ILM policy exists or ILM is not `RUNNING`; warn when an in-use policy has no delete phase; manual when `GET /_ilm/status` or the policy list is unreadable |
+| 18 | Snapshot encryption | `elastic_assess_cluster_hardening` | `ELASTIC-18` | fail when no repository or no SLM policy exists or SLM is not `RUNNING`; pass for GCS and Azure (platform encrypted) and S3 with `server_side_encryption`; warn when an SLM policy reports no `last_success` (not counted as a working backup); `manual` for `fs`, `hdfs`, `url`, and S3 without the setting, or when `GET /_slm/status` is unreadable |
+| 19 | Cluster security settings | `elastic_assess_cluster_hardening` | `ELASTIC-19` | fail when `xpack.security.enabled` is false; warn when password hashing is not a bcrypt or pbkdf2 variant, the security flag is not visible in node settings, cluster settings, usage statistics, or xpack info, or only some nodes responded |
+| 20 | Watcher and alerting security | `elastic_assess_cluster_hardening` | `ELASTIC-20` | fail when watch webhooks or Kibana connectors target plain http; warn when watch actions embed basic-auth credentials, connectors are missing secrets, a list is truncated, or connectors were read from one space while other spaces exist; manual when watches or connectors are unreadable, Kibana is scoped out, or Watcher is unlicensed and Kibana is not configured; a confirmed unlicensed Watcher is reported as not applicable and only connectors are assessed |
+| 21 | Fleet agent policy security | `elastic_assess_kibana` | `ELASTIC-21` | fail when Fleet outputs or Fleet Server hosts use plain http; warn when policies lack tamper protection (`is_protected` not true), outputs pin no CA trust, active enrollment keys exceed `max_enrollment_keys_per_policy`, or the policy list is truncated; manual (not applicable) when zero policies exist in the inspected space, or when any Fleet endpoint is unreadable |
+| 22 | Ingest pipeline security | `elastic_assess_cluster_hardening` | `ELASTIC-22` | fail when a custom pipeline `set` processor assigns a literal sensitive-looking value; warn when custom pipelines use `script` processors; manual when the pipeline list is empty (Elasticsearch ships managed pipelines) or unreadable |
+| 23 | License level verification | `elastic_assess_cluster_hardening` | `ELASTIC-23` | fail when the license tier does not cover configured features (SAML, OIDC, Kerberos, JWT, FLS, DLS need Platinum; LDAP, AD, PKI, audit logging, Watcher need Gold), the license status is `invalid` or `expired` (`active` and `valid` both count as active per the documented `LicenseStatus` values), or no license type is returned; warn for trial, expiry within 30 days, a missing expiry date, a missing status field, or when only some nodes responded. The requirement set is built from the realms, roles, audit setting, and watches actually read: a truncated watches listing (rows read, or a server total above zero, at a cap) still counts Watcher as in use, names `watches` under `partial_sources`, reports `requirements_complete: false`, and caps a clean verdict at warn; a `fail` on the features read stays `fail` |
 
 Control 12 is a permanent `manual` finding whenever auditing is enabled, because Elasticsearch never returns secure settings and the API cannot observe log shipping.
 

@@ -47,10 +47,10 @@ Compliance scopes require the Compliance Officer role. `meeting:admin_config_rea
 
 Configuration precedence: tool arguments, then environment variables, then a config file.
 
-Keys by source:
-
-- **Environment:** `WEBEX_TOKEN`, `WEBEX_ORG_ID`, `WEBEX_CLIENT_ID`, `WEBEX_CLIENT_SECRET`, `WEBEX_REFRESH_TOKEN`, `WEBEX_API_BASE_URL`, `WEBEX_TIMEOUT`, `WEBEX_CONFIG_FILE`
-- **Config file:** `~/.config/webex-sec-inspector/config.json`, `config.yaml`, or `config.yml`, with `token`, `org_id`, `client_id`, `client_secret`, `refresh_token`, `base_url`, `timeout_seconds`
+| Source | Keys |
+|--------|------|
+| Environment | `WEBEX_TOKEN`, `WEBEX_ORG_ID`, `WEBEX_CLIENT_ID`, `WEBEX_CLIENT_SECRET`, `WEBEX_REFRESH_TOKEN`, `WEBEX_API_BASE_URL`, `WEBEX_TIMEOUT`, `WEBEX_CONFIG_FILE` |
+| Config file | `~/.config/webex-sec-inspector/config.json`, `config.yaml`, or `config.yml` with `token`, `org_id`, `client_id`, `client_secret`, `refresh_token`, `base_url`, `timeout_seconds` |
 
 The default config locations are optional. A path given explicitly through `config_file` or `WEBEX_CONFIG_FILE` must exist. A missing one is reported as `Webex config file not found: <path>` rather than silently skipped.
 
@@ -73,7 +73,7 @@ The refresh is the integration and Service App token flow documented on the [int
 
 Tokens, secrets, passwords, and host PINs are redacted from every bundle file.
 
-`core_data/` never holds a raw response. Each surface is projected to a per-surface allowlist of the documented fields the findings read (the "Fields read" entries below plus the identifiers that make a row citable). An undocumented or newly added property is therefore dropped before anything is written.
+`core_data/` never holds a raw response. Each surface is projected to a per-surface allowlist of the documented fields the findings read (the "Fields read" column below plus the identifiers that make a row citable). An undocumented or newly added property is therefore dropped before anything is written.
 
 On top of that, secret-named keys are replaced with `[REDACTED]`. URL-valued fields keep host and path only:
 
@@ -102,11 +102,13 @@ Scrubbing runs as `scrubErrorText` in the `WebexApiError` constructor, in the su
 
 ## Tools
 
-- `webex_check_access`: Probes every surface and reports token type, org selection, readable counts, truncation, and the missing scopes.
-- `webex_assess_identity`: Findings WEBEX-ID-01 to WEBEX-ID-07.
-- `webex_assess_collaboration_governance`: Findings WEBEX-COLLAB-01 to WEBEX-COLLAB-08.
-- `webex_assess_meeting_hybrid_security`: Findings WEBEX-MTG-01 to WEBEX-MTG-07.
-- `webex_export_audit_bundle`: Writes `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip named after the allocated directory. Reruns allocate `-2`, `-3` and never overwrite.
+| Tool | Purpose |
+|------|---------|
+| `webex_check_access` | Probes every surface, reports token type, org selection, readable counts, truncation, and the missing scopes. |
+| `webex_assess_identity` | WEBEX-ID-01 to WEBEX-ID-07. |
+| `webex_assess_collaboration_governance` | WEBEX-COLLAB-01 to WEBEX-COLLAB-08. |
+| `webex_assess_meeting_hybrid_security` | WEBEX-MTG-01 to WEBEX-MTG-07. |
+| `webex_export_audit_bundle` | Writes `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip named after the allocated directory; reruns allocate `-2`, `-3` and never overwrite. |
 
 ## Status semantics
 
@@ -129,43 +131,33 @@ The verdict is the worst site. A passing verdict downgrades to `warn` when any o
 
 ## Control coverage
 
-Each entry names the spec control, then the tool and finding that cover it, then the status semantics.
-
-- **1 SSO enforcement** (identity, WEBEX-ID-01): Manual, because the Organizations API exposes no SSO field.
-- **2 Admin MFA** (identity, WEBEX-ID-02)
-  - Manual, because `mfaEnabled` exists only in the PATCH schema of `/identity/organizations/{orgId}/authenticationConfig`, with no documented GET.
-  - The admin list is attached.
-- **3 Compliance Officer role** (identity, WEBEX-ID-03): Pass/fail/warn from `/people` roles and `/roles` names.
-- **4 External communications** (collaboration, WEBEX-COLLAB-01): Manual (no documented endpoint).
-- **5 File sharing restrictions** (collaboration, WEBEX-COLLAB-02): Manual (Control Hub setting).
-- **6 Recording storage** (collaboration, WEBEX-COLLAB-03): Manual (no storage field). Recordings are inventoried.
-- **7 Recording retention** (collaboration, WEBEX-COLLAB-03): Manual (no retention field).
-- **8 E2E meeting encryption** (meeting-hybrid, WEBEX-MTG-01): Manual (no encryption field in meeting preferences, common settings, or session types).
-- **9 Meeting lobby** (meeting-hybrid, WEBEX-MTG-02)
-  - Pass/warn/fail/manual per site from `securityOptions.joinBeforeHost`, `audioBeforeHost`, `unlistAllMeetings`.
-  - Sampled `unlockedMeetingJoinSecurity` is attached.
-- **10 Meeting password** (meeting-hybrid, WEBEX-MTG-06)
-  - Pass/warn/fail/manual per site from `securityOptions.requireStrongPassword` and `passwordCriteria.minLength` (threshold 8).
-  - Sampled `password` is attached.
-- **11 eDiscovery and legal hold** (collaboration, WEBEX-COLLAB-08): Manual, because eDiscovery is a Control Hub report. Events readability is attached.
-- **12 Data retention policy** (collaboration, WEBEX-COLLAB-03): Manual (Control Hub setting).
-- **13 Guest access** (meeting-hybrid, identity, WEBEX-MTG-03, WEBEX-ID-07)
-  - Policy pass/fail/manual per site from `securityOptions.requireLoginBeforeAccess`.
-  - Inventory pass/warn from `type = appuser` and `GET /guests/count`.
-- **14 Space classification** (collaboration, WEBEX-COLLAB-04): Pass/fail/warn from `classificationId` on visible rooms.
-- **15 Hybrid cluster health** (meeting-hybrid, WEBEX-MTG-04): Pass/fail/warn from connector `status`.
-- **16 Hybrid connector status** (meeting-hybrid, WEBEX-MTG-04): Pass/fail/warn from connector `status`.
-- **17 Device firmware** (meeting-hybrid, WEBEX-MTG-05): Manual (no end-of-life field). `software` versions and `upgradeChannel` values are inventoried.
-- **18 Unmanaged devices** (meeting-hybrid, WEBEX-MTG-05): Manual (no blocking policy field). `personId` and `managedBy` are inventoried.
-- **19 Bot management** (identity, WEBEX-ID-05, WEBEX-ID-06): Inventory pass/warn from `type = bot`. Approval is manual.
-- **20 Webhook HTTPS and secret** (collaboration, WEBEX-COLLAB-05): Pass/fail/warn from `targetUrl` and `secret` on visible webhooks.
-- **21 Messaging DLP** (collaboration, WEBEX-COLLAB-02): Manual, because DLP is an Events API integration.
-- **22 SRTP calling encryption** (meeting-hybrid, WEBEX-MTG-01): Manual, folded (no calling SRTP setting in the public API).
-- **23 Virtual background** (meeting-hybrid, WEBEX-MTG-07): Manual (no field in common settings, meeting preferences, or session types).
-- **24 License utilization** (collaboration, WEBEX-COLLAB-06): Pass/warn from `totalUnits` and `consumedUnits`.
-- **25 Admin audit logging** (collaboration, identity, WEBEX-COLLAB-07, WEBEX-ID-04)
-  - Audit pass/warn from `/adminAudit/events` over 30 days.
-  - Admin concentration pass/warn from `/people` roles against `max_admins` (evidence for the role review, not an MFA verdict).
+| Spec control | Tool | Finding | Status semantics |
+|--------------|------|---------|------------------|
+| 1 SSO enforcement | identity | WEBEX-ID-01 | manual: Organizations API exposes no SSO field |
+| 2 Admin MFA | identity | WEBEX-ID-02 | manual: `mfaEnabled` exists only in the PATCH schema of `/identity/organizations/{orgId}/authenticationConfig`, no documented GET; admin list attached |
+| 3 Compliance Officer role | identity | WEBEX-ID-03 | pass/fail/warn from `/people` roles and `/roles` names |
+| 4 External communications | collaboration | WEBEX-COLLAB-01 | manual: no documented endpoint |
+| 5 File sharing restrictions | collaboration | WEBEX-COLLAB-02 | manual: Control Hub setting |
+| 6 Recording storage | collaboration | WEBEX-COLLAB-03 | manual: no storage field; recordings inventoried |
+| 7 Recording retention | collaboration | WEBEX-COLLAB-03 | manual: no retention field |
+| 8 E2E meeting encryption | meeting-hybrid | WEBEX-MTG-01 | manual: no encryption field in meeting preferences, common settings, or session types |
+| 9 Meeting lobby | meeting-hybrid | WEBEX-MTG-02 | pass/warn/fail/manual per site from `securityOptions.joinBeforeHost`, `audioBeforeHost`, `unlistAllMeetings`; sampled `unlockedMeetingJoinSecurity` attached |
+| 10 Meeting password | meeting-hybrid | WEBEX-MTG-06 | pass/warn/fail/manual per site from `securityOptions.requireStrongPassword` and `passwordCriteria.minLength` (threshold 8); sampled `password` attached |
+| 11 eDiscovery and legal hold | collaboration | WEBEX-COLLAB-08 | manual: eDiscovery is a Control Hub report; events readability attached |
+| 12 Data retention policy | collaboration | WEBEX-COLLAB-03 | manual: Control Hub setting |
+| 13 Guest access | meeting-hybrid, identity | WEBEX-MTG-03, WEBEX-ID-07 | policy pass/fail/manual per site from `securityOptions.requireLoginBeforeAccess`; inventory pass/warn from `type = appuser` and `GET /guests/count` |
+| 14 Space classification | collaboration | WEBEX-COLLAB-04 | pass/fail/warn from `classificationId` on visible rooms |
+| 15 Hybrid cluster health | meeting-hybrid | WEBEX-MTG-04 | pass/fail/warn from connector `status` |
+| 16 Hybrid connector status | meeting-hybrid | WEBEX-MTG-04 | pass/fail/warn from connector `status` |
+| 17 Device firmware | meeting-hybrid | WEBEX-MTG-05 | manual: no end-of-life field; `software` versions and `upgradeChannel` values inventoried |
+| 18 Unmanaged devices | meeting-hybrid | WEBEX-MTG-05 | manual: no blocking policy field; `personId` and `managedBy` inventoried |
+| 19 Bot management | identity | WEBEX-ID-05, WEBEX-ID-06 | inventory pass/warn from `type = bot`; approval manual |
+| 20 Webhook HTTPS and secret | collaboration | WEBEX-COLLAB-05 | pass/fail/warn from `targetUrl` and `secret` on visible webhooks |
+| 21 Messaging DLP | collaboration | WEBEX-COLLAB-02 | manual: DLP is an Events API integration |
+| 22 SRTP calling encryption | meeting-hybrid | WEBEX-MTG-01 | manual, folded: no calling SRTP setting in the public API |
+| 23 Virtual background | meeting-hybrid | WEBEX-MTG-07 | manual: no field in common settings, meeting preferences, or session types |
+| 24 License utilization | collaboration | WEBEX-COLLAB-06 | pass/warn from `totalUnits` and `consumedUnits` |
+| 25 Admin audit logging | collaboration, identity | WEBEX-COLLAB-07, WEBEX-ID-04 | audit pass/warn from `/adminAudit/events` over 30 days; admin concentration pass/warn from `/people` roles against `max_admins` (evidence for the role review, not an MFA verdict) |
 
 Automatable controls: 3, 9, 10, 13, 14, 15, 16, 19 (inventory), 20, 24, 25.
 
@@ -208,71 +200,31 @@ Every canonical reference URL of the form `https://developer.webex.com/docs/api/
 
 That page's server-rendered HTML embeds the OpenAPI 3.0.3 schema for every endpoint in that category, so `curl -L` fetches it without a browser.
 
-The links below are those redirect targets. Every listed field was checked against the embedded schema.
+The links below are those redirect targets. Every field in the table was checked against the embedded schema.
 
-- `POST /access_token`
-  - Fields read: `access_token`
-  - Documentation: [Integrations](https://developer.webex.com/docs/integrations), [Service Apps](https://developer.webex.com/docs/service-apps)
-- `GET /people/me`
-  - Fields read: `id`, `displayName`, `emails`, `type`
-  - Documentation: [Get My Own Details](https://developer.webex.com/admin/docs/api/v1/people/get-my-own-details)
-- `GET /people?orgId&max`
-  - Fields read: `id`, `displayName`, `emails`, `roles`, `type` (`person`, `bot`, `appuser`), `created`
-  - Documentation: [List People](https://developer.webex.com/admin/docs/api/v1/people/list-people)
-- `GET /organizations`
-  - Fields read: `id`, `displayName`
-  - Documentation: [List Organizations](https://developer.webex.com/admin/docs/api/v1/organizations/list-organizations)
-- `GET /organizations/{orgId}`
-  - Fields read: `id`, `displayName`, `created`
-  - Documentation: [Get Organization Details](https://developer.webex.com/admin/docs/api/v1/organizations/get-organization-details)
-- `GET /roles`
-  - Fields read: `id`, `name`
-  - Documentation: [List Roles](https://developer.webex.com/admin/docs/api/v1/roles/list-roles)
-- `GET /licenses?orgId`
-  - Fields read: `totalUnits`, `consumedUnits`
-  - Documentation: [List Licenses](https://developer.webex.com/admin/docs/api/v1/licenses/list-licenses)
-- `GET /guests/count`
-  - Fields read: Bare numeric body
-  - Documentation: [Get Guest Count](https://developer.webex.com/admin/docs/api/v1/guest-management/get-guest-count)
-- `GET /events?max`
-  - Fields read: Count, `created`
-  - Documentation: [List Events](https://developer.webex.com/admin/docs/api/v1/events/list-events), [Compliance guide](https://developer.webex.com/docs/api/guides/compliance)
-- `GET /adminAudit/events?orgId&from&to&max`
-  - Fields read: `created`
-  - Documentation: [List Admin Audit Events](https://developer.webex.com/admin/docs/api/v1/admin-audit-events/list-admin-audit-events)
-- `GET /admin/recordings?max`
-  - Fields read: `status`
-  - Documentation: [List Recordings For an Admin or Compliance Officer](https://developer.webex.com/admin/docs/api/v1/recordings/list-recordings-for-an-admin-or-compliance-officer)
-- `GET /meetings?max`
-  - Fields read: `password`, `unlockedMeetingJoinSecurity`
-  - Documentation: [List Meetings](https://developer.webex.com/meeting/docs/api/v1/meetings/list-meetings)
-- `GET /meetingPreferences`
-  - Fields read: `personalMeetingRoom.enabledAutoLock`, `sites[].siteUrl`
-  - Documentation: [Get Meeting Preference Details](https://developer.webex.com/meeting/docs/api/v1/meeting-preferences/get-meeting-preference-details)
-- `GET /meetingPreferences/sites`
-  - Fields read: `sites[].siteUrl`
-  - Documentation: [Get Site List](https://developer.webex.com/meeting/docs/api/v1/meeting-preferences/get-site-list)
-- `GET /admin/meeting/config/commonSettings?siteUrl`
-  - Fields read: `securityOptions.joinBeforeHost`, `audioBeforeHost`, `unlistAllMeetings`, `requireLoginBeforeAccess`, `requireStrongPassword`, `passwordCriteria.minLength`, `mixedCase`, `minNumeric`, `minAlpha`, `minSpecial`, `disallowDynamicWebText`, `disallowList`
-  - Documentation: [Get Meeting Common Settings Configuration](https://developer.webex.com/meeting/docs/api/v1/site/get-meeting-common-settings-configuration)
-- `GET /hybrid/clusters?orgId`
-  - Fields read: `id`, `name`
-  - Documentation: [List Hybrid Clusters](https://developer.webex.com/admin/docs/api/v1/hybrid-clusters/list-hybrid-clusters)
-- `GET /hybrid/connectors?orgId`
-  - Fields read: `id`, `type`, `status`, `version`, `created`
-  - Documentation: [List Hybrid Connectors](https://developer.webex.com/admin/docs/api/v1/hybrid-connectors/list-hybrid-connectors)
-- `GET /devices?orgId&max`
-  - Fields read: `software`, `upgradeChannel`, `managedBy`, `personId`, `workspaceId`
-  - Documentation: [List Devices](https://developer.webex.com/calling/docs/api/v1/devices/list-devices)
-- `GET /workspaces?orgId&max`
-  - Fields read: Count
-  - Documentation: [List Workspaces](https://developer.webex.com/calling/docs/api/v1/workspaces/list-workspaces)
-- `GET /rooms?max`
-  - Fields read: `id`, `title`, `classificationId`
-  - Documentation: [List Rooms](https://developer.webex.com/messaging/docs/api/v1/rooms/list-rooms)
-- `GET /webhooks?max`
-  - Fields read: `id`, `name`, `targetUrl`, `secret`, `status`
-  - Documentation: [List Webhooks](https://developer.webex.com/meeting/docs/api/v1/webhooks/list-webhooks)
+| Endpoint | Fields read | Documentation |
+|----------|-------------|---------------|
+| `POST /access_token` | `access_token` | [Integrations](https://developer.webex.com/docs/integrations), [Service Apps](https://developer.webex.com/docs/service-apps) |
+| `GET /people/me` | `id`, `displayName`, `emails`, `type` | [Get My Own Details](https://developer.webex.com/admin/docs/api/v1/people/get-my-own-details) |
+| `GET /people?orgId&max` | `id`, `displayName`, `emails`, `roles`, `type` (`person`, `bot`, `appuser`), `created` | [List People](https://developer.webex.com/admin/docs/api/v1/people/list-people) |
+| `GET /organizations` | `id`, `displayName` | [List Organizations](https://developer.webex.com/admin/docs/api/v1/organizations/list-organizations) |
+| `GET /organizations/{orgId}` | `id`, `displayName`, `created` | [Get Organization Details](https://developer.webex.com/admin/docs/api/v1/organizations/get-organization-details) |
+| `GET /roles` | `id`, `name` | [List Roles](https://developer.webex.com/admin/docs/api/v1/roles/list-roles) |
+| `GET /licenses?orgId` | `totalUnits`, `consumedUnits` | [List Licenses](https://developer.webex.com/admin/docs/api/v1/licenses/list-licenses) |
+| `GET /guests/count` | bare numeric body | [Get Guest Count](https://developer.webex.com/admin/docs/api/v1/guest-management/get-guest-count) |
+| `GET /events?max` | count, `created` | [List Events](https://developer.webex.com/admin/docs/api/v1/events/list-events), [Compliance guide](https://developer.webex.com/docs/api/guides/compliance) |
+| `GET /adminAudit/events?orgId&from&to&max` | `created` | [List Admin Audit Events](https://developer.webex.com/admin/docs/api/v1/admin-audit-events/list-admin-audit-events) |
+| `GET /admin/recordings?max` | `status` | [List Recordings For an Admin or Compliance Officer](https://developer.webex.com/admin/docs/api/v1/recordings/list-recordings-for-an-admin-or-compliance-officer) |
+| `GET /meetings?max` | `password`, `unlockedMeetingJoinSecurity` | [List Meetings](https://developer.webex.com/meeting/docs/api/v1/meetings/list-meetings) |
+| `GET /meetingPreferences` | `personalMeetingRoom.enabledAutoLock`, `sites[].siteUrl` | [Get Meeting Preference Details](https://developer.webex.com/meeting/docs/api/v1/meeting-preferences/get-meeting-preference-details) |
+| `GET /meetingPreferences/sites` | `sites[].siteUrl` | [Get Site List](https://developer.webex.com/meeting/docs/api/v1/meeting-preferences/get-site-list) |
+| `GET /admin/meeting/config/commonSettings?siteUrl` | `securityOptions.joinBeforeHost`, `audioBeforeHost`, `unlistAllMeetings`, `requireLoginBeforeAccess`, `requireStrongPassword`, `passwordCriteria.minLength`, `mixedCase`, `minNumeric`, `minAlpha`, `minSpecial`, `disallowDynamicWebText`, `disallowList` | [Get Meeting Common Settings Configuration](https://developer.webex.com/meeting/docs/api/v1/site/get-meeting-common-settings-configuration) |
+| `GET /hybrid/clusters?orgId` | `id`, `name` | [List Hybrid Clusters](https://developer.webex.com/admin/docs/api/v1/hybrid-clusters/list-hybrid-clusters) |
+| `GET /hybrid/connectors?orgId` | `id`, `type`, `status`, `version`, `created` | [List Hybrid Connectors](https://developer.webex.com/admin/docs/api/v1/hybrid-connectors/list-hybrid-connectors) |
+| `GET /devices?orgId&max` | `software`, `upgradeChannel`, `managedBy`, `personId`, `workspaceId` | [List Devices](https://developer.webex.com/calling/docs/api/v1/devices/list-devices) |
+| `GET /workspaces?orgId&max` | count | [List Workspaces](https://developer.webex.com/calling/docs/api/v1/workspaces/list-workspaces) |
+| `GET /rooms?max` | `id`, `title`, `classificationId` | [List Rooms](https://developer.webex.com/messaging/docs/api/v1/rooms/list-rooms) |
+| `GET /webhooks?max` | `id`, `name`, `targetUrl`, `secret`, `status` | [List Webhooks](https://developer.webex.com/meeting/docs/api/v1/webhooks/list-webhooks) |
 
 Not read, cited as proof of absence:
 

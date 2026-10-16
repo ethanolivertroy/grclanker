@@ -17,30 +17,12 @@ The integration implements the 20 controls in `specs/datadog-sec-inspector.spec.
 
 ## What it inspects
 
-The integration reads these Datadog surfaces, grouped by area.
-
-- **Identity**
-  - Organization settings (`/api/v1/org`)
-  - Users (`/api/v2/users`)
-  - Roles and role permissions (`/api/v2/roles`, `/api/v2/roles/{id}/permissions`)
-  - Org configs (`/api/v2/org_configs`)
-- **Keys and sharing**
-  - API keys (`/api/v2/api_keys`)
-  - Application keys with owners (`/api/v2/application_keys?include=owned_by`)
-  - Shared dashboards (`/api/v1/dashboard?filter[shared]=true`)
-  - IP allowlist (`/api/v2/ip_allowlist`)
-  - AWS, GCP, and Azure integrations (`/api/v1/integration/{aws,gcp,azure}`)
-- **Security monitoring**
-  - Detection and compliance rules (`/api/v2/security_monitoring/rules`)
-  - Open signals (`/api/v2/security_monitoring/signals`)
-  - Posture findings (`/api/v2/posture_management/findings`)
-  - Monitors (`/api/v1/monitor`)
-- **Data protection**
-  - Audit Trail events (`/api/v2/audit/events`)
-  - Log pipelines and indexes (`/api/v1/logs/config/pipelines`, `/api/v1/logs/config/indexes`)
-  - Log archives (`/api/v2/logs/config/archives`)
-  - Sensitive Data Scanner (`/api/v2/sensitive-data-scanner/config`)
-  - Org connections (`/api/v2/org_connections`)
+| Area | Datadog surfaces read |
+|---|---|
+| Identity | Organization settings (`/api/v1/org`), users (`/api/v2/users`), roles and role permissions (`/api/v2/roles`, `/api/v2/roles/{id}/permissions`), org configs (`/api/v2/org_configs`) |
+| Keys and sharing | API keys (`/api/v2/api_keys`), application keys with owners (`/api/v2/application_keys?include=owned_by`), shared dashboards (`/api/v1/dashboard?filter[shared]=true`), IP allowlist (`/api/v2/ip_allowlist`), AWS, GCP, and Azure integrations (`/api/v1/integration/{aws,gcp,azure}`) |
+| Security monitoring | Detection and compliance rules (`/api/v2/security_monitoring/rules`), open signals (`/api/v2/security_monitoring/signals`), posture findings (`/api/v2/posture_management/findings`), monitors (`/api/v1/monitor`) |
+| Data protection | Audit Trail events (`/api/v2/audit/events`), log pipelines and indexes (`/api/v1/logs/config/pipelines`, `/api/v1/logs/config/indexes`), log archives (`/api/v2/logs/config/archives`), Sensitive Data Scanner (`/api/v2/sensitive-data-scanner/config`), org connections (`/api/v2/org_connections`) |
 
 ## Setup and authentication
 
@@ -52,36 +34,15 @@ The API key identifies the organization. The application key inherits the permis
 
 Explicit tool arguments win, then environment variables, then a dogshell-style config file.
 
-Each setting below names its argument, environment variables, and config file entry.
-
-- **API key**
-  - Argument: `api_key`
-  - Environment variables: `DD_API_KEY`, `DATADOG_API_KEY`
-  - Config file: `apikey` under `[Connection]`
-- **Application key**
-  - Argument: `app_key`
-  - Environment variables: `DD_APP_KEY`, `DD_APPLICATION_KEY`, `DATADOG_APP_KEY`
-  - Config file: `appkey` under `[Connection]`
-- **Site**
-  - Argument: `site`
-  - Environment variables: `DD_SITE`, `DATADOG_SITE`
-  - Config file: None (defaults to `datadoghq.com`)
-- **Base URL override**
-  - Argument: `base_url`
-  - Environment variables: `DD_HOST`, `DATADOG_HOST`
-  - Config file: `api_host` under `[Connection]`
-- **Config file path**
-  - Argument: `config_file`
-  - Environment variables: `DD_CONFIG_FILE`, `DATADOG_CONFIG_FILE`
-  - Config file: Defaults to `~/.dogrc`
-- **Timeout (seconds)**
-  - Argument: `timeout_seconds`
-  - Environment variable: `DD_TIMEOUT`
-  - Config file: None (defaults to 30)
-- **Retries**
-  - Argument: `max_retries`
-  - Environment variable: `DD_MAX_RETRIES`
-  - Config file: None (defaults to 3)
+| Setting | Argument | Environment variables | Config file |
+|---|---|---|---|
+| API key | `api_key` | `DD_API_KEY`, `DATADOG_API_KEY` | `apikey` under `[Connection]` |
+| Application key | `app_key` | `DD_APP_KEY`, `DD_APPLICATION_KEY`, `DATADOG_APP_KEY` | `appkey` under `[Connection]` |
+| Site | `site` | `DD_SITE`, `DATADOG_SITE` | none (defaults to `datadoghq.com`) |
+| Base URL override | `base_url` | `DD_HOST`, `DATADOG_HOST` | `api_host` under `[Connection]` |
+| Config file path | `config_file` | `DD_CONFIG_FILE`, `DATADOG_CONFIG_FILE` | defaults to `~/.dogrc` |
+| Timeout (seconds) | `timeout_seconds` | `DD_TIMEOUT` | none (defaults to 30) |
+| Retries | `max_retries` | `DD_MAX_RETRIES` | none (defaults to 3) |
 
 The config file uses the same INI layout as `dogshell` from `datadogpy`:
 
@@ -96,39 +57,39 @@ api_host = https://api.datadoghq.eu
 
 `DD_SITE` maps to the API base URL `https://api.<site>` per the [Datadog sites guide](https://docs.datadoghq.com/getting_started/site/). Full hostnames, `https://api.<site>` URLs, and short aliases are accepted.
 
-Each site value is followed by its aliases and its API base URL.
-
-- `datadoghq.com` (aliases `us`, `us1`): `https://api.datadoghq.com`
-- `datadoghq.eu` (aliases `eu`, `eu1`): `https://api.datadoghq.eu`
-- `us3.datadoghq.com` (alias `us3`): `https://api.us3.datadoghq.com`
-- `us5.datadoghq.com` (alias `us5`): `https://api.us5.datadoghq.com`
-- `ap1.datadoghq.com` (alias `ap1`): `https://api.ap1.datadoghq.com`
-- `ap2.datadoghq.com` (alias `ap2`): `https://api.ap2.datadoghq.com`
-- `uk1.datadoghq.com` (alias `uk1`): `https://api.uk1.datadoghq.com`
-- `ddog-gov.com` (aliases `gov`, `us1-fed`): `https://api.ddog-gov.com`
-- `us2.ddog-gov.com` (aliases `us2-fed`, `us2gov`): `https://api.us2.ddog-gov.com`
+| Site value | Aliases | API base URL |
+|---|---|---|
+| `datadoghq.com` | `us`, `us1` | `https://api.datadoghq.com` |
+| `datadoghq.eu` | `eu`, `eu1` | `https://api.datadoghq.eu` |
+| `us3.datadoghq.com` | `us3` | `https://api.us3.datadoghq.com` |
+| `us5.datadoghq.com` | `us5` | `https://api.us5.datadoghq.com` |
+| `ap1.datadoghq.com` | `ap1` | `https://api.ap1.datadoghq.com` |
+| `ap2.datadoghq.com` | `ap2` | `https://api.ap2.datadoghq.com` |
+| `uk1.datadoghq.com` | `uk1` | `https://api.uk1.datadoghq.com` |
+| `ddog-gov.com` | `gov`, `us1-fed` | `https://api.ddog-gov.com` |
+| `us2.ddog-gov.com` | `us2-fed`, `us2gov` | `https://api.us2.ddog-gov.com` |
 
 ### Required application key permissions
 
 Permission names come from the [Datadog RBAC permissions list](https://docs.datadoghq.com/account_management/rbac/permissions/) and the `x-permission` metadata in the official OpenAPI definitions. `datadog_check_access` reports which of these are missing when a surface returns 403.
 
-Each permission is followed by the surfaces that need it.
-
-- `org_management`: Organization settings, IP allowlist.
-- `user_access_read`: Users, roles, role permissions, permissions catalog.
-- `api_keys_read`: API keys.
-- `org_app_keys_read`: Application keys for the whole org.
-- `audit_logs_read`: Audit Trail events.
-- `security_monitoring_rules_read`: Detection and compliance rules.
-- `security_monitoring_signals_read`: Security signals.
-- `security_monitoring_findings_read`: Posture findings.
-- `data_scanner_read`: Sensitive Data Scanner configuration.
-- `logs_read_config`: Log pipelines and indexes.
-- `logs_read_archives`: Log archives.
-- `dashboards_read`: Shared dashboards.
-- `monitors_read`: Monitors.
-- `aws_configuration_read`, `gcp_configuration_read`, `azure_configuration_read`: Cloud integrations.
-- `org_connections_read`: Cross-org connections.
+| Permission | Surfaces |
+|---|---|
+| `org_management` | Organization settings, IP allowlist |
+| `user_access_read` | Users, roles, role permissions, permissions catalog |
+| `api_keys_read` | API keys |
+| `org_app_keys_read` | Application keys for the whole org |
+| `audit_logs_read` | Audit Trail events |
+| `security_monitoring_rules_read` | Detection and compliance rules |
+| `security_monitoring_signals_read` | Security signals |
+| `security_monitoring_findings_read` | Posture findings |
+| `data_scanner_read` | Sensitive Data Scanner configuration |
+| `logs_read_config` | Log pipelines and indexes |
+| `logs_read_archives` | Log archives |
+| `dashboards_read` | Shared dashboards |
+| `monitors_read` | Monitors |
+| `aws_configuration_read`, `gcp_configuration_read`, `azure_configuration_read` | Cloud integrations |
+| `org_connections_read` | Cross-org connections |
 
 `GET /api/v1/validate`, `GET /api/v2/validate_keys`, and `GET /api/v2/org_configs` require no extra permission.
 
@@ -361,126 +322,28 @@ When a `pass` is downgraded under these rules, the summary ends with `Downgraded
 
 ## Control coverage
 
-Each entry names the control number and name, then the tool and finding, then the status semantics.
-
-- **1 SAML SSO Enforcement** (`datadog_assess_identity`, `DD-01`)
-  - `fail` when SAML is disabled.
-  - `warn` when SAML is on but strict mode is off.
-  - `pass` when strict mode is enforced.
-  - `manual` if `/api/v1/org` is unreadable or the response omits `saml` or `saml_strict_mode`.
-- **2 MFA Status** (`datadog_assess_identity`, `DD-02`)
-  - `pass` only when `mfa_enabled` was read as `true` for every active human user.
-  - `fail` when password-capable users lack MFA.
-  - `manual` in any of these cases:
-    - SAML strict mode is on but users lack native MFA. The API cannot observe IdP MFA, so the IdP authentication policy must be captured.
-    - `mfa_enabled` is absent.
-    - The user list is empty.
-  - `warn` in any of these cases:
-    - No active human users remain.
-    - The list is truncated.
-    - Organization settings are unreadable. Native MFA is still judged from the users, but whether SAML strict mode disables password login was not checked. The summary names `organization settings`.
-- **3 RBAC Configuration (Custom Roles)** (`datadog_assess_identity`, `DD-03`)
-  - `fail` when a custom role grants `org_management`, `user_access_manage`, `api_keys_write`, `org_app_keys_write`, or `service_account_write`.
-  - `manual` in either of these cases:
-    - Any custom role's permissions could not be read. The summary names `role_permissions` with the count and the failing roles, and the evidence lists them under `unreadable_inventories`.
-    - The role list is empty.
-  - `warn` when Datadog Admin Role membership exceeds `max_admins`, its `user_count` is missing, or the role list is truncated.
-  - Otherwise `pass`.
-- **4 User Access Review** (`datadog_assess_identity`, `DD-04`)
-  - `fail` when active users have not signed in within `inactive_days`.
-  - `warn` when invitations are pending longer than `pending_invite_days`, users have neither `last_login_time` nor `created_at`, or the list is truncated.
-  - `manual` when the user list is empty.
-  - Otherwise `pass`.
-- **5 API Key Rotation** (`datadog_assess_access_controls`, `DD-05`)
-  - `fail` when keys are older than `key_rotation_days`.
-  - `warn` when keys are unused beyond `key_unused_days`, carry placeholder names, lack `created_at`, or the list is truncated.
-  - `manual` when the key list is empty.
-  - Otherwise `pass`.
-- **6 Application Key Audit** (`datadog_assess_access_controls`, `DD-06`)
-  - `fail` when keys belong to disabled users.
-  - `warn` when keys are unscoped, idle beyond `key_unused_days`, have no owner record in the response, have no date, or the list is truncated.
-  - `manual` when the key list is empty.
-  - Otherwise `pass`.
-- **7 Audit Log Enabled and Retained** (`datadog_assess_data_protection`, `DD-07`)
-  - `manual` when either audit query is unreadable.
-  - `fail` when no audit events exist.
-  - `pass` when the oldest event within the window is at least `min_audit_retention_days - 7` days old and events exist in the last 7 days.
-  - `warn` when the oldest event has no timestamp, no recent events exist, or retention could not be confirmed.
-- **8 Security Detection Rules Enabled** (`datadog_assess_security_monitoring`, `DD-08`)
-  - `fail` when a completely read rule list is empty, no detection rules are enabled, or a critical category (authentication, privilege escalation, data exfiltration) has none.
-  - `warn` in any of these cases:
-    - Default rules are disabled.
-    - The list is truncated. An absence beyond the truncation point is unknown.
-    - The listing returned no rules before it stopped. The summary carries the collection's own stop reason. An empty page under a next-page cursor never renders `fail`.
-  - `manual` when the listing is unreadable.
-  - Otherwise `pass`.
-- **9 Security Signals Review** (`datadog_assess_security_monitoring`, `DD-09`)
-  - `fail` when unresolved high or critical signals exceed `signal_sla_hours`.
-  - `warn` when such signals are open within SLA, lack timestamps, or the list is truncated.
-  - `manual` when the signal list is empty but the rule inventory is unreadable (the summary names `security_rules`) or has no enabled detection rules.
-  - `pass` only when none are open in `signal_lookback_days` and enabled detection rules exist.
-- **10 Log Pipeline Security** (`datadog_assess_data_protection`, `DD-10`)
-  - `fail` when an enabled index exclusion filter drops security sources.
-  - `manual` when pipelines, indexes, or archives are unreadable or the index list is empty.
-  - `warn` when no archive exists or an archive is failing.
-  - Otherwise `pass`.
-  - Field redaction is assessed under control 11.
-- **11 Sensitive Data Scanner** (`datadog_assess_data_protection`, `DD-11`)
-  - `fail` when no scanning group or no PII/PCI rule is enabled.
-  - `manual` when no group can be confirmed enabled because groups are referenced but not returned or lack `is_enabled`.
-  - `warn` when enabled groups do not cover logs, APM, RUM, and events or the group inventory is partial.
-  - Otherwise `pass`.
-- **12 Cloud Security Posture Management** (`datadog_assess_security_monitoring`, `DD-12`)
-  - `manual` in either of these cases:
-    - Rules, any of the AWS, GCP, or Azure integration lists, or either posture findings query is unreadable. Each unreadable inventory is named in the summary.
-    - No cloud integration and no `cloud_configuration` rule exists.
-  - `fail` when integrations exist but none has CSPM resource collection and no compliance rule is enabled.
-  - `warn` when the posture counts are truncated, no findings were returned, or the passing rate is below `min_posture_pass_rate`.
-  - Otherwise `pass`.
-  - The posture counts are truncated when there is no `total_filtered_count` and the paged failing or passing count stopped early:
-    - at `finding_limit` while a next-page cursor remained
-    - on a repeated page cursor
-    - after 5 consecutive empty pages that still carried a cursor
-  - For truncated counts, the summary names each stopped count with its own stop reason. It advises raising `finding_limit` only for a cap stop, and otherwise capturing the passing percentage from the console.
-- **13 Compliance Rule Coverage** (`datadog_assess_security_monitoring`, `DD-13`)
-  - `fail` when no enabled compliance rules exist or a framework in `required_frameworks` has no rule tagged for it.
-  - `warn` when the rule list is truncated.
-  - Otherwise `pass`.
-- **14 Public Dashboard Restrictions** (`datadog_assess_access_controls`, `DD-14`)
-  - `fail` when `private_widget_share` is enabled.
-  - `manual` when org settings or the dashboard list are unreadable or the response omits `private_widget_share`.
-  - `warn` when dashboards are shared by public link (the list endpoint does not expose the share type) or the list is truncated.
-  - `pass` only when the shared list was read and is empty and `private_widget_share` was read as `false`.
-- **15 IP Allowlisting** (`datadog_assess_access_controls`, `DD-15`)
-  - `fail` when the allowlist is disabled or contains /8 or wider entries.
-  - `manual` when the response omits `enabled`.
-  - `warn` for entries wider than /16 or when the allowlist is enabled but no entries were returned.
-  - Otherwise `pass`.
-- **16 Session Timeout** (`datadog_assess_identity`, `DD-16`): Always `manual`, because the public API does not expose the session duration. Evidence lists the readable `org_configs` names.
-- **17 Monitor Notification Channels** (`datadog_assess_security_monitoring`, `DD-17`)
-  - `fail` when security monitors have no notification handles.
-  - `manual` when the monitor list is empty.
-  - `warn` when security monitors notify individual email addresses only, when no monitor is identifiable as a security monitor, or the list is truncated.
-  - Otherwise `pass`.
-- **18 Integration Permissions** (`datadog_assess_access_controls`, `DD-18`): Always `manual` with API-visible evidence.
-  - AWS, GCP, and Azure integrations are inventoried.
-  - AWS accounts authenticating with static access keys instead of role delegation are listed (`aws_accounts_with_static_key_authentication`, by account id only).
-  - Cloud-side IAM policies and webhook URLs are not exposed.
-  - When one of the three integration lists is unreadable, the summary names it and states that those accounts, projects, or tenants were not inventoried.
-- **19 Service Account Audit** (`datadog_assess_identity`, `DD-19`)
-  - `fail` when service accounts show login history or their application keys exceed `key_rotation_days`.
-  - `manual` when the user list is empty or no service accounts exist (not applicable rather than compliant).
-  - `warn` in any of these cases:
-    - Names do not match `service_account_pattern`.
-    - Keys lack `created_at`.
-    - The user or key list is truncated.
-    - The application key list is unreadable. Naming and interactive logins are still judged from the users. The summary names `application_keys` and states that key rotation was not checked.
-  - Otherwise `pass`.
-- **20 Organization Settings (Retention and Sharing)** (`datadog_assess_data_protection`, `DD-20`)
-  - `fail` when widget sharing outside the org is enabled.
-  - `manual` when org settings, log indexes, or org connections are unreadable, `private_widget_share` is absent, or the index list is empty.
-  - `warn` when indexes retain less than `min_log_retention_days` or lack `num_retention_days`, cross-org connections exist, or SAML auto-creation has no domain restriction.
-  - `pass` only when every input was read and the org connections list is empty.
+| # | Control | Tool | Finding | Status semantics |
+|---|---|---|---|---|
+| 1 | SAML SSO Enforcement | `datadog_assess_identity` | `DD-01` | `fail` when SAML is disabled; `warn` when SAML is on but strict mode is off; `pass` when strict mode is enforced. `manual` if `/api/v1/org` is unreadable or the response omits `saml` or `saml_strict_mode`. |
+| 2 | MFA Status | `datadog_assess_identity` | `DD-02` | `pass` only when `mfa_enabled` was read as `true` for every active human user; `fail` when password-capable users lack MFA; `manual` when SAML strict mode is on but users lack native MFA (the API cannot observe IdP MFA, so the IdP authentication policy must be captured), when `mfa_enabled` is absent, or when the user list is empty; `warn` when no active human users remain, the list is truncated, or organization settings are unreadable (native MFA is still judged from the users, but whether SAML strict mode disables password login was not checked, and the summary names `organization settings`). |
+| 3 | RBAC Configuration (Custom Roles) | `datadog_assess_identity` | `DD-03` | `fail` when a custom role grants `org_management`, `user_access_manage`, `api_keys_write`, `org_app_keys_write`, or `service_account_write`; `manual` when any custom role's permissions could not be read (the summary names `role_permissions` with the count and the failing roles, and the evidence lists them under `unreadable_inventories`) or the role list is empty; `warn` when Datadog Admin Role membership exceeds `max_admins`, its `user_count` is missing, or the role list is truncated; otherwise `pass`. |
+| 4 | User Access Review | `datadog_assess_identity` | `DD-04` | `fail` when active users have not signed in within `inactive_days`; `warn` when invitations are pending longer than `pending_invite_days`, users have neither `last_login_time` nor `created_at`, or the list is truncated; `manual` when the user list is empty; otherwise `pass`. |
+| 5 | API Key Rotation | `datadog_assess_access_controls` | `DD-05` | `fail` when keys are older than `key_rotation_days`; `warn` when keys are unused beyond `key_unused_days`, carry placeholder names, lack `created_at`, or the list is truncated; `manual` when the key list is empty; otherwise `pass`. |
+| 6 | Application Key Audit | `datadog_assess_access_controls` | `DD-06` | `fail` when keys belong to disabled users; `warn` when keys are unscoped, idle beyond `key_unused_days`, have no owner record in the response, have no date, or the list is truncated; `manual` when the key list is empty; otherwise `pass`. |
+| 7 | Audit Log Enabled and Retained | `datadog_assess_data_protection` | `DD-07` | `manual` when either audit query is unreadable; `fail` when no audit events exist; `pass` when the oldest event within the window is at least `min_audit_retention_days - 7` days old and events exist in the last 7 days; `warn` when the oldest event has no timestamp, no recent events exist, or retention could not be confirmed. |
+| 8 | Security Detection Rules Enabled | `datadog_assess_security_monitoring` | `DD-08` | `fail` when a completely read rule list is empty, no detection rules are enabled, or a critical category (authentication, privilege escalation, data exfiltration) has none; `warn` when default rules are disabled, when the list is truncated (an absence beyond the truncation point is unknown), or when the listing returned no rules before it stopped (the summary carries the collection's own stop reason; an empty page under a next-page cursor never renders `fail`); `manual` when the listing is unreadable; otherwise `pass`. |
+| 9 | Security Signals Review | `datadog_assess_security_monitoring` | `DD-09` | `fail` when unresolved high or critical signals exceed `signal_sla_hours`; `warn` when such signals are open within SLA, lack timestamps, or the list is truncated; `manual` when the signal list is empty but the rule inventory is unreadable (the summary names `security_rules`) or has no enabled detection rules; `pass` only when none are open in `signal_lookback_days` and enabled detection rules exist. |
+| 10 | Log Pipeline Security | `datadog_assess_data_protection` | `DD-10` | `fail` when an enabled index exclusion filter drops security sources; `manual` when pipelines, indexes, or archives are unreadable or the index list is empty; `warn` when no archive exists or an archive is failing; otherwise `pass`. Field redaction is assessed under control 11. |
+| 11 | Sensitive Data Scanner | `datadog_assess_data_protection` | `DD-11` | `fail` when no scanning group or no PII/PCI rule is enabled; `manual` when no group can be confirmed enabled because groups are referenced but not returned or lack `is_enabled`; `warn` when enabled groups do not cover logs, APM, RUM, and events or the group inventory is partial; otherwise `pass`. |
+| 12 | Cloud Security Posture Management | `datadog_assess_security_monitoring` | `DD-12` | `manual` when rules, any of the AWS, GCP, or Azure integration lists, or either posture findings query is unreadable (each unreadable inventory is named in the summary), or when no cloud integration and no `cloud_configuration` rule exists; `fail` when integrations exist but none has CSPM resource collection and no compliance rule is enabled; `warn` when the posture counts are truncated (no `total_filtered_count` and the paged failing or passing count stopped early: at `finding_limit` while a next-page cursor remained, on a repeated page cursor, or after 5 consecutive empty pages that still carried a cursor; the summary names each stopped count with its own stop reason and advises raising `finding_limit` only for a cap stop, otherwise capturing the passing percentage from the console), no findings were returned, or the passing rate is below `min_posture_pass_rate`; otherwise `pass`. |
+| 13 | Compliance Rule Coverage | `datadog_assess_security_monitoring` | `DD-13` | `fail` when no enabled compliance rules exist or a framework in `required_frameworks` has no rule tagged for it; `warn` when the rule list is truncated; otherwise `pass`. |
+| 14 | Public Dashboard Restrictions | `datadog_assess_access_controls` | `DD-14` | `fail` when `private_widget_share` is enabled; `manual` when org settings or the dashboard list are unreadable or the response omits `private_widget_share`; `warn` when dashboards are shared by public link (the list endpoint does not expose the share type) or the list is truncated; `pass` only when the shared list was read and is empty and `private_widget_share` was read as `false`. |
+| 15 | IP Allowlisting | `datadog_assess_access_controls` | `DD-15` | `fail` when the allowlist is disabled or contains /8 or wider entries; `manual` when the response omits `enabled`; `warn` for entries wider than /16 or when the allowlist is enabled but no entries were returned; otherwise `pass`. |
+| 16 | Session Timeout | `datadog_assess_identity` | `DD-16` | Always `manual`: the public API does not expose the session duration. Evidence lists the readable `org_configs` names. |
+| 17 | Monitor Notification Channels | `datadog_assess_security_monitoring` | `DD-17` | `fail` when security monitors have no notification handles; `manual` when the monitor list is empty; `warn` when they notify individual email addresses only, when no monitor is identifiable as a security monitor, or the list is truncated; otherwise `pass`. |
+| 18 | Integration Permissions | `datadog_assess_access_controls` | `DD-18` | Always `manual` with API-visible evidence: AWS, GCP, and Azure integrations are inventoried and AWS accounts authenticating with static access keys instead of role delegation are listed (`aws_accounts_with_static_key_authentication`, by account id only), but cloud-side IAM policies and webhook URLs are not exposed. When one of the three integration lists is unreadable the summary names it and states that those accounts, projects, or tenants were not inventoried. |
+| 19 | Service Account Audit | `datadog_assess_identity` | `DD-19` | `fail` when service accounts show login history or their application keys exceed `key_rotation_days`; `manual` when the user list is empty or no service accounts exist (not applicable rather than compliant); `warn` when names do not match `service_account_pattern`, keys lack `created_at`, the user or key list is truncated, or the application key list is unreadable (naming and interactive logins are still judged from the users; the summary names `application_keys` and states that key rotation was not checked); otherwise `pass`. |
+| 20 | Organization Settings (Retention and Sharing) | `datadog_assess_data_protection` | `DD-20` | `fail` when widget sharing outside the org is enabled; `manual` when org settings, log indexes, or org connections are unreadable, `private_widget_share` is absent, or the index list is empty; `warn` when indexes retain less than `min_log_retention_days` or lack `num_retention_days`, cross-org connections exist, or SAML auto-creation has no domain restriction; `pass` only when every input was read and the org connections list is empty. |
 
 Every control demotes when any surface it depends on is unreadable. The result is `manual` in every case except the `warn` paths of controls 2 and 19 described above. The finding summary names the unreadable inventory and the console page and setting to capture.
 
@@ -488,16 +351,16 @@ Every control demotes when any surface it depends on is unreadable. The result i
 
 Each finding carries the references below, from the spec's compliance mapping table. The bundle writes one report per framework under `compliance/frameworks/`.
 
-Each entry gives the framework, its report file, and example references.
-
-- **FedRAMP (NIST 800-53)** (`fedramp.md`): AC-2, IA-2(1), AU-11, SI-4, SC-7
-- **CMMC 2.0** (`cmmc.md`): AC.L2-3.1.1, IA.L2-3.5.3, AU.L2-3.3.1
-- **SOC 2** (`soc2.md`): CC6.1, CC6.6, CC7.2, CC7.3
-- **CIS** (`cis.md`): 5.1, 5.2, 6.1, 4.2
-- **PCI-DSS 4.0** (`pci-dss.md`): 8.3.1, 8.4.1, 10.1, 1.3.1
-- **DISA STIG** (`disa-stig.md`): SRG-APP-000023, SRG-APP-000149, SRG-APP-000092
-- **IRAP (ISM)** (`irap.md`): ISM-1546, ISM-1401, ISM-0580
-- **ISMAP** (`ismap.md`): CPS-9.1, CPS-9.2, CPS-11.1
+| Framework | Report file | Example references |
+|---|---|---|
+| FedRAMP (NIST 800-53) | `fedramp.md` | AC-2, IA-2(1), AU-11, SI-4, SC-7 |
+| CMMC 2.0 | `cmmc.md` | AC.L2-3.1.1, IA.L2-3.5.3, AU.L2-3.3.1 |
+| SOC 2 | `soc2.md` | CC6.1, CC6.6, CC7.2, CC7.3 |
+| CIS | `cis.md` | 5.1, 5.2, 6.1, 4.2 |
+| PCI-DSS 4.0 | `pci-dss.md` | 8.3.1, 8.4.1, 10.1, 1.3.1 |
+| DISA STIG | `disa-stig.md` | SRG-APP-000023, SRG-APP-000149, SRG-APP-000092 |
+| IRAP (ISM) | `irap.md` | ISM-1546, ISM-1401, ISM-0580 |
+| ISMAP | `ismap.md` | CPS-9.1, CPS-9.2, CPS-11.1 |
 
 ## Live smoke test
 
