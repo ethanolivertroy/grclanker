@@ -88,7 +88,7 @@ Extra findings and their mapping rows:
 
 ## Verdict rules
 
-- A forbidden, missing, or errored endpoint renders Manual with the HTTP status and the evidence a reviewer must collect.
+- A forbidden, missing, or errored endpoint that a finding rests on renders Manual with the HTTP status and the evidence a reviewer must collect. An endpoint that feeds only part of a finding, such as the owner-only 2FA filter, caps a Pass at Partial. A Fail proven by the readable part stays Fail.
 - Partial inventories (truncated GraphQL connections, per-repository 403s, an audit log sample capped at 200 events) render Partial. Only the visibility-only audit log control renders Pass instead, with the cap stated.
 - Empty inventories pass only where the summary says emptiness is compliant: outside collaborators, App installations, and webhooks and deploy keys with a non-empty repository inventory. Empty repository inventories render Info or Partial because the sweep covered nothing.
 - Deploy keys without `created_at` never count as fresh.
