@@ -44,7 +44,7 @@ Model/provider settings still decide which LLM answers questions. Compute backen
 
 ### Session lifecycle and teardown
 
-Every backend except `host` stages a session lazily on the first command and owns a teardown.
+Every shipped backend except `host` stages a session lazily on the first command and owns a teardown. The `vercel-sandbox` and `cloudflare-sandbox` stubs fail fast instead and never stage a session.
 
 Cleanup paths:
 
