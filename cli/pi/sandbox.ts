@@ -204,10 +204,19 @@ export async function resetSandboxRuntime(): Promise<void> {
   }
 }
 
-export async function wrapCommandWithSandbox(command: string, cwd: string): Promise<string> {
+export type SandboxedCommand = {
+  command: string;
+  release: () => void;
+};
+
+export async function wrapCommandWithSandbox(command: string, cwd: string): Promise<SandboxedCommand> {
   const config = await ensureSandboxReady(cwd);
-  if (!config.enabled) return command;
-  return SandboxManager.wrapWithSandbox(command);
+  if (!config.enabled) return { command, release: () => undefined };
+  return {
+    command: await SandboxManager.wrapWithSandbox(command),
+    // Protected-path mounts leave host placeholders until the last wrapped command releases them.
+    release: () => SandboxManager.cleanupAfterCommand(),
+  };
 }
 
 export function createSandboxReadOperations(cwd: string) {

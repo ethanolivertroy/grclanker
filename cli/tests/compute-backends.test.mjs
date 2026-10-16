@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -2010,7 +2010,7 @@ test("every backend output path redacts credentials echoed by the remote under e
       }
       const sandboxStream = await runExec(
         `sandbox-runtime (${strategy})`,
-        createSandboxRuntimeBackend({ runner, wrapCommand: async (command) => command }),
+        createSandboxRuntimeBackend({ runner, wrapCommand: async (command) => ({ command }) }),
       );
       assert.equal(sandboxStream, expectedStream, `sandbox-runtime (${strategy})`);
 
@@ -2356,7 +2356,7 @@ test("provider error bodies never reach thrown messages, results, streams, or lo
           assert.equal(channels.streamed, channels.stderr, `${kind} ${shape}`);
         }
         const sandbox = await observe("sandbox-runtime", "CLI stderr", shape, (onData) =>
-          createSandboxRuntimeBackend({ runner: cliRunner(text), wrapCommand: async (command) => command })
+          createSandboxRuntimeBackend({ runner: cliRunner(text), wrapCommand: async (command) => ({ command }) })
             .exec({ sessionId: "s", command: ["env"], cwd: "/repo", onData }));
         assert.equal(sandbox.streamed, sandbox.stderr);
 
@@ -2430,6 +2430,142 @@ test("search caps through the contract adapters are reported instead of silently
     assert.equal(complete.matches.length, 2);
     assert.equal(complete.matchLimitReached, false);
   }, { runner });
+});
+
+test("grep keeps rg's matches when the only errors are entries it could not read", async () => {
+  const rgMatch = (path, line) => JSON.stringify({ type: "match", data: { path: { text: path }, line_number: line } });
+  const rgSummary = JSON.stringify({ type: "summary", data: { stats: { searches: 3 } } });
+  const denied = (path) => `rg: ${path}: Permission denied (os error 13)`;
+  let kind = "dir";
+  let rg;
+  const { runner } = createFakeRunner(async (_executable, args) => {
+    const script = String(args.at(-1));
+    if (args[0] === "info") return { exitCode: 0, stdout: "ok" };
+    if (script.includes("printf yes")) return { exitCode: 0, stdout: "yes" };
+    if (script.includes("printf dir")) return { exitCode: 0, stdout: kind };
+    if (script.includes("rg '--json'")) return rg;
+    return { exitCode: 0, stdout: "" };
+  });
+
+  await withComputeBackendExecution("/repo", { computeBackend: "docker" }, async (execution) => {
+    const search = (searchPath = "/repo") =>
+      execution.grepOperations.searchMatches({ pattern: "needle", searchPath, limit: 10 });
+    const assertFails = async (label, searchPath) => {
+      const firstError = rg.stderr.split("\n")[0];
+      await assert.rejects(
+        () => search(searchPath),
+        (error) => error instanceof ExecutionBackendError && error.message.includes(firstError),
+        label,
+      );
+    };
+
+    rg = {
+      exitCode: 2,
+      stdout: `${rgMatch("./a.md", 1)}\n${rgMatch("./src/b.ts", 4)}\n${rgSummary}\n`,
+      stderr: [
+        denied("./.bashrc"),
+        denied("./.claude/commands"),
+        "rg: ./private: Operation not permitted (os error 1)",
+      ].join("\n"),
+    };
+    const found = await search();
+    assert.deepEqual(
+      found.matches.map(({ filePath, lineNumber }) => `${filePath}:${lineNumber}`),
+      ["/repo/a.md:1", "/repo/src/b.ts:4"],
+    );
+
+    const failures = {
+      "a bad pattern": { exitCode: 2, stdout: "", stderr: "rg: regex parse error:\n    (?:needle()\n    ^\nerror: unclosed group" },
+      "a run cut off before its summary": { exitCode: 2, stdout: `${rgMatch("./a.md", 1)}\n`, stderr: denied("./.bashrc") },
+      "an ignore file rg could not parse": {
+        exitCode: 2,
+        stdout: `${rgSummary}\n`,
+        stderr: `rg: ./.gitignore: line 1: error parsing glob 'a{b': unclosed alternate group; missing '}'\n${denied("./.bashrc")}`,
+      },
+      "an unreadable search root": { exitCode: 2, stdout: `${rgSummary}\n`, stderr: denied(".") },
+      "a run stopped by a signal after its summary": { exitCode: 143, stdout: `${rgSummary}\n`, stderr: denied("./.bashrc") },
+      "a missing rg": { exitCode: 127, stdout: "", stderr: "bash: line 1: rg: command not found" },
+    };
+    for (const [label, result] of Object.entries(failures)) {
+      rg = result;
+      await assertFails(label);
+    }
+
+    kind = "file";
+    rg = { exitCode: 2, stdout: `${rgSummary}\n`, stderr: denied("secret.txt") };
+    await assertFails("an unreadable file passed as the search path", "/repo/secret.txt");
+  }, { runner });
+});
+
+test("find excludes sandbox placeholders without expanding glob characters in paths", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "grclanker-find-filter-"));
+  try {
+    for (const file of ["notes.md", "src/[id].ts", "src/i.ts", "docs/read me.md"]) plant(repo, file, "x\n");
+    // A /dev/null symlink has the same stat result as a protected mount.
+    symlinkSync("/dev/null", join(repo, ".bashrc"));
+    const listing = ["./notes.md", "./.bashrc", "./src/[id].ts", "./src/i.ts", "./docs/read me.md"];
+    let rgStatus = 0;
+    const fakeRg = () => [
+      "rg() {",
+      `  printf '%s\\n' ${listing.map(quoteForBash).join(" ")}`,
+      ...(rgStatus === 2 ? ["  echo 'rg: ./private: Permission denied (os error 13)' >&2"] : []),
+      `  return ${rgStatus}`,
+      "}",
+    ].join("\n");
+    const { runner } = createFakeRunner(async (_executable, args) => {
+      const script = String(args.at(-1));
+      if (args[0] === "info") return { exitCode: 0, stdout: "ok" };
+      if (!script.includes("rg --files")) return { exitCode: 0 };
+      const run = spawnSync("sh", ["-c", `${fakeRg()}\n${script}`], { cwd: repo, encoding: "utf8" });
+      return { exitCode: run.status, stdout: run.stdout, stderr: run.stderr };
+    });
+
+    await withComputeBackendExecution(repo, { computeBackend: "docker" }, async (execution) => {
+      const glob = () => execution.findOperations.glob("**/*", repo, { ignore: [], limit: 10 });
+      assert.deepEqual(
+        await glob(),
+        ["notes.md", "src/[id].ts", "src/i.ts", "docs/read me.md"].map((file) => join(repo, file)),
+      );
+
+      rgStatus = 2;
+      await assert.rejects(
+        glob,
+        (error) => error instanceof ExecutionBackendError && error.message.includes("rg: ./private: Permission denied"),
+      );
+    }, { runner });
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("sandbox-runtime releases each wrapped command once it has exited, whatever the outcome", async () => {
+  const events = [];
+  const { runner } = createFakeRunner(async (_executable, args) => {
+    const command = String(args.at(-1));
+    events.push(`start ${command}`);
+    await new Promise((resolve) => setImmediate(resolve));
+    events.push(`exit ${command}`);
+    if (command === "wrapped:boom") throw new Error("spawn failed");
+    return { exitCode: command === "wrapped:false" ? 1 : 0 };
+  });
+  const backend = createSandboxRuntimeBackend({
+    runner,
+    wrapCommand: async (command) => {
+      events.push(`wrap ${command}`);
+      return { command: `wrapped:${command}`, release: () => events.push(`release ${command}`) };
+    },
+  });
+  const exec = (command) => backend.exec({ sessionId: "s", command: [command], cwd: "/repo" });
+
+  assert.equal((await exec("true")).exitCode, 0);
+  assert.equal((await exec("false")).exitCode, 1);
+  await assert.rejects(() => exec("boom"), /spawn failed/);
+  assert.deepEqual(events, ["true", "false", "boom"].flatMap((command) => [
+    `wrap ${command}`,
+    `start wrapped:${command}`,
+    `exit wrapped:${command}`,
+    `release ${command}`,
+  ]));
 });
 
 test("parallels mount wait reports the deadline exit as a typed timeout and destroys the clone", async () => {

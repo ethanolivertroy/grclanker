@@ -33,6 +33,7 @@ import {
   ExecutionBackendCleanupError,
   ExecutionBackendError,
   type ExecutionBackend,
+  type ExecutionResult,
 } from "./execution-backend.js";
 import { assertParallelsSourceIsUsable } from "./parallels-sandbox.js";
 import {
@@ -100,7 +101,11 @@ type BackendCommandAdapter = {
     cwd: string,
     options: StreamExecOptions,
   ) => Promise<{ exitCode: number | null }>;
-  capture: (command: string, cwd: string) => Promise<Buffer>;
+  capture: (
+    command: string,
+    cwd: string,
+    acceptFailure?: (result: ExecutionResult) => boolean,
+  ) => Promise<Buffer>;
   mapPath: (absolutePath: string) => Promise<string>;
   teardown: () => Promise<void>;
 };
@@ -156,17 +161,24 @@ function isIgnoredPath(relativePath: string, ignorePatterns: string[]): boolean 
   );
 }
 
+// sandbox-runtime's protected-path mounts still appear in rg/find's directory listing.
+// `test -f` stats through each mount and drops entries backed by /dev/null.
 function buildBackendFindCommand(pattern: string): string {
   return [
     "if command -v rg >/dev/null 2>&1; then",
-    `  rg --files --hidden -g '!**/.git/**' -g '!**/node_modules/**' -g ${quoteForBash(pattern)} .`,
+    `  files=$(rg --files --hidden -g '!**/.git/**' -g '!**/node_modules/**' -g ${quoteForBash(pattern)} .)`,
     "  status=$?",
     "else",
-    "  find . \\( -name .git -o -name node_modules \\) -prune -o -type f -print",
+    "  files=$(find . \\( -name .git -o -name node_modules \\) -prune -o -type f -print)",
     "  status=$?",
     "fi",
-    "if [ \"$status\" -eq 0 ] || [ \"$status\" -eq 1 ]; then exit 0; fi",
-    "exit \"$status\"",
+    "if [ \"$status\" -ne 0 ] && [ \"$status\" -ne 1 ]; then exit \"$status\"; fi",
+    "set -f",
+    "IFS='\n'",
+    "for file in $files; do",
+    "  [ -f \"$file\" ] && printf '%s\\n' \"$file\"",
+    "done",
+    "exit 0",
   ].join("\n");
 }
 
@@ -195,6 +207,24 @@ function buildRipgrepJsonCommand({
     "if [ \"$status\" -eq 0 ] || [ \"$status\" -eq 1 ]; then exit 0; fi",
     "exit \"$status\"",
   ].join("\n");
+}
+
+// A directory search may return matches and a summary with exit 2 for unreadable descendants.
+// Their diagnostics use "./<path>", unlike an unreadable search root or single-file target.
+const RIPGREP_UNREADABLE_ENTRY = /^rg: \.\/.+: .+ \(os error \d+\)$/;
+
+function ripgrepSkippedOnlyUnreadableEntries({ exitCode, stdout, stderr }: ExecutionResult): boolean {
+  if (exitCode !== 2 || !endsWithRipgrepSummary(stdout)) return false;
+  const errors = stderr.split("\n").filter((line) => line.trim().length > 0);
+  return errors.length > 0 && errors.every((line) => RIPGREP_UNREADABLE_ENTRY.test(line));
+}
+
+function endsWithRipgrepSummary(output: string): boolean {
+  try {
+    return JSON.parse(output.trimEnd().split("\n").at(-1) ?? "").type === "summary";
+  } catch {
+    return false;
+  }
 }
 
 function buildPosixGrepCommand({
@@ -500,7 +530,11 @@ function createBackendGrepOperations(
       const command = useRipgrep
         ? buildRipgrepJsonCommand({ pattern, target, glob, ignoreCase, literal })
         : buildPosixGrepCommand({ pattern, target, isDirectory, glob, ignoreCase, literal });
-      const output = await adapter.capture(command, workingDir);
+      const output = await adapter.capture(
+        command,
+        workingDir,
+        useRipgrep ? ripgrepSkippedOnlyUnreadableEntries : undefined,
+      );
       const text = output.toString("utf8");
 
       return useRipgrep
@@ -632,7 +666,7 @@ function createContractCommandAdapter(
       });
       return { exitCode: result.exitCode };
     },
-    async capture(command, cwd) {
+    async capture(command, cwd, acceptFailure) {
       const remoteRoot = await ensureStaged();
       // File operations round-trip content through capture (read, then edit or write back),
       // so the raw bytes are kept here and only the failure text is scrubbed.
@@ -642,7 +676,7 @@ function createContractCommandAdapter(
         cwd: ensureWorkspaceMapping(localCwd, cwd, remoteRoot),
         redactOutput: false,
       });
-      if (result.exitCode !== 0) {
+      if (result.exitCode !== 0 && !acceptFailure?.(result)) {
         throw new ExecutionBackendError(result.stderr.trim() || `Command failed (${result.exitCode}) on ${backend.kind}`);
       }
       return Buffer.from(result.stdout, "utf8");

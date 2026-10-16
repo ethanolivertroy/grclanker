@@ -14,9 +14,15 @@ import {
   type StageWorkspaceInput,
 } from "../execution-backend.js";
 
+export type WrappedCommand = {
+  command: string;
+  /** Called once the command has exited, whatever the outcome. */
+  release?: () => void;
+};
+
 export type LocalBackendOptions = {
   runner?: CommandRunner;
-  wrapCommand?: (command: string, cwd: string) => Promise<string>;
+  wrapCommand?: (command: string, cwd: string) => Promise<WrappedCommand>;
 };
 
 function createLocalBackend(
@@ -24,7 +30,7 @@ function createLocalBackend(
   options: LocalBackendOptions,
 ): ExecutionBackend {
   const runner = options.runner ?? createProcessCommandRunner();
-  const wrap = options.wrapCommand ?? (async (command: string) => command);
+  const wrap = options.wrapCommand ?? (async (command: string): Promise<WrappedCommand> => ({ command }));
 
   return {
     kind,
@@ -48,10 +54,10 @@ function createLocalBackend(
       };
     },
     async exec(request: ExecutionRequest): Promise<ExecutionResult> {
-      const command = await wrap(buildShellCommand(request.command), request.cwd);
+      const wrapped = await wrap(buildShellCommand(request.command), request.cwd);
       const guard = createExecutionOutputGuard(request);
       try {
-        const result = await runner("bash", ["-lc", command], {
+        const result = await runner("bash", ["-lc", wrapped.command], {
           cwd: request.cwd,
           env: request.env,
           timeoutMs: request.timeoutMs,
@@ -65,6 +71,7 @@ function createLocalBackend(
           artifacts: [],
         });
       } finally {
+        wrapped.release?.();
         guard.end();
       }
     },
