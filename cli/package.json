@@ -127,11 +127,12 @@
     "yaml": "^2.9.1"
   },
   "devDependencies": {
-    "@cursor/bdk": "0.2.21",
+    "@cursor/bdk": "0.2.26",
     "@flue/cli": "^2.2.2",
     "@types/archiver": "^8.0.0",
     "tsx": "^4.23.15",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "zod": "^4.4.3"
   },
   "overrides": {
     "@modelcontextprotocol/client": "2.3.1",
