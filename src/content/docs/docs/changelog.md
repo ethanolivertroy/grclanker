@@ -34,9 +34,7 @@ grclanker tools
 
 ### Installer
 
-- `grclanker.com/install` and `install.ps1` fall back to the `releases/latest` redirect when the GitHub API rate limit (60 requests an hour per IP) is used up.
-  - Before, the shell installer aborted with a misleading `Release bundle unavailable`, and the PowerShell installer threw `API rate limit exceeded`.
-  - Shared NATs, CI runners, and corporate networks could hit the rate limit.
+- `grclanker.com/install` and `install.ps1` fall back to the `releases/latest` redirect when the GitHub API rate limit (60 requests an hour per IP) is used up. Shared NATs, CI runners, and corporate networks could hit the rate limit. Before, the shell installer aborted with a misleading `Release bundle unavailable`, and the PowerShell installer threw `API rate limit exceeded`.
 - Both installers skip drafts and prereleases when they resolve the latest release, so a tag such as `v0.2.0-rc.1` never becomes the default install.
 - The site serves the installers from `main`, so both fixes have been live since before this release.
 

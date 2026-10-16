@@ -23,7 +23,7 @@ Each tool keeps the same behavior as in the CLI:
 
 - TypeBox parameter schemas are converted to plain JSON Schema at the adapter boundary. Literal unions become `enum`, TypeBox metadata is stripped, and the schema is forwarded to the model unchanged otherwise.
 - Arguments go through the tool's `prepareArguments` shim and Pi's own validator before `execute` runs, so loosely typed calls are normalized the same way the CLI normalizes them.
-- Results keep the text and image content the CLI shows the model. Error results keep `isError`.
+- Results keep the text and image content the CLI shows the model, and error results keep `isError`.
 - Tools whose name carries a read-only verb and no write verb declare `effect: "read"`. There are 199 such tools.
   - Read-only verbs: `check`, `assess`, `search`, `get`, `list`, `plan`, `recent`, `review`, `investigate`, `trace`, `validate`.
   - Write verbs: `export`, `generate`, `collect`, `init`, `import`, `create`, `assemble`.
