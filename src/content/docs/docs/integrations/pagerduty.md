@@ -137,7 +137,7 @@ Every finding follows these rules so that a `pass` is never issued on missing or
 
 #### Unreadable, empty, and undated data
 
-- An unreadable, forbidden (401/403), or errored endpoint yields `manual`. The summary names the failing endpoint and the web app evidence to collect.
+- An unreadable, forbidden (401/403), or errored endpoint never yields `pass`. For a finding's primary input, it yields `manual`, and the summary names the failing endpoint and the web app evidence to collect. For a secondary input, it caps the finding at `warn` (see [Status semantics by control](#status-semantics-by-control)).
 - An empty inventory never yields `pass`.
   - Zero users, services, escalation policies, schedules, or on-call entries yield `manual`. The credential is probably not seeing the directory.
   - Zero teams on a complete, readable `GET /teams` yield `fail` on `PD-04`, the only finding that reads the team list. An account whose team list is readable and empty has no team-based access configured, so it is treated like an unused feature rather than a hidden directory.
