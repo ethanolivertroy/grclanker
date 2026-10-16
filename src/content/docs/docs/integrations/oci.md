@@ -64,7 +64,7 @@ Allow group SecurityInspectors to read volume-family in tenancy
 Allow group SecurityInspectors to read instance-family in tenancy
 ```
 
-A surface the principal cannot read renders its control as MANUAL, with the failing command in the summary. The control never passes.
+A surface the principal cannot read never yields `pass`. When none of it can be read, its control is `manual`, with the failing command in the summary. A denied compartment or some failed sub-reads, such as a denied `key get`, demote a would-be `pass` to `warn` instead.
 
 ## Tools
 

@@ -127,7 +127,7 @@ The bundle directory is `<org name>-audit-bundle`, lowercased with other charact
 
 These verdict rules apply to every finding:
 
-- Unreadable, forbidden, or errored data yields `manual` with the cause and the Setup evidence to collect.
+- An unreadable, forbidden, or errored primary dataset yields `manual` with the cause and the Setup evidence to collect. A few unread secondary datasets cap a `pass` at `warn` instead, under the conditions in [Partial and unread inputs](#partial-and-unread-inputs).
 - Empty inventories never pass unless emptiness is compliant. Emptiness is compliant only for control 13, and only when the user list itself is non-empty.
 - Partial or truncated inventories downgrade `pass` to `warn` with seen and total counts.
 - Items missing a date are reported separately and never counted as current.
@@ -146,7 +146,7 @@ Every finding is gated on the datasets it reads (the `Inputs` column below):
 - **Unread input:** The finding is `manual` when its primary dataset was forbidden (401/403 or `INSUFFICIENT_ACCESS`), unavailable (`INVALID_TYPE`, `INVALID_FIELD`), or errored.
   - Its summary names the dataset and the observed status ("... could not be verified because the TwoFactorMethodsInfo query was forbidden (403 ...)").
   - `manualEvidence` states what to collect.
-  - A finding that also reads a secondary dataset (the Health Check MFA setting for SF-04, `PermissionSetAssignment` for SF-09, `EventLogFile` for SF-15) stops at `warn` while that dataset is unread. It says what was not checked.
+  - A few unread datasets cap a `pass` at `warn` instead, and the summary says what was not checked. SF-04 reads the MFA requirement from `SecuritySettings` and from the Health Check MFA setting. An unread source caps it at `warn` while the other exposes a value. SF-04 is `manual` when neither does. An unread `PermissionSetAssignment` query caps SF-09 at `warn` only while no permission set grants an elevated permission. SF-09 becomes `manual` once one does. An unread `EventLogFile` query caps SF-15 at `warn`.
 - **Truncated input:** The finding's summary carries "Only N of M ... records were read, so the verdict is downgraded", and a `pass` becomes `warn`. A SOQL result is `truncated`, with a known or unknown total, when any of these holds:
   - It stopped at `record_limit`.
   - It returned fewer rows than `totalSize`.

@@ -137,7 +137,7 @@ Every finding follows these rules so that a `pass` is never issued on missing or
 
 #### Unreadable, empty, and undated data
 
-- An unreadable, forbidden (401/403), or errored endpoint yields `manual`. The summary names the failing endpoint and the web app evidence to collect.
+- An unreadable, forbidden (401/403), or errored endpoint never yields `pass`. It usually yields `manual`, and the summary names the failing endpoint and the web app evidence to collect. Some unread inputs cap a would-be `pass` at `warn` instead, as the input rules in [Status semantics by control](#status-semantics-by-control) state.
 - An empty inventory never yields `pass`.
   - Zero users, services, escalation policies, schedules, or on-call entries yield `manual`. The credential is probably not seeing the directory.
   - Zero teams on a complete, readable `GET /teams` yield `fail` on `PD-04`, the only finding that reads the team list. An account whose team list is readable and empty has no team-based access configured, so it is treated like an unused feature rather than a hidden directory.
@@ -246,8 +246,8 @@ The `Inputs` column names the datasets each finding reads, using the labels of t
 
 Input rules:
 
-- An unread primary input renders the finding `manual` and names the endpoint and error.
-- An unread secondary input caps the finding at `warn`.
+- An unread primary input renders the finding `manual` and names the endpoint and error, with two exceptions. On `PD-04`, unread `abilities` cap a `pass` at `warn`. On `PD-01`, unread `users` only render the user evidence `null`.
+- An unread secondary input caps the finding at `warn`. The exception is `team members` on `PD-04`, which feeds only the manager sample, so the verdict does not depend on it.
 - A partial input downgrades `pass` to `warn` with `evidence.partial_view`.
 - A dataset that was `not requested` because its parent list was unread is treated as unread.
 
@@ -279,7 +279,7 @@ Input rules:
 | 24 | Analytics access restricted | `pagerduty_assess_access_control` | `PD-24` | `abilities`, `users` | Always `manual` (per-role analytics permissions are not exposed); `analytics_abilities` is `null` when `/abilities` is unread and `role_counts` is `null` when `users` is unread |
 | 25 | Change events tracking enabled | `pagerduty_assess_integration_security` | `PD-25` | `change events`, `services` | `pass` when change events with a `timestamp` inside `change_event_days` arrived and the collection is complete, `warn` when events are undated, when Events API v2 integrations exist but no events arrived, or when the change event pages stopped at the limit (`evidence.change_events_complete` is false and `partial_view` names the truncation), `fail` when neither exists, `manual` when `change events` or `services` is unread or `services` is empty. `change_events_complete`, `change_events_dated_in_window`, `change_events_missing_timestamp`, and `services_with_change_events` are `null` when `change events` is unread; `events_v2_services` is `null` when `services` is unread |
 
-Any control whose source endpoint cannot be read becomes `manual`. The summary carries the collection error, which is also recorded in the assessment `errors` list and the bundle `_errors.log`.
+Any control whose primary input cannot be read becomes `manual`. An unread secondary input caps it at `warn`, with the exceptions in the input rules above the table. The summary carries the collection error, which is also recorded in the assessment `errors` list and the bundle `_errors.log`.
 
 Every `pass` listed above is downgraded to `warn` when the underlying inventory is partial or the credential is a non-admin user-level key.
 

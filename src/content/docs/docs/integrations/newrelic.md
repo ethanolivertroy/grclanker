@@ -210,7 +210,7 @@ Findings use four statuses:
 
 Every finding follows the same evidence rules. `cli/tests/newrelic.test.mjs` carries a regression test for each:
 
-1. An unreadable, forbidden, or errored NerdGraph field or REST endpoint never yields `pass`. This includes GraphQL `errors` alongside partial `data`. The finding is `manual`, and its summary names the failing surface, the error, and the evidence to collect.
+1. An unreadable, forbidden, or errored NerdGraph field or REST endpoint never yields `pass`. This includes GraphQL `errors` alongside partial `data`. The finding is `manual` when the unreadable surface is its primary inventory. The same applies when the unreadable surface is another inventory that the control's row in [Status semantics by control](#status-semantics-by-control) lists under `manual`, such as the users and group grants in control 4. Its summary names the failing surface, the error, and the evidence to collect. Any other unreadable inventory, or an unreadable account or authentication domain among several, instead limits a would-be `pass` to `warn` (rules 5 and 11).
 
 2. An empty inventory never yields `pass` by default.
    - Each summary states whether emptiness is unknown (`manual`) or a violation (`fail`, for example zero destinations while alert policies exist).
@@ -267,7 +267,7 @@ Every finding follows the same evidence rules. `cli/tests/newrelic.test.mjs` car
 
 11. **Secondary inventories (the rule 1 corollary):** A finding that reads more than one inventory is limited below `pass` when any of them is unreadable. This holds even when its verdict was computed from a complete primary inventory and the failure is already disclosed in the errors array or `_errors.log`.
     - A denied query, a NerdGraph field returned as null beside an `errors` entry, and a denial for one account or authentication domain among several all count.
-    - The finding is `warn`, or `manual` when the unreadable dataset is its primary inventory.
+    - Outside the cases that rule 1 names as `manual`, a would-be `pass` becomes `warn` and a verdict already below `pass` keeps its status.
     - The summary names the dataset and its query path, for example "alerts.policiesSearch: unreadable (account 111: NerdGraph returned errors: Not authorized (at actor.account.alerts.policiesSearch); ...)".
     - Every count or list derived from the unreadable or partly readable inventory is rendered as `null` beside a `*_status` evidence field, never as `0` or `[]`.
     - A count from the readable scopes only appears in the summary text after the `Partial view:` clause, never as the evidence value.
@@ -372,7 +372,7 @@ Every `pass` above additionally requires a complete inventory. The finding is li
 - A list was truncated.
 - A scope was unreadable.
 - `keySearch` fell back to a single page.
-- Any secondary inventory the finding reads was unreadable, fully or for one account or domain.
+- Any secondary inventory the finding reads was unreadable, fully or for one account or domain, except where rule 1 under [Verdict safety](#verdict-safety) makes the finding `manual`.
 
 The summary then carries a `Partial view:` clause naming the dataset and query path.
 

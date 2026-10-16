@@ -165,7 +165,7 @@ Status semantics for every finding:
   - Only provable for items carrying a date.
 - `fail` means the documented value is non-compliant.
 - `manual` means any of these:
-  - The surface was denied or errored.
+  - The surface the verdict is read from was denied or errored. A denied `GET /groups`, group settings view, or account `lock_settings` view demotes a pass to `warn` instead.
   - The documented key was absent from the response.
   - The inventory was empty where emptiness is not compliant.
   - The API does not expose the setting (with the reference page cited in the summary).

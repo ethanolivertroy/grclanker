@@ -160,7 +160,7 @@ Status semantics:
 
 The verdicts follow these safety rules, each covered by a regression test in `cli/tests/crowdstrike.test.mjs`:
 
-- An unreadable, forbidden (401/403), or errored endpoint never yields `pass`. The affected control becomes `manual`, and the summary names the failed read.
+- An unreadable, forbidden (401/403), or errored endpoint never yields `pass`. An unread primary input renders the finding `manual`. An unread secondary input keeps its verdict but cannot exceed `warn`. Either way, the summary names the failed read.
 - An empty inventory never yields `pass` by default.
   - Zero policies, hosts, host groups, or identity rules `fail`.
   - Zero users, API clients, Discover assets, or ZTA scores are `manual` because a live tenant cannot be empty.
