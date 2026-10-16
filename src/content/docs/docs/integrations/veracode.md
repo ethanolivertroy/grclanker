@@ -316,7 +316,7 @@ Data written to the bundle follows the data-side rule. Every string leaf of a `c
 
 Verdict safety rules apply to every control:
 
-- Forbidden or errored endpoints yield `manual` naming the surface and the HTTP status the failed request observed.
+- A forbidden or errored endpoint that a verdict rests on yields `manual`, naming the surface and the HTTP status the failed request observed. An endpoint that feeds only part of a verdict usually drops `pass` to `warn` instead, as the control table states.
 - Empty inventories never pass.
 - Items missing dates never count as fresh.
 - Every list a finding reads must have been walked to its last page, or the verdict is downgraded.

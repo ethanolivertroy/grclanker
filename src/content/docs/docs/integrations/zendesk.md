@@ -339,7 +339,7 @@ Every finding has the shape `{id, control, title, severity, status, summary, evi
 - `pass`: Verified from documented API fields, read to completion, by an admin credential.
 - `warn`: Verified but needs review, or the evidence was partial (truncated inventory, undated items, non-admin credential).
 - `fail`: A verified gap.
-- `manual`: The API does not expose the setting, the endpoint was forbidden or unavailable on the plan, or the inventory was suspiciously empty. The summary names the cause and the exact Admin Center evidence a reviewer must collect. Manual never counts as passing.
+- `manual`: The API does not expose the setting, the primary endpoint was forbidden or unavailable on the plan, or the inventory was suspiciously empty. The summary names the cause and the exact Admin Center evidence a reviewer must collect. Manual never counts as passing. Some unreadable secondary inventories only cap a `pass` at `warn`, as listed under [Limitations and manual controls](#limitations-and-manual-controls), and a verified gap still yields `fail`.
 
 ## Control coverage
 
@@ -368,7 +368,7 @@ Every finding has the shape `{id, control, title, severity, status, summary, evi
 | 21 | End-user authentication required (no anonymous tickets) | `zendesk_assess_authentication` | `ZD-21` | `pass` when `security_settings.authentication.end_user.enforce_sso=true` with an SSO method enabled, when `zendesk_login=true` under the `recommended` or `high` `security_policy_name`, or when only SSO or social methods (`remote_login`, `google_login`, `office_365_login`, `facebook_login`) are enabled; `warn` when SSO is enforced without a method or the password level is `medium` or `low`; `fail` when no sign-in method is enabled; `manual` only when Security Settings is forbidden. When Account Settings could not be read, `settings.api.api_password_access_end_users` is reported as not verified with the cause and a `pass` is capped at `warn`. The "Anybody can submit tickets" toggle is not published by either reference, so every summary names it as the remaining manual capture, together with `settings.api.api_password_access_end_users`. |
 | 22 | Brand security settings consistent across brands | `zendesk_assess_integrations` | `ZD-22` | `pass` when an admin read every active brand and they share one `help_center_state`; `warn` for mixed states, a non-admin view (the summary names the role, or says the role could not be read when `/users/me` was unreadable, and never reports an unread role as non-admin), or truncation; `manual` when zero brands are visible or unreadable. |
 | 23 | External sharing agreements reviewed | `zendesk_assess_integrations` | `ZD-23` | `pass` when the readable inventory is empty; `warn` when agreements are failed or misconfigured; `manual` when accepted or pending agreements exist. |
-| 24 | External notification targets use HTTPS | `zendesk_assess_integrations` | `ZD-24` | `fail` when any active target or webhook is non-https; `warn` when a webhook has no authentication, one endpoint is unreadable, or either inventory (targets or webhooks) is truncated; `pass` when every destination is https and authenticated (or both readable, complete inventories are empty). Counts for an unreadable half render as `null`. |
+| 24 | External notification targets use HTTPS | `zendesk_assess_integrations` | `ZD-24` | `fail` when any active target or webhook is non-https; `warn` when a webhook has no authentication, one endpoint is unreadable, or either inventory (targets or webhooks) is truncated; `manual` when both endpoints are unreadable; `pass` when every destination is https and authenticated (or both readable, complete inventories are empty). Counts for an unreadable half render as `null`. |
 | 25 | Triggers/automations do not send data to external URLs | `zendesk_assess_integrations` | `ZD-25` | `fail` when an active rule notifies an `http://` destination; `warn` when rules notify external webhooks, targets, or sharing agreements, or the rule inventory is truncated; `manual` when zero rules are visible; `pass` when the complete rule set has no external actions and the target and webhook lists used to resolve destinations were readable. When targets or webhooks are unreadable or truncated, actions pointing at them are recorded as `unresolved_destinations` (their scheme cannot be checked, so `fail` is not reachable for them), the summary names the unread inventory, `insecure_destinations` renders `null` because the count is unknown rather than zero (`insecure_resolved_destinations` keeps the count among the destinations that did resolve), and a `pass` is capped at `warn`. |
 
 ## Framework mappings
@@ -405,7 +405,7 @@ The script prints a skip message and exits 0 when no credentials are present. Wi
 - Controls 1, 3, 4, 5, 12, and 21 are verified from the Security Settings and Deletion Schedules endpoints. They render `manual` only when those admin-only endpoints are forbidden. The "Anybody can submit tickets" portion of control 21 stays manual because neither reference publishes it.
 - Controls 13, 15, 16, and 23 are `manual` whenever the inventory is non-empty: reviewing token ownership, app permissions, or sharing partners is a human activity. The finding carries the inventory as evidence.
 - The API token inventory endpoint is not part of the published API reference and is not called. Token creation and deletion events are reconstructed from the audit log (`filter[source_type]=apitoken`), which needs an Enterprise plan and cannot prove that zero tokens exist.
-- Audit logs and custom roles require an Enterprise plan. The tools report 403 or 404 as `manual` with a plan or permission cause, never as a pass.
+- Audit logs and custom roles require an Enterprise plan. A 403 or 404 on them never yields a pass. The finding is `manual` with a plan or permission cause, or capped at `warn` where they are a secondary inventory listed below.
 - Help Center article visibility, Talk, Chat, and Sell settings are not inspected.
 - Non-admin credentials cap every verdict at `warn`.
 - A finding that reads several inventories never passes on a partial view.
@@ -413,10 +413,10 @@ The script prints a skip message and exits 0 when no credentials are present. Wi
   - Secondary inventories by finding:
     - Account Settings for ZD-12 and ZD-21.
     - Custom roles for ZD-12.
-    - The token audit log for ZD-13.
+    - The token audit log for ZD-13, only while `settings.api.api_token_access=false`. Otherwise an unreadable audit log makes ZD-13 `manual`.
     - OAuth tokens for ZD-14.
     - Owned apps for ZD-15.
-    - Targets or webhooks for ZD-24 and ZD-25.
+    - Targets or webhooks for ZD-24 and ZD-25. ZD-24 is `manual` when both are unreadable.
   - Counts and lists derived from an inventory that could not be read render as `null` in finding evidence and assessment summaries, never `0` or `[]`.
 - A truncated list is an incomplete inventory, and a verdict over it says only what the seen population supports.
   - A count over a truncated list is a lower bound. A positive count renders as observed, qualified by `inventory_truncated` and the summary's truncation sentence.

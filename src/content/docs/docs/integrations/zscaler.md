@@ -184,7 +184,7 @@ The script skips with exit code 0 when no ZIA or ZPA credentials are present. Ot
 
 ## Endpoints and official documentation
 
-Every endpoint, query parameter, and field below was verified against the OpenAPI documents published on the [Zscaler Automation Hub](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia) (ZIA and ZPA API reference).
+Every endpoint, query parameter, and field below was verified against the OpenAPI documents published on the [Zscaler Automation Hub](https://automate.zscaler.com/docs/api-reference-and-guides/api-reference/zia) (ZIA and ZPA API reference). The exceptions are the legacy ZPA `POST /signin` flow and the items marked "SDK only", both explained below.
 
 The Hub serves the OneAPI base URL `https://api.zsapi.net/zia/api/v1`. The resource paths, parameters, and schemas are shared with the legacy `/api/v1` and `config.private.zscaler.com` surfaces this integration calls.
 
