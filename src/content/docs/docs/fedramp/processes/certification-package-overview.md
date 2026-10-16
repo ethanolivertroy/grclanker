@@ -4,17 +4,18 @@ description: "Official Consolidated Rules summary for the CPO FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+>
 > Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+>
 > Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+>
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
-
-# Certification Package Overview
 
 Short name: `CPO` · Process ID: `CPO` · Web slug: `certification-package-overview`
 
 Applies to: `both`, `20x`, `rev5`
-Status: `stable`
 
+Status: `stable`
 
 Official page: [https://www.fedramp.gov/2026/reference/certification-package-overview/](https://www.fedramp.gov/2026/reference/certification-package-overview/)
 
@@ -89,6 +90,7 @@ Terms: `Certification Class`, `Certification Data`, `Certification Package`, `In
 Affects: Providers
 
 Note: For FedRAMP Rev5, the Certification Package Overview replaces the historically required System Security Plan (not including appendices).
+
 This list of rules may not apply to all FedRAMP Certification Classes or Types - if a rule does not apply then the information is not required.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -109,6 +111,7 @@ Terms: `Certification Package`, `Persistently`
 Affects: Providers
 
 Note: Providers are expected to maintain their FedRAMP Certification Package using automation as changes occur to ensure they are never out of date.
+
 This rule does not require or expect persistent human review of all materials in this cadence.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -128,6 +131,7 @@ Terms: `Certification Package`, `Persistently`, `Significant Change`, `Transform
 Affects: Providers
 
 Note: This maximum timeframe for Rev5 is the absolutely poorest worst case for horrible customer experience and is based on legacy FedRAMP Rev5 allowing providers to leave their packages unmaintained for up to a year. Rev5 providers should maintain their packages far more frequently than this requirement to ensure potential customers have access to up-to-date information, updating it at least after every transformative significant change.
+
 FedRAMP 20x Certifications expect providers to maintain their FedRAMP Certification Packages as changes occur to ensure they are never out of date.
 
 Recent update (2026-07-14): Removed reference to class A. All class A certifications are 20x.

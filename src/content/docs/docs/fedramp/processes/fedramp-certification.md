@@ -4,17 +4,18 @@ description: "Official Consolidated Rules summary for the FRC FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+>
 > Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+>
 > Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+>
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
-
-# FedRAMP Certification
 
 Short name: `FRC` · Process ID: `FRC` · Web slug: `fedramp-certification`
 
 Applies to: `both`, `20x`, `rev5`
-Status: `stable`
 
+Status: `stable`
 
 Official page: [https://www.fedramp.gov/2026/reference/fedramp-certification/](https://www.fedramp.gov/2026/reference/fedramp-certification/)
 
@@ -98,6 +99,7 @@ Providers MUST NOT use a third party to apply for a FedRAMP Certification on the
 Affects: Providers
 
 Note: FedRAMP previously allowed independent assessment services to submit applications on behalf of providers, but this caused confusion about who was responsible for the application and the information in it. Providers should apply directly to ensure clear accountability.
+
 Providers may use third parties to help them prepare their application and assessment materials for submission.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -131,6 +133,7 @@ Terms: `All Necessary Parties`, `Certification Class`
 Affects: Providers
 
 Note: Downgrade paths include moving from D to C, B, or A; C to B or A; or B to A.
+
 FRC-CCL-DNP (Downgrade Notification Period) applies - please DO NOT downgrade Certification Class with providing advance notification to all necessary parties!
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -156,6 +159,7 @@ Terms: `Certification Class`
 Affects: Providers
 
 Note: Upgrade paths include moving from A to B, C, or D; B to C or D; and C to D.
+
 The preferred path is to incrementally update the implementation and assurance commitments within the current Certification Class until the provider has met all requirements for the target Certification Class, then apply for the new Certification Class.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -234,7 +238,9 @@ Terms: `Artifacts`, `Certification Data`, `Certification Package`, `Certificatio
 Affects: Providers
 
 Note: Some of these specific FedRAMP rules may not have similar counterparts in external frameworks and providers will need to implement new processes to follow these rules.
+
 In general, for each of these FedRAMP requirements, providers should include a sufficiently detailed summary that reviewers will not need to dig into the related security framework materials to understand the related decisions - just saying "see SOC 2 report" is not particularly helpful.
+
 Information about how the provider addresses the included Key Security Indicators are required to receive a class A certification even if the provider intends to pursue a Rev 5 Program Certification path in the future.
 
 Recent update (2026-07-14): Clarified that providers MUST address the Key Security Indicators even if they intend to pursue a Rev 5 Program Certification path in the future.
@@ -446,6 +452,7 @@ Providers with FedRAMP Rev5 Ready status MUST convert to a FedRAMP Certification
 Affects: Providers
 
 Note: The simplest conversion in most cases would be to a FedRAMP 20x Class A Certification.
+
 Cloud services that do not wish to convert or do not meet conversion criteria will be renamed Legacy FedRAMP Ready and otherwise retired from FedRAMP Ready.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

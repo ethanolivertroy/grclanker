@@ -21,9 +21,12 @@ function esc(value: string): string {
   return value.replaceAll("|", "\\|");
 }
 
-function fenceMultiline(text: string | null | undefined): string {
-  if (!text) return "";
-  return text.trim();
+function paragraphs(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function markdownList(values: string[], indent = ""): string {
@@ -48,7 +51,7 @@ function sourceBanner(
     `> Source path: [\`${primary.path}\`](${primary.fileHtmlUrl ?? primary.rawUrl}) on \`${primary.branch}\` at blob ${blobRef}.`,
     `> Consolidated Rules version: \`${primary.version}\` · upstream \`last_updated\`: \`${primary.upstreamLastUpdated}\`.`,
     `> ${supportingNote}`,
-  ].join("\n");
+  ].join("\n>\n");
 }
 
 function frontmatter(title: string, description: string): string {
@@ -95,7 +98,7 @@ function requirementMarkdown(requirement: FedrampRequirementRecord): string {
   }
 
   if (requirement.note) {
-    lines.push("", `Note: ${requirement.note}`);
+    lines.push("", `Note: ${paragraphs(requirement.note)}`);
   }
 
   if (requirement.updated.length > 0) {
@@ -129,8 +132,6 @@ function processPage(
     "",
     sourceBanner(primary, secondary),
     "",
-    `# ${process.name}`,
-    "",
     `Short name: \`${process.shortName}\` · Process ID: \`${process.id}\` · Web slug: \`${process.webName}\``,
     "",
     `Applies to: ${process.applicability.map((value) => `\`${value}\``).join(", ")}`,
@@ -138,7 +139,7 @@ function processPage(
   ];
 
   if (process.status) {
-    lines.splice(lines.length - 1, 0, `Status: \`${process.status}\``, "");
+    lines.push(`Status: \`${process.status}\``, "");
   }
 
   if (process.sourceUrl) {
@@ -155,7 +156,7 @@ function processPage(
   );
 
   if (process.purpose) {
-    lines.push("## Purpose", "", fenceMultiline(process.purpose), "");
+    lines.push("## Purpose", "", paragraphs(process.purpose), "");
   }
 
   if (process.expectedOutcomes.length > 0) {
@@ -215,17 +216,15 @@ function ksiDomainPage(
     "",
     sourceBanner(primary, secondary),
     "",
-    `# ${domain.name}`,
-    "",
     `Domain code: \`${domain.code}\` · Domain ID: \`${domain.id}\` · Web slug: \`${domain.webName}\``,
-    "",
-    "## Indicators",
     "",
   ];
 
   if (domain.theme) {
-    lines.splice(8, 0, "## Theme", "", fenceMultiline(domain.theme), "");
+    lines.push("## Theme", "", paragraphs(domain.theme), "");
   }
+
+  lines.push("## Indicators", "");
 
   for (const indicator of indicators) {
     const former = indicator.fka ? ` (formerly \`${indicator.fka}\`)` : "";
@@ -293,8 +292,6 @@ export function buildFedrampDocsSnapshot(
     "",
     sourceBanner(primary, secondary),
     "",
-    "# FedRAMP Official Sources",
-    "",
     "This section is generated from the official FedRAMP GitHub organization. grclanker uses these machine-readable materials for both CLI lookups and reviewed docs snapshots so the public site stays fast without drifting away from upstream.",
     "",
     "## Current Grounding",
@@ -322,8 +319,6 @@ export function buildFedrampDocsSnapshot(
     "",
     sourceBanner(primary, secondary),
     "",
-    "# FedRAMP Processes",
-    "",
     processRows,
     "",
   ].join("\n");
@@ -335,8 +330,6 @@ export function buildFedrampDocsSnapshot(
     ),
     "",
     sourceBanner(primary, secondary),
-    "",
-    "# FedRAMP KSI Domains",
     "",
     ksiRows,
     "",

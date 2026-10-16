@@ -4,17 +4,18 @@ description: "Official Consolidated Rules summary for the AFC FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+>
 > Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+>
 > Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+>
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
-
-# Addressing FedRAMP Communication
 
 Short name: `AFC` · Process ID: `AFC` · Web slug: `addressing-fedramp-communication`
 
 Applies to: `both`
-Status: `stable`
 
+Status: `stable`
 
 Official page: [https://www.fedramp.gov/2026/reference/addressing-fedramp-communication/](https://www.fedramp.gov/2026/reference/addressing-fedramp-communication/)
 
@@ -90,6 +91,7 @@ Terms: `FedRAMP Security Inbox`
 Affects: Providers
 
 Note: Unless otherwise notified, FedRAMP will use the listed Security Email on the Marketplace for these notifications.
+
 If a provider establishes a new inbox in reaction to this guidance that is different from the Security Email then they must follow the AFC-CSO-NOC (Notification of Changes) rules to notify FedRAMP.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -178,6 +180,7 @@ Affects: FedRAMP
 Structured timeframe: `10` bizdays
 
 Note: Public notice may include blog posts, social media posts, announcements during Community Updates, or e-blasts.
+
 As this process matures, additional confirmed options may become available.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

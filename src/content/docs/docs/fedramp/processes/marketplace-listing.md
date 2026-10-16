@@ -4,17 +4,18 @@ description: "Official Consolidated Rules summary for the MKT FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+>
 > Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+>
 > Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+>
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
-
-# Marketplace Listing
 
 Short name: `MKT` · Process ID: `MKT` · Web slug: `marketplace-listing`
 
 Applies to: `both`
-Status: `stable`
 
+Status: `stable`
 
 Official page: [https://www.fedramp.gov/2026/reference/marketplace-listing/](https://www.fedramp.gov/2026/reference/marketplace-listing/)
 
@@ -152,6 +153,7 @@ Terms: `Cloud Service Offering`, `Information Resource`, `Third-Party Informatio
 Affects: Providers
 
 Note: FedRAMP will not list products or services that are outside the explicit statutory scope of FedRAMP; See MKT-FRP-SOF (Scope of FedRAMP).
+
 Services used by private companies to meet other compliance requirements (such as CMMC) that do not also meet one of the above use cases are outside the scope of FedRAMP.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

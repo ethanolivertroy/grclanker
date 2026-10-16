@@ -4,17 +4,18 @@ description: "Official Consolidated Rules summary for the MAS FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+>
 > Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+>
 > Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+>
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
-
-# Minimum Assessment Scope
 
 Short name: `MAS` · Process ID: `MAS` · Web slug: `minimum-assessment-scope`
 
 Applies to: `both`
-Status: `stable`
 
+Status: `stable`
 
 Official page: [https://www.fedramp.gov/2026/reference/minimum-assessment-scope/](https://www.fedramp.gov/2026/reference/minimum-assessment-scope/)
 
@@ -57,7 +58,9 @@ Terms: `Certification Package`, `Cloud Service Offering`, `Federal Customer Data
 Affects: Providers
 
 Note: Certain categories of cloud computing products and services are specified as entirely outside the scope of FedRAMP by the Director of the Office of Management and Budget. All such products and services are therefore not included in the cloud service offering for FedRAMP. For more, see https://fedramp.gov/scope.
+
 Software produced by cloud service providers that is delivered separately for installation on agency systems and not operated in a shared responsibility model (typically including agents, application clients, mobile applications, etc. that are not fully managed by the cloud service provider) is not a cloud computing product or service and is entirely outside the scope of FedRAMP under the FedRAMP Certification Act. All such software is therefore not included in the cloud service offering for FedRAMP. For more, see https://fedramp.gov/scope.
+
 All aspects of the cloud service offering are determined and maintained by the cloud service provider in accordance with related FedRAMP Certification rules and documented by the cloud service provider in their FedRAMP Certification Package.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

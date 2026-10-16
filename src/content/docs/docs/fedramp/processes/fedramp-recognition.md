@@ -4,17 +4,18 @@ description: "Official Consolidated Rules summary for the REC FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+>
 > Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+>
 > Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+>
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
-
-# FedRAMP Recognition of Independent Assessment Services
 
 Short name: `REC` · Process ID: `REC` · Web slug: `fedramp-recognition`
 
 Applies to: `both`
-Status: `stable`
 
+Status: `stable`
 
 Official page: [https://www.fedramp.gov/2026/reference/fedramp-recognition/](https://www.fedramp.gov/2026/reference/fedramp-recognition/)
 

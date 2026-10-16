@@ -4,17 +4,18 @@ description: "Official Consolidated Rules summary for the IVV FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+>
 > Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+>
 > Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+>
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
-
-# Independent Verification and Validation
 
 Short name: `IVV` · Process ID: `IVV` · Web slug: `independent-verification-and-validation`
 
 Applies to: `both`, `20x`, `rev5`
-Status: `stable`
 
+Status: `stable`
 
 Official page: [https://www.fedramp.gov/2026/reference/independent-verification-and-validation/](https://www.fedramp.gov/2026/reference/independent-verification-and-validation/)
 
@@ -65,8 +66,11 @@ Affects: Providers
 Structured timeframe: `1` years
 
 Note: The first such completed assessment is typically called an "initial assessment" while following assessments are called "annual assessments."
+
 The specific requirements for independent verification and validation assessments are documented by the FedRAMP Certification Class and Type.
+
 The option for assessment by FedRAMP directly is limited to cloud services that are explicitly prioritized by FedRAMP, in consultation with the FedRAMP Board and the federal Chief Information Officers Council; this is _extremely_ rare.
+
 FedRAMP Recognized independent assessment services are listed on the FedRAMP Marketplace.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -80,6 +84,7 @@ Terms: `Certification Package`, `FedRAMP Independent Assessment`, `Verification`
 Affects: Providers
 
 Note: Inappropriate modification in this context means changing the underlying intent/etc. of the content provided by the independent assessment service - the content itself may be modified for presentation, formatting, etc. as needed.
+
 This rule is related to IVV-IAS-VIP (Verify Inclusion in Certification Package).
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
