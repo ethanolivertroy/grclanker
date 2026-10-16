@@ -4,8 +4,11 @@ description: "Official Consolidated Rules summary for the SCN FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+>
 > Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+>
 > Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+>
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Significant Change Notification
@@ -13,8 +16,8 @@ description: "Official Consolidated Rules summary for the SCN FedRAMP process, i
 Short name: `SCN` · Process ID: `SCN` · Web slug: `significant-change-notification`
 
 Applies to: `both`
-Status: `stable`
 
+Status: `stable`
 
 Official page: [https://www.fedramp.gov/2026/reference/significant-change-notification/](https://www.fedramp.gov/2026/reference/significant-change-notification/)
 
@@ -54,6 +57,7 @@ Affects: Providers
 Structured timeframe: `10` bizdays
 
 Note: Activities that match the adaptive significant change type are a frequent and normal part of iteratively improving a service by deploying new functionality or modifying existing functionality in a way that is typically transparent to customers and does not introduce significant new security risks.
+
 In general, most changes that do not happen regularly will be adaptive changes. This change type deliberately covers a wide range of activities in a way that requires assessment and consideration.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -164,6 +168,7 @@ Terms: `Certification Package`
 Affects: Providers
 
 Note: The sharing mechanism should be designed based on the needs of the provider and their customers and may vary between providers.
+
 The default sharing mechanism for most providers during the SCN beta was to send an email to agency customers and upload a copy of the notification to the provider's secure sharing location.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -189,7 +194,9 @@ Terms: `Incident`, `Regularly`, `Routine Recurring Change`, `Significant Change`
 Affects: Providers
 
 Note: Activities that match the routine recurring significant change type are performed regularly and routinely by cloud service providers to address flaws or vulnerabilities, address incidents, and generally perform the typical maintenance and service delivery changes expected during day-to-day operations.
+
 These changes leverage mature processes and capabilities to identify, mitigate, and remediate risks as part of the change. They are often entirely automated and may occur without human intervention, even though they have an impact on security of the service.
+
 If the activity does not occur regularly and routinely then it cannot be a significant change of this type (e.g., replacing all physical firewalls to remediate a vulnerability is obviously not regular or routine).
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

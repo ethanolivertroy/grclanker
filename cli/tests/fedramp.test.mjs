@@ -447,9 +447,8 @@ test("inspectFedrampOfficialSources reports rules as primary and narrative Markd
   }
 });
 
-test("buildFedrampDocsSnapshot is deterministic and includes provenance banners", () => {
-  const catalog = normalizeFedrampConsolidatedRules(consolidatedRulesFixture);
-  const primary = {
+const docsSnapshotSources = {
+  primary: {
     org: "FedRAMP",
     repo: "rules",
     branch: "main",
@@ -461,8 +460,8 @@ test("buildFedrampDocsSnapshot is deterministic and includes provenance banners"
     repoUpdatedAt: "2026-04-13T17:52:17Z",
     version: "2026.07.02.02",
     upstreamLastUpdated: "2026-07-02",
-  };
-  const secondary = {
+  },
+  secondary: {
     org: "FedRAMP",
     repo: "2026-markdown",
     branch: "main",
@@ -471,10 +470,14 @@ test("buildFedrampDocsSnapshot is deterministic and includes provenance banners"
     state: "ready",
     rootEntries: ["README.md", "_sources.json", "providers"],
     notes: [],
-  };
+  },
+};
 
-  const first = buildFedrampDocsSnapshot(catalog, { primary, secondary });
-  const second = buildFedrampDocsSnapshot(catalog, { primary, secondary });
+test("buildFedrampDocsSnapshot is deterministic and includes provenance banners", () => {
+  const catalog = normalizeFedrampConsolidatedRules(consolidatedRulesFixture);
+
+  const first = buildFedrampDocsSnapshot(catalog, docsSnapshotSources);
+  const second = buildFedrampDocsSnapshot(catalog, docsSnapshotSources);
 
   assert.deepEqual(first, second);
   assert.ok(first.some((file) => file.path === "fedramp/index.md"));
@@ -485,6 +488,26 @@ test("buildFedrampDocsSnapshot is deterministic and includes provenance banners"
   assert.match(overview, /official FedRAMP GitHub organization/i);
   assert.match(overview, /2026.07.02.02/);
   assert.match(overview, /fedramp-consolidated-rules\.json/);
+});
+
+test("buildFedrampDocsSnapshot puts banner lines, status, and each note in separate paragraphs", () => {
+  const fixture = structuredClone(consolidatedRulesFixture);
+  fixture.FRR.CDS.data.all.CSO["CDS-CSO-PUB"].notes = [
+    "Agencies rely on this information.",
+    "Keep both formats in sync.",
+  ];
+
+  const files = buildFedrampDocsSnapshot(
+    normalizeFedrampConsolidatedRules(fixture),
+    docsSnapshotSources,
+  );
+  const page =
+    files.find((file) => file.path === "fedramp/processes/certification-data-sharing.md")
+      ?.content ?? "";
+
+  assert.match(page, /GitHub repo\.\n>\n> Source path: /);
+  assert.match(page, /\nApplies to: [^\n]+\n\nStatus: `stable`\n/);
+  assert.match(page, /\nNote: Agencies rely on this information\.\n\nKeep both formats in sync\.\n/);
 });
 
 test("readiness helper prioritizes official MUST items and infers provider-facing artifacts", () => {

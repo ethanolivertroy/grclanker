@@ -4,8 +4,11 @@ description: "Official Consolidated Rules summary for the CDS FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+>
 > Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+>
 > Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+>
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Certification Data Sharing
@@ -13,8 +16,8 @@ description: "Official Consolidated Rules summary for the CDS FedRAMP process, i
 Short name: `CDS` · Process ID: `CDS` · Web slug: `certification-data-sharing`
 
 Applies to: `both`, `rev5`
-Status: `stable`
 
+Status: `stable`
 
 Official page: [https://www.fedramp.gov/2026/reference/certification-data-sharing/](https://www.fedramp.gov/2026/reference/certification-data-sharing/)
 
@@ -75,6 +78,7 @@ Terms: `Certification Data`, `Cloud Service Offering`
 Affects: Providers
 
 Note: The FedRAMP ID is supplied by FedRAMP after a cloud service offering is registered to be listed on the FedRAMP Marketplace - providers will need to use a placeholder until the FedRAMP ID is assigned.
+
 Many providers have multiple cloud service offerings or use internal names that don't align to public materials; using the FedRAMP ID ensures we can easily align the communication with a specific cloud service offering.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -136,6 +140,7 @@ Varies by certification class:
 Affects: Providers
 
 Note: Providers determine what they consider to be separate services, based on maximizing the customer experience for agencies who may only adopt some services and not others.
+
 Providers are encouraged to provide a single comprehensive set of materials for all shared aspects of the service offering and only provide separate materials for unique aspects of each service to minimize the burden on providers and agencies.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
