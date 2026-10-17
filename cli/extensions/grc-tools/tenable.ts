@@ -4660,6 +4660,10 @@ export async function collectTenableVulnerabilityData(clients: TenableClients, o
 }
 
 export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityData, options: TenableAssessmentOptions = {}): TenableAssessmentResult {
+  return runBatchVerdictContext(TENABLE_DECISION_CONTEXT, TENABLE_SPEC, () => assessTenableVulnerabilityManagementWithDecisionContext(data, options));
+}
+
+function assessTenableVulnerabilityManagementWithDecisionContext(data: TenableVulnerabilityData, options: TenableAssessmentOptions): TenableAssessmentResult {
   const now = options.now ?? Date.now();
   const sla = {
     critical: clampInteger(options.slaCriticalDays, DEFAULT_SLA_DAYS.critical, 1, 3650),
@@ -4677,6 +4681,8 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
   const populationNote = `${partialNote(data.assetExport)}${unevaluableRecordsNote(data.vulnExport, CAPPED_AT_WARN)}${nonAdminNote(callerIsAdministrator)}`;
 
   if (data.vulnExport.status !== "ok") {
+    recordTenableDecisionFacts(14, { vuln_export_readable: false });
+    recordTenableDecisionFacts(15, { vuln_export_readable: false });
     findings.push(unreadableFinding(14, "high", data.vulnExport, "the VPR distribution of open findings from Findings > Vulnerabilities"));
     findings.push(unreadableFinding(15, "high", data.vulnExport, "the open finding age by severity and remediation times from Findings > Vulnerabilities"));
   } else {
@@ -4691,6 +4697,20 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     });
     const rated = open.filter((record) => ["low", "medium", "high", "critical"].includes(asString(record.severity)?.toLowerCase() ?? ""));
     const vprCoverage = ratio(scored.length, rated.length);
+    const unevaluableVulnRecords = unevaluableRecordsOf(data.vulnExport);
+    recordTenableDecisionFacts(14, assetCount === undefined
+      ? { vuln_export_readable: true, asset_export_readable: false }
+      : {
+        vuln_export_readable: true,
+        asset_export_readable: true,
+        asset_count: assetCount,
+        open_finding_count: open.length,
+        vuln_export_chunks_complete: !data.vulnExport.truncated,
+        vpr_coverage_ratio: vprCoverage,
+        unevaluable_vuln_record_count: unevaluableVulnRecords,
+        asset_export_complete: readInFull(data.assetExport),
+        caller_is_administrator: callerIsAdministrator === true,
+      });
     let vprStatus: TenableFindingStatus;
     let vprSummary: string;
     if (assetCount === undefined) {
@@ -4723,7 +4743,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       asset_count: assetCount ?? null,
       export_status: data.vulnExport.data.status,
       chunks: chunkRatio(data.vulnExport),
-      unevaluable_records: unevaluableRecordsOf(data.vulnExport),
+      unevaluable_records: unevaluableVulnRecords,
       asset_unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
 
@@ -4744,6 +4764,28 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     const fixTimes = fixed.map((record) => asNumber(record.time_taken_to_fix)).filter((value): value is number => value !== undefined);
     const mttrDays = fixTimes.length > 0 ? Number((fixTimes.reduce((sum, value) => sum + value, 0) / fixTimes.length / 86_400).toFixed(1)) : null;
     const overdueTotal = overdue.critical + overdue.high + overdue.medium + overdue.low;
+    const openAgeDays = (severity: keyof typeof sla): number[] =>
+      daysSinceEach(now, open.filter((record) => asString(record.severity)?.toLowerCase() === severity), "first_found");
+    recordTenableDecisionFacts(15, assetCount === undefined
+      ? { vuln_export_readable: true, asset_export_readable: false }
+      : {
+        vuln_export_readable: true,
+        asset_export_readable: true,
+        asset_count: assetCount,
+        vuln_export_chunks_complete: !data.vulnExport.truncated,
+        open_critical_finding_age_days: openAgeDays("critical"),
+        sla_critical_days: sla.critical,
+        open_high_finding_age_days: openAgeDays("high"),
+        sla_high_days: sla.high,
+        open_medium_finding_age_days: openAgeDays("medium"),
+        sla_medium_days: sla.medium,
+        open_low_finding_age_days: openAgeDays("low"),
+        sla_low_days: sla.low,
+        undated_open_finding_count: undated,
+        unevaluable_vuln_record_count: unevaluableVulnRecords,
+        asset_export_complete: readInFull(data.assetExport),
+        caller_is_administrator: callerIsAdministrator === true,
+      });
     let slaStatus: TenableFindingStatus;
     let slaSummary: string;
     if (assetCount === undefined || assetCount === 0) {
@@ -4776,13 +4818,14 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       mttr_days: mttrDays,
       asset_count: assetCount ?? null,
       chunks: chunkRatio(data.vulnExport),
-      unevaluable_records: unevaluableRecordsOf(data.vulnExport),
+      unevaluable_records: unevaluableVulnRecords,
       asset_unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
   }
 
   if (data.vulnExportJobs.status !== "ok" && data.assetExportJobs.status !== "ok") {
     const manualEvidence = "evidence of scheduled exports or report schedules from the Tenable UI (Reports) and integration logs";
+    recordTenableDecisionFacts(19, { vuln_export_jobs_readable: false, asset_export_jobs_readable: false });
     findings.push(data.vulnExportJobs.status === "not_configured"
       ? unreadableFinding(19, "medium", data.vulnExportJobs, manualEvidence)
       : finding(19, "manual", "medium", `Unknown: the export job lists could not be read because ${describeUnread(data.vulnExportJobs)} and ${describeUnread(data.assetExportJobs)}. A human must collect ${manualEvidence}.`, {
@@ -4807,6 +4850,13 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     const externalDays = new Set(externalJobs.map((job) => new Date(parseTimestampMs(job.created) ?? 0).toISOString().slice(0, 10)));
     const limitation = `The export job lists include completed jobs only from the previous ${EXPORT_JOB_WINDOW_DAYS} days, so this is a point-in-time signal of export activity, and report schedules are not exposed by the API, so they need a manual check in Reports.`;
     const unreadJobLists = unreadableNote([{ dataset: data.vulnExportJobs, consequence: "vulnerability export jobs are unobserved" }, { dataset: data.assetExportJobs, consequence: "asset export jobs are unobserved" }]);
+    recordTenableDecisionFacts(19, {
+      vuln_export_jobs_readable: data.vulnExportJobs.status === "ok",
+      asset_export_jobs_readable: data.assetExportJobs.status === "ok",
+      external_export_job_count: externalJobs.length,
+      external_export_job_day_count: externalDays.size,
+      caller_is_administrator: callerIsAdministrator === true,
+    });
     let status: TenableFindingStatus;
     let summary: string;
     if (externalDays.size >= 2) {
