@@ -1668,6 +1668,13 @@ function hoursSince(now: number, thenMs: number): number {
   return (now - thenMs) / 3_600_000;
 }
 
+function daysSinceEach(now: number, records: readonly JsonRecord[], field: string): number[] {
+  return records.flatMap((record) => {
+    const thenMs = parseTimestampMs(record[field]);
+    return thenMs === undefined ? [] : [daysBetween(now, thenMs)];
+  });
+}
+
 function ratio(part: number, whole: number): number {
   return whole > 0 ? Number((part / whole).toFixed(4)) : 0;
 }
@@ -3399,10 +3406,7 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
       scans_readable: true,
       scan_count: scans.length,
       enabled_recurring_scan_count: recurring.length,
-      recurring_scan_age_days: recurring.flatMap((scan) => {
-        const lastLaunch = parseTimestampMs(scan.last_modification_date);
-        return lastLaunch === undefined ? [] : [daysBetween(now, lastLaunch)];
-      }),
+      recurring_scan_age_days: daysSinceEach(now, recurring, "last_modification_date"),
       stale_scan_days: staleScanDays,
       never_run_or_undated_recurring_scan_count: neverRun.length,
       caller_is_administrator: callerIsAdministrator === true,
@@ -3997,10 +4001,7 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
       linked_scanner_count: linkedScanners.length,
       unlinked_scanner_count: unlinked.length,
       off_scanner_count: off.length,
-      linked_scanner_connect_age_days: linkedScanners.flatMap((scanner) => {
-        const lastConnect = parseTimestampMs(scanner.last_connect);
-        return lastConnect === undefined ? [] : [daysBetween(now, lastConnect)];
-      }),
+      linked_scanner_connect_age_days: daysSinceEach(now, linkedScanners, "last_connect"),
       undated_linked_scanner_count: undated.length,
       outdated_linked_scanner_count: outdated.length,
       caller_is_administrator: callerIsAdministrator === true,
@@ -4210,10 +4211,7 @@ function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, fe
     sc_scanners_readable: true,
     sc_scanner_count: scanners.data.length,
     sc_unhealthy_scanner_count: unhealthy.length,
-    sc_scanner_checkin_age_days: enabled.flatMap((scanner) => {
-      const stamp = parseTimestampMs(scanner.lastCheckinTime);
-      return stamp === undefined ? [] : [daysBetween(now, stamp)];
-    }),
+    sc_scanner_checkin_age_days: daysSinceEach(now, enabled, "lastCheckinTime"),
     sc_scanner_plugin_set_age_hours: enabled.flatMap((scanner) => {
       const stamp = parsePluginSetMs(scanner.loadedPluginSet) ?? parsePluginSetMs(scanner.pluginSet);
       return stamp === undefined ? [] : [hoursSince(now, stamp)];
@@ -4308,6 +4306,10 @@ function userHasStrongAuth(user: JsonRecord): boolean {
 }
 
 export function assessTenableAccessControl(data: TenableAccessControlData, options: TenableAssessmentOptions = {}): TenableAssessmentResult {
+  return runBatchVerdictContext(TENABLE_DECISION_CONTEXT, TENABLE_SPEC, () => assessTenableAccessControlWithDecisionContext(data, options));
+}
+
+function assessTenableAccessControlWithDecisionContext(data: TenableAccessControlData, options: TenableAssessmentOptions): TenableAssessmentResult {
   const now = options.now ?? Date.now();
   const inactiveDays = clampInteger(options.inactiveUserDays, DEFAULT_INACTIVE_USER_DAYS, 1, 3650);
   const maxAdmins = clampInteger(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 10000);
@@ -4316,10 +4318,13 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   const findings: TenableFinding[] = [];
 
   if (data.users.status !== "ok") {
+    recordTenableDecisionFacts(10, { users_readable: false });
     findings.push(unreadableFinding(10, "high", data.users, "the user list with roles, last login, MFA, and enabled state from Settings > Access Control > Users"));
   } else if (data.users.data.length === 0) {
+    recordTenableDecisionFacts(10, { users_readable: true, user_count: 0 });
     findings.push(finding(10, "manual", "high", `${data.users.endpoint} returned zero users, which cannot be a complete view because the calling user must exist; collect the user list from Settings > Access Control > Users.`, { user_count: 0 }));
   } else if (callerIsAdministrator !== true) {
+    recordTenableDecisionFacts(10, { users_readable: true, user_count: data.users.data.length, caller_is_administrator: false });
     findings.push(finding(10, "manual", "high", `Partial view: ${data.users.endpoint} returned ${data.users.data.length} users but only uuid, id, username, and email are exposed because the API key does not hold the Administrator [64] role. Role, last login, MFA, and enabled attributes require an Administrator key.`, {
       user_count: data.users.data.length,
       caller_is_administrator: false,
@@ -4341,6 +4346,23 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       return lastAccess !== undefined && daysBetween(now, lastAccess) > inactiveDays;
     });
     const missingEnabledFlag = users.filter((user) => asBoolean(user.enabled) === undefined);
+    recordTenableDecisionFacts(10, {
+      users_readable: true,
+      user_count: users.length,
+      caller_is_administrator: true,
+      administrators_without_strong_auth_count: adminsWithoutStrongAuth.length,
+      enabled_user_last_login_age_days: daysSinceEach(now, enabledUsers, "lastlogin"),
+      inactive_user_days: inactiveDays,
+      enabled_administrator_count: admins.length,
+      max_admins: maxAdmins,
+      enabled_user_count: enabledUsers.length,
+      never_logged_in_user_count: neverLoggedIn.length,
+      enabled_user_api_key_age_days: daysSinceEach(now, enabledUsers, "last_apikey_access"),
+      locked_out_user_count: lockedOut.length,
+      enabled_user_login_failure_counts: enabledUsers.map((user) => asNumber(user.login_fail_count) ?? 0),
+      users_without_enabled_flag_count: missingEnabledFlag.length,
+      roles_readable: data.roles.status === "ok",
+    });
     let status: TenableFindingStatus;
     let summary: string;
     if (adminsWithoutStrongAuth.length > 0 || inactive.length > 0 || admins.length > maxAdmins) {
@@ -4379,8 +4401,10 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   }
 
   if (data.permissions.status !== "ok") {
+    recordTenableDecisionFacts(11, { permissions_readable: false });
     findings.push(unreadableFinding(11, "high", data.permissions, "the access control permission list (Settings > Access Control > Permissions) and any legacy access groups"));
   } else if (data.permissions.data.length === 0) {
+    recordTenableDecisionFacts(11, { permissions_readable: true, permission_count: 0 });
     findings.push(finding(11, "manual", "high", `${data.permissions.endpoint} returned zero permissions, but Tenable always generates administrator permissions, so the view is incomplete; collect the permission list from Settings > Access Control > Permissions.`, { permission_count: boundedCount(0, data.permissions) }));
   } else {
     const permissions = data.permissions.data;
@@ -4394,6 +4418,15 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       return allUsers && allObjects && writeActions;
     });
     const legacyAccessGroups = data.accessGroups.status === "ok" ? data.accessGroups.data.filter((group) => asBoolean(group.all_assets) !== true) : [];
+    recordTenableDecisionFacts(11, {
+      permissions_readable: true,
+      permission_count: permissions.length,
+      broad_permission_count: broad.length,
+      legacy_access_group_count: legacyAccessGroups.length,
+      access_groups_complete: readInFull(data.accessGroups),
+      groups_readable: data.groups.status === "ok",
+      caller_is_administrator: callerIsAdministrator === true,
+    });
     findings.push(finding(
       11,
       broad.length > 0 ? "fail" : legacyAccessGroups.length > 0 || data.accessGroups.status !== "ok" ? "warn" : capForNonAdmin(capForUnreadable(capForPartial("pass", data.accessGroups), data.groups), callerIsAdministrator),
@@ -4418,8 +4451,10 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   }
 
   if (data.credentials.status !== "ok") {
+    recordTenableDecisionFacts(12, { credentials_readable: false });
     findings.push(unreadableFinding(12, "medium", data.credentials, "the managed credential inventory with types, owners, and last use from Settings > Credentials"));
   } else if (data.credentials.data.length === 0) {
+    recordTenableDecisionFacts(12, { credentials_readable: true, credential_count: 0 });
     findings.push(finding(12, "manual", "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total ${data.credentials.total ?? "not reported"}).${data.credentials.truncated ? " The walk was truncated before any record arrived, so the credential list was not reviewed." : ""} Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: boundedCount(0, data.credentials), pagination_total: data.credentials.total ?? null, inventory_truncated: data.credentials.truncated }));
   } else {
     const credentials = data.credentials.data;
@@ -4429,6 +4464,14 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       return created !== undefined && daysBetween(now, created) > 365;
     });
     const undated = credentials.filter((credential) => parseTimestampMs(credential.created_date) === undefined);
+    recordTenableDecisionFacts(12, {
+      credentials_readable: true,
+      credential_count: credentials.length,
+      unused_credential_count: unused.length,
+      credential_age_days: daysSinceEach(now, credentials, "created_date"),
+      undated_credential_count: undated.length,
+      credentials_complete: readInFull(data.credentials),
+    });
     const types = new Map<string, number>();
     for (const credential of credentials) {
       const type = asString(asObject(credential.type)?.name) ?? asString(asObject(credential.type)?.id) ?? "unknown";
@@ -4457,6 +4500,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   }
 
   if (data.auditLog.status !== "ok") {
+    recordTenableDecisionFacts(18, { audit_log_readable: false });
     findings.push(unreadableFinding(18, "medium", data.auditLog, `the activity log for the last ${lookbackDays} days from Settings > Activity Logs (Administrator role required)`));
   } else {
     const events = data.auditLog.data;
@@ -4465,6 +4509,12 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     const exclusionOrPolicy = events.filter((event) => /exclusion|policy|template/i.test(asString(event.action) ?? "") && asString(event.crud) !== "r");
     const failures = events.filter((event) => asBoolean(event.is_failure) === true);
     const sensitive = new Set([...deletes, ...privilege, ...exclusionOrPolicy].map((event) => asString(event.id) ?? JSON.stringify(event)));
+    recordTenableDecisionFacts(18, {
+      audit_log_readable: true,
+      audit_event_count: events.length,
+      audit_events_complete: readInFull(data.auditLog),
+      sensitive_audit_event_count: sensitive.size,
+    });
     let status: TenableFindingStatus;
     let summary: string;
     if (events.length === 0) {
@@ -4541,6 +4591,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
 
 function assessSecurityCenterUsers(users: TenableDataset<JsonRecord[]>, now: number, inactiveDays: number): TenableFinding {
   if (users.status !== "ok") {
+    recordTenableDecisionFacts(10, { sc_users_readable: false }, "-SC");
     return unreadableFinding(10, "high", users, "the Security Center user list with roles, last login, and lock state", "-SC");
   }
   const active = users.data.filter((user) => asString(user.status) === "0");
@@ -4551,6 +4602,14 @@ function assessSecurityCenterUsers(users: TenableDataset<JsonRecord[]>, now: num
   });
   const neverLoggedIn = active.filter((user) => parseTimestampMs(user.lastLogin) === undefined);
   const locked = active.filter((user) => asBoolean(user.locked) === true);
+  recordTenableDecisionFacts(10, {
+    sc_users_readable: true,
+    sc_user_count: users.data.length,
+    sc_active_user_last_login_age_days: daysSinceEach(now, active, "lastLogin"),
+    inactive_user_days: inactiveDays,
+    sc_never_logged_in_user_count: neverLoggedIn.length,
+    sc_locked_user_count: locked.length,
+  }, "-SC");
   let status: TenableFindingStatus;
   let summary: string;
   if (users.data.length === 0) {
