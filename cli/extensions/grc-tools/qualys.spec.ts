@@ -677,9 +677,42 @@ const ASSET_INVENTORY_SURFACES: readonly BatchSurfaceDefinition[] = [
   ),
 ];
 
+const VULNERABILITY_SURFACES: readonly BatchSurfaceDefinition[] = [
+  vmSurface(
+    "auth_records",
+    "/api/2.0/fo/auth/",
+    "qapi-auth/record_list/list_records.htm",
+    [LIST_ACTION],
+    "XML whose AUTH_RECORDS holds one AUTH_<TYPE>_IDS or AUTH_<TYPE>_RECORDS wrapper per technology, kept as the lowercased type and a count of its IDs plus every ID in each first-last ID_RANGE; a WARNING/URL continuation is not followed and marks the read partial; a SIMPLE_RETURN, GENERIC_RETURN, or root-level ERROR envelope, a non-XML body, or HTTP status 400 or above is a refusal.",
+  ),
+  vmSurface(
+    "compliance_policies",
+    "/api/2.0/fo/compliance/policy/",
+    "qapi-pc/policies/list_policies.htm",
+    [LIST_ACTION, param("details", "query", "Basic"), ID_MIN],
+    xmlRecords("POLICY"),
+  ),
+  vmSurface("detections", "/api/2.0/fo/asset/host/vm/detection/", "qapi-assets/host_lists/host_detection.htm", [
+    LIST_ACTION,
+    param("status", "query", "Active,New,Re-Opened"),
+    param("severities", "query", "3,4,5"),
+    param("show_qds", "query", "1"),
+    param("truncation_limit", "query", "The smaller of detection_limit and 1000"),
+    param("output_format", "query", "XML"),
+    ID_MIN,
+  ], "XML in which every DETECTION under a <HOST> element's DETECTION_LIST becomes one record carrying that host's ID and IP, and an optional WARNING carries a continuation URL; a SIMPLE_RETURN, GENERIC_RETURN, or root-level ERROR envelope, a non-XML body, or HTTP status 400 or above is a refusal."),
+  vmSurface("knowledge_base", "/api/2.0/fo/knowledge_base/vuln/", "qapi-scan/kbase/knowledgebase.htm", [
+    LIST_ACTION,
+    param("details", "query", "Basic"),
+    param("ids", "query", "Up to 200 distinct QIDs of open detections, comma-separated"),
+    ID_MIN,
+  ], xmlRecords("VULN")),
+];
+
 const QUALYS_SURFACES: readonly BatchSurfaceDefinition[] = [
   ...SCAN_COVERAGE_SURFACES,
   ...ASSET_INVENTORY_SURFACES,
+  ...VULNERABILITY_SURFACES,
   ...SCOPE_SURFACES,
 ];
 
@@ -695,6 +728,8 @@ const eq = (left: string | VerdictOperand, right: PortableValue | VerdictOperand
 const ne = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("ne", left, right);
 const gt = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("gt", left, right);
 const lt = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("lt", left, right);
+const lte = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("lte", left, right);
+const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const some = (name: string, condition: VerdictCondition): VerdictCondition => ({ op: "some", path: name, condition });
 const always: VerdictCondition = { op: "always" };
@@ -759,6 +794,35 @@ const QUALYS_INPUTS: Readonly<Record<string, string>> = {
   tags_complete: "Tag list coverage up to 2000 tags.",
   tag_count: "Number of tag records returned.",
   untagged_host_percent: "Percentage of returned hosts without a TAGS/TAG NAME, rounded to one decimal place with ties rounded up; recorded only when host_count is above 0.",
+  auth_records_readable: "True when GET /api/2.0/fo/auth/ returned its authentication record summary without a refusal.",
+  auth_records_complete: "Authentication record summary coverage.",
+  auth_record_type_count: "Number of authentication record technologies whose ID count is above 0.",
+  uncovered_os_family_count: "Number of operating system families, out of three, that some returned host runs while no authentication record technology with an ID count above 0 covers it: Windows (OS matching windows) needs a technology matching windows; Unix-like (OS matching linux, unix, bsd, solaris, aix, hp-ux, esx, mac os, or darwin) needs one matching unix or linux; network devices (OS matching cisco, nx-os, ios-xe, junos, juniper, palo alto, pan-os, fortinet, fortios, fortigate, arista, big-ip, f5, check point, gaia, router, switch, firewall, screenos, brocade, or huawei) need one matching snmp, cisco, checkpoint, check_point, palo, fortinet, juniper, arista, network, f5, huawei, or brocade. Matching is case-insensitive.",
+  os_unknown_host_count: "Number of returned hosts whose OS is absent or empty after trimming.",
+  compliance_policies_readable: "True when GET /api/2.0/fo/compliance/policy/ returned its compliance policy list without a refusal.",
+  compliance_policies_complete: "Compliance policy list coverage.",
+  policy_count: "Number of compliance policy records returned.",
+  unassigned_active_policy_count: "Number of returned policies whose STATUS is active, case-insensitively, that list no ASSET_GROUP_IDS and no TAG_SET_INCLUDE/TAG_ID and whose ASSET_GROUP_IDS does not set has_hidden_data to true.",
+  inactive_policy_count: "Number of returned policies whose STATUS, lowercased, contains inactive, draft, or disabled.",
+  unknown_status_policy_count: "Number of returned policies whose STATUS is absent, or is neither active nor contains inactive, draft, or disabled.",
+  hidden_asset_group_policy_count: "Number of returned policies whose ASSET_GROUP_IDS sets has_hidden_data to true, so some assigned asset groups are hidden from the configured user.",
+  detections_readable: "True when GET /api/2.0/fo/asset/host/vm/detection/ returned its detection list without a refusal.",
+  detections_complete: "Detection list coverage up to detection_limit.",
+  sla_scoped_detection_count: "Number of open detections (TYPE not Info, STATUS absent or one of Active, New, Re-Opened, or Reopened, case-insensitively) with a SEVERITY of 3 or higher; each has a remediation SLA of sla_critical_days for severity 5, sla_high_days for 4, and sla_medium_days for 3 (defaults 15, 30, and 90).",
+  sla_compliance_percent: "Percentage of SLA-scoped detections with a parseable FIRST_FOUND_DATETIME whose age in whole days is at most their severity's SLA, rounded to one decimal place with ties rounded up; recorded only when at least one SLA-scoped detection carries a parseable FIRST_FOUND_DATETIME.",
+  undated_sla_detection_count: "Number of SLA-scoped detections without a parseable FIRST_FOUND_DATETIME.",
+  unrated_open_detection_count: "Number of open detections without a SEVERITY.",
+  statusless_open_detection_count: "Number of open detections without a STATUS.",
+  knowledge_base_readable: "True when every GET /api/2.0/fo/knowledge_base/vuln/ batch for the open detections' QIDs returned without a refusal, or when the readable detection list holds no open QID to look up.",
+  knowledge_base_complete: "Knowledge base lookup coverage of the open QIDs; true when no lookup was needed.",
+  open_detection_count: "Number of returned detections whose TYPE is not Info and whose STATUS is absent or one of Active, New, Re-Opened, or Reopened, case-insensitively.",
+  open_qid_count: "Number of distinct QIDs among the open detections.",
+  knowledge_base_qid_count: "Number of distinct QIDs the knowledge base lookup returned; recorded only when the lookup ran.",
+  unresolved_qid_count: "Number of distinct open QIDs the knowledge base lookup returned no entry for; recorded only when the lookup ran.",
+  overdue_patchable_percent: "Percentage of dated patchable open detections (the QID's knowledge base entry sets PATCHABLE to true and FIRST_FOUND_DATETIME parses) first found more than sla_high_days whole days ago, rounded to one decimal place with ties rounded up; recorded only when at least one patchable open detection is dated.",
+  overdue_patchable_detection_count: "Number of dated patchable open detections first found more than sla_high_days whole days ago.",
+  undated_patchable_detection_count: "Number of patchable open detections without a parseable FIRST_FOUND_DATETIME.",
+  qds_detection_percent: "Percentage of open detections carrying a non-empty QDS, rounded to one decimal place with ties rounded up; recorded only when open_detection_count is above 0.",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -1229,6 +1293,235 @@ const ASSET_INVENTORY_CHECKS: readonly QualysCheck[] = [
   },
 ];
 
+const VULNERABILITY_MANAGEMENT = "qualys_assess_vulnerability_management";
+
+const DETECTIONS_COMPLETE = continuationComplete("detections", "detection list", "detection_limit detections");
+
+const VULNERABILITY_CHECKS: readonly QualysCheck[] = [
+  {
+    id: "QUALYS-C08",
+    control: 8,
+    title: "Authentication record completeness",
+    severity: "high",
+    owner: VULNERABILITY_MANAGEMENT,
+    surfaces: ["auth_records", "hosts", "users", "user_list"],
+    inputs: [
+      "auth_records_readable", "hosts_readable", "auth_record_type_count", "host_count", "uncovered_os_family_count", "scanned_host_count",
+      "authenticated_scan_percent", "min_auth_scan_percent", "os_unknown_host_count", "auth_records_complete", "hosts_complete",
+      "view_scope_partial",
+    ],
+    rules: [
+      rule("manual", any(ne("auth_records_readable", true), ne("hosts_readable", true))),
+      rule("fail", eq("auth_record_type_count", 0)),
+      rule("manual", eq("host_count", 0)),
+      rule("fail", gt("uncovered_os_family_count", 0)),
+      rule("fail", eq("scanned_host_count", 0)),
+      rule("warn", lt("authenticated_scan_percent", path("min_auth_scan_percent"))),
+      rule("warn", any(gt("os_unknown_host_count", 0), ne("auth_records_complete", true), ne("hosts_complete", true), scopePartial)),
+      rule("pass", always),
+    ],
+    completeness: {
+      auth_records_complete: completeFrom(
+        "false when the authentication record summary carried a WARNING/URL continuation, which is not followed.",
+        [{ surfaceId: "auth_records", falseWhen: ["truncated"] }],
+      ),
+      hosts_complete: HOSTS_COMPLETE,
+    },
+    decision: "Manual when the authentication record summary or the host list is unreadable. Fail when no authentication record technology holds a record. Manual when no host is returned. Fail when hosts run an operating system family (Windows, Unix-like, or network device) that no authentication record technology covers, or when no host carries a scan date. Warn when the share of scanned hosts with an authenticated scan no older than the larger of lookback_days and 30 days is below min_auth_scan_percent. Warn instead of pass when a host reports no operating system, when either list stopped early, or when the configured user's view covers only part of the subscription. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every host family is covered and exactly the minimum share of hosts had a recent authenticated scan.", {
+        auth_records_readable: true, hosts_readable: true, auth_record_type_count: 2, host_count: 10, uncovered_os_family_count: 0,
+        scanned_host_count: 10, authenticated_scan_percent: 80, min_auth_scan_percent: 80, os_unknown_host_count: 0,
+        auth_records_complete: true, hosts_complete: true, view_scope_partial: false,
+      }),
+      example("noncompliant", "fail", "Windows hosts exist but no Windows authentication record does.", {
+        auth_records_readable: true, hosts_readable: true, auth_record_type_count: 1, host_count: 10, uncovered_os_family_count: 1,
+      }),
+      example("partial", "warn", "Every family is covered, but only 79.9 percent of scanned hosts had a recent authenticated scan.", {
+        auth_records_readable: true, hosts_readable: true, auth_record_type_count: 2, host_count: 10, uncovered_os_family_count: 0,
+        scanned_host_count: 10, authenticated_scan_percent: 79.9, min_auth_scan_percent: 80, os_unknown_host_count: 0,
+        auth_records_complete: true, hosts_complete: true, view_scope_partial: false,
+      }),
+      example("unreadable", "manual", "The authentication record summary was refused.", { auth_records_readable: false, hosts_readable: true }),
+    ],
+  },
+  {
+    id: "QUALYS-C09",
+    control: 9,
+    title: "Policy compliance profile assignment",
+    severity: "medium",
+    owner: VULNERABILITY_MANAGEMENT,
+    surfaces: ["compliance_policies", "users", "user_list"],
+    inputs: [
+      "compliance_policies_readable", "policy_count", "unassigned_active_policy_count", "inactive_policy_count", "unknown_status_policy_count",
+      "hidden_asset_group_policy_count", "compliance_policies_complete", "view_scope_partial",
+    ],
+    rules: [
+      rule("manual", ne("compliance_policies_readable", true)),
+      rule("manual", eq("policy_count", 0)),
+      rule("fail", gt("unassigned_active_policy_count", 0)),
+      rule("warn", gt("inactive_policy_count", 0)),
+      rule("warn", any(
+        gt("unknown_status_policy_count", 0),
+        gt("hidden_asset_group_policy_count", 0),
+        ne("compliance_policies_complete", true),
+        scopePartial,
+      )),
+      rule("pass", always),
+    ],
+    completeness: {
+      compliance_policies_complete: continuationComplete("compliance_policies", "compliance policy list", "5000 policies"),
+    },
+    decision: "Manual when the compliance policy list is unreadable or returns no policy. Fail when an active policy is assigned no asset group or tag. Warn when a policy is inactive, draft, or disabled. Warn instead of pass when a policy's status is missing or unrecognized, when a policy's asset groups include ones hidden from the configured user, when the list stopped early, or when the configured user's view covers only part of the subscription. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every policy is active and assigned.", {
+        compliance_policies_readable: true, policy_count: 3, unassigned_active_policy_count: 0, inactive_policy_count: 0,
+        unknown_status_policy_count: 0, hidden_asset_group_policy_count: 0, compliance_policies_complete: true, view_scope_partial: false,
+      }),
+      example("noncompliant", "fail", "An active policy is assigned no asset group or tag.", {
+        compliance_policies_readable: true, policy_count: 3, unassigned_active_policy_count: 1,
+      }),
+      example("partial", "warn", "A draft policy awaits review.", {
+        compliance_policies_readable: true, policy_count: 3, unassigned_active_policy_count: 0, inactive_policy_count: 1,
+      }),
+      example("unreadable", "manual", "The compliance policy list was refused.", { compliance_policies_readable: false }),
+    ],
+  },
+  {
+    id: "QUALYS-C10",
+    control: 10,
+    title: "Vulnerability SLA adherence",
+    severity: "critical",
+    owner: VULNERABILITY_MANAGEMENT,
+    surfaces: ["detections", "hosts", "users", "user_list"],
+    inputs: [
+      "detections_readable", "hosts_readable", "host_count", "sla_scoped_detection_count", "detections_complete", "sla_compliance_percent",
+      "undated_sla_detection_count", "unrated_open_detection_count", "statusless_open_detection_count", "hosts_complete", "view_scope_partial",
+    ],
+    constants: { sla_fail_below_percent: 80, sla_warn_below_percent: 95 },
+    rules: [
+      rule("manual", any(ne("detections_readable", true), ne("hosts_readable", true))),
+      rule("manual", eq("host_count", 0)),
+      rule("manual", all(eq("sla_scoped_detection_count", 0), ne("detections_complete", true))),
+      rule("fail", lt("sla_compliance_percent", path("sla_fail_below_percent"))),
+      rule("warn", lt("sla_compliance_percent", path("sla_warn_below_percent"))),
+      rule("warn", any(
+        gt("undated_sla_detection_count", 0),
+        gt("unrated_open_detection_count", 0),
+        gt("statusless_open_detection_count", 0),
+        ne("detections_complete", true),
+        ne("hosts_complete", true),
+        scopePartial,
+      )),
+      rule("pass", always),
+    ],
+    completeness: { detections_complete: DETECTIONS_COMPLETE, hosts_complete: HOSTS_COMPLETE },
+    decision: "Manual when the detection or host list is unreadable, or when no host is returned. Manual when no open detection of severity 3 or higher is returned and the detection list stopped early. Fail when fewer than sla_fail_below_percent (80) percent of dated open detections of severity 3 or higher are within their remediation SLA (sla_critical_days for severity 5, sla_high_days for 4, sla_medium_days for 3). Warn when fewer than sla_warn_below_percent (95) percent are. Warn instead of pass when such a detection carries no first-found date, when an open detection has no severity or status, when either list stopped early, or when the configured user's view covers only part of the subscription. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Exactly 95 percent of dated detections are within their SLA.", {
+        detections_readable: true, hosts_readable: true, host_count: 10, sla_scoped_detection_count: 20, detections_complete: true,
+        sla_compliance_percent: 95, undated_sla_detection_count: 0, unrated_open_detection_count: 0, statusless_open_detection_count: 0,
+        hosts_complete: true, view_scope_partial: false,
+      }),
+      example("noncompliant", "fail", "Only 75 percent of dated detections are within their SLA.", {
+        detections_readable: true, hosts_readable: true, host_count: 10, sla_scoped_detection_count: 20, detections_complete: true,
+        sla_compliance_percent: 75,
+      }),
+      example("partial", "warn", "Exactly 80 percent of dated detections are within their SLA.", {
+        detections_readable: true, hosts_readable: true, host_count: 10, sla_scoped_detection_count: 20, detections_complete: true,
+        sla_compliance_percent: 80,
+      }),
+      example("unreadable", "manual", "The detection list was refused.", { detections_readable: false, hosts_readable: true }),
+    ],
+  },
+  {
+    id: "QUALYS-C11",
+    control: 11,
+    title: "Patch management tracking",
+    severity: "high",
+    owner: VULNERABILITY_MANAGEMENT,
+    surfaces: ["detections", "hosts", "knowledge_base", "users", "user_list"],
+    inputs: [
+      "detections_readable", "hosts_readable", "knowledge_base_readable", "open_qid_count", "knowledge_base_qid_count", "host_count",
+      "open_detection_count", "detections_complete", "overdue_patchable_percent", "overdue_patchable_detection_count",
+      "undated_patchable_detection_count", "unresolved_qid_count", "hosts_complete", "knowledge_base_complete", "view_scope_partial",
+    ],
+    constants: { max_overdue_patchable_percent: 25 },
+    rules: [
+      rule("manual", any(ne("detections_readable", true), ne("hosts_readable", true), ne("knowledge_base_readable", true))),
+      rule("manual", all(gt("open_qid_count", 0), eq("knowledge_base_qid_count", 0))),
+      rule("manual", eq("host_count", 0)),
+      rule("manual", all(eq("open_detection_count", 0), ne("detections_complete", true))),
+      rule("fail", gt("overdue_patchable_percent", path("max_overdue_patchable_percent"))),
+      rule("warn", gt("overdue_patchable_detection_count", 0)),
+      rule("warn", any(
+        gt("undated_patchable_detection_count", 0),
+        gt("unresolved_qid_count", 0),
+        ne("detections_complete", true),
+        ne("hosts_complete", true),
+        ne("knowledge_base_complete", true),
+        scopePartial,
+      )),
+      rule("pass", always),
+    ],
+    completeness: {
+      detections_complete: DETECTIONS_COMPLETE,
+      hosts_complete: HOSTS_COMPLETE,
+      knowledge_base_complete: completeFrom(
+        "false when more than 2000 distinct open QIDs left the rest unrequested, or when a 200-QID batch stopped with a WARNING/URL continuation left; true when no lookup was needed.",
+        [{ surfaceId: "knowledge_base", falseWhen: ["truncated"] }],
+      ),
+    },
+    decision: "Manual when the detection list, the host list, or the knowledge base lookup is unreadable, when the lookup returned none of the open QIDs, or when no host is returned. Manual when no open detection is returned and the detection list stopped early. Fail when more than max_overdue_patchable_percent (25) percent of dated patchable open detections were first found more than sla_high_days days ago. Warn when any was. Warn instead of pass when a patchable detection carries no first-found date, when an open QID has no knowledge base entry, when any of the three reads stopped early, or when the configured user's view covers only part of the subscription. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "No dated patchable detection is past the high-severity SLA.", {
+        detections_readable: true, hosts_readable: true, knowledge_base_readable: true, open_qid_count: 5, knowledge_base_qid_count: 5,
+        host_count: 10, open_detection_count: 12, detections_complete: true, overdue_patchable_percent: 0,
+        overdue_patchable_detection_count: 0, undated_patchable_detection_count: 0, unresolved_qid_count: 0, hosts_complete: true,
+        knowledge_base_complete: true, view_scope_partial: false,
+      }),
+      example("noncompliant", "fail", "30 percent of dated patchable detections are overdue.", {
+        detections_readable: true, hosts_readable: true, knowledge_base_readable: true, open_qid_count: 5, knowledge_base_qid_count: 5,
+        host_count: 10, open_detection_count: 12, detections_complete: true, overdue_patchable_percent: 30,
+        overdue_patchable_detection_count: 3,
+      }),
+      example("partial", "warn", "Exactly 25 percent of dated patchable detections are overdue.", {
+        detections_readable: true, hosts_readable: true, knowledge_base_readable: true, open_qid_count: 5, knowledge_base_qid_count: 5,
+        host_count: 10, open_detection_count: 12, detections_complete: true, overdue_patchable_percent: 25,
+        overdue_patchable_detection_count: 2,
+      }),
+      example("unreadable", "manual", "The knowledge base lookup returned none of the open QIDs.", {
+        detections_readable: true, hosts_readable: true, knowledge_base_readable: true, open_qid_count: 5, knowledge_base_qid_count: 0,
+      }),
+    ],
+  },
+  {
+    id: "QUALYS-C17",
+    control: 17,
+    title: "Vulnerability prioritization (QDS)",
+    severity: "medium",
+    owner: VULNERABILITY_MANAGEMENT,
+    surfaces: ["detections"],
+    inputs: ["detections_readable", "open_detection_count", "qds_detection_percent"],
+    rules: [
+      rule("manual", ne("detections_readable", true)),
+      rule("manual", eq("open_detection_count", 0)),
+      rule("fail", lte("qds_detection_percent", 0)),
+      rule("warn", always),
+    ],
+    decision: "Manual when the detection list is unreadable or holds no open detection. Fail when the share of open detections carrying a QDS score rounds to 0 percent. Otherwise warn, because QDS-based prioritization needs a reviewer.",
+    examples: [
+      example("noncompliant", "fail", "No open detection carries a QDS score.", {
+        detections_readable: true, open_detection_count: 10, qds_detection_percent: 0,
+      }),
+      example("partial", "warn", "Some open detections carry QDS scores.", {
+        detections_readable: true, open_detection_count: 10, qds_detection_percent: 40,
+      }),
+      example("unreadable", "manual", "The detection list was refused.", { detections_readable: false }),
+    ],
+  },
+];
+
 const toCheck = (check: QualysCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -1252,6 +1545,7 @@ const toCheck = (check: QualysCheck): BatchCheckDefinition => {
 const checks: readonly BatchCheckDefinition[] = [
   ...SCAN_COVERAGE_CHECKS,
   ...ASSET_INVENTORY_CHECKS,
+  ...VULNERABILITY_CHECKS,
 ].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
@@ -1324,6 +1618,12 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
       value: "Qualys Cloud Agent",
       unlocks: ["cloud_agents"],
     },
+    {
+      id: "policy-compliance-module",
+      kind: "license",
+      value: "Qualys Policy Compliance",
+      unlocks: ["compliance_policies"],
+    },
   ],
   surfaces: QUALYS_SURFACES,
   checks,
@@ -1331,11 +1631,12 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
     qualys_check_access: [],
     qualys_assess_scan_coverage: idsFor(SCAN_COVERAGE),
     qualys_assess_asset_inventory: idsFor(ASSET_INVENTORY),
+    qualys_assess_vulnerability_management: idsFor(VULNERABILITY_MANAGEMENT),
     qualys_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
     {
-      surfaceIds: ["scheduled_scans", "scans", "option_profiles", "appliances"],
+      surfaceIds: ["scheduled_scans", "scans", "option_profiles", "appliances", "compliance_policies"],
       cursorFields: ["WARNING/URL"],
       pageSize: null,
       itemCap: 5000,
@@ -1362,7 +1663,25 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
       stopConditions: continuationStops("5000 asset groups collected"),
     },
     {
-      surfaceIds: ["excluded_ips"],
+      surfaceIds: ["detections"],
+      cursorFields: ["WARNING/URL"],
+      pageSize: null,
+      itemCap: null,
+      pageCap: 25,
+      totalSemantics: `Pages of the smaller of detection_limit and 1000 hosts (truncation_limit), flattened to one record per detection, up to detection_limit detections (default 5000, set from 1 through 200000). ${NO_TOTAL}`,
+      stopConditions: continuationStops("detection_limit detections collected"),
+    },
+    {
+      surfaceIds: ["knowledge_base"],
+      cursorFields: ["WARNING/URL", "ids"],
+      pageSize: null,
+      itemCap: 5000,
+      pageCap: 25,
+      totalSemantics: "The distinct QIDs of open detections are requested in batches of 200 (ids), at most 2000 QIDs; QIDs past 2000 are not requested and mark the lookup partial. Qualys reports no total: a page without a WARNING/URL continuation ends a batch, and a continuation left at 5000 records or at the 25-page cap marks the lookup partial.",
+      stopConditions: [...continuationStops("5000 records collected in a batch"), "Every batch of up to 200 QIDs requested"],
+    },
+    {
+      surfaceIds: ["excluded_ips", "auth_records"],
       cursorFields: ["WARNING/URL"],
       pageSize: null,
       itemCap: "none",
@@ -1390,6 +1709,7 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
   runtimeBehavior: [],
   knownGaps: [
     "A WARNING/URL continuation that repeats the previous page's URL is requested again until the 25-page cap, so the list can collect duplicate records.",
+    "Authentication records are summarized as a count per technology, so record status and expiry are never evaluated.",
   ],
   sensitiveFields: ["password", "token", "Authorization", "activationKey"],
   credentialFormats: ["Qualys username and password, sent as Basic authentication or exchanged at the platform gateway", "Qualys bearer token"],
