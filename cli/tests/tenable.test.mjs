@@ -3896,8 +3896,11 @@ portableContractTest("every request the access check, the four collectors, and t
   assertRequestConformance(assert, TENABLE_SPEC, recorder.requests);
 });
 
+// The healthy credential names its last scan without an id, which TENABLE-12 reads as unused.
 function completenessInput() {
-  return { routes: healthyRoutes(), vmConfigured: true };
+  const routes = healthyRoutes();
+  routes["GET /credentials"].credentials[0].last_used_by = { id: 10, name: "Weekly Prod" };
+  return { routes, vmConfigured: true };
 }
 
 async function assessCompletenessInput({ routes, vmConfigured }) {
@@ -3966,19 +3969,281 @@ portableContractTest("the export writes every declared bundle path and nothing e
   assert.ok(readBundleFiles(partial.outputDir).has("_errors.log"));
 });
 
+const HOUR_MS = 3_600_000;
+const DAY_MS = 24 * HOUR_MS;
+const msBefore = (days, hours = 0) => NOW - days * DAY_MS - hours * HOUR_MS;
+const secondsBefore = (days, hours = 0) => Math.floor(msBefore(days, hours) / 1000);
+const isoBefore = (days, hours = 0) => new Date(msBefore(days, hours)).toISOString();
+// A plugin set stamp (YYYYMMDDHHMM, UTC) the given time before NOW.
+const pluginSetBefore = (hours, minutes = 0) => new Date(NOW - hours * HOUR_MS - minutes * 60_000).toISOString().replace(/\D/g, "").slice(0, 12);
+
+function manyAssets(count, change = () => ({})) {
+  return Array.from({ length: count }, (_, index) => ({ ...healthyAssets()[0], id: `a-${index + 1}`, ...change(index) }));
+}
+
+function manyAgents(count, change = () => ({})) {
+  const [agent] = healthyRoutes()["GET /scanners/null/agents"].agents;
+  const agents = Array.from({ length: count }, (_, index) => ({ ...agent, id: index + 1, uuid: `ag-${index + 1}`, name: `host-${index + 1}`, ...change(index) }));
+  return { agents, pagination: { total: count } };
+}
+
+function openFinding(severity, firstFound, plugin = { id: 5, vpr: { score: 6.1 } }) {
+  return { severity, state: "OPEN", first_found: firstFound, plugin };
+}
+
+function scRecord(routes, resource) {
+  return routes[`GET /rest/${resource}`].response.usable[0];
+}
+
+// The healthy scanner last connected two days ago, which already fails scanner health.
+function connectedScanners(routes) {
+  const { scanners } = routes["GET /scanners"];
+  scanners[0].last_connect = secondsBefore(0, 1);
+  return scanners;
+}
+
+// One input at or just past a threshold edge: the healthy VM and Security Center routes
+// with `change` applied to that copy.
+function boundaryScenario(check, expected, edge, change, options = {}) {
+  return {
+    name: `${check} ${expected} when ${edge}`,
+    check,
+    expected,
+    options,
+    routes: () => {
+      const routes = { ...healthyRoutes(), ...healthyScRoutes() };
+      change(routes);
+      return routes;
+    },
+  };
+}
+
+const UNCREDENTIALED = { has_agent: false, last_authentication_scan_status: "Failure" };
+const USED_CREDENTIAL = { last_used_by: { id: 10, name: "Weekly Prod" } };
+
 // Inputs that put each threshold at and beside its edge. They run as plain tests, so the byte
 // differential replays them through the baseline runtime and compares every result.
-const BOUNDARY_SCENARIOS = [];
+const BOUNDARY_SCENARIOS = [
+  boundaryScenario("TENABLE-01", "fail", "every visible scan uses a discovery template", (routes) => {
+    for (const scan of routes["GET /scans"].scans) Object.assign(scan, { wizard_uuid: "tmpl-disc", template_uuid: "tmpl-disc" });
+  }),
+  boundaryScenario("TENABLE-02", "pass", "a recurring scan last launched exactly stale_scan_days ago", (routes) => {
+    routes["GET /scans"].scans[0].last_modification_date = secondsBefore(30);
+  }),
+  boundaryScenario("TENABLE-02", "fail", "a recurring scan last launched an hour past stale_scan_days", (routes) => {
+    routes["GET /scans"].scans[0].last_modification_date = secondsBefore(30, 1);
+  }),
+  boundaryScenario("TENABLE-02-SC", "pass", "a completed result finished exactly stale_scan_days ago", (routes) => {
+    scRecord(routes, "scanResult").finishTime = String(secondsBefore(30));
+  }),
+  boundaryScenario("TENABLE-02-SC", "fail", "the newest completed result finished an hour past stale_scan_days", (routes) => {
+    scRecord(routes, "scanResult").finishTime = String(secondsBefore(30, 1));
+  }),
+  boundaryScenario("TENABLE-02-SC", "fail", "no Security Center scan has an ical schedule", (routes) => {
+    scRecord(routes, "scan").schedule = { type: "template" };
+  }),
+  boundaryScenario("TENABLE-03", "pass", "recently seen assets cover exactly 95% of expected_asset_count", (routes) => {
+    routes["GET /assets/export/asset-export-1/chunks/1"] = manyAssets(19);
+  }, { expectedAssetCount: 20 }),
+  boundaryScenario("TENABLE-03", "fail", "recently seen assets cover 90% of expected_asset_count", (routes) => {
+    routes["GET /assets/export/asset-export-1/chunks/1"] = manyAssets(18);
+  }, { expectedAssetCount: 20 }),
+  boundaryScenario("TENABLE-04", "pass", "credentialed coverage equals credential_threshold", (routes) => {
+    routes["GET /assets/export/asset-export-1/chunks/1"] = manyAssets(5, (index) => (index === 0 ? UNCREDENTIALED : {}));
+  }),
+  boundaryScenario("TENABLE-04", "fail", "credentialed coverage falls below credential_threshold", (routes) => {
+    routes["GET /assets/export/asset-export-1/chunks/1"] = manyAssets(5, (index) => (index < 2 ? UNCREDENTIALED : {}));
+  }),
+  boundaryScenario("TENABLE-16", "pass", "the tagged share of assets equals tagged_threshold", (routes) => {
+    routes["GET /assets/export/asset-export-1/chunks/1"] = manyAssets(10, (index) => (index === 0 ? { tags: [] } : {}));
+  }),
+  boundaryScenario("TENABLE-16", "fail", "the tagged share of assets falls below tagged_threshold", (routes) => {
+    routes["GET /assets/export/asset-export-1/chunks/1"] = manyAssets(10, (index) => (index < 2 ? { tags: [] } : {}));
+  }),
+  boundaryScenario("TENABLE-16", "warn", "the category walk delivered no category against a pagination.total of 3", (routes) => {
+    routes["GET /tags/categories"] = { categories: [], pagination: { total: 3 } };
+  }),
+  boundaryScenario("TENABLE-16", "fail", "no tag category is defined", (routes) => {
+    routes["GET /tags/categories"] = { categories: [], pagination: { total: 0 } };
+  }),
+  boundaryScenario("TENABLE-05", "pass", "exactly 10% of agents are offline", (routes) => {
+    routes["GET /scanners/null/agents"] = manyAgents(10, (index) => (index === 0 ? { status: "off" } : {}));
+  }),
+  boundaryScenario("TENABLE-05", "fail", "20% of agents are offline", (routes) => {
+    routes["GET /scanners/null/agents"] = manyAgents(10, (index) => (index < 2 ? { status: "off" } : {}));
+  }),
+  boundaryScenario("TENABLE-05", "warn", "an agent runs a minor version behind the newest", (routes) => {
+    routes["GET /scanners/null/agents"] = manyAgents(2, (index) => (index === 0 ? { core_version: "10.7.0" } : {}));
+  }),
+  boundaryScenario("TENABLE-06", "warn", "exactly 10% of agents belong to no group", (routes) => {
+    routes["GET /scanners/null/agents"] = manyAgents(10, (index) => (index === 0 ? { groups: [] } : {}));
+  }),
+  boundaryScenario("TENABLE-06", "fail", "20% of agents belong to no group", (routes) => {
+    routes["GET /scanners/null/agents"] = manyAgents(10, (index) => (index < 2 ? { groups: [] } : {}));
+  }),
+  boundaryScenario("TENABLE-07", "pass", "a linked scanner last connected exactly one day ago", (routes) => {
+    routes["GET /scanners"].scanners[0].last_connect = secondsBefore(1);
+  }),
+  boundaryScenario("TENABLE-07", "fail", "a linked scanner last connected an hour past one day", (routes) => {
+    routes["GET /scanners"].scanners[0].last_connect = secondsBefore(1, 1);
+  }),
+  boundaryScenario("TENABLE-07", "fail", "a linked scanner is no longer linked", (routes) => {
+    connectedScanners(routes)[0].linked = 0;
+  }),
+  boundaryScenario("TENABLE-07", "fail", "a linked scanner is off", (routes) => {
+    connectedScanners(routes)[0].status = "off";
+  }),
+  boundaryScenario("TENABLE-07", "warn", "a linked scanner runs an older version than the newest", (routes) => {
+    const scanners = connectedScanners(routes);
+    scanners.push({ ...scanners[0], id: 2, name: "Datacenter Scanner", ui_version: "10.7.0" });
+  }),
+  boundaryScenario("TENABLE-07-SC", "pass", "a scanner checked in exactly one day ago", (routes) => {
+    scRecord(routes, "scanner").lastCheckinTime = String(secondsBefore(1));
+  }),
+  boundaryScenario("TENABLE-07-SC", "fail", "a scanner last checked in an hour past one day", (routes) => {
+    scRecord(routes, "scanner").lastCheckinTime = String(secondsBefore(1, 1));
+  }),
+  boundaryScenario("TENABLE-07-SC", "pass", "a scanner loads a plugin set exactly plugin_stale_hours old", (routes) => {
+    Object.assign(scRecord(routes, "scanner"), { pluginSet: pluginSetBefore(24), loadedPluginSet: pluginSetBefore(24) });
+  }),
+  boundaryScenario("TENABLE-07-SC", "fail", "a scanner loads a plugin set a minute past plugin_stale_hours", (routes) => {
+    Object.assign(scRecord(routes, "scanner"), { pluginSet: pluginSetBefore(24, 1), loadedPluginSet: pluginSetBefore(24, 1) });
+  }),
+  boundaryScenario("TENABLE-07-SC", "fail", "an enabled scanner reports status 2", (routes) => {
+    scRecord(routes, "scanner").status = "2";
+  }),
+  boundaryScenario("TENABLE-07-SC", "warn", "an enabled scanner has no lastCheckinTime", (routes) => {
+    delete scRecord(routes, "scanner").lastCheckinTime;
+  }),
+  boundaryScenario("TENABLE-08", "pass", "the container plugin set is exactly plugin_stale_hours old", (routes) => {
+    Object.assign(routes["GET /server/properties"], { plugin_set: pluginSetBefore(24), loaded_plugin_set: pluginSetBefore(24) });
+  }),
+  boundaryScenario("TENABLE-08", "fail", "the container plugin set is a minute past plugin_stale_hours", (routes) => {
+    Object.assign(routes["GET /server/properties"], { plugin_set: pluginSetBefore(24, 1), loaded_plugin_set: pluginSetBefore(24, 1) });
+  }),
+  boundaryScenario("TENABLE-08", "pass", "a scanner loads a plugin set exactly plugin_stale_hours old", (routes) => {
+    routes["GET /scanners"].scanners[0].loaded_plugin_set = pluginSetBefore(24);
+  }),
+  boundaryScenario("TENABLE-08", "fail", "a scanner loads a plugin set a minute past plugin_stale_hours", (routes) => {
+    routes["GET /scanners"].scanners[0].loaded_plugin_set = pluginSetBefore(24, 1);
+  }),
+  boundaryScenario("TENABLE-08", "pass", "an online agent loads a plugin set exactly plugin_stale_hours old", (routes) => {
+    routes["GET /scanners/null/agents"].agents[0].plugin_feed_id = pluginSetBefore(24);
+  }),
+  boundaryScenario("TENABLE-08", "warn", "an online agent loads a plugin set a minute past plugin_stale_hours", (routes) => {
+    routes["GET /scanners/null/agents"].agents[0].plugin_feed_id = pluginSetBefore(24, 1);
+  }),
+  boundaryScenario("TENABLE-08", "manual", "the server properties expose no parseable plugin set", (routes) => {
+    routes["GET /server/properties"] = { nessus_ui_version: "10.8.0" };
+  }),
+  boundaryScenario("TENABLE-10", "pass", "an enabled user last logged in exactly inactive_user_days ago", (routes) => {
+    routes["GET /users"].users[1].lastlogin = msBefore(90);
+  }),
+  boundaryScenario("TENABLE-10", "fail", "an enabled user last logged in an hour past inactive_user_days", (routes) => {
+    routes["GET /users"].users[1].lastlogin = msBefore(90, 1);
+  }),
+  boundaryScenario("TENABLE-10", "pass", "enabled Administrators equal max_admins", () => {}, { maxAdmins: 1 }),
+  boundaryScenario("TENABLE-10", "fail", "enabled Administrators exceed max_admins", (routes) => {
+    routes["GET /users"].users[1].permissions = 64;
+  }, { maxAdmins: 1 }),
+  boundaryScenario("TENABLE-10", "pass", "an API key was last used exactly inactive_user_days ago", (routes) => {
+    routes["GET /users"].users[0].last_apikey_access = msBefore(90);
+  }),
+  boundaryScenario("TENABLE-10", "warn", "an API key went unused an hour past inactive_user_days", (routes) => {
+    routes["GET /users"].users[0].last_apikey_access = msBefore(90, 1);
+  }),
+  boundaryScenario("TENABLE-10", "pass", "an enabled user shows four failed logins", (routes) => {
+    routes["GET /users"].users[1].login_fail_count = 4;
+  }),
+  boundaryScenario("TENABLE-10", "warn", "an enabled user shows five failed logins", (routes) => {
+    routes["GET /users"].users[1].login_fail_count = 5;
+  }),
+  boundaryScenario("TENABLE-10", "warn", "an enabled user never logged in", (routes) => {
+    delete routes["GET /users"].users[1].lastlogin;
+  }),
+  boundaryScenario("TENABLE-10", "warn", "an enabled user is locked out", (routes) => {
+    routes["GET /users"].users[1].lockout = 1;
+  }),
+  boundaryScenario("TENABLE-10-SC", "pass", "an active user last logged in exactly inactive_user_days ago", (routes) => {
+    scRecord(routes, "user").lastLogin = String(secondsBefore(90));
+  }),
+  boundaryScenario("TENABLE-10-SC", "fail", "an active user last logged in an hour past inactive_user_days", (routes) => {
+    scRecord(routes, "user").lastLogin = String(secondsBefore(90, 1));
+  }),
+  boundaryScenario("TENABLE-10-SC", "warn", "an active user never logged in", (routes) => {
+    delete scRecord(routes, "user").lastLogin;
+  }),
+  boundaryScenario("TENABLE-10-SC", "warn", "an active user is locked", (routes) => {
+    scRecord(routes, "user").locked = "true";
+  }),
+  boundaryScenario("TENABLE-11", "warn", "a legacy access group other than all assets remains", (routes) => {
+    routes["GET /v2/access-groups"] = { access_groups: [{ id: "ag-1", name: "Finance servers", all_assets: false }], pagination: { total: 1 } };
+  }),
+  boundaryScenario("TENABLE-12", "pass", "every credential is in use and the oldest was created exactly 365 days ago", (routes) => {
+    Object.assign(routes["GET /credentials"].credentials[0], USED_CREDENTIAL, { created_date: secondsBefore(365) });
+  }),
+  boundaryScenario("TENABLE-12", "warn", "a credential in use was created an hour more than 365 days ago", (routes) => {
+    Object.assign(routes["GET /credentials"].credentials[0], USED_CREDENTIAL, { created_date: secondsBefore(365, 1) });
+  }),
+  boundaryScenario("TENABLE-12", "warn", "a credential in use has no created_date", (routes) => {
+    const [credential] = routes["GET /credentials"].credentials;
+    Object.assign(credential, USED_CREDENTIAL);
+    delete credential.created_date;
+  }),
+  boundaryScenario("TENABLE-18", "warn", "the activity log holds a user change", (routes) => {
+    const log = routes["GET /audit-log/v1/events"];
+    log.events.push({ ...log.events[0], id: "e-2", action: "user.update", crud: "u" });
+    log.pagination.total = 2;
+  }),
+  boundaryScenario("TENABLE-14", "pass", "exactly half of the rated open findings carry a VPR score", (routes) => {
+    routes["GET /vulns/export/vuln-export-1/chunks/1"].push(openFinding("high", RECENT_ISO, { id: 4 }));
+  }),
+  boundaryScenario("TENABLE-14", "warn", "a third of the rated open findings carry a VPR score", (routes) => {
+    routes["GET /vulns/export/vuln-export-1/chunks/1"].push(openFinding("high", RECENT_ISO, { id: 4 }), openFinding("medium", RECENT_ISO, { id: 6 }));
+  }),
+  ...[["critical", 15, "fail"], ["high", 30, "fail"], ["medium", 90, "warn"], ["low", 180, "warn"]].flatMap(([severity, slaDays, overdue]) => [
+    boundaryScenario("TENABLE-15", "pass", `an open ${severity} finding is exactly sla_${severity}_days old`, (routes) => {
+      routes["GET /vulns/export/vuln-export-1/chunks/1"].push(openFinding(severity, isoBefore(slaDays)));
+    }),
+    boundaryScenario("TENABLE-15", overdue, `an open ${severity} finding is an hour past sla_${severity}_days`, (routes) => {
+      routes["GET /vulns/export/vuln-export-1/chunks/1"].push(openFinding(severity, isoBefore(slaDays, 1)));
+    }),
+  ]),
+  boundaryScenario("TENABLE-15", "warn", "an open finding has no first_found date", (routes) => {
+    routes["GET /vulns/export/vuln-export-1/chunks/1"].push(openFinding("medium", undefined));
+  }),
+  boundaryScenario("TENABLE-20", "pass", "a target group was last modified exactly 365 days ago", (routes) => {
+    routes["GET /target-groups"] = { target_groups: [{ id: 1, name: "DMZ", members: "10.0.0.1", last_modification_date: secondsBefore(365) }] };
+  }),
+  boundaryScenario("TENABLE-20", "warn", "a target group was last modified an hour more than 365 days ago", (routes) => {
+    routes["GET /target-groups"] = { target_groups: [{ id: 1, name: "DMZ", members: "10.0.0.1", last_modification_date: secondsBefore(365, 1) }] };
+  }),
+  boundaryScenario("TENABLE-20", "warn", "a target group has no modification date", (routes) => {
+    routes["GET /target-groups"] = { target_groups: [{ id: 1, name: "DMZ", members: "10.0.0.1" }] };
+  }),
+  boundaryScenario("TENABLE-20", "warn", "a member target appears in two target groups", (routes) => {
+    routes["GET /target-groups"] = {
+      target_groups: [
+        { id: 1, name: "DMZ", members: "10.0.0.1", last_modification_date: RECENT_SECONDS },
+        { id: 2, name: "Web", members: "10.0.0.1,10.0.0.2", last_modification_date: RECENT_SECONDS },
+      ],
+    };
+  }),
+];
 
-async function runBoundaryScenario({ routes, options = {} }) {
-  return runAll(clientsFor(routes()), { expectedAssetCount: 2, ...options });
+async function runBoundaryScenario({ routes, options }) {
+  return runAll(bothPlatformClients(routerFetch(routes())), { expectedAssetCount: 2, ...options });
 }
 
 test("boundary scenarios: each threshold edge reaches the verdict on either side of it", async () => {
+  const names = BOUNDARY_SCENARIOS.map((scenario) => scenario.name);
+  assert.equal(new Set(names).size, names.length, "scenario names key the byte differential fixture");
+  const mismatches = [];
   for (const scenario of BOUNDARY_SCENARIOS) {
-    const results = await runBoundaryScenario(scenario);
-    assert.equal(byId(results, scenario.check).status, scenario.expected, scenario.name);
+    const { status } = byId(await runBoundaryScenario(scenario), scenario.check);
+    if (status !== scenario.expected) mismatches.push(`${scenario.name}: ${status}`);
   }
+  assert.deepEqual(mismatches, []);
 });
 
 function representativeRoutes() {
