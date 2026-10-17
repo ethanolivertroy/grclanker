@@ -84,10 +84,33 @@ function surfaceMatchers(spec) {
   });
 }
 
+/** Pairs each entry with a distinct value it matches; returns the unpaired values, or undefined when an entry has no value. */
+function pairDistinct(entries, values) {
+  if (entries.length === 0) return values;
+  const [entry, ...rest] = entries;
+  for (const [index, value] of values.entries()) {
+    if (!entry.pattern.test(value)) continue;
+    const unpaired = pairDistinct(rest, values.filter((_, other) => other !== index));
+    if (unpaired) return unpaired;
+  }
+  return undefined;
+}
+
+/** Received values left after every embedded query entry claims its own, by name; undefined when an entry goes unclaimed. */
+function embeddedQueryLeftovers(matcher, url) {
+  const leftovers = new Map();
+  for (const name of new Set(matcher.embeddedQuery.map((entry) => entry.name))) {
+    const unpaired = pairDistinct(matcher.embeddedQuery.filter((entry) => entry.name === name), url.searchParams.getAll(name));
+    if (!unpaired) return undefined;
+    leftovers.set(name, unpaired);
+  }
+  return leftovers;
+}
+
 function matchSurface(matchers, method, url) {
   const candidates = matchers.filter((matcher) => matcher.method === method
     && matcher.path.test(matcher.hostQualified ? `${url.host}${url.pathname}` : url.pathname)
-    && matcher.embeddedQuery.every(({ name, pattern }) => url.searchParams.getAll(name).some((value) => pattern.test(value))));
+    && embeddedQueryLeftovers(matcher, url) !== undefined);
   candidates.sort((left, right) => right.literalLength - left.literalLength
     || right.embeddedQuery.length - left.embeddedQuery.length);
   return candidates[0];
@@ -164,16 +187,17 @@ function requestViolations(matcher, request, url) {
     }
   }
   const declaredQuery = new Set(parameters.filter((parameter) => parameter.location === "query").map((parameter) => parameter.name));
+  const leftovers = embeddedQueryLeftovers(matcher, url);
   for (const name of new Set(url.searchParams.keys())) {
-    const embedded = matcher.embeddedQuery.filter((entry) => entry.name === name);
-    if (embedded.length === 0) {
+    if (!leftovers.has(name)) {
       if (!declaredQuery.has(name)) violations.push(`${label}: sends undeclared query parameter ${name}`);
       continue;
     }
-    for (const value of url.searchParams.getAll(name)) {
-      if (!embedded.some(({ pattern }) => pattern.test(value))) {
-        violations.push(`${label}: sends query parameter ${name}=${value}, not ${embedded.map((entry) => entry.value).join(" or ")}`);
-      }
+    const embedded = matcher.embeddedQuery.filter((entry) => entry.name === name);
+    for (const value of leftovers.get(name)) {
+      violations.push(embedded.some(({ pattern }) => pattern.test(value))
+        ? `${label}: repeats embedded query parameter ${name}=${value}`
+        : `${label}: sends query parameter ${name}=${value}, not ${embedded.map((entry) => entry.value).join(" or ")}`);
     }
   }
   if (request.body !== null && typeof request.body === "object") {

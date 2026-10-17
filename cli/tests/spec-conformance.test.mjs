@@ -439,6 +439,7 @@ test("request conformance reports undeclared requests, parameter values, body me
     ["/v1/groups", { headers: BEARER }],
     ["/v1/users?limit=200", { headers: BEARER }],
     ["/v1/users?status=active&status=deleted&limit=200", { headers: BEARER }],
+    ["/v1/users?status=active&status=active&limit=200", { headers: BEARER }],
     ["/v1/users/42/roles", {
       method: "POST",
       headers: { Authorization: "Basic abc", "Content-Type": "application/json" },
@@ -453,10 +454,24 @@ test("request conformance reports undeclared requests, parameter values, body me
     "undeclared request GET api.example.test/v1/groups",
     "undeclared request GET api.example.test/v1/users?limit=200",
     "users GET /v1/users?status=active&status=deleted&limit=200: sends query parameter status=deleted, not active",
+    "users GET /v1/users?status=active&status=active&limit=200: repeats embedded query parameter status=active",
     "roles POST /v1/users/42/roles: sends json-body parameter filter.kind=user, not admin",
     "roles POST /v1/users/42/roles: sends undeclared body member filter.scope",
     "roles POST /v1/users/42/roles: sends undeclared body member extra",
     "roles POST /v1/users/42/roles: sends header authorization in an undeclared format",
+  ]);
+});
+
+test("request conformance pairs each embedded query entry with its own received value", async () => {
+  const spec = buildExample({ surfaces: exampleSurfaces({ users: { path: "/v1/users?status=active&status={state}" } }) });
+  const requests = await recordCalls([
+    ["/v1/users?status=active&status=locked&limit=200", { headers: BEARER }],
+    ["/v1/users?status=active&limit=200", { headers: BEARER }],
+    ["/v1/users?status=locked&status=active&status=active&limit=200", { headers: BEARER }],
+  ]);
+  assert.deepEqual(requestConformance(spec, requests, { uncalled: { roles: "Role reads are outside this probe." } }).violations, [
+    "undeclared request GET api.example.test/v1/users?status=active&limit=200",
+    "users GET /v1/users?status=locked&status=active&status=active&limit=200: repeats embedded query parameter status=active",
   ]);
 });
 
