@@ -360,3 +360,29 @@ export const ZSCALER_AUTH_RESOLVER = {
   configFields: ["zia.client", "zpa.client", "zscaler.client"],
   refreshRequest: "POST /authenticatedSession for ZIA; POST /signin for ZPA OAuth client credentials.",
 } as const satisfies ResolverAuthenticationContract;
+
+export const TENABLE_AUTH_RESOLVER = {
+  modes: [
+    "Tenable Vulnerability Management X-ApiKeys access and secret key pair",
+    "Tenable Security Center x-apikey access and secret key pair",
+  ],
+  precedence: ["Explicit tool arguments", "TENABLE_* environment variables", "Tenable YAML config file"],
+  environment: [
+    "TENABLE_CONFIG_FILE",
+    "TENABLE_URL",
+    "TENABLE_BASE_URL",
+    "TENABLE_ACCESS_KEY",
+    "TENABLE_SECRET_KEY",
+    "TENABLE_SC_URL",
+    "TENABLE_SC_ACCESS_KEY",
+    "TENABLE_SC_SECRET_KEY",
+    "TENABLE_TIMEOUT",
+  ],
+  configLocations: ["~/.tenable/config.yaml", "Explicit path from config_file or TENABLE_CONFIG_FILE"],
+  variants: [
+    "Commercial cloud at cloud.tenable.com or a regional *.cloud.tenable.com host",
+    "FedRAMP cloud at fedcloud.tenable.com",
+    "Tenable Security Center host, alone or alongside a cloud tenant",
+  ],
+  configFields: ["url", "base_url", "access_key", "accessKey", "secret_key", "secretKey", "sc_url", "sc_access_key", "sc_secret_key", "timeout_seconds"],
+} as const satisfies ResolverAuthenticationContract;

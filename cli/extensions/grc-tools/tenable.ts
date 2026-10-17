@@ -21,6 +21,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { readResolverEnvironment, TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -1809,6 +1810,7 @@ export function resolveTenableConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
 ): TenableResolvedConfig {
+  env = readResolverEnvironment(TENABLE_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const explicitConfigPath = asString(input.config_file) ?? asString(env.TENABLE_CONFIG_FILE);
   const file = readConfigFile(explicitConfigPath ?? join(homedir(), ".tenable", "config.yaml"), explicitConfigPath !== undefined);
