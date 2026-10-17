@@ -24,7 +24,6 @@ All specs are available as raw markdown. Point your agent at any URL below.
 - [Snowflake Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/snowflake-sec-inspector.spec.md): IAM, network security, data protection policies, encryption
 - [Splunk Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/splunk-sec-inspector.spec.md): Authentication, authorization, server settings, data pipelines
 - [Sumo Logic Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/sumologic-sec-inspector.spec.md): Authentication policies, access controls, data governance
-- [Tenable Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/tenable-sec-inspector.spec.md): Scan policies, asset coverage, credential audits
 - [Veracode Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/veracode-sec-inspector.spec.md): Scan coverage, policy compliance, flaw aging, SCA library health
 
 <!-- generated integration registry start -->
@@ -43,6 +42,7 @@ All specs are available as raw markdown. Point your agent at any URL below.
 - [Salesforce Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/salesforce-sec-inspector.spec.md): Portable contract for the shipped Salesforce platform, identity, data-protection, and monitoring assessments.
 - [ServiceNow Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/servicenow-sec-inspector.spec.md): Portable contract for the shipped ServiceNow identity, hardening, access-control, and operations-governance assessments.
 - [Slack Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/slack-sec-inspector.spec.md): Portable contract for the shipped Slack Enterprise Grid identity, administration, app, channel, and monitoring assessments.
+- [Tenable Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/tenable-sec-inspector.spec.md): Portable contract for the shipped Tenable Vulnerability Management and Tenable Security Center scan program, sensor coverage, access control, and vulnerability management assessments.
 - [Webex Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/webex-sec-inspector.spec.md): Read-only Webex organization posture inspection across identity, collaboration governance, meetings, hybrid services, and devices.
 - [Zendesk Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/zendesk-sec-inspector.spec.md): Portable contract for the shipped Zendesk authentication, access-control, data-protection, and integration assessments.
 - [Zoom Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/zoom-sec-inspector.spec.md): Portable contract for the shipped Zoom identity, collaboration-governance, and meeting-security assessments.

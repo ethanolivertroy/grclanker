@@ -26,6 +26,8 @@ import { registerServicenowTools } from "./servicenow.js";
 import { SERVICENOW_SPEC } from "./servicenow.spec.js";
 import { registerSlackTools } from "./slack.js";
 import { SLACK_SPEC } from "./slack.spec.js";
+import { registerTenableTools } from "./tenable.js";
+import { TENABLE_SPEC } from "./tenable.spec.js";
 import { registerWebexTools } from "./webex.js";
 import { WEBEX_SPEC } from "./webex.spec.js";
 import { registerZendeskTools } from "./zendesk.js";
@@ -120,6 +122,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     narrativePath: "specs/narratives/slack.md",
     outputPath: "specs/slack-sec-inspector.spec.md",
     registerTools: registerSlackTools,
+  },
+  {
+    contract: TENABLE_SPEC,
+    narrativePath: "specs/narratives/tenable.md",
+    outputPath: "specs/tenable-sec-inspector.spec.md",
+    registerTools: registerTenableTools,
   },
   {
     contract: WEBEX_SPEC,
