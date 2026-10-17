@@ -1373,6 +1373,14 @@ details[open] > .agent-group-toggle::before {
   --docs-panel: var(--color-crust);
 }
 
+#nd-sidebar p {
+  color: var(--docs-accent-strong);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
 /* The Fumadocs sidebar starts at 1024px like the old one; "Browse docs" covers narrower screens. */
 @media (max-width: 1023.98px) {
   #nd-docs-layout {
@@ -1596,6 +1604,97 @@ details[open] > .agent-group-toggle::before {
   background: var(--docs-quote-bg);
   border-radius: 0.5rem;
   color: var(--docs-title);
+}
+
+.docs-prose table {
+  width: 100%;
+  margin: 0 0 1.5rem;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.docs-prose th {
+  padding: 0 0.5rem 0.55rem;
+  border-bottom: 1px solid var(--docs-border-strong);
+  color: var(--docs-accent);
+  font-size: var(--text-nano);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-align: left;
+  text-transform: uppercase;
+  vertical-align: bottom;
+}
+
+.docs-prose td {
+  padding: 0.65rem 0.5rem;
+  border-bottom: 1px solid var(--docs-border);
+  color: var(--docs-body);
+  line-height: 1.6;
+  vertical-align: top;
+  overflow-wrap: break-word;
+}
+
+.docs-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.docs-prose :is(th, td):first-child {
+  padding-left: 0;
+}
+
+.docs-prose :is(th, td):last-child {
+  padding-right: 0;
+}
+
+/* Wide tables of sentences (tagged by src/lib/table-labels.mjs): one labeled line per cell. */
+@media (min-width: 721px) {
+  .docs-prose table[data-layout='stacked'],
+  .docs-prose table[data-layout='stacked'] tbody,
+  .docs-prose table[data-layout='stacked'] tr {
+    display: block;
+  }
+
+  .docs-prose table[data-layout='stacked'] {
+    border-top: 1px solid var(--docs-border-strong);
+  }
+
+  .docs-prose table[data-layout='stacked'] thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .docs-prose table[data-layout='stacked'] tr {
+    padding: 0.85rem 0;
+    border-bottom: 1px solid var(--docs-border);
+  }
+
+  .docs-prose table[data-layout='stacked'] td {
+    display: grid;
+    grid-template-columns: minmax(6rem, 10rem) minmax(0, 1fr);
+    column-gap: 1.25rem;
+    align-items: baseline;
+    padding: 0.2rem 0;
+    border: 0;
+  }
+
+  .docs-prose table[data-layout='stacked'] td > span {
+    grid-column: 2;
+  }
+
+  .docs-prose table[data-layout='stacked'] td[data-label]::before {
+    content: attr(data-label);
+    content: attr(data-label) / '';
+    color: var(--docs-accent);
+    font-size: var(--text-nano);
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
 }
 
 .docs-prose .copy-code {
@@ -2030,6 +2129,8 @@ details[open] > .agent-group-toggle::before {
   }
 
   .docs-prose td {
+    padding: 0;
+    border: 0;
     color: var(--docs-body);
     font-size: var(--text-sm);
     line-height: 1.65;

@@ -8,7 +8,18 @@ function MdxLink({ href = '', ...props }: ComponentProps<'a'>) {
   return <a href={href} {...props} />;
 }
 
+// The docs layout clips horizontal overflow, so a table that still cannot fit
+// the column scrolls inside its own box instead of losing its right edge.
+function MdxTable(props: ComponentProps<'table'>) {
+  return (
+    <div className="docs-table-scroll">
+      <table {...props} />
+    </div>
+  );
+}
+
 export const mdxComponents: MDXComponents = {
   a: MdxLink,
   pre: CodeBlock,
+  table: MdxTable,
 };
