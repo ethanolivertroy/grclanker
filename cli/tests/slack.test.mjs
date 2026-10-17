@@ -14,6 +14,7 @@ import {
 } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import {
   byteDifferentialEnabled,
+  portableContractTest,
   prepareByteDifferentialExportRoot,
   snapshotExportBundle,
   writeByteDifferentialFixture,
@@ -47,7 +48,6 @@ import {
   vendorErrorCode,
 } from "../dist/extensions/grc-tools/slack.js";
 
-const portableContractTest = process.env.GRC_CORPUS_FIXTURE_DIR ? test.skip : test;
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const EMPTY_ENV = { SLACK_CONFIG_FILE: "" };
 

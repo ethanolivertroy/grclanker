@@ -44,12 +44,12 @@ import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-sp
 import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
 import {
   byteDifferentialEnabled,
+  portableContractTest,
   prepareByteDifferentialExportRoot,
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
 
-const portableContractTest = process.env.GRC_CORPUS_FIXTURE_DIR ? test.skip : test;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_LOGIN = new Date(Date.now() - 2 * DAY_MS).toISOString();
 const OLD_LOGIN = new Date(Date.now() - 400 * DAY_MS).toISOString();
