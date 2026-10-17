@@ -223,7 +223,7 @@ const TENABLE_INPUTS: Readonly<Record<string, string>> = {
   policies_readable: "True when GET /policies returned its documented policies array.",
   enabled_recurring_scan_count: "Number of scans with enabled true and a non-empty rrules string that does not contain FREQ=ONETIME.",
   recurring_scan_age_days: "For each enabled recurring scan whose last_modification_date parses as epoch seconds, epoch milliseconds, or a date string, the days from that timestamp to the assessment time as a fraction, floored at 0.",
-  never_run_or_undated_recurring_scan_count: "Number of enabled recurring scans whose status is empty or whose last_modification_date does not parse as a timestamp.",
+  never_run_or_undated_recurring_scan_count: "Number of enabled recurring scans whose status is the string empty, which Tenable reports for a scan that never ran, or whose last_modification_date does not parse as a timestamp.",
   active_compliance_scan_count: "Number of enabled recurring scans whose resolved template name or title contains compliance, pci, scap, audit, offline config, or stig, case-insensitively.",
   asset_export_readable: "True when the POST /assets/export job reached FINISHED and, when Tenable listed any available chunk, at least one chunk downloaded.",
   asset_count: "Number of exported asset records carrying at least one of id, uuid, has_agent, last_seen, network_id, or tags.",
