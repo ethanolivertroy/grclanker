@@ -210,7 +210,10 @@ function instrumentAssessmentExports(root, testFiles) {
     );
     if (wrappers.length === 0) throw new Error(`No assessment exports found in ${modulePath}`);
     const recorder = `
+import { AsyncLocalStorage as __CorpusAsyncLocalStorage } from "node:async_hooks";
 import { appendFileSync as __corpusAppendFileSync, mkdirSync as __corpusMkdirSync } from "node:fs";
+// Sweep replays run in the module-load context, outside any decision-fact capture the calling test holds.
+const __corpusDetachedContext = __CorpusAsyncLocalStorage.snapshot();
 function __corpusRecord(name, kind, value) {
   const directory = process.env.GRC_CORPUS_FIXTURE_DIR;
   if (!directory) return;
@@ -223,14 +226,12 @@ function __corpusRecord(name, kind, value) {
     serialized + "\\n",
   );
 }
-// A collected dataset carries a record array plus at least one collection-state field.
 function __corpusDatasets(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return [];
   return Object.entries(input).flatMap(([datasetName, dataset]) => {
     if (!dataset || typeof dataset !== "object" || Array.isArray(dataset)) return [];
     const collectionKey = ["data", "rows", "items"].find((key) => Array.isArray(dataset[key]));
-    const hasState = ["status", "error", "notCollected", "truncated", "partial"].some((key) => Object.hasOwn(dataset, key));
-    return collectionKey && hasState ? [[datasetName, collectionKey]] : [];
+    return collectionKey ? [[datasetName, collectionKey]] : [];
   });
 }
 const __corpusSweptInputs = new Set();
@@ -273,7 +274,11 @@ function __corpusSweep(name, args, original) {
         if (Object.hasOwn(mutated, "total")) mutated.total = Math.max(rows.length + 1, Number(mutated.total) || 0);
       }
       try {
-        __corpusRecord(name + "::sweep::" + mode + "::" + datasetName, "result", original(...mutatedArgs));
+        __corpusRecord(
+          name + "::sweep::" + mode + "::" + datasetName,
+          "result",
+          __corpusDetachedContext(() => original(...mutatedArgs)),
+        );
       } catch (error) {
         __corpusRecord(name + "::sweep::" + mode + "::" + datasetName, "error", {
           name: error instanceof Error ? error.name : typeof error,
