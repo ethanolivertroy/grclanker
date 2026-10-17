@@ -4,6 +4,7 @@ import { RootProvider } from 'fumadocs-ui/provider/next';
 import { KeyboardShortcuts } from '../components/keyboard-shortcuts';
 import { SiteFooter } from '../components/site-footer';
 import { SiteHeader } from '../components/site-header';
+import { SiteSearchDialog } from '../components/site-search';
 import { pageMetadata } from '../lib/metadata';
 import { siteName } from '../lib/site';
 import '../styles/global.css';
@@ -21,7 +22,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       <body className="font-sans antialiased">
         <RootProvider
           theme={{ enabled: false }}
-          search={{ options: { type: 'static', api: '/api/search.json' } }}
+          search={{ SearchDialog: SiteSearchDialog }}
         >
           <a href="#main-content" className="skip-link">
             Skip to content

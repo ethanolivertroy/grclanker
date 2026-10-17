@@ -204,7 +204,9 @@ body {
   position: relative;
 }
 .hud-corners::before,
-.hud-corners::after {
+.hud-corners::after,
+.site-search::before,
+.site-search::after {
   content: '';
   position: absolute;
   width: 16px;
@@ -213,12 +215,14 @@ body {
   border-style: solid;
   pointer-events: none;
 }
-.hud-corners::before {
+.hud-corners::before,
+.site-search::before {
   top: 0;
   left: 0;
   border-width: 1px 0 0 1px;
 }
-.hud-corners::after {
+.hud-corners::after,
+.site-search::after {
   bottom: 0;
   right: 0;
   border-width: 0 1px 1px 0;
@@ -2249,40 +2253,6 @@ details[open] > .agent-group-toggle::before {
 }
 
 /* === Overlay system === */
-.overlay-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(35, 38, 52, 0.75); /* crust */
-  z-index: 100;
-  opacity: 0;
-  transition: opacity 0.15s ease;
-  pointer-events: none;
-}
-.overlay-backdrop.open {
-  opacity: 1;
-  pointer-events: auto;
-}
-.overlay-modal {
-  position: fixed;
-  top: 20vh;
-  left: 50%;
-  transform: translateX(-50%) translateY(8px);
-  width: calc(100% - 2rem);
-  max-width: 32rem;
-  z-index: 101;
-  opacity: 0;
-  visibility: hidden;
-  transition: opacity 0.15s ease, transform 0.15s ease, visibility 0s linear 0.15s;
-  pointer-events: none;
-}
-.overlay-modal.open {
-  opacity: 1;
-  visibility: visible;
-  transform: translateX(-50%) translateY(0);
-  transition-delay: 0s;
-  pointer-events: auto;
-}
-
 .overlay-close {
   display: inline-flex;
   align-items: center;
@@ -2333,50 +2303,78 @@ details[open] > .agent-group-toggle::before {
   top: 1rem;
 }
 
-/* Search input */
-.search-input {
-  width: 100%;
-  background: var(--ui-border);
-  border: 1px solid var(--ui-border-strong);
-  border-radius: 6px;
-  padding: 0.625rem 0.75rem;
-  color: var(--ui-text);
-  font-size: var(--text-sm);
-  outline: none;
-  transition: border-color 0.15s ease;
-}
-.search-input::placeholder {
-  color: var(--ui-muted);
-}
-.search-input:focus {
-  border-color: var(--ui-accent);
+/* Search dialog */
+/* Fumadocs' z-50 ties with the sticky site header, which then covers the dialog on phones. */
+.site-search-overlay,
+.site-search {
+  z-index: 60;
 }
 
-/* Search results */
-.search-result {
-  display: block;
+.site-search {
+  border-radius: 0.5rem;
+}
+
+.site-search input {
+  min-height: 2.5rem;
   padding: 0.5rem 0.75rem;
-  border-left: 2px solid transparent;
-  cursor: pointer;
-  transition: background 0.1s ease;
-  text-decoration: none;
-}
-.search-result:hover,
-.search-result.active {
-  background: rgba(140, 170, 238, 0.08); /* blue */
-  border-left-color: var(--color-blue);
-}
-.search-result .result-name {
-  color: var(--ui-text);
-  font-weight: 500;
+  border: 1px solid var(--ui-border-strong);
+  border-radius: 6px;
+  background: var(--ui-border);
   font-size: var(--text-sm);
+  transition: border-color 0.15s ease;
 }
-.search-result.active .result-name {
+
+.site-search input:focus-visible {
+  border-color: var(--ui-accent);
+  outline: none;
+}
+
+.site-search [role='listbox'] {
+  padding-inline: 0;
+}
+
+.site-search [role='option'] {
+  border-left: 2px solid transparent;
+  border-radius: 0;
+}
+
+.site-search [role='option'][aria-selected='true'] {
+  border-left-color: var(--color-blue);
+  background: color-mix(in srgb, var(--color-blue) 8%, transparent);
   color: var(--ui-accent);
 }
-.search-result .result-meta {
+
+.search-hints {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 0.75rem;
+  background: transparent;
   color: var(--ui-muted);
   font-size: var(--text-xs);
+}
+
+@media (max-width: 767.98px) {
+  .search-hints {
+    display: none;
+  }
+}
+
+.search-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1.5rem 1rem;
+  color: var(--ui-muted);
+  font-size: var(--text-sm);
+}
+
+.search-empty img {
+  width: 6rem;
+  height: 6rem;
+  border-radius: 0.5rem;
+  object-fit: cover;
 }
 
 /* Kbd styling */
@@ -2439,9 +2437,6 @@ input:focus-visible {
   html {
     scroll-behavior: auto;
   }
-  .overlay-backdrop,
-  .overlay-modal,
-  .search-result,
   .toast {
     transition: none;
   }
