@@ -41,11 +41,16 @@ export function KeyboardShortcuts() {
   useEffect(() => {
     let hideTimer: ReturnType<typeof setTimeout> | undefined;
 
-    function copyRawUrl() {
+    async function copyRawUrl() {
       const url = document.getElementById('spec-page-data')?.getAttribute('data-raw-url');
       if (!url) return;
-      navigator.clipboard.writeText(url).catch(() => {});
-      setToast({ text: 'URL copied to clipboard', visible: true });
+      let text = 'URL copied to clipboard';
+      try {
+        await navigator.clipboard.writeText(url);
+      } catch {
+        text = 'Clipboard access failed';
+      }
+      setToast({ text, visible: true });
       clearTimeout(hideTimer);
       hideTimer = setTimeout(() => setToast((current) => ({ ...current, visible: false })), 1500);
     }

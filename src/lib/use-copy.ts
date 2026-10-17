@@ -18,6 +18,7 @@ export function useCopy(message: string, resetMs = 1500) {
       try {
         await navigator.clipboard.writeText(text);
       } catch {
+        announce('Clipboard access failed');
         return;
       }
       announce(message);
