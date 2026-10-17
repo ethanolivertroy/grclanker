@@ -256,7 +256,7 @@ Malformed configuration: Reject malformed or ambiguous configuration before any 
 | Kind | Permission, role, or plan | Unlocks | Notes |
 |---|---|---|---|
 | role | `Tenable Vulnerability Management Administrator [64]` | `scans`, `policies`, `policy-details`, `scan-templates`, `users`, `target-groups`, `exclusions`, `asset-export-request`, `asset-export-status`, `asset-export-chunks`, `vuln-export-request`, `vuln-export-status`, `vuln-export-chunks`, `vuln-export-jobs`, `asset-export-jobs`, `server-properties`, `scanners`, `agents`, `agent-groups`, `networks`, `tag-categories`, `tag-values`, `groups`, `roles`, `permissions`, `access-groups`, `credentials`, `audit-log` | Lower roles see only objects shared with them; users then come back in the reduced shape, which caps otherwise passing findings at warn. |
-| role | `Tenable Security Center Security Manager or Administrator` | `sc-scans`, `sc-scan-results`, `sc-scanners`, `sc-feed`, `sc-users` | Security Center returns only the scans, scan results, scanners, and users the role can use or manage. |
+| role | `Tenable Security Center Security Manager or Administrator` | `sc-scans`, `sc-scan-results`, `sc-scanners`, `sc-feed`, `sc-users`, `sc-current-user` | Security Center returns only the scans, scan results, scanners, and users the role can use or manage. |
 
 ## API surfaces
 
@@ -295,6 +295,7 @@ Malformed configuration: Reject malformed or ambiguous configuration before any 
 | `sc-scanners` | HTTP | `GET /rest/scanner` | Tenable Security Center REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `name`, `status`, `enabled`, `pluginSet`, `loadedPluginSet`, `lastCheckinTime` | [Official documentation](https://docs.tenable.com/security-center/api/Scanner.htm) |
 | `sc-feed` | HTTP | `GET /rest/feed` | Tenable Security Center REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `active.stale`, `active.updateTime` | [Official documentation](https://docs.tenable.com/security-center/api/Feed.htm) |
 | `sc-users` | HTTP | `GET /rest/user` | Tenable Security Center REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `username`, `status`, `role.id`, `role.name`, `lastLogin`, `locked` | [Official documentation](https://docs.tenable.com/security-center/api/User.htm) |
+| `sc-current-user` | HTTP | `GET /rest/currentUser` | Tenable Security Center REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | None | [Official documentation](https://docs.tenable.com/security-center/api/Current-User.htm) |
 
 ### Request construction
 
@@ -411,7 +412,7 @@ Malformed configuration: Reject malformed or ambiguous configuration before any 
 | `audit-log` | client | Use the configured Tenable Vulnerability Management API origin; never follow a server link to a different origin. | yes |
 | `audit-log` | headers | Accept: application/json; `X-ApiKeys: accessKey={access_key};secretKey={secret_key}` | yes |
 | `audit-log` | response | A JSON object with an events array and pagination.total. | yes |
-| `audit-log` | query:f | date.gte: followed by the ISO 8601 time audit_lookback_days days before the assessment time (clamped to 1 through 365; default 30) | yes |
+| `audit-log` | query:f | date.gte: followed by the ISO 8601 time audit_lookback_days days before the assessment time (clamped to 1 through 365; default 30), or 1 day before now for the access check | yes |
 | `audit-log` | query:limit | 5000 | yes |
 | `audit-log` | query:offset | Number of event records already received, starting at 0 | yes |
 | `sc-scans` | client | Use the configured Tenable Security Center origin (sc_url, or url when it names a Security Center host); never follow a server link to a different origin. | yes |
@@ -434,6 +435,10 @@ Malformed configuration: Reject malformed or ambiguous configuration before any 
 | `sc-users` | headers | Accept: application/json; `x-apikey: accesskey={sc_access_key}; secretkey={sc_secret_key};` | yes |
 | `sc-users` | response | A JSON object whose response is either an array of records or an object with usable and manageable arrays, merged by id; a nonzero error_code is a refusal. | yes |
 | `sc-users` | query:fields | id,username,status,role,lastLogin,locked,failedLogins,authType | yes |
+| `sc-current-user` | client | Use the configured Tenable Security Center origin (sc_url, or url when it names a Security Center host); never follow a server link to a different origin. | yes |
+| `sc-current-user` | headers | Accept: application/json; `x-apikey: accesskey={sc_access_key}; secretkey={sc_secret_key};` | yes |
+| `sc-current-user` | response | A JSON object whose response object describes the calling user; only the access check reads it, to confirm the keys authenticate, and a nonzero error_code is a refusal. | yes |
+| `sc-current-user` | query:fields | id,username,role,lastLogin | yes |
 
 ## Pagination
 
@@ -444,8 +449,8 @@ Malformed configuration: Reject malformed or ambiguous configuration before any 
 | `networks` | `limit`, `offset`, `pagination.total` | 50 | none | 200 | When pagination.total is reported the walk must reach it; without a total a page shorter than the limit ends the list. | An empty page; pagination.total reached; A short page when no total is reported; A page that opens with the same record as the previous page; The 200-page cap |
 | `tag-categories`, `tag-values` | `limit`, `offset`, `pagination.total` | 5000 | none | 200 | When pagination.total is reported the walk must reach it; without a total a page shorter than the limit ends the list. | An empty page; pagination.total reached; A short page when no total is reported; A page that opens with the same record as the previous page; The 200-page cap |
 | `audit-log` | `limit`, `offset`, `pagination.total` | 5000 | none | 20 | When pagination.total is reported the walk must reach it; without a total a page shorter than the limit ends the list. | An empty page; pagination.total reached; A short page when no total is reported; A page that opens with the same record as the previous page; The 20-page cap |
-| `asset-export-request`, `asset-export-chunks` | `export_uuid`, `chunks_available`, `chunks_failed`, `total_chunks` | 10000 | none | 50 | Each chunk holds up to 10000 assets. The first max_chunks available chunks are downloaded (default 50, clamped to 1 through 1000); listing more, a failed chunk, or total_chunks beyond the available list marks the export partial. | Export status FINISHED, ERROR, or CANCELLED; The 300-second polling deadline; Every listed chunk up to max_chunks requested |
-| `vuln-export-request`, `vuln-export-chunks` | `export_uuid`, `chunks_available`, `chunks_failed`, `total_chunks` | 5000 | none | 50 | Each chunk holds the findings of up to 5000 assets. The first max_chunks available chunks are downloaded (default 50, clamped to 1 through 1000); listing more, a failed chunk, or total_chunks beyond the available list marks the export partial. | Export status FINISHED, ERROR, or CANCELLED; The 300-second polling deadline; Every listed chunk up to max_chunks requested |
+| `asset-export-request`, `asset-export-status`, `asset-export-chunks` | `export_uuid`, `chunks_available`, `chunks_failed`, `total_chunks` | service default | none | 50 | Each chunk holds up to 10000 assets, set by chunk_size on POST /assets/export. The first max_chunks available chunks are downloaded (default 50, clamped to 1 through 1000); listing more, a failed chunk, or total_chunks beyond the available list marks the export partial. | Export status FINISHED, ERROR, or CANCELLED; The 300-second polling deadline; Every listed chunk up to max_chunks requested |
+| `vuln-export-request`, `vuln-export-status`, `vuln-export-chunks` | `export_uuid`, `chunks_available`, `chunks_failed`, `total_chunks` | service default | none | 50 | Each chunk holds the findings of up to 5000 assets, set by num_assets on POST /vulns/export. The first max_chunks available chunks are downloaded (default 50, clamped to 1 through 1000); listing more, a failed chunk, or total_chunks beyond the available list marks the export partial. | Export status FINISHED, ERROR, or CANCELLED; The 300-second polling deadline; Every listed chunk up to max_chunks requested |
 
 ## Rate limits
 
@@ -1157,6 +1162,7 @@ Projected fields by surface:
 | `sc-scanners` | `id`, `name`, `status`, `enabled`, `pluginSet`, `loadedPluginSet`, `lastCheckinTime` |
 | `sc-feed` | `active.stale`, `active.updateTime` |
 | `sc-users` | `id`, `username`, `status`, `role.id`, `role.name`, `lastLogin`, `locked` |
+| `sc-current-user` | None |
 
 ## Export layout
 

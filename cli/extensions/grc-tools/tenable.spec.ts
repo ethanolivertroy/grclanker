@@ -231,7 +231,7 @@ const TENABLE_SURFACES: readonly BatchSurfaceDefinition[] = [
     "id", "action", "crud", "is_failure", "received", "actor.name", "target.name",
   ], {
     parameters: [
-      param("f", "query", "date.gte: followed by the ISO 8601 time audit_lookback_days days before the assessment time (clamped to 1 through 365; default 30)"),
+      param("f", "query", "date.gte: followed by the ISO 8601 time audit_lookback_days days before the assessment time (clamped to 1 through 365; default 30), or 1 day before now for the access check"),
       param("limit", "query", "5000"),
       param("offset", "query", "Number of event records already received, starting at 0"),
     ],
@@ -251,6 +251,9 @@ const TENABLE_SURFACES: readonly BatchSurfaceDefinition[] = [
   scSurface("sc-users", "user", "User.htm", ["id", "username", "status", "role.id", "role.name", "lastLogin", "locked"], [
     param("fields", "query", "id,username,status,role,lastLogin,locked,failedLogins,authType"),
   ], SC_LIST_SHAPE),
+  scSurface("sc-current-user", "currentUser", "Current-User.htm", [], [
+    param("fields", "query", "id,username,role,lastLogin"),
+  ], "A JSON object whose response object describes the calling user; only the access check reads it, to confirm the keys authenticate, and a nonzero error_code is a refusal."),
 ];
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
@@ -1434,10 +1437,11 @@ const offsetWalk = (walked: readonly string[], pageSize: number, pageCap = 200):
   stopConditions: ["An empty page", "pagination.total reached", "A short page when no total is reported", "A page that opens with the same record as the previous page", `The ${pageCap}-page cap`],
 });
 
-const exportChunks = (requestId: string, chunksId: string, pageSize: number, chunkHolds: string): BatchPaginationDefinition => ({
-  surfaceIds: [requestId, chunksId],
+// Chunk downloads send no page size; the export request fixes how much each chunk holds.
+const exportChunks = (exportName: "asset" | "vuln", chunkHolds: string): BatchPaginationDefinition => ({
+  surfaceIds: [`${exportName}-export-request`, `${exportName}-export-status`, `${exportName}-export-chunks`],
   cursorFields: ["export_uuid", "chunks_available", "chunks_failed", "total_chunks"],
-  pageSize,
+  pageSize: null,
   itemCap: "none",
   pageCap: 50,
   totalSemantics: `Each chunk holds ${chunkHolds}. The first max_chunks available chunks are downloaded (default 50, clamped to 1 through 1000); listing more, a failed chunk, or total_chunks beyond the available list marks the export partial.`,
@@ -1485,8 +1489,8 @@ export const TENABLE_SPEC = buildBatchIntegrationSpec({
     offsetWalk(["networks"], 50),
     offsetWalk(["tag-categories", "tag-values"], 5000),
     offsetWalk(["audit-log"], 5000, 20),
-    exportChunks("asset-export-request", "asset-export-chunks", 10000, "up to 10000 assets"),
-    exportChunks("vuln-export-request", "vuln-export-chunks", 5000, "the findings of up to 5000 assets"),
+    exportChunks("asset", "up to 10000 assets, set by chunk_size on POST /assets/export"),
+    exportChunks("vuln", "the findings of up to 5000 assets, set by num_assets on POST /vulns/export"),
   ],
   rateLimit: {
     documentedLimit: null,
