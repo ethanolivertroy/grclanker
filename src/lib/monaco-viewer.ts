@@ -9,7 +9,7 @@ interface MountMonacoViewerOptions {
   initialWrap: boolean;
 }
 
-interface MonacoViewerController {
+export interface MonacoViewerController {
   setWrap: (enabled: boolean) => void;
   setMap: (enabled: boolean) => void;
   dispose: () => void;
