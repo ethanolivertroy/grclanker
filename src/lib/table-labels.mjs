@@ -54,37 +54,9 @@ function markStacked(table, columns) {
   }
 }
 
-// Long identifiers and URLs have no spaces, so each would set its column's
-// minimum width. Break opportunities after their dots, slashes, and
-// underscores, and between camelCase words, let the table fit the docs column
-// without splitting words. Browsers take any break opportunity that fills a
-// line, so short identifiers get none and wrap whole.
-const LONG_TOKEN = /(\S{12,})/;
-const BREAK_POINT = /(?<=[^\s./_][./_])(?=[^\s./_])|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/;
-
-function splitAtBreakPoints(child) {
-  if (child.type !== 'text') return [child];
-  const nodes = [];
-  child.value.split(LONG_TOKEN).forEach((part, partIndex) => {
-    const pieces = partIndex % 2 ? part.split(BREAK_POINT) : [part];
-    pieces.forEach((value, pieceIndex) => {
-      if (pieceIndex > 0) nodes.push({ type: 'element', tagName: 'wbr', properties: {}, children: [] });
-      if (value) nodes.push({ type: 'text', value });
-    });
-  });
-  return nodes;
-}
-
-function addBreakPoints(node) {
-  if (node.type !== 'element') return;
-  if (node.tagName === 'code' || node.tagName === 'a') node.children = node.children.flatMap(splitAtBreakPoints);
-  node.children.forEach(addBreakPoints);
-}
-
 function visitTables(node) {
   if (node.type === 'element' && node.tagName === 'table') {
     setRoles(node);
-    bodyCells(node).flat().forEach(addBreakPoints);
     const headerRow = childElements(node, 'thead').flatMap((head) => childElements(head, 'tr'))[0];
     if (!headerRow) return;
     const labels = childElements(headerRow, 'th').map((cell) => textContent(cell).trim());
