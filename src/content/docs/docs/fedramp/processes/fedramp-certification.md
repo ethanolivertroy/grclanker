@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the FRC FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -46,6 +46,9 @@ This ruleset explains how cloud service offerings obtain and maintain FedRAMP Ce
 ### `FRC-APP-AFC` MUST: Applying for FedRAMP Certification
 
 Providers MUST complete the FedRAMP Certification Application Form in full to request an initial assessment by FedRAMP.
+
+Notifications:
+- Notify FedRAMP via form: [For CSPs] FedRAMP Certification Application Form (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=51137131584283)
 
 Affects: Providers
 
@@ -243,7 +246,10 @@ In general, for each of these FedRAMP requirements, providers should include a s
 
 Information about how the provider addresses the included Key Security Indicators are required to receive a class A certification even if the provider intends to pursue a Rev 5 Program Certification path in the future.
 
-Recent update (2026-07-14): Clarified that providers MUST address the Key Security Indicators even if they intend to pursue a Rev 5 Program Certification path in the future.
+Updates:
+- 2026-07-14: Clarified that providers MUST address the Key Security Indicators even if they intend to pursue a Rev 5 Program Certification path in the future.
+- 2026-07-01: Removed reference to Independent Verification and Validation: IVV-CSF-AIA (Annual Independent Assessments for Rev5); Removed CDS-CSO-AVR (Availability Reporting) since this rule is defined as SHOULD and included in FRC-CLA-RFR (Recommended FedRAMP Rules for Class A)
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `FRC-CLA-OFR` MAY: Address Optional FedRAMP Rules for Class A
 
@@ -303,15 +309,25 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 ### `FRC-CSO-JSN` MUST: FedRAMP JSON Schemas
 
-Providers MUST supply machine-readable information in JSON documents that are valid against the corresponding JSON schema when a rule contains a FedRAMP JSON schema, UNLESS otherwise specified in the rule.
+Providers MUST supply machine-readable information in JSON documents that are valid against the corresponding JSON schema when a rule contains a FedRAMP JSON schema, UNLESS otherwise specified in the rule; public JSON data MUST be supplied in a manner compatible with modern web frameworks, including:
 
-Terms: `Machine-Readable`
+Checklist items:
+- Cross-Origin Resource Sharing (CORS) should allow web applications running on a different domain to access the public JSON data directly.
+- Proper web application headers should be supplied for public JSON data, including at least setting Content-Type to application/json and X-Content-Type-Options: nosniff.
+
+Terms: `Likely`, `Machine-Readable`
 
 Affects: Providers
 
 Note: FedRAMP JSON schemas are designed to be lightweight and flexible to establish a minimum set of structured information while allowing providers to improve on the format and structure of the information as needed to meet their needs and the needs of their customers.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Public JSON data is intended to be consumed by FedRAMP, agency GRC tools, and more - it should be available in a way that enables standard web-application use following standard web frameworks. Generally, if you can't write a web app to parse this data without configuring a browser to bypass security defaults then there has likely been a problem.
+
+The Schema Validator available at fedramp.gov will not work properly if Cross-Origin Resource Sharing is not properly configured.
+
+Updates:
+- 2026-10-05: Clarified expectations for public JSON data to be compatible with standard web frameworks.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `FRC-CSO-MRA` MUST: Maintain Responsibility and Accountability
 
@@ -336,7 +352,9 @@ Terms: `Certification Package`, `Cloud Service Offering`, `FedRAMP Certification
 
 Affects: Providers
 
-Recent update (2026-06-25): Removed dangling mention of Class B from a last-minute merger of rules; apologies for confusion, this rule applies to all classes.
+Updates:
+- 2026-06-25: Removed dangling mention of Class B from a last-minute merger of rules; apologies for confusion, this rule applies to all classes.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `FRC-CSO-POP` MUST NOT: Pick One Program Certification Type
 
@@ -362,23 +380,6 @@ Affects: Providers
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CSX-MOT` VARIES BY CLASS: Metrics Over Time for Key Security Indicators
-
-Varies by certification class:
-
-- **Class A MAY:** Providers seeking 20x Class A Certification MAY supply historical metrics for Key Security Indicators.
-- **Class B SHOULD:** Providers seeking 20x Class B Certification SHOULD supply historical metrics for Key Security Indicators.
-- **Class C MUST:** Providers seeking 20x Class C Certification MUST supply historical metrics including status from persistent validation over at least the past 6 months for all Key Security Indicators.
-- **Class D MUST:** Providers seeking 20x Class D Certification MUST provide historical metrics including status from persistent validation over at least the past 18 months for all Key Security Indicators.
-
-Terms: `Initial Certification`, `Persistently`, `Validation`
-
-Affects: Providers
-
-Note: For initial FedRAMP Certification, providers will need to have mechanisms in place and agree to meet this requirement in the event the cloud service has not been operating with related metrics available for the required period prior to applying for initial certification.
-
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
-
 ### `FRC-CSX-VVK` VARIES BY CLASS: Automated Verification and Validation of Key Security Indicators
 
 Varies by certification class:
@@ -388,11 +389,15 @@ Varies by certification class:
 - **Class C MUST:** Providers seeking 20x Class C Certification MUST implement automated methods to persistently verify and validate the accuracy and completeness of Key Security Indicators with at least 2 automated methods for each Key Security Indicator.
 - **Class D MUST:** Providers seeking 20x Class D Certification MUST implement automated methods to persistently verify and validate the accuracy and completeness of Key Security Indicators with at least 4 automated methods for each Key Security Indicator.
 
+Mapped Rev5 controls: `cm-2.2`, `si-6`
+
 Terms: `Persistently`, `Validation`, `Verification`
 
 Affects: Providers
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added cm-2.2, si-6.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `FRC-CSX-VVR` VARIES BY CLASS: Automated Verification and Validation of FedRAMP Rules
 
@@ -403,13 +408,17 @@ Varies by certification class:
 - **Class C SHOULD:** Providers seeking 20x Class C Certification SHOULD implement automated methods to persistently verify and validate the accuracy and completeness of the Security Decision Record for FedRAMP rules when applicable.
 - **Class D SHOULD:** Providers seeking 20x Class D Certification SHOULD implement automated methods to persistently verify and validate the accuracy and completeness of the Security Decision Record for FedRAMP rules when applicable.
 
+Mapped Rev5 controls: `si-6`
+
 Terms: `Persistently`, `Security Decision Record (SDR)`, `Validation`, `Verification`
 
 Affects: Providers
 
 Note: Different rules will be easy to automate for different providers, depending on the implementation, so FedRAMP generally leaves this implementation up to providers based on what makes the most sense for their own business and approach.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added si-6.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ## REV5
 
@@ -447,7 +456,7 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 ### `FRC-CSF-RDY` MUST: FedRAMP Ready Conversion
 
-Providers with FedRAMP Rev5 Ready status MUST convert to a FedRAMP Certification by whichever of the follow dates is later: the expiration of their annual assessment or November 17, 2026 (the legacy FedRAMP Ready status will be entirely removed on December 31, 2027).
+Providers with FedRAMP Rev5 Ready status MUST convert to a FedRAMP Certification by whichever of the following dates is later: the expiration of their annual assessment or November 17, 2026 (the legacy FedRAMP Ready status will be entirely removed on December 31, 2027).
 
 Affects: Providers
 
@@ -455,4 +464,6 @@ Note: The simplest conversion in most cases would be to a FedRAMP 20x Class A Ce
 
 Cloud services that do not wish to convert or do not meet conversion criteria will be renamed Legacy FedRAMP Ready and otherwise retired from FedRAMP Ready.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-05: Adding a missing ing (follow -> following).
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.

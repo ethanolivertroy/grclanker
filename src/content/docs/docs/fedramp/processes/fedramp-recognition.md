@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the REC FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -98,6 +98,9 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Assessors MUST report information relating to any foreign interest, foreign influence, or foreign control of the independent assessment service to FedRAMP annually.
 
+Notifications:
+- Notify FedRAMP via form: FedRAMP Foreign Ownership, Control, or Influence Declaration Form (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=52006681154587)
+
 Affects: Assessors
 
 Structured timeframe: `1` years
@@ -127,6 +130,9 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 ### `REC-IAS-CFI` MUST: Changes in Foreign Interest
 
 Assessors MUST report updated information relating to any foreign interest, foreign influence, or foreign control of the independent assessment service within 48 hours of any change in foreign ownership or control.
+
+Notifications:
+- Notify FedRAMP via form: FedRAMP Foreign Ownership, Control, or Influence Declaration Form (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=52006681154587)
 
 Affects: Assessors
 

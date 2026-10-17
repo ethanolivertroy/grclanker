@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the IEC FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -81,11 +81,16 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Providers MUST promptly evaluate incidents to determine if they affect confidentiality or integrity of federal customer data or are likely to affect confidentiality or integrity of federal customer data; such incidents are FedRAMP Reportable Incidents and must be reported following the FedRAMP Incident Evaluation and Communication rules.
 
+Mapped Rev5 controls: `au-5.2`, `ir-4.11`
+
 Terms: `FedRAMP Reportable Incident`, `Federal Customer Data`, `Incident`, `Likely`, `Promptly`
 
 Affects: Providers
 
-Recent update (2026-07-02): Update terminology from "Response" to "Communication" in FedRAMP Incident Evaluation rules.
+Updates:
+- 2026-10-13: Updated control mappings: added au-5.2, ir-4.11.
+- 2026-07-02: Update terminology from "Response" to "Communication" in FedRAMP Incident Evaluation rules.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `IEC-CSO-FIR` MUST: Final Incident Report
 
@@ -96,11 +101,20 @@ Varies by certification class:
 - **Class C MUST:** Providers with Class C Certifications MUST responsibly notify all affected parties by providing a Final Incident Report once the incident has been resolved and recovery is complete, including final updates to all previously reported information.
 - **Class D MUST:** Providers with Class D Certifications MUST responsibly notify all affected parties by providing a Final Incident Report once the incident has been resolved and recovery is complete, including final updates to all previously reported information.
 
+Notifications:
+- Notify FedRAMP via email: fedramp_security@fedramp.gov
+- Notify Agency Customers via the appropriate recipient-specific method: Follow agency-specific incident reporting procedures (varies by agency)
+- Notify All Necessary Parties via an update: Provider's Trust Center or USDA Connect (trust center)
+
+Mapped Rev5 controls: `ir-5`
+
 Terms: `All Affected Parties`, `Final Incident Report (FIR)`, `Incident`, `Responsibly`
 
 Affects: Providers
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added ir-5.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `IEC-CSO-IIR` VARIES BY CLASS: Initial Incident Report
 
@@ -145,11 +159,20 @@ Checklist items:
 - Class D: Estimated recovery plan, milestones, and timelines
 - Class D: List of likely affected customer agencies
 
+Notifications:
+- Notify FedRAMP via email: fedramp_security@fedramp.gov
+- Notify Agency Customers via the appropriate recipient-specific method: Follow agency-specific incident reporting procedures (varies by agency)
+- Notify All Necessary Parties via an update: Provider's Trust Center or USDA Connect (trust center)
+
+Mapped Rev5 controls: `au-5.2`, `ir-5`
+
 Terms: `All Affected Parties`, `FedRAMP Reportable Incident`, `Incident`, `Initial Incident Report (IIR)`, `Responsibly`
 
 Affects: Providers
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added au-5.2, ir-5.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `IEC-CSO-OIR` VARIES BY CLASS: Ongoing Incident Reports
 
@@ -182,11 +205,21 @@ Checklist items:
 - Class D: Root cause
 - Class D: Response and recovery activities
 
+Notifications:
+- Notify FedRAMP via email: fedramp_security@fedramp.gov
+- Notify Agency Customers via the appropriate recipient-specific method: Follow agency-specific incident reporting procedures (varies by agency)
+- Notify All Necessary Parties via an update: Provider's Trust Center or USDA Connect (trust center)
+
+Mapped Rev5 controls: `ir-5`
+
 Terms: `All Affected Parties`, `FedRAMP Reportable Incident`, `Incident`, `Responsibly`, `Vulnerability Response`
 
 Affects: Providers
 
-Recent update (2026-09-13): Removed the extra the in all statements.
+Updates:
+- 2026-10-13: Updated control mappings: added ir-5.
+- 2026-09-13: Removed the extra the in all statements.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `IEC-FRP-ORV` MUST: Ongoing Review
 
@@ -196,4 +229,6 @@ Terms: `Incident`
 
 Affects: FedRAMP
 
-Recent update (2026-07-02): Update terminology from "Response" to "Communication" in FedRAMP Incident Evaluation rules.
+Updates:
+- 2026-07-02: Update terminology from "Response" to "Communication" in FedRAMP Incident Evaluation rules.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.

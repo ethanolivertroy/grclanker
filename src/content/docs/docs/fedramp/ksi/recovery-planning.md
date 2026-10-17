@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the RPL FedRAMP key securi
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -19,11 +19,13 @@ Domain code: `RPL` · Domain ID: `KSI-RPL` · Web slug: `recovery-planning`
 
 The alignment of machine-based information resource backups with defined recovery objectives is persistently reviewed.
 
-Mapped Rev5 controls: `cm-2.3`, `cp-6`, `cp-9`, `cp-10`, `cp-10.2`, `si-12`
+Mapped Rev5 controls: `cm-2.3`, `cp-6`, `cp-9`, `cp-10`, `cp-10.2`
 
 Terms: `Information Resource`, `Machine-Based (Information Resources)`, `Persistently`
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: removed si-12.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `KSI-RPL-ARP`: Aligning Recovery Plan
 
@@ -49,8 +51,10 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 The capability to recover from incidents and contingencies aligned with defined recovery objectives is persistently tested.
 
-Mapped Rev5 controls: `cp-2.1`, `cp-2.3`, `cp-4`, `cp-4.1`, `cp-6`, `cp-6.1`, `cp-9.1`, `cp-10`, `ir-3`, `ir-3.2`
+Mapped Rev5 controls: `cp-10`, `cp-2.1`, `cp-2.3`, `cp-4`, `cp-4.1`, `cp-6`, `cp-6.1`, `cp-9.1`, `ir-3`, `ir-3.2`, `ir-9.3`, `sc-12.1`
 
 Terms: `Incident`, `Persistently`
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added ir-9.3, sc-12.1.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.

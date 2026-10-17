@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the CMU FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -51,11 +51,15 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Providers MUST document the cryptographic modules used in each service (or groups of services that use the same modules) where cryptographic services are used to protect federal customer data, including whether these modules are validated under the NIST Cryptographic Module Validation Program or are update streams of such modules.
 
+Mapped Rev5 controls: `au-9.3`, `cm-3.6`, `ia-7`, `sc-28.1`, `sc-8.1`
+
 Terms: `Federal Customer Data`, `Validation`
 
 Affects: Providers
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added au-9.3, cm-3.6, ia-7, sc-28.1, sc-8.1.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `CMU-CSO-UVM` VARIES BY CLASS: Using Validated Cryptographic Modules
 
@@ -66,8 +70,15 @@ Varies by certification class:
 - **Class C SHOULD:** Providers with Class C Certifications SHOULD use cryptographic modules or update streams of cryptographic modules with active validations under the NIST Cryptographic Module Validation Program when using cryptographic services to protect federal customer data.
 - **Class D MUST:** Providers with Class D Certifications MUST use cryptographic modules or update streams of cryptographic modules with active validations under the NIST Cryptographic Module Validation Program when using cryptographic services to protect federal customer data.
 
+Mapped Rev5 controls: `ac-18`, `au-9.3`, `ia-7`, `sc-28.1`, `sc-8.1`
+
 Terms: `Federal Customer Data`, `Validation`
 
 Affects: Providers
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Note: Cryptographic modules include specific algorithms by definition; if an update stream of a cryptographic module adds new algorithms that were not previously validated then those algorithms can not be considered within the scope of update stream usage under these rules as they are new algorithms within the module that have never been validated.
+
+Updates:
+- 2026-10-13: Updated control mappings: added ac-18, au-9.3, ia-7, sc-28.1, sc-8.1.
+- 2026-10-05: Added a note clarifying that new algorithms in update streams of modules are not included in the scope of updates to  validated cryptographic modules.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.

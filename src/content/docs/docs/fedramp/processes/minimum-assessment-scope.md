@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the MAS FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -41,17 +41,23 @@ The Minimum Assessment Scope rules help providers define assessment boundaries n
 
 Providers MUST clearly identify, document, and explain information flows and security categories for ALL information resources or sets of information resources in the cloud service offering.
 
+Mapped Rev5 controls: `ac-4`, `cm-12`, `cm-12.1`, `ra-3`, `si-4.19`
+
 Terms: `Cloud Service Offering`, `Handle`, `Information Resource`, `Security Category`, `Third-Party Information Resource`
 
 Affects: Providers
 
 Note: Information resources (including third-party information resources) MAY vary by security category as appropriate to the type of information handled by or impacted by the information resource.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added ac-4, cm-12, cm-12.1, ra-3, si-4.19.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `MAS-CSO-IIR` MUST: Identify Information Resources
 
 Providers MUST identify a set of information resources to assess for FedRAMP Certification that includes all information resources that are likely to handle federal customer data or likely to impact the confidentiality, integrity, or availability of federal customer data handled by the cloud service offering; this set of information resources is the cloud service offering.
+
+Mapped Rev5 controls: `cm-8.4`, `ra-3`, `si-4.19`
 
 Terms: `Certification Package`, `Cloud Service Offering`, `Federal Customer Data`, `Handle`, `Information Resource`, `Likely`
 
@@ -63,7 +69,9 @@ Software produced by cloud service providers that is delivered separately for in
 
 All aspects of the cloud service offering are determined and maintained by the cloud service provider in accordance with related FedRAMP Certification rules and documented by the cloud service provider in their FedRAMP Certification Package.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added cm-8.4, ra-3, si-4.19.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `MAS-CSO-MDI` MUST: Metadata Inclusion
 
@@ -97,8 +105,12 @@ Checklist items:
 - Mitigation measures in place to reduce the potential impact to federal customer data
 - Compensating controls in place to reduce the potential impact to federal customer data
 
+Mapped Rev5 controls: `ra-3`
+
 Terms: `Cloud Service Offering`, `Federal Customer Data`, `Information Resource`, `Initial Incident Report (IIR)`, `Third-Party Information Resource`
 
 Affects: Providers
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added ra-3.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
