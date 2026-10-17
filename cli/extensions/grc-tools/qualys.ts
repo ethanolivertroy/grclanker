@@ -19,6 +19,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { QUALYS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { NextLinkError, readConfigText, resolveSameOriginUrl } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -675,6 +676,7 @@ export function resolveQualysConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
 ): QualysResolvedConfig {
+  env = readResolverEnvironment(QUALYS_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const configPath = asString(input.config_file) ?? asString(env.QUALYS_CONFIG_FILE) ?? join(homedir(), ".qcrc");
   const file = readQualysConfigFile(configPath);
