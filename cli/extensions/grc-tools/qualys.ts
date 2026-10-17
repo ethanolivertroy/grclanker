@@ -6,6 +6,7 @@
  * VM/PC API (XML), the Asset Management and Tagging, Cloud Agent, and
  * Administration APIs (QPS 2.0, JSON), and the WAS API (QPS 3.0, JSON).
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   createWriteStream,
   existsSync,
@@ -20,9 +21,11 @@ import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { QUALYS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { NextLinkError, readConfigText, resolveSameOriginUrl } from "./hardening/index.js";
-import { QUALYS_RAW_DATA_ALLOWLISTS, type FieldAllowlist, type FieldRule } from "./qualys.spec.js";
+import { QUALYS_RAW_DATA_ALLOWLISTS, QUALYS_SPEC, type FieldAllowlist, type FieldRule } from "./qualys.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import type { FrameworkKey } from "./spec-model.js";
 
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
@@ -279,7 +282,7 @@ const CONTROL_MAPPINGS: Record<number, string[]> = {
   20: ["FedRAMP RA-5", "CMMC 3.11.2", "SOC 2 CC7.1", "PCI-DSS 11.3.1", "STIG SRG-APP-000516", "IRAP ISM-1163", "ISMAP CPS.RA-5"],
 };
 
-const FRAMEWORKS: Array<{ prefix: string; dir: string; file: string; title: string }> = [
+const FRAMEWORKS: Array<{ prefix: string; dir: FrameworkKey; file: string; title: string }> = [
   { prefix: "FedRAMP ", dir: "fedramp", file: "fedramp_compliance_report.md", title: "FedRAMP / NIST 800-53 Compliance Report" },
   { prefix: "CMMC ", dir: "cmmc", file: "cmmc_compliance_report.md", title: "CMMC Compliance Report" },
   { prefix: "SOC 2 ", dir: "soc2", file: "soc2_compliance_report.md", title: "SOC 2 Compliance Report" },
@@ -289,6 +292,23 @@ const FRAMEWORKS: Array<{ prefix: string; dir: string; file: string; title: stri
   { prefix: "IRAP ", dir: "irap", file: "irap_compliance_report.md", title: "IRAP / ISM Compliance Report" },
   { prefix: "ISMAP ", dir: "ismap", file: "ismap_compliance_report.md", title: "ISMAP Compliance Report" },
 ];
+
+function frameworkMappingsOf(control: number): Partial<Record<FrameworkKey, string[]>> {
+  const mappings = CONTROL_MAPPINGS[control];
+  if (!mappings) throw new Error(`Qualys control ${control} has no framework mappings`);
+  const byFramework: Partial<Record<FrameworkKey, string[]>> = {};
+  for (const mapping of mappings) {
+    const framework = FRAMEWORKS.find((report) => mapping.startsWith(report.prefix));
+    if (!framework) throw new Error(`Qualys control ${control} mapping ${mapping} names no reported framework`);
+    (byFramework[framework.dir] ??= []).push(mapping.slice(framework.prefix.length));
+  }
+  return byFramework;
+}
+
+hydrateBatchFrameworkMappings(QUALYS_SPEC, Object.fromEntries(QUALYS_SPEC.checks.map((check) => [
+  check.id,
+  frameworkMappingsOf(check.controlNumbers[0]),
+])));
 
 function asObject(value: unknown): JsonRecord | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -1920,6 +1940,15 @@ export function resolveViewScope(config: QualysResolvedConfig, users: Collected,
   return unverifiedScope(`API user ${config.username} was not returned by the user search (Managers and Super Users are hidden from it), so role scope was not verified.`);
 }
 
+const QUALYS_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordQualysDecisionFacts(control: number, facts: Readonly<Record<string, unknown>>): void {
+  const id = `QUALYS-C${String(control).padStart(2, "0")}`;
+  const store = QUALYS_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside a Qualys assessment`);
+  store.set(id, facts);
+}
+
 function finding(
   control: number,
   severity: QualysFindingSeverity,
@@ -1949,9 +1978,11 @@ interface VerdictInput {
   scope: QualysViewScope;
   manualEvidence: string;
   unknownBuckets?: Record<string, number>;
+  facts: Readonly<Record<string, unknown>>;
 }
 
 function guardedFinding(input: VerdictInput): QualysFinding {
+  recordQualysDecisionFacts(input.control, input.facts);
   const unreadable = input.sources.filter((source) => source.error);
   const truncated = input.sources.filter((source) => !source.error && source.truncated);
   const buckets = Object.entries(input.unknownBuckets ?? {}).filter(([, count]) => count > 0);
@@ -2209,9 +2240,16 @@ export function rawDataSurfaceNames(): string[] {
   return Object.keys(QUALYS_RAW_DATA_ALLOWLISTS);
 }
 
-export async function assessQualysScanCoverage(
+export function assessQualysScanCoverage(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
+): Promise<QualysAssessmentResult> {
+  return runBatchVerdictContext(QUALYS_DECISION_CONTEXT, QUALYS_SPEC, () => assessQualysScanCoverageWithDecisionContext(client, options));
+}
+
+async function assessQualysScanCoverageWithDecisionContext(
+  client: QualysDataClient,
+  options: QualysAssessmentOptions,
 ): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
@@ -2295,6 +2333,28 @@ export async function assessQualysScanCoverage(
     scope,
     manualEvidence: "export Scans > Schedules and Assets > Asset Groups from the Qualys UI and confirm each asset group has an active recurring scan and each host was scanned within the review window.",
     unknownBuckets: { hosts_without_scan_date: hostsWithoutScanDate.length, schedules_without_active_flag: schedulesWithoutActiveFlag.length },
+    facts: {
+      scheduled_scans_readable: !schedules.error,
+      ...(schedules.error ? {} : {
+        active_schedule_count: activeSchedules.length,
+        schedules_without_active_flag_count: schedulesWithoutActiveFlag.length,
+        scheduled_scans_complete: !schedules.truncated,
+      }),
+      scans_readable: !scans.error,
+      ...(scans.error ? {} : { scans_complete: !scans.truncated }),
+      asset_groups_readable: !groups.error,
+      ...(groups.error ? {} : { asset_group_count: groups.data.length, asset_groups_complete: !groups.truncated }),
+      ...(groups.error || schedules.error ? {} : { unscheduled_asset_group_count: groupsWithoutSchedule.length }),
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : {
+        host_count: hosts.data.length,
+        scanned_host_scan_age_days: scannedHosts.map((host) => ageInDays(hostLastScan(host), now)),
+        undated_host_count: hostsWithoutScanDate.length,
+        hosts_complete: !hosts.truncated,
+      }),
+      lookback_days: settings.lookbackDays,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const authStatus: QualysFindingStatus = hosts.error
@@ -2329,6 +2389,18 @@ export async function assessQualysScanCoverage(
     scope,
     manualEvidence: "run an Authentication Report in Qualys and record the percentage of hosts with successful authenticated scans.",
     unknownBuckets: { hosts_without_scan_date: hostsWithoutScanDate.length },
+    facts: {
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : {
+        host_count: hosts.data.length,
+        scanned_host_count: scannedHosts.length,
+        ...(authPercent === null ? {} : { authenticated_scan_percent: authPercent }),
+        undated_host_count: hostsWithoutScanDate.length,
+        hosts_complete: !hosts.truncated,
+      }),
+      min_auth_scan_percent: settings.minAuthScanPercent,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   findings.push(guardedFinding({
@@ -2348,6 +2420,10 @@ export async function assessQualysScanCoverage(
     sources: [profiles],
     scope,
     manualEvidence: "export each option profile from Scans > Option Profiles and review authentication, port, and performance settings against internal and external scanning requirements.",
+    facts: {
+      option_profiles_readable: !profiles.error,
+      ...(profiles.error ? {} : { option_profile_count: profiles.data.length }),
+    },
   }));
 
   const unverifiedScannerNote = schedulesWithoutScannerName.length > 0
@@ -2376,6 +2452,15 @@ export async function assessQualysScanCoverage(
     manualEvidence: "confirm at least one recurring perimeter scan uses Qualys external scanners against the public IP ranges.",
     // A missing ISCANNER_NAME only leaves the verdict uncertain when no schedule is confirmed external.
     unknownBuckets: externalSchedules.length > 0 ? {} : { schedules_without_scanner_name: schedulesWithoutScannerName.length },
+    facts: {
+      scheduled_scans_readable: !schedules.error,
+      ...(schedules.error ? {} : {
+        active_schedule_count: activeSchedules.length,
+        external_scanner_schedule_count: externalSchedules.length,
+        scheduled_scans_complete: !schedules.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const exclusionStatus: QualysFindingStatus = excluded.error
@@ -2412,6 +2497,24 @@ export async function assessQualysScanCoverage(
     sources: [excluded, profiles],
     scope,
     manualEvidence: "export Assets > Excluded Hosts and review each excluded IP range and option profile detection exclusion search list for justification.",
+    facts: {
+      excluded_ips_readable: !excluded.error,
+      ...(excluded.error ? {} : {
+        excluded_entry_count: excluded.data.length,
+        excluded_range_address_counts: excluded.data
+          .filter((entry) => entry.type === "range")
+          .map((entry) => addressCountForRange(asString(entry.value) ?? ""))
+          .filter((count) => !Number.isNaN(count)),
+        excluded_ips_complete: !excluded.truncated,
+      }),
+      option_profiles_readable: !profiles.error,
+      ...(profiles.error ? {} : {
+        option_profile_count: profiles.data.length,
+        detection_exclusion_list_count: excludedQidCount,
+        option_profiles_complete: !profiles.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   findings.push(guardedFinding({
@@ -2432,6 +2535,10 @@ export async function assessQualysScanCoverage(
     sources: [schedules],
     scope,
     manualEvidence: "document which scan schedules cover DMZ, internal, and OT/ICS segments and which scanner appliances serve each segment.",
+    facts: {
+      scheduled_scans_readable: !schedules.error,
+      ...(schedules.error ? {} : { active_schedule_count: activeSchedules.length }),
+    },
   }));
 
   return {
@@ -2550,9 +2657,16 @@ function agentHasActivationKey(agent: JsonRecord): boolean {
   return Boolean(key && (asString(key.activationId) ?? asString(key.title) ?? asString(key.id)));
 }
 
-export async function assessQualysAssetInventory(
+export function assessQualysAssetInventory(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
+): Promise<QualysAssessmentResult> {
+  return runBatchVerdictContext(QUALYS_DECISION_CONTEXT, QUALYS_SPEC, () => assessQualysAssetInventoryWithDecisionContext(client, options));
+}
+
+async function assessQualysAssetInventoryWithDecisionContext(
+  client: QualysDataClient,
+  options: QualysAssessmentOptions,
 ): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
@@ -2614,6 +2728,7 @@ export async function assessQualysAssetInventory(
     sources: [groups, hosts],
     scope,
     manualEvidence: "export the CMDB or IPAM network ranges and reconcile them against the Qualys asset group IP sets.",
+    facts: {},
   }));
 
   const connectorStatus: QualysFindingStatus = connectors.error
@@ -2653,6 +2768,20 @@ export async function assessQualysAssetInventory(
     scope,
     manualEvidence: "open the AWS, Azure, and GCP connector lists in the Qualys UI and confirm whether cloud accounts are in scope and each connector last synchronized successfully.",
     unknownBuckets: { connectors_without_state: unknownStateConnectors.length, connectors_without_sync_date: connectorsWithoutSyncDate.length },
+    facts: {
+      connectors_readable: !connectors.error,
+      ...(connectors.error ? {} : {
+        connector_count: connectors.data.length,
+        unhealthy_connector_count: unhealthyConnectors.length,
+        connector_sync_age_days: connectors.data
+          .map((connector) => ageInDays(connector.lastSync, now))
+          .filter((age) => age !== undefined),
+        unknown_state_connector_count: unknownStateConnectors.length,
+        undated_connector_count: connectorsWithoutSyncDate.length,
+        connectors_complete: !connectors.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const applianceStatusVerdict: QualysFindingStatus = appliances.error
@@ -2698,6 +2827,18 @@ export async function assessQualysAssetInventory(
     scope,
     manualEvidence: "review Scans > Appliances for offline scanners, missed heartbeats, and outdated software or signature versions.",
     unknownBuckets: { appliances_without_status: unknownStatusAppliances.length, appliances_without_version_data: appliancesWithoutVersionData.length },
+    facts: {
+      appliances_readable: !appliances.error,
+      ...(appliances.error ? {} : {
+        appliance_count: appliances.data.length,
+        offline_appliance_count: offlineAppliances.length,
+        outdated_appliance_count: outdatedAppliances.length,
+        unknown_status_appliance_count: unknownStatusAppliances.length,
+        unknown_version_appliance_count: appliancesWithoutVersionData.length,
+        appliances_complete: !appliances.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const agentCoverageStatus: QualysFindingStatus = hosts.error || agents.error
@@ -2737,6 +2878,28 @@ export async function assessQualysAssetInventory(
       agents_without_checkin_date: agentsWithoutCheckIn.length,
       agents_without_activation_key: agentsWithoutActivationKey.length,
     },
+    facts: {
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : {
+        host_count: hosts.data.length,
+        ...(agentPercent === null ? {} : { agent_coverage_percent: agentPercent }),
+        untracked_host_count: hostsWithoutTrackingMethod.length,
+        hosts_complete: !hosts.truncated,
+      }),
+      cloud_agents_readable: !agents.error,
+      ...(agents.error ? {} : {
+        inactive_agent_count: inactiveAgents.length,
+        agent_checkin_age_days: agents.data
+          .map((agent) => ageInDays(agentLastCheckIn(agent), now))
+          .filter((age) => age !== undefined),
+        unknown_status_agent_count: unknownStatusAgents.length,
+        undated_agent_count: agentsWithoutCheckIn.length,
+        agents_without_activation_key_count: agentsWithoutActivationKey.length,
+        cloud_agents_complete: !agents.truncated,
+      }),
+      min_agent_coverage_percent: settings.minAgentCoveragePercent,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const tagStatus: QualysFindingStatus = tags.error || hosts.error
@@ -2772,6 +2935,17 @@ export async function assessQualysAssetInventory(
     sources: [tags, hosts],
     scope,
     manualEvidence: "export the tag tree and confirm every in-scope asset carries a compliance scope tag.",
+    facts: {
+      tags_readable: !tags.error,
+      ...(tags.error ? {} : { tag_count: tags.data.length, tags_complete: !tags.truncated }),
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : {
+        host_count: hosts.data.length,
+        ...(untaggedPercent === null ? {} : { untagged_host_percent: untaggedPercent }),
+        hosts_complete: !hosts.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   return {
@@ -2874,9 +3048,20 @@ function policyIsAssigned(policy: JsonRecord): boolean {
 const NETWORK_DEVICE_OS_PATTERN = /cisco|nx-os|ios[- ]?xe|junos|juniper|palo alto|pan-os|fortinet|fortios|fortigate|arista|big-ip|f5 |check ?point|gaia|router|switch|firewall|screenos|brocade|huawei/i;
 const NETWORK_AUTH_TYPE_PATTERN = /snmp|cisco|checkpoint|check_point|palo|fortinet|juniper|arista|network|f5|huawei|brocade/i;
 
-export async function assessQualysVulnerabilityManagement(
+export function assessQualysVulnerabilityManagement(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
+): Promise<QualysAssessmentResult> {
+  return runBatchVerdictContext(
+    QUALYS_DECISION_CONTEXT,
+    QUALYS_SPEC,
+    () => assessQualysVulnerabilityManagementWithDecisionContext(client, options),
+  );
+}
+
+async function assessQualysVulnerabilityManagementWithDecisionContext(
+  client: QualysDataClient,
+  options: QualysAssessmentOptions,
 ): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
@@ -2996,6 +3181,21 @@ export async function assessQualysVulnerabilityManagement(
     scope,
     manualEvidence: "review Scans > Authentication for Windows, Unix, and network device records and run an Authentication Report to find expired or failing credentials.",
     unknownBuckets: { hosts_without_os: hostsWithoutOs.length },
+    facts: {
+      auth_records_readable: !authRecords.error,
+      ...(authRecords.error ? {} : { auth_record_type_count: authTypes.length, auth_records_complete: !authRecords.truncated }),
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : {
+        host_count: hosts.data.length,
+        scanned_host_count: scannedHosts.length,
+        ...(authScannedPercent === null ? {} : { authenticated_scan_percent: authScannedPercent }),
+        os_unknown_host_count: hostsWithoutOs.length,
+        hosts_complete: !hosts.truncated,
+      }),
+      ...(authRecords.error || hosts.error ? {} : { uncovered_os_family_count: missingAuthTypes.length }),
+      min_auth_scan_percent: settings.minAuthScanPercent,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const policyStatusVerdict: QualysFindingStatus = policies.error
@@ -3030,6 +3230,18 @@ export async function assessQualysVulnerabilityManagement(
     scope,
     manualEvidence: "list Policy Compliance policies and confirm each active policy is assigned to asset groups or tags, or record that the PC module is not in use.",
     unknownBuckets: { policies_without_status: unknownStatusPolicies.length, policies_with_hidden_asset_groups: hiddenAssignmentPolicies.length },
+    facts: {
+      compliance_policies_readable: !policies.error,
+      ...(policies.error ? {} : {
+        policy_count: policies.data.length,
+        unassigned_active_policy_count: unassignedPolicies.length,
+        inactive_policy_count: inactivePolicies.length,
+        unknown_status_policy_count: unknownStatusPolicies.length,
+        hidden_asset_group_policy_count: hiddenAssignmentPolicies.length,
+        compliance_policies_complete: !policies.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const slaStatus: QualysFindingStatus = detections.error || hosts.error
@@ -3081,9 +3293,24 @@ export async function assessQualysVulnerabilityManagement(
       detections_without_severity: detectionsWithoutSeverity.length,
       detections_without_status: detectionsWithoutStatus.length,
     },
+    facts: {
+      detections_readable: !detections.error,
+      ...(detections.error ? {} : {
+        sla_scoped_detection_count: slaScoped.length,
+        ...(slaPercent === null ? {} : { sla_compliance_percent: slaPercent }),
+        undated_sla_detection_count: slaUndated.length,
+        unrated_open_detection_count: detectionsWithoutSeverity.length,
+        statusless_open_detection_count: detectionsWithoutStatus.length,
+        detections_complete: !detections.truncated,
+      }),
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : { host_count: hosts.data.length, hosts_complete: !hosts.truncated }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const knowledgeBaseUnusable = openQids.length > 0 && !knowledgeBase.error && kbQids.size === 0;
+  const knowledgeBaseReadable = !knowledgeBase.error && !knowledgeBase.notCollected?.blocked;
   const patchStatus: QualysFindingStatus = detections.error || hosts.error || knowledgeBase.error || knowledgeBaseUnusable
     ? "manual"
     : !hostPopulationKnown
@@ -3131,6 +3358,25 @@ export async function assessQualysVulnerabilityManagement(
     scope,
     manualEvidence: "export the patch report for open detections and record patch availability and patch age.",
     unknownBuckets: { patchable_detections_without_first_found: patchableUndated.length, qids_without_knowledge_base_entry: unresolvedQids.length },
+    facts: {
+      detections_readable: !detections.error,
+      ...(detections.error ? {} : {
+        open_detection_count: openDetections.length,
+        open_qid_count: openQids.length,
+        detections_complete: !detections.truncated,
+      }),
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : { host_count: hosts.data.length, hosts_complete: !hosts.truncated }),
+      knowledge_base_readable: knowledgeBaseReadable,
+      ...(knowledgeBaseReadable ? {
+        ...(knowledgeBase.notCollected ? {} : { knowledge_base_qid_count: kbQids.size, unresolved_qid_count: unresolvedQids.length }),
+        ...(overduePercent === null ? {} : { overdue_patchable_percent: overduePercent }),
+        overdue_patchable_detection_count: overduePatchable.length,
+        undated_patchable_detection_count: patchableUndated.length,
+        knowledge_base_complete: !knowledgeBase.truncated,
+      } : {}),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const qdsStatus: QualysFindingStatus = detections.error
@@ -3157,6 +3403,13 @@ export async function assessQualysVulnerabilityManagement(
     sources: [detections],
     scope,
     manualEvidence: "confirm the VMDR subscription exposes Qualys Detection Scores and document the triage workflow that uses QDS or CVSS.",
+    facts: {
+      detections_readable: !detections.error,
+      ...(detections.error ? {} : {
+        open_detection_count: openDetections.length,
+        ...(qdsPercent === null ? {} : { qds_detection_percent: qdsPercent }),
+      }),
+    },
   }));
 
   return {
@@ -3322,9 +3575,16 @@ function classifyWebAppScans(webApps: JsonRecord[], recentScans: JsonRecord[], h
 
 const SENSITIVE_ACTIVITY_PATTERN = /user|delete|remove|policy|exclu|schedule|option profile|permission|role|password/i;
 
-export async function assessQualysAdministration(
+export function assessQualysAdministration(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
+): Promise<QualysAssessmentResult> {
+  return runBatchVerdictContext(QUALYS_DECISION_CONTEXT, QUALYS_SPEC, () => assessQualysAdministrationWithDecisionContext(client, options));
+}
+
+async function assessQualysAdministrationWithDecisionContext(
+  client: QualysDataClient,
+  options: QualysAssessmentOptions,
 ): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
@@ -3403,6 +3663,11 @@ export async function assessQualysAdministration(
     sources: [scheduledReports, reports],
     scope,
     manualEvidence: "review Reports > Schedules and each schedule's distribution list for appropriate recipients.",
+    facts: {
+      scheduled_reports_readable: !scheduledReports.error,
+      ...(scheduledReports.error ? {} : { active_scheduled_report_count: activeScheduledReports.length }),
+      reports_readable: !reports.error,
+    },
   }));
 
   const bothUserSourcesUnreadable = Boolean(userList.error && users.error);
@@ -3489,6 +3754,28 @@ export async function assessQualysAdministration(
       users_without_last_login: usersWithoutLastLogin.length,
       users_without_login_in_restricted_view: restrictedViewUsers.length,
     },
+    facts: {
+      user_list_readable: userListReadable,
+      users_readable: !users.error,
+      ...(bothUserSourcesUnreadable ? {} : {
+        manager_count: managers.length,
+        shared_email_count: sharedEmails.length,
+        active_user_count: activeUsers.length,
+        generic_account_count: genericAccounts.length,
+        roleless_active_user_count: usersWithoutRole.length,
+      }),
+      ...(userListReadable ? {
+        last_login_age_days: usersWithLastLogin.map((user) => ageInDays(legacyUserLastLogin(user), now)),
+        pending_activation_user_count: pendingUsers.length,
+        statusless_user_count: usersWithoutStatus.length,
+        undated_login_user_count: usersWithoutLastLogin.length,
+        loginless_user_count: restrictedViewUsers.length,
+        user_list_complete: !userList.truncated,
+      } : {}),
+      ...(users.error ? {} : { users_complete: !users.truncated }),
+      max_managers: settings.maxManagers,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const wasStatus: QualysFindingStatus = webApps.error || wasScans.error || wasAuth.error
@@ -3511,6 +3798,7 @@ export async function assessQualysAdministration(
   // Stale and never-scanned lists are unknown when the bounded scan search, the web app inventory, or a needed
   // history read did not deliver; a history search that nothing needed leaves them known and empty.
   const scanDateWithheld = withheldFor([webApps, wasScans]) ?? withheldFor(wasHistory, true);
+  const wasHistoryReadable = !wasHistory.error && !wasHistory.notCollected?.blocked;
   findings.push(guardedFinding({
     control: 15,
     severity: "medium",
@@ -3541,6 +3829,37 @@ export async function assessQualysAdministration(
       was_auth_records_without_date: wasAuthWithoutDate.length,
       was_schedules_without_active_flag: wasSchedulesWithoutFlag.length,
     },
+    facts: {
+      was_webapps_readable: !webApps.error,
+      ...(webApps.error ? {} : { web_app_count: webApps.data.length, was_webapps_complete: !webApps.truncated }),
+      was_scans_readable: !wasScans.error,
+      ...(wasScans.error ? {} : { was_scans_complete: !wasScans.truncated }),
+      ...(webApps.error || wasScans.error ? {} : {
+        never_scanned_web_app_count: neverScannedWebApps.length,
+        resolved_web_app_scan_age_days: [...webAppScans.fresh, ...webAppScans.stale].map((webApp) => ageInDays(
+          webAppLastScanDate(webApp, wasScans.data) ?? webAppLastScanDate(webApp, wasHistory.data),
+          now,
+        )),
+        unresolved_web_app_count: unresolvedWebApps.length,
+      }),
+      was_scan_history_readable: wasHistoryReadable,
+      ...(wasHistoryReadable ? { was_scan_history_complete: !wasHistory.truncated } : {}),
+      was_auth_records_readable: !wasAuth.error,
+      ...(wasAuth.error ? {} : {
+        was_auth_record_age_days: wasAuth.data
+          .map((record) => ageInDays(record.updatedDate ?? record.createdDate, now))
+          .filter((age) => age !== undefined),
+        undated_was_auth_record_count: wasAuthWithoutDate.length,
+        was_auth_records_complete: !wasAuth.truncated,
+      }),
+      was_schedules_readable: !wasSchedules.error,
+      ...(wasSchedules.error ? {} : {
+        was_schedules_without_active_flag_count: wasSchedulesWithoutFlag.length,
+        was_schedules_complete: !wasSchedules.truncated,
+      }),
+      lookback_days: settings.lookbackDays,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   findings.push(guardedFinding({
@@ -3566,6 +3885,10 @@ export async function assessQualysAdministration(
     sources: [activity],
     scope,
     manualEvidence: "export the Activity Log for the review period and document who reviews sensitive administrative actions and how long the log is retained.",
+    facts: {
+      activity_log_readable: !activity.error,
+      ...(activity.error ? {} : { activity_entry_count: activity.data.length }),
+    },
   }));
 
   return {
@@ -4076,6 +4399,7 @@ function registerAssessmentTool(
 }
 
 export function registerQualysTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, QUALYS_SPEC);
   pi.registerTool({
     name: "qualys_check_access",
     label: "Check Qualys audit access",
