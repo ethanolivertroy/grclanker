@@ -32,8 +32,28 @@ import {
   resolveSecureOutputPath,
   resolveTenableConfiguration,
 } from "../dist/extensions/grc-tools/tenable.js";
+import { TENABLE_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
+import { TENABLE_SPEC } from "../dist/extensions/grc-tools/tenable.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  portableContractTest,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
+import {
+  assertRequestConformance,
+  certifyRuntimeBoundaryCoverage,
+  certifyRuntimeRuleDecisiveness,
+  observeRuntimeDecisionFacts,
+  recordFetchRequests,
+  sweepCheckCompleteness,
+} from "./helpers/spec-conformance.mjs";
+
+// Every assessment in this file feeds the boundary and rule certification at the end.
+const observedDecisionFacts = observeRuntimeDecisionFacts(TENABLE_SPEC);
 
 const NOW = Date.parse("2026-09-21T12:00:00Z");
 const RECENT_SECONDS = Math.floor((NOW - 2 * 86_400_000) / 1000);
@@ -3829,4 +3849,163 @@ test("Tenable tools appear in the registered tool catalog under the Tenable grou
   const tools = getRegisteredToolSummaries().filter((tool) => tool.name.startsWith("tenable_"));
   assert.equal(tools.length, 6);
   for (const tool of tools) assert.equal(tool.group, "Tenable");
+});
+
+portableContractTest("the auth resolver contract names exactly the environment the resolver reads, and each variable reaches the resolved configuration", () => {
+  assert.deepEqual(TENABLE_SPEC.authentication.environmentVariables, TENABLE_AUTH_RESOLVER.environment);
+  assert.deepEqual(TENABLE_SPEC.authentication.configLocations, TENABLE_AUTH_RESOLVER.configLocations);
+  assert.deepEqual(TENABLE_SPEC.authentication.configFields, TENABLE_AUTH_RESOLVER.configFields);
+
+  const accessed = new Set();
+  const tracked = new Proxy({ ...EMPTY_ENV, TENABLE_ACCESS_KEY: "env-access-key", TENABLE_SECRET_KEY: "env-secret-key", TENABLE_CONFIG_FILE: EMPTY_CONFIG_FILE, TENABLE_REGION: "us" }, {
+    get(target, property) {
+      if (typeof property === "string") accessed.add(property);
+      return target[property];
+    },
+  });
+  resolveTenableConfiguration({}, tracked);
+  assert.deepEqual([...accessed].sort(), [...TENABLE_AUTH_RESOLVER.environment].sort());
+
+  const configPath = join(mkdtempSync(join(tmpdir(), "tenable-resolver-contract-")), "config.yaml");
+  writeFileSync(configPath, "access_key: file-access-key\nsecret_key: file-secret-key\n");
+  const keys = { TENABLE_CONFIG_FILE: EMPTY_CONFIG_FILE, TENABLE_ACCESS_KEY: "env-access-key", TENABLE_SECRET_KEY: "env-secret-key" };
+  const securityCenter = { ...keys, TENABLE_SC_URL: "https://sc.example.internal", TENABLE_SC_ACCESS_KEY: "env-sc-access-key", TENABLE_SC_SECRET_KEY: "env-sc-secret-key" };
+  const reached = {
+    TENABLE_CONFIG_FILE: [{ TENABLE_CONFIG_FILE: configPath }, (config) => config.vm.accessKey === "file-access-key"],
+    TENABLE_URL: [{ ...keys, TENABLE_URL: "https://fedcloud.tenable.com" }, (config) => config.vm.fedramp === true],
+    TENABLE_BASE_URL: [{ ...keys, TENABLE_BASE_URL: "https://fedcloud.tenable.com" }, (config) => config.vm.fedramp === true],
+    TENABLE_ACCESS_KEY: [keys, (config) => config.vm.accessKey === "env-access-key"],
+    TENABLE_SECRET_KEY: [keys, (config) => config.vm.secretKey === "env-secret-key"],
+    TENABLE_SC_URL: [securityCenter, (config) => config.securityCenter.baseUrl === "https://sc.example.internal"],
+    TENABLE_SC_ACCESS_KEY: [securityCenter, (config) => config.securityCenter.accessKey === "env-sc-access-key"],
+    TENABLE_SC_SECRET_KEY: [securityCenter, (config) => config.securityCenter.secretKey === "env-sc-secret-key"],
+    TENABLE_TIMEOUT: [{ ...keys, TENABLE_TIMEOUT: "45" }, (config) => config.timeoutMs === 45_000],
+  };
+  assert.deepEqual(Object.keys(reached).sort(), [...TENABLE_AUTH_RESOLVER.environment].sort());
+  for (const [name, [environment, applied]] of Object.entries(reached)) {
+    assert.ok(applied(resolveTenableConfiguration({}, { ...EMPTY_ENV, ...environment })), `${name} reaches the resolved configuration`);
+  }
+});
+
+portableContractTest("every request the access check, the four collectors, and the export send matches a declared surface, parameter, and header", async () => {
+  const recorder = recordFetchRequests(routerFetch({ ...healthyRoutes(), ...healthyScRoutes() }));
+  const clients = bothPlatformClients(recorder.fetch);
+  await checkTenableAccess(clients);
+  await runAll(clients);
+  await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-request-conformance-")), { now: NOW });
+  assertRequestConformance(assert, TENABLE_SPEC, recorder.requests);
+});
+
+function completenessInput() {
+  return { routes: healthyRoutes(), vmConfigured: true };
+}
+
+async function assessCompletenessInput({ routes, vmConfigured }) {
+  const config = vmConfigured
+    ? vmConfig()
+    : resolveTenableConfiguration({ url: SC_FIXTURE.sc_url, access_key: SC_FIXTURE.sc_access_key, secret_key: SC_FIXTURE.sc_secret_key, config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV);
+  const clients = createTenableClients(config, { fetchImpl: routerFetch(routes), sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 5_000 });
+  return allFindings(await runAll(clients, { expectedAssetCount: 2 }));
+}
+
+// Puts one declared completeness source into one failure mode, the way Tenable produces it.
+function failCompletenessSource(input, { surfaceId, mode }) {
+  const { routes } = input;
+  if (mode === "not-configured") return { ...input, vmConfigured: false };
+  const exportSurface = /^(asset|vuln)-export-(status|chunks)$/.exec(surfaceId);
+  if (exportSurface) {
+    const kind = `${exportSurface[1]}s`;
+    const job = `GET /${kind}/export/${exportSurface[1]}-export-1`;
+    if (exportSurface[2] === "status") {
+      routes[`${job}/status`] = { status: "FINISHED", chunks_available: [1], chunks_failed: [], total_chunks: 2 };
+    } else if (mode === "truncated") {
+      routes[`${job}/status`] = { status: "FINISHED", chunks_available: [1, 2], chunks_failed: [], total_chunks: 2 };
+      routes[`${job}/chunks/2`] = { __status: 500 };
+    } else {
+      routes[`${job}/chunks/1`] = [...routes[`${job}/chunks/1`], { note: "a record without any documented member" }];
+    }
+    return input;
+  }
+  if (surfaceId === "policy-details") {
+    const scans = Array.from({ length: 101 }, (_, index) => ({ ...routes["GET /scans"].scans[0], id: 100 + index, name: `Weekly ${index}`, policy_id: 100 + index }));
+    routes["GET /scans"] = { scans };
+    routes["GET /policies"] = { policies: scans.map((scan) => ({ id: scan.policy_id, name: `Policy ${scan.policy_id}`, template_uuid: "tmpl-basic" })) };
+    for (const scan of scans) routes[`GET /policies/${scan.policy_id}`] = healthyPolicyDetails();
+    return input;
+  }
+  const surface = TENABLE_SPEC.apiSurfaces.find((entry) => entry.id === surfaceId);
+  const route = `${surface.method ?? "GET"} ${surface.path}`;
+  if (mode === "truncated") routes[route] = { ...routes[route], pagination: { total: 250 } };
+  else if (mode === "denied") routes[route] = { __status: 403 };
+  else if (mode === "error") routes[route] = { __status: 500 };
+  else return undefined;
+  return input;
+}
+
+portableContractTest("completeness sweep: a truncated, refused, failed, or unconfigured source never lets a check that reads it pass", async () => {
+  const report = await sweepCheckCompleteness({
+    spec: TENABLE_SPEC,
+    createInput: completenessInput,
+    applyFailure: failCompletenessSource,
+    assess: assessCompletenessInput,
+  });
+  assert.deepEqual(report.baselineNotPassing, []);
+  assert.deepEqual(report.unreachable, []);
+  assert.deepEqual(report.undemoted, []);
+  assert.ok(report.combinations > 0);
+});
+
+portableContractTest("the export writes every declared bundle path and nothing else, with and without collection errors", async () => {
+  const complete = await exportTenableAuditBundle(clientsFor(healthyRoutes()), mkdtempSync(join(tmpdir(), "tenable-bundle-paths-")), { now: NOW });
+  assertBundlePathsMatchSpec(assert, complete.outputDir, TENABLE_SPEC);
+  assert.ok(!readBundleFiles(complete.outputDir).has("_errors.log"));
+  const routes = healthyRoutes();
+  routes["GET /credentials"] = { __status: 403 };
+  const partial = await exportTenableAuditBundle(clientsFor(routes), mkdtempSync(join(tmpdir(), "tenable-bundle-paths-")), { now: NOW });
+  assertBundlePathsMatchSpec(assert, partial.outputDir, TENABLE_SPEC);
+  assert.ok(readBundleFiles(partial.outputDir).has("_errors.log"));
+});
+
+// Inputs that put each threshold at and beside its edge. They run as plain tests, so the byte
+// differential replays them through the baseline runtime and compares every result.
+const BOUNDARY_SCENARIOS = [];
+
+async function runBoundaryScenario({ routes, options = {} }) {
+  return runAll(clientsFor(routes()), { expectedAssetCount: 2, ...options });
+}
+
+test("boundary scenarios: each threshold edge reaches the verdict on either side of it", async () => {
+  for (const scenario of BOUNDARY_SCENARIOS) {
+    const results = await runBoundaryScenario(scenario);
+    assert.equal(byId(results, scenario.check).status, scenario.expected, scenario.name);
+  }
+});
+
+function representativeRoutes() {
+  const routes = { ...healthyRoutes(), ...healthyScRoutes() };
+  const oldSeconds = Math.floor((NOW - 120 * 86_400_000) / 1000);
+  routes["GET /scans"] = { scans: [...routes["GET /scans"].scans, { id: 12, name: "Stale", enabled: true, rrules: "FREQ=WEEKLY", status: "completed", policy_id: 1, last_modification_date: oldSeconds, wizard_uuid: "tmpl-basic" }] };
+  routes["GET /users"] = { users: healthyUsers().map((user, index) => (index === 1 ? { ...user, two_factor: { sms_enabled: 0 } } : user)) };
+  routes["GET /vulns/export/vuln-export-1/chunks/1"] = [...healthyVulns(), { severity: "critical", state: "OPEN", first_found: new Date(NOW - 60 * 86_400_000).toISOString(), plugin: { id: 3, vpr: { score: 9.5 } } }];
+  return routes;
+}
+
+test("byte differential fixtures: Tenable assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("tenable", "representative", await runAll(bothPlatformClients(routerFetch(representativeRoutes()))));
+  writeByteDifferentialFixture("tenable", "compliant", await runAll(clientsFor(healthyRoutes()), { expectedAssetCount: 2 }));
+  writeByteDifferentialFixture("tenable", "denied", await runAll(clientsFor(healthyRoutes(), { status: 403 })));
+  writeByteDifferentialFixture("tenable", "partial", await runAll(clientsFor(partialRoutes())));
+  writeByteDifferentialFixture("tenable", "missing-null", await runAll(clientsFor(emptyRoutes())));
+  const boundary = {};
+  for (const scenario of BOUNDARY_SCENARIOS) boundary[scenario.name] = await runBoundaryScenario(scenario);
+  writeByteDifferentialFixture("tenable", "boundary", boundary);
+  const exported = await exportTenableAuditBundle(clientsFor(healthyRoutes()), prepareByteDifferentialExportRoot("tenable"), { now: NOW });
+  writeByteDifferentialFixture("tenable", "export", snapshotExportBundle(exported));
+});
+
+portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", () => {
+  observedDecisionFacts.stop();
+  const boundaries = certifyRuntimeBoundaryCoverage(TENABLE_SPEC, observedDecisionFacts.factsByCheck);
+  const rules = certifyRuntimeRuleDecisiveness(TENABLE_SPEC, observedDecisionFacts.factsByCheck);
+  assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
 });
