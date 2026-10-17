@@ -53,15 +53,18 @@ function recordedBody(body, contentType) {
 /** Wraps a `fetch` implementation and records every request it receives, in call order. */
 export function recordFetchRequests(fetchImpl) {
   const requests = [];
-  const fetch = (input, init = {}) => {
+  const fetch = async (input, init = {}) => {
     const fromRequest = input instanceof Request ? input : undefined;
     const headers = new Headers(init.headers ?? fromRequest?.headers);
-    requests.push({
+    const request = {
       method: (init.method ?? fromRequest?.method ?? "GET").toUpperCase(),
       url: fromRequest?.url ?? String(input),
       headers: Object.fromEntries(headers),
-      body: recordedBody(init.body, headers.get("content-type") ?? ""),
-    });
+      body: undefined,
+    };
+    requests.push(request);
+    const body = init.body === undefined && fromRequest?.body ? await fromRequest.clone().text() : init.body;
+    request.body = recordedBody(body, headers.get("content-type") ?? "");
     return fetchImpl(input, init);
   };
   return { fetch, requests };
@@ -75,7 +78,7 @@ function surfaceMatchers(spec) {
       method: surface.method ?? "GET",
       hostQualified: !template.startsWith("/"),
       path: new RegExp(`^${templatePattern(template, "[^/]+")}$`),
-      embeddedQuery: [...new URLSearchParams(query)].map(([name, value]) => [name, exactPattern(value)]),
+      embeddedQuery: [...new URLSearchParams(query)].map(([name, value]) => ({ name, value, pattern: exactPattern(value) })),
       literalLength: template.replace(/\{[^}]+\}/g, "").length,
     };
   });
@@ -84,7 +87,7 @@ function surfaceMatchers(spec) {
 function matchSurface(matchers, method, url) {
   const candidates = matchers.filter((matcher) => matcher.method === method
     && matcher.path.test(matcher.hostQualified ? `${url.host}${url.pathname}` : url.pathname)
-    && matcher.embeddedQuery.every(([name, pattern]) => url.searchParams.getAll(name).some((value) => pattern.test(value))));
+    && matcher.embeddedQuery.every(({ name, pattern }) => url.searchParams.getAll(name).some((value) => pattern.test(value))));
   candidates.sort((left, right) => right.literalLength - left.literalLength
     || right.embeddedQuery.length - left.embeddedQuery.length);
   return candidates[0];
@@ -119,6 +122,18 @@ function sentValues(request, url, parameter) {
   }
 }
 
+/** Body member paths no declared name covers; a declared name covers everything beneath it. */
+function undeclaredBodyMembers(body, declared, prefix = "") {
+  return Object.entries(body).flatMap(([key, value]) => {
+    const member = `${prefix}${key}`;
+    if (declared.includes(member)) return [];
+    const declaresBeneath = declared.some((name) => name.startsWith(`${member}.`));
+    return declaresBeneath && value !== null && typeof value === "object" && !Array.isArray(value)
+      ? undeclaredBodyMembers(value, declared, `${member}.`)
+      : [member];
+  });
+}
+
 function declaredHeaders(surface) {
   return surface.request.headers.flatMap((header) => {
     const match = /^([A-Za-z0-9-]+):\s?(.*)$/.exec(header);
@@ -148,19 +163,23 @@ function requestViolations(matcher, request, url) {
       }
     }
   }
-  const embedded = new Set(matcher.embeddedQuery.map(([name]) => name));
   const declaredQuery = new Set(parameters.filter((parameter) => parameter.location === "query").map((parameter) => parameter.name));
   for (const name of new Set(url.searchParams.keys())) {
-    if (!embedded.has(name) && !declaredQuery.has(name)) {
-      violations.push(`${label}: sends undeclared query parameter ${name}`);
+    const embedded = matcher.embeddedQuery.filter((entry) => entry.name === name);
+    if (embedded.length === 0) {
+      if (!declaredQuery.has(name)) violations.push(`${label}: sends undeclared query parameter ${name}`);
+      continue;
+    }
+    for (const value of url.searchParams.getAll(name)) {
+      if (!embedded.some(({ pattern }) => pattern.test(value))) {
+        violations.push(`${label}: sends query parameter ${name}=${value}, not ${embedded.map((entry) => entry.value).join(" or ")}`);
+      }
     }
   }
   if (request.body !== null && typeof request.body === "object") {
     const declaredBody = parameters.filter((parameter) => BODY_LOCATIONS.has(parameter.location)).map((parameter) => parameter.name);
-    for (const member of Object.keys(request.body)) {
-      if (!declaredBody.some((name) => name === member || name.startsWith(`${member}.`))) {
-        violations.push(`${label}: sends undeclared body member ${member}`);
-      }
+    for (const member of undeclaredBodyMembers(request.body, declaredBody)) {
+      violations.push(`${label}: sends undeclared body member ${member}`);
     }
   }
   for (const header of declaredHeaders(surface)) {

@@ -389,7 +389,7 @@ const CONFORMING_CALLS = [
 test("recorded fetch requests keep the method, URL, lowercased headers, and parsed body", async () => {
   const forwarded = [];
   const recorder = recordFetchRequests(async (input, init) => {
-    forwarded.push(input);
+    forwarded.push(input instanceof Request && input.body ? await input.text() : input);
     return new Response("{}");
   });
   await recorder.fetch(`${ORIGIN}/v1/users/42/roles`, {
@@ -404,7 +404,13 @@ test("recorded fetch requests keep the method, URL, lowercased headers, and pars
     body: "grant_type=client_credentials",
   });
   await recorder.fetch(new Request(`${ORIGIN}/v1/users`, { headers: { Accept: "application/json" } }));
-  assert.equal(forwarded.length, 4);
+  await recorder.fetch(new Request(`${ORIGIN}/v1/users/42/roles`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filter: { kind: "admin" } }),
+  }));
+  assert.equal(forwarded.length, 5);
+  assert.equal(forwarded[4], JSON.stringify({ filter: { kind: "admin" } }), "the forwarded Request body stays unread");
   assert.deepEqual(recorder.requests, [
     { method: "POST", url: `${ORIGIN}/v1/users/42/roles`, headers: { "content-type": "application/json" }, body: { filter: { kind: "admin" } } },
     { method: "POST", url: `${ORIGIN}/oauth/token`, headers: {}, body: { grant_type: "client_credentials" } },
@@ -415,6 +421,7 @@ test("recorded fetch requests keep the method, URL, lowercased headers, and pars
       body: { grant_type: "client_credentials" },
     },
     { method: "GET", url: `${ORIGIN}/v1/users`, headers: { accept: "application/json" }, body: undefined },
+    { method: "POST", url: `${ORIGIN}/v1/users/42/roles`, headers: { "content-type": "application/json" }, body: { filter: { kind: "admin" } } },
   ]);
 });
 
@@ -431,10 +438,11 @@ test("request conformance reports undeclared requests, parameter values, body me
     ["/v1/users?status=active&debug=1", { headers: { Authorization: "Bearer example-token" } }],
     ["/v1/groups", { headers: BEARER }],
     ["/v1/users?limit=200", { headers: BEARER }],
+    ["/v1/users?status=active&status=deleted&limit=200", { headers: BEARER }],
     ["/v1/users/42/roles", {
       method: "POST",
       headers: { Authorization: "Basic abc", "Content-Type": "application/json" },
-      body: JSON.stringify({ filter: { kind: "user" }, extra: true }),
+      body: JSON.stringify({ filter: { kind: "user", scope: "all" }, extra: true }),
     }],
   ]);
   assert.deepEqual(requestConformance(buildExample(), requests).violations, [
@@ -444,7 +452,9 @@ test("request conformance reports undeclared requests, parameter values, body me
     "users GET /v1/users?status=active&debug=1: omits declared header accept",
     "undeclared request GET api.example.test/v1/groups",
     "undeclared request GET api.example.test/v1/users?limit=200",
+    "users GET /v1/users?status=active&status=deleted&limit=200: sends query parameter status=deleted, not active",
     "roles POST /v1/users/42/roles: sends json-body parameter filter.kind=user, not admin",
+    "roles POST /v1/users/42/roles: sends undeclared body member filter.scope",
     "roles POST /v1/users/42/roles: sends undeclared body member extra",
     "roles POST /v1/users/42/roles: sends header authorization in an undeclared format",
   ]);
