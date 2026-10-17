@@ -1664,6 +1664,10 @@ function daysBetween(now: number, thenMs: number): number {
   return Math.max(0, (now - thenMs) / DAY_MS);
 }
 
+function hoursSince(now: number, thenMs: number): number {
+  return (now - thenMs) / 3_600_000;
+}
+
 function ratio(part: number, whole: number): number {
   return whole > 0 ? Number((part / whole).toFixed(4)) : 0;
 }
@@ -2952,6 +2956,10 @@ function capForIncomplete(status: TenableFindingStatus, ...datasets: Array<Tenab
   return status;
 }
 
+function readInFull(dataset: TenableDataset<unknown>): boolean {
+  return dataset.status === "ok" && dataset.truncated !== true && unevaluableRecordsOf(dataset) === 0;
+}
+
 interface SecondaryInventory {
   dataset: TenableDataset<unknown>;
   consequence: string;
@@ -3478,7 +3486,7 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
       asset_count: assets.length,
       credentialed_coverage_ratio: coverage,
       credential_threshold: credentialThreshold,
-      asset_export_complete: !data.assetExport.truncated && unevaluableRecordsOf(data.assetExport) === 0,
+      asset_export_complete: readInFull(data.assetExport),
     });
     let status: TenableFindingStatus;
     let summary: string;
@@ -3730,6 +3738,10 @@ function newestVersion(versions: string[]): string | undefined {
 }
 
 export function assessTenableSensorCoverage(data: TenableSensorCoverageData, options: TenableAssessmentOptions = {}): TenableAssessmentResult {
+  return runBatchVerdictContext(TENABLE_DECISION_CONTEXT, TENABLE_SPEC, () => assessTenableSensorCoverageWithDecisionContext(data, options));
+}
+
+function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCoverageData, options: TenableAssessmentOptions): TenableAssessmentResult {
   const now = options.now ?? Date.now();
   const staleAssetDays = clampInteger(options.staleAssetDays, DEFAULT_STALE_ASSET_DAYS, 1, 365);
   const agentOfflineDays = clampInteger(options.agentOfflineDays, DEFAULT_AGENT_OFFLINE_DAYS, 1, 365);
@@ -3740,6 +3752,8 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
   const assets = data.assetExport.status === "ok" ? data.assetExport.data.records : [];
 
   if (data.assetExport.status !== "ok") {
+    recordTenableDecisionFacts(3, { asset_export_readable: false });
+    recordTenableDecisionFacts(16, { asset_export_readable: false });
     findings.push(unreadableFinding(3, "high", data.assetExport, "the asset inventory per network and the expected network ranges"));
     findings.push(unreadableFinding(16, "medium", data.assetExport, "the asset tag coverage report from the Tenable UI"));
   } else {
@@ -3758,6 +3772,13 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       ? data.networks.data.filter((network) => !perNetwork.has(asString(network.name) ?? "") && !perNetwork.has(asString(network.uuid) ?? "")).map((network) => asString(network.name) ?? asString(network.uuid) ?? "network")
       : [];
     const expected = options.expectedAssetCount;
+    recordTenableDecisionFacts(3, {
+      asset_export_readable: true,
+      asset_count: assets.length,
+      expected_asset_coverage_ratio: expected !== undefined && expected > 0 ? ratio(fresh.length, expected) : null,
+      asset_export_complete: readInFull(data.assetExport),
+      networks_complete: readInFull(data.networks),
+    });
     // Networks are named only when the network inventory was read to completion; over a
     // truncated walk the note counts them and says why they are not named.
     const networkNote = data.networks.status === "ok"
@@ -3797,6 +3818,17 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     const tagged = assets.filter((asset) => asRecords(asset.tags).length > 0);
     const categories = data.tagCategories.status === "ok" ? data.tagCategories.data.map((item) => asString(item.name) ?? "category") : [];
     const taggedRatio = ratio(tagged.length, assets.length);
+    recordTenableDecisionFacts(16, {
+      asset_export_readable: true,
+      tag_categories_readable: data.tagCategories.status === "ok",
+      asset_count: assets.length,
+      tag_category_count: categories.length,
+      tag_categories_complete: readInFull(data.tagCategories),
+      tagged_asset_ratio: taggedRatio,
+      tagged_threshold: taggedThreshold,
+      asset_export_complete: readInFull(data.assetExport),
+      tag_values_complete: readInFull(data.tagValues),
+    });
     let tagStatus: TenableFindingStatus;
     let tagSummary: string;
     if (data.tagCategories.status !== "ok") {
@@ -3835,6 +3867,8 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
 
   const licensedAgents = asNumber(asObject(asObject(data.serverProperties.data)?.license)?.agents);
   if (data.agents.status !== "ok") {
+    recordTenableDecisionFacts(5, { agents_readable: false });
+    recordTenableDecisionFacts(6, { agents_readable: false });
     findings.push(unreadableFinding(5, "high", data.agents, "the agent inventory with status, last connect, and version from Sensors > Agents"));
     findings.push(unreadableFinding(6, "medium", data.agents, "the agent group membership report from Sensors > Agents"));
   } else {
@@ -3851,6 +3885,15 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       return version !== undefined && compareVersions(version, newest) < 0 && (version.split(".")[0] !== newest.split(".")[0] || Number(version.split(".")[1] ?? 0) < Number(newest.split(".")[1] ?? 0));
     }) : [];
     const unhealthy = new Set([...offline, ...staleConnect].map((agent) => asString(agent.uuid) ?? asString(agent.id) ?? asString(agent.name) ?? "agent"));
+    recordTenableDecisionFacts(5, {
+      agents_readable: true,
+      agent_count: agents.length,
+      unhealthy_agent_ratio: ratio(unhealthy.size, agents.length),
+      undated_agent_count: undated.length,
+      outdated_agent_count: outdated.length,
+      agents_complete: readInFull(data.agents),
+      server_properties_readable: data.serverProperties.status === "ok",
+    });
     let status: TenableFindingStatus;
     let summary: string;
     if (agents.length === 0) {
@@ -3884,6 +3927,15 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
 
     const ungrouped = agents.filter((agent) => asRecords(agent.groups).length === 0);
     const groupCount = data.agentGroups.status === "ok" ? data.agentGroups.data.length : null;
+    recordTenableDecisionFacts(6, {
+      agents_readable: true,
+      agent_count: agents.length,
+      agent_groups_readable: data.agentGroups.status === "ok",
+      agent_group_count: groupCount,
+      ungrouped_agent_ratio: ratio(ungrouped.length, agents.length),
+      ungrouped_agent_count: ungrouped.length,
+      agents_complete: readInFull(data.agents),
+    });
     let groupStatus: TenableFindingStatus;
     let groupSummary: string;
     if (agents.length === 0) {
@@ -3914,10 +3966,13 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
 
   const linkedScanners = data.scanners.data.filter((scanner) => asString(scanner.type) !== "local" && asBoolean(scanner.pool) !== true && asBoolean(scanner.group) !== true);
   if (data.scanners.status !== "ok") {
+    recordTenableDecisionFacts(7, { scanners_readable: false });
     findings.push(unreadableFinding(7, "high", data.scanners, "the linked scanner list with status, last connect, and Nessus version from Sensors > Nessus Scanners"));
   } else if (data.scanners.data.length === 0) {
+    recordTenableDecisionFacts(7, { scanners_readable: true, scanner_count: 0, linked_scanner_count: 0 });
     findings.push(finding(7, "manual", "high", `${data.scanners.endpoint} returned zero scanners; even cloud scanners were not visible, so the key cannot see sensors. Collect the scanner inventory from Sensors > Nessus Scanners.`, { scanner_count: 0 }));
   } else if (linkedScanners.length === 0) {
+    recordTenableDecisionFacts(7, { scanners_readable: true, scanner_count: data.scanners.data.length, linked_scanner_count: 0 });
     findings.push(finding(7, "manual", "high", `Not applicable to linked appliances: ${data.scanners.data.length} scanner entries are visible but all are Tenable-managed cloud scanners or groups. Confirm the tenant intentionally relies only on cloud scanners.`, {
       scanner_count: data.scanners.data.length,
       cloud_scanners: data.scanners.data.map((scanner) => asString(scanner.name)).slice(0, 50),
@@ -3936,6 +3991,20 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       return version !== undefined && compareVersions(version, newest) < 0;
     }) : [];
     const unhealthy = new Set([...unlinked, ...off, ...staleConnect].map((scanner) => asString(scanner.name) ?? asString(scanner.id) ?? "scanner"));
+    recordTenableDecisionFacts(7, {
+      scanners_readable: true,
+      scanner_count: data.scanners.data.length,
+      linked_scanner_count: linkedScanners.length,
+      unlinked_scanner_count: unlinked.length,
+      off_scanner_count: off.length,
+      linked_scanner_connect_age_days: linkedScanners.flatMap((scanner) => {
+        const lastConnect = parseTimestampMs(scanner.last_connect);
+        return lastConnect === undefined ? [] : [daysBetween(now, lastConnect)];
+      }),
+      undated_linked_scanner_count: undated.length,
+      outdated_linked_scanner_count: outdated.length,
+      caller_is_administrator: callerIsAdministrator === true,
+    });
     findings.push(withPartialView(finding(
       7,
       unhealthy.size > 0 ? "fail" : undated.length > 0 || outdated.length > 0 ? "warn" : capForNonAdmin(capForPartial("pass", data.scanners), callerIsAdministrator),
@@ -3960,6 +4029,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
   }
 
   if (data.serverProperties.status !== "ok") {
+    recordTenableDecisionFacts(8, { server_properties_readable: false });
     findings.push(unreadableFinding(8, "high", data.serverProperties, "the current plugin set date from Settings > About and each scanner's plugin set"));
   } else {
     const serverPluginMs = parsePluginSetMs(data.serverProperties.data.plugin_set) ?? parsePluginSetMs(data.serverProperties.data.loaded_plugin_set);
@@ -3974,6 +4044,22 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       return stamp !== undefined && now - stamp > pluginStaleHours * 3_600_000 && asString(agent.status) === "on";
     }) : [];
     const serverFresh = serverPluginMs !== undefined && now - serverPluginMs <= pluginStaleHours * 3_600_000;
+    recordTenableDecisionFacts(8, {
+      server_properties_readable: true,
+      server_plugin_set_age_hours: serverPluginMs === undefined ? null : hoursSince(now, serverPluginMs),
+      plugin_stale_hours: pluginStaleHours,
+      scanner_plugin_set_age_hours: data.scanners.data.flatMap((scanner) => {
+        const stamp = parsePluginSetMs(scanner.loaded_plugin_set);
+        return stamp === undefined ? [] : [hoursSince(now, stamp)];
+      }),
+      scanners_readable: data.scanners.status === "ok",
+      scanners_without_plugin_set_count: undatedScanners.length,
+      online_agent_plugin_set_age_hours: data.agents.status === "ok" ? data.agents.data.flatMap((agent) => {
+        const stamp = parsePluginSetMs(agent.plugin_feed_id);
+        return stamp === undefined || asString(agent.status) !== "on" ? [] : [hoursSince(now, stamp)];
+      }) : [],
+      agents_complete: readInFull(data.agents),
+    });
     let status: TenableFindingStatus;
     let summary: string;
     if (serverPluginMs === undefined) {
@@ -4019,11 +4105,19 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
   }
 
   if (data.networks.status !== "ok") {
+    recordTenableDecisionFacts(9, { networks_readable: false });
     findings.push(unreadableFinding(9, "medium", data.networks, "the network object list with assigned scanners from Settings > Sensors > Networks"));
   } else {
     const networks = data.networks.data;
     const withoutScanners = networks.filter((network) => asNumber(network.scanner_count) === 0);
     const unknownCount = networks.filter((network) => asNumber(network.scanner_count) === undefined);
+    recordTenableDecisionFacts(9, {
+      networks_readable: true,
+      network_count: networks.length,
+      zero_scanner_network_count: withoutScanners.length,
+      unreported_scanner_network_count: unknownCount.length,
+      networks_complete: readInFull(data.networks),
+    });
     findings.push(withPartialView(finding(
       9,
       networks.length === 0 ? "manual" : withoutScanners.length > 0 ? "fail" : unknownCount.length > 0 ? "warn" : capForPartial("pass", data.networks),
@@ -4096,6 +4190,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
 
 function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, feed: TenableDataset<JsonRecord>, now: number, pluginStaleHours: number): TenableFinding {
   if (scanners.status !== "ok") {
+    recordTenableDecisionFacts(7, { sc_scanners_readable: false }, "-SC");
     return unreadableFinding(7, "high", scanners, "the Security Center scanner list with status, version, plugin set, and last check-in", "-SC");
   }
   const enabled = scanners.data.filter((scanner) => asBoolean(scanner.enabled) !== false);
@@ -4111,6 +4206,23 @@ function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, fe
   });
   const feedActive = asObject(feed.data.active);
   const feedStale = feed.status === "ok" ? asBoolean(feedActive?.stale) : undefined;
+  recordTenableDecisionFacts(7, {
+    sc_scanners_readable: true,
+    sc_scanner_count: scanners.data.length,
+    sc_unhealthy_scanner_count: unhealthy.length,
+    sc_scanner_checkin_age_days: enabled.flatMap((scanner) => {
+      const stamp = parseTimestampMs(scanner.lastCheckinTime);
+      return stamp === undefined ? [] : [daysBetween(now, stamp)];
+    }),
+    sc_scanner_plugin_set_age_hours: enabled.flatMap((scanner) => {
+      const stamp = parsePluginSetMs(scanner.loadedPluginSet) ?? parsePluginSetMs(scanner.pluginSet);
+      return stamp === undefined ? [] : [hoursSince(now, stamp)];
+    }),
+    plugin_stale_hours: pluginStaleHours,
+    sc_feed_marked_stale: feedStale === true,
+    sc_undated_scanner_count: undated.length,
+    sc_feed_readable: feed.status === "ok",
+  }, "-SC");
   let status: TenableFindingStatus;
   let summary: string;
   if (scanners.data.length === 0) {
