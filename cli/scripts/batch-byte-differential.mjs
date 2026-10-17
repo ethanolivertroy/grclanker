@@ -437,12 +437,18 @@ function main() {
   let worktreeAdded = false;
   try {
     const baselineSha = resolveBaseline();
-    run("git", ["merge-base", "--is-ancestor", baselineSha, "HEAD"], { capture: true });
-    const runtimeDiff = spawnSync("git", ["diff", "--quiet", baselineSha, "--", "cli/extensions"], { cwd: repoRoot, stdio: "ignore" });
-    if (runtimeDiff.status === 0) {
-      throw new Error(`The working tree has no runtime change under cli/extensions relative to ${baselineSha}; there is nothing to compare`);
+    const headSha = run("git", ["rev-parse", "HEAD^{commit}"], { capture: true }).stdout.trim();
+    // The branch side builds and runs this checkout, so parity holds for HEAD only when cli/ is clean.
+    const uncommitted = run("git", ["status", "--porcelain", "--untracked-files=all", "--", "cli"], { capture: true }).stdout.trim();
+    if (uncommitted) {
+      throw new Error(`Commit or stash the uncommitted changes under cli/ so the comparison measures HEAD ${headSha}:\n${uncommitted}`);
     }
-    if (runtimeDiff.status !== 1) throw new Error(`Unable to inspect the runtime diff against ${baselineSha}`);
+    run("git", ["merge-base", "--is-ancestor", baselineSha, headSha], { capture: true });
+    const runtimeDiff = spawnSync("git", ["diff", "--quiet", baselineSha, headSha, "--", "cli/extensions"], { cwd: repoRoot, stdio: "ignore" });
+    if (runtimeDiff.status === 0) {
+      throw new Error(`HEAD ${headSha} has no runtime change under cli/extensions relative to ${baselineSha}; there is nothing to compare`);
+    }
+    if (runtimeDiff.status !== 1) throw new Error(`Unable to inspect the runtime diff between ${baselineSha} and ${headSha}`);
 
     run("git", ["worktree", "add", "--detach", baselineRoot, baselineSha]);
     worktreeAdded = true;
@@ -497,7 +503,7 @@ function main() {
       }
     }
     const classes = [...new Set(compared.map((path) => path.split("/").at(-1).replace(/\.json$/, "")))].sort();
-    console.log(`Baseline ${baselineSha}; differential tests: ${testFiles.join(", ")}.`);
+    console.log(`Baseline ${baselineSha}; HEAD ${headSha}; differential tests: ${testFiles.join(", ")}.`);
     if (withoutBaseline.length > 0) console.log(`No baseline runtime, so not compared: ${withoutBaseline.join(", ")}.`);
     if (stubbedFiles.length > 0) console.log(`Imports the baseline lacks were stubbed in: ${stubbedFiles.join(", ")}.`);
     console.log(`Verdict semantics match the baseline for ${semantics.unchanged.length} published specs${semantics.added.length > 0 ? `; new on this branch: ${semantics.added.join(", ")}` : ""}.`);
