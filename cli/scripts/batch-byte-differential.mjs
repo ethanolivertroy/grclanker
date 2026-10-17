@@ -44,7 +44,6 @@ function run(command, args, options = {}) {
   return result;
 }
 
-/** A vendor test joins the differential by writing fixtures; adding one needs no harness edit. */
 export function discoverDifferentialTests(root) {
   const testsDirectory = join(root, "cli", "tests");
   return readdirSync(testsDirectory)
@@ -92,10 +91,9 @@ function importStatement(bindings, specifier) {
 }
 
 /**
- * Rewrites relative imports the baseline cannot satisfy into bindings that throw
- * on first use, so a branch test that imports a new spec still loads there.
- * `exportsFor(specifier)` returns the baseline's export names, null when the
- * module is absent, or undefined to keep the import unchanged.
+ * Rewrites relative imports the baseline cannot satisfy into bindings that throw on
+ * first use, so a branch test that imports a new spec still loads there. `exportsFor`
+ * returns export names, null for a missing module, or undefined to keep the import.
  */
 export function stubUnavailableImports(source, exportsFor) {
   let stubbed = false;
@@ -384,7 +382,6 @@ function corpusSweepCounts(root, paths) {
   return counts;
 }
 
-/** Verdict semantics are the evidence inputs, derived facts, constants, and ordered rules of every check. */
 function verdictSemantics(root) {
   const dump = [
     `import { PUBLISHED_INTEGRATION_SPECS } from ${JSON.stringify(pathToFileURL(join(root, "cli", "dist", "extensions", "grc-tools", "spec-registry.js")).href)};`,
@@ -403,10 +400,6 @@ function verdictSemantics(root) {
   return JSON.parse(run(process.execPath, ["--input-type=module", "--eval", dump], { cwd: root, capture: true }).stdout);
 }
 
-/**
- * Every spec published on both sides must keep identical verdict semantics, so
- * each threshold and rule boundary is the baseline's. New specs are reported.
- */
 function compareVerdictSemantics(baselineRoot) {
   const baseline = verdictSemantics(baselineRoot);
   const branch = verdictSemantics(repoRoot);

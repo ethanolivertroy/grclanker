@@ -16,7 +16,7 @@ export const differentialRunActive = Boolean(fixtureRoot || process.env.GRC_CORP
 /**
  * Registers a test that asserts the portable spec contract. Differential runs copy
  * branch tests onto a baseline that may predate the spec, so they skip these tests
- * on both sides; keep spec imports and conformance helpers inside them.
+ * on both sides; use spec exports and conformance helpers only inside them.
  */
 export const portableContractTest = differentialRunActive ? test.skip : test;
 
