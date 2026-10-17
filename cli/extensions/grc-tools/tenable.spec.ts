@@ -1448,7 +1448,7 @@ export const TENABLE_SPEC = buildBatchIntegrationSpec({
   slug: "tenable-sec-inspector",
   displayName: "Tenable Security Inspector",
   vendor: "Tenable",
-  category: "vulnerability-management",
+  category: "vulnerability-application-security",
   summary: "Portable contract for the shipped Tenable Vulnerability Management and Tenable Security Center scan program, sensor coverage, access control, and vulnerability management assessments.",
   sourceModule: "cli/extensions/grc-tools/tenable.ts",
   baseServices: [VM_SERVICE, SC_SERVICE],
