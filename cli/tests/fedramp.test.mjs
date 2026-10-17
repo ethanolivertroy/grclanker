@@ -970,6 +970,10 @@ test("CDS starter bundle builder includes trust-center and feed templates", () =
   const readme = bundle.files.find((file) => file.path === "README.md")?.content ?? "";
   assert.match(readme, /Certification Data Sharing Starter Bundle/);
   assert.match(readme, /public\/authorization-data\.json/);
+  assert.match(
+    readme,
+    /Hosting note:\n- Serve the public JSON files with `Content-Type: application\/json` and `X-Content-Type-Options: nosniff`, and enable CORS [^\n]+\(FRC-CSO-JSN\)\.\n/,
+  );
 });
 
 test("CDS starter bundle generator writes scaffold files under the requested root", async () => {
@@ -1057,6 +1061,10 @@ test("CDS site builder includes public pages, JSON artifacts, and cloud deploy n
   assert.match(readme, /GCP: upload the generated files to Cloud Storage/i);
   assert.match(readme, /Approval status: draft-unapproved/i);
   assert.match(readme, /Review and approve every public statement/i);
+  assert.match(
+    readme,
+    /\n- Serve the public JSON files with `Content-Type: application\/json` and `X-Content-Type-Options: nosniff`, and enable CORS [^\n]+\(FRC-CSO-JSN\)\.\n/,
+  );
 
   const index = site.files.find((file) => file.path === "index.html")?.content ?? "";
   assert.match(index, /Example Cloud Trust Center/);
@@ -1090,6 +1098,10 @@ test("CDS site builder includes public pages, JSON artifacts, and cloud deploy n
   const approval = site.files.find((file) => file.path === "APPROVAL_REQUIRED.md")?.content ?? "";
   assert.match(approval, /Approval Required Before Publication/);
   assert.match(approval, /Reviewer: TODO/);
+  assert.match(
+    approval,
+    /\n- Confirm the host serves the public JSON files with `Content-Type: application\/json` and `X-Content-Type-Options: nosniff`, and allows cross-origin \(CORS\) reads \(FRC-CSO-JSN\)\.\n/,
+  );
 });
 
 test("CDS site generator writes a portable static trust-center bundle under the requested root", async () => {
