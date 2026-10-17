@@ -494,11 +494,14 @@ const VM_SERVICE = "Qualys VM/PC API";
 const ADMIN_SERVICE = "Qualys Administration API";
 const AM_SERVICE = "Qualys Asset Management and Tagging API";
 const CA_SERVICE = "Qualys Cloud Agent API";
+const WAS_SERVICE = "Qualys WAS API";
 const VM_DOCS = "https://docs.qualys.com/en/vm/qweb-all-api/mergedProjects";
+const WAS_DOCS = "https://docs.qualys.com/en/was/api";
 const API_SERVER = "Use the configured API server (base_url, else the selected platform's API server); never follow a continuation URL to another origin.";
 const AUTH_HEADER = "Authorization: {Basic base64(username:password), or Bearer token}";
 const XML_HEADERS = ["X-Requested-With: grclanker", "Accept: application/xml", AUTH_HEADER];
 const QPS_HEADERS = ["X-Requested-With: grclanker", "Accept: application/json", "Content-Type: application/json", AUTH_HEADER];
+const ACTIVITY_HEADERS = ["X-Requested-With: grclanker", "Accept: text/csv, application/xml", AUTH_HEADER];
 const PROJECTION_STAGE = "The collector keeps only the listed fields, the allowlist projection written under core_data, and drops every other response member before evidence export; decision facts read a subset of these fields.";
 
 const fieldsOf = (allowlist: FieldAllowlist, prefix = ""): string[] => Object.entries(allowlist).flatMap(([key, rule]) => {
@@ -521,6 +524,7 @@ const param = (
 ): RequestParameterContract => ({ name, location, required, value, ...(when ? { when } : {}) });
 
 const LIST_ACTION = param("action", "query", "list");
+const LOOKBACK_START = "lookback_days before the assessment time, in UTC ISO 8601 without fractional seconds";
 const ID_MIN = param(
   "id_min",
   "query",
@@ -604,7 +608,7 @@ const SCAN_COVERAGE_SURFACES: readonly BatchSurfaceDefinition[] = [
   ),
   vmSurface("scans", "/api/2.0/fo/scan/", "qapi-scan/vm_scans/list_vm_scans.htm", [
     LIST_ACTION,
-    param("launched_after_datetime", "query", "lookback_days before the assessment time, in UTC ISO 8601 without fractional seconds"),
+    param("launched_after_datetime", "query", LOOKBACK_START),
     param("show_ags", "query", "1"),
     param("show_op", "query", "1"),
     ID_MIN,
@@ -709,10 +713,66 @@ const VULNERABILITY_SURFACES: readonly BatchSurfaceDefinition[] = [
   ], xmlRecords("VULN")),
 ];
 
+const qpsContinuation = (records: string) => [limitResults(`100, or the ${records} left under the 5000-record cap when fewer`), CONTINUATION_CRITERIA];
+const scanCriteria = (criteria: string) => param(
+  "ServiceRequest.filters.Criteria",
+  "json-body",
+  `${criteria}, joined on a continuation by id GREATER than the previous page's lastId`,
+);
+
+// was_scans must stay ahead of was_scan_history: both POST the same WAS scan search.
+const ADMINISTRATION_SURFACES: readonly BatchSurfaceDefinition[] = [
+  vmSurface(
+    "scheduled_reports",
+    "/api/2.0/fo/schedule/report/",
+    "qapi-rep/reports/list_sched_reports.htm",
+    [LIST_ACTION, param("is_active", "query", "1"), ID_MIN],
+    xmlRecords("REPORT"),
+  ),
+  vmSurface("reports", "/api/2.0/fo/report/", "qapi-rep/reports/list_reports.htm", [LIST_ACTION, ID_MIN], xmlRecords("REPORT")),
+  vmSurface(
+    "activity_log",
+    "/api/2.0/fo/activity_log/",
+    "qapi-user/activity/export_activity.htm",
+    [LIST_ACTION, param("since_datetime", "query", LOOKBACK_START), param("truncation_limit", "query", "5000")],
+    "CSV whose header row is the first row with a Date column; every later row is one record keyed by its lowercased, underscore-joined headers. A SIMPLE_RETURN, GENERIC_RETURN, or root-level ERROR XML envelope, or HTTP status 400 or above, is a refusal.",
+    ACTIVITY_HEADERS,
+  ),
+  qpsSurface("was_webapps", "/qps/rest/3.0/search/was/webapp", WAS_SERVICE, `${WAS_DOCS}/web_apps/search_webapps.htm`, [
+    ...qpsContinuation("web applications"),
+    param("ServiceRequest.preferences.verbose", "json-body", "true"),
+  ]),
+  qpsSurface("was_scans", "/qps/rest/3.0/search/was/wasscan", WAS_SERVICE, `${WAS_DOCS}/scans/search_scan.htm`, [
+    limitResults("100, or the scans left under the 5000-scan cap when fewer"),
+    scanCriteria(`The criteria launchedDate GREATER ${LOOKBACK_START}, and type EQUALS VULNERABILITY`),
+  ]),
+  qpsSurface("was_scan_history", "/qps/rest/3.0/search/was/wasscan", WAS_SERVICE, `${WAS_DOCS}/scans/search_scan.htm`, [
+    limitResults("100, or the scans left under the 5000-scan cap when fewer"),
+    scanCriteria(
+      "The criteria webApp.id IN up to 100 comma-separated IDs of web applications without a finished vulnerability scan in the lookback search, type EQUALS VULNERABILITY, and status EQUALS FINISHED",
+    ),
+  ]),
+  qpsSurface(
+    "was_auth_records",
+    "/qps/rest/3.0/search/was/webappauthrecord",
+    WAS_SERVICE,
+    `${WAS_DOCS}/auth/search_auth.htm`,
+    qpsContinuation("authentication records"),
+  ),
+  qpsSurface(
+    "was_schedules",
+    "/qps/rest/3.0/search/was/wasscanschedule",
+    WAS_SERVICE,
+    `${WAS_DOCS}/schedules/search_schedule.htm`,
+    qpsContinuation("schedules"),
+  ),
+];
+
 const QUALYS_SURFACES: readonly BatchSurfaceDefinition[] = [
   ...SCAN_COVERAGE_SURFACES,
   ...ASSET_INVENTORY_SURFACES,
   ...VULNERABILITY_SURFACES,
+  ...ADMINISTRATION_SURFACES,
   ...SCOPE_SURFACES,
 ];
 
@@ -823,6 +883,42 @@ const QUALYS_INPUTS: Readonly<Record<string, string>> = {
   overdue_patchable_detection_count: "Number of dated patchable open detections first found more than sla_high_days whole days ago.",
   undated_patchable_detection_count: "Number of patchable open detections without a parseable FIRST_FOUND_DATETIME.",
   qds_detection_percent: "Percentage of open detections carrying a non-empty QDS, rounded to one decimal place with ties rounded up; recorded only when open_detection_count is above 0.",
+  scheduled_reports_readable: "True when GET /api/2.0/fo/schedule/report/ returned its active scheduled report list without a refusal.",
+  reports_readable: "True when GET /api/2.0/fo/report/ returned its report list without a refusal.",
+  active_scheduled_report_count: "Number of returned scheduled reports whose ACTIVE flag reads as true: true, 1, or yes, case-insensitively.",
+  user_list_readable: "True when GET /msp/user_list.php returned its USER_LIST_OUTPUT without a refusal.",
+  users_readable: "True when POST /qps/rest/2.0/search/am/user/ returned SUCCESS.",
+  users_complete: "QPS user search coverage up to 5000 users.",
+  active_user_count: "Number of active users: the user list rows whose USER_STATUS is active, case-insensitively, when GET /msp/user_list.php is readable, else the QPS user search rows, which list active users only.",
+  max_managers: "The max_managers assessment option, clamped to 0 through 10000; default 5.",
+  manager_count: "Number of active users holding a role (USER_ROLE in the user list, a roleList name in the QPS user search) that is exactly manager, or contains super user, superuser, or administrator, case-insensitively.",
+  shared_email_count: "Number of distinct email addresses (CONTACT_INFO EMAIL in the user list, emailAddress in the QPS user search), compared case-insensitively, that more than one active user holds.",
+  last_login_age_days: "Whole days since each active user's LAST_LOGIN_DATE, for every active user carrying a parseable one.",
+  generic_account_count: "Number of active users whose login (USER_LOGIN in the user list, username in the QPS user search), lowercased, contains shared, generic, service, svc, or test, or ends with admin followed by optional digits.",
+  pending_activation_user_count: "Number of user list rows whose USER_STATUS, lowercased, contains pending.",
+  roleless_active_user_count: "Number of active users without a role: no USER_ROLE in the user list, or no roleList name in the QPS user search.",
+  statusless_user_count: "Number of user list rows without a USER_STATUS.",
+  undated_login_user_count: "Number of active users without a parseable LAST_LOGIN_DATE.",
+  loginless_user_count: "Number of user list rows without a USER_LOGIN.",
+  was_webapps_readable: "True when POST /qps/rest/3.0/search/was/webapp returned SUCCESS.",
+  was_webapps_complete: "WAS web application list coverage up to 5000 web applications.",
+  was_scans_readable: "True when POST /qps/rest/3.0/search/was/wasscan with the lookback criteria returned SUCCESS.",
+  was_scans_complete: "Coverage of the WAS vulnerability scans launched in the lookback window, up to 5000 scans.",
+  was_scan_history_readable: "True when every WAS scan history batch, for the web applications without a finished vulnerability scan in the lookback search, returned SUCCESS, or when no web application needed history.",
+  was_scan_history_complete: "WAS scan history coverage of the web applications that needed it; true when no web application needed history.",
+  was_auth_records_readable: "True when POST /qps/rest/3.0/search/was/webappauthrecord returned SUCCESS.",
+  was_auth_records_complete: "WAS authentication record list coverage up to 5000 records.",
+  was_schedules_readable: "True when POST /qps/rest/3.0/search/was/wasscanschedule returned SUCCESS.",
+  was_schedules_complete: "WAS scan schedule list coverage up to 5000 schedules.",
+  web_app_count: "Number of WAS web application records returned.",
+  never_scanned_web_app_count: "Number of returned web applications with no finished vulnerability scan in the lookback search and none in a readable, complete scan history.",
+  resolved_web_app_scan_age_days: "Whole days since the launchedDate of each returned web application's newest finished vulnerability scan, taken from the lookback search, else from the scan history, for every web application whose scan is at most lookback_days old or whose scan history was readable and complete.",
+  unresolved_web_app_count: "Number of returned web applications without a finished vulnerability scan at most lookback_days old whose scan history was refused or stopped early.",
+  was_auth_record_age_days: "Whole days since each returned WAS authentication record's updatedDate, else its createdDate, for every record carrying one of them as a parseable date.",
+  undated_was_auth_record_count: "Number of returned WAS authentication records carrying neither a parseable updatedDate nor a parseable createdDate.",
+  was_schedules_without_active_flag_count: "Number of returned WAS scan schedules whose active flag is absent or reads as neither true nor false.",
+  activity_log_readable: "True when GET /api/2.0/fo/activity_log/ returned its rows since the lookback start without a refusal.",
+  activity_entry_count: "Number of activity log rows returned, at most 5000.",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -1522,6 +1618,182 @@ const VULNERABILITY_CHECKS: readonly QualysCheck[] = [
   },
 ];
 
+const ADMINISTRATION = "qualys_assess_administration";
+
+const qpsComplete = (surfaceId: string, search: string, cap: string): BatchCompletenessDefinition => completeFrom(
+  `false when the ${search} stopped with more records left: at ${cap}, at the 25-page cap, or on a page without lastId.`,
+  [{ surfaceId, falseWhen: ["truncated"] }],
+);
+
+const ADMINISTRATION_CHECKS: readonly QualysCheck[] = [
+  {
+    id: "QUALYS-C12",
+    control: 12,
+    title: "Report template and distribution",
+    severity: "medium",
+    owner: ADMINISTRATION,
+    surfaces: ["scheduled_reports", "reports"],
+    inputs: ["scheduled_reports_readable", "reports_readable", "active_scheduled_report_count"],
+    rules: [
+      rule("manual", any(ne("scheduled_reports_readable", true), ne("reports_readable", true))),
+      rule("fail", eq("active_scheduled_report_count", 0)),
+      rule("warn", always),
+    ],
+    decision: "Manual when the scheduled report list or the report list is unreadable. Fail when no returned scheduled report is active. Otherwise warn, because report templates and their distribution need a reviewer.",
+    examples: [
+      example("noncompliant", "fail", "No scheduled report is active.", {
+        scheduled_reports_readable: true, reports_readable: true, active_scheduled_report_count: 0,
+      }),
+      example("partial", "warn", "Two scheduled reports are active.", {
+        scheduled_reports_readable: true, reports_readable: true, active_scheduled_report_count: 2,
+      }),
+      example("unreadable", "manual", "The report list was refused.", { scheduled_reports_readable: true, reports_readable: false }),
+    ],
+  },
+  {
+    id: "QUALYS-C13",
+    control: 13,
+    title: "User role and permission audit",
+    severity: "high",
+    owner: ADMINISTRATION,
+    surfaces: ["user_list", "users", "activity_log"],
+    inputs: [
+      "user_list_readable", "users_readable", "manager_count", "max_managers", "shared_email_count", "active_user_count",
+      "last_login_age_days", "generic_account_count", "pending_activation_user_count", "roleless_active_user_count",
+      "statusless_user_count", "undated_login_user_count", "loginless_user_count", "users_complete", "view_scope_partial",
+    ],
+    constants: { inactive_user_days: 90 },
+    rules: [
+      rule("manual", all(ne("user_list_readable", true), ne("users_readable", true))),
+      rule("fail", gt("manager_count", path("max_managers"))),
+      rule("fail", gt("shared_email_count", 0)),
+      rule("manual", any(ne("user_list_readable", true), ne("users_readable", true))),
+      rule("manual", eq("active_user_count", 0)),
+      rule("warn", any(
+        some("last_login_age_days", gt("$", path("inactive_user_days"))),
+        gt("generic_account_count", 0),
+        gt("pending_activation_user_count", 0),
+      )),
+      rule("warn", any(
+        gt("roleless_active_user_count", 0),
+        gt("statusless_user_count", 0),
+        gt("undated_login_user_count", 0),
+        gt("loginless_user_count", 0),
+        ne("users_complete", true),
+        scopePartial,
+      )),
+      rule("pass", always),
+    ],
+    completeness: { users_complete: qpsComplete("users", "QPS user search", "5000 users") },
+    decision: "Manual when neither the user list nor the QPS user search is readable. Fail when more active users hold a manager, super user, or administrator role than max_managers, or when more than one active user holds the same email address. Manual when either user read is unreadable or no active user is returned. Warn when an active user last logged in more than inactive_user_days (90) days ago, when an active user's login names a shared, generic, service, admin, or test account, or when a user awaits activation. Warn instead of pass when an active user has no role or no parseable last login date, when a user list row has no status or no login, when the QPS user search stopped early, or when the configured user's view covers only part of the subscription. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Two managers, no shared email, and every active user logged in within 90 days.", {
+        user_list_readable: true, users_readable: true, manager_count: 2, max_managers: 5, shared_email_count: 0, active_user_count: 10,
+        last_login_age_days: [1, 30, 90], generic_account_count: 0, pending_activation_user_count: 0, roleless_active_user_count: 0,
+        statusless_user_count: 0, undated_login_user_count: 0, loginless_user_count: 0, users_complete: true, view_scope_partial: false,
+      }),
+      example("noncompliant", "fail", "Six active users hold a manager role against a limit of five.", {
+        user_list_readable: true, users_readable: true, manager_count: 6, max_managers: 5,
+      }),
+      example("partial", "warn", "Five managers meet the limit, but one active user last logged in 91 days ago.", {
+        user_list_readable: true, users_readable: true, manager_count: 5, max_managers: 5, shared_email_count: 0, active_user_count: 10,
+        last_login_age_days: [91, 4],
+      }),
+      example("unreadable", "manual", "Both user reads were refused.", { user_list_readable: false, users_readable: false }),
+    ],
+  },
+  {
+    id: "QUALYS-C15",
+    control: 15,
+    title: "Web application inventory",
+    severity: "medium",
+    owner: ADMINISTRATION,
+    surfaces: ["was_webapps", "was_scans", "was_scan_history", "was_auth_records", "was_schedules", "users", "user_list", "activity_log"],
+    inputs: [
+      "was_webapps_readable", "was_scans_readable", "was_auth_records_readable", "web_app_count", "never_scanned_web_app_count",
+      "resolved_web_app_scan_age_days", "lookback_days", "was_scan_history_readable", "was_schedules_readable",
+      "was_auth_record_age_days", "unresolved_web_app_count", "undated_was_auth_record_count", "was_schedules_without_active_flag_count",
+      "was_webapps_complete", "was_scans_complete", "was_scan_history_complete", "was_auth_records_complete", "was_schedules_complete",
+      "view_scope_partial",
+    ],
+    constants: { stale_was_auth_days: 180 },
+    rules: [
+      rule("manual", any(ne("was_webapps_readable", true), ne("was_scans_readable", true), ne("was_auth_records_readable", true))),
+      rule("manual", eq("web_app_count", 0)),
+      rule("fail", any(
+        gt("never_scanned_web_app_count", 0),
+        some("resolved_web_app_scan_age_days", gt("$", path("lookback_days"))),
+      )),
+      rule("manual", any(ne("was_scan_history_readable", true), ne("was_schedules_readable", true))),
+      rule("warn", some("was_auth_record_age_days", gt("$", path("stale_was_auth_days")))),
+      rule("warn", any(
+        gt("unresolved_web_app_count", 0),
+        gt("undated_was_auth_record_count", 0),
+        gt("was_schedules_without_active_flag_count", 0),
+        ne("was_webapps_complete", true),
+        ne("was_scans_complete", true),
+        ne("was_scan_history_complete", true),
+        ne("was_auth_records_complete", true),
+        ne("was_schedules_complete", true),
+        scopePartial,
+      )),
+      rule("pass", always),
+    ],
+    completeness: {
+      was_webapps_complete: qpsComplete("was_webapps", "web application search", "5000 web applications"),
+      was_scans_complete: qpsComplete("was_scans", "lookback scan search", "5000 scans"),
+      was_scan_history_complete: completeFrom(
+        "false when a history batch of up to 100 web applications stopped with more records left, or when web applications were left unrequested at 5000 scans; true when no web application needed history.",
+        [{ surfaceId: "was_scan_history", falseWhen: ["truncated"] }],
+      ),
+      was_auth_records_complete: qpsComplete("was_auth_records", "WAS authentication record search", "5000 records"),
+      was_schedules_complete: qpsComplete("was_schedules", "WAS schedule search", "5000 schedules"),
+    },
+    decision: "Manual when the web application search, the lookback scan search, or the WAS authentication record search is unreadable, or when no web application is returned. Fail when a web application has no finished vulnerability scan, or when its newest finished vulnerability scan is more than lookback_days days old. Manual when the scan history or the WAS schedule search is unreadable. Warn when a WAS authentication record was last updated more than stale_was_auth_days (180) days ago. Warn instead of pass when a web application's newest scan could not be resolved, when a WAS authentication record carries no date, when a WAS schedule carries no active flag, when any of the five searches stopped early, or when the configured user's view covers only part of the subscription. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every web application had a finished vulnerability scan within 30 days.", {
+        was_webapps_readable: true, was_scans_readable: true, was_auth_records_readable: true, web_app_count: 3,
+        never_scanned_web_app_count: 0, resolved_web_app_scan_age_days: [2, 10, 30], lookback_days: 30, was_scan_history_readable: true,
+        was_schedules_readable: true, was_auth_record_age_days: [180], unresolved_web_app_count: 0, undated_was_auth_record_count: 0,
+        was_schedules_without_active_flag_count: 0, was_webapps_complete: true, was_scans_complete: true, was_scan_history_complete: true,
+        was_auth_records_complete: true, was_schedules_complete: true, view_scope_partial: false,
+      }),
+      example("noncompliant", "fail", "One web application's newest finished scan is 31 days old.", {
+        was_webapps_readable: true, was_scans_readable: true, was_auth_records_readable: true, web_app_count: 3,
+        never_scanned_web_app_count: 0, resolved_web_app_scan_age_days: [31, 2], lookback_days: 30,
+      }),
+      example("partial", "warn", "A WAS authentication record was last updated 181 days ago.", {
+        was_webapps_readable: true, was_scans_readable: true, was_auth_records_readable: true, web_app_count: 3,
+        never_scanned_web_app_count: 0, resolved_web_app_scan_age_days: [2], lookback_days: 30, was_scan_history_readable: true,
+        was_schedules_readable: true, was_auth_record_age_days: [181],
+      }),
+      example("unreadable", "manual", "The scan history for an unscanned web application was refused.", {
+        was_webapps_readable: true, was_scans_readable: true, was_auth_records_readable: true, web_app_count: 3,
+        never_scanned_web_app_count: 0, resolved_web_app_scan_age_days: [2], lookback_days: 30, was_scan_history_readable: false,
+      }),
+    ],
+  },
+  {
+    id: "QUALYS-C19",
+    control: 19,
+    title: "Activity log monitoring",
+    severity: "medium",
+    owner: ADMINISTRATION,
+    surfaces: ["activity_log"],
+    inputs: ["activity_log_readable", "activity_entry_count"],
+    rules: [
+      rule("manual", ne("activity_log_readable", true)),
+      rule("manual", eq("activity_entry_count", 0)),
+      rule("warn", always),
+    ],
+    decision: "Manual when the activity log is unreadable or holds no row since the lookback start. Otherwise warn, because activity log monitoring needs a reviewer.",
+    examples: [
+      example("partial", "warn", "The activity log holds 120 rows in the lookback window.", { activity_log_readable: true, activity_entry_count: 120 }),
+      example("unreadable", "manual", "The activity log was refused.", { activity_log_readable: false }),
+    ],
+  },
+];
+
 const toCheck = (check: QualysCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -1546,6 +1818,7 @@ const checks: readonly BatchCheckDefinition[] = [
   ...SCAN_COVERAGE_CHECKS,
   ...ASSET_INVENTORY_CHECKS,
   ...VULNERABILITY_CHECKS,
+  ...ADMINISTRATION_CHECKS,
 ].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
@@ -1602,7 +1875,7 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
   category: "vulnerability-application-security",
   summary: "Portable contract for the shipped Qualys scan coverage, asset inventory, vulnerability management, and administration assessments over the Qualys VM/PC, Administration, Asset Management, Cloud Agent, and WAS APIs.",
   sourceModule: "cli/extensions/grc-tools/qualys.ts",
-  baseServices: [VM_SERVICE, ADMIN_SERVICE, AM_SERVICE, CA_SERVICE],
+  baseServices: [VM_SERVICE, ADMIN_SERVICE, AM_SERVICE, CA_SERVICE, WAS_SERVICE],
   authentication: QUALYS_AUTH_RESOLVER,
   permissions: [
     {
@@ -1624,6 +1897,12 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
       value: "Qualys Policy Compliance",
       unlocks: ["compliance_policies"],
     },
+    {
+      id: "web-application-scanning-module",
+      kind: "license",
+      value: "Qualys Web Application Scanning",
+      unlocks: ["was_webapps", "was_scans", "was_scan_history", "was_auth_records", "was_schedules"],
+    },
   ],
   surfaces: QUALYS_SURFACES,
   checks,
@@ -1632,11 +1911,12 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
     qualys_assess_scan_coverage: idsFor(SCAN_COVERAGE),
     qualys_assess_asset_inventory: idsFor(ASSET_INVENTORY),
     qualys_assess_vulnerability_management: idsFor(VULNERABILITY_MANAGEMENT),
+    qualys_assess_administration: idsFor(ADMINISTRATION),
     qualys_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
     {
-      surfaceIds: ["scheduled_scans", "scans", "option_profiles", "appliances", "compliance_policies"],
+      surfaceIds: ["scheduled_scans", "scans", "option_profiles", "appliances", "compliance_policies", "scheduled_reports", "reports"],
       cursorFields: ["WARNING/URL"],
       pageSize: null,
       itemCap: 5000,
@@ -1689,8 +1969,44 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
       totalSemantics: "One read; a WARNING/URL continuation is not followed and marks the list partial.",
       stopConditions: ["The first response"],
     },
+    {
+      surfaceIds: ["user_list"],
+      cursorFields: [],
+      pageSize: null,
+      itemCap: "none",
+      pageCap: 1,
+      totalSemantics: "One read of the whole user list, which carries no continuation.",
+      stopConditions: ["The first response"],
+    },
+    {
+      surfaceIds: ["activity_log"],
+      cursorFields: [],
+      pageSize: 5000,
+      itemCap: 5000,
+      pageCap: 1,
+      totalSemantics: "One read of up to 5000 rows since the lookback start (truncation_limit); 5000 rows mark the log partial, because older rows in the window may be left.",
+      stopConditions: ["The first response"],
+    },
     qpsWalk(["users"], "Pages of 500 users (limitResults)", 5000, "5000 users"),
-    qpsWalk(["connectors"], "Pages of 100 records (limitResults)", 5000, "5000 records"),
+    qpsWalk(
+      ["connectors", "was_webapps", "was_scans", "was_auth_records", "was_schedules"],
+      "Pages of 100 records (limitResults)",
+      5000,
+      "5000 records",
+    ),
+    {
+      surfaceIds: ["was_scan_history"],
+      cursorFields: ["webApp.id", "hasMoreRecords", "lastId"],
+      pageSize: null,
+      itemCap: 5000,
+      pageCap: 25,
+      totalSemantics: "The web applications without a finished vulnerability scan in the lookback search are requested in batches of 100 IDs (webApp.id IN), each walked in pages of 100 scans (limitResults) with the criterion id GREATER than the previous page's lastId. hasMoreRecords, or a full page when it is absent, means more records follow; a batch left with more records at the 25-page cap or on a page without lastId stops the history, and web applications left unrequested at 5000 scans mark it partial.",
+      stopConditions: [
+        "Every batch of up to 100 web application IDs requested",
+        "A batch that stops with more records left, which marks the history partial",
+        "5000 scans collected across batches, which marks the history partial when web applications are left unrequested",
+      ],
+    },
     qpsWalk(
       ["cloud_agents"],
       "Pages of 1000 agents (limitResults), up to host_limit agents (default 5000, set from 1 through 200000)",
