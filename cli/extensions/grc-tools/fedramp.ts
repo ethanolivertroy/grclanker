@@ -16,6 +16,8 @@ import {
   type FedrampProcessRecord,
   type FedrampRequirementRecord,
   domainIndicators,
+  fedrampUpdateLines,
+  formatFedrampNotification,
   inspectFedrampOfficialSources,
   loadFedrampCatalog,
   normalizeFedrampApplicability,
@@ -623,6 +625,17 @@ function formatRequirementText(
     }
   }
 
+  if (requirement.notifications.length > 0) {
+    lines.push("", "Notifications:");
+    for (const notification of requirement.notifications) {
+      lines.push(`- ${formatFedrampNotification(notification)}`);
+    }
+  }
+
+  if (requirement.controls.length > 0) {
+    lines.push("", `Mapped Rev5 controls: ${requirement.controls.join(", ")}`);
+  }
+
   if (requirement.terms.length > 0) {
     lines.push("", `Terms: ${requirement.terms.join(", ")}`);
   }
@@ -631,8 +644,12 @@ function formatRequirementText(
     lines.push("", `Affects: ${requirement.affects.join(", ")}`);
   }
 
+  if (requirement.note) {
+    lines.push("", `Note: ${requirement.note}`);
+  }
+
   if (requirement.updated.length > 0) {
-    lines.push("", `Recent update: ${requirement.updated[0]!.date} — ${requirement.updated[0]!.comment}`);
+    lines.push("", ...fedrampUpdateLines(requirement.updated));
   }
 
   lines.push(

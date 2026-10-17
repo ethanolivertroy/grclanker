@@ -1,6 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -30,6 +38,7 @@ import {
   generateFedrampAdsStarterBundle,
   inferFedrampArtifactSuggestions,
   inferFedrampWorkstreams,
+  registerFedrampTools,
 } from "../dist/extensions/grc-tools/fedramp.js";
 
 function jsonResponse(payload) {
@@ -284,6 +293,43 @@ test("search and resolvers support current IDs, unique names, and legacy process
   }
 });
 
+test("normalizeFedrampConsolidatedRules keeps requirement control mappings and notification rules", () => {
+  const fixture = structuredClone(consolidatedRulesFixture);
+  const rule = fixture.FRR.CDS.data.all.CSO["CDS-CSO-PUB"];
+  rule.controls = ["ac-18", "sc-8.1"];
+  rule.notification = [
+    {
+      party: "FedRAMP",
+      method: "form",
+      target: "https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=51829466938011",
+      name: "[CSP] Notification of Changes",
+    },
+    { party: "Agency Customers", method: "varies" },
+    { method: "email", target: "info@fedramp.gov" },
+  ];
+
+  const catalog = normalizeFedrampConsolidatedRules(fixture);
+  const requirement = catalog.requirements.find((item) => item.id === "CDS-CSO-PUB");
+  const unmapped = catalog.requirements.find((item) => item.id === "CDS-TRC-API");
+
+  assert.deepEqual(requirement?.controls, ["ac-18", "sc-8.1"]);
+  assert.deepEqual(requirement?.notifications, [
+    {
+      party: "FedRAMP",
+      method: "form",
+      target: "https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=51829466938011",
+      name: "[CSP] Notification of Changes",
+    },
+    { party: "Agency Customers", method: "varies", target: null, name: null },
+  ]);
+  assert.deepEqual(unmapped?.controls, []);
+  assert.deepEqual(unmapped?.notifications, []);
+  assert.equal(
+    searchFedrampCatalog(catalog, "sc-8.1", { section: "requirement" })[0]?.id,
+    "CDS-CSO-PUB",
+  );
+});
+
 test("loadFedrampCatalog writes cache and falls back to stale disk data if refresh fails", async () => {
   const originalFetch = globalThis.fetch;
   const homeDir = mkdtempSync(join(tmpdir(), "grclanker-fedramp-home-"));
@@ -379,6 +425,127 @@ test("loadFedrampCatalog and inspectFedrampOfficialSources keep caches in memory
     globalThis.fetch = originalFetch;
     clearFedrampCachesForTests();
     rmSync(join(homeDir, ".."), { recursive: true, force: true });
+  }
+});
+
+test("loadFedrampCatalog refetches instead of serving a cache written before requirement controls existed", async () => {
+  const originalFetch = globalThis.fetch;
+  const homeDir = mkdtempSync(join(tmpdir(), "grclanker-fedramp-schema-"));
+  const stateDir = join(homeDir, ".state", "fedramp");
+  const rawUrl = "https://raw.githubusercontent.com/FedRAMP/rules/main/fedramp-consolidated-rules.json";
+  const fixture = structuredClone(consolidatedRulesFixture);
+  fixture.FRR.CDS.data.all.CSO["CDS-CSO-PUB"].controls = ["ra-3"];
+  const previousShape = normalizeFedrampConsolidatedRules(consolidatedRulesFixture);
+  for (const requirement of previousShape.requirements) {
+    delete requirement.controls;
+    delete requirement.notifications;
+  }
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    join(stateDir, "catalog.json"),
+    JSON.stringify({
+      schemaVersion: 2,
+      fetchedAt: new Date().toISOString(),
+      catalog: previousShape,
+      provenance: {
+        org: "FedRAMP",
+        repo: "rules",
+        branch: "main",
+        repoUrl: "https://github.com/FedRAMP/rules",
+        path: "fedramp-consolidated-rules.json",
+        rawUrl,
+        blobSha: null,
+        fileHtmlUrl: null,
+        repoUpdatedAt: null,
+        version: "2026.07.02.02",
+        upstreamLastUpdated: "2026-07-02",
+      },
+    }),
+  );
+  let rulesFetches = 0;
+
+  globalThis.fetch = async (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url === rawUrl) {
+      rulesFetches += 1;
+      return jsonResponse(fixture);
+    }
+    return new Response("not found", { status: 404, statusText: "Not Found" });
+  };
+
+  clearFedrampCachesForTests();
+
+  try {
+    const loaded = await loadFedrampCatalog({ homeDir });
+    assert.equal(loaded.cacheStatus, "live");
+    assert.equal(rulesFetches, 1);
+    assert.deepEqual(
+      loaded.catalog.requirements.find((item) => item.id === "CDS-CSO-PUB")?.controls,
+      ["ra-3"],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearFedrampCachesForTests();
+    rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("fedramp_get_requirement shows notifications, control mappings, notes, and every update", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalHome = process.env.GRCLANKER_HOME;
+  const homeBase = mkdtempSync(join(tmpdir(), "grclanker-fedramp-tool-"));
+  const fixture = structuredClone(consolidatedRulesFixture);
+  const rule = fixture.FRR.CDS.data.all.CSO["CDS-CSO-PUB"];
+  rule.controls = ["ac-18", "sc-8.1"];
+  rule.notes = ["Agencies rely on this information.", "Keep both formats in sync."];
+  rule.notification = [
+    {
+      party: "FedRAMP",
+      method: "form",
+      target: "https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=51829466938011",
+      name: "[CSP] Notification of Changes",
+    },
+  ];
+  rule.updated = [
+    { date: "2026-10-13", comment: "Updated control mappings." },
+    { date: "2026-06-24", comment: "Official consolidated rules launch." },
+  ];
+  const tools = new Map();
+  registerFedrampTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+
+  process.env.GRCLANKER_HOME = homeBase;
+  globalThis.fetch = async (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url === "https://raw.githubusercontent.com/FedRAMP/rules/main/fedramp-consolidated-rules.json") {
+      return jsonResponse(fixture);
+    }
+    return new Response("not found", { status: 404, statusText: "Not Found" });
+  };
+
+  clearFedrampCachesForTests();
+
+  try {
+    const result = await tools
+      .get("fedramp_get_requirement")
+      .execute("call-1", { query: "CDS-CSO-PUB" });
+    const text = result.content[0].text;
+
+    assert.match(
+      text,
+      /\nNotifications:\n- Notify FedRAMP via form: \[CSP\] Notification of Changes \(https:\/\/help\.fedramp\.gov\/hc\/en-us\/requests\/new\?ticket_form_id=51829466938011\)\n\nMapped Rev5 controls: ac-18, sc-8\.1\n/,
+    );
+    assert.match(text, /\nNote: Agencies rely on this information\.\nKeep both formats in sync\.\n/);
+    assert.match(
+      text,
+      /\nUpdates:\n- 2026-10-13: Updated control mappings\.\n- 2026-06-24: Official consolidated rules launch\.\n/,
+    );
+    assert.doesNotMatch(text, /\u2014/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalHome === undefined) delete process.env.GRCLANKER_HOME;
+    else process.env.GRCLANKER_HOME = originalHome;
+    clearFedrampCachesForTests();
+    rmSync(homeBase, { recursive: true, force: true });
   }
 });
 
@@ -531,6 +698,82 @@ test("buildFedrampDocsSnapshot leaves the H1 to the docs page title", () => {
   assert.match(
     ksiPage,
     /repository\.\n\nDomain code: [^\n]+\n\n## Theme\n\nCloud services are built to keep their intended state\.\n\n## Indicators\n/,
+  );
+});
+
+test("buildFedrampDocsSnapshot renders notifications, control mappings, and every update", () => {
+  const fixture = structuredClone(consolidatedRulesFixture);
+  const rule = fixture.FRR.CDS.data.all.CSO["CDS-CSO-PUB"];
+  rule.controls = ["ac-18", "sc-8.1"];
+  rule.notification = [
+    {
+      party: "FedRAMP",
+      method: "form",
+      target: "https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=51829466938011",
+      name: "[CSP] Notification of Changes",
+    },
+    { party: "FedRAMP", method: "email", target: "info@fedramp.gov", name: "info@fedramp.gov" },
+    {
+      party: "Provider",
+      method: "varies",
+      target: "varies by provider",
+      name: "The provider's security contact email or form.",
+    },
+    {
+      party: "All Necessary Parties",
+      method: "update",
+      target: "trust center",
+      name: "Provider's Trust Center or USDA Connect",
+    },
+    {
+      party: "Everyone",
+      method: "web",
+      target: "https://www.fedramp.gov/notices",
+      name: "FedRAMP Public Notices",
+    },
+  ];
+  rule.updated = [
+    { date: "2026-10-13", comment: "Updated control mappings." },
+    { date: "2026-06-24", comment: "Official consolidated rules launch." },
+  ];
+  fixture.KSI.CNA.indicators["KSI-CNA-CDS"].updated = [
+    { date: "2026-10-13", comment: "Updated control mappings." },
+    { date: "2026-06-24", comment: "Official consolidated rules launch." },
+  ];
+
+  const files = buildFedrampDocsSnapshot(
+    normalizeFedrampConsolidatedRules(fixture),
+    docsSnapshotSources,
+  );
+  const processPage =
+    files.find((file) => file.path === "fedramp/processes/certification-data-sharing.md")
+      ?.content ?? "";
+  const ksiPage =
+    files.find((file) => file.path === "fedramp/ksi/cloud-native-architecture.md")?.content ?? "";
+
+  assert.match(
+    processPage,
+    new RegExp(
+      [
+        "\\nNotifications:",
+        "- Notify FedRAMP via form: \\[CSP\\] Notification of Changes \\(https://help\\.fedramp\\.gov/hc/en-us/requests/new\\?ticket_form_id=51829466938011\\)",
+        "- Notify FedRAMP via email: info@fedramp\\.gov",
+        "- Notify Provider via the appropriate recipient-specific method: The provider's security contact email or form \\(varies by provider\\)",
+        "- Notify All Necessary Parties via an update: Provider's Trust Center or USDA Connect \\(trust center\\)",
+        "- Notify Everyone via the web: FedRAMP Public Notices \\(https://www\\.fedramp\\.gov/notices\\)",
+        "",
+        "Mapped Rev5 controls: `ac-18`, `sc-8\\.1`\\n",
+      ].join("\\n"),
+    ),
+  );
+  assert.match(
+    processPage,
+    /\nUpdates:\n- 2026-10-13: Updated control mappings\.\n- 2026-06-24: Official consolidated rules launch\.\n/,
+  );
+  assert.match(processPage, /\nRecent update \(2026-06-24\): Official consolidated rules launch\.\n/);
+  assert.match(
+    ksiPage,
+    /\nUpdates:\n- 2026-10-13: Updated control mappings\.\n- 2026-06-24: Official consolidated rules launch\.\n/,
   );
 });
 
