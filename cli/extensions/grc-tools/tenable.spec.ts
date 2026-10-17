@@ -344,6 +344,7 @@ const TENABLE_INPUTS: Readonly<Record<string, string>> = {
   linked_scanner_connect_age_days: "For each linked scanner appliance whose last_connect parses as a timestamp, the days from that timestamp to the assessment time as a fraction, floored at 0.",
   undated_linked_scanner_count: "Number of linked scanner appliances whose last_connect does not parse as a timestamp.",
   outdated_linked_scanner_count: "Number of linked scanner appliances whose ui_version is lower than the newest dotted ui_version among the linked appliances.",
+  scanner_list_truncated: "True when the scanner dataset given to the assessment is marked truncated. The collector reads GET /scanners in one request and never marks it truncated.",
   plugin_stale_hours: "The plugin_stale_hours assessment option in hours, clamped to 1 through 720; default 24.",
   server_plugin_set_age_hours: "Hours from the plugin_set of GET /server/properties, else its loaded_plugin_set, read as a twelve-digit YYYYMMDDHHMM UTC stamp, to the assessment time; null when neither parses.",
   scanner_plugin_set_age_hours: "For each GET /scanners entry, including cloud scanners, pools, and groups, whose loaded_plugin_set parses as a twelve-digit YYYYMMDDHHMM UTC stamp, the hours from that stamp to the assessment time; empty when the scanner list is unreadable.",
@@ -935,7 +936,7 @@ const SENSOR_COVERAGE_CHECKS: readonly TenableCheck[] = [
     surfaces: ["scanners", "users"],
     inputs: [
       "scanners_readable", "scanner_count", "linked_scanner_count", "unlinked_scanner_count", "off_scanner_count", "linked_scanner_connect_age_days",
-      "undated_linked_scanner_count", "outdated_linked_scanner_count", "caller_is_administrator",
+      "undated_linked_scanner_count", "outdated_linked_scanner_count", "caller_is_administrator", "scanner_list_truncated",
     ],
     rules: [
       rule("manual", ne("scanners_readable", true)),
@@ -950,22 +951,26 @@ const SENSOR_COVERAGE_CHECKS: readonly TenableCheck[] = [
         gt("undated_linked_scanner_count", 0),
         gt("outdated_linked_scanner_count", 0),
         ne("caller_is_administrator", true),
+        eq("scanner_list_truncated", true),
       )),
       rule("pass", always),
     ],
-    decision: "Manual when the scanner list is unreadable, empty, or holds only Tenable-managed cloud scanners, pools, and groups. Fail when any linked scanner appliance is not linked, is not on, or last connected more than one day before the assessment. Warn when a linked appliance has no last_connect or runs an older ui_version than the newest linked appliance, or when the key is not confirmed as Administrator. Otherwise pass.",
+    decision: "Manual when the scanner list is unreadable, empty, or holds only Tenable-managed cloud scanners, pools, and groups. Fail when any linked scanner appliance is not linked, is not on, or last connected more than one day before the assessment. Warn when a linked appliance has no last_connect or runs an older ui_version than the newest linked appliance, when the key is not confirmed as Administrator, or when the scanner list is marked truncated. Otherwise pass.",
     examples: [
       example("compliant", "pass", "Both linked appliances are on, linked, connected today, and current, and the key is Administrator.", {
         scanners_readable: true, scanner_count: 3, linked_scanner_count: 2, unlinked_scanner_count: 0, off_scanner_count: 0,
         linked_scanner_connect_age_days: [0.1, 0.5], undated_linked_scanner_count: 0, outdated_linked_scanner_count: 0, caller_is_administrator: true,
+        scanner_list_truncated: false,
       }),
       example("noncompliant", "fail", "One linked appliance is off.", {
         scanners_readable: true, scanner_count: 3, linked_scanner_count: 2, unlinked_scanner_count: 0, off_scanner_count: 1,
         linked_scanner_connect_age_days: [0.1, 0.5], undated_linked_scanner_count: 0, outdated_linked_scanner_count: 0, caller_is_administrator: true,
+        scanner_list_truncated: false,
       }),
       example("partial", "warn", "Every appliance is healthy, but the key is not confirmed as Administrator.", {
         scanners_readable: true, scanner_count: 3, linked_scanner_count: 2, unlinked_scanner_count: 0, off_scanner_count: 0,
         linked_scanner_connect_age_days: [0.1, 0.5], undated_linked_scanner_count: 0, outdated_linked_scanner_count: 0, caller_is_administrator: false,
+        scanner_list_truncated: false,
       }),
       example("unreadable", "manual", "Only cloud scanners are visible, so no linked appliance exists to evaluate.", {
         scanners_readable: true, scanner_count: 2, linked_scanner_count: 0,

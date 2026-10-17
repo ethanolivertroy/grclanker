@@ -4246,6 +4246,18 @@ test("boundary scenarios: each threshold edge reaches the verdict on either side
   assert.deepEqual(mismatches, []);
 });
 
+test("TENABLE-07 caps a healthy scanner list at warn when the scanner dataset given to the assessment is marked truncated", async () => {
+  const routes = healthyRoutes();
+  connectedScanners(routes);
+  const data = await collectTenableSensorCoverageData(clientsFor(routes), { now: NOW });
+  assert.equal(data.scanners.truncated, false, "the collector reads GET /scanners in one request");
+  assert.equal(byId([assessTenableSensorCoverage(data, { now: NOW })], "TENABLE-07").status, "pass");
+  const truncated = { ...data, scanners: { ...data.scanners, truncated: true } };
+  const health = byId([assessTenableSensorCoverage(truncated, { now: NOW })], "TENABLE-07");
+  assert.equal(health.status, "warn", health.summary);
+  assert.equal(health.evidence.inventory_truncated, true);
+});
+
 function representativeRoutes() {
   const routes = { ...healthyRoutes(), ...healthyScRoutes() };
   const oldSeconds = Math.floor((NOW - 120 * 86_400_000) / 1000);

@@ -4005,6 +4005,7 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
       undated_linked_scanner_count: undated.length,
       outdated_linked_scanner_count: outdated.length,
       caller_is_administrator: callerIsAdministrator === true,
+      scanner_list_truncated: data.scanners.truncated === true,
     });
     findings.push(withPartialView(finding(
       7,
