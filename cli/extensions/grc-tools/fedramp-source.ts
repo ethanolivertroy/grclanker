@@ -7,7 +7,7 @@ import { persistentCachesEnabled } from "./shared.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SOURCE_STATUS_TTL_MS = 6 * 60 * 60 * 1000;
-const FEDRAMP_CACHE_SCHEMA_VERSION = 2;
+const FEDRAMP_CACHE_SCHEMA_VERSION = 3;
 const GITHUB_API = "https://api.github.com";
 const GITHUB_ORG = "FedRAMP";
 
@@ -116,6 +116,13 @@ export interface FedrampClassVariantRecord {
   timeframeNum: number | null;
 }
 
+export interface FedrampNotificationRecord {
+  party: string;
+  method: string;
+  target: string | null;
+  name: string | null;
+}
+
 export interface FedrampRequirementRecord {
   id: string;
   fka: string | null;
@@ -133,8 +140,10 @@ export interface FedrampRequirementRecord {
   primaryKeyWord: string | null;
   affects: string[];
   terms: string[];
+  controls: string[];
   followingInformation: string[];
   note: string | null;
+  notifications: FedrampNotificationRecord[];
   timeframeType: string | null;
   timeframeNum: number | null;
   updated: FedrampUpdatedNote[];
@@ -297,6 +306,43 @@ function asUpdatedNotes(value: unknown): FedrampUpdatedNote[] {
       return { date, comment };
     })
     .filter((entry): entry is FedrampUpdatedNote => Boolean(entry));
+}
+
+function asNotifications(value: unknown): FedrampNotificationRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => {
+      const item = asRecord(entry);
+      const party = asString(item.party);
+      const method = asString(item.method);
+      if (!party || !method) return null;
+      return { party, method, target: asString(item.target), name: asString(item.name) };
+    })
+    .filter((entry): entry is FedrampNotificationRecord => Boolean(entry));
+}
+
+const NOTIFICATION_METHOD_PHRASES: Record<string, string> = {
+  update: "an update",
+  varies: "the appropriate recipient-specific method",
+  web: "the web",
+};
+
+/** One notification rule as a sentence, worded like the official FedRAMP pages. */
+export function formatFedrampNotification(notification: FedrampNotificationRecord): string {
+  const method = NOTIFICATION_METHOD_PHRASES[notification.method.toLowerCase()] ?? notification.method;
+  const lead = `Notify ${notification.party} via ${method}`;
+  const label = (notification.name ?? notification.target)?.replace(/\.$/, "");
+  if (!label) return lead;
+  const target = notification.target;
+  return target && target !== label ? `${lead}: ${label} (${target})` : `${lead}: ${label}`;
+}
+
+export function fedrampUpdateLines(updated: FedrampUpdatedNote[]): string[] {
+  if (updated.length === 0) return [];
+  if (updated.length === 1) {
+    return [`Recent update (${updated[0]!.date}): ${updated[0]!.comment}`];
+  }
+  return ["Updates:", ...updated.map((note) => `- ${note.date}: ${note.comment}`)];
 }
 
 function truncate(text: string, length = 140): string {
@@ -737,8 +783,10 @@ export function normalizeFedrampConsolidatedRules(
             primaryKeyWord: aggregateKeyword(requirement, classVariants),
             affects: asStringArray(requirement.affects),
             terms: asStringArray(requirement.terms),
+            controls: asStringArray(requirement.controls),
             followingInformation: aggregateFollowingInformation(requirement, classVariants),
             note: directNote ?? commonVariantString(classVariants, (variant) => variant.note),
+            notifications: asNotifications(requirement.notification),
             timeframeType:
               asString(requirement.timeframe_type) ??
               commonVariantString(classVariants, (variant) => variant.timeframeType),
@@ -1158,6 +1206,7 @@ export function searchFedrampCatalog(
           requirement.processShortName,
           requirement.labelCode,
           requirement.labelName,
+          ...requirement.controls,
           ...requirement.terms,
           ...requirement.followingInformation,
         ],

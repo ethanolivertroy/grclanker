@@ -8,6 +8,8 @@ import type {
 } from "./fedramp-source.js";
 import {
   domainIndicators,
+  fedrampUpdateLines,
+  formatFedrampNotification,
   processRequirements,
   requirementCountsByApplicability,
 } from "./fedramp-source.js";
@@ -85,6 +87,21 @@ function requirementMarkdown(requirement: FedrampRequirementRecord): string {
     lines.push("", "Checklist items:", markdownList(requirement.followingInformation));
   }
 
+  if (requirement.notifications.length > 0) {
+    lines.push(
+      "",
+      "Notifications:",
+      markdownList(requirement.notifications.map(formatFedrampNotification)),
+    );
+  }
+
+  if (requirement.controls.length > 0) {
+    lines.push(
+      "",
+      `Mapped Rev5 controls: ${requirement.controls.map((control) => `\`${control}\``).join(", ")}`,
+    );
+  }
+
   if (requirement.terms.length > 0) {
     lines.push("", `Terms: ${requirement.terms.map((term) => `\`${term}\``).join(", ")}`);
   }
@@ -102,10 +119,7 @@ function requirementMarkdown(requirement: FedrampRequirementRecord): string {
   }
 
   if (requirement.updated.length > 0) {
-    lines.push(
-      "",
-      `Recent update (${requirement.updated[0]!.date}): ${requirement.updated[0]!.comment}`,
-    );
+    lines.push("", ...fedrampUpdateLines(requirement.updated));
   }
 
   return lines.join("\n");
@@ -250,10 +264,7 @@ function ksiDomainPage(
       lines.push(`Terms: ${indicator.terms.map((term) => `\`${term}\``).join(", ")}`, "");
     }
     if (indicator.updated.length > 0) {
-      lines.push(
-        `Recent update (${indicator.updated[0]!.date}): ${indicator.updated[0]!.comment}`,
-        "",
-      );
+      lines.push(...fedrampUpdateLines(indicator.updated), "");
     }
   }
 

@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the CPO FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -64,11 +64,15 @@ Varies by certification class:
 - **Class C MUST:** Providers seeking Class C Certification MUST also include the overall summary of their FedRAMP independent assessment, supplied by the assessor per IVV-IAS-OSA (Overall Summary of Assessment), in their Certification Package Overview.
 - **Class D MUST:** Providers seeking Class D Certification MUST also include the overall summary of their FedRAMP independent assessment, supplied by the assessor per IVV-IAS-OSA (Overall Summary of Assessment), in their Certification Package Overview.
 
+Mapped Rev5 controls: `ca-2`, `ca-2.1`, `ca-2.2`, `ca-7.1`
+
 Terms: `Certification Package`, `FedRAMP Independent Assessment`
 
 Affects: Providers
 
-Recent update (2026-06-25): Added after official launch to clarify that the provider is required to supply this artifact.
+Updates:
+- 2026-10-13: Updated control mappings: added ca-2, ca-2.1, ca-2.2, ca-7.1.
+- 2026-06-25: Added after official launch to clarify that the provider is required to supply this artifact.
 
 ### `CPO-CSO-OVR` MUST: Overview of the Cloud Service Offering
 
@@ -134,4 +138,6 @@ Note: This maximum timeframe for Rev5 is the absolutely poorest worst case for h
 
 FedRAMP 20x Certifications expect providers to maintain their FedRAMP Certification Packages as changes occur to ensure they are never out of date.
 
-Recent update (2026-07-14): Removed reference to class A. All class A certifications are 20x.
+Updates:
+- 2026-07-14: Removed reference to class A. All class A certifications are 20x.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.

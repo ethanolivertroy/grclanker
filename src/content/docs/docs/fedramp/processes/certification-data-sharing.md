@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the CDS FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -156,7 +156,7 @@ Checklist items:
 - Sales Contact Information
 - Security Contact Information
 - Product Website Link
-- Link to Product Logo
+- Link to Product Logo (must be a valid image link, properly named, that will display in a browser without processing - transparent PNG preferred)
 - Overall Service Description
 - Detailed list of specific services and their security categories (see CDS-CSO-SVC (Public Service List) (Service List))
 - Link to Secure Configuration Guidance
@@ -171,7 +171,11 @@ Affects: Providers
 
 Note: Generally, this information should be available on a public webpage or publicly shared in a FedRAMP-compatible trust center.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+The JSON data for this rule will be consumed by FedRAMP and agency GRC tools using automation with web-based tools. Do not expect FedRAMP or your customers to download this data directly, it should be accessible for common web frameworks. FedRAMP strongly recommends that application engineering experts be involved in making public JSON data and the related information available in a way that can work with web-based applications.
+
+Updates:
+- 2026-10-05: Clarified that logo link must be a viewable web image. Added note recommending the involvement of web-based application engineers.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `CDS-CSO-RIS` MUST: Responsible Information Sharing
 
@@ -283,6 +287,9 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Providers MUST notify FedRAMP within 5 business days of denying an agency access request for FedRAMP Certification Data.
 
+Notifications:
+- Notify FedRAMP via form: [CSP] Agency Access Denial (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=51829826617243)
+
 Terms: `Certification Data`
 
 Affects: Providers
@@ -306,6 +313,10 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 ### `CDS-CSF-TCM` MUST: Trust Center Migration
 
 Providers MUST notify all necessary parties when migrating to a trust center and MUST provide information in their existing USDA Connect Community Portal secure folders explaining how to use the trust center to obtain FedRAMP Certification Data.
+
+Notifications:
+- Notify FedRAMP via email: info@fedramp.gov
+- Notify Agency Customers via the appropriate recipient-specific method: Agency Security Contact (varies by agency)
 
 Terms: `All Necessary Parties`, `Certification Data`, `Trust Center`
 

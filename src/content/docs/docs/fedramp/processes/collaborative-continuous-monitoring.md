@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the CCM FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -87,13 +87,18 @@ Checklist items:
 - FedRAMP Reportable Incidents or an attestation that no such incidents occurred
 - Lessons learned and changes planned or made as a result of FedRAMP Reportable Incidents (if such occurred)
 
+Mapped Rev5 controls: `ca-7`
+
 Terms: `Accepted Vulnerability`, `All Necessary Parties`, `Certification Data`, `Cloud Service Offering`, `FedRAMP Certification Report`, `FedRAMP Reportable Incident`, `Incident`, `Ongoing Certification`, `Ongoing Certification Report (OCR)`, `Transformative Change`, `Vulnerability`
 
 Affects: Providers
 
 Structured timeframe: `3` months
 
-Recent update (2026-09-13): Added (if applicable) to clarify that some of these items are not always required depending on the FedRAMP Certification Type or Class.
+Updates:
+- 2026-10-13: Updated control mappings: added ca-7.
+- 2026-09-13: Added (if applicable) to clarify that some of these items are not always required depending on the FedRAMP Certification Type or Class.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `CCM-OCR-FBM` MUST: Feedback Mechanism
 
@@ -153,11 +158,15 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Providers SHOULD supply additional information in Quarterly Reviews that the provider determines is of interest, use, or otherwise relevant to agencies.
 
+Mapped Rev5 controls: `ca-7`
+
 Terms: `Quarterly Review`
 
 Affects: Providers
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added ca-7.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `CCM-QTR-MTG` VARIES BY CLASS: Quarterly Review Meeting
 
@@ -168,13 +177,17 @@ Varies by certification class:
 - **Class C MUST:** Providers with Class C Certifications MUST host a synchronous Quarterly Review every 3 months, open to all necessary parties, to review aspects of the most recent Ongoing Certification Reports that the provider determines are of the most relevance to agencies.
 - **Class D MUST:** Providers with Class D Certifications MUST host a synchronous Quarterly Review every 3 months, open to all necessary parties, to review aspects of the most recent Ongoing Certification Reports that the provider determines are of the most relevance to agencies.
 
+Mapped Rev5 controls: `ca-7`
+
 Terms: `All Necessary Parties`, `Ongoing Certification`, `Quarterly Review`
 
 Affects: Providers
 
 Structured timeframe: `3` months
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added ca-7.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `CCM-QTR-NID` MUST NOT: No Irresponsible Disclosure
 

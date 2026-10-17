@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the AFC FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -86,6 +86,8 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Providers MUST establish and maintain an email address to receive messages from FedRAMP; this inbox is a FedRAMP Security Inbox (FSI).
 
+Mapped Rev5 controls: `si-5`
+
 Terms: `FedRAMP Security Inbox`
 
 Affects: Providers
@@ -94,11 +96,16 @@ Note: Unless otherwise notified, FedRAMP will use the listed Security Email on t
 
 If a provider establishes a new inbox in reaction to this guidance that is different from the Security Email then they must follow the AFC-CSO-NOC (Notification of Changes) rules to notify FedRAMP.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added si-5.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `AFC-CSO-NOC` MUST: Notification of Changes
 
 Providers MUST immediately notify FedRAMP of any changes to the email address for their FedRAMP Security Inbox.
+
+Notifications:
+- Notify FedRAMP via form: [CSP] Notification of Changes (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=51829466938011)
 
 Terms: `FedRAMP Security Inbox`
 
@@ -172,6 +179,9 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 ### `AFC-FRP-PNT` MUST: Public Notice of Emergency Tests
 
 FedRAMP MUST post a public notice at least 10 business days in advance of sending an Emergency Test message; such notices MUST include explanation of the likely expected actions and timeframes for the Emergency Test message.
+
+Notifications:
+- Notify Everyone via the web: FedRAMP Public Notices (https://www.fedramp.gov/notices)
 
 Terms: `Likely`
 

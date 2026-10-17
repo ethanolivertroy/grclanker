@@ -16,6 +16,8 @@ import {
   type FedrampProcessRecord,
   type FedrampRequirementRecord,
   domainIndicators,
+  fedrampUpdateLines,
+  formatFedrampNotification,
   inspectFedrampOfficialSources,
   loadFedrampCatalog,
   normalizeFedrampApplicability,
@@ -213,6 +215,8 @@ type AdsPublicSiteResult = {
 const DEFAULT_FEDRAMP_OUTPUT_DIR = "./export/fedramp";
 const ADS_BUNDLE_DIRNAME = "ads-starter-bundle";
 const ADS_SITE_DIRNAME = "ads-public-site";
+const PUBLIC_JSON_HOSTING_NOTE =
+  "Serve the public JSON files with `Content-Type: application/json` and `X-Content-Type-Options: nosniff`, and enable CORS so web applications on other domains can read them directly (FRC-CSO-JSN).";
 
 type ArtifactPlanContext =
   | {
@@ -623,6 +627,17 @@ function formatRequirementText(
     }
   }
 
+  if (requirement.notifications.length > 0) {
+    lines.push("", "Notifications:");
+    for (const notification of requirement.notifications) {
+      lines.push(`- ${formatFedrampNotification(notification)}`);
+    }
+  }
+
+  if (requirement.controls.length > 0) {
+    lines.push("", `Mapped Rev5 controls: ${requirement.controls.join(", ")}`);
+  }
+
   if (requirement.terms.length > 0) {
     lines.push("", `Terms: ${requirement.terms.join(", ")}`);
   }
@@ -631,8 +646,12 @@ function formatRequirementText(
     lines.push("", `Affects: ${requirement.affects.join(", ")}`);
   }
 
+  if (requirement.note) {
+    lines.push("", `Note: ${requirement.note}`);
+  }
+
   if (requirement.updated.length > 0) {
-    lines.push("", `Recent update: ${requirement.updated[0]!.date} — ${requirement.updated[0]!.comment}`);
+    lines.push("", ...fedrampUpdateLines(requirement.updated));
   }
 
   lines.push(
@@ -1012,6 +1031,9 @@ function buildAdsBundleReadme(plan: AdsPackagePlan): string {
     "- private/notification-routing.md",
     "- private/continuous-validation.md",
     "- _source.json",
+    "",
+    "Hosting note:",
+    `- ${PUBLIC_JSON_HOSTING_NOTE}`,
   );
 
   return `${lines.join("\n")}\n`;
@@ -1827,6 +1849,7 @@ This generated trust-center bundle is a draft scaffold. Do not publish it to a p
   - \`llms.txt\`
   - \`llms-full.txt\`
   - \`documentation/api/api.yaml\`
+- Confirm the host serves the public JSON files with \`Content-Type: application/json\` and \`X-Content-Type-Options: nosniff\`, and allows cross-origin (CORS) reads (FRC-CSO-JSN).
 - Confirm the trust-center summary, access guidance, and version history match the latest approved public posture.
 - Only after approval: remove draft/noindex warnings, update \`robots.txt\`, and publish to the customer-owned host.
 
@@ -1885,6 +1908,7 @@ function buildAdsSiteReadme(
     "Deployment notes:",
     "- This output is static by design. No application server is required.",
     "- Keep the generated file paths intact so the relative links and `sitemap.xml` remain valid.",
+    `- ${PUBLIC_JSON_HOSTING_NOTE}`,
     "- Replace all TODO fields before publishing to a public domain.",
     "- Review and approve every public statement, endpoint, and JSON field before hosting the site publicly.",
     "- Remove the draft banner, noindex meta tag, and `Disallow: /` robots posture only after that approval step is complete.",

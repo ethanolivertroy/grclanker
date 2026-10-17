@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the IVV FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -59,6 +59,8 @@ Varies by certification class:
 - **Class C MUST:** Providers with Class C Certifications MUST persistently complete an independent verification and validation assessment of all applicable FedRAMP rules with a FedRAMP Recognized independent assessment service OR FedRAMP at least once per year; this is a FedRAMP independent assessment.
 - **Class D MUST:** Providers with Class D Certifications MUST persistently complete an independent verification and validation assessment of all applicable FedRAMP rules with a FedRAMP Recognized independent assessment service OR FedRAMP at least once per year; this is a FedRAMP independent assessment.
 
+Mapped Rev5 controls: `ca-2`, `ca-2.1`, `ca-2.2`, `ca-7.1`, `ca-7.4`
+
 Terms: `Certification Class`, `FedRAMP Independent Assessment`, `FedRAMP Recognized`, `Persistently`, `Validation`, `Verification`
 
 Affects: Providers
@@ -73,7 +75,9 @@ The option for assessment by FedRAMP directly is limited to cloud services that 
 
 FedRAMP Recognized independent assessment services are listed on the FedRAMP Marketplace.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added ca-2, ca-2.1, ca-2.2, ca-7.1, ca-7.4.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `IVV-CSO-ICP` MUST: Inclusion in Certification Package
 

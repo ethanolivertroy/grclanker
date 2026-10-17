@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the AGU FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -67,7 +67,9 @@ Agencies SHOULD assign at least 1 federal employee to be an active participant i
 
 Affects: Agencies
 
-Recent update (2026-09-13): Fixed broken reference URL for the Agency Liaison Program.
+Updates:
+- 2026-09-13: Fixed broken reference URL for the Agency Liaison Program.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `AGU-AGC-NAA` MUST: Notify FedRAMP After Authorization
 
@@ -77,6 +79,9 @@ Checklist items:
 - A copy of the agency's Authorization to Operate letter for the information system leveraging the cloud service, following agency policy and templates.
 - All other supplemental information requested in the Submit an ATO Letter form by FedRAMP.
 
+Notifications:
+- Notify FedRAMP via form: Submit an ATO Letter (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=51447926193691)
+
 Affects: Agencies
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -84,6 +89,9 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 ### `AGU-AGC-NAI` MUST: Notify Additional Information Requests
 
 Agencies MUST notify FedRAMP after requesting any additional information or materials from a FedRAMP Certified cloud service offering beyond those required by FedRAMP.
+
+Notifications:
+- Notify FedRAMP via form: [For Agencies] Additional Information, Security Requirements, or Certification Change, or After Request Form (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=51822364715035)
 
 Terms: `Cloud Service Offering`, `FedRAMP Certified`
 
@@ -96,6 +104,9 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 ### `AGU-AGC-NAR` MUST NOT: No Additional Security Requirements
 
 Agencies MUST NOT require additional information or materials from FedRAMP Certified cloud service offerings beyond those required by FedRAMP UNLESS the head of the agency or an authorized delegate determines there is a demonstrable need and notifies FedRAMP; this does not apply to seeking clarification or asking general questions about FedRAMP Certification Data.
+
+Notifications:
+- Notify FedRAMP via email: info@fedramp.gov
 
 Terms: `Certification Data`, `Cloud Service Offering`, `FedRAMP Certified`
 
@@ -118,6 +129,9 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 ### `AGU-AGC-TPP` MUST NOT: No Certification Type or Path Preferences
 
 Agencies MUST NOT require cloud service offerings to obtain or maintain a specific FedRAMP Certification Type or FedRAMP Certification Path, UNLESS the head of the agency or an authorized delegate determines there is a demonstrable need and notifies FedRAMP.
+
+Notifications:
+- Notify FedRAMP via email: info@fedramp.gov
 
 Terms: `Certification Path`, `Certification Type`, `Cloud Service Offering`, `FedRAMP Certified`
 
@@ -189,6 +203,9 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Agencies MUST notify FedRAMP if information presented in an Ongoing Certification Report, Quarterly Review, or other FedRAMP Certification Data causes significant concerns for the authorizing official that would likely result in rescission of their Authorization to Operate.
 
+Notifications:
+- Notify FedRAMP via form: Report Concerns on Ongoing Certifications (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=51821301979547)
+
 Terms: `Certification Data`, `FedRAMP Certification Report`, `Likely`, `Ongoing Certification`, `Ongoing Certification Report (OCR)`, `Quarterly Review`
 
 Affects: Agencies
@@ -200,6 +217,9 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 ### `AGU-USE-NPC` SHOULD: Notify Provider of Concerns
 
 Agencies SHOULD formally notify the cloud service provider if information presented in an Ongoing Certification Report, Quarterly Review, or other FedRAMP Certification Data causes significant concerns for the authorizing official that would likely result in rescission of their Authorization to Operate.
+
+Notifications:
+- Notify Provider via the appropriate recipient-specific method: The provider's security contact email or form (varies by provider)
 
 Terms: `Certification Data`, `FedRAMP Certification Report`, `Likely`, `Ongoing Certification`, `Ongoing Certification Report (OCR)`, `Quarterly Review`
 
@@ -243,6 +263,10 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Agencies MUST review the Secure Configuration Guides supplied by Providers and configure relevant security settings.
 
+Mapped Rev5 controls: `cm-10`, `cm-5`, `cm-6`, `ia-11`
+
 Affects: Agencies
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added cm-10, cm-5, cm-6, ia-11.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.

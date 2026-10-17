@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the MKT FedRAMP process, i
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -45,9 +45,14 @@ The Marketplace Listing rules define how FedRAMP decides which cloud service off
 
 Advisors MUST complete the Advisor Listing Request Form to request listing in the FedRAMP Marketplace.
 
+Notifications:
+- Notify FedRAMP via form: [For Advisors] Marketplace Listing Request Form (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=52060327520795)
+
 Affects: Advisors
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-05: Updated form name.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `MKT-CAS-RFR` MUST: Advisor Responses to FedRAMP
 
@@ -92,6 +97,9 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Providers MUST notify FedRAMP using the FedRAMP Marketplace Providing Listing Request Form to request a listing in the FedRAMP Marketplace.
 
+Notifications:
+- Notify FedRAMP via form: FedRAMP Marketplace Provider Listing Request Form (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=50939227168027)
+
 Affects: Providers
 
 Note: FedRAMP does not accept applications for a FedRAMP Marketplace Listing via email!
@@ -112,9 +120,14 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Assessors MUST complete the Assessor Listing Request Form to request listing in the FedRAMP Marketplace.
 
+Notifications:
+- Notify FedRAMP via form: [For Assessors] Marketplace Listing Request Form (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=54220455254427)
+
 Affects: Assessors
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-05: Updated form name and URL.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `MKT-IAS-OFR` MUST: Only FedRAMP Recognized Assessors
 

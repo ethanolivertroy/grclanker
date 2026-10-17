@@ -5,9 +5,9 @@ description: "Official Consolidated Rules summary for the CMT FedRAMP key securi
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
 >
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
 >
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
 >
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
@@ -19,11 +19,13 @@ Domain code: `CMT` · Domain ID: `KSI-CMT` · Web slug: `change-management`
 
 Modifications to the cloud service offering are logged and monitored.
 
-Mapped Rev5 controls: `au-2`, `cm-3`, `cm-3.2`, `cm-4.2`, `cm-6`, `cm-8.3`, `ma-2`
+Mapped Rev5 controls: `au-2`, `ca-7.4`, `cm-3`, `cm-3.1`, `cm-3.2`, `cm-3.6`, `cm-4.2`, `cm-6`, `cm-8.3`
 
 Terms: `Cloud Service Offering`
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added ca-7.4, cm-3.1, cm-3.6; removed ma-2.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `KSI-CMT-RMV`: Redeploying vs Modifying
 
@@ -49,8 +51,10 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Persistent testing and validation of changes throughout deployment is automated.
 
-Mapped Rev5 controls: `cm-3`, `cm-3.2`, `cm-4.2`, `si-2`
+Mapped Rev5 controls: `cm-3`, `cm-3.2`, `cm-4.2`, `cm-6.2`, `ir-9.4`, `si-2`
 
 Terms: `Persistently`, `Validation`
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-13: Updated control mappings: added cm-6.2, ir-9.4.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
