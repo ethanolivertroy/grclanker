@@ -492,6 +492,8 @@ export const QUALYS_RAW_DATA_ALLOWLISTS: Record<string, FieldAllowlist> = {
 
 const VM_SERVICE = "Qualys VM/PC API";
 const ADMIN_SERVICE = "Qualys Administration API";
+const AM_SERVICE = "Qualys Asset Management and Tagging API";
+const CA_SERVICE = "Qualys Cloud Agent API";
 const VM_DOCS = "https://docs.qualys.com/en/vm/qweb-all-api/mergedProjects";
 const API_SERVER = "Use the configured API server (base_url, else the selected platform's API server); never follow a continuation URL to another origin.";
 const AUTH_HEADER = "Authorization: {Basic base64(username:password), or Bearer token}";
@@ -636,8 +638,48 @@ const SCAN_COVERAGE_SURFACES: readonly BatchSurfaceDefinition[] = [
   ], xmlRecords("ASSET_GROUP")),
 ];
 
+const ASSET_INVENTORY_SURFACES: readonly BatchSurfaceDefinition[] = [
+  qpsSurface(
+    "connectors",
+    "/qps/rest/2.0/search/am/assetdataconnector",
+    AM_SERVICE,
+    "https://docs.qualys.com/en/am/api/asset_data_connector/search_connectors.htm",
+    [limitResults("100, or the connectors left under the 5000-connector cap when fewer"), CONTINUATION_CRITERIA],
+  ),
+  vmSurface(
+    "appliances",
+    "/api/2.0/fo/appliance/",
+    "qapi-scan/appliances/list_appliances.htm",
+    [LIST_ACTION, param("output_mode", "query", "full"), ID_MIN],
+    xmlRecords("APPLIANCE"),
+  ),
+  qpsSurface(
+    "cloud_agents",
+    "/qps/rest/2.0/search/am/hostasset",
+    CA_SERVICE,
+    "https://docs.qualys.com/en/ca/api/agents/list_agents.htm",
+    [
+      limitResults("1000, or the agents left under host_limit when fewer"),
+      param(
+        "ServiceRequest.filters.Criteria",
+        "json-body",
+        "The criterion tagName EQUALS Cloud Agent, joined on a continuation by id GREATER than the previous page's lastId",
+      ),
+    ],
+    `${PROJECTION_STAGE} QUALYS-C07 reads agentInfo.activationKey.activationId and agentInfo.activationKey.id only to tell whether an activation key is present; neither is exported.`,
+  ),
+  qpsSurface(
+    "tags",
+    "/qps/rest/2.0/search/am/tag",
+    AM_SERVICE,
+    "https://docs.qualys.com/en/am/api/tags/search_tags.htm",
+    [limitResults("1000, or the tags left under the 2000-tag cap when fewer"), CONTINUATION_CRITERIA],
+  ),
+];
+
 const QUALYS_SURFACES: readonly BatchSurfaceDefinition[] = [
   ...SCAN_COVERAGE_SURFACES,
+  ...ASSET_INVENTORY_SURFACES,
   ...SCOPE_SURFACES,
 ];
 
@@ -689,6 +731,34 @@ const QUALYS_INPUTS: Readonly<Record<string, string>> = {
   excluded_ips_complete: "Excluded IP list coverage.",
   excluded_entry_count: "Number of IP and IP_RANGE entries in the excluded IP list.",
   excluded_range_address_counts: "Address count of each IP_RANGE entry: the end address minus the start address plus one, at least 1, for a start-end range; 2 raised to 32 minus the prefix length for CIDR notation; otherwise 1. Ranges whose addresses do not parse are omitted.",
+  connectors_readable: "True when POST /qps/rest/2.0/search/am/assetdataconnector returned SUCCESS.",
+  connectors_complete: "Asset data connector list coverage.",
+  connector_count: "Number of asset data connector records returned.",
+  unhealthy_connector_count: "Number of returned connectors whose connectorState, uppercased, contains ERROR, DISABLED, or INCOMPLETE, whose disabled flag is true, or that carry a non-empty lastError.",
+  connector_sync_age_days: "Whole days since each returned connector's lastSync, for every connector carrying a parseable one.",
+  unknown_state_connector_count: "Number of healthy connectors whose connectorState is UNKNOWN.",
+  undated_connector_count: "Number of healthy connectors without a parseable lastSync.",
+  appliances_readable: "True when GET /api/2.0/fo/appliance/ returned its scanner appliance list without a refusal.",
+  appliances_complete: "Scanner appliance list coverage.",
+  appliance_count: "Number of scanner appliance records returned.",
+  offline_appliance_count: "Number of returned appliances whose STATUS, lowercased, contains offline, inactive, or disconnected.",
+  outdated_appliance_count: "Number of appliances that are not offline and either report HEARTBEATS_MISSED above 0 or run an outdated version: ML_VERSION differs from ML_LATEST, or VULNSIGS_VERSION from VULNSIGS_LATEST, when both texts are present, or, when either text is empty, that VERSION element's updated attribute is no.",
+  unknown_status_appliance_count: "Number of returned appliances whose STATUS is absent or unknown.",
+  unknown_version_appliance_count: "Number of appliances that are neither offline nor outdated and have an ML or vulnerability signature version pair that cannot be compared, because a text is empty and the updated attribute is neither yes nor no.",
+  cloud_agents_readable: "True when POST /qps/rest/2.0/search/am/hostasset with the tagName EQUALS Cloud Agent criterion returned SUCCESS.",
+  cloud_agents_complete: "Cloud agent host asset coverage up to host_limit.",
+  agent_coverage_percent: "Percentage of returned hosts whose TRACKING_METHOD, lowercased, contains agent, rounded to one decimal place with ties rounded up; recorded only when host_count is above 0.",
+  min_agent_coverage_percent: "The min_agent_coverage_percent assessment option, clamped to 0 through 100; default 50.",
+  inactive_agent_count: "Number of returned agents whose agentInfo.status, uppercased, contains INACTIVE or UNINSTALL.",
+  agent_checkin_age_days: "Whole days since each returned agent's agentInfo.lastCheckedIn (its date member when it is an object), for every agent carrying a parseable one.",
+  untracked_host_count: "Number of returned hosts without a TRACKING_METHOD.",
+  unknown_status_agent_count: "Number of returned agents whose agentInfo.status is UNKNOWN.",
+  undated_agent_count: "Number of returned agents without a parseable agentInfo.lastCheckedIn.",
+  agents_without_activation_key_count: "Number of returned agents whose agentInfo.activationKey carries none of activationId, title, or id.",
+  tags_readable: "True when POST /qps/rest/2.0/search/am/tag returned SUCCESS.",
+  tags_complete: "Tag list coverage up to 2000 tags.",
+  tag_count: "Number of tag records returned.",
+  untagged_host_percent: "Percentage of returned hosts without a TAGS/TAG NAME, rounded to one decimal place with ties rounded up; recorded only when host_count is above 0.",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -954,6 +1024,211 @@ const SCAN_COVERAGE_CHECKS: readonly QualysCheck[] = [
   },
 ];
 
+const ASSET_INVENTORY = "qualys_assess_asset_inventory";
+
+const ASSET_INVENTORY_CHECKS: readonly QualysCheck[] = [
+  {
+    id: "QUALYS-C04",
+    control: 4,
+    title: "Asset group completeness",
+    severity: "medium",
+    owner: ASSET_INVENTORY,
+    surfaces: ["asset_groups", "hosts"],
+    inputs: [],
+    rules: [rule("manual", always)],
+    decision: "Always return manual, because whether the asset groups hold every host the organization owns needs a reviewer.",
+    examples: [example("partial", "manual", "Group coverage is left to a reviewer whatever the lists hold.", {})],
+  },
+  {
+    id: "QUALYS-C05",
+    control: 5,
+    title: "Cloud connector status",
+    severity: "medium",
+    owner: ASSET_INVENTORY,
+    surfaces: ["connectors", "users", "user_list"],
+    inputs: [
+      "connectors_readable", "connector_count", "unhealthy_connector_count", "connector_sync_age_days", "unknown_state_connector_count",
+      "undated_connector_count", "connectors_complete", "view_scope_partial",
+    ],
+    constants: { stale_connector_days: 7 },
+    rules: [
+      rule("manual", ne("connectors_readable", true)),
+      rule("manual", eq("connector_count", 0)),
+      rule("fail", gt("unhealthy_connector_count", 0)),
+      rule("warn", some("connector_sync_age_days", gt("$", path("stale_connector_days")))),
+      rule("warn", any(
+        gt("unknown_state_connector_count", 0),
+        gt("undated_connector_count", 0),
+        ne("connectors_complete", true),
+        scopePartial,
+      )),
+      rule("pass", always),
+    ],
+    completeness: {
+      connectors_complete: completeFrom(
+        "false when the connector search stopped with more records left: at 5000 connectors, at the 25-page cap, or on a page without lastId.",
+        [{ surfaceId: "connectors", falseWhen: ["truncated"] }],
+      ),
+    },
+    decision: "Manual when the connector search is unreadable or returns no connector. Fail when a connector's state contains ERROR, DISABLED, or INCOMPLETE, when it is disabled, or when it reports a last error. Warn when a connector last synced more than stale_connector_days (7) days ago. Warn instead of pass when a healthy connector's state is UNKNOWN or it carries no sync date, when the search stopped early, or when the configured user's view covers only part of the subscription. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every connector is healthy and synced within 7 days.", {
+        connectors_readable: true, connector_count: 2, unhealthy_connector_count: 0, connector_sync_age_days: [1, 7],
+        unknown_state_connector_count: 0, undated_connector_count: 0, connectors_complete: true, view_scope_partial: false,
+      }),
+      example("noncompliant", "fail", "A connector reports an error state.", {
+        connectors_readable: true, connector_count: 2, unhealthy_connector_count: 1, connector_sync_age_days: [1],
+      }),
+      example("partial", "warn", "A healthy connector last synced 8 days ago.", {
+        connectors_readable: true, connector_count: 2, unhealthy_connector_count: 0, connector_sync_age_days: [1, 8],
+        unknown_state_connector_count: 0, undated_connector_count: 0, connectors_complete: true, view_scope_partial: false,
+      }),
+      example("unreadable", "manual", "The connector search was refused.", { connectors_readable: false }),
+    ],
+  },
+  {
+    id: "QUALYS-C06",
+    control: 6,
+    title: "Scanner appliance health",
+    severity: "high",
+    owner: ASSET_INVENTORY,
+    surfaces: ["appliances", "users", "user_list"],
+    inputs: [
+      "appliances_readable", "appliance_count", "offline_appliance_count", "outdated_appliance_count", "unknown_status_appliance_count",
+      "unknown_version_appliance_count", "appliances_complete", "view_scope_partial",
+    ],
+    rules: [
+      rule("manual", ne("appliances_readable", true)),
+      rule("manual", eq("appliance_count", 0)),
+      rule("fail", gt("offline_appliance_count", 0)),
+      rule("warn", gt("outdated_appliance_count", 0)),
+      rule("warn", any(
+        gt("unknown_status_appliance_count", 0),
+        gt("unknown_version_appliance_count", 0),
+        ne("appliances_complete", true),
+        scopePartial,
+      )),
+      rule("pass", always),
+    ],
+    completeness: { appliances_complete: continuationComplete("appliances", "scanner appliance list", "5000 appliances") },
+    decision: "Manual when the scanner appliance list is unreadable or returns no appliance. Fail when an appliance is offline, inactive, or disconnected. Warn when an appliance that is not offline has missed heartbeats or runs an outdated ML or vulnerability signature version. Warn instead of pass when an appliance's status is missing or unknown, when its versions cannot be compared, when the list stopped early, or when the configured user's view covers only part of the subscription. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every appliance is online and current.", {
+        appliances_readable: true, appliance_count: 2, offline_appliance_count: 0, outdated_appliance_count: 0,
+        unknown_status_appliance_count: 0, unknown_version_appliance_count: 0, appliances_complete: true, view_scope_partial: false,
+      }),
+      example("noncompliant", "fail", "An appliance is offline.", {
+        appliances_readable: true, appliance_count: 2, offline_appliance_count: 1, outdated_appliance_count: 1,
+      }),
+      example("partial", "warn", "An online appliance runs an outdated vulnerability signature version.", {
+        appliances_readable: true, appliance_count: 2, offline_appliance_count: 0, outdated_appliance_count: 1,
+        unknown_status_appliance_count: 0, unknown_version_appliance_count: 0, appliances_complete: true, view_scope_partial: false,
+      }),
+      example("unreadable", "manual", "The appliance list was refused.", { appliances_readable: false }),
+    ],
+  },
+  {
+    id: "QUALYS-C07",
+    control: 7,
+    title: "Agent deployment coverage",
+    severity: "medium",
+    owner: ASSET_INVENTORY,
+    surfaces: ["hosts", "cloud_agents", "users", "user_list"],
+    inputs: [
+      "hosts_readable", "cloud_agents_readable", "host_count", "agent_coverage_percent", "min_agent_coverage_percent", "inactive_agent_count",
+      "agent_checkin_age_days", "untracked_host_count", "unknown_status_agent_count", "undated_agent_count",
+      "agents_without_activation_key_count", "hosts_complete", "cloud_agents_complete", "view_scope_partial",
+    ],
+    constants: { stale_agent_days: 7 },
+    rules: [
+      rule("manual", any(ne("hosts_readable", true), ne("cloud_agents_readable", true))),
+      rule("manual", eq("host_count", 0)),
+      rule("fail", lt("agent_coverage_percent", path("min_agent_coverage_percent"))),
+      rule("warn", any(gt("inactive_agent_count", 0), some("agent_checkin_age_days", gt("$", path("stale_agent_days"))))),
+      rule("warn", any(
+        gt("untracked_host_count", 0),
+        gt("unknown_status_agent_count", 0),
+        gt("undated_agent_count", 0),
+        gt("agents_without_activation_key_count", 0),
+        ne("hosts_complete", true),
+        ne("cloud_agents_complete", true),
+        scopePartial,
+      )),
+      rule("pass", always),
+    ],
+    completeness: {
+      hosts_complete: HOSTS_COMPLETE,
+      cloud_agents_complete: completeFrom(
+        "false when the cloud agent search stopped with more records left: at host_limit agents, at the 25-page cap, or on a page without lastId.",
+        [{ surfaceId: "cloud_agents", falseWhen: ["truncated"] }],
+      ),
+    },
+    decision: "Manual when the host list or the cloud agent search is unreadable, or when no host is returned. Fail when the share of hosts tracked by agent is below min_agent_coverage_percent. Warn when an agent is inactive or uninstalled, or last checked in more than stale_agent_days (7) days ago. Warn instead of pass when a host has no tracking method, when an agent's status is unknown or it carries no check-in date or activation key, when either list stopped early, or when the configured user's view covers only part of the subscription. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Exactly the minimum share of hosts is agent-tracked and every agent checked in within 7 days.", {
+        hosts_readable: true, cloud_agents_readable: true, host_count: 10, agent_coverage_percent: 50, min_agent_coverage_percent: 50,
+        inactive_agent_count: 0, agent_checkin_age_days: [0, 7], untracked_host_count: 0, unknown_status_agent_count: 0,
+        undated_agent_count: 0, agents_without_activation_key_count: 0, hosts_complete: true, cloud_agents_complete: true,
+        view_scope_partial: false,
+      }),
+      example("noncompliant", "fail", "Only 40 percent of hosts are agent-tracked.", {
+        hosts_readable: true, cloud_agents_readable: true, host_count: 10, agent_coverage_percent: 40, min_agent_coverage_percent: 50,
+      }),
+      example("partial", "warn", "Coverage meets the minimum, but one agent last checked in 8 days ago.", {
+        hosts_readable: true, cloud_agents_readable: true, host_count: 10, agent_coverage_percent: 60, min_agent_coverage_percent: 50,
+        inactive_agent_count: 0, agent_checkin_age_days: [0, 8], untracked_host_count: 0, unknown_status_agent_count: 0,
+        undated_agent_count: 0, agents_without_activation_key_count: 0, hosts_complete: true, cloud_agents_complete: true,
+        view_scope_partial: false,
+      }),
+      example("unreadable", "manual", "The cloud agent search was refused.", { hosts_readable: true, cloud_agents_readable: false }),
+    ],
+  },
+  {
+    id: "QUALYS-C18",
+    control: 18,
+    title: "Tag-based asset management",
+    severity: "medium",
+    owner: ASSET_INVENTORY,
+    surfaces: ["tags", "hosts", "users", "user_list"],
+    inputs: [
+      "tags_readable", "hosts_readable", "tag_count", "host_count", "untagged_host_percent", "tags_complete", "hosts_complete",
+      "view_scope_partial",
+    ],
+    constants: { max_untagged_host_percent: 20 },
+    rules: [
+      rule("manual", any(ne("tags_readable", true), ne("hosts_readable", true))),
+      rule("fail", eq("tag_count", 0)),
+      rule("manual", eq("host_count", 0)),
+      rule("fail", gt("untagged_host_percent", path("max_untagged_host_percent"))),
+      rule("warn", gt("untagged_host_percent", 0)),
+      rule("warn", any(ne("tags_complete", true), ne("hosts_complete", true), scopePartial)),
+      rule("pass", always),
+    ],
+    completeness: {
+      tags_complete: completeFrom(
+        "false when the tag search stopped with more records left: at 2000 tags, at the 25-page cap, or on a page without lastId.",
+        [{ surfaceId: "tags", falseWhen: ["truncated"] }],
+      ),
+      hosts_complete: HOSTS_COMPLETE,
+    },
+    decision: "Manual when the tag search or the host list is unreadable. Fail when no tag is returned. Manual when no host is returned. Fail when more than max_untagged_host_percent (20) percent of hosts carry no tag. Warn when the rounded share of untagged hosts is above 0. Warn instead of pass when either list stopped early or when the configured user's view covers only part of the subscription. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every host carries a tag.", {
+        tags_readable: true, hosts_readable: true, tag_count: 12, host_count: 40, untagged_host_percent: 0, tags_complete: true,
+        hosts_complete: true, view_scope_partial: false,
+      }),
+      example("noncompliant", "fail", "20.5 percent of hosts carry no tag.", {
+        tags_readable: true, hosts_readable: true, tag_count: 12, host_count: 200, untagged_host_percent: 20.5,
+      }),
+      example("partial", "warn", "Exactly 20 percent of hosts carry no tag.", {
+        tags_readable: true, hosts_readable: true, tag_count: 12, host_count: 40, untagged_host_percent: 20, tags_complete: true,
+        hosts_complete: true, view_scope_partial: false,
+      }),
+      example("unreadable", "manual", "The tag search was refused.", { tags_readable: false, hosts_readable: true }),
+    ],
+  },
+];
+
 const toCheck = (check: QualysCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -976,6 +1251,7 @@ const toCheck = (check: QualysCheck): BatchCheckDefinition => {
 
 const checks: readonly BatchCheckDefinition[] = [
   ...SCAN_COVERAGE_CHECKS,
+  ...ASSET_INVENTORY_CHECKS,
 ].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
@@ -987,13 +1263,21 @@ const continuationStops = (cap: string): string[] => [
   "A continuation URL on another origin, which is not followed and marks the list partial",
 ];
 const NO_TOTAL = "Qualys reports no total: a page without a WARNING/URL continuation ends the list, and a continuation left at the item cap or at the 25-page cap marks it partial.";
-const qpsStops = (cap: string): string[] => [
-  "hasMoreRecords false, or a page shorter than limitResults when hasMoreRecords is absent",
-  "A page without lastId, which marks the list partial when more records follow",
-  "An empty page",
-  cap,
-  "The 25-page cap",
-];
+const qpsWalk = (surfaceIds: readonly string[], pages: string, itemCap: number | null, cap: string): BatchPaginationDefinition => ({
+  surfaceIds,
+  cursorFields: ["hasMoreRecords", "lastId"],
+  pageSize: null,
+  itemCap,
+  pageCap: 25,
+  totalSemantics: `${pages}; each continuation repeats the search with the criterion id GREATER than the previous page's lastId. hasMoreRecords, or a full page when it is absent, means more records follow; more records left at ${cap} or at the 25-page cap mark the list partial.`,
+  stopConditions: [
+    "hasMoreRecords false, or a page shorter than limitResults when hasMoreRecords is absent",
+    "A page without lastId, which marks the list partial when more records follow",
+    "An empty page",
+    `${cap} collected`,
+    "The 25-page cap",
+  ],
+});
 
 const FRAMEWORK_REPORTS = [
   "fedramp/fedramp_compliance_report.md",
@@ -1024,7 +1308,7 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
   category: "vulnerability-application-security",
   summary: "Portable contract for the shipped Qualys scan coverage, asset inventory, vulnerability management, and administration assessments over the Qualys VM/PC, Administration, Asset Management, Cloud Agent, and WAS APIs.",
   sourceModule: "cli/extensions/grc-tools/qualys.ts",
-  baseServices: [VM_SERVICE, ADMIN_SERVICE],
+  baseServices: [VM_SERVICE, ADMIN_SERVICE, AM_SERVICE, CA_SERVICE],
   authentication: QUALYS_AUTH_RESOLVER,
   permissions: [
     {
@@ -1034,17 +1318,24 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
       unlocks: QUALYS_SURFACES.map((surface) => surface.id),
       notes: "Other roles see only the assets and objects in their scope; when the configured user is verified to hold such a role or scope tags, view_scope_partial caps otherwise passing findings at warn.",
     },
+    {
+      id: "cloud-agent-module",
+      kind: "license",
+      value: "Qualys Cloud Agent",
+      unlocks: ["cloud_agents"],
+    },
   ],
   surfaces: QUALYS_SURFACES,
   checks,
   tools: {
     qualys_check_access: [],
     qualys_assess_scan_coverage: idsFor(SCAN_COVERAGE),
+    qualys_assess_asset_inventory: idsFor(ASSET_INVENTORY),
     qualys_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
     {
-      surfaceIds: ["scheduled_scans", "scans", "option_profiles"],
+      surfaceIds: ["scheduled_scans", "scans", "option_profiles", "appliances"],
       cursorFields: ["WARNING/URL"],
       pageSize: null,
       itemCap: 5000,
@@ -1079,15 +1370,15 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
       totalSemantics: "One read; a WARNING/URL continuation is not followed and marks the list partial.",
       stopConditions: ["The first response"],
     },
-    {
-      surfaceIds: ["users"],
-      cursorFields: ["hasMoreRecords", "lastId"],
-      pageSize: null,
-      itemCap: 5000,
-      pageCap: 25,
-      totalSemantics: "Pages of 500 users (limitResults); each continuation repeats the search with the criterion id GREATER than the previous page's lastId. hasMoreRecords, or a full page when it is absent, means more records follow; more records left at 5000 users or at the 25-page cap mark the list partial.",
-      stopConditions: qpsStops("5000 users collected"),
-    },
+    qpsWalk(["users"], "Pages of 500 users (limitResults)", 5000, "5000 users"),
+    qpsWalk(["connectors"], "Pages of 100 records (limitResults)", 5000, "5000 records"),
+    qpsWalk(
+      ["cloud_agents"],
+      "Pages of 1000 agents (limitResults), up to host_limit agents (default 5000, set from 1 through 200000)",
+      null,
+      "host_limit agents",
+    ),
+    qpsWalk(["tags"], "Pages of 1000 tags (limitResults)", 2000, "2000 tags"),
   ],
   rateLimit: {
     documentedLimit: "Subscription-specific: responses report X-RateLimit-Limit calls per X-RateLimit-Window-Sec seconds and X-Concurrency-Limit-Limit concurrent calls.",
