@@ -95,7 +95,10 @@ const TENABLE_SURFACES: readonly BatchSurfaceDefinition[] = [
   vmSurface("scan-templates", "/editor/scan/templates", "editor-list-templates", ["uuid", "name", "title"], {
     responseShape: "A JSON object with a templates array.",
   }),
-  vmSurface("users", "/users", "users-list", ["permissions"], {
+  vmSurface("users", "/users", "users-list", [
+    "username", "email", "enabled", "permissions", "lastlogin", "last_apikey_access", "ui_permitted", "ui_saml_only", "two_factor.sms_enabled",
+    "lockout", "login_fail_count",
+  ], {
     parameters: [param("withRoles", "query", "true")],
     responseShape: "A JSON object with a users array; only an Administrator key receives the numeric permissions attribute on each user.",
   }),
@@ -170,6 +173,39 @@ const TENABLE_SURFACES: readonly BatchSurfaceDefinition[] = [
     ],
     responseShape: "A JSON object with a values array and pagination.total; only the number of values is evaluated.",
   }),
+  vmSurface("groups", "/groups", "groups-list", [], {
+    responseShape: "A JSON object with a groups array; only whether it was returned and how many groups it holds are evaluated.",
+  }),
+  vmSurface("roles", "/access-control/v1/roles", "access-control-roles-list", ["name", "type"], {
+    responseShape: "A JSON array of role records; a non-empty array in which no record carries uuid, id, name, type, or privileges is a failed read.",
+  }),
+  vmSurface("permissions", "/api/v3/access-control/permissions", "io-v3-access-control-permissions-list", [
+    "name", "actions", "subjects.*.type", "subjects.*.uuid", "subjects.*.name", "objects.*.type",
+  ], { responseShape: "A JSON object with a permissions array." }),
+  vmSurface("access-groups", "/v2/access-groups", "io-v2-access-groups-list", ["id", "name", "all_assets"], {
+    parameters: [
+      param("limit", "query", "200"),
+      param("offset", "query", "Number of access group records already received, starting at 0"),
+    ],
+    responseShape: "A JSON object with an access_groups array and pagination.total.",
+  }),
+  vmSurface("credentials", "/credentials", "credentials-list", ["id", "name", "type.name", "type.id", "created_date", "last_used_by.id"], {
+    parameters: [
+      param("limit", "query", "200"),
+      param("offset", "query", "Number of credential records already received, starting at 0"),
+    ],
+    responseShape: "A JSON object with a credentials array and pagination.total.",
+  }),
+  vmSurface("audit-log", "/audit-log/v1/events", "audit-log-events", [
+    "id", "action", "crud", "is_failure", "received", "actor.name", "target.name",
+  ], {
+    parameters: [
+      param("f", "query", "date.gte: followed by the ISO 8601 time audit_lookback_days days before the assessment time (clamped to 1 through 365; default 30)"),
+      param("limit", "query", "5000"),
+      param("offset", "query", "Number of event records already received, starting at 0"),
+    ],
+    responseShape: "A JSON object with an events array and pagination.total.",
+  }),
   scSurface("sc-scans", "scan", "Scan.htm", ["id", "name", "schedule.type"], [
     param("fields", "query", "id,name,status,schedule,policy,repository,credentials,modifiedTime"),
   ], SC_LIST_SHAPE),
@@ -181,6 +217,9 @@ const TENABLE_SURFACES: readonly BatchSurfaceDefinition[] = [
     param("fields", "query", "id,name,status,statusMessage,enabled,version,pluginSet,loadedPluginSet,lastCheckinTime,agentCapable"),
   ], SC_LIST_SHAPE),
   scSurface("sc-feed", "feed", "Feed.htm", ["active.stale", "active.updateTime"], [], "A JSON object whose response object describes each plugin feed; a nonzero error_code is a refusal."),
+  scSurface("sc-users", "user", "User.htm", ["id", "username", "status", "role.id", "role.name", "lastLogin", "locked"], [
+    param("fields", "query", "id,username,status,role,lastLogin,locked,failedLogins,authType"),
+  ], SC_LIST_SHAPE),
 ];
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
@@ -195,6 +234,7 @@ const cmp = (op: Comparator, left: string | VerdictOperand, right: PortableValue
 const eq = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("eq", left, right);
 const ne = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("ne", left, right);
 const gt = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("gt", left, right);
+const gte = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("gte", left, right);
 const lt = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("lt", left, right);
 const lte = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("lte", left, right);
 const isNull = (name: string): VerdictCondition => ({ op: "null", operand: path(name) });
@@ -287,6 +327,41 @@ const TENABLE_INPUTS: Readonly<Record<string, string>> = {
   sc_feed_marked_stale: "True when GET /rest/feed was read and its active.stale value is true (true, 1, or the strings true or 1); false otherwise.",
   sc_undated_scanner_count: "Number of Security Center scanners whose enabled value is not false and whose lastCheckinTime does not parse as a timestamp.",
   sc_feed_readable: "True when GET /rest/feed returned its documented object.",
+  inactive_user_days: "The inactive_user_days assessment option in days, clamped to 1 through 3650; default 90.",
+  max_admins: "The max_admins assessment option, clamped to 0 through 10000; default 5.",
+  users_readable: "True when GET /users returned its documented users array.",
+  user_count: "Number of user records GET /users returned.",
+  enabled_user_count: "Number of users whose enabled value is true (true, 1, or the strings true or 1).",
+  enabled_administrator_count: "Number of enabled users whose permissions value is 64, the Administrator role, given as a number or numeric string.",
+  administrators_without_strong_auth_count: "Number of enabled Administrators whose ui_permitted value is not false (false, 0, or the strings false or 0) and that have neither ui_saml_only true (true, 1, or the strings true or 1) nor two_factor.sms_enabled 1, given as a number or numeric string.",
+  enabled_user_last_login_age_days: "For each enabled user whose lastlogin parses as epoch seconds, epoch milliseconds, or a date string, the days from that timestamp to the assessment time as a fraction, floored at 0.",
+  never_logged_in_user_count: "Number of enabled users whose lastlogin does not parse as a timestamp.",
+  enabled_user_api_key_age_days: "For each enabled user whose last_apikey_access parses as a timestamp, the days from that timestamp to the assessment time as a fraction, floored at 0.",
+  locked_out_user_count: "Number of enabled users whose lockout value is 1, given as a number or numeric string.",
+  enabled_user_login_failure_counts: "For each enabled user, its login_fail_count as a number or numeric string, or 0 when it is neither.",
+  users_without_enabled_flag_count: "Number of users whose enabled value is neither true nor false (a boolean, 1 or 0, or the strings true, false, 1, or 0).",
+  roles_readable: "True when GET /access-control/v1/roles returned its documented array of roles.",
+  permissions_readable: "True when GET /api/v3/access-control/permissions returned its documented permissions array.",
+  permission_count: "Number of permission records GET /api/v3/access-control/permissions returned.",
+  broad_permission_count: "Number of permissions whose subjects include an AllUsers subject, or a UserGroup subject whose uuid is 00000000-0000-0000-0000-000000000000 or whose name is All Users; whose objects include an AllAssets, AllObjects, or AllTags object; and whose actions include one containing CanEdit, CanScan, or CanUse, case-insensitively.",
+  legacy_access_group_count: "Number of GET /v2/access-groups records whose all_assets value is not true (true, 1, or the strings true or 1); 0 when that walk was not read.",
+  access_groups_complete: "False when the GET /v2/access-groups read was refused, failed, or not configured, or its offset walk stopped before the end of the access group list; true otherwise.",
+  groups_readable: "True when GET /groups returned its documented groups array.",
+  credentials_readable: "True when the GET /credentials offset walk returned documented credentials pages.",
+  credential_count: "Number of managed credential records the GET /credentials walk delivered.",
+  unused_credential_count: "Number of managed credentials whose last_used_by.id is not a number or numeric string, meaning no scan has used them.",
+  credential_age_days: "For each managed credential whose created_date parses as epoch seconds, epoch milliseconds, or a date string, the days from that timestamp to the assessment time as a fraction, floored at 0.",
+  undated_credential_count: "Number of managed credentials whose created_date does not parse as a timestamp.",
+  credentials_complete: "False when the GET /credentials read was refused, failed, or not configured, or its offset walk stopped before the end of the credential list; true otherwise.",
+  audit_log_readable: "True when the GET /audit-log/v1/events offset walk returned documented events pages.",
+  audit_event_count: "Number of activity log events the GET /audit-log/v1/events walk delivered for the audit_lookback_days window.",
+  audit_events_complete: "False when the GET /audit-log/v1/events read was refused, failed, or not configured, or its offset walk stopped before the end of the event list, including at its 20-page cap; true otherwise.",
+  sensitive_audit_event_count: "Number of distinct events, keyed by id or else by the whole event, whose crud is d, or whose crud is not r (a missing crud included) and whose action contains user, role, permission, key, exclusion, policy, or template, case-insensitively.",
+  sc_users_readable: "True when Tenable Security Center is configured and GET /rest/user returned a user list.",
+  sc_user_count: "Number of Security Center user records, with the usable and manageable lists merged by id.",
+  sc_active_user_last_login_age_days: "For each Security Center user whose status is 0 and whose lastLogin parses as epoch seconds, epoch milliseconds, or a date string, the days from lastLogin to the assessment time as a fraction, floored at 0.",
+  sc_never_logged_in_user_count: "Number of Security Center users whose status is 0 and whose lastLogin does not parse as a timestamp; a lastLogin of 0 counts as never.",
+  sc_locked_user_count: "Number of Security Center users whose status is 0 and whose locked value is true (true, 1, or the strings true or 1).",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -927,6 +1002,205 @@ const SENSOR_COVERAGE_CHECKS: readonly TenableCheck[] = [
   },
 ];
 
+const ACCESS_CONTROL = "tenable_assess_access_control";
+
+const ACCESS_CONTROL_CHECKS: readonly TenableCheck[] = [
+  {
+    id: "TENABLE-10-SC",
+    control: 10,
+    title: "User role and permission audit (Tenable Security Center)",
+    severity: "high",
+    owner: ACCESS_CONTROL,
+    surfaces: ["sc-users"],
+    inputs: [
+      "sc_users_readable", "sc_user_count", "sc_active_user_last_login_age_days", "inactive_user_days", "sc_never_logged_in_user_count",
+      "sc_locked_user_count",
+    ],
+    rules: [
+      rule("manual", ne("sc_users_readable", true)),
+      rule("manual", eq("sc_user_count", 0)),
+      rule("fail", some("sc_active_user_last_login_age_days", gt("$", path("inactive_user_days")))),
+      rule("warn", any(gt("sc_never_logged_in_user_count", 0), gt("sc_locked_user_count", 0))),
+      rule("pass", always),
+    ],
+    decision: "Manual when Security Center is not configured, its user list is unreadable, or it returned zero users, since the calling user must exist. Fail when an active user (status 0) last logged in more than inactive_user_days before the assessment. Warn when an active user never logged in or is locked. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "All three active users logged in within the last month.", {
+        sc_users_readable: true, sc_user_count: 3, sc_active_user_last_login_age_days: [1, 4, 20], inactive_user_days: 90,
+        sc_never_logged_in_user_count: 0, sc_locked_user_count: 0,
+      }),
+      example("noncompliant", "fail", "One active user last logged in 120 days ago, past the 90-day window.", {
+        sc_users_readable: true, sc_user_count: 3, sc_active_user_last_login_age_days: [1, 4, 120], inactive_user_days: 90,
+        sc_never_logged_in_user_count: 0, sc_locked_user_count: 0,
+      }),
+      example("partial", "warn", "Every login is recent, but one active user is locked.", {
+        sc_users_readable: true, sc_user_count: 3, sc_active_user_last_login_age_days: [1, 4, 20], inactive_user_days: 90,
+        sc_never_logged_in_user_count: 0, sc_locked_user_count: 1,
+      }),
+      example("unreadable", "manual", "Security Center is not configured, so no user list exists.", { sc_users_readable: false }),
+    ],
+  },
+  {
+    id: "TENABLE-10",
+    control: 10,
+    title: "User role and permission audit",
+    severity: "high",
+    owner: ACCESS_CONTROL,
+    surfaces: ["users", "roles"],
+    inputs: [
+      "users_readable", "user_count", "caller_is_administrator", "administrators_without_strong_auth_count", "enabled_user_last_login_age_days",
+      "inactive_user_days", "enabled_administrator_count", "max_admins", "enabled_user_count", "never_logged_in_user_count",
+      "enabled_user_api_key_age_days", "locked_out_user_count", "enabled_user_login_failure_counts", "users_without_enabled_flag_count",
+      "roles_readable",
+    ],
+    rules: [
+      rule("manual", ne("users_readable", true)),
+      rule("manual", eq("user_count", 0)),
+      rule("manual", ne("caller_is_administrator", true)),
+      rule("fail", any(
+        gt("administrators_without_strong_auth_count", 0),
+        some("enabled_user_last_login_age_days", gt("$", path("inactive_user_days"))),
+        gt("enabled_administrator_count", path("max_admins")),
+      )),
+      rule("manual", eq("enabled_user_count", 0)),
+      rule("warn", any(
+        gt("never_logged_in_user_count", 0),
+        some("enabled_user_api_key_age_days", gt("$", path("inactive_user_days"))),
+        gt("locked_out_user_count", 0),
+        some("enabled_user_login_failure_counts", gte("$", 5)),
+        gt("users_without_enabled_flag_count", 0),
+        ne("roles_readable", true),
+      )),
+      rule("pass", always),
+    ],
+    decision: "Manual when the user list is unreadable or empty, since the calling user must exist, or when users come back in the reduced shape because the key is not Administrator, which hides roles, logins, and two-factor settings. Fail when an enabled Administrator allowed into the UI has neither SAML-only login nor two-factor enabled, when an enabled user last logged in more than inactive_user_days before the assessment, or when enabled Administrators outnumber max_admins. Manual when no user is enabled, since the calling user is then unaccounted for. Warn when an enabled user never logged in, holds an API key unused for more than inactive_user_days, is locked out, or shows 5 or more failed logins, when any user exposes no enabled flag, or when the role list is unreadable. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Four enabled users logged in recently, and both Administrators enforce SAML-only login.", {
+        users_readable: true, user_count: 5, caller_is_administrator: true, administrators_without_strong_auth_count: 0,
+        enabled_user_last_login_age_days: [1, 3, 10, 30], inactive_user_days: 90, enabled_administrator_count: 2, max_admins: 5,
+        enabled_user_count: 4, never_logged_in_user_count: 0, enabled_user_api_key_age_days: [2, 15], locked_out_user_count: 0,
+        enabled_user_login_failure_counts: [0, 0, 1, 0], users_without_enabled_flag_count: 0, roles_readable: true,
+      }),
+      example("noncompliant", "fail", "One enabled user last logged in 120 days ago, past the 90-day window.", {
+        users_readable: true, user_count: 5, caller_is_administrator: true, administrators_without_strong_auth_count: 0,
+        enabled_user_last_login_age_days: [1, 3, 10, 120], inactive_user_days: 90, enabled_administrator_count: 2, max_admins: 5,
+        enabled_user_count: 4, never_logged_in_user_count: 0, enabled_user_api_key_age_days: [2, 15], locked_out_user_count: 0,
+        enabled_user_login_failure_counts: [0, 0, 1, 0], users_without_enabled_flag_count: 0, roles_readable: true,
+      }),
+      example("partial", "warn", "Every user is healthy, but the role list could not be read, so custom roles are unknown.", {
+        users_readable: true, user_count: 5, caller_is_administrator: true, administrators_without_strong_auth_count: 0,
+        enabled_user_last_login_age_days: [1, 3, 10, 30], inactive_user_days: 90, enabled_administrator_count: 2, max_admins: 5,
+        enabled_user_count: 4, never_logged_in_user_count: 0, enabled_user_api_key_age_days: [2, 15], locked_out_user_count: 0,
+        enabled_user_login_failure_counts: [0, 0, 1, 0], users_without_enabled_flag_count: 0, roles_readable: false,
+      }),
+      example("unreadable", "manual", "Users came back in the reduced shape, so roles, logins, and two-factor settings are hidden.", {
+        users_readable: true, user_count: 5, caller_is_administrator: false,
+      }),
+    ],
+  },
+  {
+    id: "TENABLE-11",
+    control: 11,
+    title: "Access group review",
+    severity: "high",
+    owner: ACCESS_CONTROL,
+    surfaces: ["permissions", "access-groups", "groups", "users"],
+    inputs: [
+      "permissions_readable", "permission_count", "broad_permission_count", "legacy_access_group_count", "access_groups_complete", "groups_readable",
+      "caller_is_administrator",
+    ],
+    rules: [
+      rule("manual", ne("permissions_readable", true)),
+      rule("manual", eq("permission_count", 0)),
+      rule("fail", gt("broad_permission_count", 0)),
+      rule("warn", any(
+        gt("legacy_access_group_count", 0),
+        ne("access_groups_complete", true),
+        ne("groups_readable", true),
+        ne("caller_is_administrator", true),
+      )),
+      rule("pass", always),
+    ],
+    completeness: { access_groups_complete: walkComplete("access-groups", "GET /v2/access-groups") },
+    decision: "Manual when the permission list is unreadable or empty, since Tenable always generates administrator permissions. Fail when any permission grants all users write-style actions (CanEdit, CanScan, or CanUse) on all assets, objects, or tags. Warn when a deprecated access group other than an all-assets group remains, when the access group walk was unreadable or stopped early, when the user group list is unreadable, or when the key is not confirmed as Administrator. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Six scoped permissions, no legacy access group, and an Administrator key.", {
+        permissions_readable: true, permission_count: 6, broad_permission_count: 0, legacy_access_group_count: 0, access_groups_complete: true,
+        groups_readable: true, caller_is_administrator: true,
+      }),
+      example("noncompliant", "fail", "One permission lets All Users scan every asset.", {
+        permissions_readable: true, permission_count: 6, broad_permission_count: 1, legacy_access_group_count: 0, access_groups_complete: true,
+        groups_readable: true, caller_is_administrator: true,
+      }),
+      example("partial", "warn", "Permissions are scoped, but the access group walk stopped early.", {
+        permissions_readable: true, permission_count: 6, broad_permission_count: 0, legacy_access_group_count: 0, access_groups_complete: false,
+        groups_readable: true, caller_is_administrator: true,
+      }),
+      example("unreadable", "manual", "The permission list was refused.", { permissions_readable: false }),
+    ],
+  },
+  {
+    id: "TENABLE-12",
+    control: 12,
+    title: "Managed credential hygiene",
+    severity: "medium",
+    owner: ACCESS_CONTROL,
+    surfaces: ["credentials"],
+    inputs: ["credentials_readable", "credential_count", "unused_credential_count", "credential_age_days", "undated_credential_count", "credentials_complete"],
+    rules: [
+      rule("manual", ne("credentials_readable", true)),
+      rule("manual", eq("credential_count", 0)),
+      rule("warn", any(
+        gt("unused_credential_count", 0),
+        some("credential_age_days", gt("$", 365)),
+        gt("undated_credential_count", 0),
+        ne("credentials_complete", true),
+      )),
+      rule("pass", always),
+    ],
+    completeness: { credentials_complete: walkComplete("credentials", "GET /credentials") },
+    decision: "Manual when the managed credential walk is unreadable or delivered no credential, since scan-embedded credentials are not listed by the API. Warn when any credential was never used by a scan, was created more than 365 days before the assessment, or has no created_date, since the API exposes no rotation date, or when the walk stopped early. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Three credentials are in use and were created within the last year.", {
+        credentials_readable: true, credential_count: 3, unused_credential_count: 0, credential_age_days: [30, 200, 365], undated_credential_count: 0,
+        credentials_complete: true,
+      }),
+      example("partial", "warn", "One credential was created 366 days ago.", {
+        credentials_readable: true, credential_count: 3, unused_credential_count: 0, credential_age_days: [30, 200, 366], undated_credential_count: 0,
+        credentials_complete: true,
+      }),
+      example("unreadable", "manual", "The credential walk delivered no credential, so scan credentials need a human review.", {
+        credentials_readable: true, credential_count: 0,
+      }),
+    ],
+  },
+  {
+    id: "TENABLE-18",
+    control: 18,
+    title: "Audit log review",
+    severity: "medium",
+    owner: ACCESS_CONTROL,
+    surfaces: ["audit-log"],
+    inputs: ["audit_log_readable", "audit_event_count", "audit_events_complete", "sensitive_audit_event_count"],
+    rules: [
+      rule("manual", ne("audit_log_readable", true)),
+      rule("warn", any(eq("audit_event_count", 0), ne("audit_events_complete", true), gt("sensitive_audit_event_count", 0))),
+      rule("pass", always),
+    ],
+    completeness: { audit_events_complete: walkComplete("audit-log", "GET /audit-log/v1/events") },
+    decision: "Manual when the activity log walk was unreadable. Warn when it returned no event for the audit_lookback_days window, since an active tenant records logins and API calls, when it stopped before the end of the event list, or when it holds sensitive events needing sign-off: deletions, or changes to users, roles, permissions, keys, exclusions, policies, or templates. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "All 420 events were read and none is sensitive.", {
+        audit_log_readable: true, audit_event_count: 420, audit_events_complete: true, sensitive_audit_event_count: 0,
+      }),
+      example("partial", "warn", "Two user changes in the window need reviewer sign-off.", {
+        audit_log_readable: true, audit_event_count: 420, audit_events_complete: true, sensitive_audit_event_count: 2,
+      }),
+      example("unreadable", "manual", "The activity log was refused to a non-Administrator key.", { audit_log_readable: false }),
+    ],
+  },
+];
+
 const toCheck = (check: TenableCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -948,19 +1222,19 @@ const toCheck = (check: TenableCheck): BatchCheckDefinition => {
   };
 };
 
-const checks: readonly BatchCheckDefinition[] = [...SCAN_PROGRAM_CHECKS, ...SENSOR_COVERAGE_CHECKS].map(toCheck);
+const checks: readonly BatchCheckDefinition[] = [...SCAN_PROGRAM_CHECKS, ...SENSOR_COVERAGE_CHECKS, ...ACCESS_CONTROL_CHECKS].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 const surfaceIds = (predicate: (surface: BatchSurfaceDefinition) => boolean): string[] =>
   TENABLE_SURFACES.filter(predicate).map((surface) => surface.id);
 
-const offsetWalk = (walked: readonly string[], pageSize: number): BatchPaginationDefinition => ({
+const offsetWalk = (walked: readonly string[], pageSize: number, pageCap = 200): BatchPaginationDefinition => ({
   surfaceIds: walked,
   cursorFields: ["limit", "offset", "pagination.total"],
   pageSize,
   itemCap: "none",
-  pageCap: 200,
+  pageCap,
   totalSemantics: "When pagination.total is reported the walk must reach it; without a total a page shorter than the limit ends the list.",
-  stopConditions: ["An empty page", "pagination.total reached", "A short page when no total is reported", "A page that opens with the same record as the previous page", "The 200-page cap"],
+  stopConditions: ["An empty page", "pagination.total reached", "A short page when no total is reported", "A page that opens with the same record as the previous page", `The ${pageCap}-page cap`],
 });
 
 export const TENABLE_SPEC = buildBatchIntegrationSpec({
@@ -985,7 +1259,7 @@ export const TENABLE_SPEC = buildBatchIntegrationSpec({
       kind: "role",
       value: "Tenable Security Center Security Manager or Administrator",
       unlocks: surfaceIds((surface) => surface.service === SC_SERVICE),
-      notes: "Security Center returns only the scans and scan results the role can use or manage.",
+      notes: "Security Center returns only the scans, scan results, scanners, and users the role can use or manage.",
     },
   ],
   surfaces: TENABLE_SURFACES,
@@ -994,13 +1268,15 @@ export const TENABLE_SPEC = buildBatchIntegrationSpec({
     tenable_check_access: [],
     tenable_assess_scan_program: idsFor(SCAN_PROGRAM),
     tenable_assess_sensor_coverage: idsFor(SENSOR_COVERAGE),
+    tenable_assess_access_control: idsFor(ACCESS_CONTROL),
     tenable_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
-    offsetWalk(["exclusions"], 200),
+    offsetWalk(["exclusions", "access-groups", "credentials"], 200),
     offsetWalk(["agents"], 1000),
     offsetWalk(["networks"], 50),
     offsetWalk(["tag-categories", "tag-values"], 5000),
+    offsetWalk(["audit-log"], 5000, 20),
     {
       surfaceIds: ["asset-export-request", "asset-export-chunks"],
       cursorFields: ["export_uuid", "chunks_available", "chunks_failed", "total_chunks"],
