@@ -23,7 +23,7 @@ import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import { readResolverEnvironment, TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, runBatchVerdictContext } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import type { FrameworkKey } from "./spec-model.js";
 import { TENABLE_SPEC } from "./tenable.spec.js";
@@ -5458,6 +5458,7 @@ function registerAssessmentTool(pi: ExtensionAPI, kind: AssessmentKind, name: st
 }
 
 export function registerTenableTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, TENABLE_SPEC);
   pi.registerTool({
     name: "tenable_check_access",
     label: "Check Tenable audit access",

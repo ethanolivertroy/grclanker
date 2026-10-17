@@ -1502,8 +1502,24 @@ export const TENABLE_SPEC = buildBatchIntegrationSpec({
   sensitiveFields: ["access_key", "secret_key", "sc_access_key", "sc_secret_key", "X-ApiKeys", "x-apikey", "credentials", "key"],
   credentialFormats: ["Tenable Vulnerability Management access and secret key pairs", "Tenable Security Center access and secret key pairs"],
   output: buildBatchOutputContract({
-    files: [],
-    overwritePolicy: "Allocate a new {host}-audit-bundle directory with a numeric suffix when needed; never overwrite a prior directory.",
+    files: [
+      ...[
+        "access_check", "scans", "policies", "policy_details", "scan_templates", "exclusions", "target_groups", "assets_export", "server_properties",
+        "scanners", "agents", "agent_groups", "networks", "tag_categories", "tag_values", "users", "groups", "roles", "permissions", "access_groups",
+        "credentials", "audit_log_events", "vulns_export", "export_jobs", "security_center",
+      ].map((name) => `core_data/${name}.json`),
+      ...["scan_program", "sensor_coverage", "access_control", "vulnerability_management", "findings"].map((name) => `analysis/${name}.json`),
+      "metadata.json",
+      "compliance/executive_summary.md",
+      "compliance/unified_compliance_matrix.md",
+      ...["fedramp", "cmmc", "soc2", "cis", "pci_dss", "disa_stig", "irap", "ismap"].map((slug) => `compliance/${slug}/${slug}_compliance_report.md`),
+      "QUICK_REFERENCE.md",
+    ],
+    conditionalFiles: ["_errors.log"],
+    conditionalFileConditions: {
+      "_errors.log": "Only when a configured dataset read was refused or failed with an error message, stopped partway, or returned records that could not be evaluated.",
+    },
+    overwritePolicy: "Allocate {host}-audit-bundle, or the first of -2 through -50 whose directory and zip are both free, and fail rather than overwrite.",
     archivePairing: "Write a sibling zip named from the exact allocated bundle-directory path plus .zip.",
   }),
   lastUpdated: "2026-10-17",
