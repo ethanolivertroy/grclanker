@@ -54,6 +54,8 @@ import {
 
 // Every assessment in this file feeds the boundary and rule certification at the end.
 const observedDecisionFacts = observeRuntimeDecisionFacts(TENABLE_SPEC);
+// A name filter, skip filter, or --test-only run leaves those facts incomplete, so certification would report false gaps.
+const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
 
 const NOW = Date.parse("2026-09-21T12:00:00Z");
 const RECENT_SECONDS = Math.floor((NOW - 2 * 86_400_000) / 1000);
@@ -4277,7 +4279,9 @@ test("byte differential fixtures: Tenable assessments and export", { skip: !byte
   writeByteDifferentialFixture("tenable", "export", snapshotExportBundle(exported));
 });
 
-portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", () => {
+portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", {
+  skip: testFilterActive && "a test filter ran only part of this file",
+}, () => {
   observedDecisionFacts.stop();
   const boundaries = certifyRuntimeBoundaryCoverage(TENABLE_SPEC, observedDecisionFacts.factsByCheck);
   const rules = certifyRuntimeRuleDecisiveness(TENABLE_SPEC, observedDecisionFacts.factsByCheck);
