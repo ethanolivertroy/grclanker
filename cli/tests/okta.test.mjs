@@ -4033,7 +4033,7 @@ test("byte differential fixtures: Okta assessments and export artifacts", { skip
   writeByteDifferentialFixture("okta", "partial", partial);
 
   const compliant = await runAllAssessments(
-    createSampleClient(),
+    { ...createSampleClient(), async listApiTokens() { return []; } },
     createSampleConfig({ authMode: "PrivateKey", token: undefined, clientId: "service-app" }),
   );
   writeByteDifferentialFixture("okta", "compliant", compliant);
