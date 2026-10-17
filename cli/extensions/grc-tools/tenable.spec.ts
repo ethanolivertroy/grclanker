@@ -192,7 +192,7 @@ const TENABLE_INPUTS: Readonly<Record<string, string>> = {
   sc_scan_count: "Number of Security Center scan records, with the usable and manageable lists merged by id.",
   sc_recurring_scan_count: "Number of Security Center scans whose schedule.type is ical.",
   sc_scan_results_readable: "True when GET /rest/scanResult returned a result list.",
-  sc_completed_result_age_days: "For each returned Security Center scan result whose status contains completed, case-insensitively, and whose finishTime parses as a timestamp, the days from finishTime to the assessment time as a fraction, floored at 0.",
+  sc_finished_result_age_days: "For each returned Security Center scan result whose status contains completed, case-insensitively, and whose finishTime parses as a timestamp, the days from finishTime to the assessment time as a fraction, floored at 0.",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -285,6 +285,33 @@ const SCAN_PROGRAM_CHECKS: readonly TenableCheck[] = [
         templates_readable: true, policies_readable: true, caller_is_administrator: true,
       }),
       example("unreadable", "manual", "The scan list was refused, so no policy can be located.", { scans_readable: false }),
+    ],
+  },
+  {
+    id: "TENABLE-02-SC",
+    control: 2,
+    title: "Scan schedule discipline (Tenable Security Center)",
+    severity: "high",
+    owner: SCAN_PROGRAM,
+    surfaces: ["sc-scans", "sc-scan-results"],
+    inputs: ["sc_scans_readable", "sc_scan_count", "sc_recurring_scan_count", "sc_scan_results_readable", "sc_finished_result_age_days", "stale_scan_days"],
+    rules: [
+      rule("manual", ne("sc_scans_readable", true)),
+      rule("fail", eq("sc_scan_count", 0)),
+      rule("fail", eq("sc_recurring_scan_count", 0)),
+      rule("manual", ne("sc_scan_results_readable", true)),
+      rule("pass", some("sc_finished_result_age_days", lte("$", path("stale_scan_days")))),
+      rule("fail", always),
+    ],
+    decision: "Manual when Security Center is not configured or GET /rest/scan is unreadable. Fail when Security Center returns no scan or no scan has an ical (recurring) schedule. Manual when GET /rest/scanResult is unreadable. Pass when at least one scan result whose status mentions completed finished within stale_scan_days; otherwise fail.",
+    examples: [
+      example("compliant", "pass", "A completed result finished exactly 30 days ago, inside the 30-day window.", {
+        sc_scans_readable: true, sc_scan_count: 2, sc_recurring_scan_count: 1, sc_scan_results_readable: true, sc_finished_result_age_days: [30], stale_scan_days: 30,
+      }),
+      example("noncompliant", "fail", "Scans are visible, but none uses an ical schedule, which fails before the results are consulted.", {
+        sc_scans_readable: true, sc_scan_count: 2, sc_recurring_scan_count: 0, sc_scan_results_readable: false,
+      }),
+      example("unreadable", "manual", "Security Center is not configured.", { sc_scans_readable: false }),
     ],
   },
   {
@@ -458,33 +485,6 @@ const SCAN_PROGRAM_CHECKS: readonly TenableCheck[] = [
         target_groups_readable: true, target_group_age_days: [10, 366], undated_target_group_count: 0, overlapping_member_count: 0, caller_is_administrator: true,
       }),
       example("unreadable", "manual", "GET /target-groups failed.", { target_groups_readable: false }),
-    ],
-  },
-  {
-    id: "TENABLE-02-SC",
-    control: 2,
-    title: "Scan schedule discipline (Tenable Security Center)",
-    severity: "high",
-    owner: SCAN_PROGRAM,
-    surfaces: ["sc-scans", "sc-scan-results"],
-    inputs: ["sc_scans_readable", "sc_scan_count", "sc_recurring_scan_count", "sc_scan_results_readable", "sc_completed_result_age_days", "stale_scan_days"],
-    rules: [
-      rule("manual", ne("sc_scans_readable", true)),
-      rule("fail", eq("sc_scan_count", 0)),
-      rule("fail", eq("sc_recurring_scan_count", 0)),
-      rule("manual", ne("sc_scan_results_readable", true)),
-      rule("pass", some("sc_completed_result_age_days", lte("$", path("stale_scan_days")))),
-      rule("fail", always),
-    ],
-    decision: "Manual when Security Center is not configured or GET /rest/scan is unreadable. Fail when Security Center returns no scan or no scan has an ical (recurring) schedule. Manual when GET /rest/scanResult is unreadable. Pass when at least one scan result whose status mentions completed finished within stale_scan_days; otherwise fail.",
-    examples: [
-      example("compliant", "pass", "A completed result finished exactly 30 days ago, inside the 30-day window.", {
-        sc_scans_readable: true, sc_scan_count: 2, sc_recurring_scan_count: 1, sc_scan_results_readable: true, sc_completed_result_age_days: [30], stale_scan_days: 30,
-      }),
-      example("noncompliant", "fail", "Scans are visible, but none uses an ical schedule, which fails before the results are consulted.", {
-        sc_scans_readable: true, sc_scan_count: 2, sc_recurring_scan_count: 0, sc_scan_results_readable: false,
-      }),
-      example("unreadable", "manual", "Security Center is not configured.", { sc_scans_readable: false }),
     ],
   },
 ];

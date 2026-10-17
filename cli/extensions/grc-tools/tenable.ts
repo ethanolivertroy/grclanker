@@ -5,6 +5,7 @@
  * or fedcloud.tenable.com) with optional Tenable Security Center equivalents. The only
  * POST calls are the documented asset and vulnerability export requests.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   createWriteStream,
   existsSync,
@@ -22,7 +23,10 @@ import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import { readResolverEnvironment, TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import type { FrameworkKey } from "./spec-model.js";
+import { TENABLE_SPEC } from "./tenable.spec.js";
 
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
@@ -246,7 +250,7 @@ const CONTROL_TITLES: Record<number, string> = {
   20: "Target group management",
 };
 
-const FRAMEWORK_REPORTS: Array<{ prefix: string; slug: string; title: string }> = [
+const FRAMEWORK_REPORTS: Array<{ prefix: string; slug: FrameworkKey; title: string }> = [
   { prefix: "FedRAMP", slug: "fedramp", title: "FedRAMP / NIST 800-53 Compliance Report" },
   { prefix: "CMMC", slug: "cmmc", title: "CMMC Compliance Report" },
   { prefix: "SOC 2", slug: "soc2", title: "SOC 2 Compliance Report" },
@@ -256,6 +260,23 @@ const FRAMEWORK_REPORTS: Array<{ prefix: string; slug: string; title: string }> 
   { prefix: "IRAP", slug: "irap", title: "IRAP / ISM Compliance Report" },
   { prefix: "ISMAP", slug: "ismap", title: "ISMAP Compliance Report" },
 ];
+
+function frameworkMappingsOf(control: number): Partial<Record<FrameworkKey, string[]>> {
+  const mappings = CONTROL_MAPPINGS[control];
+  if (!mappings) throw new Error(`Tenable control ${control} has no framework mappings`);
+  const byFramework: Partial<Record<FrameworkKey, string[]>> = {};
+  for (const mapping of mappings) {
+    const framework = FRAMEWORK_REPORTS.find((report) => mapping.startsWith(`${report.prefix} `));
+    if (!framework) throw new Error(`Tenable control ${control} mapping ${mapping} names no reported framework`);
+    (byFramework[framework.slug] ??= []).push(mapping.slice(framework.prefix.length + 1));
+  }
+  return byFramework;
+}
+
+hydrateBatchFrameworkMappings(TENABLE_SPEC, Object.fromEntries(TENABLE_SPEC.checks.map((check) => [
+  check.id,
+  frameworkMappingsOf(check.controlNumbers[0]),
+])));
 
 function asObject(value: unknown): JsonRecord | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -2814,6 +2835,15 @@ function collectionSummary(datasets: Record<string, TenableDataset<unknown>>): J
   return Object.fromEntries(Object.entries(datasets).map(([name, dataset]) => [name, collectionStatusOf(dataset)]));
 }
 
+const TENABLE_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordTenableDecisionFacts(control: number, facts: Readonly<Record<string, unknown>>, idSuffix = ""): void {
+  const id = `TENABLE-${String(control).padStart(2, "0")}${idSuffix}`;
+  const store = TENABLE_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside a Tenable assessment`);
+  store.set(id, facts);
+}
+
 function finding(
   control: number,
   status: TenableFindingStatus,
@@ -3219,6 +3249,10 @@ export async function collectTenableScanProgramData(clients: TenableClients, opt
 }
 
 export function assessTenableScanProgram(data: TenableScanProgramData, options: TenableAssessmentOptions = {}): TenableAssessmentResult {
+  return runBatchVerdictContext(TENABLE_DECISION_CONTEXT, TENABLE_SPEC, () => assessTenableScanProgramWithDecisionContext(data, options));
+}
+
+function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramData, options: TenableAssessmentOptions): TenableAssessmentResult {
   const now = options.now ?? Date.now();
   const staleScanDays = clampInteger(options.staleScanDays, DEFAULT_STALE_SCAN_DAYS, 1, 365);
   const credentialThreshold = clampNumber(options.credentialThreshold, DEFAULT_CREDENTIAL_THRESHOLD, 0, 1);
@@ -3234,6 +3268,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     templatesById.get(asString(item.wizard_uuid) ?? "") ?? templatesById.get(asString(item.template_uuid) ?? "");
 
   if (data.scans.status !== "ok") {
+    for (const control of [1, 2, 17]) recordTenableDecisionFacts(control, { scans_readable: false });
     findings.push(unreadableFinding(1, "high", data.scans, "the scan template list, port ranges, plugin families, and safe-check settings from the Tenable UI"));
     findings.push(unreadableFinding(2, "high", data.scans, "the scan schedule list and last run dates from the Tenable UI"));
     findings.push(unreadableFinding(17, "medium", data.scans, "the list of scheduled compliance audit scans (CIS, DISA STIG, PCI) from the Tenable UI"));
@@ -3276,6 +3311,22 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       { dataset: data.policies, consequence: "policy names are unknown" },
     ];
     const templateNote = unreadableNote(policySecondaries);
+    recordTenableDecisionFacts(1, {
+      scans_readable: true,
+      scan_count: scans.length,
+      discovery_scan_count: discoveryOnly,
+      failing_policy_count: failingPolicies.length,
+      policy_details_readable: data.policyDetails.status === "ok",
+      evaluated_policy_count: evaluations.length,
+      scans_without_policy_id_count: scansWithoutPolicy.length,
+      unreadable_policy_count: unreadablePolicies.length,
+      unverified_policy_count: unverifiedPolicies.length,
+      policy_details_complete: data.policyDetails.truncated !== true,
+      warning_policy_count: warningPolicies.length,
+      templates_readable: data.templates.status === "ok",
+      policies_readable: data.policies.status === "ok",
+      caller_is_administrator: callerIsAdministrator === true,
+    });
     let policyStatus: TenableFindingStatus;
     let policySummary: string;
     if (scans.length === 0) {
@@ -3336,6 +3387,18 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       return lastLaunch !== undefined && daysBetween(now, lastLaunch) > staleScanDays;
     });
     const neverRun = recurring.filter((scan) => asString(scan.status) === "empty" || parseTimestampMs(scan.last_modification_date) === undefined);
+    recordTenableDecisionFacts(2, {
+      scans_readable: true,
+      scan_count: scans.length,
+      enabled_recurring_scan_count: recurring.length,
+      recurring_scan_age_days: recurring.flatMap((scan) => {
+        const lastLaunch = parseTimestampMs(scan.last_modification_date);
+        return lastLaunch === undefined ? [] : [daysBetween(now, lastLaunch)];
+      }),
+      stale_scan_days: staleScanDays,
+      never_run_or_undated_recurring_scan_count: neverRun.length,
+      caller_is_administrator: callerIsAdministrator === true,
+    });
     let scheduleStatus: TenableFindingStatus;
     let scheduleSummary: string;
     if (scans.length === 0) {
@@ -3365,6 +3428,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     }));
 
     if (data.templates.status !== "ok") {
+      recordTenableDecisionFacts(17, { scans_readable: true, templates_readable: false });
       findings.push(unreadableFinding(17, "medium", data.templates, "the list of scheduled compliance audit scans (CIS, DISA STIG, PCI) from the Tenable UI"));
     } else {
       const complianceScans = scans.filter((scan) => {
@@ -3372,6 +3436,13 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
         return Boolean(template && templateLooksCompliance(template));
       });
       const activeCompliance = complianceScans.filter((scan) => scanIsEnabled(scan) && scanIsRecurring(scan));
+      recordTenableDecisionFacts(17, {
+        scans_readable: true,
+        templates_readable: true,
+        scan_count: scans.length,
+        active_compliance_scan_count: activeCompliance.length,
+        caller_is_administrator: callerIsAdministrator === true,
+      });
       findings.push(finding(
         17,
         scans.length === 0 ? "fail" : activeCompliance.length > 0 ? capForNonAdmin("pass", callerIsAdministrator) : "fail",
@@ -3391,6 +3462,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
   }
 
   if (data.assetExport.status !== "ok") {
+    recordTenableDecisionFacts(4, { asset_export_readable: false });
     findings.push(unreadableFinding(4, "high", data.assetExport, "the credentialed scan ratio from the Tenable asset inventory (Last Authenticated Scan filter)"));
   } else {
     const assets = data.assetExport.data.records;
@@ -3401,6 +3473,13 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       return asBoolean(asset.has_agent) !== true && (status === undefined || status === "N/A");
     });
     const coverage = ratio(credentialed.length, assets.length);
+    recordTenableDecisionFacts(4, {
+      asset_export_readable: true,
+      asset_count: assets.length,
+      credentialed_coverage_ratio: coverage,
+      credential_threshold: credentialThreshold,
+      asset_export_complete: !data.assetExport.truncated && unevaluableRecordsOf(data.assetExport) === 0,
+    });
     let status: TenableFindingStatus;
     let summary: string;
     if (assets.length === 0) {
@@ -3427,12 +3506,20 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
   }
 
   if (data.exclusions.status !== "ok") {
+    recordTenableDecisionFacts(13, { exclusions_readable: false });
     findings.push(unreadableFinding(13, "medium", data.exclusions, "the scan exclusion list with schedules, targets, and justifications from Settings > Exclusions"));
   } else {
     const exclusions = data.exclusions.data;
     const permanent = exclusions.filter((item) => asBoolean(asObject(item.schedule)?.enabled) !== true);
     const undocumented = exclusions.filter((item) => !asString(item.description));
     const broad = exclusions.filter((item) => exclusionIsBroad(asString(item.members)));
+    recordTenableDecisionFacts(13, {
+      exclusions_readable: true,
+      exclusions_complete: !data.exclusions.truncated,
+      permanent_exclusion_count: permanent.length,
+      broad_exclusion_count: broad.length,
+      undocumented_exclusion_count: undocumented.length,
+    });
     const issues = new Set([...permanent, ...undocumented, ...broad].map((item) => asString(item.name) ?? asString(item.id) ?? "exclusion"));
     findings.push(withPartialView(finding(
       13,
@@ -3460,6 +3547,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
   }
 
   if (data.targetGroups.status !== "ok") {
+    recordTenableDecisionFacts(20, { target_groups_readable: false });
     findings.push(unreadableFinding(20, "low", data.targetGroups, "the legacy target group list (deprecated feature) or confirmation that tags replaced target groups"));
   } else {
     const groups = data.targetGroups.data;
@@ -3474,6 +3562,14 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       }
     }
     const overlapping = [...memberIndex.entries()].filter(([, owners]) => owners.length > 1);
+    const modifiedTimes = groups.map((group) => parseTimestampMs(group.last_modification_date));
+    recordTenableDecisionFacts(20, {
+      target_groups_readable: true,
+      target_group_age_days: modifiedTimes.flatMap((modified) => modified === undefined ? [] : [daysBetween(now, modified)]),
+      undated_target_group_count: modifiedTimes.filter((modified) => modified === undefined).length,
+      overlapping_member_count: overlapping.length,
+      caller_is_administrator: callerIsAdministrator === true,
+    });
     findings.push(finding(
       20,
       groups.length === 0 ? capForNonAdmin("pass", callerIsAdministrator) : stale.length === 0 && overlapping.length === 0 ? capForNonAdmin("pass", callerIsAdministrator) : "warn",
@@ -3538,6 +3634,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
 
 function assessSecurityCenterSchedule(scans: TenableDataset<JsonRecord[]>, results: TenableDataset<JsonRecord[]>, now: number, staleScanDays: number): TenableFinding {
   if (scans.status !== "ok") {
+    recordTenableDecisionFacts(2, { sc_scans_readable: false }, "-SC");
     return unreadableFinding(2, "high", scans, "the Security Center scan schedule list and recent scan results", "-SC");
   }
   const scheduled = scans.data.filter((scan) => asString(asObject(scan.schedule)?.type) === "ical");
@@ -3547,6 +3644,19 @@ function assessSecurityCenterSchedule(scans: TenableDataset<JsonRecord[]>, resul
         return /completed/i.test(asString(result.status) ?? "") && finishedAt !== undefined && daysBetween(now, finishedAt) <= staleScanDays;
       })
     : [];
+  recordTenableDecisionFacts(2, {
+    sc_scans_readable: true,
+    sc_scan_count: scans.data.length,
+    sc_recurring_scan_count: scheduled.length,
+    sc_scan_results_readable: results.status === "ok",
+    sc_finished_result_age_days: results.status === "ok"
+      ? results.data.flatMap((result) => {
+          const finishedAt = parseTimestampMs(result.finishTime);
+          return /completed/i.test(asString(result.status) ?? "") && finishedAt !== undefined ? [daysBetween(now, finishedAt)] : [];
+        })
+      : [],
+    stale_scan_days: staleScanDays,
+  }, "-SC");
   let status: TenableFindingStatus;
   let summary: string;
   if (scans.data.length === 0) {
