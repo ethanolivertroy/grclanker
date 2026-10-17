@@ -1416,15 +1416,22 @@ details[open] > .agent-group-toggle::before {
   padding: 0.38rem 0.75rem;
   border-left: 2px solid transparent;
   color: var(--docs-subtle);
-  font-family: var(--docs-font-body);
   font-size: var(--text-sm);
   text-decoration: none;
   transition: color 0.15s ease, border-color 0.15s ease;
 }
 
+#nd-sidebar a,
+.docs-sidebar-link,
 #nd-toc a,
 [data-toc-popover-content] a {
   font-family: var(--docs-font-body);
+}
+
+/* Fumadocs leaves this bar translucent, so scrolled text shows through it. */
+#nd-docs-layout [data-toc-popover] > header {
+  background-color: var(--color-fd-background);
+  backdrop-filter: none;
 }
 
 .docs-sidebar-link:hover {

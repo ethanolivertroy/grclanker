@@ -29,7 +29,7 @@ export function SiteHeader() {
   }
 
   return (
-    <nav className="border-b border-surface0/60 bg-mantle/95 sticky top-0 z-50" aria-label="Main navigation">
+    <nav className="border-b border-surface0/60 bg-mantle sticky top-0 z-50" aria-label="Main navigation">
       <div className="max-w-content mx-auto px-4 sm:px-6">
         <div className="site-nav-row flex min-h-[4.25rem] items-center justify-between gap-4 py-2">
           <div className="site-nav-brand flex items-center gap-2.5 min-w-0">
