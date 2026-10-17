@@ -3,6 +3,7 @@
 import { useRouter } from 'next/navigation';
 import { useEffect, useRef, useState } from 'react';
 import { useSearchContext } from 'fumadocs-ui/contexts/search';
+import { shortcutHandler } from '../lib/shortcut-keys.mjs';
 
 const BANNER =
   '%c  ┌─────────────────────────┐\n' +
@@ -23,14 +24,10 @@ const SHORTCUTS = [
   { label: 'This help', keys: <kbd>?</kbd> },
 ];
 
-function isTypingTarget(target: EventTarget | null) {
-  return target instanceof HTMLElement && (/^(input|textarea|select)$/i.test(target.tagName) || target.isContentEditable);
-}
-
-/** Site-wide `/`, `?`, `c`, and `h` shortcuts. Cmd/Ctrl+K comes from the Fumadocs search provider. */
+/** Site-wide keyboard shortcuts, the help dialog that lists them, and the copy toast. */
 export function KeyboardShortcuts() {
   const router = useRouter();
-  const { open: searchOpen, setOpenSearch } = useSearchContext();
+  const { open: searchOpen, setOpenSearch, hotKey } = useSearchContext();
   const helpRef = useRef<HTMLDialogElement>(null);
   const [toast, setToast] = useState({ text: '', visible: false });
 
@@ -55,36 +52,20 @@ export function KeyboardShortcuts() {
       hideTimer = setTimeout(() => setToast((current) => ({ ...current, visible: false })), 1500);
     }
 
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || searchOpen) return;
-      const help = helpRef.current;
-      if (help?.open) {
-        if (event.key === '?') {
-          event.preventDefault();
-          help.close();
-        }
-        return;
-      }
-      if (isTypingTarget(event.target)) return;
-      if (event.key === '/') {
-        event.preventDefault();
-        setOpenSearch(true);
-      } else if (event.key === '?') {
-        event.preventDefault();
-        help?.showModal();
-      } else if (event.key === 'c') {
-        copyRawUrl();
-      } else if (event.key === 'h') {
-        router.push('/');
-      }
-    }
-
+    const onKeyDown = shortcutHandler({
+      help: helpRef.current,
+      searchOpen,
+      searchHotKey: hotKey,
+      openSearch: () => setOpenSearch(true),
+      copyRawUrl,
+      goHome: () => router.push('/'),
+    });
     document.addEventListener('keydown', onKeyDown);
     return () => {
       document.removeEventListener('keydown', onKeyDown);
       clearTimeout(hideTimer);
     };
-  }, [router, searchOpen, setOpenSearch]);
+  }, [hotKey, router, searchOpen, setOpenSearch]);
 
   return (
     <>
