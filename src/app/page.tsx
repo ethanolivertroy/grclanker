@@ -77,59 +77,48 @@ function releaseFacts(integrationSpecCount: number) {
   ];
 }
 
-function whatsNew(specCount: number, generatedSpecCount: number) {
-  return [
-    {
-      label: '8 to 241 tools',
-      color: 'text-sapphire',
-      detail: '35 vendor integrations plus FedRAMP, SCF, and OSCAL tools, each integration with its own docs guide.',
-    },
-    {
-      label: 'Ask from the shell',
-      color: 'text-yellow',
-      detail:
-        'grclanker "<prompt>" and grclanker investigate <subject> pass your question straight in, with an optional --compute backend for that run.',
-    },
-    {
-      label: 'Two more runtimes',
-      color: 'text-peach',
-      detail:
-        'The Cursor Agent SDK serves all 241 tools with 42 approval-gated writers, and grclanker flue run drives the same agent under Flue.',
-    },
-    {
-      label: 'Remote compute',
-      color: 'text-green',
-      detail: 'Modal, RunPod Pod, and RunPod Serverless join host, sandbox-runtime, Docker, and Parallels VM backends.',
-    },
-    {
-      label: 'Specs from code',
-      color: 'text-mauve',
-      detail: `${specCount} repository specs, ${generatedSpecCount} of them generated from the tool registry. CI fails when a generated spec drifts.`,
-    },
-    {
-      label: 'Hardened evidence',
-      color: 'text-blue',
-      detail:
-        'Credential scrubbing in errors and exports, no credentials on cross-origin pagination links, and exports that allocate a new bundle on rerun.',
-    },
-    {
-      label: 'Verifiable releases',
-      color: 'text-sky',
-      detail:
-        'Reproducible bundles for six platforms with SHA256SUMS and GitHub build provenance attestations, plus CI on every pull request.',
-    },
-    {
-      label: 'Apache-2.0',
-      color: 'text-lavender',
-      detail: 'grclanker is licensed under the Apache License 2.0, with a NOTICE file.',
-    },
-  ];
-}
+const whatsNewCards = [
+  {
+    label: 'October 2026 FedRAMP rules',
+    color: 'text-sapphire',
+    detail:
+      'The FedRAMP docs are regenerated from Consolidated Rules 2026.10.13.01. FRC-CSX-MOT is gone, leaving 245 requirements.',
+  },
+  {
+    label: 'Fuller FedRAMP lookups',
+    color: 'text-yellow',
+    detail:
+      'fedramp_get_requirement shows notification forms, mapped Rev5 controls, and the full update history. fedramp_search_frmr matches control IDs such as ra-5.',
+  },
+  {
+    label: 'Trust-center headers',
+    color: 'text-peach',
+    detail:
+      'The ADS bundle and site scaffolds list the FRC-CSO-JSN hosting requirements: a JSON content type, nosniff, and CORS.',
+  },
+  {
+    label: 'sandbox-runtime 0.0.78',
+    color: 'text-green',
+    detail:
+      'Backend grep and find keep working with the placeholder files it mounts, and env exec and env smoke-test exit when done.',
+  },
+  {
+    label: 'Agent SDK on BDK 0.2.26',
+    color: 'text-mauve',
+    detail:
+      'The Cursor Agent SDK project moves up from 0.2.21 and still serves all 241 tools: 199 read-only and 42 approval-gated writers.',
+  },
+  {
+    label: 'New docs site',
+    color: 'text-blue',
+    detail:
+      'grclanker.com runs on Next.js with Fumadocs at the same URLs. Search covers docs, specs, and pages, and wide tables stack into cards on phones.',
+  },
+];
 
 export default function HomePage() {
   const specs = loadSpecs();
   const integrationSpecCount = specs.filter((spec) => spec.vendor !== 'grclanker').length;
-  const generatedSpecCount = specs.filter((spec) => spec.status === 'generated').length;
 
   return (
     <>
@@ -243,11 +232,11 @@ export default function HomePage() {
             <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
               <div>
                 <h2 id="whats-new-heading" className="font-semibold text-sm tracking-widest uppercase text-blue">
-                  What's New in v0.1.0
+                  What's New in v0.1.2
                 </h2>
                 <p className="text-subtext0 text-sm mt-1 italic">
-                  The first full release since v0.0.1. The one-line installer now ships v0.1.2, which adds the October 2026
-                  FedRAMP rules and sandbox-runtime fixes.
+                  Updates the FedRAMP tools to the October 2026 Consolidated Rules and moves the sandbox-runtime backend to
+                  0.0.78. The tool surface is unchanged, and the changelog has upgrade notes.
                 </p>
               </div>
               <Link href="/docs/changelog/" className="spec-action-btn spec-action-btn-primary self-start md:self-auto">
@@ -256,7 +245,7 @@ export default function HomePage() {
             </div>
 
             <div className="workflow-grid">
-              {whatsNew(specs.length, generatedSpecCount).map((item) => (
+              {whatsNewCards.map((item) => (
                 <div key={item.label} className="workflow-row">
                   <div className={`font-mono text-sm ${item.color}`}>{item.label}</div>
                   <div className="text-subtext0 text-sm mt-2 leading-relaxed">{item.detail}</div>
