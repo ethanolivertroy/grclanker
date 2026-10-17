@@ -6,7 +6,14 @@ export type ApiIntent = "read" | "auth-only";
 export type PermissionKind = "oauth-scope" | "iam-action" | "role" | "license" | "plan";
 export type FindingSeverity = "critical" | "high" | "medium" | "low" | "info" | "dynamic";
 export type FrameworkKey = "fedramp" | "cmmc" | "soc2" | "cis" | "pci_dss" | "disa_stig" | "irap" | "ismap";
-export type RequestParameterLocation = "path" | "query" | "header" | "form-body" | "operation-input" | "client";
+export type RequestParameterLocation =
+  | "path"
+  | "query"
+  | "header"
+  | "form-body"
+  | "json-body"
+  | "operation-input"
+  | "client";
 export type CriterionExampleKind = "compliant" | "noncompliant" | "partial" | "unreadable";
 export type PortableValue = string | number | boolean | null | readonly string[] | readonly number[];
 
@@ -76,10 +83,16 @@ export interface PaginationContract {
   surfaceIds: readonly string[];
   cursorFields: readonly string[];
   pageSize: number | null;
-  itemCap: number | null;
+  /** `null` means the caller supplies the limit; `"none"` means the collector applies no item cap. */
+  itemCap: number | "none" | null;
   pageCap: number | null;
   totalSemantics: string;
   stopConditions: readonly string[];
+}
+
+export interface RetryableStatusRange {
+  from: number;
+  to: number;
 }
 
 export interface RateLimitContract {
@@ -87,6 +100,7 @@ export interface RateLimitContract {
   documentedLimit: string | null;
   retryHeaders: readonly string[];
   retryableStatuses: readonly number[];
+  retryableStatusRanges?: readonly RetryableStatusRange[];
   backoffPolicy: string;
 }
 
@@ -142,6 +156,8 @@ export type VerdictCondition =
 export interface CriterionExample {
   kind: CriterionExampleKind;
   input: string;
+  /** Primitive decision inputs that evaluate to `expected`; examples without facts are explanatory only. */
+  facts?: VerdictFacts;
   expected: EvaluatedFindingStatus;
   reason: string;
 }
@@ -166,6 +182,7 @@ export type CompletenessFailureMode =
   | "error"
   | "denied"
   | "not-collected"
+  | "not-configured"
   | "missing-required-field";
 
 export interface CompletenessSourceContract {
@@ -329,7 +346,12 @@ export function evaluateVerdictCriteria(criteria: VerdictCriteria, facts: Verdic
   throw new Error("No verdict criterion matched the supplied facts");
 }
 
-export function evaluateCheckVerdict(check: CheckContract, rawFacts: VerdictFacts): EvaluatedFindingStatus {
+export interface SelectedVerdictRule {
+  index: number;
+  rule: VerdictRule;
+}
+
+export function resolveCheckDecisionFacts(check: CheckContract, rawFacts: VerdictFacts): VerdictFacts {
   const declaredRawInputs = new Set(check.evidenceFields);
   const undeclared = Object.keys(rawFacts).filter((name) => !declaredRawInputs.has(name));
   if (undeclared.length > 0) {
@@ -342,7 +364,18 @@ export function evaluateCheckVerdict(check: CheckContract, rawFacts: VerdictFact
   for (const [name, derivation] of Object.entries(check.derivedFactRules ?? {})) {
     facts[name] = evaluateVerdictCondition(derivation.condition, facts);
   }
-  return evaluateVerdictCriteria(check.criteria, facts);
+  return facts;
+}
+
+export function selectCheckVerdictRule(check: CheckContract, rawFacts: VerdictFacts): SelectedVerdictRule {
+  const facts = resolveCheckDecisionFacts(check, rawFacts);
+  const index = check.criteria.rules.findIndex((rule) => evaluateVerdictCondition(rule.condition, facts));
+  if (index < 0) throw new Error("No verdict criterion matched the supplied facts");
+  return { index, rule: check.criteria.rules[index] };
+}
+
+export function evaluateCheckVerdict(check: CheckContract, rawFacts: VerdictFacts): EvaluatedFindingStatus {
+  return selectCheckVerdictRule(check, rawFacts).rule.status;
 }
 
 export function evaluateCompletenessSource(
@@ -482,6 +515,11 @@ function evaluateCondition(condition: VerdictCondition, facts: VerdictFacts, ite
 
 export function evaluateVerdictCondition(condition: VerdictCondition, facts: VerdictFacts): boolean {
   return evaluateCondition(condition, facts, undefined);
+}
+
+/** `item` is the collection entry that `$`-rooted paths read inside `some` and `every` conditions. */
+export function evaluateVerdictOperand(operand: VerdictOperand, facts: VerdictFacts, item?: unknown): unknown {
+  return operandValue(operand, facts, item);
 }
 
 function renderOperand(operand: VerdictOperand): string {
