@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import {
   cpSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -12,45 +13,28 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..", "..");
-const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
-// Immutable stack base integrated immediately before final validation. Update
-// this SHA only when a newer parent head is merged into this branch.
-const baselineRef = "0ae89670cdf4ae291a326e40ecc7daaadef09de0";
-const mainWorktree = join(runRoot, "stacked-parent");
-const mainFixtures = join(runRoot, "fixtures-stacked-parent");
-const branchFixtures = join(runRoot, "fixtures-branch");
-const mainCorpus = join(runRoot, "corpus-main");
-const branchCorpus = join(runRoot, "corpus-branch");
-const exportRoot = join(runRoot, "exports");
-const testFiles = [
-  "okta.test.mjs",
-  "duo.test.mjs",
-  "gws.test.mjs",
-  "box.test.mjs",
-  "slack.test.mjs",
-  "zoom.test.mjs",
-  "zendesk.test.mjs",
-  "salesforce.test.mjs",
-  "servicenow.test.mjs",
-  "azure.test.mjs",
-  "gcp.test.mjs",
-  "oci.test.mjs",
-  "cloudflare.test.mjs",
-  "paloalto.test.mjs",
-  "zscaler.test.mjs",
-];
+const runtimeDirectory = join("cli", "extensions", "grc-tools");
+const defaultBaselineRef = "origin/main";
 const fixtureClasses = ["boundary", "compliant", "denied", "export", "missing-null", "partial", "representative"];
-const batch2Integrations = ["azure", "cloudflare", "gcp", "oci", "paloalto", "zscaler"];
+const relativeImport = /^import\s+([^;]*?)\s+from\s+(["'])(\.{1,2}\/[^"']+)\2;?[ \t]*$/gm;
+const unavailableBindingSource = `function __differentialUnavailable(specifier, name) {
+  const fail = () => {
+    throw new Error(\`\${name} from \${specifier} does not exist in the differential baseline; use it only inside portableContractTest\`);
+  };
+  return new Proxy(function unavailable() {}, { apply: fail, construct: fail, get: fail, has: fail, set: fail });
+}
+`;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd ?? repoRoot,
     env: { ...process.env, ...options.env },
     encoding: "utf8",
+    maxBuffer: 256 * 1024 * 1024,
     stdio: options.capture ? "pipe" : "inherit",
   });
   if (result.status !== 0) {
@@ -60,47 +44,136 @@ function run(command, args, options = {}) {
   return result;
 }
 
-function instrumentedMainTest(source) {
-  return source
-    .replace(/assertBundlePathsMatchSpec, /g, "")
-    .replace(/^import \{ OKTA_SPEC \} from .*okta\.spec\.js";\n/m, "")
-    .replace(/^import \{ DUO_SPEC \} from .*duo\.spec\.js";\n/m, "")
-    .replace(/^import \{ GWS_SPEC \} from .*gws\.spec\.js";\n/m, "")
-    .replace(/^import \{ BOX_SPEC \} from .*box\.spec\.js";\n/m, "")
-    .replace(/^import \{ SLACK_SPEC \} from .*slack\.spec\.js";\n/m, "")
-    .replace(/^import \{ ZOOM_SPEC \} from .*zoom\.spec\.js";\n/m, "")
-    .replace(/^import \{ ZENDESK_SPEC \} from .*zendesk\.spec\.js";\n/m, "")
-    .replace(/^import \{ SALESFORCE_SPEC \} from .*salesforce\.spec\.js";\n/m, "")
-    .replace(/^import \{ SERVICENOW_SPEC \} from .*servicenow\.spec\.js";\n/m, "")
-    .replace(/^import \{ AZURE_COMPLETENESS_SOURCES, AZURE_SPEC \} from .*azure\.spec\.js";\n/m, "")
-    .replace(/^import \{ CLOUDFLARE_COMPLETENESS_SOURCES, CLOUDFLARE_SPEC \} from .*cloudflare\.spec\.js";\n/m, "")
-    .replace(/^import \{ GCP_COMPLETENESS_SOURCES, GCP_SPEC \} from .*gcp\.spec\.js";\n/m, "")
-    .replace(/^import \{ OCI_COMPLETENESS_SOURCES, OCI_SPEC \} from .*oci\.spec\.js";\n/m, "")
-    .replace(/^import \{ PALOALTO_COMPLETENESS_SOURCES, PALOALTO_SPEC \} from .*paloalto\.spec\.js";\n/m, "")
-    .replace(/^import \{ ZSCALER_COMPLETENESS_SOURCES, ZSCALER_SPEC \} from .*zscaler\.spec\.js";\n/m, "")
-    .replace(/^import \{ captureBatchDecisionFacts \} from .*batch-spec-builder\.js";\n/m, "")
-    .replace(/^import \{\n  captureBatchDecisionFacts,\n  evaluateBatchCheckVerdict,\n\} from .*batch-spec-builder\.js";\n/m, "")
-    .replace(
-      'import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";',
-      'import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";',
-    )
-    .replace(/^import \{ assertBundlePathsMatchSpec \} from "\.\/helpers\/bundle-contents\.mjs";\n/m, "")
-    .replace(/^  assertBundlePathsMatchSpec\(assert, .*;\n/gm, "");
+export function discoverDifferentialTests(root) {
+  const testsDirectory = join(root, "cli", "tests");
+  return readdirSync(testsDirectory)
+    .filter((name) => name.endsWith(".test.mjs"))
+    .filter((name) => existsSync(join(root, runtimeDirectory, name.replace(/\.test\.mjs$/, ".ts"))))
+    .filter((name) => readFileSync(join(testsDirectory, name), "utf8").includes("writeByteDifferentialFixture("))
+    .sort();
 }
 
-function copyDifferentialTestsToMain() {
+function importBindings(clause) {
+  const bindings = [];
+  let rest = clause.trim();
+  const defaultBinding = /^([A-Za-z_$][\w$]*)\s*(?:,\s*)?/.exec(rest);
+  if (defaultBinding) {
+    bindings.push({ imported: "default", local: defaultBinding[1] });
+    rest = rest.slice(defaultBinding[0].length);
+  }
+  const namespace = /^\*\s*as\s+([A-Za-z_$][\w$]*)$/.exec(rest);
+  if (namespace) {
+    bindings.push({ imported: "*", local: namespace[1] });
+  } else if (rest.startsWith("{") && rest.endsWith("}")) {
+    for (const entry of rest.slice(1, -1).split(",").map((part) => part.trim()).filter(Boolean)) {
+      const named = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/.exec(entry);
+      if (!named) throw new Error(`Unsupported import binding: ${entry}`);
+      bindings.push({ imported: named[1], local: named[2] ?? named[1] });
+    }
+  } else if (rest) {
+    throw new Error(`Unsupported import clause: ${clause}`);
+  }
+  return bindings;
+}
+
+function importStatement(bindings, specifier) {
+  const defaultBinding = bindings.find(({ imported }) => imported === "default");
+  const namespace = bindings.find(({ imported }) => imported === "*");
+  const named = bindings.filter(({ imported }) => imported !== "default" && imported !== "*");
+  const clause = [
+    ...(defaultBinding ? [defaultBinding.local] : []),
+    ...(namespace ? [`* as ${namespace.local}`] : []),
+    ...(named.length > 0
+      ? [`{ ${named.map(({ imported, local }) => imported === local ? local : `${imported} as ${local}`).join(", ")} }`]
+      : []),
+  ].join(", ");
+  return `import ${clause} from ${JSON.stringify(specifier)};`;
+}
+
+/**
+ * Rewrites relative imports the baseline cannot satisfy into bindings that throw on
+ * first use, so a branch test that imports a new spec still loads there. `exportsFor`
+ * returns export names, null for a missing module, or undefined to keep the import.
+ */
+export function stubUnavailableImports(source, exportsFor) {
+  let stubbed = false;
+  const rewritten = source.replace(relativeImport, (statement, clause, _quote, specifier) => {
+    const available = exportsFor(specifier);
+    if (available === undefined) return statement;
+    const bindings = importBindings(clause);
+    const missing = bindings.filter(({ imported }) =>
+      available === null || (imported !== "*" && !available.includes(imported)));
+    if (missing.length === 0) return statement;
+    stubbed = true;
+    const kept = bindings.filter((binding) => !missing.includes(binding));
+    return [
+      ...(kept.length > 0 ? [importStatement(kept, specifier)] : []),
+      ...missing.map(({ imported, local }) =>
+        `const ${local} = __differentialUnavailable(${JSON.stringify(specifier)}, ${JSON.stringify(imported)});`),
+    ].join("\n");
+  });
+  return stubbed ? `${unavailableBindingSource}${rewritten}` : rewritten;
+}
+
+function filesUnder(root, relativePath = "") {
+  const directory = join(root, relativePath);
+  return readdirSync(directory).flatMap((name) => {
+    const child = join(relativePath, name);
+    return lstatSync(join(root, child)).isDirectory() ? filesUnder(root, child) : [child];
+  }).sort();
+}
+
+function baselineExports(root, targets) {
+  const inspector = [
+    'import { existsSync } from "node:fs";',
+    'import { pathToFileURL } from "node:url";',
+    "const exports = {};",
+    "for (const target of JSON.parse(process.argv[1])) {",
+    "  exports[target] = existsSync(target) ? Object.keys(await import(pathToFileURL(target).href)) : null;",
+    "}",
+    "process.stdout.write(JSON.stringify(exports));",
+  ].join("\n");
+  const result = run(process.execPath, ["--input-type=module", "--eval", inspector, JSON.stringify(targets)], {
+    cwd: root,
+    capture: true,
+  });
+  return JSON.parse(result.stdout);
+}
+
+function copyTestsToBaseline(baselineRoot, testFiles) {
   const sourceTests = join(repoRoot, "cli", "tests");
-  const targetTests = join(mainWorktree, "cli", "tests");
-  for (const testFile of testFiles) {
-    const source = readFileSync(join(sourceTests, testFile), "utf8");
-    writeFileSync(join(targetTests, testFile), instrumentedMainTest(source));
+  const targetTests = join(baselineRoot, "cli", "tests");
+  cpSync(join(sourceTests, "helpers"), join(targetTests, "helpers"), { recursive: true });
+  for (const testFile of testFiles) cpSync(join(sourceTests, testFile), join(targetTests, testFile));
+  const copied = [
+    ...testFiles.map((testFile) => join(targetTests, testFile)),
+    ...filesUnder(join(targetTests, "helpers")).filter((path) => path.endsWith(".mjs")).map((path) => join(targetTests, "helpers", path)),
+  ];
+  const copiedSet = new Set(copied);
+  const sources = new Map(copied.map((file) => [file, readFileSync(file, "utf8")]));
+  const targetOf = (file, specifier) => resolve(dirname(file), specifier);
+  const external = new Set();
+  for (const [file, source] of sources) {
+    for (const match of source.matchAll(relativeImport)) {
+      const target = targetOf(file, match[3]);
+      if (!copiedSet.has(target)) external.add(target);
+    }
   }
-  for (const helper of ["byte-differential-fixtures.mjs", "freeze-time.mjs"]) {
-    cpSync(join(sourceTests, "helpers", helper), join(targetTests, "helpers", helper));
+  const exportsByTarget = baselineExports(baselineRoot, [...external].sort());
+  const stubbedFiles = [];
+  for (const [file, source] of sources) {
+    const rewritten = stubUnavailableImports(source, (specifier) => {
+      const target = targetOf(file, specifier);
+      return copiedSet.has(target) ? undefined : exportsByTarget[target];
+    });
+    if (rewritten === source) continue;
+    writeFileSync(file, rewritten);
+    stubbedFiles.push(file.slice(targetTests.length + 1));
   }
+  return stubbedFiles;
 }
 
-function runFixtureSuite(root, fixtureDirectory) {
+function runFixtureSuite(root, testFiles, fixtureDirectory, exportRoot) {
   mkdirSync(fixtureDirectory, { recursive: true });
   run(process.execPath, [
     "--import",
@@ -119,7 +192,7 @@ function runFixtureSuite(root, fixtureDirectory) {
   });
 }
 
-function instrumentAssessmentExports(root) {
+function instrumentAssessmentExports(root, testFiles) {
   for (const testFile of testFiles) {
     const moduleName = testFile.replace(/\.test\.mjs$/, "");
     const modulePath = join(root, "cli", "dist", "extensions", "grc-tools", `${moduleName}.js`);
@@ -135,7 +208,10 @@ function instrumentAssessmentExports(root) {
     );
     if (wrappers.length === 0) throw new Error(`No assessment exports found in ${modulePath}`);
     const recorder = `
+import { AsyncLocalStorage as __CorpusAsyncLocalStorage } from "node:async_hooks";
 import { appendFileSync as __corpusAppendFileSync, mkdirSync as __corpusMkdirSync } from "node:fs";
+// Sweep replays run in the module-load context, outside any decision-fact capture the calling test holds.
+const __corpusDetachedContext = __CorpusAsyncLocalStorage.snapshot();
 function __corpusRecord(name, kind, value) {
   const directory = process.env.GRC_CORPUS_FIXTURE_DIR;
   if (!directory) return;
@@ -148,25 +224,22 @@ function __corpusRecord(name, kind, value) {
     serialized + "\\n",
   );
 }
-const __corpusSweepFunctions = new Set([
-  "assessOktaAuthentication", "assessOktaAdminAccess", "assessOktaIntegrations", "assessOktaMonitoring",
-  "assessDuoAuthentication", "assessDuoAdminAccess", "assessDuoIntegrations", "assessDuoMonitoring",
-  "assessGwsIdentity", "assessGwsAdminAccess", "assessGwsIntegrations", "assessGwsMonitoring",
-  "assessBoxIdentityAccessData", "assessBoxSharingCollaborationData", "assessBoxDataGovernanceData", "assessBoxShieldMonitoringData",
-  "assessZoomIdentityFromSnapshot", "assessZoomCollaborationGovernanceFromSnapshot", "assessZoomMeetingSecurityFromSnapshot",
-  "assessSalesforcePlatformData", "assessSalesforceIdentityData", "assessSalesforceDataProtectionData", "assessSalesforceMonitoringData",
-  "assessServicenowIdentityAccessData", "assessServicenowPlatformHardeningData", "assessServicenowAccessControlData", "assessServicenowOperationsGovernanceData",
-]);
+function __corpusDatasets(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return [];
+  return Object.entries(input).flatMap(([datasetName, dataset]) => {
+    if (!dataset || typeof dataset !== "object" || Array.isArray(dataset)) return [];
+    const collectionKey = ["data", "rows", "items"].find((key) => Array.isArray(dataset[key]));
+    return collectionKey ? [[datasetName, collectionKey]] : [];
+  });
+}
 const __corpusSweptInputs = new Set();
 function __corpusSweep(name, args, original) {
-  if (!__corpusSweepFunctions.has(name) || !args[0] || typeof args[0] !== "object") return;
+  const datasets = __corpusDatasets(args[0]);
+  if (datasets.length === 0) return;
   const signature = name + ":" + JSON.stringify(args[0]);
   if (__corpusSweptInputs.has(signature)) return;
   __corpusSweptInputs.add(signature);
-  for (const [datasetName, dataset] of Object.entries(args[0])) {
-    if (!dataset || typeof dataset !== "object" || Array.isArray(dataset)) continue;
-    const collectionKey = Array.isArray(dataset.data) ? "data" : Array.isArray(dataset.rows) ? "rows" : Array.isArray(dataset.items) ? "items" : undefined;
-    if (!collectionKey) continue;
+  for (const [datasetName, collectionKey] of datasets) {
     for (const mode of ["truncated", "denied", "empty"]) {
       const mutatedArgs = structuredClone(args);
       const mutated = mutatedArgs[0][datasetName];
@@ -199,7 +272,11 @@ function __corpusSweep(name, args, original) {
         if (Object.hasOwn(mutated, "total")) mutated.total = Math.max(rows.length + 1, Number(mutated.total) || 0);
       }
       try {
-        __corpusRecord(name + "::sweep::" + mode + "::" + datasetName, "result", original(...mutatedArgs));
+        __corpusRecord(
+          name + "::sweep::" + mode + "::" + datasetName,
+          "result",
+          __corpusDetachedContext(() => original(...mutatedArgs)),
+        );
       } catch (error) {
         __corpusRecord(name + "::sweep::" + mode + "::" + datasetName, "error", {
           name: error instanceof Error ? error.name : typeof error,
@@ -244,14 +321,13 @@ export function ${functionName}(...args) {
   }
 }
 
-function runCorpusSuite(root, fixtureDirectory) {
+function runCorpusSuite(root, testFiles, fixtureDirectory) {
   mkdirSync(fixtureDirectory, { recursive: true });
   const result = run(process.execPath, [
     "--import",
     join(root, "cli", "tests", "helpers", "freeze-time.mjs"),
     "--test",
     "--test-concurrency=1",
-    "--test-skip-pattern=^(?:all 25 (?:Palo Alto|Zscaler) checks replay|SNOW-08 counts an active non-IdP integration TLS certificate|AZURE-SUB-04 network-watcher truncation|CF-IAM-06 treats token-list 404|CF-TRF-06 preserves the unpaginated|OCI prerequisite and nested-read failures)",
     ...testFiles.map((testFile) => join(root, "cli", "tests", testFile)),
   ], {
     cwd: root,
@@ -263,19 +339,11 @@ function runCorpusSuite(root, fixtureDirectory) {
   return { executed: tests - skipped, skipped, total: tests };
 }
 
-function filesUnder(root, relativePath = "") {
-  const directory = join(root, relativePath);
-  return readdirSync(directory).flatMap((name) => {
-    const child = join(relativePath, name);
-    return lstatSync(join(root, child)).isDirectory() ? filesUnder(root, child) : [child];
-  }).sort();
-}
-
 function compareTrees(expectedRoot, actualRoot, label) {
   const expectedPaths = filesUnder(expectedRoot);
   const actualPaths = filesUnder(actualRoot);
   if (JSON.stringify(actualPaths) !== JSON.stringify(expectedPaths)) {
-    throw new Error(`${label} path mismatch\nmain: ${expectedPaths.join(", ")}\nbranch: ${actualPaths.join(", ")}`);
+    throw new Error(`${label} path mismatch\nbaseline: ${expectedPaths.join(", ")}\nbranch: ${actualPaths.join(", ")}`);
   }
   for (const path of expectedPaths) {
     const expected = readFileSync(join(expectedRoot, path));
@@ -285,11 +353,11 @@ function compareTrees(expectedRoot, actualRoot, label) {
       while (offset < expected.length && offset < actual.length && expected[offset] === actual[offset]) offset += 1;
       const contextStart = Math.max(0, offset - 160);
       const contextEnd = offset + 320;
-      const mainContext = expected.subarray(contextStart, contextEnd).toString("utf8");
+      const baselineContext = expected.subarray(contextStart, contextEnd).toString("utf8");
       const branchContext = actual.subarray(contextStart, contextEnd).toString("utf8");
       throw new Error(
-        `${label} byte mismatch for ${path} (main=${expected.length} bytes, branch=${actual.length} bytes, first offset=${offset})`
-        + `\nmain context: ${JSON.stringify(mainContext)}`
+        `${label} byte mismatch for ${path} (baseline=${expected.length} bytes, branch=${actual.length} bytes, first offset=${offset})`
+        + `\nbaseline context: ${JSON.stringify(baselineContext)}`
         + `\nbranch context: ${JSON.stringify(branchContext)}`,
       );
     }
@@ -314,80 +382,141 @@ function corpusSweepCounts(root, paths) {
   return counts;
 }
 
-let worktreeAdded = false;
-try {
-  const baselineSha = run("git", ["rev-parse", `${baselineRef}^{commit}`], { capture: true }).stdout.trim();
-  const headSha = run("git", ["rev-parse", "HEAD^{commit}"], { capture: true }).stdout.trim();
-  if (baselineSha === headSha) {
-    throw new Error(`Differential baseline resolved to HEAD (${headSha}); self-comparison is forbidden`);
-  }
-  run("git", ["merge-base", "--is-ancestor", baselineSha, headSha], { capture: true });
-  const batchSpecificPaths = [
-    "cli/extensions/grc-tools/azure.ts",
-    "cli/extensions/grc-tools/cloudflare.ts",
-    "cli/extensions/grc-tools/gcp.ts",
-    "cli/extensions/grc-tools/oci.ts",
-    "cli/extensions/grc-tools/paloalto.ts",
-    "cli/extensions/grc-tools/zscaler.ts",
-  ];
-  const batchDiff = spawnSync("git", ["diff", "--quiet", baselineSha, headSha, "--", ...batchSpecificPaths], {
-    cwd: repoRoot,
-    stdio: "ignore",
-  });
-  if (batchDiff.status === 0) {
-    throw new Error(`No batch-2 runtime diff exists between immutable base ${baselineSha} and HEAD ${headSha}`);
-  }
-  if (batchDiff.status !== 1) {
-    throw new Error(`Unable to inspect batch-2 diff between ${baselineSha} and ${headSha}`);
-  }
-  run("git", ["worktree", "add", "--detach", mainWorktree, baselineRef]);
-  worktreeAdded = true;
-  symlinkSync(join(repoRoot, "cli", "node_modules"), join(mainWorktree, "cli", "node_modules"), "dir");
-  copyDifferentialTestsToMain();
-
-  run("npm", ["--prefix", join(mainWorktree, "cli"), "run", "build"]);
-  run("npm", ["--prefix", join(repoRoot, "cli"), "run", "build"]);
-  instrumentAssessmentExports(mainWorktree);
-  instrumentAssessmentExports(repoRoot);
-  const mainCorpusTests = runCorpusSuite(mainWorktree, mainCorpus);
-  const branchCorpusTests = runCorpusSuite(repoRoot, branchCorpus);
-  if (JSON.stringify(mainCorpusTests) !== JSON.stringify(branchCorpusTests)) {
-    throw new Error(`corpus test-count mismatch: main=${JSON.stringify(mainCorpusTests)} branch=${JSON.stringify(branchCorpusTests)}`);
-  }
-  const corpusPaths = compareTrees(mainCorpus, branchCorpus, "assessment corpus");
-  const corpusCalls = corpusCallCount(mainCorpus, corpusPaths);
-  const sweepCounts = corpusSweepCounts(mainCorpus, corpusPaths);
-
-  // Rebuild after instrumentation so the curated export run uses unmodified modules.
-  run("npm", ["--prefix", join(mainWorktree, "cli"), "run", "build"]);
-  run("npm", ["--prefix", join(repoRoot, "cli"), "run", "build"]);
-  runFixtureSuite(mainWorktree, mainFixtures);
-  runFixtureSuite(repoRoot, branchFixtures);
-
-  const expectedFixturePaths = testFiles.flatMap((testFile) => {
-    const integration = testFile.replace(/\.test\.mjs$/, "");
-    return fixtureClasses.map((fixtureClass) => `${integration}/${fixtureClass}.json`);
-  }).sort();
-  const mainFixturePaths = filesUnder(mainFixtures);
-  if (JSON.stringify(mainFixturePaths) !== JSON.stringify(expectedFixturePaths)) {
-    throw new Error(`stacked-parent fixture registry mismatch\nexpected: ${expectedFixturePaths.join(", ")}\nactual: ${mainFixturePaths.join(", ")}`);
-  }
-  const compared = compareTrees(mainFixtures, branchFixtures, "curated fixture");
-  for (const integration of batch2Integrations) {
-    const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
-    const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
-    if (representative.equals(compliant)) {
-      throw new Error(`${integration}: representative fixture is byte-identical to compliant`);
-    }
-  }
-  const classes = [...new Set(compared.map((path) => path.split("/").at(-1).replace(/\.json$/, "")))].sort();
-  console.log(`Whole-corpus replay passed against immutable stack base ${baselineSha}: ${mainCorpusTests.executed}/${mainCorpusTests.total} non-skipped tests and ${corpusCalls} exact serialized assessment calls matched the stacked parent.`);
-  console.log(`Realistic single-dataset sweeps matched the stacked parent: ${sweepCounts.truncated} truncated, ${sweepCounts.denied} denied, ${sweepCounts.empty} empty.`);
-  console.log(`Byte differential passed: ${compared.length} exact fixtures across ${testFiles.length} integrations.`);
-  console.log(`Fixture classes: ${classes.join(", ")}.`);
-} finally {
-  if (worktreeAdded) {
-    spawnSync("git", ["worktree", "remove", "--force", mainWorktree], { cwd: repoRoot, stdio: "ignore" });
-  }
-  rmSync(runRoot, { recursive: true, force: true });
+function verdictSemantics(root) {
+  const dump = [
+    `import { PUBLISHED_INTEGRATION_SPECS } from ${JSON.stringify(pathToFileURL(join(root, "cli", "dist", "extensions", "grc-tools", "spec-registry.js")).href)};`,
+    "const semantics = {};",
+    "for (const { contract } of PUBLISHED_INTEGRATION_SPECS) {",
+    "  semantics[contract.identity.slug] = contract.checks.map((check) => ({",
+    "    id: check.id,",
+    "    evidenceFields: check.evidenceFields,",
+    "    derivedFactRules: Object.entries(check.derivedFactRules ?? {}).map(([name, rule]) => [name, rule.condition]),",
+    "    constants: check.criteria.constants,",
+    "    rules: check.criteria.rules.map((rule) => ({ status: rule.status, condition: rule.condition })),",
+    "  }));",
+    "}",
+    "process.stdout.write(JSON.stringify(semantics));",
+  ].join("\n");
+  return JSON.parse(run(process.execPath, ["--input-type=module", "--eval", dump], { cwd: root, capture: true }).stdout);
 }
+
+function compareVerdictSemantics(baselineRoot) {
+  const baseline = verdictSemantics(baselineRoot);
+  const branch = verdictSemantics(repoRoot);
+  const changed = Object.keys(branch).filter((slug) => slug in baseline
+    && JSON.stringify(branch[slug]) !== JSON.stringify(baseline[slug]));
+  const removed = Object.keys(baseline).filter((slug) => !(slug in branch));
+  if (changed.length > 0 || removed.length > 0) {
+    throw new Error(`verdict semantics differ from the baseline: changed ${changed.join(", ") || "none"}; removed ${removed.join(", ") || "none"}`);
+  }
+  return {
+    unchanged: Object.keys(branch).filter((slug) => slug in baseline),
+    added: Object.keys(branch).filter((slug) => !(slug in baseline)),
+  };
+}
+
+function argumentValue(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+}
+
+function resolveBaseline() {
+  const requested = argumentValue("--base") ?? process.env.GRC_DIFFERENTIAL_BASE;
+  if (requested) return run("git", ["rev-parse", `${requested}^{commit}`], { capture: true }).stdout.trim();
+  const mergeBase = spawnSync("git", ["merge-base", "HEAD", defaultBaselineRef], { cwd: repoRoot, encoding: "utf8" });
+  if (mergeBase.status !== 0) {
+    throw new Error(`Unable to find the merge base with ${defaultBaselineRef}; run git fetch origin main or pass --base <ref>`);
+  }
+  return mergeBase.stdout.trim();
+}
+
+function main() {
+  const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
+  const baselineRoot = join(runRoot, "baseline");
+  const exportRoot = join(runRoot, "exports");
+  let worktreeAdded = false;
+  try {
+    const baselineSha = resolveBaseline();
+    const headSha = run("git", ["rev-parse", "HEAD^{commit}"], { capture: true }).stdout.trim();
+    // The branch side builds and runs this checkout, so parity holds for HEAD only when cli/ is clean.
+    const uncommitted = run("git", ["status", "--porcelain", "--untracked-files=all", "--", "cli"], { capture: true }).stdout.trim();
+    if (uncommitted) {
+      throw new Error(`Commit or stash the uncommitted changes under cli/ so the comparison measures HEAD ${headSha}:\n${uncommitted}`);
+    }
+    run("git", ["merge-base", "--is-ancestor", baselineSha, headSha], { capture: true });
+    const runtimeDiff = spawnSync("git", ["diff", "--quiet", baselineSha, headSha, "--", "cli/extensions"], { cwd: repoRoot, stdio: "ignore" });
+    if (runtimeDiff.status === 0) {
+      throw new Error(`HEAD ${headSha} has no runtime change under cli/extensions relative to ${baselineSha}; there is nothing to compare`);
+    }
+    if (runtimeDiff.status !== 1) throw new Error(`Unable to inspect the runtime diff between ${baselineSha} and ${headSha}`);
+
+    run("git", ["worktree", "add", "--detach", baselineRoot, baselineSha]);
+    worktreeAdded = true;
+    symlinkSync(join(repoRoot, "cli", "node_modules"), join(baselineRoot, "cli", "node_modules"), "dir");
+    const branchTests = discoverDifferentialTests(repoRoot);
+    const testFiles = branchTests.filter((testFile) =>
+      existsSync(join(baselineRoot, runtimeDirectory, testFile.replace(/\.test\.mjs$/, ".ts"))));
+    if (testFiles.length === 0) throw new Error("No differential test has a baseline runtime to compare against");
+    const withoutBaseline = branchTests.filter((testFile) => !testFiles.includes(testFile));
+
+    run("npm", ["--prefix", join(baselineRoot, "cli"), "run", "build"]);
+    run("npm", ["--prefix", join(repoRoot, "cli"), "run", "build"]);
+    const stubbedFiles = copyTestsToBaseline(baselineRoot, testFiles);
+    const semantics = compareVerdictSemantics(baselineRoot);
+
+    instrumentAssessmentExports(baselineRoot, testFiles);
+    instrumentAssessmentExports(repoRoot, testFiles);
+    const baselineCorpus = join(runRoot, "corpus-baseline");
+    const branchCorpus = join(runRoot, "corpus-branch");
+    const baselineCorpusTests = runCorpusSuite(baselineRoot, testFiles, baselineCorpus);
+    const branchCorpusTests = runCorpusSuite(repoRoot, testFiles, branchCorpus);
+    if (JSON.stringify(baselineCorpusTests) !== JSON.stringify(branchCorpusTests)) {
+      throw new Error(`corpus test-count mismatch: baseline=${JSON.stringify(baselineCorpusTests)} branch=${JSON.stringify(branchCorpusTests)}`);
+    }
+    const corpusPaths = compareTrees(baselineCorpus, branchCorpus, "assessment corpus");
+    const corpusCalls = corpusCallCount(baselineCorpus, corpusPaths);
+    const sweepCounts = corpusSweepCounts(baselineCorpus, corpusPaths);
+
+    // Rebuild after instrumentation so the curated export run uses unmodified modules.
+    run("npm", ["--prefix", join(baselineRoot, "cli"), "run", "build"]);
+    run("npm", ["--prefix", join(repoRoot, "cli"), "run", "build"]);
+    const baselineFixtures = join(runRoot, "fixtures-baseline");
+    const branchFixtures = join(runRoot, "fixtures-branch");
+    runFixtureSuite(baselineRoot, testFiles, baselineFixtures, exportRoot);
+    runFixtureSuite(repoRoot, testFiles, branchFixtures, exportRoot);
+
+    const expectedFixturePaths = testFiles.flatMap((testFile) => {
+      const integration = testFile.replace(/\.test\.mjs$/, "");
+      return fixtureClasses.map((fixtureClass) => `${integration}/${fixtureClass}.json`);
+    }).sort();
+    const baselineFixturePaths = filesUnder(baselineFixtures);
+    if (JSON.stringify(baselineFixturePaths) !== JSON.stringify(expectedFixturePaths)) {
+      throw new Error(`baseline fixture registry mismatch\nexpected: ${expectedFixturePaths.join(", ")}\nactual: ${baselineFixturePaths.join(", ")}`);
+    }
+    const compared = compareTrees(baselineFixtures, branchFixtures, "curated fixture");
+    for (const testFile of testFiles) {
+      const integration = testFile.replace(/\.test\.mjs$/, "");
+      const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
+      const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
+      if (representative.equals(compliant)) {
+        throw new Error(`${integration}: representative fixture is byte-identical to compliant`);
+      }
+    }
+    const classes = [...new Set(compared.map((path) => path.split("/").at(-1).replace(/\.json$/, "")))].sort();
+    console.log(`Baseline ${baselineSha}; HEAD ${headSha}; differential tests: ${testFiles.join(", ")}.`);
+    if (withoutBaseline.length > 0) console.log(`No baseline runtime, so not compared: ${withoutBaseline.join(", ")}.`);
+    if (stubbedFiles.length > 0) console.log(`Imports the baseline lacks were stubbed in: ${stubbedFiles.join(", ")}.`);
+    console.log(`Verdict semantics match the baseline for ${semantics.unchanged.length} published specs${semantics.added.length > 0 ? `; new on this branch: ${semantics.added.join(", ")}` : ""}.`);
+    console.log(`Whole-corpus replay passed: ${baselineCorpusTests.executed}/${baselineCorpusTests.total} non-skipped tests and ${corpusCalls} exact serialized assessment calls matched the baseline.`);
+    console.log(`Single-dataset sweeps matched the baseline: ${sweepCounts.truncated} truncated, ${sweepCounts.denied} denied, ${sweepCounts.empty} empty.`);
+    console.log(`Byte differential passed: ${compared.length} exact fixtures across ${testFiles.length} integrations.`);
+    console.log(`Fixture classes: ${classes.join(", ")}.`);
+  } finally {
+    if (worktreeAdded) {
+      spawnSync("git", ["worktree", "remove", "--force", baselineRoot], { cwd: repoRoot, stdio: "ignore" });
+    }
+    rmSync(runRoot, { recursive: true, force: true });
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();

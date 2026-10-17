@@ -40,12 +40,11 @@ import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-sp
 import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
   byteDifferentialEnabled,
+  portableContractTest,
   prepareByteDifferentialExportRoot,
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
-
-const portableContractTest = process.env.GRC_CORPUS_FIXTURE_DIR ? test.skip : test;
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -4034,7 +4033,7 @@ test("byte differential fixtures: Okta assessments and export artifacts", { skip
   writeByteDifferentialFixture("okta", "partial", partial);
 
   const compliant = await runAllAssessments(
-    createSampleClient(),
+    { ...createSampleClient(), async listApiTokens() { return []; } },
     createSampleConfig({ authMode: "PrivateKey", token: undefined, clientId: "service-app" }),
   );
   writeByteDifferentialFixture("okta", "compliant", compliant);

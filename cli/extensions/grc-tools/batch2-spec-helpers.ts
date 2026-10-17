@@ -3,8 +3,10 @@ import {
   type BatchCheckDefinition,
   type BatchCompletenessDefinition,
   type BatchCompletenessSourceDefinition,
+  type BatchCriterionExample,
   type PortableInputType,
   type BatchSurfaceDefinition,
+  type BatchSurfaceRequest,
 } from "./batch-spec-builder.js";
 import type {
   FindingSeverity,
@@ -29,8 +31,11 @@ export interface Batch2CheckRow {
   violationOutcome?: "fail" | "warn";
   constants?: Readonly<Record<string, PortableValue>>;
   decisionInputs?: Readonly<Record<string, string>>;
+  /** Replaces the name-based type inference for the listed inputs. */
+  decisionInputTypes?: Readonly<Record<string, readonly PortableInputType[]>>;
   decisionRules?: readonly VerdictRule[];
   completeness?: Readonly<Record<string, BatchCompletenessDefinition>>;
+  examples?: readonly BatchCriterionExample[];
 }
 
 export const batch2Value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
@@ -244,12 +249,16 @@ export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinit
       frameworks: row.frameworks,
       evidenceFields: [...row.surfaces, "complete_source_counts"],
       decisionInputs: inputs,
-      decisionInputTypes: Object.fromEntries(Object.keys(inputs).map((name) => [name, portableTypes(name)])),
+      decisionInputTypes: Object.fromEntries(Object.keys(inputs).map((name) => [
+        name,
+        row.decisionInputTypes?.[name] ?? portableTypes(name),
+      ])),
       decisionConstants: row.constants,
       decisionRules: executable.rules,
       derivedFactRules: executable.derivedFactRules,
       completeness: row.completeness,
       decision: row.decision,
+      ...(row.examples ? { examples: row.examples } : {}),
     };
   });
 }
@@ -261,6 +270,7 @@ export function restSurface(
   documentationUrl: string,
   fields: readonly string[],
   method: "GET" | "POST" = "GET",
+  request?: BatchSurfaceRequest,
 ): BatchSurfaceDefinition {
-  return { id, path: pathValue, service, documentationUrl, fields, method };
+  return { id, path: pathValue, service, documentationUrl, fields, method, ...(request ? { request } : {}) };
 }

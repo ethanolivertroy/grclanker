@@ -10,6 +10,8 @@ import {
   type CompletenessContract,
   type CompletenessFailureMode,
   type CompletenessSourceContract,
+  type CriterionExample,
+  type CriterionExampleKind,
   type DerivedFactRule,
   type EvaluatedFindingStatus,
   type ExportContract,
@@ -18,6 +20,9 @@ import {
   type IntegrationSpecContract,
   type PermissionKind,
   type PortableValue,
+  type RequestContract,
+  type RequestParameterContract,
+  type RetryableStatusRange,
   type VerdictCondition,
   type VerdictOperand,
   type VerdictRule,
@@ -37,6 +42,13 @@ const FRAMEWORK_KEYS: readonly FrameworkKey[] = [
   "ismap",
 ];
 
+export interface BatchSurfaceRequest {
+  clientRegion?: string;
+  headers?: readonly string[];
+  parameters?: readonly RequestParameterContract[];
+  responseShape?: string;
+}
+
 export interface BatchSurfaceDefinition {
   id: string;
   method?: "GET" | "POST";
@@ -44,6 +56,16 @@ export interface BatchSurfaceDefinition {
   service: string;
   documentationUrl: string;
   fields: readonly string[];
+  request?: BatchSurfaceRequest;
+  /** Defaults to a collector that projects the response to `fields` before evidence export. */
+  projectionStage?: string;
+}
+
+export interface BatchCriterionExample {
+  kind: CriterionExampleKind;
+  facts: Readonly<Record<string, unknown>>;
+  expected: EvaluatedFindingStatus;
+  reason: string;
 }
 
 export interface BatchCheckDefinition {
@@ -63,6 +85,7 @@ export interface BatchCheckDefinition {
   derivedFactRules?: Readonly<Record<string, DerivedFactRule>>;
   completeness?: Readonly<Record<string, BatchCompletenessDefinition>>;
   decision: string;
+  examples?: readonly BatchCriterionExample[];
   outcomes?: {
     fail?: boolean;
     warn?: boolean;
@@ -86,7 +109,7 @@ export interface BatchPaginationDefinition {
   surfaceIds: readonly string[];
   cursorFields: readonly string[];
   pageSize: number | null;
-  itemCap: number | null;
+  itemCap: number | "none" | null;
   pageCap: number | null;
   totalSemantics: string;
   stopConditions: readonly string[];
@@ -118,6 +141,7 @@ export interface BatchSpecDefinition {
     documentedLimit: string | null;
     retryHeaders: readonly string[];
     retryableStatuses: readonly number[];
+    retryableStatusRanges?: readonly RetryableStatusRange[];
     backoffPolicy: string;
   };
   runtimeBehavior: readonly string[];
@@ -125,6 +149,15 @@ export interface BatchSpecDefinition {
   sensitiveFields: readonly string[];
   credentialFormats: readonly string[];
   output: ExportContract;
+  /** ISO date; defaults to the date the batch 1 and batch 2 specs were published. */
+  lastUpdated?: string;
+  /** Items shown in each finding's evidence lists, which decision facts never read; defaults to 25. */
+  findingPreviewLimit?: number;
+  /** Each member replaces the default, which describes collectors that export only verdict fields. */
+  redaction?: {
+    projectionStage?: string;
+    integrationRules?: readonly string[];
+  };
 }
 
 export interface BatchOutputDefinition {
@@ -316,7 +349,7 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
       requiredEvidenceReadable: true,
       requiredEvidenceComplete: true,
     },
-    examples: [
+    examples: check.examples?.map(executableExample) ?? [
       {
         kind: "compliant",
         input: `All required source reads are complete and this derivation returns pass: ${check.decision}`,
@@ -344,6 +377,97 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
     ],
     rules: check.decisionRules ?? rules,
   };
+}
+
+function executableExample(example: BatchCriterionExample): CriterionExample {
+  const assignments = Object.entries(example.facts).map(([name, value]) => `\`${name}\` = ${JSON.stringify(value)}`);
+  return {
+    kind: example.kind,
+    input: assignments.length > 0 ? assignments.join("; ") : "No primitive decision inputs are supplied.",
+    facts: example.facts,
+    expected: example.expected,
+    reason: example.reason,
+  };
+}
+
+function validateExecutableExamples(check: CheckContract): void {
+  const examples = check.criteria.examples.filter((example) => example.facts !== undefined);
+  if (examples.length === 0) return;
+  for (const example of examples) {
+    const facts = example.facts ?? {};
+    const undefinedInputs = Object.keys(facts).filter((name) => facts[name] === undefined);
+    if (undefinedInputs.length > 0) {
+      throw new Error(`${check.id} ${example.kind} example sets ${undefinedInputs.join(", ")} to undefined; omit missing inputs instead`);
+    }
+    let evaluated: EvaluatedFindingStatus;
+    try {
+      evaluated = evaluateCheckVerdict(check, facts);
+    } catch (error) {
+      throw new Error(`${check.id} ${example.kind} example is not executable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (evaluated !== example.expected) {
+      throw new Error(`${check.id} ${example.kind} example evaluates to ${evaluated}, not ${example.expected}`);
+    }
+  }
+  const demonstrated = new Set(examples.map((example) => example.expected));
+  const undemonstrated = [...new Set(check.criteria.rules.map((rule) => rule.status))]
+    .filter((status) => !demonstrated.has(status));
+  if (undemonstrated.length > 0) {
+    throw new Error(`${check.id} executable examples do not demonstrate ${undemonstrated.join(", ")}`);
+  }
+}
+
+function surfaceRequest(surface: BatchSurfaceDefinition): RequestContract {
+  const parameters = surface.request?.parameters ?? [];
+  if (parameters.length > 0) validateRequestParameters(surface, parameters);
+  return {
+    clientRegion: surface.request?.clientRegion
+      ?? `Use the configured ${surface.service} origin; never follow a server link to a different origin.`,
+    headers: surface.request?.headers ?? ["Authorization appropriate to the selected authentication mode", "Accept: application/json"],
+    parameters,
+    responseShape: surface.request?.responseShape
+      ?? `A JSON object or list containing only the documented ${surface.fields.join(", ")} members consumed by verdicts.`,
+  };
+}
+
+// A surface that declares any parameter must declare its whole request, so every
+// path placeholder needs a path parameter and the path may not repeat a query parameter.
+function validateRequestParameters(surface: BatchSurfaceDefinition, parameters: readonly RequestParameterContract[]): void {
+  const [pathname, query = ""] = surface.path.split("?", 2);
+  const embeddedQuery = new Set(new URLSearchParams(query).keys());
+  const placeholders = new Set([...pathname.matchAll(/\{([^}]+)\}/g)].map((match) => match[1]));
+  const declared = new Set<string>();
+  for (const parameter of parameters) {
+    const key = `${parameter.location}:${parameter.name}`;
+    if (declared.has(key)) throw new Error(`${surface.id} declares request parameter ${key} more than once`);
+    declared.add(key);
+    if (parameter.location === "query" && embeddedQuery.has(parameter.name)) {
+      throw new Error(`${surface.id} declares query parameter ${parameter.name} that its path already embeds`);
+    }
+    if (parameter.location === "path" && !placeholders.has(parameter.name)) {
+      throw new Error(`${surface.id} path parameter ${parameter.name} has no {${parameter.name}} placeholder`);
+    }
+  }
+  for (const placeholder of placeholders) {
+    if (!declared.has(`path:${placeholder}`)) {
+      throw new Error(`${surface.id} path placeholder {${placeholder}} has no path parameter`);
+    }
+  }
+}
+
+function validateRetryableStatuses(
+  statuses: readonly number[],
+  ranges: readonly RetryableStatusRange[],
+): void {
+  for (const range of ranges) {
+    if (!Number.isInteger(range.from) || !Number.isInteger(range.to) || range.from < 100 || range.to > 599 || range.from > range.to) {
+      throw new Error(`Retryable status range ${range.from}-${range.to} must be an ascending HTTP status range`);
+    }
+  }
+  const overlapping = statuses.filter((status) => ranges.some((range) => status >= range.from && status <= range.to));
+  if (overlapping.length > 0) {
+    throw new Error(`Retryable statuses ${overlapping.join(", ")} repeat a declared retryable status range`);
+  }
 }
 
 export type PortableInputType = "array" | "boolean" | "null" | "number" | "string";
@@ -504,7 +628,7 @@ function renderPortableInputDefinitions(
       : "the explicitly manual collector state; this check performs no vendor read";
     const completeness = name.includes("complete")
       ? renderCompletenessSemantics(check, name, completenessContract)
-      : "The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained";
+      : `The primitive is calculated from the uncapped collector state before any ${definition.findingPreviewLimit ?? 25}-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained`;
     const portableMeaning = completenessContract?.semantics ?? supplied;
     return [
       name,
@@ -546,6 +670,13 @@ function renderCompletenessSemantics(
 }
 
 export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): IntegrationSpecContract {
+  if (definition.lastUpdated !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(definition.lastUpdated)) {
+    throw new Error(`${definition.slug} lastUpdated must be an ISO date`);
+  }
+  const previewLimit = definition.findingPreviewLimit;
+  if (previewLimit !== undefined && !(Number.isInteger(previewLimit) && previewLimit > 0)) {
+    throw new Error(`${definition.slug} findingPreviewLimit must be a positive integer`);
+  }
   for (const check of definition.checks) {
     if (!check.decision.trim()) {
       throw new Error(`${check.id} requires a portable decision derivation`);
@@ -606,13 +737,9 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
     baseService: surface.service,
     documentationUrl: surface.documentationUrl,
     fieldsConsumed: surface.fields,
-    projectionStage: "The collector projects the response to the listed verdict fields before evidence export.",
-    request: {
-      clientRegion: `Use the configured ${surface.service} origin; never follow a server link to a different origin.`,
-      headers: ["Authorization appropriate to the selected authentication mode", "Accept: application/json"],
-      parameters: [],
-      responseShape: `A JSON object or list containing only the documented ${surface.fields.join(", ")} members consumed by verdicts.`,
-    },
+    projectionStage: surface.projectionStage
+      ?? "The collector projects the response to the listed verdict fields before evidence export.",
+    request: surfaceRequest(surface),
     intent: "read" as const,
   }));
   const surfaceIds = new Set(surfaces.map((surface) => surface.id));
@@ -657,6 +784,9 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
     ...(check.derivedFactRules ? { derivedFactRules: check.derivedFactRules } : {}),
     criteria: criterion(check),
   }));
+  for (const check of checks) validateExecutableExamples(check);
+  const retryableStatusRanges = definition.rateLimit.retryableStatusRanges;
+  if (retryableStatusRanges) validateRetryableStatuses(definition.rateLimit.retryableStatuses, retryableStatusRanges);
   const tools = Object.entries(definition.tools).map(([name, checkIds]) => ({
     name,
     checkIds,
@@ -674,7 +804,7 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
       category: definition.category,
       kind: "security-inspector",
       version: "1.0.0",
-      lastUpdated: "2026-09-27",
+      lastUpdated: definition.lastUpdated ?? "2026-09-27",
       summary: definition.summary,
     },
     sourceModule: definition.sourceModule,
@@ -697,6 +827,7 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
       documentedLimit: definition.rateLimit.documentedLimit,
       retryHeaders: definition.rateLimit.retryHeaders,
       retryableStatuses: definition.rateLimit.retryableStatuses,
+      ...(retryableStatusRanges ? { retryableStatusRanges } : {}),
       backoffPolicy: definition.rateLimit.backoffPolicy,
     }],
     controls,
@@ -713,11 +844,12 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
     redaction: {
       sharedContractVersion: SHARED_INTEGRATION_CONTRACT_VERSION,
       projections,
-      projectionStage: "Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.",
+      projectionStage: definition.redaction?.projectionStage
+        ?? "Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.",
       sensitiveFields: definition.sensitiveFields,
       benignExceptions: ["Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field."],
       credentialFormats: definition.credentialFormats,
-      integrationRules: [
+      integrationRules: definition.redaction?.integrationRules ?? [
         "Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.",
         "Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.",
         "Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.",
@@ -745,7 +877,7 @@ export function evaluateBatchRuntimeCheckVerdict(
   const declaredFacts = Object.fromEntries(
     Object.entries(collectedFacts).filter(([name]) => check.evidenceFields.includes(name)),
   );
-  BATCH_DECISION_CAPTURE.getStore()?.push({
+  recordBatchDecisionFacts({
     integration: spec.identity.slug,
     checks: new Map([[checkId, declaredFacts]]),
   });
@@ -795,6 +927,12 @@ export interface CapturedBatchDecisionFacts {
 }
 
 const BATCH_DECISION_CAPTURE = new AsyncLocalStorage<CapturedBatchDecisionFacts[]>();
+const BATCH_DECISION_OBSERVERS = new Set<(capture: CapturedBatchDecisionFacts) => void>();
+
+function recordBatchDecisionFacts(capture: CapturedBatchDecisionFacts): void {
+  BATCH_DECISION_CAPTURE.getStore()?.push(capture);
+  for (const observer of BATCH_DECISION_OBSERVERS) observer(capture);
+}
 
 export async function captureBatchDecisionFacts<T>(
   callback: () => T | Promise<T>,
@@ -802,6 +940,17 @@ export async function captureBatchDecisionFacts<T>(
   const captures: CapturedBatchDecisionFacts[] = [];
   const result = await BATCH_DECISION_CAPTURE.run(captures, callback);
   return { result, captures };
+}
+
+/**
+ * Receives every decision-fact capture in this process, including captures made
+ * outside `captureBatchDecisionFacts`. Returns a function that stops observing.
+ */
+export function observeBatchDecisionFacts(observer: (capture: CapturedBatchDecisionFacts) => void): () => void {
+  BATCH_DECISION_OBSERVERS.add(observer);
+  return () => {
+    BATCH_DECISION_OBSERVERS.delete(observer);
+  };
 }
 
 function assertBatchResultVerdicts<T>(
@@ -813,7 +962,7 @@ function assertBatchResultVerdicts<T>(
   if (!candidate || !Array.isArray(candidate.findings)) {
     throw new Error(`${spec.identity.slug} assessment did not return a findings array`);
   }
-  BATCH_DECISION_CAPTURE.getStore()?.push({
+  recordBatchDecisionFacts({
     integration: spec.identity.slug,
     checks: new Map(factsByCheck),
   });

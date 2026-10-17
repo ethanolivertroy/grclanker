@@ -113,26 +113,32 @@ test("generated integration specs are current", async () => {
   assert.deepEqual(await checkIntegrationSpecs(), []);
 });
 
+// Specs published when this floor was set. Integration PRs never edit it: the list only changes when
+// a published spec is intentionally retired.
+const BASELINE_PUBLISHED_SPECS = [
+  "aws-sec-inspector",
+  "azure-sec-inspector",
+  "box-sec-inspector",
+  "cloudflare-sec-inspector",
+  "duo-sec-inspector",
+  "gcp-sec-inspector",
+  "gws-inspector-go",
+  "oci-sec-inspector",
+  "okta-sec-inspector",
+  "paloalto-sec-inspector",
+  "salesforce-sec-inspector",
+  "servicenow-sec-inspector",
+  "slack-sec-inspector",
+  "webex-sec-inspector",
+  "zendesk-sec-inspector",
+  "zoom-sec-inspector",
+  "zscaler-sec-inspector",
+];
+
 test("published registry entries have complete, internally linked contracts", () => {
-  assert.deepEqual(PUBLISHED_INTEGRATION_SPECS.map((entry) => entry.contract.identity.slug), [
-    "aws-sec-inspector",
-    "azure-sec-inspector",
-    "box-sec-inspector",
-    "cloudflare-sec-inspector",
-    "duo-sec-inspector",
-    "gcp-sec-inspector",
-    "gws-inspector-go",
-    "oci-sec-inspector",
-    "okta-sec-inspector",
-    "paloalto-sec-inspector",
-    "salesforce-sec-inspector",
-    "servicenow-sec-inspector",
-    "slack-sec-inspector",
-    "webex-sec-inspector",
-    "zendesk-sec-inspector",
-    "zoom-sec-inspector",
-    "zscaler-sec-inspector",
-  ]);
+  const slugs = PUBLISHED_INTEGRATION_SPECS.map((entry) => entry.contract.identity.slug);
+  assert.deepEqual(slugs, [...new Set(slugs)].sort(), "registry slugs are unique and alphabetical");
+  for (const slug of BASELINE_PUBLISHED_SPECS) assert.ok(slugs.includes(slug), `${slug}: still published`);
 
   for (const entry of PUBLISHED_INTEGRATION_SPECS) {
     const { contract } = entry;

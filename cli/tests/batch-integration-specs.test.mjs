@@ -1273,11 +1273,33 @@ test("contracts enumerate exact surfaces, permission unlocks, framework mappings
       for (const surface of permission.unlocks) assert.ok(surfaceIds.has(surface), `${permission.id}: ${surface}`);
     }
   }
-  const publishedSurfaceCount = PUBLISHED_INTEGRATION_SPECS.reduce(
-    (count, entry) => count + entry.contract.apiSurfaces.length,
-    0,
-  );
-  assert.equal(publishedSurfaceCount, 432, "all runtime-owned pilot and batch surfaces are represented exactly once");
+  // Surface counts of the specs published when this floor was set. Integration PRs never edit it:
+  // a newly published spec proves its surfaces with its own request-conformance tests, and an entry
+  // only changes when that spec's runtime surfaces intentionally change.
+  const baselineSurfaceCounts = {
+    "aws-sec-inspector": 45,
+    "azure-sec-inspector": 37,
+    "box-sec-inspector": 18,
+    "cloudflare-sec-inspector": 15,
+    "duo-sec-inspector": 16,
+    "gcp-sec-inspector": 29,
+    "gws-inspector-go": 9,
+    "oci-sec-inspector": 28,
+    "okta-sec-inspector": 32,
+    "paloalto-sec-inspector": 26,
+    "salesforce-sec-inspector": 21,
+    "servicenow-sec-inspector": 33,
+    "slack-sec-inspector": 19,
+    "webex-sec-inspector": 21,
+    "zendesk-sec-inspector": 22,
+    "zoom-sec-inspector": 15,
+    "zscaler-sec-inspector": 46,
+  };
+  for (const [slug, surfaceCount] of Object.entries(baselineSurfaceCounts)) {
+    const entry = PUBLISHED_INTEGRATION_SPECS.find((candidate) => candidate.contract.identity.slug === slug);
+    assert.ok(entry, `${slug}: still published`);
+    assert.equal(entry.contract.apiSurfaces.length, surfaceCount, `${slug}: every runtime-owned surface is represented exactly once`);
+  }
   const slackConfig = resolveSlackConfiguration({ token: "surface-contract-token" }, {});
   const slackScimUsers = SLACK_SPEC.apiSurfaces.find((surface) => surface.id === "scim-users");
   assert.equal(slackConfig.scimBaseUrl, "https://api.slack.com/scim/v2");

@@ -45,6 +45,7 @@ import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } fr
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 import {
   byteDifferentialEnabled,
+  portableContractTest,
   prepareByteDifferentialExportRoot,
   snapshotExportBundle,
   writeByteDifferentialFixture,
@@ -54,7 +55,6 @@ import {
   evaluateBatchCheckVerdict,
 } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 
-const portableContractTest = process.env.GRC_CORPUS_FIXTURE_DIR ? test.skip : test;
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
 const RECENT_LOGIN = "2026-09-20 08:15:00";
 const STALE_LOGIN = "2026-01-05 08:15:00";
