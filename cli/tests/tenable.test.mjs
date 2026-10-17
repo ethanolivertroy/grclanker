@@ -3911,7 +3911,6 @@ async function assessCompletenessInput({ routes, vmConfigured }) {
   return allFindings(await runAll(clients, { expectedAssetCount: 2 }));
 }
 
-// Puts one declared completeness source into one failure mode, the way Tenable produces it.
 function failCompletenessSource(input, { surfaceId, mode }) {
   const { routes } = input;
   if (mode === "not-configured") return { ...input, vmConfigured: false };
@@ -4002,8 +4001,6 @@ function connectedScanners(routes) {
   return scanners;
 }
 
-// One input at or just past a threshold edge: the healthy VM and Security Center routes
-// with `change` applied to that copy.
 function boundaryScenario(check, expected, edge, change, options = {}) {
   return {
     name: `${check} ${expected} when ${edge}`,
