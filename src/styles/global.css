@@ -136,13 +136,6 @@ body {
   box-shadow: 0 4px 16px rgba(35, 38, 52, 0.5); /* crust/50% */
 }
 
-/* Panel — secondary surface */
-.panel {
-  border: 1px solid var(--ui-border);
-  background: var(--ui-surface);
-  box-shadow: 0 1px 3px rgba(35, 38, 52, 0.4); /* crust/40% */
-}
-
 /* Scanlines — subtle texture overlay */
 .scanlines {
   position: relative;
@@ -190,13 +183,6 @@ body {
 }
 @media (prefers-reduced-motion: reduce) {
   .led-live { animation: none; }
-}
-.led-draft {
-  background: var(--color-blue);
-  box-shadow: 0 0 4px color-mix(in srgb, var(--color-blue) 40%, transparent);
-}
-.led-coming {
-  background: var(--color-surface1);
 }
 
 /* HUD corner brackets */
@@ -278,73 +264,6 @@ code {
   border-radius: 3px;
   color: var(--ui-accent);
   font-size: 0.8125em;
-}
-
-/* === Spec markdown content === */
-.spec-content h1 {
-  font-size: var(--text-lg);
-  font-weight: 700;
-  color: var(--color-text);
-  margin: 2rem 0 1rem;
-}
-.spec-content h2 {
-  font-size: var(--text-md);
-  font-weight: 600;
-  color: var(--color-text);
-  margin: 2.5rem 0 0.75rem;
-  padding-bottom: 0.5rem;
-  border-bottom: 1px solid var(--color-surface0);
-}
-.spec-content h3 {
-  font-size: var(--text-base);
-  font-weight: 600;
-  color: var(--color-subtext1);
-  margin: 1.5rem 0 0.5rem;
-}
-.spec-content h4 {
-  font-size: var(--text-base);
-  font-weight: 700;
-  color: var(--color-subtext1);
-  margin: 1rem 0 0.5rem;
-}
-.spec-content p { margin: 0.75rem 0; line-height: 1.75; }
-.spec-content ul, .spec-content ol { margin: 0.75rem 0; padding-left: 1.5rem; }
-.spec-content li { margin: 0.3rem 0; line-height: 1.65; }
-.spec-content li::marker { color: var(--color-surface2); }
-.spec-content table {
-  width: 100%;
-  border-collapse: collapse;
-  margin: 1rem 0;
-  font-size: var(--text-sm);
-  display: block;
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
-  scrollbar-width: thin;
-  scrollbar-color: var(--color-surface1) transparent;
-}
-.spec-content thead, .spec-content tbody, .spec-content tr { display: table; width: 100%; table-layout: auto; }
-.spec-content th {
-  text-align: left;
-  padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid var(--color-surface0);
-  color: var(--color-blue);
-  font-weight: 600;
-  font-size: var(--text-xs);
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-}
-.spec-content td {
-  padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid rgba(65, 69, 89, 0.5); /* surface0 */
-}
-.spec-content tr:hover td { background: rgba(140, 170, 238, 0.03); /* blue */ }
-.spec-content strong { color: var(--color-text); }
-.spec-content hr { border: none; height: 1px; background: var(--color-surface0); margin: 2rem 0; }
-.spec-content blockquote {
-  border-left: 2px solid var(--color-blue);
-  padding-left: 1rem;
-  margin: 1rem 0;
-  color: var(--color-subtext0);
 }
 
 /* === Monaco Editor === */
@@ -554,17 +473,6 @@ code {
   color: var(--color-text);
 }
 
-/* === Cursor blink === */
-@keyframes blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0; }
-}
-#cursor {
-  animation: blink 1s step-end infinite;
-  font-weight: 400;
-  font-size: 0.8em;
-}
-
 /* === Agent group (details/summary) === */
 .agent-group {
   border: 1px solid var(--color-surface0);
@@ -657,58 +565,6 @@ details[open] > .agent-group-toggle::before {
   background: var(--color-surface0);
   border-color: var(--color-surface1);
   color: var(--color-text);
-}
-
-/* === Install tabs === */
-.install-tabbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.install-tab {
-  border: 1px solid var(--color-surface0);
-  background: rgba(35, 38, 52, 0.45); /* crust */
-  color: var(--color-subtext0);
-  border-radius: 999px;
-  padding: 0.55rem 0.95rem;
-  font-size: var(--text-xs);
-  font-weight: 600;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  cursor: pointer;
-  transition: all 0.15s ease;
-  font-family: inherit;
-}
-
-.install-tab:hover {
-  color: var(--color-text);
-  border-color: var(--color-surface2);
-}
-
-.install-tab[data-active="true"] {
-  color: var(--color-blue);
-  border-color: rgba(140, 170, 238, 0.35); /* blue */
-  background: rgba(140, 170, 238, 0.08);
-}
-
-.install-panel {
-  display: none;
-}
-
-.install-panel[data-active="true"] {
-  display: block;
-}
-
-.install-command {
-  display: block;
-  background: none !important;
-  border: none !important;
-  padding: 0 !important;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--color-text);
-  line-height: 1.7;
 }
 
 /* === Copy button feedback === */
@@ -821,11 +677,6 @@ details[open] > .agent-group-toggle::before {
   line-height: 1.7;
 }
 
-.hero-summary-grid {
-  display: grid;
-  gap: 1.25rem;
-}
-
 @media (min-width: 960px) {
   .hero-briefing-grid {
     grid-template-columns: minmax(0, 1.16fr) minmax(18rem, 0.84fr);
@@ -837,10 +688,6 @@ details[open] > .agent-group-toggle::before {
     padding-left: 1.5rem;
     border-top: none;
     border-left: 1px solid color-mix(in srgb, var(--ui-border) 72%, transparent);
-  }
-
-  .hero-summary-grid {
-    grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
   }
 }
 
@@ -1070,11 +917,6 @@ details[open] > .agent-group-toggle::before {
   line-height: 1.7;
 }
 
-.hero-support-separator {
-  display: inline-block;
-  width: 0.4rem;
-}
-
 .hero-support-copy a {
   color: var(--ui-accent-soft);
 }
@@ -1107,29 +949,6 @@ details[open] > .agent-group-toggle::before {
   display: block;
   width: 100%;
   height: auto;
-}
-
-.hero-preview-fallback {
-  background: color-mix(in srgb, var(--ui-surface-strong) 94%, transparent);
-}
-
-.hero-surface-panel {
-  border: 1px solid color-mix(in srgb, var(--ui-border-strong) 78%, transparent);
-}
-
-.hero-preview-body {
-  padding: 1.5rem;
-}
-
-.hero-preview-grid {
-  display: grid;
-  gap: 1rem;
-}
-
-@media (min-width: 900px) {
-  .hero-preview-grid {
-    grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
-  }
 }
 
 @media (min-width: 768px) {
@@ -1387,7 +1206,7 @@ details[open] > .agent-group-toggle::before {
   text-transform: uppercase;
 }
 
-/* The Fumadocs sidebar starts at 1024px like the old one; "Browse docs" covers narrower screens. */
+/* Hide the Fumadocs sidebar below 1024px; "Browse docs" covers narrower screens. */
 @media (max-width: 1023.98px) {
   #nd-docs-layout {
     --fd-sidebar-width: 0px;
@@ -2115,10 +1934,6 @@ details[open] > .agent-group-toggle::before {
     font-size: var(--text-sm);
   }
 
-  .hero-preview-body {
-    padding: 1rem;
-  }
-
   .hero-brand-card {
     min-height: 9.5rem;
   }
@@ -2141,14 +1956,6 @@ details[open] > .agent-group-toggle::before {
   .hero-image-break-overlay,
   .page-image-break-overlay {
     padding: 0.9rem;
-  }
-
-  .docs-command-block {
-    flex-direction: column;
-  }
-
-  .docs-copy-btn {
-    align-self: flex-start;
   }
 
   .docs-article-title {
@@ -2425,13 +2232,6 @@ kbd {
   outline-offset: 2px;
 }
 
-button:focus-visible,
-a:focus-visible,
-input:focus-visible {
-  outline: 2px solid var(--color-blue);
-  outline-offset: 2px;
-}
-
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
   html {
@@ -2440,7 +2240,6 @@ input:focus-visible {
   .toast {
     transition: none;
   }
-  #cursor,
   .skeleton-line,
   .copy-btn.copied {
     animation: none;

@@ -15,7 +15,6 @@ export function SiteFooter() {
   return (
     <footer className="border-t border-surface0/60 bg-mantle/80">
       <div className="footer-image-strip" aria-hidden="true">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src={footerImageFor(pathname)} alt="" className="footer-image-strip-media" loading="lazy" />
         <div className="footer-image-strip-overlay" />
       </div>

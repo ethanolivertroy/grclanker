@@ -4,7 +4,6 @@ import Link from 'next/link';
 import { useRef, type SyntheticEvent } from 'react';
 import { getDocHref, type DocsSection } from '../lib/docs';
 
-/** Docs navigation below the desktop sidebar breakpoint. */
 export function DocsMobileNav({
   sections,
   currentSlug,

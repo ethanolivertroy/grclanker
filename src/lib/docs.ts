@@ -1,5 +1,3 @@
-export const docsDefaultSlug = 'getting-started/installation';
-
 export const docsSections = [
   {
     title: 'Getting Started',
