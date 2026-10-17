@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-// Checks the built site in dist/ for broken internal links and docs pages
-// missing from the sidebar. `--external` also probes external links and
-// reports (never fails on) the results.
+// Checks the built site in out/ for broken internal links, docs pages
+// missing from the sidebar, and pages missing from the search index.
+// `--external` also probes external links and reports (never fails on) the
+// results.
 //
-// Usage: node scripts/check-links.mjs [--external] [distDir]
+// Usage: node scripts/check-links.mjs [--external] [outDir]
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
@@ -17,6 +18,10 @@ export const HUB_LINKED_DOCS = [
   { prefix: '/docs/fedramp/ksi/', hub: '/docs/fedramp/ksis/' },
   { prefix: '/docs/fedramp/processes/', hub: '/docs/fedramp/processes/' },
 ];
+
+export const SEARCH_INDEX = 'api/search.json';
+// Every other page must be findable from the search dialog.
+const UNSEARCHABLE = /^\/(404|_not-found)(\.html|\/)/;
 
 const LINK_ATTRS = new Set(['href', 'src', 'srcset', 'poster']);
 // RFC 3986 scheme. Only http(s) and protocol-relative URLs are probed by
@@ -126,7 +131,14 @@ function baseUrl(file) {
   return file.endsWith('/index.html') ? file.slice(0, -'index.html'.length) : file;
 }
 
-export function checkSite({ distDir = 'dist', hubs = HUB_LINKED_DOCS } = {}) {
+// Page entries in the Orama database that Fumadocs exports for static search.
+export function searchIndexUrls(index) {
+  return Object.values(index.docs?.docs ?? {})
+    .filter((doc) => doc.type === 'page')
+    .map((doc) => doc.url);
+}
+
+export function checkSite({ distDir = 'out', hubs = HUB_LINKED_DOCS, searchIndex = SEARCH_INDEX } = {}) {
   const allFiles = walk(distDir);
   const toKey = (file) => '/' + relative(distDir, file).split(sep).join('/');
   const files = new Set(allFiles.map(toKey));
@@ -208,6 +220,20 @@ export function checkSite({ distDir = 'dist', hubs = HUB_LINKED_DOCS } = {}) {
     }
   }
 
+  if (searchIndex) {
+    const indexFile = join(distDir, searchIndex);
+    if (!existsSync(indexFile)) {
+      problems.push(`${relative('.', indexFile)}: search index not found`);
+    } else {
+      const urls = searchIndexUrls(JSON.parse(readFileSync(indexFile, 'utf8')));
+      const indexed = new Set(urls.map((url) => resolveTarget(url, files)));
+      for (const [key, page] of pages) {
+        if (UNSEARCHABLE.test(key) || indexed.has(key)) continue;
+        problems.push(`${page.file}: not in the search index (src/app/api/search.json/route.ts)`);
+      }
+    }
+  }
+
   return { problems, external, stats: { pages: pages.size, internalLinks, sidebar: sidebar.size } };
 }
 
@@ -267,7 +293,7 @@ async function reportExternal(urls) {
 
 async function main() {
   const args = process.argv.slice(2);
-  const distDir = args.find((arg) => !arg.startsWith('--')) ?? 'dist';
+  const distDir = args.find((arg) => !arg.startsWith('--')) ?? 'out';
   if (!existsSync(join(distDir, 'docs', 'index.html'))) {
     console.error(`check-links: ${distDir}/docs/index.html not found; run \`npm run build\` first.`);
     process.exit(1);
@@ -288,7 +314,7 @@ async function main() {
     for (const problem of problems) console.error(`  ${problem}`);
     process.exit(1);
   }
-  console.log('check-links: no broken internal links or orphaned docs pages');
+  console.log('check-links: no broken internal links, orphaned docs pages, or pages missing from search');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

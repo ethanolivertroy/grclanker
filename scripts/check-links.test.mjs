@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { checkSite, parseSrcset, parseTags, resolveTarget } from './check-links.mjs';
+import { checkSite, parseSrcset, parseTags, resolveTarget, SEARCH_INDEX } from './check-links.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), 'check-links.mjs');
 const fixtures = [];
@@ -42,8 +42,14 @@ function site(files) {
 const hubs = [{ prefix: '/docs/hub/', hub: '/docs/hub/' }];
 
 function problemsFor(files, options = {}) {
-  return checkSite({ distDir: site(files), hubs, ...options }).problems;
+  return checkSite({ distDir: site(files), hubs, searchIndex: null, ...options }).problems;
 }
+
+function searchIndex(entries) {
+  return JSON.stringify({ docs: { docs: Object.fromEntries(entries.map((entry, i) => [String(i + 1), entry])) } });
+}
+
+const indexed = (url) => ({ type: 'page', url });
 
 test('resolveTarget mirrors the Workers auto-trailing-slash table', () => {
   const files = new Set(['/index.html', '/file.html', '/folder/index.html', '/install']);
@@ -177,7 +183,7 @@ test('only same-site paths are internal and only http(s) is external', () => {
       <a href="./missing:colon/">bad</a>
       <a href="/also:missing">bad</a>`,
   });
-  const { problems, external } = checkSite({ distDir: dir, hubs });
+  const { problems, external } = checkSite({ distDir: dir, hubs, searchIndex: null });
   assert.deepEqual([...external.keys()].sort(), ['https://cdn.example/lib.js', 'https://docs.example/a']);
   assert.equal(problems.length, 3);
   assert.match(problems[0], /C:\\Users\\me\\notes\.html \(looks like a local drive path\)/);
@@ -216,9 +222,37 @@ test('docs pages must be in the sidebar or linked from their hub', () => {
   assert.equal(unlinked.length, 1);
   assert.match(unlinked[0], /docs\/hub\/detail\/index\.html: not linked from its hub page \/docs\/hub\//);
 
-  const noHubRule = checkSite({ distDir: site({}), hubs: [] }).problems;
+  const noHubRule = checkSite({ distDir: site({}), hubs: [], searchIndex: null }).problems;
   assert.equal(noHubRule.length, 1);
   assert.match(noHubRule[0], /docs\/hub\/detail\/index\.html: not in the docs sidebar/);
+});
+
+test('every page except the 404 pages must be in the search index', () => {
+  const docs = ['/docs/', '/docs/guide/', '/docs/hub/', '/docs/hub/detail/'].map(indexed);
+  const pages = {
+    'index.html': '',
+    'specs/okta/index.html': '',
+    '404.html': '',
+    '404/index.html': '',
+    '_not-found/index.html': '',
+  };
+
+  const covered = problemsFor({
+    ...pages,
+    [SEARCH_INDEX]: searchIndex([...docs, indexed('/'), indexed('/specs/okta/')]),
+  }, { searchIndex: SEARCH_INDEX });
+  assert.deepEqual(covered, []);
+
+  const missing = problemsFor({
+    ...pages,
+    [SEARCH_INDEX]: searchIndex([...docs, indexed('/'), { type: 'heading', url: '/specs/okta/#scope' }]),
+  }, { searchIndex: SEARCH_INDEX });
+  assert.equal(missing.length, 1);
+  assert.match(missing[0], /specs\/okta\/index\.html: not in the search index/);
+
+  const noIndex = problemsFor({}, { searchIndex: SEARCH_INDEX });
+  assert.equal(noIndex.length, 1);
+  assert.match(noIndex[0], /api\/search\.json: search index not found/);
 });
 
 test('the CLI exits 1 on problems and 0 on a clean site', () => {
@@ -231,6 +265,8 @@ test('the CLI exits 1 on problems and 0 on a clean site', () => {
   fixtures.push(minimal);
   mkdirSync(join(minimal, 'docs'));
   writeFileSync(join(minimal, 'docs', 'index.html'), '<nav class="docs-sidebar-nav"><a href="/docs/">Docs</a></nav>');
+  mkdirSync(dirname(join(minimal, SEARCH_INDEX)), { recursive: true });
+  writeFileSync(join(minimal, SEARCH_INDEX), searchIndex([indexed('/docs/')]));
   const okRun = spawnSync(process.execPath, [script, minimal], { encoding: 'utf8' });
   assert.equal(okRun.status, 0, okRun.stderr);
   assert.match(okRun.stdout, /no broken internal links/);

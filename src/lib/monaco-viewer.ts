@@ -9,7 +9,7 @@ interface MountMonacoViewerOptions {
   initialWrap: boolean;
 }
 
-interface MonacoViewerController {
+export interface MonacoViewerController {
   setWrap: (enabled: boolean) => void;
   setMap: (enabled: boolean) => void;
   dispose: () => void;
@@ -44,7 +44,7 @@ export async function mountMonacoViewer({
     smoothScrolling: true,
     fontSize: isMobile ? 12 : 13,
     lineHeight: isMobile ? 20 : 22,
-    fontFamily: "'Google Sans Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+    fontFamily: "'Berkeley Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
     padding: { top: isMobile ? 12 : 16, bottom: isMobile ? 12 : 16 },
     minimap: { enabled: false },
     scrollBeyondLastLine: false,

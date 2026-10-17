@@ -60,5 +60,8 @@ jobs:
         working-directory: cli
         run: npm run check:integration-specs
 
-      - name: Build Astro site
+      - name: Test site scripts
+        run: npm run test:site
+
+      - name: Build site
         run: npm run build
