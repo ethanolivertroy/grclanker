@@ -480,7 +480,7 @@ code {
   max-height: 85vh;
   overflow-y: auto;
   white-space: pre;
-  font-family: 'Google Sans Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: var(--text-sm);
   line-height: 1.7;
 }
