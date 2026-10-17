@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// Checks the built site in dist/ for broken internal links and docs pages
+// Checks the built site in out/ for broken internal links and docs pages
 // missing from the sidebar. `--external` also probes external links and
 // reports (never fails on) the results.
 //
-// Usage: node scripts/check-links.mjs [--external] [distDir]
+// Usage: node scripts/check-links.mjs [--external] [outDir]
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
@@ -126,7 +126,7 @@ function baseUrl(file) {
   return file.endsWith('/index.html') ? file.slice(0, -'index.html'.length) : file;
 }
 
-export function checkSite({ distDir = 'dist', hubs = HUB_LINKED_DOCS } = {}) {
+export function checkSite({ distDir = 'out', hubs = HUB_LINKED_DOCS } = {}) {
   const allFiles = walk(distDir);
   const toKey = (file) => '/' + relative(distDir, file).split(sep).join('/');
   const files = new Set(allFiles.map(toKey));
@@ -267,7 +267,7 @@ async function reportExternal(urls) {
 
 async function main() {
   const args = process.argv.slice(2);
-  const distDir = args.find((arg) => !arg.startsWith('--')) ?? 'dist';
+  const distDir = args.find((arg) => !arg.startsWith('--')) ?? 'out';
   if (!existsSync(join(distDir, 'docs', 'index.html'))) {
     console.error(`check-links: ${distDir}/docs/index.html not found; run \`npm run build\` first.`);
     process.exit(1);

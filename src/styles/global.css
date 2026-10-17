@@ -1,4 +1,6 @@
 @import "tailwindcss";
+@import "fumadocs-ui/css/neutral.css";
+@import "fumadocs-ui/css/preset.css";
 
 @theme {
   /* Catppuccin Frappé */
@@ -59,6 +61,30 @@
   --ui-muted-strong: var(--color-subtext1);
   --ui-accent: var(--color-blue);
   --ui-accent-soft: var(--color-green);
+  /* Height of the sticky site header; Fumadocs offsets its sticky sidebar and TOC by it. */
+  --fd-banner-height: calc(4.25rem + 1px);
+}
+
+/* Fumadocs UI colors on the Catppuccin Frappé palette. */
+.dark,
+.dark #nd-sidebar {
+  --color-fd-background: var(--color-base);
+  --color-fd-foreground: var(--color-text);
+  --color-fd-muted: var(--color-mantle);
+  --color-fd-muted-foreground: var(--color-subtext0);
+  --color-fd-popover: var(--color-mantle);
+  --color-fd-popover-foreground: var(--color-text);
+  --color-fd-card: var(--color-mantle);
+  --color-fd-card-foreground: var(--color-text);
+  --color-fd-border: var(--color-surface0);
+  --color-fd-primary: var(--color-green);
+  --color-fd-primary-foreground: var(--color-crust);
+  --color-fd-secondary: var(--color-surface0);
+  --color-fd-secondary-foreground: var(--color-text);
+  --color-fd-accent: color-mix(in srgb, var(--color-surface1) 50%, transparent);
+  --color-fd-accent-foreground: var(--color-text);
+  --color-fd-ring: var(--color-blue);
+  --color-fd-overlay: rgba(35, 38, 52, 0.75);
 }
 
 /* === Fonts === */
@@ -213,12 +239,13 @@ body {
 }
 
 /* === Links === */
-a {
+/* Unlayered rules beat Tailwind utilities, so Fumadocs' own link colors need the docs layout excluded. */
+a:where(:not(#nd-docs-layout *)) {
   color: var(--ui-accent);
   text-decoration: none;
   transition: color 0.15s ease;
 }
-a:hover {
+a:where(:not(#nd-docs-layout *)):hover {
   color: var(--color-lavender);
 }
 
@@ -1332,7 +1359,7 @@ details[open] > .agent-group-toggle::before {
 }
 
 /* === Docs === */
-.docs-layout {
+#nd-docs-layout {
   --docs-border: color-mix(in srgb, var(--color-surface1) 62%, transparent);
   --docs-border-strong: color-mix(in srgb, var(--color-surface1) 84%, transparent);
   --docs-inline-bg: color-mix(in srgb, var(--color-surface0) 70%, transparent);
@@ -1344,24 +1371,18 @@ details[open] > .agent-group-toggle::before {
   --docs-accent: var(--color-blue);
   --docs-accent-strong: var(--color-green);
   --docs-panel: var(--color-crust);
-  display: flex;
-  gap: 2rem;
-  align-items: flex-start;
 }
 
-.docs-sidebar {
-  display: none;
-  width: 16rem;
-  flex-shrink: 0;
-  border-right: 1px solid var(--docs-border);
-}
+/* The Fumadocs sidebar starts at 1024px like the old one; "Browse docs" covers narrower screens. */
+@media (max-width: 1023.98px) {
+  #nd-docs-layout {
+    --fd-sidebar-width: 0px;
+  }
 
-.docs-sidebar-inner {
-  position: sticky;
-  top: 4.75rem;
-  max-height: calc(100vh - 5.75rem);
-  overflow-y: auto;
-  padding: 0.25rem 1rem 0.25rem 0;
+  #nd-sidebar,
+  #nd-docs-layout [data-sidebar-placeholder] {
+    display: none;
+  }
 }
 
 .docs-sidebar-nav {
@@ -1397,11 +1418,6 @@ details[open] > .agent-group-toggle::before {
 .docs-sidebar-link.is-active {
   border-left-color: var(--docs-accent-strong);
   color: var(--docs-title);
-}
-
-.docs-main {
-  flex: 1;
-  min-width: 0;
 }
 
 .docs-mobile-nav {
@@ -1447,10 +1463,6 @@ details[open] > .agent-group-toggle::before {
 
 .docs-mobile-nav .docs-sidebar-link {
   padding-block: 0.75rem;
-}
-
-.docs-article {
-  max-width: 48rem;
 }
 
 .docs-article-title {
@@ -1557,14 +1569,16 @@ details[open] > .agent-group-toggle::before {
   line-height: 1.7;
 }
 
-.docs-prose .astro-code {
+.docs-prose .shiki {
+  --padding-left: 0;
+  --padding-right: 0;
   position: relative !important;
   background: var(--docs-panel) !important;
   color: var(--docs-title) !important;
 }
 
-.docs-prose .astro-code code,
-.docs-prose .astro-code .line {
+.docs-prose .shiki code,
+.docs-prose .shiki .line {
   background: transparent !important;
 }
 
@@ -1913,12 +1927,6 @@ details[open] > .agent-group-toggle::before {
   color: var(--ui-accent);
 }
 
-@media (min-width: 1024px) {
-  .docs-sidebar {
-    display: block;
-  }
-}
-
 @media (max-width: 720px) {
   .hero-install-command-text {
     font-size: var(--text-sm);
@@ -1958,10 +1966,6 @@ details[open] > .agent-group-toggle::before {
 
   .docs-copy-btn {
     align-self: flex-start;
-  }
-
-  .docs-article {
-    max-width: none;
   }
 
   .docs-article-title {
@@ -2126,6 +2130,34 @@ details[open] > .agent-group-toggle::before {
 .overlay-close:hover {
   color: var(--ui-text);
   border-color: color-mix(in srgb, var(--ui-accent) 30%, transparent);
+}
+
+.overlay-dialog {
+  width: calc(100% - 2rem);
+  max-width: 32rem;
+  margin: 20vh auto auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ui-text);
+}
+
+.overlay-dialog::backdrop {
+  background: rgba(35, 38, 52, 0.75); /* crust */
+}
+
+.skip-link {
+  position: absolute;
+  top: -4rem;
+  left: 1rem;
+  z-index: 100;
+  padding: 0.5rem 1rem;
+  border-radius: 0.5rem;
+  background: var(--color-mantle);
+}
+
+.skip-link:focus {
+  top: 1rem;
 }
 
 /* Search input */

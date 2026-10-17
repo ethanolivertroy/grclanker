@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 export interface SpecMeta {
   slug: string;
   name: string;
@@ -46,12 +49,21 @@ export const categoryLabels: Record<string, string> = {
 
 export const RAW_BASE = 'https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs';
 
-export function loadSpecs(): SpecMeta[] {
-  const specFiles = import.meta.glob('/specs/*.spec.md', { query: '?raw', import: 'default', eager: true });
+const specsDir = join(process.cwd(), 'specs');
 
-  return Object.values(specFiles)
-    .map((raw) => parseFrontmatter(raw as string).meta)
-    .sort((a, b) => a.name.localeCompare(b.name));
+export function readSpecs(): Array<{ meta: SpecMeta; content: string }> {
+  return readdirSync(specsDir)
+    .filter((file) => file.endsWith('.spec.md'))
+    .map((file) => parseFrontmatter(readFileSync(join(specsDir, file), 'utf8')))
+    .sort((a, b) => a.meta.name.localeCompare(b.meta.name));
+}
+
+export function loadSpecs(): SpecMeta[] {
+  return readSpecs().map((spec) => spec.meta);
+}
+
+export function getSpec(slug: string) {
+  return readSpecs().find((spec) => spec.meta.slug === slug);
 }
 
 export function groupSpecsByCategory(specs: SpecMeta[] = loadSpecs()): Record<string, SpecCategoryGroup> {

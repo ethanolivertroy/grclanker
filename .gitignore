@@ -7,9 +7,12 @@ cli/release/
 # Cursor Agent SDK local state (sessions, traces, evals)
 .agent-serve/
 
-# Astro
-dist/
-.astro/
+# Next.js
+.next/
+out/
+next-env.d.ts
+.source/
+*.tsbuildinfo
 
 # Cloudflare
 .wrangler/

@@ -84,6 +84,6 @@ export function buildDocsSections(
 }
 
 export function getDocHref(slug: string) {
-  if (!slug || slug === 'index') return '/docs';
-  return `/docs/${slug}`;
+  if (!slug || slug === 'index') return '/docs/';
+  return `/docs/${slug}/`;
 }
