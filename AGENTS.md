@@ -3,15 +3,16 @@
 ## Project Structure & Module Organization
 `grclanker` has two main surfaces:
 
-- `src/`: Astro marketing/docs site (`src/pages`, `src/content/docs`)
+- `src/`: Next.js marketing site and Fumadocs docs, exported as static files (`src/app`, `src/components`, `src/content/docs/docs`)
 - `cli/`: TypeScript CLI runtime, prompts, extensions, scripts, and tests
 - `specs/`: product and tool build specs, usually one `*-spec.md` per integration
 
 Most contributor work lands in `cli/extensions/grc-tools/` for native tools, `cli/tests/` for regression coverage, and `cli/scripts/` for sync or live-smoke helpers.
 
 ## Build, Test, and Development Commands
-- `npm run dev`: run the Astro site locally
-- `npm run build`: build the Astro site
+- `npm run dev`: run the site locally
+- `npm run build`: type-check and export the site to `out/`, then check links, docs sidebar coverage, and search coverage
+- `npm run test:site`: run the site build helper tests in `scripts/`
 - `npm --prefix cli run build`: compile the CLI to `cli/dist/`
 - `npm --prefix cli run dev`: run the CLI entrypoint with `tsx`
 - `npm --prefix cli run test:cli`: build the CLI and run the full Node test suite
@@ -36,7 +37,7 @@ Integrations are designed so several can land in parallel with minimal overlap i
 - Regenerate `src/content/docs/docs/tools/catalog.md` with `npm --prefix cli run sync:tool-catalog` only when you are not landing alongside other integration PRs, since every regeneration rewrites the shared counts.
 
 ## Testing Guidelines
-Tests use Node’s built-in runner (`node --test`) with `.test.mjs` files in `cli/tests/`. Add targeted tests for every new tool, plus bundle/output-path checks when exporting files. Prefer mocked API coverage first, then add an optional `test:*:live` script for real-tenant smoke tests when relevant.
+Tests use Node’s built-in runner (`node --test`) with `.test.mjs` files in `cli/tests/`; the site build helpers have their own in `scripts/`. Add targeted tests for every new tool, plus bundle/output-path checks when exporting files. Prefer mocked API coverage first, then add an optional `test:*:live` script for real-tenant smoke tests when relevant.
 
 ## Commit & Pull Request Guidelines
 Recent history uses short imperative subjects like `Add Okta compliance assessment tools` and `Add Google Workspace CLI operator bridge`. Keep commits scoped to one feature or hardening pass. PRs should include:
