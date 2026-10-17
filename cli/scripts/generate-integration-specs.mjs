@@ -140,9 +140,10 @@ function renderSurfaces(spec) {
     }),
   ];
   const requestRows = spec.apiSurfaces.flatMap((surface) => {
+    const headers = surface.request.headers.map((header) => header.includes(";") ? `\`${header}\`` : header);
     const base = [
       `| \`${surface.id}\` | client | ${escapeCell(surface.request.clientRegion)} | yes |`,
-      `| \`${surface.id}\` | headers | ${escapeCell(surface.request.headers.join("; ") || "None")} | yes |`,
+      `| \`${surface.id}\` | headers | ${escapeCell(headers.join("; ") || "None")} | yes |`,
       `| \`${surface.id}\` | response | ${escapeCell(surface.request.responseShape)} | yes |`,
     ];
     return [
@@ -181,7 +182,13 @@ function renderRateLimits(spec) {
     "",
     "| Scope | Documented limit | Retry headers | Retryable statuses | Policy |",
     "|---|---|---|---|---|",
-    ...spec.rateLimits.map((entry) => `| ${escapeCell(entry.scope)} | ${escapeCell(entry.documentedLimit ?? "Not published")} | ${listCell(entry.retryHeaders)} | ${entry.retryableStatuses.join(", ")} | ${escapeCell(entry.backoffPolicy)} |`),
+    ...spec.rateLimits.map((entry) => {
+      const statuses = [
+        ...entry.retryableStatuses,
+        ...(entry.retryableStatusRanges ?? []).map((range) => `${range.from}-${range.to}`),
+      ];
+      return `| ${escapeCell(entry.scope)} | ${escapeCell(entry.documentedLimit ?? "Not published")} | ${listCell(entry.retryHeaders)} | ${statuses.join(", ")} | ${escapeCell(entry.backoffPolicy)} |`;
+    }),
   ].join("\n");
 }
 
@@ -193,7 +200,38 @@ function renderChecks(spec) {
   const constantRows = spec.checks.flatMap((check) => Object.entries(check.criteria.constants)
     .map(([name, value]) => `| \`${check.id}\` | \`${name}\` | ${escapeCell(Array.isArray(value) ? value.join(", ") : value)} |`));
   const exampleRows = spec.checks.flatMap((check) => check.criteria.examples
+    .filter((example) => !example.facts)
     .map((example) => `| \`${check.id}\` | ${example.kind} | ${escapeCell(example.input)} | ${example.expected} | ${escapeCell(example.reason)} |`));
+  const illustrativeExamples = exampleRows.length > 0
+    ? [
+      "### Illustrative criterion notes",
+      "",
+      "Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.",
+      "",
+      "| Finding | Case | Input condition | Expected | Reason |",
+      "|---|---|---|---|---|",
+      ...exampleRows,
+      "",
+    ]
+    : [];
+  const executableExampleRows = spec.checks.flatMap((check) => check.criteria.examples
+    .filter((example) => example.facts)
+    .map((example) => {
+      const facts = Object.entries(example.facts).map(([name, value]) => `\`${name}\` = ${JSON.stringify(value)}`);
+      return `| \`${check.id}\` | ${example.kind} | ${escapeCell(facts.join("; ") || "None")} | ${example.expected} | ${escapeCell(example.reason)} |`;
+    }));
+  const executableExamples = executableExampleRows.length > 0
+    ? [
+      "### Executable criterion examples",
+      "",
+      "Each example's facts are evaluated against the ordered rules above when the spec is built; the build fails if the first matching rule does not produce the expected status.",
+      "",
+      "| Finding | Case | Facts | Expected | Reason |",
+      "|---|---|---|---|---|",
+      ...executableExampleRows,
+      "",
+    ]
+    : [];
   const derivedRows = spec.checks.flatMap((check) => Object.entries(check.derivedFacts)
     .map(([name, derivation]) => {
       const executable = check.derivedFactRules?.[name];
@@ -258,14 +296,8 @@ function renderChecks(spec) {
     "|---|---|---|",
     ...(constantRows.length > 0 ? constantRows : ["| None |  |  |"]),
     "",
-    "### Illustrative criterion notes",
-    "",
-    "Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.",
-    "",
-    "| Finding | Case | Input condition | Expected | Reason |",
-    "|---|---|---|---|---|",
-    ...exampleRows,
-    "",
+    ...executableExamples,
+    ...illustrativeExamples,
     "### Compliance framework mappings",
     "",
     `| # | Control | ${frameworkColumns.map(([, label]) => label).join(" | ")} |`,
