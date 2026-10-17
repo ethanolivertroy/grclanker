@@ -132,6 +132,37 @@ const TENABLE_SURFACES: readonly BatchSurfaceDefinition[] = [
     ],
     responseShape: "A JSON array of asset records; a record carrying none of id, uuid, has_agent, last_seen, network_id, or tags is counted as unevaluable and kept out.",
   }),
+  vmSurface("vuln-export-request", "/vulns/export", "exports-vulns-request-export", ["export_uuid"], {
+    method: "POST",
+    parameters: [
+      param("num_assets", "json-body", "5000"),
+      param("include_plugin_output", "json-body", "false"),
+      param("filters.since", "json-body", "Unix seconds vuln_lookback_days days before the assessment time (clamped to 1 through 730; default 90)"),
+      param("filters.state", "json-body", "[\"open\",\"reopened\",\"fixed\"]"),
+    ],
+    responseShape: "A JSON object with export_uuid.",
+  }),
+  vmSurface("vuln-export-status", "/vulns/export/{export_uuid}/status", "exports-vulns-export-status", [
+    "status", "reason", "chunks_available", "chunks_failed", "total_chunks",
+  ], {
+    parameters: [param("export_uuid", "path", "The export_uuid returned by POST /vulns/export, polled every 2 seconds for up to 300 seconds")],
+    responseShape: "A JSON object with a status string and the chunks_available, chunks_failed, and total_chunks members.",
+  }),
+  vmSurface("vuln-export-chunks", "/vulns/export/{export_uuid}/chunks/{chunk_id}", "exports-vulns-download-chunk", [
+    "state", "severity", "plugin.vpr.score", "first_found", "time_taken_to_fix",
+  ], {
+    parameters: [
+      param("export_uuid", "path", "The export_uuid returned by POST /vulns/export"),
+      param("chunk_id", "path", "Each id in chunks_available, for the first max_chunks ids (default 50, clamped to 1 through 1000)"),
+    ],
+    responseShape: "A JSON array of vulnerability records; a record carrying none of state, severity, plugin, asset, first_found, or last_found is counted as unevaluable and kept out.",
+  }),
+  vmSurface("vuln-export-jobs", "/vulns/export/status", "exports-vulns-export-status-recent", ["uuid", "created", "num_assets_per_chunk", "filters.state"], {
+    responseShape: "A JSON object with an exports array.",
+  }),
+  vmSurface("asset-export-jobs", "/assets/export/status", "exports-assets-export-status-recent", ["uuid", "created", "num_assets_per_chunk", "filters"], {
+    responseShape: "A JSON object with an exports array.",
+  }),
   vmSurface("server-properties", "/server/properties", "server-properties", ["plugin_set", "loaded_plugin_set", "license.agents"], {
     responseShape: "A JSON object carrying at least one of plugin_set, loaded_plugin_set, server_version, nessus_type, nessus_ui_version, or license.",
   }),
@@ -362,6 +393,24 @@ const TENABLE_INPUTS: Readonly<Record<string, string>> = {
   sc_active_user_last_login_age_days: "For each Security Center user whose status is 0 and whose lastLogin parses as epoch seconds, epoch milliseconds, or a date string, the days from lastLogin to the assessment time as a fraction, floored at 0.",
   sc_never_logged_in_user_count: "Number of Security Center users whose status is 0 and whose lastLogin does not parse as a timestamp; a lastLogin of 0 counts as never.",
   sc_locked_user_count: "Number of Security Center users whose status is 0 and whose locked value is true (true, 1, or the strings true or 1).",
+  vuln_export_readable: "True when the POST /vulns/export job reached FINISHED and, when Tenable listed any available chunk, at least one chunk downloaded.",
+  open_finding_count: "Number of exported vulnerability records whose state is OPEN or REOPENED, case-insensitively.",
+  vuln_export_chunks_complete: "Vulnerability export chunk coverage.",
+  vpr_coverage_ratio: "Open findings whose plugin.vpr.score is a number or numeric string, divided by the open findings whose severity is low, medium, high, or critical, case-insensitively, and rounded to four decimal places with ties rounded up; 0 when no open finding has one of those severities.",
+  unevaluable_vuln_record_count: "Number of records in the downloaded vulnerability chunks that carried none of state, severity, plugin, asset, first_found, or last_found; they are kept out of every other count.",
+  open_critical_finding_age_days: "For each open finding whose severity is critical, case-insensitively, and whose first_found parses as epoch seconds, epoch milliseconds, or a date string, the days from first_found to the assessment time as a fraction, floored at 0.",
+  open_high_finding_age_days: "For each open finding whose severity is high, case-insensitively, and whose first_found parses as a timestamp, the days from first_found to the assessment time as a fraction, floored at 0.",
+  open_medium_finding_age_days: "For each open finding whose severity is medium, case-insensitively, and whose first_found parses as a timestamp, the days from first_found to the assessment time as a fraction, floored at 0.",
+  open_low_finding_age_days: "For each open finding whose severity is low, case-insensitively, and whose first_found parses as a timestamp, the days from first_found to the assessment time as a fraction, floored at 0.",
+  sla_critical_days: "The sla_critical_days assessment option in days, clamped to 1 through 3650; default 15.",
+  sla_high_days: "The sla_high_days assessment option in days, clamped to 1 through 3650; default 30.",
+  sla_medium_days: "The sla_medium_days assessment option in days, clamped to 1 through 3650; default 90.",
+  sla_low_days: "The sla_low_days assessment option in days, clamped to 1 through 3650; default 180.",
+  undated_open_finding_count: "Number of open findings, of any severity, whose first_found does not parse as a timestamp.",
+  vuln_export_jobs_readable: "True when GET /vulns/export/status returned its documented exports array.",
+  asset_export_jobs_readable: "True when GET /assets/export/status returned its documented exports array.",
+  external_export_job_count: "Number of jobs in the readable GET /vulns/export/status and GET /assets/export/status lists whose created timestamp is no more than 3 days before the assessment time, whose uuid is not one of this assessment's own export_uuid values, and that are not shaped like this tool's own export request: a vulnerability export with num_assets_per_chunk 5000 and filters.state of exactly open, reopened, and fixed in any order and case, or an asset export with num_assets_per_chunk 10000 and no filters.",
+  external_export_job_day_count: "Number of distinct UTC calendar dates among the created timestamps of the jobs counted in external_export_job_count.",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -1201,6 +1250,149 @@ const ACCESS_CONTROL_CHECKS: readonly TenableCheck[] = [
   },
 ];
 
+const VULNERABILITY_MANAGEMENT = "tenable_assess_vulnerability_management";
+
+const VULN_EXPORT_SURFACES = ["vuln-export-request", "vuln-export-status", "vuln-export-chunks"];
+
+const VULN_EXPORT_CHUNKS_COMPLETE = completeFrom(
+  "true when the finished export listed no more than max_chunks available chunks, Tenable reported no failed chunk and no total_chunks beyond the available list, and every requested chunk downloaded.",
+  [
+    { surfaceId: "vuln-export-status", falseWhen: ["truncated"] },
+    { surfaceId: "vuln-export-chunks", falseWhen: ["truncated"] },
+  ],
+);
+
+const VULNERABILITY_CHECKS: readonly TenableCheck[] = [
+  {
+    id: "TENABLE-14",
+    control: 14,
+    title: "Vulnerability prioritization (VPR)",
+    severity: "high",
+    owner: VULNERABILITY_MANAGEMENT,
+    surfaces: [...VULN_EXPORT_SURFACES, ...ASSET_EXPORT_SURFACES, "users"],
+    inputs: [
+      "vuln_export_readable", "asset_export_readable", "asset_count", "open_finding_count", "vuln_export_chunks_complete", "vpr_coverage_ratio",
+      "unevaluable_vuln_record_count", "asset_export_complete", "caller_is_administrator",
+    ],
+    rules: [
+      rule("manual", ne("vuln_export_readable", true)),
+      rule("manual", ne("asset_export_readable", true)),
+      rule("manual", eq("asset_count", 0)),
+      rule("manual", eq("open_finding_count", 0)),
+      rule("warn", any(
+        ne("vuln_export_chunks_complete", true),
+        lt("vpr_coverage_ratio", 0.5),
+        gt("unevaluable_vuln_record_count", 0),
+        ne("asset_export_complete", true),
+        ne("caller_is_administrator", true),
+      )),
+      rule("pass", always),
+    ],
+    completeness: { vuln_export_chunks_complete: VULN_EXPORT_CHUNKS_COMPLETE, asset_export_complete: ASSET_EXPORT_COMPLETE },
+    decision: "Manual when the vulnerability export or the asset export is unreadable, when the asset export returned zero assets, or when no open finding was exported for the vuln_lookback_days window, since an empty finding set does not show VPR in use. Warn when export chunks were not downloaded, when fewer than half of the rated open findings carry a VPR score, when any vulnerability record could not be evaluated, when the asset export is partial, or when the caller is not an Administrator. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "92 percent of rated open findings carry a VPR score and both exports were read in full.", {
+        vuln_export_readable: true, asset_export_readable: true, asset_count: 120, open_finding_count: 40, vuln_export_chunks_complete: true,
+        vpr_coverage_ratio: 0.92, unevaluable_vuln_record_count: 0, asset_export_complete: true, caller_is_administrator: true,
+      }),
+      example("partial", "warn", "Only 40 percent of rated open findings carry a VPR score.", {
+        vuln_export_readable: true, asset_export_readable: true, asset_count: 120, open_finding_count: 40, vuln_export_chunks_complete: true,
+        vpr_coverage_ratio: 0.4, unevaluable_vuln_record_count: 0, asset_export_complete: true, caller_is_administrator: true,
+      }),
+      example("unreadable", "manual", "The vulnerability export was refused.", { vuln_export_readable: false }),
+    ],
+  },
+  {
+    id: "TENABLE-15",
+    control: 15,
+    title: "Vulnerability SLA tracking",
+    severity: "high",
+    owner: VULNERABILITY_MANAGEMENT,
+    surfaces: [...VULN_EXPORT_SURFACES, ...ASSET_EXPORT_SURFACES, "users"],
+    inputs: [
+      "vuln_export_readable", "asset_export_readable", "asset_count", "vuln_export_chunks_complete", "open_critical_finding_age_days", "sla_critical_days",
+      "open_high_finding_age_days", "sla_high_days", "open_medium_finding_age_days", "sla_medium_days", "open_low_finding_age_days", "sla_low_days",
+      "undated_open_finding_count", "unevaluable_vuln_record_count", "asset_export_complete", "caller_is_administrator",
+    ],
+    rules: [
+      rule("manual", ne("vuln_export_readable", true)),
+      rule("manual", ne("asset_export_readable", true)),
+      rule("manual", eq("asset_count", 0)),
+      rule("warn", ne("vuln_export_chunks_complete", true)),
+      rule("fail", any(
+        some("open_critical_finding_age_days", gt("$", path("sla_critical_days"))),
+        some("open_high_finding_age_days", gt("$", path("sla_high_days"))),
+      )),
+      rule("warn", any(
+        some("open_medium_finding_age_days", gt("$", path("sla_medium_days"))),
+        some("open_low_finding_age_days", gt("$", path("sla_low_days"))),
+        gt("undated_open_finding_count", 0),
+        gt("unevaluable_vuln_record_count", 0),
+        ne("asset_export_complete", true),
+        ne("caller_is_administrator", true),
+      )),
+      rule("pass", always),
+    ],
+    completeness: { vuln_export_chunks_complete: VULN_EXPORT_CHUNKS_COMPLETE, asset_export_complete: ASSET_EXPORT_COMPLETE },
+    decision: "Manual when the vulnerability export or the asset export is unreadable, or when the asset export returned zero assets. Warn when export chunks were not downloaded, since unseen chunks may hold overdue findings. Fail when any open critical finding is older than sla_critical_days or any open high finding is older than sla_high_days, counted from first_found. Warn when any open medium or low finding is past its SLA, when any open finding has no first_found date, when any vulnerability record could not be evaluated, when the asset export is partial, or when the caller is not an Administrator. Otherwise pass, including when no open finding was exported.",
+    examples: [
+      example("compliant", "pass", "Every open finding is within its SLA.", {
+        vuln_export_readable: true, asset_export_readable: true, asset_count: 120, vuln_export_chunks_complete: true,
+        open_critical_finding_age_days: [3, 15], sla_critical_days: 15, open_high_finding_age_days: [29.5], sla_high_days: 30,
+        open_medium_finding_age_days: [80], sla_medium_days: 90, open_low_finding_age_days: [], sla_low_days: 180,
+        undated_open_finding_count: 0, unevaluable_vuln_record_count: 0, asset_export_complete: true, caller_is_administrator: true,
+      }),
+      example("noncompliant", "fail", "A critical finding has been open for 16 days against a 15-day SLA.", {
+        vuln_export_readable: true, asset_export_readable: true, asset_count: 120, vuln_export_chunks_complete: true,
+        open_critical_finding_age_days: [3, 16], sla_critical_days: 15, open_high_finding_age_days: [29.5], sla_high_days: 30,
+        open_medium_finding_age_days: [80], sla_medium_days: 90, open_low_finding_age_days: [], sla_low_days: 180,
+        undated_open_finding_count: 0, unevaluable_vuln_record_count: 0, asset_export_complete: true, caller_is_administrator: true,
+      }),
+      example("partial", "warn", "A medium finding has been open for 91 days against a 90-day SLA.", {
+        vuln_export_readable: true, asset_export_readable: true, asset_count: 120, vuln_export_chunks_complete: true,
+        open_critical_finding_age_days: [3], sla_critical_days: 15, open_high_finding_age_days: [29.5], sla_high_days: 30,
+        open_medium_finding_age_days: [91], sla_medium_days: 90, open_low_finding_age_days: [], sla_low_days: 180,
+        undated_open_finding_count: 0, unevaluable_vuln_record_count: 0, asset_export_complete: true, caller_is_administrator: true,
+      }),
+      example("unreadable", "manual", "The asset export was refused, so the finding population cannot be validated.", {
+        vuln_export_readable: true, asset_export_readable: false,
+      }),
+    ],
+  },
+  {
+    id: "TENABLE-19",
+    control: 19,
+    title: "Export and reporting automation",
+    severity: "medium",
+    owner: VULNERABILITY_MANAGEMENT,
+    surfaces: ["vuln-export-jobs", "asset-export-jobs", "vuln-export-request", "asset-export-request", "users"],
+    inputs: ["vuln_export_jobs_readable", "asset_export_jobs_readable", "external_export_job_count", "external_export_job_day_count", "caller_is_administrator"],
+    rules: [
+      rule("manual", all(ne("vuln_export_jobs_readable", true), ne("asset_export_jobs_readable", true))),
+      rule("pass", all(
+        gte("external_export_job_day_count", 2),
+        eq("vuln_export_jobs_readable", true),
+        eq("asset_export_jobs_readable", true),
+        eq("caller_is_administrator", true),
+      )),
+      rule("warn", gt("external_export_job_count", 0)),
+      rule("manual", always),
+    ],
+    decision: "Manual when neither export job list is readable. Pass when export jobs this tool did not create ran on at least two distinct UTC dates within the last 3 days, both job lists were read, and the caller is an Administrator. Warn when any such job ran but that bar is not met. Otherwise manual, since report schedules are not exposed by the API and a human must collect the integration or report schedule that distributes results.",
+    examples: [
+      example("compliant", "pass", "Four external export jobs ran on two different days.", {
+        vuln_export_jobs_readable: true, asset_export_jobs_readable: true, external_export_job_count: 4, external_export_job_day_count: 2,
+        caller_is_administrator: true,
+      }),
+      example("partial", "warn", "Two external export jobs ran, both on the same day.", {
+        vuln_export_jobs_readable: true, asset_export_jobs_readable: true, external_export_job_count: 2, external_export_job_day_count: 1,
+        caller_is_administrator: true,
+      }),
+      example("unreadable", "manual", "Both export job lists were refused.", { vuln_export_jobs_readable: false, asset_export_jobs_readable: false }),
+    ],
+  },
+];
+
 const toCheck = (check: TenableCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -1222,7 +1414,12 @@ const toCheck = (check: TenableCheck): BatchCheckDefinition => {
   };
 };
 
-const checks: readonly BatchCheckDefinition[] = [...SCAN_PROGRAM_CHECKS, ...SENSOR_COVERAGE_CHECKS, ...ACCESS_CONTROL_CHECKS].map(toCheck);
+const checks: readonly BatchCheckDefinition[] = [
+  ...SCAN_PROGRAM_CHECKS,
+  ...SENSOR_COVERAGE_CHECKS,
+  ...ACCESS_CONTROL_CHECKS,
+  ...VULNERABILITY_CHECKS,
+].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 const surfaceIds = (predicate: (surface: BatchSurfaceDefinition) => boolean): string[] =>
   TENABLE_SURFACES.filter(predicate).map((surface) => surface.id);
@@ -1235,6 +1432,16 @@ const offsetWalk = (walked: readonly string[], pageSize: number, pageCap = 200):
   pageCap,
   totalSemantics: "When pagination.total is reported the walk must reach it; without a total a page shorter than the limit ends the list.",
   stopConditions: ["An empty page", "pagination.total reached", "A short page when no total is reported", "A page that opens with the same record as the previous page", `The ${pageCap}-page cap`],
+});
+
+const exportChunks = (requestId: string, chunksId: string, pageSize: number, chunkHolds: string): BatchPaginationDefinition => ({
+  surfaceIds: [requestId, chunksId],
+  cursorFields: ["export_uuid", "chunks_available", "chunks_failed", "total_chunks"],
+  pageSize,
+  itemCap: "none",
+  pageCap: 50,
+  totalSemantics: `Each chunk holds ${chunkHolds}. The first max_chunks available chunks are downloaded (default 50, clamped to 1 through 1000); listing more, a failed chunk, or total_chunks beyond the available list marks the export partial.`,
+  stopConditions: ["Export status FINISHED, ERROR, or CANCELLED", "The 300-second polling deadline", "Every listed chunk up to max_chunks requested"],
 });
 
 export const TENABLE_SPEC = buildBatchIntegrationSpec({
@@ -1269,6 +1476,7 @@ export const TENABLE_SPEC = buildBatchIntegrationSpec({
     tenable_assess_scan_program: idsFor(SCAN_PROGRAM),
     tenable_assess_sensor_coverage: idsFor(SENSOR_COVERAGE),
     tenable_assess_access_control: idsFor(ACCESS_CONTROL),
+    tenable_assess_vulnerability_management: idsFor(VULNERABILITY_MANAGEMENT),
     tenable_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
@@ -1277,15 +1485,8 @@ export const TENABLE_SPEC = buildBatchIntegrationSpec({
     offsetWalk(["networks"], 50),
     offsetWalk(["tag-categories", "tag-values"], 5000),
     offsetWalk(["audit-log"], 5000, 20),
-    {
-      surfaceIds: ["asset-export-request", "asset-export-chunks"],
-      cursorFields: ["export_uuid", "chunks_available", "chunks_failed", "total_chunks"],
-      pageSize: 10000,
-      itemCap: "none",
-      pageCap: 50,
-      totalSemantics: "Each chunk holds up to 10000 assets. The first max_chunks available chunks are downloaded (default 50, clamped to 1 through 1000); listing more, a failed chunk, or total_chunks beyond the available list marks the export partial.",
-      stopConditions: ["Export status FINISHED, ERROR, or CANCELLED", "The 300-second polling deadline", "Every listed chunk up to max_chunks requested"],
-    },
+    exportChunks("asset-export-request", "asset-export-chunks", 10000, "up to 10000 assets"),
+    exportChunks("vuln-export-request", "vuln-export-chunks", 5000, "the findings of up to 5000 assets"),
   ],
   rateLimit: {
     documentedLimit: null,
