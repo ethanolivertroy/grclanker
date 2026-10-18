@@ -41,8 +41,24 @@ import { QUALYS_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver
 import { QUALYS_SPEC } from "../dist/extensions/grc-tools/qualys.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertBundlePathsMatchSpec, readBundleFiles } from "./helpers/bundle-contents.mjs";
-import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
-import { assertRequestConformance, recordFetchRequests, sweepCheckCompleteness } from "./helpers/spec-conformance.mjs";
+import {
+  byteDifferentialEnabled,
+  portableContractTest,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
+import {
+  assertRequestConformance,
+  certifyRuntimeBoundaryCoverage,
+  certifyRuntimeRuleDecisiveness,
+  observeRuntimeDecisionFacts,
+  recordFetchRequests,
+  sweepCheckCompleteness,
+} from "./helpers/spec-conformance.mjs";
+
+const observedDecisionFacts = observeRuntimeDecisionFacts(QUALYS_SPEC);
+const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
 
 const NOW = new Date();
 const daysAgo = (days) => new Date(NOW.getTime() - days * 86_400_000).toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -1108,7 +1124,10 @@ function tenantRouter(state) {
     if (url.includes("/vm/detection/")) return xmlResponse(listOutputXml("HOST_LIST_VM_DETECTION_OUTPUT", "HOST_LIST", "HOST", state.detectionHosts));
     if (url.includes("/asset/host/")) return xmlResponse(listOutputXml("HOST_LIST_OUTPUT", "HOST_LIST", "HOST", state.hosts));
     if (url.includes("/option_profile/vm/")) return xmlResponse(`<?xml version="1.0" encoding="UTF-8" ?><OPTION_PROFILES>${xmlFromRecord("OPTION_PROFILE", state.profiles)}</OPTION_PROFILES>`);
-    if (url.includes("/excluded_ip/")) return xmlResponse(`<?xml version="1.0" encoding="UTF-8" ?><IP_LIST_OUTPUT><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME></RESPONSE></IP_LIST_OUTPUT>`);
+    if (url.includes("/excluded_ip/")) {
+      const ipSet = state.excludedRanges ? `<IP_SET>${xmlFromRecord("IP_RANGE", state.excludedRanges)}</IP_SET>` : "";
+      return xmlResponse(`<?xml version="1.0" encoding="UTF-8" ?><IP_LIST_OUTPUT><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME>${ipSet}</RESPONSE></IP_LIST_OUTPUT>`);
+    }
     if (url.includes("/asset/group/")) return xmlResponse(listOutputXml("ASSET_GROUP_LIST_OUTPUT", "ASSET_GROUP_LIST", "ASSET_GROUP", state.groups));
     if (url.includes("/appliance/")) return xmlResponse(listOutputXml("APPLIANCE_LIST_OUTPUT", "APPLIANCE_LIST", "APPLIANCE", state.appliances));
     if (url.includes("/fo/auth/")) return xmlResponse(AUTH_RECORDS_SAMPLE);
@@ -4488,4 +4507,204 @@ portableContractTest("the export writes every declared bundle path and nothing e
   const partial = await exportQualysAuditBundle(routedClient(contractRouter(contractTenant(), { compliance_policies: refusal })), sampleConfig(), createTempBase("qualys-bundle-paths-"));
   assertBundlePathsMatchSpec(assert, partial.outputDir, QUALYS_SPEC);
   assert.ok(readBundleFiles(partial.outputDir).has("_errors.log"));
+});
+
+function boundaryScenario(check, expected, edge, change, options = {}) {
+  return {
+    name: `${check} ${expected} when ${edge}`,
+    check,
+    expected,
+    options,
+    state: () => {
+      const state = structuredClone(tenant);
+      change(state);
+      return state;
+    },
+  };
+}
+
+function manyHosts(count, overridesFor = () => ({})) {
+  return Array.from({ length: count }, (_, index) => documentedHost({
+    ID: String(200 + index),
+    IP: `10.0.1.${index + 1}`,
+    DNS: `host-${index + 1}.example.com`,
+    ...overridesFor(index),
+  }));
+}
+
+function scannedOn(days) {
+  return { LAST_VULN_SCAN_DATETIME: daysAgo(days), LAST_VM_SCANNED_DATE: daysAgo(days), LAST_VM_AUTH_SCANNED_DATE: daysAgo(days) };
+}
+
+const UNAUTHENTICATED = { LAST_VM_AUTH_SCANNED_DATE: undefined, LAST_VM_AUTH_SCANNED_DURATION: undefined };
+const UNSCANNED = { ...UNAUTHENTICATED, LAST_VULN_SCAN_DATETIME: undefined, LAST_VM_SCANNED_DATE: undefined, LAST_VM_SCANNED_DURATION: undefined };
+
+// One open severity 5 detection of QID 91000, patchable in the knowledge base, per host, first found the given days ago.
+function detectionHostsFirstFound(...days) {
+  return days.map((age, index) => ({
+    ID: String(300 + index),
+    IP: `10.0.2.${index + 1}`,
+    TRACKING_METHOD: "Cloud Agent",
+    OS: "Windows Server 2022",
+    LAST_SCAN_DATETIME: daysAgo(1),
+    DETECTION_LIST: { DETECTION: [documentedDetection({ FIRST_FOUND_DATETIME: daysAgo(age) })] },
+  }));
+}
+
+// Inputs that put each threshold at and beside its edge. They run as plain tests, so the byte
+// differential replays them through the baseline runtime and compares every result.
+const BOUNDARY_SCENARIOS = [
+  boundaryScenario("QUALYS-C01", "pass", "a host was last scanned exactly lookback_days ago", (state) => {
+    Object.assign(state.hosts[0], scannedOn(30));
+  }),
+  boundaryScenario("QUALYS-C01", "warn", "a host was last scanned a day past lookback_days", (state) => {
+    Object.assign(state.hosts[0], scannedOn(31));
+  }),
+  boundaryScenario("QUALYS-C02", "pass", "exactly min_auth_scan_percent of scanned hosts have a recent authenticated scan", (state) => {
+    state.hosts = manyHosts(5, (index) => (index === 0 ? UNAUTHENTICATED : {}));
+  }),
+  boundaryScenario("QUALYS-C02", "fail", "fewer than min_auth_scan_percent of scanned hosts have a recent authenticated scan", (state) => {
+    state.hosts = manyHosts(4, (index) => (index === 0 ? UNAUTHENTICATED : {}));
+  }),
+  boundaryScenario("QUALYS-C02", "fail", "no host carries a scan date", (state) => {
+    state.hosts = manyHosts(2, () => UNSCANNED);
+  }),
+  boundaryScenario("QUALYS-C16", "warn", "an excluded range spans exactly broad_exclusion_address_count addresses", (state) => {
+    state.excludedRanges = ["10.1.0.0-10.1.0.255"];
+  }),
+  boundaryScenario("QUALYS-C16", "fail", "an excluded range spans one address past broad_exclusion_address_count", (state) => {
+    state.excludedRanges = ["10.1.0.0-10.1.1.0"];
+  }),
+  boundaryScenario("QUALYS-C16", "warn", "an option profile excludes a QID search list from detection", (state) => {
+    state.profiles[0].SCAN.VULNERABILITY_DETECTION.DETECTION_EXCLUDE = { CUSTOM_LIST: { CUSTOM: { ID: "7", TITLE: "Accepted risk QIDs" } } };
+  }),
+  boundaryScenario("QUALYS-C05", "pass", "a connector last synced exactly stale_connector_days ago", (state) => {
+    state.connectors[0].lastSync = daysAgo(7);
+  }),
+  boundaryScenario("QUALYS-C05", "warn", "a connector last synced a day past stale_connector_days", (state) => {
+    state.connectors[0].lastSync = daysAgo(8);
+  }),
+  boundaryScenario("QUALYS-C05", "warn", "a connector reports no connectorState", (state) => {
+    delete state.connectors[0].connectorState;
+  }),
+  boundaryScenario("QUALYS-C07", "pass", "Cloud Agent tracks exactly min_agent_coverage_percent of hosts", (state) => {
+    state.hosts[1].TRACKING_METHOD = "IP";
+  }),
+  boundaryScenario("QUALYS-C07", "fail", "Cloud Agent tracks fewer than min_agent_coverage_percent of hosts", (state) => {
+    state.hosts = manyHosts(3, (index) => (index === 0 ? {} : { TRACKING_METHOD: "IP" }));
+  }),
+  boundaryScenario("QUALYS-C07", "pass", "an agent last checked in exactly stale_agent_days ago", (state) => {
+    state.agents[0].agentInfo.lastCheckedIn = { date: daysAgo(7) };
+  }),
+  boundaryScenario("QUALYS-C07", "warn", "an agent last checked in a day past stale_agent_days", (state) => {
+    state.agents[0].agentInfo.lastCheckedIn = { date: daysAgo(8) };
+  }),
+  boundaryScenario("QUALYS-C07", "warn", "an agent carries no activation key", (state) => {
+    delete state.agents[0].agentInfo.activationKey;
+  }),
+  boundaryScenario("QUALYS-C18", "warn", "exactly max_untagged_host_percent of hosts carry no tag", (state) => {
+    state.hosts = manyHosts(5, (index) => (index === 0 ? { TAGS: undefined } : {}));
+  }),
+  boundaryScenario("QUALYS-C18", "fail", "more than max_untagged_host_percent of hosts carry no tag", (state) => {
+    state.hosts = manyHosts(4, (index) => (index === 0 ? { TAGS: undefined } : {}));
+  }),
+  boundaryScenario("QUALYS-C08", "pass", "exactly min_auth_scan_percent of scanned hosts have a recent authenticated scan", (state) => {
+    state.hosts = manyHosts(5, (index) => (index === 0 ? UNAUTHENTICATED : {}));
+  }),
+  boundaryScenario("QUALYS-C08", "warn", "fewer than min_auth_scan_percent of scanned hosts have a recent authenticated scan", (state) => {
+    state.hosts = manyHosts(4, (index) => (index === 0 ? UNAUTHENTICATED : {}));
+  }),
+  boundaryScenario("QUALYS-C08", "fail", "no host carries a scan date", (state) => {
+    state.hosts = manyHosts(2, () => UNSCANNED);
+  }),
+  boundaryScenario("QUALYS-C08", "fail", "a network device host has no matching authentication record type", (state) => {
+    state.hosts.push(documentedHost({ ID: "102", IP: "10.0.0.7", DNS: "core-sw-01.example.com", OS: "Cisco IOS 15.2", TRACKING_METHOD: "IP" }));
+  }),
+  boundaryScenario("QUALYS-C08", "warn", "a host reports no operating system", (state) => {
+    delete state.hosts[1].OS;
+  }),
+  boundaryScenario("QUALYS-C09", "warn", "a compliance policy is inactive", (state) => {
+    state.policies.push(documentedPolicy({ ID: "6", TITLE: "Retired baseline", STATUS: "inactive" }));
+  }),
+  boundaryScenario("QUALYS-C10", "warn", "SLA compliance equals sla_fail_below_percent", (state) => {
+    state.detectionHosts = detectionHostsFirstFound(16, 3, 3, 3, 3);
+  }),
+  boundaryScenario("QUALYS-C10", "fail", "SLA compliance falls below sla_fail_below_percent", (state) => {
+    state.detectionHosts = detectionHostsFirstFound(16, 16, 3, 3, 3);
+  }),
+  boundaryScenario("QUALYS-C10", "pass", "SLA compliance equals sla_warn_below_percent", (state) => {
+    state.detectionHosts = detectionHostsFirstFound(16, ...Array(19).fill(3));
+  }),
+  boundaryScenario("QUALYS-C10", "warn", "an open detection carries no STATUS", (state) => {
+    delete state.detectionHosts[1].DETECTION_LIST.DETECTION[0].STATUS;
+  }),
+  boundaryScenario("QUALYS-C11", "warn", "overdue patchable detections equal max_overdue_patchable_percent", (state) => {
+    state.detectionHosts = detectionHostsFirstFound(31, 3, 3, 3);
+  }),
+  boundaryScenario("QUALYS-C11", "fail", "overdue patchable detections exceed max_overdue_patchable_percent", (state) => {
+    state.detectionHosts = detectionHostsFirstFound(31, 31, 3, 3);
+  }),
+  boundaryScenario("QUALYS-C13", "pass", "Manager accounts equal max_managers", () => {}, { maxManagers: 2 }),
+  boundaryScenario("QUALYS-C13", "fail", "Manager accounts exceed max_managers", () => {}, { maxManagers: 1 }),
+  boundaryScenario("QUALYS-C13", "pass", "an Active user last logged in exactly inactive_user_days ago", (state) => {
+    state.legacyUsers[2].LAST_LOGIN_DATE = daysAgo(90);
+  }),
+  boundaryScenario("QUALYS-C13", "warn", "an Active user last logged in a day past inactive_user_days", (state) => {
+    state.legacyUsers[2].LAST_LOGIN_DATE = daysAgo(91);
+  }),
+  boundaryScenario("QUALYS-C13", "warn", "a user carries no USER_STATUS", (state) => {
+    delete state.legacyUsers[2].USER_STATUS;
+  }),
+  boundaryScenario("QUALYS-C15", "pass", "a WAS authentication record was last updated exactly stale_was_auth_days ago", (state) => {
+    Object.assign(state.wasAuthRecords[0], { createdDate: daysAgo(400), updatedDate: daysAgo(180) });
+  }),
+  boundaryScenario("QUALYS-C15", "warn", "a WAS authentication record was last updated a day past stale_was_auth_days", (state) => {
+    Object.assign(state.wasAuthRecords[0], { createdDate: daysAgo(400), updatedDate: daysAgo(181) });
+  }),
+];
+
+async function runBoundaryScenario({ state, options }) {
+  return runAllAssessments(routedClient(tenantRouter(state())), options);
+}
+
+test("boundary scenarios: each threshold edge reaches the verdict on either side of it", async () => {
+  const names = BOUNDARY_SCENARIOS.map((scenario) => scenario.name);
+  assert.equal(new Set(names).size, names.length, "scenario names key the byte differential fixture");
+  const mismatches = [];
+  for (const scenario of BOUNDARY_SCENARIOS) {
+    const finding = allFindings(await runBoundaryScenario(scenario)).find((item) => item.id === scenario.check);
+    if (finding?.status !== scenario.expected) mismatches.push(`${scenario.name}: ${finding?.status}`);
+  }
+  assert.deepEqual(mismatches, []);
+});
+
+function representativeTenant() {
+  const state = structuredClone(tenant);
+  state.hosts.push(documentedHost({ ID: "102", IP: "10.0.0.7", DNS: "legacy-01.example.com", OS: "Cisco IOS 15.2", TRACKING_METHOD: "IP", ...scannedOn(120), ...UNAUTHENTICATED, TAGS: undefined }));
+  state.connectors[0].lastSync = daysAgo(12);
+  state.legacyUsers[2].LAST_LOGIN_DATE = daysAgo(200);
+  state.detectionHosts = detectionHostsFirstFound(60, 3, 3);
+  return state;
+}
+
+test("byte differential fixtures: Qualys assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("qualys", "representative", await runAllAssessments(routedClient(tenantRouter(representativeTenant()))));
+  writeByteDifferentialFixture("qualys", "compliant", await runAllAssessments(routedClient(compliantRouter)));
+  writeByteDifferentialFixture("qualys", "denied", await runAllAssessments(routedClient(forbiddenRouter)));
+  writeByteDifferentialFixture("qualys", "partial", await runAllAssessments(routedClient(partialRouter)));
+  writeByteDifferentialFixture("qualys", "missing-null", await runAllAssessments(routedClient(emptyRouter)));
+  const boundary = {};
+  for (const scenario of BOUNDARY_SCENARIOS) boundary[scenario.name] = await runBoundaryScenario(scenario);
+  writeByteDifferentialFixture("qualys", "boundary", boundary);
+  const exported = await exportQualysAuditBundle(routedClient(compliantRouter), sampleConfig(), prepareByteDifferentialExportRoot("qualys"));
+  writeByteDifferentialFixture("qualys", "export", snapshotExportBundle(exported));
+});
+
+portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", {
+  skip: testFilterActive && "a test filter ran only part of this file",
+}, () => {
+  observedDecisionFacts.stop();
+  const boundaries = certifyRuntimeBoundaryCoverage(QUALYS_SPEC, observedDecisionFacts.factsByCheck);
+  const rules = certifyRuntimeRuleDecisiveness(QUALYS_SPEC, observedDecisionFacts.factsByCheck);
+  assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
 });
