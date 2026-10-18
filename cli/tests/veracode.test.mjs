@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -149,6 +150,36 @@ function healthyFixture() {
     self: { user_id: "u-2", user_name: "svc-api", roles: [{ role_name: "Results API" }, { role_name: "Administrator" }] },
     credentials: { api_id: "abc123", created_ts: daysAgo(30), expiration_ts: new Date(NOW.getTime() + 300 * 86_400_000).toISOString() },
   };
+}
+
+/** Every check with a fail rule fails, VERACODE-10, 16, and 18 warn, and the manual-only checks stay manual. */
+function failingFixture() {
+  const fixture = healthyFixture();
+  const [payments, portal] = fixture.applications;
+  payments.last_completed_scan_date = daysAgo(200);
+  payments.scans = [{ scan_type: "STATIC", status: "PUBLISHED", modified_date: daysAgo(200) }];
+  payments.profile.policies = [{ guid: "pol-builtin", name: "Veracode Recommended", is_default: true, policy_compliance_status: "DID_NOT_PASS" }];
+  portal.profile.policies = [];
+  portal.scans = [{ scan_type: "STATIC", status: "ANALYSIS_ERRORS" }];
+  fixture.policies = [{ guid: "pol-builtin", name: "Veracode Recommended", type: "BUILTIN", finding_rules: [] }];
+  fixture.sandboxes = [];
+  fixture.findings = [
+    { issue_id: 1, finding_status: { status: "OPEN", resolution: "UNRESOLVED", resolution_status: "NONE", first_found_date: daysAgo(45) }, finding_details: { severity: 5 }, annotations: [] },
+    { issue_id: 2, finding_status: { status: "OPEN", resolution_status: "PROPOSED" }, finding_details: { severity: 4 }, annotations: [{ action: "FP", comment: "" }] },
+    { issue_id: 3, finding_status: { status: "CLOSED", resolution_status: "APPROVED" }, finding_details: { severity: 3 }, annotations: [{ action: "FP", comment: "Encoded input" }, { action: "APPROVED", comment: "Reviewed" }] },
+  ];
+  fixture.summaryReport = { static_analysis: { modules: { module: [{ loc: 1000, numflawssev5: 3, numflawssev4: 2 }] } } };
+  fixture.vulnerabilityIssues = [{ id: "i1", issue_type: "vulnerability", severity: 9.8, library: { name: "log4j" }, vulnerability: { cve: "CVE-2021-44228", cvss3_score: 10 } }];
+  fixture.licenseIssues = [{ id: "i2", issue_type: "license", license: { name: "GPL-3.0", risk: "HIGH" }, library: { name: "gpl-lib" } }];
+  fixture.scaProjects = { application: { guid: "app-2", name: "Portal" }, linked_projects: [] };
+  fixture.scanConfiguration = { auth_configuration: { authentications: {} }, crawl_configuration: { disabled: false } };
+  fixture.users.push(
+    { user_id: "u-3", user_name: "stale", active: true, login_enabled: true, account_type: "USER", saml_user: false, last_login: daysAgo(400), roles: [{ role_name: "Administrator" }], teams: [] },
+    { user_id: "u-4", user_name: "orphan-api", active: true, login_enabled: false, account_type: "API", api_user: true, roles: [{ role_name: "Results API" }], teams: [] },
+  );
+  fixture.credentials = { api_id: "old", created_ts: daysAgo(500), expiration_ts: daysAgo(10) };
+  fixture.teams = [];
+  return fixture;
 }
 
 function mockClient(fixture = healthyFixture(), overrides = {}) {
@@ -3182,4 +3213,83 @@ portableContractTest("the export writes every declared bundle path and nothing e
   const partialExport = await exportVeracodeAuditBundle(partial, sampleConfig(), createTempBase("grclanker-veracode-bundle-paths-"), { now: NOW });
   assertBundlePathsMatchSpec(assert, partialExport.outputDir, VERACODE_SPEC);
   assert.ok(readBundleFiles(partialExport.outputDir).has("_errors.log"));
+});
+
+const VERACODE_ASSESSMENT_TOOLS = [
+  ["veracode_assess_scan_coverage", assessVeracodeScanCoverage],
+  ["veracode_assess_policy_compliance", assessVeracodePolicyCompliance],
+  ["veracode_assess_findings_hygiene", assessVeracodeFindingsHygiene],
+  ["veracode_assess_sca_posture", assessVeracodeScaPosture],
+  ["veracode_assess_access_controls", assessVeracodeAccessControls],
+];
+
+portableContractTest("every control and finding carries the title, severity, and tool of its spec check, whether it passes, fails, or cannot be read", async () => {
+  const checks = new Map(VERACODE_SPEC.checks.map((check) => [check.id, check]));
+  assert.equal(checks.size, VERACODE_CONTROLS.length);
+  const owners = new Map();
+  for (const [tool, assess] of VERACODE_ASSESSMENT_TOOLS) {
+    const { findings } = await assess(veracodeHttpClient(recordingVeracodeFetch().fetchImpl), { now: NOW });
+    for (const item of findings) owners.set(item.id, tool);
+  }
+  for (const control of VERACODE_CONTROLS) {
+    const id = `VERACODE-${String(control.number).padStart(2, "0")}`;
+    const check = checks.get(id);
+    assert.deepEqual(
+      { title: check.title, controls: check.controlNumbers, tool: check.owningTool },
+      { title: control.title, controls: [control.number], tool: owners.get(id) },
+    );
+  }
+
+  const runs = {
+    healthy: recordingVeracodeFetch(),
+    failing: recordingVeracodeFetch({ fixture: failingFixture() }),
+    empty: recordingVeracodeFetch({ fixture: { ...healthyFixture(), applications: [] } }),
+    denied: recordingVeracodeFetch({ denied: [/./] }),
+  };
+  const statuses = new Set();
+  const severityDeviations = {};
+  for (const [name, { fetchImpl }] of Object.entries(runs)) {
+    severityDeviations[name] = [];
+    for (const item of (await runVeracodeAssessments(veracodeHttpClient(fetchImpl))).flatMap((result) => result.findings)) {
+      const check = checks.get(item.id);
+      assert.equal(item.title, check.title, `${name} run: ${item.id}`);
+      if (item.severity !== check.severity) severityDeviations[name].push(`${item.id} ${item.severity}`);
+      statuses.add(item.status);
+    }
+  }
+  assert.deepEqual([...statuses].sort(), ["fail", "manual", "pass", "warn"]);
+  assert.ok(VERACODE_SPEC.knownGaps.some((gap) => gap.includes("reports VERACODE-16 and VERACODE-17 at high severity")));
+  const blocked = ["VERACODE-16 high", "VERACODE-17 high"];
+  assert.deepEqual(severityDeviations, { healthy: [], failing: [], empty: blocked, denied: blocked });
+});
+
+portableContractTest("the spec module carries its framework mappings, and loading the runtime leaves the spec unchanged", () => {
+  const specUrl = new URL("../dist/extensions/grc-tools/veracode.spec.js", import.meta.url).href;
+  const script = `import { VERACODE_SPEC } from ${JSON.stringify(specUrl)};\nprocess.stdout.write(JSON.stringify(VERACODE_SPEC));`;
+  const specOnly = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: 30_000,
+  });
+  assert.equal(specOnly.status, 0, specOnly.stderr);
+  assert.deepEqual(JSON.parse(specOnly.stdout), JSON.parse(JSON.stringify(VERACODE_SPEC)));
+
+  for (const control of VERACODE_SPEC.controls) {
+    const { mappings } = VERACODE_CONTROLS.find((entry) => entry.number === control.number);
+    const reference = (label) => {
+      const mapping = mappings.find((entry) => entry.startsWith(`${label} `));
+      assert.ok(mapping, `control ${control.number} carries a ${label} mapping`);
+      return mapping.slice(label.length + 1);
+    };
+    assert.deepEqual(control.frameworks, {
+      fedramp: [reference("FedRAMP")],
+      cmmc: [reference("CMMC")],
+      soc2: [reference("SOC 2")],
+      cis: [reference("CIS Controls v8")],
+      pci_dss: [reference("PCI-DSS")],
+      disa_stig: [reference("STIG")],
+      irap: [reference("IRAP")],
+      ismap: [reference("ISMAP")],
+    }, `control ${control.number}`);
+  }
 });
