@@ -64,10 +64,14 @@ const API_SERVICE = "CrowdStrike Falcon API";
 const API_DOCS = "https://developer.crowdstrike.com/api-reference/collections";
 const API_HOST = "Use the resolved API host (base_url, else the selected cloud's host); member_cid scopes the bearer token and is never sent on a read.";
 const READ_HEADERS = ["Accept: application/json", "Authorization: Bearer {access_token}"];
+const POST_HEADERS = [...READ_HEADERS, "Content-Type: application/json"];
 const RAW_EXPORT_STAGE = "The collector exports every returned record as read, after the data redaction pass has rewritten every string in it; decision facts read the listed fields.";
+const projectedExport = (record: string, projection: string): string =>
+  `The collector exports each ${record} cut to ${projection}, after the data redaction pass has rewritten every string in it; decision facts read the listed fields, which the cut keeps.`;
+const PROBE_STAGE = "Never exported: the crowdstrike_check_access probe keeps only meta.pagination.total, else the number of returned IDs, as the surface's count.";
 
-const resourcesResponse = (records: string): string =>
-  `A JSON object whose resources array holds ${records} and whose meta.pagination may carry total, offset, and next; a status outside 200 through 299 after retries, a body that is not a JSON object, or a missing resources array is a refusal.`;
+const resourcesResponse = (records: string, pagination = "total, offset, and next"): string =>
+  `A JSON object whose resources array holds ${records} and whose meta.pagination may carry ${pagination}; a status outside 200 through 299 after retries, a body that is not a JSON object, or a missing resources array is a refusal.`;
 
 const param = (
   name: string,
@@ -77,16 +81,21 @@ const param = (
   when?: string,
 ): RequestParameterContract => ({ name, location, required, value, ...(when ? { when } : {}) });
 
+// A number is a fixed item cap; an option is a caller-supplied one.
+type ItemCap = number | { option: string; fallback: number; max: number };
+const capText = (cap: ItemCap): string =>
+  typeof cap === "number" ? `the ${cap} cap` : `${cap.option} (default ${cap.fallback}, set from 1 through ${cap.max})`;
+const capReached = (cap: ItemCap, records: string): string =>
+  `${typeof cap === "number" ? cap : cap.option} ${records}`;
+const HOST_LIMIT: ItemCap = { option: "host_limit", fallback: 5000, max: 100000 };
+const ALERT_LIMIT: ItemCap = { option: "alert_limit", fallback: 2000, max: 10000 };
+
 const ACCESS_PROBE = "1 on the crowdstrike_check_access probe";
-const offsetParameters = (records: string, pageSize: number, itemCap: number, probed: boolean): RequestParameterContract[] => [
-  param("limit", "query", `${pageSize}, or the ${records} left under the ${itemCap} cap when fewer${probed ? `; ${ACCESS_PROBE}` : ""}`),
-  param(
-    "offset",
-    "query",
-    `The number of ${records} already read, or the previous page's meta.pagination.next (else meta.pagination.offset) when that is not a whole number`,
-    false,
-    "On every page after the first",
-  ),
+const nextOffset = (records: string): string =>
+  `the previous page's meta.pagination.next (else meta.pagination.offset) when that is not a whole number; otherwise the previous page's offset (0 for the first page or after such a cursor) plus the number of ${records} it returned`;
+const offsetParameters = (records: string, pageSize: number, cap: ItemCap, probed: boolean): RequestParameterContract[] => [
+  param("limit", "query", `${pageSize}, or the ${records} left under ${capText(cap)} when fewer${probed ? `; ${ACCESS_PROBE}` : ""}`),
+  param("offset", "query", `The offset: ${nextOffset(records)}`, false, "On every page after the first"),
 ];
 
 const apiSurface = (
@@ -96,14 +105,16 @@ const apiSurface = (
   fields: readonly string[],
   parameters: readonly RequestParameterContract[],
   responseShape: string,
+  { method, projectionStage = RAW_EXPORT_STAGE }: { method?: "POST"; projectionStage?: string } = {},
 ): BatchSurfaceDefinition => ({
   id,
+  ...(method ? { method } : {}),
   path,
   service: API_SERVICE,
   documentationUrl: `${API_DOCS}/${collection}/`,
   fields,
-  request: { clientRegion: API_HOST, headers: READ_HEADERS, parameters, responseShape },
-  projectionStage: RAW_EXPORT_STAGE,
+  request: { clientRegion: API_HOST, headers: method === "POST" ? POST_HEADERS : READ_HEADERS, parameters, responseShape },
+  projectionStage,
 });
 
 const PREVENTION_SURFACES: readonly BatchSurfaceDefinition[] = [
@@ -128,8 +139,80 @@ const PREVENTION_SURFACES: readonly BatchSurfaceDefinition[] = [
   ),
 ];
 
+const EXCEPT_PROBE = "On every read except the crowdstrike_check_access probe";
+const LOOKBACK_START = "now-{lookback_days}d";
+const CONTAINMENT_FILTER = "status:['contained','containment_pending','lift_containment_pending']";
+const HOST_FIELDS = "device_id,hostname,platform_name,os_version,agent_version,last_seen,first_seen,status,groups,product_type_desc,reduced_functionality_mode,modified_timestamp";
+
+const RESPONSE_SURFACES: readonly BatchSurfaceDefinition[] = [
+  apiSurface(
+    "response_policies",
+    "/policy/combined/response/v1",
+    "response-policies",
+    ["id", "name", "platform_name", "enabled", "platform_default", "groups", "settings.settings.id", "settings.settings.value.enabled"],
+    offsetParameters("policies", 500, 5000, true),
+    resourcesResponse("one response policy per entry"),
+  ),
+  apiSurface(
+    "rtr_audit_sessions",
+    "/real-time-response-audit/combined/sessions/v1",
+    "real-time-response-audit",
+    ["id", "user_id", "user_uuid", "hostname", "created_at", "updated_at", "deleted_at", "duration"],
+    [
+      param("filter", "query", `created_at:>'${LOOKBACK_START}'`, true, EXCEPT_PROBE),
+      param("sort", "query", "created_at|desc", true, EXCEPT_PROBE),
+      ...offsetParameters("sessions", 500, 500, true),
+    ],
+    resourcesResponse("one RTR session per entry"),
+    {
+      projectionStage: projectedExport(
+        "session",
+        `the members it carries among ${RTR_SESSION_SNAPSHOT_FIELDS.join(", ")}, plus command_count (how many of its commands entries are JSON objects) and base_commands (their distinct trimmed base_command values)`,
+      ),
+    },
+  ),
+  apiSurface(
+    "alerts",
+    "/alerts/combined/alerts/v1",
+    "alerts",
+    ["composite_id", "id", "severity", "severity_name", "status", "created_timestamp", "timestamp", "updated_timestamp", "seconds_to_resolved"],
+    [
+      param("filter", "json-body", `severity:>=70+created_timestamp:>'${LOOKBACK_START}'`),
+      param("limit", "json-body", `1000, or the alerts left under ${capText(ALERT_LIMIT)} when fewer`),
+      param("sort", "json-body", "created_timestamp|desc"),
+      param("after", "json-body", "The previous page's meta.pagination.after", false, "On every page after the first"),
+    ],
+    resourcesResponse("one alert per entry", "total and after"),
+    {
+      method: "POST",
+      projectionStage: projectedExport(
+        "alert",
+        `the members it carries among ${ALERT_SNAPSHOT_FIELDS.join(", ")}, with device cut to its ${ALERT_DEVICE_SNAPSHOT_FIELDS.join(", ")}`,
+      ),
+    },
+  ),
+  apiSurface(
+    "alert_ids",
+    "/alerts/queries/alerts/v2",
+    "alerts",
+    ["meta.pagination.total", "resources"],
+    [param("limit", "query", "1")],
+    resourcesResponse("alert IDs", "total"),
+    { projectionStage: PROBE_STAGE },
+  ),
+  apiSurface(
+    "contained_hosts",
+    `/devices/combined/devices/v1?filter=${CONTAINMENT_FILTER}`,
+    "hosts",
+    ["device_id", "hostname", "status", "last_seen", "modified_timestamp"],
+    [param("sort", "query", "device_id.asc"), param("fields", "query", HOST_FIELDS), ...offsetParameters("hosts", 1000, HOST_LIMIT, false)],
+    resourcesResponse("one host per entry"),
+  ),
+];
+
 const CROWDSTRIKE_SURFACES: readonly BatchSurfaceDefinition[] = [
   ...PREVENTION_SURFACES,
+  ...RESPONSE_SURFACES,
 ];
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
@@ -150,6 +233,16 @@ const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or"
 const some = (name: string, condition: VerdictCondition): VerdictCondition => ({ op: "some", path: name, condition });
 const always: VerdictCondition = { op: "always" };
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
+// Whole tenths of a percent: the runtime compares Math.round(part / total * 1000) / 10.
+const perMilleBelow = (numerator: string, denominator: string, threshold: string): VerdictCondition => ({
+  op: "ratio",
+  numerator: path(numerator),
+  denominator: path(denominator),
+  comparator: "lt",
+  threshold: path(threshold),
+  scale: 1000,
+  roundDigits: 0,
+});
 
 // A fail that rests on no assigned policy is provable only against a complete list, so a partial list renders it manual.
 const noAssignedPolicy = (count: string, complete: string): VerdictRule[] => [
@@ -159,17 +252,32 @@ const noAssignedPolicy = (count: string, complete: string): VerdictRule[] => [
 
 const TRUTHY = "the boolean true or a string that trims to true, 1, yes, enabled, or on in any letter case";
 const FALSY = "the boolean false or a string that trims to false, 0, no, disabled, or off in any letter case";
+const assignedPolicyCount = (label: string): string =>
+  `Number of returned ${label} policies whose enabled is ${TRUTHY} and that reach hosts through a non-empty groups array, a platform_default of ${TRUTHY}, or a name that trims and lowercases to platform_default.`;
+const carries = (settingsKey: string): string =>
+  `A policy carries a setting when one of its ${settingsKey}[].settings[] entries has that id after trimming, and the last such entry wins.`;
 const ASSIGNED = "assigned prevention policies, as counted by assigned_prevention_policy_count";
-const CARRIES = "A policy carries a setting when one of its prevention_settings[].settings[] entries has that id after trimming, and the last such entry wins.";
+const CARRIES = carries("prevention_settings");
 const NOT_ENABLED = `A carried setting is enabled only when its value.enabled is ${TRUTHY}; false, absent, and every other value count as not enabled.`;
 const CORE_MITIGATIONS = "ForceASLR, ForceDEP, HeapSprayPreallocation, NullPageAllocation, and SEHOverwriteProtection";
 const EXTENDED_MITIGATIONS = "ApplicationExploitationActivity, ChopperWebshell, DriveByDownload, ProcessHollowing, JavaScriptViaRundll32, and HardwareEnhancedExploitDetection";
 const SCRIPT_CONTROLS = "ScriptBasedExecutionMonitoring, InterpreterProtection, and EngineProtectionV2";
+const ASSIGNED_RESPONSE = "assigned response policies, as counted by assigned_response_policy_count";
+const RESPONSE_CARRIES = carries("settings");
+const AS_NUMBER = "read as a number (a finite number, or a string that is not blank and parses as one)";
+const optionValue = (name: string, fallback: number, max: number): string =>
+  `${name} argument ${AS_NUMBER}, ${fallback} when absent or not numeric, truncated to a whole number, and clamped to 1 through ${max}`;
+const LOOKBACK_WINDOW = `The lookback window is the last N days, where N is the ${optionValue("lookback_days", 30, 365)}.`;
+const PARSES_AS_DATE = "A value parses as a date when ECMAScript Date.parse reads its trimmed text, a finite number being read as its decimal text.";
+const SESSION_LENGTH = `A session's length in minutes is its duration, ${AS_NUMBER}, divided by 60 when that is above 0; otherwise the minutes from its created_at to the first of its deleted_at and updated_at that parses as a date, when created_at parses too; otherwise it has no length. ${PARSES_AS_DATE}`;
+const ALERT_SLA = `An alert's SLA is 24 hours when its severity, ${AS_NUMBER}, is at least 90 or its severity_name trims and lowercases to critical, and 72 hours otherwise.`;
+const ALERT_CLOSED = `An alert is closed when its status trims and lowercases to closed. A closed alert's resolution time is its seconds_to_resolved, ${AS_NUMBER}, divided by 3600 when that is above 0, else the hours from its creation to its updated_timestamp (0 when negative) when updated_timestamp parses as a date, else none.`;
+const ALERT_CREATION = `An alert's creation is the first of its created_timestamp and timestamp that parses as a date. ${PARSES_AS_DATE}`;
 
 const CROWDSTRIKE_INPUTS: Readonly<Record<string, string>> = {
   prevention_policies_readable: "True when GET /policy/combined/prevention/v1 returned its prevention policy list without a refusal.",
   prevention_policies_complete: "Prevention policy list coverage.",
-  assigned_prevention_policy_count: `Number of returned prevention policies whose enabled is ${TRUTHY} and that reach hosts through a non-empty groups array, a platform_default of ${TRUTHY}, or a name that trims and lowercases to platform_default.`,
+  assigned_prevention_policy_count: assignedPolicyCount("prevention"),
   assigned_policy_min_ml_ranks: `Lowest ranked machine learning level of each of the ${ASSIGNED}, over the value.detection and value.prevention of its CloudAntiMalware and OnSensorMLSlider settings; a level trimmed and uppercased ranks DISABLED 0, CAUTIOUS 1, MODERATE 2, AGGRESSIVE 3, or EXTRA_AGGRESSIVE 4, any other level is unranked, and a policy with no ranked level contributes no entry. ${CARRIES}`,
   assigned_policies_with_unranked_sliders: `Number of ${ASSIGNED} that do not carry CloudAntiMalware or OnSensorMLSlider, or whose value.detection or value.prevention on either is absent or unranked as defined for assigned_policy_min_ml_ranks. ${CARRIES}`,
   platforms_without_assigned_policy_count: `Number of the platforms Windows, Mac, and Linux that are not the platform_name, compared trimmed and ignoring letter case, of any of the ${ASSIGNED}; recorded only when the prevention policy list is complete.`,
@@ -183,6 +291,25 @@ const CROWDSTRIKE_INPUTS: Readonly<Record<string, string>> = {
   policies_with_detect_on_write_disabled: `Number of ${ASSIGNED} whose DetectOnWrite value.enabled is ${FALSY}. ${CARRIES}`,
   policies_with_detect_on_write_unknown: `Number of ${ASSIGNED} that do not carry DetectOnWrite, or whose DetectOnWrite value.enabled is neither ${TRUTHY} nor ${FALSY}. ${CARRIES}`,
   policies_without_quarantine_on_write: `Number of ${ASSIGNED} that do not carry QuarantineOnWrite, or whose QuarantineOnWrite value.enabled is not ${TRUTHY}. ${CARRIES}`,
+  response_policies_readable: "True when GET /policy/combined/response/v1 returned its response policy list without a refusal.",
+  response_policies_complete: "Response policy list coverage.",
+  assigned_response_policy_count: assignedPolicyCount("response"),
+  rtr_enabled_policy_count: `Number of ${ASSIGNED_RESPONSE} whose RealTimeFunctionality value.enabled is ${TRUTHY}. ${RESPONSE_CARRIES}`,
+  policies_without_rtr: `Number of ${ASSIGNED_RESPONSE} that do not carry RealTimeFunctionality, or whose RealTimeFunctionality value.enabled is not ${TRUTHY}. ${RESPONSE_CARRIES}`,
+  policies_with_custom_scripts: `Number of ${ASSIGNED_RESPONSE} whose CustomScripts value.enabled is ${TRUTHY}. ${RESPONSE_CARRIES}`,
+  rtr_audit_sessions_readable: `True when GET /real-time-response-audit/combined/sessions/v1, filtered to the RTR sessions created in the lookback window, returned its session list without a refusal. ${LOOKBACK_WINDOW}`,
+  longest_rtr_session_minutes: `Largest length in minutes, unrounded, among the returned RTR sessions, or 0 when no session has a length above 0. ${SESSION_LENGTH}`,
+  peak_concurrent_rtr_sessions: `Largest number of one user's returned RTR sessions open at the start of one of that user's sessions, or 0 when no session's created_at parses as a date. Sessions whose created_at does not parse are skipped, and the rest are grouped by trimmed user_id, else trimmed user_uuid, else together under unknown. A session is open from its created_at to the first of its deleted_at and updated_at that parses, else to its created_at, and is open at a start when it began at or before that start and ends at or after it. ${PARSES_AS_DATE}`,
+  max_session_minutes: `The ${optionValue("max_session_minutes", 30, 1440)}.`,
+  max_concurrent_sessions: `The ${optionValue("max_concurrent_sessions", 3, 100)}.`,
+  alerts_readable: `True when POST /alerts/combined/alerts/v1, filtered to the alerts of severity 70 or higher created in the lookback window, returned its alert list without a refusal. ${LOOKBACK_WINDOW}`,
+  alerts_complete: "Alert list coverage.",
+  dated_alert_count: `Number of returned alerts with a creation. ${ALERT_CREATION}`,
+  undated_alert_count: `Number of returned alerts without a creation. ${ALERT_CREATION}`,
+  sla_compliant_alert_count: `Number of returned alerts with a creation that count as within their SLA: the closed ones whose resolution time is at most their SLA hours, plus the ones that are not closed and whose age, the hours from creation to the assessment time (0 when negative), is at most their SLA hours. That second count is first reduced, never below 0, by the number of closed alerts with a creation and without a resolution time within their SLA whose status, trimmed, is not exactly the lowercase closed. ${ALERT_CREATION} ${ALERT_SLA} ${ALERT_CLOSED}`,
+  contained_hosts_readable: "True when GET /devices/combined/devices/v1 with the containment status filter returned its host list without a refusal.",
+  contained_hosts_complete: "Contained host list coverage.",
+  contained_host_count: "Number of hosts returned by the read filtered to the status contained, containment_pending, or lift_containment_pending.",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -202,6 +329,12 @@ const offsetWalkComplete = (surfaceId: string, list: string, cap: string): Batch
 );
 
 const PREVENTION_POLICIES_COMPLETE = offsetWalkComplete("prevention_policies", "prevention policy list", "5000 policies");
+const RESPONSE_POLICIES_COMPLETE = offsetWalkComplete("response_policies", "response policy list", "5000 policies");
+const CONTAINED_HOSTS_COMPLETE = offsetWalkComplete("contained_hosts", "contained host list", "host_limit hosts");
+const ALERTS_COMPLETE = completeFrom(
+  "false when the alert list is partial: fewer alerts were kept than meta.pagination.total; or, without a total, the walk stopped at alert_limit alerts, at an empty page, or at an after cursor equal to the one the page was requested with, on a page that still carried meta.pagination.after; or a returned resource is not a JSON object.",
+  [{ surfaceId: "alerts", falseWhen: ["truncated"] }],
+);
 
 type CrowdstrikeCheck = {
   id: string;
@@ -427,6 +560,174 @@ const PREVENTION_CHECKS: readonly CrowdstrikeCheck[] = [
   },
 ];
 
+const RESPONSE = "crowdstrike_assess_response_readiness";
+
+const RESPONSE_CHECKS: readonly CrowdstrikeCheck[] = [
+  {
+    id: "CS-06",
+    control: 6,
+    title: "Response Policy - RTR Enabled",
+    severity: "medium",
+    owner: RESPONSE,
+    surfaces: ["response_policies"],
+    inputs: [
+      "response_policies_readable",
+      "response_policies_complete",
+      "assigned_response_policy_count",
+      "rtr_enabled_policy_count",
+      "policies_without_rtr",
+      "policies_with_custom_scripts",
+    ],
+    rules: [
+      rule("manual", ne("response_policies_readable", true)),
+      ...noAssignedPolicy("assigned_response_policy_count", "response_policies_complete"),
+      rule("fail", eq("rtr_enabled_policy_count", 0)),
+      rule("warn", any(gt("policies_without_rtr", 0), gt("policies_with_custom_scripts", 0))),
+      rule("warn", ne("response_policies_complete", true)),
+      rule("pass", always),
+    ],
+    completeness: { response_policies_complete: RESPONSE_POLICIES_COMPLETE },
+    decision: "Manual when the response policy list is unreadable, or when it is partial and shows no assigned policy. Fail when no response policy is assigned, or when no assigned policy enables RealTimeFunctionality, even on a partial list. Warn when an assigned policy does not enable RealTimeFunctionality or enables CustomScripts. Warn instead of pass when the response policy list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every assigned policy enables RealTimeFunctionality and leaves CustomScripts off.", {
+        response_policies_readable: true, response_policies_complete: true, assigned_response_policy_count: 2,
+        rtr_enabled_policy_count: 2, policies_without_rtr: 0, policies_with_custom_scripts: 0,
+      }),
+      example("noncompliant", "fail", "No assigned policy enables RealTimeFunctionality.", {
+        response_policies_readable: true, response_policies_complete: true, assigned_response_policy_count: 2,
+        rtr_enabled_policy_count: 0, policies_without_rtr: 2, policies_with_custom_scripts: 0,
+      }),
+      example("noncompliant", "fail", "No visible assigned policy enables RealTimeFunctionality, and the list stopped at the cap.", {
+        response_policies_readable: true, response_policies_complete: false, assigned_response_policy_count: 1,
+        rtr_enabled_policy_count: 0, policies_without_rtr: 1, policies_with_custom_scripts: 0,
+      }),
+      example("partial", "warn", "One assigned policy enables CustomScripts.", {
+        response_policies_readable: true, response_policies_complete: true, assigned_response_policy_count: 2,
+        rtr_enabled_policy_count: 2, policies_without_rtr: 0, policies_with_custom_scripts: 1,
+      }),
+      example("partial", "warn", "One of two assigned policies leaves RealTimeFunctionality off.", {
+        response_policies_readable: true, response_policies_complete: true, assigned_response_policy_count: 2,
+        rtr_enabled_policy_count: 1, policies_without_rtr: 1, policies_with_custom_scripts: 0,
+      }),
+      example("partial", "warn", "The visible policies pass, but the list stopped at the cap.", {
+        response_policies_readable: true, response_policies_complete: false, assigned_response_policy_count: 2,
+        rtr_enabled_policy_count: 2, policies_without_rtr: 0, policies_with_custom_scripts: 0,
+      }),
+      example("noncompliant", "fail", "The complete response policy list holds no enabled policy that reaches hosts.", {
+        response_policies_readable: true, response_policies_complete: true, assigned_response_policy_count: 0,
+      }),
+      example("partial", "manual", "The list stopped at the cap before any assigned policy was visible.", {
+        response_policies_readable: true, response_policies_complete: false, assigned_response_policy_count: 0,
+      }),
+      example("unreadable", "manual", "The response policy list was refused.", { response_policies_readable: false }),
+    ],
+  },
+  {
+    id: "CS-07",
+    control: 7,
+    title: "Response Policy - Session Limits",
+    severity: "low",
+    owner: RESPONSE,
+    surfaces: ["rtr_audit_sessions"],
+    inputs: ["rtr_audit_sessions_readable", "longest_rtr_session_minutes", "peak_concurrent_rtr_sessions", "max_session_minutes", "max_concurrent_sessions"],
+    rules: [
+      rule("manual", ne("rtr_audit_sessions_readable", true)),
+      rule("warn", any(
+        gt("longest_rtr_session_minutes", path("max_session_minutes")),
+        gt("peak_concurrent_rtr_sessions", path("max_concurrent_sessions")),
+      )),
+      rule("manual", always),
+    ],
+    decision: "Manual when the RTR session list is unreadable. Warn when a returned session lasted longer than max_session_minutes, or when one user held more than max_concurrent_sessions returned sessions open at once. Otherwise manual: the Falcon API does not expose the configured RTR session timeout or concurrent session limit, so sessions within both thresholds cannot show that the limits are set. A partial session list never changes the verdict.",
+    examples: [
+      example("partial", "warn", "One session ran 30.5 minutes against a 30-minute threshold.", {
+        rtr_audit_sessions_readable: true, longest_rtr_session_minutes: 30.5, peak_concurrent_rtr_sessions: 1, max_session_minutes: 30, max_concurrent_sessions: 3,
+      }),
+      example("partial", "warn", "One user held 4 sessions open at once against a threshold of 3.", {
+        rtr_audit_sessions_readable: true, longest_rtr_session_minutes: 12, peak_concurrent_rtr_sessions: 4, max_session_minutes: 30, max_concurrent_sessions: 3,
+      }),
+      example("partial", "manual", "Every session stayed within both thresholds, but the API cannot show that the limits are configured.", {
+        rtr_audit_sessions_readable: true, longest_rtr_session_minutes: 30, peak_concurrent_rtr_sessions: 3, max_session_minutes: 30, max_concurrent_sessions: 3,
+      }),
+      example("unreadable", "manual", "The RTR session list was refused.", { rtr_audit_sessions_readable: false }),
+    ],
+  },
+  {
+    id: "CS-22",
+    control: 22,
+    title: "Detection Response SLA",
+    severity: "high",
+    owner: RESPONSE,
+    surfaces: ["alerts"],
+    inputs: ["alerts_readable", "alerts_complete", "dated_alert_count", "undated_alert_count", "sla_compliant_alert_count"],
+    constants: { sla_fail_below_per_mille: 800, sla_warn_below_per_mille: 950 },
+    rules: [
+      rule("manual", ne("alerts_readable", true)),
+      rule("fail", perMilleBelow("sla_compliant_alert_count", "dated_alert_count", "sla_fail_below_per_mille")),
+      rule("warn", any(
+        perMilleBelow("sla_compliant_alert_count", "dated_alert_count", "sla_warn_below_per_mille"),
+        gt("undated_alert_count", 0),
+        ne("alerts_complete", true),
+      )),
+      rule("pass", always),
+    ],
+    completeness: { alerts_complete: ALERTS_COMPLETE },
+    decision: "Manual when the alert list is unreadable. When at least one returned alert has a creation, divide the ones within their SLA by all of them, multiply by 1000, and round halves up: fail below sla_fail_below_per_mille (800, so 79.95 percent rounds to 80.0 and does not fail) and warn below sla_warn_below_per_mille (950). Warn instead of pass when a returned alert has no creation or the alert list is partial. Otherwise pass, including when no alert was returned.",
+    examples: [
+      example("compliant", "pass", "1899 of 2000 alerts within their SLA round to 950 per mille.", {
+        alerts_readable: true, alerts_complete: true, dated_alert_count: 2000, undated_alert_count: 0, sla_compliant_alert_count: 1899,
+      }),
+      example("compliant", "pass", "The complete read returned no alert in the lookback window.", {
+        alerts_readable: true, alerts_complete: true, dated_alert_count: 0, undated_alert_count: 0, sla_compliant_alert_count: 0,
+      }),
+      example("partial", "warn", "1599 of 2000 alerts within their SLA round to 800 per mille.", {
+        alerts_readable: true, alerts_complete: true, dated_alert_count: 2000, undated_alert_count: 0, sla_compliant_alert_count: 1599,
+      }),
+      example("noncompliant", "fail", "1598 of 2000 alerts within their SLA are 799 per mille.", {
+        alerts_readable: true, alerts_complete: true, dated_alert_count: 2000, undated_alert_count: 0, sla_compliant_alert_count: 1598,
+      }),
+      example("noncompliant", "fail", "Half the visible alerts breached their SLA, and the list stopped at alert_limit.", {
+        alerts_readable: true, alerts_complete: false, dated_alert_count: 100, undated_alert_count: 0, sla_compliant_alert_count: 50,
+      }),
+      example("partial", "warn", "Every dated alert is within its SLA, but two alerts carry no creation.", {
+        alerts_readable: true, alerts_complete: true, dated_alert_count: 40, undated_alert_count: 2, sla_compliant_alert_count: 40,
+      }),
+      example("partial", "warn", "The list stopped at alert_limit before any alert with a creation was visible.", {
+        alerts_readable: true, alerts_complete: false, dated_alert_count: 0, undated_alert_count: 0, sla_compliant_alert_count: 0,
+      }),
+      example("unreadable", "manual", "The alert list was refused.", { alerts_readable: false }),
+    ],
+  },
+  {
+    id: "CS-23",
+    control: 23,
+    title: "Containment Policy",
+    severity: "medium",
+    owner: RESPONSE,
+    surfaces: ["contained_hosts"],
+    inputs: ["contained_hosts_readable", "contained_hosts_complete", "contained_host_count"],
+    rules: [
+      rule("manual", ne("contained_hosts_readable", true)),
+      rule("warn", any(gt("contained_host_count", 0), ne("contained_hosts_complete", true))),
+      rule("pass", always),
+    ],
+    completeness: { contained_hosts_complete: CONTAINED_HOSTS_COMPLETE },
+    decision: "Manual when the contained host list is unreadable. Warn when a host is contained or has a containment change pending, since each containment needs its incident reference documented, or when the contained host list is partial. Otherwise pass. How long a host has been contained, and whether it carries a modified_timestamp, never change the verdict.",
+    examples: [
+      example("compliant", "pass", "The containment filter returned no host.", {
+        contained_hosts_readable: true, contained_hosts_complete: true, contained_host_count: 0,
+      }),
+      example("partial", "warn", "Two hosts are contained.", {
+        contained_hosts_readable: true, contained_hosts_complete: true, contained_host_count: 2,
+      }),
+      example("partial", "warn", "The list stopped at host_limit before any contained host was visible.", {
+        contained_hosts_readable: true, contained_hosts_complete: false, contained_host_count: 0,
+      }),
+      example("unreadable", "manual", "The contained host read was refused.", { contained_hosts_readable: false }),
+    ],
+  },
+];
+
 const toCheck = (check: CrowdstrikeCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -449,21 +750,38 @@ const toCheck = (check: CrowdstrikeCheck): BatchCheckDefinition => {
 
 const checks: readonly BatchCheckDefinition[] = [
   ...PREVENTION_CHECKS,
+  ...RESPONSE_CHECKS,
 ].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
-const offsetWalk = (surfaceIds: readonly string[], records: string, pageSize: number, itemCap: number): BatchPaginationDefinition => ({
+const DROPPED_RESOURCE = "A returned resource that is not a JSON object is dropped and marks the list partial.";
+
+// pageSize stays null: the limit sent shrinks on the last page under the cap, so no single value is always sent.
+const offsetWalk = (surfaceIds: readonly string[], records: string, pageSize: number, cap: ItemCap): BatchPaginationDefinition => ({
   surfaceIds,
   cursorFields: ["meta.pagination.total", "meta.pagination.next", "meta.pagination.offset"],
-  pageSize,
-  itemCap,
+  pageSize: null,
+  itemCap: typeof cap === "number" ? cap : null,
   pageCap: null,
-  totalSemantics: `Pages of ${pageSize} ${records} (limit), or the ${records} left under the ${itemCap} cap when fewer. The first page sends no offset; each later page sends the previous page's meta.pagination.next (else meta.pagination.offset) when that is not a whole number, otherwise the number of ${records} already read. Without meta.pagination.total the walk runs to an empty page or the cap. A returned resource that is not a JSON object is dropped and marks the list partial.`,
+  totalSemantics: `Pages of ${pageSize} ${records} (limit), or the ${records} left under ${capText(cap)} when fewer. The first page sends no offset; each later page sends ${nextOffset(records)}. Without meta.pagination.total the walk runs to an empty page or the cap. ${DROPPED_RESOURCE}`,
   stopConditions: [
     `meta.pagination.total ${records} read`,
     `An empty page, which marks the list partial when fewer than meta.pagination.total ${records} were read`,
-    `${itemCap} ${records} read, which marks the list partial when meta.pagination.total is larger or, without a total, when the last page was full or carried a cursor that is not a whole number`,
+    `${capReached(cap, records)} read, which marks the list partial when meta.pagination.total is larger or, without a total, when the last page was full or carried a cursor that is not a whole number`,
     "A cursor that is not a whole number and repeats an earlier page's, which marks the list partial",
+  ],
+});
+
+const afterWalk = (surfaceIds: readonly string[], records: string, pageSize: number, cap: ItemCap): BatchPaginationDefinition => ({
+  surfaceIds,
+  cursorFields: ["meta.pagination.after", "meta.pagination.total"],
+  pageSize: null,
+  itemCap: typeof cap === "number" ? cap : null,
+  pageCap: null,
+  totalSemantics: `Pages of ${pageSize} ${records} (limit), or the ${records} left under ${capText(cap)} when fewer. The first page sends no after; each later page sends the previous page's meta.pagination.after. ${DROPPED_RESOURCE}`,
+  stopConditions: [
+    `A page without meta.pagination.after, which marks the list partial when fewer than meta.pagination.total ${records} were kept`,
+    `${capReached(cap, records)} read, an empty page, or a meta.pagination.after equal to the one the page was requested with, each of which marks the list partial unless meta.pagination.total is reported and that many ${records} were kept`,
   ],
 });
 
@@ -472,6 +790,7 @@ const FRAMEWORK_REPORTS = ["fedramp", "cmmc", "soc2", "cis", "pci_dss", "disa_st
 // The export runs every assessment and writes each one's datasets under its own category.
 const RAW_DATA_FILES: Readonly<Record<string, readonly string[]>> = {
   prevention_policies: ["prevention_policies"],
+  response_readiness: ["response_policies", "rtr_audit_sessions", "alerts", "contained_hosts"],
 };
 
 export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
@@ -490,16 +809,53 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
       value: "Prevention policies: Read",
       unlocks: ["prevention_policies"],
     },
+    {
+      id: "response-policies-read",
+      kind: "oauth-scope",
+      value: "Response policies: Read",
+      unlocks: ["response_policies"],
+    },
+    {
+      id: "rtr-audit-read",
+      kind: "oauth-scope",
+      value: "Real time response audit: Read",
+      unlocks: ["rtr_audit_sessions"],
+    },
+    {
+      id: "alerts-read",
+      kind: "oauth-scope",
+      value: "Alerts: Read",
+      unlocks: ["alerts", "alert_ids"],
+    },
+    {
+      id: "hosts-read",
+      kind: "oauth-scope",
+      value: "Hosts: Read",
+      unlocks: ["contained_hosts"],
+    },
   ],
   surfaces: CROWDSTRIKE_SURFACES,
   checks,
   tools: {
     crowdstrike_check_access: [],
     crowdstrike_assess_prevention_policies: idsFor(PREVENTION),
+    crowdstrike_assess_response_readiness: idsFor(RESPONSE),
     crowdstrike_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
-    offsetWalk(["prevention_policies"], "policies", 500, 5000),
+    offsetWalk(["prevention_policies", "response_policies"], "policies", 500, 5000),
+    offsetWalk(["rtr_audit_sessions"], "sessions", 500, 500),
+    afterWalk(["alerts"], "alerts", 1000, ALERT_LIMIT),
+    offsetWalk(["contained_hosts"], "hosts", 1000, HOST_LIMIT),
+    {
+      surfaceIds: ["alert_ids"],
+      cursorFields: ["meta.pagination.total"],
+      pageSize: 1,
+      itemCap: "none",
+      pageCap: 1,
+      totalSemantics: "One read of a single alert ID on the crowdstrike_check_access probe; meta.pagination.total, else the number of returned IDs, is the surface's count.",
+      stopConditions: ["The first response"],
+    },
   ],
   rateLimit: {
     documentedLimit: "Per API client: responses report the limit in X-Ratelimit-Limit and the requests left in X-Ratelimit-Remaining, which the collector does not read.",
