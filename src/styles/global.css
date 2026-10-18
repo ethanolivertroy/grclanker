@@ -1472,9 +1472,11 @@ details[open] > .agent-group-toggle::before {
 }
 
 .docs-prose pre {
+  --code-pad-y: 1rem;
+  --corner-width: 3rem;
   position: relative;
   margin: 1.25rem 0 1.5rem;
-  padding: 1rem 4rem 1rem 1.25rem;
+  padding: var(--code-pad-y) 1.25rem;
   overflow-x: auto;
   border: 1px solid var(--docs-border-strong);
   border-radius: 0.6rem;
@@ -1483,6 +1485,17 @@ details[open] > .agent-group-toggle::before {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   line-height: 1.7;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Holds the copy button's corner, so only the first rows wrap around it and a
+   one-row block is just tall enough for the button and its 0.5rem inset. */
+.docs-prose pre::before {
+  content: '';
+  float: right;
+  width: var(--corner-width);
+  height: calc(2.75rem + 2 * 0.5rem - 2 * var(--code-pad-y));
 }
 
 .docs-prose .shiki {
@@ -1503,6 +1516,62 @@ details[open] > .agent-group-toggle::before {
   background: none !important;
   color: inherit;
   font-size: inherit;
+}
+
+/* Wrapped rows start at the --hang column that src/lib/hanging-indents.mjs sets
+   per line, at most --hang-max past 2ch. Where --word, the longest word that
+   could start a wrapped row, would not fit beside that column (with half a
+   character spare for rounding), the rows hang less, down to none, so the word
+   stays whole. Where --word is too long for any row, it breaks wherever the
+   column is, and --word-2, the next longest, gets the same room instead. Each
+   max(fit, -1000 * fit) is the room a word leaves when it fits and huge when
+   it cannot, so the min keeps the longest word that can fit. The first line's
+   first rows run beside the copy button's corner, so its words are fitted both
+   beside the corner and below it. */
+.docs-prose .shiki code {
+  --hang-max: 50%;
+  display: block;
+}
+
+.docs-prose .shiki .line {
+  --fit: calc(100% - var(--word, 0ch) - 0.5ch);
+  --fit-2: calc(100% - var(--word-2, 0ch) - 0.5ch);
+  --fit-corner: calc(var(--fit) - var(--corner, 0rem));
+  --fit-2-corner: calc(var(--fit-2) - var(--corner, 0rem));
+  --hang-fit: min(
+    var(--hang, 2ch),
+    2ch + var(--hang-max),
+    max(var(--fit), -1000 * var(--fit)),
+    max(var(--fit-2), -1000 * var(--fit-2)),
+    max(var(--fit-corner), -1000 * var(--fit-corner)),
+    max(var(--fit-2-corner), -1000 * var(--fit-2-corner))
+  );
+  /* A description continued on its own line starts where wrapped rows hang;
+     the spaces this pulls past the left edge are blank. */
+  --indent-pull: max(0ch, var(--indent, 0ch) - var(--hang-fit));
+  padding-left: var(--hang-fit);
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+.docs-prose .shiki .line:first-child {
+  --corner: var(--corner-width);
+}
+
+.docs-prose .shiki .line::before {
+  content: '';
+  margin-left: calc(-1 * (var(--hang-fit) + var(--indent-pull)));
+}
+
+/* Without a wrap opportunity after the indentation, a long first word stays on
+   the indented row instead of leaving the indentation alone on a row. Where
+   --first, that word's length, would not fit beside the --spaces of
+   indentation, the indentation shrinks until it does, unless the word is too
+   long for any row. */
+.docs-prose .shiki .indent {
+  --room: calc(100% - var(--first, 100%) - 0.5ch - var(--corner, 0rem));
+  margin-right: calc(-1 * max(0ch, min(var(--spaces, 0ch) - var(--room), 1000 * var(--room))));
+  white-space: pre;
 }
 
 .docs-prose blockquote {
@@ -2002,16 +2071,12 @@ details[open] > .agent-group-toggle::before {
   }
 
   .docs-prose pre {
-    padding: 0.75rem 0.875rem;
-    word-break: normal;
+    --code-pad-y: 0.75rem;
+    padding: var(--code-pad-y) 0.875rem;
   }
 
-  /* Holds the copy button's corner so only the first lines wrap around it. */
-  .docs-prose pre::before {
-    content: '';
-    float: right;
-    width: 3rem;
-    height: 2.25rem;
+  .docs-prose .shiki code {
+    --hang-max: 40%;
   }
 
   /* Each table row becomes a block, each cell labeled from its column header (data-label). */
