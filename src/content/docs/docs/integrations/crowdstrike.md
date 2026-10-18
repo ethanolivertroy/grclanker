@@ -63,12 +63,7 @@ The client:
 - Caches the bearer token until shortly before `expires_in`.
 - Refreshes once on a 401.
 - Retries 429 and 5xx responses with exponential backoff while honoring `X-RateLimit-RetryAfter` and `Retry-After`.
-- Passes every error message through a redaction pass. The pass removes:
-  - The client secret and every bearer token obtained, in their encoded forms too.
-  - Any value inside a credential carrier: `Authorization` and cookie headers; auth schemes; credential-named fields, assignments, and command-line flags; URL userinfo and query strings.
-  - Bare values with a real token shape.
-
-See "Limitations and manual controls" below for the full boundary.
+- Passes every error message through a redaction pass that removes the client secret, every bearer token, and other credential values. [Error string redaction](#error-string-redaction) lists exactly what it removes.
 
 Required API client scopes (all Read):
 
@@ -132,34 +127,9 @@ The export refuses traversal or symlinked parent paths. It writes:
 - `_errors.log` only when some reads failed
 - A sibling `.zip` archive of the bundle
 
-#### Snapshot projection and redaction
-
-Alerts and RTR audit sessions keep verdict fields only. Process command lines, file paths, and RTR command strings are never exported.
-
-The free-text fields of every exclusion (`cl_regex`, `ifn_regex`, `value`, `name`, `description`, `comment`) pass through the credential redaction pass.
-
-Every string a snapshot, an evidence list, or a summary keeps from a Falcon response passes the data-side pass at the collector (`collectDataset`). From a description, a note, a name, or a comment, the pass removes:
-
-- The client's remembered credentials in every form and every carrier:
-  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare
-  - URL userinfo and query strings, which go whole
-  - Credential-named assignments and fields
-  - Auth schemes
-  - JWTs
-  - PEM blocks
-- Bare vendor-prefixed token shapes (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest)
-
-JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too. The generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay.
-
-A resource nested deeper than 32 levels is replaced by `[REDACTED]` at that depth rather than passed through. The payload is server-controlled.
-
-#### Datasets that were not collected
-
-A dataset that was denied, errored, or never requested is written as `{ collected: false, dataset, status, endpoint, error }` instead of an empty array. So `[]` always means a readable list with no items.
-
-A dependent read that was skipped carries `not requested: <parent read>` in `error`.
-
 ## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the [safety rules](#safety-rules).
 
 Status semantics:
 
@@ -167,43 +137,6 @@ Status semantics:
 - `warn`: Partial or threshold-adjacent evidence.
 - `fail`: The evidence contradicts the control, or an inventory the control depends on is empty (for example zero prevention policies).
 - `manual`: The API cannot verify the control. The summary names the cause and exactly what to collect from the Falcon console.
-
-### Safety rules
-
-The verdicts follow these safety rules, each covered by a regression test in `cli/tests/crowdstrike.test.mjs`:
-
-- An unreadable, forbidden (401/403), or errored endpoint never yields `pass`. An unread primary input renders the finding `manual`. An unread secondary input keeps its verdict but cannot exceed `warn`. Either way, the summary names the failed read.
-- An empty inventory never yields `pass` by default.
-  - Zero policies, hosts, host groups, or identity rules `fail`.
-  - Zero users, API clients, Discover assets, or ZTA scores are `manual` because a live tenant cannot be empty.
-  - Zero exclusions, zero critical/high alerts in the stated window, and zero contained hosts `pass` because emptiness is compliant, and the summary says so.
-- Each of those empty-inventory verdicts holds only when the read was complete. A truncated page with zero visible rows is a claim about rows that were not read.
-  - CS-19, CS-20, CS-21, CS-22, and CS-23 say the property cannot be confirmed or ruled out from the visible rows. They cap at `warn` instead of claiming emptiness.
-  - CS-13, CS-14, and CS-24 set `absence_claim` and render `manual` instead of `fail`.
-  - A finding's summary counts over the rows it read (`N users reviewed; ...`), so a capped list never asserts an absence across rows it did not see.
-- Falcon Discover, Identity Protection, and Zero Trust Assessment responses of 401, 403, or 404 render as `manual` with an "unlicensed or not applicable" summary.
-- Records without a timestamp (`last_seen`, `created_timestamp`, `last_login_at`, `modified_timestamp`) are never counted as fresh or compliant. They are reported in an `undated_items` bucket and cap the verdict at `warn`.
-- Every sampled read compares the returned count against `meta.pagination.total`. A truncated or sampled inventory is reported as `partial_inventory` with seen and total counts, and it caps the verdict at `warn`.
-  - Pagination runs to completion within the configured limit. The client records truncation instead of treating a first page as the population.
-  - Single-page queries with no documented pagination parameters (the role catalog and Identity Protection rule ids) still compare the returned ids against the reported total.
-  - Count-only reads (Discover and ZTA totals) treat a missing total as unknown rather than zero.
-  - An id query followed by an entity lookup is also recorded as truncated when the lookup returns fewer records than the ids listed. This applies to firewall rule groups and rules, the role catalog, API clients, the three exclusion types, and Identity Protection rules.
-  - A shortfall of deleted or forbidden entities demotes the verdict instead of passing on the subset.
-- A `fail` that rests on the absence of something among the visible rows (no enabled and host-assigned prevention or response policy, no firewall policy container) is provable only against the rows that were read.
-  - On a partial inventory, it renders `manual` with "the absence this verdict rests on cannot be asserted for the unread rows" instead of `fail`.
-  - A `fail` observed on a visible row (a disabled slider, a `default_inbound` that is not `DENY`, a stale admin) stands.
-- A dependent read is never requested when the read it depends on was denied or errored. The dependent reads are device control v2 details, firewall policy containers, sensor build catalogs, Discover managed counts and samples, ZTA below-threshold queries, and user details and role grants.
-  - The three id lookups (device control v2 details, firewall policy containers, sensor build catalogs) are also not requested when the parent list was readable but returned no ids or platforms to look up.
-  - In every case, the dependent's dataset carries `not requested: <reason>` naming the parent, and the bundle writes a not-collected marker rather than an empty array.
-- The two parent states lead to different verdicts.
-  - A denied or errored parent is the unreadable dataset, so the finding names the parent read as such and renders `manual`.
-  - A readable parent that returned no ids is a complete empty read, so the skipped dependent is not treated as unread. The finding takes the parent's complete-empty verdict: zero device control or firewall policies `fail` CS-08 through CS-11, and zero enabled, host-assigned sensor update policies `fail` CS-12 with the build catalogs left unrequested.
-- A finding whose primary dataset is unread renders `manual` with `unreadable_dataset` in its evidence. It names the dataset and the error, as in "The hosts read failed (...), so no API evidence supports this control."
-- A finding whose secondary dataset is unread keeps its verdict but cannot exceed `warn`. It records the read under `unreadable_secondary_reads`. The secondary datasets are the sensor build catalog for CS-12, Discover unmanaged samples for CS-15, and the role catalog for CS-16 and CS-17.
-- Summary counts and truncation flags derived from a dataset that was not read render `null` rather than `0` or `false`. Every summary carries an `inventories` map naming each dataset's state.
-- Only policies that are enabled and assigned to host groups (or the `platform_default` policy) count as enforcement. An aggressive setting on a disabled or unassigned policy never supports `pass`. An `mlslider` missing its `detection` or `prevention` value caps CS-01 at `warn`.
-- Re-running an export allocates a new suffixed bundle directory and a zip with the same name (`<bundle>-2/` and `<bundle>-2.zip`) instead of overwriting a prior bundle.
-- With `member_cid` set, every summary states that results cover that member CID only.
 
 ### Verdicts by control
 
@@ -265,6 +198,74 @@ The script prints a skip message and exits 0 when credentials are absent. With c
   - Raise the limit to read the full population.
 - Identity Protection GraphQL requires a write scope, so the tools use the REST policy-rules endpoints and parse `enabled`, `simulationMode`, and `action` defensively.
 - Thunderbolt and SD card restrictions are evaluated through the PCIe enforcement mode and the `MASS_STORAGE` class because the API exposes no dedicated Thunderbolt or SD card classes.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Snapshot projection and redaction
+
+Alerts and RTR audit sessions keep verdict fields only. Process command lines, file paths, and RTR command strings are never exported.
+
+The free-text fields of every exclusion (`cl_regex`, `ifn_regex`, `value`, `name`, `description`, `comment`) pass through the credential redaction pass.
+
+Every string a snapshot, an evidence list, or a summary keeps from a Falcon response passes the data-side pass at the collector (`collectDataset`). From a description, a note, a name, or a comment, the pass removes:
+
+- The client's remembered credentials in every form and every carrier:
+  - `Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare
+  - URL userinfo and query strings, which go whole
+  - Credential-named assignments and fields
+  - Auth schemes
+  - JWTs
+  - PEM blocks
+- Bare vendor-prefixed token shapes (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest)
+
+JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too. The generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay.
+
+A resource nested deeper than 32 levels is replaced by `[REDACTED]` at that depth rather than passed through. The payload is server-controlled.
+
+### Datasets that were not collected
+
+A dataset that was denied, errored, or never requested is written as `{ collected: false, dataset, status, endpoint, error }` instead of an empty array. So `[]` always means a readable list with no items.
+
+A dependent read that was skipped carries `not requested: <parent read>` in `error`.
+
+### Safety rules
+
+The verdicts follow these safety rules, each covered by a regression test in `cli/tests/crowdstrike.test.mjs`:
+
+- An unreadable, forbidden (401/403), or errored endpoint never yields `pass`. An unread primary input renders the finding `manual`. An unread secondary input keeps its verdict but cannot exceed `warn`. Either way, the summary names the failed read.
+- An empty inventory never yields `pass` by default.
+  - Zero policies, hosts, host groups, or identity rules `fail`.
+  - Zero users, API clients, Discover assets, or ZTA scores are `manual` because a live tenant cannot be empty.
+  - Zero exclusions, zero critical/high alerts in the stated window, and zero contained hosts `pass` because emptiness is compliant, and the summary says so.
+- Each of those empty-inventory verdicts holds only when the read was complete. A truncated page with zero visible rows is a claim about rows that were not read.
+  - CS-19, CS-20, CS-21, CS-22, and CS-23 say the property cannot be confirmed or ruled out from the visible rows. They cap at `warn` instead of claiming emptiness.
+  - CS-13, CS-14, and CS-24 set `absence_claim` and render `manual` instead of `fail`.
+  - A finding's summary counts over the rows it read (`N users reviewed; ...`), so a capped list never asserts an absence across rows it did not see.
+- Falcon Discover, Identity Protection, and Zero Trust Assessment responses of 401, 403, or 404 render as `manual` with an "unlicensed or not applicable" summary.
+- Records without a timestamp (`last_seen`, `created_timestamp`, `last_login_at`, `modified_timestamp`) are never counted as fresh or compliant. They are reported in an `undated_items` bucket and cap the verdict at `warn`.
+- Every sampled read compares the returned count against `meta.pagination.total`. A truncated or sampled inventory is reported as `partial_inventory` with seen and total counts, and it caps the verdict at `warn`.
+  - Pagination runs to completion within the configured limit. The client records truncation instead of treating a first page as the population.
+  - Single-page queries with no documented pagination parameters (the role catalog and Identity Protection rule ids) still compare the returned ids against the reported total.
+  - Count-only reads (Discover and ZTA totals) treat a missing total as unknown rather than zero.
+  - An id query followed by an entity lookup is also recorded as truncated when the lookup returns fewer records than the ids listed. This applies to firewall rule groups and rules, the role catalog, API clients, the three exclusion types, and Identity Protection rules.
+  - A shortfall of deleted or forbidden entities demotes the verdict instead of passing on the subset.
+- A `fail` that rests on the absence of something among the visible rows (no enabled and host-assigned prevention or response policy, no firewall policy container) is provable only against the rows that were read.
+  - On a partial inventory, it renders `manual` with "the absence this verdict rests on cannot be asserted for the unread rows" instead of `fail`.
+  - A `fail` observed on a visible row (a disabled slider, a `default_inbound` that is not `DENY`, a stale admin) stands.
+- A dependent read is never requested when the read it depends on was denied or errored. The dependent reads are device control v2 details, firewall policy containers, sensor build catalogs, Discover managed counts and samples, ZTA below-threshold queries, and user details and role grants.
+  - The three id lookups (device control v2 details, firewall policy containers, sensor build catalogs) are also not requested when the parent list was readable but returned no ids or platforms to look up.
+  - In every case, the dependent's dataset carries `not requested: <reason>` naming the parent, and the bundle writes a not-collected marker rather than an empty array.
+- The two parent states lead to different verdicts.
+  - A denied or errored parent is the unreadable dataset, so the finding names the parent read as such and renders `manual`.
+  - A readable parent that returned no ids is a complete empty read, so the skipped dependent is not treated as unread. The finding takes the parent's complete-empty verdict: zero device control or firewall policies `fail` CS-08 through CS-11, and zero enabled, host-assigned sensor update policies `fail` CS-12 with the build catalogs left unrequested.
+- A finding whose primary dataset is unread renders `manual` with `unreadable_dataset` in its evidence. It names the dataset and the error, as in "The hosts read failed (...), so no API evidence supports this control."
+- A finding whose secondary dataset is unread keeps its verdict but cannot exceed `warn`. It records the read under `unreadable_secondary_reads`. The secondary datasets are the sensor build catalog for CS-12, Discover unmanaged samples for CS-15, and the role catalog for CS-16 and CS-17.
+- Summary counts and truncation flags derived from a dataset that was not read render `null` rather than `0` or `false`. Every summary carries an `inventories` map naming each dataset's state.
+- Only policies that are enabled and assigned to host groups (or the `platform_default` policy) count as enforcement. An aggressive setting on a disabled or unassigned policy never supports `pass`. An `mlslider` missing its `detection` or `prevention` value caps CS-01 at `warn`.
+- Re-running an export allocates a new suffixed bundle directory and a zip with the same name (`<bundle>-2/` and `<bundle>-2.zip`) instead of overwriting a prior bundle.
+- With `member_cid` set, every summary states that results cover that member CID only.
 
 ### Error string redaction
 

@@ -12,25 +12,7 @@ Every finding carries the references from the compliance mapping table in `specs
 
 ## Setup and authentication
 
-Configure one product or both. When only one product is configured, the other product's controls become `manual` findings that state exactly which evidence a human must collect.
-
-The cross-product controls are the exception: PA-19 (admin roles), PA-20 (logging and SIEM), and PA-21 (data loss prevention). Each evaluates whichever product is configured and caps at `warn` when only one is. As a result, a single configured product that is compliant renders `warn`, not `manual` and not `pass`.
-
-The verdict for a non-compliant product depends on the finding:
-
-- **PA-21:** Fails when no configured product is compliant, whichever product that is.
-  - A Prisma Cloud tenant alone with no enabled data security policy fails.
-  - A PAN-OS estate alone with no data filtering profile attached to an allow rule fails too.
-  - PA-21 warns when one of two configured products is compliant.
-- **PA-19 and PA-20:** Fail only on their PAN-OS half. A non-compliant Prisma Cloud half warns, so a Prisma Cloud tenant alone never renders worse than `warn` on those two.
-  - PAN-OS half: Superusers above the threshold or password complexity disabled (PA-19), and rules with `log-end=no` or no syslog or Panorama forwarding (PA-20).
-  - Prisma Cloud half: System Admin roles above the threshold or zero roles returned (PA-19), and no SIEM integration (PA-20).
-
-The `manual` cases are:
-
-- The absence of both products.
-- A failed read of a surface the finding depends on (the partial-view rule under Control coverage).
-- For PA-19, zero readable PAN-OS administrators.
+Configure one product or both. When only one product is configured, the other product's controls become `manual` findings that state exactly which evidence a human must collect. The three [cross-product controls](#cross-product-controls) are the exception.
 
 ### Prisma Cloud
 
@@ -59,13 +41,6 @@ The client first calls `POST /api/v1/authenticate` with the access key ID and se
 Only System Admin users (mapped to the Compute Administrator role) can call the Compute API.
 
 Read endpoints used: `/defenders`, `/policies/runtime/container`, `/policies/compliance/container`, `/policies/compliance/host`, `/policies/vulnerability/images`, `/settings/registry`, `/registry`, `/images`, `/stats/vulnerabilities`, `/stats/compliance`, `/cloud/discovery`, and `/scans`.
-
-List endpoints (`/defenders`, `/registry`, `/images`, `/cloud/discovery`, `/scans`) are paged with `limit` and `offset` (50 per page, 500 records per surface). The loop records truncation, with the reason, in these cases:
-
-- The 500-record cap is reached while full pages are still being returned.
-- The console answers consecutive offsets with the same page (a stuck offset).
-
-Either case caps the dependent findings at `warn` and names the reason in the summary.
 
 ### PAN-OS firewalls and Panorama
 
@@ -113,6 +88,163 @@ Loader errors use fixed text and never quote the file:
 - A file that is not a JSON object reports `INVALID_CONFIG_SHAPE`.
 
 Neither the filesystem message nor the `JSON.parse` message is ever interpolated. The `JSON.parse` message quotes a window of the source around the failure. Because neither is interpolated, an unquoted or misplaced credential in a malformed file cannot leak through the error.
+
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Palo Alto credentials can read everything grclanker needs.
+Run the Palo Alto assessments and list the failing findings first.
+Export a Palo Alto audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Prisma Cloud tenant and PAN-OS firewalls"`. Both start with `paloalto_check_access`, then run the assessments or `paloalto_export_audit_bundle`.
+
+## Tools
+
+<!-- The probe counts and surface names in the paloalto_check_access row are asserted against checkPaloaltoAccess (cli/extensions/grc-tools/paloalto.ts) by cli/tests/paloalto.test.mjs; change the code and this row together. -->
+
+| Tool | What it does |
+|---|---|
+| `paloalto_check_access` | Probes every read surface per product and reports `healthy`, `degraded`, or `unconfigured` with the scrubbed error for each missing permission. The probes are the 8 Prisma Cloud CSPM endpoints (`compliance_posture`, `alert_rules`, `open_alerts`, `policies`, `cloud_accounts`, `account_groups`, `user_roles`, `integrations`), the 9 Compute console surfaces when the console is reachable (`defenders`, `runtime_container_policy`, `compliance_container_policy`, `compliance_host_policy`, `vulnerability_image_policy`, `registry_settings`, `vulnerability_stats`, `cloud_discovery`, `ci_scans`), and, per PAN-OS device, `show system info`, `show high-availability state`, and the configuration subtrees for its platform. Paged Compute probes (`defenders`, `cloud_discovery`, `ci_scans`) that stop at the page cap are marked `partial`, their counts render with a trailing `+` as lower bounds, and a note says so; the counts are never presented as inventory totals. |
+| `paloalto_assess_cloud_posture` | Prisma Cloud CSPM controls 1 to 6 plus the Compute (CWPP) controls 7 to 11, 24, and 25, evaluated from the Compute API when the console is reachable and reported as manual findings otherwise. |
+| `paloalto_assess_firewall_policy` | PAN-OS controls 12 to 14: any/any and shadowed rules, session-end logging, zones and zone protection, default rule actions, decryption coverage, and SSL/TLS service profile minimum versions. |
+| `paloalto_assess_threat_prevention` | Controls 16 to 18, 21, and 22: antivirus, anti-spyware, vulnerability, WildFire, URL filtering and credential phishing, data loss prevention (Prisma Cloud data policies plus PAN-OS data filtering), and file blocking. |
+| `paloalto_assess_device_hardening` | Controls 15, 19, 20, and 23: GlobalProtect, administrators and password complexity (PAN-OS plus Prisma Cloud roles), logging and SIEM forwarding, system hardening, plus supplementary HA state (`PA-HA-01`) and software version (`PA-SW-01`) findings. |
+| `paloalto_export_audit_bundle` | Runs everything and writes the audit bundle and a zip archive. |
+
+`paloalto_export_audit_bundle` writes these outputs under `./export/paloalto` by default:
+
+- `core_data/`
+- `analysis/`
+- `compliance/`
+- `QUICK_REFERENCE.md`
+- `_errors.log` (only on partial failure)
+- A zip archive
+
+`core_data/` is not a verbatim dump:
+
+- The PAN-OS configuration is stored with credential-bearing nodes (`phash`, `password`, `secret`, `key` and `pre-shared-key`, `private-key`, `passphrase`, `token`, SNMPv3 `authpwd` and `privpwd`, `snmp-community-string`, and similar names) replaced by `[REDACTED]`.
+  - Names are matched in kebab-case, snake_case, camelCase, and attribute forms.
+  - Settings such as `password-complexity` and `public-key` are kept.
+  - The assessments still evaluate the raw values in memory.
+- The Prisma Cloud and Compute JSON in `core_data/prisma_cloud.json` is redacted as it is collected.
+  - Every property whose name's last segment denotes a credential (`authToken`, `password`, `clientSecret`, `api_key`, `secret_key`, `private_key`, `credentials`, and similar, in snake_case or camelCase) is replaced whole. A bare `key` and `public_key` are kept.
+  - Because the property is replaced whole, an integration's `integrationConfig` secrets, a Compute registry credential block, or an image `secrets` list never leak a nested child.
+  - `{key, value}` header pairs flagged `secure` lose their `value`. So do pairs labelled with a credential name in either the walker's vocabulary (`Authorization`, `X-Api-Key`) or the error-text rules' (`x-redlock-auth`, `X-Auth`, `Cookie`, `X-PAN-KEY`), whatever the `secure` flag says. A benign unflagged pair (`X-Trace`, `Content-Type`) keeps its `value`.
+  - Every remaining string is scrubbed of URL query credentials (the parameters named `token` and `api_key`, among others) and of the user-and-secret prefix before the host in a URL. It is also scrubbed of Slack, Discord, and Teams token-in-path webhook URLs and of JSON-encoded credential fields.
+  - The assessments read the same redacted copy, so nothing a finding or tool result carries can differ from the bundle.
+
+### Arguments and tunables
+
+All tools accept the same authentication arguments: `prisma_api_url`, `prisma_access_key_id`, `prisma_secret_key`, `panos_hosts`, `panos_api_key`, `panos_username`, `panos_password`, `config_file`, `verify_tls`, and `timeout_seconds`.
+
+Tunables:
+
+- `alert_limit` (default 500, clamped to 1-10000): For cloud posture and export.
+- `min_compliance_pass_rate` (default 90, clamped to 1-100): For cloud posture and export.
+- `max_superusers` (default 3, clamped to 0-1000): For device hardening and export.
+
+`paloalto_export_audit_bundle` also takes `output_dir` (default `./export/paloalto`).
+
+### Audit bundle naming
+
+The bundle directory is named `<host>-audit-bundle` (for example `api.prismacloud.io-audit-bundle`), with `<name>.zip` beside it. The host is the Prisma Cloud API hostname when Prisma Cloud is configured, and otherwise the first PAN-OS host.
+
+A repeat run takes the suffixes `-2` through `-6`, skipping any name whose directory or zip already exists. It fails once all six are taken.
+
+## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the [verdict-safety rules](#verdict-safety-rules).
+
+Status semantics:
+
+- `pass`: The evidence satisfied the check.
+- `warn`: Partial evidence or a heuristic concern.
+- `fail`: The evidence contradicted the control.
+- `manual`: The control cannot be verified through the configured APIs, and the summary states the evidence a human must collect.
+
+### Cross-product controls
+
+Most controls read one product and become `manual` when that product is not configured. The cross-product controls, PA-19 (admin roles), PA-20 (logging and SIEM), and PA-21 (data loss prevention), evaluate whichever product is configured and cap at `warn` when only one is. As a result, a single configured product that is compliant renders `warn`, not `manual` and not `pass`.
+
+The verdict for a non-compliant product depends on the finding:
+
+- **PA-21:** Fails when no configured product is compliant, whichever product that is.
+  - A Prisma Cloud tenant alone with no enabled data security policy fails.
+  - A PAN-OS estate alone with no data filtering profile attached to an allow rule fails too.
+  - PA-21 warns when one of two configured products is compliant.
+- **PA-19 and PA-20:** Fail only on their PAN-OS half. A non-compliant Prisma Cloud half warns, so a Prisma Cloud tenant alone never renders worse than `warn` on those two.
+  - PAN-OS half: Superusers above the threshold or password complexity disabled (PA-19), and rules with `log-end=no` or no syslog or Panorama forwarding (PA-20).
+  - Prisma Cloud half: System Admin roles above the threshold or zero roles returned (PA-19), and no SIEM integration (PA-20).
+
+The `manual` cases are:
+
+- The absence of both products.
+- A failed read of a surface the finding depends on (the partial-view rule under [Unreadable surfaces](#unreadable-surfaces)).
+- For PA-19, zero readable PAN-OS administrators.
+
+### Per-control evaluation
+
+| # | Control | Tool | Finding | How it is evaluated |
+|---|---|---|---|---|
+| 1 | CSPM compliance posture | cloud_posture | PA-01 | `GET /v2/compliance/posture` pass rate against `min_compliance_pass_rate` (default 90%). |
+| 2 | Alert policy coverage | cloud_posture | PA-02 | `GET /v2/alert/rule` and open alerts from `GET /v2/alert`: zero alert rules or zero rules with `enabled=true` fail; disabled rules or open critical alerts warn; a truncated alert list caps at `warn`; manual when either read fails. |
+| 3 | IAM overprivileged access | cloud_posture | PA-03 | IAM policies from `GET /v2/policy` and open alerts with `policyType=iam`; manual when the CIEM module is not visible. The documented `POST /api/v1/permission` query is not used because it needs a caller-written IAM RQL definition of "overprivileged" (see limitations). |
+| 4 | Cloud account governance | cloud_posture | PA-04 | `GET /cloud` and `GET /cloud/group`: zero accounts, accounts without `enabled=true`, or accounts in no account group fail; accounts whose `status` reports an error or warning warn; manual when either read fails, with the account or group counts rendered `null`. |
+| 5 | Network exposure analysis | cloud_posture | PA-05 | Open alerts with `policyType=network` or exposure keywords; fails on critical or high, manual when no enabled network policy exists. Zero such alerts passes only over an alert walk read to completion; over a truncated walk it is `warn`, the summary says emptiness is not asserted, and the alert counts render `null` in place of `0`. |
+| 6 | Encryption at rest | cloud_posture | PA-06 | Policies from `GET /v2/policy` whose name or labels match encryption at rest, and open alerts from `GET /v2/alert`: zero enabled encryption policies or any open encryption alert fails; enabled policies alongside disabled ones warn; a truncated alert list caps at `warn`; manual when either read fails. |
+| 7 | Container image vulnerability | cloud_posture | PA-07 | Compute `GET /policies/vulnerability/images` enabled rules with a block or prevent effect; critical and high CVE counts summed from the `cves` distribution of each `images`, `registryImages`, `containers`, `hosts`, and `functions` member in the `GET /stats/vulnerabilities` array, combined with `vulnerabilityDistribution` on `GET /images` scan results (the stricter count is used); any critical CVE fails, images without `scanTime` warn, no distribution at all warns. Manual when the console is unreachable. |
+| 8 | Host compliance posture | cloud_posture | PA-08 | Compute `GET /policies/compliance/host` and `/container` enabled rules, `GET /defenders` connected population, and `GET /stats/compliance` where the rate is derived from `rules[]` (or `categories[]`) `failed` versus `total`; below 90% or zero connected Defenders fails, zero recorded evaluations warns. Zero connected Defenders over a truncated Defender walk is `warn` (PA-09 likewise), with `connected_defenders` rendered `null`. |
+| 9 | Runtime protection policies | cloud_posture | PA-09 | Compute `GET /policies/runtime/container` enabled rules and `GET /defenders`; passes only when at least one rule prevents or blocks a process, network, file system, or DNS behavior and at least one Defender is connected to enforce it. |
+| 10 | Defender deployment coverage | cloud_posture | PA-10 | Compute `GET /defenders`: zero Defenders or any Defender without `connected=true` fails; missing `lastModified` or more than two versions warn. Zero Defenders over a truncated walk is `warn`, and while the walk is truncated or the page carried an unevaluable record the `versions`, `disconnected`, and `without_timestamp` lists render `null` beside their `_count` lower bounds. |
+| 11 | Registry scanning configuration | cloud_posture | PA-11 | Compute `GET /settings/registry` specifications and `GET /registry` scan results; zero registries is manual, registries without scans fail (`warn` when the scan walk was truncated before any result arrived). |
+| 12 | Firewall security rule audit | firewall_policy | PA-12 | Any/any allow rules fail; shadowed rules, `log-end=no`, or rules without an explicit `log-end` warn; zero rules is manual. |
+| 13 | Zone segmentation | firewall_policy | PA-13 | Any-zone allow rules fail; `intrazone-default` not denied, `interzone-default` not logged, or zones without a zone protection profile warn. |
+| 14 | SSL/TLS decryption coverage | firewall_policy | PA-14 | No enabled `decrypt` rules fails; SSL/TLS service profiles below TLS 1.2 warn. |
+| 15 | GlobalProtect VPN configuration | device_hardening | PA-15 | Portals and gateways are read from the vsys, network, and template trees; the authentication profiles whose `multi-factor-auth/mfa-enable` flag the MFA check reads live there and under `/config/shared`. Portals or gateways without an authentication profile fail; no MFA-enabled authentication profile or split tunneling warns; GlobalProtect not configured is manual (scoped out); manual when any vsys, network, template, or shared configuration read fails on any device, with `mfa_authentication_profiles` rendered `null`. HIP profiles remain a manual review. |
+| 16 | Threat prevention profiles | threat_prevention | PA-16 | Missing antivirus, anti-spyware, or vulnerability profiles, or allow rules without them, fail; lenient critical/high actions warn. |
+| 17 | WildFire analysis | threat_prevention | PA-17 | No WildFire profile fails; profiles not forwarding any application and any file type, or uncovered allow rules, warn. Cloud connectivity needs `show wildfire status`. |
+| 18 | URL filtering enforcement | threat_prevention | PA-18 | Profiles that do not block malware, phishing, and command-and-control fail; disabled credential enforcement or uncovered allow rules warn. |
+| 19 | Admin role and access audit | device_hardening | PA-19 | Superusers above `max_superusers` or password complexity disabled fail; local-password-only admins, excess Prisma Cloud System Admin roles, or a single configured product warn; zero readable admins is manual. |
+| 20 | Logging and SIEM integration | device_hardening | PA-20 | Rules with `log-end=no` or no syslog/Panorama forwarding fail; implicit `log-end`, missing log forwarding profiles, no Prisma Cloud SIEM integration (from `GET /api/v1/tenant/{prismaId}/integration`), or a single configured product warn. |
+| 21 | Data loss prevention | threat_prevention | PA-21 | Prisma Cloud policies with `policyType=data` (or DLP-labelled) from `GET /v2/policy` and PAN-OS data filtering profiles attached to allow rules: passes only when both products are configured and both are compliant (at least one enabled data security policy; at least one profile attached to an allow rule); one compliant product, or a single configured product that is compliant, warns (the exception to the one-product rule above: the unconfigured product does not make this finding `manual`); neither compliant fails; manual when neither product is configured or when the policy list or a rulebase read fails. |
+| 22 | File blocking policies | threat_prevention | PA-22 | No profile blocking PE or all file types fails; uncovered allow rules warn. |
+| 23 | System hardening | device_hardening | PA-23 | Missing NTP, default SNMP community, telnet or HTTP management fail; missing banner, permitted IPs, DNS, or idle timeout over 15 minutes warn. Supplementary `PA-HA-01` (HA state) and `PA-SW-01` (software and content versions) share control 23 and its CM-6/CM-7 mappings; they appear in a separate section of the unified compliance matrix so the matrix keeps one row per numbered control. |
+| 24 | Cloud discovery and shadow IT | cloud_posture | PA-24 | Compute `GET /cloud/discovery`: entries with more `total` than `defended` resources fail; an entry that reports neither `total` nor `defended` is unevaluable and caps the verdict at warn with the count named (`unevaluable_entries`), as does a record without any documented member (`unevaluable_records`); entries reporting `err` warn; zero entries is manual (discovery credentials not configured); an array of records without the documented members is an unreadable surface and renders manual. |
+| 25 | CI/CD pipeline security | cloud_posture | PA-25 | Compute `GET /scans` CI results; zero scans fail (`warn` when the scan walk was truncated before any result arrived). Caps at `warn` because the admission control policy has no verified public read endpoint (see limitations). |
+
+## Live smoke test
+
+```bash
+npm --prefix cli run test:paloalto:live
+```
+
+The script exits 0 with a skip message when neither product is configured. Otherwise it runs `paloalto_check_access` and one assessment: cloud posture when Prisma Cloud is configured, firewall policy otherwise.
+
+## Limitations
+
+- Prisma Cloud Compute (CWPP) controls 7 to 11 and 24 are automated when the console is reachable.
+- Control 25 caps at `warn`.
+  - CI scan results come from the documented `GET /scans` endpoint.
+  - No admission control (OPA) read endpoint could be located on the public pan.dev CWPP reference, so admission rules remain a manual review.
+- The CSPM `GET /meta_info` page is also not published on pan.dev. The PCEE access guide documents copying the console path from the UI, which is what `PRISMA_COMPUTE_URL` carries.
+- Control 3 uses the tenant's IAM policies and open `iam` alerts as the overprivilege signal.
+  - The documented `POST /api/v1/permission` endpoint runs a caller-supplied IAM RQL query and returns raw permission rows.
+  - Using it would require this tool to hard-code its own RQL definition of "overprivileged" that cannot be validated without a licensed CIEM tenant.
+  - The built-in IAM policies already encode those detections.
+  - `GET /api/v1/permission/alert/search` only returns the RQL behind one alert ID.
+- Control 2 reads alert rules from `GET /v2/alert/rule`. `GET /alert/policy` (List Alert Counts By Policy) is documented but only returns open alert counts grouped by policy, not rule configuration.
+- Control 20 reads push integrations from `GET /api/v1/tenant/{prismaId}/integration`, with the `prismaId` from the login response. `GET /integration` only lists Okta, Qualys, and Tenable pull integrations. It is used as a fallback when no `prismaId` is returned.
+- Shadow detection is heuristic. A rule is reported as shadowed when an earlier enabled rule in the same rulebase already allows any source, destination, and application for the same zones.
+- Software version evaluation flags PAN-OS 9.x and older, and missing content versions. End-of-life dates for current releases must be checked against the Palo Alto Networks end-of-life summary.
+- WildFire cloud connectivity, GlobalProtect HIP requirements, admin MFA enforcement, and log retention are reported as review items inside the finding summaries.
+- Disabling TLS verification affects only the PAN-OS clients created for that run (a dedicated `node:https` transport). The process-wide `NODE_TLS_REJECT_UNAUTHORIZED` variable is never set.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
 
 ### Redaction and error strings
 
@@ -306,80 +438,6 @@ Response bodies are never echoed.
 - A PAN-OS response without a `<response>` element is described as `returned a non-XML {content-type} response (status {n}, {n} bytes, not echoed)`.
 - An XML error contributes only the `<msg>` or `<line>` text and the response `code`, scrubbed before the 300-character cap.
 
-## Run it
-
-After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
-
-```text
-Check whether my Palo Alto credentials can read everything grclanker needs.
-Run the Palo Alto assessments and list the failing findings first.
-Export a Palo Alto audit bundle.
-```
-
-For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Prisma Cloud tenant and PAN-OS firewalls"`. Both start with `paloalto_check_access`, then run the assessments or `paloalto_export_audit_bundle`.
-
-## Tools
-
-<!-- The probe counts and surface names in the paloalto_check_access row are asserted against checkPaloaltoAccess (cli/extensions/grc-tools/paloalto.ts) by cli/tests/paloalto.test.mjs; change the code and this row together. -->
-
-| Tool | What it does |
-|---|---|
-| `paloalto_check_access` | Probes every read surface per product and reports `healthy`, `degraded`, or `unconfigured` with the scrubbed error for each missing permission. The probes are the 8 Prisma Cloud CSPM endpoints (`compliance_posture`, `alert_rules`, `open_alerts`, `policies`, `cloud_accounts`, `account_groups`, `user_roles`, `integrations`), the 9 Compute console surfaces when the console is reachable (`defenders`, `runtime_container_policy`, `compliance_container_policy`, `compliance_host_policy`, `vulnerability_image_policy`, `registry_settings`, `vulnerability_stats`, `cloud_discovery`, `ci_scans`), and, per PAN-OS device, `show system info`, `show high-availability state`, and the configuration subtrees for its platform. Paged Compute probes (`defenders`, `cloud_discovery`, `ci_scans`) that stop at the page cap are marked `partial`, their counts render with a trailing `+` as lower bounds, and a note says so; the counts are never presented as inventory totals. |
-| `paloalto_assess_cloud_posture` | Prisma Cloud CSPM controls 1 to 6 plus the Compute (CWPP) controls 7 to 11, 24, and 25, evaluated from the Compute API when the console is reachable and reported as manual findings otherwise. |
-| `paloalto_assess_firewall_policy` | PAN-OS controls 12 to 14: any/any and shadowed rules, session-end logging, zones and zone protection, default rule actions, decryption coverage, and SSL/TLS service profile minimum versions. |
-| `paloalto_assess_threat_prevention` | Controls 16 to 18, 21, and 22: antivirus, anti-spyware, vulnerability, WildFire, URL filtering and credential phishing, data loss prevention (Prisma Cloud data policies plus PAN-OS data filtering), and file blocking. |
-| `paloalto_assess_device_hardening` | Controls 15, 19, 20, and 23: GlobalProtect, administrators and password complexity (PAN-OS plus Prisma Cloud roles), logging and SIEM forwarding, system hardening, plus supplementary HA state (`PA-HA-01`) and software version (`PA-SW-01`) findings. |
-| `paloalto_export_audit_bundle` | Runs everything and writes the audit bundle and a zip archive. |
-
-`paloalto_export_audit_bundle` writes these outputs under `./export/paloalto` by default:
-
-- `core_data/`
-- `analysis/`
-- `compliance/`
-- `QUICK_REFERENCE.md`
-- `_errors.log` (only on partial failure)
-- A zip archive
-
-`core_data/` is not a verbatim dump:
-
-- The PAN-OS configuration is stored with credential-bearing nodes (`phash`, `password`, `secret`, `key` and `pre-shared-key`, `private-key`, `passphrase`, `token`, SNMPv3 `authpwd` and `privpwd`, `snmp-community-string`, and similar names) replaced by `[REDACTED]`.
-  - Names are matched in kebab-case, snake_case, camelCase, and attribute forms.
-  - Settings such as `password-complexity` and `public-key` are kept.
-  - The assessments still evaluate the raw values in memory.
-- The Prisma Cloud and Compute JSON in `core_data/prisma_cloud.json` is redacted as it is collected.
-  - Every property whose name's last segment denotes a credential (`authToken`, `password`, `clientSecret`, `api_key`, `secret_key`, `private_key`, `credentials`, and similar, in snake_case or camelCase) is replaced whole. A bare `key` and `public_key` are kept.
-  - Because the property is replaced whole, an integration's `integrationConfig` secrets, a Compute registry credential block, or an image `secrets` list never leak a nested child.
-  - `{key, value}` header pairs flagged `secure` lose their `value`. So do pairs labelled with a credential name in either the walker's vocabulary (`Authorization`, `X-Api-Key`) or the error-text rules' (`x-redlock-auth`, `X-Auth`, `Cookie`, `X-PAN-KEY`), whatever the `secure` flag says. A benign unflagged pair (`X-Trace`, `Content-Type`) keeps its `value`.
-  - Every remaining string is scrubbed of URL query credentials (the parameters named `token` and `api_key`, among others) and of the user-and-secret prefix before the host in a URL. It is also scrubbed of Slack, Discord, and Teams token-in-path webhook URLs and of JSON-encoded credential fields.
-  - The assessments read the same redacted copy, so nothing a finding or tool result carries can differ from the bundle.
-
-### Arguments and tunables
-
-All tools accept the same authentication arguments: `prisma_api_url`, `prisma_access_key_id`, `prisma_secret_key`, `panos_hosts`, `panos_api_key`, `panos_username`, `panos_password`, `config_file`, `verify_tls`, and `timeout_seconds`.
-
-Tunables:
-
-- `alert_limit` (default 500, clamped to 1-10000): For cloud posture and export.
-- `min_compliance_pass_rate` (default 90, clamped to 1-100): For cloud posture and export.
-- `max_superusers` (default 3, clamped to 0-1000): For device hardening and export.
-
-`paloalto_export_audit_bundle` also takes `output_dir` (default `./export/paloalto`).
-
-### Audit bundle naming
-
-The bundle directory is named `<host>-audit-bundle` (for example `api.prismacloud.io-audit-bundle`), with `<name>.zip` beside it. The host is the Prisma Cloud API hostname when Prisma Cloud is configured, and otherwise the first PAN-OS host.
-
-A repeat run takes the suffixes `-2` through `-6`, skipping any name whose directory or zip already exists. It fails once all six are taken.
-
-## Control coverage
-
-Status semantics:
-
-- `pass`: The evidence satisfied the check.
-- `warn`: Partial evidence or a heuristic concern.
-- `fail`: The evidence contradicted the control.
-- `manual`: The control cannot be verified through the configured APIs, and the summary states the evidence a human must collect.
-
 ### Verdict-safety rules
 
 These rules apply to every finding.
@@ -442,7 +500,10 @@ Alert pagination follows `nextPageToken` to completion. The loop records truncat
 - A token repeats (a stuck cursor).
 - `totalRows` exceeds what was read.
 
-Compute lists record truncation at the 500-record cap or on a stuck offset.
+Compute list endpoints (`/defenders`, `/registry`, `/images`, `/cloud/discovery`, `/scans`) are paged with `limit` and `offset` (50 per page, 500 records per surface). The loop records truncation, with the reason, when either of these happens:
+
+- The 500-record cap is reached while full pages are still being returned.
+- The console answers consecutive offsets with the same page (a stuck offset).
 
 Truncation caps these findings at `warn`: PA-02, PA-03, PA-05, PA-06 (alerts), and the Compute findings that read the truncated list. The summary and `partial_inventory` evidence name the reason.
 
@@ -488,63 +549,6 @@ Export reruns allocate a new directory and derive the zip name from it, so a pri
 
 - Allocation skips a name when either `<name>/` or `<name>.zip` exists. A zip left without its directory, or a dangling symlink at either path, counts as taken.
 - The zip is created exclusively, so an existing file at that path fails the export instead of being replaced.
-
-### Per-control evaluation
-
-| # | Control | Tool | Finding | How it is evaluated |
-|---|---|---|---|---|
-| 1 | CSPM compliance posture | cloud_posture | PA-01 | `GET /v2/compliance/posture` pass rate against `min_compliance_pass_rate` (default 90%). |
-| 2 | Alert policy coverage | cloud_posture | PA-02 | `GET /v2/alert/rule` and open alerts from `GET /v2/alert`: zero alert rules or zero rules with `enabled=true` fail; disabled rules or open critical alerts warn; a truncated alert list caps at `warn`; manual when either read fails. |
-| 3 | IAM overprivileged access | cloud_posture | PA-03 | IAM policies from `GET /v2/policy` and open alerts with `policyType=iam`; manual when the CIEM module is not visible. The documented `POST /api/v1/permission` query is not used because it needs a caller-written IAM RQL definition of "overprivileged" (see limitations). |
-| 4 | Cloud account governance | cloud_posture | PA-04 | `GET /cloud` and `GET /cloud/group`: zero accounts, accounts without `enabled=true`, or accounts in no account group fail; accounts whose `status` reports an error or warning warn; manual when either read fails, with the account or group counts rendered `null`. |
-| 5 | Network exposure analysis | cloud_posture | PA-05 | Open alerts with `policyType=network` or exposure keywords; fails on critical or high, manual when no enabled network policy exists. Zero such alerts passes only over an alert walk read to completion; over a truncated walk it is `warn`, the summary says emptiness is not asserted, and the alert counts render `null` in place of `0`. |
-| 6 | Encryption at rest | cloud_posture | PA-06 | Policies from `GET /v2/policy` whose name or labels match encryption at rest, and open alerts from `GET /v2/alert`: zero enabled encryption policies or any open encryption alert fails; enabled policies alongside disabled ones warn; a truncated alert list caps at `warn`; manual when either read fails. |
-| 7 | Container image vulnerability | cloud_posture | PA-07 | Compute `GET /policies/vulnerability/images` enabled rules with a block or prevent effect; critical and high CVE counts summed from the `cves` distribution of each `images`, `registryImages`, `containers`, `hosts`, and `functions` member in the `GET /stats/vulnerabilities` array, combined with `vulnerabilityDistribution` on `GET /images` scan results (the stricter count is used); any critical CVE fails, images without `scanTime` warn, no distribution at all warns. Manual when the console is unreachable. |
-| 8 | Host compliance posture | cloud_posture | PA-08 | Compute `GET /policies/compliance/host` and `/container` enabled rules, `GET /defenders` connected population, and `GET /stats/compliance` where the rate is derived from `rules[]` (or `categories[]`) `failed` versus `total`; below 90% or zero connected Defenders fails, zero recorded evaluations warns. Zero connected Defenders over a truncated Defender walk is `warn` (PA-09 likewise), with `connected_defenders` rendered `null`. |
-| 9 | Runtime protection policies | cloud_posture | PA-09 | Compute `GET /policies/runtime/container` enabled rules and `GET /defenders`; passes only when at least one rule prevents or blocks a process, network, file system, or DNS behavior and at least one Defender is connected to enforce it. |
-| 10 | Defender deployment coverage | cloud_posture | PA-10 | Compute `GET /defenders`: zero Defenders or any Defender without `connected=true` fails; missing `lastModified` or more than two versions warn. Zero Defenders over a truncated walk is `warn`, and while the walk is truncated or the page carried an unevaluable record the `versions`, `disconnected`, and `without_timestamp` lists render `null` beside their `_count` lower bounds. |
-| 11 | Registry scanning configuration | cloud_posture | PA-11 | Compute `GET /settings/registry` specifications and `GET /registry` scan results; zero registries is manual, registries without scans fail (`warn` when the scan walk was truncated before any result arrived). |
-| 12 | Firewall security rule audit | firewall_policy | PA-12 | Any/any allow rules fail; shadowed rules, `log-end=no`, or rules without an explicit `log-end` warn; zero rules is manual. |
-| 13 | Zone segmentation | firewall_policy | PA-13 | Any-zone allow rules fail; `intrazone-default` not denied, `interzone-default` not logged, or zones without a zone protection profile warn. |
-| 14 | SSL/TLS decryption coverage | firewall_policy | PA-14 | No enabled `decrypt` rules fails; SSL/TLS service profiles below TLS 1.2 warn. |
-| 15 | GlobalProtect VPN configuration | device_hardening | PA-15 | Portals and gateways are read from the vsys, network, and template trees; the authentication profiles whose `multi-factor-auth/mfa-enable` flag the MFA check reads live there and under `/config/shared`. Portals or gateways without an authentication profile fail; no MFA-enabled authentication profile or split tunneling warns; GlobalProtect not configured is manual (scoped out); manual when any vsys, network, template, or shared configuration read fails on any device, with `mfa_authentication_profiles` rendered `null`. HIP profiles remain a manual review. |
-| 16 | Threat prevention profiles | threat_prevention | PA-16 | Missing antivirus, anti-spyware, or vulnerability profiles, or allow rules without them, fail; lenient critical/high actions warn. |
-| 17 | WildFire analysis | threat_prevention | PA-17 | No WildFire profile fails; profiles not forwarding any application and any file type, or uncovered allow rules, warn. Cloud connectivity needs `show wildfire status`. |
-| 18 | URL filtering enforcement | threat_prevention | PA-18 | Profiles that do not block malware, phishing, and command-and-control fail; disabled credential enforcement or uncovered allow rules warn. |
-| 19 | Admin role and access audit | device_hardening | PA-19 | Superusers above `max_superusers` or password complexity disabled fail; local-password-only admins, excess Prisma Cloud System Admin roles, or a single configured product warn; zero readable admins is manual. |
-| 20 | Logging and SIEM integration | device_hardening | PA-20 | Rules with `log-end=no` or no syslog/Panorama forwarding fail; implicit `log-end`, missing log forwarding profiles, no Prisma Cloud SIEM integration (from `GET /api/v1/tenant/{prismaId}/integration`), or a single configured product warn. |
-| 21 | Data loss prevention | threat_prevention | PA-21 | Prisma Cloud policies with `policyType=data` (or DLP-labelled) from `GET /v2/policy` and PAN-OS data filtering profiles attached to allow rules: passes only when both products are configured and both are compliant (at least one enabled data security policy; at least one profile attached to an allow rule); one compliant product, or a single configured product that is compliant, warns (the exception to the one-product rule above: the unconfigured product does not make this finding `manual`); neither compliant fails; manual when neither product is configured or when the policy list or a rulebase read fails. |
-| 22 | File blocking policies | threat_prevention | PA-22 | No profile blocking PE or all file types fails; uncovered allow rules warn. |
-| 23 | System hardening | device_hardening | PA-23 | Missing NTP, default SNMP community, telnet or HTTP management fail; missing banner, permitted IPs, DNS, or idle timeout over 15 minutes warn. Supplementary `PA-HA-01` (HA state) and `PA-SW-01` (software and content versions) share control 23 and its CM-6/CM-7 mappings; they appear in a separate section of the unified compliance matrix so the matrix keeps one row per numbered control. |
-| 24 | Cloud discovery and shadow IT | cloud_posture | PA-24 | Compute `GET /cloud/discovery`: entries with more `total` than `defended` resources fail; an entry that reports neither `total` nor `defended` is unevaluable and caps the verdict at warn with the count named (`unevaluable_entries`), as does a record without any documented member (`unevaluable_records`); entries reporting `err` warn; zero entries is manual (discovery credentials not configured); an array of records without the documented members is an unreadable surface and renders manual. |
-| 25 | CI/CD pipeline security | cloud_posture | PA-25 | Compute `GET /scans` CI results; zero scans fail (`warn` when the scan walk was truncated before any result arrived). Caps at `warn` because the admission control policy has no verified public read endpoint (see limitations). |
-
-## Live smoke test
-
-```bash
-npm --prefix cli run test:paloalto:live
-```
-
-The script exits 0 with a skip message when neither product is configured. Otherwise it runs `paloalto_check_access` and one assessment: cloud posture when Prisma Cloud is configured, firewall policy otherwise.
-
-## Limitations
-
-- Prisma Cloud Compute (CWPP) controls 7 to 11 and 24 are automated when the console is reachable.
-- Control 25 caps at `warn`.
-  - CI scan results come from the documented `GET /scans` endpoint.
-  - No admission control (OPA) read endpoint could be located on the public pan.dev CWPP reference, so admission rules remain a manual review.
-- The CSPM `GET /meta_info` page is also not published on pan.dev. The PCEE access guide documents copying the console path from the UI, which is what `PRISMA_COMPUTE_URL` carries.
-- Control 3 uses the tenant's IAM policies and open `iam` alerts as the overprivilege signal.
-  - The documented `POST /api/v1/permission` endpoint runs a caller-supplied IAM RQL query and returns raw permission rows.
-  - Using it would require this tool to hard-code its own RQL definition of "overprivileged" that cannot be validated without a licensed CIEM tenant.
-  - The built-in IAM policies already encode those detections.
-  - `GET /api/v1/permission/alert/search` only returns the RQL behind one alert ID.
-- Control 2 reads alert rules from `GET /v2/alert/rule`. `GET /alert/policy` (List Alert Counts By Policy) is documented but only returns open alert counts grouped by policy, not rule configuration.
-- Control 20 reads push integrations from `GET /api/v1/tenant/{prismaId}/integration`, with the `prismaId` from the login response. `GET /integration` only lists Okta, Qualys, and Tenable pull integrations. It is used as a fallback when no `prismaId` is returned.
-- Shadow detection is heuristic. A rule is reported as shadowed when an earlier enabled rule in the same rulebase already allows any source, destination, and application for the same zones.
-- Software version evaluation flags PAN-OS 9.x and older, and missing content versions. End-of-life dates for current releases must be checked against the Palo Alto Networks end-of-life summary.
-- WildFire cloud connectivity, GlobalProtect HIP requirements, admin MFA enforcement, and log retention are reported as review items inside the finding summaries.
-- Disabling TLS verification affects only the PAN-OS clients created for that run (a dedicated `node:https` transport). The process-wide `NODE_TLS_REJECT_UNAUTHORIZED` variable is never set.
 
 ## Official documentation
 

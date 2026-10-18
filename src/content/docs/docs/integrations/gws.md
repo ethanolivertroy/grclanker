@@ -5,7 +5,7 @@ description: Read-only Google Workspace security inspector covering identity, 2-
 
 The Google Workspace inspector (`gws_*` tools) reviews identity, privileged access, third-party OAuth integrations, and security monitoring in a Google Workspace tenant.
 
-It is read-only. Every request is a GET against a documented Google API, and nothing is written back to the tenant. Every verdict follows the verdict-safety rules described below.
+It is read-only. Every request is a GET against a documented Google API, and nothing is written back to the tenant. Every verdict follows the [verdict-safety rules](#verdict-safety-rules).
 
 - **Spec:** `specs/gws-inspector-go.spec.md`
 - **Implementation:** `cli/extensions/grc-tools/gws.ts`
@@ -108,6 +108,8 @@ Status semantics:
 - `Fail`: The documented flags contradict the control.
 - `Manual`: The verdict could not be reached automatically (unreadable endpoint, empty inventory, surface not collected). The summary names the evidence a human must collect.
 
+Verdicts on unread, partial, or truncated data follow the [verdict-safety rules](#verdict-safety-rules).
+
 | # | Control | Tool | Finding | Pass condition | Manual when |
 | --- | --- | --- | --- | --- | --- |
 | 1 | Privileged users enforce 2-step verification | identity | GWS-ID-001 | Every privileged user has `isEnforcedIn2Sv=true` | Directory unreadable or no privileged user identified |
@@ -130,7 +132,92 @@ Status semantics:
 | 18 | Token audit telemetry stays available | monitoring | GWS-MON-004 | `activities.list` for `token` returns at least one event | Reports unreadable or zero events |
 | 19 | Open alert backlog is manageable | monitoring | GWS-MON-005 | 3 or fewer alerts whose `metadata.status` is not `CLOSED`; alerts without a status cap the verdict at Partial | Alert Center unreadable or zero alerts |
 
-## Verdict-safety rules
+## Framework mappings
+
+Each finding maps to these frameworks:
+
+- FedRAMP (NIST 800-53)
+- CMMC 2.0 (NIST 800-171)
+- SOC 2
+- CIS Google Workspace Benchmark
+- PCI-DSS 4.0.1
+- DISA STIG SRG
+- IRAP (ISM)
+- ISMAP (ISO 27001)
+
+The full matrix is written to `compliance/unified_compliance_matrix.md` in every bundle.
+
+Examples:
+
+| Finding | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| GWS-ID-001 | IA-2, IA-2(1) | 3.5.3 | CC6.1 | 1.2 | 8.4.2 | SRG-APP-000149 | ISM-1504 | CPS.IA-2 |
+| GWS-ID-005 | IA-2, IA-2(1), CM-6 | 3.5.3 | CC6.1 | 1.1 | 8.4.2 | SRG-APP-000149 | ISM-1504 | CPS.IA-2 |
+| GWS-ADMIN-001 | AC-5, AC-6 | 3.1.5 | CC6.2 | 2.1 | 7.2.5 | SRG-APP-000033 | ISM-0414 | CPS.AC-6 |
+| GWS-INTEG-002 | AC-6, SA-9 | 3.1.5 | CC6.2 | 4.2 | 7.2.5 | SRG-APP-000033 | ISM-0414 | CPS.AC-6 |
+| GWS-MON-005 | IR-5, SI-4 | 3.6.2 | CC7.4 | 5.5 | 12.10.5 | SRG-APP-000516 | ISM-1807 | CPS.IR-5 |
+
+## Audit bundle layout
+
+`gws_export_audit_bundle` writes `<domain>-gws-audit/` under `output_dir` (default `./export/gws`) and a zip with the same name.
+
+Without `GWS_DOMAIN` or `domain`, the customer ID takes the place of `<domain>` (for example `my_customer-gws-audit/`).
+
+Bundle contents:
+
+- `core_data/`: API snapshots.
+  - Files: `users.json`, `roles.json`, `role_assignments.json`, `login_activities.json`, `admin_activities.json`, `token_activities.json`, `token_inventory.json`, `alerts.json`, `two_step_verification_policies.json`.
+  - Each is a `{status, endpoint, data, seen, pages, truncated}` object whose `status` names the endpoint and reads `complete`, `partial`, `unreadable`, or `not collected`.
+  - A read that failed or never happened writes `error` and `errorKind`, with `data`, `seen`, `pages`, and `truncated` all `null`, never `[]`, `0`, or `false` ([verdict-safety rule 11](#verdict-safety-rules)).
+  - `token_inventory.json` adds `total`, `failed`, `failures` (per-user `userId`, `primaryEmail`, and the projected error), and `readable_users` (`3 of 4`).
+    - Its `data` is null when every sampled read failed or the sample was never drawn.
+    - Its `truncated` is null whenever any read failed, because the sample cap no longer describes completeness.
+  - Every record is projected to the documented fields listed under the endpoint reference, and credential-like values are redacted ([verdict-safety rule 9](#verdict-safety-rules)).
+- `analysis/`: `findings.json` plus one JSON and one Markdown summary per category.
+- `compliance/`: `executive_summary.md`, `unified_compliance_matrix.md`, and one report per framework (`fedramp/`, `cmmc/`, `soc2/`, `disa_stig/`, `irap/`, `ismap/`, `pci_dss/`, `cis/`).
+- `QUICK_REFERENCE.md`
+- `_errors.log`: Only when at least one collection failed, with one `<endpoint>: <status and reasons>` line per failure.
+
+Findings and collection errors are redacted as objects before any Markdown or JSON is rendered. Every file above passes through the same text scrubber on its way to disk ([verdict-safety rule 9](#verdict-safety-rules)). As a result, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log`, and the zip entries carry the same guarantees as `core_data/`.
+
+Pass `frameworks` (for example `["soc2", "cis"]`) to limit the per-framework reports. Output paths are validated against traversal and symlinked parents.
+
+## Live smoke
+
+```bash
+npm --prefix cli run test:gws:live
+```
+
+The script:
+
+1. Runs `gws_check_access`.
+2. Stops with exit 1 unless the access status is `healthy`.
+3. Runs all four assessments and the export into a temp directory.
+4. Fails unless the bundle holds 19 findings.
+
+Without `GWS_ACCESS_TOKEN` or a service-account file or inline JSON (any of the credential variables above) plus `GWS_ADMIN_EMAIL`, it prints a skip message and exits 0.
+
+## Limitations and deferrals
+
+- Installed-app OAuth (client secrets plus a stored refresh token) is deferred. Use a delegated service account or a pre-obtained access token.
+- Token inventory samples privileged users first and then active users, up to 50 users per run.
+  - The finding reports `seen` versus `total` and caps at Partial when the sample is smaller than the active population.
+  - The privileged-first ordering depends on `roles.list` and `roleAssignments.list`. When either is unreadable, only the `isAdmin` and `isDelegatedAdmin` flags order the sample, and GWS-INTEG-001 and GWS-INTEG-003 cap at Partial for that reason.
+- Error projection keeps any bare identifier of at most 63 characters found in `error.status`, `errors[].reason`, `details[].reason`, or the RFC 6749 `error` code, because those fields are documented as identifiers.
+  - A server-controlled value in one of those fields that has no `.`, `-`, or `/` and matches no credential shape would be rendered verbatim into `_errors.log`, `analysis/`, `compliance/executive_summary.md`, and the failing `core_data/` file.
+  - The free-text `message` fields and the server's HTTP reason phrase are never rendered.
+- The user listing stops at 5000 users, roles at 1000, role assignments at 10000, activity listings at 5000 records, alerts at 1000, and policies at 1000.
+  - No listing follows more than 1000 pages or a cursor that stops advancing.
+  - Every such exit is recorded as truncation and caps dependent verdicts at Partial.
+- GWS-ADMIN-005 does not expand group membership. Any group-based admin grant renders Manual for a membership review.
+- Chrome Policy API (`chromepolicy/v1`) and Cloud Identity device surfaces listed in the spec are not called. No shipped control depends on them.
+- Alert Center `pageSize` has no documented maximum ([alerts.list](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list)). grclanker requests 100 and follows `nextPageToken`.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Verdict-safety rules
 
 Every finding applies these rules. `cli/tests/gws.test.mjs` carries a regression test per rule plus the four-fixture false-pass self-check.
 
@@ -191,87 +278,6 @@ Every finding applies these rules. `cli/tests/gws.test.mjs` carries a regression
     - `cli/tests/gws.test.mjs` sweeps 34 denial scenarios (eleven surfaces by three failure kinds plus the never-collected Policy API dataset) over every finding line, snapshot field, and `core_data/` file. The sweep uses two generic guards:
       - No `0` or `[]` beside an unreadable, not collected, or unknown status.
       - No complete or partial status naming an endpoint the run never requested.
-
-## Framework mappings
-
-Each finding maps to these frameworks:
-
-- FedRAMP (NIST 800-53)
-- CMMC 2.0 (NIST 800-171)
-- SOC 2
-- CIS Google Workspace Benchmark
-- PCI-DSS 4.0.1
-- DISA STIG SRG
-- IRAP (ISM)
-- ISMAP (ISO 27001)
-
-The full matrix is written to `compliance/unified_compliance_matrix.md` in every bundle.
-
-Examples:
-
-| Finding | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GWS-ID-001 | IA-2, IA-2(1) | 3.5.3 | CC6.1 | 1.2 | 8.4.2 | SRG-APP-000149 | ISM-1504 | CPS.IA-2 |
-| GWS-ID-005 | IA-2, IA-2(1), CM-6 | 3.5.3 | CC6.1 | 1.1 | 8.4.2 | SRG-APP-000149 | ISM-1504 | CPS.IA-2 |
-| GWS-ADMIN-001 | AC-5, AC-6 | 3.1.5 | CC6.2 | 2.1 | 7.2.5 | SRG-APP-000033 | ISM-0414 | CPS.AC-6 |
-| GWS-INTEG-002 | AC-6, SA-9 | 3.1.5 | CC6.2 | 4.2 | 7.2.5 | SRG-APP-000033 | ISM-0414 | CPS.AC-6 |
-| GWS-MON-005 | IR-5, SI-4 | 3.6.2 | CC7.4 | 5.5 | 12.10.5 | SRG-APP-000516 | ISM-1807 | CPS.IR-5 |
-
-## Audit bundle layout
-
-`gws_export_audit_bundle` writes `<domain>-gws-audit/` under `output_dir` (default `./export/gws`) and a zip with the same name.
-
-Without `GWS_DOMAIN` or `domain`, the customer ID takes the place of `<domain>` (for example `my_customer-gws-audit/`).
-
-Bundle contents:
-
-- `core_data/`: API snapshots.
-  - Files: `users.json`, `roles.json`, `role_assignments.json`, `login_activities.json`, `admin_activities.json`, `token_activities.json`, `token_inventory.json`, `alerts.json`, `two_step_verification_policies.json`.
-  - Each is a `{status, endpoint, data, seen, pages, truncated}` object whose `status` names the endpoint and reads `complete`, `partial`, `unreadable`, or `not collected`.
-  - A read that failed or never happened writes `error` and `errorKind`, with `data`, `seen`, `pages`, and `truncated` all `null`, never `[]`, `0`, or `false` (verdict-safety rule 11).
-  - `token_inventory.json` adds `total`, `failed`, `failures` (per-user `userId`, `primaryEmail`, and the projected error), and `readable_users` (`3 of 4`).
-    - Its `data` is null when every sampled read failed or the sample was never drawn.
-    - Its `truncated` is null whenever any read failed, because the sample cap no longer describes completeness.
-  - Every record is projected to the documented fields listed under the endpoint reference, and credential-like values are redacted (verdict-safety rule 9).
-- `analysis/`: `findings.json` plus one JSON and one Markdown summary per category.
-- `compliance/`: `executive_summary.md`, `unified_compliance_matrix.md`, and one report per framework (`fedramp/`, `cmmc/`, `soc2/`, `disa_stig/`, `irap/`, `ismap/`, `pci_dss/`, `cis/`).
-- `QUICK_REFERENCE.md`
-- `_errors.log`: Only when at least one collection failed, with one `<endpoint>: <status and reasons>` line per failure.
-
-Findings and collection errors are redacted as objects before any Markdown or JSON is rendered. Every file above passes through the same text scrubber on its way to disk (verdict-safety rule 9). As a result, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log`, and the zip entries carry the same guarantees as `core_data/`.
-
-Pass `frameworks` (for example `["soc2", "cis"]`) to limit the per-framework reports. Output paths are validated against traversal and symlinked parents.
-
-## Live smoke
-
-```bash
-npm --prefix cli run test:gws:live
-```
-
-The script:
-
-1. Runs `gws_check_access`.
-2. Stops with exit 1 unless the access status is `healthy`.
-3. Runs all four assessments and the export into a temp directory.
-4. Fails unless the bundle holds 19 findings.
-
-Without `GWS_ACCESS_TOKEN` or a service-account file or inline JSON (any of the credential variables above) plus `GWS_ADMIN_EMAIL`, it prints a skip message and exits 0.
-
-## Limitations and deferrals
-
-- Installed-app OAuth (client secrets plus a stored refresh token) is deferred. Use a delegated service account or a pre-obtained access token.
-- Token inventory samples privileged users first and then active users, up to 50 users per run.
-  - The finding reports `seen` versus `total` and caps at Partial when the sample is smaller than the active population.
-  - The privileged-first ordering depends on `roles.list` and `roleAssignments.list`. When either is unreadable, only the `isAdmin` and `isDelegatedAdmin` flags order the sample, and GWS-INTEG-001 and GWS-INTEG-003 cap at Partial for that reason.
-- Error projection keeps any bare identifier of at most 63 characters found in `error.status`, `errors[].reason`, `details[].reason`, or the RFC 6749 `error` code, because those fields are documented as identifiers.
-  - A server-controlled value in one of those fields that has no `.`, `-`, or `/` and matches no credential shape would be rendered verbatim into `_errors.log`, `analysis/`, `compliance/executive_summary.md`, and the failing `core_data/` file.
-  - The free-text `message` fields and the server's HTTP reason phrase are never rendered.
-- The user listing stops at 5000 users, roles at 1000, role assignments at 10000, activity listings at 5000 records, alerts at 1000, and policies at 1000.
-  - No listing follows more than 1000 pages or a cursor that stops advancing.
-  - Every such exit is recorded as truncation and caps dependent verdicts at Partial.
-- GWS-ADMIN-005 does not expand group membership. Any group-based admin grant renders Manual for a membership review.
-- Chrome Policy API (`chromepolicy/v1`) and Cloud Identity device surfaces listed in the spec are not called. No shipped control depends on them.
-- Alert Center `pageSize` has no documented maximum ([alerts.list](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list)). grclanker requests 100 and follows `nextPageToken`.
 
 ## Endpoint reference
 

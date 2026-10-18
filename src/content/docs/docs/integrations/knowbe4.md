@@ -66,39 +66,6 @@ Regional base URLs follow the official documentation:
 
 Both APIs use an `Authorization: Bearer <token>` header. Tokens are never written to findings, bundles, or error messages.
 
-## Rate limits and pagination
-
-The Reporting API allows:
-
-- Four requests per second
-- A burst of 50 requests per minute
-- 2,000 requests per day plus the number of licensed users
-
-The client:
-
-- Spaces requests at least 250 ms apart.
-- Retries `429` and `503` responses with exponential backoff, honoring `Retry-After` when present.
-- Pages every list endpoint with `page` and `per_page` (500 per page, or 10 for training campaigns as documented).
-
-Recipient results are only loaded for the most recent security tests (`security_test_sample_limit`, default 12) to stay within the daily quota on large accounts.
-
-PhishER messages are paged with the GraphQL `per`, `page`, and `nextPageKey` arguments of `phisherMessages`. They are filtered with a Lucene `reported_at` range for the lookback window.
-
-The PhishER argument names come from the public schema that the developer portal's schema browser loads. An unauthenticated introspection query posted to `https://training.knowbe4.com/graphql?scope=phisher` returns:
-
-- `phisherMessages(per: Int, page: Int, all: Boolean, query: String!, sortField: PhisherMessageSortFields, sortDirection: SortDirections, nextPageKey: String)`
-- `phisherRules(per: Int, page: Int, all: Boolean, query: String!, active: Boolean)`
-
-Both return `nodes` plus a `pagination { page pages per totalCount nextPageKey }` object.
-
-The PhishER pagination prose page describes `page` and `per_page` with REST wording. GraphQL validation rejects arguments that are not in the schema, so the client follows the schema. You can reproduce the check with:
-
-```bash
-curl -s -X POST 'https://training.knowbe4.com/graphql?scope=phisher' \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"{ __schema { queryType { fields { name args { name } } } } }"}'
-```
-
 ## Run it
 
 After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
@@ -138,88 +105,6 @@ Every assessment returns findings shaped as `{ id, control, title, severity, sta
 - `fail`: The API evidence shows the control is not met.
 - `manual`: The API cannot verify the control. The summary and `manualEvidence` state exactly which console export a human must collect.
 
-#### Unreadable inventories
-
-An unreadable inventory never produces a `pass`. It is recorded in:
-
-- The assessment `errors` list
-- `core_data/collection_status.json`
-- The bundle `_errors.log`
-
-The affected finding carries `Unreadable inventory: <inventory> (<endpoint>: <error>), so <what was not checked>. Collect manually: <console evidence>.` in its summary, plus the same entries under `evidence.unreadable_inventories`.
-
-That holds for every inventory a finding reads, not only its primary one. A finding that combines several inventories never produces a `pass` while any of them is unreadable (403, 401, 5xx, or a transport error), even when the readable inventories alone would satisfy the control.
-
-Examples of combined inventories:
-
-- Users plus security tests plus recipient results
-- Groups plus phishing and training campaigns
-- Training campaigns plus enrollments plus policies
-
-The verdict is `manual` when the missing inventory is essential:
-
-- Security tests for 1, 2, 6, 7, 10, 19, and 20
-- Users for 2, 4, 5, and 18
-- Training campaigns for 3, 8, 11, and 17
-- Enrollments for 4 and 10
-- Groups and phishing campaigns for 8
-- Phishing campaigns for 9, plus users or groups for 9 when no campaign targets All Users
-- The account for 12
-- Callback tests for 16
-
-The verdict is `warn` when the readable inventories still support a judgement and the summary says what was not checked:
-
-- Recipient results for 2, 10, and 18
-- Users and the account for 6
-- The risk score history for 5 and 7
-- The account for 5
-- Security tests, users, and groups for 9 while an All Users campaign exists
-- PhishER messages for 19
-- Enrollments for 3 and 17
-- Training campaigns for 10
-- Store purchases for 11
-- Policies for 17
-- Security tests and enrollments for 18
-
-Failing verdicts on the readable inventories stay `fail`.
-
-#### Truncated listings
-
-A truncated listing never produces a `pass` either.
-
-Every list read is capped:
-
-- `user_limit`
-- `enrollment_limit`
-- `phisher_message_limit`
-- An internal cap for the other inventories
-
-The client reports the listing as truncated when the cap stopped it while the last page was still full or dropped items from it. The Reporting API returns bare arrays with no total, so a short page is the only completion signal.
-
-For PhishER, the client reports truncation in any of these cases:
-
-- The cap stopped short of `totalCount`.
-- The server repeats the same `nextPageKey`.
-- An empty page arrives while `totalCount` says more exist.
-
-When a finding's verdict depends on a truncated inventory:
-
-- A clean verdict becomes `warn`.
-- The summary ends with `Truncated listing: <inventory> (<seen> of <total> loaded, truncated at <argument> (<limit>))` plus the argument to raise.
-- The evidence carries `truncated_inventories` with the seen versus total counts.
-
-A count that would read as "none exist" renders `null` rather than `0` when the inventory it is derived from was truncated or unreadable. A positive count and the figures named for the read's own size (`enrollments_loaded`, `users_read`, `security_tests_read`) always render.
-
-For example, `KNOWBE4-10` renders `remediated_users` as `null` when the enrollments read stopped before any remediation was seen. When some were seen, it renders the count observed, a lower bound.
-
-A listing the server stopped rather than the cap states its own stop reason in the `Truncated listing:` clause instead of the cap. Such a stop is an empty page or an ended pagination while `totalCount` says more exist, or a repeated `nextPageKey`. An example clause is `<seen> of <total> loaded; the server returned an empty page while reporting <total> records`.
-
-The remedy to raise the argument is offered only for a cap exit. The stop reason is written per inventory under `truncation_reason` in `core_data/collection_status.json` and in `truncated_inventories`.
-
-Context inventories (the per-user phish-prone average, the account risk score, PhishER enrichment, uploaded policies) only annotate the evidence when truncated. The PhishER inbox clause on KNOWBE4-19 carries the same stop reason.
-
-Failing verdicts stay `fail`.
-
 ### Audit bundle layout
 
 ```text
@@ -240,51 +125,9 @@ Output paths are resolved inside `output_dir`. Traversal outside the root and sy
 
 Set `redact_pii` to pseudonymize emails and mask names, phone numbers, and IP addresses in `core_data/` and findings.
 
-#### Credential redaction
-
-Credentials never reach the bundle regardless of `redact_pii`.
-
-User records drop their free-form fields at collection time, and so does the user embedded in each security test recipient. The dropped fields are `comment`, `custom_field_1` through `custom_field_4`, `custom_date_1`, and `custom_date_2`. They are dropped because nothing downstream reads them and an admin can type anything into them.
-
-Every `core_data/` file then passes through a redaction step. The step replaces the value under any credential-shaped key with `[REDACTED]`, whether the value is a string, a list, or a nested object. It keeps the key so an auditor can see the field existed.
-
-Credential-shaped keys are `token`, `secret`, `password`, `passphrase`, `authorization`, `credential`, `bearer`, `api_key`/`apiKey`, `private_key`, `access_key`, `client_secret`, and their plural and camelCase forms. The step treats `{name, value}` pairs whose name is credential-shaped the same way.
-
-URL-shaped keys (`url`, `uri`, `endpoint`, `link`, `href`) keep only scheme and host, so signed policy and content links cannot carry a token into the bundle.
-
-Non-JSON error bodies are described by content type and length in error text, never echoed. JSON error messages are capped in length.
-
-The assessment tools return findings, summaries, and errors without the raw snapshots.
-
-#### Recorded error text
-
-Recorded error text follows one rule at one place. Every collection error, access surface `error`, assessment `errors` entry, `_errors.log` line, and tool failure message is produced by a single function. That function passes the thrown message through the module scrubber.
-
-A `SyntaxError` raised by the transport is recorded as its class name plus a fixed note, because the parser's message quotes the body.
-
-The scrubber removes the configured Reporting API and PhishER tokens at full length in plain, base64, base64url, URL-encoded, form-encoded, and JSON-escaped form. It also removes the value of every credential carrier, whatever the value's shape:
-
-- **Pairs:** A `key=value`, `key: value`, or `"key": "value"` pair loses its value when its key carries a credential word (`api_token`, `KNOWBE4_API_TOKEN`, `phisher_api_token`, and the bearer ids `secret_id`, `session_id`, and `token_id`).
-  - The same applies when the key follows a JSON escape (`\"api_token\": \"v\"`) or a command-line flag (`--api-token v`, `--api-token=v`, `-Dapi_token=v`).
-- **Authorization schemes:** An authorization scheme word in any casing (`Bearer`, `bearer`, `Basic`, `Token`) loses the value after it.
-  - The rule applies alike to a bare token and a whole auth-param list (`Snowflake Token="v"`, `Digest username="v", nonce="v", response="v"`).
-  - The word itself stays only under `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate`, where a challenge's `realm="api"` stays as well.
-  - By contrast, an API-key or token header (`X-Api-Key: splunk rejected`, `X-Phisher-Token: token rejected`) and a credential-named assignment (`token=Bearer v`) lose their whole value.
-- **Cookies:** A cookie header loses its value whole, its `;` separating pairs and attributes.
-- **Query strings:** The query of any URL becomes one marker.
-  - A credential-named parameter of a relative path or bare query string loses its whole value, including a `;` inside the value.
-  - For example, `?token=v;rest` renders `?token=[REDACTED]`, as URLSearchParams reads it.
-- **Webhook and callback URLs:** A webhook or callback URL keeps its origin alone.
-  - A `webhook`-prefixed key is a URL carrier only when its last segment is `url` or `uri`, or the key is the bare `webhook`.
-  - `webhook_secret`, `webhook_token`, and `webhookSecret` are credential keys and lose their value whatever its shape.
-
-A configured secret that is itself a carrier word (`password`, `Authorization`, `Bearer`) is removed after the carriers rather than before them, so the pair or header it names still loses its value.
-
-A name after a path slash (`GET /v1/account: 403`) is a path segment, not a key. A key whose last segment names a setting (`KNOWBE4_BASE_URL`, `KNOWBE4_PHISHER_GRAPHQL_URL`, `phisher_message_limit`, `inactive_days`) keeps a word value and loses only a token-shaped or registered one. So every fixed message and every finding summary, manual-evidence instruction, and bundle document survives the pass unchanged.
-
-The test suite sweeps the strings recorded by healthy and partially denied runs for alterations.
-
 ## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the rules in [How the tools handle evidence](#how-the-tools-handle-evidence).
 
 | Spec control | Tool | Finding | Status semantics |
 | --- | --- | --- | --- |
@@ -369,6 +212,169 @@ The script skips with exit code 0 when no Reporting API key or config file is pr
   - The client uses `page` and `per_page` today because the cursor response contract is not yet documented.
   - Switching to cursor pagination is a follow-up.
 - Risk scores, phish-prone percentages, and admin lists are only as fresh as the Reporting API. There is no PII-free mode for `core_data/` other than `redact_pii`.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Rate limits and pagination
+
+The Reporting API allows:
+
+- Four requests per second
+- A burst of 50 requests per minute
+- 2,000 requests per day plus the number of licensed users
+
+The client:
+
+- Spaces requests at least 250 ms apart.
+- Retries `429` and `503` responses with exponential backoff, honoring `Retry-After` when present.
+- Pages every list endpoint with `page` and `per_page` (500 per page, or 10 for training campaigns as documented).
+
+Recipient results are only loaded for the most recent security tests (`security_test_sample_limit`, default 12) to stay within the daily quota on large accounts.
+
+PhishER messages are paged with the GraphQL `per`, `page`, and `nextPageKey` arguments of `phisherMessages`. They are filtered with a Lucene `reported_at` range for the lookback window.
+
+The PhishER argument names come from the public schema that the developer portal's schema browser loads. An unauthenticated introspection query posted to `https://training.knowbe4.com/graphql?scope=phisher` returns:
+
+- `phisherMessages(per: Int, page: Int, all: Boolean, query: String!, sortField: PhisherMessageSortFields, sortDirection: SortDirections, nextPageKey: String)`
+- `phisherRules(per: Int, page: Int, all: Boolean, query: String!, active: Boolean)`
+
+Both return `nodes` plus a `pagination { page pages per totalCount nextPageKey }` object.
+
+The PhishER pagination prose page describes `page` and `per_page` with REST wording. GraphQL validation rejects arguments that are not in the schema, so the client follows the schema. You can reproduce the check with:
+
+```bash
+curl -s -X POST 'https://training.knowbe4.com/graphql?scope=phisher' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"{ __schema { queryType { fields { name args { name } } } } }"}'
+```
+
+### Unreadable inventories
+
+An unreadable inventory never produces a `pass`. It is recorded in:
+
+- The assessment `errors` list
+- `core_data/collection_status.json`
+- The bundle `_errors.log`
+
+The affected finding carries `Unreadable inventory: <inventory> (<endpoint>: <error>), so <what was not checked>. Collect manually: <console evidence>.` in its summary, plus the same entries under `evidence.unreadable_inventories`.
+
+That holds for every inventory a finding reads, not only its primary one. A finding that combines several inventories never produces a `pass` while any of them is unreadable (403, 401, 5xx, or a transport error), even when the readable inventories alone would satisfy the control.
+
+Examples of combined inventories:
+
+- Users plus security tests plus recipient results
+- Groups plus phishing and training campaigns
+- Training campaigns plus enrollments plus policies
+
+The verdict is `manual` when the missing inventory is essential:
+
+- Security tests for 1, 2, 6, 7, 10, 19, and 20
+- Users for 2, 4, 5, and 18
+- Training campaigns for 3, 8, 11, and 17
+- Enrollments for 4 and 10
+- Groups and phishing campaigns for 8
+- Phishing campaigns for 9, plus users or groups for 9 when no campaign targets All Users
+- The account for 12
+- Callback tests for 16
+
+The verdict is `warn` when the readable inventories still support a judgement and the summary says what was not checked:
+
+- Recipient results for 2, 10, and 18
+- Users and the account for 6
+- The risk score history for 5 and 7
+- The account for 5
+- Security tests, users, and groups for 9 while an All Users campaign exists
+- PhishER messages for 19
+- Enrollments for 3 and 17
+- Training campaigns for 10
+- Store purchases for 11
+- Policies for 17
+- Security tests and enrollments for 18
+
+Failing verdicts on the readable inventories stay `fail`.
+
+### Truncated listings
+
+A truncated listing never produces a `pass` either.
+
+Every list read is capped:
+
+- `user_limit`
+- `enrollment_limit`
+- `phisher_message_limit`
+- An internal cap for the other inventories
+
+The client reports the listing as truncated when the cap stopped it while the last page was still full or dropped items from it. The Reporting API returns bare arrays with no total, so a short page is the only completion signal.
+
+For PhishER, the client reports truncation in any of these cases:
+
+- The cap stopped short of `totalCount`.
+- The server repeats the same `nextPageKey`.
+- An empty page arrives while `totalCount` says more exist.
+
+When a finding's verdict depends on a truncated inventory:
+
+- A clean verdict becomes `warn`.
+- The summary ends with `Truncated listing: <inventory> (<seen> of <total> loaded, truncated at <argument> (<limit>))` plus the argument to raise.
+- The evidence carries `truncated_inventories` with the seen versus total counts.
+
+A count that would read as "none exist" renders `null` rather than `0` when the inventory it is derived from was truncated or unreadable. A positive count and the figures named for the read's own size (`enrollments_loaded`, `users_read`, `security_tests_read`) always render.
+
+For example, `KNOWBE4-10` renders `remediated_users` as `null` when the enrollments read stopped before any remediation was seen. When some were seen, it renders the count observed, a lower bound.
+
+A listing the server stopped rather than the cap states its own stop reason in the `Truncated listing:` clause instead of the cap. Such a stop is an empty page or an ended pagination while `totalCount` says more exist, or a repeated `nextPageKey`. An example clause is `<seen> of <total> loaded; the server returned an empty page while reporting <total> records`.
+
+The remedy to raise the argument is offered only for a cap exit. The stop reason is written per inventory under `truncation_reason` in `core_data/collection_status.json` and in `truncated_inventories`.
+
+Context inventories (the per-user phish-prone average, the account risk score, PhishER enrichment, uploaded policies) only annotate the evidence when truncated. The PhishER inbox clause on KNOWBE4-19 carries the same stop reason.
+
+Failing verdicts stay `fail`.
+
+### Credential redaction
+
+Credentials never reach the bundle regardless of `redact_pii`.
+
+User records drop their free-form fields at collection time, and so does the user embedded in each security test recipient. The dropped fields are `comment`, `custom_field_1` through `custom_field_4`, `custom_date_1`, and `custom_date_2`. They are dropped because nothing downstream reads them and an admin can type anything into them.
+
+Every `core_data/` file then passes through a redaction step. The step replaces the value under any credential-shaped key with `[REDACTED]`, whether the value is a string, a list, or a nested object. It keeps the key so an auditor can see the field existed.
+
+Credential-shaped keys are `token`, `secret`, `password`, `passphrase`, `authorization`, `credential`, `bearer`, `api_key`/`apiKey`, `private_key`, `access_key`, `client_secret`, and their plural and camelCase forms. The step treats `{name, value}` pairs whose name is credential-shaped the same way.
+
+URL-shaped keys (`url`, `uri`, `endpoint`, `link`, `href`) keep only scheme and host, so signed policy and content links cannot carry a token into the bundle.
+
+Non-JSON error bodies are described by content type and length in error text, never echoed. JSON error messages are capped in length.
+
+The assessment tools return findings, summaries, and errors without the raw snapshots.
+
+### Recorded error text
+
+Recorded error text follows one rule at one place. Every collection error, access surface `error`, assessment `errors` entry, `_errors.log` line, and tool failure message is produced by a single function. That function passes the thrown message through the module scrubber.
+
+A `SyntaxError` raised by the transport is recorded as its class name plus a fixed note, because the parser's message quotes the body.
+
+The scrubber removes the configured Reporting API and PhishER tokens at full length in plain, base64, base64url, URL-encoded, form-encoded, and JSON-escaped form. It also removes the value of every credential carrier, whatever the value's shape:
+
+- **Pairs:** A `key=value`, `key: value`, or `"key": "value"` pair loses its value when its key carries a credential word (`api_token`, `KNOWBE4_API_TOKEN`, `phisher_api_token`, and the bearer ids `secret_id`, `session_id`, and `token_id`).
+  - The same applies when the key follows a JSON escape (`\"api_token\": \"v\"`) or a command-line flag (`--api-token v`, `--api-token=v`, `-Dapi_token=v`).
+- **Authorization schemes:** An authorization scheme word in any casing (`Bearer`, `bearer`, `Basic`, `Token`) loses the value after it.
+  - The rule applies alike to a bare token and a whole auth-param list (`Snowflake Token="v"`, `Digest username="v", nonce="v", response="v"`).
+  - The word itself stays only under `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate`, where a challenge's `realm="api"` stays as well.
+  - By contrast, an API-key or token header (`X-Api-Key: splunk rejected`, `X-Phisher-Token: token rejected`) and a credential-named assignment (`token=Bearer v`) lose their whole value.
+- **Cookies:** A cookie header loses its value whole, its `;` separating pairs and attributes.
+- **Query strings:** The query of any URL becomes one marker.
+  - A credential-named parameter of a relative path or bare query string loses its whole value, including a `;` inside the value.
+  - For example, `?token=v;rest` renders `?token=[REDACTED]`, as URLSearchParams reads it.
+- **Webhook and callback URLs:** A webhook or callback URL keeps its origin alone.
+  - A `webhook`-prefixed key is a URL carrier only when its last segment is `url` or `uri`, or the key is the bare `webhook`.
+  - `webhook_secret`, `webhook_token`, and `webhookSecret` are credential keys and lose their value whatever its shape.
+
+A configured secret that is itself a carrier word (`password`, `Authorization`, `Bearer`) is removed after the carriers rather than before them, so the pair or header it names still loses its value.
+
+A name after a path slash (`GET /v1/account: 403`) is a path segment, not a key. A key whose last segment names a setting (`KNOWBE4_BASE_URL`, `KNOWBE4_PHISHER_GRAPHQL_URL`, `phisher_message_limit`, `inactive_days`) keeps a word value and loses only a token-shaped or registered one. So every fixed message and every finding summary, manual-evidence instruction, and bundle document survives the pass unchanged.
+
+The test suite sweeps the strings recorded by healthy and partially denied runs for alterations.
 
 ## Official documentation
 

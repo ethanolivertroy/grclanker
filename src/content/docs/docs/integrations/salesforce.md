@@ -151,51 +151,9 @@ Population sanity gate: every org has a System Administrator profile with Modify
 
 These controls render `manual` because such a view can only come from a credential without `View All Users` or setup visibility. The `population_view_issue` field in the identity summary states the reason.
 
-### Partial and unread inputs
-
-Every finding is gated on the datasets it reads (the `Inputs` column below):
-
-- **Unread input:** The finding is `manual` when its primary dataset was forbidden (401/403 or `INSUFFICIENT_ACCESS`), unavailable (`INVALID_TYPE`, `INVALID_FIELD`), or errored.
-  - Its summary names the dataset and the observed status ("... could not be verified because the TwoFactorMethodsInfo query was forbidden (403 ...)").
-  - `manualEvidence` states what to collect.
-  - A few unread datasets cap a `pass` at `warn` instead, and the summary says what was not checked. SF-04 reads the MFA requirement from `SecuritySettings` and from the Health Check MFA setting. An unread source caps it at `warn` while the other exposes a value. SF-04 is `manual` when neither does. An unread `PermissionSetAssignment` query caps SF-09 at `warn` only while no permission set grants an elevated permission. SF-09 becomes `manual` once one does. An unread `EventLogFile` query caps SF-15 at `warn`.
-- **Truncated input:** The finding's summary carries "Only N of M ... records were read, so the verdict is downgraded", and a `pass` becomes `warn`. A SOQL result is `truncated`, with a known or unknown total, when any of these holds:
-  - It stopped at `record_limit`.
-  - It returned fewer rows than `totalSize`.
-  - It omitted `done` or `totalSize`.
-  - It promised more rows without a `nextRecordsUrl`.
-  - Its cursor stopped advancing.
-  - Its `nextRecordsUrl` pointed at another origin (scheme, host, port) than the instance URL, or carried userinfo. That cursor is refused before it reaches `fetch`.
-- **Partial reads:** A claim over the rows not seen is not made from a partial read.
-  - SF-04 does not count or name users without a method.
-  - SF-07 renders the API Only absence and the users-on-API-profiles count `null` and caps at `warn`.
-  - SF-13 caps at `warn`.
-  - SF-14 renders its failure ratio and every zero count (`brute_force_sources`, `legacy_tls_logins`, `rows_without_login_time`) `null` and caps at `warn`.
-  - A `fail` observed on a visible row (a stale administrator, an expired certificate, a public organization-wide default) stands.
-- **Documented row caps:** `TwoFactorMethodsInfo` and `OauthToken` stop at 2500 rows with `done=true`. A result of 2500 or more rows is therefore treated as truncated (`two_factor_methods_possibly_capped`, `oauth_tokens_possibly_capped`). The SF-04 summary states which signal was observed: the cap, a larger `totalSize`, or `done=false` or a stalled cursor.
-- **Named principals:** Whenever `User` or `TwoFactorMethodsInfo` is partial, SF-04 renders `users_without_registered_mfa_method` and `sample_users_without_mfa` as `null` with a `principals_withheld` note, and stops at `warn`. The visible users without an enrollment row are not named, because the unread rows could hold their enrollments.
-- **Dependent datasets:** `Profile` metadata is only requested for the sensitive profiles found in the `Profile` list. When that list is unread, the metadata dataset carries `not requested: the Profile list was not readable (...)` with the parent's status, and SF-05 and SF-06 render `manual` naming the parent.
-- **Evidence and summaries**
-  - Counts and lists derived from a dataset that was not read render `null` rather than `0` or `[]`, for example `active_users`, `users_seen`, `elevated_assignments`, `oauth_tokens`, and `health_check_risks`.
-  - Each finding's evidence carries the `*_truncated`, `seen`, and `total` values of the datasets it read.
-  - Every area summary carries an `inventories` map naming each dataset as `complete (N rows)`, `partial (N of M rows)`, or `unread (<status>: <error>)`.
-
-#### Cursor and request origins
-
-When a cursor is refused for its origin or its userinfo, the dataset line carries a reason. The reason names the instance origin and the rejected origin only, never the cursor's path, query, or userinfo:
-
-- `User read: partial (3 of 4000 rows; nextRecordsUrl pointed at another origin, https://evil.example.test, than the instance origin https://acme.my.salesforce.com; not followed)`
-- `User read: partial (3 of 4000 rows; nextRecordsUrl carried embedded credentials (userinfo) and pointed at the instance origin https://acme.my.salesforce.com; not followed)`
-
-A cursor that does not parse is refused as `nextRecordsUrl was not a valid URL (instance origin ...); not followed`.
-
-Because the cursor never reaches the transport, no fetch error names it, and the dataset's `core_data` marker carries no `endpoint` built from its path.
-
-Every request resolves against the session's instance URL and is sent to that origin only, without userinfo. A server-supplied absolute URL elsewhere, or one with embedded credentials, is refused before any request and records no endpoint. The refusal uses the same two-origin wording:
-
-`Salesforce request URL pointed at another origin, https://evil.example.test, than the instance origin https://acme.my.salesforce.com; the request was not sent.`
-
 ## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the rules in [Partial and unread inputs](#partial-and-unread-inputs).
 
 | # | Control | Tool | Finding | Inputs | Status semantics |
 |---|---|---|---|---|---|
@@ -263,6 +221,54 @@ The script skips with exit code 0 when no credentials are present. Otherwise it 
 - A finding that also reads a secondary inventory (for example permission set assignments or `EventLogFile`) stops at `warn` or `manual` while that inventory is unreadable.
 - Shield Event Monitoring and Platform Encryption are add-on licenses. Unavailable objects render as manual not-applicable, never pass.
 - The username-password flow is disabled by default in newer orgs and is kept only for legacy compatibility.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Partial and unread inputs
+
+Every finding is gated on the datasets it reads (the `Inputs` column of the [Control coverage](#control-coverage) table):
+
+- **Unread input:** The finding is `manual` when its primary dataset was forbidden (401/403 or `INSUFFICIENT_ACCESS`), unavailable (`INVALID_TYPE`, `INVALID_FIELD`), or errored.
+  - Its summary names the dataset and the observed status ("... could not be verified because the TwoFactorMethodsInfo query was forbidden (403 ...)").
+  - `manualEvidence` states what to collect.
+  - A few unread datasets cap a `pass` at `warn` instead, and the summary says what was not checked. SF-04 reads the MFA requirement from `SecuritySettings` and from the Health Check MFA setting. An unread source caps it at `warn` while the other exposes a value. SF-04 is `manual` when neither does. An unread `PermissionSetAssignment` query caps SF-09 at `warn` only while no permission set grants an elevated permission. SF-09 becomes `manual` once one does. An unread `EventLogFile` query caps SF-15 at `warn`.
+- **Truncated input:** The finding's summary carries "Only N of M ... records were read, so the verdict is downgraded", and a `pass` becomes `warn`. A SOQL result is `truncated`, with a known or unknown total, when any of these holds:
+  - It stopped at `record_limit`.
+  - It returned fewer rows than `totalSize`.
+  - It omitted `done` or `totalSize`.
+  - It promised more rows without a `nextRecordsUrl`.
+  - Its cursor stopped advancing.
+  - Its `nextRecordsUrl` pointed at another origin (scheme, host, port) than the instance URL, or carried userinfo. That cursor is refused before it reaches `fetch`.
+- **Partial reads:** A claim over the rows not seen is not made from a partial read.
+  - SF-04 does not count or name users without a method.
+  - SF-07 renders the API Only absence and the users-on-API-profiles count `null` and caps at `warn`.
+  - SF-13 caps at `warn`.
+  - SF-14 renders its failure ratio and every zero count (`brute_force_sources`, `legacy_tls_logins`, `rows_without_login_time`) `null` and caps at `warn`.
+  - A `fail` observed on a visible row (a stale administrator, an expired certificate, a public organization-wide default) stands.
+- **Documented row caps:** `TwoFactorMethodsInfo` and `OauthToken` stop at 2500 rows with `done=true`. A result of 2500 or more rows is therefore treated as truncated (`two_factor_methods_possibly_capped`, `oauth_tokens_possibly_capped`). The SF-04 summary states which signal was observed: the cap, a larger `totalSize`, or `done=false` or a stalled cursor.
+- **Named principals:** Whenever `User` or `TwoFactorMethodsInfo` is partial, SF-04 renders `users_without_registered_mfa_method` and `sample_users_without_mfa` as `null` with a `principals_withheld` note, and stops at `warn`. The visible users without an enrollment row are not named, because the unread rows could hold their enrollments.
+- **Dependent datasets:** `Profile` metadata is only requested for the sensitive profiles found in the `Profile` list. When that list is unread, the metadata dataset carries `not requested: the Profile list was not readable (...)` with the parent's status, and SF-05 and SF-06 render `manual` naming the parent.
+- **Evidence and summaries**
+  - Counts and lists derived from a dataset that was not read render `null` rather than `0` or `[]`, for example `active_users`, `users_seen`, `elevated_assignments`, `oauth_tokens`, and `health_check_risks`.
+  - Each finding's evidence carries the `*_truncated`, `seen`, and `total` values of the datasets it read.
+  - Every area summary carries an `inventories` map naming each dataset as `complete (N rows)`, `partial (N of M rows)`, or `unread (<status>: <error>)`.
+
+#### Cursor and request origins
+
+When a cursor is refused for its origin or its userinfo, the dataset line carries a reason. The reason names the instance origin and the rejected origin only, never the cursor's path, query, or userinfo:
+
+- `User read: partial (3 of 4000 rows; nextRecordsUrl pointed at another origin, https://evil.example.test, than the instance origin https://acme.my.salesforce.com; not followed)`
+- `User read: partial (3 of 4000 rows; nextRecordsUrl carried embedded credentials (userinfo) and pointed at the instance origin https://acme.my.salesforce.com; not followed)`
+
+A cursor that does not parse is refused as `nextRecordsUrl was not a valid URL (instance origin ...); not followed`.
+
+Because the cursor never reaches the transport, no fetch error names it, and the dataset's `core_data` marker carries no `endpoint` built from its path.
+
+Every request resolves against the session's instance URL and is sent to that origin only, without userinfo. A server-supplied absolute URL elsewhere, or one with embedded credentials, is refused before any request and records no endpoint. The refusal uses the same two-origin wording:
+
+`Salesforce request URL pointed at another origin, https://evil.example.test, than the instance origin https://acme.my.salesforce.com; the request was not sent.`
 
 ### Data-side redaction
 

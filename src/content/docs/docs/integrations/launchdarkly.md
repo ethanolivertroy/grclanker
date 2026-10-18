@@ -139,7 +139,96 @@ Repeated exports never overwrite earlier results.
 
 Output paths are resolved through `resolveSecureOutputPath`, which rejects directory traversal and symlinked parents. Files are written with owner-only permissions.
 
-#### Redaction and projection
+## Finding shape and status semantics
+
+Every finding is `{ id, control, title, severity, status, summary, evidence, mappings, frameworks }`. Finding ids are `LD-01` through `LD-25` and match the spec control numbers.
+
+- `pass`: The API evidence satisfies the control.
+- `warn`: Any of these:
+  - The control is partially satisfied.
+  - The data was too thin to conclude (for example, no production environments detected or an endpoint was unreadable).
+  - A low severity hygiene issue was found.
+- `fail`: The API evidence shows the control is not met.
+- `manual`: The API cannot verify the control. The summary and `evidence.manual_evidence` state exactly what a human must collect.
+
+## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the rules in [How the tools handle evidence](#how-the-tools-handle-evidence).
+
+| # | Spec control | Tool | Finding | Status semantics |
+| --- | --- | --- | --- | --- |
+| 1 | SSO/SAML enforcement enabled for the account | `launchdarkly_assess_identity` | LD-01 | Always `manual`: the API does not expose the account SSO setting. Evidence includes SCIM-provisioned member counts, members with passwords, and SAML/SCIM/MFA audit entries. |
+| 2 | MFA required for all members | `launchdarkly_assess_identity` | LD-02 | `pass` when every active member reports `mfa: enabled`; `fail` otherwise; `warn` when no members were readable. |
+| 3 | No members with Owner role beyond minimum required | `launchdarkly_assess_identity` | LD-03 | `fail` when Owners exceed `max_owners`; `warn` when Admins exceed `max_admins`. |
+| 4 | Custom roles follow least-privilege (no wildcard actions) | `launchdarkly_assess_access_control` | LD-04 | `fail` when any allow statement uses wildcard actions or open-ended `notActions`; `warn` when no custom roles exist. |
+| 5 | Custom role policies deny sensitive actions by default | `launchdarkly_assess_access_control` | LD-05 | `fail` when a role allows account, member, role, token, relay, webhook, or team administration actions without an explicit deny; `warn` when roles use reader base permissions. |
+| 6 | All members assigned to teams | `launchdarkly_assess_identity` | LD-06 | `fail` when active members have no team; `warn` when no teams exist. |
+| 7 | Team permissions use custom roles, not built-in admin | `launchdarkly_assess_identity` | LD-07 | `fail` when sampled teams have no custom roles; `warn` when no teams exist; `pass` only when every sampled team has a custom role and the members listing is complete, so the count of members still holding built-in Admin or Owner base roles is known. A truncated members listing demotes the clean verdict to `warn` with the built-in role holders stated as unknown and `built_in_admin_or_owner_members` rendered `null`; `manual` when teams or members cannot be read. |
+| 8 | API access tokens have expiration dates set | `launchdarkly_assess_access_control` | LD-08 | `fail` when any visible token lacks `expiry`; `warn` when tokens were not readable or the inventory is partial (see below). |
+| 9 | No API tokens unused beyond 90 days | `launchdarkly_assess_access_control` | LD-09 | `fail` when `lastUsed` (or creation) is older than `stale_token_days`; `warn` on a partial inventory. |
+| 10 | Service tokens scoped to minimum required roles | `launchdarkly_assess_access_control` | LD-10 | `fail` for Owner/Admin base role or wildcard inline policies; `warn` for the Writer base role, for a partial or unknown inventory (including an empty listing), or when the only Admin service token is the one running the assessment (disclosed in the summary). |
+| 11 | Personal tokens limited to individual member scope | `launchdarkly_assess_access_control` | LD-11 | `fail` when personal tokens are not tied to a current member in a complete member listing; `warn` when a token's base role outranks its member's role, when the member listing is truncated so unmatched tokens cannot be confirmed as orphaned, or when the inventory is partial or unknown (including an empty listing). |
+| 12 | Audit log retention (>= 90 days queryable) | `launchdarkly_assess_monitoring_integrations` | LD-12 | `pass` when entries older than `retention_days` are returned and the recent audit log query was read; `warn` when the retention probe returned none but recent entries exist, or when the probe returned entries while the recent audit log query was unreadable; `fail` when a readable audit log returned no entries at all (the retention probe and the recent query both empty); `manual` when the retention probe is unreadable (including when no audit log query is readable) or when the probe returned nothing and the recent query was unreadable. The summary names each unreadable query with its request and error. |
+| 13 | Audit log events present for critical actions | `launchdarkly_assess_monitoring_integrations` | LD-13 | `pass` when member or role entries carry critical actions and both queries were read; `warn` when no critical actions were returned, or when critical actions were seen but one of the two queries was unreadable; `manual` when both the member and the role query are unreadable (including when no audit log query is readable). The summary names each unreadable query with its request and error. |
+| 14 | Flag targeting rules do not expose individual user keys in production | `launchdarkly_assess_flag_hygiene` | LD-14 | `fail` when production flags carry `targets` or `contextTargets` values; `warn` when no production flags were readable. |
+| 15 | Stale flags identified (> 30 days) | `launchdarkly_assess_flag_hygiene` | LD-15 | `warn` when flags are inactive or unrequested beyond `stale_flag_days`. |
+| 16 | Environment-level access controls restrict production modifications | `launchdarkly_assess_environment_governance` | LD-16 | `pass` only when every production environment is restricted by a custom role statement (a `deny` or `notResources` entry whose resource specifier matches it, or a role whose environment-scoped allows never cover it); `warn` when the environment relies on the `critical` designation alone, which only enables safeguards; `fail` when a non-critical production environment has no role restriction. |
+| 17 | Approval workflows enabled for production changes | `launchdarkly_assess_environment_governance` | LD-17 | `fail` when `approvalSettings.required` is false; `warn` when the gate is weakened by `bypassApprovalsForPendingChanges`, `canReviewOwnRequest`, `canApplyDeclinedChanges` (one approval is enough even when other reviewers declined), or a non-empty `requiredApprovalTags` list (untagged flags skip approval). The normalized `approval_settings` block, including `minNumApprovals`, is included in `production_environment_settings` evidence. |
+| 18 | Relay proxy configurations use secure mode | `launchdarkly_assess_monitoring_integrations` | LD-18 | `fail` for wildcard project or environment scope or referenced production environments without secure mode; `warn` when unmodified beyond `relay_config_max_age_days`; `manual` when no automatic configurations exist. |
+| 19 | SDK keys rotated within policy period (< 365 days) | `launchdarkly_assess_environment_governance` | LD-19 | `fail` when server-side keys exceed `sdk_key_max_age_days`; `manual` when the beta SDK keys endpoint is unreadable. |
+| 20 | Integrations use least-privilege scopes | `launchdarkly_assess_monitoring_integrations` | LD-20 | `fail` when enabled subscriptions allow all actions across all projects; `manual` when no subscriptions were found for the probed integration keys. |
+| 21 | Webhook endpoints use HTTPS and signing is enabled | `launchdarkly_assess_monitoring_integrations` | LD-21 | `fail` when an enabled webhook uses plain HTTP or has no secret; `warn` when only disabled webhooks are insecure or the endpoint was unreadable. |
+| 22 | No test/temporary projects in production account | `launchdarkly_assess_environment_governance` | LD-22 | `warn` when project keys, names, or tags match `test_project_pattern`. |
+| 23 | Environment critical settings (secure mode, default TTL) configured | `launchdarkly_assess_environment_governance` | LD-23 | `fail` when production lacks secure mode; `warn` for zero TTL or missing confirm changes / required comments. |
+| 24 | Member email domains match organization domain policy | `launchdarkly_assess_identity` | LD-24 | `fail` when active members use unapproved domains; `manual` when no `allowed_domains` policy is supplied (the observed domain distribution is included). |
+| 25 | Flag prerequisites do not create circular dependencies | `launchdarkly_assess_flag_hygiene` | LD-25 | `fail` when the prerequisite graph contains a cycle. |
+
+## Framework mappings
+
+Each finding carries the eight framework references from the spec compliance table as `mappings` and as a `frameworks` object keyed by `fedramp`, `cmmc`, `soc2`, `cis`, `pci_dss`, `stig`, `irap`, and `ismap`.
+
+For example, control 1 carries `FedRAMP IA-2(1)`, `CMMC L2 3.5.3`, `SOC 2 CC6.1`, `CIS 16.2`, `PCI-DSS 8.4.1`, `STIG SRG-APP-000148`, `IRAP ISM-1546`, and `ISMAP CPS-7.1`.
+
+The export bundle renders one report per framework plus a unified matrix.
+
+## Live smoke test
+
+```bash
+LAUNCHDARKLY_API_TOKEN=api-... npm --prefix cli run test:launchdarkly:live
+```
+
+The script prints a skip message and exits 0 when no token or config file is present.
+
+Otherwise it runs `launchdarkly_check_access` and the access control assessment, and prints surface status and finding summaries. It never writes to the account.
+
+## Limitations and manual controls
+
+- Control 1 is always `manual`. LaunchDarkly does not expose the account SSO or Require SSO setting through the REST API. Confirm it in Organization settings > Security and capture a screenshot or IdP configuration.
+- Control 2 evaluates per-member `mfa` status. The account level "Require MFA" toggle is not exposed by the API, so the finding asks you to confirm it in Organization settings, even when every member has MFA enabled.
+- Control 19 depends on the beta SDK keys endpoint. When it is unavailable, record the creation date of each active server-side SDK key from Organization settings > SDK keys.
+- Control 20 probes a default list of integration keys, because the API has no endpoint that enumerates every integration subscription.
+  - Default keys: `datadog`, `dynatrace`, `elastic`, `honeycomb`, `logdna`, `msteams`, `new-relic-apm`, `signalfx`, `splunk`.
+  - Pass `integration_keys` for other integrations.
+- Control 18 covers Relay Proxy automatic configurations only. Relay Proxy deployments that use static SDK keys must be reviewed manually.
+- The API caps audit log queries at 20 entries per request. Retention is demonstrated by probing for any entry older than `retention_days`, rather than by enumerating the entire log.
+- Listing every member's personal tokens requires an Admin or Owner token.
+  - `GET /api/v2/tokens?showAll=true` returns other members' personal tokens only when the caller has the Admin role.
+  - So the inspector resolves the caller through `/api/v2/caller-identity` and looks up the caller's own token and member base roles in the listing. It treats personal tokens from other members as proof of a complete inventory.
+  - An Admin personal token whose member record cannot be resolved (members unreadable or truncated) resolves to unknown rather than full. An empty listing resolves to unknown. A truncated token listing resolves to partial.
+  - When the inventory is partial or its completeness is unknown, controls 8 through 11 never `pass`, even when zero tokens are visible:
+    - A clean result becomes `warn` with the caveat in the finding summary.
+    - Failures stay `fail`.
+    - Every finding carries a `token_inventory` evidence block.
+- Listing limits are verdict boundaries, not silent caps.
+  - Defaults are 1000 members, 100 teams, 200 roles, 500 tokens, 50 projects, 50 environments per project, and 500 flags per environment.
+  - When an account exceeds a limit, the affected findings `warn` with the seen versus total counts and name the argument to raise. They never `pass` on a slice of the data.
+- Audit log sampling is intentional (20 entries per query) and is not treated as truncation. Controls 12 and 13 are presence probes rather than inventory claims.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Redaction and projection
 
 Credentials never reach the bundle. Every `core_data/` snapshot (including `access_check.json`) passes through a redaction step:
 
@@ -158,18 +247,6 @@ Variation values and targeting clause values are never written.
 Non-JSON error bodies are described by content type and length in error text, never echoed.
 
 The assessment tools return findings, summaries, and errors without the raw snapshots.
-
-## Finding shape and status semantics
-
-Every finding is `{ id, control, title, severity, status, summary, evidence, mappings, frameworks }`. Finding ids are `LD-01` through `LD-25` and match the spec control numbers.
-
-- `pass`: The API evidence satisfies the control.
-- `warn`: Any of these:
-  - The control is partially satisfied.
-  - The data was too thin to conclude (for example, no production environments detected or an endpoint was unreadable).
-  - A low severity hygiene issue was found.
-- `fail`: The API evidence shows the control is not met.
-- `manual`: The API cannot verify the control. The summary and `evidence.manual_evidence` state exactly what a human must collect.
 
 ### Unreadable inventories
 
@@ -304,77 +381,6 @@ A positive count from a truncated listing renders as the lower bound observed, a
 Item-level detail from a truncated token listing is withheld. LD-08 renders `tokens_without_expiry` as `null` beside `tokens_without_expiry_count`, and the names return from a complete listing. So a truncated page never names its part of the inventory as the whole.
 
 The `core_data/` snapshots record the same `truncated`, `seen`, and `total` fields per collection. The executive summary lists every truncated listing.
-
-## Control coverage
-
-| # | Spec control | Tool | Finding | Status semantics |
-| --- | --- | --- | --- | --- |
-| 1 | SSO/SAML enforcement enabled for the account | `launchdarkly_assess_identity` | LD-01 | Always `manual`: the API does not expose the account SSO setting. Evidence includes SCIM-provisioned member counts, members with passwords, and SAML/SCIM/MFA audit entries. |
-| 2 | MFA required for all members | `launchdarkly_assess_identity` | LD-02 | `pass` when every active member reports `mfa: enabled`; `fail` otherwise; `warn` when no members were readable. |
-| 3 | No members with Owner role beyond minimum required | `launchdarkly_assess_identity` | LD-03 | `fail` when Owners exceed `max_owners`; `warn` when Admins exceed `max_admins`. |
-| 4 | Custom roles follow least-privilege (no wildcard actions) | `launchdarkly_assess_access_control` | LD-04 | `fail` when any allow statement uses wildcard actions or open-ended `notActions`; `warn` when no custom roles exist. |
-| 5 | Custom role policies deny sensitive actions by default | `launchdarkly_assess_access_control` | LD-05 | `fail` when a role allows account, member, role, token, relay, webhook, or team administration actions without an explicit deny; `warn` when roles use reader base permissions. |
-| 6 | All members assigned to teams | `launchdarkly_assess_identity` | LD-06 | `fail` when active members have no team; `warn` when no teams exist. |
-| 7 | Team permissions use custom roles, not built-in admin | `launchdarkly_assess_identity` | LD-07 | `fail` when sampled teams have no custom roles; `warn` when no teams exist; `pass` only when every sampled team has a custom role and the members listing is complete, so the count of members still holding built-in Admin or Owner base roles is known. A truncated members listing demotes the clean verdict to `warn` with the built-in role holders stated as unknown and `built_in_admin_or_owner_members` rendered `null`; `manual` when teams or members cannot be read. |
-| 8 | API access tokens have expiration dates set | `launchdarkly_assess_access_control` | LD-08 | `fail` when any visible token lacks `expiry`; `warn` when tokens were not readable or the inventory is partial (see below). |
-| 9 | No API tokens unused beyond 90 days | `launchdarkly_assess_access_control` | LD-09 | `fail` when `lastUsed` (or creation) is older than `stale_token_days`; `warn` on a partial inventory. |
-| 10 | Service tokens scoped to minimum required roles | `launchdarkly_assess_access_control` | LD-10 | `fail` for Owner/Admin base role or wildcard inline policies; `warn` for the Writer base role, for a partial or unknown inventory (including an empty listing), or when the only Admin service token is the one running the assessment (disclosed in the summary). |
-| 11 | Personal tokens limited to individual member scope | `launchdarkly_assess_access_control` | LD-11 | `fail` when personal tokens are not tied to a current member in a complete member listing; `warn` when a token's base role outranks its member's role, when the member listing is truncated so unmatched tokens cannot be confirmed as orphaned, or when the inventory is partial or unknown (including an empty listing). |
-| 12 | Audit log retention (>= 90 days queryable) | `launchdarkly_assess_monitoring_integrations` | LD-12 | `pass` when entries older than `retention_days` are returned and the recent audit log query was read; `warn` when the retention probe returned none but recent entries exist, or when the probe returned entries while the recent audit log query was unreadable; `fail` when a readable audit log returned no entries at all (the retention probe and the recent query both empty); `manual` when the retention probe is unreadable (including when no audit log query is readable) or when the probe returned nothing and the recent query was unreadable. The summary names each unreadable query with its request and error. |
-| 13 | Audit log events present for critical actions | `launchdarkly_assess_monitoring_integrations` | LD-13 | `pass` when member or role entries carry critical actions and both queries were read; `warn` when no critical actions were returned, or when critical actions were seen but one of the two queries was unreadable; `manual` when both the member and the role query are unreadable (including when no audit log query is readable). The summary names each unreadable query with its request and error. |
-| 14 | Flag targeting rules do not expose individual user keys in production | `launchdarkly_assess_flag_hygiene` | LD-14 | `fail` when production flags carry `targets` or `contextTargets` values; `warn` when no production flags were readable. |
-| 15 | Stale flags identified (> 30 days) | `launchdarkly_assess_flag_hygiene` | LD-15 | `warn` when flags are inactive or unrequested beyond `stale_flag_days`. |
-| 16 | Environment-level access controls restrict production modifications | `launchdarkly_assess_environment_governance` | LD-16 | `pass` only when every production environment is restricted by a custom role statement (a `deny` or `notResources` entry whose resource specifier matches it, or a role whose environment-scoped allows never cover it); `warn` when the environment relies on the `critical` designation alone, which only enables safeguards; `fail` when a non-critical production environment has no role restriction. |
-| 17 | Approval workflows enabled for production changes | `launchdarkly_assess_environment_governance` | LD-17 | `fail` when `approvalSettings.required` is false; `warn` when the gate is weakened by `bypassApprovalsForPendingChanges`, `canReviewOwnRequest`, `canApplyDeclinedChanges` (one approval is enough even when other reviewers declined), or a non-empty `requiredApprovalTags` list (untagged flags skip approval). The normalized `approval_settings` block, including `minNumApprovals`, is included in `production_environment_settings` evidence. |
-| 18 | Relay proxy configurations use secure mode | `launchdarkly_assess_monitoring_integrations` | LD-18 | `fail` for wildcard project or environment scope or referenced production environments without secure mode; `warn` when unmodified beyond `relay_config_max_age_days`; `manual` when no automatic configurations exist. |
-| 19 | SDK keys rotated within policy period (< 365 days) | `launchdarkly_assess_environment_governance` | LD-19 | `fail` when server-side keys exceed `sdk_key_max_age_days`; `manual` when the beta SDK keys endpoint is unreadable. |
-| 20 | Integrations use least-privilege scopes | `launchdarkly_assess_monitoring_integrations` | LD-20 | `fail` when enabled subscriptions allow all actions across all projects; `manual` when no subscriptions were found for the probed integration keys. |
-| 21 | Webhook endpoints use HTTPS and signing is enabled | `launchdarkly_assess_monitoring_integrations` | LD-21 | `fail` when an enabled webhook uses plain HTTP or has no secret; `warn` when only disabled webhooks are insecure or the endpoint was unreadable. |
-| 22 | No test/temporary projects in production account | `launchdarkly_assess_environment_governance` | LD-22 | `warn` when project keys, names, or tags match `test_project_pattern`. |
-| 23 | Environment critical settings (secure mode, default TTL) configured | `launchdarkly_assess_environment_governance` | LD-23 | `fail` when production lacks secure mode; `warn` for zero TTL or missing confirm changes / required comments. |
-| 24 | Member email domains match organization domain policy | `launchdarkly_assess_identity` | LD-24 | `fail` when active members use unapproved domains; `manual` when no `allowed_domains` policy is supplied (the observed domain distribution is included). |
-| 25 | Flag prerequisites do not create circular dependencies | `launchdarkly_assess_flag_hygiene` | LD-25 | `fail` when the prerequisite graph contains a cycle. |
-
-## Framework mappings
-
-Each finding carries the eight framework references from the spec compliance table as `mappings` and as a `frameworks` object keyed by `fedramp`, `cmmc`, `soc2`, `cis`, `pci_dss`, `stig`, `irap`, and `ismap`.
-
-For example, control 1 carries `FedRAMP IA-2(1)`, `CMMC L2 3.5.3`, `SOC 2 CC6.1`, `CIS 16.2`, `PCI-DSS 8.4.1`, `STIG SRG-APP-000148`, `IRAP ISM-1546`, and `ISMAP CPS-7.1`.
-
-The export bundle renders one report per framework plus a unified matrix.
-
-## Live smoke test
-
-```bash
-LAUNCHDARKLY_API_TOKEN=api-... npm --prefix cli run test:launchdarkly:live
-```
-
-The script prints a skip message and exits 0 when no token or config file is present.
-
-Otherwise it runs `launchdarkly_check_access` and the access control assessment, and prints surface status and finding summaries. It never writes to the account.
-
-## Limitations and manual controls
-
-- Control 1 is always `manual`. LaunchDarkly does not expose the account SSO or Require SSO setting through the REST API. Confirm it in Organization settings > Security and capture a screenshot or IdP configuration.
-- Control 2 evaluates per-member `mfa` status. The account level "Require MFA" toggle is not exposed by the API, so the finding asks you to confirm it in Organization settings, even when every member has MFA enabled.
-- Control 19 depends on the beta SDK keys endpoint. When it is unavailable, record the creation date of each active server-side SDK key from Organization settings > SDK keys.
-- Control 20 probes a default list of integration keys, because the API has no endpoint that enumerates every integration subscription.
-  - Default keys: `datadog`, `dynatrace`, `elastic`, `honeycomb`, `logdna`, `msteams`, `new-relic-apm`, `signalfx`, `splunk`.
-  - Pass `integration_keys` for other integrations.
-- Control 18 covers Relay Proxy automatic configurations only. Relay Proxy deployments that use static SDK keys must be reviewed manually.
-- The API caps audit log queries at 20 entries per request. Retention is demonstrated by probing for any entry older than `retention_days`, rather than by enumerating the entire log.
-- Listing every member's personal tokens requires an Admin or Owner token.
-  - `GET /api/v2/tokens?showAll=true` returns other members' personal tokens only when the caller has the Admin role.
-  - So the inspector resolves the caller through `/api/v2/caller-identity` and looks up the caller's own token and member base roles in the listing. It treats personal tokens from other members as proof of a complete inventory.
-  - An Admin personal token whose member record cannot be resolved (members unreadable or truncated) resolves to unknown rather than full. An empty listing resolves to unknown. A truncated token listing resolves to partial.
-  - When the inventory is partial or its completeness is unknown, controls 8 through 11 never `pass`, even when zero tokens are visible:
-    - A clean result becomes `warn` with the caveat in the finding summary.
-    - Failures stay `fail`.
-    - Every finding carries a `token_inventory` evidence block.
-- Listing limits are verdict boundaries, not silent caps.
-  - Defaults are 1000 members, 100 teams, 200 roles, 500 tokens, 50 projects, 50 environments per project, and 500 flags per environment.
-  - When an account exceeds a limit, the affected findings `warn` with the seen versus total counts and name the argument to raise. They never `pass` on a slice of the data.
-- Audit log sampling is intentional (20 entries per query) and is not treated as truncation. Controls 12 and 13 are presence probes rather than inventory claims.
 
 ## Official documentation consulted
 

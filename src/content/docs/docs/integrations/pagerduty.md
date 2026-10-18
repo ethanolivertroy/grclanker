@@ -50,16 +50,6 @@ The `api_key` and `token` aliases for `api_token` are also accepted as tool argu
 
 When more than one credential resolves, the REST API key wins, then the OAuth bearer token, then client credentials.
 
-### Request handling
-
-Every request carries `Accept: application/vnd.pagerduty+json;version=2`.
-
-The client follows classic `limit`/`offset` pagination using the `more` flag (100 per page, capped at the documented 10,000 record ceiling). It follows cursor pagination (`cursor`, `next_cursor`) on audit records and incident workflow triggers.
-
-`GET /change_events` declares no `more` or `total` field. So the client keeps reading offset pages until a page comes back shorter than requested. A full final page at the requested limit is recorded as incomplete.
-
-The client retries 429 and 5xx responses, waiting for the `ratelimit-reset` or `Retry-After` value when present. It redacts tokens from error messages.
-
 ## Run it
 
 After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
@@ -134,6 +124,8 @@ Files are written with mode `0600` and directories with `0700`.
 
 ## Control coverage
 
+Verdicts on unread, partial, or truncated data follow the [verdict safety rules](#verdict-safety-rules).
+
 Finding ids are `PD-01` through `PD-25`, one per spec control.
 
 Status semantics:
@@ -142,6 +134,100 @@ Status semantics:
 - `warn`: Partial or degraded evidence that should be reviewed.
 - `fail`: The API evidence contradicts the control.
 - `manual`: The API cannot prove the control, or the endpoint was unreadable. The finding summary states exactly which evidence to collect from the PagerDuty web app.
+
+### Status semantics by control
+
+The `Inputs` column names the datasets each finding reads, using the labels of the summary's `inventories` map.
+
+Input rules:
+
+- An unread primary input renders the finding `manual` and names the endpoint and error, with two exceptions. On `PD-04`, unread `abilities` cap a `pass` at `warn`. On `PD-01`, unread `users` only render the user evidence `null`.
+- An unread secondary input caps the finding at `warn`. The exception is `team members` on `PD-04`, which feeds only the manager sample, so the verdict does not depend on it.
+- A partial input downgrades `pass` to `warn` with `evidence.partial_view`.
+- A dataset that was `not requested` because its parent list was unread is treated as unread.
+
+| # | Control | Tool | Finding | Inputs | Status semantics |
+|---|---------|------|---------|--------|------------------|
+| 1 | SSO enforcement enabled | `pagerduty_assess_access_control` | `PD-01` | `abilities`, `users` | `fail` when abilities are readable, non-empty, and lack `sso`; otherwise `manual` (the API does not expose whether SSO login is required; collect Account Settings > Single Sign-On). `sso_ability` and `abilities` are `null` when `/abilities` is unread; `users_created_via_sso` and `users_not_created_via_sso` are `null` with `principals_withheld` unless `users` was read to completion |
+| 2 | User roles follow least privilege | `pagerduty_assess_access_control` | `PD-02` | `users` | `pass` when owner plus admin users are within `max_admins` (default 5) and every user has a `role`, `warn` when some users have no role field, `fail` above the threshold, `manual` when `users` is unread or empty. A partial user list downgrades `pass` to `warn` and renders `privileged_users` and `users_without_role` as `null` with `principals_withheld`; `role_counts` is `null` when `users` is unread |
+| 3 | Owner role limited to the account owner | `pagerduty_assess_access_control` | `PD-03` | `users` | `pass` for exactly one owner, `warn` for none or for users without a role, `fail` for more than one, `manual` when `users` is unread or empty. A partial user list downgrades `pass` to `warn` and renders `owners` and `users_without_role` as `null` with `principals_withheld` |
+| 4 | Team-based access configured | `pagerduty_assess_access_control` | `PD-04` | `users`, `teams`, `abilities`; secondary `team members` | `fail` with zero teams on a complete read, a `teams` ability absent from a readable, non-empty ability list (a complete observation, so it fails even beside a truncated team page), or more than half of users teamless, `warn` for some teamless users, `pass` when everyone belongs to a team (capped at `warn` while `/abilities` is unread or empty, since the `teams` ability cannot be confirmed), `manual` when `users` is unread or empty or `teams` is unread, and `manual` (not `fail`) when the team page was truncated before any team was visible: the sentence names the truncation, because the unread teams could contradict the absence. A partial user or team list downgrades `pass` to `warn`; `users_without_teams` is `null` with `principals_withheld` unless `users` is complete; `team_manager_assignments` and `team_member_lists_truncated` are `null` when the member lists were unread or not requested (they are not requested when `/teams` was unread), `team_member_lists_truncated` is also `null` when the team list is partial and would otherwise report an empty list, and the count is `null` when a truncated member list would otherwise report zero managers |
+| 5 | Services have escalation policies | `pagerduty_assess_incident_response` | `PD-05` | `services` | `pass` when every active service references a policy, `fail` otherwise, `manual` when `services` is unread, empty, or every returned service is disabled. A partial service list downgrades `pass` to `warn`; `active_services`, `services_without_policy`, and `disabled_services` are `null` when `services` is unread |
+| 6 | Escalation policies have multiple levels | `pagerduty_assess_incident_response` | `PD-06` | `escalation policies` | `pass` when every attached policy has two or more rules, `warn` otherwise, `manual` when `escalation policies` is unread, empty, or none is attached to a service. A partial policy list downgrades `pass` to `warn`; `attached_policies` and `single_level_policies` are `null` when the list is unread |
+| 7 | Escalation does not end without notification | `pagerduty_assess_incident_response` | `PD-07` | `escalation policies` | `fail` for policies without rules or rules without targets, `warn` for attached policies with `num_loops` 0 or absent, else `pass`; `manual` when the policy list is unread, empty, or none is attached. A partial policy list downgrades `pass` to `warn`; the three policy name lists are `null` when the list is unread |
+| 8 | Schedules provide 24/7 coverage | `pagerduty_assess_oncall_coverage` | `PD-08` | `schedules`, `schedule details` | `pass` when rendered final schedules have no gaps over `coverage_days` (default 30), `warn` when entries missing a start or end were excluded, `fail` on gaps, `manual` when `schedules` is unread or empty, when the detail reads failed or were not requested (they are not requested when `/schedules` was unread), or when no schedule is attached to an escalation policy. A partial schedule list downgrades `pass` to `warn`; `attached_schedules`, `schedules_with_gaps`, `schedules_with_undated_entries`, and `unattached_schedules` are `null` when either input is unread |
+| 9 | Schedules have multiple participants | `pagerduty_assess_oncall_coverage` | `PD-09` | `schedules`, `schedule details` | `pass` when every attached schedule has two or more distinct users, else `fail`; `manual` on the same gate as `PD-08`. A partial schedule list downgrades `pass` to `warn`; `attached_schedules` and `single_participant_schedules` are `null` when either input is unread |
+| 10 | Incident response automation configured | `pagerduty_assess_incident_response` | `PD-10` | `incident workflows`, `incident workflow triggers`; secondary `services` | `pass` with at least one `is_enabled: true` workflow, at least one enabled trigger, and no unresolved trigger; a trigger is enabled when its parent workflow (`trigger.workflow.id`) was returned with `is_enabled: true`, or when it carries `is_disabled: false` and no parent is available, and it is disabled whenever `is_disabled` is `true` or the parent has `is_enabled: false`; `warn` when workflows, triggers, or legacy response plays exist but none is verified enabled, or when a trigger without `is_disabled` cannot be matched to a returned workflow (unresolved); `fail` when the readable endpoints return none; `manual` when `incident workflows` or `incident workflow triggers` is unread (a 402 or plan message is reported as a plan limitation); capped at `warn` while `services` is unread because legacy response play references cannot be counted, with `services_inventory` naming its state. The response play count is stated bare (`N services still reference one`) only from a complete service read; a partial read names the visible services and the truncation (`N of the S visible services still reference one (...; the unread services are not counted)`) and never claims that no service references a response play. A partial workflow or trigger list downgrades `pass` to `warn`; the trigger counts are `null` when triggers or workflows are unread and `services_with_legacy_response_plays` is `null` when `services` is unread or when a partial service read would otherwise report zero; the summary states enabled, disabled, and unresolved trigger counts |
+| 11 | Audit logging active | `pagerduty_assess_audit_logging` | `PD-11` | `audit records` | `pass` when records dated inside `audit_window_days` exist, `warn` when readable but empty (the `returned zero records` sentence is stated only from a complete read; a read truncated before any record was visible carries the partial view instead and does not claim that logging is inactive) or undated, `manual` when `audit records` is unread (HTTP 402 or a plan message is reported as the Audit Trail feature missing from the plan). A partial record list downgrades `pass` to `warn`; `records_dated_in_window`, `records_missing_execution_time`, `records_outside_window`, and `method_types` are `null` when the records are unread, and `null` when the read is partial and the value would otherwise assert absence |
+| 12 | Audit log retention | `pagerduty_assess_audit_logging` | `PD-12` | `audit records`; secondary `retention probe records` | `pass` when the 11-to-12 month probe returns dated records, `warn` when the probe is empty (the `No audit records were returned` sentence is stated only from a complete probe; a probe truncated before any record was visible carries the partial view instead and does not claim that retention is short), undated, or unread, `manual` when `min_retention_days` exceeds the documented 365 days or `audit records` is unread. A partial recent record list downgrades `pass` to `warn` (the probe is a deliberate 25-record sample, so a truncated probe that returned a dated record still passes); `probe_records_dated_in_window` and `probe_records_missing_execution_time` are `null` when the probe is unread |
+| 13 | API keys rotated | `pagerduty_assess_audit_logging` | `PD-13` | `audit records` | Always `manual` (no API key inventory endpoint). `api_tokens_observed` lists distinct truncated tokens seen in audit records only when the record list was read to completion; when it is unread or partial the summary says the token set is unknown and the list is `null` with `principals_withheld` |
+| 14 | Webhook endpoints use HTTPS | `pagerduty_assess_integration_security` | `PD-14` | `extensions`, `webhook subscriptions` | `pass` when all extension `endpoint_url` and subscription `delivery_method.url` values are `https`, `fail` otherwise, `manual` when either list is unread or both are empty (no webhooks exist). A partial list downgrades `pass` to `warn`; `insecure_extensions`, `insecure_subscriptions`, and `temporarily_disabled_deliveries` are `null` when their source is unread |
+| 15 | Webhook signatures verified | `pagerduty_assess_integration_security` | `PD-15` | `extensions`, `webhook subscriptions` | `warn` when unsigned legacy generic webhook extensions remain, extensions lack a schema, no subscription has `active: true`, or a subscription omits the `active` flag; `pass` only when `/extensions` was readable (count stated), none is a legacy webhook, and at least one v3 subscription is active (confirm receivers verify `X-PagerDuty-Signature`); `manual` when either list is unread or both are empty. A partial list downgrades `pass` to `warn`; the extension and subscription counts and lists are `null` when their source is unread |
+| 16 | Integration permissions scoped | `pagerduty_assess_integration_security` | `PD-16` | `services` | `pass` when no legacy inbound integrations or unfiltered email integrations exist and every service returned its integrations, else `warn`; `manual` when `services` is unread or empty. A partial service list downgrades `pass` to `warn`; `integrations`, `legacy_integrations`, `unfiltered_email_integrations`, and `services_without_integration_expansion` are `null` when `services` is unread |
+| 17 | Notification rules for all users | `pagerduty_assess_oncall_coverage` | `PD-17` | `users` | `pass` when every responder has rules including a high-urgency rule, `fail` when more than a quarter have none, `warn` otherwise or when users lack a role, `manual` when `users` is unread or empty or no returned user has a responder role. A partial user list downgrades `pass` to `warn` and renders `responders_without_rules`, `responders_without_high_urgency_rule`, and `users_without_role` as `null` with `principals_withheld`; `responders` is `null` when `users` is unread |
+| 18 | Contact methods for on-call users | `pagerduty_assess_oncall_coverage` | `PD-18` | `users`, `on-call entries` | `fail` when an on-call user has only blocked or disabled methods, `warn` for email-only users, methods whose `enabled`/`blacklisted` flags are absent, or on-call users outside the returned user set, `pass` when every on-call user has a phone or SMS method with `enabled: true` and `blacklisted: false` or a push method with `blacklisted: false`, `manual` when `users` is unread or empty, `on-call entries` is unread or empty (nobody is on call), or no on-call user could be matched to a returned user. A partial user or on-call list downgrades `pass` to `warn` and renders the three on-call user lists as `null` with `principals_withheld`; `current_oncall_users` and `oncall_users_not_in_returned_set` are `null` when either input is unread |
+| 19 | Service urgency rules configured | `pagerduty_assess_incident_response` | `PD-19` | `services` | `fail` when a service lacks an urgency rule, `warn` when every service is constant high, else `pass`; `manual` when `services` is unread, empty, or all disabled. A partial service list downgrades `pass` to `warn`; `active_services`, `services_without_urgency_rule`, and `urgency_modes` are `null` when `services` is unread |
+| 20 | Custom incident priorities defined | `pagerduty_assess_incident_response` | `PD-20` | `priorities` | `pass` when priorities exist, `fail` when a complete read of the readable endpoint returns none, `manual` when `priorities` is unread (a 402 or plan message is reported as a plan limitation), and `manual` (not `fail`) with the partial-view sentence when the page was truncated before any priority was visible. A partial priority list downgrades `pass` to `warn`; `priorities` is `null` when unread, and `null` when the read is partial and would otherwise report an empty list |
+| 21 | Service dependencies mapped | `pagerduty_assess_integration_security` | `PD-21` | `business services`; secondary `business service dependencies` | `fail` with zero business services on a complete read, `warn` when some have no dependencies or the dependency reads failed (the failure is named in the summary), else `pass`; `manual` when `business services` is unread (a 402 or plan message is reported as a plan limitation; the dependency reads are then not requested), and `manual` (not `fail`) with the partial-view sentence when the page was truncated before any business service was visible. A partial business service list downgrades `pass` to `warn`; `unmapped_business_services` is `null` when the dependency reads failed or the list is unread |
+| 22 | Acknowledgement timeouts configured | `pagerduty_assess_incident_response` | `PD-22` | `services` | `pass` when every active service sets one, else `warn`; `manual` when `services` is unread, empty, or all disabled. A partial service list downgrades `pass` to `warn`; `active_services` and `services_without_ack_timeout` are `null` when `services` is unread |
+| 23 | Auto-resolve timeouts configured | `pagerduty_assess_incident_response` | `PD-23` | `services` | `pass` when every active service sets one, else `warn`; `manual` when `services` is unread, empty, or all disabled. A partial service list downgrades `pass` to `warn`; `active_services` and `services_without_auto_resolve` are `null` when `services` is unread |
+| 24 | Analytics access restricted | `pagerduty_assess_access_control` | `PD-24` | `abilities`, `users` | Always `manual` (per-role analytics permissions are not exposed); `analytics_abilities` is `null` when `/abilities` is unread and `role_counts` is `null` when `users` is unread |
+| 25 | Change events tracking enabled | `pagerduty_assess_integration_security` | `PD-25` | `change events`, `services` | `pass` when change events with a `timestamp` inside `change_event_days` arrived and the collection is complete, `warn` when events are undated, when Events API v2 integrations exist but no events arrived, or when the change event pages stopped at the limit (`evidence.change_events_complete` is false and `partial_view` names the truncation), `fail` when neither exists, `manual` when `change events` or `services` is unread or `services` is empty. `change_events_complete`, `change_events_dated_in_window`, `change_events_missing_timestamp`, and `services_with_change_events` are `null` when `change events` is unread; `events_v2_services` is `null` when `services` is unread |
+
+Any control whose primary input cannot be read becomes `manual`. An unread secondary input caps it at `warn`, with the exceptions in the input rules above the table. The summary carries the collection error, which is also recorded in the assessment `errors` list and the bundle `_errors.log`.
+
+Every `pass` listed above is downgraded to `warn` when the underlying inventory is partial or the credential is a non-admin user-level key.
+
+## Framework mappings
+
+Each finding carries eight mappings from the spec's compliance table. They are labelled `FedRAMP`, `CMMC`, `SOC 2`, `CIS`, `PCI-DSS`, `STIG`, `IRAP`, and `ISMAP`.
+
+For example, `PD-01` maps to `FedRAMP IA-2`, `CMMC IA.L2-3.5.1`, `SOC 2 CC6.1`, `CIS 4.1`, `PCI-DSS 8.3.1`, `STIG SRG-APP-000148`, `IRAP ISM-1557`, and `ISMAP 8.2.1`.
+
+The audit bundle groups the mappings into `compliance/unified_compliance_matrix.md` and one report per framework.
+
+## Live smoke test
+
+```bash
+PAGERDUTY_API_TOKEN=... npm --prefix cli run test:pagerduty:live
+```
+
+The script skips with exit code 0 when no credentials are present.
+
+With credentials it:
+
+1. Runs `pagerduty_check_access`.
+2. Stops if the core abilities, users, services, and escalation policy surfaces are unreadable.
+3. Runs the incident response assessment against up to 100 services.
+
+## Limitations and manual controls
+
+- Controls 1, 13, and 24 always produce `manual` findings, because the REST API:
+  - Exposes the `sso` ability but not SSO enforcement.
+  - Has no endpoint listing API keys or their creation dates.
+  - Does not expose per-role analytics permissions.
+- Contact method verification status is not exposed, so control 18 checks for enabled, non-blocked phone, SMS, or push methods instead.
+- Response plays are no longer in the published REST API reference. Control 10 evaluates incident workflows and triggers and only reports legacy `response_play` references on services.
+- Webhook signature verification happens on the receiving side. Control 15 confirms only that unsigned legacy generic webhook extensions are gone.
+- Audit records need the Audit Trail plan feature and an admin, owner, or global API key. PagerDuty retains audit records for 12 months, so longer retention requirements need SIEM or archive evidence.
+- Users and services are read up to `user_limit` and `service_limit` (default 1000 each), and audit records up to `audit_limit` (default 2000). All are within the classic pagination ceiling of 10,000 records.
+  - When a limit stops the collection, the finding records seen and total counts and cannot pass.
+  - Raise the limit or narrow the window to obtain a complete inventory.
+- A user-level API key with a role below `admin` only returns the objects that user can see, so its passing findings are downgraded to `warn`. Use an account-level read-only key for a complete assessment.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Request handling
+
+Every request carries `Accept: application/vnd.pagerduty+json;version=2`.
+
+The client follows classic `limit`/`offset` pagination using the `more` flag (100 per page, capped at the documented 10,000 record ceiling). It follows cursor pagination (`cursor`, `next_cursor`) on audit records and incident workflow triggers.
+
+`GET /change_events` declares no `more` or `total` field. So the client keeps reading offset pages until a page comes back shorter than requested. A full final page at the requested limit is recorded as incomplete.
+
+The client retries 429 and 5xx responses, waiting for the `ratelimit-reset` or `Retry-After` value when present. It redacts tokens from error messages.
 
 ### Verdict safety rules
 
@@ -251,86 +337,6 @@ A value nested deeper than 32 levels, container or leaf, is replaced by `[REDACT
   - Ability names in `/abilities`
 - An absent or false flag never supports `pass`.
 - Re-running the export never overwrites. The bundle directory and the zip share the same allocated name (`pagerduty-us-audit-bundle-2/` and `pagerduty-us-audit-bundle-2.zip`).
-
-### Status semantics by control
-
-The `Inputs` column names the datasets each finding reads, using the labels of the summary's `inventories` map.
-
-Input rules:
-
-- An unread primary input renders the finding `manual` and names the endpoint and error, with two exceptions. On `PD-04`, unread `abilities` cap a `pass` at `warn`. On `PD-01`, unread `users` only render the user evidence `null`.
-- An unread secondary input caps the finding at `warn`. The exception is `team members` on `PD-04`, which feeds only the manager sample, so the verdict does not depend on it.
-- A partial input downgrades `pass` to `warn` with `evidence.partial_view`.
-- A dataset that was `not requested` because its parent list was unread is treated as unread.
-
-| # | Control | Tool | Finding | Inputs | Status semantics |
-|---|---------|------|---------|--------|------------------|
-| 1 | SSO enforcement enabled | `pagerduty_assess_access_control` | `PD-01` | `abilities`, `users` | `fail` when abilities are readable, non-empty, and lack `sso`; otherwise `manual` (the API does not expose whether SSO login is required; collect Account Settings > Single Sign-On). `sso_ability` and `abilities` are `null` when `/abilities` is unread; `users_created_via_sso` and `users_not_created_via_sso` are `null` with `principals_withheld` unless `users` was read to completion |
-| 2 | User roles follow least privilege | `pagerduty_assess_access_control` | `PD-02` | `users` | `pass` when owner plus admin users are within `max_admins` (default 5) and every user has a `role`, `warn` when some users have no role field, `fail` above the threshold, `manual` when `users` is unread or empty. A partial user list downgrades `pass` to `warn` and renders `privileged_users` and `users_without_role` as `null` with `principals_withheld`; `role_counts` is `null` when `users` is unread |
-| 3 | Owner role limited to the account owner | `pagerduty_assess_access_control` | `PD-03` | `users` | `pass` for exactly one owner, `warn` for none or for users without a role, `fail` for more than one, `manual` when `users` is unread or empty. A partial user list downgrades `pass` to `warn` and renders `owners` and `users_without_role` as `null` with `principals_withheld` |
-| 4 | Team-based access configured | `pagerduty_assess_access_control` | `PD-04` | `users`, `teams`, `abilities`; secondary `team members` | `fail` with zero teams on a complete read, a `teams` ability absent from a readable, non-empty ability list (a complete observation, so it fails even beside a truncated team page), or more than half of users teamless, `warn` for some teamless users, `pass` when everyone belongs to a team (capped at `warn` while `/abilities` is unread or empty, since the `teams` ability cannot be confirmed), `manual` when `users` is unread or empty or `teams` is unread, and `manual` (not `fail`) when the team page was truncated before any team was visible: the sentence names the truncation, because the unread teams could contradict the absence. A partial user or team list downgrades `pass` to `warn`; `users_without_teams` is `null` with `principals_withheld` unless `users` is complete; `team_manager_assignments` and `team_member_lists_truncated` are `null` when the member lists were unread or not requested (they are not requested when `/teams` was unread), `team_member_lists_truncated` is also `null` when the team list is partial and would otherwise report an empty list, and the count is `null` when a truncated member list would otherwise report zero managers |
-| 5 | Services have escalation policies | `pagerduty_assess_incident_response` | `PD-05` | `services` | `pass` when every active service references a policy, `fail` otherwise, `manual` when `services` is unread, empty, or every returned service is disabled. A partial service list downgrades `pass` to `warn`; `active_services`, `services_without_policy`, and `disabled_services` are `null` when `services` is unread |
-| 6 | Escalation policies have multiple levels | `pagerduty_assess_incident_response` | `PD-06` | `escalation policies` | `pass` when every attached policy has two or more rules, `warn` otherwise, `manual` when `escalation policies` is unread, empty, or none is attached to a service. A partial policy list downgrades `pass` to `warn`; `attached_policies` and `single_level_policies` are `null` when the list is unread |
-| 7 | Escalation does not end without notification | `pagerduty_assess_incident_response` | `PD-07` | `escalation policies` | `fail` for policies without rules or rules without targets, `warn` for attached policies with `num_loops` 0 or absent, else `pass`; `manual` when the policy list is unread, empty, or none is attached. A partial policy list downgrades `pass` to `warn`; the three policy name lists are `null` when the list is unread |
-| 8 | Schedules provide 24/7 coverage | `pagerduty_assess_oncall_coverage` | `PD-08` | `schedules`, `schedule details` | `pass` when rendered final schedules have no gaps over `coverage_days` (default 30), `warn` when entries missing a start or end were excluded, `fail` on gaps, `manual` when `schedules` is unread or empty, when the detail reads failed or were not requested (they are not requested when `/schedules` was unread), or when no schedule is attached to an escalation policy. A partial schedule list downgrades `pass` to `warn`; `attached_schedules`, `schedules_with_gaps`, `schedules_with_undated_entries`, and `unattached_schedules` are `null` when either input is unread |
-| 9 | Schedules have multiple participants | `pagerduty_assess_oncall_coverage` | `PD-09` | `schedules`, `schedule details` | `pass` when every attached schedule has two or more distinct users, else `fail`; `manual` on the same gate as `PD-08`. A partial schedule list downgrades `pass` to `warn`; `attached_schedules` and `single_participant_schedules` are `null` when either input is unread |
-| 10 | Incident response automation configured | `pagerduty_assess_incident_response` | `PD-10` | `incident workflows`, `incident workflow triggers`; secondary `services` | `pass` with at least one `is_enabled: true` workflow, at least one enabled trigger, and no unresolved trigger; a trigger is enabled when its parent workflow (`trigger.workflow.id`) was returned with `is_enabled: true`, or when it carries `is_disabled: false` and no parent is available, and it is disabled whenever `is_disabled` is `true` or the parent has `is_enabled: false`; `warn` when workflows, triggers, or legacy response plays exist but none is verified enabled, or when a trigger without `is_disabled` cannot be matched to a returned workflow (unresolved); `fail` when the readable endpoints return none; `manual` when `incident workflows` or `incident workflow triggers` is unread (a 402 or plan message is reported as a plan limitation); capped at `warn` while `services` is unread because legacy response play references cannot be counted, with `services_inventory` naming its state. The response play count is stated bare (`N services still reference one`) only from a complete service read; a partial read names the visible services and the truncation (`N of the S visible services still reference one (...; the unread services are not counted)`) and never claims that no service references a response play. A partial workflow or trigger list downgrades `pass` to `warn`; the trigger counts are `null` when triggers or workflows are unread and `services_with_legacy_response_plays` is `null` when `services` is unread or when a partial service read would otherwise report zero; the summary states enabled, disabled, and unresolved trigger counts |
-| 11 | Audit logging active | `pagerduty_assess_audit_logging` | `PD-11` | `audit records` | `pass` when records dated inside `audit_window_days` exist, `warn` when readable but empty (the `returned zero records` sentence is stated only from a complete read; a read truncated before any record was visible carries the partial view instead and does not claim that logging is inactive) or undated, `manual` when `audit records` is unread (HTTP 402 or a plan message is reported as the Audit Trail feature missing from the plan). A partial record list downgrades `pass` to `warn`; `records_dated_in_window`, `records_missing_execution_time`, `records_outside_window`, and `method_types` are `null` when the records are unread, and `null` when the read is partial and the value would otherwise assert absence |
-| 12 | Audit log retention | `pagerduty_assess_audit_logging` | `PD-12` | `audit records`; secondary `retention probe records` | `pass` when the 11-to-12 month probe returns dated records, `warn` when the probe is empty (the `No audit records were returned` sentence is stated only from a complete probe; a probe truncated before any record was visible carries the partial view instead and does not claim that retention is short), undated, or unread, `manual` when `min_retention_days` exceeds the documented 365 days or `audit records` is unread. A partial recent record list downgrades `pass` to `warn` (the probe is a deliberate 25-record sample, so a truncated probe that returned a dated record still passes); `probe_records_dated_in_window` and `probe_records_missing_execution_time` are `null` when the probe is unread |
-| 13 | API keys rotated | `pagerduty_assess_audit_logging` | `PD-13` | `audit records` | Always `manual` (no API key inventory endpoint). `api_tokens_observed` lists distinct truncated tokens seen in audit records only when the record list was read to completion; when it is unread or partial the summary says the token set is unknown and the list is `null` with `principals_withheld` |
-| 14 | Webhook endpoints use HTTPS | `pagerduty_assess_integration_security` | `PD-14` | `extensions`, `webhook subscriptions` | `pass` when all extension `endpoint_url` and subscription `delivery_method.url` values are `https`, `fail` otherwise, `manual` when either list is unread or both are empty (no webhooks exist). A partial list downgrades `pass` to `warn`; `insecure_extensions`, `insecure_subscriptions`, and `temporarily_disabled_deliveries` are `null` when their source is unread |
-| 15 | Webhook signatures verified | `pagerduty_assess_integration_security` | `PD-15` | `extensions`, `webhook subscriptions` | `warn` when unsigned legacy generic webhook extensions remain, extensions lack a schema, no subscription has `active: true`, or a subscription omits the `active` flag; `pass` only when `/extensions` was readable (count stated), none is a legacy webhook, and at least one v3 subscription is active (confirm receivers verify `X-PagerDuty-Signature`); `manual` when either list is unread or both are empty. A partial list downgrades `pass` to `warn`; the extension and subscription counts and lists are `null` when their source is unread |
-| 16 | Integration permissions scoped | `pagerduty_assess_integration_security` | `PD-16` | `services` | `pass` when no legacy inbound integrations or unfiltered email integrations exist and every service returned its integrations, else `warn`; `manual` when `services` is unread or empty. A partial service list downgrades `pass` to `warn`; `integrations`, `legacy_integrations`, `unfiltered_email_integrations`, and `services_without_integration_expansion` are `null` when `services` is unread |
-| 17 | Notification rules for all users | `pagerduty_assess_oncall_coverage` | `PD-17` | `users` | `pass` when every responder has rules including a high-urgency rule, `fail` when more than a quarter have none, `warn` otherwise or when users lack a role, `manual` when `users` is unread or empty or no returned user has a responder role. A partial user list downgrades `pass` to `warn` and renders `responders_without_rules`, `responders_without_high_urgency_rule`, and `users_without_role` as `null` with `principals_withheld`; `responders` is `null` when `users` is unread |
-| 18 | Contact methods for on-call users | `pagerduty_assess_oncall_coverage` | `PD-18` | `users`, `on-call entries` | `fail` when an on-call user has only blocked or disabled methods, `warn` for email-only users, methods whose `enabled`/`blacklisted` flags are absent, or on-call users outside the returned user set, `pass` when every on-call user has a phone or SMS method with `enabled: true` and `blacklisted: false` or a push method with `blacklisted: false`, `manual` when `users` is unread or empty, `on-call entries` is unread or empty (nobody is on call), or no on-call user could be matched to a returned user. A partial user or on-call list downgrades `pass` to `warn` and renders the three on-call user lists as `null` with `principals_withheld`; `current_oncall_users` and `oncall_users_not_in_returned_set` are `null` when either input is unread |
-| 19 | Service urgency rules configured | `pagerduty_assess_incident_response` | `PD-19` | `services` | `fail` when a service lacks an urgency rule, `warn` when every service is constant high, else `pass`; `manual` when `services` is unread, empty, or all disabled. A partial service list downgrades `pass` to `warn`; `active_services`, `services_without_urgency_rule`, and `urgency_modes` are `null` when `services` is unread |
-| 20 | Custom incident priorities defined | `pagerduty_assess_incident_response` | `PD-20` | `priorities` | `pass` when priorities exist, `fail` when a complete read of the readable endpoint returns none, `manual` when `priorities` is unread (a 402 or plan message is reported as a plan limitation), and `manual` (not `fail`) with the partial-view sentence when the page was truncated before any priority was visible. A partial priority list downgrades `pass` to `warn`; `priorities` is `null` when unread, and `null` when the read is partial and would otherwise report an empty list |
-| 21 | Service dependencies mapped | `pagerduty_assess_integration_security` | `PD-21` | `business services`; secondary `business service dependencies` | `fail` with zero business services on a complete read, `warn` when some have no dependencies or the dependency reads failed (the failure is named in the summary), else `pass`; `manual` when `business services` is unread (a 402 or plan message is reported as a plan limitation; the dependency reads are then not requested), and `manual` (not `fail`) with the partial-view sentence when the page was truncated before any business service was visible. A partial business service list downgrades `pass` to `warn`; `unmapped_business_services` is `null` when the dependency reads failed or the list is unread |
-| 22 | Acknowledgement timeouts configured | `pagerduty_assess_incident_response` | `PD-22` | `services` | `pass` when every active service sets one, else `warn`; `manual` when `services` is unread, empty, or all disabled. A partial service list downgrades `pass` to `warn`; `active_services` and `services_without_ack_timeout` are `null` when `services` is unread |
-| 23 | Auto-resolve timeouts configured | `pagerduty_assess_incident_response` | `PD-23` | `services` | `pass` when every active service sets one, else `warn`; `manual` when `services` is unread, empty, or all disabled. A partial service list downgrades `pass` to `warn`; `active_services` and `services_without_auto_resolve` are `null` when `services` is unread |
-| 24 | Analytics access restricted | `pagerduty_assess_access_control` | `PD-24` | `abilities`, `users` | Always `manual` (per-role analytics permissions are not exposed); `analytics_abilities` is `null` when `/abilities` is unread and `role_counts` is `null` when `users` is unread |
-| 25 | Change events tracking enabled | `pagerduty_assess_integration_security` | `PD-25` | `change events`, `services` | `pass` when change events with a `timestamp` inside `change_event_days` arrived and the collection is complete, `warn` when events are undated, when Events API v2 integrations exist but no events arrived, or when the change event pages stopped at the limit (`evidence.change_events_complete` is false and `partial_view` names the truncation), `fail` when neither exists, `manual` when `change events` or `services` is unread or `services` is empty. `change_events_complete`, `change_events_dated_in_window`, `change_events_missing_timestamp`, and `services_with_change_events` are `null` when `change events` is unread; `events_v2_services` is `null` when `services` is unread |
-
-Any control whose primary input cannot be read becomes `manual`. An unread secondary input caps it at `warn`, with the exceptions in the input rules above the table. The summary carries the collection error, which is also recorded in the assessment `errors` list and the bundle `_errors.log`.
-
-Every `pass` listed above is downgraded to `warn` when the underlying inventory is partial or the credential is a non-admin user-level key.
-
-## Framework mappings
-
-Each finding carries eight mappings from the spec's compliance table. They are labelled `FedRAMP`, `CMMC`, `SOC 2`, `CIS`, `PCI-DSS`, `STIG`, `IRAP`, and `ISMAP`.
-
-For example, `PD-01` maps to `FedRAMP IA-2`, `CMMC IA.L2-3.5.1`, `SOC 2 CC6.1`, `CIS 4.1`, `PCI-DSS 8.3.1`, `STIG SRG-APP-000148`, `IRAP ISM-1557`, and `ISMAP 8.2.1`.
-
-The audit bundle groups the mappings into `compliance/unified_compliance_matrix.md` and one report per framework.
-
-## Live smoke test
-
-```bash
-PAGERDUTY_API_TOKEN=... npm --prefix cli run test:pagerduty:live
-```
-
-The script skips with exit code 0 when no credentials are present.
-
-With credentials it:
-
-1. Runs `pagerduty_check_access`.
-2. Stops if the core abilities, users, services, and escalation policy surfaces are unreadable.
-3. Runs the incident response assessment against up to 100 services.
-
-## Limitations and manual controls
-
-- Controls 1, 13, and 24 always produce `manual` findings, because the REST API:
-  - Exposes the `sso` ability but not SSO enforcement.
-  - Has no endpoint listing API keys or their creation dates.
-  - Does not expose per-role analytics permissions.
-- Contact method verification status is not exposed, so control 18 checks for enabled, non-blocked phone, SMS, or push methods instead.
-- Response plays are no longer in the published REST API reference. Control 10 evaluates incident workflows and triggers and only reports legacy `response_play` references on services.
-- Webhook signature verification happens on the receiving side. Control 15 confirms only that unsigned legacy generic webhook extensions are gone.
-- Audit records need the Audit Trail plan feature and an admin, owner, or global API key. PagerDuty retains audit records for 12 months, so longer retention requirements need SIEM or archive evidence.
-- Users and services are read up to `user_limit` and `service_limit` (default 1000 each), and audit records up to `audit_limit` (default 2000). All are within the classic pagination ceiling of 10,000 records.
-  - When a limit stops the collection, the finding records seen and total counts and cannot pass.
-  - Raise the limit or narrow the window to obtain a complete inventory.
-- A user-level API key with a role below `admin` only returns the objects that user can see, so its passing findings are downgraded to `warn`. Use an account-level read-only key for a complete assessment.
 
 ### Error strings
 

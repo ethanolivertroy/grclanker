@@ -87,52 +87,6 @@ The platform ID maps to the API server and API gateway published on the Qualys p
 
 A hostname such as `qualysapi.qg2.apps.qualys.com` is accepted in place of the ID. Unknown hostnames are used as-is with platform `custom`.
 
-### Rate limits and retries
-
-The client records these headers from every response:
-
-- `X-RateLimit-Limit`
-- `X-RateLimit-Window-Sec`
-- `X-RateLimit-Remaining`
-- `X-RateLimit-ToWait-Sec`
-- `X-Concurrency-Limit-Limit`
-- `X-Concurrency-Limit-Running`
-
-On HTTP 409 or 429 it waits for `X-RateLimit-ToWait-Sec` (capped at 30 seconds, exponential backoff when the header is absent) and retries up to `QUALYS_MAX_RETRIES` times.
-
-### Error messages and secrets
-
-A failed request is reported with its HTTP status and endpoint path, never with the response body.
-
-A documented error envelope contributes only its documented fields:
-
-- `SIMPLE_RETURN` `CODE` and `TEXT`.
-- The `/msp/` `ERROR` number and text.
-- A QPS `responseCode` and `responseErrorDetails.errorMessage`.
-
-The code itself is scrubbed and validated before it is rendered. The value is first passed through the error scrub with the configured password, token, and basic auth string. A configured credential returned as a code renders the placeholder, even when it collides with a documented value.
-
-Then the value must be one of the codes Qualys documents:
-
-- A `CODE`, `ERROR` number, or `RETURN` number renders only when it is one of these:
-  - The three- or four-digit codes of Appendix D of the Qualys API (VM, PC) user guide.
-  - The sample codes the guide shows: `999`, `1901`, `1903`, `1904`, `1905`, `1907`, `1908`, `1920`, `1922`, `1960`, `1965`, `1980`, `1981`, `1982`, `1999`, `2000`, `2002`, `2003`, `2010`, `2011`, `2012`.
-- A `responseCode` renders only when it is one of the `ResponseCode` enumeration values of the published QPS XSDs. Examples are `INVALID_REQUEST`, `INVALID_CREDENTIALS`, `UNAUTHORIZED`, and `NOT_FOUND`.
-- Anything else renders as the fixed `UnknownError`, including a six-digit passcode, a letters-only base32 fragment, or an undocumented constant.
-
-Any other body (an HTML gateway page, CSV, unexpected JSON) is described by content type and byte length only, for example `non-XML error body (text/html; 236 bytes)`.
-
-Every error string passes through one scrub before it exists. The scrub removes:
-
-- The configured password, token, and basic auth string.
-- Embedded URL queries and fragments.
-- `Bearer` and `Basic` values.
-- `Cookie` and `Set-Cookie` values.
-- Credential name-value pairs (api key, session, access, refresh, and id tokens, client secret, password).
-- Any 16-character or longer run with a digit or mixed case that a Qualys server echoes in free text.
-
-Every bundle file is scrubbed again on write with the same rules minus the long-token rule, so QIDs, asset ids, and tag ids survive as evidence.
-
 ## Run it
 
 After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
@@ -202,12 +156,6 @@ The assessments additionally read:
 - `POST /qps/rest/3.0/search/was/wasscan` (scan dates, bounded to the lookback window and then unbounded by `webApp.id` for web apps still unresolved)
 - `POST /qps/rest/3.0/search/was/webappauthrecord`
 - `POST /qps/rest/3.0/search/was/wasscanschedule`
-
-Pagination rules:
-
-- Every XML list follows its `WARNING/URL` continuation.
-- Every QPS search pages with `hasMoreRecords` and `lastId`.
-- A page that fills `limitResults` without `hasMoreRecords` is treated as a possible continuation and recorded as truncated when it cannot be followed.
 
 ### `qualys_assess_scan_coverage`
 
@@ -340,6 +288,62 @@ The script skips with exit code 0 when no credentials are present. With `QUALYS_
 - Host and detection sampling is capped by `host_limit` and `detection_limit` (default 5000 each, up to 25 pages per list). Very large subscriptions should raise these limits or scope with asset groups.
 - Option profile exclusion counts are the `VULNERABILITY_DETECTION/DETECTION_EXCLUDE` custom search lists in `option_profile_info.dtd`. QID exclusion semantics vary by profile type.
 - The integration is read-only. It never launches scans, changes schedules, or edits users, tags, or policies.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how the client pages through lists and handles rate limits and retries, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Pagination
+
+- Every XML list follows its `WARNING/URL` continuation.
+- Every QPS search pages with `hasMoreRecords` and `lastId`.
+- A page that fills `limitResults` without `hasMoreRecords` is treated as a possible continuation and recorded as truncated when it cannot be followed.
+
+### Rate limits and retries
+
+The client records these headers from every response:
+
+- `X-RateLimit-Limit`
+- `X-RateLimit-Window-Sec`
+- `X-RateLimit-Remaining`
+- `X-RateLimit-ToWait-Sec`
+- `X-Concurrency-Limit-Limit`
+- `X-Concurrency-Limit-Running`
+
+On HTTP 409 or 429 it waits for `X-RateLimit-ToWait-Sec` (capped at 30 seconds, exponential backoff when the header is absent) and retries up to `QUALYS_MAX_RETRIES` times.
+
+### Error messages and secrets
+
+A failed request is reported with its HTTP status and endpoint path, never with the response body.
+
+A documented error envelope contributes only its documented fields:
+
+- `SIMPLE_RETURN` `CODE` and `TEXT`.
+- The `/msp/` `ERROR` number and text.
+- A QPS `responseCode` and `responseErrorDetails.errorMessage`.
+
+The code itself is scrubbed and validated before it is rendered. The value is first passed through the error scrub with the configured password, token, and basic auth string. A configured credential returned as a code renders the placeholder, even when it collides with a documented value.
+
+Then the value must be one of the codes Qualys documents:
+
+- A `CODE`, `ERROR` number, or `RETURN` number renders only when it is one of these:
+  - The three- or four-digit codes of Appendix D of the Qualys API (VM, PC) user guide.
+  - The sample codes the guide shows: `999`, `1901`, `1903`, `1904`, `1905`, `1907`, `1908`, `1920`, `1922`, `1960`, `1965`, `1980`, `1981`, `1982`, `1999`, `2000`, `2002`, `2003`, `2010`, `2011`, `2012`.
+- A `responseCode` renders only when it is one of the `ResponseCode` enumeration values of the published QPS XSDs. Examples are `INVALID_REQUEST`, `INVALID_CREDENTIALS`, `UNAUTHORIZED`, and `NOT_FOUND`.
+- Anything else renders as the fixed `UnknownError`, including a six-digit passcode, a letters-only base32 fragment, or an undocumented constant.
+
+Any other body (an HTML gateway page, CSV, unexpected JSON) is described by content type and byte length only, for example `non-XML error body (text/html; 236 bytes)`.
+
+Every error string passes through one scrub before it exists. The scrub removes:
+
+- The configured password, token, and basic auth string.
+- Embedded URL queries and fragments.
+- `Bearer` and `Basic` values.
+- `Cookie` and `Set-Cookie` values.
+- Credential name-value pairs (api key, session, access, refresh, and id tokens, client secret, password).
+- Any 16-character or longer run with a digit or mixed case that a Qualys server echoes in free text.
+
+Every bundle file is scrubbed again on write with the same rules minus the long-token rule, so QIDs, asset ids, and tag ids survive as evidence.
 
 ## Official documentation
 

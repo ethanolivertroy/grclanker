@@ -123,68 +123,14 @@ The export tool adds `output_dir` (default `./export/elastic`).
 
 ## Control coverage
 
+Verdicts on unread, partial, or truncated data follow the [evidence rules](#evidence-rules).
+
 Status semantics:
 
 - `pass`: API evidence shows the control is satisfied.
 - `warn`: The control is partially satisfied or not fully confirmable from the visible data.
 - `fail`: API evidence shows a violation.
 - `manual`: The API cannot verify the control, and the summary states exactly what evidence a human must collect.
-
-### Evidence rules
-
-Every verdict follows the same evidence rules, so a `pass` is never produced from missing or partial data:
-
-- A forbidden (401/403), timed out, or errored source endpoint never yields `pass`. Without an observed violation, the verdict becomes `manual` or `warn`. The summary names the endpoint and error. A `manual` summary also lists what to collect.
-- Observed violations (for example too many superusers) still `fail` even when a secondary source is unreadable.
-- An empty inventory never passes by default. Each control states how emptiness is judged:
-  - Zero users, roles, spaces, certificates, or ingest pipelines is `manual`, because Elasticsearch and Kibana always return built-in entries.
-  - Zero ILM policies, repositories, or SLM policies is `fail`.
-  - Zero role mappings for an SSO realm is `fail`.
-  - Zero Fleet policies is `manual` (not applicable).
-  - Zero API keys passes only because controls 9 and 10 concern existing keys, and only with full inventory visibility.
-- Controls render as `manual`, with a "Not applicable" or "Scoped out" summary, when they are:
-  - Scoped out (Kibana not configured).
-  - Disabled by configuration (no SSO realm).
-  - Unavailable on the license tier (FLS, DLS, Watcher on Basic).
-- Features in use without a covering license `fail`.
-- Items without a date are bucketed separately, reported in the evidence, and cap the verdict at `warn`. These items are:
-  - API keys with no `creation`.
-  - Certificates with no `expiry`.
-  - SLM policies with no `last_success`.
-  - A license with no expiry or status.
-- Partial inventories cap the verdict at `warn` or `manual` and report seen and total counts:
-  - An API key query limited to the caller's own keys (no `read_security`, `manage_api_key`, or `manage_security`).
-  - A truncated page set.
-  - Node settings from only some nodes.
-  - `GET /_ssl/certificates` on a multi-node cluster (it reports only the responding node).
-  - Kibana inventories read from a single space when other spaces exist.
-- Every enabling flag is read before a `pass`:
-  - `xpack.security.enabled`
-  - `xpack.security.transport.ssl.enabled` and `verification_mode`
-  - `xpack.security.http.ssl.enabled`
-  - `xpack.security.audit.enabled`
-  - Realm `enabled` flags
-  - Anonymous role settings
-  - License type and status
-- An absent or false flag never supports `pass`.
-- Settings resolve as transient over persistent over node-level over cluster defaults.
-- Pagination runs to the configured limit. When the total exceeds what was read, the dataset is marked truncated and the verdict is downgraded.
-- An inventory count in a finding or a tool summary renders `null` rather than `0` when the listing behind it stopped before any record was read, and the rows read as a lower bound when some were, with the dataset's `inventories` row beside it.
-  - Inventory counts: `watches`, `connectors`, `alerting_rules`, `detection_rules`, `rules_with_actions`.
-  - `inventories` row fields: `complete`, `seen`, `total`.
-- `ELASTIC-20` asserts that no alerting destination exists only from complete empty reads. Otherwise it says the listing stopped.
-- A success status is not a success by itself. Every 2xx body is checked against the documented container of that endpoint before it is accepted. The container is one of:
-  - An object carrying its documented keys.
-  - A map whose entries carry the documented entry keys.
-  - An array of objects.
-  - An object with an array under its documented key.
-- An empty body, a non-JSON body (a portal or proxy page), or JSON of another shape is recorded as a failed read of that request.
-  - The record carries the status the server sent (`http_status: 200`) and a fixed status-and-length note that never echoes the body.
-  - The failed read is recorded in the access check, the dataset's `core_data/` marker, and `_errors.log`.
-- Dependent verdicts then move only to `manual` or `warn`:
-  - ELASTIC-09 and ELASTIC-10 do not pass on an empty 2xx from the API key query.
-  - ELASTIC-06 does not pass and ELASTIC-07 and ELASTIC-08 do not warn over a foreign-JSON 2xx.
-  - ELASTIC-17, ELASTIC-18, and ELASTIC-23 do not fail on a body that was never a documented answer.
 
 ### Verdicts by control
 
@@ -256,6 +202,99 @@ Re-running the export never overwrites a prior bundle. The directory name is all
 
 Paginated datasets under `core_data/` carry a `page` block with `seen`, `total`, `pages`, and `truncated`.
 
+## Live smoke test
+
+```bash
+ELASTIC_URL=https://es.example.com:9200 ELASTIC_API_KEY=... KIBANA_URL=https://kibana.example.com:5601 \
+  npm --prefix cli run test:elastic:live
+```
+
+The script prints a skip message and exits 0 when no credentials or config file are present.
+
+Otherwise it:
+
+1. Runs `elastic_check_access`.
+2. Stops if core surfaces are unreadable.
+3. Runs the transport security assessment.
+
+Mocked API coverage lives in `cli/tests/elastic.test.mjs` and runs with `npm --prefix cli run test:cli`.
+
+## Limitations and manual controls
+
+- Control 12 (audit log output) is always `manual` when auditing is enabled. Collect evidence that `<cluster>_audit.json` is shipped to a tamper-resistant store.
+- Control 18 is `manual` for repository types whose encryption is not visible through the API. Collect bucket or filesystem encryption evidence.
+- Secure settings (bind passwords, client secrets, keystore entries) are never returned by Elasticsearch, so SSO checks rely on non-secret realm settings and role mappings.
+- Controls 7 and 8 report `warn` rather than `pass` when no index patterns are supplied, because the API cannot know which indices hold sensitive or tenant data.
+- Cluster-level defaults come from `GET /_cluster/settings?include_defaults=true` and per-node values from `GET /_nodes/settings`. Settings that differ between nodes are reported per node. When some nodes fail to respond, every settings-based verdict is capped at `warn` with the responding and total node counts.
+- Without `read_security`, `manage_api_key`, or `manage_security`, `POST /_security/_query/api_key` returns only the caller's own keys. Controls 9 and 10 then report a partial view and cannot pass.
+- `GET /_ssl/certificates` describes only the node that served the request. On multi-node clusters, control 5 is capped at `warn` until certificates from every node are collected.
+- Kibana connectors, alerting rules, detection rules, and Fleet policies are read from the configured `space_id` (the default space unless set). When other spaces exist, control 20 is capped at `warn` and names the spaces still to inspect, and an empty Fleet inventory is reported for the inspected space only.
+- `GET /api/spaces/space` returns only the spaces the auditing credential is authorized to access and gives no signal that others exist. As a result, controls 15 and 16 can pass on a partial space list.
+  - Before relying on those verdicts, grant the credential read access to every space (or confirm the space count against a Kibana administrator's view).
+- List collection stops at `api_key_limit`, `watch_limit`, and `kibana_limit`. A truncated dataset is recorded in `core_data/` and downgrades the dependent verdicts rather than being treated as the full population.
+- Elastic Cloud is used only for deployment inventory (`GET /api/v1/deployments`). The per-deployment detail and activity endpoints listed in the spec are not collected. Deployment configuration is assessed through the cluster and Kibana APIs instead.
+- The integration does not evaluate CIS Elasticsearch Benchmark line items beyond the spec's 23 controls.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Evidence rules
+
+Every verdict follows the same evidence rules, so a `pass` is never produced from missing or partial data:
+
+- A forbidden (401/403), timed out, or errored source endpoint never yields `pass`. Without an observed violation, the verdict becomes `manual` or `warn`. The summary names the endpoint and error. A `manual` summary also lists what to collect.
+- Observed violations (for example too many superusers) still `fail` even when a secondary source is unreadable.
+- An empty inventory never passes by default. Each control states how emptiness is judged:
+  - Zero users, roles, spaces, certificates, or ingest pipelines is `manual`, because Elasticsearch and Kibana always return built-in entries.
+  - Zero ILM policies, repositories, or SLM policies is `fail`.
+  - Zero role mappings for an SSO realm is `fail`.
+  - Zero Fleet policies is `manual` (not applicable).
+  - Zero API keys passes only because controls 9 and 10 concern existing keys, and only with full inventory visibility.
+- Controls render as `manual`, with a "Not applicable" or "Scoped out" summary, when they are:
+  - Scoped out (Kibana not configured).
+  - Disabled by configuration (no SSO realm).
+  - Unavailable on the license tier (FLS, DLS, Watcher on Basic).
+- Features in use without a covering license `fail`.
+- Items without a date are bucketed separately, reported in the evidence, and cap the verdict at `warn`. These items are:
+  - API keys with no `creation`.
+  - Certificates with no `expiry`.
+  - SLM policies with no `last_success`.
+  - A license with no expiry or status.
+- Partial inventories cap the verdict at `warn` or `manual` and report seen and total counts:
+  - An API key query limited to the caller's own keys (no `read_security`, `manage_api_key`, or `manage_security`).
+  - A truncated page set.
+  - Node settings from only some nodes.
+  - `GET /_ssl/certificates` on a multi-node cluster (it reports only the responding node).
+  - Kibana inventories read from a single space when other spaces exist.
+- Every enabling flag is read before a `pass`:
+  - `xpack.security.enabled`
+  - `xpack.security.transport.ssl.enabled` and `verification_mode`
+  - `xpack.security.http.ssl.enabled`
+  - `xpack.security.audit.enabled`
+  - Realm `enabled` flags
+  - Anonymous role settings
+  - License type and status
+- An absent or false flag never supports `pass`.
+- Settings resolve as transient over persistent over node-level over cluster defaults.
+- Pagination runs to the configured limit. When the total exceeds what was read, the dataset is marked truncated and the verdict is downgraded.
+- An inventory count in a finding or a tool summary renders `null` rather than `0` when the listing behind it stopped before any record was read, and the rows read as a lower bound when some were, with the dataset's `inventories` row beside it.
+  - Inventory counts: `watches`, `connectors`, `alerting_rules`, `detection_rules`, `rules_with_actions`.
+  - `inventories` row fields: `complete`, `seen`, `total`.
+- `ELASTIC-20` asserts that no alerting destination exists only from complete empty reads. Otherwise it says the listing stopped.
+- A success status is not a success by itself. Every 2xx body is checked against the documented container of that endpoint before it is accepted. The container is one of:
+  - An object carrying its documented keys.
+  - A map whose entries carry the documented entry keys.
+  - An array of objects.
+  - An object with an array under its documented key.
+- An empty body, a non-JSON body (a portal or proxy page), or JSON of another shape is recorded as a failed read of that request.
+  - The record carries the status the server sent (`http_status: 200`) and a fixed status-and-length note that never echoes the body.
+  - The failed read is recorded in the access check, the dataset's `core_data/` marker, and `_errors.log`.
+- Dependent verdicts then move only to `manual` or `warn`:
+  - ELASTIC-09 and ELASTIC-10 do not pass on an empty 2xx from the API key query.
+  - ELASTIC-06 does not pass and ELASTIC-07 and ELASTIC-08 do not warn over a foreign-JSON 2xx.
+  - ELASTIC-17, ELASTIC-18, and ELASTIC-23 do not fail on a body that was never a documented answer.
+
 ### Credentials in collected data
 
 Credentials are never written into the bundle, an assess payload, or the access check.
@@ -318,39 +357,6 @@ A configured secret that is itself a carrier word (`password`, `Authorization`, 
 A name after a path slash (`GET /_security/api_key: 403`) is a path segment, not a key. A key whose last segment names a setting (`ELASTIC_URL`, `ELASTIC_USERNAME`, `api_key_limit`, `max_api_key_age_days`) keeps a word value and loses only a token-shaped or registered one. As a result, every fixed message and every finding summary, manual-evidence instruction, and bundle document survives the pass unchanged.
 
 The test suite sweeps the strings recorded by healthy and partially denied runs for alterations.
-
-## Live smoke test
-
-```bash
-ELASTIC_URL=https://es.example.com:9200 ELASTIC_API_KEY=... KIBANA_URL=https://kibana.example.com:5601 \
-  npm --prefix cli run test:elastic:live
-```
-
-The script prints a skip message and exits 0 when no credentials or config file are present.
-
-Otherwise it:
-
-1. Runs `elastic_check_access`.
-2. Stops if core surfaces are unreadable.
-3. Runs the transport security assessment.
-
-Mocked API coverage lives in `cli/tests/elastic.test.mjs` and runs with `npm --prefix cli run test:cli`.
-
-## Limitations and manual controls
-
-- Control 12 (audit log output) is always `manual` when auditing is enabled. Collect evidence that `<cluster>_audit.json` is shipped to a tamper-resistant store.
-- Control 18 is `manual` for repository types whose encryption is not visible through the API. Collect bucket or filesystem encryption evidence.
-- Secure settings (bind passwords, client secrets, keystore entries) are never returned by Elasticsearch, so SSO checks rely on non-secret realm settings and role mappings.
-- Controls 7 and 8 report `warn` rather than `pass` when no index patterns are supplied, because the API cannot know which indices hold sensitive or tenant data.
-- Cluster-level defaults come from `GET /_cluster/settings?include_defaults=true` and per-node values from `GET /_nodes/settings`. Settings that differ between nodes are reported per node. When some nodes fail to respond, every settings-based verdict is capped at `warn` with the responding and total node counts.
-- Without `read_security`, `manage_api_key`, or `manage_security`, `POST /_security/_query/api_key` returns only the caller's own keys. Controls 9 and 10 then report a partial view and cannot pass.
-- `GET /_ssl/certificates` describes only the node that served the request. On multi-node clusters, control 5 is capped at `warn` until certificates from every node are collected.
-- Kibana connectors, alerting rules, detection rules, and Fleet policies are read from the configured `space_id` (the default space unless set). When other spaces exist, control 20 is capped at `warn` and names the spaces still to inspect, and an empty Fleet inventory is reported for the inspected space only.
-- `GET /api/spaces/space` returns only the spaces the auditing credential is authorized to access and gives no signal that others exist. As a result, controls 15 and 16 can pass on a partial space list.
-  - Before relying on those verdicts, grant the credential read access to every space (or confirm the space count against a Kibana administrator's view).
-- List collection stops at `api_key_limit`, `watch_limit`, and `kibana_limit`. A truncated dataset is recorded in `core_data/` and downgrades the dependent verdicts rather than being treated as the full population.
-- Elastic Cloud is used only for deployment inventory (`GET /api/v1/deployments`). The per-deployment detail and activity endpoints listed in the spec are not collected. Deployment configuration is assessed through the cluster and Kibana APIs instead.
-- The integration does not evaluate CIS Elasticsearch Benchmark line items beyond the spec's 23 controls.
 
 ## Official documentation
 

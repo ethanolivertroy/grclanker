@@ -31,7 +31,7 @@ Findings carry:
 
 Nothing is written to the controller.
 
-The bundle never records the token or password used to authenticate. It also does not rely on the API's own `$encrypted$` masking. Every `core_data/` snapshot is projected to the fields the verdicts read before it is written, and credential-bearing values are replaced by `[REDACTED]` at that step (see the bundle layout below).
+The bundle never records the token or password used to authenticate. It also does not rely on the API's own `$encrypted$` masking. Every `core_data/` snapshot is projected to the fields the verdicts read before it is written, and credential-bearing values are replaced by `[REDACTED]` at that step (see [Bundle redaction](#bundle-redaction)).
 
 ## Setup and authentication
 
@@ -87,7 +87,76 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 - `QUICK_REFERENCE.md` and `README.md`.
 - `_errors.log`, written only when some reads failed but the bundle still completed.
 
-#### Bundle redaction
+## Status semantics
+
+Every finding is `pass`, `warn`, `fail`, or `manual`.
+
+- `manual` means the API cannot prove the control on this deployment or with this account. The summary names the cause (a 403, a missing endpoint, an empty inventory that needs confirmation, a setting the version does not expose) and the evidence to collect from the controller UI.
+## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the [verdict safety rules](#verdict-safety-rules).
+
+| Spec control | Tool | Finding id | Status semantics |
+|---|---|---|---|
+| 1 Job success rate | job health | `AAP-JOB-01` | fail below `min_success_rate` (90) or when zero jobs exist; warn if no job has finished |
+| 2 Chronic playbook failures | job health | `AAP-JOB-02` | fail when a template with 3+ runs has more than 3 consecutive failures or over 20% failures; manual on empty history |
+| 3 Stuck or long-running jobs | job health | `AAP-JOB-04` | warn when a running or pending job exceeds 2x its template's average successful runtime, has no `started`, or has no baseline |
+| 4 Manual job launch rate | job health | `AAP-JOB-03` | warn above `max_manual_rate` (25%) |
+| 5 Failed job remediation rate | job health | `AAP-JOB-05` | fail when a failure older than 7 days had no later successful run of the same template; warn on undated failures; pass with no failures |
+| 6 Unmanaged hosts | host coverage | `AAP-HOST-01` | fail when any host has `last_job` null; manual when no hosts are visible |
+| 7 Stale host coverage | host coverage | `AAP-HOST-02` | fail beyond `stale_host_days` (30), severity critical beyond `critical_stale_host_days` (60); warn when `summary_fields.last_job.finished` is missing |
+| 8 Inventory source sync health | host coverage | `AAP-HOST-03` | warn on `last_update_failed`, failed status, stale or missing `last_updated`; manual when no sources exist |
+| 9 Host failure rate | host coverage | `AAP-HOST-05` | warn when a host with 3+ runs failed over 30% in the window, or when no host has enough runs |
+| 10 Disabled hosts | host coverage | `AAP-HOST-04` | warn above 5% disabled or when `enabled` is missing |
+| 11 Stale job templates | host coverage | `AAP-TMPL-01` | warn when `last_job_run` is older than `stale_template_days` (90) or null |
+| 12 Unscheduled critical templates | host coverage | `AAP-TMPL-02` | fail when a template matching the critical keyword list has no schedule; manual when none matches |
+| 13 Missed scheduled runs | host coverage | `AAP-SCHED-01` | fail when an enabled schedule has a past or null `next_run`, or its template last ran more than 1.5x the rrule interval ago; warn when the rrule or template cannot be evaluated |
+| 14 Disabled schedules | host coverage | `AAP-SCHED-02` | warn when any schedule has `enabled=false` or no `enabled` flag |
+| 15 Workflow coverage | host coverage | `AAP-TMPL-03` | fail when job templates exist but no workflow does; warn when no workflow matches the critical keywords; manual when nothing is visible |
+| 16 Stale credentials | platform security | `AAP-CRED-01` | fail when a non-managed credential was modified more than `stale_credential_days` (90) ago, broken down by `kind`; warn on missing `modified` |
+| 17 Shared credential usage | platform security | `AAP-CRED-03` | fail when a credential is attached to more than `max_shared_templates` (5) templates; `ask_credential_on_launch` templates are reported |
+| 18 Unvaulted secrets | platform security | `AAP-CRED-04` | fail on plaintext values under secret-like names in template `extra_vars`, survey defaults, inventory or group variables; manual when surveys or variable sources are unreadable; reports Vault credentials and `ask_variables_on_launch` templates. `inventories`, `groups`, and `vault_credentials` evidence render `null` when their list was unreadable, never `0` or `[]` |
+| 19 Credential ownership gaps | platform security | `AAP-CRED-05` | warn when a credential has no user or team owner; manual when owners cannot be read |
+| 20 OAuth2 token hygiene | platform security | `AAP-CRED-02` | warn when a token has no `expires` or is older than `stale_token_days` (90); pass on zero tokens by intent |
+| 21 Organization admin count | platform security | `AAP-RBAC-01` | fail when an organization has more than `max_org_admins` (3) admins; manual when the organizations list is unreadable (evidence carries only the endpoint, HTTP status, and error, never an empty `organizations` list) or when any organization's `admins/` list could not be read (that organization stays listed with `admin_count: null`) |
+| 22 Team role audit | platform security | `AAP-RBAC-03` | fail when a team holds Admin on an organization or on every inventory |
+| 23 Execute versus admin separation | platform security | `AAP-RBAC-04` | fail when a probed user holds an Execute role together with an Admin-family role or `is_superuser` |
+| 24 Audit role coverage | platform security | `AAP-RBAC-05` | pass when a system auditor exists or every organization has a confirmed Auditor role holder among probed users and teams and every probed role list was read; when the teams list or any user or team role list could not be read, no organization is named as uncovered (`uncovered` is `null` and `coverage_unknown_organizations` counts the unconfirmed ones): a system auditor or a confirmed Auditor for every organization still covers the control at warn naming the unread lists, otherwise manual ("coverage is unknown for N organizations"); warn when every list was read and an organization has no Auditor |
+| 25 External authentication enforcement | platform security | `AAP-RBAC-02` | fail when the documented LDAP, SAML, or OIDC keys exist but none is populated; manual when the settings category exposes none of them (AAP 2.5 gateway, recognized by the category's session and local-auth keys) or when the body carries none of the documented authentication keys at all (unreadable path, `evidence.keys` absent) |
+| 26 Activity stream retention | platform security | `AAP-AUDIT-01` | fail when `ACTIVITY_STREAM_ENABLED` is false, no records are visible, or the newest record is older than 24 hours; warn when the system or logging settings could not be read or carried none of their documented keys |
+| 27 Notification coverage | platform security | `AAP-AUDIT-02` | fail with zero notification templates; warn when no critical template has an error notification or recent deliveries failed; manual when the notification templates list is unreadable or a template's notification list could not be read; warn naming the read when the delivery history is unreadable, and `critical_templates`, `critical_templates_eligible`, `covered`, and `unreadable` evidence render `null` when the job templates list was not read |
+| 28 Concurrent job limit | job health | `AAP-JOB-06` | warn when an instance group has neither `max_concurrent_jobs` nor `max_forks`; manual when `SCHEDULE_MAX_JOBS` or the group fields are absent |
+| 29 Project SCM health | platform security | `AAP-PROJ-01` | warn on manual SCM, `last_update_failed`, or missing `last_updated` |
+| 30 Execution environment inventory | platform security | `AAP-PLAT-01` | warn when a template relies on the default execution environment or defers it to launch; manual when the version exposes no execution environments |
+
+## Framework mappings
+
+Each finding's `mappings` array expands the spec's mapping table, for example `FedRAMP CA-7`, `CMMC CM.L2-3.4.1`, `SOC 2 CC7.1`, `CIS 16.12`, `PCI-DSS 6.3.3`, `STIG SRG-APP-000456` for control 1. The bundle writes one report per framework under `compliance/` and a unified matrix listing every control against all six frameworks.
+
+## Live smoke test
+
+```bash
+AAP_URL=https://controller.example.com AAP_TOKEN=... npm --prefix cli run test:ansible:live
+```
+
+The script exits 0 with a skip message when `AAP_URL` plus credentials are absent. Otherwise it runs `ansible_check_access` and the job health assessment over the last 30 days and prints each finding.
+
+## Limitations and manual controls
+
+- Only the `/api/v2/` controller API is used. AAP 2.5 gateway authenticators, gateway tokens, and Event-Driven Ansible are out of scope.
+  - Control 25 is therefore `manual` when the controller settings category exposes none of the documented LDAP, SAML, or OIDC keys.
+  - The category's session and local-auth keys (`SESSION_COOKIE_AGE` and its siblings) keep a 2.5 body recognizable, so that case renders the gateway note rather than the unreadable marker.
+- Control 18 scans job template `extra_vars`, survey defaults, inventory variables, and group variables. Host variables and launch-time `extra_vars` are not scanned.
+- Control 20 cannot flag tokens of disabled users because the user API exposes no active flag.
+- Control 23 probes roles for the first 50 users. The rest are reported as unprobed in `evidence`.
+- Controls 12, 15, and 27 identify critical templates and workflows by keyword (patch, harden, CIS, STIG, baseline, logging, audit, access, password, compliance, security, firewall). Review the manual findings when your naming differs.
+- Controllers without execution environments, without `SCHEDULE_MAX_JOBS`, or without an activity stream render the related controls as `manual`, never `pass`.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Bundle redaction
 
 Credentials never reach the bundle. Each snapshot keeps only the fields the controls read (ids, names, statuses, timestamps, flags, and `summary_fields` references).
 
@@ -151,7 +220,7 @@ As a result of the data-side carrier scrub:
 
 An object or array nested more than 32 containers below the file's root, or below the value handed to `redactCredentialTree`, is written as `[REDACTED]`, so the depth of a server-supplied tree bounds what is copied.
 
-#### Error text
+### Error text
 
 Error strings are scrubbed at one choke point. Every failed request is raised as an `AnsibleApiError` carrying the HTTP status and the endpoint, and its message is passed through `redactErrorText` when the error is created.
 
@@ -171,7 +240,7 @@ A failed response whose body is not JSON (for example a proxy's 502 HTML page) i
 
 A `SyntaxError` reaching the error sink from any other path is recorded by name only (`SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body`), because V8's parse message quotes a snippet of the rejected text.
 
-#### Scrub boundary
+### Scrub boundary
 
 One boundary governs the scrub:
 
@@ -248,11 +317,8 @@ Every fixed-text message the integration emits is held to the scrub by a test an
 - The unreadable-view and downgrade wordings.
 - The session-login and manual-review prose.
 
-## Status semantics
+### Verdict safety rules
 
-Every finding is `pass`, `warn`, `fail`, or `manual`.
-
-- `manual` means the API cannot prove the control on this deployment or with this account. The summary names the cause (a 403, a missing endpoint, an empty inventory that needs confirmation, a setting the version does not expose) and the evidence to collect from the controller UI.
 - An unreadable endpoint never yields `pass`. That holds for every inventory a finding reads, not only its primary one.
   - Secondary inventories: the inventories list for control 22, the system settings for control 26, the notification deliveries for control 27, the job templates for control 13, a user or team role list for control 24.
   - When a secondary inventory answers 403, the finding is `warn` or `manual`. Its summary names the unreadable read and what was not checked. `evidence.partial_view` carries `<inventory>: unreadable (<endpoint>: <error>)`.
@@ -279,64 +345,6 @@ Every finding is `pass`, `warn`, `fail`, or `manual`.
   - No path, query, fragment, or userinfo of the link is recorded.
   - The same rule sits in front of the transport, ahead of the session login. A refused target renders as `AAP request refused: the target is not on the configured origin, so no request was made.` with `endpoint` set to `not requested`.
   - The survey spec and error notification probes (50 templates each) report `<n> of <eligible> probed` the same way for controls 18 and 27.
-
-## Control coverage
-
-| Spec control | Tool | Finding id | Status semantics |
-|---|---|---|---|
-| 1 Job success rate | job health | `AAP-JOB-01` | fail below `min_success_rate` (90) or when zero jobs exist; warn if no job has finished |
-| 2 Chronic playbook failures | job health | `AAP-JOB-02` | fail when a template with 3+ runs has more than 3 consecutive failures or over 20% failures; manual on empty history |
-| 3 Stuck or long-running jobs | job health | `AAP-JOB-04` | warn when a running or pending job exceeds 2x its template's average successful runtime, has no `started`, or has no baseline |
-| 4 Manual job launch rate | job health | `AAP-JOB-03` | warn above `max_manual_rate` (25%) |
-| 5 Failed job remediation rate | job health | `AAP-JOB-05` | fail when a failure older than 7 days had no later successful run of the same template; warn on undated failures; pass with no failures |
-| 6 Unmanaged hosts | host coverage | `AAP-HOST-01` | fail when any host has `last_job` null; manual when no hosts are visible |
-| 7 Stale host coverage | host coverage | `AAP-HOST-02` | fail beyond `stale_host_days` (30), severity critical beyond `critical_stale_host_days` (60); warn when `summary_fields.last_job.finished` is missing |
-| 8 Inventory source sync health | host coverage | `AAP-HOST-03` | warn on `last_update_failed`, failed status, stale or missing `last_updated`; manual when no sources exist |
-| 9 Host failure rate | host coverage | `AAP-HOST-05` | warn when a host with 3+ runs failed over 30% in the window, or when no host has enough runs |
-| 10 Disabled hosts | host coverage | `AAP-HOST-04` | warn above 5% disabled or when `enabled` is missing |
-| 11 Stale job templates | host coverage | `AAP-TMPL-01` | warn when `last_job_run` is older than `stale_template_days` (90) or null |
-| 12 Unscheduled critical templates | host coverage | `AAP-TMPL-02` | fail when a template matching the critical keyword list has no schedule; manual when none matches |
-| 13 Missed scheduled runs | host coverage | `AAP-SCHED-01` | fail when an enabled schedule has a past or null `next_run`, or its template last ran more than 1.5x the rrule interval ago; warn when the rrule or template cannot be evaluated |
-| 14 Disabled schedules | host coverage | `AAP-SCHED-02` | warn when any schedule has `enabled=false` or no `enabled` flag |
-| 15 Workflow coverage | host coverage | `AAP-TMPL-03` | fail when job templates exist but no workflow does; warn when no workflow matches the critical keywords; manual when nothing is visible |
-| 16 Stale credentials | platform security | `AAP-CRED-01` | fail when a non-managed credential was modified more than `stale_credential_days` (90) ago, broken down by `kind`; warn on missing `modified` |
-| 17 Shared credential usage | platform security | `AAP-CRED-03` | fail when a credential is attached to more than `max_shared_templates` (5) templates; `ask_credential_on_launch` templates are reported |
-| 18 Unvaulted secrets | platform security | `AAP-CRED-04` | fail on plaintext values under secret-like names in template `extra_vars`, survey defaults, inventory or group variables; manual when surveys or variable sources are unreadable; reports Vault credentials and `ask_variables_on_launch` templates. `inventories`, `groups`, and `vault_credentials` evidence render `null` when their list was unreadable, never `0` or `[]` |
-| 19 Credential ownership gaps | platform security | `AAP-CRED-05` | warn when a credential has no user or team owner; manual when owners cannot be read |
-| 20 OAuth2 token hygiene | platform security | `AAP-CRED-02` | warn when a token has no `expires` or is older than `stale_token_days` (90); pass on zero tokens by intent |
-| 21 Organization admin count | platform security | `AAP-RBAC-01` | fail when an organization has more than `max_org_admins` (3) admins; manual when the organizations list is unreadable (evidence carries only the endpoint, HTTP status, and error, never an empty `organizations` list) or when any organization's `admins/` list could not be read (that organization stays listed with `admin_count: null`) |
-| 22 Team role audit | platform security | `AAP-RBAC-03` | fail when a team holds Admin on an organization or on every inventory |
-| 23 Execute versus admin separation | platform security | `AAP-RBAC-04` | fail when a probed user holds an Execute role together with an Admin-family role or `is_superuser` |
-| 24 Audit role coverage | platform security | `AAP-RBAC-05` | pass when a system auditor exists or every organization has a confirmed Auditor role holder among probed users and teams and every probed role list was read; when the teams list or any user or team role list could not be read, no organization is named as uncovered (`uncovered` is `null` and `coverage_unknown_organizations` counts the unconfirmed ones): a system auditor or a confirmed Auditor for every organization still covers the control at warn naming the unread lists, otherwise manual ("coverage is unknown for N organizations"); warn when every list was read and an organization has no Auditor |
-| 25 External authentication enforcement | platform security | `AAP-RBAC-02` | fail when the documented LDAP, SAML, or OIDC keys exist but none is populated; manual when the settings category exposes none of them (AAP 2.5 gateway, recognized by the category's session and local-auth keys) or when the body carries none of the documented authentication keys at all (unreadable path, `evidence.keys` absent) |
-| 26 Activity stream retention | platform security | `AAP-AUDIT-01` | fail when `ACTIVITY_STREAM_ENABLED` is false, no records are visible, or the newest record is older than 24 hours; warn when the system or logging settings could not be read or carried none of their documented keys |
-| 27 Notification coverage | platform security | `AAP-AUDIT-02` | fail with zero notification templates; warn when no critical template has an error notification or recent deliveries failed; manual when the notification templates list is unreadable or a template's notification list could not be read; warn naming the read when the delivery history is unreadable, and `critical_templates`, `critical_templates_eligible`, `covered`, and `unreadable` evidence render `null` when the job templates list was not read |
-| 28 Concurrent job limit | job health | `AAP-JOB-06` | warn when an instance group has neither `max_concurrent_jobs` nor `max_forks`; manual when `SCHEDULE_MAX_JOBS` or the group fields are absent |
-| 29 Project SCM health | platform security | `AAP-PROJ-01` | warn on manual SCM, `last_update_failed`, or missing `last_updated` |
-| 30 Execution environment inventory | platform security | `AAP-PLAT-01` | warn when a template relies on the default execution environment or defers it to launch; manual when the version exposes no execution environments |
-
-## Framework mappings
-
-Each finding's `mappings` array expands the spec's mapping table, for example `FedRAMP CA-7`, `CMMC CM.L2-3.4.1`, `SOC 2 CC7.1`, `CIS 16.12`, `PCI-DSS 6.3.3`, `STIG SRG-APP-000456` for control 1. The bundle writes one report per framework under `compliance/` and a unified matrix listing every control against all six frameworks.
-
-## Live smoke test
-
-```bash
-AAP_URL=https://controller.example.com AAP_TOKEN=... npm --prefix cli run test:ansible:live
-```
-
-The script exits 0 with a skip message when `AAP_URL` plus credentials are absent. Otherwise it runs `ansible_check_access` and the job health assessment over the last 30 days and prints each finding.
-
-## Limitations and manual controls
-
-- Only the `/api/v2/` controller API is used. AAP 2.5 gateway authenticators, gateway tokens, and Event-Driven Ansible are out of scope.
-  - Control 25 is therefore `manual` when the controller settings category exposes none of the documented LDAP, SAML, or OIDC keys.
-  - The category's session and local-auth keys (`SESSION_COOKIE_AGE` and its siblings) keep a 2.5 body recognizable, so that case renders the gateway note rather than the unreadable marker.
-- Control 18 scans job template `extra_vars`, survey defaults, inventory variables, and group variables. Host variables and launch-time `extra_vars` are not scanned.
-- Control 20 cannot flag tokens of disabled users because the user API exposes no active flag.
-- Control 23 probes roles for the first 50 users. The rest are reported as unprobed in `evidence`.
-- Controls 12, 15, and 27 identify critical templates and workflows by keyword (patch, harden, CIS, STIG, baseline, logging, audit, access, password, compliance, security, firewall). Review the manual findings when your naming differs.
-- Controllers without execution environments, without `SCHEDULE_MAX_JOBS`, or without an activity stream render the related controls as `manual`, never `pass`.
 
 ## Official documentation
 

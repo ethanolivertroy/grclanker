@@ -151,43 +151,6 @@ The assessment and export tools add thresholds:
 - `min_password_length` (14)
 - `min_retention_days` (1)
 
-### Statement execution
-
-Statements are submitted with `POST /api/v2/statements?async=true` and polled with `GET /api/v2/statements/{handle}` while the API returns `202`, honoring `Retry-After`.
-
-- **Status URL:** The poll follows the `statementStatusUrl` the API returned only when it carries no userinfo and is one of these:
-  - A root path on the configured account origin.
-  - An absolute URL that resolves, as a browser would, onto that origin. Scheme, host, and port are compared after URL normalization, so casing and a default port never matter.
-- **Refused URLs:** Anything else is never requested, so the bearer token never leaves for another host. Refused shapes:
-  - A URL on another origin (`is on origin https://other.example, not the configured account origin https://myorg-myaccount.snowflakecomputing.com`).
-  - A URL carrying userinfo on either origin (`carries userinfo for origin <origin> (configured account origin <origin>)`).
-  - A host-moving relative reference such as `@other.example/x`.
-  - A protocol-relative (`//host/...`) or backslash (`\\host\...`) form, which resolves to the host it names and is refused as off-origin.
-  - The same form when it names the configured host, refused as `a protocol-relative or relative reference rather than a root path on the configured account origin <origin> or an absolute URL on it`.
-  - A URL on a hostless scheme (`javascript:`, `data:`, `blob:`, `file:`), including a `blob:` URL wrapping the configured origin. It is refused by its scheme (`is on origin data:, not the configured account origin <origin>`).
-  - A URL that `could not be parsed against the configured account origin <origin>`.
-- **Refusal outcome:** The statement fails with `Snowflake SQL API returned a statement status URL that <reason>; the statement was not polled and its result was not read.`, recorded as an `error` outcome with that reason.
-- **Request URLs:** The request layer refuses the same shapes before any credential is built (`Snowflake SQL API request refused: the request URL <reason>, so no request was sent.`).
-- **Refusal text:** Every refusal is fixed text naming only the configured origin and the rejected origin. No path, query, fragment, or userinfo of the returned URL reaches any text.
-- **Partitions:** The response that completes the statement carries partition 0 in its `data`. When `resultSetMetaData.partitionInfo` lists more than one partition, each additional partition (1 through the last, within `max_partitions`) is fetched with `GET /api/v2/statements/{handle}?partition=N`.
-- **Errors:** `429` and `5xx` responses are retried with exponential backoff. HTTP timeouts abort the request. Error messages are scrubbed as described under Export bundle.
-
-Every statement outcome carries `status` (`ok`, `denied`, `error`, `timeout`, or `not_requested`). The outcome carries `numRows`, `partitionCount`, `fetchedPartitions`, and `truncated` only when `ok`. A statement that did not complete has all four set to `null` rather than `0` or `false`.
-
-`not_requested` is the outcome of a statement that was never sent because no bearer token could be built. The cause is a private key that does not load (a malformed PEM body, an encrypted key with the wrong passphrase) or a missing token.
-
-The `not_requested` error reads `Not requested: the Snowflake private key could not be loaded (<code>); no statement was sent.` with OpenSSL's `ERR_OSSL_*` code (or `INVALID_PRIVATE_KEY`). The failure is not retried, and no endpoint, HTTP status, or statement text is recorded for it.
-
-Truncation is recorded on three exits:
-
-- The partition cap (`max_partitions`, default 50) leaves `fetchedPartitions` below `partitionCount`.
-- An `ACCOUNT_USAGE` query whose rows reach `row_limit` (default 20,000) is truncated.
-- The six `SHOW` inventories are collected with a 10,000-row cap because Snowflake returns at most 10,000 rows from a `SHOW` command and reports no total.
-  - A full page is therefore recorded as truncated.
-  - The six inventories are `SHOW NETWORK POLICIES`, `SHOW INTEGRATIONS`, `SHOW WAREHOUSES`, `SHOW DATABASES`, `SHOW SHARES`, and `SHOW REPLICATION GROUPS`.
-
-A finding that reads a truncated statement gains `Partial inventory: <key> hit the N-row limit (M rows seen)` or `<key> returned F/P partitions (R/N rows seen)` in its summary and `evidence.partial_inventory`. A `pass` drops to `warn`, and other verdicts keep their status.
-
 ### Export bundle
 
 `core_data/<statement key>.json` and the `statements` array echoed by each assess tool are the same snapshot per statement: `{ key, statement, status, columns, rows, numRows, partitionCount, fetchedPartitions, truncated, rowLimit, error }`.
@@ -205,144 +168,6 @@ A finding that reads a truncated statement gains `Partial inventory: <key> hit t
 - `metadata.json` counts `requested_statement_count` and `not_requested_statement_count` beside `statement_count` and `failed_statement_count`.
 - `_errors.log` lists `[status] key: error` followed by the statement text for every statement that did not complete. A `not_requested` line has no statement text.
 
-#### Error text carriers
-
-Error text follows its own rule. The rule is applied when an API error is constructed, and again wherever an error string is recorded: statement markers, `_errors.log`, finding evidence, the access check, and tool error payloads.
-
-- A value inside a carrier is removed whatever its shape:
-  - The value of a credential-named header (`Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, and similar).
-  - A cookie or session assignment.
-  - URL userinfo and query pairs. The query string collapses to `?[REDACTED]`.
-  - The value after a scheme word (`Bearer`, `Basic`, `Digest`, `Token`, `OAuth`, `Negotiate`, `NTLM`, `SSWS`, `ApiKey`, `Splunk`, `Snowflake`, and `HMAC`, in any casing). The scheme word stays.
-  - The value of every credential-named `key=value` or `key: value` pair.
-- The credential-named pair is read before any scheme word. A key that names a credential loses its value whatever word it starts with:
-  - `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=Snowflake rejected` renders `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=[REDACTED] rejected`.
-  - `sslPassword=splunk rejected` renders `sslPassword=[REDACTED] rejected`.
-  - `db_password: token` renders `db_password: [REDACTED]`.
-
-#### Scheme words
-
-A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Authorization`, `WWW-Authenticate`) and bare in prose.
-
-- Under an Authorization-style key, the run after the scheme word goes whatever its shape or the scheme's casing:
-  - `Authorization: Snowflake <token>` renders `Authorization: Snowflake [REDACTED]`.
-  - `Authorization: sNoWfLaKe <token>` renders `Authorization: sNoWfLaKe [REDACTED]`.
-  - `Authorization: SSWS prod-us-east-2026` renders `Authorization: SSWS [REDACTED]`.
-- Under such a key, a pair list after the scheme (under a request header or a challenge) is read pair by pair as described below. `WWW-Authenticate: Bearer realm="api"` stays.
-- Bare in prose, the word after a scheme word is ordinary text when it is a mechanism word (`authentication`, `credentials`, `challenge`), a version (`OAuth 2.0`), an auth-param (`realm="api"`), or one plain word after a lowercase spelling or a product name.
-  - `Basic authentication failed`, `the bearer presented an expired token`, `Splunk Enterprise rejected the request`, and `Snowflake statement failed` stay.
-- Bare in prose, a header-cased pure scheme followed by a run of 8 or more characters loses the run whatever its shape:
-  - `Bearer abcdefghijkl rejected` renders `Bearer [REDACTED] rejected`.
-  - `replayed BASIC <token> upstream` renders `replayed BASIC [REDACTED] upstream`.
-
-#### Credential-named pairs
-
-- The pair rule holds whatever the value's shape and length and wherever the pair sits. It holds in the `=`, `: `, `:`, and JSON forms, in prose and inside a JSON string alike:
-  - `upstream echoed DB_PASSWORD: monkey while proxying` renders `DB_PASSWORD: [REDACTED] while proxying`.
-  - `InvalidAuthenticationToken: Access token has expired` renders `InvalidAuthenticationToken: [REDACTED] token has expired`.
-- A credential word anywhere in the key makes it a pair key (`DB_PASSWORD`, `SPLUNK_PASSWORD`, `OKTA_CLIENT_TOKEN`).
-- Three key classes refine that rule, tested in this order:
-  - **Bearer ids:** A key carries a bearer credential, and loses its value whatever the shape (a UUID included), when it does either of these:
-    - Ends in `secret_id`, `session_id`, or `token_id` in any prefix, casing, or separator (`VAULT_SECRET_ID`, `role_secret_id`, `token_id`, `tokenId`).
-    - Names a session id (`sid`, `jsessionid`).
-  - **Webhook keys:** A URL-valued webhook key keeps its origin and loses its path and query.
-    - A URL-valued webhook key is the bare word `webhook` or `hook`, or a `webhook*`, `*hook_*`, or `callback_*` key whose final segment is `url`, `uri`, or `endpoint`.
-    - A webhook key that is not URL-valued follows the rule for its own final segment. `webhook_count=3` stays, and `webhook_secret=<value>` goes whole.
-  - **Setting keys:** A credential-named key names a setting when its final segment is one of the segments listed below. It keeps a value that is neither token-shaped nor a configured secret.
-    - The final segments are `url`, `uri`, `endpoint`, `method`, `algorithm`, `audience`, `issuer`, `shape`, `type`, `mode`, `path`, `file`, `dir`, `limit`, `count`, `id`, `name`, `policy`, `policies`, `ttl`, `uses`, `cidrs`, and `accessor`.
-    - Setting keys include `token_endpoint`, `auth_method`, `token_type`, `api_key_id`, `access_key_id`, `key_id`, `private_key_id`, `secret_name`, `secret_id_ttl`, `token_max_ttl`, `secret_id_num_uses`, `token_bound_cidrs`, and `secret_id_accessor`.
-    - `secret_id_ttl=3600`, `key_id=kid-primary`, and `secret_name=db-credentials-prod` stay. `token_type=<token>` goes.
-- A key without a credential word (`OKTA_CLIENT_ID`, `client_id`, `tenant_id`, `SUMO_ACCESS_ID`, `SNOWFLAKE_ACCOUNT`, `X-Request-Id`) is an identifier rather than a pair key, so its value is judged by shape alone.
-- A credential-named command-line flag is a pair too, with a space or `=` before its value:
-  - `psql --password <value> -h db` renders `psql --password [REDACTED] -h db`.
-  - `helm --set db.password=<value> upgrade` renders `helm --set db.password=[REDACTED] upgrade`.
-  - `-Dspring.datasource.password=<value>` renders `-Dspring.datasource.password=[REDACTED]`.
-
-#### Quoted values and pair lists
-
-- A quoted value in any of the carriers above is removed with its quotes kept. The rule holds for plain, single, or JSON-escaped quotes, as in `Cookie: sid="..."`, `Authorization: Bearer "..."`, or `\"Authorization\": \"Bearer ...\"`.
-- A quote alone never makes a header value a credential. `Content-Type: "application/json"` stays.
-- On a compound header line the reader is quote-aware at every JSON depth. A quoted value ends at the closing quote that matches its opener (the same quote character behind the same run of backslashes). An escaped inner quote is therefore inner content and goes with the value.
-  - At the top level and inside a double-escaped raw JSON string alike, `{"Cookie": "sid=\"...\""}` renders `{"Cookie": "[REDACTED]"}`, and `{"X-Api-Key": "\"...\""}` renders `{"X-Api-Key": "[REDACTED]"}`.
-- A quoted value that opens with a scheme word keeps the scheme and loses the rest. `{"Authorization": "Bearer \"...\""}` renders `{"Authorization": "Bearer [REDACTED]"}`.
-- The exception is a scheme followed by a pair list, which is read pair by pair, under `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate` alike:
-  - A quoted value in the list is the credential and goes whatever its key, unless the key is a descriptive parameter (`realm`, `qop`, `algorithm`, `charset`, `error`, `error_description`, `error_uri`, `scope`).
-  - A bare value follows its key's own rule.
-  - `Authorization: Snowflake Token="<token>"` renders `Authorization: Snowflake Token="[REDACTED]"`.
-  - Any other `<Scheme> <Key>="..."` pair renders the same way. `Authorization: Bearer blob="<token>"` renders `Authorization: Bearer blob="[REDACTED]"`.
-  - A Digest header keeps `realm="api"`, `qop=auth`, and `nc=00000001`. It loses `username`, `nonce`, `uri`, `cnonce`, `response`, and `opaque`.
-  - A challenge's `WWW-Authenticate: Bearer realm="api", error="invalid_token"` stays whole.
-  - `"VERACODE-HMAC-SHA-256 id=...,ts=...,nonce=...,sig=..."` renders `"VERACODE-HMAC-SHA-256 [REDACTED],ts=...,nonce=[REDACTED],sig=[REDACTED]"`. An unquoted first run after the scheme goes whole, and the pairs after it follow their keys.
-- The same list rule reads a pair list after a scheme word in prose, bare, JSON-escaped, and inside a JSON string alike:
-  - `upstream said Bearer blob="<token>"` renders `upstream said Bearer blob="[REDACTED]"`.
-  - `{"headers":{"Authorization":"Snowflake Token=\"<token>\""}}` renders `{"headers":{"Authorization":"Snowflake Token=\"[REDACTED]\""}}`.
-- A proof parameter (`response`, `signature`, `oauth_signature`, `mac`, `sig`) loses its value wherever its pair sits in a list with a challenge parameter (`realm`, `nonce`, `cnonce`, `opaque`, `qop`, or an `oauth_*` name). The rule holds with or without a scheme word or a header in front of the list, and whatever the value's shape.
-  - As a result, a data value such as `realm="api", nonce="n", response="<proof>"` is never read as a bare challenge. It renders `realm="api", nonce="[REDACTED]", response="[REDACTED]"` bare, after a literal escape, and inside a JSON string alike.
-  - `realm=api, nonce=n, mac=<proof>` loses its `mac` the same way.
-  - Inside a scheme word's list, a bare proof goes whatever its neighbours. `Authorization: Digest username="u", response=<proof>` renders `Authorization: Digest username="[REDACTED]", response=[REDACTED]`.
-- A proof-free challenge keeps its descriptive values:
-  - `WWW-Authenticate: Bearer realm="api"` stays whole.
-  - `Digest realm="api", qop="auth", nonce="n"` keeps `realm="api"` and `qop="auth"`. Its nonce goes as a credential-named pair does everywhere.
-- A pair list of another kind keeps its values. `status=500 response=slow` stays.
-
-#### Header and cookie boundaries
-
-- An unquoted cookie or header value ends at a `;` or `,` before the next `Name:` token (or at the end of the line). An unterminated quote ends the same way rather than swallowing the following header, so that header keeps its name and gets its own carrier treatment:
-  - `Cookie: sid=...; X-Api-Key: ...; Content-Type: application/json` renders `Cookie: [REDACTED]; X-Api-Key: [REDACTED]; Content-Type: application/json`.
-  - `Cookie: sid="...; X-Api-Key: "..."; Content-Type: "application/json"` renders `Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"`.
-- A `;` inside a URL query value is part of the value (URLSearchParams semantics). So a relative `/api/v1/things?token=hunter2;restofsecret` renders `/api/v1/things?token=[REDACTED]` with no tail, and an absolute URL's query collapses to `?[REDACTED]` as before, in the plain, JSON-escaped, and slash-escaped spellings alike.
-- The `;` separator belongs to `Cookie` and `Set-Cookie` parsing alone. The cookie reader runs before the query pass, so `Cookie: &sid=a; pref=b` still renders `Cookie: [REDACTED]`.
-- An apostrophe is a cookie character:
-  - `Cookie: sid=O'<value>; X-Api-Key: <value>` renders `Cookie: [REDACTED]; X-Api-Key: [REDACTED]`.
-  - `Cookie: theme=dark; my'pref=<value>` renders `Cookie: [REDACTED]`.
-- The next header's name may carry any RFC 7230 token character, so a dotted or underscored name (`X.Api.Key:`, `X_Api_Key:`) is recognised as the next header and its value is judged by its own key.
-
-#### JSON escapes and URLs
-
-- A literal JSON escape is a boundary before every carrier opener. The escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\/`, and `\uXXXX`: the two- or six-character sequence as it sits inside a JSON string, not the control character.
-  - A header name, scheme word, pair key, URL, or token that begins right after one is read on its own, and never as the value of the word before the escape.
-  - `request headers:\u000aAuthorization: Splunk <key>` renders `request headers:\u000aAuthorization: Splunk [REDACTED]`, and `proxy:\tpassword: hunter2` renders `proxy:\tpassword: [REDACTED]`.
-  - The escape sequence itself stays.
-  - A token glued to an escape never takes the escape letter as its first character.
-  - A value, URL, or query pair ends at the backslash that opens the next escape.
-  - A `\/` escape is a boundary rather than a path separator, so a key or token after it is judged on its own.
-- A URL whose slashes are JSON-escaped (`https:\/\/hooks.example.com\/a?token=<value>`) is still read as a URL, so its userinfo and query go the same way (`note https:\/\/hooks.example.com\/a?[REDACTED] next`).
-- The userinfo of a URL ends at the first `/`, `?`, or `#`, so an `@` inside a query or fragment never turns the query into the host. In the plain and the slash-escaped spelling alike:
-  - `https://h?e=a@x.com&token=s3cr3t` renders `https://h?[REDACTED]`.
-  - `https://h#f@x.com` renders `https://h#[REDACTED]`.
-- A bare `?` or `#` left before an earlier marker stays as it is, so a second pass adds no second marker.
-
-#### Configured secrets and value shapes
-
-- A configured secret (the bearer token, the JWT built from the key pair, the private key, and its passphrase) is removed whatever its shape, in its raw, JSON-escaped, URL-encoded, base64, and base64url forms.
-- A secret handed to the scrub call is also removed wherever it stands, glued into a longer run included, so a short passphrase does not survive inside another value. A value under four characters is ignored.
-- A value with a real token shape is removed bare:
-  - PEM blocks
-  - JWTs
-  - AWS key IDs and secrets
-  - Other vendor-prefixed tokens
-  - Hex digests of 32 or more characters
-  - Runs of 16 or more characters that carry a base64 symbol, more than one digit group, or token casing
-- A bare value shaped like a name is indistinguishable from a resource name and stays:
-  - Words joined by hyphens or underscores with at most one digit group, such as `prod-us-east-2026`.
-  - A camelCase identifier whose words average three or more letters, such as `resultSetMetaData`, `statementHandle`.
-
-#### Paths and path labels
-
-- A token-shaped segment of a bare request path or file path (`/api/v2/statements/<handle>`, the `config.toml` path) also stays, so the endpoint or file an error names is the one the run used.
-- Inside a URL with a scheme, every path segment keeps the rule.
-- The last segment of a bare path used as a label (`/home/auditor/.snowflake/rsa_key.p8: <detail>`, `/oauth/token-request: invalid_client`, `/api/v1/api-tokens: request failed with 403`) is a request target rather than a pair key.
-  - The text after that segment stays, unless that segment itself names a credential and the value stands alone on the line. In that case the label is a pair: `kv/password: <value>` renders `kv/password: [REDACTED]`.
-  - That segment names a credential when it ends in `password`, `passwd`, `passphrase`, `pwd`, `secret`, `token`, `key`, or `assertion`, alone or followed by an encoding word such as `pem` or `base64` (as in `privateKeyPem`), or when it is a bearer id.
-  - Inside a URL with a scheme, the pair rule still applies.
-
-#### Data-side rule
-
-Data written to the bundle follows the data-side rule. Every string leaf of a `core_data/` snapshot, an assess payload, and the access check passes through the same carrier and shape rules, with the generic long-run and hex-digest rules left off.
-
-- A vendor-prefixed token (`sk_live_`, `xox*-`, `ghp_`, `AKIA`, and the rest of the vendor set), a JWT, a PEM block, or a credential carrier inside a free-text field (a policy comment, a user comment, a share comment) is removed there too. `key sk_live_<24 characters> end` renders `key [REDACTED] end`.
-- An identifier such as `prod-us-east-2026-cluster` or a bare random run survives as evidence.
-
 ## Verdict semantics
 
 Every finding carries `id`, `control`, `title`, `severity`, `status`, `summary`, `evidence`, and `mappings`. Statuses follow these rules:
@@ -358,41 +183,9 @@ Every finding carries `id`, `control`, `title`, `severity`, `status`, `summary`,
 
 The summary of a `manual` finding names the cause and the evidence to collect.
 
-Items with a NULL `LAST_SUCCESS_LOGIN` are reported in their own bucket and never counted as active.
-
-An empty result only passes when the control's intent makes emptiness compliant and the statement was readable:
-
-- No direct user grants (10).
-- No `PUBLIC` grants (16).
-- No outbound shares (22, only under `ACCOUNTADMIN`).
-- No enabled API or external access integrations (23, only under `ACCOUNTADMIN` or `SECURITYADMIN`).
-
-Two further rules apply to every finding:
-
-- A finding that also reads an optional statement never passes while that statement is denied, failed, or timed out.
-  - The optional statements are the session context (for 19, 22, 23, and 24), `ACCESS_HISTORY` (for 13), `TAG_REFERENCES` (for 14), and `SHOW REPLICATION GROUPS` (for 22).
-  - The summary appends `Unreadable inventory: <key> was denied (insufficient privileges): <error>, so <what went unchecked>`, and `evidence.unreadable_inventories` names the key.
-  - The pass drops to `warn`, or to `manual` for control 22 when the session context cannot verify the role as `ACCOUNTADMIN`.
-  - Other verdicts keep their status and gain `Unreadable inventory: <key> (<status>)`.
-- Every statement text, HTTP status, and endpoint named in a summary, in `evidence.statements`, in the access check, or in `_errors.log` comes from a request the run actually made.
-  - The outcome status (`denied`, `error`, `timeout`) is classified from the observed error or HTTP status.
-  - **Unsent statements:** A statement that was never sent is recorded as `not_requested` under its key with `statement: null`, so `POST /api/v2/statements` and the statement text appear nowhere for it.
-  - **Identity:** When no request was sent, the run does not claim an identity:
-    - The access check, the executive summary, and `metadata.json` report `not_authenticated` with the key failure code.
-    - The assessment `summary.role` renders `null`.
-    - No visibility note is derived from the configured role.
-  - **Incomplete statements:** Row counts derived from a statement that did not complete render `null` in evidence and in the assessment `summary`, never `0`.
-  - **Partial reads:** A count judged over a statement that completed with unfetched partitions or a hit row limit renders `null` too, never the count of the rows read. The affected counts are:
-    - `enabled_human_users`, `password_human_users`, `users_with_unknown_mfa_flags`, `service_users`, `users_without_login_timestamp_count`, and every `user_classes` count (3, 5, 12) while the `users` read was partial.
-    - `successful_logins` and `failed_logins` (11) while the `login_outcomes` read was partial.
-  - **Seen-of-total:** The seen-of-total appears beside each such count in `evidence.statements[].rows`, `evidence.partial_inventory`, and the summary's `Partial inventory: <key> returned F/P partitions (S/N rows seen)`.
-  - Those summaries qualify the population with `among the rows read`.
-  - **Empty classes:** An empty class that came from a partial read is unread rather than absent.
-    - Control 5 renders `manual` with `No user typed SERVICE, SERVICE_AGENT, or LEGACY_SERVICE was among the N user rows read, and the read stopped early, so the service account inventory is unread rather than empty` instead of `None of the N users are typed ...`.
-    - Control 11 renders `manual` with `No LOGIN_HISTORY outcome row for the last N days was among the rows read, and the read stopped early, so the login window is unread rather than empty` instead of the empty-window note.
-  - A complete read keeps its real zeros and its wording.
-
 ## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the [verdict safety rules](#verdict-safety-rules).
 
 | # | Spec control | Tool | Finding | Status semantics |
 |---|--------------|------|---------|------------------|
@@ -463,6 +256,221 @@ The script exits 0 with a skip message when no credentials resolve. With credent
 - Trust Center findings are not queried in this release.
 - Inventory queries carry a `row_limit` (default 20,000) and a partition cap (50). `SHOW` commands carry a fixed 10,000-row cap. Hitting any of them marks the statement truncated and downgrades any `pass`.
 - A finding that reads several statements never passes while one of them is unreadable (the summary names the statement).
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Statement execution
+
+Statements are submitted with `POST /api/v2/statements?async=true` and polled with `GET /api/v2/statements/{handle}` while the API returns `202`, honoring `Retry-After`.
+
+- **Status URL:** The poll follows the `statementStatusUrl` the API returned only when it carries no userinfo and is one of these:
+  - A root path on the configured account origin.
+  - An absolute URL that resolves, as a browser would, onto that origin. Scheme, host, and port are compared after URL normalization, so casing and a default port never matter.
+- **Refused URLs:** Anything else is never requested, so the bearer token never leaves for another host. Refused shapes:
+  - A URL on another origin (`is on origin https://other.example, not the configured account origin https://myorg-myaccount.snowflakecomputing.com`).
+  - A URL carrying userinfo on either origin (`carries userinfo for origin <origin> (configured account origin <origin>)`).
+  - A host-moving relative reference such as `@other.example/x`.
+  - A protocol-relative (`//host/...`) or backslash (`\\host\...`) form, which resolves to the host it names and is refused as off-origin.
+  - The same form when it names the configured host, refused as `a protocol-relative or relative reference rather than a root path on the configured account origin <origin> or an absolute URL on it`.
+  - A URL on a hostless scheme (`javascript:`, `data:`, `blob:`, `file:`), including a `blob:` URL wrapping the configured origin. It is refused by its scheme (`is on origin data:, not the configured account origin <origin>`).
+  - A URL that `could not be parsed against the configured account origin <origin>`.
+- **Refusal outcome:** The statement fails with `Snowflake SQL API returned a statement status URL that <reason>; the statement was not polled and its result was not read.`, recorded as an `error` outcome with that reason.
+- **Request URLs:** The request layer refuses the same shapes before any credential is built (`Snowflake SQL API request refused: the request URL <reason>, so no request was sent.`).
+- **Refusal text:** Every refusal is fixed text naming only the configured origin and the rejected origin. No path, query, fragment, or userinfo of the returned URL reaches any text.
+- **Partitions:** The response that completes the statement carries partition 0 in its `data`. When `resultSetMetaData.partitionInfo` lists more than one partition, each additional partition (1 through the last, within `max_partitions`) is fetched with `GET /api/v2/statements/{handle}?partition=N`.
+- **Errors:** `429` and `5xx` responses are retried with exponential backoff. HTTP timeouts abort the request. Error messages are scrubbed by the [error text rules](#error-text-carriers).
+
+Every statement outcome carries `status` (`ok`, `denied`, `error`, `timeout`, or `not_requested`). The outcome carries `numRows`, `partitionCount`, `fetchedPartitions`, and `truncated` only when `ok`. A statement that did not complete has all four set to `null` rather than `0` or `false`.
+
+`not_requested` is the outcome of a statement that was never sent because no bearer token could be built. The cause is a private key that does not load (a malformed PEM body, an encrypted key with the wrong passphrase) or a missing token.
+
+The `not_requested` error reads `Not requested: the Snowflake private key could not be loaded (<code>); no statement was sent.` with OpenSSL's `ERR_OSSL_*` code (or `INVALID_PRIVATE_KEY`). The failure is not retried, and no endpoint, HTTP status, or statement text is recorded for it.
+
+Truncation is recorded on three exits:
+
+- The partition cap (`max_partitions`, default 50) leaves `fetchedPartitions` below `partitionCount`.
+- An `ACCOUNT_USAGE` query whose rows reach `row_limit` (default 20,000) is truncated.
+- The six `SHOW` inventories are collected with a 10,000-row cap because Snowflake returns at most 10,000 rows from a `SHOW` command and reports no total.
+  - A full page is therefore recorded as truncated.
+  - The six inventories are `SHOW NETWORK POLICIES`, `SHOW INTEGRATIONS`, `SHOW WAREHOUSES`, `SHOW DATABASES`, `SHOW SHARES`, and `SHOW REPLICATION GROUPS`.
+
+A finding that reads a truncated statement gains `Partial inventory: <key> hit the N-row limit (M rows seen)` or `<key> returned F/P partitions (R/N rows seen)` in its summary and `evidence.partial_inventory`. A `pass` drops to `warn`, and other verdicts keep their status.
+
+### Error text carriers
+
+Error text follows its own rule. The rule is applied when an API error is constructed, and again wherever an error string is recorded: statement markers, `_errors.log`, finding evidence, the access check, and tool error payloads.
+
+- A value inside a carrier is removed whatever its shape:
+  - The value of a credential-named header (`Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, and similar).
+  - A cookie or session assignment.
+  - URL userinfo and query pairs. The query string collapses to `?[REDACTED]`.
+  - The value after a scheme word (`Bearer`, `Basic`, `Digest`, `Token`, `OAuth`, `Negotiate`, `NTLM`, `SSWS`, `ApiKey`, `Splunk`, `Snowflake`, and `HMAC`, in any casing). The scheme word stays.
+  - The value of every credential-named `key=value` or `key: value` pair.
+- The credential-named pair is read before any scheme word. A key that names a credential loses its value whatever word it starts with:
+  - `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=Snowflake rejected` renders `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=[REDACTED] rejected`.
+  - `sslPassword=splunk rejected` renders `sslPassword=[REDACTED] rejected`.
+  - `db_password: token` renders `db_password: [REDACTED]`.
+
+### Scheme words
+
+A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Authorization`, `WWW-Authenticate`) and bare in prose.
+
+- Under an Authorization-style key, the run after the scheme word goes whatever its shape or the scheme's casing:
+  - `Authorization: Snowflake <token>` renders `Authorization: Snowflake [REDACTED]`.
+  - `Authorization: sNoWfLaKe <token>` renders `Authorization: sNoWfLaKe [REDACTED]`.
+  - `Authorization: SSWS prod-us-east-2026` renders `Authorization: SSWS [REDACTED]`.
+- Under such a key, a pair list after the scheme (under a request header or a challenge) is read pair by pair as described below. `WWW-Authenticate: Bearer realm="api"` stays.
+- Bare in prose, the word after a scheme word is ordinary text when it is a mechanism word (`authentication`, `credentials`, `challenge`), a version (`OAuth 2.0`), an auth-param (`realm="api"`), or one plain word after a lowercase spelling or a product name.
+  - `Basic authentication failed`, `the bearer presented an expired token`, `Splunk Enterprise rejected the request`, and `Snowflake statement failed` stay.
+- Bare in prose, a header-cased pure scheme followed by a run of 8 or more characters loses the run whatever its shape:
+  - `Bearer abcdefghijkl rejected` renders `Bearer [REDACTED] rejected`.
+  - `replayed BASIC <token> upstream` renders `replayed BASIC [REDACTED] upstream`.
+
+### Credential-named pairs
+
+- The pair rule holds whatever the value's shape and length and wherever the pair sits. It holds in the `=`, `: `, `:`, and JSON forms, in prose and inside a JSON string alike:
+  - `upstream echoed DB_PASSWORD: monkey while proxying` renders `DB_PASSWORD: [REDACTED] while proxying`.
+  - `InvalidAuthenticationToken: Access token has expired` renders `InvalidAuthenticationToken: [REDACTED] token has expired`.
+- A credential word anywhere in the key makes it a pair key (`DB_PASSWORD`, `SPLUNK_PASSWORD`, `OKTA_CLIENT_TOKEN`).
+- Three key classes refine that rule, tested in this order:
+  - **Bearer ids:** A key carries a bearer credential, and loses its value whatever the shape (a UUID included), when it does either of these:
+    - Ends in `secret_id`, `session_id`, or `token_id` in any prefix, casing, or separator (`VAULT_SECRET_ID`, `role_secret_id`, `token_id`, `tokenId`).
+    - Names a session id (`sid`, `jsessionid`).
+  - **Webhook keys:** A URL-valued webhook key keeps its origin and loses its path and query.
+    - A URL-valued webhook key is the bare word `webhook` or `hook`, or a `webhook*`, `*hook_*`, or `callback_*` key whose final segment is `url`, `uri`, or `endpoint`.
+    - A webhook key that is not URL-valued follows the rule for its own final segment. `webhook_count=3` stays, and `webhook_secret=<value>` goes whole.
+  - **Setting keys:** A credential-named key names a setting when its final segment is one of the segments listed below. It keeps a value that is neither token-shaped nor a configured secret.
+    - The final segments are `url`, `uri`, `endpoint`, `method`, `algorithm`, `audience`, `issuer`, `shape`, `type`, `mode`, `path`, `file`, `dir`, `limit`, `count`, `id`, `name`, `policy`, `policies`, `ttl`, `uses`, `cidrs`, and `accessor`.
+    - Setting keys include `token_endpoint`, `auth_method`, `token_type`, `api_key_id`, `access_key_id`, `key_id`, `private_key_id`, `secret_name`, `secret_id_ttl`, `token_max_ttl`, `secret_id_num_uses`, `token_bound_cidrs`, and `secret_id_accessor`.
+    - `secret_id_ttl=3600`, `key_id=kid-primary`, and `secret_name=db-credentials-prod` stay. `token_type=<token>` goes.
+- A key without a credential word (`OKTA_CLIENT_ID`, `client_id`, `tenant_id`, `SUMO_ACCESS_ID`, `SNOWFLAKE_ACCOUNT`, `X-Request-Id`) is an identifier rather than a pair key, so its value is judged by shape alone.
+- A credential-named command-line flag is a pair too, with a space or `=` before its value:
+  - `psql --password <value> -h db` renders `psql --password [REDACTED] -h db`.
+  - `helm --set db.password=<value> upgrade` renders `helm --set db.password=[REDACTED] upgrade`.
+  - `-Dspring.datasource.password=<value>` renders `-Dspring.datasource.password=[REDACTED]`.
+
+### Quoted values and pair lists
+
+- A quoted value in any of the carriers above is removed with its quotes kept. The rule holds for plain, single, or JSON-escaped quotes, as in `Cookie: sid="..."`, `Authorization: Bearer "..."`, or `\"Authorization\": \"Bearer ...\"`.
+- A quote alone never makes a header value a credential. `Content-Type: "application/json"` stays.
+- On a compound header line the reader is quote-aware at every JSON depth. A quoted value ends at the closing quote that matches its opener (the same quote character behind the same run of backslashes). An escaped inner quote is therefore inner content and goes with the value.
+  - At the top level and inside a double-escaped raw JSON string alike, `{"Cookie": "sid=\"...\""}` renders `{"Cookie": "[REDACTED]"}`, and `{"X-Api-Key": "\"...\""}` renders `{"X-Api-Key": "[REDACTED]"}`.
+- A quoted value that opens with a scheme word keeps the scheme and loses the rest. `{"Authorization": "Bearer \"...\""}` renders `{"Authorization": "Bearer [REDACTED]"}`.
+- The exception is a scheme followed by a pair list, which is read pair by pair, under `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate` alike:
+  - A quoted value in the list is the credential and goes whatever its key, unless the key is a descriptive parameter (`realm`, `qop`, `algorithm`, `charset`, `error`, `error_description`, `error_uri`, `scope`).
+  - A bare value follows its key's own rule.
+  - `Authorization: Snowflake Token="<token>"` renders `Authorization: Snowflake Token="[REDACTED]"`.
+  - Any other `<Scheme> <Key>="..."` pair renders the same way. `Authorization: Bearer blob="<token>"` renders `Authorization: Bearer blob="[REDACTED]"`.
+  - A Digest header keeps `realm="api"`, `qop=auth`, and `nc=00000001`. It loses `username`, `nonce`, `uri`, `cnonce`, `response`, and `opaque`.
+  - A challenge's `WWW-Authenticate: Bearer realm="api", error="invalid_token"` stays whole.
+  - `"VERACODE-HMAC-SHA-256 id=...,ts=...,nonce=...,sig=..."` renders `"VERACODE-HMAC-SHA-256 [REDACTED],ts=...,nonce=[REDACTED],sig=[REDACTED]"`. An unquoted first run after the scheme goes whole, and the pairs after it follow their keys.
+- The same list rule reads a pair list after a scheme word in prose, bare, JSON-escaped, and inside a JSON string alike:
+  - `upstream said Bearer blob="<token>"` renders `upstream said Bearer blob="[REDACTED]"`.
+  - `{"headers":{"Authorization":"Snowflake Token=\"<token>\""}}` renders `{"headers":{"Authorization":"Snowflake Token=\"[REDACTED]\""}}`.
+- A proof parameter (`response`, `signature`, `oauth_signature`, `mac`, `sig`) loses its value wherever its pair sits in a list with a challenge parameter (`realm`, `nonce`, `cnonce`, `opaque`, `qop`, or an `oauth_*` name). The rule holds with or without a scheme word or a header in front of the list, and whatever the value's shape.
+  - As a result, a data value such as `realm="api", nonce="n", response="<proof>"` is never read as a bare challenge. It renders `realm="api", nonce="[REDACTED]", response="[REDACTED]"` bare, after a literal escape, and inside a JSON string alike.
+  - `realm=api, nonce=n, mac=<proof>` loses its `mac` the same way.
+  - Inside a scheme word's list, a bare proof goes whatever its neighbours. `Authorization: Digest username="u", response=<proof>` renders `Authorization: Digest username="[REDACTED]", response=[REDACTED]`.
+- A proof-free challenge keeps its descriptive values:
+  - `WWW-Authenticate: Bearer realm="api"` stays whole.
+  - `Digest realm="api", qop="auth", nonce="n"` keeps `realm="api"` and `qop="auth"`. Its nonce goes as a credential-named pair does everywhere.
+- A pair list of another kind keeps its values. `status=500 response=slow` stays.
+
+### Header and cookie boundaries
+
+- An unquoted cookie or header value ends at a `;` or `,` before the next `Name:` token (or at the end of the line). An unterminated quote ends the same way rather than swallowing the following header, so that header keeps its name and gets its own carrier treatment:
+  - `Cookie: sid=...; X-Api-Key: ...; Content-Type: application/json` renders `Cookie: [REDACTED]; X-Api-Key: [REDACTED]; Content-Type: application/json`.
+  - `Cookie: sid="...; X-Api-Key: "..."; Content-Type: "application/json"` renders `Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"`.
+- A `;` inside a URL query value is part of the value (URLSearchParams semantics). So a relative `/api/v1/things?token=hunter2;restofsecret` renders `/api/v1/things?token=[REDACTED]` with no tail, and an absolute URL's query collapses to `?[REDACTED]` as before, in the plain, JSON-escaped, and slash-escaped spellings alike.
+- The `;` separator belongs to `Cookie` and `Set-Cookie` parsing alone. The cookie reader runs before the query pass, so `Cookie: &sid=a; pref=b` still renders `Cookie: [REDACTED]`.
+- An apostrophe is a cookie character:
+  - `Cookie: sid=O'<value>; X-Api-Key: <value>` renders `Cookie: [REDACTED]; X-Api-Key: [REDACTED]`.
+  - `Cookie: theme=dark; my'pref=<value>` renders `Cookie: [REDACTED]`.
+- The next header's name may carry any RFC 7230 token character, so a dotted or underscored name (`X.Api.Key:`, `X_Api_Key:`) is recognised as the next header and its value is judged by its own key.
+
+### JSON escapes and URLs
+
+- A literal JSON escape is a boundary before every carrier opener. The escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\/`, and `\uXXXX`: the two- or six-character sequence as it sits inside a JSON string, not the control character.
+  - A header name, scheme word, pair key, URL, or token that begins right after one is read on its own, and never as the value of the word before the escape.
+  - `request headers:\u000aAuthorization: Splunk <key>` renders `request headers:\u000aAuthorization: Splunk [REDACTED]`, and `proxy:\tpassword: hunter2` renders `proxy:\tpassword: [REDACTED]`.
+  - The escape sequence itself stays.
+  - A token glued to an escape never takes the escape letter as its first character.
+  - A value, URL, or query pair ends at the backslash that opens the next escape.
+  - A `\/` escape is a boundary rather than a path separator, so a key or token after it is judged on its own.
+- A URL whose slashes are JSON-escaped (`https:\/\/hooks.example.com\/a?token=<value>`) is still read as a URL, so its userinfo and query go the same way (`note https:\/\/hooks.example.com\/a?[REDACTED] next`).
+- The userinfo of a URL ends at the first `/`, `?`, or `#`, so an `@` inside a query or fragment never turns the query into the host. In the plain and the slash-escaped spelling alike:
+  - `https://h?e=a@x.com&token=s3cr3t` renders `https://h?[REDACTED]`.
+  - `https://h#f@x.com` renders `https://h#[REDACTED]`.
+- A bare `?` or `#` left before an earlier marker stays as it is, so a second pass adds no second marker.
+
+### Configured secrets and value shapes
+
+- A configured secret (the bearer token, the JWT built from the key pair, the private key, and its passphrase) is removed whatever its shape, in its raw, JSON-escaped, URL-encoded, base64, and base64url forms.
+- A secret handed to the scrub call is also removed wherever it stands, glued into a longer run included, so a short passphrase does not survive inside another value. A value under four characters is ignored.
+- A value with a real token shape is removed bare:
+  - PEM blocks
+  - JWTs
+  - AWS key IDs and secrets
+  - Other vendor-prefixed tokens
+  - Hex digests of 32 or more characters
+  - Runs of 16 or more characters that carry a base64 symbol, more than one digit group, or token casing
+- A bare value shaped like a name is indistinguishable from a resource name and stays:
+  - Words joined by hyphens or underscores with at most one digit group, such as `prod-us-east-2026`.
+  - A camelCase identifier whose words average three or more letters, such as `resultSetMetaData`, `statementHandle`.
+
+### Paths and path labels
+
+- A token-shaped segment of a bare request path or file path (`/api/v2/statements/<handle>`, the `config.toml` path) also stays, so the endpoint or file an error names is the one the run used.
+- Inside a URL with a scheme, every path segment keeps the rule.
+- The last segment of a bare path used as a label (`/home/auditor/.snowflake/rsa_key.p8: <detail>`, `/oauth/token-request: invalid_client`, `/api/v1/api-tokens: request failed with 403`) is a request target rather than a pair key.
+  - The text after that segment stays, unless that segment itself names a credential and the value stands alone on the line. In that case the label is a pair: `kv/password: <value>` renders `kv/password: [REDACTED]`.
+  - That segment names a credential when it ends in `password`, `passwd`, `passphrase`, `pwd`, `secret`, `token`, `key`, or `assertion`, alone or followed by an encoding word such as `pem` or `base64` (as in `privateKeyPem`), or when it is a bearer id.
+  - Inside a URL with a scheme, the pair rule still applies.
+
+### Data-side rule
+
+Data written to the bundle follows the data-side rule. Every string leaf of a `core_data/` snapshot, an assess payload, and the access check passes through the same carrier and shape rules, with the generic long-run and hex-digest rules left off.
+
+- A vendor-prefixed token (`sk_live_`, `xox*-`, `ghp_`, `AKIA`, and the rest of the vendor set), a JWT, a PEM block, or a credential carrier inside a free-text field (a policy comment, a user comment, a share comment) is removed there too. `key sk_live_<24 characters> end` renders `key [REDACTED] end`.
+- An identifier such as `prod-us-east-2026-cluster` or a bare random run survives as evidence.
+
+### Verdict safety rules
+
+Items with a NULL `LAST_SUCCESS_LOGIN` are reported in their own bucket and never counted as active.
+
+An empty result only passes when the control's intent makes emptiness compliant and the statement was readable:
+
+- No direct user grants (10).
+- No `PUBLIC` grants (16).
+- No outbound shares (22, only under `ACCOUNTADMIN`).
+- No enabled API or external access integrations (23, only under `ACCOUNTADMIN` or `SECURITYADMIN`).
+
+Two further rules apply to every finding:
+
+- A finding that also reads an optional statement never passes while that statement is denied, failed, or timed out.
+  - The optional statements are the session context (for 19, 22, 23, and 24), `ACCESS_HISTORY` (for 13), `TAG_REFERENCES` (for 14), and `SHOW REPLICATION GROUPS` (for 22).
+  - The summary appends `Unreadable inventory: <key> was denied (insufficient privileges): <error>, so <what went unchecked>`, and `evidence.unreadable_inventories` names the key.
+  - The pass drops to `warn`, or to `manual` for control 22 when the session context cannot verify the role as `ACCOUNTADMIN`.
+  - Other verdicts keep their status and gain `Unreadable inventory: <key> (<status>)`.
+- Every statement text, HTTP status, and endpoint named in a summary, in `evidence.statements`, in the access check, or in `_errors.log` comes from a request the run actually made.
+  - The outcome status (`denied`, `error`, `timeout`) is classified from the observed error or HTTP status.
+  - **Unsent statements:** A statement that was never sent is recorded as `not_requested` under its key with `statement: null`, so `POST /api/v2/statements` and the statement text appear nowhere for it.
+  - **Identity:** When no request was sent, the run does not claim an identity:
+    - The access check, the executive summary, and `metadata.json` report `not_authenticated` with the key failure code.
+    - The assessment `summary.role` renders `null`.
+    - No visibility note is derived from the configured role.
+  - **Incomplete statements:** Row counts derived from a statement that did not complete render `null` in evidence and in the assessment `summary`, never `0`.
+  - **Partial reads:** A count judged over a statement that completed with unfetched partitions or a hit row limit renders `null` too, never the count of the rows read. The affected counts are:
+    - `enabled_human_users`, `password_human_users`, `users_with_unknown_mfa_flags`, `service_users`, `users_without_login_timestamp_count`, and every `user_classes` count (3, 5, 12) while the `users` read was partial.
+    - `successful_logins` and `failed_logins` (11) while the `login_outcomes` read was partial.
+  - **Seen-of-total:** The seen-of-total appears beside each such count in `evidence.statements[].rows`, `evidence.partial_inventory`, and the summary's `Partial inventory: <key> returned F/P partitions (S/N rows seen)`.
+  - Those summaries qualify the population with `among the rows read`.
+  - **Empty classes:** An empty class that came from a partial read is unread rather than absent.
+    - Control 5 renders `manual` with `No user typed SERVICE, SERVICE_AGENT, or LEGACY_SERVICE was among the N user rows read, and the read stopped early, so the service account inventory is unread rather than empty` instead of `None of the N users are typed ...`.
+    - Control 11 renders `manual` with `No LOGIN_HISTORY outcome row for the last N days was among the rows read, and the read stopped early, so the login window is unread rather than empty` instead of the empty-window note.
+  - A complete read keeps its real zeros and its wording.
 
 ## Official documentation
 
