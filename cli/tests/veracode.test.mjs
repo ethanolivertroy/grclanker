@@ -3039,3 +3039,29 @@ portableContractTest("the auth resolver contract names exactly the environment t
     assert.ok(applied(resolveVeracodeConfiguration({}, environment, { homeDir: home })), `${name} reaches the resolved configuration`);
   }
 });
+
+function veracodeHttpClient(fetchImpl) {
+  return new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl, sleep: async () => {} });
+}
+
+portableContractTest("every request the access check, the five assessments, and the export send matches a declared surface, parameter, and header", async () => {
+  const recorder = recordFetchRequests(recordingVeracodeFetch().fetchImpl);
+  const client = veracodeHttpClient(recorder.fetch);
+  await checkVeracodeAccess(client);
+  await runVeracodeAssessments(client);
+  await exportVeracodeAuditBundle(client, sampleConfig(), createTempBase("grclanker-veracode-request-conformance-"), { now: NOW });
+
+  const { fetchImpl } = recordingVeracodeFetch();
+  const memberOnly = recordFetchRequests(async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/authn/v2/teams" && url.searchParams.has("all_for_org")) return jsonResponse({ message: "Forbidden" }, { status: 403 });
+    return fetchImpl(input, init);
+  });
+  const fallbackClient = veracodeHttpClient(memberOnly.fetch);
+  await checkVeracodeAccess(fallbackClient);
+  await assessVeracodeAccessControls(fallbackClient, { now: NOW });
+  const teamRequests = memberOnly.requests.filter((request) => new URL(request.url).pathname === "/api/authn/v2/teams");
+  assert.ok(teamRequests.some((request) => !new URL(request.url).searchParams.has("all_for_org")), "the refused organization-wide team list falls back to the member-only request");
+
+  assertRequestConformance(assert, VERACODE_SPEC, [...recorder.requests, ...memberOnly.requests]);
+});
