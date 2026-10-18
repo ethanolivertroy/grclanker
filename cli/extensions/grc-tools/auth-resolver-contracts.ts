@@ -386,3 +386,42 @@ export const TENABLE_AUTH_RESOLVER = {
   ],
   configFields: ["url", "base_url", "access_key", "accessKey", "secret_key", "secretKey", "sc_url", "sc_access_key", "sc_secret_key", "timeout_seconds"],
 } as const satisfies ResolverAuthenticationContract;
+
+export const QUALYS_AUTH_RESOLVER = {
+  modes: [
+    "Basic authentication: Authorization: Basic with the base64 encoding of username:password",
+    "Pre-issued bearer token: Authorization: Bearer with the configured token",
+    "Gateway token exchange: the username and password are exchanged at the platform gateway for a bearer token",
+  ],
+  precedence: [
+    "Explicit tool arguments",
+    "QUALYS_* environment variables",
+    "Qualys key=value config file",
+    "A token from any source selects bearer authentication; otherwise use_oauth selects the gateway token exchange; otherwise basic authentication",
+  ],
+  environment: [
+    "QUALYS_CONFIG_FILE",
+    "QUALYS_USERNAME",
+    "QUALYS_USER",
+    "QUALYS_PASSWORD",
+    "QUALYS_TOKEN",
+    "QUALYS_ACCESS_TOKEN",
+    "QUALYS_USE_OAUTH",
+    "QUALYS_PLATFORM",
+    "QUALYS_API_SERVER",
+    "QUALYS_BASE_URL",
+    "QUALYS_API_URL",
+    "QUALYS_GATEWAY_URL",
+    "QUALYS_TIMEOUT",
+    "QUALYS_MAX_RETRIES",
+    "QUALYS_LOOKBACK_DAYS",
+  ],
+  configLocations: ["~/.qcrc", "Explicit path from config_file or QUALYS_CONFIG_FILE"],
+  variants: [
+    "Named platforms US1 (the default), US2, US3, US4, GOV1, EU1, EU2, EU3, IN1, CA1, AE1, UK1, AU1, and KSA1, each with its own API server and gateway",
+    "An API server hostname or https URL that belongs to a named platform resolves to that platform",
+    "Any other API server host is a custom platform whose gateway replaces a leading qualysapi. with qualysgateway., unless gateway_url overrides it",
+  ],
+  configFields: ["username", "user", "password", "token", "use_oauth", "platform", "hostname", "base_url", "gateway_url", "timeout"],
+  refreshRequest: "POST {gateway}/auth with the form fields username, password, and token=true when use_oauth is set and no token is configured; the returned token is reused for 3.5 hours.",
+} as const satisfies ResolverAuthenticationContract;

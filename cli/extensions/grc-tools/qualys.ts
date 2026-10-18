@@ -6,6 +6,7 @@
  * VM/PC API (XML), the Asset Management and Tagging, Cloud Agent, and
  * Administration APIs (QPS 2.0, JSON), and the WAS API (QPS 3.0, JSON).
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   createWriteStream,
   existsSync,
@@ -19,8 +20,12 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { QUALYS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { NextLinkError, readConfigText, resolveSameOriginUrl } from "./hardening/index.js";
+import { QUALYS_RAW_DATA_ALLOWLISTS, QUALYS_SPEC, type FieldAllowlist, type FieldRule } from "./qualys.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import type { FrameworkKey } from "./spec-model.js";
 
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
@@ -277,7 +282,7 @@ const CONTROL_MAPPINGS: Record<number, string[]> = {
   20: ["FedRAMP RA-5", "CMMC 3.11.2", "SOC 2 CC7.1", "PCI-DSS 11.3.1", "STIG SRG-APP-000516", "IRAP ISM-1163", "ISMAP CPS.RA-5"],
 };
 
-const FRAMEWORKS: Array<{ prefix: string; dir: string; file: string; title: string }> = [
+const FRAMEWORKS: Array<{ prefix: string; dir: FrameworkKey; file: string; title: string }> = [
   { prefix: "FedRAMP ", dir: "fedramp", file: "fedramp_compliance_report.md", title: "FedRAMP / NIST 800-53 Compliance Report" },
   { prefix: "CMMC ", dir: "cmmc", file: "cmmc_compliance_report.md", title: "CMMC Compliance Report" },
   { prefix: "SOC 2 ", dir: "soc2", file: "soc2_compliance_report.md", title: "SOC 2 Compliance Report" },
@@ -287,6 +292,23 @@ const FRAMEWORKS: Array<{ prefix: string; dir: string; file: string; title: stri
   { prefix: "IRAP ", dir: "irap", file: "irap_compliance_report.md", title: "IRAP / ISM Compliance Report" },
   { prefix: "ISMAP ", dir: "ismap", file: "ismap_compliance_report.md", title: "ISMAP Compliance Report" },
 ];
+
+function frameworkMappingsOf(control: number): Partial<Record<FrameworkKey, string[]>> {
+  const mappings = CONTROL_MAPPINGS[control];
+  if (!mappings) throw new Error(`Qualys control ${control} has no framework mappings`);
+  const byFramework: Partial<Record<FrameworkKey, string[]>> = {};
+  for (const mapping of mappings) {
+    const framework = FRAMEWORKS.find((report) => mapping.startsWith(report.prefix));
+    if (!framework) throw new Error(`Qualys control ${control} mapping ${mapping} names no reported framework`);
+    (byFramework[framework.dir] ??= []).push(mapping.slice(framework.prefix.length));
+  }
+  return byFramework;
+}
+
+hydrateBatchFrameworkMappings(QUALYS_SPEC, Object.fromEntries(QUALYS_SPEC.checks.map((check) => [
+  check.id,
+  frameworkMappingsOf(check.controlNumbers[0]),
+])));
 
 function asObject(value: unknown): JsonRecord | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -675,6 +697,7 @@ export function resolveQualysConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
 ): QualysResolvedConfig {
+  env = readResolverEnvironment(QUALYS_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const configPath = asString(input.config_file) ?? asString(env.QUALYS_CONFIG_FILE) ?? join(homedir(), ".qcrc");
   const file = readQualysConfigFile(configPath);
@@ -1917,6 +1940,15 @@ export function resolveViewScope(config: QualysResolvedConfig, users: Collected,
   return unverifiedScope(`API user ${config.username} was not returned by the user search (Managers and Super Users are hidden from it), so role scope was not verified.`);
 }
 
+const QUALYS_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordQualysDecisionFacts(control: number, facts: Readonly<Record<string, unknown>>): void {
+  const id = `QUALYS-C${String(control).padStart(2, "0")}`;
+  const store = QUALYS_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside a Qualys assessment`);
+  store.set(id, facts);
+}
+
 function finding(
   control: number,
   severity: QualysFindingSeverity,
@@ -1946,9 +1978,11 @@ interface VerdictInput {
   scope: QualysViewScope;
   manualEvidence: string;
   unknownBuckets?: Record<string, number>;
+  facts: Readonly<Record<string, unknown>>;
 }
 
 function guardedFinding(input: VerdictInput): QualysFinding {
+  recordQualysDecisionFacts(input.control, input.facts);
   const unreadable = input.sources.filter((source) => source.error);
   const truncated = input.sources.filter((source) => !source.error && source.truncated);
   const buckets = Object.entries(input.unknownBuckets ?? {}).filter(([, count]) => count > 0);
@@ -2154,11 +2188,6 @@ function optionProfileExcludedQidCount(profile: JsonRecord): number {
 // listed, so an undocumented or unexpected field is dropped rather than exported.
 // ---------------------------------------------------------------------------------------------
 
-// true keeps a scalar or a DTD text node; "date" also keeps the QPS JSON date wrapper {"date": "..."}; a nested
-// allowlist descends into an object (or into every element of an array) and keeps only the listed fields.
-type FieldRule = true | "date" | FieldAllowlist;
-type FieldAllowlist = { readonly [field: string]: FieldRule };
-
 function isXmlTextNode(record: JsonRecord): boolean {
   return Object.keys(record).every((key) => key.startsWith("@") || key === "#text");
 }
@@ -2199,482 +2228,8 @@ export function projectRecords(records: JsonRecord[], allowlist: FieldAllowlist)
     .filter((record): record is JsonRecord => Boolean(asObject(record)));
 }
 
-// schedule_scan_list_output.dtd and schedule_report_list_output.dtd: SCHEDULE
-const SCHEDULE_PLAN_FIELDS: FieldAllowlist = {
-  DAILY: true,
-  WEEKLY: true,
-  MONTHLY: true,
-  START_DATE_UTC: true,
-  START_HOUR: true,
-  START_MINUTE: true,
-  NEXTLAUNCH_UTC: true,
-  TIME_ZONE: { TIME_ZONE_CODE: true, TIME_ZONE_DETAILS: true },
-  DST_SELECTED: true,
-  MAX_OCCURRENCE: true,
-  END_AFTER: true,
-  END_AFTER_MINS: true,
-  PAUSE_AFTER_HOURS: true,
-  RESUME_IN_DAYS: true,
-  RESUME_IN_HOURS: true,
-};
-
-// host_list_output.dtd (details=All, show_tags=1). METADATA, CLOUD_PROVIDER_TAGS, USER_DEF, OWNER, and
-// COMMENTS are free-form and are not exported.
-const HOST_FIELDS: FieldAllowlist = {
-  ID: true,
-  ASSET_ID: true,
-  IP: true,
-  IPV6: true,
-  TRACKING_METHOD: true,
-  NETWORK_ID: true,
-  DNS: true,
-  DNS_DATA: { HOSTNAME: true, DOMAIN: true, FQDN: true },
-  CLOUD_PROVIDER: true,
-  CLOUD_SERVICE: true,
-  CLOUD_RESOURCE_ID: true,
-  EC2_INSTANCE_ID: true,
-  NETBIOS: true,
-  OS: true,
-  QG_HOSTID: true,
-  LAST_BOOT: true,
-  FIRST_FOUND_DATE: true,
-  LAST_ACTIVITY: true,
-  AGENT_STATUS: true,
-  CLOUD_AGENT_RUNNING_ON: true,
-  TAGS: { TAG: { TAG_ID: true, NAME: true } },
-  LAST_VULN_SCAN_DATETIME: true,
-  LAST_VULN_SCAN_DURATION: true,
-  LAST_VM_SCANNED_DATE: true,
-  LAST_VM_SCANNED_DURATION: true,
-  LAST_VM_AUTH_SCANNED_DATE: true,
-  LAST_VM_AUTH_SCANNED_DURATION: true,
-  LAST_COMPLIANCE_SCAN_DATETIME: true,
-  LAST_SCAP_SCAN_DATETIME: true,
-  ASSET_GROUP_IDS: true,
-};
-
-// asset_group_list_output.dtd; COMMENTS is not exported.
-const ASSET_GROUP_FIELDS: FieldAllowlist = {
-  ID: true,
-  TITLE: true,
-  OWNER_USER_ID: true,
-  OWNER_UNIT_ID: true,
-  OWNER_USER_NAME: true,
-  NETWORK_ID: true,
-  NETWORK_IDS: true,
-  LAST_UPDATE: true,
-  BUSINESS_IMPACT: true,
-  DEFAULT_APPLIANCE_ID: true,
-  APPLIANCE_IDS: true,
-  IP_SET: { IP: true, IP_RANGE: true },
-  DOMAIN_LIST: { DOMAIN: true },
-  DNS_LIST: { DNS: true },
-  NETBIOS_LIST: { NETBIOS: true },
-  HOST_IDS: true,
-  EC2_IDS: true,
-  ASSIGNED_USER_IDS: true,
-  ASSIGNED_UNIT_IDS: true,
-};
-
-// user.xsd (Administration API search/am/user)
-const ADMIN_USER_FIELDS: FieldAllowlist = {
-  id: true,
-  username: true,
-  firstName: true,
-  lastName: true,
-  title: true,
-  emailAddress: true,
-  roleList: { count: true, list: { RoleData: { id: true, name: true } } },
-  scopeTags: { count: true, list: { TagData: { id: true, name: true } } },
-};
-
-const QPS_USER_REFERENCE: FieldAllowlist = { id: true, username: true, firstName: true, lastName: true };
-const QPS_NAMED_REFERENCE: FieldAllowlist = { id: true, name: true };
-const QPS_TAG_LIST: FieldAllowlist = { count: true, list: { Tag: QPS_NAMED_REFERENCE } };
-const WAS_WEB_APP_REFERENCE: FieldAllowlist = { id: true, name: true, url: true };
-const WAS_SCANNER_REFERENCE: FieldAllowlist = { type: true, friendlyName: true };
-
-// wasscan.xsd: options, sensitiveContents, vulns, igs, and stats are not exported.
-const WAS_SCAN_FIELDS: FieldAllowlist = {
-  id: true,
-  name: true,
-  reference: true,
-  type: true,
-  mode: true,
-  multi: true,
-  progressiveScanning: true,
-  target: {
-    webApp: WAS_WEB_APP_REFERENCE,
-    webApps: { count: true, list: { WebApp: WAS_WEB_APP_REFERENCE } },
-    tags: QPS_TAG_LIST,
-    scannerAppliance: WAS_SCANNER_REFERENCE,
-    cancelOption: true,
-    authRecord: QPS_NAMED_REFERENCE,
-  },
-  profile: QPS_NAMED_REFERENCE,
-  launchedDate: "date",
-  launchedBy: QPS_USER_REFERENCE,
-  status: true,
-  endScanDate: "date",
-  scanDuration: true,
-  summary: { crawlDuration: true, testDuration: true, linksCrawled: true, nbRequests: true, resultsStatus: true, authStatus: true, os: true },
-};
-
-const RAW_DATA_ALLOWLISTS: Record<string, FieldAllowlist> = {
-  // schedule_scan_list_output.dtd; NOTIFICATIONS (custom messages and distribution) is not exported.
-  scheduled_scans: {
-    ID: true,
-    SCAN_TYPE: true,
-    ACTIVE: true,
-    TITLE: true,
-    CLIENT: { ID: true, NAME: true },
-    USER_LOGIN: true,
-    TARGET: true,
-    NETWORK_ID: true,
-    ISCANNER_NAME: true,
-    EC2_INSTANCE: { CONNECTOR_UUID: true, EC2_ENDPOINT: true, EC2_ONLY_CLASSIC: true },
-    CLOUD_DETAILS: { PROVIDER: true, CONNECTOR: { ID: true, UUID: true, NAME: true }, SCAN_TYPE: true, CLOUD_TARGET: { PLATFORM: true, REGION: { UUID: true, CODE: true, NAME: true }, VPC_SCOPE: true } },
-    ASSET_GROUP_TITLE_LIST: { ASSET_GROUP_TITLE: true },
-    ASSET_TAGS: {
-      TAG_INCLUDE_SELECTOR: true,
-      TAG_SET_INCLUDE: true,
-      TAG_EXCLUDE_SELECTOR: true,
-      TAG_SET_EXCLUDE: true,
-      USE_IP_NT_RANGE_TAGS: true,
-      USE_IP_NT_RANGE_TAGS_INCLUDE: true,
-      USE_IP_NT_RANGE_TAGS_EXCLUDE: true,
-    },
-    EXCLUDE_IP_PER_SCAN: true,
-    DEFAULT_SCANNER: true,
-    USER_ENTERED_IPS: { IP: true, RANGE: { START: true, END: true } },
-    ELB_DNS: { DNS: true },
-    OPTION_PROFILE: { TITLE: true, DEFAULT_FLAG: true },
-    PROCESSING_PRIORITY: true,
-    SCHEDULE: SCHEDULE_PLAN_FIELDS,
-  },
-  // scan_list_output.dtd
-  scans: {
-    ID: true,
-    REF: true,
-    SCAN_TYPE: true,
-    TYPE: true,
-    TITLE: true,
-    CLIENT: { ID: true, NAME: true },
-    USER_LOGIN: true,
-    LAUNCH_DATETIME: true,
-    DURATION: true,
-    PROCESSING_PRIORITY: true,
-    PROCESSED: true,
-    STATUS: { STATE: true, SUB_STATE: true },
-    TARGET: true,
-    ASSET_GROUP_TITLE_LIST: { ASSET_GROUP_TITLE: true },
-    OPTION_PROFILE: { TITLE: true, DEFAULT_FLAG: true },
-  },
-  hosts: HOST_FIELDS,
-  // option_profile_info.dtd: only the identity block and the settings the verdicts read (authentication types
-  // and detection exclusion search lists). PASSWORD_BRUTE_FORCING, CUSTOM_HTTP_HEADER, SYSTEM_AUTH_RECORD, and
-  // the rest of the configuration are never exported.
-  option_profiles: {
-    BASIC_INFO: { ID: true, GROUP_NAME: true, GROUP_TYPE: true, USER_ID: true, UNIT_ID: true, SUBSCRIPTION_ID: true, IS_DEFAULT: true, IS_GLOBAL: true, IS_OFFLINE_SYNCABLE: true, UPDATE_DATE: true },
-    SCAN: {
-      AUTHENTICATION: true,
-      AUTHENTICATION_LEAST_PRIVILEGE: true,
-      VULNERABILITY_DETECTION: {
-        COMPLETE: true,
-        RUNTIME: true,
-        CUSTOM_LIST: { CUSTOM: { ID: true, TITLE: true } },
-        DETECTION_INCLUDE: { BASIC_HOST_INFO_CHECKS: true, OVAL_CHECKS: true, QRDI_CHECKS: true },
-        DETECTION_EXCLUDE: { CUSTOM_LIST: { CUSTOM: { ID: true, TITLE: true } } },
-      },
-    },
-  },
-  // ip_list_output.dtd: IP and IP_RANGE text with network_id and expiration_date attributes.
-  excluded_ips: { type: true, value: true, network_id: true, expiration_date: true },
-  asset_groups: ASSET_GROUP_FIELDS,
-  // asset_data_connector.xsd plus the documented cloud account identifiers; arn, externalId, authRecord, and
-  // any other credential material are not exported.
-  connectors: {
-    id: true,
-    name: true,
-    awsAccountId: true,
-    subscriptionId: true,
-    projectId: true,
-    lastSync: "date",
-    lastError: true,
-    connectorState: true,
-    type: true,
-    serviceType: true,
-    disabled: true,
-    isGovCloudConfigured: true,
-    isChinaConfigured: true,
-    isInstantAssessmentEnabled: true,
-    isSnapshotAssessmentEnabled: true,
-    isAttachedToOrganization: true,
-    isDeleted: true,
-  },
-  // appliance_list_output.dtd; ACTIVATION_CODE, INTERFACE_SETTINGS, PROXY_SETTINGS, CLOUD_INFO, VLANS,
-  // STATIC_ROUTES, and COMMENTS are not exported.
-  appliances: {
-    ID: true,
-    UUID: true,
-    NAME: true,
-    NETWORK_ID: true,
-    SOFTWARE_VERSION: true,
-    RUNNING_SLICES_COUNT: true,
-    RUNNING_SCAN_COUNT: true,
-    STATUS: true,
-    MODEL_NUMBER: true,
-    TYPE: true,
-    IS_CLOUD_DEPLOYED: true,
-    ML_LATEST: true,
-    ML_VERSION: true,
-    VULNSIGS_LATEST: true,
-    VULNSIGS_VERSION: true,
-    ASSET_GROUP_COUNT: true,
-    ASSET_GROUP_LIST: { ASSET_GROUP: { ID: true, NAME: true } },
-    ASSET_TAGS_LIST: { ASSET_TAG: { UUID: true, NAME: true } },
-    LAST_UPDATED_DATE: true,
-    POLLING_INTERVAL: true,
-    USER_LOGIN: true,
-    HEARTBEATS_MISSED: true,
-    SS_CONNECTION: true,
-    SS_LAST_CONNECTED: true,
-    UPDATED: true,
-    MAX_CAPACITY_UNITS: true,
-  },
-  // hostasset.xsd with agent_source.xsd; activationKey keeps its title only, never the activationId.
-  cloud_agents: {
-    id: true,
-    name: true,
-    created: "date",
-    modified: "date",
-    type: true,
-    qwebHostId: true,
-    trackingMethod: true,
-    fqdn: true,
-    dnsHostName: true,
-    netbiosName: true,
-    os: true,
-    address: true,
-    lastVulnScan: "date",
-    lastComplianceScan: "date",
-    lastSystemBoot: "date",
-    criticalityScore: true,
-    agentInfo: {
-      agentVersion: true,
-      agentId: true,
-      status: true,
-      lastCheckedIn: "date",
-      platform: true,
-      activatedModule: true,
-      chirpStatus: true,
-      manifestVersion: { vm: true, pc: true, sca: true },
-      agentConfiguration: QPS_NAMED_REFERENCE,
-      activationKey: { title: true },
-    },
-    tags: QPS_TAG_LIST,
-  },
-  // tag.xsd; ruleText and description are free-form configuration and are not exported.
-  tags: {
-    id: true,
-    name: true,
-    created: "date",
-    modified: "date",
-    ruleType: true,
-    color: true,
-    parentTagId: true,
-    criticalityScore: true,
-    provider: true,
-    srcAssetGroupId: true,
-    srcBusinessUnitId: true,
-    srcOperatingSystemName: true,
-  },
-  // Summary rows built from auth_records.dtd ID_SET counts.
-  auth_records: { type: true, count: true },
-  // policy_list_output.dtd (details=Basic)
-  compliance_policies: {
-    ID: true,
-    TITLE: true,
-    CREATED: { DATETIME: true, BY: true },
-    LAST_MODIFIED: { DATETIME: true, BY: true },
-    LAST_EVALUATED: { DATETIME: true },
-    STATUS: true,
-    IS_LOCKED: true,
-    EVALUATE_NOW: true,
-    ASSET_GROUP_IDS: true,
-    TAG_SET_INCLUDE: { TAG_ID: true },
-    TAG_INCLUDE_SELECTOR: true,
-    TAG_SET_EXCLUDE: { TAG_ID: true },
-    TAG_EXCLUDE_SELECTOR: true,
-    INCLUDE_AGENT_IPS: true,
-  },
-  // host_list_vm_detection_output.dtd flattened with host_id and ip; RESULTS (scanner output) is not exported.
-  detections: {
-    host_id: true,
-    ip: true,
-    UNIQUE_VULN_ID: true,
-    QID: true,
-    TYPE: true,
-    SEVERITY: true,
-    PORT: true,
-    PROTOCOL: true,
-    FQDN: true,
-    SSL: true,
-    INSTANCE: true,
-    STATUS: true,
-    FIRST_FOUND_DATETIME: true,
-    LAST_FOUND_DATETIME: true,
-    QDS: true,
-    TIMES_FOUND: true,
-    LAST_TEST_DATETIME: true,
-    LAST_UPDATE_DATETIME: true,
-    LAST_FIXED_DATETIME: true,
-    LAST_PROCESSED_DATETIME: true,
-    IS_IGNORED: true,
-    IS_DISABLED: true,
-    AFFECT_RUNNING_KERNEL: true,
-    AFFECT_RUNNING_SERVICE: true,
-    AFFECT_EXPLOITABLE_CONFIG: true,
-  },
-  // knowledge_base_vuln_list_output.dtd (details=Basic); DIAGNOSIS, CONSEQUENCE, and SOLUTION text is not exported.
-  knowledge_base: {
-    QID: true,
-    VULN_TYPE: true,
-    SEVERITY_LEVEL: true,
-    TITLE: true,
-    CATEGORY: true,
-    LAST_SERVICE_MODIFICATION_DATETIME: true,
-    PUBLISHED_DATETIME: true,
-    PATCHABLE: true,
-    PCI_FLAG: true,
-    IS_DISABLED: true,
-    DISCOVERY: { REMOTE: true, AUTH_TYPE_LIST: { AUTH_TYPE: true } },
-    CVE_LIST: { CVE: { ID: true, URL: true } },
-    CVSS: { BASE: true, TEMPORAL: true, VECTOR_STRING: true },
-    CVSS_V3: { BASE: true, TEMPORAL: true, VECTOR_STRING: true, CVSS3_VERSION: true },
-    THREAT_INTELLIGENCE: { THREAT_INTEL: true },
-  },
-  // schedule_report_list_output.dtd; any distribution or recipient element is not exported.
-  scheduled_reports: {
-    ID: true,
-    TITLE: true,
-    OUTPUT_FORMAT: true,
-    TEMPLATE_TITLE: true,
-    ACTIVE: true,
-    SCHEDULE: SCHEDULE_PLAN_FIELDS,
-  },
-  // report_list_output.dtd
-  reports: {
-    ID: true,
-    TITLE: true,
-    TYPE: true,
-    USER_LOGIN: true,
-    LAUNCH_DATETIME: true,
-    OUTPUT_FORMAT: true,
-    SIZE: true,
-    STATUS: { STATE: true, MESSAGE: true, PERCENT: true },
-    EXPIRATION_DATETIME: true,
-  },
-  users: ADMIN_USER_FIELDS,
-  // user_list_output.dtd; postal address and phone contact details are not exported.
-  user_list: {
-    USER_LOGIN: true,
-    USER_ID: true,
-    EXTERNAL_ID: true,
-    CONTACT_INFO: { FIRSTNAME: true, LASTNAME: true, TITLE: true, EMAIL: true, COMPANY: true, COUNTRY: true, TIME_ZONE_CODE: true },
-    ASSIGNED_ASSET_GROUPS: { ASSET_GROUP_TITLE: true },
-    USER_STATUS: true,
-    CREATION_DATE: true,
-    LAST_LOGIN_DATE: true,
-    USER_ROLE: true,
-    BUSINESS_UNIT: true,
-    UNIT_MANAGER_POC: true,
-    MANAGER_POC: true,
-  },
-  // Activity Log CSV columns.
-  activity_log: { date: true, action: true, module: true, details: true, user_name: true, user_role: true, user_ip: true },
-  // webapp.xsd; headers, proxy, config, crawlingScripts, authRecords values, and screenshot are not exported.
-  was_webapps: {
-    id: true,
-    name: true,
-    url: true,
-    os: true,
-    owner: QPS_USER_REFERENCE,
-    scope: true,
-    tags: QPS_TAG_LIST,
-    defaultProfile: QPS_NAMED_REFERENCE,
-    defaultScanner: WAS_SCANNER_REFERENCE,
-    scannerLocked: true,
-    progressiveScanning: true,
-    authRecords: { count: true, list: { WebAppAuthRecord: QPS_NAMED_REFERENCE } },
-    useRobots: true,
-    useSitemap: true,
-    malwareMonitoring: true,
-    isScheduled: true,
-    lastScan: QPS_NAMED_REFERENCE,
-    lastScanStatus: true,
-    riskScore: true,
-    createdBy: QPS_USER_REFERENCE,
-    createdDate: "date",
-    updatedBy: QPS_USER_REFERENCE,
-    updatedDate: "date",
-  },
-  was_scans: WAS_SCAN_FIELDS,
-  was_scan_history: WAS_SCAN_FIELDS,
-  // webappauthrecord.xsd: form field values, server record credentials, OAuth2 client secrets and tokens,
-  // selenium scripts, certificates, and auth vault details are not exported.
-  was_auth_records: {
-    id: true,
-    name: true,
-    owner: QPS_USER_REFERENCE,
-    formRecord: {
-      type: true,
-      sslOnly: true,
-      fields: { count: true, list: { WebAppAuthFormRecordField: { id: true, name: true, secured: true } } },
-    },
-    serverRecord: {
-      type: true,
-      sslOnly: true,
-      fields: { count: true, list: { WebAppAuthServerRecordField: { id: true, type: true, domain: true } } },
-    },
-    oauth2Record: { grantType: true },
-    tags: QPS_TAG_LIST,
-    createdBy: QPS_USER_REFERENCE,
-    createdDate: "date",
-    updatedBy: QPS_USER_REFERENCE,
-    updatedDate: "date",
-  },
-  // wasscanschedule.xsd; notification recipients and proxy settings are not exported.
-  was_schedules: {
-    id: true,
-    name: true,
-    type: true,
-    active: true,
-    multi: true,
-    progressiveScanning: true,
-    target: {
-      webApp: WAS_WEB_APP_REFERENCE,
-      webApps: { count: true, list: { WebApp: WAS_WEB_APP_REFERENCE } },
-      tags: QPS_TAG_LIST,
-      scannerAppliance: WAS_SCANNER_REFERENCE,
-      cancelOption: true,
-      authRecord: QPS_NAMED_REFERENCE,
-    },
-    profile: QPS_NAMED_REFERENCE,
-    schedule: { startDate: "date", timeZone: { code: true, offset: true }, occurrenceType: true, occurrenceCount: true },
-    launchedCount: true,
-    launchedDate: "date",
-    nextLaunchDate: "date",
-    owner: QPS_USER_REFERENCE,
-    createdBy: QPS_USER_REFERENCE,
-    createdDate: "date",
-    updatedBy: QPS_USER_REFERENCE,
-    updatedDate: "date",
-  },
-};
-
 export function exportableRecords(name: string, records: JsonRecord[]): JsonRecord[] {
-  const allowlist = RAW_DATA_ALLOWLISTS[name];
+  const allowlist = QUALYS_RAW_DATA_ALLOWLISTS[name];
   if (!allowlist) {
     throw new Error(`No rawData allowlist is defined for surface ${name}; refusing to export verbatim records.`);
   }
@@ -2682,12 +2237,19 @@ export function exportableRecords(name: string, records: JsonRecord[]): JsonReco
 }
 
 export function rawDataSurfaceNames(): string[] {
-  return Object.keys(RAW_DATA_ALLOWLISTS);
+  return Object.keys(QUALYS_RAW_DATA_ALLOWLISTS);
 }
 
 export async function assessQualysScanCoverage(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
+): Promise<QualysAssessmentResult> {
+  return runBatchVerdictContext(QUALYS_DECISION_CONTEXT, QUALYS_SPEC, () => assessQualysScanCoverageWithDecisionContext(client, options));
+}
+
+async function assessQualysScanCoverageWithDecisionContext(
+  client: QualysDataClient,
+  options: QualysAssessmentOptions,
 ): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
@@ -2771,6 +2333,28 @@ export async function assessQualysScanCoverage(
     scope,
     manualEvidence: "export Scans > Schedules and Assets > Asset Groups from the Qualys UI and confirm each asset group has an active recurring scan and each host was scanned within the review window.",
     unknownBuckets: { hosts_without_scan_date: hostsWithoutScanDate.length, schedules_without_active_flag: schedulesWithoutActiveFlag.length },
+    facts: {
+      scheduled_scans_readable: !schedules.error,
+      ...(schedules.error ? {} : {
+        active_schedule_count: activeSchedules.length,
+        schedules_without_active_flag_count: schedulesWithoutActiveFlag.length,
+        scheduled_scans_complete: !schedules.truncated,
+      }),
+      scans_readable: !scans.error,
+      ...(scans.error ? {} : { scans_complete: !scans.truncated }),
+      asset_groups_readable: !groups.error,
+      ...(groups.error ? {} : { asset_group_count: groups.data.length, asset_groups_complete: !groups.truncated }),
+      ...(groups.error || schedules.error ? {} : { unscheduled_asset_group_count: groupsWithoutSchedule.length }),
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : {
+        host_count: hosts.data.length,
+        scanned_host_scan_age_days: scannedHosts.map((host) => ageInDays(hostLastScan(host), now)),
+        undated_host_count: hostsWithoutScanDate.length,
+        hosts_complete: !hosts.truncated,
+      }),
+      lookback_days: settings.lookbackDays,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const authStatus: QualysFindingStatus = hosts.error
@@ -2805,6 +2389,18 @@ export async function assessQualysScanCoverage(
     scope,
     manualEvidence: "run an Authentication Report in Qualys and record the percentage of hosts with successful authenticated scans.",
     unknownBuckets: { hosts_without_scan_date: hostsWithoutScanDate.length },
+    facts: {
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : {
+        host_count: hosts.data.length,
+        scanned_host_count: scannedHosts.length,
+        ...(authPercent === null ? {} : { authenticated_scan_percent: authPercent }),
+        undated_host_count: hostsWithoutScanDate.length,
+        hosts_complete: !hosts.truncated,
+      }),
+      min_auth_scan_percent: settings.minAuthScanPercent,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   findings.push(guardedFinding({
@@ -2824,6 +2420,10 @@ export async function assessQualysScanCoverage(
     sources: [profiles],
     scope,
     manualEvidence: "export each option profile from Scans > Option Profiles and review authentication, port, and performance settings against internal and external scanning requirements.",
+    facts: {
+      option_profiles_readable: !profiles.error,
+      ...(profiles.error ? {} : { option_profile_count: profiles.data.length }),
+    },
   }));
 
   const unverifiedScannerNote = schedulesWithoutScannerName.length > 0
@@ -2852,6 +2452,15 @@ export async function assessQualysScanCoverage(
     manualEvidence: "confirm at least one recurring perimeter scan uses Qualys external scanners against the public IP ranges.",
     // A missing ISCANNER_NAME only leaves the verdict uncertain when no schedule is confirmed external.
     unknownBuckets: externalSchedules.length > 0 ? {} : { schedules_without_scanner_name: schedulesWithoutScannerName.length },
+    facts: {
+      scheduled_scans_readable: !schedules.error,
+      ...(schedules.error ? {} : {
+        active_schedule_count: activeSchedules.length,
+        external_scanner_schedule_count: externalSchedules.length,
+        scheduled_scans_complete: !schedules.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const exclusionStatus: QualysFindingStatus = excluded.error
@@ -2888,6 +2497,24 @@ export async function assessQualysScanCoverage(
     sources: [excluded, profiles],
     scope,
     manualEvidence: "export Assets > Excluded Hosts and review each excluded IP range and option profile detection exclusion search list for justification.",
+    facts: {
+      excluded_ips_readable: !excluded.error,
+      ...(excluded.error ? {} : {
+        excluded_entry_count: excluded.data.length,
+        excluded_range_address_counts: excluded.data
+          .filter((entry) => entry.type === "range")
+          .map((entry) => addressCountForRange(asString(entry.value) ?? ""))
+          .filter((count) => !Number.isNaN(count)),
+        excluded_ips_complete: !excluded.truncated,
+      }),
+      option_profiles_readable: !profiles.error,
+      ...(profiles.error ? {} : {
+        option_profile_count: profiles.data.length,
+        detection_exclusion_list_count: excludedQidCount,
+        option_profiles_complete: !profiles.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   findings.push(guardedFinding({
@@ -2908,6 +2535,10 @@ export async function assessQualysScanCoverage(
     sources: [schedules],
     scope,
     manualEvidence: "document which scan schedules cover DMZ, internal, and OT/ICS segments and which scanner appliances serve each segment.",
+    facts: {
+      scheduled_scans_readable: !schedules.error,
+      ...(schedules.error ? {} : { active_schedule_count: activeSchedules.length }),
+    },
   }));
 
   return {
@@ -3030,6 +2661,13 @@ export async function assessQualysAssetInventory(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
 ): Promise<QualysAssessmentResult> {
+  return runBatchVerdictContext(QUALYS_DECISION_CONTEXT, QUALYS_SPEC, () => assessQualysAssetInventoryWithDecisionContext(client, options));
+}
+
+async function assessQualysAssetInventoryWithDecisionContext(
+  client: QualysDataClient,
+  options: QualysAssessmentOptions,
+): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
   const errors: string[] = [];
@@ -3090,6 +2728,7 @@ export async function assessQualysAssetInventory(
     sources: [groups, hosts],
     scope,
     manualEvidence: "export the CMDB or IPAM network ranges and reconcile them against the Qualys asset group IP sets.",
+    facts: {},
   }));
 
   const connectorStatus: QualysFindingStatus = connectors.error
@@ -3129,6 +2768,20 @@ export async function assessQualysAssetInventory(
     scope,
     manualEvidence: "open the AWS, Azure, and GCP connector lists in the Qualys UI and confirm whether cloud accounts are in scope and each connector last synchronized successfully.",
     unknownBuckets: { connectors_without_state: unknownStateConnectors.length, connectors_without_sync_date: connectorsWithoutSyncDate.length },
+    facts: {
+      connectors_readable: !connectors.error,
+      ...(connectors.error ? {} : {
+        connector_count: connectors.data.length,
+        unhealthy_connector_count: unhealthyConnectors.length,
+        connector_sync_age_days: connectors.data
+          .map((connector) => ageInDays(connector.lastSync, now))
+          .filter((age) => age !== undefined),
+        unknown_state_connector_count: unknownStateConnectors.length,
+        undated_connector_count: connectorsWithoutSyncDate.length,
+        connectors_complete: !connectors.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const applianceStatusVerdict: QualysFindingStatus = appliances.error
@@ -3174,6 +2827,18 @@ export async function assessQualysAssetInventory(
     scope,
     manualEvidence: "review Scans > Appliances for offline scanners, missed heartbeats, and outdated software or signature versions.",
     unknownBuckets: { appliances_without_status: unknownStatusAppliances.length, appliances_without_version_data: appliancesWithoutVersionData.length },
+    facts: {
+      appliances_readable: !appliances.error,
+      ...(appliances.error ? {} : {
+        appliance_count: appliances.data.length,
+        offline_appliance_count: offlineAppliances.length,
+        outdated_appliance_count: outdatedAppliances.length,
+        unknown_status_appliance_count: unknownStatusAppliances.length,
+        unknown_version_appliance_count: appliancesWithoutVersionData.length,
+        appliances_complete: !appliances.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const agentCoverageStatus: QualysFindingStatus = hosts.error || agents.error
@@ -3213,6 +2878,28 @@ export async function assessQualysAssetInventory(
       agents_without_checkin_date: agentsWithoutCheckIn.length,
       agents_without_activation_key: agentsWithoutActivationKey.length,
     },
+    facts: {
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : {
+        host_count: hosts.data.length,
+        ...(agentPercent === null ? {} : { agent_coverage_percent: agentPercent }),
+        untracked_host_count: hostsWithoutTrackingMethod.length,
+        hosts_complete: !hosts.truncated,
+      }),
+      cloud_agents_readable: !agents.error,
+      ...(agents.error ? {} : {
+        inactive_agent_count: inactiveAgents.length,
+        agent_checkin_age_days: agents.data
+          .map((agent) => ageInDays(agentLastCheckIn(agent), now))
+          .filter((age) => age !== undefined),
+        unknown_status_agent_count: unknownStatusAgents.length,
+        undated_agent_count: agentsWithoutCheckIn.length,
+        agents_without_activation_key_count: agentsWithoutActivationKey.length,
+        cloud_agents_complete: !agents.truncated,
+      }),
+      min_agent_coverage_percent: settings.minAgentCoveragePercent,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const tagStatus: QualysFindingStatus = tags.error || hosts.error
@@ -3248,6 +2935,17 @@ export async function assessQualysAssetInventory(
     sources: [tags, hosts],
     scope,
     manualEvidence: "export the tag tree and confirm every in-scope asset carries a compliance scope tag.",
+    facts: {
+      tags_readable: !tags.error,
+      ...(tags.error ? {} : { tag_count: tags.data.length, tags_complete: !tags.truncated }),
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : {
+        host_count: hosts.data.length,
+        ...(untaggedPercent === null ? {} : { untagged_host_percent: untaggedPercent }),
+        hosts_complete: !hosts.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   return {
@@ -3353,6 +3051,17 @@ const NETWORK_AUTH_TYPE_PATTERN = /snmp|cisco|checkpoint|check_point|palo|fortin
 export async function assessQualysVulnerabilityManagement(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
+): Promise<QualysAssessmentResult> {
+  return runBatchVerdictContext(
+    QUALYS_DECISION_CONTEXT,
+    QUALYS_SPEC,
+    () => assessQualysVulnerabilityManagementWithDecisionContext(client, options),
+  );
+}
+
+async function assessQualysVulnerabilityManagementWithDecisionContext(
+  client: QualysDataClient,
+  options: QualysAssessmentOptions,
 ): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
@@ -3472,6 +3181,21 @@ export async function assessQualysVulnerabilityManagement(
     scope,
     manualEvidence: "review Scans > Authentication for Windows, Unix, and network device records and run an Authentication Report to find expired or failing credentials.",
     unknownBuckets: { hosts_without_os: hostsWithoutOs.length },
+    facts: {
+      auth_records_readable: !authRecords.error,
+      ...(authRecords.error ? {} : { auth_record_type_count: authTypes.length, auth_records_complete: !authRecords.truncated }),
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : {
+        host_count: hosts.data.length,
+        scanned_host_count: scannedHosts.length,
+        ...(authScannedPercent === null ? {} : { authenticated_scan_percent: authScannedPercent }),
+        os_unknown_host_count: hostsWithoutOs.length,
+        hosts_complete: !hosts.truncated,
+      }),
+      ...(authRecords.error || hosts.error ? {} : { uncovered_os_family_count: missingAuthTypes.length }),
+      min_auth_scan_percent: settings.minAuthScanPercent,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const policyStatusVerdict: QualysFindingStatus = policies.error
@@ -3506,6 +3230,18 @@ export async function assessQualysVulnerabilityManagement(
     scope,
     manualEvidence: "list Policy Compliance policies and confirm each active policy is assigned to asset groups or tags, or record that the PC module is not in use.",
     unknownBuckets: { policies_without_status: unknownStatusPolicies.length, policies_with_hidden_asset_groups: hiddenAssignmentPolicies.length },
+    facts: {
+      compliance_policies_readable: !policies.error,
+      ...(policies.error ? {} : {
+        policy_count: policies.data.length,
+        unassigned_active_policy_count: unassignedPolicies.length,
+        inactive_policy_count: inactivePolicies.length,
+        unknown_status_policy_count: unknownStatusPolicies.length,
+        hidden_asset_group_policy_count: hiddenAssignmentPolicies.length,
+        compliance_policies_complete: !policies.truncated,
+      }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const slaStatus: QualysFindingStatus = detections.error || hosts.error
@@ -3557,9 +3293,24 @@ export async function assessQualysVulnerabilityManagement(
       detections_without_severity: detectionsWithoutSeverity.length,
       detections_without_status: detectionsWithoutStatus.length,
     },
+    facts: {
+      detections_readable: !detections.error,
+      ...(detections.error ? {} : {
+        sla_scoped_detection_count: slaScoped.length,
+        ...(slaPercent === null ? {} : { sla_compliance_percent: slaPercent }),
+        undated_sla_detection_count: slaUndated.length,
+        unrated_open_detection_count: detectionsWithoutSeverity.length,
+        statusless_open_detection_count: detectionsWithoutStatus.length,
+        detections_complete: !detections.truncated,
+      }),
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : { host_count: hosts.data.length, hosts_complete: !hosts.truncated }),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const knowledgeBaseUnusable = openQids.length > 0 && !knowledgeBase.error && kbQids.size === 0;
+  const knowledgeBaseReadable = !knowledgeBase.error && !knowledgeBase.notCollected?.blocked;
   const patchStatus: QualysFindingStatus = detections.error || hosts.error || knowledgeBase.error || knowledgeBaseUnusable
     ? "manual"
     : !hostPopulationKnown
@@ -3607,6 +3358,25 @@ export async function assessQualysVulnerabilityManagement(
     scope,
     manualEvidence: "export the patch report for open detections and record patch availability and patch age.",
     unknownBuckets: { patchable_detections_without_first_found: patchableUndated.length, qids_without_knowledge_base_entry: unresolvedQids.length },
+    facts: {
+      detections_readable: !detections.error,
+      ...(detections.error ? {} : {
+        open_detection_count: openDetections.length,
+        open_qid_count: openQids.length,
+        detections_complete: !detections.truncated,
+      }),
+      hosts_readable: !hosts.error,
+      ...(hosts.error ? {} : { host_count: hosts.data.length, hosts_complete: !hosts.truncated }),
+      knowledge_base_readable: knowledgeBaseReadable,
+      ...(knowledgeBaseReadable ? {
+        ...(knowledgeBase.notCollected ? {} : { knowledge_base_qid_count: kbQids.size, unresolved_qid_count: unresolvedQids.length }),
+        ...(overduePercent === null ? {} : { overdue_patchable_percent: overduePercent }),
+        overdue_patchable_detection_count: overduePatchable.length,
+        undated_patchable_detection_count: patchableUndated.length,
+        knowledge_base_complete: !knowledgeBase.truncated,
+      } : {}),
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const qdsStatus: QualysFindingStatus = detections.error
@@ -3633,6 +3403,13 @@ export async function assessQualysVulnerabilityManagement(
     sources: [detections],
     scope,
     manualEvidence: "confirm the VMDR subscription exposes Qualys Detection Scores and document the triage workflow that uses QDS or CVSS.",
+    facts: {
+      detections_readable: !detections.error,
+      ...(detections.error ? {} : {
+        open_detection_count: openDetections.length,
+        ...(qdsPercent === null ? {} : { qds_detection_percent: qdsPercent }),
+      }),
+    },
   }));
 
   return {
@@ -3802,6 +3579,13 @@ export async function assessQualysAdministration(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
 ): Promise<QualysAssessmentResult> {
+  return runBatchVerdictContext(QUALYS_DECISION_CONTEXT, QUALYS_SPEC, () => assessQualysAdministrationWithDecisionContext(client, options));
+}
+
+async function assessQualysAdministrationWithDecisionContext(
+  client: QualysDataClient,
+  options: QualysAssessmentOptions,
+): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
   const errors: string[] = [];
@@ -3879,6 +3663,11 @@ export async function assessQualysAdministration(
     sources: [scheduledReports, reports],
     scope,
     manualEvidence: "review Reports > Schedules and each schedule's distribution list for appropriate recipients.",
+    facts: {
+      scheduled_reports_readable: !scheduledReports.error,
+      ...(scheduledReports.error ? {} : { active_scheduled_report_count: activeScheduledReports.length }),
+      reports_readable: !reports.error,
+    },
   }));
 
   const bothUserSourcesUnreadable = Boolean(userList.error && users.error);
@@ -3965,6 +3754,28 @@ export async function assessQualysAdministration(
       users_without_last_login: usersWithoutLastLogin.length,
       users_without_login_in_restricted_view: restrictedViewUsers.length,
     },
+    facts: {
+      user_list_readable: userListReadable,
+      users_readable: !users.error,
+      ...(bothUserSourcesUnreadable ? {} : {
+        manager_count: managers.length,
+        shared_email_count: sharedEmails.length,
+        active_user_count: activeUsers.length,
+        generic_account_count: genericAccounts.length,
+        roleless_active_user_count: usersWithoutRole.length,
+      }),
+      ...(userListReadable ? {
+        last_login_age_days: usersWithLastLogin.map((user) => ageInDays(legacyUserLastLogin(user), now)),
+        pending_activation_user_count: pendingUsers.length,
+        statusless_user_count: usersWithoutStatus.length,
+        undated_login_user_count: usersWithoutLastLogin.length,
+        loginless_user_count: restrictedViewUsers.length,
+        user_list_complete: !userList.truncated,
+      } : {}),
+      ...(users.error ? {} : { users_complete: !users.truncated }),
+      max_managers: settings.maxManagers,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   const wasStatus: QualysFindingStatus = webApps.error || wasScans.error || wasAuth.error
@@ -3987,6 +3798,7 @@ export async function assessQualysAdministration(
   // Stale and never-scanned lists are unknown when the bounded scan search, the web app inventory, or a needed
   // history read did not deliver; a history search that nothing needed leaves them known and empty.
   const scanDateWithheld = withheldFor([webApps, wasScans]) ?? withheldFor(wasHistory, true);
+  const wasHistoryReadable = !wasHistory.error && !wasHistory.notCollected?.blocked;
   findings.push(guardedFinding({
     control: 15,
     severity: "medium",
@@ -4017,6 +3829,37 @@ export async function assessQualysAdministration(
       was_auth_records_without_date: wasAuthWithoutDate.length,
       was_schedules_without_active_flag: wasSchedulesWithoutFlag.length,
     },
+    facts: {
+      was_webapps_readable: !webApps.error,
+      ...(webApps.error ? {} : { web_app_count: webApps.data.length, was_webapps_complete: !webApps.truncated }),
+      was_scans_readable: !wasScans.error,
+      ...(wasScans.error ? {} : { was_scans_complete: !wasScans.truncated }),
+      ...(webApps.error || wasScans.error ? {} : {
+        never_scanned_web_app_count: neverScannedWebApps.length,
+        resolved_web_app_scan_age_days: [...webAppScans.fresh, ...webAppScans.stale].map((webApp) => ageInDays(
+          webAppLastScanDate(webApp, wasScans.data) ?? webAppLastScanDate(webApp, wasHistory.data),
+          now,
+        )),
+        unresolved_web_app_count: unresolvedWebApps.length,
+      }),
+      was_scan_history_readable: wasHistoryReadable,
+      ...(wasHistoryReadable ? { was_scan_history_complete: !wasHistory.truncated } : {}),
+      was_auth_records_readable: !wasAuth.error,
+      ...(wasAuth.error ? {} : {
+        was_auth_record_age_days: wasAuth.data
+          .map((record) => ageInDays(record.updatedDate ?? record.createdDate, now))
+          .filter((age) => age !== undefined),
+        undated_was_auth_record_count: wasAuthWithoutDate.length,
+        was_auth_records_complete: !wasAuth.truncated,
+      }),
+      was_schedules_readable: !wasSchedules.error,
+      ...(wasSchedules.error ? {} : {
+        was_schedules_without_active_flag_count: wasSchedulesWithoutFlag.length,
+        was_schedules_complete: !wasSchedules.truncated,
+      }),
+      lookback_days: settings.lookbackDays,
+      view_scope_partial: scope.partial,
+    },
   }));
 
   findings.push(guardedFinding({
@@ -4042,6 +3885,10 @@ export async function assessQualysAdministration(
     sources: [activity],
     scope,
     manualEvidence: "export the Activity Log for the review period and document who reviews sensitive administrative actions and how long the log is retained.",
+    facts: {
+      activity_log_readable: !activity.error,
+      ...(activity.error ? {} : { activity_entry_count: activity.data.length }),
+    },
   }));
 
   return {
@@ -4552,6 +4399,7 @@ function registerAssessmentTool(
 }
 
 export function registerQualysTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, QUALYS_SPEC);
   pi.registerTool({
     name: "qualys_check_access",
     label: "Check Qualys audit access",

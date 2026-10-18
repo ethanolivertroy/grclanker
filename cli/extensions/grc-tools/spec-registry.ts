@@ -20,6 +20,8 @@ import { registerOktaTools } from "./okta.js";
 import { OKTA_SPEC } from "./okta.spec.js";
 import { registerPaloaltoTools } from "./paloalto.js";
 import { PALOALTO_SPEC } from "./paloalto.spec.js";
+import { registerQualysTools } from "./qualys.js";
+import { QUALYS_SPEC } from "./qualys.spec.js";
 import { registerSalesforceTools } from "./salesforce.js";
 import { SALESFORCE_SPEC } from "./salesforce.spec.js";
 import { registerServicenowTools } from "./servicenow.js";
@@ -104,6 +106,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     narrativePath: "specs/narratives/paloalto.md",
     outputPath: "specs/paloalto-sec-inspector.spec.md",
     registerTools: registerPaloaltoTools,
+  },
+  {
+    contract: QUALYS_SPEC,
+    narrativePath: "specs/narratives/qualys.md",
+    outputPath: "specs/qualys-sec-inspector.spec.md",
+    registerTools: registerQualysTools,
   },
   {
     contract: SALESFORCE_SPEC,
