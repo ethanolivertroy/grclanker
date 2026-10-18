@@ -2045,17 +2045,21 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
       ? "manual"
       : trustedNames.length === 0
         ? "manual"
-        : wildcardDomains.length === 0
-          ? "pass"
-          : "fail",
+        : wildcardDomains.length > 0
+          ? "fail"
+          : trusted.truncated
+            ? "warn"
+            : "pass",
     snapshot.trustedDomains.status !== "ok"
       ? manualForSurface(snapshot.trustedDomains, "the trusted domains list")
       : trustedNames.length === 0
         ? "Manual: GET /accounts/{accountId}/trusted_domains returned no domains. Emptiness is treated as manual: confirm whether trusted domains are intentionally unused."
-        : wildcardDomains.length === 0
-          ? `${trustedNames.length} trusted domains are explicitly named with no wildcard entries.`
-          : `${wildcardDomains.length}/${trustedNames.length} trusted domain entries are wildcards.`,
-    { trusted_domains: trustedNames.slice(0, 50), wildcard_entries: wildcardDomains },
+        : wildcardDomains.length > 0
+          ? `${wildcardDomains.length}/${trustedNames.length} trusted domain entries are wildcards.`
+          : trusted.truncated
+            ? `${partialNote(trustedNames.length, trusted.total, true)} Seen trusted domains are explicitly named, but the unseen entries were not judged.`
+            : `${trustedNames.length} trusted domains are explicitly named with no wildcard entries.`,
+    { trusted_domains: trustedNames.slice(0, 50), wildcard_entries: wildcardDomains, truncated: trusted.truncated },
   ));
 
   const fileTransfer = readSetting(bundle, "in_meeting.file_transfer");

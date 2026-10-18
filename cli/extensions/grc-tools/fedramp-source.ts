@@ -1125,6 +1125,16 @@ function matchesApplicability(
   return (filter === "20x" || filter === "rev5") && recordApplicability === "both";
 }
 
+function summarizeProcessApplicability(
+  applicability: readonly FedrampApplicability[],
+): FedrampApplicability {
+  const has20x = applicability.includes("20x");
+  const hasRev5 = applicability.includes("rev5");
+  if (applicability.includes("both") || (has20x && hasRev5)) return "both";
+  if (has20x) return "20x";
+  return "rev5";
+}
+
 export function searchFedrampCatalog(
   catalog: FedrampCatalog,
   query: string,
@@ -1162,12 +1172,7 @@ export function searchFedrampCatalog(
 
   if (section === "any" || section === "process") {
     for (const process of catalog.processes) {
-      const processApplicability =
-        process.applicability.includes("both")
-          ? "both"
-          : process.applicability.includes("20x")
-            ? "20x"
-            : "rev5";
+      const processApplicability = summarizeProcessApplicability(process.applicability);
       if (!matchesApplicability(processApplicability, appliesTo)) continue;
       const score = matchScore(
         [

@@ -715,7 +715,7 @@ test("portable source and population contracts encode the final audit distinctio
   assert.ok(OKTA_SPEC.knownGaps.some((gap) => /OKTA-INTEG-004.*network-zone read is denied.*Pass/.test(gap)));
   assert.ok(OKTA_SPEC.knownGaps.some((gap) => /OKTA-AUTH-001 and OKTA-AUTH-009.*retain Pass.*organization-factor read is denied/.test(gap)));
   assert.ok(DUO_SPEC.knownGaps.some((gap) => /DUO-AUTH-010.*user inventory only.*WebAuthn.*do not make that fact incomplete/.test(gap)));
-  assert.ok(ZOOM_SPEC.knownGaps.some((gap) => /ZOOM-COLLAB-01.*trusted-domain.*truncated.*assertion throw/.test(gap)));
+  assert.equal(ZOOM_SPEC.knownGaps.some((gap) => /ZOOM-COLLAB-01/.test(gap)), false);
 });
 
 test("ServiceNow metadata owns every concrete runtime property and relevant check", () => {

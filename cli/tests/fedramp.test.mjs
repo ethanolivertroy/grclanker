@@ -7,6 +7,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,6 +33,8 @@ import {
   buildFedrampAdsSite,
   buildFedrampAdsStarterBundle,
   buildFedrampAdsPackagePlan,
+  resolveSecureOutputPath,
+  writeSecureTextFile,
   buildFedrampArtifactPlan,
   buildFedrampReadinessBrief,
   generateFedrampAdsSite,
@@ -285,6 +288,18 @@ test("search and resolvers support current IDs, unique names, and legacy process
   assert.equal(resolveFedrampProcess(catalog, "certification-data-sharing").id, "CDS");
   assert.equal(resolveFedrampProcess(catalog, "ADS").id, "CDS");
   assert.equal(resolveFedrampRequirement(catalog, "CDS-CSO-PUB").id, "CDS-CSO-PUB");
+
+  const dualBaseline = structuredClone(consolidatedRulesFixture);
+  delete dualBaseline.FRR.CDS.data.all;
+  const dualCatalog = normalizeFedrampConsolidatedRules(dualBaseline);
+  const cds = dualCatalog.processes.find((item) => item.id === "CDS");
+  assert.deepEqual(cds?.applicability.slice().sort(), ["20x", "rev5"]);
+  const rev5Process = searchFedrampCatalog(dualCatalog, "Certification Data Sharing", {
+    section: "process",
+    appliesTo: "rev5",
+  });
+  assert.equal(rev5Process[0]?.id, "CDS");
+  assert.equal(rev5Process[0]?.appliesTo, "both");
 
   const ksiMatch = resolveFedrampKsi(catalog, "KSI-CNA-EIS");
   assert.equal(ksiMatch.kind, "indicator");
@@ -996,6 +1011,23 @@ test("CDS starter bundle builder includes trust-center and feed templates", () =
     readme,
     /Hosting note:\n- Serve the public JSON files with `Content-Type: application\/json` and `X-Content-Type-Options: nosniff`, and enable CORS [^\n]+\(FRC-CSO-JSN\)\.\n/,
   );
+});
+
+test("FedRAMP bundle writes reject paths outside the output root before creating them", async () => {
+  const root = mkdtempSync(join(tmpdir(), "grclanker-fedramp-path-"));
+  const outside = mkdtempSync(join(tmpdir(), "grclanker-fedramp-outside-"));
+  const linked = join(root, "linked");
+  symlinkSync(outside, linked, "dir");
+  const escaped = join(outside, "escape.txt");
+
+  assert.throws(() => resolveSecureOutputPath(root, join(root, "../escape.txt")), /path traversal detected/);
+  assert.throws(() => resolveSecureOutputPath(root, join(linked, "file.txt")), /Refusing to write through symlink/);
+  await assert.rejects(writeSecureTextFile(root, escaped, "secret"), /path traversal detected/);
+  assert.equal(existsSync(escaped), false);
+
+  const written = await writeSecureTextFile(root, join(root, "public", "authorization-data.json"), "{\"ok\":true}\n");
+  assert.equal(existsSync(written), true);
+  assert.equal(readFileSync(written, "utf8"), "{\"ok\":true}\n");
 });
 
 test("CDS starter bundle generator writes scaffold files under the requested root", async () => {
