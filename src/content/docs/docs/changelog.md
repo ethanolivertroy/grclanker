@@ -1,7 +1,61 @@
 ---
 title: What's New
-description: What shipped in grclanker v0.1.1, v0.1.0, and v0.0.1.
+description: What shipped in grclanker v0.1.2, v0.1.1, v0.1.0, and v0.0.1.
 ---
+
+## v0.1.2 (October 17, 2026)
+
+Updates the FedRAMP tools to the October 2026 Consolidated Rules and moves the `sandbox-runtime` backend to sandbox-runtime 0.0.78. The tool surface is unchanged. Install or upgrade with:
+
+```bash
+curl -fsSL https://grclanker.com/install | bash
+grclanker tools
+```
+
+`grclanker tools` still reports `241 domain tools + 7 compute backend tools`.
+
+### FedRAMP
+
+- The [FedRAMP docs](/docs/fedramp/) are regenerated from Consolidated Rules `2026.10.13.01`, published October 13. `FRC-CSX-MOT` is gone, leaving 245 requirements.
+- The CLI fetches the official rules at runtime, so `v0.1.1` already returned the October rule text. The tool changes below are new.
+- `fedramp_get_requirement` shows each requirement's notification forms, mapped Rev5 controls, upstream note, and full update history. Before, it showed only the newest update.
+- `fedramp_search_frmr` matches control IDs in requirement search, as KSI search already did, so `ra-5` finds the vulnerability detection and response rules.
+- `fedramp_generate_ads_bundle` and `fedramp_generate_ads_site` add the `FRC-CSO-JSN` hosting requirements to their READMEs and approval checklist: `Content-Type: application/json`, `X-Content-Type-Options: nosniff`, and CORS for cross-origin reads.
+- The FedRAMP cache schema moves from version 2 to 3. The first run after upgrading discards older caches instead of serving them for up to 24 hours.
+- The generated FedRAMP pages list each requirement's notification forms, mapped Rev5 controls, and full update history. Their paragraphs no longer run together, and each page has a single title heading.
+
+### Compute backends
+
+- The `sandbox-runtime` backend moves to sandbox-runtime 0.0.78, up from 0.0.61. On Linux, 0.0.78 mounts placeholders over protected files and folders that do not exist yet, such as `.bashrc`, `.gitconfig`, and `.vscode`, for every sandboxed command.
+  - `grep` no longer fails when ripgrep skipped only those placeholders. A bad regex, a missing `rg`, or an unreadable search path still fails.
+  - `find` leaves the placeholders out of its results.
+  - The local backend releases each sandboxed command when it exits, on success, failure, or timeout, so sandbox-runtime removes its placeholders from the project.
+- `grclanker env exec` and `grclanker env smoke-test` on `sandbox-runtime` exit when done. Before, a successful run printed its result and then never exited.
+
+### Runtimes
+
+- The [Cursor Agent SDK](/docs/getting-started/agent-sdk/) project moves to `@cursor/bdk` 0.2.26, up from 0.2.21. `zod` is now a CLI devDependency, because bdk 0.2.24 made it a peer dependency. The project still serves all 241 tools: 199 read-only and 42 approval-gated writers.
+- Pi 1.1 and Flue 2.2.2 are unchanged.
+
+### Docs and site
+
+- grclanker.com moves from Astro to a static Next.js site, with Fumadocs rendering the docs. URLs are unchanged.
+- Search covers every docs page, every spec, and the CLI, Specs, and About pages, with results labeled Docs, Spec, or Page. Press `/` or Cmd/Ctrl+K to open it.
+- Docs body text uses a sans-serif font. Headings, labels, and code stay in Berkeley Mono.
+- On phones, wide tables stack into labeled cards and long inline code wraps.
+- The hand-written docs are rewritten in shorter paragraphs, with the same commands, tool names, and facts. Fifteen integration pages now say exactly when an unreadable endpoint yields `manual` and when it only caps a `pass` at `warn`.
+
+### Security
+
+- `npm audit` is unchanged from `v0.1.1`. The CLI has 2 high advisories, both GHSA-86w9-cpqp-85rv in `node-forge`, counted once directly and once through `@anthropic-ai/sandbox-runtime`. No patched `node-forge` exists yet. The site has none.
+
+### Upgrade notes
+
+- Rerun the installer to upgrade. Settings and runtime state under `~/.grclanker/agent` are kept.
+- Source checkouts should rerun `npm --prefix cli ci`, since the CLI lockfile changed.
+- On the [`sandbox-runtime` backend](/docs/getting-started/compute-backends/#sandbox-runtime), an allow-listed hostname that resolves to a loopback, link-local, or cloud metadata address, or to one of your machine's own addresses, is now refused. Intranet hostnames on private ranges still work. To allow a refused address, add the IP address itself to `network.allowedDomains`.
+
+Full history: [v0.1.1...v0.1.2](https://github.com/ethanolivertroy/grclanker/compare/v0.1.1...v0.1.2). [Release notes and bundles](https://github.com/ethanolivertroy/grclanker/releases/tag/v0.1.2).
 
 ## v0.1.1 (October 10, 2026)
 
