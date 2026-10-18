@@ -146,6 +146,29 @@ Bundle contents:
 - `compliance/`: `executive_summary.md`, `unified_compliance_matrix.md`, one report per framework
 - `_errors.log`: Only when collection partially failed
 
+## Live smoke
+
+```
+npm --prefix cli run test:oci:live
+```
+
+The smoke test skips with exit 0 when no `~/.oci/config`, `OCI_CONFIG_FILE`, or `OCI_TENANCY_OCID` is present, or when the `oci` binary is missing. Otherwise it runs the access check and every assess tool against the configured profile.
+
+## Limitations and manual controls
+
+- Password expiration (control 1) is manual: not exposed by the IAM `PasswordPolicy` datatype.
+- Vault key strength (control 19) is judged from `Key.keyShape.length` in bytes (AES 16/24/32, RSA 256/384/512, ECDSA 32/48/66 per the `KeyShape` datatype).
+  - ECDSA keys pass on any documented `curveId` because the spec control names only the AES-256 and RSA-4096 floors.
+  - Tighten `judgeKeyShape` if your baseline requires P-384 or above.
+- Controls 24 (budgets and alert rules) and 25 (OS Management Hub patching) are deferred.
+- Auth modes other than API-key profiles are deferred.
+- Controls 3-5, 16-17, 18-19, and 20-21 stay folded into one finding each with per-kind evidence.
+- SARIF and JSON-CLI output formats from the spec are out of scope. Findings are available as JSON in `analysis/findings.json`.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how the tools page through the API and report incomplete listings and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
 ### Secret hygiene
 
 Nothing credential-bearing is written. Redaction rules:
@@ -226,25 +249,6 @@ In each case:
 The OCI CLI has printed nothing for an empty list on some versions (oracle/oci-cli issue 204). But no docs.oracle.com page documents that behaviour for any command, so no command's empty stdout is treated as a documented empty result.
 
 A tenancy whose list is genuinely empty on such a CLI version renders `manual`, and the operator confirms the empty inventory by hand.
-
-## Live smoke
-
-```
-npm --prefix cli run test:oci:live
-```
-
-The smoke test skips with exit 0 when no `~/.oci/config`, `OCI_CONFIG_FILE`, or `OCI_TENANCY_OCID` is present, or when the `oci` binary is missing. Otherwise it runs the access check and every assess tool against the configured profile.
-
-## Limitations and manual controls
-
-- Password expiration (control 1) is manual: not exposed by the IAM `PasswordPolicy` datatype.
-- Vault key strength (control 19) is judged from `Key.keyShape.length` in bytes (AES 16/24/32, RSA 256/384/512, ECDSA 32/48/66 per the `KeyShape` datatype).
-  - ECDSA keys pass on any documented `curveId` because the spec control names only the AES-256 and RSA-4096 floors.
-  - Tighten `judgeKeyShape` if your baseline requires P-384 or above.
-- Controls 24 (budgets and alert rules) and 25 (OS Management Hub patching) are deferred.
-- Auth modes other than API-key profiles are deferred.
-- Controls 3-5, 16-17, 18-19, and 20-21 stay folded into one finding each with per-kind evidence.
-- SARIF and JSON-CLI output formats from the spec are out of scope. Findings are available as JSON in `analysis/findings.json`.
 
 ## Surfaces
 

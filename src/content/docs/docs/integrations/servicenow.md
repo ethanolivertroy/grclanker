@@ -164,25 +164,9 @@ For a `manual` finding, the summary names the cause and `manualEvidence` states 
 
 Rows without a date (`last_login_time`, `expires`) are bucketed separately and never counted as active or valid.
 
-### Partial and unread inputs
-
-Every finding is gated on the tables it reads (the `Inputs` column below), in this order:
-
-- **Unread input:** The finding is `manual` when any input was forbidden (401/403), ACL-filtered, or errored.
-  - Its summary names the table and the observed status ("Verdict unknown: sys_user read was forbidden (403)").
-  - `manualEvidence` states what to collect.
-  - Nothing is evaluated on the remaining inputs.
-- **Truncated input:** When an input stopped at `record_limit`, returned fewer rows than `X-Total-Count`, or has no total, the finding's summary carries "Partial view: ..." and a `pass` becomes `warn`.
-  - An absence-driven `fail` is capped at `manual`, and the names of the things not seen are dropped, because an unseen row may sit in the unread remainder.
-  - Such a `fail` rests on a property, ACL, identity provider, access rule, or plugin not found among the visible rows (SNOW-07, SNOW-08, SNOW-11, SNOW-17, SNOW-20).
-  - A `fail` observed on a visible row (a non-compliant value, an inactive plugin row, an unvalidated MID Server) stands.
-- **Named principals:** User, admin, and integration account names and the counts derived from them are rendered `null` with a `principals_withheld` note whenever `sys_user` or `sys_user_has_role` is partial (SNOW-04, SNOW-07, SNOW-14).
-- **Evidence**
-  - Every finding carries `inputs[]` with one entry per table read (`table`, `state`, `visible_rows`, `total_rows`, `pages`, `truncated`, `total_unknown`, `partial`), each `null` when the read was not answered.
-  - Area summaries render every count derived from an unread table as `null`.
-  - Area summaries carry an `inventories` map naming each table as read, `unread (<status>)`, or `not requested (<reason>)`.
-
 ## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the rules in [Partial and unread inputs](#partial-and-unread-inputs).
 
 | # | Control | Tool | Finding | Inputs | Status semantics |
 | --- | --- | --- | --- | --- | --- |
@@ -259,6 +243,28 @@ Otherwise it:
   - Adaptive authentication MFA policies are not read.
   - When the roles list is not returned, enforcement falls back to the per-user flags and the finding says so.
 - Mutual TLS is not supported by the runtime's HTTP client.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Partial and unread inputs
+
+Every finding is gated on the tables it reads (the `Inputs` column below), in this order:
+
+- **Unread input:** The finding is `manual` when any input was forbidden (401/403), ACL-filtered, or errored.
+  - Its summary names the table and the observed status ("Verdict unknown: sys_user read was forbidden (403)").
+  - `manualEvidence` states what to collect.
+  - Nothing is evaluated on the remaining inputs.
+- **Truncated input:** When an input stopped at `record_limit`, returned fewer rows than `X-Total-Count`, or has no total, the finding's summary carries "Partial view: ..." and a `pass` becomes `warn`.
+  - An absence-driven `fail` is capped at `manual`, and the names of the things not seen are dropped, because an unseen row may sit in the unread remainder.
+  - Such a `fail` rests on a property, ACL, identity provider, access rule, or plugin not found among the visible rows (SNOW-07, SNOW-08, SNOW-11, SNOW-17, SNOW-20).
+  - A `fail` observed on a visible row (a non-compliant value, an inactive plugin row, an unvalidated MID Server) stands.
+- **Named principals:** User, admin, and integration account names and the counts derived from them are rendered `null` with a `principals_withheld` note whenever `sys_user` or `sys_user_has_role` is partial (SNOW-04, SNOW-07, SNOW-14).
+- **Evidence**
+  - Every finding carries `inputs[]` with one entry per table read (`table`, `state`, `visible_rows`, `total_rows`, `pages`, `truncated`, `total_unknown`, `partial`), each `null` when the read was not answered.
+  - Area summaries render every count derived from an unread table as `null`.
+  - Area summaries carry an `inventories` map naming each table as read, `unread (<status>)`, or `not requested (<reason>)`.
 
 ### Link and request origins
 

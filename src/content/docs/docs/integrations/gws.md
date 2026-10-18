@@ -99,6 +99,8 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 ## Control coverage
 
+Verdicts on unread, partial, or truncated data follow the [verdict-safety rules](#verdict-safety-rules).
+
 19 of 19 spec controls are automated.
 
 Status semantics:
@@ -129,68 +131,6 @@ Status semantics:
 | 17 | Admin audit telemetry stays available | monitoring | GWS-MON-003 | `activities.list` for `admin` returns at least one event | Reports unreadable or zero events |
 | 18 | Token audit telemetry stays available | monitoring | GWS-MON-004 | `activities.list` for `token` returns at least one event | Reports unreadable or zero events |
 | 19 | Open alert backlog is manageable | monitoring | GWS-MON-005 | 3 or fewer alerts whose `metadata.status` is not `CLOSED`; alerts without a status cap the verdict at Partial | Alert Center unreadable or zero alerts |
-
-## Verdict-safety rules
-
-Every finding applies these rules. `cli/tests/gws.test.mjs` carries a regression test per rule plus the four-fixture false-pass self-check.
-
-1. An unreadable, 401, 403, or errored endpoint never passes. The finding is Manual, names the endpoint and the missing scope or admin role, and lists the manual evidence.
-   - The same holds per item. When `tokens.list` fails for some sampled users:
-     - GWS-INTEG-001, GWS-INTEG-002, and GWS-INTEG-003 each name the failed users and the endpoint.
-     - GWS-INTEG-002 renders its privileged counts as lower bounds (`Privileged users with readable tokens.list: 1 of 2 (tokens.list failed: super@example.com)`).
-     - The verdict stays below Pass.
-   - A listing that only orders the sample is still a dependency. When `roles.list` or `roleAssignments.list` is unreadable, the privileged-first token sample is not known to cover the privileged users, so GWS-INTEG-001 and GWS-INTEG-003 cap at Partial and name that endpoint in the summary.
-2. An empty inventory never passes by default. Where emptiness is compliant, the summary says so. Emptiness is compliant only inside a non-empty parent inventory:
-   - Zero group grants among returned assignments.
-   - Zero privileged tokens inside a non-empty token inventory.
-   - Zero suspicious events inside a non-empty login log.
-   - Zero dormant users among users with a known last login.
-3. A surface that was not collected in the run renders Manual (for example GWS-ID-005 without the Policy API scope).
-4. Users without `lastLoginTime` and alerts without `metadata.status` are reported in a separate bucket and cap the verdict at Partial.
-5. A partial view (user cap of 5000, truncated pages, denied per-user reads) is flagged with seen counts and caps the verdict at Partial.
-6. Only the documented enabling flag counts. `isEnrolledIn2Sv` without `isEnforcedIn2Sv=true` does not support a pass. An enforcement policy without a past `enforcedFrom` is not enforced.
-7. Pagination follows `nextPageToken` until it is absent or the collection cap is hit. The cap is recorded as truncation.
-8. Re-running the export allocates `-2`, `-3`, and so on, and never overwrites an earlier directory or zip.
-9. **Bundle secret hygiene:** Every `core_data/` object is projected to the documented fields the verdicts read before it is written.
-   - Alert Center `data` payloads, `events[].parameters[]`, `actor.key`, and undocumented keys are never stored.
-   - A second pass then redacts credential-like keys matched on normalized names (`privateKey`, `refresh_token`, `clientSecret`) and `{name, value}` pairs whose name is credential-like.
-   - Every file in the bundle, not only `core_data/`, then passes through one text scrubber before it is written:
-     - The query string and fragment of every URL are removed, whether the URL is the whole value or sits mid-prose.
-     - Well-known credential shapes are replaced: bearer credentials, `ya29.` and `1//` tokens, `AIza` keys, `GOCSPX-` secrets, JWTs, and PEM private keys.
-     - `key=value` or `key: value` pairs naming a credential are replaced.
-     - The run's own bearer token, service-account key, and every token minted during the run (including one a 401 evicted from the cache) are replaced wherever they appear.
-   - API error bodies are reduced at the client to the HTTP status plus documented identifiers (`error.status`, `errors[].reason`, `details[].reason`, or the RFC 6749 `error` code).
-     - An identifier is a bare `[A-Za-z][A-Za-z0-9_]*` value of at most 63 characters, so dotted, hyphenated, and path-shaped values are dropped.
-     - The HTTP reason phrase comes from a fixed RFC 9110 table rather than the server.
-     - The server's free-text `message` is never stored.
-     - `_errors.log` names the failing endpoint on each line.
-   - Third-party OAuth `displayText` is scrubbed and paired with the documented `clientId` wherever a finding renders it.
-   - The tool path carries the same guarantee:
-     - Every error string is scrubbed at the point it is created. `GwsApiError` scrubs its message in its constructor, and `summarizeError` scrubs every other error, so dataset statuses, evidence lines, access probes, and tool error results inherit that scrubbing.
-     - The `gws_check_access` and `gws_assess_*` results are redacted as objects before they are rendered.
-     - A successful response whose body is not JSON is reported as `<status> with non-JSON <content type> body (N bytes) withheld` beside the endpoint, rather than through a parser message that quotes the body.
-     - `gws_check_access` reads each probe body the same way, so a 200 page that is not JSON renders `error` with that description instead of `ok`.
-   - The service-account key loader reads and parses in two guarded steps. It never repeats the file, the parser message, or Node's message.
-     - A read failure renders `unable to read <path> (<code>)` with only a well-formed system error code such as `ENOENT` or `EISDIR`.
-     - A parse failure renders `invalid JSON in <path>` with the size read.
-10. Every cap exit reports `truncated: true`.
-    - The collection caps, a `nextPageToken` equal to the previous one (a stalled cursor), and a 1000-page ceiling all end the listing as truncation.
-    - Privileged verdicts (GWS-ID-001, GWS-ID-004, GWS-ADMIN-001 to 003, GWS-ADMIN-005, GWS-INTEG-002) cap at Partial when the user, role, or role-assignment listing was truncated.
-11. Unreadable or never-collected data renders `null` with a status naming the read, never `0`, `[]`, or a default.
-    - Every count in the four assessment snapshot summaries carries a `<field>_status` companion that reads one of:
-      - `complete: Directory users.list returned 4 record(s) across 1 page(s)`
-      - `partial: at least 4; Directory users.list stopped at the collection cap after 3 page(s) with 4 seen, more pages exist`
-      - `unreadable: Directory roles.list (403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions))`
-      - `not collected: Directory tokens.list was not called because Directory users.list was unreadable (...)`
-    - A count is only as readable as its weakest source. A count derived from users, roles, and role assignments is null when any of the three failed. The rendered summary shows the status word (`- privileged_users: unreadable`) or the bound (`- active_users: at least 4`) instead of a number.
-    - `users_seen_partial_view` reads from the same collection status (`no`, `yes`, or `unreadable (Directory users.list (...))`), so a failed listing never renders as `no`.
-    - Evidence lines take the same form:
-      - `Token records collected: at least 1 (Directory tokens.list failed for 1 of 4 sampled users (user@example.com: 403 Forbidden ...))` whenever any per-user read failed.
-      - `Token records collected: unreadable (Directory tokens.list failed for all 4 sampled users (...))` when none succeeded.
-    - `core_data/` files write an explicit marker for a failed read (see the bundle layout).
-    - `cli/tests/gws.test.mjs` sweeps 34 denial scenarios (eleven surfaces by three failure kinds plus the never-collected Policy API dataset) over every finding line, snapshot field, and `core_data/` file. The sweep uses two generic guards:
-      - No `0` or `[]` beside an unreadable, not collected, or unknown status.
-      - No complete or partial status naming an endpoint the run never requested.
 
 ## Framework mappings
 
@@ -272,6 +212,72 @@ Without `GWS_ACCESS_TOKEN` or a service-account file or inline JSON (any of the 
 - GWS-ADMIN-005 does not expand group membership. Any group-based admin grant renders Manual for a membership review.
 - Chrome Policy API (`chromepolicy/v1`) and Cloud Identity device surfaces listed in the spec are not called. No shipped control depends on them.
 - Alert Center `pageSize` has no documented maximum ([alerts.list](https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts/list)). grclanker requests 100 and follows `nextPageToken`.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Verdict-safety rules
+
+Every finding applies these rules. `cli/tests/gws.test.mjs` carries a regression test per rule plus the four-fixture false-pass self-check.
+
+1. An unreadable, 401, 403, or errored endpoint never passes. The finding is Manual, names the endpoint and the missing scope or admin role, and lists the manual evidence.
+   - The same holds per item. When `tokens.list` fails for some sampled users:
+     - GWS-INTEG-001, GWS-INTEG-002, and GWS-INTEG-003 each name the failed users and the endpoint.
+     - GWS-INTEG-002 renders its privileged counts as lower bounds (`Privileged users with readable tokens.list: 1 of 2 (tokens.list failed: super@example.com)`).
+     - The verdict stays below Pass.
+   - A listing that only orders the sample is still a dependency. When `roles.list` or `roleAssignments.list` is unreadable, the privileged-first token sample is not known to cover the privileged users, so GWS-INTEG-001 and GWS-INTEG-003 cap at Partial and name that endpoint in the summary.
+2. An empty inventory never passes by default. Where emptiness is compliant, the summary says so. Emptiness is compliant only inside a non-empty parent inventory:
+   - Zero group grants among returned assignments.
+   - Zero privileged tokens inside a non-empty token inventory.
+   - Zero suspicious events inside a non-empty login log.
+   - Zero dormant users among users with a known last login.
+3. A surface that was not collected in the run renders Manual (for example GWS-ID-005 without the Policy API scope).
+4. Users without `lastLoginTime` and alerts without `metadata.status` are reported in a separate bucket and cap the verdict at Partial.
+5. A partial view (user cap of 5000, truncated pages, denied per-user reads) is flagged with seen counts and caps the verdict at Partial.
+6. Only the documented enabling flag counts. `isEnrolledIn2Sv` without `isEnforcedIn2Sv=true` does not support a pass. An enforcement policy without a past `enforcedFrom` is not enforced.
+7. Pagination follows `nextPageToken` until it is absent or the collection cap is hit. The cap is recorded as truncation.
+8. Re-running the export allocates `-2`, `-3`, and so on, and never overwrites an earlier directory or zip.
+9. **Bundle secret hygiene:** Every `core_data/` object is projected to the documented fields the verdicts read before it is written.
+   - Alert Center `data` payloads, `events[].parameters[]`, `actor.key`, and undocumented keys are never stored.
+   - A second pass then redacts credential-like keys matched on normalized names (`privateKey`, `refresh_token`, `clientSecret`) and `{name, value}` pairs whose name is credential-like.
+   - Every file in the bundle, not only `core_data/`, then passes through one text scrubber before it is written:
+     - The query string and fragment of every URL are removed, whether the URL is the whole value or sits mid-prose.
+     - Well-known credential shapes are replaced: bearer credentials, `ya29.` and `1//` tokens, `AIza` keys, `GOCSPX-` secrets, JWTs, and PEM private keys.
+     - `key=value` or `key: value` pairs naming a credential are replaced.
+     - The run's own bearer token, service-account key, and every token minted during the run (including one a 401 evicted from the cache) are replaced wherever they appear.
+   - API error bodies are reduced at the client to the HTTP status plus documented identifiers (`error.status`, `errors[].reason`, `details[].reason`, or the RFC 6749 `error` code).
+     - An identifier is a bare `[A-Za-z][A-Za-z0-9_]*` value of at most 63 characters, so dotted, hyphenated, and path-shaped values are dropped.
+     - The HTTP reason phrase comes from a fixed RFC 9110 table rather than the server.
+     - The server's free-text `message` is never stored.
+     - `_errors.log` names the failing endpoint on each line.
+   - Third-party OAuth `displayText` is scrubbed and paired with the documented `clientId` wherever a finding renders it.
+   - The tool path carries the same guarantee:
+     - Every error string is scrubbed at the point it is created. `GwsApiError` scrubs its message in its constructor, and `summarizeError` scrubs every other error, so dataset statuses, evidence lines, access probes, and tool error results inherit that scrubbing.
+     - The `gws_check_access` and `gws_assess_*` results are redacted as objects before they are rendered.
+     - A successful response whose body is not JSON is reported as `<status> with non-JSON <content type> body (N bytes) withheld` beside the endpoint, rather than through a parser message that quotes the body.
+     - `gws_check_access` reads each probe body the same way, so a 200 page that is not JSON renders `error` with that description instead of `ok`.
+   - The service-account key loader reads and parses in two guarded steps. It never repeats the file, the parser message, or Node's message.
+     - A read failure renders `unable to read <path> (<code>)` with only a well-formed system error code such as `ENOENT` or `EISDIR`.
+     - A parse failure renders `invalid JSON in <path>` with the size read.
+10. Every cap exit reports `truncated: true`.
+    - The collection caps, a `nextPageToken` equal to the previous one (a stalled cursor), and a 1000-page ceiling all end the listing as truncation.
+    - Privileged verdicts (GWS-ID-001, GWS-ID-004, GWS-ADMIN-001 to 003, GWS-ADMIN-005, GWS-INTEG-002) cap at Partial when the user, role, or role-assignment listing was truncated.
+11. Unreadable or never-collected data renders `null` with a status naming the read, never `0`, `[]`, or a default.
+    - Every count in the four assessment snapshot summaries carries a `<field>_status` companion that reads one of:
+      - `complete: Directory users.list returned 4 record(s) across 1 page(s)`
+      - `partial: at least 4; Directory users.list stopped at the collection cap after 3 page(s) with 4 seen, more pages exist`
+      - `unreadable: Directory roles.list (403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions))`
+      - `not collected: Directory tokens.list was not called because Directory users.list was unreadable (...)`
+    - A count is only as readable as its weakest source. A count derived from users, roles, and role assignments is null when any of the three failed. The rendered summary shows the status word (`- privileged_users: unreadable`) or the bound (`- active_users: at least 4`) instead of a number.
+    - `users_seen_partial_view` reads from the same collection status (`no`, `yes`, or `unreadable (Directory users.list (...))`), so a failed listing never renders as `no`.
+    - Evidence lines take the same form:
+      - `Token records collected: at least 1 (Directory tokens.list failed for 1 of 4 sampled users (user@example.com: 403 Forbidden ...))` whenever any per-user read failed.
+      - `Token records collected: unreadable (Directory tokens.list failed for all 4 sampled users (...))` when none succeeded.
+    - `core_data/` files write an explicit marker for a failed read (see the bundle layout).
+    - `cli/tests/gws.test.mjs` sweeps 34 denial scenarios (eleven surfaces by three failure kinds plus the never-collected Policy API dataset) over every finding line, snapshot field, and `core_data/` file. The sweep uses two generic guards:
+      - No `0` or `[]` beside an unreadable, not collected, or unknown status.
+      - No complete or partial status naming an endpoint the run never requested.
 
 ## Endpoint reference
 

@@ -61,38 +61,6 @@ The YAML parser's own message is never echoed, because it quotes the offending s
 
 The config file path is the caller's own text, so it passes through the same scrub as every other error string, in both the message and the error's `path` field. A key embedded in a directory name renders as `[REDACTED]`. The structured `kind`, `format`, `code`, `line`, and `column` fields stay available.
 
-### API behavior
-
-NerdGraph queries are POSTed to `/graphql` and paginated with `nextCursor` where the schema exposes a cursor.
-
-A listing is complete only when the API returned no next cursor and the items seen reach the reported total. These all mark the list incomplete, with the number of items seen and the reported total:
-
-- A cursor that stops advancing.
-- An empty page beside a next cursor.
-- The item limit.
-- The page maximum.
-- A total larger than the items returned.
-
-The affected findings record the truncation.
-
-Every fallback is recorded as an incomplete listing:
-
-- `apiAccess.keySearch` is tried in three layers:
-  1. Schema-cited fields with a cursor.
-  2. The same fields on a single page.
-  3. Only the fields shown on the docs page.
-- `aiWorkflows.workflows` and `authorizationManagement` group grants fall back to the documented unpaginated shape when the schema rejects the cursor or filter argument.
-
-Other API behavior:
-
-- Every field in every NerdGraph selection is traceable to a public docs.newrelic.com page or to the public NerdGraph schema. See "NerdGraph field provenance" below.
-- A NerdGraph response that carries `errors` entries is treated as a failed read even when it also carries partial `data`.
-- REST API v2 calls send `Api-Key` and follow RFC 5988 `Link` headers (`rel="next"`) or the `page=` parameter.
-- HTTP 429, 500, 502, 503, and 504 responses are retried up to three times.
-  - The delay honors `Retry-After` or `X-RateLimit-Reset` when present. Otherwise it backs off exponentially, capped at 15 seconds per wait.
-  - New Relic documents a REST API v2 limit of 1000 calls per minute per key.
-- Every request has a timeout (30 seconds by default).
-
 ## Run it
 
 After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
@@ -211,12 +179,136 @@ Directories are created with mode `0700` and files with `0600`.
 
 ## Control coverage
 
+Verdicts on unread, partial, or truncated data follow the [verdict safety](#verdict-safety) rules.
+
 Findings use four statuses:
 
 - `pass`: The control is met from complete API evidence.
 - `warn`: Met with caveats, or the evidence was incomplete.
 - `fail`: API evidence shows a violation.
 - `manual`: The API cannot establish the control. The finding summary names the cause and the exact UI evidence a reviewer must collect.
+
+### Status semantics by control
+
+| # | Spec control | Tool | Finding id | Status semantics |
+|---|--------------|------|------------|------------------|
+| 1 | SSO/SAML Enforcement | `newrelic_assess_identity` | `NR-01-SSO-ENFORCEMENT` | `fail` if any authentication domain uses password login. `manual` when domains are unreadable, zero domains are returned, `customerAdministration` does not expose `authenticationType` (single-tenant organizations, scoped out), or a domain exposes no recognizable type. `pass` only when every listed domain exposes a SAML or OIDC `authenticationType`. |
+| 2 | User Type Least Privilege | `newrelic_assess_identity` | `NR-02-USER-TYPE-LEAST-PRIVILEGE` | `manual` when users are unreadable or zero users are returned. `fail` if full platform users are inactive past `inactive_days`. `warn` if the full platform share exceeds `max_full_platform_percent`, or if any full platform user has no `lastActive` or any user exposes no type. `pass` otherwise. |
+| 3 | Admin User Minimization | `newrelic_assess_identity` | `NR-03-ADMIN-MINIMIZATION` | `manual` when groups or users are unreadable or empty, or when no group exposes role grants or no user exposes group membership. `fail` if admin group members exceed `max_admins`. `warn` if no group matches `admin_role_pattern` or some role or membership data is missing. `pass` otherwise. |
+| 4 | API Key Inventory | `newrelic_assess_access_control` | `NR-04-API-KEY-INVENTORY` | `manual` when keys, users, or group grants are unreadable, zero keys are returned (every account has its original license key), or no user key exposes `userId` (the documented-only `keySearch` layer). `warn` if keys are unnamed, expose no type, belong to admin group members, or admin detection is incomplete, including a group grant listing (`authorizationManagement.groups`) that is readable for some authentication domains only: an admin roster built from part of the domains never concludes that no admin-owned keys exist, and `admin_owned_user_keys` renders as `null`. `pass` otherwise. The `NrAuditEvent` key-actor rows are not part of this finding; control 6 renders them with their own status. |
+| 5 | API Key Age | `newrelic_assess_access_control` | `NR-05-API-KEY-AGE` | `manual` when keys are unreadable, zero keys are returned, no key exposes `createdAt`, or no user or license keys exist to age-check. `fail` if user keys exceed `max_key_age_days`. `warn` if license keys exceed it or any key has no `createdAt`. `pass` otherwise. |
+| 6 | Unused API Keys | `newrelic_assess_access_control` | `NR-06-UNUSED-API-KEYS` | `warn` for user keys owned by missing, inactive, or undated users. `manual` when keys are unreadable, zero keys are returned (a complete listing cannot be empty, so the key cannot see them), no user key exposes `userId`, or keys exist without owner signals, because `NrAuditEvent` records configuration changes only. Never `pass`. |
+| 7 | Account Access Controls | `newrelic_assess_access_control` | `NR-07-ACCOUNT-ACCESS-CONTROLS` | `manual` when groups, users, or accounts are unreadable, empty, or expose no role or membership data. `warn` if non-admin users hold organization-scoped grants, exceed `max_accounts_per_user`, or some role or membership data is missing. `pass` otherwise. |
+| 8 | Cross-Account Access Restrictions | `newrelic_assess_access_control` | `NR-08-CROSS-ACCOUNT-RESTRICTIONS` | `manual` when groups, users, or accounts are unreadable or empty, when only one account is visible (not applicable), or when account names match neither pattern; `cross_environment_users` then renders as `null` beside an `unknown` status naming the classification gap, never as an empty list beside `complete`. `warn` if non-admin users reach both production and non-production accounts or some accounts are unclassified. `pass` only when every account is classified and no overlap exists. |
+| 9 | Alert Policy Coverage | `newrelic_assess_alerting` | `NR-09-ALERT-POLICY-COVERAGE` | `manual` when policies, conditions, or entities are unreadable, or when zero reporting entities are visible. `fail` with no policies while entities report, no condition with `enabled = true`, or reporting APM, host, or synthetic entities with `alertSeverity = NOT_CONFIGURED`. `warn` for other uncovered entities, policies without enabled conditions, or conditions missing the `enabled` flag. `pass` otherwise, limited to `warn` when the workload listing (`entitySearch` workloads) is unreadable for any account; `workloads` and `disrupted_workloads` then render as `null` beside `workloads_status`. |
+| 10 | Alert Notification Channels | `newrelic_assess_alerting` | `NR-10-ALERT-NOTIFICATION-CHANNELS` | `manual` when destinations, channels, or workflows are unreadable (including a documented per-account `error { details }`), when nothing exists and policies are absent or unreadable, when no workflow exposes `workflowEnabled`, or when no enabled workflow routes through a channel `destinationId` to an inventoried destination. `fail` for personal email destinations or zero destinations while policies exist. `warn` for unapproved domains, no workflow with `workflowEnabled = true`, destinations missing `type`, or no approved domain list. `pass` otherwise, limited to `warn` when alert policies (`alerts.policiesSearch`) are unreadable for any account, since the pass path compares routing against the policy inventory; the summary notes that destination active state is not read because the public schema does not document it. `unapproved_email_destinations` rests on the destination listing and on the approved-domain inventory (`actor.user`, unless `approved_email_domains` was passed), so its status names both, and it renders as `null` when `actor.user` is unreadable or yields no email domain rather than as an empty list. |
+| 11 | Data Retention Settings | `newrelic_assess_data_governance` | `NR-11-DATA-RETENTION` | `manual` when rules are unreadable or no custom rules exist (defaults are not exposed by the API). `fail` if active rules retain less than `min_retention_days`. `warn` if a rule exposes no `retentionInDays`, namespaces are unreadable, or a customizable namespace has no rule. `pass` only when every customizable namespace has an explicit rule at or above the threshold. |
+| 12 | Log Obfuscation Rules | `newrelic_assess_data_governance` | `NR-12-LOG-OBFUSCATION` | `manual` when rules are unreadable or were never collected because no account resolved (`actor.accounts` unreadable or empty with no `account_ids` configured), or when no rules exist and no logs were ingested (not applicable). `fail` with no rule that has `enabled = true`. `warn` if expressions are unreadable, do not cover both credential and PII patterns, or rules lack the `enabled` flag. `pass` otherwise, limited to `warn` naming the query path when Pipeline Control cloud rules (`entityManagement.pipelineCloudRules`), NRQL drop rules (`nrqlDropRules.list`), or the `Log` volume NRQL are unreadable for any account, because attribute drop coverage or log volume is then unverified; `pipeline_cloud_rules`, `legacy_drop_rules`, `attribute_drop_rules`, and `log_events_last_day` render as `null` beside their status fields instead of a count from the readable subset. A 403 on Pipeline Control cannot be told apart from a missing entitlement, so it is reported as unverified rather than as zero rules. |
+| 13 | Synthetic Monitor Security | `newrelic_assess_data_governance` | `NR-13-SYNTHETIC-MONITOR-SECURITY` | `manual` when monitors are unreadable, zero monitors or zero scripted monitors exist (not applicable), `monitorType` is missing, or scripts are unreadable or unsampled. `fail` if sampled scripts contain credential patterns. `warn` if the sample hit `script_sample_limit`, secure credentials are unreadable, or no script references `$secure.*` while no secure credentials exist. `pass` only when every scripted monitor's script was scanned. |
+| 14 | Dashboard Permissions | `newrelic_assess_data_governance` | `NR-14-DASHBOARD-PERMISSIONS` | `manual` when dashboards or the live URL listing are unreadable, or zero dashboards are returned. `fail` if public live URLs exist. `warn` for `PUBLIC_READ_WRITE` dashboards or dashboards without a `permissions` value. `pass` otherwise. |
+| 15 | Logs in Context Security | `newrelic_assess_data_governance` | `NR-15-LOGS-IN-CONTEXT-SECURITY` | `manual` when the pattern query or log volume query is unreadable, or when no logs were ingested in the last day. `fail` if `Log` messages match credential patterns. `pass` otherwise. Only counts are collected, never matching messages. |
+| 16 | Infrastructure Agent Configuration | `newrelic_assess_data_governance` | `NR-16-INFRA-AGENT-CONFIGURATION` | Always `manual`: agent transport settings are not API visible. Evidence lists reporting hosts and agent versions. |
+| 17 | Applied Intelligence Sensitivity | `newrelic_assess_alerting` | `NR-17-APPLIED-INTELLIGENCE-SENSITIVITY` | `warn` if enabled workflows attach NRQL enrichments to external or unidentified destination types, otherwise `manual` because correlation decision settings are not API visible. Never `pass`. |
+| 18 | Authentication Domain Configuration | `newrelic_assess_identity` | `NR-18-AUTH-DOMAIN-CONFIGURATION` | `warn` if any domain provisions users manually instead of SCIM, otherwise `manual`: session duration and user upgrade settings are not exposed by NerdGraph, so the finding stays manual even when every domain uses SCIM. Never `pass`. |
+| 19 | Inactive User Accounts | `newrelic_assess_identity` | `NR-19-INACTIVE-USER-ACCOUNTS` | `manual` when users are unreadable or zero users are returned. `fail` if users exceed `inactive_days` since `lastActive`. `warn` if any user has no `lastActive` value. `pass` otherwise. |
+| 20 | Custom Role Permissions | `newrelic_assess_access_control` | `NR-20-CUSTOM-ROLE-PERMISSIONS` | `manual` when the `customerAdministration.roles` catalog is unreadable (organizations without the multi-tenancy entitlement; custom roles seen in group grants are listed), zero roles are returned, custom roles exist (NerdGraph does not expose role capabilities), or roles expose no `type` (`CUSTOM` or `STANDARD`). `warn` if the role listing was incomplete, or if group grants (`authorizationManagement.groups`, or the domain listing they depend on) are unreadable or readable for some domains only, because the roles in use were not fully cross-checked against the catalog; `custom_roles_in_group_grants` and `groups_granted_custom_roles` then render as `null`. `pass` only when the catalog listing was readable and complete and returned standard roles and the complete group grant listing confirms no custom role is in use; the summary states the conditions. |
+
+Every `pass` above additionally requires a complete inventory. The finding is limited to `warn` when:
+
+- A list was truncated.
+- A scope was unreadable.
+- `keySearch` fell back to a single page.
+- Any secondary inventory the finding reads was unreadable, fully or for one account or domain, except where rule 1 under [Verdict safety](#verdict-safety) makes the finding `manual`.
+
+The summary then carries a `Partial view:` clause naming the dataset and query path.
+
+Coverage: 20 of 20 controls.
+
+Controls 6, 16, 17, and 18 never pass by design. Control 6 never passes because `NrAuditEvent` cannot prove read-only key usage and an empty key listing means the key cannot see the keys.
+
+Control 20 is manual whenever custom roles exist. Each `manual` summary states the UI evidence to collect.
+
+## Framework mappings
+
+Every finding carries eight mappings taken from the spec's compliance table, formatted as `<Framework> <control>`. For example:
+
+- `FedRAMP IA-2`
+- `CMMC AC.L2-3.1.1`
+- `SOC 2 CC6.1`
+- `CIS 1.1`
+- `PCI-DSS 8.3.1`
+- `STIG SRG-APP-000148`
+- `IRAP ISM-1557`
+- `ISMAP CPS-04`
+
+The unified matrix and the per-framework reports in the audit bundle are generated from these mappings, so a finding appears under each framework it maps to.
+
+## Live smoke test
+
+```bash
+npm --prefix cli run test:newrelic:live
+```
+
+The script skips with exit code 0 when none of these is present:
+
+- `NEW_RELIC_API_KEY`
+- `NEW_RELIC_SEC_INSPECTOR_CONFIG`
+- `~/.newrelic-sec-inspector/config.yaml`
+
+With credentials, it runs `newrelic_check_access` and `newrelic_assess_identity` against the real organization. It fails if any required surface is unreadable.
+
+## Limitations and manual controls
+
+- `authenticationType` is only exposed by `customerAdministration.authenticationDomains`, which serves multi-tenant organizations. Single-tenant organizations receive a `manual` SSO finding with the exact UI path to capture.
+- `NrAuditEvent` records configuration changes, so it cannot prove that a key is unused for read traffic (control 6) or that a user logged in. Control 19 uses `lastActive` from user management instead.
+- NerdGraph does not expose:
+  - Role capabilities (control 20).
+  - Correlation decision settings (control 17).
+  - Session or user upgrade settings (control 18).
+  - Infrastructure agent transport configuration (control 16).
+- REST API v2 `GET /v2/users.json` only lists original user model users and is collected for reference only.
+- The spec's `notification_channels.json` endpoint does not exist in REST v2. Notification data comes from NerdGraph destinations, channels, and workflows.
+- NRQL drop rules reached end of life in favor of Pipeline Control cloud rules. Cloud rules are collected first, and legacy drop rules are collected best effort.
+- Dashboard live URL values and `uuid`s are deliberately not collected. Only title, type, and creation time are recorded.
+- Synthetic script scanning samples up to `script_sample_limit` scripted monitors and reports indicator labels, never script contents. When the sample hits the limit, control 13 is capped at `warn`.
+- Default retention values for namespaces without a custom rule are not exposed by the API, so control 11 only passes when every customizable namespace has an explicit rule.
+- `keySearch` obfuscates the key values of other users' user keys but still lists the keys, so key inventory findings cover every visible key. Key values are never requested.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### API behavior
+
+NerdGraph queries are POSTed to `/graphql` and paginated with `nextCursor` where the schema exposes a cursor.
+
+A listing is complete only when the API returned no next cursor and the items seen reach the reported total. These all mark the list incomplete, with the number of items seen and the reported total:
+
+- A cursor that stops advancing.
+- An empty page beside a next cursor.
+- The item limit.
+- The page maximum.
+- A total larger than the items returned.
+
+The affected findings record the truncation.
+
+Every fallback is recorded as an incomplete listing:
+
+- `apiAccess.keySearch` is tried in three layers:
+  1. Schema-cited fields with a cursor.
+  2. The same fields on a single page.
+  3. Only the fields shown on the docs page.
+- `aiWorkflows.workflows` and `authorizationManagement` group grants fall back to the documented unpaginated shape when the schema rejects the cursor or filter argument.
+
+Other API behavior:
+
+- Every field in every NerdGraph selection is traceable to a public docs.newrelic.com page or to the public NerdGraph schema. See "NerdGraph field provenance" below.
+- A NerdGraph response that carries `errors` entries is treated as a failed read even when it also carries partial `data`.
+- REST API v2 calls send `Api-Key` and follow RFC 5988 `Link` headers (`rel="next"`) or the `page=` parameter.
+- HTTP 429, 500, 502, 503, and 504 responses are retried up to three times.
+  - The delay honors `Retry-After` or `X-RateLimit-Reset` when present. Otherwise it backs off exponentially, capped at 15 seconds per wait.
+  - New Relic documents a REST API v2 limit of 1000 calls per minute per key.
+- Every request has a timeout (30 seconds by default).
 
 ### Verdict safety
 
@@ -354,46 +446,6 @@ Both may quote literals from your own configuration, such as attribute names or 
 
 The module exports the projection shapes as `NEWRELIC_STORED_RECORD_SHAPES`. The test suite holds every NerdGraph-backed shape to the identifiers its selection requests.
 
-### Status semantics by control
-
-| # | Spec control | Tool | Finding id | Status semantics |
-|---|--------------|------|------------|------------------|
-| 1 | SSO/SAML Enforcement | `newrelic_assess_identity` | `NR-01-SSO-ENFORCEMENT` | `fail` if any authentication domain uses password login. `manual` when domains are unreadable, zero domains are returned, `customerAdministration` does not expose `authenticationType` (single-tenant organizations, scoped out), or a domain exposes no recognizable type. `pass` only when every listed domain exposes a SAML or OIDC `authenticationType`. |
-| 2 | User Type Least Privilege | `newrelic_assess_identity` | `NR-02-USER-TYPE-LEAST-PRIVILEGE` | `manual` when users are unreadable or zero users are returned. `fail` if full platform users are inactive past `inactive_days`. `warn` if the full platform share exceeds `max_full_platform_percent`, or if any full platform user has no `lastActive` or any user exposes no type. `pass` otherwise. |
-| 3 | Admin User Minimization | `newrelic_assess_identity` | `NR-03-ADMIN-MINIMIZATION` | `manual` when groups or users are unreadable or empty, or when no group exposes role grants or no user exposes group membership. `fail` if admin group members exceed `max_admins`. `warn` if no group matches `admin_role_pattern` or some role or membership data is missing. `pass` otherwise. |
-| 4 | API Key Inventory | `newrelic_assess_access_control` | `NR-04-API-KEY-INVENTORY` | `manual` when keys, users, or group grants are unreadable, zero keys are returned (every account has its original license key), or no user key exposes `userId` (the documented-only `keySearch` layer). `warn` if keys are unnamed, expose no type, belong to admin group members, or admin detection is incomplete, including a group grant listing (`authorizationManagement.groups`) that is readable for some authentication domains only: an admin roster built from part of the domains never concludes that no admin-owned keys exist, and `admin_owned_user_keys` renders as `null`. `pass` otherwise. The `NrAuditEvent` key-actor rows are not part of this finding; control 6 renders them with their own status. |
-| 5 | API Key Age | `newrelic_assess_access_control` | `NR-05-API-KEY-AGE` | `manual` when keys are unreadable, zero keys are returned, no key exposes `createdAt`, or no user or license keys exist to age-check. `fail` if user keys exceed `max_key_age_days`. `warn` if license keys exceed it or any key has no `createdAt`. `pass` otherwise. |
-| 6 | Unused API Keys | `newrelic_assess_access_control` | `NR-06-UNUSED-API-KEYS` | `warn` for user keys owned by missing, inactive, or undated users. `manual` when keys are unreadable, zero keys are returned (a complete listing cannot be empty, so the key cannot see them), no user key exposes `userId`, or keys exist without owner signals, because `NrAuditEvent` records configuration changes only. Never `pass`. |
-| 7 | Account Access Controls | `newrelic_assess_access_control` | `NR-07-ACCOUNT-ACCESS-CONTROLS` | `manual` when groups, users, or accounts are unreadable, empty, or expose no role or membership data. `warn` if non-admin users hold organization-scoped grants, exceed `max_accounts_per_user`, or some role or membership data is missing. `pass` otherwise. |
-| 8 | Cross-Account Access Restrictions | `newrelic_assess_access_control` | `NR-08-CROSS-ACCOUNT-RESTRICTIONS` | `manual` when groups, users, or accounts are unreadable or empty, when only one account is visible (not applicable), or when account names match neither pattern; `cross_environment_users` then renders as `null` beside an `unknown` status naming the classification gap, never as an empty list beside `complete`. `warn` if non-admin users reach both production and non-production accounts or some accounts are unclassified. `pass` only when every account is classified and no overlap exists. |
-| 9 | Alert Policy Coverage | `newrelic_assess_alerting` | `NR-09-ALERT-POLICY-COVERAGE` | `manual` when policies, conditions, or entities are unreadable, or when zero reporting entities are visible. `fail` with no policies while entities report, no condition with `enabled = true`, or reporting APM, host, or synthetic entities with `alertSeverity = NOT_CONFIGURED`. `warn` for other uncovered entities, policies without enabled conditions, or conditions missing the `enabled` flag. `pass` otherwise, limited to `warn` when the workload listing (`entitySearch` workloads) is unreadable for any account; `workloads` and `disrupted_workloads` then render as `null` beside `workloads_status`. |
-| 10 | Alert Notification Channels | `newrelic_assess_alerting` | `NR-10-ALERT-NOTIFICATION-CHANNELS` | `manual` when destinations, channels, or workflows are unreadable (including a documented per-account `error { details }`), when nothing exists and policies are absent or unreadable, when no workflow exposes `workflowEnabled`, or when no enabled workflow routes through a channel `destinationId` to an inventoried destination. `fail` for personal email destinations or zero destinations while policies exist. `warn` for unapproved domains, no workflow with `workflowEnabled = true`, destinations missing `type`, or no approved domain list. `pass` otherwise, limited to `warn` when alert policies (`alerts.policiesSearch`) are unreadable for any account, since the pass path compares routing against the policy inventory; the summary notes that destination active state is not read because the public schema does not document it. `unapproved_email_destinations` rests on the destination listing and on the approved-domain inventory (`actor.user`, unless `approved_email_domains` was passed), so its status names both, and it renders as `null` when `actor.user` is unreadable or yields no email domain rather than as an empty list. |
-| 11 | Data Retention Settings | `newrelic_assess_data_governance` | `NR-11-DATA-RETENTION` | `manual` when rules are unreadable or no custom rules exist (defaults are not exposed by the API). `fail` if active rules retain less than `min_retention_days`. `warn` if a rule exposes no `retentionInDays`, namespaces are unreadable, or a customizable namespace has no rule. `pass` only when every customizable namespace has an explicit rule at or above the threshold. |
-| 12 | Log Obfuscation Rules | `newrelic_assess_data_governance` | `NR-12-LOG-OBFUSCATION` | `manual` when rules are unreadable or were never collected because no account resolved (`actor.accounts` unreadable or empty with no `account_ids` configured), or when no rules exist and no logs were ingested (not applicable). `fail` with no rule that has `enabled = true`. `warn` if expressions are unreadable, do not cover both credential and PII patterns, or rules lack the `enabled` flag. `pass` otherwise, limited to `warn` naming the query path when Pipeline Control cloud rules (`entityManagement.pipelineCloudRules`), NRQL drop rules (`nrqlDropRules.list`), or the `Log` volume NRQL are unreadable for any account, because attribute drop coverage or log volume is then unverified; `pipeline_cloud_rules`, `legacy_drop_rules`, `attribute_drop_rules`, and `log_events_last_day` render as `null` beside their status fields instead of a count from the readable subset. A 403 on Pipeline Control cannot be told apart from a missing entitlement, so it is reported as unverified rather than as zero rules. |
-| 13 | Synthetic Monitor Security | `newrelic_assess_data_governance` | `NR-13-SYNTHETIC-MONITOR-SECURITY` | `manual` when monitors are unreadable, zero monitors or zero scripted monitors exist (not applicable), `monitorType` is missing, or scripts are unreadable or unsampled. `fail` if sampled scripts contain credential patterns. `warn` if the sample hit `script_sample_limit`, secure credentials are unreadable, or no script references `$secure.*` while no secure credentials exist. `pass` only when every scripted monitor's script was scanned. |
-| 14 | Dashboard Permissions | `newrelic_assess_data_governance` | `NR-14-DASHBOARD-PERMISSIONS` | `manual` when dashboards or the live URL listing are unreadable, or zero dashboards are returned. `fail` if public live URLs exist. `warn` for `PUBLIC_READ_WRITE` dashboards or dashboards without a `permissions` value. `pass` otherwise. |
-| 15 | Logs in Context Security | `newrelic_assess_data_governance` | `NR-15-LOGS-IN-CONTEXT-SECURITY` | `manual` when the pattern query or log volume query is unreadable, or when no logs were ingested in the last day. `fail` if `Log` messages match credential patterns. `pass` otherwise. Only counts are collected, never matching messages. |
-| 16 | Infrastructure Agent Configuration | `newrelic_assess_data_governance` | `NR-16-INFRA-AGENT-CONFIGURATION` | Always `manual`: agent transport settings are not API visible. Evidence lists reporting hosts and agent versions. |
-| 17 | Applied Intelligence Sensitivity | `newrelic_assess_alerting` | `NR-17-APPLIED-INTELLIGENCE-SENSITIVITY` | `warn` if enabled workflows attach NRQL enrichments to external or unidentified destination types, otherwise `manual` because correlation decision settings are not API visible. Never `pass`. |
-| 18 | Authentication Domain Configuration | `newrelic_assess_identity` | `NR-18-AUTH-DOMAIN-CONFIGURATION` | `warn` if any domain provisions users manually instead of SCIM, otherwise `manual`: session duration and user upgrade settings are not exposed by NerdGraph, so the finding stays manual even when every domain uses SCIM. Never `pass`. |
-| 19 | Inactive User Accounts | `newrelic_assess_identity` | `NR-19-INACTIVE-USER-ACCOUNTS` | `manual` when users are unreadable or zero users are returned. `fail` if users exceed `inactive_days` since `lastActive`. `warn` if any user has no `lastActive` value. `pass` otherwise. |
-| 20 | Custom Role Permissions | `newrelic_assess_access_control` | `NR-20-CUSTOM-ROLE-PERMISSIONS` | `manual` when the `customerAdministration.roles` catalog is unreadable (organizations without the multi-tenancy entitlement; custom roles seen in group grants are listed), zero roles are returned, custom roles exist (NerdGraph does not expose role capabilities), or roles expose no `type` (`CUSTOM` or `STANDARD`). `warn` if the role listing was incomplete, or if group grants (`authorizationManagement.groups`, or the domain listing they depend on) are unreadable or readable for some domains only, because the roles in use were not fully cross-checked against the catalog; `custom_roles_in_group_grants` and `groups_granted_custom_roles` then render as `null`. `pass` only when the catalog listing was readable and complete and returned standard roles and the complete group grant listing confirms no custom role is in use; the summary states the conditions. |
-
-Every `pass` above additionally requires a complete inventory. The finding is limited to `warn` when:
-
-- A list was truncated.
-- A scope was unreadable.
-- `keySearch` fell back to a single page.
-- Any secondary inventory the finding reads was unreadable, fully or for one account or domain, except where rule 1 under [Verdict safety](#verdict-safety) makes the finding `manual`.
-
-The summary then carries a `Partial view:` clause naming the dataset and query path.
-
-Coverage: 20 of 20 controls.
-
-Controls 6, 16, 17, and 18 never pass by design. Control 6 never passes because `NrAuditEvent` cannot prove read-only key usage and an empty key listing means the key cannot see the keys.
-
-Control 20 is manual whenever custom roles exist. Each `manual` summary states the UI evidence to collect.
-
 ### NerdGraph field provenance
 
 Every field the inspector requests is traceable to one of two public sources. The code cites the source in a comment block above each `QUERY_*` constant in `cli/extensions/grc-tools/newrelic.ts`.
@@ -422,52 +474,6 @@ Fields that are neither documented nor read by any verdict are not requested, be
 - Live URL `url` and `uuid`.
 
 The module exports every selection as `NEWRELIC_NERDGRAPH_SELECTIONS`. `cli/tests/newrelic.test.mjs` holds each one to an identifier allowlist, so a new undocumented field fails the suite.
-
-## Framework mappings
-
-Every finding carries eight mappings taken from the spec's compliance table, formatted as `<Framework> <control>`. For example:
-
-- `FedRAMP IA-2`
-- `CMMC AC.L2-3.1.1`
-- `SOC 2 CC6.1`
-- `CIS 1.1`
-- `PCI-DSS 8.3.1`
-- `STIG SRG-APP-000148`
-- `IRAP ISM-1557`
-- `ISMAP CPS-04`
-
-The unified matrix and the per-framework reports in the audit bundle are generated from these mappings, so a finding appears under each framework it maps to.
-
-## Live smoke test
-
-```bash
-npm --prefix cli run test:newrelic:live
-```
-
-The script skips with exit code 0 when none of these is present:
-
-- `NEW_RELIC_API_KEY`
-- `NEW_RELIC_SEC_INSPECTOR_CONFIG`
-- `~/.newrelic-sec-inspector/config.yaml`
-
-With credentials, it runs `newrelic_check_access` and `newrelic_assess_identity` against the real organization. It fails if any required surface is unreadable.
-
-## Limitations and manual controls
-
-- `authenticationType` is only exposed by `customerAdministration.authenticationDomains`, which serves multi-tenant organizations. Single-tenant organizations receive a `manual` SSO finding with the exact UI path to capture.
-- `NrAuditEvent` records configuration changes, so it cannot prove that a key is unused for read traffic (control 6) or that a user logged in. Control 19 uses `lastActive` from user management instead.
-- NerdGraph does not expose:
-  - Role capabilities (control 20).
-  - Correlation decision settings (control 17).
-  - Session or user upgrade settings (control 18).
-  - Infrastructure agent transport configuration (control 16).
-- REST API v2 `GET /v2/users.json` only lists original user model users and is collected for reference only.
-- The spec's `notification_channels.json` endpoint does not exist in REST v2. Notification data comes from NerdGraph destinations, channels, and workflows.
-- NRQL drop rules reached end of life in favor of Pipeline Control cloud rules. Cloud rules are collected first, and legacy drop rules are collected best effort.
-- Dashboard live URL values and `uuid`s are deliberately not collected. Only title, type, and creation time are recorded.
-- Synthetic script scanning samples up to `script_sample_limit` scripted monitors and reports indicator labels, never script contents. When the sample hits the limit, control 13 is capped at `warn`.
-- Default retention values for namespaces without a custom rule are not exposed by the API, so control 11 only passes when every customizable namespace has an explicit rule.
-- `keySearch` obfuscates the key values of other users' user keys but still lists the keys, so key inventory findings cover every visible key. Key values are never requested.
 
 ## Official documentation consulted
 

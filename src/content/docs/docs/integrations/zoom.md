@@ -57,24 +57,6 @@ For Zoom for Government, set `base_url` to `https://api.zoomgov.com/v2`. The OAu
 
 A pre-issued token can be supplied with `ZOOM_TOKEN` instead of the client credentials.
 
-### Pagination and retries
-
-Pagination follows the [documented `next_page_token` contract](https://developers.zoom.us/docs/api/pagination/). It runs to completion or records truncation on every cap exit:
-
-- A caller limit (users default 1000, groups 50, operation logs 300, role members 3000).
-- The 500-page cap.
-- A `next_page_token` that repeats or stops yielding items.
-- A `total_records` above the collected count.
-
-The single-response lists (`/roles`, `/im/groups`, managed domains) are complete only when `total_records` is present and matches. A missing total is reported as an unknown total. `/trusted_domains` documents a single array with no total, so that list is complete by contract.
-
-Every truncated list demotes its dependent findings to warn with seen versus total counts.
-
-`429` responses are retried up to three times ([rate limits](https://developers.zoom.us/docs/api/rate-limits/)). The rate limits page documents the 429 status and asks clients to wait before retrying, but it names no header. The `Retry-After` read is therefore a defensive fallback:
-
-- The header is honored when present (delta-seconds or HTTP-date, capped at 30 seconds per wait).
-- The wait otherwise defaults to one second.
-
 ## Run it
 
 After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
@@ -113,57 +95,6 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 Reruns allocate `-2`, `-3`, and so on. A prior bundle is never overwritten, and the zip name always derives from the allocated directory.
 
 Output paths are resolved through `resolveSecureOutputPath`, which rejects traversal outside the output root and symlinked parents.
-
-### Secret hygiene
-
-The bundle never contains credential-bearing values. Every collected surface is sanitized once at collection time, so the tool output, the findings evidence, and the bundle all see the same view:
-
-- Keys that carry credential material (`host_key`, `pmi_password`, tokens, secrets, certificates, API keys) keep their name with a `[REDACTED]` marker.
-- Passcode and token query parameters in URLs are blanked.
-- The Server-to-Server OAuth client id, client secret, and token values are scrubbed from every string and error message.
-
-`core_data/account_settings.json` and `account_lock_settings.json` hold only the setting paths a verdict read (listed under `fields_read`), never the full configuration dump. List snapshots hold only the record fields a verdict read, and operation log `operation_detail` free text is dropped.
-
-Every written file is scrubbed again before it lands on disk.
-
-### Error-body hygiene
-
-A failing response body is never copied into an error string. The client:
-
-- Describes a failure by HTTP status, method and endpoint, content type, and body length (`Zoom request failed for GET /v2/users (502 Bad Gateway): non-JSON text/html body of 236 bytes omitted`).
-- Echoes only the documented JSON error fields (`message`, `error`, `reason`, `errors[]`).
-- Passes every error string through one exported scrub, `scrubErrorText`, at three points:
-  - The `ZoomApiError` constructor.
-  - The error-to-text helper every collector uses.
-  - The bundle write sink.
-
-The scrub:
-
-- Drops the query and any `name=value` fragment of every embedded URL.
-- Redacts:
-  - `Bearer` and `Basic` values.
-  - `Cookie` and `Set-Cookie` header values.
-  - Quoted or unquoted assignments of API keys, session ids, access, refresh, and id tokens, client secrets, and passwords. The assignment scrub covers `client_id` and `clientId` as well, matching the resolver, which treats the client id as a secret.
-  - In error text only, any 16-character-plus run that looks like a token.
-
-The failing `POST /oauth/token` exchange is covered by the same path.
-
-A table-driven test derives every request the collectors make from the client itself. The test fails each request in three body shapes:
-
-- 502 HTML carrying bearer, session, and API key values.
-- 403 JSON with a tokenised URL.
-- 403 JSON free text with header values and a long token.
-
-The test asserts that no value reaches a finding, summary, errors array, bundle file, zip entry, or thrown error. It also asserts that each failure is disclosed with status, endpoint, content type, and length.
-
-#### Config file errors
-
-The config file loader follows the same rule:
-
-- A read failure is reported as `Unable to read Zoom config file <path> (<code>)`, with only a validated Node error code such as `EISDIR` or `EACCES`.
-- A malformed file is reported as `Unable to parse Zoom config file: invalid JSON in <path>`.
-
-The loader never reports the parser message or the filesystem wording. The parser message quotes a 10-character source window, the start of an unquoted credential value.
 
 ## Control coverage
 
@@ -252,6 +183,79 @@ With credentials, the script runs `zoom_check_access` and all three assessments 
   - ZOOM-ID-02 warns and names `GET /roles` when the admin role inventory behind its evidence is denied or truncated, even when `sign_in_with_two_factor_auth` is `all`.
   - Lock notes name the exact `lock_settings` view that was denied.
 - User-level OAuth flows, JWT apps, and SARIF, CSV, and HTML reporters are out of scope for this integration.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how the tools page through the API and report incomplete listings and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Pagination and retries
+
+Pagination follows the [documented `next_page_token` contract](https://developers.zoom.us/docs/api/pagination/). It runs to completion or records truncation on every cap exit:
+
+- A caller limit (users default 1000, groups 50, operation logs 300, role members 3000).
+- The 500-page cap.
+- A `next_page_token` that repeats or stops yielding items.
+- A `total_records` above the collected count.
+
+The single-response lists (`/roles`, `/im/groups`, managed domains) are complete only when `total_records` is present and matches. A missing total is reported as an unknown total. `/trusted_domains` documents a single array with no total, so that list is complete by contract.
+
+Every truncated list demotes its dependent findings to warn with seen versus total counts.
+
+`429` responses are retried up to three times ([rate limits](https://developers.zoom.us/docs/api/rate-limits/)). The rate limits page documents the 429 status and asks clients to wait before retrying, but it names no header. The `Retry-After` read is therefore a defensive fallback:
+
+- The header is honored when present (delta-seconds or HTTP-date, capped at 30 seconds per wait).
+- The wait otherwise defaults to one second.
+
+### Secret hygiene
+
+The bundle never contains credential-bearing values. Every collected surface is sanitized once at collection time, so the tool output, the findings evidence, and the bundle all see the same view:
+
+- Keys that carry credential material (`host_key`, `pmi_password`, tokens, secrets, certificates, API keys) keep their name with a `[REDACTED]` marker.
+- Passcode and token query parameters in URLs are blanked.
+- The Server-to-Server OAuth client id, client secret, and token values are scrubbed from every string and error message.
+
+`core_data/account_settings.json` and `account_lock_settings.json` hold only the setting paths a verdict read (listed under `fields_read`), never the full configuration dump. List snapshots hold only the record fields a verdict read, and operation log `operation_detail` free text is dropped.
+
+Every written file is scrubbed again before it lands on disk.
+
+### Error-body hygiene
+
+A failing response body is never copied into an error string. The client:
+
+- Describes a failure by HTTP status, method and endpoint, content type, and body length (`Zoom request failed for GET /v2/users (502 Bad Gateway): non-JSON text/html body of 236 bytes omitted`).
+- Echoes only the documented JSON error fields (`message`, `error`, `reason`, `errors[]`).
+- Passes every error string through one exported scrub, `scrubErrorText`, at three points:
+  - The `ZoomApiError` constructor.
+  - The error-to-text helper every collector uses.
+  - The bundle write sink.
+
+The scrub:
+
+- Drops the query and any `name=value` fragment of every embedded URL.
+- Redacts:
+  - `Bearer` and `Basic` values.
+  - `Cookie` and `Set-Cookie` header values.
+  - Quoted or unquoted assignments of API keys, session ids, access, refresh, and id tokens, client secrets, and passwords. The assignment scrub covers `client_id` and `clientId` as well, matching the resolver, which treats the client id as a secret.
+  - In error text only, any 16-character-plus run that looks like a token.
+
+The failing `POST /oauth/token` exchange is covered by the same path.
+
+A table-driven test derives every request the collectors make from the client itself. The test fails each request in three body shapes:
+
+- 502 HTML carrying bearer, session, and API key values.
+- 403 JSON with a tokenised URL.
+- 403 JSON free text with header values and a long token.
+
+The test asserts that no value reaches a finding, summary, errors array, bundle file, zip entry, or thrown error. It also asserts that each failure is disclosed with status, endpoint, content type, and length.
+
+#### Config file errors
+
+The config file loader follows the same rule:
+
+- A read failure is reported as `Unable to read Zoom config file <path> (<code>)`, with only a validated Node error code such as `EISDIR` or `EACCES`.
+- A malformed file is reported as `Unable to parse Zoom config file: invalid JSON in <path>`.
+
+The loader never reports the parser message or the filesystem wording. The parser message quotes a 10-character source window, the start of an unquoted credential value.
 
 ## Endpoints
 

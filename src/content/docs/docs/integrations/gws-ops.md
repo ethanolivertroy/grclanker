@@ -95,39 +95,6 @@ The bridge applies the inspector's verdict-safety rules that are meaningful for 
   - Output paths are validated against traversal and symlinked parents.
 - Bundle secret hygiene and error text hygiene, each described in its own section below.
 
-### Bundle secret hygiene
-
-No capture is written verbatim. `raw/<category>.json` holds the CLI response projected page by page to the documented fields in the command reference below. Alert Center `data` payloads, `events[].parameters[]`, `actor.key`, `securityInvestigationToolLink`, and undocumented keys are dropped.
-
-Both `raw/` and the normalized records then pass through the inspector's `redactSecrets` (normalized key names, `{name, value}` pairs, URL query strings). They also pass through a scrub of every `GOOGLE_WORKSPACE_CLI_*` token or secret value from the environment. As a result, a CLI that echoes its own credential cannot leak it into evidence.
-
-The recorded command in `commands.json` lets an operator re-run for parameter detail.
-
-### Error text hygiene
-
-The CLI's stderr and every error string the bridge builds pass through one function, `scrubCliText` in `cli/extensions/grc-tools/gws-ops.ts`. It applies the inspector's text scrubber and then replaces every `GOOGLE_WORKSPACE_CLI_*` token or secret value from the environment.
-
-The inspector's text scrubber covers bearer credentials, `ya29.` and `1//` tokens, `AIza` keys, `GOCSPX-` secrets, JWTs, PEM blocks, `key=value` and `key: value` credential pairs, and URL query strings.
-
-No consumer of the bridge can receive an unscrubbed string, because:
-
-- `GwsCliCommandError` scrubs its own message in the constructor.
-- The access probe scrubs the stderr it reports.
-- A zero exit whose stdout is not JSON is described without repeating that stdout.
-- Every tool error result is scrubbed once more where it is built.
-
-`cli/tests/gws-ops.test.mjs` plants an env token, a `Bearer ya29.` value, and an `access_token=` pair in stderr. It asserts none reaches the thrown error, the tool result, or the probe.
-
-The `--version` output is the one CLI-produced string that reaches a tool result without a JSON projection. It passes through `scrubCliText`, and then only its first line is matched against the documented `gws <version>` line. The binary prints two lines, `gws <version>` and a fixed disclaimer.
-
-`gws_ops_check_cli` renders:
-
-- The numeric core alone (`gws 0.22.5`). A pre-release or build suffix is accepted but never rendered.
-- The version number plus a note, when the first line is not the documented one but a version number sits in the output.
-- A descriptor giving only the output length, when no version number is present.
-
-As a result, nothing the binary prints beyond `major.minor.patch` can reach the tool text or JSON.
-
 ## Alert Center caveat
 
 No `alertcenter` alias is registered in the `gws` source consulted for this release, so `gws alertcenter:v1beta1 alerts list` fails with a validation error (exit 3) on such a build.
@@ -167,6 +134,43 @@ When `gws` is not installed or not authenticated, the script prints a skip messa
 - Only the five workflows above are exposed. Arbitrary `gws` passthrough is refused by design.
 - `gws_ops_review_tokens` reviews token activity telemetry. It does not clone a tenant-wide token inventory (the inspector's `gws_assess_integrations` does that).
 - Real smoke testing requires an installed and authenticated `gws` binary.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Bundle secret hygiene
+
+No capture is written verbatim. `raw/<category>.json` holds the CLI response projected page by page to the documented fields in the command reference below. Alert Center `data` payloads, `events[].parameters[]`, `actor.key`, `securityInvestigationToolLink`, and undocumented keys are dropped.
+
+Both `raw/` and the normalized records then pass through the inspector's `redactSecrets` (normalized key names, `{name, value}` pairs, URL query strings). They also pass through a scrub of every `GOOGLE_WORKSPACE_CLI_*` token or secret value from the environment. As a result, a CLI that echoes its own credential cannot leak it into evidence.
+
+The recorded command in `commands.json` lets an operator re-run for parameter detail.
+
+### Error text hygiene
+
+The CLI's stderr and every error string the bridge builds pass through one function, `scrubCliText` in `cli/extensions/grc-tools/gws-ops.ts`. It applies the inspector's text scrubber and then replaces every `GOOGLE_WORKSPACE_CLI_*` token or secret value from the environment.
+
+The inspector's text scrubber covers bearer credentials, `ya29.` and `1//` tokens, `AIza` keys, `GOCSPX-` secrets, JWTs, PEM blocks, `key=value` and `key: value` credential pairs, and URL query strings.
+
+No consumer of the bridge can receive an unscrubbed string, because:
+
+- `GwsCliCommandError` scrubs its own message in the constructor.
+- The access probe scrubs the stderr it reports.
+- A zero exit whose stdout is not JSON is described without repeating that stdout.
+- Every tool error result is scrubbed once more where it is built.
+
+`cli/tests/gws-ops.test.mjs` plants an env token, a `Bearer ya29.` value, and an `access_token=` pair in stderr. It asserts none reaches the thrown error, the tool result, or the probe.
+
+The `--version` output is the one CLI-produced string that reaches a tool result without a JSON projection. It passes through `scrubCliText`, and then only its first line is matched against the documented `gws <version>` line. The binary prints two lines, `gws <version>` and a fixed disclaimer.
+
+`gws_ops_check_cli` renders:
+
+- The numeric core alone (`gws 0.22.5`). A pre-release or build suffix is accepted but never rendered.
+- The version number plus a note, when the first line is not the documented one but a version number sits in the output.
+- A descriptor giving only the output length, when no version number is present.
+
+As a result, nothing the binary prints beyond `major.minor.patch` can reach the tool text or JSON.
 
 ## Command reference
 

@@ -121,6 +121,112 @@ Each assessment returns findings shaped as `{ id, control, title, severity, stat
 
 `manual` means the tool could not verify the control (endpoint unreadable, control out of scope for the deployment type, or evidence that only a human can collect). The summary states exactly what to collect.
 
+### Export bundle layout
+
+`splunk_export_audit_bundle` allocates a fresh directory under `output_dir`, named `<host>-splunk-audit-<timestamp>`. If that directory or its zip already exists, the name gets a numeric suffix, so a rerun never overwrites a prior bundle. The tool writes:
+
+- `metadata.json` with the target URL, ACS state, configuration source chain, and TLS verification flag.
+- `core_data/` snapshots of `server_info`, `current_context`, `users`, `roles`, `tokens`, `conf_authentication`, `conf_server`, `conf_web`, `conf_outputs`, `conf_inputs`, `indexes`, `hec_inputs`, `saved_searches`, `apps`, `kv_collections`, and `tcp_cooked_inputs`, plus `access_check.json`.
+  - Every snapshot passes a deny list that keeps key names and replaces values with `[REDACTED]`:
+    - Keys whose normalized name (lowercased, dots, underscores, and hyphens removed) ends in `password`, `passwd`, `passphrase`, or `token`, or contains `secret`, `pass4symmkey`, `accesskey`, `apikey`, `authkey`, `privatekey`, `sessionkey`, `integrationkey`, `routingkey`, `webhook`, or `credential`.
+    - The `value` of a `{name, value}` or `{key, value}` pair whose name matches.
+    - Every `$1$` or `$7$` ciphertext and JWT-shaped string.
+    - The userinfo and query string of every URL-valued string. URL-shaped stanza names without either stay verbatim.
+  - `saved_searches.json` is a projection that keeps the ACL (app, owner, sharing, read and write permissions), `is_scheduled`, `disabled`, `dispatchAs`, `dispatch.earliest_time`, `cron_schedule`, enabled action names, and an `all_indexes` or `index_bound` classification of the SPL. The SPL text is `[REDACTED]`, and every `action.<name>.param.*` value is dropped (`action_params_dropped` counts them).
+- When a snapshot was denied, errored, or timed out, it is still written as a marker object `{ collected: false, status, endpoint, error }`.
+  - The marker names the endpoint the failed request went to and its observed HTTP status (`null` when there was no response).
+- A readable-but-empty list keeps `entries: []`.
+- `access_check.json` carries the same nulls per surface:
+  - `count`, `total`, `truncated`, and `httpStatus` are `null` on a probe that did not succeed or a surface that is not configured.
+  - `total` is `null` when splunkd omitted `paging.total`.
+  - `capabilities` is `null` when `current-context` was unreadable.
+- `analysis/findings.json`, one JSON file per assessment area, and `analysis/summary.md`, all passed through the same redactor.
+- `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, and one report per framework (`fedramp.md`, `cmmc.md`, `soc2.md`, `cis.md`, `pci.md`, `stig.md`, `irap.md`, `ismap.md`).
+- `QUICK_REFERENCE.md`.
+- `_errors.log` when any collection step failed. It lists one `[<dataset>] <error>` line per failed read, with every message scrubbed by the error text rule below.
+  - The dataset sits in brackets because `tokens: Splunk ...` would read as a session-key carrier to that rule.
+- A `.zip` archive named after the allocated directory.
+
+#### Output paths
+
+Output paths are resolved with traversal and symlink-parent protection. A path that escapes `output_dir` is rejected.
+
+## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the [common verdict rules](#common-verdict-rules).
+
+| # | Control | Tool | Finding id | Status semantics |
+|---|---------|------|------------|------------------|
+| 1 | Authentication method enforcement | `splunk_assess_authentication` | `SPLUNK-AUTH-01` | `pass` when `authType` is SAML or LDAP with an enabled provider stanza and at most 3 local accounts; `warn` when the provider endpoint or user list is unreadable or more than 3 local accounts remain; `fail` when `authType` is Splunk or the referenced provider is disabled or missing; `manual` for ProxySSO/Scripted or when `authentication.conf` is unreadable |
+| 2 | Password policy compliance | `splunk_assess_authentication` | `SPLUNK-AUTH-02` | `pass` only when every evaluated `[splunk_auth]` setting is explicitly present and compliant; `warn` when settings are absent (absent is not treated as compliant); `fail` on any non-compliant value; `manual` when the stanza is unreadable |
+| 3 | Multi-factor authentication | `splunk_assess_authentication` | `SPLUNK-AUTH-03` | `pass` when `externalTwoFactorAuthVendor` is Duo or RSA and the `/services/admin/Duo-MFA` or `Rsa-MFA` stanza exists; `fail` when no vendor is set and authType is not SAML; `manual` for SAML (MFA lives at the IdP) or unreadable config |
+| 4 | Session timeout configuration | `splunk_assess_authentication` | `SPLUNK-AUTH-04` | `pass` when `web.conf tools.sessions.timeout` and `server.conf sessionTimeout` are within `max_session_minutes` (documented defaults are assumed and stated when a setting is absent); `fail` when either exceeds the threshold; `manual` when the stanzas are unreadable |
+| 5 | Concurrent session limits | `splunk_assess_authentication` | `SPLUNK-AUTH-05` | always `manual`: Splunk exposes no per-user concurrent session limit through the REST API; role search quotas are attached as related evidence |
+| 6 | Authentication token hygiene | `splunk_assess_authentication` | `SPLUNK-AUTH-06` | `pass` when every token expires, is newer than `max_token_age_days`, and maps to a known user in a readable user list; `warn` for stale tokens, tokens missing `iat`/`exp` claims, or a partial list (`seen N of M tokens` or total unknown); `fail` for non-expiring or orphaned tokens; `manual` when the token list is unreadable or empty; when the user list is unreadable the subject-to-user check is skipped, a pass is capped at `warn`, and the summary and `evidence.caveats` say so with the observed cause (`subject_not_in_user_list` renders `null`); when the user list is only partially retrieved a subject missing from it is not shown to be orphaned, so the finding never turns `fail` on that ground and names no token or subject: a pass is capped at `warn`, the summary and `evidence.caveats` state `The user list was only partially retrieved (seen N of M users)` with the count of token subjects not among the users seen (`subjects_not_among_seen_users`, names withheld, `subject_not_in_user_list` renders `null`, `users_inventory` carries seen, total, and truncated), and a non-expiring token still fails on the token list's own evidence |
+| 7 | Role-based access control | `splunk_assess_access_control` | `SPLUNK-AC-07` | `pass` when no non-admin role holds `admin_all_objects`, `delete_by_keyword`, `edit_tcp`, `edit_user`, `edit_roles`, `edit_roles_grantable`, `change_authentication`, or `edit_server` (built-in `admin`, `sc_admin`, `splunk-system-role`, and `can_delete` are treated as admin roles); `fail` otherwise; `manual` when roles are unreadable or empty |
+| 8 | Admin role minimization | `splunk_assess_access_control` | `SPLUNK-AC-08` | `pass` when 1 to `max_admins` users hold `admin` or `sc_admin`; `fail` above the threshold; `manual` when users are unreadable, empty, or show zero admins (a partial view) |
+| 9 | Search head access controls | `splunk_assess_access_control` | `SPLUNK-AC-09` | `pass` when every non-admin role exposes `srchIndexesAllowed` and none contains `*` without an `srchFilter`; `warn` when some roles do not expose the field (their scope is unknown and is not counted as unrestricted); `fail` when a role has unrestricted scope; `manual` when no role exposes the field |
+| 10 | Index access control | `splunk_assess_access_control` | `SPLUNK-AC-10` | `pass` when every non-admin role exposes `srchIndexesAllowed` (imported roles included) and none covers `_audit` or `_internal`; `warn` when some roles do not expose the field (their access is unknown and is not counted as granted); `fail` when a non-admin role can search those indexes; `manual` when no role exposes the field |
+| 11 | Knowledge object permissions | `splunk_assess_access_control` | `SPLUNK-AC-11` | `pass` when no globally shared saved search or lookup grants write to `*` or `user`; `warn` when lookups were unreadable; `fail` otherwise; `manual` when the inventory is unreadable or empty |
+| 12 | User capabilities audit | `splunk_assess_access_control` | `SPLUNK-AC-12` | `pass` when no non-admin role holds an elevated platform capability (`edit_server`, `change_authentication`, `run_debug_commands`, `edit_forwarders`, `edit_deployment_server`, `edit_deployment_client`, `restart_splunkd`, `edit_tokens_all`, `edit_httpauths`, `edit_storage_passwords`, `list_storage_passwords`, `install_apps`, `edit_local_apps`, `rest_apps_management`, `edit_indexer_cluster`, `edit_search_server`); `fail` otherwise. The spec's `run_commands_on_forwarder` is not a documented capability, so `edit_forwarders` and `run_debug_commands` are checked instead |
+| 13 | TLS/SSL configuration | `splunk_assess_data_protection` | `SPLUNK-DP-13` | `pass` when `enableSplunkdSSL` and `enableSplunkWebSSL` are on, `sslVersions` is set explicitly and excludes TLS below 1.2, and `requireClientCert=true`; `warn` when `requireClientCert` is not enabled or `sslVersions` is absent (its documented default varies by release, so it is reported as unknown rather than assumed); `fail` when SSL is off, `enableSplunkWebSSL` is absent (documented default false), or legacy TLS is allowed; `manual` when `[sslConfig]` or `web.conf` is unreadable |
+| 14 | Data encryption at rest | `splunk_assess_data_protection` | `SPLUNK-DP-14` | always `manual`: Splunk Enterprise has no index-level encryption setting (collect volume encryption evidence for `homePath`/`coldPath`), and the ACS EMEK endpoints (`/emek/key-policy`, `/emek/waiver`, `/emek/key`) generate onboarding artifacts rather than reporting whether EMEK is active (collect the EMEK provisioning record or encryption attestation); when `/services/server/info` could not be read, the summary states that the Cloud or Enterprise classification came from the URL heuristic and why that read failed |
+| 15 | Forwarding encryption | `splunk_assess_data_protection` | `SPLUNK-DP-15` | `useSSL` is resolved per target through the documented levels (`[tcpout-server://*]`, then `[tcpout:*]`, then the global `[tcpout]`); `pass` only when every target resolves to an explicit `useSSL=true` and `inputs.conf` was readable; `warn` when a target relies on `legacy` mode (or an unset `useSSL`) with a `clientCert`, because TLS then depends on a certificate file the REST view cannot verify, and when `inputs.conf [SSL]` could not be read (the pass is capped at `warn` and the summary names the failed read, since the receiving-side `serverCert` and `requireClientCert` went unchecked); `fail` when any target has an explicit `useSSL=false` (a `clientCert` never overrides it) or `legacy` mode without a `clientCert`; `sslPassword` is the CA certificate password and is never TLS evidence; `manual` on Splunk Cloud, when `outputs.conf` is unreadable, or when the node has no `[tcpout:*]` groups; a failed `server/info` read is named as the URL-heuristic caveat |
+| 16 | HEC token security | `splunk_assess_data_protection` | `SPLUNK-DP-16` | on Splunk Cloud with ACS, judged on `acs:/inputs/http-event-collectors`: `pass` when every enabled token restricts indexes, enables `useACK`, and sets a default sourcetype; `warn` for missing `useACK`/sourcetype or a truncated token list (seen count, total unknown); `fail` for any-index tokens; `manual` when ACS returns no tokens. Otherwise judged on `/services/data/inputs/http`: `pass` when `[http] enableSSL=true` is read explicitly and every enabled token restricts indexes, enables `useACK`, and sets a sourcetype (or when HEC is globally disabled with no tokens); `warn` for missing `useACK`/sourcetype, absent `enableSSL`, or a partial list; `fail` for `enableSSL=false` or any-index tokens; `manual` when the inputs are unreadable (the summary names whichever of the ACS and local endpoints failed), the global `[http]` entry is missing, or no tokens are visible. When ACS was requested but unreadable and the local list was readable, the local verdict is capped at `warn` and the summary names the ACS failure; a failed `server/info` read is named as the URL-heuristic caveat |
+| 17 | Audit logging enabled | `splunk_assess_audit_monitoring` | `SPLUNK-AUD-17` | `pass` when `_audit` is enabled, the last 24 hours contain login and search events, and `audit.conf [auditTrail] queueing` is true or absent (there is no default `audit.conf`, so the documented default is assumed and stated); `warn` when the confirmation search was skipped, failed, or coverage is incomplete, when `queueing=false`, or when `audit.conf` is forbidden; `fail` when `_audit` is disabled or empty; `manual` when indexes are unreadable or `_audit` is not visible |
+| 18 | Audit log integrity | `splunk_assess_audit_monitoring` | `SPLUNK-AUD-18` | `pass` when only unassigned admin-like roles can delete `_audit` events, the user list was readable, and `frozenTimePeriodInSecs` meets `min_audit_retention_days`; `warn` when users hold delete-capable roles, retention is unreadable (the summary says whether the index list itself failed), the role list is partial, or the user list is unreadable (role assignments could not be enumerated, the summary names the cause, and `users_with_delete_roles` renders `null`); `fail` when a non-admin role can delete audit events or retention is below the minimum; `manual` when roles are unreadable or empty |
+| 19 | IP allow listing | `splunk_assess_platform_hardening` | `SPLUNK-PLAT-19` | Splunk Cloud with ACS: `pass` when `search-api`, `hec`, `s2s`, and `search-ui` all have explicit subnets; `warn` when `search-api` returns no subnets (documented closed by default); `fail` for `0.0.0.0/0` or an empty list on a feature documented open by default; `manual` on Splunk Enterprise, when ACS is not configured, or when any feature's allow list could not be read; a failed `server/info` read caps a pass at `warn` and the summary states that the classification came from the URL heuristic |
+| 20 | App installation restrictions | `splunk_assess_platform_hardening` | `SPLUNK-PLAT-20` | `pass` when every app is Splunk core or Splunkbase-linked and only admin roles hold `install_apps`, `edit_local_apps`, or `rest_apps_management`; `warn` for apps without provenance; `fail` when a non-admin role can install apps; `manual` when apps are unreadable or empty |
+| 21 | KV Store access controls | `splunk_assess_platform_hardening` | `SPLUNK-PLAT-21` | `pass` when no collection is globally shared with `*` read or write; `warn` for global read; `fail` for global write; `manual` when collections are unreadable or empty |
+| 22 | Saved search permissions | `splunk_assess_platform_hardening` | `SPLUNK-PLAT-22` | `pass` when no scheduled search dispatches as an admin owner over all indexes with an unbounded time range, or when none are scheduled, judged on a complete saved search list with the user list readable; `warn` when admin-owned searches dispatch as owner, when the list is partial, or when the user list is unreadable (the summary reads `Owner roles of the N scheduled searches could not be verified because the user list could not be read (...)` with no admin-owner count, and with no scheduled searches the pass is capped at `warn` naming the failed user read); `fail` when a scheduled search runs as its admin owner, or as its unverified owner when the user list was unreadable, over all indexes with no time bound (the summary says which and names the failed user read); `manual` when saved searches are unreadable or empty |
+| 23 | Splunk-to-Splunk port security | `splunk_assess_platform_hardening` | `SPLUNK-PLAT-23` | enabled listeners are the union of `/services/data/inputs/tcp/cooked` entries and `inputs.conf` receiver stanzas, keyed by port; the cooked REST view does not report TLS and listener names are never used as evidence; `serverCert` and `requireClientCert` are resolved per port, from the `[splunktcp-ssl:<port>]` stanza first (inputs.conf: "Specify any TLS setting that deviates from the global setting here") and the global `[SSL]` stanza second; `pass` when every listener has an enabled `[splunktcp-ssl:<port>]` stanza and resolves to a `serverCert` with `requireClientCert=true`; `warn` when any port resolves `requireClientCert` to a non-true value (a per-port `false` overrides a global `true`) or to no value at all (inputs.conf documents the default as `false` if using self-signed and third-party certificates and `true` if using the default certificates, which the REST view cannot distinguish, so absent is reported as unknown), or when no `serverCert` is set at either level; `fail` when any enabled `[splunktcp://]` plaintext receiver exists; `manual` on Splunk Cloud, when this node has no enabled receiving ports, when the cooked input list or `inputs.conf` is unreadable (the summary names the endpoint and cause), or when a listener has no matching stanza; evidence carries the resolved `serverCert`, `requireClientCert`, and `sslVersions` values rather than the raw stanza; a failed `server/info` read caps a pass at `warn` with the URL-heuristic caveat |
+
+## Framework mappings
+
+Each finding's `mappings` array contains one entry per framework, for example `FedRAMP (NIST 800-53 r5): IA-2, IA-8`.
+
+The mapping table is the one in section 5 of the spec. It is embedded in `SPLUNK_CONTROLS` inside `cli/extensions/grc-tools/splunk.ts`.
+
+The export bundle renders the same data as `compliance/unified_compliance_matrix.md` and one markdown report per framework.
+
+## Live smoke test
+
+```bash
+export SPLUNK_URL="https://splunk.example.com:8089"
+export SPLUNK_TOKEN="..."
+npm --prefix cli run test:splunk:live
+```
+
+The script skips with exit code 0 when no credentials or config file are present.
+
+With credentials, it:
+
+1. Runs `splunk_check_access`.
+2. Stops with a non-zero exit if the credential is `limited`.
+3. Otherwise runs the authentication assessment and prints each finding.
+
+## Limitations and manual controls
+
+- Controls 5 (concurrent session limits) and 14 (encryption at rest) are always `manual` because Splunk does not expose them through a read-only API.
+- Control 19 (IP allow listing) needs Splunk Cloud plus ACS. On Splunk Enterprise, it asks for firewall or load balancer evidence.
+- Controls 15 and 23 (forwarder and S2S TLS) read `outputs.conf` and `inputs.conf` on the node you connect to.
+  - On Splunk Cloud, or on a search head that neither forwards nor receives, they are `manual` and name the forwarder or indexer files to collect.
+  - A documented explicit value always beats an inference. `useSSL=false` fails even with a `clientCert`, and a listener name containing `ssl` proves nothing.
+- Control 3 is `manual` for SAML deployments without Splunk-native Duo or RSA, because MFA is enforced by the identity provider.
+- Control 17's confirmation search creates one search job. Pass `run_searches: false` to skip it, which caps the verdict at `warn`.
+- Enterprise Security correlation searches, deployment server clients, and Splunk version currency are recorded as evidence where visible but are not separate verdicts.
+- The spec describes "auditTrail enabled in audit.conf". The documented `[auditTrail]` stanza has no enabled flag.
+  - The stanza's `queueing` setting (default true) controls whether audit events reach the index queue.
+  - That setting is therefore read through `/services/configs/conf-audit`, and a missing file is reported as the assumed default.
+- The spec lists `sslCertPath` and `sslPassword` for forwarder TLS.
+  - Current `outputs.conf` documents `clientCert`. The deprecated `sslCertPath` is also accepted.
+  - In current `outputs.conf`, `sslPassword` is the CA certificate password. The password is recorded but never counts as TLS evidence.
+- `/services/data/inputs/tcp/ssl` and `/services/data/inputs/tcp/cooked` do not document `serverCert`, `requireClientCert`, or a per-listener `SSL` value in their GET responses, so those values are read from `/services/configs/conf-inputs` instead.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
 ### Paging and truncation
 
 Every splunkd list endpoint is paged with `output_mode=json`, `count` (100), and `offset` against the configured URL until `paging.total` is reached.
@@ -173,33 +279,7 @@ No verdict calls a stanza, token, or setting absent when it may sit in the unrea
 
 A complete read keeps its real zeros and its absence wording.
 
-### Export bundle layout
-
-`splunk_export_audit_bundle` allocates a fresh directory under `output_dir`, named `<host>-splunk-audit-<timestamp>`. If that directory or its zip already exists, the name gets a numeric suffix, so a rerun never overwrites a prior bundle. The tool writes:
-
-- `metadata.json` with the target URL, ACS state, configuration source chain, and TLS verification flag.
-- `core_data/` snapshots of `server_info`, `current_context`, `users`, `roles`, `tokens`, `conf_authentication`, `conf_server`, `conf_web`, `conf_outputs`, `conf_inputs`, `indexes`, `hec_inputs`, `saved_searches`, `apps`, `kv_collections`, and `tcp_cooked_inputs`, plus `access_check.json`.
-  - Every snapshot passes a deny list that keeps key names and replaces values with `[REDACTED]`:
-    - Keys whose normalized name (lowercased, dots, underscores, and hyphens removed) ends in `password`, `passwd`, `passphrase`, or `token`, or contains `secret`, `pass4symmkey`, `accesskey`, `apikey`, `authkey`, `privatekey`, `sessionkey`, `integrationkey`, `routingkey`, `webhook`, or `credential`.
-    - The `value` of a `{name, value}` or `{key, value}` pair whose name matches.
-    - Every `$1$` or `$7$` ciphertext and JWT-shaped string.
-    - The userinfo and query string of every URL-valued string. URL-shaped stanza names without either stay verbatim.
-  - `saved_searches.json` is a projection that keeps the ACL (app, owner, sharing, read and write permissions), `is_scheduled`, `disabled`, `dispatchAs`, `dispatch.earliest_time`, `cron_schedule`, enabled action names, and an `all_indexes` or `index_bound` classification of the SPL. The SPL text is `[REDACTED]`, and every `action.<name>.param.*` value is dropped (`action_params_dropped` counts them).
-- When a snapshot was denied, errored, or timed out, it is still written as a marker object `{ collected: false, status, endpoint, error }`.
-  - The marker names the endpoint the failed request went to and its observed HTTP status (`null` when there was no response).
-- A readable-but-empty list keeps `entries: []`.
-- `access_check.json` carries the same nulls per surface:
-  - `count`, `total`, `truncated`, and `httpStatus` are `null` on a probe that did not succeed or a surface that is not configured.
-  - `total` is `null` when splunkd omitted `paging.total`.
-  - `capabilities` is `null` when `current-context` was unreadable.
-- `analysis/findings.json`, one JSON file per assessment area, and `analysis/summary.md`, all passed through the same redactor.
-- `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, and one report per framework (`fedramp.md`, `cmmc.md`, `soc2.md`, `cis.md`, `pci.md`, `stig.md`, `irap.md`, `ismap.md`).
-- `QUICK_REFERENCE.md`.
-- `_errors.log` when any collection step failed. It lists one `[<dataset>] <error>` line per failed read, with every message scrubbed by the error text rule below.
-  - The dataset sits in brackets because `tokens: Splunk ...` would read as a session-key carrier to that rule.
-- A `.zip` archive named after the allocated directory.
-
-#### Error text carriers
+### Error text carriers
 
 Error text follows its own rule. The rule is applied when an API error is constructed, and again wherever an error string is recorded: marker objects, `_errors.log`, finding evidence, the access check, and tool error payloads.
 
@@ -214,7 +294,7 @@ Error text follows its own rule. The rule is applied when an API error is constr
   - `pass4SymmKey: splunk rejected` renders `pass4SymmKey: [REDACTED] rejected`.
   - `db_password: token` renders `db_password: [REDACTED]`.
 
-#### Scheme words
+### Scheme words
 
 A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Authorization`, `WWW-Authenticate`) and bare in prose.
 
@@ -229,7 +309,7 @@ A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Aut
   - `replayed BASIC <token> upstream` renders `replayed BASIC [REDACTED] upstream`.
   - `replayed splunk <token> upstream` renders `replayed splunk [REDACTED] upstream`.
 
-#### Credential-named pairs
+### Credential-named pairs
 
 - The pair rule holds whatever the value's shape and length and wherever the pair sits. It holds in the `=`, `: `, `:`, and JSON forms, in prose and inside a JSON string alike:
   - `upstream echoed DB_PASSWORD: monkey while proxying` renders `DB_PASSWORD: [REDACTED] while proxying`.
@@ -252,7 +332,7 @@ A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Aut
   - `helm --set db.password=<value> upgrade` renders `helm --set db.password=[REDACTED] upgrade`.
   - `-Dspring.datasource.password=<value>` renders `-Dspring.datasource.password=[REDACTED]`.
 
-#### Quoted values and pair lists
+### Quoted values and pair lists
 
 - A quoted value in any of the carriers above is removed with its quotes kept. The rule holds for plain, single, or JSON-escaped quotes, as in `Cookie: sid="..."`, `Authorization: Bearer "..."`, or `\"Authorization\": \"Bearer ...\"`.
 - A quote alone never makes a header value a credential. `Content-Type: "application/json"` stays.
@@ -279,7 +359,7 @@ A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Aut
   - `Digest realm="api", qop="auth", nonce="n"` keeps `realm="api"` and `qop="auth"`. Its nonce goes as a credential-named pair does everywhere.
 - A pair list of another kind keeps its values. `status=500 response=slow` stays.
 
-#### Header and cookie boundaries
+### Header and cookie boundaries
 
 - An unquoted cookie or header value ends at a `;` or `,` before the next `Name:` token (or at the end of the line). An unterminated quote ends the same way rather than swallowing the following header, so that header keeps its name and gets its own carrier treatment:
   - `Cookie: sid=...; X-Api-Key: ...; Content-Type: application/json` renders `Cookie: [REDACTED]; X-Api-Key: [REDACTED]; Content-Type: application/json`.
@@ -291,7 +371,7 @@ A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Aut
   - `Cookie: theme=dark; my'pref=<value>` renders `Cookie: [REDACTED]`.
 - The next header's name may carry any RFC 7230 token character, so a dotted or underscored name (`X.Api.Key:`, `X_Api_Key:`) is recognised as the next header and its value is judged by its own key.
 
-#### JSON escapes and URLs
+### JSON escapes and URLs
 
 - A literal JSON escape is a boundary before every carrier opener. The escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\/`, and `\uXXXX`: the two- or six-character sequence as it sits inside a JSON string, not the control character.
   - A header name, scheme word, pair key, URL, or token that begins right after one is read on its own, and never as the value of the word before the escape.
@@ -306,7 +386,7 @@ A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Aut
   - `https://h#f@x.com` renders `https://h#[REDACTED]`.
 - A bare `?` or `#` left before an earlier marker stays as it is, so a second pass adds no second marker.
 
-#### Configured secrets and value shapes
+### Configured secrets and value shapes
 
 - A configured secret (the token, the password, the ACS token, and the session key obtained by logging in) is removed whatever its shape, in its raw, JSON-escaped, URL-encoded, base64, and base64url forms.
 - A secret handed to the scrub call is also removed wherever it stands, glued into a longer run included, so a short passphrase does not survive inside another value. A value under four characters is ignored.
@@ -321,7 +401,7 @@ A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Aut
   - Words joined by hyphens or underscores with at most one digit group, such as `prod-us-east-2026`.
   - A camelCase identifier whose words average three or more letters, such as `frozenTimePeriodInSecs`.
 
-#### Paths and path labels
+### Paths and path labels
 
 - A token-shaped segment of a bare request path or file path (`/servicesNS/-/-/saved/searches`, the config file path) also stays, so the endpoint or file an error names is the one the run used.
 - Inside a URL with a scheme, every path segment keeps the rule, because webhook URLs carry their token there.
@@ -330,44 +410,12 @@ A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Aut
   - That segment names a credential when it ends in `password`, `passwd`, `passphrase`, `pwd`, `secret`, `token`, `key`, or `assertion`, alone or followed by an encoding word such as `pem` or `base64` (as in `privateKeyPem`), or when it is a bearer id.
   - Inside a URL with a scheme, the pair rule still applies.
 
-#### Data-side rule
+### Data-side rule
 
 Data written to the bundle follows the data-side rule. Every string leaf of a `core_data/` snapshot, an assess payload, and the access check passes through the same carrier and shape rules, with the generic long-run and hex-digest rules left off.
 
 - A vendor-prefixed token (`sk_live_`, `xox*-`, `ghp_`, `AKIA`, and the rest of the vendor set), a JWT, a PEM block, or a credential carrier inside a free-text field (an app description, a saved search description, a stanza comment) is removed there too. `key sk_live_<24 characters> end` renders `key [REDACTED] end`.
 - An identifier such as `prod-us-east-2026-cluster` or a bare random run survives as evidence.
-
-#### Output paths
-
-Output paths are resolved with traversal and symlink-parent protection. A path that escapes `output_dir` is rejected.
-
-## Control coverage
-
-| # | Control | Tool | Finding id | Status semantics |
-|---|---------|------|------------|------------------|
-| 1 | Authentication method enforcement | `splunk_assess_authentication` | `SPLUNK-AUTH-01` | `pass` when `authType` is SAML or LDAP with an enabled provider stanza and at most 3 local accounts; `warn` when the provider endpoint or user list is unreadable or more than 3 local accounts remain; `fail` when `authType` is Splunk or the referenced provider is disabled or missing; `manual` for ProxySSO/Scripted or when `authentication.conf` is unreadable |
-| 2 | Password policy compliance | `splunk_assess_authentication` | `SPLUNK-AUTH-02` | `pass` only when every evaluated `[splunk_auth]` setting is explicitly present and compliant; `warn` when settings are absent (absent is not treated as compliant); `fail` on any non-compliant value; `manual` when the stanza is unreadable |
-| 3 | Multi-factor authentication | `splunk_assess_authentication` | `SPLUNK-AUTH-03` | `pass` when `externalTwoFactorAuthVendor` is Duo or RSA and the `/services/admin/Duo-MFA` or `Rsa-MFA` stanza exists; `fail` when no vendor is set and authType is not SAML; `manual` for SAML (MFA lives at the IdP) or unreadable config |
-| 4 | Session timeout configuration | `splunk_assess_authentication` | `SPLUNK-AUTH-04` | `pass` when `web.conf tools.sessions.timeout` and `server.conf sessionTimeout` are within `max_session_minutes` (documented defaults are assumed and stated when a setting is absent); `fail` when either exceeds the threshold; `manual` when the stanzas are unreadable |
-| 5 | Concurrent session limits | `splunk_assess_authentication` | `SPLUNK-AUTH-05` | always `manual`: Splunk exposes no per-user concurrent session limit through the REST API; role search quotas are attached as related evidence |
-| 6 | Authentication token hygiene | `splunk_assess_authentication` | `SPLUNK-AUTH-06` | `pass` when every token expires, is newer than `max_token_age_days`, and maps to a known user in a readable user list; `warn` for stale tokens, tokens missing `iat`/`exp` claims, or a partial list (`seen N of M tokens` or total unknown); `fail` for non-expiring or orphaned tokens; `manual` when the token list is unreadable or empty; when the user list is unreadable the subject-to-user check is skipped, a pass is capped at `warn`, and the summary and `evidence.caveats` say so with the observed cause (`subject_not_in_user_list` renders `null`); when the user list is only partially retrieved a subject missing from it is not shown to be orphaned, so the finding never turns `fail` on that ground and names no token or subject: a pass is capped at `warn`, the summary and `evidence.caveats` state `The user list was only partially retrieved (seen N of M users)` with the count of token subjects not among the users seen (`subjects_not_among_seen_users`, names withheld, `subject_not_in_user_list` renders `null`, `users_inventory` carries seen, total, and truncated), and a non-expiring token still fails on the token list's own evidence |
-| 7 | Role-based access control | `splunk_assess_access_control` | `SPLUNK-AC-07` | `pass` when no non-admin role holds `admin_all_objects`, `delete_by_keyword`, `edit_tcp`, `edit_user`, `edit_roles`, `edit_roles_grantable`, `change_authentication`, or `edit_server` (built-in `admin`, `sc_admin`, `splunk-system-role`, and `can_delete` are treated as admin roles); `fail` otherwise; `manual` when roles are unreadable or empty |
-| 8 | Admin role minimization | `splunk_assess_access_control` | `SPLUNK-AC-08` | `pass` when 1 to `max_admins` users hold `admin` or `sc_admin`; `fail` above the threshold; `manual` when users are unreadable, empty, or show zero admins (a partial view) |
-| 9 | Search head access controls | `splunk_assess_access_control` | `SPLUNK-AC-09` | `pass` when every non-admin role exposes `srchIndexesAllowed` and none contains `*` without an `srchFilter`; `warn` when some roles do not expose the field (their scope is unknown and is not counted as unrestricted); `fail` when a role has unrestricted scope; `manual` when no role exposes the field |
-| 10 | Index access control | `splunk_assess_access_control` | `SPLUNK-AC-10` | `pass` when every non-admin role exposes `srchIndexesAllowed` (imported roles included) and none covers `_audit` or `_internal`; `warn` when some roles do not expose the field (their access is unknown and is not counted as granted); `fail` when a non-admin role can search those indexes; `manual` when no role exposes the field |
-| 11 | Knowledge object permissions | `splunk_assess_access_control` | `SPLUNK-AC-11` | `pass` when no globally shared saved search or lookup grants write to `*` or `user`; `warn` when lookups were unreadable; `fail` otherwise; `manual` when the inventory is unreadable or empty |
-| 12 | User capabilities audit | `splunk_assess_access_control` | `SPLUNK-AC-12` | `pass` when no non-admin role holds an elevated platform capability (`edit_server`, `change_authentication`, `run_debug_commands`, `edit_forwarders`, `edit_deployment_server`, `edit_deployment_client`, `restart_splunkd`, `edit_tokens_all`, `edit_httpauths`, `edit_storage_passwords`, `list_storage_passwords`, `install_apps`, `edit_local_apps`, `rest_apps_management`, `edit_indexer_cluster`, `edit_search_server`); `fail` otherwise. The spec's `run_commands_on_forwarder` is not a documented capability, so `edit_forwarders` and `run_debug_commands` are checked instead |
-| 13 | TLS/SSL configuration | `splunk_assess_data_protection` | `SPLUNK-DP-13` | `pass` when `enableSplunkdSSL` and `enableSplunkWebSSL` are on, `sslVersions` is set explicitly and excludes TLS below 1.2, and `requireClientCert=true`; `warn` when `requireClientCert` is not enabled or `sslVersions` is absent (its documented default varies by release, so it is reported as unknown rather than assumed); `fail` when SSL is off, `enableSplunkWebSSL` is absent (documented default false), or legacy TLS is allowed; `manual` when `[sslConfig]` or `web.conf` is unreadable |
-| 14 | Data encryption at rest | `splunk_assess_data_protection` | `SPLUNK-DP-14` | always `manual`: Splunk Enterprise has no index-level encryption setting (collect volume encryption evidence for `homePath`/`coldPath`), and the ACS EMEK endpoints (`/emek/key-policy`, `/emek/waiver`, `/emek/key`) generate onboarding artifacts rather than reporting whether EMEK is active (collect the EMEK provisioning record or encryption attestation); when `/services/server/info` could not be read, the summary states that the Cloud or Enterprise classification came from the URL heuristic and why that read failed |
-| 15 | Forwarding encryption | `splunk_assess_data_protection` | `SPLUNK-DP-15` | `useSSL` is resolved per target through the documented levels (`[tcpout-server://*]`, then `[tcpout:*]`, then the global `[tcpout]`); `pass` only when every target resolves to an explicit `useSSL=true` and `inputs.conf` was readable; `warn` when a target relies on `legacy` mode (or an unset `useSSL`) with a `clientCert`, because TLS then depends on a certificate file the REST view cannot verify, and when `inputs.conf [SSL]` could not be read (the pass is capped at `warn` and the summary names the failed read, since the receiving-side `serverCert` and `requireClientCert` went unchecked); `fail` when any target has an explicit `useSSL=false` (a `clientCert` never overrides it) or `legacy` mode without a `clientCert`; `sslPassword` is the CA certificate password and is never TLS evidence; `manual` on Splunk Cloud, when `outputs.conf` is unreadable, or when the node has no `[tcpout:*]` groups; a failed `server/info` read is named as the URL-heuristic caveat |
-| 16 | HEC token security | `splunk_assess_data_protection` | `SPLUNK-DP-16` | on Splunk Cloud with ACS, judged on `acs:/inputs/http-event-collectors`: `pass` when every enabled token restricts indexes, enables `useACK`, and sets a default sourcetype; `warn` for missing `useACK`/sourcetype or a truncated token list (seen count, total unknown); `fail` for any-index tokens; `manual` when ACS returns no tokens. Otherwise judged on `/services/data/inputs/http`: `pass` when `[http] enableSSL=true` is read explicitly and every enabled token restricts indexes, enables `useACK`, and sets a sourcetype (or when HEC is globally disabled with no tokens); `warn` for missing `useACK`/sourcetype, absent `enableSSL`, or a partial list; `fail` for `enableSSL=false` or any-index tokens; `manual` when the inputs are unreadable (the summary names whichever of the ACS and local endpoints failed), the global `[http]` entry is missing, or no tokens are visible. When ACS was requested but unreadable and the local list was readable, the local verdict is capped at `warn` and the summary names the ACS failure; a failed `server/info` read is named as the URL-heuristic caveat |
-| 17 | Audit logging enabled | `splunk_assess_audit_monitoring` | `SPLUNK-AUD-17` | `pass` when `_audit` is enabled, the last 24 hours contain login and search events, and `audit.conf [auditTrail] queueing` is true or absent (there is no default `audit.conf`, so the documented default is assumed and stated); `warn` when the confirmation search was skipped, failed, or coverage is incomplete, when `queueing=false`, or when `audit.conf` is forbidden; `fail` when `_audit` is disabled or empty; `manual` when indexes are unreadable or `_audit` is not visible |
-| 18 | Audit log integrity | `splunk_assess_audit_monitoring` | `SPLUNK-AUD-18` | `pass` when only unassigned admin-like roles can delete `_audit` events, the user list was readable, and `frozenTimePeriodInSecs` meets `min_audit_retention_days`; `warn` when users hold delete-capable roles, retention is unreadable (the summary says whether the index list itself failed), the role list is partial, or the user list is unreadable (role assignments could not be enumerated, the summary names the cause, and `users_with_delete_roles` renders `null`); `fail` when a non-admin role can delete audit events or retention is below the minimum; `manual` when roles are unreadable or empty |
-| 19 | IP allow listing | `splunk_assess_platform_hardening` | `SPLUNK-PLAT-19` | Splunk Cloud with ACS: `pass` when `search-api`, `hec`, `s2s`, and `search-ui` all have explicit subnets; `warn` when `search-api` returns no subnets (documented closed by default); `fail` for `0.0.0.0/0` or an empty list on a feature documented open by default; `manual` on Splunk Enterprise, when ACS is not configured, or when any feature's allow list could not be read; a failed `server/info` read caps a pass at `warn` and the summary states that the classification came from the URL heuristic |
-| 20 | App installation restrictions | `splunk_assess_platform_hardening` | `SPLUNK-PLAT-20` | `pass` when every app is Splunk core or Splunkbase-linked and only admin roles hold `install_apps`, `edit_local_apps`, or `rest_apps_management`; `warn` for apps without provenance; `fail` when a non-admin role can install apps; `manual` when apps are unreadable or empty |
-| 21 | KV Store access controls | `splunk_assess_platform_hardening` | `SPLUNK-PLAT-21` | `pass` when no collection is globally shared with `*` read or write; `warn` for global read; `fail` for global write; `manual` when collections are unreadable or empty |
-| 22 | Saved search permissions | `splunk_assess_platform_hardening` | `SPLUNK-PLAT-22` | `pass` when no scheduled search dispatches as an admin owner over all indexes with an unbounded time range, or when none are scheduled, judged on a complete saved search list with the user list readable; `warn` when admin-owned searches dispatch as owner, when the list is partial, or when the user list is unreadable (the summary reads `Owner roles of the N scheduled searches could not be verified because the user list could not be read (...)` with no admin-owner count, and with no scheduled searches the pass is capped at `warn` naming the failed user read); `fail` when a scheduled search runs as its admin owner, or as its unverified owner when the user list was unreadable, over all indexes with no time bound (the summary says which and names the failed user read); `manual` when saved searches are unreadable or empty |
-| 23 | Splunk-to-Splunk port security | `splunk_assess_platform_hardening` | `SPLUNK-PLAT-23` | enabled listeners are the union of `/services/data/inputs/tcp/cooked` entries and `inputs.conf` receiver stanzas, keyed by port; the cooked REST view does not report TLS and listener names are never used as evidence; `serverCert` and `requireClientCert` are resolved per port, from the `[splunktcp-ssl:<port>]` stanza first (inputs.conf: "Specify any TLS setting that deviates from the global setting here") and the global `[SSL]` stanza second; `pass` when every listener has an enabled `[splunktcp-ssl:<port>]` stanza and resolves to a `serverCert` with `requireClientCert=true`; `warn` when any port resolves `requireClientCert` to a non-true value (a per-port `false` overrides a global `true`) or to no value at all (inputs.conf documents the default as `false` if using self-signed and third-party certificates and `true` if using the default certificates, which the REST view cannot distinguish, so absent is reported as unknown), or when no `serverCert` is set at either level; `fail` when any enabled `[splunktcp://]` plaintext receiver exists; `manual` on Splunk Cloud, when this node has no enabled receiving ports, when the cooked input list or `inputs.conf` is unreadable (the summary names the endpoint and cause), or when a listener has no matching stanza; evidence carries the resolved `serverCert`, `requireClientCert`, and `sslVersions` values rather than the raw stanza; a failed `server/info` read caps a pass at `warn` with the URL-heuristic caveat |
 
 ### Common verdict rules
 
@@ -394,48 +442,6 @@ These rules apply to every control.
   - `ssl_stanza` and `ssl_stanza_present` for PLAT-23 when `inputs.conf` failed.
   - `deployment.serverRoles` in the access check when `/services/server/info` failed.
 - Leaves read from a snapshot that was collected keep their real values beside those nulls, for example `sslVersions` from `server.conf` and `scheduled` from the saved searches themselves.
-
-## Framework mappings
-
-Each finding's `mappings` array contains one entry per framework, for example `FedRAMP (NIST 800-53 r5): IA-2, IA-8`.
-
-The mapping table is the one in section 5 of the spec. It is embedded in `SPLUNK_CONTROLS` inside `cli/extensions/grc-tools/splunk.ts`.
-
-The export bundle renders the same data as `compliance/unified_compliance_matrix.md` and one markdown report per framework.
-
-## Live smoke test
-
-```bash
-export SPLUNK_URL="https://splunk.example.com:8089"
-export SPLUNK_TOKEN="..."
-npm --prefix cli run test:splunk:live
-```
-
-The script skips with exit code 0 when no credentials or config file are present.
-
-With credentials, it:
-
-1. Runs `splunk_check_access`.
-2. Stops with a non-zero exit if the credential is `limited`.
-3. Otherwise runs the authentication assessment and prints each finding.
-
-## Limitations and manual controls
-
-- Controls 5 (concurrent session limits) and 14 (encryption at rest) are always `manual` because Splunk does not expose them through a read-only API.
-- Control 19 (IP allow listing) needs Splunk Cloud plus ACS. On Splunk Enterprise, it asks for firewall or load balancer evidence.
-- Controls 15 and 23 (forwarder and S2S TLS) read `outputs.conf` and `inputs.conf` on the node you connect to.
-  - On Splunk Cloud, or on a search head that neither forwards nor receives, they are `manual` and name the forwarder or indexer files to collect.
-  - A documented explicit value always beats an inference. `useSSL=false` fails even with a `clientCert`, and a listener name containing `ssl` proves nothing.
-- Control 3 is `manual` for SAML deployments without Splunk-native Duo or RSA, because MFA is enforced by the identity provider.
-- Control 17's confirmation search creates one search job. Pass `run_searches: false` to skip it, which caps the verdict at `warn`.
-- Enterprise Security correlation searches, deployment server clients, and Splunk version currency are recorded as evidence where visible but are not separate verdicts.
-- The spec describes "auditTrail enabled in audit.conf". The documented `[auditTrail]` stanza has no enabled flag.
-  - The stanza's `queueing` setting (default true) controls whether audit events reach the index queue.
-  - That setting is therefore read through `/services/configs/conf-audit`, and a missing file is reported as the assumed default.
-- The spec lists `sslCertPath` and `sslPassword` for forwarder TLS.
-  - Current `outputs.conf` documents `clientCert`. The deprecated `sslCertPath` is also accepted.
-  - In current `outputs.conf`, `sslPassword` is the CA certificate password. The password is recorded but never counts as TLS evidence.
-- `/services/data/inputs/tcp/ssl` and `/services/data/inputs/tcp/cooked` do not document `serverCert`, `requireClientCert`, or a per-listener `SSL` value in their GET responses, so those values are read from `/services/configs/conf-inputs` instead.
 
 ## Official documentation
 

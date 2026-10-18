@@ -99,6 +99,69 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 Empty inventories that pass by intent are stated in the finding text: no guests (AZURE-ID-08) and no risky users (AZURE-ID-11). Zero Key Vaults, storage accounts, NSGs, users, service principals, app registrations, oauth2PermissionGrants, role assignments, Defender plans, or managed devices render `manual` because emptiness usually means a read problem.
 
+## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the [verdict safety rules](#verdict-safety-rules).
+
+| # | Spec control | Tool | Finding | Status semantics |
+|---|--------------|------|---------|------------------|
+| 1 | Conditional Access | identity | AZURE-ID-01 | pass with enabled MFA policy or security defaults; report-only never counts; no MFA policy and an unreadable security defaults read is manual |
+| 2 | MFA Enforcement | identity | AZURE-ID-03 | fail above 10% unregistered; zero users manual |
+| 3 | Secure Score | monitoring | AZURE-MON-01 | pass at 75%+; no score manual |
+| 4 | Legacy Auth Blocked | identity | AZURE-ID-02 | pass only with an enabled block policy on exchangeActiveSync/other or security defaults; no block policy and an unreadable security defaults read is manual |
+| 5 | Privileged Roles | identity | AZURE-ID-04, AZURE-ID-06 | fail above 4 Global Admins or 2 permanent privileged PIM assignments; P2 required for ID-06 |
+| 6 | Guest User Access | identity | AZURE-ID-07, AZURE-ID-08 | pass with restricted guestUserRoleId and admin-only invites; stale guests fail, unknown last sign-in warns |
+| 7 | Sign-In Risk | identity | AZURE-ID-09, AZURE-ID-11 | enabled CA on medium/high signInRiskLevels with mfa or block; P2 required |
+| 8 | User Risk | identity | AZURE-ID-10 | enabled CA on medium/high userRiskLevels with passwordChange or block; P2 required |
+| 9 | Device Compliance | data_protection | AZURE-DP-01 | policies exist, no noncompliant devices, CA requires compliantDevice; Intune required |
+| 10 | DLP Policies | data_protection | AZURE-DP-02 | always manual (no DLP policy resource in Graph v1.0 or beta) |
+| 11 | Sensitivity Labels | data_protection | AZURE-DP-03 | pass with at least one isActive label; read from the Graph beta endpoint (the only documented tenant-wide form), which Microsoft may change |
+| 12 | NSG Rules | network_and_policy | AZURE-NP-01 | fail on inbound Allow from any source to 22/3389/3306/1433 |
+| 13 | Key Vault Access | data_protection | AZURE-DP-04 | fail without enableSoftDelete and enablePurgeProtection; access policies or open network warn |
+| 14 | Storage Encryption | data_protection | AZURE-DP-05 | fail without supportsHttpsTrafficOnly or with allowBlobPublicAccess true; TLS below 1.2 warns |
+| 15 | Diagnostic Logging | monitoring | AZURE-MON-05 | pass with an enabled log category and destination; a truncated settings page caps at warn |
+| 16 | Defender Enabled | monitoring | AZURE-MON-04 | pass when every plan is Standard; a truncated pricing page caps at warn; a failed alerts read is named in evidence |
+| 17 | RBAC Least Privilege | subscription_guardrails | AZURE-SUB-01, AZURE-SUB-02 | Owner above 2 or Contributor above 5 fails |
+| 18 | Security Contacts | subscription_guardrails | AZURE-SUB-03 | pass with an emails value |
+| 19 | Audit Log Retention | monitoring | AZURE-MON-02, AZURE-MON-03, AZURE-MON-06, AZURE-MON-07 | Log Analytics retentionInDays 90+; Entra export is manual |
+| 20 | Mail Forwarding | data_protection | AZURE-DP-06, AZURE-DP-07 | inbox rules automated (denied mailboxes are named as a MailboxSettings.Read gap and cap at warn; all denied is manual); mailbox forwarding and transport rules manual |
+| 21 | External Sharing | data_protection | AZURE-DP-08 | pass with disabled or existing-guest sharing; anonymous links fail |
+| 22 | App Registrations | identity | AZURE-ID-12, AZURE-ID-13 | expired credentials fail; missing dates, long-lived secrets, or no owners warn; risky AllPrincipals grants fail; zero grants manual |
+| 23 | Service Principals | identity, subscription_guardrails | AZURE-ID-05, AZURE-SUB-05 | expired credentials or Owner/Contributor service principals fail |
+| 24 | Network Watcher | subscription_guardrails, network_and_policy | AZURE-SUB-04, AZURE-NP-04 | SUB-04 warns without a Network Watcher; NP-04 reads flow logs from every Network Watcher and passes only when every NSG has an enabled flow log whose targetResourceId is that NSG (partial coverage warns, none fails, truncation caps at warn) |
+| 25 | Azure Policy | network_and_policy | AZURE-NP-02, AZURE-NP-03 | assignments must use enforcementMode Default; non-compliant policies warn. AZURE-NP-02 names absent mandatory built-ins under `mandatory_missing` only when the assignment page was complete; under a truncated page they move to `mandatory_not_seen` (`mandatory_missing` is `null`) and the summary says they "may exist among the unseen assignments" |
+
+## Framework mappings
+
+Every finding carries the spec control number. The bundle's `compliance/` folder renders one report per framework from section 5 of the spec: FedRAMP (NIST 800-53), CMMC 2.0, SOC 2, CIS Azure v2.1, PCI-DSS v4.0, DISA STIG, IRAP, and ISMAP. The folder also renders `executive_summary.md` and `unified_compliance_matrix.md`.
+
+## Live smoke
+
+```bash
+npm --prefix cli run test:azure:live
+```
+
+The script skips with exit 0 unless `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID` are set together with either tokens or client credentials. Otherwise it runs `azure_check_access` and the identity assessment.
+
+## Limitations and manual controls
+
+- Control 10 and the mailbox-forwarding and transport-rule half of control 20 always render `manual` with the exact PowerShell evidence to collect, because:
+  - DLP policies (control 10) have no Graph resource in v1.0 or beta.
+  - Graph `mailboxSettings` exposes no forwarding property.
+- Teams guest access (control 21) and Entra diagnostic settings for log export (control 19) are not read by this implementation. AZURE-DP-08 and AZURE-MON-07 name the admin center pages to collect.
+- Sensitivity labels (control 11) are read from `GET /beta/security/informationProtection/sensitivityLabels`, the only documented tenant-wide (application permission) form. Beta endpoints may change without notice, and the finding says so.
+- NSG flow logs (control 24) are read per Network Watcher from `Microsoft.Network/networkWatchers/{name}/flowLogs`. Retention policy values are reported as evidence but not judged.
+- Identity Protection, PIM, and risk-based Conditional Access require Entra ID P2. Intune and Purview require their licenses. Missing licenses render `manual`, never `pass`.
+- Inbox rule inspection is capped by `max_mailboxes`. A capped or partially readable sample is reported as `warn` with seen and total counts. Denied mailboxes are counted apart from mailboxes without Exchange.
+- Graph and ARM list walks stop at 5,000 items (500 for risk detections, 200 for alerts, audits, and sign-ins, 20 for secure scores, `max_assignments` for role assignments).
+  - The walks also stop on a repeated or empty-page next link, and on a next link off the configured origin (refused unrequested).
+  - Every early exit is reported as truncated and demotes the dependent verdict.
+- One subscription per run. Certificate credentials and managed identity are documented but not implemented.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
 ### Failed request attribution
 
 When the failure behind a `manual` finding was the token request itself, the finding names that request and states that no resource request was made. The named request is taken from the observed request URL, not from the finding's endpoint constant.
@@ -259,63 +322,6 @@ As a result of the walk:
 - An object or array nested more than 32 containers below the file's root is written as `[REDACTED]`, so the depth of a server-supplied tree bounds what is copied.
 
 Because the collectors keep documented fields only, a probe tree planted on every object of every fixture response in the export test reaches no file, no zip entry, and no tool result. The walk is the guarantee behind that projection, not a substitute for it.
-
-## Control coverage
-
-| # | Spec control | Tool | Finding | Status semantics |
-|---|--------------|------|---------|------------------|
-| 1 | Conditional Access | identity | AZURE-ID-01 | pass with enabled MFA policy or security defaults; report-only never counts; no MFA policy and an unreadable security defaults read is manual |
-| 2 | MFA Enforcement | identity | AZURE-ID-03 | fail above 10% unregistered; zero users manual |
-| 3 | Secure Score | monitoring | AZURE-MON-01 | pass at 75%+; no score manual |
-| 4 | Legacy Auth Blocked | identity | AZURE-ID-02 | pass only with an enabled block policy on exchangeActiveSync/other or security defaults; no block policy and an unreadable security defaults read is manual |
-| 5 | Privileged Roles | identity | AZURE-ID-04, AZURE-ID-06 | fail above 4 Global Admins or 2 permanent privileged PIM assignments; P2 required for ID-06 |
-| 6 | Guest User Access | identity | AZURE-ID-07, AZURE-ID-08 | pass with restricted guestUserRoleId and admin-only invites; stale guests fail, unknown last sign-in warns |
-| 7 | Sign-In Risk | identity | AZURE-ID-09, AZURE-ID-11 | enabled CA on medium/high signInRiskLevels with mfa or block; P2 required |
-| 8 | User Risk | identity | AZURE-ID-10 | enabled CA on medium/high userRiskLevels with passwordChange or block; P2 required |
-| 9 | Device Compliance | data_protection | AZURE-DP-01 | policies exist, no noncompliant devices, CA requires compliantDevice; Intune required |
-| 10 | DLP Policies | data_protection | AZURE-DP-02 | always manual (no DLP policy resource in Graph v1.0 or beta) |
-| 11 | Sensitivity Labels | data_protection | AZURE-DP-03 | pass with at least one isActive label; read from the Graph beta endpoint (the only documented tenant-wide form), which Microsoft may change |
-| 12 | NSG Rules | network_and_policy | AZURE-NP-01 | fail on inbound Allow from any source to 22/3389/3306/1433 |
-| 13 | Key Vault Access | data_protection | AZURE-DP-04 | fail without enableSoftDelete and enablePurgeProtection; access policies or open network warn |
-| 14 | Storage Encryption | data_protection | AZURE-DP-05 | fail without supportsHttpsTrafficOnly or with allowBlobPublicAccess true; TLS below 1.2 warns |
-| 15 | Diagnostic Logging | monitoring | AZURE-MON-05 | pass with an enabled log category and destination; a truncated settings page caps at warn |
-| 16 | Defender Enabled | monitoring | AZURE-MON-04 | pass when every plan is Standard; a truncated pricing page caps at warn; a failed alerts read is named in evidence |
-| 17 | RBAC Least Privilege | subscription_guardrails | AZURE-SUB-01, AZURE-SUB-02 | Owner above 2 or Contributor above 5 fails |
-| 18 | Security Contacts | subscription_guardrails | AZURE-SUB-03 | pass with an emails value |
-| 19 | Audit Log Retention | monitoring | AZURE-MON-02, AZURE-MON-03, AZURE-MON-06, AZURE-MON-07 | Log Analytics retentionInDays 90+; Entra export is manual |
-| 20 | Mail Forwarding | data_protection | AZURE-DP-06, AZURE-DP-07 | inbox rules automated (denied mailboxes are named as a MailboxSettings.Read gap and cap at warn; all denied is manual); mailbox forwarding and transport rules manual |
-| 21 | External Sharing | data_protection | AZURE-DP-08 | pass with disabled or existing-guest sharing; anonymous links fail |
-| 22 | App Registrations | identity | AZURE-ID-12, AZURE-ID-13 | expired credentials fail; missing dates, long-lived secrets, or no owners warn; risky AllPrincipals grants fail; zero grants manual |
-| 23 | Service Principals | identity, subscription_guardrails | AZURE-ID-05, AZURE-SUB-05 | expired credentials or Owner/Contributor service principals fail |
-| 24 | Network Watcher | subscription_guardrails, network_and_policy | AZURE-SUB-04, AZURE-NP-04 | SUB-04 warns without a Network Watcher; NP-04 reads flow logs from every Network Watcher and passes only when every NSG has an enabled flow log whose targetResourceId is that NSG (partial coverage warns, none fails, truncation caps at warn) |
-| 25 | Azure Policy | network_and_policy | AZURE-NP-02, AZURE-NP-03 | assignments must use enforcementMode Default; non-compliant policies warn. AZURE-NP-02 names absent mandatory built-ins under `mandatory_missing` only when the assignment page was complete; under a truncated page they move to `mandatory_not_seen` (`mandatory_missing` is `null`) and the summary says they "may exist among the unseen assignments" |
-
-## Framework mappings
-
-Every finding carries the spec control number. The bundle's `compliance/` folder renders one report per framework from section 5 of the spec: FedRAMP (NIST 800-53), CMMC 2.0, SOC 2, CIS Azure v2.1, PCI-DSS v4.0, DISA STIG, IRAP, and ISMAP. The folder also renders `executive_summary.md` and `unified_compliance_matrix.md`.
-
-## Live smoke
-
-```bash
-npm --prefix cli run test:azure:live
-```
-
-The script skips with exit 0 unless `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID` are set together with either tokens or client credentials. Otherwise it runs `azure_check_access` and the identity assessment.
-
-## Limitations and manual controls
-
-- Control 10 and the mailbox-forwarding and transport-rule half of control 20 always render `manual` with the exact PowerShell evidence to collect, because:
-  - DLP policies (control 10) have no Graph resource in v1.0 or beta.
-  - Graph `mailboxSettings` exposes no forwarding property.
-- Teams guest access (control 21) and Entra diagnostic settings for log export (control 19) are not read by this implementation. AZURE-DP-08 and AZURE-MON-07 name the admin center pages to collect.
-- Sensitivity labels (control 11) are read from `GET /beta/security/informationProtection/sensitivityLabels`, the only documented tenant-wide (application permission) form. Beta endpoints may change without notice, and the finding says so.
-- NSG flow logs (control 24) are read per Network Watcher from `Microsoft.Network/networkWatchers/{name}/flowLogs`. Retention policy values are reported as evidence but not judged.
-- Identity Protection, PIM, and risk-based Conditional Access require Entra ID P2. Intune and Purview require their licenses. Missing licenses render `manual`, never `pass`.
-- Inbox rule inspection is capped by `max_mailboxes`. A capped or partially readable sample is reported as `warn` with seen and total counts. Denied mailboxes are counted apart from mailboxes without Exchange.
-- Graph and ARM list walks stop at 5,000 items (500 for risk detections, 200 for alerts, audits, and sign-ins, 20 for secure scores, `max_assignments` for role assignments).
-  - The walks also stop on a repeated or empty-page next link, and on a next link off the configured origin (refused unrequested).
-  - Every early exit is reported as truncated and demotes the dependent verdict.
-- One subscription per run. Certificate credentials and managed identity are documented but not implemented.
 
 ## Official documentation
 

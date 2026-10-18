@@ -72,6 +72,68 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 Every finding is `{ id, title, severity, status, summary, evidence, mappings }`, where `status` is `pass`, `warn`, `fail`, or `manual`.
 
+### Export bundle
+
+- `core_data/<assessment>.json` (`scan-coverage`, `policy-compliance`, `findings-hygiene`, `sca-posture`, `access-controls`) holds the raw snapshot each assess tool also returns as `rawData`.
+- `analysis/<assessment>.json` holds the title, `summary`, findings, and errors.
+- `analysis/findings.json` merges every finding.
+- `analysis/summary.md` renders the access check and every assessment as text.
+- `core_data/access.json` is the access check result.
+
+## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the [verdict safety rules](#verdict-safety-rules).
+
+| # | Control | Tool | Finding | Status semantics |
+| --- | --- | --- | --- | --- |
+| 1 | Application scan coverage | scan_coverage | VERACODE-01 | judged on the latest STATIC entry in `scans[]` (`scan_type`, published `status`, `modified_date`): fail when that scan is older than `max_scan_age_days` (90) or an application exposes no static scan at all (dynamic, manual, or SCA scans do not count); warn when the latest static scan is unpublished or undated; pass only for a complete inventory with every application fresh. The scan-type agnostic `last_completed_scan_date` is evidence only |
+| 2 | Policy compliance status | policy_compliance | VERACODE-02 | fail on `DID_NOT_PASS` or no assigned policy; warn on `CONDITIONAL_PASS`, `NOT_ASSESSED`, `DETERMINING`, `VENDOR_REVIEW`; pass only when every assigned policy is `PASSED` |
+| 3 | Flaw aging | findings_hygiene | VERACODE-03 | open `UNRESOLVED` findings aged from `first_found_date` against 30/60/90/180 days for severity 5/4/3/2; missing dates warn; zero findings is manual |
+| 4 | Scan frequency compliance | scan_coverage | VERACODE-04 | required interval is the strictest of every assigned policy's `scan_frequency_rules` per scan type (checked against the matching published `scans[]` entry; `ONCE` requires one published scan, `NOT_REQUIRED` is skipped) and the business criticality tier (`critical_scan_interval_days` 7 for VERY_HIGH, `standard_scan_interval_days` 31 for other tiers, checked against `last_completed_scan_date`); overdue fails; no requirement, unpublished or undated scans, or assigned policies missing from the policy inventory warn |
+| 5 | SCA library currency | sca_posture | VERACODE-05 | manual when `/srcclr/v3/workspaces` is unavailable (401, 403, or 404, named as unlicensed or missing Workspace role), errored, or empty, or when no sampled workspace's open vulnerability issue list was readable; fail on open issues at or above `sca_cvss_threshold` (7); manual when no issues were returned but no library was readable in any sampled workspace (it is unknown whether a scan populated them); pass only when every sampled workspace's issue list and library list were read to completion: a page-capped workspace, issue, or library list (`Only N of ... were read`, `N issue lists were truncated`, `N library lists were truncated, so libraries_seen is a lower bound`), a sampled subset of workspaces (`max_workspaces`, 25), or an unreadable issue or library list (`N workspace library lists were unreadable, so libraries_seen undercounts the scanned libraries`) drops pass to warn; `libraries_seen` is `null` when no library list was readable |
+| 6 | SCA license risk | sca_posture | VERACODE-06 | open license issues with `risk` HIGH fail; UNKNOWN risk warns |
+| 7 | Team access controls | access_controls | VERACODE-07 | manual when the users, roles, or teams endpoint could not be read (the summary names which and its observed status) or returned zero users or zero roles; teams are listed with `all_for_org=true`; zero teams fails; more than `max_unrestricted_users` active users on roles with `ignore_team_restrictions` fails; applications without a team warn; pass only when the user, role, team, and application lists were all read to completion: a page-capped user, role, team, or application list drops pass to warn with seen versus total (or an unknown total), an unreadable application inventory drops it to warn (`The application inventory was unreadable, so application team assignment was not verified`), and a refused `all_for_org=true` makes the member-only team list a partial view, so pass downgrades to warn (manual when the API user is a member of no teams); evidence records `roles_seen`, `roles_complete`, and `teams_scope` |
+| 8 | User role audit | access_controls | VERACODE-08 | users are listed with `detailed=true`, `include_roles=true`, and `include_teams=true`; Administrator count above `max_admins`, humans without login in `inactive_days`, or API accounts without a team fail; missing `last_login` warns |
+| 9 | API credential management | access_controls | VERACODE-09 | unrevoked credentials with `created_ts` older than `max_credential_age_days` (365) fail; missing `created_ts` or `expiration_ts` warns; manual when a complete user list carries no active API account (`No active API service accounts were returned ... so the credential inventory is unverifiable`); when the user list was only partially read and no active API account was among the users read, the inventory is unread rather than absent: manual with `No active API service account was among the users read, so the credential inventory is unread rather than empty; read the full user list before judging it.` followed by the seen-of-total (`Only N of M users were read (P/Q pages) ...`), evidence `users_seen`, `users_total`, `users_complete: false`, and no credential record requested; `evidence.api_accounts` renders `null` while the user list is incomplete (never the count of the part read) beside the honest `api_accounts_sampled` and `credentials_readable` |
+| 10 | Sandbox usage | scan_coverage | VERACODE-10 | applications with zero development sandboxes warn |
+| 11 | Prescan module coverage | scan_coverage | VERACODE-11 | manual: prescan results only exist in the XML `getprescanresults.do` API |
+| 12 | Mitigation approval workflow | findings_hygiene | VERACODE-12 | `resolution_status` PROPOSED or mitigation annotations without a comment fail (findings fetched with `include_annot=TRUE`) |
+| 13 | Dynamic scan configuration | scan_coverage | VERACODE-13 | manual when `/was/configservice/v1/analyses` is unavailable (401, 403, or 404, named as unlicensed or missing role), errored, or empty, or when no scan configuration could be read; scans without `auth_configuration.authentications` or with `crawl_configuration.disabled` fail; pass only when every inspected configuration was read from complete lists: the analyses walk, each per-analysis scan list (5-page cap, recorded per analysis in `evidence.scan_coverage` as `scans_seen`, `scans_total`, and `scan_list_complete`), the `max_analyses` (25) sample, the ten-scans-per-analysis sample (`Only 10 of N scans of <analysis> were sampled`), and any unreadable scan list or configuration each drop pass to warn and are named in the summary |
+| 14 | Pipeline integration status | scan_coverage | VERACODE-14 | manual: Pipeline Scan results are not persisted on application profiles |
+| 15 | Custom policy profiles | policy_compliance | VERACODE-15 | no `CUSTOMER` type policy fails; applications on built-in policies or custom policies without finding rules warn |
+| 16 | Finding false positive rate | findings_hygiene | VERACODE-16 | manual when the application inventory is unreadable or empty, when no sampled finding list was readable (the first failure's status is named), or when no sampled application returned findings; applications where more than `max_fp_rate_percent` (20) of findings carry an `annotations[].action` FP mitigation (read with `include_annot=TRUE`) warn; pass only when every sampled finding list was read to its last page: a finding list that hit the 50-page cap or repeated a page is computed over the findings seen and drops pass to warn (`N finding lists were truncated, so the rate was computed over the findings seen (total unknown or larger)`), as do a page-capped application inventory, the `max_applications` sample, and unreadable finding lists; `evidence.per_application` records `findings_seen`, `findings_total` (`null` when the API reported none), and `list_complete`; `finding_status.resolution` is recorded as evidence only because it is not enumerated in the published reference |
+| 17 | Very High/High flaw density | findings_hygiene | VERACODE-17 | summary report module `loc` and `numflawssev4` plus `numflawssev5`; above `max_flaw_density_per_kloc` (1) fails; missing LOC warns |
+| 18 | SCA workspace coverage | sca_posture | VERACODE-18 | manual when the application inventory is unreadable or empty, when the SCA Agent API is unavailable and no sampled application has `upload_and_scan_sca_enabled`, or when the SCA Agent API is available but every linked project list requested was unreadable (no sampled application has `upload_and_scan_sca_enabled` and every `GET /srcclr/v3/applications/{guid}/projects` failed): that summary names the lists with their count, endpoint, and observed status (`No application could be evaluated for SCA coverage: every linked project list requested was unreadable (2 of 2; GET /srcclr/v3/applications/{guid}/projects returned 403 Forbidden).`, the single-list form naming the real path, `the requests returned <status>` when the client reported no endpoint) ahead of the manual evidence line, with the partial-inventory and sample caveats between them; applications with neither `upload_and_scan_sca_enabled` nor an entry in `linked_projects` from `GET /srcclr/v3/applications/{guid}/projects` (the documented `LinkedProjects` shape) warn (`evidence.uncovered_applications`); an application whose projects request failed is `unreadable_applications`, never uncovered; pass only when every sampled application is covered and the application list was complete: a page-capped inventory, the `max_applications` sample, or unreadable linked project lists drop pass to warn while at least one application is covered (`1 of 2 sampled applications have upload-and-scan SCA enabled or a linked SCA agent project ...` counts the covered applications against the sample, `All N ...` only when every sampled application is covered), and every warn or pass summary with an unread list carries `<n> of <requested> requested linked project lists could not be read (GET <endpoint> returned <status>).` from the requests the run observed; `evidence.unreadable_linked_project_lists` lists each unread list as `{ application, status, endpoint }` and `linked_project_lists_requested` counts the lists requested. When `/srcclr/v3/workspaces` was unavailable no linked project list is requested (`evidence.sca_agent_api_available: false`, `sca_agent_api_status` the observed status or `null`, `uncovered_applications` and `linked_projects_by_application` render `null`): every sampled application without `upload_and_scan_sca_enabled` is `unchecked_applications` and the finding warns, naming the cause (`N/M sampled applications have no upload-and-scan SCA and their linked SCA agent projects were not checked because the SCA Agent API workspace list was forbidden (<status>), so their coverage is unknown.`, or `returned an error (<status>)`, `could not be read`, `the SCA Agent API returned zero workspaces`); a pass earned by upload-and-scan SCA on every sampled application says so with the same cause (`Linked agent projects were not checked because <cause>; every sampled application is covered by upload-and-scan SCA alone.`). `evidence.linked_projects_by_application` keys the read lists by application name; an application whose projects request failed sits beside them as the `{ collected: false, status, endpoint, error }` marker (`status` and `endpoint` from the request that failed), and the map renders `null`, never `{}`, when no list was read: every requested list denied, or no list needed because every sampled application has `upload_and_scan_sca_enabled` |
+| 19 | Scan completion rate | scan_coverage | VERACODE-19 | latest scans in `ANALYSIS_ERRORS`, `SCAN_CANCELED`, `PRE_SCAN_FAILED`, `INCOMPLETE`, or similar statuses fail; applications without scan records warn |
+| 20 | Collections compliance posture | policy_compliance | VERACODE-20 | manual: the Collections API is not in the published REST reference; business-unit grouping is provided as evidence |
+
+## Framework mappings
+
+Each finding carries the spec's mapping row. For example, control 1 maps to FedRAMP SA-11, CMMC L2 3.14.1, SOC 2 CC7.1, CIS Controls v8 16.12, PCI-DSS 6.5, STIG SRG-APP-000456, IRAP ISM-1143, and ISMAP VM-01.
+
+The export bundle writes `compliance/unified_compliance_matrix.md` plus one report per framework: `fedramp.md`, `cmmc.md`, `soc2.md`, `cis-controls-v8.md`, `pci-dss.md`, `stig.md`, `irap.md`, and `ismap.md`.
+
+## Live smoke
+
+```bash
+npm --prefix cli run test:veracode:live
+```
+
+The script skips with exit code 0 when no credentials are configured. Otherwise it runs `veracode_check_access` and the policy compliance assessment against the real tenant.
+
+## Limitations and manual controls
+
+- Controls 11 (prescan module coverage), 14 (pipeline integration), and 20 (collections posture) always render as `manual` with the evidence a human must collect.
+- SCA (controls 5, 6, 18) and Dynamic Analysis (control 13) render as `manual` with an unlicensed or not applicable summary when the APIs return 401, 403, or 404 or return empty inventories.
+- Per-application calls (sandboxes, findings, summary reports, SCA projects) are capped by `max_applications` (100). When the cap is below the inventory, the verdict flags the partial view.
+- The business criticality cadence for control 4 (VERY_HIGH weekly, every other tier monthly) is the spec's organizational default. Adjust `critical_scan_interval_days` and `standard_scan_interval_days` to match the organization's scanning standard.
+- The `scans[]` array on an application profile exposes only the latest scan per type, so an application whose latest static scan is still in progress is reported as unconfirmed (warn) rather than stale.
+- The Reporting API is not called because report generation requires a POST.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
 ### Pagination and truncation reporting
 
 Every HAL list below is walked with `page` and `size` against the configured base URL until the last page:
@@ -102,15 +164,7 @@ A finding that reads an incomplete list never passes: `pass` drops to `warn` and
 
 Per-item sampling caps (`max_applications`, `max_workspaces`, `max_analyses`, ten scans per analysis, 200 API accounts) are stated the same way: `Only S of T <items> were sampled, so the verdict reflects a partial view`. They demote `pass` to `warn`.
 
-### Export bundle
-
-- `core_data/<assessment>.json` (`scan-coverage`, `policy-compliance`, `findings-hygiene`, `sca-posture`, `access-controls`) holds the raw snapshot each assess tool also returns as `rawData`.
-- `analysis/<assessment>.json` holds the title, `summary`, findings, and errors.
-- `analysis/findings.json` merges every finding.
-- `analysis/summary.md` renders the access check and every assessment as text.
-- `core_data/access.json` is the access check result.
-
-#### JSON document redaction
+### JSON document redaction
 
 Every JSON document passes through the same redaction before it is written:
 
@@ -131,7 +185,7 @@ Dynamic scan configurations are not stored verbatim. Each is projected to:
 
 Per-user API credential records keep only `api_id`, `created_ts`, `expiration_ts`, `revocation_ts`, and `last_used_ts`. Per-analysis scan lists keep `scan_id` and a scrubbed `target_url`.
 
-#### Unread surfaces
+### Unread surfaces
 
 - A surface that was denied, errored, or timed out is written as the marker `{ collected: false, status, endpoint, error }`, never as `[]` or `{}`.
   - `status` and `endpoint` are the HTTP status and path of the request that actually failed (both `null` when the failure carried none).
@@ -152,7 +206,7 @@ Evidence counters derived from an unread inventory render `null` too:
 
 Every HTTP status, path, and error string in a finding, a summary, the access check, or `_errors.log` comes from a request the run made. `manual` verdicts name the failed surface's own status (`was forbidden (<401 or 403>)`, `returned an error (<status>)`, or `could not be read` when no status was observed).
 
-#### Error text carriers
+### Error text carriers
 
 Error text follows its own rule, applied when an API error is constructed and again wherever an error string is recorded: marker objects, `_errors.log`, finding evidence, the access check, and tool error payloads.
 
@@ -167,7 +221,7 @@ Error text follows its own rule, applied when an API error is constructed and ag
   - `sslPassword=splunk rejected` renders `sslPassword=[REDACTED] rejected`.
   - `db_password: token` renders `db_password: [REDACTED]`.
 
-#### Scheme words
+### Scheme words
 
 A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Authorization`, `WWW-Authenticate`) and bare in prose.
 
@@ -182,7 +236,7 @@ A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Aut
   - `Bearer abcdefghijkl rejected` renders `Bearer [REDACTED] rejected`.
   - `replayed BASIC <token> upstream` renders `replayed BASIC [REDACTED] upstream`.
 
-#### Credential-named pairs
+### Credential-named pairs
 
 - The pair rule holds whatever the value's shape and length and wherever the pair sits. It holds in the `=`, `: `, `:`, and JSON forms, in prose and inside a JSON string alike:
   - `upstream echoed DB_PASSWORD: monkey while proxying` renders `DB_PASSWORD: [REDACTED] while proxying`.
@@ -205,7 +259,7 @@ A scheme word acts under an Authorization-style key (`Authorization`, `Proxy-Aut
   - `helm --set db.password=<value> upgrade` renders `helm --set db.password=[REDACTED] upgrade`.
   - `-Dspring.datasource.password=<value>` renders `-Dspring.datasource.password=[REDACTED]`.
 
-#### Signed header
+### Signed header
 
 The signed header renders as `VERACODE-HMAC-SHA-256 [REDACTED],ts=<ms>,nonce=[REDACTED],sig=[REDACTED]` wherever it appears, bare or inside an `Authorization:` carrier:
 
@@ -214,7 +268,7 @@ The signed header renders as `VERACODE-HMAC-SHA-256 [REDACTED],ts=<ms>,nonce=[RE
 - The `ts=` timestamp stays.
 - A run the scheme rule does not cover goes whole.
 
-#### Quoted values and pair lists
+### Quoted values and pair lists
 
 - A quoted value in any of the carriers above is removed with its quotes kept. The rule holds for plain, single, or JSON-escaped quotes, as in `Cookie: sid="..."`, `Authorization: Bearer "..."`, or `\"Authorization\": \"Bearer ...\"`.
 - A quote alone never makes a header value a credential. `Content-Type: "application/json"` stays.
@@ -241,7 +295,7 @@ The signed header renders as `VERACODE-HMAC-SHA-256 [REDACTED],ts=<ms>,nonce=[RE
   - `Digest realm="api", qop="auth", nonce="n"` keeps `realm="api"` and `qop="auth"`. Its nonce goes as a credential-named pair does everywhere.
 - A pair list of another kind keeps its values. `status=500 response=slow` stays.
 
-#### Header and cookie boundaries
+### Header and cookie boundaries
 
 - An unquoted cookie or header value ends at a `;` or `,` before the next `Name:` token (or at the end of the line). An unterminated quote ends the same way rather than swallowing the following header, so that header keeps its name and gets its own carrier treatment:
   - `Cookie: sid=...; X-Api-Key: ...; Content-Type: application/json` renders `Cookie: [REDACTED]; X-Api-Key: [REDACTED]; Content-Type: application/json`.
@@ -253,7 +307,7 @@ The signed header renders as `VERACODE-HMAC-SHA-256 [REDACTED],ts=<ms>,nonce=[RE
   - `Cookie: theme=dark; my'pref=<value>` renders `Cookie: [REDACTED]`.
 - The next header's name may carry any RFC 7230 token character, so a dotted or underscored name (`X.Api.Key:`, `X_Api_Key:`) is recognised as the next header and its value is judged by its own key.
 
-#### JSON escapes and URLs
+### JSON escapes and URLs
 
 - A literal JSON escape is a boundary before every carrier opener. The escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\/`, and `\uXXXX`: the two- or six-character sequence as it sits inside a JSON string, not the control character.
   - A header name, scheme word, pair key, URL, or token that begins right after one is read on its own, and never as the value of the word before the escape.
@@ -268,7 +322,7 @@ The signed header renders as `VERACODE-HMAC-SHA-256 [REDACTED],ts=<ms>,nonce=[RE
   - `https://h#f@x.com` renders `https://h#[REDACTED]`.
 - A bare `?` or `#` left before an earlier marker stays as it is, so a second pass adds no second marker.
 
-#### Configured secrets and value shapes
+### Configured secrets and value shapes
 
 - A configured secret (the API key ID and the API key secret) is removed whatever its shape, in its raw, JSON-escaped, URL-encoded, base64, and base64url forms.
 - A secret handed to the scrub call is also removed wherever it stands, glued into a longer run included, so a short passphrase does not survive inside another value. A value under four characters is ignored.
@@ -283,7 +337,7 @@ The signed header renders as `VERACODE-HMAC-SHA-256 [REDACTED],ts=<ms>,nonce=[RE
   - Words joined by hyphens or underscores with at most one digit group, such as `prod-us-east-2026`.
   - A camelCase identifier whose words average three or more letters.
 
-#### Paths and path labels
+### Paths and path labels
 
 - A token-shaped segment of a bare request path or file path (`/appsec/v2/applications/<guid>/findings`, the `credentials` file path) also stays, so the endpoint or file an error names is the one the run used.
 - Inside a URL with a scheme, every path segment keeps the rule.
@@ -292,37 +346,12 @@ The signed header renders as `VERACODE-HMAC-SHA-256 [REDACTED],ts=<ms>,nonce=[RE
   - That segment names a credential when it ends in `password`, `passwd`, `passphrase`, `pwd`, `secret`, `token`, `key`, or `assertion`, alone or followed by an encoding word such as `pem` or `base64` (as in `privateKeyPem`), or when it is a bearer id.
   - Inside a URL with a scheme, the pair rule still applies.
 
-#### Data-side rule
+### Data-side rule
 
 Data written to the bundle follows the data-side rule. Every string leaf of a `core_data/` snapshot, an assess payload, and the access check passes through the same carrier and shape rules, with the generic long-run and hex-digest rules left off.
 
 - A vendor-prefixed token (`sk_live_`, `xox*-`, `ghp_`, `AKIA`, and the rest of the vendor set), a JWT, a PEM block, or a credential carrier inside a free-text field (an application description, a custom field value, a team name) is removed there too. `key sk_live_<24 characters> end` renders `key [REDACTED] end`.
 - An identifier such as `prod-us-east-2026-cluster` or a bare random run survives as evidence.
-
-## Control coverage
-
-| # | Control | Tool | Finding | Status semantics |
-| --- | --- | --- | --- | --- |
-| 1 | Application scan coverage | scan_coverage | VERACODE-01 | judged on the latest STATIC entry in `scans[]` (`scan_type`, published `status`, `modified_date`): fail when that scan is older than `max_scan_age_days` (90) or an application exposes no static scan at all (dynamic, manual, or SCA scans do not count); warn when the latest static scan is unpublished or undated; pass only for a complete inventory with every application fresh. The scan-type agnostic `last_completed_scan_date` is evidence only |
-| 2 | Policy compliance status | policy_compliance | VERACODE-02 | fail on `DID_NOT_PASS` or no assigned policy; warn on `CONDITIONAL_PASS`, `NOT_ASSESSED`, `DETERMINING`, `VENDOR_REVIEW`; pass only when every assigned policy is `PASSED` |
-| 3 | Flaw aging | findings_hygiene | VERACODE-03 | open `UNRESOLVED` findings aged from `first_found_date` against 30/60/90/180 days for severity 5/4/3/2; missing dates warn; zero findings is manual |
-| 4 | Scan frequency compliance | scan_coverage | VERACODE-04 | required interval is the strictest of every assigned policy's `scan_frequency_rules` per scan type (checked against the matching published `scans[]` entry; `ONCE` requires one published scan, `NOT_REQUIRED` is skipped) and the business criticality tier (`critical_scan_interval_days` 7 for VERY_HIGH, `standard_scan_interval_days` 31 for other tiers, checked against `last_completed_scan_date`); overdue fails; no requirement, unpublished or undated scans, or assigned policies missing from the policy inventory warn |
-| 5 | SCA library currency | sca_posture | VERACODE-05 | manual when `/srcclr/v3/workspaces` is unavailable (401, 403, or 404, named as unlicensed or missing Workspace role), errored, or empty, or when no sampled workspace's open vulnerability issue list was readable; fail on open issues at or above `sca_cvss_threshold` (7); manual when no issues were returned but no library was readable in any sampled workspace (it is unknown whether a scan populated them); pass only when every sampled workspace's issue list and library list were read to completion: a page-capped workspace, issue, or library list (`Only N of ... were read`, `N issue lists were truncated`, `N library lists were truncated, so libraries_seen is a lower bound`), a sampled subset of workspaces (`max_workspaces`, 25), or an unreadable issue or library list (`N workspace library lists were unreadable, so libraries_seen undercounts the scanned libraries`) drops pass to warn; `libraries_seen` is `null` when no library list was readable |
-| 6 | SCA license risk | sca_posture | VERACODE-06 | open license issues with `risk` HIGH fail; UNKNOWN risk warns |
-| 7 | Team access controls | access_controls | VERACODE-07 | manual when the users, roles, or teams endpoint could not be read (the summary names which and its observed status) or returned zero users or zero roles; teams are listed with `all_for_org=true`; zero teams fails; more than `max_unrestricted_users` active users on roles with `ignore_team_restrictions` fails; applications without a team warn; pass only when the user, role, team, and application lists were all read to completion: a page-capped user, role, team, or application list drops pass to warn with seen versus total (or an unknown total), an unreadable application inventory drops it to warn (`The application inventory was unreadable, so application team assignment was not verified`), and a refused `all_for_org=true` makes the member-only team list a partial view, so pass downgrades to warn (manual when the API user is a member of no teams); evidence records `roles_seen`, `roles_complete`, and `teams_scope` |
-| 8 | User role audit | access_controls | VERACODE-08 | users are listed with `detailed=true`, `include_roles=true`, and `include_teams=true`; Administrator count above `max_admins`, humans without login in `inactive_days`, or API accounts without a team fail; missing `last_login` warns |
-| 9 | API credential management | access_controls | VERACODE-09 | unrevoked credentials with `created_ts` older than `max_credential_age_days` (365) fail; missing `created_ts` or `expiration_ts` warns; manual when a complete user list carries no active API account (`No active API service accounts were returned ... so the credential inventory is unverifiable`); when the user list was only partially read and no active API account was among the users read, the inventory is unread rather than absent: manual with `No active API service account was among the users read, so the credential inventory is unread rather than empty; read the full user list before judging it.` followed by the seen-of-total (`Only N of M users were read (P/Q pages) ...`), evidence `users_seen`, `users_total`, `users_complete: false`, and no credential record requested; `evidence.api_accounts` renders `null` while the user list is incomplete (never the count of the part read) beside the honest `api_accounts_sampled` and `credentials_readable` |
-| 10 | Sandbox usage | scan_coverage | VERACODE-10 | applications with zero development sandboxes warn |
-| 11 | Prescan module coverage | scan_coverage | VERACODE-11 | manual: prescan results only exist in the XML `getprescanresults.do` API |
-| 12 | Mitigation approval workflow | findings_hygiene | VERACODE-12 | `resolution_status` PROPOSED or mitigation annotations without a comment fail (findings fetched with `include_annot=TRUE`) |
-| 13 | Dynamic scan configuration | scan_coverage | VERACODE-13 | manual when `/was/configservice/v1/analyses` is unavailable (401, 403, or 404, named as unlicensed or missing role), errored, or empty, or when no scan configuration could be read; scans without `auth_configuration.authentications` or with `crawl_configuration.disabled` fail; pass only when every inspected configuration was read from complete lists: the analyses walk, each per-analysis scan list (5-page cap, recorded per analysis in `evidence.scan_coverage` as `scans_seen`, `scans_total`, and `scan_list_complete`), the `max_analyses` (25) sample, the ten-scans-per-analysis sample (`Only 10 of N scans of <analysis> were sampled`), and any unreadable scan list or configuration each drop pass to warn and are named in the summary |
-| 14 | Pipeline integration status | scan_coverage | VERACODE-14 | manual: Pipeline Scan results are not persisted on application profiles |
-| 15 | Custom policy profiles | policy_compliance | VERACODE-15 | no `CUSTOMER` type policy fails; applications on built-in policies or custom policies without finding rules warn |
-| 16 | Finding false positive rate | findings_hygiene | VERACODE-16 | manual when the application inventory is unreadable or empty, when no sampled finding list was readable (the first failure's status is named), or when no sampled application returned findings; applications where more than `max_fp_rate_percent` (20) of findings carry an `annotations[].action` FP mitigation (read with `include_annot=TRUE`) warn; pass only when every sampled finding list was read to its last page: a finding list that hit the 50-page cap or repeated a page is computed over the findings seen and drops pass to warn (`N finding lists were truncated, so the rate was computed over the findings seen (total unknown or larger)`), as do a page-capped application inventory, the `max_applications` sample, and unreadable finding lists; `evidence.per_application` records `findings_seen`, `findings_total` (`null` when the API reported none), and `list_complete`; `finding_status.resolution` is recorded as evidence only because it is not enumerated in the published reference |
-| 17 | Very High/High flaw density | findings_hygiene | VERACODE-17 | summary report module `loc` and `numflawssev4` plus `numflawssev5`; above `max_flaw_density_per_kloc` (1) fails; missing LOC warns |
-| 18 | SCA workspace coverage | sca_posture | VERACODE-18 | manual when the application inventory is unreadable or empty, when the SCA Agent API is unavailable and no sampled application has `upload_and_scan_sca_enabled`, or when the SCA Agent API is available but every linked project list requested was unreadable (no sampled application has `upload_and_scan_sca_enabled` and every `GET /srcclr/v3/applications/{guid}/projects` failed): that summary names the lists with their count, endpoint, and observed status (`No application could be evaluated for SCA coverage: every linked project list requested was unreadable (2 of 2; GET /srcclr/v3/applications/{guid}/projects returned 403 Forbidden).`, the single-list form naming the real path, `the requests returned <status>` when the client reported no endpoint) ahead of the manual evidence line, with the partial-inventory and sample caveats between them; applications with neither `upload_and_scan_sca_enabled` nor an entry in `linked_projects` from `GET /srcclr/v3/applications/{guid}/projects` (the documented `LinkedProjects` shape) warn (`evidence.uncovered_applications`); an application whose projects request failed is `unreadable_applications`, never uncovered; pass only when every sampled application is covered and the application list was complete: a page-capped inventory, the `max_applications` sample, or unreadable linked project lists drop pass to warn while at least one application is covered (`1 of 2 sampled applications have upload-and-scan SCA enabled or a linked SCA agent project ...` counts the covered applications against the sample, `All N ...` only when every sampled application is covered), and every warn or pass summary with an unread list carries `<n> of <requested> requested linked project lists could not be read (GET <endpoint> returned <status>).` from the requests the run observed; `evidence.unreadable_linked_project_lists` lists each unread list as `{ application, status, endpoint }` and `linked_project_lists_requested` counts the lists requested. When `/srcclr/v3/workspaces` was unavailable no linked project list is requested (`evidence.sca_agent_api_available: false`, `sca_agent_api_status` the observed status or `null`, `uncovered_applications` and `linked_projects_by_application` render `null`): every sampled application without `upload_and_scan_sca_enabled` is `unchecked_applications` and the finding warns, naming the cause (`N/M sampled applications have no upload-and-scan SCA and their linked SCA agent projects were not checked because the SCA Agent API workspace list was forbidden (<status>), so their coverage is unknown.`, or `returned an error (<status>)`, `could not be read`, `the SCA Agent API returned zero workspaces`); a pass earned by upload-and-scan SCA on every sampled application says so with the same cause (`Linked agent projects were not checked because <cause>; every sampled application is covered by upload-and-scan SCA alone.`). `evidence.linked_projects_by_application` keys the read lists by application name; an application whose projects request failed sits beside them as the `{ collected: false, status, endpoint, error }` marker (`status` and `endpoint` from the request that failed), and the map renders `null`, never `{}`, when no list was read: every requested list denied, or no list needed because every sampled application has `upload_and_scan_sca_enabled` |
-| 19 | Scan completion rate | scan_coverage | VERACODE-19 | latest scans in `ANALYSIS_ERRORS`, `SCAN_CANCELED`, `PRE_SCAN_FAILED`, `INCOMPLETE`, or similar statuses fail; applications without scan records warn |
-| 20 | Collections compliance posture | policy_compliance | VERACODE-20 | manual: the Collections API is not in the published REST reference; business-unit grouping is provided as evidence |
 
 ### Verdict safety rules
 
@@ -345,29 +374,6 @@ A page-cap exit (with or without page metadata), a repeated page, or a `total_el
 Any sampled or team-scoped partial view downgrades `pass` to `warn` with seen and total counts.
 
 Bundle JSON has credential-named fields, JWT-shaped values, and URL userinfo or query strings replaced by `[REDACTED]`. Dynamic scan configurations are projected to their non-secret settings. Every surface that was not collected is written as a marker object rather than an empty list (see Export bundle).
-
-## Framework mappings
-
-Each finding carries the spec's mapping row. For example, control 1 maps to FedRAMP SA-11, CMMC L2 3.14.1, SOC 2 CC7.1, CIS Controls v8 16.12, PCI-DSS 6.5, STIG SRG-APP-000456, IRAP ISM-1143, and ISMAP VM-01.
-
-The export bundle writes `compliance/unified_compliance_matrix.md` plus one report per framework: `fedramp.md`, `cmmc.md`, `soc2.md`, `cis-controls-v8.md`, `pci-dss.md`, `stig.md`, `irap.md`, and `ismap.md`.
-
-## Live smoke
-
-```bash
-npm --prefix cli run test:veracode:live
-```
-
-The script skips with exit code 0 when no credentials are configured. Otherwise it runs `veracode_check_access` and the policy compliance assessment against the real tenant.
-
-## Limitations and manual controls
-
-- Controls 11 (prescan module coverage), 14 (pipeline integration), and 20 (collections posture) always render as `manual` with the evidence a human must collect.
-- SCA (controls 5, 6, 18) and Dynamic Analysis (control 13) render as `manual` with an unlicensed or not applicable summary when the APIs return 401, 403, or 404 or return empty inventories.
-- Per-application calls (sandboxes, findings, summary reports, SCA projects) are capped by `max_applications` (100). When the cap is below the inventory, the verdict flags the partial view.
-- The business criticality cadence for control 4 (VERY_HIGH weekly, every other tier monthly) is the spec's organizational default. Adjust `critical_scan_interval_days` and `standard_scan_interval_days` to match the organization's scanning standard.
-- The `scans[]` array on an application profile exposes only the latest scan per type, so an application whose latest static scan is still in progress is reported as unconfirmed (warn) rather than stale.
-- The Reporting API is not called because report generation requires a POST.
 
 ## Official documentation
 

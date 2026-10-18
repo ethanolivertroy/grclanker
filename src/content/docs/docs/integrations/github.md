@@ -63,6 +63,8 @@ All tools accept `organization`, `auth_mode` (`pat` or `app`), `api_token`, `app
 
 ## Control coverage
 
+Verdicts on unread, partial, or truncated data follow the [verdict rules](#verdict-rules).
+
 | Spec control | Tool | Finding | Status semantics |
 |--------------|------|---------|------------------|
 | 1 SAML SSO Enforcement | org_access | GITHUB-ORG-006 | Pass with a SAML provider and every member linked; Partial when identities are truncated; Fail without a provider |
@@ -97,22 +99,6 @@ Extra findings and their mapping rows:
 - GITHUB-ORG-005: Audit log visibility, row 19.
 - GITHUB-REPO-005: Web commit signoff, row 13.
 - GITHUB-CODE-001: Code security configurations exist, union of rows 15 to 17.
-
-## Verdict rules
-
-- A forbidden, missing, or errored endpoint that a finding rests on renders Manual with the HTTP status and the evidence a reviewer must collect. Some endpoints that feed only part of a finding, such as the owner-only 2FA filter, cap a Pass at Partial instead. A Fail proven by the readable part stays Fail.
-- Partial inventories (truncated GraphQL connections, per-repository 403s, an audit log sample capped at 200 events) render Partial. Only the visibility-only audit log control renders Pass instead, with the cap stated.
-- Empty inventories pass only where the summary says emptiness is compliant: outside collaborators, App installations, and webhooks and deploy keys with a non-empty repository inventory. Empty repository inventories render Info or Partial because the sweep covered nothing.
-- Deploy keys without `created_at` never count as fresh.
-- Truncated inventories never pass.
-  - REST pagination follows `Link` headers to completion and reports truncation when a record cap stops it.
-  - GraphQL connections page on `endCursor`. They report truncation when `hasNextPage` is true without a cursor, when the cursor repeats, at the page cap, and whenever `totalCount` exceeds the collected nodes.
-- Before collected records are persisted, they are projected to the documented fields the verdicts read.
-  - Webhook secrets become a `[redacted]` presence marker.
-  - Deploy key material, `token_last_eight`, `openssh_public_key`, and the unconstrained audit event bags are dropped.
-  - Every JSON file in the bundle passes a key-name redaction belt.
-  - A test exports a canary-laden tenant and walks every bundle file and zip entry.
-- A rerun of the export allocates a new directory and a zip with the same stem, so prior bundles are never overwritten.
 
 ## Framework mappings
 
@@ -156,6 +142,26 @@ Otherwise it:
 - Open alert counts for code scanning, secret scanning, and Dependabot are not collected yet. Controls 15 to 17 check defaults and configurations only.
 - The org runners endpoint does not enumerate repository-level self-hosted runners.
 - The interactive OAuth App flow from the spec is not implemented. Use a PAT or a GitHub App.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict and how the tools page through the API and report incomplete listings. You don't need it to set up or run the integration.
+
+### Verdict rules
+
+- A forbidden, missing, or errored endpoint that a finding rests on renders Manual with the HTTP status and the evidence a reviewer must collect. Some endpoints that feed only part of a finding, such as the owner-only 2FA filter, cap a Pass at Partial instead. A Fail proven by the readable part stays Fail.
+- Partial inventories (truncated GraphQL connections, per-repository 403s, an audit log sample capped at 200 events) render Partial. Only the visibility-only audit log control renders Pass instead, with the cap stated.
+- Empty inventories pass only where the summary says emptiness is compliant: outside collaborators, App installations, and webhooks and deploy keys with a non-empty repository inventory. Empty repository inventories render Info or Partial because the sweep covered nothing.
+- Deploy keys without `created_at` never count as fresh.
+- Truncated inventories never pass.
+  - REST pagination follows `Link` headers to completion and reports truncation when a record cap stops it.
+  - GraphQL connections page on `endCursor`. They report truncation when `hasNextPage` is true without a cursor, when the cursor repeats, at the page cap, and whenever `totalCount` exceeds the collected nodes.
+- Before collected records are persisted, they are projected to the documented fields the verdicts read.
+  - Webhook secrets become a `[redacted]` presence marker.
+  - Deploy key material, `token_last_eight`, `openssh_public_key`, and the unconstrained audit event bags are dropped.
+  - Every JSON file in the bundle passes a key-name redaction belt.
+  - A test exports a canary-laden tenant and walks every bundle file and zip entry.
+- A rerun of the export allocates a new directory and a zip with the same stem, so prior bundles are never overwritten.
 
 ## Official documentation
 

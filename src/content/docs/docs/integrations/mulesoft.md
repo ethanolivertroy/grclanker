@@ -138,43 +138,6 @@ Each finding has the shape `{ id, control, title, severity, status, summary, evi
 
 A `manual` finding states exactly what evidence a human must collect from Anypoint Platform. When a read failed or the credential saw only part of the inventory, `evidence.unreadable_sources` and `evidence.partial_view` list the causes.
 
-### Verdict safety
-
-Every finding follows the same rules so that missing or partial evidence never produces a `pass`:
-
-- An unreadable, forbidden (401/403), or errored primary source yields `manual`. Its summary starts `Could not evaluate:`, names the source and HTTP cause, and states the evidence to collect.
-- A failed secondary source turns a would-be pass into `manual` with `Could not confirm:`.
-- An empty inventory never passes by default. Each control states whether emptiness is `fail` or `manual`.
-  - `fail`: No identity provider, zero audit events in 7 days, a production environment with no alerts.
-  - `manual`: Zero role groups, environments, connected apps, API instances, applications, VPCs, or Exchange assets.
-- These render as `manual` with a not-applicable or unavailable summary:
-  - Controls that do not apply (no dedicated load balancer, no Anypoint MQ region, no hybrid server, no persistent queues, `createSubOrgs` entitlement false).
-  - Endpoints that return 404 on the control plane.
-- Items without a date are reported in their own bucket and yield at most `warn`. That covers connected apps without `last_used`, applications without `endOfSupportDate` or a runtime version, and certificates without `validTo`.
-- A partial view is recorded with seen and total counts. These count as a partial view:
-  - An environment filter or `environment_limit` that excludes environments.
-  - `api_limit` or `application_limit` caps.
-  - Truncated pages.
-  - Per-item reads that were truncated or failed.
-  - A credential scoped to a business group.
-- On a partial view, a would-be pass becomes `warn` with a `Partial view:` prefix and the sentence "The unseen items were not evaluated, so the control cannot pass on this sample."
-- Verdicts read the documented flags they depend on. An absent flag never supports `pass`. The flags are `isFederated`, `allow_new_non_sso_users`, `mfaVerificationExcluded`, policy `disabled`, `tlsv1`, `httpMode` and `defaultCipherSuite`, `persistentQueuesEncrypted`, property `secure`, alert `enabled`, `entitlements.createSubOrgs`, and hierarchy `isRoot`.
-- Pagination runs to the requested limit, and every list reports whether it was truncated. A first page is never treated as the whole population.
-- A read that depends on a list which was not read is never requested. It is recorded as `not requested`, naming the parent read. The finding reports the parent failure once instead of an empty child read. These reads depend on a parent list:
-  - Role group roles and members.
-  - Connected app scopes.
-  - API instances and policies.
-  - Applications and servers.
-  - MQ regions, queues, and clients.
-  - Secret groups.
-  - VPC and load balancer details, and the load balancer certificate probes.
-  - Alerts.
-- When some parents were read and others were not, the children of the unread parents are reported as a partial failure.
-- Evidence and summaries derived from an unread or unrequested source render `null` rather than `0` or `[]`.
-  - `evidence.partial_view` is `null` (not `[]`) when a source was never read.
-  - Every category summary carries an `inventories` map naming each source as `complete (N items)`, `partial (N of M)`, `unread (<error>)`, or `not requested (<reason>)`.
-- Re-running the export allocates a new directory (`-2` up to `-50`, then it fails) and derives the `.zip` name from it, so no prior bundle or archive is overwritten.
-
 ### Bundle layout
 
 ```text
@@ -195,6 +158,8 @@ Every finding follows the same rules so that missing or partial evidence never p
 Output paths are resolved inside `output_dir`. Traversal outside the root and symlinked parent directories are rejected. Files are written with `0600` permissions.
 
 ## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the [verdict safety](#verdict-safety) rules.
 
 The `Inputs` column names the sources each finding reads, using the keys of the category summary's `inventories` map.
 
@@ -270,6 +235,47 @@ The script exits 0 with a skip message when no credentials are present. With cre
   - Hosts that cannot be probed from the auditor are reported as undated and yield warn, or manual when no certificate could be probed at all.
 - CloudHub 2.0 private spaces and Runtime Fabric are not inventoried. Controls 13 and 14 become manual when no Anypoint VPC is visible.
 - Secure CloudHub properties are never returned in plaintext by the API. Control 22 checks that sensitive-looking property keys are marked secure and that production environments have Secrets Manager secret groups.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Verdict safety
+
+Every finding follows the same rules so that missing or partial evidence never produces a `pass`:
+
+- An unreadable, forbidden (401/403), or errored primary source yields `manual`. Its summary starts `Could not evaluate:`, names the source and HTTP cause, and states the evidence to collect.
+- A failed secondary source turns a would-be pass into `manual` with `Could not confirm:`.
+- An empty inventory never passes by default. Each control states whether emptiness is `fail` or `manual`.
+  - `fail`: No identity provider, zero audit events in 7 days, a production environment with no alerts.
+  - `manual`: Zero role groups, environments, connected apps, API instances, applications, VPCs, or Exchange assets.
+- These render as `manual` with a not-applicable or unavailable summary:
+  - Controls that do not apply (no dedicated load balancer, no Anypoint MQ region, no hybrid server, no persistent queues, `createSubOrgs` entitlement false).
+  - Endpoints that return 404 on the control plane.
+- Items without a date are reported in their own bucket and yield at most `warn`. That covers connected apps without `last_used`, applications without `endOfSupportDate` or a runtime version, and certificates without `validTo`.
+- A partial view is recorded with seen and total counts. These count as a partial view:
+  - An environment filter or `environment_limit` that excludes environments.
+  - `api_limit` or `application_limit` caps.
+  - Truncated pages.
+  - Per-item reads that were truncated or failed.
+  - A credential scoped to a business group.
+- On a partial view, a would-be pass becomes `warn` with a `Partial view:` prefix and the sentence "The unseen items were not evaluated, so the control cannot pass on this sample."
+- Verdicts read the documented flags they depend on. An absent flag never supports `pass`. The flags are `isFederated`, `allow_new_non_sso_users`, `mfaVerificationExcluded`, policy `disabled`, `tlsv1`, `httpMode` and `defaultCipherSuite`, `persistentQueuesEncrypted`, property `secure`, alert `enabled`, `entitlements.createSubOrgs`, and hierarchy `isRoot`.
+- Pagination runs to the requested limit, and every list reports whether it was truncated. A first page is never treated as the whole population.
+- A read that depends on a list which was not read is never requested. It is recorded as `not requested`, naming the parent read. The finding reports the parent failure once instead of an empty child read. These reads depend on a parent list:
+  - Role group roles and members.
+  - Connected app scopes.
+  - API instances and policies.
+  - Applications and servers.
+  - MQ regions, queues, and clients.
+  - Secret groups.
+  - VPC and load balancer details, and the load balancer certificate probes.
+  - Alerts.
+- When some parents were read and others were not, the children of the unread parents are reported as a partial failure.
+- Evidence and summaries derived from an unread or unrequested source render `null` rather than `0` or `[]`.
+  - `evidence.partial_view` is `null` (not `[]`) when a source was never read.
+  - Every category summary carries an `inventories` map naming each source as `complete (N items)`, `partial (N of M)`, `unread (<error>)`, or `not requested (<reason>)`.
+- Re-running the export allocates a new directory (`-2` up to `-50`, then it fails) and derives the `.zip` name from it, so no prior bundle or archive is overwritten.
 
 ### Snapshot redaction
 

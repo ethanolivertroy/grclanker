@@ -69,37 +69,6 @@ When `client_id`, `client_secret`, and `refresh_token` are present and no token 
 
 The refresh is the integration and Service App token flow documented on the [integrations](https://developer.webex.com/docs/integrations) and [Service Apps](https://developer.webex.com/docs/service-apps) pages.
 
-### Bundle hygiene
-
-Tokens, secrets, passwords, and host PINs are redacted from every bundle file.
-
-`core_data/` never holds a raw response. Each surface is projected to a per-surface allowlist of the documented fields the findings read (the "Fields read" column below plus the identifiers that make a row citable). An undocumented or newly added property is therefore dropped before anything is written.
-
-Secret-named keys are also replaced with `[REDACTED]`. URL-valued fields keep host and path only:
-
-- The recording `downloadUrl` and `playbackUrl` lose their `RCID` access token.
-- The meeting `webLink` loses its `MTID` join token.
-- Webhook `targetUrl` values lose any query string.
-- `;pwd=` parameters are removed from SIP URIs.
-
-The same rules apply to the zip, which is built from the written directory.
-
-### Error hygiene
-
-Error strings follow the same rule, because they travel further than data (the errors array, `_errors.log`, `core_data/access.json`, every `*_status` object, finding summaries, and the reports).
-
-A response body is never copied into an error string:
-
-- A JSON error contributes only its documented `message`, `errors[].description`, `error`, and `error_description` fields.
-- A non-JSON body, such as an HTML gateway page, is described only as `non-JSON error body (<content type>; <bytes> bytes)` next to the status and endpoint.
-
-Every error string is then scrubbed once, at the point it is created. Scrubbing:
-
-- Strips the query string and fragment of any URL embedded anywhere in the text.
-- Redacts credential-shaped fragments such as `Bearer <value>`, `session=<value>`, or `X-Api-Key: <value>`.
-
-Scrubbing runs as `scrubErrorText` in the `WebexApiError` constructor, in the surface collectors, and on the config loader's fixed messages. No consumer downstream can therefore receive an unscrubbed error.
-
 ## Run it
 
 After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
@@ -205,6 +174,41 @@ The script skips with exit code 0 when no `WEBEX_TOKEN`, refresh credential trio
 - Events older than 90 days require Pro Pack for Control Hub.
 - Pagination follows `Link rel="next"` for at most 1000 pages per listing. Both the item limit and the page ceiling report `truncated: true`. Evidence lists capped at 25 or 50 entries carry a matching `*_count` total.
 - SARIF, CSV, and HTML reporters from the spec are out of scope for this pass.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Bundle hygiene
+
+Tokens, secrets, passwords, and host PINs are redacted from every bundle file.
+
+`core_data/` never holds a raw response. Each surface is projected to a per-surface allowlist of the documented fields the findings read (the "Fields read" column below plus the identifiers that make a row citable). An undocumented or newly added property is therefore dropped before anything is written.
+
+Secret-named keys are also replaced with `[REDACTED]`. URL-valued fields keep host and path only:
+
+- The recording `downloadUrl` and `playbackUrl` lose their `RCID` access token.
+- The meeting `webLink` loses its `MTID` join token.
+- Webhook `targetUrl` values lose any query string.
+- `;pwd=` parameters are removed from SIP URIs.
+
+The same rules apply to the zip, which is built from the written directory.
+
+### Error hygiene
+
+Error strings follow the same rule, because they travel further than data (the errors array, `_errors.log`, `core_data/access.json`, every `*_status` object, finding summaries, and the reports).
+
+A response body is never copied into an error string:
+
+- A JSON error contributes only its documented `message`, `errors[].description`, `error`, and `error_description` fields.
+- A non-JSON body, such as an HTML gateway page, is described only as `non-JSON error body (<content type>; <bytes> bytes)` next to the status and endpoint.
+
+Every error string is then scrubbed once, at the point it is created. Scrubbing:
+
+- Strips the query string and fragment of any URL embedded anywhere in the text.
+- Redacts credential-shaped fragments such as `Bearer <value>`, `session=<value>`, or `X-Api-Key: <value>`.
+
+Scrubbing runs as `scrubErrorText` in the `WebexApiError` constructor, in the surface collectors, and on the config loader's fixed messages. No consumer downstream can therefore receive an unscrubbed error.
 
 ## Endpoints
 

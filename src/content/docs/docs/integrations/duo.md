@@ -103,6 +103,8 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 ## Control coverage
 
+Verdicts on unread, partial, or truncated data follow the [verdict safety rules](#verdict-safety-rules).
+
 Status semantics:
 
 - `Pass`: The documented setting or population meets the control.
@@ -145,6 +147,50 @@ Supporting findings without a spec control number:
 - DUO-ADMIN-004: Stale administrators.
 - DUO-INTEGRATIONS-002: Universal Prompt adoption.
 - DUO-MON-004: Notifications.
+
+## Framework mappings
+
+Every finding carries FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP identifiers from the mapping table in `specs/duo-sec-inspector.spec.md`. The bundle writes one report per framework under `compliance/` and a unified matrix in `compliance/unified_compliance_matrix.md`.
+
+## Audit bundle layout
+
+```text
+<api-host>_<timestamp>/
+  QUICK_REFERENCE.md
+  config.json
+  core_data/          Admin API payloads (integration secret keys and bypass code values redacted) plus collection_status.json
+  analysis/           one JSON per assessment plus findings.json
+  compliance/         executive_summary.md, unified_compliance_matrix.md, <framework>/<report>.md
+  _errors.log         only when a read failed but the bundle still completed
+<api-host>_<timestamp>.zip
+```
+
+A rerun allocates a new directory and zip and never overwrites a previous bundle.
+
+## Live smoke test
+
+```bash
+DUO_API_HOST=... DUO_IKEY=... DUO_SKEY=... npm --prefix cli run test:duo:live
+```
+
+The smoke test exits 0 without credentials. With credentials, it runs the access check and stops with exit 1 unless the access status is `healthy`. Otherwise, it:
+
+- Runs all four assessments.
+- Prints every finding.
+- Fails if any finding passed while carrying a collection error.
+
+## Limitations and manual controls
+
+- Offline access limits (days and authentication count) are not exposed by the Admin API. Verify them in the Global Policy Offline Access section.
+- Device health, operating system, disk encryption, screen lock, User Location, and access device location data require Duo Advantage or Premier. On other editions, the affected findings are Manual and name the edition reported by `/admin/v1/info/summary`.
+- Critical application detection relies on `sensitivity_level` and `compliance_requirements`, which administrators set in the Admin Panel. Untagged tenants receive a Manual finding.
+- Log-based checks sample up to 400 events per log within the lookback window. When the sample is incomplete, the affected findings are capped at Partial and report seen, total, and cap counts.
+- The reference notes that Trust Monitor is available to Duo Premier and Advantage accounts created before September 29, 2025. It also notes that the events endpoint reaches end of support on January 31, 2027. Tenants without Trust Monitor receive a Manual DUO-MON-002 naming the endpoint and permission.
+- The Auth API and Accounts API are out of scope. Only Admin API read endpoints are used.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
 
 ### Verdict safety rules
 
@@ -252,46 +298,6 @@ Every fixed-text message the integration emits is held to the scrub by a test an
 - The `was not attempted` and `not collected` wordings.
 - The `unread` evidence lines.
 - The capped-verdict and manual-review prose.
-
-## Framework mappings
-
-Every finding carries FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP identifiers from the mapping table in `specs/duo-sec-inspector.spec.md`. The bundle writes one report per framework under `compliance/` and a unified matrix in `compliance/unified_compliance_matrix.md`.
-
-## Audit bundle layout
-
-```text
-<api-host>_<timestamp>/
-  QUICK_REFERENCE.md
-  config.json
-  core_data/          Admin API payloads (integration secret keys and bypass code values redacted) plus collection_status.json
-  analysis/           one JSON per assessment plus findings.json
-  compliance/         executive_summary.md, unified_compliance_matrix.md, <framework>/<report>.md
-  _errors.log         only when a read failed but the bundle still completed
-<api-host>_<timestamp>.zip
-```
-
-A rerun allocates a new directory and zip and never overwrites a previous bundle.
-
-## Live smoke test
-
-```bash
-DUO_API_HOST=... DUO_IKEY=... DUO_SKEY=... npm --prefix cli run test:duo:live
-```
-
-The smoke test exits 0 without credentials. With credentials, it runs the access check and stops with exit 1 unless the access status is `healthy`. Otherwise, it:
-
-- Runs all four assessments.
-- Prints every finding.
-- Fails if any finding passed while carrying a collection error.
-
-## Limitations and manual controls
-
-- Offline access limits (days and authentication count) are not exposed by the Admin API. Verify them in the Global Policy Offline Access section.
-- Device health, operating system, disk encryption, screen lock, User Location, and access device location data require Duo Advantage or Premier. On other editions, the affected findings are Manual and name the edition reported by `/admin/v1/info/summary`.
-- Critical application detection relies on `sensitivity_level` and `compliance_requirements`, which administrators set in the Admin Panel. Untagged tenants receive a Manual finding.
-- Log-based checks sample up to 400 events per log within the lookback window. When the sample is incomplete, the affected findings are capped at Partial and report seen, total, and cap counts.
-- The reference notes that Trust Monitor is available to Duo Premier and Advantage accounts created before September 29, 2025. It also notes that the events endpoint reaches end of support on January 31, 2027. Tenants without Trust Monitor receive a Manual DUO-MON-002 naming the endpoint and permission.
-- The Auth API and Accounts API are out of scope. Only Admin API read endpoints are used.
 
 ## References
 

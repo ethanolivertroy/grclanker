@@ -115,46 +115,6 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 `project_limit` (alias `max_projects`, default 20) caps how many projects are inventoried. When the cap truncates the inventory, every dependent finding is downgraded to `warn` with seen and total counts, so a partial view can never pass.
 
-Every paginated list follows `nextPageToken` until the API stops returning one. A list that exits early for any other reason is recorded as truncated and downgrades its findings the same way:
-
-- The per-list item cap was reached.
-- The cursor repeated itself.
-- The page budget of 250 pages was spent.
-
-The summary then reads `N seen, total unknown`.
-
-### Unreadable inventories
-
-Every finding also tracks each inventory it depends on. When any of them is unreadable (403, 401, or an error), for the whole scope or for one project, the finding drops below `pass`. This happens even if its primary inventory was read completely.
-
-- The finding is `manual` when the unreadable inventory is the one the finding scores, and `warn` otherwise.
-- The summary names the dataset and the endpoint, for example:
-  - `Partial view: Cloud Routers unreadable for 1 of 2 projects (second-project) via compute.googleapis.com/compute/v1/projects/{project}/aggregated/routers (403 Forbidden)`
-- `evidence.unreadable_inventories` lists every entry with its scope and error.
-
-A count or list that would have been derived from an unreadable inventory is rendered as `null`, never as zero or an empty list.
-
-- The rule holds whether that inventory is the one the finding scores or a dependent one.
-- The same rule applies to the assessment-level `summary` counters: `sampled_projects` is `null` when the project inventory itself was unreadable.
-- A summary sentence names the unreadable dataset instead of counting it: `instance overrides could not be checked because Compute Engine instances were unreadable`, never `none of 0 instances overrides it`.
-
-### Collection-status fields
-
-The collection-status fields follow the same rule. These fields are `null` whenever the scan they describe was denied or never ran:
-
-- On a finding: `evidence.truncated`, `denied_projects`, and `unreachable_scopes`.
-- In the assessment summaries: `projects_truncated`, `sources_truncated`, and `findings_truncated`.
-
-`false`, `0`, or `[]` is written only when that scan ran to completion, so no status ever says complete about a call that did not happen.
-
-A read that was skipped because its upstream discovery failed is recorded with `status: "not_collected"` rather than `"unreadable"`. Its wording names the upstream call with the status that call actually returned. For example, with no project to resolve an effective org policy against, GCP-ORG-02 through GCP-ORG-05 read:
-
-`effective org policy constraints/iam.allowedPolicyMemberDomains not collected for the scope (cloudresourcemanager.googleapis.com/v1/projects/{project}:getEffectiveOrgPolicy was not called): no project could be enumerated because project inventory was unreadable via cloudasset.googleapis.com/v1/{scope}:searchAllResources (403 Forbidden)`
-
-An HTTP status is never attributed to an endpoint that was not requested.
-
-In `core_data/`, a dataset that was denied or never collected is written as a `{status, dataset, endpoint, scope, error, data: null}` marker in place of the rows, never as `[]`. The same entry appears in the snapshot's `unreadable_inventories`.
-
 ## Status semantics
 
 | Status | Meaning |
@@ -172,6 +132,8 @@ Emptiness passes only for two findings:
 `GCP-DATA-07` fails on emptiness (no access policy means no perimeter). Every other finding renders `manual` on an empty inventory.
 
 ## Control coverage
+
+Verdicts on unread, partial, or truncated data follow the rules in [How the tools handle evidence](#how-the-tools-handle-evidence).
 
 | # | Control | Tool | Finding | Semantics |
 |---|---------|------|---------|-----------|
@@ -230,6 +192,79 @@ Every finding carries the spec mapping table entries for its controls. The expor
 ```
 
 Reruns allocate `-2`, `-3`, and so on. The zip name derives from the allocated directory, so nothing is overwritten. Output paths are resolved with traversal and symlink-parent protection.
+
+## Live smoke test
+
+```bash
+npm --prefix cli run test:gcp:live
+```
+
+The script prints a skip message and exits 0 when no credential hint exists: no organization or project variable, no token, no credentials file, and no ADC file.
+
+Otherwise it runs `gcp_check_access` followed by every assess tool with a small project and asset cap.
+
+## Limitations and manual controls
+
+- All 23 spec controls have automated findings. These sub-aspects are not evaluated and remain manual:
+  - Unused permission analysis (control 2)
+  - Unused firewall rules (control 4)
+  - Binary Authorization attestor configuration (control 8)
+  - OS Login 2FA (control 11)
+- Security Command Center is visibility only. `GCP-LOG-05` never scores a control, and the findings feed is sampled, not exhaustive.
+- KMS keys are read from Cloud Asset Inventory (`cloudkms.googleapis.com/CryptoKey`) rather than per-location Cloud KMS list calls. As a result, the Cloud Asset API must be enabled and the asset feed reflects its documented freshness.
+- Public exposure relies on the Cloud Asset Inventory IAM policy search at organization scope (`policy:(allUsers OR allAuthenticatedUsers)`). The search covers every asset type CAI indexes. Object ACLs on non-uniform buckets are not inspected.
+- Compute `aggregatedList` responses that report `unreachables[]` or a scope with `warning.code` `UNREACHABLE` mark the inventory as partial. Every compute-backed finding then downgrades to `warn` and names the unreachable scopes.
+- Effective organization policies are computed against the first inventoried project.
+  - When the project cap truncates the inventory, or the project inventory itself is unreadable while a project ID is configured, org-policy findings are downgraded to `warn` and name the project inventory endpoint.
+  - An unreadable constraint renders its finding `manual`.
+- Security Command Center visibility (`GCP-LOG-05`) is `manual` when the source list is unreadable, and `warn` when the findings feed is unreadable or truncated. The findings count is then rendered as `null`, never as zero.
+- Single-project scope (no organization ID) renders `GCP-ORG-01` and `GCP-DATA-07` as `manual` because organization metadata and access policies are organization resources.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Pagination
+
+Every paginated list follows `nextPageToken` until the API stops returning one. A list that exits early for any other reason is recorded as truncated and downgrades its findings the same way:
+
+- The per-list item cap was reached.
+- The cursor repeated itself.
+- The page budget of 250 pages was spent.
+
+The summary then reads `N seen, total unknown`.
+
+### Unreadable inventories
+
+Every finding also tracks each inventory it depends on. When any of them is unreadable (403, 401, or an error), for the whole scope or for one project, the finding drops below `pass`. This happens even if its primary inventory was read completely.
+
+- The finding is `manual` when the unreadable inventory is the one the finding scores, and `warn` otherwise.
+- The summary names the dataset and the endpoint, for example:
+  - `Partial view: Cloud Routers unreadable for 1 of 2 projects (second-project) via compute.googleapis.com/compute/v1/projects/{project}/aggregated/routers (403 Forbidden)`
+- `evidence.unreadable_inventories` lists every entry with its scope and error.
+
+A count or list that would have been derived from an unreadable inventory is rendered as `null`, never as zero or an empty list.
+
+- The rule holds whether that inventory is the one the finding scores or a dependent one.
+- The same rule applies to the assessment-level `summary` counters: `sampled_projects` is `null` when the project inventory itself was unreadable.
+- A summary sentence names the unreadable dataset instead of counting it: `instance overrides could not be checked because Compute Engine instances were unreadable`, never `none of 0 instances overrides it`.
+
+### Collection-status fields
+
+The collection-status fields follow the same rule. These fields are `null` whenever the scan they describe was denied or never ran:
+
+- On a finding: `evidence.truncated`, `denied_projects`, and `unreachable_scopes`.
+- In the assessment summaries: `projects_truncated`, `sources_truncated`, and `findings_truncated`.
+
+`false`, `0`, or `[]` is written only when that scan ran to completion, so no status ever says complete about a call that did not happen.
+
+A read that was skipped because its upstream discovery failed is recorded with `status: "not_collected"` rather than `"unreadable"`. Its wording names the upstream call with the status that call actually returned. For example, with no project to resolve an effective org policy against, GCP-ORG-02 through GCP-ORG-05 read:
+
+`effective org policy constraints/iam.allowedPolicyMemberDomains not collected for the scope (cloudresourcemanager.googleapis.com/v1/projects/{project}:getEffectiveOrgPolicy was not called): no project could be enumerated because project inventory was unreadable via cloudasset.googleapis.com/v1/{scope}:searchAllResources (403 Forbidden)`
+
+An HTTP status is never attributed to an endpoint that was not requested.
+
+In `core_data/`, a dataset that was denied or never collected is written as a `{status, dataset, endpoint, scope, error, data: null}` marker in place of the rows, never as `[]`. The same entry appears in the snapshot's `unreadable_inventories`.
 
 ### Projected snapshots
 
@@ -296,33 +331,6 @@ A regression walk fails every `GCP_INVENTORIES` surface in turn with:
 It asserts that no canary reaches any finding, summary, `unreadable_inventories` entry, `core_data` marker, errors array, bundle file, zip entry, or thrown error while every failure is still disclosed with its status, endpoint, and content type and length or documented fields.
 
 A second export plants a shapeless configured token and an `AIza` key in the organization display name. It asserts that neither reaches any bundle file or zip entry, which binds the writer's second layer.
-
-## Live smoke test
-
-```bash
-npm --prefix cli run test:gcp:live
-```
-
-The script prints a skip message and exits 0 when no credential hint exists: no organization or project variable, no token, no credentials file, and no ADC file.
-
-Otherwise it runs `gcp_check_access` followed by every assess tool with a small project and asset cap.
-
-## Limitations and manual controls
-
-- All 23 spec controls have automated findings. These sub-aspects are not evaluated and remain manual:
-  - Unused permission analysis (control 2)
-  - Unused firewall rules (control 4)
-  - Binary Authorization attestor configuration (control 8)
-  - OS Login 2FA (control 11)
-- Security Command Center is visibility only. `GCP-LOG-05` never scores a control, and the findings feed is sampled, not exhaustive.
-- KMS keys are read from Cloud Asset Inventory (`cloudkms.googleapis.com/CryptoKey`) rather than per-location Cloud KMS list calls. As a result, the Cloud Asset API must be enabled and the asset feed reflects its documented freshness.
-- Public exposure relies on the Cloud Asset Inventory IAM policy search at organization scope (`policy:(allUsers OR allAuthenticatedUsers)`). The search covers every asset type CAI indexes. Object ACLs on non-uniform buckets are not inspected.
-- Compute `aggregatedList` responses that report `unreachables[]` or a scope with `warning.code` `UNREACHABLE` mark the inventory as partial. Every compute-backed finding then downgrades to `warn` and names the unreachable scopes.
-- Effective organization policies are computed against the first inventoried project.
-  - When the project cap truncates the inventory, or the project inventory itself is unreadable while a project ID is configured, org-policy findings are downgraded to `warn` and name the project inventory endpoint.
-  - An unreadable constraint renders its finding `manual`.
-- Security Command Center visibility (`GCP-LOG-05`) is `manual` when the source list is unreadable, and `warn` when the findings feed is unreadable or truncated. The findings count is then rendered as `null`, never as zero.
-- Single-project scope (no organization ID) renders `GCP-ORG-01` and `GCP-DATA-07` as `manual` because organization metadata and access policies are organization resources.
 
 ## Endpoint reference
 
