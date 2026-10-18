@@ -2748,6 +2748,63 @@ function evaluatePeripheralRestrictions(views: DeviceControlView[], policies: Js
   );
 }
 
+function recordDeviceControlFacts(
+  views: DeviceControlView[],
+  dataset: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+  error: string | undefined,
+  maxUsbExceptions: number,
+): void {
+  if (error) {
+    for (const id of ["CS-08", "CS-09"] as const) recordCrowdstrikeDecisionFacts(id, { device_control_policies_readable: false });
+    return;
+  }
+  const applied = views.filter((view) => view.applied);
+  const blocksMassStorage = (view: DeviceControlView) => view.mass_storage_action !== undefined && view.mass_storage_action !== "FULL_ACCESS";
+  const restrictions = applied.map((view) => [
+    view.bluetooth_enforcement_mode === "MONITOR_ENFORCE" && view.bluetooth_restricted_classes > 0,
+    view.pcie_enforcement_mode === "MONITOR_ENFORCE",
+    blocksMassStorage(view),
+  ].filter(Boolean).length);
+  const base = {
+    device_control_policies_readable: true,
+    device_control_policies_complete: !dataset.data.truncated,
+    assigned_device_control_policy_count: applied.length,
+  };
+  recordCrowdstrikeDecisionFacts("CS-08", {
+    ...base,
+    policies_without_usb_blocking: applied.filter((view) => view.usb_enforcement_mode !== "MONITOR_ENFORCE" || !blocksMassStorage(view)).length,
+    most_mass_storage_exceptions: Math.max(0, ...applied.map((view) => view.mass_storage_exceptions)),
+    max_usb_exceptions: maxUsbExceptions,
+  });
+  recordCrowdstrikeDecisionFacts("CS-09", {
+    ...base,
+    policies_without_peripheral_restrictions: restrictions.filter((count) => count === 0).length,
+    policies_missing_a_peripheral_restriction: restrictions.filter((count) => count < 3).length,
+  });
+}
+
+function recordFirewallReadFacts(
+  policies: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+  containers: CollectedDataset<JsonRecord[]>,
+  ruleGroups: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+  rules: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+): void {
+  const policyFacts = policies.error ?? containers.error
+    ? { firewall_policies_readable: false }
+    : { firewall_policies_readable: true, firewall_policies_complete: !policies.data.truncated };
+  recordCrowdstrikeDecisionFacts("CS-10", {
+    ...policyFacts,
+    ...(policyFacts.firewall_policies_readable ? { assigned_firewall_policy_count: assignedPolicies(policies.data.items).length } : {}),
+    ...(ruleGroups.error
+      ? { firewall_rule_groups_readable: false }
+      : { firewall_rule_groups_readable: true, firewall_rule_groups_complete: !ruleGroups.data.truncated }),
+  });
+  recordCrowdstrikeDecisionFacts("CS-11", {
+    ...policyFacts,
+    ...(rules.error ? { firewall_rules_readable: false } : { firewall_rules_readable: true, firewall_rules_complete: !rules.data.truncated }),
+  });
+}
+
 function evaluateHostFirewall(policies: JsonRecord[], containers: JsonRecord[], ruleGroups: JsonRecord[]): CrowdstrikeFinding {
   const applied = assignedPolicies(policies);
   if (applied.length === 0) return noAssignedPolicyFinding("CS-10", "firewall", policies);
@@ -2784,6 +2841,12 @@ function evaluateHostFirewall(policies: JsonRecord[], containers: JsonRecord[], 
       host_groups: asArray(policy.groups).length,
     };
   });
+  recordCrowdstrikeDecisionFacts("CS-10", {
+    firewall_policies_without_container: perPolicy.filter((item) => !item.container_returned).length,
+    firewall_policies_not_enforcing: perPolicy.filter((item) => item.container_returned && (item.enforce !== true || item.active_rule_groups + item.unknown_rule_groups === 0)).length,
+    firewall_policies_in_test_mode: perPolicy.filter((item) => item.container_returned && item.test_mode === true).length,
+    firewall_policies_without_active_rule_group: perPolicy.filter((item) => item.container_returned && item.active_rule_groups === 0).length,
+  });
   const status = worstStatus(perPolicy.map((item) => item.status));
   const weak = perPolicy.filter((item) => item.status !== "pass");
   return finding(
@@ -2799,6 +2862,7 @@ function evaluateHostFirewall(policies: JsonRecord[], containers: JsonRecord[], 
 function evaluateDefaultDeny(policies: JsonRecord[], containers: JsonRecord[], rules: JsonRecord[]): CrowdstrikeFinding {
   const appliedIds = new Set(assignedPolicies(policies).map((policy) => asString(policy.id) ?? ""));
   const activeContainers = containers.filter((container) => appliedIds.has(asString(container.policy_id) ?? ""));
+  recordCrowdstrikeDecisionFacts("CS-11", { assigned_firewall_container_count: activeContainers.length });
   if (activeContainers.length === 0) {
     return finding("CS-11", "fail", `No firewall policy containers were returned for enabled and host-assigned firewall policies (${appliedIds.size} applied policies, ${containers.length} containers), so a default deny posture cannot be demonstrated.`, { ...policyInventory(policies), containers: containers.length, absence_claim: true });
   }
@@ -2810,6 +2874,12 @@ function evaluateDefaultDeny(policies: JsonRecord[], containers: JsonRecord[], r
   });
   const allowRules = rules.filter((rule) => asString(rule.action)?.toUpperCase() === "ALLOW" && asBoolean(rule.enabled) === true);
   const undocumentedAllows = allowRules.filter((rule) => !asString(rule.description));
+  recordCrowdstrikeDecisionFacts("CS-11", {
+    containers_without_inbound_deny: perContainer.filter((item) => item.default_inbound !== "DENY").length,
+    containers_not_enforced: perContainer.filter((item) => item.enforce !== true).length,
+    undocumented_allow_rule_count: undocumentedAllows.length,
+    firewall_rule_count: rules.length,
+  });
   const statuses = perContainer.map((item) => item.status);
   if (undocumentedAllows.length > 0) statuses.push("warn");
   if (rules.length === 0) statuses.push("warn");
@@ -2834,18 +2904,27 @@ function evaluateDefaultDeny(policies: JsonRecord[], containers: JsonRecord[], r
 const DEVICE_CONTROL_CONSOLE_EVIDENCE = "export each device control policy from Falcon console > Endpoint security > Device control policies showing USB, Bluetooth, and PCIe enforcement, class actions, exceptions, and assigned host groups.";
 const FIREWALL_CONSOLE_EVIDENCE = "export firewall policies with their default inbound and outbound actions, enforcement state, assigned rule groups, documented allow rules, and assigned host groups from Falcon console > Endpoint security > Firewall policies.";
 
+type DeviceFirewallClient = Pick<
+  CrowdstrikeApiClient,
+  | "getResolvedConfig"
+  | "listDeviceControlPolicies"
+  | "getDeviceControlPoliciesV2"
+  | "listFirewallPolicies"
+  | "getFirewallPolicyContainers"
+  | "listFirewallRuleGroups"
+  | "listFirewallRules"
+>;
+
 export async function assessCrowdstrikeDeviceFirewall(
-  client: Pick<
-    CrowdstrikeApiClient,
-    | "getResolvedConfig"
-    | "listDeviceControlPolicies"
-    | "getDeviceControlPoliciesV2"
-    | "listFirewallPolicies"
-    | "getFirewallPolicyContainers"
-    | "listFirewallRuleGroups"
-    | "listFirewallRules"
-  >,
+  client: DeviceFirewallClient,
   options: CrowdstrikeAssessmentOptions = {},
+): Promise<CrowdstrikeAssessmentResult> {
+  return runBatchVerdictContext(CROWDSTRIKE_DECISION_CONTEXT, CROWDSTRIKE_SPEC, () => assessCrowdstrikeDeviceFirewallWithDecisionContext(client, options));
+}
+
+async function assessCrowdstrikeDeviceFirewallWithDecisionContext(
+  client: DeviceFirewallClient,
+  options: CrowdstrikeAssessmentOptions,
 ): Promise<CrowdstrikeAssessmentResult> {
   const maxUsbExceptions = clampNumber(options.maxUsbExceptions, DEFAULT_MAX_USB_EXCEPTIONS, 0, 10_000);
   const ruleLimit = clampNumber(options.ruleLimit, DEFAULT_RULE_LIMIT, 1, 10_000);
@@ -2880,6 +2959,8 @@ export async function assessCrowdstrikeDeviceFirewall(
   const firewallPartial = partialInventory(firewallPolicies.data, "firewall policies");
   const ruleGroupPartial = partialInventory(ruleGroups.data, "firewall rule groups");
   const rulePartial = partialInventory(rules.data, "firewall rules");
+  recordDeviceControlFacts(views, deviceControl, deviceControlError, maxUsbExceptions);
+  recordFirewallReadFacts(firewallPolicies, containers, ruleGroups, rules);
 
   const findings = [
     deviceControlError
