@@ -20,3 +20,25 @@ export const USER_FREE_FORM_FIELDS: readonly string[] = [
   "custom_date_1",
   "custom_date_2",
 ];
+// With redact_pii, exported values under these keys are pseudonymized (hash) or replaced with [redacted] (mask).
+export const PII_HASH_FIELDS: readonly string[] = ["email", "manager_email", "reportedBy", "reported_by", "from", "to", "cc"];
+export const PII_MASK_FIELDS: readonly string[] = [
+  "first_name",
+  "last_name",
+  "manager_name",
+  "phone_number",
+  "mobile_phone_number",
+  "extension",
+  "aliases",
+  "employee_number",
+  "comment",
+  "subject",
+  "ip",
+  "ip_location",
+  "custom_field_1",
+  "custom_field_2",
+  "custom_field_3",
+  "custom_field_4",
+  "custom_date_1",
+  "custom_date_2",
+];

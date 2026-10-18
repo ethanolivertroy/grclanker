@@ -23,7 +23,7 @@ import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { KNOWBE4_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
-import { ACCOUNT_ADMIN_FIELDS, ACCOUNT_FIELDS, USER_FREE_FORM_FIELDS } from "./knowbe4.spec.js";
+import { ACCOUNT_ADMIN_FIELDS, ACCOUNT_FIELDS, PII_HASH_FIELDS, PII_MASK_FIELDS, USER_FREE_FORM_FIELDS } from "./knowbe4.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -592,27 +592,8 @@ function pseudonymize(value: string): string {
   return `user-${createHash("sha256").update(value.trim().toLowerCase()).digest("hex").slice(0, 12)}`;
 }
 
-const PII_HASH_KEYS = new Set(["email", "manager_email", "reportedBy", "reported_by", "from", "to", "cc"]);
-const PII_MASK_KEYS = new Set([
-  "first_name",
-  "last_name",
-  "manager_name",
-  "phone_number",
-  "mobile_phone_number",
-  "extension",
-  "aliases",
-  "employee_number",
-  "comment",
-  "subject",
-  "ip",
-  "ip_location",
-  "custom_field_1",
-  "custom_field_2",
-  "custom_field_3",
-  "custom_field_4",
-  "custom_date_1",
-  "custom_date_2",
-]);
+const PII_HASH_KEYS = new Set(PII_HASH_FIELDS);
+const PII_MASK_KEYS = new Set(PII_MASK_FIELDS);
 
 export function redactKnowbe4Pii(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactKnowbe4Pii);
