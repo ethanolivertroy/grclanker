@@ -3098,3 +3098,31 @@ portableContractTest("the export writes every declared bundle path and nothing e
   assertBundlePathsMatchSpec(assert, partialExport.outputDir, KNOWBE4_SPEC);
   assert.ok(readBundleFiles(partialExport.outputDir).has("_errors.log"));
 });
+
+function kbDeniedRoutes() {
+  const refuse = () => jsonResponse({ message: "Forbidden" }, { status: 403, statusText: "Forbidden" });
+  return Object.fromEntries(Object.keys(kbRoutes(healthyFixture())).map((route) => [route, refuse]));
+}
+
+portableContractTest("every control and finding carries the title, severity, and tool of its spec check, whether it passes, fails, or cannot be read", async () => {
+  const checks = new Map(KNOWBE4_SPEC.checks.map((check) => [check.id, check]));
+  assert.equal(checks.size, KNOWBE4_CONTROLS.length);
+  for (const control of KNOWBE4_CONTROLS) {
+    const check = checks.get(`KNOWBE4-${String(control.number).padStart(2, "0")}`);
+    assert.deepEqual(
+      { title: check.title, controls: check.controlNumbers, tool: check.owningTool },
+      { title: control.title, controls: [control.number], tool: knowbe4ToolForArea(control.area) },
+    );
+  }
+
+  const runs = [httpKnowbe4(healthyFixture()), httpKnowbe4(failingFixture()), httpKnowbe4(healthyFixture(), { routes: kbDeniedRoutes() })];
+  const statuses = new Set();
+  for (const { client } of runs) {
+    for (const item of (await runAllKnowbe4Assessments(client)).flatMap((result) => result.findings)) {
+      const check = checks.get(item.id);
+      assert.deepEqual({ id: item.id, title: item.title, severity: item.severity }, { id: item.id, title: check.title, severity: check.severity });
+      statuses.add(item.status);
+    }
+  }
+  assert.deepEqual([...statuses].sort(), ["fail", "manual", "pass", "warn"]);
+});
