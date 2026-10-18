@@ -28,6 +28,7 @@ import {
   FAILED_SCAN_STATUSES,
   FLAW_AGE_THRESHOLDS,
   FREQUENCY_DAYS,
+  MAX_CREDENTIAL_ACCOUNTS,
   MAX_DYNAMIC_SCANS_PER_ANALYSIS,
   MITIGATION_ACTIONS,
   USER_MEMBERS,
@@ -3216,7 +3217,7 @@ async function evaluateApiCredentials(client: ClientLike, snapshot: IdentitySnap
     return { finding: manualFinding(9, "high", joinNotes("No active API service account was among the users read, so the credential inventory is unread rather than empty; read the full user list before judging it.", usersPartial), manualEvidence, { users_seen: snapshot.users.value.items.length, users_total: snapshot.users.value.totalElements ?? null, users_complete: false }), raw: skipped("no active API account was among the users read before the page walk stopped, so no credential record was requested."), errors: [] };
   }
   if (apiUsers.length === 0) return { finding: manualFinding(9, "high", "No active API service accounts were returned even though this request is authenticated with API credentials, so the credential inventory is unverifiable.", manualEvidence, { users_seen: snapshot.users.value.items.length }), raw: skipped("the user list carried no active API account, so no credential record was requested."), errors: [] };
-  const sampled = apiUsers.slice(0, 200);
+  const sampled = apiUsers.slice(0, MAX_CREDENTIAL_ACCOUNTS);
   const results = await Promise.all(sampled.map(async (user) => ({ user: userLabel(user), userId: asString(user.user_id) ?? "", credentials: await surface(() => client.getUserApiCredentials(asString(user.user_id) ?? "")) })));
   const errors = results.flatMap((item) => surfaceErrors(`api credentials (${item.user})`, item.credentials));
   const readable = results.filter((item) => item.credentials.status === "ok");

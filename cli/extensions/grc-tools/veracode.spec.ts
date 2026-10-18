@@ -82,6 +82,8 @@ export const VERACODE_FRAMEWORK_MAPPINGS: Readonly<Record<number, readonly [stri
 };
 // Each sampled analysis has at most this many of its returned scans inspected.
 export const MAX_DYNAMIC_SCANS_PER_ANALYSIS = 10;
+// The credential records of at most this many active API accounts are read, the first in user list order.
+export const MAX_CREDENTIAL_ACCOUNTS = 200;
 
 const series = (items: readonly string[], conjunction = "and"): string =>
   items.length <= 2 ? items.join(` ${conjunction} `) : `${items.slice(0, -1).join(", ")}, ${conjunction} ${items[items.length - 1]}`;
@@ -113,7 +115,10 @@ const BY_WORKSPACE = "keyed by the workspace's id read as text (empty text when 
 const REFUSAL = "a status outside 200 through 299 after retries, or a 2xx body that is not JSON, is a refusal";
 const halResponse = (key: string, records: string): string =>
   `A JSON object whose _embedded.${key} array holds ${records}, an entry that is not a JSON object being dropped (an _embedded that is itself an array is read in place of that array), and whose page object reports total_pages (else totalPages) and total_elements (else totalElements), each read as a number when present. An empty 2xx body, or JSON that is not an object, is read as a page holding no records; ${REFUSAL}.`;
-const SELF_RESPONSE = `A JSON object carrying at least one of ${series(USER_MEMBERS, "or")}; any other 2xx body, an empty one included, is a refusal, as is a status outside 200 through 299 after retries.`;
+const memberResponse = (members: readonly string[]): string =>
+  `A JSON object carrying at least one of ${series(members, "or")}; any other 2xx body, an empty one included, is a refusal, as is a status outside 200 through 299 after retries.`;
+const SELF_RESPONSE = memberResponse(USER_MEMBERS);
+const CREDENTIAL_RESPONSE = memberResponse(API_CREDENTIAL_MEMBERS);
 const SCAN_CONFIGURATION_RESPONSE = `A JSON object read for auth_configuration.authentications, whose members name the configured authentication methods, crawl_configuration.disabled and crawl_script_data, target_url (its url when it is an object), and scan_setting.allowed_hosts, else allowed_hosts. An empty 2xx body, or JSON that is not an object, is read as a configuration without authentication; ${REFUSAL}.`;
 const SUMMARY_REPORT_RESPONSE = `A JSON object whose static_analysis.modules.module array holds one static module per JSON object entry, each read for loc, numflawssev5, and numflawssev4. An empty 2xx body, or JSON that is not an object, is read as a report without static modules; ${REFUSAL}.`;
 const LINKED_PROJECTS_RESPONSE = `A JSON object whose linked_projects array holds one linked SCA agent project per JSON object entry. An empty 2xx body, or JSON that is not an object, is read as a response without linked projects; ${REFUSAL}.`;
@@ -173,6 +178,7 @@ const SCAN_COVERAGE_SURFACES: readonly BatchSurfaceDefinition[] = [
       "profile.policies.policy_compliance_status",
       "profile.business_criticality",
       "profile.business_unit.name",
+      "profile.teams",
       "profile.upload_and_scan_sca_enabled",
       "scans.scan_type",
       "scans.status",
@@ -336,7 +342,81 @@ const SCA_POSTURE_SURFACES: readonly BatchSurfaceDefinition[] = [
   ),
 ];
 
-const VERACODE_SURFACES: readonly BatchSurfaceDefinition[] = [...SCAN_COVERAGE_SURFACES, ...FINDINGS_HYGIENE_SURFACES, ...SCA_POSTURE_SURFACES];
+const ACCESS_CONTROL_SURFACES: readonly BatchSurfaceDefinition[] = [
+  surface(
+    "users",
+    IDENTITY_SERVICE,
+    IDENTITY_DOCS,
+    "/api/authn/v2/users",
+    [
+      "user_id",
+      "user_name",
+      "email_address",
+      "active",
+      "login_enabled",
+      "account_type",
+      "api_user",
+      "roles.role_name",
+      "teams",
+      "no_teams_required",
+      "last_login",
+      "saml_user",
+    ],
+    [param("detailed", "query", "true"), param("include_roles", "query", "true"), param("include_teams", "query", "true"), ...HAL_PAGE_PARAMETERS],
+    halResponse("users", "one user per entry"),
+    LIST_STAGE,
+  ),
+  surface(
+    "teams",
+    IDENTITY_SERVICE,
+    IDENTITY_DOCS,
+    "/api/authn/v2/teams",
+    [],
+    [
+      param("all_for_org", "query", "true", false, "On every page until a page is refused with status 400 or 403, after which the walk restarts from page 0 without it"),
+      ...HAL_PAGE_PARAMETERS,
+    ],
+    halResponse("teams", "one team per entry"),
+    `The collector exports the walk's result as read, ${WALK_EXPORT}, through ${CREDENTIAL_PASS}; decisions count the records and read no field. After a restart without all_for_org, notes ends with "all_for_org=true was refused (<status>), so only teams the API user is a member of were listed and the team inventory is a partial view."`,
+  ),
+  surface(
+    "roles",
+    IDENTITY_SERVICE,
+    IDENTITY_DOCS,
+    "/api/authn/v2/roles",
+    ["role_name", "ignore_team_restrictions"],
+    HAL_PAGE_PARAMETERS,
+    halResponse("roles", "one role per entry"),
+    LIST_STAGE,
+  ),
+  surface(
+    "api_credentials",
+    IDENTITY_SERVICE,
+    IDENTITY_DOCS,
+    "/api/authn/v2/api_credentials/user_id/{user_id}",
+    ["api_id", "created_ts", "expiration_ts", "revocation_ts", "last_used_ts"],
+    [pathId("user_id", "sampled API account")],
+    CREDENTIAL_RESPONSE,
+    `The collector keeps each sampled API account's api_id, created_ts, expiration_ts, revocation_ts, and last_used_ts, each read as text, else null; every other field is dropped, and the records are exported keyed by the account's user_id read as text (empty text when it has none) through ${CREDENTIAL_PASS}. Decisions read created_ts, expiration_ts, and revocation_ts. When no record was requested the dataset is a marker naming the reason.`,
+  ),
+  surface(
+    "self_api_credentials",
+    IDENTITY_SERVICE,
+    IDENTITY_DOCS,
+    "/api/authn/v2/api_credentials",
+    [],
+    [],
+    CREDENTIAL_RESPONSE,
+    "Only veracode_check_access requests it, to report whether it is readable; the record is neither exported nor read for a decision.",
+  ),
+];
+
+const VERACODE_SURFACES: readonly BatchSurfaceDefinition[] = [
+  ...SCAN_COVERAGE_SURFACES,
+  ...FINDINGS_HYGIENE_SURFACES,
+  ...SCA_POSTURE_SURFACES,
+  ...ACCESS_CONTROL_SURFACES,
+];
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
 const path = (name: string): VerdictOperand => ({ kind: "path", path: name });
@@ -346,6 +426,7 @@ const cmp = (op: Comparator, left: string | VerdictOperand, right: PortableValue
   left: typeof left === "string" ? path(left) : left,
   right: right !== null && typeof right === "object" && !Array.isArray(right) ? right as VerdictOperand : value(right as PortableValue),
 });
+const eq = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("eq", left, right);
 const ne = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("ne", left, right);
 const gt = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("gt", left, right);
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
@@ -359,8 +440,10 @@ const incomplete = (...complete: string[]): VerdictCondition =>
 const AS_NUMBER = "read as a number (a finite number, or a string that is not blank and parses as one)";
 const READS_AS_TEXT = "A value reads as text when it is a string that is not blank, trimmed, or a finite number, as ECMAScript writes it.";
 const PARSES_AS_DATE = "A value parses as a date when it reads as text and ECMAScript Date.parse reads that text.";
-const option = (name: string, fallback: number, max: number): string =>
-  `the ${name} argument ${AS_NUMBER}, else ${fallback}, truncated to a whole number and clamped to 1 through ${max}`;
+const argument = (name: string, fallback: number, max: number, min = 1): string =>
+  `${name} argument ${AS_NUMBER}, else ${fallback}, truncated to a whole number and clamped to ${min} through ${max}`;
+const option = (name: string, fallback: number, max: number): string => `the ${argument(name, fallback, max)}`;
+const IS_TRUE = "the boolean true or a string that trims to true in any letter case";
 const WHOLE_DAYS = "Whole days before the assessment time are the milliseconds from a date to the assessment time divided by 86400000 and rounded down.";
 const APPLICATION_SCANS = `An application's scans of a type are the JSON object entries of its scans array whose scan_type, read as text and uppercased, is that type. A scan is published when its status, read as text and uppercased, is ${series(COMPLETED_SCAN_STATUSES, "or")}, and an application's published date for a type is the latest modified_date that parses as a date among its published scans of that type. ${READS_AS_TEXT} ${PARSES_AS_DATE}`;
 const LISTED_SCANS = `An application's listed scans are the JSON object entries of its scans array, of every scan type, and a listed scan has failed when its status, read as text and uppercased, is ${series(FAILED_SCAN_STATUSES, "or")}. ${READS_AS_TEXT}`;
@@ -372,7 +455,7 @@ const FREQUENCY_REQUIREMENTS = `${ASSIGNED_POLICIES} Each resolved policy adds o
 const REQUIREMENT_OUTCOMES = `A counted requirement of type ANY is unconfirmed when the application's last_completed_scan_date does not parse as a date, and overdue when that date is more of the requirement's days in whole days before the assessment time. A counted requirement of another type is overdue when the application has no scan of that type, unconfirmed when it has none published or no published date for that type, and overdue when that published date is more of the requirement's days in whole days before the assessment time; an at-least-once requirement is never overdue by age. An application is overdue when one of its counted requirements is overdue, and otherwise unconfirmed when one is unconfirmed or one of its assigned policies does not resolve. ${APPLICATION_SCANS} ${WHOLE_DAYS}`;
 const SANDBOX_SAMPLE = `The sampled applications are the first N returned applications, N being ${option("max_applications", 100, 5000)}; each sampled application's sandbox list is read from GET /appsec/v1/applications/{application_guid}/sandboxes, its records being the entries that are JSON objects.`;
 const DYNAMIC_SAMPLE = `The sampled analyses are the first N returned Dynamic Analysis records, N being ${option("max_analyses", 25, 500)}. Each sampled analysis's scan list is read from GET /was/configservice/v1/analyses/{analysis_id}/scans, and the first ${MAX_DYNAMIC_SCANS_PER_ANALYSIS} returned scans of each are inspected by reading GET /was/configservice/v1/scans/{scan_id}/configuration.`;
-const SCAN_AUTH = "An inspected scan is unauthenticated when its configuration's auth_configuration.authentications is not a JSON object with at least one member, and crawl-disabled when it is not unauthenticated and its configuration's crawl_configuration.disabled is the boolean true or a string that trims to true in any letter case.";
+const SCAN_AUTH = `An inspected scan is unauthenticated when its configuration's auth_configuration.authentications is not a JSON object with at least one member, and crawl-disabled when it is not unauthenticated and its configuration's crawl_configuration.disabled is ${IS_TRUE}.`;
 const limit = (name: string, fallback: number, max: number): string => `the ${name} argument ${AS_NUMBER}, else ${fallback}, clamped to 0 through ${max}`;
 const FINDING_SAMPLE = `The sampled applications are the first N returned applications, N being ${option("max_applications", 100, 5000)}; each sampled application's finding list is read from GET /appsec/v2/applications/{application_guid}/findings with include_annot=TRUE, its findings being the entries that are JSON objects.`;
 const AGED_SEVERITIES = series(Object.keys(FLAW_AGE_THRESHOLDS), "or");
@@ -385,8 +468,13 @@ const SUMMARY_SAMPLE = `The sampled applications are the first N returned applic
 const STATIC_MODULES = `A summary report's static modules are the JSON object entries of its static_analysis.modules.module array, and its lines of code are the sum of their loc values, each ${AS_NUMBER}, else 0. A summary report counts lines of code when it has a static module and its lines of code are more than 0. ${SUMMARY_SAMPLE}`;
 const FLAW_DENSITY = `A summary report's flaw density is H / (L / 1000) in IEEE 754 double precision, L being its lines of code and H the sum of its static modules' numflawssev5 and numflawssev4 values, each ${AS_NUMBER}, else 0. ${STATIC_MODULES}`;
 const WORKSPACE_SAMPLE = `The sampled workspaces are the first N returned workspaces, N being ${option("max_workspaces", 25, 500)}. Each sampled workspace in turn has its open vulnerability issues read from GET /srcclr/v3/workspaces/{workspace_id}/issues with type=vulnerability and status=open, its open license issues from the same path with type=license and status=open, and its libraries from GET /srcclr/v3/workspaces/{workspace_id}/libraries, each list's records being the entries that are JSON objects.`;
-const UPLOAD_SCAN_SCA = "An application has upload-and-scan SCA when its profile.upload_and_scan_sca_enabled is the boolean true or a string that trims to true in any letter case.";
+const UPLOAD_SCAN_SCA = `An application has upload-and-scan SCA when its profile.upload_and_scan_sca_enabled is ${IS_TRUE}.`;
 const LINKED_PROJECT_SAMPLE = `${UPLOAD_SCAN_SCA} The sampled applications are the first N returned applications, N being ${option("max_applications", 100, 5000)}. When the GET /srcclr/v3/workspaces walk returned without a refusal and kept a workspace, each sampled application without upload-and-scan SCA has its linked project list read from GET /srcclr/v3/applications/{application_guid}/projects, its linked projects being the JSON object entries of the response's linked_projects array; otherwise no linked project list is requested.`;
+const USER_KINDS = `A user is active when its active is ${IS_TRUE}, and an API account when its account_type, read as text and uppercased, is API or its api_user is ${IS_TRUE}. An active human is an active user that is not an API account and whose login_enabled is ${IS_TRUE}. ${READS_AS_TEXT}`;
+const ROLE_NAMES = "A user's role names are the role_name values, read as text, of the JSON object entries of its roles.";
+const TEAM_LIST = "The team list is the GET /api/authn/v2/teams walk with all_for_org=true, or, when a page of that walk is refused with status 400 or 403, the same walk without all_for_org, which lists only the teams the API user is a member of.";
+const CREDENTIAL_SAMPLE = `The sampled API accounts are the first ${MAX_CREDENTIAL_ACCOUNTS} active API accounts in user list order, and each has its credential record read from GET /api/authn/v2/api_credentials/user_id/{user_id}. ${USER_KINDS}`;
+const CREDENTIAL_STATES = `A credential record is revoked when its revocation_ts reads as text, and dated when its created_ts and its expiration_ts both parse as dates. ${PARSES_AS_DATE}`;
 
 const VERACODE_INPUTS: Readonly<Record<string, string>> = {
   applications_readable: "True when the GET /appsec/v1/applications walk returned without a refusal.",
@@ -449,6 +537,29 @@ const VERACODE_INPUTS: Readonly<Record<string, string>> = {
   sca_uncovered_application_count: `Number of sampled applications without upload-and-scan SCA whose linked project list was read without a refusal and holds no linked project. ${LINKED_PROJECT_SAMPLE}`,
   sca_unchecked_application_count: `Number of sampled applications without upload-and-scan SCA whose linked project list was not requested because the GET /srcclr/v3/workspaces walk was refused or kept no workspace. ${LINKED_PROJECT_SAMPLE}`,
   linked_project_reads_complete: "Linked project read coverage.",
+  users_readable: "True when the GET /api/authn/v2/users walk returned without a refusal.",
+  user_count: "Number of users the walk kept, entries that are not JSON objects being dropped.",
+  roles_readable: "True when the GET /api/authn/v2/roles walk returned without a refusal.",
+  role_count: "Number of roles the walk kept, entries that are not JSON objects being dropped.",
+  teams_readable: `True when the team list was read without a refusal. ${TEAM_LIST}`,
+  team_count: `Number of teams the team list kept, entries that are not JSON objects being dropped. ${TEAM_LIST}`,
+  teams_member_only: `True when the team list was read by the walk without all_for_org. ${TEAM_LIST}`,
+  unrestricted_user_count: `Number of active humans with a role name equal to the role_name, read as text, of a returned role whose ignore_team_restrictions is ${IS_TRUE}. ${USER_KINDS} ${ROLE_NAMES}`,
+  max_unrestricted_users: `The ${argument("max_unrestricted_users", 10, 10000, 0)}.`,
+  application_without_team_count: "Number of applications the GET /appsec/v1/applications walk kept whose profile.teams holds no JSON object entry; 0 when that walk was refused.",
+  team_scope_complete: "Team access coverage.",
+  administrator_count: `Number of active users, API accounts included, with a role name that is administrator in any letter case. ${USER_KINDS} ${ROLE_NAMES}`,
+  max_admins: `The ${argument("max_admins", 5, 10000, 0)}.`,
+  inactive_user_count: `Number of active humans whose last_login parses as a date more than N whole days before the assessment time, N being ${option("inactive_days", 90, 3650)}. ${USER_KINDS} ${PARSES_AS_DATE} ${WHOLE_DAYS}`,
+  users_without_last_login_count: `Number of active humans whose last_login does not parse as a date. ${USER_KINDS} ${PARSES_AS_DATE}`,
+  api_account_without_team_count: `Number of active API accounts whose teams holds no JSON object entry and whose no_teams_required is not ${IS_TRUE}. ${USER_KINDS}`,
+  users_complete: "User list coverage.",
+  active_api_account_count: `Number of active API accounts among the users the walk kept. ${USER_KINDS}`,
+  credential_record_read_count: `Number of sampled API accounts whose credential record was read without a refusal. ${CREDENTIAL_SAMPLE}`,
+  aged_credential_count: `Number of credential records read without a refusal that are unrevoked and dated and whose created_ts is more than N whole days before the assessment time, N being ${option("max_credential_age_days", 365, 3650)}. ${CREDENTIAL_STATES} ${CREDENTIAL_SAMPLE} ${WHOLE_DAYS}`,
+  undated_credential_count: `Number of credential records read without a refusal that are unrevoked and not dated. ${CREDENTIAL_STATES} ${CREDENTIAL_SAMPLE}`,
+  expired_credential_count: `Number of credential records read without a refusal that are unrevoked and dated and whose expiration_ts is before the assessment time, whatever their age. ${CREDENTIAL_STATES} ${CREDENTIAL_SAMPLE}`,
+  credential_reads_complete: "API credential read coverage.",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -522,6 +633,23 @@ const LINKED_PROJECT_READS_COMPLETE: BatchCompletenessDefinition = {
     { surfaceId: "applications", falseWhen: ["truncated", "error", "denied"] },
     { surfaceId: "sca_workspaces", falseWhen: ["error", "denied"] },
     { surfaceId: "sca_application_projects", falseWhen: ["error", "denied", "not-collected"] },
+  ],
+};
+const USERS_COMPLETE = halWalkComplete("users", "user list");
+const TEAM_SCOPE_COMPLETE: BatchCompletenessDefinition = {
+  semantics: `false when the team access reads do not cover the whole organization: the user, role, or team list read was refused or is partial because ${walkPartial(50)}; the team list was read without all_for_org, so it lists only the API user's own teams; or the application inventory read was refused or is partial because ${walkPartial(50)}. ${TEAM_LIST}`,
+  sources: [
+    { surfaceId: "users", falseWhen: ["truncated", "error", "denied"] },
+    { surfaceId: "roles", falseWhen: ["truncated", "error", "denied"] },
+    { surfaceId: "teams", falseWhen: ["truncated", "error", "denied"] },
+    { surfaceId: "applications", falseWhen: ["truncated", "error", "denied"] },
+  ],
+};
+const CREDENTIAL_READS_COMPLETE: BatchCompletenessDefinition = {
+  semantics: `false when the credential reads do not cover every active API account: the user list read was refused or is partial because ${walkPartial(50)}; the user list holds more than ${MAX_CREDENTIAL_ACCOUNTS} active API accounts; or a sampled API account's credential record was refused. ${CREDENTIAL_SAMPLE}`,
+  sources: [
+    { surfaceId: "users", falseWhen: ["truncated", "error", "denied"] },
+    { surfaceId: "api_credentials", falseWhen: ["error", "denied", "not-collected"] },
   ],
 };
 
@@ -1325,6 +1453,207 @@ const SCA_POSTURE_CHECKS: readonly VeracodeCheck[] = [
   },
 ];
 
+const ACCESS_CONTROLS = "veracode_assess_access_controls";
+const USERS_GATE = [rule("manual", ne("users_readable", true)), rule("manual", not(gt("user_count", 0)))];
+const USERS_READ = { users_readable: true, user_count: 40 };
+const EMPTY_USERS = example("partial", "manual", "The user list came back empty, which cannot be complete because the API credential belongs to a user.", {
+  ...USERS_READ,
+  user_count: 0,
+});
+const UNREADABLE_USERS = example("unreadable", "manual", "The user list was refused.", { users_readable: false });
+const TEAM_ACCESS_HEALTHY = {
+  ...USERS_READ,
+  roles_readable: true,
+  role_count: 30,
+  teams_readable: true,
+  team_count: 6,
+  teams_member_only: false,
+  unrestricted_user_count: 3,
+  max_unrestricted_users: 10,
+  application_without_team_count: 0,
+  team_scope_complete: true,
+};
+const USER_ROLES_HEALTHY = {
+  ...USERS_READ,
+  administrator_count: 3,
+  max_admins: 5,
+  inactive_user_count: 0,
+  users_without_last_login_count: 0,
+  api_account_without_team_count: 0,
+  users_complete: true,
+};
+const CREDENTIALS_HEALTHY = {
+  ...USERS_READ,
+  active_api_account_count: 4,
+  credential_record_read_count: 4,
+  aged_credential_count: 0,
+  undated_credential_count: 0,
+  expired_credential_count: 0,
+  credential_reads_complete: true,
+};
+
+const ACCESS_CONTROL_CHECKS: readonly VeracodeCheck[] = [
+  {
+    id: "VERACODE-07",
+    control: 7,
+    title: "Team access controls",
+    severity: "high",
+    owner: ACCESS_CONTROLS,
+    surfaces: ["users", "roles", "teams", "applications"],
+    inputs: [
+      "users_readable",
+      "user_count",
+      "roles_readable",
+      "role_count",
+      "teams_readable",
+      "team_count",
+      "teams_member_only",
+      "unrestricted_user_count",
+      "max_unrestricted_users",
+      "application_without_team_count",
+      "team_scope_complete",
+    ],
+    rules: [
+      ...USERS_GATE,
+      rule("manual", ne("roles_readable", true)),
+      rule("manual", ne("teams_readable", true)),
+      rule("manual", not(gt("role_count", 0))),
+      rule("manual", all(not(gt("team_count", 0)), eq("teams_member_only", true))),
+      rule("fail", not(gt("team_count", 0))),
+      rule("fail", gt("unrestricted_user_count", path("max_unrestricted_users"))),
+      rule("warn", gt("application_without_team_count", 0)),
+      rule("warn", incomplete("team_scope_complete")),
+      rule("pass", always),
+    ],
+    completeness: { team_scope_complete: TEAM_SCOPE_COMPLETE },
+    decision: "Manual when the user, role, or team list is unreadable, the user or role list is empty, or the organization-wide team list was refused and the API user is a member of no team. Fail when the organization-wide team list holds no team, since no team then scopes application access, or when more than max_unrestricted_users active human users hold a role that ignores team restrictions. Warn when an application has no team assigned. Warn instead of pass when the user, role, or team list is partial, the team list covers only the API user's own teams, or the application inventory is unreadable or partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Six teams scope access, every application has a team, and three active users hold team-unrestricted roles against a maximum of 10.", TEAM_ACCESS_HEALTHY),
+      example("noncompliant", "fail", "Twelve active users hold roles that ignore team restrictions, against a maximum of 10.", {
+        ...TEAM_ACCESS_HEALTHY,
+        unrestricted_user_count: 12,
+      }),
+      example("noncompliant", "fail", "The organization-wide team list holds no team, so no team scopes application access.", { ...TEAM_ACCESS_HEALTHY, team_count: 0 }),
+      example("noncompliant", "warn", "Two applications have no team assigned, so only team-unrestricted roles can see them.", {
+        ...TEAM_ACCESS_HEALTHY,
+        application_without_team_count: 2,
+      }),
+      example("partial", "warn", "The organization-wide team list was refused, so only the API user's own teams were listed.", {
+        ...TEAM_ACCESS_HEALTHY,
+        team_count: 2,
+        teams_member_only: true,
+        team_scope_complete: false,
+      }),
+      example("partial", "warn", "The application inventory was refused, so application team assignment was not verified.", {
+        ...TEAM_ACCESS_HEALTHY,
+        team_scope_complete: false,
+      }),
+      example("partial", "manual", "The organization-wide team list was refused and the API user is a member of no team.", {
+        ...TEAM_ACCESS_HEALTHY,
+        team_count: 0,
+        teams_member_only: true,
+        team_scope_complete: false,
+      }),
+      example("partial", "manual", "The role list came back empty, though Veracode ships built-in roles.", { ...TEAM_ACCESS_HEALTHY, role_count: 0 }),
+      example("unreadable", "manual", "The team list was refused.", { ...TEAM_ACCESS_HEALTHY, teams_readable: false, team_count: 0, team_scope_complete: false }),
+      example("unreadable", "manual", "The role list was refused.", { ...TEAM_ACCESS_HEALTHY, roles_readable: false, role_count: 0, team_scope_complete: false }),
+      EMPTY_USERS,
+      UNREADABLE_USERS,
+    ],
+  },
+  {
+    id: "VERACODE-08",
+    control: 8,
+    title: "User role audit",
+    severity: "high",
+    owner: ACCESS_CONTROLS,
+    surfaces: ["users"],
+    inputs: [
+      "users_readable",
+      "user_count",
+      "administrator_count",
+      "max_admins",
+      "inactive_user_count",
+      "users_without_last_login_count",
+      "api_account_without_team_count",
+      "users_complete",
+    ],
+    rules: [
+      ...USERS_GATE,
+      rule("fail", any(gt("inactive_user_count", 0), gt("api_account_without_team_count", 0), gt("administrator_count", path("max_admins")))),
+      rule("warn", gt("users_without_last_login_count", 0)),
+      rule("warn", incomplete("users_complete")),
+      rule("pass", always),
+    ],
+    completeness: { users_complete: USERS_COMPLETE },
+    decision: "Manual when the user list is unreadable or empty. Fail when an active human user last logged in more than inactive_days ago, an active API account has no team and does not set no_teams_required, or more than max_admins active users, API accounts included, hold the Administrator role. Warn when an active human user exposes no readable last_login. Warn instead of pass when the user list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Three active users hold the Administrator role against a maximum of 5, every active human user logged in within inactive_days, and every active API account has a team.", USER_ROLES_HEALTHY),
+      example("noncompliant", "fail", "Seven active users hold the Administrator role, against a maximum of 5.", { ...USER_ROLES_HEALTHY, administrator_count: 7 }),
+      example("noncompliant", "fail", "Two active human users have not logged in within inactive_days.", { ...USER_ROLES_HEALTHY, inactive_user_count: 2 }),
+      example("noncompliant", "fail", "One active API account has no team and does not set no_teams_required.", { ...USER_ROLES_HEALTHY, api_account_without_team_count: 1 }),
+      example("partial", "warn", "Three active human users expose no last_login.", { ...USER_ROLES_HEALTHY, users_without_last_login_count: 3 }),
+      example("partial", "warn", "The user walk stopped at its page cap.", { ...USER_ROLES_HEALTHY, users_complete: false }),
+      EMPTY_USERS,
+      UNREADABLE_USERS,
+    ],
+  },
+  {
+    id: "VERACODE-09",
+    control: 9,
+    title: "API credential management",
+    severity: "high",
+    owner: ACCESS_CONTROLS,
+    surfaces: ["users", "api_credentials"],
+    inputs: [
+      "users_readable",
+      "user_count",
+      "active_api_account_count",
+      "credential_record_read_count",
+      "aged_credential_count",
+      "undated_credential_count",
+      "expired_credential_count",
+      "credential_reads_complete",
+    ],
+    rules: [
+      ...USERS_GATE,
+      rule("manual", not(gt("active_api_account_count", 0))),
+      rule("manual", not(gt("credential_record_read_count", 0))),
+      rule("fail", gt("aged_credential_count", 0)),
+      rule("warn", any(gt("undated_credential_count", 0), gt("expired_credential_count", 0))),
+      rule("warn", incomplete("credential_reads_complete")),
+      rule("pass", always),
+    ],
+    completeness: { credential_reads_complete: CREDENTIAL_READS_COMPLETE },
+    decision: "Manual when the user list is unreadable or empty, when no active API account is among the users read, which a partial user list leaves unread rather than empty, or when no sampled API account's credential record could be read. Fail when an unrevoked credential was created more than max_credential_age_days ago. Warn when an unrevoked credential lacks a readable created_ts or expiration_ts, or has expired without being revoked. Warn instead of pass when the credential reads do not cover every active API account. Otherwise pass, including when every credential read is revoked.",
+    examples: [
+      example("compliant", "pass", "Every unrevoked credential of the four active API accounts was created within max_credential_age_days and carries an expiration_ts.", CREDENTIALS_HEALTHY),
+      example("noncompliant", "fail", "One unrevoked credential was created more than max_credential_age_days ago.", { ...CREDENTIALS_HEALTHY, aged_credential_count: 1 }),
+      example("partial", "warn", "One credential expired but was never revoked.", { ...CREDENTIALS_HEALTHY, expired_credential_count: 1 }),
+      example("partial", "warn", "One unrevoked credential carries no expiration_ts.", { ...CREDENTIALS_HEALTHY, undated_credential_count: 1 }),
+      example("partial", "warn", "One sampled API account's credential record was refused.", {
+        ...CREDENTIALS_HEALTHY,
+        credential_record_read_count: 3,
+        credential_reads_complete: false,
+      }),
+      example("partial", "manual", "No active API account was among the users read before the user walk stopped, so the credential inventory is unread rather than empty.", {
+        ...CREDENTIALS_HEALTHY,
+        active_api_account_count: 0,
+        credential_record_read_count: 0,
+        credential_reads_complete: false,
+      }),
+      example("partial", "manual", "The user list holds no active API account.", { ...CREDENTIALS_HEALTHY, active_api_account_count: 0, credential_record_read_count: 0 }),
+      example("unreadable", "manual", "Every sampled API account's credential record was refused.", {
+        ...CREDENTIALS_HEALTHY,
+        credential_record_read_count: 0,
+        credential_reads_complete: false,
+      }),
+      EMPTY_USERS,
+      UNREADABLE_USERS,
+    ],
+  },
+];
+
 const toCheck = (check: VeracodeCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   const [fedramp, cmmc, soc2, cis, pciDss, disaStig, irap, ismap] = VERACODE_FRAMEWORK_MAPPINGS[check.control];
@@ -1360,6 +1689,7 @@ const checks: readonly BatchCheckDefinition[] = [
   ...POLICY_COMPLIANCE_CHECKS,
   ...FINDINGS_HYGIENE_CHECKS,
   ...SCA_POSTURE_CHECKS,
+  ...ACCESS_CONTROL_CHECKS,
 ].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
@@ -1425,7 +1755,7 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
   displayName: "Veracode Security Inspector",
   vendor: "Veracode",
   category: "application-security",
-  summary: "Portable contract for the shipped Veracode scan coverage, policy compliance, findings hygiene, and SCA posture assessments over the Veracode Applications, Policy, Identity, Dynamic Analysis, Findings, Summary Report, and SCA Agent REST APIs.",
+  summary: "Portable contract for the shipped Veracode scan coverage, policy compliance, findings hygiene, SCA posture, and access control assessments over the Veracode Applications, Policy, Identity, Dynamic Analysis, Findings, Summary Report, and SCA Agent REST APIs.",
   sourceModule: "cli/extensions/grc-tools/veracode.ts",
   baseServices: [APPLICATIONS_SERVICE, POLICY_SERVICE, IDENTITY_SERVICE, DYNAMIC_SERVICE, FINDINGS_SERVICE, SUMMARY_REPORT_SERVICE, SCA_SERVICE],
   authentication: VERACODE_AUTH_RESOLVER,
@@ -1434,7 +1764,8 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
       id: "api-user",
       kind: "role",
       value: "Any Veracode API user",
-      unlocks: ["self"],
+      unlocks: ["self", "self_api_credentials"],
+      notes: "The Identity REST API documentation lets an account without the Admin API or Administrator role read its own user record and API credentials.",
     },
     {
       id: "application-reader",
@@ -1464,6 +1795,13 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
       unlocks: ["sca_workspaces", "sca_vulnerability_issues", "sca_license_issues", "sca_libraries", "sca_application_projects"],
       notes: "veracode_check_access names these roles for the workspace list; the SCA REST API documentation requires the API credentials of a UI user account and does not support API user accounts.",
     },
+    {
+      id: "identity-administrator",
+      kind: "role",
+      value: "Administrator role",
+      unlocks: ["users", "teams", "roles", "api_credentials"],
+      notes: "veracode_check_access names this role for users, teams, and roles; the Identity REST API documentation names an API user account with the Admin API role or a user account with the Administrator role, and reading another user's API credentials needs the Administrator role or being that user's administrator.",
+    },
   ],
   surfaces: VERACODE_SURFACES,
   checks,
@@ -1473,10 +1811,16 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
     veracode_assess_policy_compliance: idsFor(POLICY_COMPLIANCE),
     veracode_assess_findings_hygiene: idsFor(FINDINGS_HYGIENE),
     veracode_assess_sca_posture: idsFor(SCA_POSTURE),
+    veracode_assess_access_controls: idsFor(ACCESS_CONTROLS),
     veracode_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
-    halWalk(["applications", "policies", "dynamic_analyses", "sca_workspaces"], "records", { pageCap: 50, probed: true }),
+    halWalk(["applications", "policies", "dynamic_analyses", "sca_workspaces", "users", "roles"], "records", { pageCap: 50, probed: true }),
+    halWalk(["teams"], "teams", {
+      pageCap: 50,
+      probed: true,
+      scope: "The team list is walked with all_for_org=true; when a page of that walk is refused with status 400 or 403, the walk restarts from page 0 without it, and only the restarted walk's pages are kept. ",
+    }),
     halWalk(["sandboxes"], "sandboxes", { pageCap: 10, scope: "Each sampled application's sandbox list is walked separately. " }),
     halWalk(["findings"], "findings", { pageCap: 50, pageSize: 500, scope: "Each sampled application's finding list is walked separately. " }),
     halWalk(["dynamic_analysis_scans"], "scans", { pageCap: 5, scope: "Each sampled analysis's scan list is walked separately. " }),
@@ -1486,6 +1830,8 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
     singleRead(["summary_reports"], "One read of each sampled application's summary report."),
     singleRead(["dynamic_scan_configurations"], "One read of each inspected scan's configuration."),
     singleRead(["sca_application_projects"], "One read of each requested linked project list."),
+    singleRead(["api_credentials"], `One read of each sampled API account's credential record, at most ${MAX_CREDENTIAL_ACCOUNTS}, all requested at once.`),
+    singleRead(["self_api_credentials"], "One read of the API user's own API credentials, by veracode_check_access only."),
   ],
   rateLimit: {
     documentedLimit: "Veracode documents 500 REST API calls per minute from one IP address, answering a 429 with a retry-after time in seconds beyond it; the collector reads neither the limit nor the retry-after time.",
@@ -1503,6 +1849,7 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
     "VERACODE-16 skips a finding list that kept no finding before checking whether that list is partial, so a truncated empty list does not lower fp_rate_coverage_complete and the check can pass without that application's rate; changing that behavior requires a separate runtime fix.",
     "VERACODE-06 can pass when the license issue lists read hold no issue, even when the sampled workspaces hold no scanned library, though VERACODE-05 treats an empty library set as unverifiable.",
     "VERACODE-18 counts an application as covered when its profile enables upload-and-scan SCA or it has a linked SCA agent project, without checking that either has produced a scan.",
+    "VERACODE-07 fails when the organization-wide team list kept no team even when that list is partial, for example when its only page is empty but reports a positive total_elements.",
     "The SCA REST API documentation asks for a user-agent header and accept-encoding: gzip on every request; the collector sets neither itself and relies on Node.js fetch, which sends user-agent: node and accept-encoding: gzip, deflate.",
   ],
   sensitiveFields: ["api_key_id", "api_key_secret", "veracode_api_key_id", "veracode_api_key_secret", "Authorization", "authentications", "crawl_script_data"],
