@@ -1,0 +1,51 @@
+name: Bug report
+description: grclanker crashed, rejected a valid command, or reported a result the data does not support
+title: ""
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste API keys, tokens, passwords, or tenant data. Redact them before you file.
+
+        A security vulnerability does not belong here. Read https://github.com/ethanolivertroy/grclanker/blob/main/SECURITY.md and do not open a public issue for it.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The command you ran and the output you got. Include the tool name if you called one.
+      placeholder: grclanker tools
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: Quote the docs or the help text you were following, if you have it.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release bundle (for example v0.1.2) or the git commit if you built from source. There is no grclanker version command.
+      placeholder: v0.1.2
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Operating system and architecture.
+      placeholder: macOS arm64
+    validations:
+      required: true
+  - type: input
+    id: backend
+    attributes:
+      label: Compute backend
+      description: The kind from grclanker env list, if the bug is about execution rather than a domain tool.
+      placeholder: host
+    validations:
+      required: false

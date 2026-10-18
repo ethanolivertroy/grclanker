@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ethanolivertroy/grclanker/blob/main/SECURITY.md
+    about: Do not open a public issue. Read SECURITY.md first.
+  - name: Documentation
+    url: https://grclanker.com/docs/
+    about: Install, setup, workflows, and the tool catalog.

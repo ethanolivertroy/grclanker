@@ -1,0 +1,34 @@
+name: Feature request
+description: A tool, workflow, or docs change you want
+title: ""
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste API keys, tokens, passwords, or tenant data.
+
+        Read https://github.com/ethanolivertroy/grclanker/blob/main/AGENTS.md before proposing a new integration. That file is the layout a new tool family has to follow.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you cannot do today, and who hits it.
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: Change you want
+      description: The behavior you want, including the command or tool name if you have one in mind.
+    validations:
+      required: true
+  - type: input
+    id: integration
+    attributes:
+      label: Integration
+      description: Leave blank if this is not about a specific product.
+      placeholder: Okta
+    validations:
+      required: false
