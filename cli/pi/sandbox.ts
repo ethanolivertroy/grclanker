@@ -12,6 +12,7 @@ import { basename, dirname, relative, resolve, sep } from "node:path";
 import { minimatch } from "minimatch";
 import {
   SandboxManager,
+  type FilesystemPathEntry,
   type SandboxRuntimeConfig,
 } from "@anthropic-ai/sandbox-runtime";
 import { getGrclankerSandboxConfigPath } from "../config/paths.js";
@@ -121,10 +122,17 @@ function canonicalizePath(targetPath: string): string {
   return suffix.length > 0 ? resolve(canonicalParent, suffix) : canonicalParent;
 }
 
-function matchesRule(absolutePath: string, rule: string, cwd: string): boolean {
+function rulePath(rule: FilesystemPathEntry): string {
+  if (typeof rule === "string") return rule;
+  if (rule?.literal === true && typeof rule.path === "string") return rule.path;
+  throw new Error('Sandbox filesystem rules must be a path or { "path": "<path>", "literal": true }.');
+}
+
+function matchesRule(absolutePath: string, rule: FilesystemPathEntry, cwd: string): boolean {
   const normalizedPath = canonicalizePath(absolutePath);
   const normalizedCwd = canonicalizePath(cwd);
-  const expandedRule = expandHome(rule);
+  const expandedRule = expandHome(rulePath(rule));
+  const isPattern = typeof rule === "string" && hasGlob(expandedRule);
 
   if (expandedRule === ".") {
     return isWithin(normalizedCwd, normalizedPath);
@@ -132,12 +140,12 @@ function matchesRule(absolutePath: string, rule: string, cwd: string): boolean {
 
   if (expandedRule.startsWith("/")) {
     const absoluteRule = canonicalizePath(expandedRule);
-    return hasGlob(expandedRule)
+    return isPattern
       ? minimatch(normalizedPath, absoluteRule, { dot: true, matchBase: true })
       : isWithin(absoluteRule, normalizedPath);
   }
 
-  if (!hasGlob(expandedRule)) {
+  if (!isPattern) {
     return isWithin(canonicalizePath(resolve(normalizedCwd, expandedRule)), normalizedPath);
   }
 
