@@ -241,7 +241,7 @@ export interface Knowbe4Collected<T> {
   endpoint?: string;
   /** The read is partial: it stopped at a cap while the API could still hold more records, or for truncationReason. */
   truncated?: boolean;
-  /** Why a truncated read stopped when the reason was not its cap (see Knowbe4Listing.truncationReason). */
+  /** Why a truncated read stopped when its cap was not the whole reason (see Knowbe4Listing.truncationReason). */
   truncationReason?: string;
   /** Server-reported total when the API exposes one (PhishER pagination). */
   total?: number;
@@ -259,7 +259,8 @@ export interface Knowbe4Listing {
   /**
    * Present when the listing stopped short for a reason other than its cap: the server returned an empty page or
    * ended paging while still reporting more records, repeated its page key, or returned an entry that is not a JSON
-   * object. Raising the cap does not read further.
+   * object (the reason then also names the cap if the walk reached it on that page). Raising the cap cannot complete
+   * the listing.
    */
   truncationReason?: string;
   /** The request the listing made, as "METHOD /path[?filters]" without the pagination parameters. */
@@ -1382,9 +1383,9 @@ export class Knowbe4ApiClient {
    * Walks page/per_page pagination up to limit items. The Reporting API returns bare arrays with no total, so the
    * only completion signal is a short page: the listing is reported truncated whenever the loop stopped at the cap
    * while the last page was still full (more pages may exist) or while items were dropped from it. A page holding an
-   * entry that is not a JSON object ends the walk truncated as well, with a truncationReason: the entry may be a
-   * record no check can read, and paging on would let a server returning only such entries, which never count toward
-   * the cap, keep the walk going without end.
+   * entry that is not a JSON object ends the walk truncated as well, with a truncationReason that also names the cap
+   * when the walk reached it on that page: the entry may be a record no check can read, and paging on would let a
+   * server returning only such entries, which never count toward the cap, keep the walk going without end.
    */
   async list(
     path: string,
@@ -1409,7 +1410,8 @@ export class Knowbe4ApiClient {
       items.push(...pageItems.slice(0, room));
       if (dropped > 0) {
         truncated = true;
-        truncationReason = `the server returned ${dropped === 1 ? "an entry that is not a JSON object" : `${dropped} entries that are not JSON objects`} on page ${page}`;
+        const reachedCap = pageItems.length > room || (entries.length >= pageSize && items.length >= limit);
+        truncationReason = `the server returned ${dropped === 1 ? "an entry that is not a JSON object" : `${dropped} entries that are not JSON objects`} on page ${page}${reachedCap ? `, where the walk also reached its cap of ${limit} records` : ""}`;
         break;
       }
       if (pageItems.length > room) {

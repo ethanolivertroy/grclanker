@@ -1785,6 +1785,17 @@ test("verdict rule 10: a Reporting API page holding an entry that is not a JSON 
   assert.equal(short.truncated, true);
   assert.equal(short.truncationReason, "the server returned 2 entries that are not JSON objects on page 1");
 
+  // The reason names the cap as well when the walk reached it on that page, so a cap stop is never hidden behind the entry.
+  const cutPage = served({ 1: [{ id: 1 }, { id: 2 }, { id: 3 }], 2: [{ id: 4 }, { id: 5 }, null] });
+  const cut = await cutPage.list("/v1/users", {}, { limit: 4, pageSize: 3 });
+  assert.deepEqual(cut.items.map((item) => item.id), [1, 2, 3, 4], "the cap still keeps only the records it has room for");
+  assert.equal(cut.truncated, true);
+  assert.equal(cut.truncationReason, "the server returned an entry that is not a JSON object on page 2, where the walk also reached its cap of 4 records");
+  const filled = await served({ 1: [{ id: 1 }, { id: 2 }, null] }).list("/v1/users", {}, { limit: 2, pageSize: 3 });
+  assert.equal(filled.truncationReason, "the server returned an entry that is not a JSON object on page 1, where the walk also reached its cap of 2 records", "a full page that brings the records kept to the cap names the cap");
+  const ended = await served({ 1: [{ id: 1 }, { id: 2 }, null] }).list("/v1/users", {}, { limit: 2, pageSize: 5 });
+  assert.equal(ended.truncationReason, "the server returned an entry that is not a JSON object on page 1", "a short page that fits under the cap ends the list, so the cap is not named");
+
   const probed = served({ 1: [null] });
   assert.deepEqual(await probed.probe("/v1/users"), []);
   assert.equal(probed.getRequestCount(), 1, "the access probe still makes one request");
