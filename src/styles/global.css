@@ -1246,6 +1246,7 @@ details[open] > .agent-group-toggle::before {
 
 #nd-sidebar a,
 .docs-sidebar-link,
+.docs-sidebar-folder,
 #nd-toc a,
 [data-toc-popover-content] a {
   font-family: var(--docs-font-body);
@@ -1264,6 +1265,14 @@ details[open] > .agent-group-toggle::before {
 .docs-sidebar-link.is-active {
   border-left-color: var(--docs-accent-strong);
   color: var(--docs-title);
+}
+
+.docs-sidebar-folder {
+  padding: 0.38rem 0.75rem;
+  border-left: 2px solid transparent;
+  color: var(--docs-label);
+  font-size: var(--text-sm);
+  font-weight: 600;
 }
 
 .docs-sidebar-children {
@@ -1343,7 +1352,8 @@ details[open] > .agent-group-toggle::before {
   box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.25), 0 4px 6px -4px rgb(0 0 0 / 0.25);
 }
 
-.docs-menu-panel .docs-sidebar-link {
+.docs-menu-panel .docs-sidebar-link,
+.docs-menu-panel .docs-sidebar-folder {
   padding-block: 0.75rem;
 }
 

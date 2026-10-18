@@ -28,11 +28,17 @@ function DocsMenuNode({ node, path }: { node: PageTree.Node; path: PageTree.Node
       return <div className="docs-sidebar-title">{node.name}</div>;
     case 'page':
       return <DocsMenuLink item={node} path={path} />;
-    case 'folder':
+    case 'folder': {
+      // A folder without an index page has no link that opens it, so its pages always show.
+      const open = !node.index || path.includes(node);
       return (
         <div>
-          {node.index ? <DocsMenuLink item={node.index} path={path} /> : null}
-          {path.includes(node) ? (
+          {node.index ? (
+            <DocsMenuLink item={node.index} path={path} />
+          ) : (
+            <div className="docs-sidebar-folder">{node.name}</div>
+          )}
+          {open ? (
             <div className="docs-sidebar-children">
               {node.children.map((child, i) => (
                 <DocsMenuNode key={i} node={child} path={path} />
@@ -41,6 +47,7 @@ function DocsMenuNode({ node, path }: { node: PageTree.Node; path: PageTree.Node
           ) : null}
         </div>
       );
+    }
     default: {
       const unhandled: never = node;
       return unhandled;
