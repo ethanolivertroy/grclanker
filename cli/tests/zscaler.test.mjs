@@ -763,6 +763,16 @@ test("assessZiaPolicy collects through the client, follows sub-locations, and re
     listCloudAppRuleTypes: async () => ["WEBMAIL"],
     listCloudAppRules: async () => [],
   };
+  const collected = await collectZiaPolicyData(client);
+  assert.equal(collected.webDlpRules.truncated, false);
+  assert.equal(collected.webDlpRules.seen, 1);
+  assert.equal(collected.dlpEngines.seen, 1);
+  assert.equal(collected.dnsRules.seen, 1);
+  assert.equal(collected.sandboxRules.seen, 1);
+  assert.equal(collected.bandwidthRules.seen, 1);
+  assert.equal(collected.isolationProfiles.seen, 1);
+  assert.equal(collected.sslInspectionRules.truncated, false);
+  calls.length = 0;
   const result = await assessZiaPolicy(client);
   assert.deepEqual(calls, ["7"]);
   assert.equal(result.summary.sub_locations, 1);
@@ -1726,6 +1736,9 @@ test("schema: the real clients send exactly the documented path and query for ev
 
   const access = await collectZiaAccessControlData(zia);
   const policy = await collectZiaPolicyData(zia);
+  assert.equal(access.adminRoles.truncated, false);
+  assert.equal(access.adminRoles.seen, 1);
+  assert.equal(access.nssFeeds.seen, 1);
   const zpaData = await collectZpaData(zpa);
   await zia.logout();
   for (const dataset of [...Object.values(access), ...Object.values(policy), ...Object.values(zpaData).filter((value) => value instanceof Date === false)]) {
@@ -1978,23 +1991,45 @@ function singleDatasetTruncationCases() {
   return cases;
 }
 
-test("parent-parity truncation replay covers all 41 ZIA-policy and ZPA single-dataset paths and records the known pass limitation", () => {
+test("single-dataset truncation caps every dependent ZIA-policy and ZPA finding below pass and names seen versus total", () => {
   const cases = singleDatasetTruncationCases();
   assert.equal(cases.length, 41);
-  const limitationIds = new Set();
-  let limitationCount = 0;
+  const stillPassing = [];
+  const namesSeenVersusTotal = new Set(["ZS-03", "ZS-04", "ZS-05", "ZS-16", "ZS-17", "ZS-20", "ZS-25"]);
   for (const { suite, dataset, result } of cases) {
     const [, dependency] = UNREADABLE_DATASET_DEPENDENTS[suite][dataset];
     for (const id of [...(dependency.primary ?? []), ...(dependency.secondary ?? [])]) {
       const item = findingById(result, id);
-      if (item.status === "pass") {
-        limitationCount += 1;
-        limitationIds.add(id);
+      if (item.status === "pass") stillPassing.push(`${dataset}->${id}`);
+      if (namesSeenVersusTotal.has(id)) {
+        assert.equal(item.status, "warn", `${dataset}->${id}: ${item.summary}`);
+        assert.match(item.summary, /inventory is partial/, `${dataset}->${id}: ${item.summary}`);
+        assert.match(item.summary, /200 of 201 pages/, `${dataset}->${id}: ${item.summary}`);
       }
     }
   }
-  assert.equal(limitationCount, 16);
-  assert.deepEqual([...limitationIds].sort(), ["ZS-03", "ZS-04", "ZS-05", "ZS-16", "ZS-17", "ZS-20", "ZS-25"]);
+  assert.deepEqual(stillPassing, []);
+});
+
+test("truncated admin roles, password expiry, and the audit log report cap ZS-07 and ZS-14 at warn", () => {
+  const partial = (dataset) => ({ ...dataset, truncated: true, seen: 200, total: 201 });
+  const roles = accessControlFixture();
+  roles.adminRoles = partial(roles.adminRoles);
+  const roleResult = assessZiaAccessControlData(roles);
+  assert.equal(findingById(roleResult, "ZS-07").status, "warn");
+  assert.match(findingById(roleResult, "ZS-07").summary, /administrator role inventory is partial \(.*200 of 201 pages\)/);
+
+  const expiry = accessControlFixture();
+  expiry.passwordExpiry = partial(expiry.passwordExpiry);
+  const expiryResult = assessZiaAccessControlData(expiry);
+  assert.equal(findingById(expiryResult, "ZS-07").status, "warn");
+  assert.match(findingById(expiryResult, "ZS-07").summary, /password expiry inventory is partial \(200 of 201 pages\)/);
+
+  const audit = accessControlFixture();
+  audit.auditLogReport = partial(audit.auditLogReport);
+  const auditResult = assessZiaAccessControlData(audit);
+  assert.equal(findingById(auditResult, "ZS-14").status, "warn");
+  assert.match(findingById(auditResult, "ZS-14").summary, /audit log report inventory is partial \(200 of 201 pages\)/);
 });
 
 const UNREADABLE_DATASET_DEPENDENTS = {
