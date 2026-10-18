@@ -21,6 +21,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { KNOWBE4_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -952,6 +953,7 @@ export function resolveKnowbe4Configuration(
   homeDir: string = homedir(),
   cwd: string = process.cwd(),
 ): Knowbe4ResolvedConfig {
+  env = readResolverEnvironment(KNOWBE4_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const explicitConfigFile = asString(input.config_file) ?? asString(env.KNOWBE4_CONFIG_FILE);
   const configFile = resolve(cwd, explicitConfigFile ?? join(homeDir, DEFAULT_CONFIG_FILE));
