@@ -5,6 +5,7 @@ import { runComputeExec, runComputeList, runComputeSmokeTest } from "./pi/env.js
 import { CLI_HELP } from "./pi/cli-help.js";
 import { launchCli, runCliSetup } from "./pi/launch.js";
 import { routeCliInvocation } from "./pi/cli-routing.js";
+import { ConfigFileError } from "./extensions/grc-tools/hardening/config-file.js";
 import { GrclankerUserError } from "./pi/setup.js";
 import type { ComputeBackendKind } from "./pi/compute.js";
 import {
@@ -119,7 +120,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  if (error instanceof GrclankerUserError) {
+  if (error instanceof GrclankerUserError || error instanceof ConfigFileError) {
     console.error(error.message);
     process.exit(1);
   }
