@@ -3,26 +3,13 @@ title: "FedRAMP Official Sources"
 description: "Official GitHub-grounded FedRAMP 20x and Rev5 reference material generated from the Consolidated Rules."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-This section is generated from the official FedRAMP GitHub organization. grclanker uses these machine-readable materials for both CLI lookups and reviewed docs snapshots so the public site stays fast without drifting away from upstream.
+These pages are generated from the official FedRAMP GitHub organization. They cover each process in the FedRAMP Consolidated Rules for 2026, with its requirements for 20x and Rev5, and each key security indicator (KSI) domain for 20x. The grclanker FedRAMP tools read the same rules live, cached for up to a day, so their answers can be newer than these pages.
 
 To check readiness against these rules, plan the artifacts, and draft a Certification Data Sharing bundle and trust-center site, follow the [FedRAMP Readiness guide](/docs/guides/fedramp-readiness/).
 
-## Current Grounding
-
-- Primary source: [FedRAMP/rules](https://github.com/FedRAMP/rules) → [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main`
-- Consolidated Rules version: `2026.10.13.01`
-- Upstream `last_updated`: `2026-10-13`
-- Rev5 remains a first-class lane beside 20x in grclanker.
-
-## Process Docs
+## Processes
 
 - [Addressing FedRAMP Communication](/docs/fedramp/processes/addressing-fedramp-communication/) · `AFC` · requirements: 16 for 20x and Rev5
 - [Agency Use of FedRAMP Certified Cloud Services](/docs/fedramp/processes/agency-use/) · `AGU` · requirements: 20 for 20x and Rev5
@@ -54,3 +41,10 @@ To check readiness against these rules, plan the artifacts, and draft a Certific
 - [Recovery Planning](/docs/fedramp/ksi/recovery-planning/) · `RPL` · 4 indicators
 - [Supply Chain Risk](/docs/fedramp/ksi/supply-chain-risk/) · `SCR` · 2 indicators
 - [Service Configuration](/docs/fedramp/ksi/service-configuration/) · `SVC` · 8 indicators
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

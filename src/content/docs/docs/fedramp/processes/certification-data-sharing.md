@@ -3,31 +3,19 @@ title: "Certification Data Sharing"
 description: "Official Consolidated Rules summary for the CDS FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Short name: `CDS` · Process ID: `CDS` · Web slug: `certification-data-sharing`
+The Certification Data Sharing rules allow providers to store and share FedRAMP Certification Data through the platform they choose as long as it follows FedRAMP rules for access, accuracy, and transparency. This helps customers and the public review consistent, current security and compliance information while recognizing that the information usually remains the provider's intellectual property and is not federal information.
 
-Applies to: 20x and Rev5
+## At a Glance
 
-Status: `stable`
-
-Official page: [https://www.fedramp.gov/2026/reference/certification-data-sharing/](https://www.fedramp.gov/2026/reference/certification-data-sharing/)
-
-## Effective Status
-
+- Applies to: 20x and Rev5
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2028-02-01
 - Requirements: 20 for 20x and Rev5, 1 for Rev5 only
-
-## Purpose
-
-The Certification Data Sharing rules allow providers to store and share FedRAMP Certification Data through the platform they choose as long as it follows FedRAMP rules for access, accuracy, and transparency. This helps customers and the public review consistent, current security and compliance information while recognizing that the information usually remains the provider's intellectual property and is not federal information.
+- Status: `stable`
+- Short name: `CDS`
+- Official page: [https://www.fedramp.gov/2026/reference/certification-data-sharing/](https://www.fedramp.gov/2026/reference/certification-data-sharing/)
 
 ## Rule Subsets
 
@@ -36,9 +24,7 @@ The Certification Data Sharing rules allow providers to store and share FedRAMP 
 - `TRC` · FedRAMP-Compatible Trust Centers: These rules apply to trust centers that are FedRAMP-compatible. · types: 20x, Rev5 · classes: B, C, D
 - `UTC` · Using a Trust Center: These rules apply to providers that are using a FedRAMP-compatible trust center instead of USDA Connect; they DO NOT apply to providers using USDA Connect. · types: 20x, Rev5 · classes: B, C, D
 
-## Requirements and Recommendations
-
-## 20x and Rev5
+## Requirements for 20x and Rev5
 
 ### `CDS-CSO-AVR` VARIES BY CLASS: Availability Reporting
 
@@ -308,7 +294,7 @@ Affects: Providers
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## Rev5 only
+## Requirements for Rev5 only
 
 ### `CDS-CSF-TCM` MUST: Trust Center Migration
 
@@ -323,3 +309,10 @@ Terms: `All Necessary Parties`, `Certification Data`, `Trust Center`
 Affects: Providers
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

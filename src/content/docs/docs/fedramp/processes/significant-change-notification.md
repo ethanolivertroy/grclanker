@@ -3,31 +3,19 @@ title: "Significant Change Notification"
 description: "Official Consolidated Rules summary for the SCN FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Short name: `SCN` · Process ID: `SCN` · Web slug: `significant-change-notification`
+The Significant Change Notification rules supply a simple framework allowing providers to make significant changes to their own products while keeping agency customers in the loop. These rules organize significant changes into clear categories so agencies can understand the expected risk and make authorization decisions accordingly.
 
-Applies to: 20x and Rev5
+## At a Glance
 
-Status: `stable`
-
-Official page: [https://www.fedramp.gov/2026/reference/significant-change-notification/](https://www.fedramp.gov/2026/reference/significant-change-notification/)
-
-## Effective Status
-
+- Applies to: 20x and Rev5
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-06-01
 - Requirements: 17 for 20x and Rev5
-
-## Purpose
-
-The Significant Change Notification rules supply a simple framework allowing providers to make significant changes to their own products while keeping agency customers in the loop. These rules organize significant changes into clear categories so agencies can understand the expected risk and make authorization decisions accordingly.
+- Status: `stable`
+- Short name: `SCN`
+- Official page: [https://www.fedramp.gov/2026/reference/significant-change-notification/](https://www.fedramp.gov/2026/reference/significant-change-notification/)
 
 ## Rule Subsets
 
@@ -37,9 +25,7 @@ The Significant Change Notification rules supply a simple framework allowing pro
 - `RTR` · Routine Recurring Changes: These rules apply to all routine recurring significant changes. · types: 20x, Rev5 · classes: B, C, D
 - `TRF` · Transformative Changes: These rules apply to all transformative significant changes. · types: 20x, Rev5 · classes: B, C, D
 
-## Requirements and Recommendations
-
-## 20x and Rev5
+## Requirements for 20x and Rev5
 
 ### `SCN-ADP-NTF` MUST: Notification Requirements
 
@@ -300,3 +286,10 @@ Structured timeframe: `30` bizdays
 Note: This requirement is focused on service documentation like user guides, information listed in the marketplace, and other such materials; it does not require updating the system security plan or FedRAMP Certification Package.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

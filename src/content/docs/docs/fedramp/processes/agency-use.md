@@ -3,31 +3,19 @@ title: "Agency Use of FedRAMP Certified Cloud Services"
 description: "Official Consolidated Rules summary for the AGU FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Short name: `AGU` · Process ID: `AGU` · Web slug: `agency-use`
+The Agency Use rules summarize the many demands made on agencies by the FedRAMP Authorization Act and OMB Memorandum M-24-15 in a simple, clear, easy-to-follow set of FedRAMP-style rules. These rules align agency policies, authorization letters, machine-readable tools, secure configuration review, continuous monitoring, and communication with FedRAMP so certifications can be reused consistently across government.
 
-Applies to: 20x and Rev5
+## At a Glance
 
-Status: `placeholder`
-
-Official page: [https://www.fedramp.gov/2026/reference/agency-use/](https://www.fedramp.gov/2026/reference/agency-use/)
-
-## Effective Status
-
+- Applies to: 20x and Rev5
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
 - Rev5: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
 - Requirements: 20 for 20x and Rev5
-
-## Purpose
-
-The Agency Use rules summarize the many demands made on agencies by the FedRAMP Authorization Act and OMB Memorandum M-24-15 in a simple, clear, easy-to-follow set of FedRAMP-style rules. These rules align agency policies, authorization letters, machine-readable tools, secure configuration review, continuous monitoring, and communication with FedRAMP so certifications can be reused consistently across government.
+- Status: `placeholder`
+- Short name: `AGU`
+- Official page: [https://www.fedramp.gov/2026/reference/agency-use/](https://www.fedramp.gov/2026/reference/agency-use/)
 
 ## Rule Subsets
 
@@ -35,9 +23,7 @@ The Agency Use rules summarize the many demands made on agencies by the FedRAMP 
 - `SPN` · Agency Sponsored Certifications: These rules apply when an agency sponsors a FedRAMP Rev5 Certification after completing an agency authorization. · types: Rev5 · classes: B, C, D
 - `USE` · Use of FedRAMP Certifications: These rules apply when agencies use FedRAMP Certifications to make agency authorization decisions. · types: 20x, Rev5 · classes: A, B, C, D
 
-## Requirements and Recommendations
-
-## 20x and Rev5
+## Requirements for 20x and Rev5
 
 ### `AGU-AGC-AIP` MUST: Agency Internal Policies
 
@@ -270,3 +256,10 @@ Affects: Agencies
 Updates:
 - 2026-10-13: Updated control mappings: added cm-10, cm-5, cm-6, ia-11.
 - 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

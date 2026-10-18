@@ -3,31 +3,19 @@ title: "Marketplace Listing"
 description: "Official Consolidated Rules summary for the MKT FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Short name: `MKT` · Process ID: `MKT` · Web slug: `marketplace-listing`
+The Marketplace Listing rules define how FedRAMP decides which cloud service offerings, assessors, and advisors may be listed in the FedRAMP Marketplace. These rules help agencies and other customers rely on the Marketplace as a consistent source of eligible services and supporting organizations, while requiring listed organizations to supply accurate, accessible, and machine-readable information.
 
-Applies to: 20x and Rev5
+## At a Glance
 
-Status: `stable`
-
-Official page: [https://www.fedramp.gov/2026/reference/marketplace-listing/](https://www.fedramp.gov/2026/reference/marketplace-listing/)
-
-## Effective Status
-
+- Applies to: 20x and Rev5
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
 - Rev5: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
 - Requirements: 12 for 20x and Rev5
-
-## Purpose
-
-The Marketplace Listing rules define how FedRAMP decides which cloud service offerings, assessors, and advisors may be listed in the FedRAMP Marketplace. These rules help agencies and other customers rely on the Marketplace as a consistent source of eligible services and supporting organizations, while requiring listed organizations to supply accurate, accessible, and machine-readable information.
+- Status: `stable`
+- Short name: `MKT`
+- Official page: [https://www.fedramp.gov/2026/reference/marketplace-listing/](https://www.fedramp.gov/2026/reference/marketplace-listing/)
 
 ## Rule Subsets
 
@@ -37,9 +25,7 @@ The Marketplace Listing rules define how FedRAMP decides which cloud service off
 - `IAS` · General Assessor Responsibilities: These rules apply to independent assessment services seeking a listing in the FedRAMP Marketplace.
 - `IIP` · Provider Responsibilities for Initial Implementation Phase Listings: FedRAMP allows cloud service providers that are actively preparing to obtain a FedRAMP Certification to apply for listing in the FedRAMP Marketplace. All cloud service providers must obtain a Initial Implementation Phase Marketplace Listing before they can apply for FedRAMP Certification. These rules apply to providers seeking a Initial Implementation Phase listing in the FedRAMP Marketplace. · types: 20x, Rev5
 
-## Requirements and Recommendations
-
-## 20x and Rev5
+## Requirements for 20x and Rev5
 
 ### `MKT-CAS-LRQ` MUST: Listing Requests for Advisors
 
@@ -194,3 +180,10 @@ Affects: Providers
 Structured timeframe: `2` years
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

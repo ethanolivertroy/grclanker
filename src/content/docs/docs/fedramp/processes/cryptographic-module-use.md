@@ -3,39 +3,25 @@ title: "Cryptographic Module Use"
 description: "Official Consolidated Rules summary for the CMU FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Short name: `CMU` · Process ID: `CMU` · Web slug: `cryptographic-module-use`
+The Cryptographic Module Use rules clarify how providers should select and use cryptographic modules. These rules allow risk-based decisions for some services while still encouraging validated cryptographic modules whenever they are technically feasible and reasonable.
 
-Applies to: 20x and Rev5
+## At a Glance
 
-Status: `stable`
-
-Official page: [https://www.fedramp.gov/2026/reference/cryptographic-module-use/](https://www.fedramp.gov/2026/reference/cryptographic-module-use/)
-
-## Effective Status
-
+- Applies to: 20x and Rev5
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-06-01
 - Requirements: 3 for 20x and Rev5
-
-## Purpose
-
-The Cryptographic Module Use rules clarify how providers should select and use cryptographic modules. These rules allow risk-based decisions for some services while still encouraging validated cryptographic modules whenever they are technically feasible and reasonable.
+- Status: `stable`
+- Short name: `CMU`
+- Official page: [https://www.fedramp.gov/2026/reference/cryptographic-module-use/](https://www.fedramp.gov/2026/reference/cryptographic-module-use/)
 
 ## Rule Subsets
 
 - `CSO` · Cloud Service Provider Responsibilities: These rules apply to providers for FedRAMP Certifications. · types: 20x, Rev5 · classes: B, C, D
 
-## Requirements and Recommendations
-
-## 20x and Rev5
+## Requirements for 20x and Rev5
 
 ### `CMU-CSO-CAT` SHOULD: Configuration of Agency Tenants
 
@@ -82,3 +68,10 @@ Updates:
 - 2026-10-13: Updated control mappings: added ac-18, au-9.3, ia-7, sc-28.1, sc-8.1.
 - 2026-10-05: Added a note clarifying that new algorithms in update streams of modules are not included in the scope of updates to  validated cryptographic modules.
 - 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

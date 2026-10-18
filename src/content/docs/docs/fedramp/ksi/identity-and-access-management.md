@@ -3,15 +3,14 @@ title: "Identity and Access Management"
 description: "Official Consolidated Rules summary for the IAM FedRAMP key security indicator domain."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Domain code: `IAM` · Domain ID: `KSI-IAM` · Web slug: `identity-and-access-management`
+## At a Glance
+
+- Applies to: 20x only
+- Indicators: 6
+- Status: `stable`
+- Domain ID: `KSI-IAM`
 
 ## Indicators
 
@@ -82,3 +81,10 @@ Terms: `Vulnerability Response`
 Updates:
 - 2026-10-13: Updated control mappings: added ac-2.11, ac-2.12, au-6.5, cm-5.1, cm-6.2, ir-4.2, ir-4.6, si-4, si-4.1, si-4.19, si-4.20, si-4.22, si-4.4.
 - 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

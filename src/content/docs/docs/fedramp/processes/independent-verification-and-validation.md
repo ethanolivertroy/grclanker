@@ -3,31 +3,19 @@ title: "Independent Verification and Validation"
 description: "Official Consolidated Rules summary for the IVV FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Short name: `IVV` · Process ID: `IVV` · Web slug: `independent-verification-and-validation`
+This ruleset explains the expectations for independent verification and validation assessments.
 
-Applies to: 20x and Rev5
+## At a Glance
 
-Status: `stable`
-
-Official page: [https://www.fedramp.gov/2026/reference/independent-verification-and-validation/](https://www.fedramp.gov/2026/reference/independent-verification-and-validation/)
-
-## Effective Status
-
+- Applies to: 20x and Rev5
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-01-01
 - Requirements: 15 for 20x and Rev5, 1 for 20x only, 4 for Rev5 only
-
-## Purpose
-
-This ruleset explains the expectations for independent verification and validation assessments.
+- Status: `stable`
+- Short name: `IVV`
+- Official page: [https://www.fedramp.gov/2026/reference/independent-verification-and-validation/](https://www.fedramp.gov/2026/reference/independent-verification-and-validation/)
 
 ## Rule Subsets
 
@@ -36,9 +24,7 @@ This ruleset explains the expectations for independent verification and validati
 - `CSX` · 20x-Specific Provider Responsibilities: These rules apply to providers for FedRAMP 20x Certifications. · types: 20x · classes: B, C, D
 - `IAS` · General Independent Assessor Responsibilities: These rules apply to independent assessment services supporting all FedRAMP Certification types. · types: 20x, Rev5 · classes: B, C, D
 
-## Requirements and Recommendations
-
-## 20x and Rev5
+## Requirements for 20x and Rev5
 
 ### `IVV-CSO-DUS` MUST: Document Use of Representative Samples
 
@@ -227,7 +213,7 @@ Note: This rule is related to IVV-CSO-ICP (Inclusion in Certification Package).
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## 20x only
+## Requirements for 20x only
 
 ### `IVV-CSX-AIA` MUST: Annual Independent Assessments for 20x
 
@@ -246,7 +232,7 @@ Structured timeframe: `1` years
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## Rev5 only
+## Requirements for Rev5 only
 
 ### `IVV-CSF-ACF` MUST: Assessment of Rev5 Controls with Findings
 
@@ -297,3 +283,10 @@ Terms: `FedRAMP Independent Assessment`
 Affects: Providers
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

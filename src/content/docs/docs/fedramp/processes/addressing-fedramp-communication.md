@@ -3,40 +3,26 @@ title: "Addressing FedRAMP Communication"
 description: "Official Consolidated Rules summary for the AFC FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Short name: `AFC` · Process ID: `AFC` · Web slug: `addressing-fedramp-communication`
+The Addressing FedRAMP Communication rules (formerly FedRAMP Security Inbox) ensure FedRAMP can reliably contact the security and compliance staff responsible for every FedRAMP-authorized cloud service offering. These rules also set expectations for urgent communications, response time testing, and routing important messages separately from general support or customer service channels.
 
-Applies to: 20x and Rev5
+## At a Glance
 
-Status: `stable`
-
-Official page: [https://www.fedramp.gov/2026/reference/addressing-fedramp-communication/](https://www.fedramp.gov/2026/reference/addressing-fedramp-communication/)
-
-## Effective Status
-
+- Applies to: 20x and Rev5
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-01-05 · grace through 2026-07-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2026-01-05 · grace through 2026-07-01
 - Requirements: 16 for 20x and Rev5
-
-## Purpose
-
-The Addressing FedRAMP Communication rules (formerly FedRAMP Security Inbox) ensure FedRAMP can reliably contact the security and compliance staff responsible for every FedRAMP-authorized cloud service offering. These rules also set expectations for urgent communications, response time testing, and routing important messages separately from general support or customer service channels.
+- Status: `stable`
+- Short name: `AFC`
+- Official page: [https://www.fedramp.gov/2026/reference/addressing-fedramp-communication/](https://www.fedramp.gov/2026/reference/addressing-fedramp-communication/)
 
 ## Rule Subsets
 
 - `CSO` · General Provider Responsibilities: These rules apply to providers with any type of FedRAMP Certification. · types: 20x, Rev5 · classes: B, C, D
 - `FRP` · FedRAMP Responsibilities: These rules apply to FedRAMP when communicating with cloud service providers. · types: 20x, Rev5 · classes: B, C, D
 
-## Requirements and Recommendations
-
-## 20x and Rev5
+## Requirements for 20x and Rev5
 
 ### `AFC-CSO-ACK` SHOULD: Acknowledge Receipt
 
@@ -228,3 +214,10 @@ Affects: FedRAMP
 Note: Anyone at GSA can send email from @fedramp.gov or @gsa.gov - FedRAMP team members will typically have "FedRAMP" or "F20B" in their name but this is not universal or enforceable. The nature of government enterprise IT services makes it difficult for FedRAMP to isolate FedRAMP-specific team members with enforceable identifiers.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
