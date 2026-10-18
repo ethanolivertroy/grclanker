@@ -3732,7 +3732,9 @@ const RISK_DISTRIBUTION_READS: Knowbe4InventoryRead[] = [
 ];
 
 function assessRiskDistribution(snapshot: Knowbe4Snapshot, maxMeanRiskScore: number, maxStddev: number, redact: boolean): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(5, { users_readable: isRead(snapshot.activeUsers) });
   if (snapshot.activeUsers.error) return unavailableFinding(5, "medium", "users", snapshot);
+  recordKnowbe4DecisionFacts(5, { user_record_count: snapshot.activeUsers.data.length });
   if (snapshot.activeUsers.data.length === 0) {
     return withInventoryCaveats(emptyUserListFinding(5, "medium", "the user risk score distribution", {
       users_scored: 0,
@@ -3747,6 +3749,15 @@ function assessRiskDistribution(snapshot: Knowbe4Snapshot, maxMeanRiskScore: num
   const scores = scored.map((item) => item.score);
   const average = mean(scores);
   const deviation = standardDeviation(scores);
+  recordKnowbe4DecisionFacts(5, {
+    mean_risk_score: average,
+    max_mean_risk_score: maxMeanRiskScore,
+    risk_score_stddev: deviation,
+    max_risk_score_stddev: maxStddev,
+    users_complete: isComplete(snapshot.activeUsers),
+    account_readable: isRead(snapshot.account),
+    account_risk_score_history_readable: isRead(snapshot.accountRiskHistory),
+  });
   const highest = [...scored].sort((left, right) => right.score - left.score).slice(0, 10);
   const history = snapshot.accountRiskHistory.data
     .map((point) => ({ risk_score: asNumber(point.risk_score) ?? null, date: asString(point.date) ?? null }))
@@ -3804,8 +3815,11 @@ const GROUP_COVERAGE_READS: Knowbe4InventoryRead[] = [
 ];
 
 function assessGroupCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(8, { groups_readable: isRead(snapshot.groups) });
   if (snapshot.groups.error) return unavailableFinding(8, "medium", "groups", snapshot);
+  recordKnowbe4DecisionFacts(8, { phishing_campaigns_readable: isRead(snapshot.phishingCampaigns) });
   if (snapshot.phishingCampaigns.error) return unavailableFinding(8, "medium", "phishing_campaigns", snapshot);
+  recordKnowbe4DecisionFacts(8, { training_campaigns_readable: isRead(snapshot.trainingCampaigns) });
   if (snapshot.trainingCampaigns.error) return unavailableFinding(8, "medium", "training_campaigns", snapshot);
   const groups = snapshot.groups.data.filter((group) => (asNumber(group.member_count) ?? 1) > 0);
   const phishingCampaigns = snapshot.phishingCampaigns.data.filter((campaign) => phishingCampaignInWindow(campaign, lookbackDays, now));
@@ -3835,6 +3849,13 @@ function assessGroupCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDays:
   const phishingComplete = isComplete(snapshot.phishingCampaigns);
   const trainingComplete = isComplete(snapshot.trainingCampaigns);
   const campaignsComplete = phishingComplete && trainingComplete;
+  recordKnowbe4DecisionFacts(8, {
+    active_group_count: groups.length,
+    uncovered_group_count: new Set([...missingPhishing, ...missingTraining]).size,
+    groups_complete: isComplete(snapshot.groups),
+    phishing_campaigns_complete: phishingComplete,
+    training_campaigns_complete: trainingComplete,
+  });
 
   let status: Knowbe4Finding["status"];
   let summary: string;
@@ -3877,7 +3898,9 @@ const INACTIVE_USER_READS: Knowbe4InventoryRead[] = [
 ];
 
 function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays: number, redact: boolean): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(18, { users_readable: isRead(snapshot.activeUsers) });
   if (snapshot.activeUsers.error) return unavailableFinding(18, "medium", "users", snapshot);
+  recordKnowbe4DecisionFacts(18, { user_record_count: snapshot.activeUsers.data.length });
   if (snapshot.activeUsers.data.length === 0) {
     return withInventoryCaveats(emptyUserListFinding(18, "medium", "inactive user cleanup", {
       users_evaluated: 0,
@@ -3917,6 +3940,15 @@ function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays:
     || !isComplete(snapshot.securityTests)
     || !isComplete(snapshot.securityTestRecipients);
   const populationComplete = !partialData && isComplete(snapshot.activeUsers);
+  recordKnowbe4DecisionFacts(18, {
+    long_standing_user_count: candidates.length,
+    inactive_user_count: inactive.length,
+    activity_data_complete: !partialData,
+    users_complete: isComplete(snapshot.activeUsers),
+    security_tests_complete: isComplete(snapshot.securityTests),
+    recipient_walks_complete: isComplete(snapshot.securityTestRecipients),
+    training_enrollments_complete: isComplete(snapshot.trainingEnrollments),
+  });
 
   let status: Knowbe4Finding["status"];
   let summary: string;
@@ -3954,6 +3986,13 @@ function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays:
 export function assessKnowbe4UserRisk(
   snapshot: Knowbe4Snapshot,
   options: Knowbe4AssessmentOptions = {},
+): Knowbe4AssessmentResult {
+  return runBatchVerdictContext(KNOWBE4_DECISION_CONTEXT, KNOWBE4_SPEC, () => assessKnowbe4UserRiskWithDecisionContext(snapshot, options));
+}
+
+function assessKnowbe4UserRiskWithDecisionContext(
+  snapshot: Knowbe4Snapshot,
+  options: Knowbe4AssessmentOptions,
 ): Knowbe4AssessmentResult {
   const now = options.now ?? new Date();
   const redact = options.redactPii ?? false;
