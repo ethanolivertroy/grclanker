@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the MKT FedRAMP process, i
 
 Short name: `MKT` · Process ID: `MKT` · Web slug: `marketplace-listing`
 
-Applies to: `both`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/marketplace-listing/](htt
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
 - Rev5: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
-- Shared requirements: 12
+- Requirements: 12 for 20x and Rev5
 
 ## Purpose
 
@@ -39,7 +39,7 @@ The Marketplace Listing rules define how FedRAMP decides which cloud service off
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `MKT-CAS-LRQ` MUST: Listing Requests for Advisors
 

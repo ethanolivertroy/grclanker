@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the SCN FedRAMP process, i
 
 Short name: `SCN` · Process ID: `SCN` · Web slug: `significant-change-notification`
 
-Applies to: `both`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/significant-change-notifi
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-06-01
-- Shared requirements: 17
+- Requirements: 17 for 20x and Rev5
 
 ## Purpose
 
@@ -39,7 +39,7 @@ The Significant Change Notification rules supply a simple framework allowing pro
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `SCN-ADP-NTF` MUST: Notification Requirements
 

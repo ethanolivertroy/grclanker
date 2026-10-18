@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the IVV FedRAMP process, i
 
 Short name: `IVV` · Process ID: `IVV` · Web slug: `independent-verification-and-validation`
 
-Applies to: `both`, `20x`, `rev5`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/independent-verification-
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-01-01
-- Shared requirements: 15
+- Requirements: 15 for 20x and Rev5, 1 for 20x only, 4 for Rev5 only
 
 ## Purpose
 
@@ -38,7 +38,7 @@ This ruleset explains the expectations for independent verification and validati
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `IVV-CSO-DUS` MUST: Document Use of Representative Samples
 
@@ -227,7 +227,7 @@ Note: This rule is related to IVV-CSO-ICP (Inclusion in Certification Package).
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## 20X
+## 20x only
 
 ### `IVV-CSX-AIA` MUST: Annual Independent Assessments for 20x
 
@@ -246,7 +246,7 @@ Structured timeframe: `1` years
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## REV5
+## Rev5 only
 
 ### `IVV-CSF-ACF` MUST: Assessment of Rev5 Controls with Findings
 

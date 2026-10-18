@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the SCG FedRAMP process, i
 
 Short name: `SCG` · Process ID: `SCG` · Web slug: `secure-configuration-guide`
 
-Applies to: `both`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/secure-configuration-guid
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-03-01 · grace through 2026-07-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2026-03-01 · grace through 2026-07-01
-- Shared requirements: 9
+- Requirements: 9 for 20x and Rev5
 
 ## Purpose
 
@@ -36,7 +36,7 @@ The Secure Configuration Guide rules help agencies and other customers understan
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `SCG-CSO-AUP` MUST: Use Instructions
 

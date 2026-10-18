@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the SDR FedRAMP process, i
 
 Short name: `SDR` · Process ID: `SDR` · Web slug: `security-decision-record`
 
-Applies to: `both`, `20x`, `rev5`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/security-decision-record/
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-08-01
-- Shared requirements: 2
+- Requirements: 2 for 20x and Rev5, 2 for 20x only, 1 for Rev5 only
 
 ## Purpose
 
@@ -37,7 +37,7 @@ The Security Decision Record replaced a traditional System Security Plan with a 
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `SDR-CSO-FRR` MUST: FedRAMP Rules
 
@@ -73,7 +73,7 @@ Affects: Providers
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## 20X
+## 20x only
 
 ### `SDR-CSX-KMT` VARIES BY CLASS: Key Security Indicator Metrics
 
@@ -118,7 +118,7 @@ Affects: Providers
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## REV5
+## Rev5 only
 
 ### `SDR-CSF-CTF` MUST: Rev5 Controls
 

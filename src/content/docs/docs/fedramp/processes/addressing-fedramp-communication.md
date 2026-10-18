@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the AFC FedRAMP process, i
 
 Short name: `AFC` · Process ID: `AFC` · Web slug: `addressing-fedramp-communication`
 
-Applies to: `both`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/addressing-fedramp-commun
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-01-05 · grace through 2026-07-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2026-01-05 · grace through 2026-07-01
-- Shared requirements: 16
+- Requirements: 16 for 20x and Rev5
 
 ## Purpose
 
@@ -36,7 +36,7 @@ The Addressing FedRAMP Communication rules (formerly FedRAMP Security Inbox) ens
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `AFC-CSO-ACK` SHOULD: Acknowledge Receipt
 

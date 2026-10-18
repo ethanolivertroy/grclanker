@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the MAS FedRAMP process, i
 
 Short name: `MAS` · Process ID: `MAS` · Web slug: `minimum-assessment-scope`
 
-Applies to: `both`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/minimum-assessment-scope/
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-01-01
-- Shared requirements: 5
+- Requirements: 5 for 20x and Rev5
 
 ## Purpose
 
@@ -35,7 +35,7 @@ The Minimum Assessment Scope rules help providers define assessment boundaries n
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `MAS-CSO-FLO` MUST: Information Flows and Security Categories
 

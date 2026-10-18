@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the CDS FedRAMP process, i
 
 Short name: `CDS` · Process ID: `CDS` · Web slug: `certification-data-sharing`
 
-Applies to: `both`, `rev5`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/certification-data-sharin
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2028-02-01
-- Shared requirements: 20
+- Requirements: 20 for 20x and Rev5, 1 for Rev5 only
 
 ## Purpose
 
@@ -38,7 +38,7 @@ The Certification Data Sharing rules allow providers to store and share FedRAMP 
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `CDS-CSO-AVR` VARIES BY CLASS: Availability Reporting
 
@@ -308,7 +308,7 @@ Affects: Providers
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## REV5
+## Rev5 only
 
 ### `CDS-CSF-TCM` MUST: Trust Center Migration
 

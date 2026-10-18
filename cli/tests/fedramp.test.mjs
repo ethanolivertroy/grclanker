@@ -738,6 +738,34 @@ test("buildFedrampDocsSnapshot titles process and KSI pages with their bare name
   assert.equal(title("fedramp/ksi/cloud-native-architecture.md"), '"Cloud Native Architecture"');
 });
 
+test("buildFedrampDocsSnapshot names requirement groups in words and skips empty ones", () => {
+  const files = buildFedrampDocsSnapshot(
+    normalizeFedrampConsolidatedRules(consolidatedRulesFixture),
+    docsSnapshotSources,
+  );
+  const content = (path) => files.find((file) => file.path === path)?.content ?? "";
+  const cdsPage = content("fedramp/processes/certification-data-sharing.md");
+
+  for (const index of ["fedramp/index.md", "fedramp/processes.md"]) {
+    assert.match(
+      content(index),
+      /\(\/docs\/fedramp\/processes\/certification-data-sharing\/\) · `CDS` · requirements: 1 for 20x and Rev5, 1 for 20x only, 1 for Rev5 only\n/,
+      index,
+    );
+    assert.match(
+      content(index),
+      /\(\/docs\/fedramp\/processes\/collaborative-continuous-monitoring\/\) · `CCM` · requirements: 1 for 20x and Rev5\n/,
+      index,
+    );
+  }
+  assert.match(cdsPage, /\nApplies to: 20x and Rev5\n/);
+  assert.match(cdsPage, /\n- Requirements: 1 for 20x and Rev5, 1 for 20x only, 1 for Rev5 only\n/);
+  assert.match(cdsPage, /\n## 20x and Rev5\n[\s\S]*\n## 20x only\n[\s\S]*\n## Rev5 only\n/);
+  for (const file of files) {
+    assert.doesNotMatch(file.content, /`both`|applies to `|^## (BOTH|20X|REV5)$/m, file.path);
+  }
+});
+
 test("buildFedrampDocsSnapshot renders notifications, control mappings, and every update", () => {
   const fixture = structuredClone(consolidatedRulesFixture);
   const rule = fixture.FRR.CDS.data.all.CSO["CDS-CSO-PUB"];

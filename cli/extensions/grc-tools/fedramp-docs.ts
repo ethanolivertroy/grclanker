@@ -1,4 +1,5 @@
 import type {
+  FedrampApplicability,
   FedrampCatalog,
   FedrampKsiDomainRecord,
   FedrampPrimarySourceStatus,
@@ -58,6 +59,30 @@ function sourceBanner(
 
 function frontmatter(title: string, description: string): string {
   return `---\ntitle: ${JSON.stringify(title)}\ndescription: ${JSON.stringify(description)}\n---`;
+}
+
+const REQUIREMENT_GROUPS = ["both", "20x", "rev5"] as const;
+
+const REQUIREMENT_GROUP_NAMES: Record<FedrampApplicability, string> = {
+  both: "20x and Rev5",
+  "20x": "20x only",
+  rev5: "Rev5 only",
+};
+
+function requirementSummary(counts: Record<FedrampApplicability, number>): string {
+  const parts = REQUIREMENT_GROUPS.filter((group) => counts[group] > 0).map(
+    (group) => `${counts[group]} for ${REQUIREMENT_GROUP_NAMES[group]}`,
+  );
+  return parts.length > 0 ? parts.join(", ") : "none";
+}
+
+function applicabilitySummary(applicability: readonly FedrampApplicability[]): string {
+  const has20x = applicability.includes("20x");
+  const hasRev5 = applicability.includes("rev5");
+  if (applicability.includes("both") || (has20x && hasRev5)) return REQUIREMENT_GROUP_NAMES.both;
+  if (has20x) return REQUIREMENT_GROUP_NAMES["20x"];
+  if (hasRev5) return REQUIREMENT_GROUP_NAMES.rev5;
+  return "none";
 }
 
 function requirementBadge(requirement: FedrampRequirementRecord): string {
@@ -148,7 +173,7 @@ function processPage(
     "",
     `Short name: \`${process.shortName}\` · Process ID: \`${process.id}\` · Web slug: \`${process.webName}\``,
     "",
-    `Applies to: ${process.applicability.map((value) => `\`${value}\``).join(", ")}`,
+    `Applies to: ${applicabilitySummary(process.applicability)}`,
     "",
   ];
 
@@ -165,7 +190,7 @@ function processPage(
     "",
     `- 20x: ${process.effective["20x"]?.is ?? "n/a"}${process.effective["20x"]?.currentStatus ? ` · ${process.effective["20x"]?.currentStatus}` : ""}${process.effective["20x"]?.startDate ? ` · obtain ${process.effective["20x"]?.startDate}` : ""}${process.effective["20x"]?.graceDate ? ` · grace through ${process.effective["20x"]?.graceDate}` : ""}`,
     `- Rev5: ${process.effective.rev5?.is ?? "n/a"}${process.effective.rev5?.currentStatus ? ` · ${process.effective.rev5?.currentStatus}` : ""}${process.effective.rev5?.startDate ? ` · obtain ${process.effective.rev5?.startDate}` : ""}${process.effective.rev5?.graceDate ? ` · grace through ${process.effective.rev5?.graceDate}` : ""}`,
-    `- Shared requirements: ${counts.both}`,
+    `- Requirements: ${requirementSummary(counts)}`,
     "",
   );
 
@@ -201,10 +226,10 @@ function processPage(
 
   lines.push("## Requirements and Recommendations", "");
 
-  for (const applicability of ["both", "20x", "rev5"] as const) {
-    if (grouped[applicability].length === 0) continue;
-    lines.push(`## ${applicability.toUpperCase()}`, "");
-    for (const requirement of grouped[applicability]) {
+  for (const group of REQUIREMENT_GROUPS) {
+    if (grouped[group].length === 0) continue;
+    lines.push(`## ${REQUIREMENT_GROUP_NAMES[group]}`, "");
+    for (const requirement of grouped[group]) {
       lines.push(requirementMarkdown(requirement), "");
     }
   }
@@ -285,7 +310,7 @@ export function buildFedrampDocsSnapshot(
   const processRows = catalog.processes
     .map((process) => {
       const counts = requirementCountsByApplicability(catalog, process.id);
-      return `- [${process.name}](/docs/fedramp/processes/${process.webName}/) · \`${process.shortName}\` · applies to ${process.applicability.map((value) => `\`${value}\``).join(", ")} · requirements: \`both ${counts.both}\`, \`20x ${counts["20x"]}\`, \`rev5 ${counts.rev5}\``;
+      return `- [${process.name}](/docs/fedramp/processes/${process.webName}/) · \`${process.shortName}\` · requirements: ${requirementSummary(counts)}`;
     })
     .join("\n");
   const ksiRows = catalog.ksiDomains
