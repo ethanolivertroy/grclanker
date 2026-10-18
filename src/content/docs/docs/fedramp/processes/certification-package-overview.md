@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the CPO FedRAMP process, i
 
 Short name: `CPO` · Process ID: `CPO` · Web slug: `certification-package-overview`
 
-Applies to: `both`, `20x`, `rev5`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/certification-package-ove
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-07-01
-- Shared requirements: 3
+- Requirements: 3 for 20x and Rev5, 1 for 20x only, 1 for Rev5 only
 
 ## Purpose
 
@@ -37,7 +37,7 @@ The Certification Package Overview rules outline the expectations for a simple o
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `CPO-CSO-MTD` MUST: Certification Package Overview Metadata
 
@@ -99,7 +99,7 @@ This list of rules may not apply to all FedRAMP Certification Classes or Types -
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## 20X
+## 20x only
 
 ### `CPO-CSX-CPM` VARIES BY CLASS: Certification Package Maintenance for 20x
 
@@ -120,7 +120,7 @@ This rule does not require or expect persistent human review of all materials in
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## REV5
+## Rev5 only
 
 ### `CPO-CSF-CPM` MUST: Certification Package Maintenance for Rev5
 

@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the FRC FedRAMP process, i
 
 Short name: `FRC` · Process ID: `FRC` · Web slug: `fedramp-certification`
 
-Applies to: `both`, `20x`, `rev5`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/fedramp-certification/](h
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-01-01
-- Shared requirements: 21
+- Requirements: 21 for 20x and Rev5, 3 for 20x only, 4 for Rev5 only
 
 ## Purpose
 
@@ -41,7 +41,7 @@ This ruleset explains how cloud service offerings obtain and maintain FedRAMP Ce
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `FRC-APP-AFC` MUST: Applying for FedRAMP Certification
 
@@ -368,7 +368,7 @@ Note: This rule does not prevent a provider from seeking and maintaining a FedRA
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## 20X
+## 20x only
 
 ### `FRC-CSX-MAS` SHOULD: Application within MAS
 
@@ -420,7 +420,7 @@ Updates:
 - 2026-10-13: Updated control mappings: added si-6.
 - 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
-## REV5
+## Rev5 only
 
 ### `FRC-CSF-ACP` MUST: Assign Control Parameters
 

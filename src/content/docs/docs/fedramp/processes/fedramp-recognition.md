@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the REC FedRAMP process, i
 
 Short name: `REC` · Process ID: `REC` · Web slug: `fedramp-recognition`
 
-Applies to: `both`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/fedramp-recognition/](htt
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
 - Rev5: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
-- Shared requirements: 16
+- Requirements: 16 for 20x and Rev5
 
 ## Purpose
 
@@ -36,7 +36,7 @@ The FedRAMP Recognition of independent assessment services rules explain the req
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `REC-FRP-DRD` MUST NOT: Double Revocation Disqualification
 

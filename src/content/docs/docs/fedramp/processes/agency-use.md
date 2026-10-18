@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the AGU FedRAMP process, i
 
 Short name: `AGU` · Process ID: `AGU` · Web slug: `agency-use`
 
-Applies to: `both`
+Applies to: 20x and Rev5
 
 Status: `placeholder`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/agency-use/](https://www.
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
 - Rev5: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
-- Shared requirements: 20
+- Requirements: 20 for 20x and Rev5
 
 ## Purpose
 
@@ -37,7 +37,7 @@ The Agency Use rules summarize the many demands made on agencies by the FedRAMP 
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `AGU-AGC-AIP` MUST: Agency Internal Policies
 

@@ -13,7 +13,7 @@ description: "Official Consolidated Rules summary for the IEC FedRAMP process, i
 
 Short name: `IEC` · Process ID: `IEC` · Web slug: `incident-evaluation-and-communication`
 
-Applies to: `both`
+Applies to: 20x and Rev5
 
 Status: `stable`
 
@@ -23,7 +23,7 @@ Official page: [https://www.fedramp.gov/2026/reference/incident-evaluation-and-c
 
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-06-01
-- Shared requirements: 8
+- Requirements: 8 for 20x and Rev5
 
 ## Purpose
 
@@ -36,7 +36,7 @@ The Incident Evaluation and Communication rules explain how providers must commu
 
 ## Requirements and Recommendations
 
-## BOTH
+## 20x and Rev5
 
 ### `IEC-CSO-AIR` SHOULD: Automated Incident Reporting
 
