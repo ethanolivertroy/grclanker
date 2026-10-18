@@ -19,7 +19,7 @@ export function DocsPageContainer({ className, ...props }: ComponentProps<'artic
         data-layout-content=""
         {...props}
         className={[
-          'w-full min-w-0 max-w-[52rem] px-4 py-8 sm:px-6 md:py-10 xl:px-8',
+          'w-full min-w-0 max-w-[52rem] px-4 pt-5 pb-8 sm:px-6 md:py-10 xl:px-8',
           className,
         ]
           .filter(Boolean)
