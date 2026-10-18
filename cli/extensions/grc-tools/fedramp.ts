@@ -6,7 +6,7 @@ import {
   chmodSync,
 } from "node:fs";
 import { chmod, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 
 import {
@@ -939,30 +939,31 @@ function ensurePrivateDir(path: string): void {
   chmodSync(path, 0o700);
 }
 
-function resolveSecureOutputPath(baseDir: string, destPath: string): string {
+export function resolveSecureOutputPath(baseDir: string, destPath: string): string {
   const resolvedBase = realpathSync(resolve(baseDir));
   const absoluteDest = resolve(destPath);
-
-  if (existsSync(absoluteDest)) {
-    const info = lstatSync(absoluteDest);
-    if (info.isSymbolicLink()) {
-      throw new Error(`Refusing to write through symlink: ${absoluteDest}`);
-    }
-  }
-
-  const resolvedDestDir = realpathSync(resolve(dirname(absoluteDest)));
-  const resolvedDest = join(resolvedDestDir, basename(absoluteDest));
-  const relPath = relative(resolvedBase, resolvedDest);
-  if (relPath.startsWith("..")) {
+  const relPath = relative(resolvedBase, absoluteDest);
+  if (relPath === "" || relPath.startsWith("..") || isAbsolute(relPath)) {
     throw new Error("Invalid output path: path traversal detected");
   }
 
-  return resolvedDest;
+  const segments = relPath.split(/[\\/]+/).filter(Boolean);
+  let current = resolvedBase;
+  for (const segment of segments) {
+    current = join(current, segment);
+    if (!existsSync(current)) break;
+    const info = lstatSync(current);
+    if (info.isSymbolicLink()) {
+      throw new Error(`Refusing to write through symlink: ${current}`);
+    }
+  }
+
+  return absoluteDest;
 }
 
-async function writeSecureTextFile(baseDir: string, destPath: string, data: string): Promise<string> {
-  ensurePrivateDir(dirname(destPath));
+export async function writeSecureTextFile(baseDir: string, destPath: string, data: string): Promise<string> {
   const resolvedPath = resolveSecureOutputPath(baseDir, destPath);
+  ensurePrivateDir(dirname(resolvedPath));
   await writeFile(resolvedPath, data, { mode: 0o600 });
   await chmod(resolvedPath, 0o600);
   return resolvedPath;

@@ -36,7 +36,6 @@ This specification requires [shared integration contract version 1.1](./integrat
 - User, role-member, group, operation-log, and IM-group verdict facts use complete seen and declared-total counts, while exported evidence may retain bounded record samples.
 - The account API exposes neither a decisive Team Chat encryption setting nor account vanity URL field; those findings remain manual rather than inferred from unrelated fields.
 - User OAuth, per-user settings drift, deeper Zoom Phone policy, and usage analytics are deferred.
-- ZOOM-COLLAB-01 legacy finding construction does not demote a non-empty trusted-domain result when that listing is truncated, while the executable metadata requires complete evidence for Pass. The collector cannot currently produce this combination, but a synthetic truncated result can make the strict metadata/runtime assertion throw; a separate runtime fix must choose and apply one behavior.
 
 ## Tools
 

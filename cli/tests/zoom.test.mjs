@@ -1135,6 +1135,19 @@ test("rule 10: the group_limit cap reports truncated and every group-dependent v
   }
 });
 
+test("ZOOM-COLLAB-01 warns when a non-empty trusted-domain list is truncated", async () => {
+  const snapshot = await collectZoomSnapshot(compliantClient(), { now: NOW });
+  snapshot.trustedDomains.data.truncated = true;
+  snapshot.trustedDomains.data.totalRecords = 4;
+  const item = findingById(
+    assessZoomCollaborationGovernanceFromSnapshot(snapshot, { now: NOW }),
+    "ZOOM-COLLAB-01",
+  );
+  assert.equal(item.status, "warn", item.summary);
+  assert.match(item.summary, /Partial inventory: 1 seen of 4/);
+  assert.equal(item.evidence.truncated, true);
+});
+
 test("rule 10: the role member cap reports truncated and admin concentration states seen versus declared", async () => {
   const members = range(3001, (n) => ({ id: `admin-${n}`, email: `admin-${n}@example.com` }));
   const client = httpAccountClient({
