@@ -36,7 +36,7 @@ import { CROWDSTRIKE_SPEC } from "../dist/extensions/grc-tools/crowdstrike.spec.
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
-import { assertRequestConformance, recordFetchRequests } from "./helpers/spec-conformance.mjs";
+import { assertRequestConformance, recordFetchRequests, sweepCheckCompleteness } from "./helpers/spec-conformance.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
@@ -3095,4 +3095,107 @@ portableContractTest("every request the access check, the five assessments, and 
   const reads = recorder.requests.filter((request) => request !== token);
   assert.ok(reads.every((request) => !JSON.stringify(request).includes("child-cid")), "member_cid travels only in the token request");
   assertRequestConformance(assert, CROWDSTRIKE_SPEC, reads);
+});
+
+const CONTRACT_SURFACES = CROWDSTRIKE_SPEC.apiSurfaces.map((surface) => {
+  const [path, query = ""] = surface.path.split("?");
+  const embedded = [...new URLSearchParams(query)].map(([name, value]) => {
+    const pattern = value.split(/\{[^}]+\}/).map(escapeRegExp).join(".+");
+    return { name, pattern: new RegExp(`^${pattern}$`) };
+  });
+  return { id: surface.id, method: surface.method ?? "GET", path, embedded };
+});
+
+// The most specific declared surface wins, so a host walk with the containment filter is contained_hosts.
+function requestedSurface(method, url) {
+  const matches = CONTRACT_SURFACES.filter((surface) => surface.method === method && surface.path === url.pathname
+    && surface.embedded.every(({ name, pattern }) => pattern.test(url.searchParams.get(name) ?? "")));
+  return matches.sort((left, right) => right.embedded.length - left.embedded.length)[0]?.id;
+}
+
+const ids = (records, field = "id") => async (fake) => (await records(fake)).items.map((record) => record[field]);
+
+// The passing fake client's records behind each declared surface; counts answer with a total only.
+const CONTRACT_READS = {
+  prevention_policies: (fake) => fake.listPreventionPolicies(),
+  response_policies: (fake) => fake.listResponsePolicies(),
+  rtr_audit_sessions: (fake) => fake.listRtrSessions(),
+  alerts: (fake) => fake.listAlerts(),
+  alert_ids: ids((fake) => fake.listAlerts(), "composite_id"),
+  contained_hosts: (fake, url) => fake.listHosts(undefined, url.searchParams.get("filter")),
+  device_control_policies: (fake) => fake.listDeviceControlPolicies(),
+  device_control_policy_details: (fake) => fake.getDeviceControlPoliciesV2(),
+  firewall_policies: (fake) => fake.listFirewallPolicies(),
+  firewall_policy_containers: (fake) => fake.getFirewallPolicyContainers(),
+  firewall_rule_group_ids: ids((fake) => fake.listFirewallRuleGroups()),
+  firewall_rule_groups: (fake) => fake.listFirewallRuleGroups(),
+  firewall_rule_ids: ids((fake) => fake.listFirewallRules()),
+  firewall_rules: (fake) => fake.listFirewallRules(),
+  sensor_update_policies: (fake) => fake.listSensorUpdatePolicies(),
+  sensor_update_builds: (fake) => fake.listSensorUpdateBuilds(),
+  hosts: (fake) => fake.listHosts(),
+  host_groups: (fake) => fake.listHostGroups(),
+  discover_host_ids: async (fake) => ({ count: await fake.countDiscoverHosts("") }),
+  discover_unmanaged_count: async (fake, url) => ({ count: await fake.countDiscoverHosts(url.searchParams.get("filter")) }),
+  discover_managed_count: async (fake, url) => ({ count: await fake.countDiscoverHosts(url.searchParams.get("filter")) }),
+  discover_unmanaged_hosts: (fake) => fake.listDiscoverHosts(),
+  zero_trust_scored_count: async (fake, url) => ({ count: await fake.countZtaAssessments(url.searchParams.get("filter")) }),
+  zero_trust_below_threshold: (fake) => fake.listZtaAssessments(),
+  zero_trust_below_threshold_count: async (fake, url) => ({ count: await fake.countZtaAssessments(url.searchParams.get("filter")) }),
+  user_uuids: (fake) => fake.listUserUuids(),
+  users: (fake) => fake.getUsers(),
+  user_roles: (fake, url) => fake.listUserRoles(url.searchParams.get("user_uuid")),
+  role_ids: ids((fake) => fake.listRoles()),
+  roles: (fake) => fake.listRoles(),
+  api_client_ids: ids((fake) => fake.listApiClients()),
+  api_clients: (fake) => fake.listApiClients(),
+  ioa_exclusion_ids: ids((fake) => fake.listIoaExclusions()),
+  ioa_exclusions: (fake) => fake.listIoaExclusions(),
+  ml_exclusion_ids: ids((fake) => fake.listMlExclusions()),
+  ml_exclusions: (fake) => fake.listMlExclusions(),
+  sensor_visibility_exclusion_ids: ids((fake) => fake.listSensorVisibilityExclusions()),
+  sensor_visibility_exclusions: (fake) => fake.listSensorVisibilityExclusions(),
+  identity_protection_rule_ids: ids((fake) => fake.listIdentityProtectionRules()),
+  identity_protection_rules: (fake) => fake.listIdentityProtectionRules(),
+};
+
+// Serves the passing tenant through the real client and passes each response through the transform
+// registered for the surface it answers.
+function contractFetch(transforms = {}) {
+  const fake = createFakeClient();
+  return async (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: "contract-token", expires_in: 1799 });
+    const body = typeof init.body === "string" ? JSON.parse(init.body) : undefined;
+    const surfaceId = requestedSurface((init.method ?? "GET").toUpperCase(), url);
+    assert.ok(surfaceId, `undeclared request ${url.pathname}`);
+    const read = await CONTRACT_READS[surfaceId](fake, url, body);
+    const resources = read.count === undefined ? (Array.isArray(read) ? read : read.items) : [];
+    const response = { resources, meta: { pagination: { total: read.count ?? resources.length } } };
+    const transform = transforms[surfaceId];
+    return jsonResponse(transform ? transform(response, url, body) : response);
+  };
+}
+
+// Leaves a read partial the way Falcon does: an ID lookup returns fewer entities than it was asked for,
+// a single-page ID query reports more IDs than it returned, and a walk reports one more record than it
+// delivers and then answers the next page empty.
+function truncatedRead(response, url, body) {
+  const total = response.meta.pagination.total + 1;
+  if (url.searchParams.has("ids") || body?.ids) return { ...response, resources: response.resources.slice(0, -1) };
+  if (url.searchParams.has("offset") || url.searchParams.has("after") || body?.after) return { resources: [], meta: { pagination: { total } } };
+  return { ...response, meta: { pagination: { total, after: "next-page" } } };
+}
+
+portableContractTest("completeness sweep: a truncated source never lets a check that reads it pass", async () => {
+  const report = await sweepCheckCompleteness({
+    spec: CROWDSTRIKE_SPEC,
+    createInput: () => ({}),
+    applyFailure: (transforms, { surfaceId, mode }) => (mode === "truncated" ? { ...transforms, [surfaceId]: truncatedRead } : undefined),
+    assess: async (transforms) => (await runAllCrowdstrikeAssessments(contractClient(contractFetch(transforms)))).flatMap((assessment) => assessment.findings),
+  });
+  assert.deepEqual(report.baselineNotPassing, []);
+  assert.deepEqual(report.unreachable, []);
+  assert.deepEqual(report.undemoted, []);
+  assert.ok(report.combinations > 0);
 });
