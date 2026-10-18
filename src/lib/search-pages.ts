@@ -1,0 +1,75 @@
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import type { AdvancedIndex } from 'fumadocs-core/search/server';
+import { getDocHref } from './docs';
+import { identifierContents } from './search-identifiers.mjs';
+import { getDocSlug, getDocsSections, source } from './source';
+import { categoryLabels, loadSpecs } from './specs';
+
+const noContent = { headings: [], contents: [] };
+
+// The docs overview is indexed with the docs, at /docs/.
+const sitePages = [
+  { url: '/', title: 'CLI', description: 'Install grclanker and see its domain tools, vendor integrations, and runtime paths' },
+  { url: '/specs/', title: 'Specs', description: 'Repository specs for shipped integrations and compute backends' },
+  { url: '/about/', title: 'About', description: 'What grclanker ships today' },
+].map((page) => ({ ...page, id: page.url, breadcrumbs: ['Page'], structuredData: noContent }));
+
+// The integration guides and the generated FedRAMP section hold over 90% of the
+// docs text. Their body text would make the static index the browser downloads
+// about eight times larger, so they are indexed by title, description,
+// headings, and the identifiers each section mentions, such as environment
+// variables, tool names, finding IDs, and control IDs.
+const identifiersOnlySections = ['/docs/integrations/', '/docs/fedramp/'];
+
+// `sync:agent-sdk-tools` writes one file per registered tool, named after it.
+const toolNames = new Set(
+  readdirSync(join(process.cwd(), 'cli/agent-sdk/bot/tools')).map((file) => file.replace(/\.ts$/, '')),
+);
+
+// A hit shows its sidebar section above the page title. That is what tells a
+// FedRAMP KSI domain such as "Incident Response" apart from the guides.
+const sectionTrails = new Map<string, string[]>();
+for (const section of getDocsSections()) {
+  for (const item of section.items) {
+    sectionTrails.set(item.slug, [section.title]);
+    for (const child of item.items ?? []) sectionTrails.set(child.slug, [section.title, item.label]);
+  }
+}
+
+const docsSearchPages: AdvancedIndex[] = source.getPages().map((page) => {
+  const slug = getDocSlug(page);
+  const url = getDocHref(slug);
+  return {
+    id: url,
+    title: page.data.title,
+    description: page.data.description,
+    url,
+    breadcrumbs: ['Docs', ...(sectionTrails.get(slug) ?? [])],
+    structuredData: page.data.structuredData,
+  };
+});
+
+const docs = docsSearchPages.map((page) => {
+  const { headings, contents } = page.structuredData;
+  const identifiersOnly = identifiersOnlySections.some((prefix) => page.url.startsWith(prefix));
+  return {
+    ...page,
+    structuredData: { headings, contents: identifiersOnly ? identifierContents(contents, toolNames) : contents },
+  };
+});
+
+const specs = loadSpecs().map((spec) => {
+  const url = `/specs/${spec.slug}/`;
+  return {
+    id: url,
+    title: spec.name,
+    description: `${spec.vendor} · ${categoryLabels[spec.category] ?? spec.category}`,
+    url,
+    breadcrumbs: ['Spec'],
+    structuredData: noContent,
+  };
+});
+
+/** What the main search index lists. */
+export const searchPages: AdvancedIndex[] = [...sitePages, ...docs, ...specs];
