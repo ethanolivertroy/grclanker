@@ -1,6 +1,12 @@
 'use client';
 
-import { type SearchClient, useDocsSearch } from 'fumadocs-core/search/client';
+import { useEffect, useState } from 'react';
+import {
+  type SearchClient,
+  type SearchResultItem,
+  type UseSearchReturn,
+  useDocsSearch,
+} from 'fumadocs-core/search/client';
 import { staticClient } from 'fumadocs-core/search/client/orama-static';
 import {
   SearchDialog,
@@ -38,10 +44,39 @@ const defaultItems = primaryLinks.map((link) => ({
 
 function Empty() {
   return (
-    <div role="status" className="search-empty">
+    <div className="search-empty">
       <img src="/empty-state.webp" alt="" width={96} height={96} loading="lazy" />
       No pages found
     </div>
+  );
+}
+
+function countResults(items: SearchResultItem[]) {
+  return items.reduce((count, item) => count + (item.type === 'table' ? item.rows.length : 1), 0);
+}
+
+/**
+ * Says how many results the list holds once typing pauses. Fumadocs' own
+ * status line in the dialog only reports failed searches.
+ */
+function ResultCount({ search, isLoading, data, error }: UseSearchReturn) {
+  const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    // Clearing first lets a refined query with the same count be spoken again.
+    setMessage('');
+    if (!search || isLoading || error || data?.query !== search) return;
+    const count = countResults(data.items);
+    const timer = setTimeout(() => {
+      setMessage(count === 0 ? 'No pages found' : `${count} ${count === 1 ? 'result' : 'results'}`);
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [search, isLoading, data, error]);
+
+  return (
+    <p role="status" className="sr-only">
+      {message}
+    </p>
   );
 }
 
@@ -55,6 +90,7 @@ export default function SiteSearchDialog(props: SharedProps) {
         <SearchDialogHeader>
           <SearchDialogIcon />
           <SearchDialogInput />
+          <ResultCount {...search} />
           <SearchDialogClose className="overlay-close">Close</SearchDialogClose>
         </SearchDialogHeader>
         <SearchDialogList defaultItems={defaultItems} Empty={Empty} />
