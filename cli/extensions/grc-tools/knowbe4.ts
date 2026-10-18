@@ -6,6 +6,7 @@
  * Every finding maps to one of the twenty numbered controls in
  * specs/knowbe4-sec-inspector.spec.md.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import {
   createWriteStream,
@@ -22,12 +23,14 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { KNOWBE4_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import {
   ACCOUNT_ADMIN_FIELDS,
   ACCOUNT_FIELDS,
   COMPLIANCE_TOPIC_PATTERN,
   FAILURE_TIMESTAMP_KEYS,
+  KNOWBE4_SPEC,
   PII_HASH_FIELDS,
   PII_MASK_FIELDS,
   USER_FREE_FORM_FIELDS,
@@ -174,6 +177,20 @@ export const KNOWBE4_CONTROLS: readonly Knowbe4ControlDefinition[] = [
   controlDefinition(19, "Phishing report rate", "phishing", ["AT-2(1)", "L2 3.2.3", "CC1.4", "14.4", "12.6.3.1", "SRG-APP-000516", "ISM-0252", "HR-03"]),
   controlDefinition(20, "Campaign scheduling regularity", "phishing", ["AT-2", "L2 3.2.1", "CC1.4", "14.1", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-01"]),
 ];
+
+hydrateBatchFrameworkMappings(KNOWBE4_SPEC, Object.fromEntries(KNOWBE4_CONTROLS.map(({ number, frameworks }) => [
+  findingId(number),
+  {
+    fedramp: [frameworks.fedramp],
+    cmmc: [frameworks.cmmc],
+    soc2: [frameworks.soc2],
+    cis: [frameworks.cis_v8],
+    pci_dss: [frameworks.pci_dss],
+    disa_stig: [frameworks.disa_stig],
+    irap: [frameworks.irap],
+    ismap: [frameworks.ismap],
+  },
+])));
 
 export interface Knowbe4ResolvedConfig {
   apiToken: string;
@@ -2209,6 +2226,15 @@ function findingId(number: number): string {
   return `KNOWBE4-${String(number).padStart(2, "0")}`;
 }
 
+const KNOWBE4_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordKnowbe4DecisionFacts(number: number, facts: Readonly<Record<string, unknown>>): void {
+  const store = KNOWBE4_DECISION_CONTEXT.getStore();
+  const id = findingId(number);
+  if (!store) throw new Error(`${id} decision facts were recorded outside a KnowBe4 assessment`);
+  store.set(id, { ...store.get(id), ...facts });
+}
+
 function finding(
   number: number,
   severity: Knowbe4Finding["severity"],
@@ -2503,12 +2529,18 @@ function frameworkReportPath(key: Knowbe4FrameworkKey): string {
 }
 
 function assessPhishingFrequency(snapshot: Knowbe4Snapshot, now: Date, maxGapDays: number, lookbackDays: number): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(1, { security_tests_readable: isRead(snapshot.securityTests) });
   if (snapshot.securityTests.error) return unavailableFinding(1, "high", "security_tests", snapshot);
   const tests = runTests(snapshot.securityTests.data, now);
   const latest = tests[0];
   const daysSince = latest ? roundTo(daysBetween(latest.startedAt, now)) : undefined;
   const inLookback = testsWithin(snapshot.securityTests.data, lookbackDays, now).length;
   const status = !latest ? "fail" : daysSince !== undefined && daysSince <= maxGapDays ? "pass" : "fail";
+  recordKnowbe4DecisionFacts(1, {
+    security_tests_complete: isComplete(snapshot.securityTests),
+    days_since_latest_test: daysSince,
+    max_campaign_gap_days: maxGapDays,
+  });
 
   return withInventoryCaveats(finding(
     1,
@@ -2549,10 +2581,16 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     USERS_READ,
     { inventory: "security_test_recipients", notChecked: "recipients of the security tests whose results failed to load were not counted toward coverage" },
   ];
+  recordKnowbe4DecisionFacts(2, { security_tests_readable: isRead(snapshot.securityTests) });
   if (snapshot.securityTests.error) return unavailableFinding(2, "high", "security_tests", snapshot);
+  recordKnowbe4DecisionFacts(2, { users_readable: isRead(snapshot.activeUsers) });
   if (snapshot.activeUsers.error) return unavailableFinding(2, "high", "users", snapshot);
   const active = activeUserIds(snapshot);
   const testsInWindow = testsWithin(snapshot.securityTests.data, lookbackDays, now);
+  recordKnowbe4DecisionFacts(2, {
+    security_tests_in_window: testsInWindow.length,
+    user_record_count: snapshot.activeUsers.data.length,
+  });
   // With no tests the fail below stands on the test data alone; only a measured coverage needs a user population.
   if (testsInWindow.length > 0 && snapshot.activeUsers.data.length === 0) {
     return withInventoryCaveats(emptyUserListFinding(2, "high", "phishing simulation coverage", {
@@ -2580,6 +2618,15 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
   // was read in full, so a partial read renders the coverage unknown and names nobody as untested.
   const recipients = recipientReadState(snapshot, samples, testsInWindow.length);
   const complete = isComplete(snapshot.activeUsers) && recipients.complete;
+  recordKnowbe4DecisionFacts(2, {
+    sampled_test_count: samples.length,
+    users_complete: isComplete(snapshot.activeUsers),
+    recipient_reads_complete: recipients.complete,
+    tested_user_count: tested.size,
+    active_user_count: active.size,
+    min_coverage_pct: minCoveragePct,
+    security_tests_complete: isComplete(snapshot.securityTests),
+  });
 
   let status: Knowbe4Finding["status"];
   let summary: string;
@@ -2616,6 +2663,7 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
 }
 
 function assessPhishPronePercentage(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, maxPhishPronePct: number): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(6, { security_tests_readable: isRead(snapshot.securityTests) });
   if (snapshot.securityTests.error) return unavailableFinding(6, "high", "security_tests", snapshot);
   const recent = testsWithin(snapshot.securityTests.data, lookbackDays, now).map((item) => item.test);
   const history = runTests(snapshot.securityTests.data, now).map((item) => item.test).reverse();
@@ -2624,6 +2672,14 @@ function assessPhishPronePercentage(snapshot: Knowbe4Snapshot, now: Date, lookba
   const userAverage = mean(snapshot.activeUsers.data.map((user) => asNumber(user.phish_prone_percentage)).filter((value): value is number => value !== undefined));
   const baseline = history.length >= MIN_TREND_TESTS ? weightedPhishPronePercent(history.slice(0, 3)) : undefined;
   const accountRisk = asNumber(snapshot.account.data.current_risk_score);
+  recordKnowbe4DecisionFacts(6, {
+    security_tests_complete: isComplete(snapshot.securityTests),
+    current_phish_prone_pct: current,
+    baseline_phish_prone_pct: baseline,
+    max_phish_prone_pct: maxPhishPronePct,
+    users_readable: isRead(snapshot.activeUsers),
+    account_readable: isRead(snapshot.account),
+  });
 
   let status: Knowbe4Finding["status"];
   let summary: string;
@@ -2664,6 +2720,7 @@ function assessPhishPronePercentage(snapshot: Knowbe4Snapshot, now: Date, lookba
 }
 
 function assessFailureTrend(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(7, { security_tests_readable: isRead(snapshot.securityTests) });
   if (snapshot.securityTests.error) return unavailableFinding(7, "medium", "security_tests", snapshot);
   const windowDays = lookbackDays * 2;
   const tests = testsWithin(snapshot.securityTests.data, windowDays, now)
@@ -2678,6 +2735,11 @@ function assessFailureTrend(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
     SECURITY_TEST_READ,
     { inventory: "account_risk_score_history", notChecked: "the organization risk score history was not attached", verdict: false },
   ];
+  recordKnowbe4DecisionFacts(7, {
+    security_tests_complete: isComplete(snapshot.securityTests),
+    trend_test_count: tests.length,
+    account_risk_score_history_readable: isRead(snapshot.accountRiskHistory),
+  });
   if (tests.length < MIN_TREND_TESTS) {
     return withInventoryCaveats(finding(7, "medium", "warn", `Only ${tests.length} phishing security tests with results ran in the last ${windowDays} days; at least ${MIN_TREND_TESTS} are needed to evaluate a trend.`, {
       security_tests_considered: tests.length,
@@ -2690,6 +2752,7 @@ function assessFailureTrend(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
   const earlier = mean(tests.slice(0, midpoint).map((item) => item.ppp)) ?? 0;
   const later = mean(tests.slice(midpoint).map((item) => item.ppp)) ?? 0;
   const delta = roundTo(later - earlier, 2);
+  recordKnowbe4DecisionFacts(7, { phish_prone_delta_points: delta });
   const status = delta > TREND_FAIL_DELTA_PCT ? "fail" : delta > TREND_WARN_DELTA_PCT ? "warn" : "pass";
 
   return withInventoryCaveats(finding(
@@ -2714,6 +2777,7 @@ function assessFailureTrend(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
 }
 
 function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCoveragePct: number, requireFullTargeting: boolean): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(9, { phishing_campaigns_readable: isRead(snapshot.phishingCampaigns) });
   if (snapshot.phishingCampaigns.error) return unavailableFinding(9, "medium", "phishing_campaigns", snapshot);
   const cutoff = daysAgo(now, lookbackDays).getTime();
   const recentCampaignIds = new Set(
@@ -2732,6 +2796,12 @@ function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackD
   });
   const fullCampaigns = activeCampaigns.filter(campaignTargetsAllUsers);
   const partialCampaigns = activeCampaigns.filter((campaign) => !campaignTargetsAllUsers(campaign));
+  recordKnowbe4DecisionFacts(9, {
+    active_campaign_count: activeCampaigns.length,
+    full_targeting_campaign_count: fullCampaigns.length,
+    users_readable: isRead(snapshot.activeUsers),
+    groups_readable: isRead(snapshot.groups),
+  });
   // Without an All Users campaign the verdict is a coverage estimate over users and group member counts, so those
   // inventories become essential: an unreadable one leaves the estimate undefined and the control unprovable.
   if (partialCampaigns.length > 0 && fullCampaigns.length === 0) {
@@ -2755,6 +2825,16 @@ function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackD
     : activeUsers > 0
       ? Math.min(100, roundTo((targetedMembers / activeUsers) * 100))
       : undefined;
+  recordKnowbe4DecisionFacts(9, {
+    phishing_campaigns_complete: isComplete(snapshot.phishingCampaigns),
+    targeted_member_count: isRead(snapshot.groups) ? targetedMembers : undefined,
+    active_user_count: isRead(snapshot.activeUsers) ? activeUsers : undefined,
+    min_coverage_pct: minCoveragePct,
+    require_full_targeting: requireFullTargeting,
+    security_tests_complete: isComplete(snapshot.securityTests),
+    users_complete: isComplete(snapshot.activeUsers),
+    groups_complete: isComplete(snapshot.groups),
+  });
 
   let status: Knowbe4Finding["status"];
   let summary: string;
@@ -2797,6 +2877,7 @@ function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackD
 }
 
 function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minReportRatePct: number): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(19, { security_tests_readable: isRead(snapshot.securityTests) });
   if (snapshot.securityTests.error) return unavailableFinding(19, "medium", "security_tests", snapshot);
   const recent = testsWithin(snapshot.securityTests.data, lookbackDays, now).map((item) => item.test);
   let delivered = 0;
@@ -2807,6 +2888,14 @@ function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: nu
   }
   const reportRate = percentage(reported, delivered);
   const phisher = snapshot.phisherMessages;
+  recordKnowbe4DecisionFacts(19, {
+    delivered_count: delivered,
+    reported_count: reported,
+    min_report_rate_pct: minReportRatePct,
+    report_rate_warn_floor_pct: minReportRatePct / 2,
+    security_tests_complete: isComplete(snapshot.securityTests),
+    phisher_messages_readable: phisher.collected ? isRead(phisher) : undefined,
+  });
   // Inbox counts are population figures: unknown when the inbox was not read, partial (and so unknown) when the
   // read stopped at phisher_message_limit; only the number of messages actually read is stated then.
   const phisherEvidence: JsonRecord = phisher.collected
@@ -2874,8 +2963,13 @@ function countBy(records: JsonRecord[], key: string): JsonRecord {
 }
 
 function assessScheduleRegularity(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, maxScheduleGapDays: number): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(20, { security_tests_readable: isRead(snapshot.securityTests) });
   if (snapshot.securityTests.error) return unavailableFinding(20, "medium", "security_tests", snapshot);
   const allTests = runTests(snapshot.securityTests.data, now);
+  recordKnowbe4DecisionFacts(20, {
+    security_tests_complete: isComplete(snapshot.securityTests),
+    max_schedule_gap_days: maxScheduleGapDays,
+  });
   if (allTests.length === 0) {
     return withInventoryCaveats(finding(20, "medium", "fail", "No phishing security tests have ever run, so there is no scheduling cadence to evaluate.", {
       security_tests_in_window: 0,
@@ -2902,6 +2996,7 @@ function assessScheduleRegularity(snapshot: Knowbe4Snapshot, now: Date, lookback
   const daysSinceLatest = roundTo(daysBetween(latest.startedAt, now));
   gaps.push({ from: latest.startedAt.toISOString(), to: now.toISOString(), days: daysSinceLatest, boundary: "now" });
   const maxGap = Math.max(...gaps.map((gap) => gap.days));
+  recordKnowbe4DecisionFacts(20, { largest_schedule_gap_days: maxGap });
   const averageGap = roundTo(mean(gaps.map((gap) => gap.days)) ?? 0);
   const overThreshold = gaps.filter((gap) => gap.days > maxScheduleGapDays);
   const status = overThreshold.length === 0 ? "pass" : "fail";
@@ -2933,6 +3028,13 @@ function assessScheduleRegularity(snapshot: Knowbe4Snapshot, now: Date, lookback
 export function assessKnowbe4PhishingProgram(
   snapshot: Knowbe4Snapshot,
   options: Knowbe4AssessmentOptions = {},
+): Knowbe4AssessmentResult {
+  return runBatchVerdictContext(KNOWBE4_DECISION_CONTEXT, KNOWBE4_SPEC, () => assessKnowbe4PhishingProgramWithDecisionContext(snapshot, options));
+}
+
+function assessKnowbe4PhishingProgramWithDecisionContext(
+  snapshot: Knowbe4Snapshot,
+  options: Knowbe4AssessmentOptions,
 ): Knowbe4AssessmentResult {
   const now = options.now ?? new Date();
   const redact = options.redactPii ?? false;
