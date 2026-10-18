@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import http from "node:http";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -605,16 +606,243 @@ test("an unsupported architecture names the architecture", () => {
   assert.match(result.stderr, /unsupported architecture: i686/);
 });
 
+const pwshBin = process.env.PWSH || "pwsh";
+const hasPwsh = spawnSync(pwshBin, ["-NoProfile", "-Command", "exit 0"]).status === 0;
+
+function writeZip(archivePath, entries) {
+  const specPath = `${archivePath}.spec.json`;
+  writeFileSync(specPath, JSON.stringify(entries));
+  const writer = spawnSync("python3", ["-c", `
+import json, os, zipfile
+with open(os.environ["ZIP_SPEC"], encoding="utf-8") as handle:
+    entries = json.load(handle)
+with zipfile.ZipFile(os.environ["ZIP_PATH"], "w") as archive:
+    for name, body in entries.items():
+        archive.writestr(name, body)
+`], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ZIP_PATH: archivePath,
+      ZIP_SPEC: specPath,
+    },
+  });
+  rmSync(specPath, { force: true });
+  assert.equal(writer.status, 0, writer.stderr);
+}
+
+function runPwshInstallAsync(root, env) {
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawn(pwshBin, ["-NoProfile", "-File", resolve(root, "public", "install.ps1")], {
+      cwd: root,
+      // spawnSync would freeze this process, so a local HTTP server could never answer.
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        HOME: resolve(root, "home"),
+        GRCLANKER_BIN_DIR: resolve(root, "bin"),
+        GRCLANKER_INSTALL_DIR: resolve(root, "install"),
+        GRCLANKER_INSTALL_TARGET: "win32-x64",
+        GRCLANKER_ASSET_URL: "",
+        GRCLANKER_RELEASE_BASE_URL: "",
+        GRCLANKER_VERSION: "",
+        ...env,
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+    }, 20000);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      rejectRun(error);
+    });
+    child.on("close", (status) => {
+      clearTimeout(timer);
+      resolveRun({ status, stdout, stderr });
+    });
+  });
+}
+
+function runPwshInstall(root, env) {
+  return spawnSync(pwshBin, ["-NoProfile", "-File", resolve(root, "public", "install.ps1")], {
+    cwd: root,
+    encoding: "utf8",
+    // An open empty stdin pipe makes pwsh block, and a progress bar deadlocks a full stdout pipe.
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 20000,
+    env: {
+      ...process.env,
+      HOME: resolve(root, "home"),
+      GRCLANKER_BIN_DIR: resolve(root, "bin"),
+      GRCLANKER_INSTALL_DIR: resolve(root, "install"),
+      GRCLANKER_INSTALL_TARGET: "win32-x64",
+      GRCLANKER_ASSET_URL: "",
+      GRCLANKER_RELEASE_BASE_URL: "",
+      GRCLANKER_VERSION: "",
+      ...env,
+    },
+  });
+}
+
+function stagePwshCheckout(names, { packageVersion = "9.9.9", sums = null } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "grclanker-release-ps-"));
+  const releaseDir = resolve(root, "cli", "release");
+  mkdirSync(releaseDir, { recursive: true });
+  mkdirSync(resolve(root, "public"), { recursive: true });
+  writeFileSync(resolve(root, "cli", "package.json"), JSON.stringify({ version: packageVersion }));
+  copyFileSync(resolve(REPO_ROOT, "public", "install.ps1"), resolve(root, "public", "install.ps1"));
+  for (const name of names) {
+    writeZip(resolve(releaseDir, name), { "ok.txt": "ok\n" });
+  }
+  if (sums !== null) {
+    writeFileSync(resolve(releaseDir, "SHA256SUMS.txt"), sums);
+  }
+  return { root, releaseDir };
+}
+
+test("PowerShell local bundle selection keeps numeric order and prerelease names", { skip: !hasPwsh }, () => {
+  const stage = stagePwshCheckout([
+    "grclanker-0.1.2-win32-x64.zip",
+    "grclanker-0.1.10-win32-x64.zip",
+    "grclanker-0.2.0-rc.2-win32-x64.zip",
+    "grclanker-0.2.0-rc.10-win32-x64.zip",
+  ]);
+  try {
+    const result = runPwshInstall(stage.root);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /Using local release artifact grclanker-0\.2\.0-rc\.10-win32-x64\.zip/);
+  } finally {
+    rmSync(stage.root, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell prefers a stable local bundle over its release candidate", { skip: !hasPwsh }, () => {
+  const stage = stagePwshCheckout([
+    "grclanker-0.1.10-win32-x64.zip",
+    "grclanker-0.2.0-rc.10-win32-x64.zip",
+    "grclanker-0.2.0-win32-x64.zip",
+  ]);
+  try {
+    const result = runPwshInstall(stage.root);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /Using local release artifact grclanker-0\.2\.0-win32-x64\.zip/);
+    assert.doesNotMatch(result.stdout, /grclanker-0\.2\.0-rc/);
+  } finally {
+    rmSync(stage.root, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell refuses a local checksum file that omits the archive", { skip: !hasPwsh }, () => {
+  const name = "grclanker-1.0.0-win32-x64.zip";
+  const stage = stagePwshCheckout([name], {
+    packageVersion: "1.0.0",
+    sums: `${"a".repeat(64)}  grclanker-0.0.1-win32-x64.zip\n`,
+  });
+  try {
+    const result = runPwshInstall(stage.root);
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /No checksum entry for grclanker-1\.0\.0-win32-x64\.zip/);
+    assert.equal(existsSync(resolve(stage.root, "install")), false);
+  } finally {
+    rmSync(stage.root, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell refuses zip entries that escape the install directory", { skip: !hasPwsh }, () => {
+  const root = mkdtempSync(join(tmpdir(), "grclanker-release-ps-slip-"));
+  const releaseDir = resolve(root, "cli", "release");
+  mkdirSync(releaseDir, { recursive: true });
+  mkdirSync(resolve(root, "public"), { recursive: true });
+  writeFileSync(resolve(root, "cli", "package.json"), JSON.stringify({ version: "1.0.0" }));
+  copyFileSync(resolve(REPO_ROOT, "public", "install.ps1"), resolve(root, "public", "install.ps1"));
+  writeZip(resolve(releaseDir, "grclanker-1.0.0-win32-x64.zip"), {
+    "ok.txt": "ok\n",
+    "../escaped.txt": "pwned\n",
+    "C:/evil.txt": "pwned\n",
+  });
+  try {
+    const result = runPwshInstall(root);
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /Refusing to extract unsafe archive entry: \.\.\/escaped\.txt/);
+    assert.equal(existsSync(resolve(root, "escaped.txt")), false);
+    assert.equal(existsSync(resolve(root, "install")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell refuses a release base URL whose checksum file is missing", { skip: !hasPwsh }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "grclanker-release-ps-base-"));
+  mkdirSync(resolve(root, "public"), { recursive: true });
+  copyFileSync(resolve(REPO_ROOT, "public", "install.ps1"), resolve(root, "public", "install.ps1"));
+  const zipPath = resolve(root, "grclanker-1.2.3-win32-x64.zip");
+  writeZip(zipPath, { "ok.txt": "ok\n" });
+  const zipBytes = readFileSync(zipPath);
+  const server = http.createServer((request, response) => {
+    if (request.url === "/grclanker-1.2.3-win32-x64.zip") {
+      response.end(zipBytes);
+      return;
+    }
+    response.statusCode = 404;
+    response.end("missing");
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const { port } = server.address();
+  try {
+    const result = await runPwshInstallAsync(root, {
+      GRCLANKER_VERSION: "1.2.3",
+      GRCLANKER_RELEASE_BASE_URL: `http://127.0.0.1:${port}`,
+    });
+    assert.notEqual(result.status, 0);
+    const output = `${result.stdout}\n${result.stderr}`;
+    assert.match(output, /Could not fetch SHA256SUMS\.txt/);
+    assert.match(output, new RegExp(`http://127\\.0\\.0\\.1:${port}/SHA256SUMS\\.txt`));
+    assert.equal(existsSync(resolve(root, "install")), false);
+  } finally {
+    await new Promise((resolveClose) => server.close(resolveClose));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell rejects a non-http release base URL instead of hanging", { skip: !hasPwsh }, () => {
+  const root = mkdtempSync(join(tmpdir(), "grclanker-release-ps-scheme-"));
+  mkdirSync(resolve(root, "public"), { recursive: true });
+  copyFileSync(resolve(REPO_ROOT, "public", "install.ps1"), resolve(root, "public", "install.ps1"));
+  try {
+    const result = runPwshInstall(root, {
+      GRCLANKER_VERSION: "9.9.9",
+      GRCLANKER_RELEASE_BASE_URL: "file:///tmp/not-a-release",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /must be an http or https URL/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the PowerShell installer fails closed and checks zip entries before expanding", () => {
   const contents = readFileSync(resolve(REPO_ROOT, "public", "install.ps1"), "utf8");
-  const check = contents.indexOf("function Assert-ZipEntriesSafe");
+  const check = contents.indexOf("Assert-ZipEntriesSafe -ArchivePath $ArchivePath");
   const expand = contents.indexOf("Expand-Archive -Path $ArchivePath");
-  assert.ok(check > 0 && expand > check);
+  const replaceInstall = contents.indexOf("Remove-Item -Recurse -Force $InstallDir");
+  assert.ok(check > 0 && replaceInstall > check && expand > replaceInstall);
   assert.match(contents, /Refusing to extract unsafe archive entry/);
   assert.match(contents, /\^\[A-Za-z\]:/);
   assert.match(contents, /Could not fetch SHA256SUMS\.txt/);
   assert.match(contents, /No checksum entry for \$AssetName/);
   assert.match(contents, /is not a SHA-256 hex digest/);
   assert.match(contents, /function Test-VersionNewer/);
+  assert.match(contents, /function Assert-HttpUrl/);
+  assert.match(contents, /\$ProgressPreference = "SilentlyContinue"/);
   assert.doesNotMatch(contents, /Sort-Object/);
 });

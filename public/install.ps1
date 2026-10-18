@@ -3,6 +3,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Invoke-WebRequest otherwise draws a progress bar that can stall noninteractive hosts.
+$ProgressPreference = "SilentlyContinue"
 
 $RepoOwner = if ($env:GRCLANKER_REPO_OWNER) { $env:GRCLANKER_REPO_OWNER } else { "ethanolivertroy" }
 $RepoName = if ($env:GRCLANKER_REPO_NAME) { $env:GRCLANKER_REPO_NAME } else { "grclanker" }
@@ -289,6 +291,12 @@ function Assert-ZipEntriesSafe([string]$ArchivePath) {
   }
 }
 
+function Assert-HttpUrl([string]$Url, [string]$Label) {
+  if ($Url -notmatch "^https?://") {
+    throw "$Label must be an http or https URL. Got: $Url"
+  }
+}
+
 function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag, [string]$AssetSourcePath, [string]$AssetUrl) {
   $ChecksumsPath = Join-Path $TempRoot "SHA256SUMS.txt"
   $ChecksumsUrl = $null
@@ -320,6 +328,7 @@ function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag,
   }
 
   if ($ChecksumsUrl) {
+    Assert-HttpUrl $ChecksumsUrl "Checksum URL"
     try {
       Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $ChecksumsPath | Out-Null
     } catch {
@@ -423,6 +432,7 @@ try {
     Copy-Item -LiteralPath $AssetSourcePath -Destination $ArchivePath -Force
   } else {
     Write-Info "Downloading $AssetName"
+    Assert-HttpUrl $AssetUrl "Asset URL"
     try {
       Invoke-WebRequest -Uri $AssetUrl -OutFile $ArchivePath
     } catch {
@@ -436,12 +446,14 @@ try {
     Write-Ok "Integrity verified"
   }
 
+  # Reject a hostile archive before replacing anything already installed.
+  Assert-ZipEntriesSafe -ArchivePath $ArchivePath
+
   if (Test-Path $InstallDir) {
     Remove-Item -Recurse -Force $InstallDir
   }
 
   New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-  Assert-ZipEntriesSafe -ArchivePath $ArchivePath
   Expand-Archive -Path $ArchivePath -DestinationPath $InstallDir -Force
   Write-Ok "Installed bundle into $InstallDir"
 
