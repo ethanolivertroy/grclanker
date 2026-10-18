@@ -1429,35 +1429,97 @@ details[open] > .agent-group-toggle::before {
 }
 
 /* Reading measure for running text; tables and code blocks use the full column. */
-.docs-prose > :is(p, ul, ol, blockquote, h2, h3, h4) {
+.docs-prose > :is(p, ul, ol, blockquote, h2, h3, h4, div:where(.docs-heading)) {
   max-width: 60ch;
 }
 
-.docs-prose :is(h2, h3, h4) {
+/* A heading with an id sits in a .docs-heading wrapper next to its anchor link
+   (src/components/docs-heading.tsx). The wrapper takes the heading's spacing
+   and size so the heading can run inline and the link follow its last word.
+   :where() keeps each wrapper selector at its heading's specificity, so
+   `.docs-prose > :first-child` still clears a leading wrapper's top margin. */
+.docs-prose :is(h2, h3, h4, div:where(.docs-heading)) {
   font-family: var(--font-mono);
   font-weight: 700;
   text-wrap: balance;
 }
 
-.docs-prose h2 {
+.docs-prose :is(h2, div:where(.docs-heading-h2)) {
   margin: 2.75rem 0 1rem;
   color: var(--docs-title);
   font-size: var(--text-lg);
   line-height: 1.3;
 }
 
-.docs-prose h3 {
+.docs-prose :is(h3, div:where(.docs-heading-h3)) {
   margin: 2.25rem 0 0.75rem;
   color: var(--docs-title);
   font-size: 1.125rem;
   line-height: 1.4;
 }
 
-.docs-prose h4 {
+.docs-prose :is(h4, div:where(.docs-heading-h4)) {
   margin: 1.75rem 0 0.5rem;
   color: var(--docs-title);
   font-size: var(--text-base);
   line-height: 1.4;
+}
+
+.docs-prose .docs-heading > :is(h2, h3, h4) {
+  display: inline;
+  margin: 0;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+/* Without hover the link would show on every heading, and on phones the room
+   it takes would push a word of some headings onto a new line. The contents
+   list links each section there instead. */
+.docs-prose .docs-heading-anchor {
+  display: none;
+}
+
+@media (hover: hover) {
+  .docs-prose .docs-heading {
+    --docs-anchor-gap: 0.35em;
+    --docs-anchor-size: 0.75em;
+    padding-inline-end: calc(var(--docs-anchor-gap) + var(--docs-anchor-size));
+  }
+
+  /* The end padding sits outside the heading's 60ch measure. */
+  .docs-prose > .docs-heading {
+    max-width: calc(60ch + var(--docs-anchor-gap) + var(--docs-anchor-size));
+  }
+
+  /* The end margin cancels the link's width, so it never wraps onto a line of
+     its own; the wrapper's end padding leaves room for it to hang into. */
+  .docs-prose .docs-heading-anchor {
+    position: relative;
+    display: inline-block;
+    margin-inline: var(--docs-anchor-gap) calc(-1 * (var(--docs-anchor-gap) + var(--docs-anchor-size)));
+    border-radius: 0.2em;
+    color: var(--docs-subtle);
+    text-decoration: none;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+
+  /* Enlarges the link's hit area around the icon without moving it. */
+  .docs-prose .docs-heading-anchor::after {
+    content: '';
+    position: absolute;
+    inset: -0.4em -0.4em -0.4em calc(-1 * var(--docs-anchor-gap));
+  }
+
+  .docs-prose .docs-heading-anchor svg {
+    width: var(--docs-anchor-size);
+    height: var(--docs-anchor-size);
+  }
+
+  .docs-prose .docs-heading:hover .docs-heading-anchor,
+  .docs-prose .docs-heading-anchor:focus-visible {
+    opacity: 1;
+  }
 }
 
 .docs-prose p {
@@ -1676,7 +1738,7 @@ details[open] > .agent-group-toggle::before {
   overflow-x: auto;
 }
 
-.docs-prose :is(h2, h3, h4) + .docs-table-scroll {
+.docs-prose :is(h2, h3, h4, div:where(.docs-heading)) + .docs-table-scroll {
   margin-top: 0;
 }
 
@@ -2223,7 +2285,7 @@ details[open] > .agent-group-toggle::before {
     overflow-wrap: anywhere;
   }
 
-  .docs-prose h2 {
+  .docs-prose :is(h2, div:where(.docs-heading-h2)) {
     margin: 2rem 0 0.75rem;
     font-size: var(--text-md);
     line-height: 1.3;

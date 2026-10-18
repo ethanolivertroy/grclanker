@@ -3,6 +3,7 @@ import { Fragment } from 'react';
 import type { TOCItemType } from 'fumadocs-core/toc';
 import { getDocHref, integrationsDocsPrefix } from '../lib/docs';
 import { getDocSlug, getDocsSections, source } from '../lib/source';
+import { DocsHeading } from './docs-heading';
 
 interface DocsRoute {
   href: string;
@@ -49,7 +50,9 @@ export function DocsRoutes() {
     <nav className="docs-routes" aria-label="Docs sections">
       {getDocsRouteGroups().map((group) => (
         <Fragment key={group.id}>
-          <h2 id={group.id}>{group.title}</h2>
+          <DocsHeading as="h2" id={group.id}>
+            {group.title}
+          </DocsHeading>
           <ul className="docs-route-list" data-names-only={group.namesOnly || undefined}>
             {group.routes.map((route) => (
               <li key={route.href}>
