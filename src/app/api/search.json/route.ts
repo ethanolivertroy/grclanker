@@ -1,5 +1,8 @@
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { createSearchAPI } from 'fumadocs-core/search/server';
 import { getDocHref } from '../../../lib/docs';
+import { identifierContents } from '../../../lib/search-identifiers.mjs';
 import { getDocSlug, getDocsSections, source } from '../../../lib/source';
 import { categoryLabels, loadSpecs } from '../../../lib/specs';
 
@@ -16,9 +19,15 @@ const sitePages = [
 
 // The integration guides and the generated FedRAMP section hold over 90% of the
 // docs text. Their body text would make the static index the browser downloads
-// about eight times larger, so they are indexed by title, description, and
-// headings only.
-const headingsOnlySections = new Set(['integrations', 'fedramp']);
+// about eight times larger, so they are indexed by title, description,
+// headings, and the identifiers each section mentions, such as environment
+// variables, tool names, finding IDs, and control IDs.
+const identifiersOnlySections = new Set(['integrations', 'fedramp']);
+
+// `sync:agent-sdk-tools` writes one file per registered tool, named after it.
+const toolNames = new Set(
+  readdirSync(join(process.cwd(), 'cli/agent-sdk/bot/tools')).map((file) => file.replace(/\.ts$/, '')),
+);
 
 // A hit shows its sidebar section above the page title. That is what tells a
 // FedRAMP KSI domain such as "Incident Response" apart from the guides.
@@ -40,7 +49,10 @@ const docs = source.getPages().map((page) => {
     description: page.data.description,
     url,
     breadcrumbs: ['Docs', ...(sectionTrails.get(slug) ?? [])],
-    structuredData: { headings, contents: headingsOnlySections.has(slug.split('/')[0]) ? [] : contents },
+    structuredData: {
+      headings,
+      contents: identifiersOnlySections.has(slug.split('/')[0]) ? identifierContents(contents, toolNames) : contents,
+    },
   };
 });
 
