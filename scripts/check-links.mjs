@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Checks the built site in out/ for broken internal links, docs pages
-// missing from the sidebar, and pages missing from the search index.
-// `--external` also probes external links and reports (never fails on) the
-// results.
+// missing from the sidebar, pages missing from the search index, and images
+// that prefetch data preloads. `--external` also probes external links and
+// reports (never fails on) the results.
 //
 // Usage: node scripts/check-links.mjs [--external] [outDir]
 
@@ -22,6 +22,11 @@ export const HUB_LINKED_DOCS = [
 export const SEARCH_INDEX = 'api/search.json';
 // Every other page must be findable from the search dialog.
 const UNSEARCHABLE = /^\/(404|_not-found)(\.html|\/)/;
+
+// React writes a preload hint into a page's RSC data for each eager <img> a
+// Server Component renders, and the router prefetches that data from every
+// link to the page, so readers of other pages download the image unseen.
+const PRELOADED_IMAGE = /:HL\["([^"]+)","image"/g;
 
 const LINK_ATTRS = new Set(['href', 'src', 'srcset', 'poster']);
 // RFC 3986 scheme. Only http(s) and protocol-relative URLs are probed by
@@ -234,6 +239,16 @@ export function checkSite({ distDir = 'out', hubs = HUB_LINKED_DOCS, searchIndex
     }
   }
 
+  const preloaded = new Map();
+  for (const file of allFiles.filter((path) => path.endsWith('.txt'))) {
+    for (const [, src] of readFileSync(file, 'utf8').matchAll(PRELOADED_IMAGE)) {
+      if (!preloaded.has(src)) preloaded.set(src, relative('.', file));
+    }
+  }
+  for (const [src, file] of preloaded) {
+    problems.push(`${file}: prefetch data preloads ${src} (render the image with HeroImage, src/components/hero-image.tsx)`);
+  }
+
   return { problems, external, stats: { pages: pages.size, internalLinks, sidebar: sidebar.size } };
 }
 
@@ -314,7 +329,7 @@ async function main() {
     for (const problem of problems) console.error(`  ${problem}`);
     process.exit(1);
   }
-  console.log('check-links: no broken internal links, orphaned docs pages, or pages missing from search');
+  console.log('check-links: no broken internal links, orphaned docs pages, pages missing from search, or images preloaded by prefetch data');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
