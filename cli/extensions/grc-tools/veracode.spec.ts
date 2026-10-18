@@ -92,17 +92,23 @@ const IDENTITY_SERVICE = "Veracode Identity REST API";
 const DYNAMIC_SERVICE = "Veracode Dynamic Analysis REST API";
 const FINDINGS_SERVICE = "Veracode Findings REST API";
 const SUMMARY_REPORT_SERVICE = "Veracode Summary Report REST API";
+const SCA_SERVICE = "Veracode SCA Agent REST API";
 const APPLICATIONS_DOCS = "https://docs.veracode.com/r/c_apps_intro";
 const POLICY_DOCS = "https://api.swaggerhub.com/apis/Veracode/veracode-policy_api_specification/1.0";
 const IDENTITY_DOCS = "https://docs.veracode.com/r/c_identity_intro";
 const DYNAMIC_DOCS = "https://docs.veracode.com/r/c_dynamic_intro";
 const FINDINGS_DOCS = "https://docs.veracode.com/r/c_findings_v2_intro";
 const SUMMARY_REPORT_DOCS = "https://docs.veracode.com/r/c_rest_summary_report_intro";
+const SCA_DOCS = "https://docs.veracode.com/r/c_sourceclear_intro";
 const API_HOST = "Use the resolved API base URL: base_url, else VERACODE_API_BASE_URL, else the region's host, with any query, fragment, and trailing slashes removed. The region is the region argument, else VERACODE_REGION, else us, trimmed and lowercased: us or commercial is https://api.veracode.com, eu, europe, or european is https://api.veracode.eu, and us-fed, fedramp, or federal is https://api.veracode.us.";
 const API_HEADERS = ["Accept: application/json", "Authorization: VERACODE-HMAC-SHA-256 id={api_key_id},ts={timestamp},nonce={nonce},sig={signature}"];
 const CREDENTIAL_PASS = "the export's credential pass";
-const LIST_STAGE = `The collector exports the walk's result as read, every returned record with all its fields alongside pagesFetched, complete, and, when known, totalPages, totalElements, and notes, through ${CREDENTIAL_PASS}; decision facts read the listed fields.`;
+const WALK_EXPORT = "every returned record with all its fields alongside pagesFetched, complete, and, when known, totalPages, totalElements, and notes";
+const LIST_STAGE = `The collector exports the walk's result as read, ${WALK_EXPORT}, through ${CREDENTIAL_PASS}; decision facts read the listed fields.`;
+const keyedWalkStage = (list: string, keyed: string, reads = "decision facts read the listed fields"): string =>
+  `The collector exports ${list} as the walk returned it, ${WALK_EXPORT}, ${keyed}, through ${CREDENTIAL_PASS}; ${reads}.`;
 const BY_APPLICATION = "keyed by the application's guid read as text (empty text when it has none)";
+const BY_WORKSPACE = "keyed by the workspace's id read as text (empty text when it has none)";
 
 const REFUSAL = "a status outside 200 through 299 after retries, or a 2xx body that is not JSON, is a refusal";
 const halResponse = (key: string, records: string): string =>
@@ -110,6 +116,7 @@ const halResponse = (key: string, records: string): string =>
 const SELF_RESPONSE = `A JSON object carrying at least one of ${series(USER_MEMBERS, "or")}; any other 2xx body, an empty one included, is a refusal, as is a status outside 200 through 299 after retries.`;
 const SCAN_CONFIGURATION_RESPONSE = `A JSON object read for auth_configuration.authentications, whose members name the configured authentication methods, crawl_configuration.disabled and crawl_script_data, target_url (its url when it is an object), and scan_setting.allowed_hosts, else allowed_hosts. An empty 2xx body, or JSON that is not an object, is read as a configuration without authentication; ${REFUSAL}.`;
 const SUMMARY_REPORT_RESPONSE = `A JSON object whose static_analysis.modules.module array holds one static module per JSON object entry, each read for loc, numflawssev5, and numflawssev4. An empty 2xx body, or JSON that is not an object, is read as a report without static modules; ${REFUSAL}.`;
+const LINKED_PROJECTS_RESPONSE = `A JSON object whose linked_projects array holds one linked SCA agent project per JSON object entry. An empty 2xx body, or JSON that is not an object, is read as a response without linked projects; ${REFUSAL}.`;
 
 const param = (
   name: string,
@@ -121,8 +128,8 @@ const param = (
 
 const PAGE_INDEX = "The zero-based page index: 0 for the first page, then one more than the previous page's";
 const HAL_PAGE_PARAMETERS: readonly RequestParameterContract[] = [param("page", "query", PAGE_INDEX), param("size", "query", "100")];
-const pathId = (name: string, record: string): RequestParameterContract =>
-  param(name, "path", `The ${record}'s ${name.replace("application_", "")} read as text and percent-encoded, empty when it has none`);
+const pathId = (name: string, record: string, field = name.replace("application_", "")): RequestParameterContract =>
+  param(name, "path", `The ${record}'s ${field} read as text and percent-encoded, empty when it has none`);
 
 const surface = (
   id: string,
@@ -166,6 +173,7 @@ const SCAN_COVERAGE_SURFACES: readonly BatchSurfaceDefinition[] = [
       "profile.policies.policy_compliance_status",
       "profile.business_criticality",
       "profile.business_unit.name",
+      "profile.upload_and_scan_sca_enabled",
       "scans.scan_type",
       "scans.status",
       "scans.modified_date",
@@ -261,7 +269,7 @@ const FINDINGS_HYGIENE_SURFACES: readonly BatchSurfaceDefinition[] = [
     ],
     [pathId("application_guid", "sampled application"), param("include_annot", "query", "TRUE"), param("page", "query", PAGE_INDEX), param("size", "query", "500")],
     halResponse("findings", "one finding per entry"),
-    `The collector exports each sampled application's finding list as the walk returned it, every returned record with all its fields alongside pagesFetched, complete, and, when known, totalPages, totalElements, and notes, ${BY_APPLICATION}, through ${CREDENTIAL_PASS}; decision facts read the listed fields.`,
+    keyedWalkStage("each sampled application's finding list", BY_APPLICATION),
   ),
   surface(
     "summary_reports",
@@ -275,7 +283,60 @@ const FINDINGS_HYGIENE_SURFACES: readonly BatchSurfaceDefinition[] = [
   ),
 ];
 
-const VERACODE_SURFACES: readonly BatchSurfaceDefinition[] = [...SCAN_COVERAGE_SURFACES, ...FINDINGS_HYGIENE_SURFACES];
+const WORKSPACE_ID = pathId("workspace_id", "sampled workspace", "id");
+const workspaceIssues = (type: string, records: string, fields: readonly string[], member: string): BatchSurfaceDefinition =>
+  surface(
+    `sca_${type}_issues`,
+    SCA_SERVICE,
+    SCA_DOCS,
+    `/srcclr/v3/workspaces/{workspace_id}/issues?type=${type}&status=open`,
+    fields,
+    [WORKSPACE_ID, ...HAL_PAGE_PARAMETERS],
+    halResponse("issues", records),
+    keyedWalkStage(`each sampled workspace's ${type} issue list`, `as the ${member} member of an entry ${BY_WORKSPACE}`),
+  );
+
+const SCA_POSTURE_SURFACES: readonly BatchSurfaceDefinition[] = [
+  surface(
+    "sca_workspaces",
+    SCA_SERVICE,
+    SCA_DOCS,
+    "/srcclr/v3/workspaces",
+    ["id", "name"],
+    HAL_PAGE_PARAMETERS,
+    halResponse("workspaces", "one SCA agent workspace per entry"),
+    LIST_STAGE,
+  ),
+  workspaceIssues(
+    "vulnerability",
+    "one open vulnerability issue per entry",
+    ["severity", "vulnerability.cvss3_score", "vulnerability.cvss2_score", "vulnerability.cve", "library.name"],
+    "vulnerabilities",
+  ),
+  workspaceIssues("license", "one open license issue per entry", ["license.risk", "license.name", "library.name"], "licenses"),
+  surface(
+    "sca_libraries",
+    SCA_SERVICE,
+    SCA_DOCS,
+    "/srcclr/v3/workspaces/{workspace_id}/libraries",
+    [],
+    [WORKSPACE_ID, ...HAL_PAGE_PARAMETERS],
+    halResponse("libraries", "one library per entry"),
+    keyedWalkStage("each sampled workspace's library list", `as the libraries member of an entry ${BY_WORKSPACE}`, "decisions count the records and read no field"),
+  ),
+  surface(
+    "sca_application_projects",
+    SCA_SERVICE,
+    SCA_DOCS,
+    "/srcclr/v3/applications/{application_guid}/projects",
+    ["linked_projects.name", "linked_projects.id", "linked_projects.workspace.name", "linked_projects.last_scan_date"],
+    [pathId("application_guid", "sampled application")],
+    LINKED_PROJECTS_RESPONSE,
+    `The collector exports each requested linked project response as read, ${BY_APPLICATION}, through ${CREDENTIAL_PASS}; decision facts read the listed fields. When no list was requested the dataset is a marker naming the reason, which calls the SCA Agent API not readable both when its workspace list was refused and when it held no workspace.`,
+  ),
+];
+
+const VERACODE_SURFACES: readonly BatchSurfaceDefinition[] = [...SCAN_COVERAGE_SURFACES, ...FINDINGS_HYGIENE_SURFACES, ...SCA_POSTURE_SURFACES];
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
 const path = (name: string): VerdictOperand => ({ kind: "path", path: name });
@@ -288,6 +349,7 @@ const cmp = (op: Comparator, left: string | VerdictOperand, right: PortableValue
 const ne = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("ne", left, right);
 const gt = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("gt", left, right);
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const not = (condition: VerdictCondition): VerdictCondition => ({ op: "not", condition });
 const always: VerdictCondition = { op: "always" };
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
@@ -322,6 +384,9 @@ const FP_RATE = `An application's false positive rate is (F / N) * 100 in IEEE 7
 const SUMMARY_SAMPLE = `The sampled applications are the first N returned applications, N being ${option("max_applications", 100, 5000)}; each sampled application's summary report is read from GET /appsec/v2/applications/{application_guid}/summary_report.`;
 const STATIC_MODULES = `A summary report's static modules are the JSON object entries of its static_analysis.modules.module array, and its lines of code are the sum of their loc values, each ${AS_NUMBER}, else 0. A summary report counts lines of code when it has a static module and its lines of code are more than 0. ${SUMMARY_SAMPLE}`;
 const FLAW_DENSITY = `A summary report's flaw density is H / (L / 1000) in IEEE 754 double precision, L being its lines of code and H the sum of its static modules' numflawssev5 and numflawssev4 values, each ${AS_NUMBER}, else 0. ${STATIC_MODULES}`;
+const WORKSPACE_SAMPLE = `The sampled workspaces are the first N returned workspaces, N being ${option("max_workspaces", 25, 500)}. Each sampled workspace in turn has its open vulnerability issues read from GET /srcclr/v3/workspaces/{workspace_id}/issues with type=vulnerability and status=open, its open license issues from the same path with type=license and status=open, and its libraries from GET /srcclr/v3/workspaces/{workspace_id}/libraries, each list's records being the entries that are JSON objects.`;
+const UPLOAD_SCAN_SCA = "An application has upload-and-scan SCA when its profile.upload_and_scan_sca_enabled is the boolean true or a string that trims to true in any letter case.";
+const LINKED_PROJECT_SAMPLE = `${UPLOAD_SCAN_SCA} The sampled applications are the first N returned applications, N being ${option("max_applications", 100, 5000)}. When the GET /srcclr/v3/workspaces walk returned without a refusal and kept a workspace, each sampled application without upload-and-scan SCA has its linked project list read from GET /srcclr/v3/applications/{application_guid}/projects, its linked projects being the JSON object entries of the response's linked_projects array; otherwise no linked project list is requested.`;
 
 const VERACODE_INPUTS: Readonly<Record<string, string>> = {
   applications_readable: "True when the GET /appsec/v1/applications walk returned without a refusal.",
@@ -370,6 +435,20 @@ const VERACODE_INPUTS: Readonly<Record<string, string>> = {
   density_exceeding_application_count: `Number of sampled applications whose summary report was read without a refusal, counts lines of code, and has a flaw density of more than D, D being ${limit("max_flaw_density_per_kloc", 1, 1000)}. ${FLAW_DENSITY}`,
   no_loc_application_count: `Number of sampled applications whose summary report was read without a refusal and does not count lines of code. ${STATIC_MODULES}`,
   summary_reports_complete: "Summary report coverage.",
+  sca_workspaces_readable: "True when the GET /srcclr/v3/workspaces walk returned without a refusal.",
+  sca_workspace_count: "Number of SCA agent workspaces the walk kept, entries that are not JSON objects being dropped.",
+  vulnerability_list_read_count: `Number of sampled workspaces whose vulnerability issue list was read without a refusal. ${WORKSPACE_SAMPLE}`,
+  high_severity_issue_count: `Number of issues in the vulnerability issue lists read without a refusal whose score is at least T, T being ${limit("sca_cvss_threshold", 7, 10)}; an issue's score is its severity, else its vulnerability.cvss3_score, else its vulnerability.cvss2_score, the first of them that reads as a number (a finite number, or a string that is not blank and parses as one), and an issue with none has no score. ${WORKSPACE_SAMPLE}`,
+  library_count: `Number of libraries in the library lists read without a refusal, counting only sampled workspaces whose vulnerability issue list was read without a refusal. ${WORKSPACE_SAMPLE}`,
+  vulnerability_reads_complete: "Vulnerability read coverage.",
+  license_list_read_count: `Number of sampled workspaces whose license issue list was read without a refusal. ${WORKSPACE_SAMPLE}`,
+  high_risk_license_issue_count: `Number of issues in the license issue lists read without a refusal whose license.risk, read as text and uppercased, is HIGH. ${READS_AS_TEXT} ${WORKSPACE_SAMPLE}`,
+  unknown_risk_license_issue_count: `Number of issues in the license issue lists read without a refusal whose license.risk does not read as text or, read as text and uppercased, is UNKNOWN. ${READS_AS_TEXT} ${WORKSPACE_SAMPLE}`,
+  license_reads_complete: "License read coverage.",
+  sca_covered_application_count: `Number of sampled applications that have upload-and-scan SCA, or whose linked project list was read without a refusal and holds a linked project. ${LINKED_PROJECT_SAMPLE}`,
+  sca_uncovered_application_count: `Number of sampled applications without upload-and-scan SCA whose linked project list was read without a refusal and holds no linked project. ${LINKED_PROJECT_SAMPLE}`,
+  sca_unchecked_application_count: `Number of sampled applications without upload-and-scan SCA whose linked project list was not requested because the GET /srcclr/v3/workspaces walk was refused or kept no workspace. ${LINKED_PROJECT_SAMPLE}`,
+  linked_project_reads_complete: "Linked project read coverage.",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -419,6 +498,30 @@ const SUMMARY_REPORTS_COMPLETE: BatchCompletenessDefinition = {
   sources: [
     { surfaceId: "applications", falseWhen: ["truncated", "error", "denied"] },
     { surfaceId: "summary_reports", falseWhen: ["error", "denied", "not-collected"] },
+  ],
+};
+const WORKSPACES_UNCOVERED = `the workspace list read was refused or is partial because ${walkPartial(50)}; the list holds more workspaces than were sampled`;
+const VULNERABILITY_READS_COMPLETE: BatchCompletenessDefinition = {
+  semantics: `false when the vulnerability reads do not cover every workspace: ${WORKSPACES_UNCOVERED}; a sampled workspace's vulnerability issue list was refused or is partial because ${walkPartial(20)}; or a sampled workspace whose vulnerability issue list was read had its library list refused, or partial because ${walkPartial(5)}. ${WORKSPACE_SAMPLE}`,
+  sources: [
+    { surfaceId: "sca_workspaces", falseWhen: ["truncated", "error", "denied"] },
+    { surfaceId: "sca_vulnerability_issues", falseWhen: ["truncated", "error", "denied", "not-collected"] },
+    { surfaceId: "sca_libraries", falseWhen: ["truncated", "error", "denied", "not-collected"] },
+  ],
+};
+const LICENSE_READS_COMPLETE: BatchCompletenessDefinition = {
+  semantics: `false when the license reads do not cover every workspace: ${WORKSPACES_UNCOVERED}; or a sampled workspace's license issue list was refused or is partial because ${walkPartial(20)}. ${WORKSPACE_SAMPLE}`,
+  sources: [
+    { surfaceId: "sca_workspaces", falseWhen: ["truncated", "error", "denied"] },
+    { surfaceId: "sca_license_issues", falseWhen: ["truncated", "error", "denied", "not-collected"] },
+  ],
+};
+const LINKED_PROJECT_READS_COMPLETE: BatchCompletenessDefinition = {
+  semantics: `false when the coverage reads do not cover the whole application inventory: ${INVENTORY_UNCOVERED}, or a sampled application without upload-and-scan SCA did not have its linked project list read, because that read was refused or because the GET /srcclr/v3/workspaces walk was refused or kept no workspace. ${LINKED_PROJECT_SAMPLE}`,
+  sources: [
+    { surfaceId: "applications", falseWhen: ["truncated", "error", "denied"] },
+    { surfaceId: "sca_workspaces", falseWhen: ["error", "denied"] },
+    { surfaceId: "sca_application_projects", falseWhen: ["error", "denied", "not-collected"] },
   ],
 };
 
@@ -1029,6 +1132,199 @@ const FINDINGS_HYGIENE_CHECKS: readonly VeracodeCheck[] = [
   },
 ];
 
+const SCA_POSTURE = "veracode_assess_sca_posture";
+const SCA_UNAVAILABLE = any(ne("sca_workspaces_readable", true), not(gt("sca_workspace_count", 0)));
+const SCA_WORKSPACES_GATE = [rule("manual", ne("sca_workspaces_readable", true)), rule("manual", not(gt("sca_workspace_count", 0)))];
+const SCA_WORKSPACES_READ = { sca_workspaces_readable: true, sca_workspace_count: 4 };
+const NO_SCA_WORKSPACES = { sca_workspaces_readable: true, sca_workspace_count: 0 };
+const REFUSED_SCA_WORKSPACES = { sca_workspaces_readable: false, sca_workspace_count: 0 };
+const EMPTY_SCA_WORKSPACES = example("partial", "manual", "The SCA workspace list came back empty, so agent-based SCA is treated as not applicable rather than compliant.", NO_SCA_WORKSPACES);
+const UNREADABLE_SCA_WORKSPACES = example("unreadable", "manual", "The SCA workspace list was refused, which can mean agent-based SCA is unlicensed.", REFUSED_SCA_WORKSPACES);
+const VULNERABILITIES_HEALTHY = {
+  ...SCA_WORKSPACES_READ,
+  vulnerability_list_read_count: 4,
+  high_severity_issue_count: 0,
+  library_count: 230,
+  vulnerability_reads_complete: true,
+};
+const LICENSES_HEALTHY = {
+  ...SCA_WORKSPACES_READ,
+  license_list_read_count: 4,
+  high_risk_license_issue_count: 0,
+  unknown_risk_license_issue_count: 0,
+  license_reads_complete: true,
+};
+const SCA_COVERAGE_HEALTHY = {
+  ...APPLICATIONS_READ,
+  ...SCA_WORKSPACES_READ,
+  sca_covered_application_count: 12,
+  sca_uncovered_application_count: 0,
+  sca_unchecked_application_count: 0,
+  linked_project_reads_complete: true,
+};
+
+const SCA_POSTURE_CHECKS: readonly VeracodeCheck[] = [
+  {
+    id: "VERACODE-05",
+    control: 5,
+    title: "SCA library currency",
+    severity: "high",
+    owner: SCA_POSTURE,
+    surfaces: ["sca_workspaces", "sca_vulnerability_issues", "sca_libraries"],
+    inputs: [
+      "sca_workspaces_readable",
+      "sca_workspace_count",
+      "vulnerability_list_read_count",
+      "high_severity_issue_count",
+      "library_count",
+      "vulnerability_reads_complete",
+    ],
+    rules: [
+      ...SCA_WORKSPACES_GATE,
+      rule("manual", not(gt("vulnerability_list_read_count", 0))),
+      rule("fail", gt("high_severity_issue_count", 0)),
+      rule("manual", not(gt("library_count", 0))),
+      rule("warn", incomplete("vulnerability_reads_complete")),
+      rule("pass", always),
+    ],
+    completeness: { vulnerability_reads_complete: VULNERABILITY_READS_COMPLETE },
+    decision: "Manual when the SCA workspace list is refused or empty, which can mean agent-based SCA is unlicensed or unused, or when no sampled workspace's vulnerability issue list could be read. Fail when an open vulnerability issue scores at or above sca_cvss_threshold. Otherwise manual when no library was read in the workspaces whose issues were read, since it is then unknown whether any scan populated them. Warn instead of pass when the vulnerability reads do not cover every workspace. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "No open vulnerability issue reaches sca_cvss_threshold, and the sampled workspaces hold scanned libraries.", VULNERABILITIES_HEALTHY),
+      example("noncompliant", "fail", "Six open vulnerability issues score at or above sca_cvss_threshold.", { ...VULNERABILITIES_HEALTHY, high_severity_issue_count: 6 }),
+      example("partial", "warn", "One sampled workspace's library list stopped at its page cap.", { ...VULNERABILITIES_HEALTHY, vulnerability_reads_complete: false }),
+      example("partial", "manual", "No open vulnerability issue was returned, but no library was read either, so the workspaces may never have been scanned.", {
+        ...VULNERABILITIES_HEALTHY,
+        library_count: 0,
+      }),
+      example("unreadable", "manual", "Every sampled workspace's vulnerability issue list was refused.", {
+        ...VULNERABILITIES_HEALTHY,
+        vulnerability_list_read_count: 0,
+        library_count: 0,
+        vulnerability_reads_complete: false,
+      }),
+      EMPTY_SCA_WORKSPACES,
+      UNREADABLE_SCA_WORKSPACES,
+    ],
+  },
+  {
+    id: "VERACODE-06",
+    control: 6,
+    title: "SCA license risk",
+    severity: "medium",
+    owner: SCA_POSTURE,
+    surfaces: ["sca_workspaces", "sca_license_issues"],
+    inputs: [
+      "sca_workspaces_readable",
+      "sca_workspace_count",
+      "license_list_read_count",
+      "high_risk_license_issue_count",
+      "unknown_risk_license_issue_count",
+      "license_reads_complete",
+    ],
+    rules: [
+      ...SCA_WORKSPACES_GATE,
+      rule("manual", not(gt("license_list_read_count", 0))),
+      rule("fail", gt("high_risk_license_issue_count", 0)),
+      rule("warn", gt("unknown_risk_license_issue_count", 0)),
+      rule("warn", incomplete("license_reads_complete")),
+      rule("pass", always),
+    ],
+    completeness: { license_reads_complete: LICENSE_READS_COMPLETE },
+    decision: "Manual when the SCA workspace list is refused or empty, which can mean agent-based SCA is unlicensed or unused, or when no sampled workspace's license issue list could be read. Fail when an open license issue carries HIGH license risk (restrictive or copyleft). Warn when an open license issue carries an UNKNOWN or missing risk rating, which needs review. Warn instead of pass when the license reads do not cover every workspace. Otherwise pass, including when the license issue lists read are empty.",
+    examples: [
+      example("compliant", "pass", "No open license issue carries a HIGH, UNKNOWN, or missing license risk.", LICENSES_HEALTHY),
+      example("noncompliant", "fail", "Three open license issues carry HIGH license risk.", { ...LICENSES_HEALTHY, high_risk_license_issue_count: 3 }),
+      example("partial", "warn", "Two open license issues carry no license risk rating.", { ...LICENSES_HEALTHY, unknown_risk_license_issue_count: 2 }),
+      example("partial", "warn", "The workspace list holds more workspaces than max_workspaces lets the assessment sample.", {
+        ...LICENSES_HEALTHY,
+        license_reads_complete: false,
+      }),
+      example("unreadable", "manual", "Every sampled workspace's license issue list was refused.", {
+        ...LICENSES_HEALTHY,
+        license_list_read_count: 0,
+        license_reads_complete: false,
+      }),
+      EMPTY_SCA_WORKSPACES,
+      UNREADABLE_SCA_WORKSPACES,
+    ],
+  },
+  {
+    id: "VERACODE-18",
+    control: 18,
+    title: "SCA workspace coverage",
+    severity: "medium",
+    owner: SCA_POSTURE,
+    surfaces: ["applications", "sca_workspaces", "sca_application_projects"],
+    inputs: [
+      "applications_readable",
+      "application_count",
+      "sca_workspaces_readable",
+      "sca_workspace_count",
+      "sca_covered_application_count",
+      "sca_uncovered_application_count",
+      "sca_unchecked_application_count",
+      "linked_project_reads_complete",
+    ],
+    rules: [
+      ...APPLICATIONS_GATE,
+      rule("manual", all(SCA_UNAVAILABLE, not(gt("sca_covered_application_count", 0)))),
+      rule("warn", gt("sca_unchecked_application_count", 0)),
+      rule("warn", gt("sca_uncovered_application_count", 0)),
+      rule("manual", not(gt("sca_covered_application_count", 0))),
+      rule("warn", incomplete("linked_project_reads_complete")),
+      rule("pass", always),
+    ],
+    completeness: { linked_project_reads_complete: LINKED_PROJECT_READS_COMPLETE },
+    decision: "Manual when the application inventory is unreadable or empty, or when the SCA workspace list is refused or empty and no sampled application has upload-and-scan SCA. An application counts as covered when its profile enables upload-and-scan SCA or the SCA Agent API lists a linked project for it; neither shows that a scan has run. Warn when an application without upload-and-scan SCA could not be checked for linked projects because the SCA workspace list is refused or empty, or when an application has neither. Otherwise manual when every requested linked project list was refused. Warn instead of pass when the coverage reads do not cover the whole application inventory. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every sampled application has upload-and-scan SCA or a linked SCA agent project.", SCA_COVERAGE_HEALTHY),
+      example("compliant", "pass", "The SCA workspace list was refused, but every sampled application has upload-and-scan SCA, so no linked project list was needed.", {
+        ...SCA_COVERAGE_HEALTHY,
+        ...REFUSED_SCA_WORKSPACES,
+      }),
+      example("noncompliant", "warn", "Three applications have neither upload-and-scan SCA nor a linked SCA agent project.", {
+        ...SCA_COVERAGE_HEALTHY,
+        sca_covered_application_count: 9,
+        sca_uncovered_application_count: 3,
+      }),
+      example("partial", "warn", "The SCA workspace list was refused, so four applications without upload-and-scan SCA were not checked for linked projects.", {
+        ...SCA_COVERAGE_HEALTHY,
+        ...REFUSED_SCA_WORKSPACES,
+        sca_covered_application_count: 8,
+        sca_unchecked_application_count: 4,
+        linked_project_reads_complete: false,
+      }),
+      example("partial", "warn", "One sampled application's linked project list was refused.", {
+        ...SCA_COVERAGE_HEALTHY,
+        sca_covered_application_count: 11,
+        linked_project_reads_complete: false,
+      }),
+      example("partial", "manual", "The SCA workspace list came back empty and no sampled application has upload-and-scan SCA.", {
+        ...SCA_COVERAGE_HEALTHY,
+        ...NO_SCA_WORKSPACES,
+        sca_covered_application_count: 0,
+        sca_unchecked_application_count: 12,
+        linked_project_reads_complete: false,
+      }),
+      example("unreadable", "manual", "The SCA workspace list was refused and no sampled application has upload-and-scan SCA.", {
+        ...SCA_COVERAGE_HEALTHY,
+        ...REFUSED_SCA_WORKSPACES,
+        sca_covered_application_count: 0,
+        sca_unchecked_application_count: 12,
+        linked_project_reads_complete: false,
+      }),
+      example("unreadable", "manual", "Every requested linked project list was refused.", {
+        ...SCA_COVERAGE_HEALTHY,
+        sca_covered_application_count: 0,
+        linked_project_reads_complete: false,
+      }),
+      EMPTY_APPLICATIONS,
+      UNREADABLE_APPLICATIONS,
+    ],
+  },
+];
+
 const toCheck = (check: VeracodeCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   const [fedramp, cmmc, soc2, cis, pciDss, disaStig, irap, ismap] = VERACODE_FRAMEWORK_MAPPINGS[check.control];
@@ -1059,7 +1355,12 @@ const toCheck = (check: VeracodeCheck): BatchCheckDefinition => {
   };
 };
 
-const checks: readonly BatchCheckDefinition[] = [...SCAN_COVERAGE_CHECKS, ...POLICY_COMPLIANCE_CHECKS, ...FINDINGS_HYGIENE_CHECKS].map(toCheck);
+const checks: readonly BatchCheckDefinition[] = [
+  ...SCAN_COVERAGE_CHECKS,
+  ...POLICY_COMPLIANCE_CHECKS,
+  ...FINDINGS_HYGIENE_CHECKS,
+  ...SCA_POSTURE_CHECKS,
+].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
 const RECORD_KEY = "a record's key being the first of its guid, id, user_id, team_id, issue_id, and scan_id that is present and not null, else the whole record";
@@ -1124,9 +1425,9 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
   displayName: "Veracode Security Inspector",
   vendor: "Veracode",
   category: "application-security",
-  summary: "Portable contract for the shipped Veracode scan coverage, policy compliance, and findings hygiene assessments over the Veracode Applications, Policy, Identity, Dynamic Analysis, Findings, and Summary Report REST APIs.",
+  summary: "Portable contract for the shipped Veracode scan coverage, policy compliance, findings hygiene, and SCA posture assessments over the Veracode Applications, Policy, Identity, Dynamic Analysis, Findings, Summary Report, and SCA Agent REST APIs.",
   sourceModule: "cli/extensions/grc-tools/veracode.ts",
-  baseServices: [APPLICATIONS_SERVICE, POLICY_SERVICE, IDENTITY_SERVICE, DYNAMIC_SERVICE, FINDINGS_SERVICE, SUMMARY_REPORT_SERVICE],
+  baseServices: [APPLICATIONS_SERVICE, POLICY_SERVICE, IDENTITY_SERVICE, DYNAMIC_SERVICE, FINDINGS_SERVICE, SUMMARY_REPORT_SERVICE, SCA_SERVICE],
   authentication: VERACODE_AUTH_RESOLVER,
   permissions: [
     {
@@ -1156,6 +1457,13 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
       unlocks: ["findings", "summary_reports"],
       notes: "veracode_check_access does not probe these APIs; the Findings and Summary Report REST API documentation names an API user account with the Results API role, or a user account with the Reviewer or Security Lead role.",
     },
+    {
+      id: "sca-agent",
+      kind: "license",
+      value: "SCA license and the Workspace Administrator or Workspace Editor role",
+      unlocks: ["sca_workspaces", "sca_vulnerability_issues", "sca_license_issues", "sca_libraries", "sca_application_projects"],
+      notes: "veracode_check_access names these roles for the workspace list; the SCA REST API documentation requires the API credentials of a UI user account and does not support API user accounts.",
+    },
   ],
   surfaces: VERACODE_SURFACES,
   checks,
@@ -1164,16 +1472,20 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
     veracode_assess_scan_coverage: idsFor(SCAN_COVERAGE),
     veracode_assess_policy_compliance: idsFor(POLICY_COMPLIANCE),
     veracode_assess_findings_hygiene: idsFor(FINDINGS_HYGIENE),
+    veracode_assess_sca_posture: idsFor(SCA_POSTURE),
     veracode_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
-    halWalk(["applications", "policies", "dynamic_analyses"], "records", { pageCap: 50, probed: true }),
+    halWalk(["applications", "policies", "dynamic_analyses", "sca_workspaces"], "records", { pageCap: 50, probed: true }),
     halWalk(["sandboxes"], "sandboxes", { pageCap: 10, scope: "Each sampled application's sandbox list is walked separately. " }),
     halWalk(["findings"], "findings", { pageCap: 50, pageSize: 500, scope: "Each sampled application's finding list is walked separately. " }),
     halWalk(["dynamic_analysis_scans"], "scans", { pageCap: 5, scope: "Each sampled analysis's scan list is walked separately. " }),
+    halWalk(["sca_vulnerability_issues", "sca_license_issues"], "issues", { pageCap: 20, scope: "Each sampled workspace's vulnerability and license issue lists are walked separately. " }),
+    halWalk(["sca_libraries"], "libraries", { pageCap: 5, scope: "Each sampled workspace's library list is walked separately. " }),
     singleRead(["self"], "One read of the API user's own record."),
     singleRead(["summary_reports"], "One read of each sampled application's summary report."),
     singleRead(["dynamic_scan_configurations"], "One read of each inspected scan's configuration."),
+    singleRead(["sca_application_projects"], "One read of each requested linked project list."),
   ],
   rateLimit: {
     documentedLimit: "Veracode documents 500 REST API calls per minute from one IP address, answering a 429 with a retry-after time in seconds beyond it; the collector reads neither the limit nor the retry-after time.",
@@ -1189,6 +1501,9 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
     "VERACODE-15 can pass when the application inventory is read and empty, though the other application checks treat an empty inventory as unverifiable.",
     "When the application inventory is unreadable or empty, the findings hygiene assessment reports VERACODE-16 and VERACODE-17 at high severity, copied from VERACODE-03's manual finding, instead of their own medium severity.",
     "VERACODE-16 skips a finding list that kept no finding before checking whether that list is partial, so a truncated empty list does not lower fp_rate_coverage_complete and the check can pass without that application's rate; changing that behavior requires a separate runtime fix.",
+    "VERACODE-06 can pass when the license issue lists read hold no issue, even when the sampled workspaces hold no scanned library, though VERACODE-05 treats an empty library set as unverifiable.",
+    "VERACODE-18 counts an application as covered when its profile enables upload-and-scan SCA or it has a linked SCA agent project, without checking that either has produced a scan.",
+    "The SCA REST API documentation asks for a user-agent header and accept-encoding: gzip on every request; the collector sets neither itself and relies on Node.js fetch, which sends user-agent: node and accept-encoding: gzip, deflate.",
   ],
   sensitiveFields: ["api_key_id", "api_key_secret", "veracode_api_key_id", "veracode_api_key_secret", "Authorization", "authentications", "crawl_script_data"],
   credentialFormats: ["Veracode API key ID and hex API key secret, used to sign every request with VERACODE-HMAC-SHA-256"],
