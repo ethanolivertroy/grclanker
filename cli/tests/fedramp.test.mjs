@@ -657,6 +657,16 @@ test("buildFedrampDocsSnapshot is deterministic and includes provenance banners"
   assert.match(overview, /fedramp-consolidated-rules\.json/);
 });
 
+test("buildFedrampDocsSnapshot links the overview to the FedRAMP readiness guide", () => {
+  const files = buildFedrampDocsSnapshot(
+    normalizeFedrampConsolidatedRules(consolidatedRulesFixture),
+    docsSnapshotSources,
+  );
+  const overview = files.find((file) => file.path === "fedramp/index.md")?.content ?? "";
+
+  assert.match(overview, /\[FedRAMP Readiness guide\]\(\/docs\/guides\/fedramp-readiness\/\)/);
+});
+
 test("buildFedrampDocsSnapshot puts banner lines, status, and each note in separate paragraphs", () => {
   const fixture = structuredClone(consolidatedRulesFixture);
   fixture.FRR.CDS.data.all.CSO["CDS-CSO-PUB"].notes = [
