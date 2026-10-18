@@ -309,7 +309,31 @@ test("VantaAuditorClient does not drop earlier pages when a later evidence URL p
 
   await assert.rejects(
     client.listEvidenceUrls("audit-1", "ae-1"),
-    /returned 404 after 1 item\(s\); refusing to treat a partial page as a complete list/,
+    /returned 404 after 1 fetched page\(s\); refusing to treat a partial page as a complete list/,
+  );
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient does not treat a later 404 as complete when an earlier page was empty", async () => {
+  clearVantaTokenCacheForTests();
+  const client = vantaClient(withVantaToken(async (url) => {
+    if (url.pathname !== "/v1/audits/audit-1/evidence/ae-1/urls") {
+      return jsonResponse({ error: "not found" }, 404);
+    }
+    if (!url.searchParams.get("pageCursor")) {
+      return jsonResponse({
+        results: {
+          data: [],
+          pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+        },
+      });
+    }
+    return jsonResponse({ error: "missing page" }, 404);
+  }));
+
+  await assert.rejects(
+    client.listEvidenceUrls("audit-1", "ae-1"),
+    /returned 404 after 1 fetched page\(s\); refusing to treat a partial page as a complete list/,
   );
   clearVantaTokenCacheForTests();
 });
@@ -342,6 +366,30 @@ test("VantaAuditorClient redacts credentials echoed in authentication and API er
     assert.match(error.message, /Vanta API request failed/);
     assert.equal(error.message.includes(clientSecret), false);
     assert.equal(error.message.includes(accessToken), false);
+    assert.match(error.message, /\[redacted\]/);
+    return true;
+  });
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient redacts a secret that straddles the error body limit", async () => {
+  clearVantaTokenCacheForTests();
+  const accessToken = `token-head-${"A".repeat(80)}-token-tail-${"B".repeat(80)}`;
+  const filler = "x".repeat(200);
+  const client = vantaClient(async (input, init = {}) => {
+    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
+    if ((init.method ?? "GET") === "POST" && requestUrl.pathname === "/oauth/token") {
+      return jsonResponse({ access_token: accessToken, expires_in: 3600 });
+    }
+    return jsonResponse({ error: `${filler}${accessToken}` }, 500);
+  });
+
+  await assert.rejects(client.listAudits(), (error) => {
+    assert.match(error.message, /Vanta API request failed/);
+    assert.equal(error.message.includes(accessToken), false);
+    assert.equal(error.message.includes("token-head"), false);
+    assert.equal(error.message.includes("token-tail"), false);
+    assert.equal(error.message.includes("A".repeat(10)), false);
     assert.match(error.message, /\[redacted\]/);
     return true;
   });

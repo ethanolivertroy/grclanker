@@ -491,7 +491,7 @@ function buildQuery(params: Record<string, string | number | undefined>): string
 
 async function readResponseBody(response: Response): Promise<string> {
   try {
-    return limitErrorBody(await response.text());
+    return await response.text();
   } catch {
     return "";
   }
@@ -551,7 +551,7 @@ export class VantaAuditorClient {
     });
 
     if (!response.ok) {
-      const detail = this.redact(await readResponseBody(response));
+      const detail = this.redactErrorDetail(await readResponseBody(response));
       throw new Error(
         `Vanta authentication failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
       );
@@ -607,6 +607,11 @@ export class VantaAuditorClient {
     ]);
   }
 
+  /** Redact known secrets in the raw body, then shorten it for display. */
+  private redactErrorDetail(body: string, extra: Array<string | undefined> = []): string {
+    return limitErrorBody(this.redact(body, extra));
+  }
+
   private async requestJson<T>(
     path: string,
     options: {
@@ -638,7 +643,7 @@ export class VantaAuditorClient {
     }
 
     if (!response.ok) {
-      const detail = this.redact(await readResponseBody(response), [token]);
+      const detail = this.redactErrorDetail(await readResponseBody(response), [token]);
       throw new Error(
         `Vanta API request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
       );
@@ -669,9 +674,9 @@ export class VantaAuditorClient {
       });
 
       if (payload === null) {
-        if (items.length === 0) return [];
+        if (page === 0) return [];
         throw new Error(
-          `Vanta API request for ${path} returned 404 after ${items.length} item(s); refusing to treat a partial page as a complete list.`,
+          `Vanta API request for ${path} returned 404 after ${page} fetched page(s); refusing to treat a partial page as a complete list.`,
         );
       }
 
