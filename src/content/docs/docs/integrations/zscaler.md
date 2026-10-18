@@ -123,10 +123,9 @@ Findings are normalized as `{id, control, title, severity, status, summary, evid
 - An empty inventory fails or is `manual` per the control's intent. The summary says which.
 - Products that are not configured or not licensed render `manual`.
 - Undated items (no last connect time, no certificate validity) never count as healthy and cap at `warn`.
-- Every inventory a finding reads, primary or secondary, that came back partial caps that finding at `warn`. The finding also:
-  - Sets `evidence.partial_inventory`.
-  - Names the partial inventory with the records read over the pages read versus the total pages, or "total unknown" when the API published no total.
-  - For sub-locations, names parents read versus total.
+- Every inventory a finding reads, primary or secondary, that came back partial sets `evidence.partial_inventory` and names that inventory in the summary. A result that would otherwise pass is capped at `warn`. A fail, manual, empty, disabled, or unreadable result keeps that status and does not say the verdict was capped at warn.
+  - The name includes the records read over the pages read versus the total pages, or "total unknown" when the API published no total.
+  - Sub-locations name parents read versus total. Cloud app control names rule types read versus total.
 
 ### Bundle secret hygiene
 

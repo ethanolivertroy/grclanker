@@ -2104,6 +2104,593 @@ test("an unreadable Zscaler finding still names a truncated sibling inventory", 
   assert.equal(rbac.evidence.partial_inventory, true);
 });
 
+function truncatedInventory(dataset, seen = 200, total = 201) {
+  return { ...dataset, truncated: true, seen, total };
+}
+
+function deniedAndTruncated(dataset, seen = 0, total = 4) {
+  return {
+    data: Array.isArray(dataset.data) ? [] : {},
+    error: "stub read failed (403): forbidden",
+    statusCode: 403,
+    truncated: true,
+    seen,
+    total,
+  };
+}
+
+const TRUNCATION_RETURN_PATHS = [
+  {
+    id: "ZS-01",
+    path: "empty URL filtering rules",
+    status: "fail",
+    named: /URL filtering rule inventory is partial \(0 records over 200 of 201 pages\)/,
+    data: () => assessZiaPolicyData(policyFixture({ urlFilteringRules: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-01",
+    path: "disabled URL filtering rules",
+    status: "fail",
+    named: /URL filtering rule inventory is partial/,
+    data: () => assessZiaPolicyData(policyFixture({
+      urlFilteringRules: truncatedInventory(readable([{ id: 1, name: "Off", state: "DISABLED", action: "BLOCK", urlCategories: ["ANONYMIZER"] }])),
+    })),
+  },
+  {
+    id: "ZS-01",
+    path: "URL filtering rules with no BLOCK action",
+    status: "fail",
+    named: /URL filtering rule inventory is partial/,
+    data: () => assessZiaPolicyData(policyFixture({
+      urlFilteringRules: truncatedInventory(readable([{ id: 1, name: "Allow all", state: "ENABLED", action: "ALLOW", urlCategories: [] }])),
+    })),
+  },
+  {
+    id: "ZS-01",
+    path: "unreadable URL filtering rules that are also truncated",
+    status: "manual",
+    named: /URL filtering rule inventory is partial \(0 records over 0 of 4 pages\)/,
+    data: () => assessZiaPolicyData(policyFixture({ urlFilteringRules: deniedAndTruncated(policyFixture().urlFilteringRules) })),
+  },
+  {
+    id: "ZS-02",
+    path: "empty firewall rules",
+    status: "fail",
+    named: /firewall rule inventory is partial/,
+    data: () => assessZiaPolicyData(policyFixture({ firewallRules: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-02",
+    path: "default firewall rule allows",
+    status: "fail",
+    named: /firewall rule inventory is partial/,
+    data: () => assessZiaPolicyData(policyFixture({
+      firewallRules: truncatedInventory(readable([
+        { id: 1, name: "Allow web", state: "ENABLED", action: "ALLOW", nwServices: [{ id: 1, name: "HTTP" }] },
+        { id: 99, name: "Default", state: "ENABLED", action: "ALLOW", defaultRule: true },
+      ])),
+    })),
+  },
+  {
+    id: "ZS-02",
+    path: "unbounded firewall allow",
+    status: "fail",
+    named: /firewall rule inventory is partial/,
+    data: () => assessZiaPolicyData(policyFixture({
+      firewallRules: truncatedInventory(readable([
+        { id: 1, name: "Any any", state: "ENABLED", action: "ALLOW" },
+        { id: 99, name: "Default", state: "ENABLED", action: "BLOCK_DROP", defaultRule: true },
+      ])),
+    })),
+  },
+  {
+    id: "ZS-02",
+    path: "only the default firewall rule",
+    status: "warn",
+    named: /firewall rule inventory is partial/,
+    data: () => assessZiaPolicyData(policyFixture({
+      firewallRules: truncatedInventory(readable([{ id: 99, name: "Default", state: "ENABLED", action: "BLOCK_DROP", defaultRule: true }])),
+    })),
+  },
+  {
+    id: "ZS-02",
+    path: "unreadable firewall rules that are also truncated",
+    status: "manual",
+    named: /firewall rule inventory is partial/,
+    data: () => assessZiaPolicyData(policyFixture({ firewallRules: deniedAndTruncated(policyFixture().firewallRules) })),
+  },
+  {
+    id: "ZS-06",
+    path: "empty administrator inventory",
+    status: "manual",
+    named: /administrator inventory is partial \(0 records over 0 of 2 pages\)/,
+    data: () => assessZiaAccessControlData(accessControlFixture({ adminUsers: truncatedInventory(readable([]), 0, 2) })),
+  },
+  {
+    id: "ZS-06",
+    path: "unreadable administrators that are also truncated",
+    status: "manual",
+    named: /administrator inventory is partial/,
+    data: () => assessZiaAccessControlData(accessControlFixture({ adminUsers: deniedAndTruncated(accessControlFixture().adminUsers) })),
+  },
+  {
+    id: "ZS-06",
+    path: "truncated authentication settings",
+    status: "manual",
+    named: /authentication settings inventory is partial \(200 of 201 pages\)/,
+    data: () => assessZiaAccessControlData(accessControlFixture({ authSettings: truncatedInventory(accessControlFixture().authSettings) })),
+  },
+  {
+    id: "ZS-08",
+    path: "empty application segments",
+    status: "fail",
+    named: /application segment inventory is partial/,
+    data: () => assessZpaData(zpaFixture({ applicationSegments: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-08",
+    path: "disabled application segments",
+    status: "fail",
+    named: /application segment inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      applicationSegments: truncatedInventory(readable([{ id: "seg-1", name: "HR app", enabled: false, domainNames: ["hr.corp.example.com"], tcpPortRange: [{ from: "443", to: "443" }] }])),
+    })),
+  },
+  {
+    id: "ZS-08",
+    path: "wildcard application segments",
+    status: "fail",
+    named: /application segment inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      applicationSegments: truncatedInventory(readable([{ id: "seg-1", name: "Everything", enabled: true, domainNames: ["*"], tcpPortRanges: ["1", "65535"], segmentGroupId: "sg-1" }])),
+    })),
+  },
+  {
+    id: "ZS-08",
+    path: "unreadable application segments with a truncated segment group",
+    status: "manual",
+    named: /segment group inventory is partial \(1 records over 200 of 201 pages\)/,
+    data: () => {
+      const data = zpaFixture();
+      data.applicationSegments = deniedAndTruncated(data.applicationSegments);
+      data.segmentGroups = truncatedInventory(data.segmentGroups);
+      return assessZpaData(data);
+    },
+  },
+  {
+    id: "ZS-09",
+    path: "empty access rules",
+    status: "fail",
+    named: /access rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({ accessRules: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-09",
+    path: "access rules with no allow",
+    status: "warn",
+    named: /access rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      accessRules: truncatedInventory(readable([{ id: "r-9", name: "Deny all", action: "DENY", disabled: false, conditions: [] }])),
+    })),
+  },
+  {
+    id: "ZS-09",
+    path: "unconditional access allow",
+    status: "fail",
+    named: /access rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      accessRules: truncatedInventory(readable([{ id: "r-1", name: "Allow all", action: "ALLOW", disabled: false, conditions: [] }])),
+    })),
+  },
+  {
+    id: "ZS-09",
+    path: "unreadable access rules that are also truncated",
+    status: "manual",
+    named: /access rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({ accessRules: deniedAndTruncated(zpaFixture().accessRules) })),
+  },
+  {
+    id: "ZS-10",
+    path: "empty posture profiles",
+    status: "fail",
+    named: /posture profile inventory is partial/,
+    data: () => assessZpaData(zpaFixture({ postureProfiles: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-10",
+    path: "posture profiles with no allow rule",
+    status: "warn",
+    named: /posture profile inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      postureProfiles: truncatedInventory(zpaFixture().postureProfiles),
+      accessRules: readable([{ id: "r-9", name: "Deny all", action: "DENY", disabled: false, conditions: [] }]),
+    })),
+  },
+  {
+    id: "ZS-10",
+    path: "allow rules without posture",
+    status: "fail",
+    named: /posture profile inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      postureProfiles: truncatedInventory(zpaFixture().postureProfiles),
+      accessRules: readable([{ id: "r-1", name: "Allow all", action: "ALLOW", disabled: false, conditions: [] }]),
+    })),
+  },
+  {
+    id: "ZS-10",
+    path: "some allow rules without posture",
+    status: "warn",
+    named: /posture profile inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      postureProfiles: truncatedInventory(zpaFixture().postureProfiles),
+      accessRules: readable([
+        { id: "r-1", name: "HR access", action: "ALLOW", disabled: false, conditions: [{ operands: [{ objectType: "POSTURE", lhs: "posture-udid", rhs: "true" }] }] },
+        { id: "r-2", name: "App only", action: "ALLOW", disabled: false, conditions: [{ operands: [{ objectType: "APP", lhs: "seg-1", rhs: "true" }] }] },
+      ]),
+    })),
+  },
+  {
+    id: "ZS-10",
+    path: "unreadable posture profiles with truncated access rules",
+    status: "manual",
+    named: /access rule inventory is partial \(2 records over 200 of 201 pages\)/,
+    data: () => {
+      const data = zpaFixture();
+      data.postureProfiles = deniedAndTruncated(data.postureProfiles);
+      data.accessRules = truncatedInventory(data.accessRules);
+      return assessZpaData(data);
+    },
+  },
+  {
+    id: "ZS-10",
+    path: "unreadable access rules with truncated posture profiles",
+    status: "manual",
+    named: /posture profile inventory is partial \(1 records over 200 of 201 pages\)/,
+    data: () => {
+      const data = zpaFixture();
+      data.accessRules = deniedAndTruncated(data.accessRules);
+      data.postureProfiles = truncatedInventory(data.postureProfiles);
+      return assessZpaData(data);
+    },
+  },
+  {
+    id: "ZS-11",
+    path: "empty app connectors",
+    status: "fail",
+    named: /connector inventory is partial/,
+    data: () => assessZpaData(zpaFixture({ appConnectors: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-11",
+    path: "connectors that are not authenticated",
+    status: "fail",
+    named: /connector inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      appConnectors: truncatedInventory(readable([{ id: "c-1", name: "connector-1", enabled: true, controlChannelStatus: "ZPN_STATUS_DISCONNECTED" }])),
+    })),
+  },
+  {
+    id: "ZS-11",
+    path: "unreadable connectors with a truncated connector group",
+    status: "manual",
+    named: /connector group inventory is partial \(1 records over 200 of 201 pages\)/,
+    data: () => {
+      const data = zpaFixture();
+      data.appConnectors = deniedAndTruncated(data.appConnectors);
+      data.appConnectorGroups = truncatedInventory(data.appConnectorGroups);
+      return assessZpaData(data);
+    },
+  },
+  {
+    id: "ZS-12",
+    path: "empty identity providers",
+    status: "fail",
+    named: /IdP inventory is partial/,
+    data: () => assessZpaData(zpaFixture({ idpControllers: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-12",
+    path: "identity providers without user SSO",
+    status: "fail",
+    named: /IdP inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      idpControllers: truncatedInventory(readable([{ id: "idp-1", name: "Okta", enabled: true, ssoType: ["ADMIN"], scimEnabled: true, signSamlRequest: "1" }])),
+    })),
+  },
+  {
+    id: "ZS-12",
+    path: "unreadable identity providers with truncated administrators",
+    status: "manual",
+    named: /ZPA administrator inventory is partial \(1 records over 200 of 201 pages\)/,
+    data: () => {
+      const data = zpaFixture();
+      data.idpControllers = deniedAndTruncated(data.idpControllers);
+      data.administrators = truncatedInventory(data.administrators);
+      return assessZpaData(data);
+    },
+  },
+  {
+    id: "ZS-13",
+    path: "empty timeout rules",
+    status: "fail",
+    named: /timeout rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({ timeoutRules: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-13",
+    path: "disabled timeout rules",
+    status: "fail",
+    named: /timeout rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      timeoutRules: truncatedInventory(readable([{ id: "t-1", name: "Off", disabled: true, reauthTimeout: "3600" }])),
+    })),
+  },
+  {
+    id: "ZS-13",
+    path: "excessive timeout rules",
+    status: "fail",
+    named: /timeout rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      timeoutRules: truncatedInventory(readable([{ id: "t-1", name: "Never", disabled: false, reauthTimeout: "-1" }])),
+    })),
+  },
+  {
+    id: "ZS-13",
+    path: "timeout rules without a reauth value",
+    status: "warn",
+    named: /timeout rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      timeoutRules: truncatedInventory(readable([{ id: "t-1", name: "Undated", disabled: false }])),
+    })),
+  },
+  {
+    id: "ZS-13",
+    path: "unreadable timeout rules that are also truncated",
+    status: "manual",
+    named: /timeout rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({ timeoutRules: deniedAndTruncated(zpaFixture().timeoutRules) })),
+  },
+  {
+    id: "ZS-15",
+    path: "empty trusted networks",
+    status: "manual",
+    named: /trusted network inventory is partial \(0 records over 200 of 201 pages\)/,
+    data: () => assessZpaData(zpaFixture({ trustedNetworks: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-15",
+    path: "empty trusted networks with truncated access rules",
+    status: "manual",
+    named: /access rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      trustedNetworks: readable([]),
+      accessRules: truncatedInventory(zpaFixture().accessRules),
+    })),
+  },
+  {
+    id: "ZS-15",
+    path: "trusted networks whose policy rules are unreadable",
+    status: "manual",
+    named: /trusted network inventory is partial \(1 records over 200 of 201 pages\)/,
+    data: () => {
+      const data = zpaFixture();
+      data.trustedNetworks = truncatedInventory(data.trustedNetworks);
+      data.accessRules = deniedAndTruncated(data.accessRules);
+      data.forwardingRules = deniedAndTruncated(data.forwardingRules);
+      return assessZpaData(data);
+    },
+  },
+  {
+    id: "ZS-15",
+    path: "unreadable trusted networks with truncated access rules",
+    status: "manual",
+    named: /access rule inventory is partial \(2 records over 200 of 201 pages\)/,
+    data: () => {
+      const data = zpaFixture();
+      data.trustedNetworks = deniedAndTruncated(data.trustedNetworks);
+      data.accessRules = truncatedInventory(data.accessRules);
+      return assessZpaData(data);
+    },
+  },
+  {
+    id: "ZS-18",
+    path: "empty locations",
+    status: "manual",
+    named: /location inventory is partial \(0 records over 200 of 201 pages\)/,
+    data: () => assessZiaPolicyData(policyFixture({ locations: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-18",
+    path: "empty locations with truncated GRE tunnels",
+    status: "manual",
+    named: /GRE tunnel inventory is partial \(1 records over 200 of 201 pages\)/,
+    data: () => assessZiaPolicyData(policyFixture({
+      locations: readable([]),
+      greTunnels: truncatedInventory(policyFixture().greTunnels),
+    })),
+  },
+  {
+    id: "ZS-18",
+    path: "empty locations with truncated sub-locations",
+    status: "manual",
+    named: /sub-location inventory is partial \(1 records over 100 of 150 parent locations\)/,
+    data: () => assessZiaPolicyData(policyFixture({
+      locations: readable([]),
+      subLocations: truncatedInventory(policyFixture().subLocations, 100, 150),
+    })),
+  },
+  {
+    id: "ZS-18",
+    path: "unreadable locations with truncated VPN credentials",
+    status: "manual",
+    named: /VPN credential inventory is partial \(1 records over 200 of 201 pages\)/,
+    data: () => {
+      const data = policyFixture();
+      data.locations = deniedAndTruncated(data.locations);
+      data.vpnCredentials = truncatedInventory(data.vpnCredentials);
+      return assessZiaPolicyData(data);
+    },
+  },
+  {
+    id: "ZS-19",
+    path: "empty cloud app control rules",
+    status: "fail",
+    named: /cloud app control rule inventory is partial \(0 records over 0 of 3 rule types\)/,
+    data: () => assessZiaPolicyData(policyFixture({ cloudAppRules: { data: [], seen: 0, total: 3, truncated: true } })),
+  },
+  {
+    id: "ZS-19",
+    path: "cloud app control rules that do not restrict",
+    status: "fail",
+    named: /cloud app control rule inventory is partial \(1 records over 1 of 3 rule types\)/,
+    data: () => assessZiaPolicyData(policyFixture({
+      cloudAppRules: { data: [{ id: 1, name: "Allow mail", state: "ENABLED", ruleType: "WEBMAIL", actions: ["ALLOW_WEBMAIL"] }], seen: 1, total: 3, truncated: true },
+    })),
+  },
+  {
+    id: "ZS-19",
+    path: "unreadable cloud app control rules that are also truncated",
+    status: "manual",
+    named: /cloud app control rule inventory is partial \(0 records over 0 of 3 rule types\)/,
+    data: () => assessZiaPolicyData(policyFixture({
+      cloudAppRules: { data: [], error: "stub read failed (403): forbidden", statusCode: 403, truncated: true, seen: 0, total: 3 },
+    })),
+  },
+  {
+    id: "ZS-19",
+    path: "partially unreadable cloud app rule types",
+    status: "manual",
+    named: /cloud app control rule inventory is partial \(1 records over 1 of 3 rule types\)/,
+    data: () => assessZiaPolicyData(policyFixture({
+      cloudAppRules: {
+        data: [{ id: 1, name: "Block personal webmail", state: "ENABLED", ruleType: "WEBMAIL", actions: ["BLOCK_WEBMAIL_SEND"] }],
+        error: "FILESHARE: read failed",
+        truncated: true,
+        seen: 1,
+        total: 3,
+      },
+    })),
+  },
+  {
+    id: "ZS-19",
+    path: "restrictive cloud app rules over a truncated rule-type list",
+    status: "warn",
+    named: /only 25 of 30 rule types were read, so the cloud app control rule inventory is partial/,
+    data: () => {
+      const data = policyFixture();
+      data.cloudAppRules = { ...data.cloudAppRules, truncated: true, seen: 25, total: 30 };
+      return assessZiaPolicyData(data);
+    },
+  },
+  {
+    id: "ZS-21",
+    path: "empty private service edges",
+    status: "manual",
+    named: /service edge inventory is partial \(0 records over 200 of 201 pages\)/,
+    data: () => assessZpaData(zpaFixture({ serviceEdges: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-21",
+    path: "service edges that are not authenticated",
+    status: "fail",
+    named: /service edge inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      serviceEdges: truncatedInventory(readable([{ id: "se-1", name: "edge-1", enabled: true, controlChannelStatus: "ZPN_STATUS_DISCONNECTED" }])),
+    })),
+  },
+  {
+    id: "ZS-21",
+    path: "unreadable service edges with a truncated service edge group",
+    status: "manual",
+    named: /service edge group inventory is partial \(1 records over 200 of 201 pages\)/,
+    data: () => {
+      const data = zpaFixture();
+      data.serviceEdges = deniedAndTruncated(data.serviceEdges);
+      data.serviceEdgeGroups = truncatedInventory(data.serviceEdgeGroups);
+      return assessZpaData(data);
+    },
+  },
+  {
+    id: "ZS-22",
+    path: "empty forwarding rules",
+    status: "manual",
+    named: /forwarding rule inventory is partial \(0 records over 200 of 201 pages\)/,
+    data: () => assessZpaData(zpaFixture({ forwardingRules: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-22",
+    path: "unconditional forwarding bypass",
+    status: "fail",
+    named: /forwarding rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      forwardingRules: truncatedInventory(readable([{ id: "f-1", name: "Bypass all", action: "BYPASS", disabled: false, conditions: [] }])),
+    })),
+  },
+  {
+    id: "ZS-22",
+    path: "conditional forwarding bypass",
+    status: "warn",
+    named: /forwarding rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({
+      forwardingRules: truncatedInventory(readable([{ id: "f-1", name: "Bypass guest", action: "BYPASS", disabled: false, conditions: [{ operands: [{ objectType: "SCIM_GROUP", lhs: "idp-1", rhs: "g" }] }] }])),
+    })),
+  },
+  {
+    id: "ZS-22",
+    path: "unreadable forwarding rules that are also truncated",
+    status: "manual",
+    named: /forwarding rule inventory is partial/,
+    data: () => assessZpaData(zpaFixture({ forwardingRules: deniedAndTruncated(zpaFixture().forwardingRules) })),
+  },
+  {
+    id: "ZS-23",
+    path: "empty emergency access users",
+    status: "manual",
+    named: /emergency access user inventory is partial \(0 records over 200 of 201 pages\)/,
+    data: () => assessZpaData(zpaFixture({ emergencyAccessUsers: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-24",
+    path: "empty enrollment certificates",
+    status: "manual",
+    named: /enrollment certificate inventory is partial \(0 records over 200 of 201 pages\)/,
+    data: () => assessZpaData(zpaFixture({ enrollmentCertificates: truncatedInventory(readable([])) })),
+  },
+  {
+    id: "ZS-24",
+    path: "expired enrollment certificates",
+    status: "fail",
+    named: /enrollment certificate inventory is partial \(1 records over 200 of 201 pages\)/,
+    data: () => assessZpaData(zpaFixture({
+      enrollmentCertificates: truncatedInventory(readable([{ id: "ec-1", name: "Connector", validToInEpochSec: PAST_EPOCH }])),
+    })),
+  },
+  {
+    id: "ZS-24",
+    path: "unreadable enrollment certificates with truncated browser access certificates",
+    status: "manual",
+    named: /browser access certificate inventory is partial \(1 records over 200 of 201 pages\)/,
+    data: () => {
+      const data = zpaFixture();
+      data.enrollmentCertificates = deniedAndTruncated(data.enrollmentCertificates);
+      data.browserAccessCertificates = truncatedInventory(data.browserAccessCertificates);
+      return assessZpaData(data);
+    },
+  },
+];
+
+for (const item of TRUNCATION_RETURN_PATHS) {
+  test(`${item.id} ${item.path} names the truncated inventory`, () => {
+    const finding = findingById(item.data(), item.id);
+    assert.equal(finding.status, item.status, finding.summary);
+    assert.equal(finding.evidence.partial_inventory, true, finding.summary);
+    assert.match(finding.summary, item.named, finding.summary);
+    if (item.status === "fail" || item.status === "manual") {
+      assert.doesNotMatch(finding.summary, /capped at warn/, finding.summary);
+    }
+  });
+}
+
 test("truncated admin roles, password expiry, and the audit log report cap ZS-07 and ZS-14 at warn", () => {
   const partial = (dataset) => ({ ...dataset, truncated: true, seen: 200, total: 201 });
   const roles = accessControlFixture();

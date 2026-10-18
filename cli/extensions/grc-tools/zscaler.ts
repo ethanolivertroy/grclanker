@@ -1272,31 +1272,44 @@ function notConfiguredFinding(controlNumber: number, product: ZscalerProduct, ma
   );
 }
 
-function partialSuffix(dataset: CollectedDataset<unknown>, label: string, capped = true): string {
+type PartialInventorySource = [CollectedDataset<unknown>, string, string?];
+
+function partialSuffix(dataset: CollectedDataset<unknown>, label: string, capped = true, unit = "pages"): string {
   if (!dataset.truncated) return "";
   const extent = dataset.total !== undefined
-    ? `${dataset.seen ?? 0} of ${dataset.total} pages`
-    : `${dataset.seen ?? 0} pages, total unknown`;
+    ? `${dataset.seen ?? 0} of ${dataset.total} ${unit}`
+    : `${dataset.seen ?? 0} ${unit}, total unknown`;
   const seenRecords = Array.isArray(dataset.data) ? `${dataset.data.length} records over ` : "";
   const cap = capped ? ", so this verdict is capped at warn" : "";
   return ` The ${label} inventory is partial (${seenRecords}${extent})${cap}.`;
 }
 
-function joinedPartialSuffix(entries: Array<[CollectedDataset<unknown>, string]>, capped = true): string {
-  return entries.map(([dataset, label]) => partialSuffix(dataset, label, capped)).join("");
+function joinedPartialSuffix(entries: PartialInventorySource[], capped = true): string {
+  return entries.map(([dataset, label, unit]) => partialSuffix(dataset, label, capped, unit)).join("");
 }
 
-function notePartialInventories(item: ZscalerFinding, entries: Array<[CollectedDataset<unknown>, string]>): ZscalerFinding {
-  const note = joinedPartialSuffix(entries, false);
-  if (!note) return item;
+function withDecisionFacts(item: ZscalerFinding, summary: string, evidence: JsonRecord): ZscalerFinding {
   const facts = (item as ZscalerFindingWithFacts)[ZSCALER_DECISION_FACTS];
-  const result: ZscalerFindingWithFacts = {
-    ...item,
-    summary: `${item.summary}${note}`,
-    evidence: { ...(item.evidence ?? {}), partial_inventory: true },
-  };
+  const result: ZscalerFindingWithFacts = { ...item, summary, evidence };
   if (facts !== undefined) Object.defineProperty(result, ZSCALER_DECISION_FACTS, { value: facts });
   return result;
+}
+
+function notePartialInventories(item: ZscalerFinding, entries: PartialInventorySource[]): ZscalerFinding {
+  const note = joinedPartialSuffix(entries, false);
+  if (!note) return item;
+  return withDecisionFacts(item, `${item.summary}${note}`, { ...(item.evidence ?? {}), partial_inventory: true });
+}
+
+function namesPartialInventory(summary: string, label: string): boolean {
+  return new RegExp(`the ${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} inventory is partial`, "i").test(summary);
+}
+
+function ensureNamedPartialInventory(item: ZscalerFinding, sources: PartialInventorySource[]): ZscalerFinding {
+  const missing = sources.filter(([dataset, label]) => dataset.truncated === true && !namesPartialInventory(item.summary, label));
+  const named = notePartialInventories(item, missing);
+  if (!sources.some(([dataset]) => dataset.truncated === true) || named.evidence?.partial_inventory === true) return named;
+  return withDecisionFacts(named, named.summary, { ...(named.evidence ?? {}), partial_inventory: true });
 }
 
 function datasetsComplete(...datasets: Array<CollectedDataset<unknown>>): boolean {
@@ -1558,9 +1571,15 @@ export function assessZiaAccessControlData(
     7: [[dependsOn("password expiry settings", "GET /passwordExpiry/settings", data.passwordExpiry)], rbacEvidence],
     14: [[dependsOn("NSS feed", "GET /nssFeeds", data.nssFeeds)], auditEvidence],
   };
+  const partialSources: Partial<Record<number, PartialInventorySource[]>> = {
+    6: [[data.adminUsers, "administrator"], [data.authSettings, "authentication settings"]],
+    7: rbacSources,
+    14: auditSources,
+  };
   const findings = verdicts.map((item) => {
     const entry = secondaryInventories[item.control];
-    return entry ? capForUnreadableAll(item, entry[0], entry[1]) : item;
+    const capped = entry ? capForUnreadableAll(item, entry[0], entry[1]) : item;
+    return ensureNamedPartialInventory(capped, partialSources[item.control] ?? []);
   });
 
   const errors = [
@@ -2635,7 +2654,7 @@ function assessCloudAppControl(data: ZiaPolicyData): ZscalerFinding {
     return finding(19, "fail", `${active.length} enabled cloud app control rules exist but none blocks, isolates, or cautions any application.`, evidence, evidenceNote, facts);
   }
   if (rules.truncated) {
-    return finding(19, "warn", `${restrictive.length} restrictive rules were found, but only ${rules.seen} of ${rules.total} rule types were read, so the view is partial.`, evidence, evidenceNote, facts);
+    return finding(19, "warn", `${restrictive.length} restrictive rules were found, but only ${rules.seen} of ${rules.total} rule types were read, so the cloud app control rule inventory is partial.`, evidence, evidenceNote, facts);
   }
   return finding(19, "pass", `${restrictive.length} enabled cloud app control rules block, isolate, or caution applications across ${rules.total ?? rules.seen} rule types.`, evidence, undefined, facts);
 }
@@ -2761,17 +2780,45 @@ function securityBaselineVerdict(data: ZiaPolicyData, evidenceNote: string): Zsc
 export function assessZiaPolicyData(data: ZiaPolicyData, options: { maxSslExemptions?: number } = {}): ZscalerAssessmentResult {
   const maxExemptions = clampNumber(options.maxSslExemptions, DEFAULT_MAX_SSL_EXEMPTIONS, 0, 100_000);
   const findings = [
-    assessUrlFiltering(data),
-    assessFirewall(data),
-    assessDlp(data),
-    assessSslInspection(data, maxExemptions),
-    assessSandbox(data),
-    assessBandwidth(data),
-    assessBrowserIsolation(data),
-    assessLocations(data),
-    assessCloudAppControl(data),
-    assessDnsSecurity(data),
-    assessSecurityBaseline(data),
+    ensureNamedPartialInventory(assessUrlFiltering(data), [[data.urlFilteringRules, "URL filtering rule"]]),
+    ensureNamedPartialInventory(assessFirewall(data), [[data.firewallRules, "firewall rule"]]),
+    ensureNamedPartialInventory(assessDlp(data), [
+      [data.webDlpRules, "web DLP rule"],
+      [data.dlpEngines, "DLP engine"],
+      [data.dlpDictionaries, "DLP dictionary"],
+    ]),
+    ensureNamedPartialInventory(assessSslInspection(data, maxExemptions), [
+      [data.sslInspectionRules, "SSL inspection rule"],
+      [data.sslExemptedUrls, "SSL exemption"],
+      [data.locations, "location"],
+    ]),
+    ensureNamedPartialInventory(assessSandbox(data), [
+      [data.sandboxRules, "sandbox rule"],
+      [data.sandboxSettings, "sandbox settings"],
+    ]),
+    ensureNamedPartialInventory(assessBandwidth(data), [[data.bandwidthRules, "bandwidth control rule"]]),
+    ensureNamedPartialInventory(assessBrowserIsolation(data), [
+      [data.isolationProfiles, "isolation profile"],
+      [data.urlFilteringRules, "URL filtering rule"],
+    ]),
+    ensureNamedPartialInventory(assessLocations(data), [
+      [data.locations, "location"],
+      [data.subLocations, "sub-location", "parent locations"],
+      [data.greTunnels, "GRE tunnel"],
+      [data.vpnCredentials, "VPN credential"],
+    ]),
+    ensureNamedPartialInventory(assessCloudAppControl(data), [[data.cloudAppRules, "cloud app control rule", "rule types"]]),
+    ensureNamedPartialInventory(assessDnsSecurity(data), [
+      [data.dnsRules, "DNS rule"],
+      [data.advancedThreatSettings, "advanced threat protection settings"],
+    ]),
+    ensureNamedPartialInventory(assessSecurityBaseline(data), [
+      [data.advancedThreatSettings, "advanced threat protection settings"],
+      [data.malwareSettings, "malware settings"],
+      [data.malwarePolicy, "malware policy"],
+      [data.securityAllowlist, "security allowlist"],
+      [data.securityDenylist, "security denylist"],
+    ]),
   ];
   const datasets: Array<[string, CollectedDataset<unknown>, string?]> = [
     ["urlFilteringRules", data.urlFilteringRules],
@@ -3466,17 +3513,41 @@ export function assessZpaData(data: ZpaData, options: ZpaAssessmentOptions = {})
   const staleDays = clampNumber(options.staleConnectorDays, DEFAULT_STALE_CONNECTOR_DAYS, 1, 3650);
   const maxTimeoutHours = clampNumber(options.maxTimeoutHours, DEFAULT_MAX_TIMEOUT_HOURS, 1, 8760);
   const findings = [
-    assessSegmentation(data),
-    assessAccessPolicies(data),
-    assessPosture(data),
-    assessConnectors(data, staleDays),
-    assessIdp(data),
-    assessTimeoutPolicy(data, maxTimeoutHours),
-    assessTrustedNetworks(data),
-    assessServiceEdges(data, staleDays),
-    assessForwardingPolicy(data),
-    assessEmergencyAccess(data),
-    assessCertificates(data, warnDays),
+    ensureNamedPartialInventory(assessSegmentation(data), [
+      [data.applicationSegments, "application segment"],
+      [data.segmentGroups, "segment group"],
+    ]),
+    ensureNamedPartialInventory(assessAccessPolicies(data), [[data.accessRules, "access rule"]]),
+    ensureNamedPartialInventory(assessPosture(data), [
+      [data.postureProfiles, "posture profile"],
+      [data.accessRules, "access rule"],
+    ]),
+    ensureNamedPartialInventory(assessConnectors(data, staleDays), [
+      [data.appConnectors, "connector"],
+      [data.appConnectorGroups, "connector group"],
+    ]),
+    ensureNamedPartialInventory(assessIdp(data), [
+      [data.idpControllers, "IdP"],
+      [data.administrators, "ZPA administrator"],
+      [data.samlAttributes, "SAML attribute"],
+      [data.scimGroups, "SCIM group"],
+    ]),
+    ensureNamedPartialInventory(assessTimeoutPolicy(data, maxTimeoutHours), [[data.timeoutRules, "timeout rule"]]),
+    ensureNamedPartialInventory(assessTrustedNetworks(data), [
+      [data.trustedNetworks, "trusted network"],
+      [data.accessRules, "access rule"],
+      [data.forwardingRules, "forwarding rule"],
+    ]),
+    ensureNamedPartialInventory(assessServiceEdges(data, staleDays), [
+      [data.serviceEdges, "service edge"],
+      [data.serviceEdgeGroups, "service edge group"],
+    ]),
+    ensureNamedPartialInventory(assessForwardingPolicy(data), [[data.forwardingRules, "forwarding rule"]]),
+    ensureNamedPartialInventory(assessEmergencyAccess(data), [[data.emergencyAccessUsers, "emergency access user"]]),
+    ensureNamedPartialInventory(assessCertificates(data, warnDays), [
+      [data.enrollmentCertificates, "enrollment certificate"],
+      [data.browserAccessCertificates, "browser access certificate"],
+    ]),
   ];
   const datasets: Array<[string, CollectedDataset<unknown>]> = [
     ["application", data.applicationSegments],
