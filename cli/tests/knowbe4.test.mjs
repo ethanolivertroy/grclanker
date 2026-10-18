@@ -2172,7 +2172,6 @@ function kbClient(config, fetchImpl) {
   return new Knowbe4ApiClient(config, { fetchImpl, sleepImpl: async () => {}, maxRetries: 0, minRequestIntervalMs: 0 });
 }
 
-/** The real Knowbe4ApiClient over the fixture's router. */
 function httpKnowbe4(fixture, options = {}) {
   const log = [];
   const fetchImpl = kbRouter({ ...kbRoutes(fixture), ...(options.routes ?? {}) }, log);
@@ -3048,7 +3047,6 @@ const KB_SWEEP_TARGETS = {
   store_purchases: { route: "GET /v1/training/store_purchases" },
 };
 
-/** What each assess tool returns for the input, flattened: one snapshot per area over the real client. */
 async function assessKbCompletenessInput({ fixture, routes, options }) {
   const { client } = httpKnowbe4(fixture, { routes });
   const findings = [];
@@ -3366,7 +3364,6 @@ const BOUNDARY_SCENARIOS = [
 
 const KB_ASSESSORS = new Map(KB_AREAS);
 
-/** Collects only the area that owns the check and assesses it, with the scenario's options on both calls. */
 async function runBoundaryScenario({ check, fixture, options }) {
   const { area } = KNOWBE4_CONTROLS.find((control) => control.number === Number(check.slice(-2)));
   const snapshot = await collectKnowbe4Snapshot(mockClient(fixture()), { ...options, scopes: [area], now: NOW });
@@ -3385,7 +3382,6 @@ test("boundary scenarios: each threshold edge reaches the verdict on either side
   assert.deepEqual(mismatches, []);
 });
 
-/** Every inventory holds a record whose optional fields are null or absent. */
 function missingNullFixture() {
   const users = [1, 2, 3].map((id) => ({ id, email: `user${id}@acme.example`, status: "active", joined_on: null, last_sign_in: null, current_risk_score: null, groups: null }));
   return {
