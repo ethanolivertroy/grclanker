@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { staticClient } from 'fumadocs-core/search/client/orama-static';
+import { createSearchAPI } from 'fumadocs-core/search/server';
 import { components, create, insertMultiple, load, save, search } from 'zbsearch';
 
-import { createSearchTokenizer, searchWholeIdentifiersFirst } from '../src/lib/search-tokenizer.mjs';
+import { createSearchTokenizer, getIndexedProperties, searchWholeIdentifiersFirst } from '../src/lib/search-tokenizer.mjs';
 
 const tokenizer = createSearchTokenizer();
 const defaultTokenizer = components.tokenizer.createTokenizer({ language: 'multilingual' });
@@ -86,4 +88,76 @@ test('an identifier that finds nothing whole searches its parts even when other 
   assert.equal((await searchWholeIdentifiersFirst(record, 'ISO-9001 audit'))[0], 'Export ISO-9001 audit evidence');
   await searchWholeIdentifiersFirst(record, 'ISO-9001 or SOC-2');
   assert.deepEqual(searched, ['SOC-2', 'SOC 2 audit', 'ISO-9001', 'ISO-9001 audit', 'ISO-9001', 'SOC-2', 'ISO-9001 or SOC 2']);
+});
+
+// Pages shaped like the ones the search route indexes. Integrations appears
+// only in URLs and section trails, never in page text.
+const pages = [
+  {
+    id: '/docs/integrations/aws/',
+    url: '/docs/integrations/aws/',
+    title: 'AWS',
+    description: 'Assess IAM and logging',
+    breadcrumbs: ['Docs', 'Integrations'],
+    structuredData: {
+      headings: [{ id: 'aws-iam-01-root-mfa', content: 'AWS-IAM-01 root MFA' }],
+      contents: [{ heading: 'aws-iam-01-root-mfa', content: 'Requires MFA on the root account' }],
+    },
+  },
+  {
+    id: '/docs/integrations/okta/',
+    url: '/docs/integrations/okta/',
+    title: 'Okta',
+    description: 'Assess MFA policies and admin roles',
+    breadcrumbs: ['Docs', 'Integrations'],
+    structuredData: {
+      headings: [{ id: 'okta-mfa-01', content: 'OKTA-MFA-01 phishing-resistant MFA' }],
+      contents: [{ heading: 'okta-mfa-01', content: 'Checks that admins enroll a FIDO2 factor' }],
+    },
+  },
+  {
+    id: '/docs/quick-start/',
+    url: '/docs/quick-start/',
+    title: 'Quick start',
+    description: 'Install grclanker and run a first assessment',
+    breadcrumbs: ['Docs'],
+    structuredData: { headings: [], contents: [{ content: 'Run npm install, then grclanker' }] },
+  },
+];
+
+async function exportIndex(indexes, options) {
+  const api = createSearchAPI('advanced', { indexes, tokenizer: createSearchTokenizer(), sort: { enabled: false }, ...options });
+  return JSON.parse(JSON.stringify(await api.export()));
+}
+
+function loadLikeTheDialog(data) {
+  return staticClient({
+    from: `data:application/json,${encodeURIComponent(JSON.stringify(data))}`,
+    initDB: () => create({ schema: { _: 'string' }, components: { tokenizer: createSearchTokenizer() } }),
+    search: { limit: 200, groupBy: { properties: ['page_id'], maxResult: 3 } },
+  }).search;
+}
+
+test('the index holds only the content field, and searches return what a full index returns', async () => {
+  const full = await exportIndex(pages);
+  const trimmed = await exportIndex(pages, { components: { getDocumentProperties: getIndexedProperties } });
+  const empty = await exportIndex([]);
+  assert.deepEqual(trimmed.docs, full.docs);
+  for (const part of ['indexes', 'frequencies', 'avgFieldLength', 'fieldLengths']) {
+    for (const field of Object.keys(full.index[part])) {
+      const expected = field === 'content' ? full : empty;
+      assert.deepEqual(trimmed.index[part][field], expected.index[part][field], `${part}.${field}`);
+    }
+  }
+
+  const searchFull = loadLikeTheDialog(full);
+  const searchTrimmed = loadLikeTheDialog(trimmed);
+  for (const query of ['AWS-IAM-01', 'root mfa', 'mfa', 'assess', 'install grclanker', 'integrations']) {
+    assert.deepEqual(await searchTrimmed(query), await searchFull(query), query);
+  }
+  assert.deepEqual(
+    (await searchTrimmed('AWS-IAM-01')).map((result) => result.url),
+    ['/docs/integrations/aws/', '/docs/integrations/aws/#aws-iam-01-root-mfa'],
+  );
+  assert.deepEqual(await searchTrimmed('integrations'), []);
 });
