@@ -2149,6 +2149,57 @@ function evaluateOnWriteDetection(policies: JsonRecord[]): CrowdstrikeFinding {
   );
 }
 
+const PREVENTION_CONTROLS: ControlId[] = ["CS-01", "CS-02", "CS-03", "CS-04", "CS-05"];
+
+function recordPreventionFacts(dataset: CollectedDataset<CrowdstrikePage<JsonRecord>>): void {
+  if (dataset.error) {
+    for (const id of PREVENTION_CONTROLS) recordCrowdstrikeDecisionFacts(id, { prevention_policies_readable: false });
+    return;
+  }
+  const applied = assignedPolicies(dataset.data.items);
+  const complete = !dataset.data.truncated;
+  const base = { prevention_policies_readable: true, prevention_policies_complete: complete, assigned_prevention_policy_count: applied.length };
+  const settings = applied.map((policy) => flattenPolicySettings(policy, "prevention_settings"));
+  const carrying = (ids: readonly string[]) => settings.filter((entry) => ids.some((id) => entry.has(id))).length;
+  const disabling = (ids: readonly string[]) => settings.filter((entry) => ids.some((id) => entry.has(id) && toggleState(entry, id) !== true)).length;
+  const ranked = settings.map((entry) => PRIMARY_ML_SLIDERS
+    .flatMap((id) => {
+      const levels = sliderLevels(entry, id);
+      return levels ? [sliderRank(levels.detection), sliderRank(levels.prevention)] : [undefined];
+    })
+    .filter((rank): rank is number => rank !== undefined));
+  const onWrite = (id: string) => settings.map((entry) => toggleState(entry, id));
+
+  recordCrowdstrikeDecisionFacts("CS-01", {
+    ...base,
+    assigned_policy_min_ml_ranks: ranked.filter((ranks) => ranks.length > 0).map((ranks) => Math.min(...ranks)),
+    assigned_policies_with_unranked_sliders: ranked.filter((ranks) => ranks.length < PRIMARY_ML_SLIDERS.length * 2).length,
+    ...(complete ? { platforms_without_assigned_policy_count: missingPlatforms(applied).length } : {}),
+  });
+  recordCrowdstrikeDecisionFacts("CS-02", {
+    ...base,
+    exploit_mitigation_policy_count: carrying([...CORE_EXPLOIT_MITIGATIONS, ...EXTENDED_EXPLOIT_MITIGATIONS]),
+    policies_with_core_mitigation_disabled: disabling(CORE_EXPLOIT_MITIGATIONS),
+    policies_with_extended_mitigation_disabled: disabling(EXTENDED_EXPLOIT_MITIGATIONS),
+  });
+  recordCrowdstrikeDecisionFacts("CS-03", {
+    ...base,
+    script_control_policy_count: carrying(SCRIPT_CONTROL_SETTINGS),
+    policies_with_script_control_disabled: disabling(SCRIPT_CONTROL_SETTINGS),
+  });
+  recordCrowdstrikeDecisionFacts("CS-04", {
+    ...base,
+    policies_with_tamper_protection_disabled: disabling([TAMPER_PROTECTION_SETTING]),
+    policies_without_tamper_protection_setting: settings.length - carrying([TAMPER_PROTECTION_SETTING]),
+  });
+  recordCrowdstrikeDecisionFacts("CS-05", {
+    ...base,
+    policies_with_detect_on_write_disabled: onWrite(ON_WRITE_DETECT_SETTING).filter((state) => state === false).length,
+    policies_with_detect_on_write_unknown: onWrite(ON_WRITE_DETECT_SETTING).filter((state) => state === undefined).length,
+    policies_without_quarantine_on_write: onWrite(ON_WRITE_QUARANTINE_SETTING).filter((state) => state !== true).length,
+  });
+}
+
 function assessmentSummaryBase(config: CrowdstrikeResolvedConfig): JsonRecord {
   return {
     base_url: config.baseUrl,
@@ -2170,13 +2221,19 @@ const PREVENTION_CONSOLE_EVIDENCE = "export each prevention policy from Falcon c
 export async function assessCrowdstrikePreventionPolicies(
   client: Pick<CrowdstrikeApiClient, "getResolvedConfig" | "listPreventionPolicies">,
 ): Promise<CrowdstrikeAssessmentResult> {
+  return runBatchVerdictContext(CROWDSTRIKE_DECISION_CONTEXT, CROWDSTRIKE_SPEC, () => assessCrowdstrikePreventionPoliciesWithDecisionContext(client));
+}
+
+async function assessCrowdstrikePreventionPoliciesWithDecisionContext(
+  client: Pick<CrowdstrikeApiClient, "getResolvedConfig" | "listPreventionPolicies">,
+): Promise<CrowdstrikeAssessmentResult> {
   const policiesDataset = await collectDataset(() => client.listPreventionPolicies(), emptyPage<JsonRecord>(), "prevention policies", "/policy/combined/prevention/v1");
   const policies = policiesDataset.data.items;
   const partial = partialInventory(policiesDataset.data, "prevention policies");
-  const controls: ControlId[] = ["CS-01", "CS-02", "CS-03", "CS-04", "CS-05"];
+  recordPreventionFacts(policiesDataset);
 
   const findings = policiesDataset.error
-    ? controls.map((id) => unreadableFinding(id, "prevention policies", policiesDataset.error ?? "unknown error", PREVENTION_CONSOLE_EVIDENCE))
+    ? PREVENTION_CONTROLS.map((id) => unreadableFinding(id, "prevention policies", policiesDataset.error ?? "unknown error", PREVENTION_CONSOLE_EVIDENCE))
     : [
       evaluateMlDetectionLevels(policies, partial !== undefined),
       evaluateToggleControl("CS-02", policies, [...CORE_EXPLOIT_MITIGATIONS, ...EXTENDED_EXPLOIT_MITIGATIONS], [], {
