@@ -76,7 +76,7 @@ Is CVE-2024-3400 in the CISA KEV catalog, and what is its EPSS score?
 Which vulnerabilities were added to the CISA KEV catalog in the last 30 days?
 ```
 
-Both are answered by the KEV and EPSS tools (`kevs_search`, `kevs_get_epss`, `kevs_recent`), which ship in every release bundle.
+Both are answered by `kevs_search`, `kevs_get_epss`, and `kevs_recent`. `kevs_check_ransomware` is the fourth KEV tool. All four ship in every release bundle. See [KEV / EPSS](/docs/integrations/kevs/).
 
 ## 5. Review or extend a shipped integration
 
