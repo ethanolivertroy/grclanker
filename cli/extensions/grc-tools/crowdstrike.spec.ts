@@ -598,6 +598,13 @@ const SHARED_ACCOUNT_PATTERNS = [
 ];
 const API_CLIENT_SCOPES = "A client's scopes are the entries of its scopes array. A JSON object scope's id is its id, else name, else scope, read as text; its group is its group read as text, else the group parsed from its id; and its action is its action read as text, else the action parsed from its id. Any other scope's id is the scope read as text, with its group and action parsed from that id. Text made of a group without a colon, a colon, and an action of letters, underscores, and hyphens, with optional whitespace around each, parses to that group and action; other text parses to the whole text as the group and no action; a scope whose id does not read as text parses to neither.";
 const SENSITIVE_WRITE_SCOPE = "A scope is a sensitive write scope when its action contains write or admin in any letter case, and its group or its id, trimmed, lowercased, and with every run of whitespace or underscores turned into one hyphen, contains prevention, response, sensor-update, device-control, firewall, user-management, api-client, host, exclusion, identity-protection, alert, detect, or incident.";
+const EXCLUSION_FIELDS_READ = "Exclusion fields are read as the data redaction and exclusion text passes rewrote them.";
+const GLOBAL_EXCLUSION = `An exclusion applies globally when its applied_globally is ${TRUTHY}.`;
+const BROAD_PATTERN = String.raw`A pattern is broad when, read as text, it is a lone *, or it is made of an optional leading ^, an optional inline flag group such as (?i) (an opening parenthesis, a question mark, any number of letters, and a closing parenthesis), one or more match-anything pieces (.*, .+, (.*), (.+), [^]*, [^]+, [^]]*, [^]]+, \.*, or \\.*), and an optional trailing $.`;
+const SENSITIVE_PATH = String.raw`A value is a sensitive path when, read as text and ignoring letter case, it is *, **, /, /*, /**, a drive letter and a colon optionally followed by a backslash and then by an optional * (as in C:, C:\, C:*, and C:\*), or a drive letter followed by :\**; or it starts with a drive letter, a colon, and a backslash, optionally preceded by \\?\, followed by windows, program files, program files (x86), programdata, users, or temp, which ends the text or is followed by a backslash; or it starts with / followed by usr, bin, sbin, etc, var, tmp, home, root, library, or system, which ends the text or is followed by /; or it starts with %systemroot%, %windir%, %programfiles%, %programdata%, %userprofile%, %temp%, or %appdata%.`;
+const HIDES_DIRECTORY = "A value hides a directory when, read as text, it ends with a slash or backslash followed by * or **, or it is a sensitive path.";
+const ACTIVE_RULE = `A rule is active when its enabled is ${TRUTHY} and it is not in simulation mode. A rule is in simulation mode when its simulationMode is ${TRUTHY}, or when its simulationMode is neither ${TRUTHY} nor ${FALSY} and its simulation_mode is ${TRUTHY}.`;
+const ENFORCING_RULE = "An active rule enforces when its action, read as text, contains block, deny, mfa, verif, challenge, or identity in any letter case.";
 
 const CROWDSTRIKE_INPUTS: Readonly<Record<string, string>> = {
   prevention_policies_readable: "True when GET /policy/combined/prevention/v1 returned its prevention policy list without a refusal.",
@@ -697,6 +704,23 @@ const CROWDSTRIKE_INPUTS: Readonly<Record<string, string>> = {
   clients_without_scope_list: "Number of returned API clients whose scopes is not an array.",
   clients_with_actionless_scopes: `Number of returned API clients whose scopes array holds a scope without an action. ${API_CLIENT_SCOPES}`,
   max_write_clients: `The ${optionValue("max_write_clients", 3, 10000, 0)}.`,
+  ioa_exclusions_readable: "True when the GET /policy/queries/ioa-exclusions/v1 walk and every GET /policy/entities/ioa-exclusions/v1 lookup of the IDs it listed returned without a refusal.",
+  ioa_exclusions_complete: "IOA exclusion list coverage.",
+  broad_ioa_exclusion_count: `Number of returned IOA exclusions whose ifn_regex or cl_regex is broad. ${BROAD_PATTERN} ${READS_AS_TEXT} ${EXCLUSION_FIELDS_READ}`,
+  global_broad_ioa_exclusion_count: `Number of the IOA exclusions counted by broad_ioa_exclusion_count that apply globally. ${GLOBAL_EXCLUSION}`,
+  ml_exclusions_readable: "True when the GET /policy/queries/ml-exclusions/v1 walk and every GET /policy/entities/ml-exclusions/v1 lookup of the IDs it listed returned without a refusal.",
+  ml_exclusions_complete: "Machine learning exclusion list coverage.",
+  sensitive_ml_exclusion_count: `Number of returned machine learning exclusions whose value is a sensitive path. ${SENSITIVE_PATH} ${READS_AS_TEXT} ${EXCLUSION_FIELDS_READ}`,
+  global_sensitive_ml_exclusion_count: `Number of the machine learning exclusions counted by sensitive_ml_exclusion_count that apply globally. ${GLOBAL_EXCLUSION}`,
+  sensor_visibility_exclusions_readable: "True when the GET /policy/queries/sv-exclusions/v1 walk and every GET /policy/entities/sv-exclusions/v1 lookup of the IDs it listed returned without a refusal.",
+  sensor_visibility_exclusions_complete: "Sensor visibility exclusion list coverage.",
+  hiding_sensor_visibility_exclusion_count: `Number of returned sensor visibility exclusions whose value hides a directory. ${HIDES_DIRECTORY} ${SENSITIVE_PATH} ${READS_AS_TEXT} ${EXCLUSION_FIELDS_READ}`,
+  global_hiding_sensor_visibility_exclusion_count: `Number of the sensor visibility exclusions counted by hiding_sensor_visibility_exclusion_count that apply globally. ${GLOBAL_EXCLUSION}`,
+  identity_protection_rules_readable: "True when GET /identity-protection/queries/policy-rules/v1 and every GET /identity-protection/entities/policy-rules/v1 lookup of the IDs it listed returned without a refusal.",
+  identity_protection_rules_complete: "Identity protection policy rule list coverage.",
+  identity_protection_rule_count: "Number of identity protection policy rules returned by the GET /identity-protection/entities/policy-rules/v1 lookups.",
+  active_identity_protection_rule_count: `Number of returned identity protection policy rules that are active. ${ACTIVE_RULE}`,
+  enforcing_identity_protection_rule_count: `Number of returned identity protection policy rules that are active and enforce. ${ACTIVE_RULE} ${ENFORCING_RULE} ${READS_AS_TEXT}`,
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -743,6 +767,16 @@ const SENSOR_UPDATE_POLICIES_COMPLETE = offsetWalkComplete("sensor_update_polici
 const HOSTS_COMPLETE = offsetWalkComplete("hosts", "host list", "host_limit hosts");
 const HOST_GROUPS_COMPLETE = offsetWalkComplete("host_groups", "host group list", "5000 host groups");
 const API_CLIENTS_COMPLETE = lookupWalkComplete("api_client_ids", "api_clients", "API client list", "API clients", "user_limit IDs");
+const IOA_EXCLUSIONS_COMPLETE = lookupWalkComplete("ioa_exclusion_ids", "ioa_exclusions", "IOA exclusion list", "exclusions", "exclusion_limit IDs");
+const ML_EXCLUSIONS_COMPLETE = lookupWalkComplete("ml_exclusion_ids", "ml_exclusions", "machine learning exclusion list", "exclusions", "exclusion_limit IDs");
+const SENSOR_VISIBILITY_EXCLUSIONS_COMPLETE = lookupWalkComplete("sensor_visibility_exclusion_ids", "sensor_visibility_exclusions", "sensor visibility exclusion list", "exclusions", "exclusion_limit IDs");
+const IDENTITY_PROTECTION_RULES_COMPLETE = completeFrom(
+  "false when the identity protection policy rule list is partial: its one ID read reported no meta.pagination.total, or a total larger than the number of IDs it returned, or the lookups of the IDs it listed returned fewer rules than it listed.",
+  [
+    { surfaceId: "identity_protection_rule_ids", falseWhen: ["truncated"] },
+    { surfaceId: "identity_protection_rules", falseWhen: ["truncated"], scope: "fewer rules returned than IDs listed" },
+  ],
+);
 
 type CrowdstrikeCheck = {
   id: string;
@@ -1645,9 +1679,62 @@ const API_CLIENTS_HEALTHY = {
   clients_with_actionless_scopes: 0,
   max_write_clients: 3,
 };
+const IDENTITY_HEALTHY = {
+  identity_protection_rules_readable: true,
+  identity_protection_rules_complete: true,
+  identity_protection_rule_count: 3,
+  active_identity_protection_rule_count: 2,
+  enforcing_identity_protection_rule_count: 1,
+};
+const NO_ACTIVE_RULE = { active_identity_protection_rule_count: 0, enforcing_identity_protection_rule_count: 0 };
 const LOOKS_SHARED = matchesAny("$.local_part", SHARED_ACCOUNT_PATTERNS);
 const HOLDS_ADMIN = gt("$.admin_role_count", 0);
 const SHARED_LOCAL_PART = "A local part looks shared when it contains shared in any letter case, or holds admin, administrator, root, shared, service, svc, soc, security, ops, team, helpdesk, noreply, generic, or test in any letter case as a token that starts the text or follows a dot, underscore, or hyphen, and ends the text or precedes a dot, underscore, hyphen, or @.";
+
+type ExclusionCheck = {
+  id: string;
+  control: number;
+  title: string;
+  severity: BatchCheckDefinition["severity"];
+  prefix: string;
+  list: string;
+  matching: string;
+  global: string;
+  completeness: BatchCompletenessDefinition;
+  matches: string;
+  instance: string;
+};
+
+const exclusionCheck = (check: ExclusionCheck): CrowdstrikeCheck => {
+  const readable = `${check.prefix}_exclusions_readable`;
+  const complete = `${check.prefix}_exclusions_complete`;
+  const healthy = { [readable]: true, [complete]: true, [check.matching]: 0, [check.global]: 0 };
+  return {
+    id: check.id,
+    control: check.control,
+    title: check.title,
+    severity: check.severity,
+    owner: ACCESS_GOVERNANCE,
+    surfaces: [`${check.prefix}_exclusion_ids`, `${check.prefix}_exclusions`],
+    inputs: Object.keys(healthy),
+    rules: [
+      rule("manual", ne(readable, true)),
+      rule("fail", gt(check.global, 0)),
+      rule("warn", any(gt(check.matching, 0), incomplete(complete))),
+      rule("pass", always),
+    ],
+    completeness: { [complete]: check.completeness },
+    decision: `Manual when the ${check.list} is unreadable. Fail when an exclusion that ${check.matches} applies globally. Warn when such an exclusion does not apply globally. Warn instead of pass when the ${check.list} is partial. Otherwise pass, including when no exclusion is returned.`,
+    examples: [
+      example("compliant", "pass", `No returned exclusion ${check.matches}.`, healthy),
+      example("partial", "warn", `${check.instance} does not apply globally.`, { ...healthy, [check.matching]: 1 }),
+      example("noncompliant", "fail", `${check.instance} applies globally.`, { ...healthy, [check.matching]: 1, [check.global]: 1 }),
+      example("noncompliant", "fail", `${check.instance} applies globally on a partial list.`, { ...healthy, [complete]: false, [check.matching]: 1, [check.global]: 1 }),
+      example("partial", "warn", `No returned exclusion ${check.matches}, but the ${check.list} stopped at exclusion_limit.`, { ...healthy, [complete]: false }),
+      example("unreadable", "manual", `The ${check.list} was refused.`, { [readable]: false }),
+    ],
+  };
+};
 
 const ACCESS_GOVERNANCE_CHECKS: readonly CrowdstrikeCheck[] = [
   {
@@ -1775,6 +1862,79 @@ const ACCESS_GOVERNANCE_CHECKS: readonly CrowdstrikeCheck[] = [
       example("partial", "warn", "No visible client writes, but the API client list stopped at user_limit.", { ...API_CLIENTS_HEALTHY, api_clients_complete: false }),
       example("partial", "manual", "The API client lookups returned no client.", { ...API_CLIENTS_HEALTHY, api_client_count: 0 }),
       example("unreadable", "manual", "The API client list was refused.", { api_clients_readable: false }),
+    ],
+  },
+  exclusionCheck({
+    id: "CS-19",
+    control: 19,
+    title: "Exclusion Review - IOA Exclusions",
+    severity: "medium",
+    prefix: "ioa",
+    list: "IOA exclusion list",
+    matching: "broad_ioa_exclusion_count",
+    global: "global_broad_ioa_exclusion_count",
+    completeness: IOA_EXCLUSIONS_COMPLETE,
+    matches: "has a broad ifn_regex or cl_regex",
+    instance: "An IOA exclusion with the cl_regex .*",
+  }),
+  exclusionCheck({
+    id: "CS-20",
+    control: 20,
+    title: "Exclusion Review - ML Exclusions",
+    severity: "medium",
+    prefix: "ml",
+    list: "machine learning exclusion list",
+    matching: "sensitive_ml_exclusion_count",
+    global: "global_sensitive_ml_exclusion_count",
+    completeness: ML_EXCLUSIONS_COMPLETE,
+    matches: "excludes a sensitive path",
+    instance: String.raw`A machine learning exclusion of C:\Windows\System32`,
+  }),
+  exclusionCheck({
+    id: "CS-21",
+    control: 21,
+    title: "Exclusion Review - Sensor Visibility",
+    severity: "high",
+    prefix: "sensor_visibility",
+    list: "sensor visibility exclusion list",
+    matching: "hiding_sensor_visibility_exclusion_count",
+    global: "global_hiding_sensor_visibility_exclusion_count",
+    completeness: SENSOR_VISIBILITY_EXCLUSIONS_COMPLETE,
+    matches: "hides a directory",
+    instance: "A sensor visibility exclusion of /opt/app/**",
+  }),
+  {
+    id: "CS-24",
+    control: 24,
+    title: "Identity Protection",
+    severity: "medium",
+    owner: ACCESS_GOVERNANCE,
+    surfaces: ["identity_protection_rule_ids", "identity_protection_rules"],
+    inputs: Object.keys(IDENTITY_HEALTHY),
+    rules: [
+      rule("manual", any(
+        ne("identity_protection_rules_readable", true),
+        all(eq("identity_protection_rule_count", 0), incomplete("identity_protection_rules_complete")),
+      )),
+      rule("fail", eq("active_identity_protection_rule_count", 0)),
+      rule("warn", any(eq("enforcing_identity_protection_rule_count", 0), incomplete("identity_protection_rules_complete"))),
+      rule("pass", always),
+    ],
+    completeness: { identity_protection_rules_complete: IDENTITY_PROTECTION_RULES_COMPLETE },
+    decision: "Manual when the identity protection policy rule list is unreadable (a 401, 403, or 404 answer reports Identity Protection as not licensed), or when it is partial and returned no rule. Fail when no returned rule is active, including when the complete list holds no rule; a partial list whose returned rules include no active one still fails. Warn when no active rule enforces. Warn instead of pass when the list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Two rules are active and one of them enforces.", IDENTITY_HEALTHY),
+      example("partial", "warn", "Two rules are active, but neither enforces.", { ...IDENTITY_HEALTHY, enforcing_identity_protection_rule_count: 0 }),
+      example("noncompliant", "fail", "Every returned rule is disabled or in simulation mode.", { ...IDENTITY_HEALTHY, ...NO_ACTIVE_RULE }),
+      example("noncompliant", "fail", "The complete rule list holds no rule.", { ...IDENTITY_HEALTHY, ...NO_ACTIVE_RULE, identity_protection_rule_count: 0 }),
+      example("noncompliant", "fail", "A partial rule list whose returned rules include no active one still fails.", {
+        ...IDENTITY_HEALTHY, ...NO_ACTIVE_RULE, identity_protection_rules_complete: false,
+      }),
+      example("partial", "warn", "An enforcing rule is returned, but the rule list is partial.", { ...IDENTITY_HEALTHY, identity_protection_rules_complete: false }),
+      example("partial", "manual", "The partial rule list returned no rule.", {
+        ...IDENTITY_HEALTHY, ...NO_ACTIVE_RULE, identity_protection_rules_complete: false, identity_protection_rule_count: 0,
+      }),
+      example("unreadable", "manual", "The rule list was refused, as it is on a tenant without Identity Protection.", { identity_protection_rules_readable: false }),
     ],
   },
 ];
