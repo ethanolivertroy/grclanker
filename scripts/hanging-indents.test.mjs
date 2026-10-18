@@ -161,6 +161,15 @@ test('a line of several words that runs into the column puts no description on t
   ]);
 });
 
+test('a wrapped description ending in one word puts no description on the next line', () => {
+  assert.deepEqual(styles('ab  desc', '_errors.log  only when a', ' '.repeat(13) + 'failed', '    deeper code'), [
+    '--hang:4ch;--word:6ch;--word-2:4ch',
+    '--hang:13ch;--word:6ch;--word-2:4ch',
+    '--hang:13ch;--indent:13ch;--word:6ch;--word-2:4ch',
+    '--hang:6ch;--word:4ch',
+  ]);
+});
+
 test('lines are found by className as well as class, inside any wrapper', () => {
   const node = line('  indented', { className: ['line'] });
   const pre = el('pre', [el('code', [node])]);

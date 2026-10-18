@@ -53,7 +53,7 @@ function lineHang(text, columns, above = {}) {
   const continues = above.description !== undefined && indent >= above.description;
   // A name that runs into the column leaves no room for its description, which
   // starts the next line instead.
-  const spills = above.name && above.end >= indent && columns.includes(indent);
+  const spills = above.description === undefined && above.name && above.end >= indent && columns.includes(indent);
   if (continues || spills) return { hang: indent, description: indent, indent };
   return { hang: indent + DEFAULT_HANG };
 }
