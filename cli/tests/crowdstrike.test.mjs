@@ -1321,10 +1321,6 @@ test("verdict safety rule 5: partial inventories never pass and report seen vers
   assert.equal(sensorCoverage.summary.reported_total_hosts, 43);
 });
 
-portableContractTest("known gap: the spec declares that a user the details lookup omits is left out of CS-16 and CS-17", () => {
-  assert.ok(CROWDSTRIKE_SPEC.knownGaps.some((gap) => /user details lookup.*left out of CS-16 and CS-17 without marking the user inventory partial/.test(gap)));
-});
-
 test("verdict safety rule 5: a user the details lookup omits makes the user inventory partial, so CS-16 and CS-17 cannot pass", async () => {
   const result = await assessCrowdstrikeAccessGovernance(createFakeClient({
     listUserUuids: async () => [...passingUsers().users.map((user) => user.uuid), "u-deleted"],
