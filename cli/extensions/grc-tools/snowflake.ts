@@ -2858,8 +2858,11 @@ export async function assessSnowflakeNetworkAndAuthentication(
     if (permissive.length > 0) {
       return { status: "fail", summary: `${permissive.length}/${networkPolicies.rows.length} network policies allow 0.0.0.0/0 or a CIDR broader than /8: ${permissive.slice(0, 10).join(", ")}.`, evidence };
     }
-    if (emptyAllowLists.length === networkPolicies.rows.length) {
-      return { status: "warn", summary: `All ${networkPolicies.rows.length} network policies have an empty ALLOWED_IP_LIST; they may rely on network rules that this view does not expose, so review the rules manually.`, evidence };
+    if (emptyAllowLists.length > 0) {
+      const summary = emptyAllowLists.length === networkPolicies.rows.length
+        ? `All ${networkPolicies.rows.length} network policies have an empty ALLOWED_IP_LIST; they may rely on network rules that this view does not expose, so review the rules manually.`
+        : `${emptyAllowLists.length} of ${networkPolicies.rows.length} network policies have an empty ALLOWED_IP_LIST (${emptyAllowLists.slice(0, 10).join(", ")}); an empty list is not a restrictive allowlist and may allow every address or rely on network rules this view does not expose.`;
+      return { status: "warn", summary, evidence };
     }
     return { status: "pass", summary: `All ${networkPolicies.rows.length} network policies define restrictive allowlists without 0.0.0.0/0 entries.`, evidence };
   }));
