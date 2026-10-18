@@ -23,7 +23,15 @@ import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { KNOWBE4_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
-import { ACCOUNT_ADMIN_FIELDS, ACCOUNT_FIELDS, PII_HASH_FIELDS, PII_MASK_FIELDS, USER_FREE_FORM_FIELDS } from "./knowbe4.spec.js";
+import {
+  ACCOUNT_ADMIN_FIELDS,
+  ACCOUNT_FIELDS,
+  COMPLIANCE_TOPIC_PATTERN,
+  FAILURE_TIMESTAMP_KEYS,
+  PII_HASH_FIELDS,
+  PII_MASK_FIELDS,
+  USER_FREE_FORM_FIELDS,
+} from "./knowbe4.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -2381,15 +2389,6 @@ function campaignName(campaign: JsonRecord): string {
   return asString(campaign.name) ?? `campaign-${asString(campaign.campaign_id) ?? "unknown"}`;
 }
 
-const FAILURE_TIMESTAMP_KEYS = [
-  "clicked_at",
-  "replied_at",
-  "attachment_opened_at",
-  "macro_enabled_at",
-  "data_entered_at",
-  "qr_code_scanned",
-];
-
 function recipientFailureDate(recipient: JsonRecord): Date | undefined {
   const dates = FAILURE_TIMESTAMP_KEYS
     .map((key) => toDate(recipient[key]))
@@ -3415,8 +3414,6 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
     { inventory: "store_purchases", notChecked: "assigned modules were not cross-checked against the ModStore catalog for retirement and publish dates" },
   ]);
 }
-
-const COMPLIANCE_TOPIC_PATTERN = /\b(hipaa|pci|gdpr|sox|ferpa|ccpa|cpra|glba|cmmc|nist|iso\s?27001|fedramp|privacy|compliance|acceptable use|insider threat)\b/i;
 
 function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCompletionPct: number, requiredTopics: string[], enrollmentLimitReached: boolean | null): Knowbe4Finding {
   if (snapshot.trainingCampaigns.error) return unavailableFinding(17, "medium", "training_campaigns", snapshot);

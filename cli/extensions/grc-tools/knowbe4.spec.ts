@@ -55,6 +55,17 @@ export const PII_MASK_FIELDS: readonly string[] = [
   "custom_date_1",
   "custom_date_2",
 ];
+// A recipient failed a security test at the earliest of these timestamps that parses as a date.
+export const FAILURE_TIMESTAMP_KEYS: readonly string[] = [
+  "clicked_at",
+  "replied_at",
+  "attachment_opened_at",
+  "macro_enabled_at",
+  "data_entered_at",
+  "qr_code_scanned",
+];
+// Without required_compliance_topics, an assigned training module counts as compliance content when its name matches.
+export const COMPLIANCE_TOPIC_PATTERN = /\b(hipaa|pci|gdpr|sox|ferpa|ccpa|cpra|glba|cmmc|nist|iso\s?27001|fedramp|privacy|compliance|acceptable use|insider threat)\b/i;
 
 const series = (items: readonly string[], conjunction = "and"): string =>
   items.length <= 2 ? items.join(` ${conjunction} `) : `${items.slice(0, -1).join(", ")}, ${conjunction} ${items[items.length - 1]}`;
