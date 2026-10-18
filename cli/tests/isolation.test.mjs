@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { getGrclankerHome } from "../dist/config/paths.js";
 import { prepareCliRuntime } from "../dist/pi/launch.js";
+import { saveLocalSetup } from "../dist/pi/setup.js";
 import { readModelsConfig } from "../dist/pi/settings.js";
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -141,6 +142,38 @@ test("prepareCliRuntime does not rewrite settings that are JSON but not an objec
     },
   );
   assert.equal(readFileSync(settingsPath, "utf8"), body);
+});
+
+test("saveLocalSetup validates models.json before it writes settings or models", () => {
+  const base = createTempBase("grclanker-isolation-local-setup-");
+  const settingsPath = join(base, "settings.json");
+  const modelsPath = join(base, "models.json");
+  const settingsBody = '{ "sentinel": true }\n';
+  const modelsBody = '{ "providers": { "ollama": { "apiKey": "CANARYMODELKEY998877" }\n';
+  writeFileSync(settingsPath, settingsBody, "utf8");
+  writeFileSync(modelsPath, modelsBody, "utf8");
+
+  assert.throws(
+    () => saveLocalSetup(settingsPath, modelsPath, {}, "http://127.0.0.1:11434", "llama3.2", {}),
+    (error) => {
+      assert.match(error.message, /Unable to parse config file: invalid JSON/);
+      assert.equal(error.message.includes("CANARYMODELKEY998877"), false);
+      return true;
+    },
+  );
+  assert.equal(readFileSync(settingsPath, "utf8"), settingsBody);
+  assert.equal(readFileSync(modelsPath, "utf8"), modelsBody);
+
+  const okBase = createTempBase("grclanker-isolation-local-setup-ok-");
+  const okSettings = join(okBase, "settings.json");
+  const okModels = join(okBase, "models.json");
+  writeFileSync(okModels, '{ "providers": {} }\n', "utf8");
+  saveLocalSetup(okSettings, okModels, { theme: "grclanker" }, "http://127.0.0.1:11434", "llama3.2", {});
+  const writtenSettings = JSON.parse(readFileSync(okSettings, "utf8"));
+  const writtenModels = JSON.parse(readFileSync(okModels, "utf8"));
+  assert.equal(writtenSettings.defaultModel, "llama3.2");
+  assert.equal(writtenSettings.defaultProvider, "ollama");
+  assert.equal(writtenModels.providers.ollama.models[0].id, "llama3.2");
 });
 
 test("readModelsConfig refuses a malformed models file without quoting or replacing it", () => {

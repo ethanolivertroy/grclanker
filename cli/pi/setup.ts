@@ -765,7 +765,7 @@ function localModelsConfig(baseUrl: string, modelId: string): LocalProviderConfi
   };
 }
 
-function saveLocalSetup(
+export function saveLocalSetup(
   settingsPath: string,
   modelsPath: string,
   baseSettings: GrclankerSettings,
@@ -773,6 +773,14 @@ function saveLocalSetup(
   modelId: string,
   computeSettings: Partial<GrclankerSettings>,
 ): void {
+  const modelsConfig = readModelsConfig(modelsPath);
+  const providers =
+    modelsConfig.providers && typeof modelsConfig.providers === "object"
+      ? (modelsConfig.providers as Record<string, unknown>)
+      : {};
+  providers[LOCAL_PROVIDER] = localModelsConfig(baseUrl, modelId).providers.ollama;
+  const nextModels = { ...modelsConfig, providers };
+
   const settings: GrclankerSettings = {
     ...baseSettings,
     modelMode: "local",
@@ -782,15 +790,8 @@ function saveLocalSetup(
     defaultModel: modelId,
     ...computeSettings,
   };
+  writeModelsConfig(modelsPath, nextModels);
   writeGrclankerSettings(settingsPath, settings);
-
-  const modelsConfig = readModelsConfig(modelsPath);
-  const providers =
-    modelsConfig.providers && typeof modelsConfig.providers === "object"
-      ? (modelsConfig.providers as Record<string, unknown>)
-      : {};
-  providers[LOCAL_PROVIDER] = localModelsConfig(baseUrl, modelId).providers.ollama;
-  writeModelsConfig(modelsPath, { ...modelsConfig, providers });
 }
 
 function saveHostedSetup(
