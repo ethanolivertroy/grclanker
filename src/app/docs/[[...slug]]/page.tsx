@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import { DocsPage } from 'fumadocs-ui/layouts/docs/page';
 import { AgentCommandsSection } from '../../../components/agent-commands-section';
+import { getDocsFooterItems } from '../../../components/docs-footer';
 import { DocsMobileNav } from '../../../components/docs-mobile-nav';
 import { getDocsRoutesToc } from '../../../components/docs-routes';
 import { DocsPageContainer } from '../../../components/docs-slots';
@@ -33,6 +34,7 @@ export default async function Page(props: PageProps) {
       toc={toc}
       breadcrumb={{ enabled: false }}
       slots={{ container: DocsPageContainer }}
+      footer={{ items: getDocsFooterItems(slug) }}
     >
       <DocsMobileNav sections={getDocsSections()} currentSlug={slug} />
       <h1 className="docs-article-title">{page.data.title}</h1>
