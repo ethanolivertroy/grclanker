@@ -31,8 +31,11 @@ import {
   resolveSecureOutputPath,
   runAllCrowdstrikeAssessments,
 } from "../dist/extensions/grc-tools/crowdstrike.js";
+import { CROWDSTRIKE_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
+import { CROWDSTRIKE_SPEC } from "../dist/extensions/grc-tools/crowdstrike.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
@@ -3021,4 +3024,48 @@ test("CrowdStrike tools are registered in the tool catalog under the CrowdStrike
   }
   const exportTool = tools.find((entry) => entry.name === "crowdstrike_export_audit_bundle");
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "output_dir"));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Portable contract: auth resolver, requests, completeness, bundle paths
+// ---------------------------------------------------------------------------------------------
+
+portableContractTest("the auth resolver contract names exactly the environment the resolver reads, and each variable reaches the resolved configuration", () => {
+  assert.deepEqual(CROWDSTRIKE_SPEC.authentication.environmentVariables, CROWDSTRIKE_AUTH_RESOLVER.environment);
+  assert.deepEqual(CROWDSTRIKE_SPEC.authentication.configLocations, CROWDSTRIKE_AUTH_RESOLVER.configLocations);
+  assert.deepEqual(CROWDSTRIKE_SPEC.authentication.configFields, CROWDSTRIKE_AUTH_RESOLVER.configFields);
+
+  const home = createTempBase("grclanker-cs-resolver-contract-");
+  const configFile = join(home, "file.json");
+  writeFileSync(configFile, JSON.stringify({ client_id: "file-client", client_secret: "<file-secret>" }));
+  const basic = { CS_CLIENT_ID: "env-client", CS_CLIENT_SECRET: "<env-secret>" };
+
+  const accessed = new Set();
+  const tracked = new Proxy({ ...basic }, {
+    get(target, property) {
+      if (typeof property === "string") accessed.add(property);
+      return target[property];
+    },
+  });
+  resolveCrowdstrikeConfiguration({}, tracked, home);
+  assert.deepEqual([...accessed].sort(), [...CROWDSTRIKE_AUTH_RESOLVER.environment].sort());
+
+  const reached = {
+    CS_CONFIG_FILE: [{ CS_CONFIG_FILE: configFile }, (config) => config.clientId === "file-client" && config.clientSecret === "<file-secret>"],
+    CS_CLIENT_ID: [basic, (config) => config.clientId === "env-client"],
+    FALCON_CLIENT_ID: [{ FALCON_CLIENT_ID: "falcon-client", CS_CLIENT_SECRET: "<env-secret>" }, (config) => config.clientId === "falcon-client"],
+    CS_CLIENT_SECRET: [basic, (config) => config.clientSecret === "<env-secret>"],
+    FALCON_CLIENT_SECRET: [{ CS_CLIENT_ID: "env-client", FALCON_CLIENT_SECRET: "<falcon-secret>" }, (config) => config.clientSecret === "<falcon-secret>"],
+    CS_CLOUD: [{ ...basic, CS_CLOUD: "eu-1" }, (config) => config.cloud === "eu-1" && config.baseUrl === CROWDSTRIKE_CLOUDS["eu-1"]],
+    FALCON_CLOUD: [{ ...basic, FALCON_CLOUD: "us-2" }, (config) => config.cloud === "us-2" && config.baseUrl === CROWDSTRIKE_CLOUDS["us-2"]],
+    CS_BASE_URL: [{ ...basic, CS_BASE_URL: "https://falcon.example.internal" }, (config) => config.baseUrl === "https://falcon.example.internal"],
+    FALCON_BASE_URL: [{ ...basic, FALCON_BASE_URL: "https://falcon-alias.example.internal" }, (config) => config.baseUrl === "https://falcon-alias.example.internal"],
+    CS_MEMBER_CID: [{ ...basic, CS_MEMBER_CID: "child-cid" }, (config) => config.memberCid === "child-cid"],
+    FALCON_MEMBER_CID: [{ ...basic, FALCON_MEMBER_CID: "falcon-child-cid" }, (config) => config.memberCid === "falcon-child-cid"],
+    CS_TIMEOUT: [{ ...basic, CS_TIMEOUT: "45" }, (config) => config.timeoutMs === 45_000],
+  };
+  assert.deepEqual(Object.keys(reached).sort(), [...CROWDSTRIKE_AUTH_RESOLVER.environment].sort());
+  for (const [name, [environment, applied]] of Object.entries(reached)) {
+    assert.ok(applied(resolveCrowdstrikeConfiguration({}, environment, home)), `${name} reaches the resolved configuration`);
+  }
 });
