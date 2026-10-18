@@ -18,6 +18,7 @@ import {
 import { sqlite as flueSqlite, start as flueStart, type Flue, type StartOptions } from "@flue/runtime/node";
 import { getGrclankerHome } from "../config/paths.js";
 import { Grclanker, prepareGrclankerAgent } from "./agent.js";
+import { flueConversationStreamPath, readPriorSensitiveValues } from "./history.js";
 import { collectSensitiveValues, redactSensitiveArguments, scrubSensitiveValues, withholdEchoedArguments } from "./redact.js";
 import { collectGrclankerDomainTools } from "./tools.js";
 
@@ -193,14 +194,24 @@ export async function runGrclankerFlueAgent(
   const dbPath = resolveFlueDatabasePath(request.db);
   if (dbPath !== FLUE_MEMORY_DATABASE) mkdirSync(dirname(dbPath), { recursive: true });
 
+  const parameterSchemas = deps.toolParameterSchemas?.();
+  // A resumed `--id` does not replay earlier tool-input events, so rebuild the
+  // redaction list from the conversation file before this turn starts.
+  const rememberedSensitiveValues: string[] = request.id
+    ? readPriorSensitiveValues({
+        dbPath,
+        streamPath: flueConversationStreamPath(FLUE_AGENT_NAME, request.id),
+        schemas: parameterSchemas,
+      })
+    : [];
+
   const flue = await deps.start({ agents: [deps.agent], db: deps.sqlite(dbPath) });
   try {
     const handle = deps.init(deps.agent, request.id ? { id: request.id } : undefined);
     deps.writeErr(`conversation: ${handle.id}`);
     const receipt = await handle.dispatch(request.message);
-    const rememberedSensitiveValues: string[] = [];
     const formatActivity = createFlueActivityFormatter({
-      parameterSchemas: deps.toolParameterSchemas?.(),
+      parameterSchemas,
       onSensitiveValues: (values) => {
         rememberedSensitiveValues.push(...values);
       },
