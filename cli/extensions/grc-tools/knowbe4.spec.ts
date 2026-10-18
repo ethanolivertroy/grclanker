@@ -99,12 +99,15 @@ const param = (
 ): RequestParameterContract => ({ name, location, required, value, ...(when ? { when } : {}) });
 
 const PAGE_NUMBER = "The page number: 1 for the first page, then one more than the previous page's";
-const listParameters = (probed: boolean, ...filters: RequestParameterContract[]): RequestParameterContract[] => [
+const pagedParameters = (pageSize: number, probed: boolean, filters: readonly RequestParameterContract[]): RequestParameterContract[] => [
   ...filters,
   param("page", "query", PAGE_NUMBER),
-  param("per_page", "query", probed ? "500, or 1 on the knowbe4_check_access probe" : "500"),
+  param("per_page", "query", probed ? `${pageSize}, or 1 on the knowbe4_check_access probe` : `${pageSize}`),
 ];
+const listParameters = (probed: boolean, ...filters: RequestParameterContract[]): RequestParameterContract[] =>
+  pagedParameters(500, probed, filters);
 const EXCEPT_COUNT = "On every read except the knowbe4_check_access count";
+const EXCEPT_PROBE = "On every read except the knowbe4_check_access probe";
 const PHISHER_PARAMETERS: readonly RequestParameterContract[] = [
   param("query", "json-body", "The phisherMessages query document, sorted by REPORTED_AT DESCENDING; the count-only document on the knowbe4_check_access count"),
   param("variables.query", "json-body", "The PhishER filter reported_at:[{date} TO *], {date} being the UTC calendar date (YYYY-MM-DD) of the assessment time minus the lookback days; an empty string on the knowbe4_check_access count"),
@@ -191,7 +194,44 @@ const PHISHING_SURFACES: readonly BatchSurfaceDefinition[] = [
   },
 ];
 
-const KNOWBE4_SURFACES: readonly BatchSurfaceDefinition[] = [...PHISHING_SURFACES];
+const TRAINING_SURFACES: readonly BatchSurfaceDefinition[] = [
+  reportingSurface(
+    "training_campaigns",
+    "/v1/training/campaigns",
+    [
+      "campaign_id",
+      "status",
+      "start_date",
+      "end_date",
+      "completion_percentage",
+      ...["name", "content_type", "store_purchase_id", "store_purchased_id", "retired", "publish_date"].map((field) => `content.${field}`),
+    ],
+    pagedParameters(10, true, []),
+    arrayResponse("one training campaign per entry"),
+  ),
+  reportingSurface(
+    "training_enrollments",
+    "/v1/training/enrollments",
+    ["campaign_id", "module_name", "status", "user.id", "enrollment_date", "start_date"],
+    listParameters(
+      true,
+      param("exclude_archived_users", "query", "true", true, EXCEPT_PROBE),
+      param("include_campaign_id", "query", "true", true, EXCEPT_PROBE),
+      param("include_store_purchase_id", "query", "true", true, EXCEPT_PROBE),
+    ),
+    arrayResponse("one training enrollment per entry"),
+  ),
+  reportingSurface(
+    "store_purchases",
+    "/v1/training/store_purchases",
+    ["store_purchase_id", "store_purchased_id", "retired", "publish_date"],
+    listParameters(true),
+    arrayResponse("one ModStore purchase per entry"),
+  ),
+  reportingSurface("training_policies", "/v1/training/policies", [], listParameters(true), arrayResponse("one uploaded policy per entry")),
+];
+
+const KNOWBE4_SURFACES: readonly BatchSurfaceDefinition[] = [...PHISHING_SURFACES, ...TRAINING_SURFACES];
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
 const path = (name: string): VerdictOperand => ({ kind: "path", path: name });
@@ -215,11 +255,11 @@ const incomplete = (...complete: string[]): VerdictCondition =>
   complete.length === 1 ? ne(complete[0], true) : any(...complete.map((name) => ne(name, true)));
 // The runtime's percentage(): part / total * 100 rounded half up to one decimal place, and no value (false here) when
 // total is not above 0.
-const percentAtLeast = (numerator: string, denominator: string, threshold: string): VerdictCondition => ({
+const percent = (comparator: "gt" | "gte" | "lt", numerator: string, denominator: string, threshold: string): VerdictCondition => ({
   op: "ratio",
   numerator: path(numerator),
   denominator: path(denominator),
-  comparator: "gte",
+  comparator,
   threshold: path(threshold),
   scale: 100,
   roundDigits: 1,
@@ -239,8 +279,24 @@ const OLDEST_FIRST = "ordered oldest first by start, tests of equal start in the
 const TEST_PERCENTAGE = `A test's percentage is its phish_prone_percentage, ${AS_NUMBER}, times 100 and rounded half up to 2 decimal places.`;
 const WEIGHTED = `${TEST_PERCENTAGE} Its weight is its delivered_count when that reads as a number, else its scheduled_count when that does, else 0. A weighted percentage over a set of tests is the sum of percentage times weight over the tests with a percentage and a weight above 0, divided by the sum of those weights, rounded half up to 2 decimal places.`;
 const RECIPIENT_SAMPLE = `The recipient sample is the first N security tests that ran in the sample window, newest first by start with tests of equal start in their returned order, N being the ${dayOption("security_test_sample_limit", 12, 200).replace("clamped to 1", "clamped to 0")}. The sample window is the lookback window, or the last M days when the user risk assessment runs in the same call and M is larger, M being the ${dayOption("inactive_days", 180)}. A sampled test is read only when its pst_id reads as text, from GET /v1/phishing/security_tests/{pst_id}/recipients. ${READS_AS_TEXT}`;
-const ACTIVE_CAMPAIGN = `A campaign is active when it is not hidden and its campaign_id, read as text, is the campaign_id, read as text, of a security test that ran in the lookback window; or its last_run parses as a date at or after the start of the lookback window; or its status, read as text, contains active, scheduled, or in progress in any letter case. A campaign is hidden when its hidden is the boolean true, the number 1, or a string that trims to true, 1, yes, or on in any letter case. ${TEST_START} ${LOOKBACK} ${READS_AS_TEXT}`;
+const IS_TRUE = "the boolean true, the number 1, or a string that trims to true, 1, yes, or on in any letter case";
+const ACTIVE_CAMPAIGN = `A campaign is active when it is not hidden and its campaign_id, read as text, is the campaign_id, read as text, of a security test that ran in the lookback window; or its last_run parses as a date at or after the start of the lookback window; or its status, read as text, contains active, scheduled, or in progress in any letter case. A campaign is hidden when its hidden is ${IS_TRUE}. ${TEST_START} ${LOOKBACK} ${READS_AS_TEXT}`;
 const ALL_USERS = `A campaign targets All Users when one of the JSON object entries of its groups array has a group_id that, ${AS_NUMBER}, is 0, or a name that trims to All Users in any letter case.`;
+const TRAINING_LOOKBACK = `The training lookback window runs from N days before the assessment time to the assessment time, ${DAY} and N being the ${dayOption("training_lookback_days", 365)}.`;
+const TRAINING_CAMPAIGN = `A training campaign is cancelled when its status, read as text, contains cancelled or canceled in any letter case, and closed when its status, read as text, contains completed in any letter case or its end_date parses as a date no later than the assessment time. It is in the training lookback window when its start_date parses as a date in the window, its end_date parses as a date at or after the window's start, or its status, read as text, contains in progress, enrolling, or created in any letter case and its end_date does not parse as a date or parses as one at or after the window's start. ${TRAINING_LOOKBACK} ${PARSES_AS_DATE} ${READS_AS_TEXT}`;
+const COMPLETED_ENROLLMENT = "An enrollment is completed when its status reads as text that is completed or passed in any letter case.";
+const CAMPAIGN_COMPLETION = `A campaign's loaded enrollments are the returned enrollments whose campaign_id, read as text, is the campaign's campaign_id, read as text; a campaign without one has none. Its completion is its completion_percentage, ${AS_NUMBER}, when that is at or above 0, and otherwise the percentage of its loaded enrollments that are completed, rounded half up to 1 decimal place, when it has any. ${COMPLETED_ENROLLMENT}`;
+const ENROLLMENT_LIMIT = `enrollment_limit (the ${dayOption("enrollment_limit", 20000, 1000000)})`;
+const ENROLLMENTS_CUT = `the enrollment list was read but is partial because a page held more enrollments than were left under ${ENROLLMENT_LIMIT} or a full page brought the enrollments kept to it`;
+const ENROLLMENT_DATE = "An enrollment belongs to the user whose ID is its user.id read as text, and its date is its enrollment_date when that parses as a date, else its start_date when that does.";
+const GRACE_DAYS = `the ${dayOption("enrollment_grace_days", 30, 365)}`;
+const FAILED_USERS = `A failed user is a distinct ID that is the user.id, read as text, of a recipient with a failure time among the recipients of the sampled tests counted by sampled_test_count, a recipient's failure time being the earliest of its ${series(FAILURE_TIMESTAMP_KEYS)} that parse as dates; the user's failure time is the earliest across those recipients. ${PARSES_AS_DATE} ${READS_AS_TEXT}`;
+const STORE_MODULES = `An assigned store module is a JSON object entry of the content array of a training campaign that is not cancelled and is in the training lookback window, whose content_type does not read as text or contains store purchase in any letter case. A module's store purchase ID is its store_purchase_id read as text, else its store_purchased_id read as text, and a returned store purchase's ID is read the same way. ${TRAINING_CAMPAIGN}`;
+const RETIRED_MODULE = `A module is retired when its retired is ${IS_TRUE}, or its store purchase ID is the ID of a returned store purchase whose retired is.`;
+const MODULE_PUBLISHED = "A module's publish date is its publish_date when that parses as a date, else the publish_date of the last returned store purchase with the same ID whose publish_date parses as a date.";
+const REQUIRED_TOPICS = "The required compliance topics are the entries of the required_compliance_topics argument that read as text, trimmed, when it is an array, or the non-blank comma-separated pieces of its text, trimmed, when it reads as text; a repeated topic counts each time.";
+const COMPLIANCE_TOPICS = `The compliance topics are the required compliance topics, each matching the assigned modules whose name, lowercased by ECMAScript toLowerCase, contains the topic so lowercased; when no topic is required, a single topic matching the assigned modules whose name matches the ECMAScript regular expression /${COMPLIANCE_TOPIC_PATTERN.source}/${COMPLIANCE_TOPIC_PATTERN.flags}. The assigned modules are the distinct names, read as text, of the JSON object entries of the content arrays of the training campaigns that are not cancelled and are in the training lookback window. ${REQUIRED_TOPICS} ${TRAINING_CAMPAIGN}`;
+const TOPIC_COMPLETION = `A topic's loaded enrollments are the returned enrollments whose module_name, read as text, is the name of one of its matching modules, and its completion is the percentage of them that are completed, rounded half up to 1 decimal place. ${COMPLETED_ENROLLMENT}`;
 
 const KNOWBE4_INPUTS: Readonly<Record<string, string>> = {
   security_tests_readable: "True when the GET /v1/phishing/security_tests walk returned without a refusal.",
@@ -278,6 +334,30 @@ const KNOWBE4_INPUTS: Readonly<Record<string, string>> = {
   phisher_messages_readable: "True when the PhishER GraphQL phisherMessages walk over the messages reported in the lookback window returned without a refusal; unreported when no PhishER API token is configured.",
   largest_schedule_gap_days: `Largest gap, in days rounded half up to 1 decimal place, between consecutive starts in the series formed by the newest security test that ran before the lookback window, when there is one, followed by the tests that ran in the lookback window oldest first, and between the start of the newest test that ran and the assessment time; unreported when no security test ran. ${TEST_START} ${LOOKBACK}`,
   max_schedule_gap_days: `The ${dayOption("max_schedule_gap_days", 45)}.`,
+  training_campaigns_readable: "True when the GET /v1/training/campaigns walk returned without a refusal.",
+  training_campaigns_complete: "Training campaign list coverage.",
+  training_enrollments_readable: "True when the GET /v1/training/enrollments walk returned without a refusal.",
+  training_enrollments_complete: "Training enrollment list coverage.",
+  lowest_completion_pct: `Lowest completion, rounded half up to 1 decimal place, among the closed training campaigns that are not cancelled, are in the training lookback window, and have a completion, leaving out those counted by enrollment_cut_campaign_count; unreported when there is none. ${CAMPAIGN_COMPLETION} ${TRAINING_CAMPAIGN}`,
+  enrollment_cut_campaign_count: `Number of closed training campaigns that are not cancelled and are in the training lookback window, whose completion_percentage does not read as a number at or above 0, and that have a loaded enrollment, when ${ENROLLMENTS_CUT}; 0 otherwise. ${CAMPAIGN_COMPLETION} ${TRAINING_CAMPAIGN}`,
+  unmeasured_campaign_count: `Number of closed training campaigns that are not cancelled, are in the training lookback window, and have no completion. ${CAMPAIGN_COMPLETION} ${TRAINING_CAMPAIGN}`,
+  min_completion_pct: `The ${percentOption("min_completion_pct", 90)}.`,
+  fail_completion_pct: `The ${percentOption("fail_completion_pct", 80)}, lowered to min_completion_pct when above it.`,
+  new_user_count: `Number of returned active users whose joined_on parses as a date from N days before the assessment time through G days before it, ${DAY}, N being the ${dayOption("training_lookback_days", 365)}, and G ${GRACE_DAYS}. ${PARSES_AS_DATE}`,
+  late_user_count: `Number of the users counted by new_user_count whose id reads as text and who either have no enrollment with a date or have an earliest enrollment date more than G days after their joined_on, ${DAY} and G being ${GRACE_DAYS}. ${ENROLLMENT_DATE} ${PARSES_AS_DATE} ${READS_AS_TEXT}`,
+  failed_user_count: `Number of failed users. ${FAILED_USERS}`,
+  overdue_failed_user_count: `Number of failed users whose failure time is at least R days before the assessment time, ${DAY} and R being the ${dayOption("remedial_window_days", 14, 365)}. ${FAILED_USERS}`,
+  remediated_user_count: `Number of the users counted by overdue_failed_user_count who have an enrollment whose date is no earlier than 1 day, 86400000 milliseconds, before their failure time. ${ENROLLMENT_DATE} ${FAILED_USERS}`,
+  assigned_module_count: `Number of assigned store modules. ${STORE_MODULES}`,
+  retired_module_count: `Number of assigned store modules that are retired. ${RETIRED_MODULE} ${STORE_MODULES}`,
+  stale_module_count: `Number of assigned store modules that are not retired and whose publish date is more than N days before the assessment time, ${DAY} and N being the ${dayOption("max_content_age_days", 365)}. ${MODULE_PUBLISHED} ${RETIRED_MODULE} ${STORE_MODULES}`,
+  undated_module_count: `Number of assigned store modules that are not retired and have no publish date. ${MODULE_PUBLISHED} ${RETIRED_MODULE} ${STORE_MODULES}`,
+  store_purchases_complete: "Store purchase list coverage.",
+  required_topic_count: `Number of required compliance topics. ${REQUIRED_TOPICS}`,
+  topics_without_modules: `Number of compliance topics with no matching assigned module. ${COMPLIANCE_TOPICS}`,
+  topics_without_enrollments: `Number of compliance topics with a matching assigned module but no loaded enrollment. ${TOPIC_COMPLETION} ${COMPLIANCE_TOPICS}`,
+  lowest_topic_completion_pct: `Lowest completion among the compliance topics with a loaded enrollment; unreported when none has one. ${TOPIC_COMPLETION} ${COMPLIANCE_TOPICS}`,
+  training_policies_readable: "True when the GET /v1/training/policies walk returned without a refusal.",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -287,7 +367,7 @@ const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.
 }));
 
 const USER_LIMIT = `user_limit (the ${dayOption("user_limit", 5000, 200000)})`;
-// Check KNOWBE4-09 reads these lists without a manual gate, so a refused read must make them incomplete too.
+// Some checks read these lists without a manual gate, so a refused read must make them incomplete too.
 const pageWalkComplete = (surfaceId: string, list: string, cap: string): BatchCompletenessDefinition => ({
   semantics: `false when the ${list} read was refused, or the list is partial because a page held more records than were left under ${cap} or a full page brought the records kept to ${cap}.`,
   sources: [{ surfaceId, falseWhen: ["truncated", "error", "denied"] }],
@@ -296,6 +376,9 @@ const SECURITY_TESTS_COMPLETE = pageWalkComplete("security_tests", "security tes
 const USERS_COMPLETE = pageWalkComplete("users", "active user list", USER_LIMIT);
 const GROUPS_COMPLETE = pageWalkComplete("groups", "active group list", "20000 records");
 const PHISHING_CAMPAIGNS_COMPLETE = pageWalkComplete("phishing_campaigns", "phishing campaign list", "20000 records");
+const TRAINING_CAMPAIGNS_COMPLETE = pageWalkComplete("training_campaigns", "training campaign list", "20000 records");
+const TRAINING_ENROLLMENTS_COMPLETE = pageWalkComplete("training_enrollments", "training enrollment list", ENROLLMENT_LIMIT);
+const STORE_PURCHASES_COMPLETE = pageWalkComplete("store_purchases", "store purchase list", "20000 records");
 const RECIPIENT_READS_COMPLETE: BatchCompletenessDefinition = {
   semantics: `false when the recipient reads do not cover every security test that ran in the lookback window: fewer sampled tests with a start in that window were read than ran in it (the sample holds at most security_test_sample_limit tests, and a sampled test whose pst_id does not read as text takes a place without being read), a recipient read was refused or never made, or a recipient walk was partial because a page held more recipients than were left under 20000 or a full page brought the recipients kept to 20000. ${RECIPIENT_SAMPLE} ${TEST_START} ${LOOKBACK}`,
   sources: [{ surfaceId: "security_test_recipients", falseWhen: ["truncated", "error", "denied", "not-collected"] }],
@@ -409,7 +492,7 @@ const PHISHING_CHECKS: readonly Knowbe4Check[] = [
       rule("fail", eq("security_tests_in_window", 0)),
       rule("warn", eq("sampled_test_count", 0)),
       rule("warn", incomplete("users_complete", "recipient_reads_complete")),
-      rule("fail", not(percentAtLeast("tested_user_count", "active_user_count", "min_coverage_pct"))),
+      rule("fail", not(percent("gte", "tested_user_count", "active_user_count", "min_coverage_pct"))),
       rule("warn", ne("security_tests_complete", true)),
       rule("pass", always),
     ],
@@ -542,7 +625,7 @@ const PHISHING_CHECKS: readonly Knowbe4Check[] = [
       rule("fail", eq("active_campaign_count", 0)),
       rule("fail", all(
         eq("full_targeting_campaign_count", 0),
-        not(percentAtLeast("targeted_member_count", "active_user_count", "min_coverage_pct")),
+        not(percent("gte", "targeted_member_count", "active_user_count", "min_coverage_pct")),
         eq("require_full_targeting", true),
       )),
       rule("warn", incomplete("phishing_campaigns_complete", "security_tests_complete", "users_complete", "groups_complete")),
@@ -593,8 +676,8 @@ const PHISHING_CHECKS: readonly Knowbe4Check[] = [
     rules: [
       rule("manual", ne("security_tests_readable", true)),
       rule("warn", eq("delivered_count", 0)),
-      rule("fail", not(percentAtLeast("reported_count", "delivered_count", "report_rate_warn_floor_pct"))),
-      rule("warn", not(percentAtLeast("reported_count", "delivered_count", "min_report_rate_pct"))),
+      rule("fail", not(percent("gte", "reported_count", "delivered_count", "report_rate_warn_floor_pct"))),
+      rule("warn", not(percent("gte", "reported_count", "delivered_count", "min_report_rate_pct"))),
       rule("warn", any(ne("security_tests_complete", true), eq("phisher_messages_readable", false))),
       rule("pass", always),
     ],
@@ -643,6 +726,294 @@ const PHISHING_CHECKS: readonly Knowbe4Check[] = [
   },
 ];
 
+const TRAINING = "knowbe4_assess_training_program";
+const CAMPAIGNS_READ = { training_campaigns_readable: true, training_campaigns_complete: true };
+const ENROLLMENTS_READ = { training_enrollments_readable: true, training_enrollments_complete: true };
+const COMPLETION_HEALTHY = {
+  ...CAMPAIGNS_READ,
+  training_enrollments_readable: true,
+  enrollment_cut_campaign_count: 0,
+  unmeasured_campaign_count: 0,
+  min_completion_pct: 90,
+  fail_completion_pct: 80,
+};
+const TIMELINESS_HEALTHY = { users_readable: true, users_complete: true, ...ENROLLMENTS_READ, user_record_count: 500, new_user_count: 40 };
+const REMEDIAL_HEALTHY = {
+  ...TESTS_READ,
+  ...ENROLLMENTS_READ,
+  training_campaigns_readable: true,
+  sampled_test_count: 3,
+  recipient_reads_complete: true,
+  failed_user_count: 20,
+  overdue_failed_user_count: 20,
+};
+const CONTENT_HEALTHY = {
+  ...CAMPAIGNS_READ,
+  store_purchases_complete: true,
+  assigned_module_count: 12,
+  retired_module_count: 0,
+  stale_module_count: 0,
+  undated_module_count: 0,
+};
+const COMPLIANCE_READ = {
+  ...CAMPAIGNS_READ,
+  training_enrollments_complete: true,
+  training_policies_readable: true,
+  required_topic_count: 2,
+  topics_without_modules: 0,
+  topics_without_enrollments: 0,
+  min_completion_pct: 90,
+};
+const COMPLIANCE_HEALTHY = { ...COMPLIANCE_READ, lowest_topic_completion_pct: 94.2 };
+const UNREADABLE_CAMPAIGNS = example("unreadable", "manual", "The training campaign list was refused.", { training_campaigns_readable: false });
+
+const TRAINING_CHECKS: readonly Knowbe4Check[] = [
+  {
+    id: "KNOWBE4-03",
+    control: 3,
+    title: "Training completion rate",
+    severity: "high",
+    owner: TRAINING,
+    surfaces: ["training_campaigns", "training_enrollments"],
+    inputs: [
+      "training_campaigns_readable",
+      "lowest_completion_pct",
+      "fail_completion_pct",
+      "min_completion_pct",
+      "enrollment_cut_campaign_count",
+      "unmeasured_campaign_count",
+      "training_campaigns_complete",
+      "training_enrollments_readable",
+    ],
+    rules: [
+      rule("manual", ne("training_campaigns_readable", true)),
+      rule("fail", lt("lowest_completion_pct", path("fail_completion_pct"))),
+      rule("warn", lt("lowest_completion_pct", path("min_completion_pct"))),
+      rule("warn", any(gt("enrollment_cut_campaign_count", 0), gt("unmeasured_campaign_count", 0), unreported("lowest_completion_pct"))),
+      rule("warn", any(ne("training_campaigns_complete", true), ne("training_enrollments_readable", true))),
+      rule("pass", always),
+    ],
+    completeness: { training_campaigns_complete: TRAINING_CAMPAIGNS_COMPLETE },
+    decision: "Manual when the training campaign list is unreadable. Fail when a closed, uncancelled campaign in the training lookback window finished below fail_completion_pct percent completion, and warn when one finished below min_completion_pct percent. Warn when such a campaign's completion could only come from enrollments and the enrollment list stopped at enrollment_limit, when such a campaign has neither a completion_percentage of 0 or more nor a loaded enrollment, or when no such campaign has a completion. Warn instead of pass when the training campaign list is partial or the enrollment list is unreadable. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every closed campaign in the window met the target; the lowest finished at 93.5 percent.", { ...COMPLETION_HEALTHY, lowest_completion_pct: 93.5 }),
+      example("compliant", "pass", "The lowest closed campaign finished exactly at the 90 percent target.", { ...COMPLETION_HEALTHY, lowest_completion_pct: 90 }),
+      example("noncompliant", "fail", "A closed campaign finished at 72.4 percent, below the 80 percent floor.", { ...COMPLETION_HEALTHY, lowest_completion_pct: 72.4 }),
+      example("partial", "warn", "A closed campaign finished at 85 percent, between the floor and the target.", { ...COMPLETION_HEALTHY, lowest_completion_pct: 85 }),
+      example("partial", "warn", "A closed campaign reports the -1 completion sentinel and the enrollment list stopped at enrollment_limit.", {
+        ...COMPLETION_HEALTHY, lowest_completion_pct: 95, enrollment_cut_campaign_count: 1,
+      }),
+      example("partial", "warn", "A closed campaign reports the -1 completion sentinel and has no loaded enrollment.", {
+        ...COMPLETION_HEALTHY, lowest_completion_pct: 95, unmeasured_campaign_count: 1,
+      }),
+      example("partial", "warn", "No closed campaign in the training lookback window has a completion.", { ...COMPLETION_HEALTHY }),
+      example("partial", "warn", "Every closed campaign met the target, but the enrollment list was refused.", {
+        ...COMPLETION_HEALTHY, lowest_completion_pct: 95, training_enrollments_readable: false,
+      }),
+      UNREADABLE_CAMPAIGNS,
+    ],
+  },
+  {
+    id: "KNOWBE4-04",
+    control: 4,
+    title: "New user training enrollment timeliness",
+    severity: "medium",
+    owner: TRAINING,
+    surfaces: ["users", "training_enrollments"],
+    inputs: [
+      "users_readable",
+      "training_enrollments_readable",
+      "user_record_count",
+      "late_user_count",
+      "new_user_count",
+      "training_enrollments_complete",
+      "users_complete",
+    ],
+    constants: { max_late_pct: 5 },
+    rules: [
+      rule("manual", ne("users_readable", true)),
+      rule("manual", ne("training_enrollments_readable", true)),
+      rule("warn", eq("user_record_count", 0)),
+      rule("warn", all(gt("late_user_count", 0), ne("training_enrollments_complete", true))),
+      rule("fail", percent("gt", "late_user_count", "new_user_count", "max_late_pct")),
+      rule("warn", gt("late_user_count", 0)),
+      rule("warn", incomplete("users_complete", "training_enrollments_complete")),
+      rule("pass", always),
+    ],
+    completeness: { training_enrollments_complete: TRAINING_ENROLLMENTS_COMPLETE, users_complete: USERS_COMPLETE },
+    decision: "Manual when the active user list or the training enrollment list is unreadable. Warn when the active user list returned no user. Among active users who joined between training_lookback_days and enrollment_grace_days days ago, a user is late without a training enrollment dated within enrollment_grace_days days of joining: warn when any is late but the enrollment list is partial, fail when the late users are more than 5 percent of those users, rounded half up to 1 decimal place, and warn when any is late. Warn instead of pass when the active user list or the enrollment list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "All 40 users who joined in the span were enrolled within the grace period.", { ...TIMELINESS_HEALTHY, late_user_count: 0 }),
+      example("compliant", "pass", "Nobody joined in the span, so no enrollment deadline has passed.", { ...TIMELINESS_HEALTHY, new_user_count: 0, late_user_count: 0 }),
+      example("noncompliant", "fail", "6 of the 40 users who joined in the span, 15 percent, were not enrolled in time.", { ...TIMELINESS_HEALTHY, late_user_count: 6 }),
+      example("partial", "warn", "2 of the 40 users, exactly 5 percent, were not enrolled in time.", { ...TIMELINESS_HEALTHY, late_user_count: 2 }),
+      example("partial", "warn", "6 of the 40 users have no enrollment among those read, but the enrollment list stopped at enrollment_limit.", {
+        ...TIMELINESS_HEALTHY, late_user_count: 6, training_enrollments_complete: false,
+      }),
+      example("partial", "warn", "The active user list returned no user, as it does for an anonymized account.", {
+        ...TIMELINESS_HEALTHY, user_record_count: 0, new_user_count: 0, late_user_count: 0,
+      }),
+      example("partial", "warn", "Every user read was enrolled in time, but the active user list stopped at user_limit.", {
+        ...TIMELINESS_HEALTHY, late_user_count: 0, users_complete: false,
+      }),
+      example("unreadable", "manual", "The active user list was refused.", { users_readable: false }),
+      example("unreadable", "manual", "The training enrollment list was refused.", { users_readable: true, training_enrollments_readable: false }),
+    ],
+  },
+  {
+    id: "KNOWBE4-10",
+    control: 10,
+    title: "Remedial training after phishing failures",
+    severity: "medium",
+    owner: TRAINING,
+    surfaces: ["security_tests", "security_test_recipients", "training_enrollments", "training_campaigns"],
+    inputs: [
+      "security_tests_readable",
+      "training_enrollments_readable",
+      "sampled_test_count",
+      "overdue_failed_user_count",
+      "failed_user_count",
+      "remediated_user_count",
+      "training_enrollments_complete",
+      "recipient_reads_complete",
+      "security_tests_complete",
+      "training_campaigns_readable",
+    ],
+    constants: { remediated_floor_pct: 50, remediated_target_pct: 90 },
+    rules: [
+      rule("manual", ne("security_tests_readable", true)),
+      rule("manual", ne("training_enrollments_readable", true)),
+      rule("warn", eq("sampled_test_count", 0)),
+      rule("warn", all(eq("overdue_failed_user_count", 0), gt("failed_user_count", 0))),
+      rule("warn", all(lt("remediated_user_count", path("overdue_failed_user_count")), ne("training_enrollments_complete", true))),
+      rule("fail", percent("lt", "remediated_user_count", "overdue_failed_user_count", "remediated_floor_pct")),
+      rule("warn", percent("lt", "remediated_user_count", "overdue_failed_user_count", "remediated_target_pct")),
+      rule("warn", any(
+        ne("recipient_reads_complete", true),
+        ne("security_tests_complete", true),
+        ne("training_enrollments_complete", true),
+        ne("training_campaigns_readable", true),
+      )),
+      rule("pass", always),
+    ],
+    completeness: {
+      training_enrollments_complete: TRAINING_ENROLLMENTS_COMPLETE,
+      recipient_reads_complete: RECIPIENT_READS_COMPLETE,
+      security_tests_complete: SECURITY_TESTS_COMPLETE,
+    },
+    decision: "Manual when the security test list or the training enrollment list is unreadable. Warn when no recipient list of a test in the lookback window was read, or when users failed a sampled test but none failed at least remedial_window_days days ago. Among users who did, a user is remediated by a training enrollment dated no earlier than 1 day before the failure: warn when any is not remediated but the enrollment list is partial, fail when fewer than 50 percent are remediated, and warn when fewer than 90 percent are, each rounded half up to 1 decimal place. Warn instead of pass when the recipient reads, the security test list, or the enrollment list are partial, or the training campaign list is unreadable. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "19 of the 20 users who failed at least 14 days ago, 95 percent, were enrolled after the failure.", { ...REMEDIAL_HEALTHY, remediated_user_count: 19 }),
+      example("compliant", "pass", "No user failed a sampled test in the window.", {
+        ...REMEDIAL_HEALTHY, failed_user_count: 0, overdue_failed_user_count: 0, remediated_user_count: 0,
+      }),
+      example("noncompliant", "fail", "8 of the 20 users, 40 percent, were enrolled after the failure.", { ...REMEDIAL_HEALTHY, remediated_user_count: 8 }),
+      example("partial", "warn", "Exactly half of the 20 users were enrolled after the failure.", { ...REMEDIAL_HEALTHY, remediated_user_count: 10 }),
+      example("partial", "warn", "14 of the 20 users, 70 percent, were enrolled after the failure.", { ...REMEDIAL_HEALTHY, remediated_user_count: 14 }),
+      example("partial", "warn", "12 of the 20 users have no enrollment among those read, but the enrollment list stopped at enrollment_limit.", {
+        ...REMEDIAL_HEALTHY, remediated_user_count: 8, training_enrollments_complete: false,
+      }),
+      example("partial", "warn", "5 users failed within the last 14 days, so their remedial window is still open.", {
+        ...REMEDIAL_HEALTHY, failed_user_count: 5, overdue_failed_user_count: 0, remediated_user_count: 0,
+      }),
+      example("partial", "warn", "No recipient list of a test in the window was read.", {
+        ...REMEDIAL_HEALTHY, sampled_test_count: 0, recipient_reads_complete: false, failed_user_count: 0, overdue_failed_user_count: 0, remediated_user_count: 0,
+      }),
+      example("partial", "warn", "19 of the 20 users were remediated, but tests in the window went unsampled.", {
+        ...REMEDIAL_HEALTHY, remediated_user_count: 19, recipient_reads_complete: false,
+      }),
+      example("unreadable", "manual", "The security test list was refused.", { security_tests_readable: false }),
+      example("unreadable", "manual", "The training enrollment list was refused.", { security_tests_readable: true, training_enrollments_readable: false }),
+    ],
+  },
+  {
+    id: "KNOWBE4-11",
+    control: 11,
+    title: "Training content currency",
+    severity: "low",
+    owner: TRAINING,
+    surfaces: ["training_campaigns", "store_purchases"],
+    inputs: [
+      "training_campaigns_readable",
+      "assigned_module_count",
+      "retired_module_count",
+      "stale_module_count",
+      "undated_module_count",
+      "training_campaigns_complete",
+      "store_purchases_complete",
+    ],
+    rules: [
+      rule("manual", ne("training_campaigns_readable", true)),
+      rule("warn", eq("assigned_module_count", 0)),
+      rule("fail", gt("retired_module_count", 0)),
+      rule("warn", any(gt("stale_module_count", 0), gt("undated_module_count", 0))),
+      rule("warn", incomplete("training_campaigns_complete", "store_purchases_complete")),
+      rule("pass", always),
+    ],
+    completeness: { training_campaigns_complete: TRAINING_CAMPAIGNS_COMPLETE, store_purchases_complete: STORE_PURCHASES_COMPLETE },
+    decision: "Manual when the training campaign list is unreadable. Warn when no store-purchased module is assigned in an uncancelled campaign in the training lookback window. Fail when an assigned module is retired. Warn when an assigned module was published more than max_content_age_days days ago or has no publish date. Warn instead of pass when the training campaign list or the store purchase list is partial or unreadable. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "All 12 assigned modules are current and none is retired.", { ...CONTENT_HEALTHY }),
+      example("noncompliant", "fail", "An assigned module is retired by its publisher.", { ...CONTENT_HEALTHY, retired_module_count: 1 }),
+      example("partial", "warn", "Two assigned modules were published more than 365 days ago.", { ...CONTENT_HEALTHY, stale_module_count: 2 }),
+      example("partial", "warn", "An assigned module has no publish date in the campaign or the store catalog.", { ...CONTENT_HEALTHY, undated_module_count: 1 }),
+      example("partial", "warn", "No store-purchased module is assigned in the window.", { ...CONTENT_HEALTHY, assigned_module_count: 0 }),
+      example("partial", "warn", "The modules are current, but the store purchase list was refused, so retirement was not cross-checked.", {
+        ...CONTENT_HEALTHY, store_purchases_complete: false,
+      }),
+      UNREADABLE_CAMPAIGNS,
+    ],
+  },
+  {
+    id: "KNOWBE4-17",
+    control: 17,
+    title: "Compliance training modules",
+    severity: "medium",
+    owner: TRAINING,
+    surfaces: ["training_campaigns", "training_enrollments", "training_policies"],
+    inputs: [
+      "training_campaigns_readable",
+      "topics_without_modules",
+      "required_topic_count",
+      "topics_without_enrollments",
+      "training_enrollments_complete",
+      "lowest_topic_completion_pct",
+      "min_completion_pct",
+      "training_campaigns_complete",
+      "training_policies_readable",
+    ],
+    rules: [
+      rule("manual", ne("training_campaigns_readable", true)),
+      rule("fail", all(gt("topics_without_modules", 0), gt("required_topic_count", 0))),
+      rule("warn", gt("topics_without_modules", 0)),
+      rule("fail", all(gt("topics_without_enrollments", 0), gt("required_topic_count", 0), eq("training_enrollments_complete", true))),
+      rule("warn", gt("topics_without_enrollments", 0)),
+      rule("warn", lt("lowest_topic_completion_pct", path("min_completion_pct"))),
+      rule("warn", any(ne("training_enrollments_complete", true), ne("training_campaigns_complete", true), ne("training_policies_readable", true))),
+      rule("pass", always),
+    ],
+    completeness: { training_enrollments_complete: TRAINING_ENROLLMENTS_COMPLETE, training_campaigns_complete: TRAINING_CAMPAIGNS_COMPLETE },
+    decision: "Manual when the training campaign list is unreadable. Fail when a required compliance topic matches no module assigned in an uncancelled campaign in the training lookback window, and warn when no topic is required and no assigned module matches the built-in compliance pattern. Fail when a required topic's modules have no enrollment in a complete enrollment list, and warn when any topic's modules have no loaded enrollment. Warn when a topic's completion is below min_completion_pct percent. Warn instead of pass when the training enrollment or campaign list is partial or unreadable, or the training policy list is unreadable. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Both required topics have assigned modules with completion of at least 94.2 percent.", { ...COMPLIANCE_HEALTHY }),
+      example("compliant", "pass", "No topic is required, and modules matching the built-in pattern are 96 percent complete.", {
+        ...COMPLIANCE_HEALTHY, required_topic_count: 0, lowest_topic_completion_pct: 96,
+      }),
+      example("noncompliant", "fail", "A required topic matches no assigned module.", { ...COMPLIANCE_HEALTHY, topics_without_modules: 1 }),
+      example("partial", "warn", "No topic is required and no assigned module matches the built-in pattern.", {
+        ...COMPLIANCE_READ, required_topic_count: 0, topics_without_modules: 1,
+      }),
+      example("noncompliant", "fail", "A required topic's modules have no enrollment in the complete enrollment list.", { ...COMPLIANCE_HEALTHY, topics_without_enrollments: 1 }),
+      example("partial", "warn", "A required topic's modules have no loaded enrollment, but the enrollment list stopped at enrollment_limit.", {
+        ...COMPLIANCE_HEALTHY, topics_without_enrollments: 1, training_enrollments_complete: false,
+      }),
+      example("partial", "warn", "A topic's modules are 85 percent complete.", { ...COMPLIANCE_HEALTHY, lowest_topic_completion_pct: 85 }),
+      example("partial", "warn", "The modules are complete, but the training policy list was refused.", { ...COMPLIANCE_HEALTHY, training_policies_readable: false }),
+      UNREADABLE_CAMPAIGNS,
+    ],
+  },
+];
+
 const toCheck = (check: Knowbe4Check): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -663,7 +1034,7 @@ const toCheck = (check: Knowbe4Check): BatchCheckDefinition => {
   };
 };
 
-const checks: readonly BatchCheckDefinition[] = [...PHISHING_CHECKS].map(toCheck);
+const checks: readonly BatchCheckDefinition[] = [...PHISHING_CHECKS, ...TRAINING_CHECKS].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
 const NOT_OBJECTS = "Entries that are not JSON objects are dropped before a page is counted.";
@@ -674,15 +1045,16 @@ const pageWalk = (
   itemCap: number | null,
   probed: boolean,
   scope = "",
+  pageSize = 500,
 ): BatchPaginationDefinition => ({
   surfaceIds,
   cursorFields: ["page"],
-  pageSize: probed ? null : 500,
+  pageSize: probed ? null : pageSize,
   itemCap,
   pageCap: null,
-  totalSemantics: `${scope}Pages of 500 ${records} (per_page), numbered from 1 (page)${probed ? "; the knowbe4_check_access probe reads only page 1 with per_page 1" : ""}. ${NOT_OBJECTS} Up to ${cap} ${records} are kept; no total, Link header, or cursor is read.`,
+  totalSemantics: `${scope}Pages of ${pageSize} ${records} (per_page), numbered from 1 (page)${probed ? "; the knowbe4_check_access probe reads only page 1 with per_page 1" : ""}. ${NOT_OBJECTS} Up to ${cap} ${records} are kept; no total, Link header, or cursor is read.`,
   stopConditions: [
-    `A page holding fewer than 500 ${records}`,
+    `A page holding fewer than ${pageSize} ${records}`,
     `A page holding more ${records} than were left under ${cap}, which marks the list partial`,
     `A full page that brings the ${records} kept to ${cap}, which marks the list partial`,
   ],
@@ -739,6 +1111,10 @@ export const KNOWBE4_SPEC = buildBatchIntegrationSpec({
         "phishing_campaigns",
         "security_tests",
         "security_test_recipients",
+        "training_campaigns",
+        "training_enrollments",
+        "store_purchases",
+        "training_policies",
       ],
     },
     {
@@ -753,11 +1129,14 @@ export const KNOWBE4_SPEC = buildBatchIntegrationSpec({
   tools: {
     knowbe4_check_access: [],
     knowbe4_assess_phishing_program: idsFor(PHISHING),
+    knowbe4_assess_training_program: idsFor(TRAINING),
     knowbe4_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
     pageWalk(["users"], "users", USER_LIMIT, null, true),
-    pageWalk(["groups", "phishing_campaigns", "security_tests"], "records", "20000", 20000, true),
+    pageWalk(["training_enrollments"], "enrollments", ENROLLMENT_LIMIT, null, true),
+    pageWalk(["groups", "phishing_campaigns", "security_tests", "store_purchases", "training_policies"], "records", "20000", 20000, true),
+    pageWalk(["training_campaigns"], "campaigns", "20000", 20000, true, "", 10),
     pageWalk(["account_risk_score_history"], "points", "20000", 20000, false),
     pageWalk(["security_test_recipients"], "recipients", "20000", 20000, false, "Each sampled test's recipient list is walked separately. "),
     {
