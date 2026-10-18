@@ -157,7 +157,9 @@ const SCAN_COVERAGE_SURFACES: readonly BatchSurfaceDefinition[] = [
       "guid",
       "profile.name",
       "profile.policies.guid",
+      "profile.policies.policy_compliance_status",
       "profile.business_criticality",
+      "profile.business_unit.name",
       "scans.scan_type",
       "scans.status",
       "scans.modified_date",
@@ -172,7 +174,15 @@ const SCAN_COVERAGE_SURFACES: readonly BatchSurfaceDefinition[] = [
     POLICY_SERVICE,
     POLICY_DOCS,
     "/appsec/v1/policies",
-    ["guid", "name", "scan_frequency_rules.scan_type", "scan_frequency_rules.frequency"],
+    [
+      "guid",
+      "name",
+      "type",
+      "finding_rules",
+      ...[0, 1, 2, 3, 4, 5].map((level) => `sev${level}_grace_period`),
+      "scan_frequency_rules.scan_type",
+      "scan_frequency_rules.frequency",
+    ],
     HAL_PAGE_PARAMETERS,
     halResponse("policy_versions", "one policy per entry"),
     LIST_STAGE,
@@ -255,7 +265,10 @@ const WHOLE_DAYS = "Whole days before the assessment time are the milliseconds f
 const APPLICATION_SCANS = `An application's scans of a type are the JSON object entries of its scans array whose scan_type, read as text and uppercased, is that type. A scan is published when its status, read as text and uppercased, is ${series(COMPLETED_SCAN_STATUSES, "or")}, and an application's published date for a type is the latest modified_date that parses as a date among its published scans of that type. ${READS_AS_TEXT} ${PARSES_AS_DATE}`;
 const LISTED_SCANS = `An application's listed scans are the JSON object entries of its scans array, of every scan type, and a listed scan has failed when its status, read as text and uppercased, is ${series(FAILED_SCAN_STATUSES, "or")}. ${READS_AS_TEXT}`;
 const FREQUENCIES = Object.entries(FREQUENCY_DAYS).map(([name, days]) => `${name} (${days} days)`);
-const FREQUENCY_REQUIREMENTS = `An application's assigned policies are the JSON object entries of its profile.policies, and an assigned policy resolves to the last returned policy whose guid, read as text, is the same, a guid that does not read as text counting as empty text. Each resolved policy adds one requirement per JSON object entry of its scan_frequency_rules whose frequency, read as text and uppercased, is ONCE (at least once) or ${series(FREQUENCIES, "or")}, for the scan type that the entry's scan_type gives, read as text and uppercased, else ANY. An application whose profile.business_criticality reads as text adds an ANY requirement of N days, N being ${option("critical_scan_interval_days", 7, 3650)} when that text uppercases to VERY_HIGH, and otherwise ${option("standard_scan_interval_days", 31, 3650)}. Only the strictest requirement per scan type counts: the one with the fewest days, the first on ties, the policies' requirements coming in assignment and rule order before the business criticality one.`;
+const ASSIGNED_POLICIES = "An application's assigned policies are the JSON object entries of its profile.policies, and an assigned policy resolves to the last returned policy whose guid, read as text, is the same, a guid that does not read as text counting as empty text.";
+const POLICY_STATUSES = `An application's assigned policies are the JSON object entries of its profile.policies, and an assigned policy's status is its policy_compliance_status read as text and uppercased. ${READS_AS_TEXT}`;
+const CUSTOM_POLICY = `A custom policy is a returned policy whose type, read as text and uppercased, is CUSTOMER. ${READS_AS_TEXT}`;
+const FREQUENCY_REQUIREMENTS = `${ASSIGNED_POLICIES} Each resolved policy adds one requirement per JSON object entry of its scan_frequency_rules whose frequency, read as text and uppercased, is ONCE (at least once) or ${series(FREQUENCIES, "or")}, for the scan type that the entry's scan_type gives, read as text and uppercased, else ANY. An application whose profile.business_criticality reads as text adds an ANY requirement of N days, N being ${option("critical_scan_interval_days", 7, 3650)} when that text uppercases to VERY_HIGH, and otherwise ${option("standard_scan_interval_days", 31, 3650)}. Only the strictest requirement per scan type counts: the one with the fewest days, the first on ties, the policies' requirements coming in assignment and rule order before the business criticality one.`;
 const REQUIREMENT_OUTCOMES = `A counted requirement of type ANY is unconfirmed when the application's last_completed_scan_date does not parse as a date, and overdue when that date is more of the requirement's days in whole days before the assessment time. A counted requirement of another type is overdue when the application has no scan of that type, unconfirmed when it has none published or no published date for that type, and overdue when that published date is more of the requirement's days in whole days before the assessment time; an at-least-once requirement is never overdue by age. An application is overdue when one of its counted requirements is overdue, and otherwise unconfirmed when one is unconfirmed or one of its assigned policies does not resolve. ${APPLICATION_SCANS} ${WHOLE_DAYS}`;
 const SANDBOX_SAMPLE = `The sampled applications are the first N returned applications, N being ${option("max_applications", 100, 5000)}; each sampled application's sandbox list is read from GET /appsec/v1/applications/{application_guid}/sandboxes, its records being the entries that are JSON objects.`;
 const DYNAMIC_SAMPLE = `The sampled analyses are the first N returned Dynamic Analysis records, N being ${option("max_analyses", 25, 500)}. Each sampled analysis's scan list is read from GET /was/configservice/v1/analyses/{analysis_id}/scans, and the first ${MAX_DYNAMIC_SCANS_PER_ANALYSIS} returned scans of each are inspected by reading GET /was/configservice/v1/scans/{scan_id}/configuration.`;
@@ -286,6 +299,14 @@ const VERACODE_INPUTS: Readonly<Record<string, string>> = {
   failed_scan_application_count: `Number of applications with a failed listed scan. ${LISTED_SCANS}`,
   healthy_scan_application_count: `Number of applications with at least one listed scan and no failed one. ${LISTED_SCANS}`,
   no_scan_application_count: `Number of applications without a listed scan. ${LISTED_SCANS}`,
+  failing_policy_application_count: `Number of applications with an assigned policy whose status is DID_NOT_PASS. ${POLICY_STATUSES}`,
+  no_policy_application_count: `Number of applications without an assigned policy. ${POLICY_STATUSES}`,
+  conditional_pass_application_count: `Number of applications with an assigned policy whose status is CONDITIONAL_PASS and none whose status is DID_NOT_PASS. ${POLICY_STATUSES}`,
+  unassessed_policy_application_count: `Number of applications with assigned policies, none of whose status is DID_NOT_PASS or CONDITIONAL_PASS, and one whose status is not PASSED, a missing status included. ${POLICY_STATUSES}`,
+  policy_count: "Number of policies the walk kept, entries that are not JSON objects being dropped.",
+  custom_policy_count: `Number of custom policies. ${CUSTOM_POLICY}`,
+  custom_policy_without_finding_rules_count: `Number of custom policies whose finding_rules holds no JSON object entry. ${CUSTOM_POLICY}`,
+  no_custom_policy_application_count: `Number of applications none of whose assigned policies resolves to a custom policy, applications without an assigned policy included; 0 when the GET /appsec/v1/applications walk was refused. ${ASSIGNED_POLICIES} ${CUSTOM_POLICY}`,
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -604,6 +625,116 @@ const SCAN_COVERAGE_CHECKS: readonly VeracodeCheck[] = [
   },
 ];
 
+const POLICY_COMPLIANCE = "veracode_assess_policy_compliance";
+const POLICY_STATUS_HEALTHY = {
+  ...FULL_INVENTORY,
+  failing_policy_application_count: 0,
+  no_policy_application_count: 0,
+  conditional_pass_application_count: 0,
+  unassessed_policy_application_count: 0,
+};
+const CUSTOM_POLICIES_HEALTHY = {
+  policies_readable: true,
+  policies_complete: true,
+  policy_count: 9,
+  custom_policy_count: 2,
+  custom_policy_without_finding_rules_count: 0,
+  no_custom_policy_application_count: 0,
+  applications_complete: true,
+};
+
+const POLICY_COMPLIANCE_CHECKS: readonly VeracodeCheck[] = [
+  {
+    id: "VERACODE-02",
+    control: 2,
+    title: "Policy compliance status",
+    severity: "critical",
+    owner: POLICY_COMPLIANCE,
+    surfaces: ["applications"],
+    inputs: [
+      "applications_readable",
+      "application_count",
+      "failing_policy_application_count",
+      "no_policy_application_count",
+      "conditional_pass_application_count",
+      "unassessed_policy_application_count",
+      "applications_complete",
+    ],
+    rules: [
+      ...APPLICATIONS_GATE,
+      rule("fail", any(gt("failing_policy_application_count", 0), gt("no_policy_application_count", 0))),
+      rule("warn", any(gt("conditional_pass_application_count", 0), gt("unassessed_policy_application_count", 0))),
+      rule("warn", incomplete("applications_complete")),
+      rule("pass", always),
+    ],
+    completeness: { applications_complete: APPLICATIONS_COMPLETE },
+    decision: "Manual when the application inventory is unreadable or empty. Fail when an application did not pass an assigned policy or has no policy assigned. Warn when an application is in conditional pass, or reports a policy status other than PASSED (NOT_ASSESSED, DETERMINING, VENDOR_REVIEW, or none). Warn instead of pass when the application inventory is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every application reports PASSED for every assigned policy.", POLICY_STATUS_HEALTHY),
+      example("noncompliant", "fail", "One application did not pass its assigned policy.", { ...POLICY_STATUS_HEALTHY, failing_policy_application_count: 1 }),
+      example("noncompliant", "fail", "Two applications have no policy assigned.", { ...POLICY_STATUS_HEALTHY, no_policy_application_count: 2 }),
+      example("partial", "warn", "One application is in conditional pass during its grace period.", { ...POLICY_STATUS_HEALTHY, conditional_pass_application_count: 1 }),
+      example("partial", "warn", "Three applications are still NOT_ASSESSED.", { ...POLICY_STATUS_HEALTHY, unassessed_policy_application_count: 3 }),
+      example("partial", "warn", "The application walk stopped at its page cap.", { ...POLICY_STATUS_HEALTHY, applications_complete: false }),
+      EMPTY_APPLICATIONS,
+      UNREADABLE_APPLICATIONS,
+    ],
+  },
+  {
+    id: "VERACODE-15",
+    control: 15,
+    title: "Custom policy profiles",
+    severity: "high",
+    owner: POLICY_COMPLIANCE,
+    surfaces: ["policies", "applications"],
+    inputs: [
+      "policies_readable",
+      "policy_count",
+      "custom_policy_count",
+      "custom_policy_without_finding_rules_count",
+      "no_custom_policy_application_count",
+      "policies_complete",
+      "applications_complete",
+    ],
+    rules: [
+      rule("manual", ne("policies_readable", true)),
+      rule("manual", not(gt("policy_count", 0))),
+      rule("fail", not(gt("custom_policy_count", 0))),
+      rule("warn", any(gt("no_custom_policy_application_count", 0), gt("custom_policy_without_finding_rules_count", 0))),
+      rule("warn", incomplete("policies_complete", "applications_complete")),
+      rule("pass", always),
+    ],
+    completeness: { policies_complete: POLICIES_COMPLETE, applications_complete: APPLICATIONS_COMPLETE },
+    decision: "Manual when the policy list is unreadable or empty, since every Veracode account exposes the built-in policies. Fail when no policy is a custom (CUSTOMER type) policy. Warn when an application is assigned no custom policy, or a custom policy defines no finding rules. Warn instead of pass when the policy list is partial, or the application inventory is unreadable or partial. Otherwise pass, which an empty application inventory allows.",
+    examples: [
+      example("compliant", "pass", "Two custom policies define finding rules and every application is assigned one.", CUSTOM_POLICIES_HEALTHY),
+      example("noncompliant", "fail", "Every policy is a built-in Veracode policy.", { ...CUSTOM_POLICIES_HEALTHY, custom_policy_count: 0 }),
+      example("partial", "warn", "Three applications are assigned only built-in policies.", { ...CUSTOM_POLICIES_HEALTHY, no_custom_policy_application_count: 3 }),
+      example("partial", "warn", "One custom policy defines no finding rules.", { ...CUSTOM_POLICIES_HEALTHY, custom_policy_without_finding_rules_count: 1 }),
+      example("partial", "warn", "The application inventory was refused, so no assignment was checked.", { ...CUSTOM_POLICIES_HEALTHY, applications_complete: false }),
+      example("partial", "warn", "The policy walk stopped at its page cap.", { ...CUSTOM_POLICIES_HEALTHY, policies_complete: false }),
+      example("partial", "manual", "The policy list came back empty, though every account exposes the built-in policies.", {
+        ...CUSTOM_POLICIES_HEALTHY,
+        policy_count: 0,
+        custom_policy_count: 0,
+      }),
+      example("unreadable", "manual", "The policy list was refused.", { policies_readable: false }),
+    ],
+  },
+  {
+    id: "VERACODE-20",
+    control: 20,
+    title: "Collections compliance posture",
+    severity: "medium",
+    owner: POLICY_COMPLIANCE,
+    surfaces: ["applications"],
+    inputs: [],
+    rules: [rule("manual", always)],
+    decision: "Always return manual, because the Collections API is not part of the published Veracode REST API reference the inspector uses, so a reviewer must export each application collection's aggregate compliance; the applications grouped by profile.business_unit.name with their DID_NOT_PASS counts are supporting evidence only.",
+    examples: [example("partial", "manual", "Collection posture is left to a reviewer whatever the application inventory holds.", {})],
+  },
+];
+
 const toCheck = (check: VeracodeCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   const [fedramp, cmmc, soc2, cis, pciDss, disaStig, irap, ismap] = VERACODE_FRAMEWORK_MAPPINGS[check.control];
@@ -634,7 +765,7 @@ const toCheck = (check: VeracodeCheck): BatchCheckDefinition => {
   };
 };
 
-const checks: readonly BatchCheckDefinition[] = [...SCAN_COVERAGE_CHECKS].map(toCheck);
+const checks: readonly BatchCheckDefinition[] = [...SCAN_COVERAGE_CHECKS, ...POLICY_COMPLIANCE_CHECKS].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
 const RECORD_KEY = "a record's key being the first of its guid, id, user_id, team_id, issue_id, and scan_id that is not null, else the whole record";
@@ -689,7 +820,7 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
   displayName: "Veracode Security Inspector",
   vendor: "Veracode",
   category: "application-security",
-  summary: "Portable contract for the shipped Veracode scan coverage assessment over the Veracode Applications, Policy, Identity, and Dynamic Analysis REST APIs.",
+  summary: "Portable contract for the shipped Veracode scan coverage and policy compliance assessments over the Veracode Applications, Policy, Identity, and Dynamic Analysis REST APIs.",
   sourceModule: "cli/extensions/grc-tools/veracode.ts",
   baseServices: [APPLICATIONS_SERVICE, POLICY_SERVICE, IDENTITY_SERVICE, DYNAMIC_SERVICE],
   authentication: VERACODE_AUTH_RESOLVER,
@@ -720,6 +851,7 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
   tools: {
     veracode_check_access: [],
     veracode_assess_scan_coverage: idsFor(SCAN_COVERAGE),
+    veracode_assess_policy_compliance: idsFor(POLICY_COMPLIANCE),
     veracode_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
@@ -756,6 +888,7 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
   knownGaps: [
     "A list entry that is not a JSON object is dropped without marking the list partial, and before any page reports total_pages a full page holding one counts as short and ends the walk with the list complete.",
     "An empty 2xx list page, or one whose JSON is not an object, is read as a page holding no records, which ends the walk with the list complete when no total_pages has been reported.",
+    "VERACODE-15 can pass when the application inventory is read and empty, though the other application checks treat an empty inventory as unverifiable.",
   ],
   sensitiveFields: ["api_key_id", "api_key_secret", "veracode_api_key_id", "veracode_api_key_secret", "Authorization", "authentications", "crawl_script_data"],
   credentialFormats: ["Veracode API key ID and hex API key secret, used to sign every request with VERACODE-HMAC-SHA-256"],
