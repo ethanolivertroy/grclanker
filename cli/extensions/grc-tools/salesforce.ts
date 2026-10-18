@@ -1437,7 +1437,7 @@ export class SalesforceApiClient {
     let done = doneFlag ?? nextUrl === undefined;
     let stalled = false;
     let truncationReason: string | undefined;
-    records.push(...asRecords(payload.records));
+    records.push(...this.requireQueryRecords(payload, resource));
 
     while (!done && records.length < recordLimit) {
       // More records promised but no cursor, or a cursor that stopped advancing: exit and report truncated.
@@ -1460,7 +1460,7 @@ export class SalesforceApiClient {
       visitedCursors.add(nextUrl);
       payload = asObject(await this.getJson(nextUrl)) ?? {};
       pages += 1;
-      const pageRecords = asRecords(payload.records);
+      const pageRecords = this.requireQueryRecords(payload, resource);
       records.push(...pageRecords);
       doneFlag = asBoolean(payload.done);
       nextUrl = asString(payload.nextRecordsUrl);
@@ -1712,6 +1712,17 @@ export class SalesforceApiClient {
   async listEventLogFiles(days = 7, limit = 200): Promise<SalesforceQueryResult> {
     const window = clampNumber(days, 7, 1, 30);
     return this.query(`SELECT Id, EventType, LogDate, LogFileLength FROM EventLogFile WHERE LogDate = LAST_N_DAYS:${window} ORDER BY LogDate DESC`, limit);
+  }
+
+  /**
+   * A SOQL page is complete only when records is an array. A 200 object that omits the
+   * member is not an empty result set and must not be summarized as zero rows.
+   */
+  private requireQueryRecords(payload: JsonRecord, resource: string): JsonRecord[] {
+    if (!Array.isArray(payload.records)) {
+      throw new Error(`Salesforce query for ${resource} returned a response without a records array, so the result cannot be treated as an empty inventory.`);
+    }
+    return asRecords(payload.records);
   }
 }
 

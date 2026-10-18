@@ -368,6 +368,17 @@ function pageHasMore(payload: JsonRecord, pageLength: number, requestLimit: numb
   return pageLength >= requestLimit;
 }
 
+/**
+ * The documented collection member. An empty array is a real empty inventory.
+ * A 200 object that omits the member is not one, and must not be reported complete.
+ */
+function requireCollection(payload: JsonRecord, collectionKey: string, path: string): JsonRecord[] {
+  if (!Array.isArray(payload[collectionKey])) {
+    throw new Error(`PagerDuty response for ${path} did not include a ${collectionKey} array, so the listing cannot be treated as an empty inventory.`);
+  }
+  return asRecords(payload[collectionKey]);
+}
+
 export interface PagerdutyCredentialScope {
   kind: "account" | "user" | "unknown";
   userId?: string;
@@ -1553,7 +1564,7 @@ export class PagerdutyApiClient {
     while (items.length < limit && offset < CLASSIC_PAGINATION_CAP) {
       const requestLimit = Math.min(pageSize, limit - items.length, CLASSIC_PAGINATION_CAP - offset);
       const payload = await this.get(path, { ...query, limit: requestLimit, offset, total: true });
-      const pageItems = asRecords(payload[collectionKey]);
+      const pageItems = requireCollection(payload, collectionKey, path);
       const room = limit - items.length;
       items.push(...pageItems.slice(0, room));
       offset += pageItems.length;
@@ -1602,7 +1613,7 @@ export class PagerdutyApiClient {
 
     while (items.length < limit) {
       const payload = await this.get(path, { ...query, limit: Math.min(pageSize, limit - items.length), cursor });
-      const pageItems = asRecords(payload[collectionKey]);
+      const pageItems = requireCollection(payload, collectionKey, path);
       items.push(...pageItems.slice(0, limit - items.length));
       const nextCursor = asString(payload.next_cursor);
       if (!nextCursor) {
@@ -1632,6 +1643,9 @@ export class PagerdutyApiClient {
 
   async getAbilities(): Promise<string[]> {
     const payload = await this.get("/abilities");
+    if (!Array.isArray(payload.abilities)) {
+      throw new Error("PagerDuty response for /abilities did not include an abilities array, so the listing cannot be treated as an empty inventory.");
+    }
     return asArray(payload.abilities).map((item) => asString(item)).filter((item): item is string => Boolean(item));
   }
 
@@ -1717,8 +1731,9 @@ export class PagerdutyApiClient {
   }
 
   async getBusinessServiceDependencies(businessServiceId: string): Promise<JsonRecord[]> {
-    const payload = await this.get(`/service_dependencies/business_services/${encodeURIComponent(businessServiceId)}`);
-    return asRecords(payload.relationships);
+    const path = `/service_dependencies/business_services/${encodeURIComponent(businessServiceId)}`;
+    const payload = await this.get(path);
+    return requireCollection(payload, "relationships", path);
   }
 
   async listPriorities(limit = DEFAULT_LIST_LIMIT): Promise<PagerdutyCollection> {

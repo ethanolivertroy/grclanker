@@ -1763,6 +1763,9 @@ export class NewrelicApiClient {
       const currentUrl = this.buildRestUrl(url);
       visited.add(currentUrl);
       const { payload, nextLink } = await this.restGet(currentUrl);
+      if (!Array.isArray(payload[collectionKey])) {
+        throw new Error(`REST API v2 response for GET ${new URL(currentUrl).pathname} did not include a ${collectionKey} array, so the listing cannot be treated as an empty inventory.`);
+      }
       const pageItems = asRecords(payload[collectionKey]);
       const kept = pageItems.slice(0, Math.max(0, limit - items.length));
       items.push(...kept);
