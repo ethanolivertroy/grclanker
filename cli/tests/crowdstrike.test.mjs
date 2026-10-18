@@ -1325,16 +1325,19 @@ portableContractTest("known gap: the spec declares that a user the details looku
   assert.ok(CROWDSTRIKE_SPEC.knownGaps.some((gap) => /user details lookup.*left out of CS-16 and CS-17 without marking the user inventory partial/.test(gap)));
 });
 
-test("known gap: a user the details lookup omits drops out of CS-16 and CS-17 without making the user inventory partial", async () => {
+test("verdict safety rule 5: a user the details lookup omits makes the user inventory partial, so CS-16 and CS-17 cannot pass", async () => {
   const result = await assessCrowdstrikeAccessGovernance(createFakeClient({
     listUserUuids: async () => [...passingUsers().users.map((user) => user.uuid), "u-deleted"],
   }));
   for (const id of ["CS-16", "CS-17"]) {
-    assert.equal(findingById(result, id).status, "pass", findingById(result, id).summary);
-    assert.equal(findingById(result, id).evidence.partial_inventory, undefined);
+    const finding = findingById(result, id);
+    assert.equal(finding.status, "warn", finding.summary);
+    assert.deepEqual(finding.evidence.partial_inventory, [{ dataset: "users", seen: 2, total: 3 }]);
+    assert.match(finding.summary, /Partial inventory: only 2 of 3 users were read/);
   }
   assert.equal(result.summary.users_reviewed, 2);
   assert.equal(result.summary.reported_total_users, 3);
+  assert.equal(result.summary.users_truncated, true);
 });
 
 test("verdict safety rule 6: disabled, unassigned, or incomplete enabling flags never support pass", async () => {

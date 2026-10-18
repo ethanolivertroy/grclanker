@@ -4037,10 +4037,11 @@ async function assessCrowdstrikeAccessGovernanceWithDecisionContext(
 
   const views = buildUserViews(users.data, rolesByUser);
   const usersUnavailable = uuids.error ?? users.error;
+  const userPage = !users.error && users.data.length < uuids.data.items.length ? recordPage(uuids.data, users.data) : uuids.data;
   const now = Date.now();
   recordUserFacts(views, {
     readable: !usersUnavailable,
-    users_complete: !uuids.data.truncated,
+    users_complete: !userPage.truncated,
     role_catalog_readable: !roleCatalog.error,
     role_catalog_complete: !roleCatalog.data.truncated,
     truncated_role_users: truncatedRoleUsers,
@@ -4049,7 +4050,7 @@ async function assessCrowdstrikeAccessGovernanceWithDecisionContext(
   const userRoles: CollectedDataset<Record<string, unknown>> = usersUnavailable
     ? skippedDataset<Record<string, unknown>>({}, "user roles", uuids.error ? "the user uuid list was not read" : "the user details were not read", "/user-management/combined/user-roles/v2")
     : { data: roleSnapshots, label: "user roles", endpoint: "/user-management/combined/user-roles/v2" };
-  const userPartial = partialInventory(uuids.data, "users");
+  const userPartial = partialInventory(userPage, "users");
   const userFinding = (id: ControlId, evaluate: () => CrowdstrikeFinding): CrowdstrikeFinding => {
     if (usersUnavailable) {
       return unreadableFinding(id, uuids.error ? "user list" : "user details", usersUnavailable, USER_CONSOLE_EVIDENCE);
@@ -4093,7 +4094,7 @@ async function assessCrowdstrikeAccessGovernanceWithDecisionContext(
       ...assessmentSummaryBase(client.getResolvedConfig()),
       users_reviewed: derived(views.length, uuids, users),
       reported_total_users: derived(uuids.data.total ?? "unknown", uuids),
-      users_truncated: derived(uuids.data.truncated, uuids),
+      users_truncated: derived(userPage.truncated, uuids),
       role_lookups_failed: derived(roleErrors.length, uuids, users),
       role_pages_truncated: derived(truncatedRoleUsers.size, uuids, users),
       // Admin grants come from the per-user role lookups; with none readable the count is unknown, not zero.
