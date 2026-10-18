@@ -2489,7 +2489,10 @@ function pipelineManualFinding(snapshot: ApplicationSnapshot): VeracodeFinding {
 
 type ScanCoverageOptions = { maxApplications?: number; maxScanAgeDays?: number; maxAnalyses?: number; criticalScanIntervalDays?: number; standardScanIntervalDays?: number; now?: Date };
 
-export function assessVeracodeScanCoverage(client: ClientLike, options: ScanCoverageOptions = {}): Promise<VeracodeAssessmentResult> {
+export async function assessVeracodeScanCoverage(
+  client: ClientLike,
+  options: ScanCoverageOptions = {},
+): Promise<VeracodeAssessmentResult> {
   return runBatchVerdictContext(VERACODE_DECISION_CONTEXT, VERACODE_SPEC, () => assessVeracodeScanCoverageWithDecisionContext(client, options));
 }
 
@@ -2650,7 +2653,10 @@ function evaluateCollectionsPosture(snapshot: ApplicationSnapshot): VeracodeFind
   );
 }
 
-export function assessVeracodePolicyCompliance(client: ClientLike, _options: { maxApplications?: number } = {}): Promise<VeracodeAssessmentResult> {
+export async function assessVeracodePolicyCompliance(
+  client: ClientLike,
+  _options: { maxApplications?: number } = {},
+): Promise<VeracodeAssessmentResult> {
   return runBatchVerdictContext(VERACODE_DECISION_CONTEXT, VERACODE_SPEC, () => assessVeracodePolicyComplianceWithDecisionContext(client));
 }
 
@@ -2915,7 +2921,10 @@ function evaluateFlawDensity(samples: ApplicationFindingsSample[], inventory: Ha
 
 type FindingsHygieneOptions = { maxApplications?: number; maxFpRatePercent?: number; maxFlawDensityPerKloc?: number; now?: Date };
 
-export function assessVeracodeFindingsHygiene(client: ClientLike, options: FindingsHygieneOptions = {}): Promise<VeracodeAssessmentResult> {
+export async function assessVeracodeFindingsHygiene(
+  client: ClientLike,
+  options: FindingsHygieneOptions = {},
+): Promise<VeracodeAssessmentResult> {
   return runBatchVerdictContext(VERACODE_DECISION_CONTEXT, VERACODE_SPEC, () => assessVeracodeFindingsHygieneWithDecisionContext(client, options));
 }
 
@@ -3204,7 +3213,10 @@ function scaAgentUnavailableCause(workspaces: Surface<HalListResult>): string {
 
 type ScaPostureOptions = { maxApplications?: number; maxWorkspaces?: number; scaCvssThreshold?: number };
 
-export function assessVeracodeScaPosture(client: ClientLike, options: ScaPostureOptions = {}): Promise<VeracodeAssessmentResult> {
+export async function assessVeracodeScaPosture(
+  client: ClientLike,
+  options: ScaPostureOptions = {},
+): Promise<VeracodeAssessmentResult> {
   return runBatchVerdictContext(VERACODE_DECISION_CONTEXT, VERACODE_SPEC, () => assessVeracodeScaPostureWithDecisionContext(client, options));
 }
 
@@ -3420,7 +3432,10 @@ async function evaluateApiCredentials(client: ClientLike, snapshot: IdentitySnap
 
 type AccessControlOptions = { maxAdmins?: number; maxUnrestrictedUsers?: number; inactiveDays?: number; maxCredentialAgeDays?: number; now?: Date };
 
-export function assessVeracodeAccessControls(client: ClientLike, options: AccessControlOptions = {}): Promise<VeracodeAssessmentResult> {
+export async function assessVeracodeAccessControls(
+  client: ClientLike,
+  options: AccessControlOptions = {},
+): Promise<VeracodeAssessmentResult> {
   return runBatchVerdictContext(VERACODE_DECISION_CONTEXT, VERACODE_SPEC, () => assessVeracodeAccessControlsWithDecisionContext(client, options));
 }
 
