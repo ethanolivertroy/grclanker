@@ -117,7 +117,9 @@ export default function AboutPage() {
               </div>
               <div className="about-robot-figure">
                 <img
-                  src="/about/grclanker-robot-v1-transparent.png"
+                  src="/about/grclanker-robot-v1.webp"
+                  width={896}
+                  height={1200}
                   alt="Full-body illustration of the grclanker robot"
                   className="about-robot-image"
                   loading="lazy"
