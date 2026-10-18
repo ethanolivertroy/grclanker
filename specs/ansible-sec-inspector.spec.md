@@ -7,8 +7,8 @@ language: "typescript"
 status: "implemented"
 version: "1.0"
 last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
-source_pr: "https://github.com/hackIDLE/grclanker/pull/4"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+source_pr: "https://github.com/ethanolivertroy/grclanker/pull/4"
 contributor: "GRCJP"
 contributor_url: "https://github.com/GRCJP"
 ---
@@ -16,7 +16,7 @@ contributor_url: "https://github.com/GRCJP"
 # ansible-sec-inspector — Architecture Specification
 
 Community spec contributed by [GRCJP](https://github.com/GRCJP) in
-[hackIDLE/grclanker#4](https://github.com/hackIDLE/grclanker/pull/4).
+[ethanolivertroy/grclanker#4](https://github.com/ethanolivertroy/grclanker/pull/4).
 
 ## 1. Overview
 
@@ -794,4 +794,4 @@ Remaining and out of scope for grclanker:
   user detection for control 20, which the controller API does not expose
 - Live integration tests against an AAP trial or sandbox instance
 
-Mirrors the grclanker spec format: https://github.com/hackIDLE/grclanker
+Mirrors the grclanker spec format: https://github.com/ethanolivertroy/grclanker

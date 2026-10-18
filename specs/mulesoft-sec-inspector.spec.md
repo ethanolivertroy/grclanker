@@ -7,7 +7,7 @@ language: "typescript"
 status: "implemented"
 version: "1.0"
 last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
 ---
 
 # MuleSoft Anypoint Platform Security Inspector - Architecture Specification
@@ -20,7 +20,7 @@ The inspector targets Anypoint Platform organizations on Enterprise and Titanium
 
 ### grclanker implementation
 
-The shipped implementation is the native TypeScript module `cli/extensions/grc-tools/mulesoft.ts` in [grclanker](https://github.com/hackIDLE/grclanker), not the standalone Go binary sketched in sections 7 to 9. It registers six read-only tools:
+The shipped implementation is the native TypeScript module `cli/extensions/grc-tools/mulesoft.ts` in [grclanker](https://github.com/ethanolivertroy/grclanker), not the standalone Go binary sketched in sections 7 to 9. It registers six read-only tools:
 
 | Tool | Covers |
 |------|--------|
