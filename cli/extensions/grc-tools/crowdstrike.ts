@@ -1052,7 +1052,8 @@ function truncatedBeforeVisible(read: string, row: string, property: string): st
 /**
  * A sampled or truncated inventory caps pass at warn. A fail that rests on the absence of something in
  * the visible rows (no enabled and assigned policy, no policy container) is provable only against the
- * rows that were not read, so it renders manual instead of fail.
+ * rows that were not read, so it renders manual instead of fail. Any other fail was observed in the rows
+ * that were read, so it stands.
  */
 function withPartialInventory(
   item: CrowdstrikeFinding,
@@ -1069,7 +1070,9 @@ function withPartialInventory(
     status: item.status === "pass" ? "warn" : absenceClaim ? "manual" : item.status,
     summary: absenceClaim
       ? `${item.summary} Partial inventory: only ${description} were read (sampled or truncated), so the absence this verdict rests on cannot be asserted for the unread rows. Verdict: manual (unknown).`
-      : `${item.summary} Partial inventory: only ${description} were read (sampled or truncated), so this verdict cannot exceed warn.`,
+      : item.status === "fail"
+        ? `${item.summary} Partial inventory: only ${description} were read (sampled or truncated); the failure observed in the rows read stands.`
+        : `${item.summary} Partial inventory: only ${description} were read (sampled or truncated), so this verdict cannot exceed warn.`,
     evidence: { ...(item.evidence ?? {}), partial_inventory: present },
   };
 }
