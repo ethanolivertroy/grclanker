@@ -69,9 +69,14 @@ const RAW_EXPORT_STAGE = "The collector exports every returned record as read, a
 const projectedExport = (record: string, projection: string): string =>
   `The collector exports each ${record} cut to ${projection}, after the data redaction pass has rewritten every string in it; decision facts read the listed fields, which the cut keeps.`;
 const PROBE_STAGE = "Never exported: the crowdstrike_check_access probe keeps only meta.pagination.total, else the number of returned IDs, as the surface's count.";
+const idWalkStage = (lookup: string, probed: boolean): string =>
+  `Never exported: the listed IDs are looked up through ${lookup}, whose records are exported instead${probed ? ", and the crowdstrike_check_access probe keeps only meta.pagination.total, else the number of returned IDs, as the surface's count" : ""}.`;
 
+const REFUSAL = "a status outside 200 through 299 after retries, a body that is not a JSON object, or a missing resources array is a refusal";
 const resourcesResponse = (records: string, pagination = "total, offset, and next"): string =>
-  `A JSON object whose resources array holds ${records} and whose meta.pagination may carry ${pagination}; a status outside 200 through 299 after retries, a body that is not a JSON object, or a missing resources array is a refusal.`;
+  `A JSON object whose resources array holds ${records} and whose meta.pagination may carry ${pagination}; ${REFUSAL}.`;
+const lookupResponse = (records: string): string =>
+  `A JSON object whose resources array holds ${records}, a resource that is not a JSON object being dropped; ${REFUSAL}.`;
 
 const param = (
   name: string,
@@ -89,6 +94,7 @@ const capReached = (cap: ItemCap, records: string): string =>
   `${typeof cap === "number" ? cap : cap.option} ${records}`;
 const HOST_LIMIT: ItemCap = { option: "host_limit", fallback: 5000, max: 100000 };
 const ALERT_LIMIT: ItemCap = { option: "alert_limit", fallback: 2000, max: 10000 };
+const RULE_LIMIT: ItemCap = { option: "rule_limit", fallback: 1000, max: 10000 };
 
 const ACCESS_PROBE = "1 on the crowdstrike_check_access probe";
 const nextOffset = (records: string): string =>
@@ -97,6 +103,11 @@ const offsetParameters = (records: string, pageSize: number, cap: ItemCap, probe
   param("limit", "query", `${pageSize}, or the ${records} left under ${capText(cap)} when fewer${probed ? `; ${ACCESS_PROBE}` : ""}`),
   param("offset", "query", `The offset: ${nextOffset(records)}`, false, "On every page after the first"),
 ];
+const idsParameter = (records: string): RequestParameterContract =>
+  param("ids", "query", `Up to 100 IDs of ${records}, each sent as its own ids parameter`);
+const TEXT_IDS = "taking each id that is a non-blank string (sent trimmed) or a finite number, in list order";
+const LISTED_TEXT_IDS = "non-blank strings (sent trimmed) or finite numbers, in list order";
+const POLICY_FIELDS = ["id", "name", "enabled", "platform_default", "groups"];
 
 const apiSurface = (
   id: string,
@@ -123,12 +134,8 @@ const PREVENTION_SURFACES: readonly BatchSurfaceDefinition[] = [
     "/policy/combined/prevention/v1",
     "prevention-policy",
     [
-      "id",
-      "name",
+      ...POLICY_FIELDS,
       "platform_name",
-      "enabled",
-      "platform_default",
-      "groups",
       "prevention_settings.settings.id",
       "prevention_settings.settings.value.enabled",
       "prevention_settings.settings.value.detection",
@@ -149,7 +156,7 @@ const RESPONSE_SURFACES: readonly BatchSurfaceDefinition[] = [
     "response_policies",
     "/policy/combined/response/v1",
     "response-policies",
-    ["id", "name", "platform_name", "enabled", "platform_default", "groups", "settings.settings.id", "settings.settings.value.enabled"],
+    [...POLICY_FIELDS, "settings.settings.id", "settings.settings.value.enabled"],
     offsetParameters("policies", 500, 5000, true),
     resourcesResponse("one response policy per entry"),
   ),
@@ -210,9 +217,89 @@ const RESPONSE_SURFACES: readonly BatchSurfaceDefinition[] = [
   ),
 ];
 
+const DEVICE_FIREWALL_SURFACES: readonly BatchSurfaceDefinition[] = [
+  apiSurface(
+    "device_control_policies",
+    "/policy/combined/device-control/v1",
+    "device-control-policies",
+    POLICY_FIELDS,
+    offsetParameters("policies", 500, 5000, true),
+    resourcesResponse("one device control policy per entry"),
+  ),
+  apiSurface(
+    "device_control_policy_details",
+    "/policy/entities/device-control/v2",
+    "device-control-policies",
+    [
+      "id",
+      "usb_settings.enforcement_mode",
+      "usb_settings.pcie_enforcement_mode",
+      "usb_settings.classes.id",
+      "usb_settings.classes.class",
+      "usb_settings.classes.action",
+      "usb_settings.classes.exceptions",
+      "bluetooth_settings.enforcement_mode",
+      "bluetooth_settings.classes.action",
+    ],
+    [idsParameter(`the returned device control policies, ${TEXT_IDS}`)],
+    lookupResponse("one device control policy's details per entry"),
+  ),
+  apiSurface(
+    "firewall_policies",
+    "/policy/combined/firewall/v1",
+    "firewall-policies",
+    POLICY_FIELDS,
+    offsetParameters("policies", 500, 5000, true),
+    resourcesResponse("one firewall policy per entry"),
+  ),
+  apiSurface(
+    "firewall_policy_containers",
+    "/fwmgr/entities/policies/v1",
+    "firewall-management",
+    ["policy_id", "enforce", "test_mode", "default_inbound", "rule_group_ids"],
+    [idsParameter(`the firewall policies counted by assigned_firewall_policy_count, ${TEXT_IDS}`)],
+    lookupResponse("one firewall policy container per entry"),
+  ),
+  apiSurface(
+    "firewall_rule_group_ids",
+    "/fwmgr/queries/rule-groups/v1",
+    "firewall-management",
+    ["resources"],
+    offsetParameters("rule group IDs", 500, RULE_LIMIT, true),
+    resourcesResponse("firewall rule group IDs"),
+    { projectionStage: idWalkStage("GET /fwmgr/entities/rule-groups/v1", true) },
+  ),
+  apiSurface(
+    "firewall_rule_groups",
+    "/fwmgr/entities/rule-groups/v1",
+    "firewall-management",
+    ["id", "enabled", "rule_ids"],
+    [idsParameter(`the rule group IDs listed by GET /fwmgr/queries/rule-groups/v1 that are ${LISTED_TEXT_IDS}`)],
+    lookupResponse("one firewall rule group per entry"),
+  ),
+  apiSurface(
+    "firewall_rule_ids",
+    "/fwmgr/queries/rules/v1",
+    "firewall-management",
+    ["resources"],
+    offsetParameters("rule IDs", 500, RULE_LIMIT, false),
+    resourcesResponse("firewall rule IDs"),
+    { projectionStage: idWalkStage("GET /fwmgr/entities/rules/v1", false) },
+  ),
+  apiSurface(
+    "firewall_rules",
+    "/fwmgr/entities/rules/v1",
+    "firewall-management",
+    ["action", "enabled", "description"],
+    [idsParameter(`the rule IDs listed by GET /fwmgr/queries/rules/v1 that are ${LISTED_TEXT_IDS}`)],
+    lookupResponse("one firewall rule per entry"),
+  ),
+];
+
 const CROWDSTRIKE_SURFACES: readonly BatchSurfaceDefinition[] = [
   ...PREVENTION_SURFACES,
   ...RESPONSE_SURFACES,
+  ...DEVICE_FIREWALL_SURFACES,
 ];
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
@@ -244,9 +331,11 @@ const perMilleBelow = (numerator: string, denominator: string, threshold: string
   roundDigits: 0,
 });
 
-// A fail that rests on no assigned policy is provable only against a complete list, so a partial list renders it manual.
-const noAssignedPolicy = (count: string, complete: string): VerdictRule[] => [
-  rule("manual", all(eq(count, 0), ne(complete, true))),
+const incomplete = (...complete: string[]): VerdictCondition =>
+  complete.length === 1 ? ne(complete[0], true) : any(...complete.map((name) => ne(name, true)));
+// A fail that rests on nothing being assigned is provable only against complete lists, so a partial list renders it manual.
+const noneAssigned = (count: string, ...complete: string[]): VerdictRule[] => [
+  rule("manual", all(eq(count, 0), incomplete(...complete))),
   rule("fail", eq(count, 0)),
 ];
 
@@ -265,14 +354,25 @@ const SCRIPT_CONTROLS = "ScriptBasedExecutionMonitoring, InterpreterProtection, 
 const ASSIGNED_RESPONSE = "assigned response policies, as counted by assigned_response_policy_count";
 const RESPONSE_CARRIES = carries("settings");
 const AS_NUMBER = "read as a number (a finite number, or a string that is not blank and parses as one)";
-const optionValue = (name: string, fallback: number, max: number): string =>
-  `${name} argument ${AS_NUMBER}, ${fallback} when absent or not numeric, truncated to a whole number, and clamped to 1 through ${max}`;
+const optionValue = (name: string, fallback: number, max: number, min = 1): string =>
+  `${name} argument ${AS_NUMBER}, ${fallback} when absent or not numeric, truncated to a whole number, and clamped to ${min} through ${max}`;
 const LOOKBACK_WINDOW = `The lookback window is the last N days, where N is the ${optionValue("lookback_days", 30, 365)}.`;
 const PARSES_AS_DATE = "A value parses as a date when ECMAScript Date.parse reads its trimmed text, a finite number being read as its decimal text.";
 const SESSION_LENGTH = `A session's length in minutes is its duration, ${AS_NUMBER}, divided by 60 when that is above 0; otherwise the minutes from its created_at to the first of its deleted_at and updated_at that parses as a date, when created_at parses too; otherwise it has no length. ${PARSES_AS_DATE}`;
 const ALERT_SLA = `An alert's SLA is 24 hours when its severity, ${AS_NUMBER}, is at least 90 or its severity_name trims and lowercases to critical, and 72 hours otherwise.`;
 const ALERT_CLOSED = `An alert is closed when its status trims and lowercases to closed. A closed alert's resolution time is its seconds_to_resolved, ${AS_NUMBER}, divided by 3600 when that is above 0, else the hours from its creation to its updated_timestamp (0 when negative) when updated_timestamp parses as a date, else none.`;
 const ALERT_CREATION = `An alert's creation is the first of its created_timestamp and timestamp that parses as a date. ${PARSES_AS_DATE}`;
+const READS_AS_TEXT = "A value reads as text when it is a string that is not blank, trimmed, or a finite number, in decimal.";
+const SAME_ID = "read as the same text, or both do not read as text";
+const ASSIGNED_DEVICE = "assigned device control policies, as counted by assigned_device_control_policy_count";
+const DEVICE_DETAILS = `A policy's details are the last returned device control policy details record whose id and the policy's id ${SAME_ID}; a policy without details has none of their settings. ${READS_AS_TEXT}`;
+const MASS_STORAGE_CLASS = "A policy's mass storage class is the last JSON object in its details' usb_settings.classes whose id, or class when id does not read as text, reads as MASS_STORAGE in any letter case.";
+const BLOCKS_MASS_STORAGE = `A policy blocks mass storage when its mass storage class has an action that reads as text other than FULL_ACCESS in any letter case. ${MASS_STORAGE_CLASS}`;
+const PERIPHERALS = `The three peripheral restrictions are Bluetooth, enforced when the details' bluetooth_settings.enforcement_mode reads as MONITOR_ENFORCE in any letter case and at least one JSON object in bluetooth_settings.classes has an action that does not read as FULL_ACCESS in any letter case, an absent action included; PCIe, enforced when usb_settings.pcie_enforcement_mode reads as MONITOR_ENFORCE in any letter case; and mass storage, enforced when the policy blocks mass storage. ${BLOCKS_MASS_STORAGE}`;
+const ASSIGNED_FIREWALL = "assigned firewall policies, as counted by assigned_firewall_policy_count";
+const CONTAINER = `A policy's container is the last returned firewall policy container whose policy_id and the policy's id ${SAME_ID}. ${READS_AS_TEXT}`;
+const RULE_GROUPS = `A container's rule groups are the entries of its rule_group_ids array that read as text. One is unknown when no returned firewall rule group has an id that reads as that text, and active when the last returned rule group whose id does has an enabled of ${TRUTHY} and a non-empty rule_ids array.`;
+const ASSIGNED_CONTAINERS = "containers counted by assigned_firewall_container_count";
 
 const CROWDSTRIKE_INPUTS: Readonly<Record<string, string>> = {
   prevention_policies_readable: "True when GET /policy/combined/prevention/v1 returned its prevention policy list without a refusal.",
@@ -310,6 +410,30 @@ const CROWDSTRIKE_INPUTS: Readonly<Record<string, string>> = {
   contained_hosts_readable: "True when GET /devices/combined/devices/v1 with the containment status filter returned its host list without a refusal.",
   contained_hosts_complete: "Contained host list coverage.",
   contained_host_count: "Number of hosts returned by the read filtered to the status contained, containment_pending, or lift_containment_pending.",
+  device_control_policies_readable: "True when GET /policy/combined/device-control/v1 returned its device control policy list, and every GET /policy/entities/device-control/v2 lookup of the listed policies' details returned, without a refusal.",
+  device_control_policies_complete: "Device control policy list coverage.",
+  assigned_device_control_policy_count: assignedPolicyCount("device control"),
+  policies_without_usb_blocking: `Number of ${ASSIGNED_DEVICE} whose details' usb_settings.enforcement_mode does not read as MONITOR_ENFORCE in any letter case, or that do not block mass storage. ${BLOCKS_MASS_STORAGE} ${DEVICE_DETAILS}`,
+  most_mass_storage_exceptions: `Largest number of entries in the exceptions array of the mass storage class of any of the ${ASSIGNED_DEVICE}, or 0 when none has a mass storage class with a non-empty exceptions array. ${MASS_STORAGE_CLASS} ${DEVICE_DETAILS}`,
+  max_usb_exceptions: `The ${optionValue("max_usb_exceptions", 25, 10000, 0)}.`,
+  policies_without_peripheral_restrictions: `Number of ${ASSIGNED_DEVICE} that enforce none of the three peripheral restrictions. ${PERIPHERALS} ${DEVICE_DETAILS}`,
+  policies_missing_a_peripheral_restriction: `Number of ${ASSIGNED_DEVICE} that do not enforce all three peripheral restrictions. ${PERIPHERALS} ${DEVICE_DETAILS}`,
+  firewall_policies_readable: "True when GET /policy/combined/firewall/v1 returned its firewall policy list, and every GET /fwmgr/entities/policies/v1 lookup of the assigned policies' containers returned, without a refusal.",
+  firewall_policies_complete: "Firewall policy list coverage.",
+  assigned_firewall_policy_count: assignedPolicyCount("firewall"),
+  firewall_policies_without_container: `Number of ${ASSIGNED_FIREWALL} without a container. ${CONTAINER}`,
+  firewall_policies_not_enforcing: `Number of ${ASSIGNED_FIREWALL} with a container whose enforce is not ${TRUTHY}, or whose rule groups include neither an active nor an unknown one. ${CONTAINER} ${RULE_GROUPS}`,
+  firewall_policies_in_test_mode: `Number of ${ASSIGNED_FIREWALL} with a container whose test_mode is ${TRUTHY}. ${CONTAINER}`,
+  firewall_policies_without_active_rule_group: `Number of ${ASSIGNED_FIREWALL} with a container whose rule groups include no active one. ${CONTAINER} ${RULE_GROUPS}`,
+  firewall_rule_groups_readable: "True when the GET /fwmgr/queries/rule-groups/v1 walk and every GET /fwmgr/entities/rule-groups/v1 lookup of the IDs it listed returned without a refusal.",
+  firewall_rule_groups_complete: "Firewall rule group list coverage.",
+  assigned_firewall_container_count: `Number of returned firewall policy containers that match one of the ${ASSIGNED_FIREWALL}: the container's policy_id and the policy's id ${SAME_ID}. Two containers for one policy count twice. ${READS_AS_TEXT}`,
+  containers_without_inbound_deny: `Number of ${ASSIGNED_CONTAINERS} whose default_inbound does not read as DENY in any letter case. ${READS_AS_TEXT}`,
+  containers_not_enforced: `Number of ${ASSIGNED_CONTAINERS} whose enforce is not ${TRUTHY}.`,
+  firewall_rules_readable: "True when the GET /fwmgr/queries/rules/v1 walk and every GET /fwmgr/entities/rules/v1 lookup of the IDs it listed returned without a refusal.",
+  firewall_rules_complete: "Firewall rule list coverage.",
+  firewall_rule_count: "Number of firewall rules returned by the GET /fwmgr/entities/rules/v1 lookups.",
+  undocumented_allow_rule_count: `Number of returned firewall rules whose action reads as ALLOW in any letter case, whose enabled is ${TRUTHY}, and whose description does not read as text. ${READS_AS_TEXT}`,
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -323,14 +447,27 @@ const completeFrom = (
   sources: BatchCompletenessDefinition["sources"],
 ): BatchCompletenessDefinition => ({ semantics, sources });
 
+const walkStops = (cap: string): string =>
+  `stopped at ${cap} below meta.pagination.total (or, without a total, after a full last page or a cursor that is not a whole number), at an empty page before meta.pagination.total, or at a repeated cursor that is not a whole number`;
 const offsetWalkComplete = (surfaceId: string, list: string, cap: string): BatchCompletenessDefinition => completeFrom(
-  `false when the ${list} is partial: it stopped at ${cap} below meta.pagination.total (or, without a total, after a full last page or a cursor that is not a whole number), at an empty page before meta.pagination.total, or at a repeated cursor that is not a whole number, or a returned resource is not a JSON object.`,
+  `false when the ${list} is partial: it ${walkStops(cap)}, or a returned resource is not a JSON object.`,
   [{ surfaceId, falseWhen: ["truncated"] }],
+);
+const lookupWalkComplete = (idSurfaceId: string, recordSurfaceId: string, list: string, records: string): BatchCompletenessDefinition => completeFrom(
+  `false when the ${list} is partial: its ID walk ${walkStops("rule_limit IDs")}, or the lookups of the IDs it listed returned fewer ${records} than it listed.`,
+  [
+    { surfaceId: idSurfaceId, falseWhen: ["truncated"] },
+    { surfaceId: recordSurfaceId, falseWhen: ["truncated"], scope: `fewer ${records} returned than IDs listed` },
+  ],
 );
 
 const PREVENTION_POLICIES_COMPLETE = offsetWalkComplete("prevention_policies", "prevention policy list", "5000 policies");
 const RESPONSE_POLICIES_COMPLETE = offsetWalkComplete("response_policies", "response policy list", "5000 policies");
 const CONTAINED_HOSTS_COMPLETE = offsetWalkComplete("contained_hosts", "contained host list", "host_limit hosts");
+const DEVICE_CONTROL_POLICIES_COMPLETE = offsetWalkComplete("device_control_policies", "device control policy list", "5000 policies");
+const FIREWALL_POLICIES_COMPLETE = offsetWalkComplete("firewall_policies", "firewall policy list", "5000 policies");
+const FIREWALL_RULE_GROUPS_COMPLETE = lookupWalkComplete("firewall_rule_group_ids", "firewall_rule_groups", "firewall rule group list", "rule groups");
+const FIREWALL_RULES_COMPLETE = lookupWalkComplete("firewall_rule_ids", "firewall_rules", "firewall rule list", "rules");
 const ALERTS_COMPLETE = completeFrom(
   "false when the alert list is partial: fewer alerts were kept than meta.pagination.total; or, without a total, the walk stopped at alert_limit alerts, at an empty page, or at an after cursor equal to the one the page was requested with, on a page that still carried meta.pagination.after; or a returned resource is not a JSON object.",
   [{ surfaceId: "alerts", falseWhen: ["truncated"] }],
@@ -363,7 +500,7 @@ const PREVENTION = "crowdstrike_assess_prevention_policies";
 const PREVENTION_BASE = ["prevention_policies_readable", "prevention_policies_complete", "assigned_prevention_policy_count"];
 const preventionRules = (...decisive: VerdictRule[]): VerdictRule[] => [
   rule("manual", ne("prevention_policies_readable", true)),
-  ...noAssignedPolicy("assigned_prevention_policy_count", "prevention_policies_complete"),
+  ...noneAssigned("assigned_prevention_policy_count", "prevention_policies_complete"),
   ...decisive,
   rule("warn", ne("prevention_policies_complete", true)),
   rule("pass", always),
@@ -580,7 +717,7 @@ const RESPONSE_CHECKS: readonly CrowdstrikeCheck[] = [
     ],
     rules: [
       rule("manual", ne("response_policies_readable", true)),
-      ...noAssignedPolicy("assigned_response_policy_count", "response_policies_complete"),
+      ...noneAssigned("assigned_response_policy_count", "response_policies_complete"),
       rule("fail", eq("rtr_enabled_policy_count", 0)),
       rule("warn", any(gt("policies_without_rtr", 0), gt("policies_with_custom_scripts", 0))),
       rule("warn", ne("response_policies_complete", true)),
@@ -728,6 +865,238 @@ const RESPONSE_CHECKS: readonly CrowdstrikeCheck[] = [
   },
 ];
 
+const DEVICE_FIREWALL = "crowdstrike_assess_device_firewall";
+
+const DEVICE_CONTROL_SURFACES = ["device_control_policies", "device_control_policy_details"];
+const DEVICE_BASE = ["device_control_policies_readable", "device_control_policies_complete", "assigned_device_control_policy_count"];
+const deviceRules = (...decisive: VerdictRule[]): VerdictRule[] => [
+  rule("manual", ne("device_control_policies_readable", true)),
+  ...noneAssigned("assigned_device_control_policy_count", "device_control_policies_complete"),
+  ...decisive,
+  rule("warn", ne("device_control_policies_complete", true)),
+  rule("pass", always),
+];
+const DEVICE_HEAD = "Manual when the device control policy list or a details lookup is unreadable, or when the list is partial and shows no assigned policy. Fail when no device control policy is assigned.";
+const DEVICE_TAIL = "Warn instead of pass when the device control policy list is partial. Otherwise pass.";
+const deviceExamples = (check: string, healthy: Readonly<Record<string, unknown>>): BatchCriterionExample[] => [
+  example("noncompliant", "fail", "The complete device control policy list holds no enabled policy that reaches hosts.", {
+    ...healthy, assigned_device_control_policy_count: 0,
+  }),
+  example("partial", "manual", `The list stopped at the 5000-policy cap before any assigned policy was visible, so ${check} cannot rest on the absence.`, {
+    ...healthy, device_control_policies_complete: false, assigned_device_control_policy_count: 0,
+  }),
+  example("unreadable", "manual", "A device control policy details lookup was refused.", { device_control_policies_readable: false }),
+];
+const USB_HEALTHY = {
+  device_control_policies_readable: true, device_control_policies_complete: true, assigned_device_control_policy_count: 2,
+  policies_without_usb_blocking: 0, most_mass_storage_exceptions: 3, max_usb_exceptions: 25,
+};
+const PERIPHERAL_HEALTHY = {
+  device_control_policies_readable: true, device_control_policies_complete: true, assigned_device_control_policy_count: 2,
+  policies_without_peripheral_restrictions: 0, policies_missing_a_peripheral_restriction: 0,
+};
+
+const FIREWALL_SURFACES = ["firewall_policies", "firewall_policy_containers"];
+const HOST_FIREWALL_HEALTHY = {
+  firewall_policies_readable: true, firewall_policies_complete: true, firewall_rule_groups_readable: true, firewall_rule_groups_complete: true,
+  assigned_firewall_policy_count: 2, firewall_policies_without_container: 0, firewall_policies_not_enforcing: 0,
+  firewall_policies_in_test_mode: 0, firewall_policies_without_active_rule_group: 0,
+};
+const DEFAULT_DENY_HEALTHY = {
+  firewall_policies_readable: true, firewall_policies_complete: true, firewall_rules_readable: true, firewall_rules_complete: true,
+  assigned_firewall_container_count: 2, containers_without_inbound_deny: 0, containers_not_enforced: 0,
+  undocumented_allow_rule_count: 0, firewall_rule_count: 40,
+};
+
+const DEVICE_FIREWALL_CHECKS: readonly CrowdstrikeCheck[] = [
+  {
+    id: "CS-08",
+    control: 8,
+    title: "Device Control - USB Blocking",
+    severity: "high",
+    owner: DEVICE_FIREWALL,
+    surfaces: DEVICE_CONTROL_SURFACES,
+    inputs: [...DEVICE_BASE, "policies_without_usb_blocking", "most_mass_storage_exceptions", "max_usb_exceptions"],
+    rules: deviceRules(
+      rule("fail", gt("policies_without_usb_blocking", 0)),
+      rule("warn", gt("most_mass_storage_exceptions", path("max_usb_exceptions"))),
+    ),
+    completeness: { device_control_policies_complete: DEVICE_CONTROL_POLICIES_COMPLETE },
+    decision: `${DEVICE_HEAD} Fail when an assigned policy's USB enforcement mode is not MONITOR_ENFORCE, or when it does not block mass storage because its mass storage class is missing, has no action, or allows FULL_ACCESS. Warn when an assigned policy's mass storage class lists more than max_usb_exceptions exceptions. ${DEVICE_TAIL}`,
+    examples: [
+      example("compliant", "pass", "Both assigned policies enforce USB and block mass storage, with at most 3 exceptions.", USB_HEALTHY),
+      example("compliant", "pass", "The largest exception list holds exactly the 25 exceptions max_usb_exceptions allows.", {
+        ...USB_HEALTHY, most_mass_storage_exceptions: 25,
+      }),
+      example("noncompliant", "fail", "An assigned policy blocks mass storage but sets the USB enforcement mode to MONITOR_ONLY.", {
+        ...USB_HEALTHY, policies_without_usb_blocking: 1,
+      }),
+      example("noncompliant", "fail", "An assigned policy allows mass storage FULL_ACCESS, and the list stopped at the cap.", {
+        ...USB_HEALTHY, device_control_policies_complete: false, policies_without_usb_blocking: 1,
+      }),
+      example("partial", "warn", "An assigned policy's mass storage class lists 26 exceptions against a threshold of 25.", {
+        ...USB_HEALTHY, most_mass_storage_exceptions: 26,
+      }),
+      example("partial", "warn", "The visible policies pass, but the list stopped at the cap.", {
+        ...USB_HEALTHY, device_control_policies_complete: false,
+      }),
+      ...deviceExamples("CS-08", { ...USB_HEALTHY, most_mass_storage_exceptions: 0 }),
+    ],
+  },
+  {
+    id: "CS-09",
+    control: 9,
+    title: "Device Control - Peripheral Restrictions",
+    severity: "medium",
+    owner: DEVICE_FIREWALL,
+    surfaces: DEVICE_CONTROL_SURFACES,
+    inputs: [...DEVICE_BASE, "policies_without_peripheral_restrictions", "policies_missing_a_peripheral_restriction"],
+    rules: deviceRules(
+      rule("fail", gt("policies_without_peripheral_restrictions", 0)),
+      rule("warn", gt("policies_missing_a_peripheral_restriction", 0)),
+    ),
+    completeness: { device_control_policies_complete: DEVICE_CONTROL_POLICIES_COMPLETE },
+    decision: `${DEVICE_HEAD} Fail when an assigned policy enforces none of the Bluetooth, PCIe, and mass storage restrictions. Warn when an assigned policy enforces only one or two of them. ${DEVICE_TAIL}`,
+    examples: [
+      example("compliant", "pass", "Both assigned policies enforce the Bluetooth, PCIe, and mass storage restrictions.", PERIPHERAL_HEALTHY),
+      example("noncompliant", "fail", "An assigned policy enforces none of the three restrictions.", {
+        ...PERIPHERAL_HEALTHY, policies_without_peripheral_restrictions: 1, policies_missing_a_peripheral_restriction: 1,
+      }),
+      example("partial", "warn", "An assigned policy enforces PCIe and mass storage, but every Bluetooth class it lists has FULL_ACCESS.", {
+        ...PERIPHERAL_HEALTHY, policies_missing_a_peripheral_restriction: 1,
+      }),
+      example("partial", "warn", "The visible policies pass, but the list stopped at the cap.", {
+        ...PERIPHERAL_HEALTHY, device_control_policies_complete: false,
+      }),
+      ...deviceExamples("CS-09", PERIPHERAL_HEALTHY),
+    ],
+  },
+  {
+    id: "CS-10",
+    control: 10,
+    title: "Firewall - Host Firewall Enabled",
+    severity: "medium",
+    owner: DEVICE_FIREWALL,
+    surfaces: [...FIREWALL_SURFACES, "firewall_rule_group_ids", "firewall_rule_groups"],
+    inputs: [
+      "firewall_policies_readable",
+      "firewall_policies_complete",
+      "firewall_rule_groups_readable",
+      "firewall_rule_groups_complete",
+      "assigned_firewall_policy_count",
+      "firewall_policies_without_container",
+      "firewall_policies_not_enforcing",
+      "firewall_policies_in_test_mode",
+      "firewall_policies_without_active_rule_group",
+    ],
+    rules: [
+      rule("manual", any(ne("firewall_policies_readable", true), ne("firewall_rule_groups_readable", true))),
+      ...noneAssigned("assigned_firewall_policy_count", "firewall_policies_complete", "firewall_rule_groups_complete"),
+      rule("fail", gt("firewall_policies_not_enforcing", 0)),
+      rule("warn", any(
+        gt("firewall_policies_without_container", 0),
+        gt("firewall_policies_in_test_mode", 0),
+        gt("firewall_policies_without_active_rule_group", 0),
+      )),
+      rule("warn", incomplete("firewall_policies_complete", "firewall_rule_groups_complete")),
+      rule("pass", always),
+    ],
+    completeness: {
+      firewall_policies_complete: FIREWALL_POLICIES_COMPLETE,
+      firewall_rule_groups_complete: FIREWALL_RULE_GROUPS_COMPLETE,
+    },
+    decision: "Manual when the firewall policy list, a container lookup, the rule group walk, or a rule group lookup is unreadable, or when the firewall policy list or the rule group list is partial and the policy list shows no assigned policy. Fail when no firewall policy is assigned, or when an assigned policy's container does not enforce, or lists neither an active rule group (enabled, with at least one rule) nor one the rule group list did not return. Warn when an assigned policy has no container, which is review evidence rather than a violation, when its container runs in test mode, or when it has no active rule group. Warn instead of pass when the firewall policy list or the rule group list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Both assigned policies enforce an active rule group outside test mode.", HOST_FIREWALL_HEALTHY),
+      example("noncompliant", "fail", "An assigned policy's container sets enforce to false although it lists an active rule group.", {
+        ...HOST_FIREWALL_HEALTHY, firewall_policies_not_enforcing: 1,
+      }),
+      example("noncompliant", "fail", "An assigned policy's container enforces but lists no rule group.", {
+        ...HOST_FIREWALL_HEALTHY, firewall_policies_not_enforcing: 1, firewall_policies_without_active_rule_group: 1,
+      }),
+      example("partial", "warn", "No container was returned for an assigned policy.", {
+        ...HOST_FIREWALL_HEALTHY, firewall_policies_without_container: 1,
+      }),
+      example("partial", "warn", "An assigned policy's container enforces an active rule group in test mode.", {
+        ...HOST_FIREWALL_HEALTHY, firewall_policies_in_test_mode: 1,
+      }),
+      example("partial", "warn", "An assigned policy's container enforces only a rule group the rule group list did not return.", {
+        ...HOST_FIREWALL_HEALTHY, firewall_policies_without_active_rule_group: 1,
+      }),
+      example("partial", "warn", "Every assigned policy passes, but the rule group walk stopped at rule_limit.", {
+        ...HOST_FIREWALL_HEALTHY, firewall_rule_groups_complete: false,
+      }),
+      example("noncompliant", "fail", "The complete firewall policy list holds no enabled policy that reaches hosts.", {
+        ...HOST_FIREWALL_HEALTHY, assigned_firewall_policy_count: 0,
+      }),
+      example("partial", "manual", "No assigned policy is visible and the rule group walk stopped at rule_limit, so CS-10 cannot rest on the absence.", {
+        ...HOST_FIREWALL_HEALTHY, assigned_firewall_policy_count: 0, firewall_rule_groups_complete: false,
+      }),
+      example("unreadable", "manual", "A rule group lookup was refused.", { firewall_policies_readable: true, firewall_rule_groups_readable: false }),
+    ],
+  },
+  {
+    id: "CS-11",
+    control: 11,
+    title: "Firewall - Default Deny",
+    severity: "high",
+    owner: DEVICE_FIREWALL,
+    surfaces: [...FIREWALL_SURFACES, "firewall_rule_ids", "firewall_rules"],
+    inputs: [
+      "firewall_policies_readable",
+      "firewall_policies_complete",
+      "firewall_rules_readable",
+      "firewall_rules_complete",
+      "assigned_firewall_container_count",
+      "containers_without_inbound_deny",
+      "containers_not_enforced",
+      "undocumented_allow_rule_count",
+      "firewall_rule_count",
+    ],
+    rules: [
+      rule("manual", any(ne("firewall_policies_readable", true), ne("firewall_rules_readable", true))),
+      ...noneAssigned("assigned_firewall_container_count", "firewall_policies_complete", "firewall_rules_complete"),
+      rule("fail", gt("containers_without_inbound_deny", 0)),
+      rule("warn", any(gt("containers_not_enforced", 0), gt("undocumented_allow_rule_count", 0), eq("firewall_rule_count", 0))),
+      rule("warn", incomplete("firewall_policies_complete", "firewall_rules_complete")),
+      rule("pass", always),
+    ],
+    completeness: {
+      firewall_policies_complete: FIREWALL_POLICIES_COMPLETE,
+      firewall_rules_complete: FIREWALL_RULES_COMPLETE,
+    },
+    decision: "Manual when the firewall policy list, a container lookup, the rule walk, or a rule lookup is unreadable, or when the firewall policy list or the rule list is partial and no container of an assigned policy was returned. Fail when no container of an assigned firewall policy was returned, or when such a container's default_inbound is not DENY. Warn when such a container does not enforce, when an enabled ALLOW rule has no description, or when no firewall rule was returned. Warn instead of pass when the firewall policy list or the rule list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Both assigned containers enforce a default inbound DENY, and every enabled ALLOW rule has a description.", DEFAULT_DENY_HEALTHY),
+      example("noncompliant", "fail", "An assigned container's default_inbound is ALLOW.", {
+        ...DEFAULT_DENY_HEALTHY, containers_without_inbound_deny: 1,
+      }),
+      example("noncompliant", "fail", "An assigned container's default_inbound is ALLOW, and the rule walk stopped at rule_limit.", {
+        ...DEFAULT_DENY_HEALTHY, firewall_rules_complete: false, containers_without_inbound_deny: 1,
+      }),
+      example("partial", "warn", "An assigned container defaults inbound to DENY without enforcing.", {
+        ...DEFAULT_DENY_HEALTHY, containers_not_enforced: 1,
+      }),
+      example("partial", "warn", "An enabled ALLOW rule has no description.", {
+        ...DEFAULT_DENY_HEALTHY, undocumented_allow_rule_count: 1,
+      }),
+      example("partial", "warn", "The rule lookups returned no rule.", {
+        ...DEFAULT_DENY_HEALTHY, firewall_rule_count: 0,
+      }),
+      example("partial", "warn", "Every assigned container passes, but the rule walk stopped at rule_limit.", {
+        ...DEFAULT_DENY_HEALTHY, firewall_rules_complete: false,
+      }),
+      example("noncompliant", "fail", "The complete lists show no container for an assigned firewall policy.", {
+        ...DEFAULT_DENY_HEALTHY, assigned_firewall_container_count: 0,
+      }),
+      example("partial", "manual", "No container of an assigned policy is visible and the firewall policy list stopped at the cap, so CS-11 cannot rest on the absence.", {
+        ...DEFAULT_DENY_HEALTHY, firewall_policies_complete: false, assigned_firewall_container_count: 0,
+      }),
+      example("unreadable", "manual", "A container lookup was refused.", { firewall_policies_readable: false }),
+    ],
+  },
+];
+
 const toCheck = (check: CrowdstrikeCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -751,19 +1120,27 @@ const toCheck = (check: CrowdstrikeCheck): BatchCheckDefinition => {
 const checks: readonly BatchCheckDefinition[] = [
   ...PREVENTION_CHECKS,
   ...RESPONSE_CHECKS,
+  ...DEVICE_FIREWALL_CHECKS,
 ].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
 const DROPPED_RESOURCE = "A returned resource that is not a JSON object is dropped and marks the list partial.";
+const LOOKED_UP = "The listed IDs that are non-blank strings or finite numbers are then looked up by ID, and fewer returned records than listed IDs marks the list partial.";
 
 // pageSize stays null: the limit sent shrinks on the last page under the cap, so no single value is always sent.
-const offsetWalk = (surfaceIds: readonly string[], records: string, pageSize: number, cap: ItemCap): BatchPaginationDefinition => ({
+const offsetWalk = (
+  surfaceIds: readonly string[],
+  records: string,
+  pageSize: number,
+  cap: ItemCap,
+  partial = DROPPED_RESOURCE,
+): BatchPaginationDefinition => ({
   surfaceIds,
   cursorFields: ["meta.pagination.total", "meta.pagination.next", "meta.pagination.offset"],
   pageSize: null,
   itemCap: typeof cap === "number" ? cap : null,
   pageCap: null,
-  totalSemantics: `Pages of ${pageSize} ${records} (limit), or the ${records} left under ${capText(cap)} when fewer. The first page sends no offset; each later page sends ${nextOffset(records)}. Without meta.pagination.total the walk runs to an empty page or the cap. ${DROPPED_RESOURCE}`,
+  totalSemantics: `Pages of ${pageSize} ${records} (limit), or the ${records} left under ${capText(cap)} when fewer. The first page sends no offset; each later page sends ${nextOffset(records)}. Without meta.pagination.total the walk runs to an empty page or the cap. ${partial}`,
   stopConditions: [
     `meta.pagination.total ${records} read`,
     `An empty page, which marks the list partial when fewer than meta.pagination.total ${records} were read`,
@@ -791,6 +1168,14 @@ const FRAMEWORK_REPORTS = ["fedramp", "cmmc", "soc2", "cis", "pci_dss", "disa_st
 const RAW_DATA_FILES: Readonly<Record<string, readonly string[]>> = {
   prevention_policies: ["prevention_policies"],
   response_readiness: ["response_policies", "rtr_audit_sessions", "alerts", "contained_hosts"],
+  device_firewall: [
+    "device_control_policies",
+    "device_control_policy_details",
+    "firewall_policies",
+    "firewall_policy_containers",
+    "firewall_rule_groups",
+    "firewall_rules",
+  ],
 };
 
 export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
@@ -833,6 +1218,18 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
       value: "Hosts: Read",
       unlocks: ["contained_hosts"],
     },
+    {
+      id: "device-control-policies-read",
+      kind: "oauth-scope",
+      value: "Device control policies: Read",
+      unlocks: ["device_control_policies", "device_control_policy_details"],
+    },
+    {
+      id: "firewall-management-read",
+      kind: "oauth-scope",
+      value: "Firewall management: Read",
+      unlocks: ["firewall_policies", "firewall_policy_containers", "firewall_rule_group_ids", "firewall_rule_groups", "firewall_rule_ids", "firewall_rules"],
+    },
   ],
   surfaces: CROWDSTRIKE_SURFACES,
   checks,
@@ -840,13 +1237,24 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
     crowdstrike_check_access: [],
     crowdstrike_assess_prevention_policies: idsFor(PREVENTION),
     crowdstrike_assess_response_readiness: idsFor(RESPONSE),
+    crowdstrike_assess_device_firewall: idsFor(DEVICE_FIREWALL),
     crowdstrike_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
-    offsetWalk(["prevention_policies", "response_policies"], "policies", 500, 5000),
+    offsetWalk(["prevention_policies", "response_policies", "device_control_policies", "firewall_policies"], "policies", 500, 5000),
     offsetWalk(["rtr_audit_sessions"], "sessions", 500, 500),
     afterWalk(["alerts"], "alerts", 1000, ALERT_LIMIT),
     offsetWalk(["contained_hosts"], "hosts", 1000, HOST_LIMIT),
+    offsetWalk(["firewall_rule_group_ids", "firewall_rule_ids"], "IDs", 500, RULE_LIMIT, LOOKED_UP),
+    {
+      surfaceIds: ["device_control_policy_details", "firewall_policy_containers", "firewall_rule_groups", "firewall_rules"],
+      cursorFields: ["ids"],
+      pageSize: null,
+      itemCap: "none",
+      pageCap: null,
+      totalSemantics: "Every ID to look up is requested in batches of 100, each ID sent as its own ids query parameter; each batch is one read, and no cursor in its response is followed.",
+      stopConditions: ["Every batch of up to 100 IDs requested"],
+    },
     {
       surfaceIds: ["alert_ids"],
       cursorFields: ["meta.pagination.total"],
