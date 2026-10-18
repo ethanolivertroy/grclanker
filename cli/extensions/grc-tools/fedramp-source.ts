@@ -234,6 +234,23 @@ export interface FedrampSourceStatus {
   notes: string[];
 }
 
+/** Rules provenance for the generated docs, where every field came from a successful GitHub read. */
+export interface FedrampDocsPrimarySource extends FedrampPrimarySourceStatus {
+  blobSha: string;
+  fileHtmlUrl: string;
+}
+
+/** Narrative-repo status for the generated docs, where the repo was read successfully. */
+export interface FedrampDocsSupportingSource extends FedrampSupportingSourceStatus {
+  state: "placeholder" | "ready";
+}
+
+export interface FedrampDocsSources {
+  catalog: FedrampCatalog;
+  primary: FedrampDocsPrimarySource;
+  secondary: FedrampDocsSupportingSource;
+}
+
 export interface FedrampSearchMatch {
   section: Exclude<FedrampSearchSection, "any">;
   id: string;
@@ -273,6 +290,12 @@ type GitHubContentEntry = {
   name?: string;
   type?: string;
 };
+
+/**
+ * Only the docs sync authenticates, with the token from GITHUB_TOKEN or GH_TOKEN.
+ * The cached tool path reads anonymously and tolerates failed metadata reads.
+ */
+type GitHubAuth = { token: string | null };
 
 let catalogMemoryCache:
   | { key: string; expires: number; value: FedrampLoadedCatalog }
@@ -405,100 +428,160 @@ async function writeCacheFile(path: string, value: unknown): Promise<void> {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
-function githubHeaders() {
+function githubHeaders(token: string | null): Record<string, string> {
   return {
     Accept: "application/vnd.github+json",
     "User-Agent": "grclanker-fedramp-sync",
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: githubHeaders() });
-  if (!response.ok) {
-    throw new Error(`Fetch failed: ${url} (${response.status} ${response.statusText})`);
-  }
-  return (await response.json()) as T;
+function githubTokenFromEnv(env: NodeJS.ProcessEnv): string | null {
+  return asString(env.GITHUB_TOKEN) ?? asString(env.GH_TOKEN);
 }
 
-async function fetchPrimarySourceMetadata(): Promise<{
+function errorText(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  return error.cause instanceof Error && error.cause.message
+    ? `${error.message}: ${error.cause.message}`
+    : error.message;
+}
+
+function rateLimitNote(response: Response): string | null {
+  const retryAfter = response.headers.get("retry-after");
+  const exhausted = response.headers.get("x-ratelimit-remaining") === "0";
+  if (response.status !== 429 && !(response.status === 403 && (exhausted || retryAfter !== null))) {
+    return null;
+  }
+  if (retryAfter !== null) return `GitHub rate limit exceeded; retry after ${retryAfter} seconds.`;
+  const resetSeconds = Number(response.headers.get("x-ratelimit-reset"));
+  return resetSeconds > 0
+    ? `GitHub rate limit exceeded; it resets at ${new Date(resetSeconds * 1000).toISOString()}.`
+    : "GitHub rate limit exceeded.";
+}
+
+function failedReadDetail(
+  response: Response,
+  token: string | null,
+  suggestToken: boolean,
+): string | null {
+  const rateLimit = rateLimitNote(response);
+  if (rateLimit) {
+    return suggestToken
+      ? `${rateLimit} Set GITHUB_TOKEN or GH_TOKEN to authenticate GitHub API reads.`
+      : rateLimit;
+  }
+  return response.status === 401 && token
+    ? "GitHub rejected the token from GITHUB_TOKEN or GH_TOKEN."
+    : null;
+}
+
+/**
+ * The token goes to api.github.com only: raw.githubusercontent.com serves the
+ * public catalog without one and answers a rejected token with 404.
+ */
+async function fetchJson<T>(url: string, auth?: GitHubAuth): Promise<T> {
+  const apiRead = url.startsWith(`${GITHUB_API}/`);
+  const token = apiRead ? (auth?.token ?? null) : null;
+  // fetch echoes an invalid header value, token included, in its error message.
+  const failure = (reason: string, detail: string | null = null): Error => {
+    const message = `Fetch failed: ${url} (${reason})${detail ? `. ${detail}` : ""}`;
+    return new Error(token ? message.replaceAll(token, "[REDACTED]") : message);
+  };
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: githubHeaders(token) });
+  } catch (error) {
+    throw failure(errorText(error));
+  }
+  if (!response.ok) {
+    throw failure(
+      `${response.status} ${response.statusText}`.trim(),
+      failedReadDetail(response, token, apiRead && auth !== undefined && !token),
+    );
+  }
+  try {
+    return (await response.json()) as T;
+  } catch (error) {
+    throw failure(`unreadable JSON: ${errorText(error)}`);
+  }
+}
+
+async function fetchPrimarySourceMetadata(auth?: GitHubAuth): Promise<{
   repo: RepoOverviewResponse;
   file: GitHubContentFileResponse;
 }> {
   const [repo, file] = await Promise.all([
     fetchJson<RepoOverviewResponse>(
       `${GITHUB_API}/repos/${FEDRAMP_RULES_SOURCE.org}/${FEDRAMP_RULES_SOURCE.repo}`,
+      auth,
     ),
     fetchJson<GitHubContentFileResponse>(
       `${GITHUB_API}/repos/${FEDRAMP_RULES_SOURCE.org}/${FEDRAMP_RULES_SOURCE.repo}/contents/${FEDRAMP_RULES_SOURCE.path}?ref=${FEDRAMP_RULES_SOURCE.branch}`,
+      auth,
     ),
   ]);
 
   return { repo, file };
 }
 
-async function fetchSupportingSourceMetadata(): Promise<FedrampSupportingSourceStatus> {
-  try {
-    const [repo, contents] = await Promise.all([
-      fetchJson<RepoOverviewResponse>(
-        `${GITHUB_API}/repos/${FEDRAMP_MARKDOWN_SOURCE.org}/${FEDRAMP_MARKDOWN_SOURCE.repo}`,
-      ),
-      fetchJson<GitHubContentEntry[]>(
-        `${GITHUB_API}/repos/${FEDRAMP_MARKDOWN_SOURCE.org}/${FEDRAMP_MARKDOWN_SOURCE.repo}/contents/?ref=${FEDRAMP_MARKDOWN_SOURCE.branch}`,
-      ),
-    ]);
-
-    const rootEntries = contents
-      .map((entry) => asString(entry.name))
-      .filter((entry): entry is string => Boolean(entry))
-      .sort((left, right) => left.localeCompare(right));
-    const isReady =
-      rootEntries.includes("_sources.json") ||
-      rootEntries.some((entry) => entry.endsWith(".md") && entry !== "README.md");
-
-    return {
-      org: FEDRAMP_MARKDOWN_SOURCE.org,
-      repo: FEDRAMP_MARKDOWN_SOURCE.repo,
-      branch: repo.default_branch ?? FEDRAMP_MARKDOWN_SOURCE.branch,
-      repoUrl: repo.html_url ?? FEDRAMP_MARKDOWN_SOURCE.repoUrl,
-      repoUpdatedAt: asString(repo.updated_at),
-      state: isReady ? "ready" : "placeholder",
-      rootEntries,
-      notes: isReady
-        ? []
-        : [
-            "The official FedRAMP/2026-markdown repo exists, but no generated narrative content was found.",
-          ],
-    };
-  } catch (error) {
-    return {
-      org: FEDRAMP_MARKDOWN_SOURCE.org,
-      repo: FEDRAMP_MARKDOWN_SOURCE.repo,
-      branch: FEDRAMP_MARKDOWN_SOURCE.branch,
-      repoUrl: FEDRAMP_MARKDOWN_SOURCE.repoUrl,
-      repoUpdatedAt: null,
-      state: "unavailable",
-      rootEntries: [],
-      notes: [
-        `Unable to inspect FedRAMP/2026-markdown: ${error instanceof Error ? error.message : String(error)}`,
-      ],
-    };
-  }
-}
-
-async function fetchPrimarySourceCatalog(): Promise<{
-  catalog: FedrampCatalog;
-  provenance: FedrampPrimarySourceStatus;
-}> {
-  const emptyRepoMetadata: RepoOverviewResponse = {};
-  const emptyFileMetadata: GitHubContentFileResponse = {};
-  const [rawCatalog, metadata] = await Promise.all([
-    fetchJson<Record<string, unknown>>(FEDRAMP_RULES_SOURCE.rawUrl),
-    fetchPrimarySourceMetadata().catch(() => ({ repo: emptyRepoMetadata, file: emptyFileMetadata })),
+async function fetchSupportingSourceMetadata(auth?: GitHubAuth): Promise<FedrampDocsSupportingSource> {
+  const [repo, contents] = await Promise.all([
+    fetchJson<RepoOverviewResponse>(
+      `${GITHUB_API}/repos/${FEDRAMP_MARKDOWN_SOURCE.org}/${FEDRAMP_MARKDOWN_SOURCE.repo}`,
+      auth,
+    ),
+    fetchJson<GitHubContentEntry[]>(
+      `${GITHUB_API}/repos/${FEDRAMP_MARKDOWN_SOURCE.org}/${FEDRAMP_MARKDOWN_SOURCE.repo}/contents/?ref=${FEDRAMP_MARKDOWN_SOURCE.branch}`,
+      auth,
+    ),
   ]);
 
-  const catalog = normalizeFedrampConsolidatedRules(rawCatalog);
+  const rootEntries = contents
+    .map((entry) => asString(entry.name))
+    .filter((entry): entry is string => Boolean(entry))
+    .sort((left, right) => left.localeCompare(right));
+  const isReady =
+    rootEntries.includes("_sources.json") ||
+    rootEntries.some((entry) => entry.endsWith(".md") && entry !== "README.md");
 
-  const provenance: FedrampPrimarySourceStatus = {
+  return {
+    org: FEDRAMP_MARKDOWN_SOURCE.org,
+    repo: FEDRAMP_MARKDOWN_SOURCE.repo,
+    branch: repo.default_branch ?? FEDRAMP_MARKDOWN_SOURCE.branch,
+    repoUrl: repo.html_url ?? FEDRAMP_MARKDOWN_SOURCE.repoUrl,
+    repoUpdatedAt: asString(repo.updated_at),
+    state: isReady ? "ready" : "placeholder",
+    rootEntries,
+    notes: isReady
+      ? []
+      : [
+          "The official FedRAMP/2026-markdown repo exists, but no generated narrative content was found.",
+        ],
+  };
+}
+
+function unavailableSupportingSource(error: unknown): FedrampSupportingSourceStatus {
+  return {
+    org: FEDRAMP_MARKDOWN_SOURCE.org,
+    repo: FEDRAMP_MARKDOWN_SOURCE.repo,
+    branch: FEDRAMP_MARKDOWN_SOURCE.branch,
+    repoUrl: FEDRAMP_MARKDOWN_SOURCE.repoUrl,
+    repoUpdatedAt: null,
+    state: "unavailable",
+    rootEntries: [],
+    notes: [
+      `Unable to inspect FedRAMP/2026-markdown: ${error instanceof Error ? error.message : String(error)}`,
+    ],
+  };
+}
+
+function primarySourceStatus(
+  catalog: FedrampCatalog,
+  metadata: { repo: RepoOverviewResponse; file: GitHubContentFileResponse },
+): FedrampPrimarySourceStatus {
+  return {
     org: FEDRAMP_RULES_SOURCE.org,
     repo: FEDRAMP_RULES_SOURCE.repo,
     branch:
@@ -515,8 +598,53 @@ async function fetchPrimarySourceCatalog(): Promise<{
     version: catalog.info.version,
     upstreamLastUpdated: catalog.info.lastUpdated,
   };
+}
 
-  return { catalog, provenance };
+async function fetchPrimarySourceCatalog(): Promise<{
+  catalog: FedrampCatalog;
+  provenance: FedrampPrimarySourceStatus;
+}> {
+  const emptyRepoMetadata: RepoOverviewResponse = {};
+  const emptyFileMetadata: GitHubContentFileResponse = {};
+  const [rawCatalog, metadata] = await Promise.all([
+    fetchJson<Record<string, unknown>>(FEDRAMP_RULES_SOURCE.rawUrl),
+    fetchPrimarySourceMetadata().catch(() => ({ repo: emptyRepoMetadata, file: emptyFileMetadata })),
+  ]);
+
+  const catalog = normalizeFedrampConsolidatedRules(rawCatalog);
+  return { catalog, provenance: primarySourceStatus(catalog, metadata) };
+}
+
+/**
+ * Read the catalog and the provenance the generated docs cite, live and with no
+ * fallback, so a failed read or a missing version, blob SHA, or file URL throws
+ * instead of leaving placeholder provenance in the docs.
+ */
+export async function fetchFedrampDocsSources(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<FedrampDocsSources> {
+  const auth: GitHubAuth = { token: githubTokenFromEnv(env) };
+  const [rawCatalog, metadata, secondary] = await Promise.all([
+    fetchJson<Record<string, unknown>>(FEDRAMP_RULES_SOURCE.rawUrl),
+    fetchPrimarySourceMetadata(auth),
+    fetchSupportingSourceMetadata(auth),
+  ]);
+
+  const info = asRecord(asRecord(rawCatalog).info);
+  if (!asString(info.version) || !asString(info.last_updated)) {
+    throw new Error(`${FEDRAMP_RULES_SOURCE.rawUrl} has no info.version or info.last_updated.`);
+  }
+
+  const catalog = normalizeFedrampConsolidatedRules(rawCatalog);
+  const primary = primarySourceStatus(catalog, metadata);
+  const { blobSha, fileHtmlUrl } = primary;
+  if (!blobSha || !fileHtmlUrl) {
+    throw new Error(
+      `GitHub returned no blob SHA or file URL for ${FEDRAMP_RULES_SOURCE.org}/${FEDRAMP_RULES_SOURCE.repo}/${FEDRAMP_RULES_SOURCE.path} on ${FEDRAMP_RULES_SOURCE.branch}.`,
+    );
+  }
+
+  return { catalog, primary: { ...primary, blobSha, fileHtmlUrl }, secondary };
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -1050,7 +1178,7 @@ export async function inspectFedrampOfficialSources(options?: {
   try {
     const [catalog, secondary] = await Promise.all([
       loadFedrampCatalog({ refresh: options?.refresh, homeDir }),
-      fetchSupportingSourceMetadata(),
+      fetchSupportingSourceMetadata().catch(unavailableSupportingSource),
     ]);
     const fetchedAt = new Date().toISOString();
     const payload: SourceCachePayload = {

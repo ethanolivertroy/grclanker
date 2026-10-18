@@ -1,11 +1,11 @@
 import type {
   FedrampApplicability,
   FedrampCatalog,
+  FedrampDocsPrimarySource,
+  FedrampDocsSupportingSource,
   FedrampKsiDomainRecord,
-  FedrampPrimarySourceStatus,
   FedrampProcessRecord,
   FedrampRequirementRecord,
-  FedrampRulesSourceStatus,
 } from "./fedramp-source.js";
 import {
   domainIndicators,
@@ -37,27 +37,24 @@ function markdownList(values: string[], indent = ""): string {
   return values.map((value) => `${indent}- ${value}`).join("\n");
 }
 
-function versionNote(primary: FedrampPrimarySourceStatus): string {
+function versionNote(primary: FedrampDocsPrimarySource): string {
   return `> Generated from the official FedRAMP Consolidated Rules \`${primary.version}\`, last updated upstream on ${primary.upstreamLastUpdated}. [Source details](#source)`;
 }
 
 function sourceSection(
-  primary: FedrampPrimarySourceStatus,
-  secondary: FedrampRulesSourceStatus,
+  primary: FedrampDocsPrimarySource,
+  secondary: FedrampDocsSupportingSource,
 ): string {
-  const blobRef = primary.blobSha ? `\`${primary.blobSha.slice(0, 12)}\`` : "`unknown`";
   const supportingNote =
     secondary.state === "ready"
       ? "Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository."
-      : secondary.state === "placeholder"
-        ? "The official `FedRAMP/2026-markdown` repository exists, but generated narrative content was not found."
-        : "The official `FedRAMP/2026-markdown` repository could not be inspected during this sync.";
+      : "The official `FedRAMP/2026-markdown` repository exists, but generated narrative content was not found.";
 
   return [
     "## Source",
     "",
     `- Generated from the official [${primary.org}/${primary.repo}](${primary.repoUrl}) GitHub repo.`,
-    `- Source path: [\`${primary.path}\`](${primary.fileHtmlUrl ?? primary.rawUrl}) on \`${primary.branch}\` at blob ${blobRef}.`,
+    `- Source path: [\`${primary.path}\`](${primary.fileHtmlUrl}) on \`${primary.branch}\` at blob \`${primary.blobSha.slice(0, 12)}\`.`,
     `- Consolidated Rules version: \`${primary.version}\` · upstream \`last_updated\`: \`${primary.upstreamLastUpdated}\`.`,
     `- ${supportingNote}`,
   ].join("\n");
@@ -159,8 +156,8 @@ function requirementMarkdown(requirement: FedrampRequirementRecord): string {
 function processPage(
   catalog: FedrampCatalog,
   process: FedrampProcessRecord,
-  primary: FedrampPrimarySourceStatus,
-  secondary: FedrampRulesSourceStatus,
+  primary: FedrampDocsPrimarySource,
+  secondary: FedrampDocsSupportingSource,
 ): GeneratedFedrampDoc {
   const requirements = processRequirements(catalog, process.id);
   const grouped = {
@@ -251,8 +248,8 @@ function processPage(
 function ksiDomainPage(
   catalog: FedrampCatalog,
   domain: FedrampKsiDomainRecord,
-  primary: FedrampPrimarySourceStatus,
-  secondary: FedrampRulesSourceStatus,
+  primary: FedrampDocsPrimarySource,
+  secondary: FedrampDocsSupportingSource,
 ): GeneratedFedrampDoc {
   const indicators = domainIndicators(catalog, domain.id);
   const lines = [
@@ -321,8 +318,8 @@ function ksiDomainPage(
 export function buildFedrampDocsSnapshot(
   catalog: FedrampCatalog,
   options: {
-    primary: FedrampPrimarySourceStatus;
-    secondary: FedrampRulesSourceStatus;
+    primary: FedrampDocsPrimarySource;
+    secondary: FedrampDocsSupportingSource;
   },
 ): GeneratedFedrampDoc[] {
   const { primary, secondary } = options;
