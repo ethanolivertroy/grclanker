@@ -39,7 +39,7 @@ import {
 import { KNOWBE4_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
 import { KNOWBE4_SPEC } from "../dist/extensions/grc-tools/knowbe4.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertBundlePathsMatchSpec, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
 import { assertRequestConformance, recordFetchRequests, sweepCheckCompleteness } from "./helpers/spec-conformance.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
@@ -3085,4 +3085,16 @@ portableContractTest("completeness sweep: a truncated, refused, failed, or uncol
     { status: inactive.status, partial: inactive.evidence.partial_activity_data, unsampled: inactive.evidence.unsampled_security_tests },
     { status: "pass", partial: true, unsampled: 5 },
   );
+});
+
+portableContractTest("the export writes every declared bundle path and nothing else, with and without collection errors or PhishER", async () => {
+  const complete = httpKnowbe4(healthyFixture());
+  const completeExport = await exportKnowbe4AuditBundle(complete.client, complete.config, createTempBase("grclanker-knowbe4-bundle-paths-"), { now: NOW });
+  assertBundlePathsMatchSpec(assert, completeExport.outputDir, KNOWBE4_SPEC);
+  assert.ok(!readBundleFiles(completeExport.outputDir).has("_errors.log"));
+
+  const partial = httpKnowbe4(healthyFixture(), { phisher: false, routes: { "GET /v1/groups": jsonForbiddenWithUrl() } });
+  const partialExport = await exportKnowbe4AuditBundle(partial.client, partial.config, createTempBase("grclanker-knowbe4-bundle-paths-"), { now: NOW });
+  assertBundlePathsMatchSpec(assert, partialExport.outputDir, KNOWBE4_SPEC);
+  assert.ok(readBundleFiles(partialExport.outputDir).has("_errors.log"));
 });
