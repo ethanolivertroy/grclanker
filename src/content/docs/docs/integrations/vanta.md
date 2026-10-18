@@ -82,3 +82,6 @@ The smoke test skips when `VANTA_CLIENT_ID` or `VANTA_CLIENT_SECRET` is missing.
 - The integration exposes the Auditor API only. It does not manage Vanta controls, tests, users, or integrations.
 - Visibility is limited to audits granted to the OAuth client.
 - A partial download still produces the package and records each failure in `_errors.log`.
+- Incomplete Auditor API pagination fails the request. A missing `endCursor`, a repeated cursor, a later 404 (including after a page that returned no items), or the 500-page cap does not return the pages already read as a complete list. When evidence URL pagination fails, the evidence item is recorded in `_errors.log` and its files are not treated as absent.
+- Authentication and API error text redacts the client id, client secret, and access token before the response body is shortened for display.
+- A download that redirects off HTTPS records the destination host and path in `_errors.log` and omits userinfo and the query string, so a signed URL is not written into the package.
