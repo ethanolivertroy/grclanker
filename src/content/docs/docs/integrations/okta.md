@@ -163,7 +163,7 @@ All tools accept the same optional auth arguments listed above.
 
 ## Control coverage
 
-Every row below is also subject to the truncation demotion of rule 7. When any inventory the finding reads was truncated, a `Pass` caps at `Partial`, and the summary and evidence carry the walk's note.
+Every row below is also subject to the truncation demotion in rule 7 of [Verdict safety](#verdict-safety). When any inventory the finding reads was truncated, a `Pass` caps at `Partial`, and the summary and evidence carry the walk's note.
 
 The inventories each finding reads for this purpose are:
 
@@ -312,7 +312,7 @@ The assessors follow these rules so a verdict never rests on missing or partial 
      - The note is appended to the finding's summary as `Inventory truncated: ...` and to its evidence as `Partial data: ...`.
      - `_errors.log` lists it as `Truncated inventory: ...`.
      - Every `snapshot` counter derived from that inventory renders `null` rather than the count of the part read, since a `0` there would claim an absence from the unread part. For example, `custom_network_zones` renders `null` while the zone list is truncated.
-   - **Redaction:** `core_data/` records have credential fields (client secrets, passwords, hook header values, tokens) replaced by `[REDACTED]`. Event hook URIs are reduced to scheme and host. System Log events are projected to identity and outcome fields (see Export bundle).
+   - **Redaction:** `core_data/` records have credential fields (client secrets, passwords, hook header values, tokens) replaced by `[REDACTED]`. Event hook URIs are reduced to scheme and host. System Log events are projected to identity and outcome fields (see [Record redaction](#record-redaction)).
 8. Re-running the export never overwrites a prior bundle.
    - The bundle directory is `<org host>-audit-bundle`, for example `your-org.okta.com-audit-bundle`.
    - Repeat runs allocate `-2` through `-10` and fail once all ten names are taken.

@@ -89,7 +89,7 @@ Either `SPLUNK_TOKEN` or both `SPLUNK_USERNAME` and `SPLUNK_PASSWORD` are requir
 
 The TLS verification opt-out is implemented with a per-request `node:https` agent (`rejectUnauthorized: false`). The inspector never sets `process.env.NODE_TLS_REJECT_UNAUTHORIZED`, so other tools in the same process keep verifying certificates.
 
-Error messages are scrubbed as described under Export bundle layout.
+Error messages are scrubbed by the [error text rules](#error-text-carriers).
 
 ## Run it
 
@@ -143,7 +143,7 @@ Each assessment returns findings shaped as `{ id, control, title, severity, stat
 - `analysis/findings.json`, one JSON file per assessment area, and `analysis/summary.md`, all passed through the same redactor.
 - `compliance/executive_summary.md`, `compliance/unified_compliance_matrix.md`, and one report per framework (`fedramp.md`, `cmmc.md`, `soc2.md`, `cis.md`, `pci.md`, `stig.md`, `irap.md`, `ismap.md`).
 - `QUICK_REFERENCE.md`.
-- `_errors.log` when any collection step failed. It lists one `[<dataset>] <error>` line per failed read, with every message scrubbed by the error text rule below.
+- `_errors.log` when any collection step failed. It lists one `[<dataset>] <error>` line per failed read, with every message scrubbed by the [error text rules](#error-text-carriers).
   - The dataset sits in brackets because `tokens: Splunk ...` would read as a session-key carrier to that rule.
 - A `.zip` archive named after the allocated directory.
 

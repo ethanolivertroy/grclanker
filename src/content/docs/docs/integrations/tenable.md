@@ -110,7 +110,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 `tenable_export_audit_bundle` writes into `<platform host>-audit-bundle` under `output_dir` (default `./export/tenable`):
 
-- `core_data/`: API snapshots with credential-bearing values redacted (see below).
+- `core_data/`: API snapshots with credential-bearing values redacted (see [Bundle redaction](#bundle-redaction)).
 - `analysis/`: findings.json and per-category summaries.
 - `compliance/`: executive summary, unified matrix, one report per framework.
 - `QUICK_REFERENCE.md`.

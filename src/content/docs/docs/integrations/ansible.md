@@ -31,7 +31,7 @@ Findings carry:
 
 Nothing is written to the controller.
 
-The bundle never records the token or password used to authenticate. It also does not rely on the API's own `$encrypted$` masking. Every `core_data/` snapshot is projected to the fields the verdicts read before it is written, and credential-bearing values are replaced by `[REDACTED]` at that step (see the bundle layout below).
+The bundle never records the token or password used to authenticate. It also does not rely on the API's own `$encrypted$` masking. Every `core_data/` snapshot is projected to the fields the verdicts read before it is written, and credential-bearing values are replaced by `[REDACTED]` at that step (see [Bundle redaction](#bundle-redaction)).
 
 ## Setup and authentication
 

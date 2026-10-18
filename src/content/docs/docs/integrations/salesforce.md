@@ -228,7 +228,7 @@ This section is reference for reviewing findings and bundles: how unread, partia
 
 ### Partial and unread inputs
 
-Every finding is gated on the datasets it reads (the `Inputs` column below):
+Every finding is gated on the datasets it reads (the `Inputs` column of the [Control coverage](#control-coverage) table):
 
 - **Unread input:** The finding is `manual` when its primary dataset was forbidden (401/403 or `INSUFFICIENT_ACCESS`), unavailable (`INVALID_TYPE`, `INVALID_FIELD`), or errored.
   - Its summary names the dataset and the observed status ("... could not be verified because the TwoFactorMethodsInfo query was forbidden (403 ...)").

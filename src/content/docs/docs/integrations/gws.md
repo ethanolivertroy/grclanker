@@ -5,7 +5,7 @@ description: Read-only Google Workspace security inspector covering identity, 2-
 
 The Google Workspace inspector (`gws_*` tools) reviews identity, privileged access, third-party OAuth integrations, and security monitoring in a Google Workspace tenant.
 
-It is read-only. Every request is a GET against a documented Google API, and nothing is written back to the tenant. Every verdict follows the verdict-safety rules described below.
+It is read-only. Every request is a GET against a documented Google API, and nothing is written back to the tenant. Every verdict follows the [verdict-safety rules](#verdict-safety-rules).
 
 - **Spec:** `specs/gws-inspector-go.spec.md`
 - **Implementation:** `cli/extensions/grc-tools/gws.ts`
@@ -99,8 +99,6 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 ## Control coverage
 
-Verdicts on unread, partial, or truncated data follow the [verdict-safety rules](#verdict-safety-rules).
-
 19 of 19 spec controls are automated.
 
 Status semantics:
@@ -109,6 +107,8 @@ Status semantics:
 - `Partial`: The control holds only partially, or the credential saw a partial view.
 - `Fail`: The documented flags contradict the control.
 - `Manual`: The verdict could not be reached automatically (unreadable endpoint, empty inventory, surface not collected). The summary names the evidence a human must collect.
+
+Verdicts on unread, partial, or truncated data follow the [verdict-safety rules](#verdict-safety-rules).
 
 | # | Control | Tool | Finding | Pass condition | Manual when |
 | --- | --- | --- | --- | --- | --- |
@@ -168,17 +168,17 @@ Bundle contents:
 - `core_data/`: API snapshots.
   - Files: `users.json`, `roles.json`, `role_assignments.json`, `login_activities.json`, `admin_activities.json`, `token_activities.json`, `token_inventory.json`, `alerts.json`, `two_step_verification_policies.json`.
   - Each is a `{status, endpoint, data, seen, pages, truncated}` object whose `status` names the endpoint and reads `complete`, `partial`, `unreadable`, or `not collected`.
-  - A read that failed or never happened writes `error` and `errorKind`, with `data`, `seen`, `pages`, and `truncated` all `null`, never `[]`, `0`, or `false` (verdict-safety rule 11).
+  - A read that failed or never happened writes `error` and `errorKind`, with `data`, `seen`, `pages`, and `truncated` all `null`, never `[]`, `0`, or `false` ([verdict-safety rule 11](#verdict-safety-rules)).
   - `token_inventory.json` adds `total`, `failed`, `failures` (per-user `userId`, `primaryEmail`, and the projected error), and `readable_users` (`3 of 4`).
     - Its `data` is null when every sampled read failed or the sample was never drawn.
     - Its `truncated` is null whenever any read failed, because the sample cap no longer describes completeness.
-  - Every record is projected to the documented fields listed under the endpoint reference, and credential-like values are redacted (verdict-safety rule 9).
+  - Every record is projected to the documented fields listed under the endpoint reference, and credential-like values are redacted ([verdict-safety rule 9](#verdict-safety-rules)).
 - `analysis/`: `findings.json` plus one JSON and one Markdown summary per category.
 - `compliance/`: `executive_summary.md`, `unified_compliance_matrix.md`, and one report per framework (`fedramp/`, `cmmc/`, `soc2/`, `disa_stig/`, `irap/`, `ismap/`, `pci_dss/`, `cis/`).
 - `QUICK_REFERENCE.md`
 - `_errors.log`: Only when at least one collection failed, with one `<endpoint>: <status and reasons>` line per failure.
 
-Findings and collection errors are redacted as objects before any Markdown or JSON is rendered. Every file above passes through the same text scrubber on its way to disk (verdict-safety rule 9). As a result, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log`, and the zip entries carry the same guarantees as `core_data/`.
+Findings and collection errors are redacted as objects before any Markdown or JSON is rendered. Every file above passes through the same text scrubber on its way to disk ([verdict-safety rule 9](#verdict-safety-rules)). As a result, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log`, and the zip entries carry the same guarantees as `core_data/`.
 
 Pass `frameworks` (for example `["soc2", "cis"]`) to limit the per-framework reports. Output paths are validated against traversal and symlinked parents.
 

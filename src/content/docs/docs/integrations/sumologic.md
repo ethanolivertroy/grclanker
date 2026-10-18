@@ -69,7 +69,7 @@ The client also:
 - Uses `limit`/`offset` for the Collector Management and monitor search APIs.
 - Retries 429 and 5xx responses with backoff, honoring `Retry-After` when present.
 - Enforces a request timeout.
-- Scrubs error messages as described under Export bundle.
+- Scrubs error messages by the [error text rules](#error-text-carriers).
 
 ### Deployments
 
@@ -134,7 +134,7 @@ Every run allocates a fresh output directory and a zip with the same base name, 
   - When every issued lookup failed, the dataset is the marker with `error` starting `every content permission lookup failed (N of N):` followed by each item's error. No single status or endpoint stands for the set. In that case, `org_shared_items` renders `null` in the summary and in the evidence of controls 11 and 18.
   - Otherwise the dataset holds one row per sampled item (`id`, `name`, `itemType`, `ok`, `permissions`). It is `complete` only when every lookup succeeded.
 - `core_data/access_check.json` carries the same nulls per surface: `count`, `complete`, and `httpStatus` are `null` on a probe that did not succeed, and `httpStatus` is `null` on a readable one.
-- `_errors.log` lists `<area>: <dataset>: <error>`, with every message scrubbed by the error text rule below.
+- `_errors.log` lists `<area>: <dataset>: <error>`, with every message scrubbed by the [error text rules](#error-text-carriers).
 - `analysis/<area>.json` holds the assessment summary, findings, and errors.
 - `QUICK_REFERENCE.md` and the `compliance/` reports hold finding text only.
 
@@ -357,7 +357,7 @@ Unreadable endpoints, empty inventories, capability-limited views, and unfollowe
 - A finding that reads several inventories never passes while one of them is unreadable.
   - The summary appends `Not checked: the <inventory> could not be read because <cause>; collect manually: ...`.
   - `evidence.unreadable_inventories` names the inventory.
-  - The pass drops to `warn` when the control can still be judged from the readable inventories, or to `manual` when the unreadable inventory is essential (the rows below say which).
+  - The pass drops to `warn` when the control can still be judged from the readable inventories, or to `manual` when the unreadable inventory is essential (the [Control coverage](#control-coverage) rows say which).
   - Existing `warn`, `fail`, and `manual` verdicts keep their status and gain the note.
 - A list whose pagination stopped early (`complete: false`) drops a pass judged on it to `warn`.
   - The summary states how many items were seen and that the population is incomplete.

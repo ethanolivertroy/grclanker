@@ -399,7 +399,7 @@ A snapshot that was refused, not on the plan, or failed is never written as an e
 
 Every assessment summary carries a `collection` object with one entry per snapshot it read (`status`, `endpoint`, `http_status`, `seen`, `truncated`, `truncation_reason`, `pages`, `error`).
 
-- `truncated`: Derived from the observed page walk (the reasons listed under the tools below), never from a default.
+- `truncated`: Derived from the observed page walk (the reasons listed under [Pagination and truncation](#pagination-and-truncation)), never from a default.
 - `truncation_reason`: Names why paging stopped. It is `null` for a list read to completion.
 - `seen`, `truncated`, and `pages`: Render `null` for a snapshot that was not read. `seen` also renders `null` for a truncated list that delivered no item (`0` would read as an empty inventory).
 

@@ -29,7 +29,7 @@ The verdict for a non-compliant product depends on the finding:
 The `manual` cases are:
 
 - The absence of both products.
-- A failed read of a surface the finding depends on (the partial-view rule under Control coverage).
+- A failed read of a surface the finding depends on (the partial-view rule under [Unreadable surfaces](#unreadable-surfaces)).
 - For PA-19, zero readable PAN-OS administrators.
 
 ### Prisma Cloud

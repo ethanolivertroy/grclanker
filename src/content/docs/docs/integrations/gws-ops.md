@@ -93,7 +93,7 @@ The bridge applies the inspector's verdict-safety rules that are meaningful for 
   - It names the zip after the allocated directory and never overwrites an earlier directory or zip.
   - It fails once all six names are taken.
   - Output paths are validated against traversal and symlinked parents.
-- Bundle secret hygiene and error text hygiene, each described in its own section below.
+- [Bundle secret hygiene](#bundle-secret-hygiene) and [error text hygiene](#error-text-hygiene), each described in its own section.
 
 ## Alert Center caveat
 

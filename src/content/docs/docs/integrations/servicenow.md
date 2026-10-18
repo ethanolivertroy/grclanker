@@ -234,7 +234,7 @@ Otherwise it:
   - ACL `condition` and `script` bodies are reduced to `has_condition` and `has_script`.
 - A `Link rel="next"` that arrives with an empty page or a non-advancing offset, or a non-empty read without `X-Total-Count`, is reported as truncated or "total unknown".
   - `total_rows` is reported only when the header was returned, and is `null` otherwise.
-  - Such a read counts as a partial input under Partial and unread inputs above. A would-be `pass` on it becomes `warn`, and an absence-driven `fail` is capped at `manual` with the names of the things not seen dropped.
+  - Such a read counts as a partial input under [Partial and unread inputs](#partial-and-unread-inputs). A would-be `pass` on it becomes `warn`, and an absence-driven `fail` is capped at `manual` with the names of the things not seen dropped.
   - A `fail` observed on a visible row stands.
   - A finding that reads several inventories stays `manual` while any one of them is forbidden.
 - Rate limiting (429 with `Retry-After`) and 5xx responses are retried with backoff up to `max_retries`.
@@ -250,7 +250,7 @@ This section is reference for reviewing findings and bundles: how unread, partia
 
 ### Partial and unread inputs
 
-Every finding is gated on the tables it reads (the `Inputs` column below), in this order:
+Every finding is gated on the tables it reads (the `Inputs` column of the [Control coverage](#control-coverage) table), in this order:
 
 - **Unread input:** The finding is `manual` when any input was forbidden (401/403), ACL-filtered, or errored.
   - Its summary names the table and the observed status ("Verdict unknown: sys_user read was forbidden (403)").

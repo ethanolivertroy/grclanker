@@ -44,7 +44,7 @@ Requests are signed per the documented `VERACODE-HMAC-SHA-256` scheme:
 - The key chain `HMAC(key, nonce) -> HMAC(., timestamp) -> HMAC(., "vcode_request_version_1")`.
 - A final HMAC over the data string.
 
-The key ID and secret are removed from error messages as described under Export bundle. They are never written into bundles.
+The key ID and secret are removed from error messages by the [error text rules](#error-text-carriers). They are never written into bundles.
 
 ## Run it
 
@@ -373,7 +373,7 @@ A page-cap exit (with or without page metadata), a repeated page, or a `total_el
 
 Any sampled or team-scoped partial view downgrades `pass` to `warn` with seen and total counts.
 
-Bundle JSON has credential-named fields, JWT-shaped values, and URL userinfo or query strings replaced by `[REDACTED]`. Dynamic scan configurations are projected to their non-secret settings. Every surface that was not collected is written as a marker object rather than an empty list (see Export bundle).
+Bundle JSON has credential-named fields, JWT-shaped values, and URL userinfo or query strings replaced by `[REDACTED]`. Dynamic scan configurations are projected to their non-secret settings. Every surface that was not collected is written as a marker object rather than an empty list (see [Unread surfaces](#unread-surfaces)).
 
 ## Official documentation
 

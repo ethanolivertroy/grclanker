@@ -111,7 +111,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 | `gcp_assess_network_security` | Controls 4, 9, 10, 18, 19, 22 | `max_assets` (2000), `project_limit` |
 | `gcp_export_audit_bundle` | Run everything and write the shared bundle layout | `output_dir` (`./export/gcp`) plus every option above |
 
-### Project cap and pagination
+### Project cap
 
 `project_limit` (alias `max_projects`, default 20) caps how many projects are inventoried. When the cap truncates the inventory, every dependent finding is downgraded to `warn` with seen and total counts, so a partial view can never pass.
 
@@ -226,7 +226,7 @@ This section is reference for reviewing findings and bundles: how unread, partia
 
 ### Pagination
 
-Every paginated list follows `nextPageToken` until the API stops returning one. A list that exits early for any other reason is recorded as truncated and downgrades its findings the same way:
+Every paginated list follows `nextPageToken` until the API stops returning one. A list that exits early for any other reason is recorded as truncated, so the findings that depend on it can't pass:
 
 - The per-list item cap was reached.
 - The cursor repeated itself.

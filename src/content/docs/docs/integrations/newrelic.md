@@ -53,7 +53,7 @@ audit_window_days: 30
 
 Resolution precedence is explicit tool arguments, then environment variables, then the config file, then defaults (US region, account discovery through `actor.accounts`). The audit bundle's `metadata.json` records the `source_chain` that was used.
 
-The API key is never requested from the API. Every error message is scrubbed of credential material before it is stored (see rule 13 under "Verdict safety"). So neither the configured key nor a credential an upstream error page happens to carry appears in an audit bundle.
+The API key is never requested from the API. Every error message is scrubbed of credential material before it is stored (see rule 13 under [Verdict safety](#verdict-safety)). So neither the configured key nor a credential an upstream error page happens to carry appears in an audit bundle.
 
 A config file that fails to parse is reported as `invalid YAML in <path> at line N, column M (<code>)`. A file that cannot be read is reported as `Unable to read New Relic config file <path> (<code>)`.
 
@@ -150,7 +150,7 @@ The directory contains:
 - `core_data/*.json`: NerdGraph and REST records projected to the fields each query selects.
   - The records cover accounts, organization, authentication domains, users, group role grants, roles, API keys, audit events, alert policies and conditions, destinations, channels, workflows, alertable entities, workloads, retention rules and namespaces, obfuscation rules and expressions, pipeline cloud rules, drop rules, dashboards, live URL metadata, synthetic monitors, secure credentials, script scan results, log scan counts, and infrastructure host and agent version rows.
   - A file whose query failed, was never issued, or lost a scope is written as `{ status, records }` rather than as an empty list. Its records are the readable rows for a partial listing, or `null` when nothing was read.
-  - See "Bundle secret hygiene" below for what is deliberately not stored.
+  - See [Bundle secret hygiene](#bundle-secret-hygiene) for what is deliberately not stored.
 - `analysis/findings.json` plus `analysis/identity.json`, `analysis/access_control.json`, `analysis/alerting.json`, and `analysis/data_governance.json`.
   - Every count in a category `summary` carries a paired `*_status` naming the queries it rests on. The status is `complete`, `truncated`, `partial`, `unreadable`, or `not collected`, with `null` beside the last three.
   - Each category file lists its `coverage` limitations: truncated lists, unreadable datasets and scopes with their query paths, and fallback pagination.
@@ -302,7 +302,7 @@ Every fallback is recorded as an incomplete listing:
 
 Other API behavior:
 
-- Every field in every NerdGraph selection is traceable to a public docs.newrelic.com page or to the public NerdGraph schema. See "NerdGraph field provenance" below.
+- Every field in every NerdGraph selection is traceable to a public docs.newrelic.com page or to the public NerdGraph schema. See [NerdGraph field provenance](#nerdgraph-field-provenance).
 - A NerdGraph response that carries `errors` entries is treated as a failed read even when it also carries partial `data`.
 - REST API v2 calls send `Api-Key` and follow RFC 5988 `Link` headers (`rel="next"`) or the `page=` parameter.
 - HTTP 429, 500, 502, 503, and 504 responses are retried up to three times.

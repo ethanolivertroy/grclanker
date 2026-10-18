@@ -280,7 +280,7 @@ Statements are submitted with `POST /api/v2/statements?async=true` and polled wi
 - **Request URLs:** The request layer refuses the same shapes before any credential is built (`Snowflake SQL API request refused: the request URL <reason>, so no request was sent.`).
 - **Refusal text:** Every refusal is fixed text naming only the configured origin and the rejected origin. No path, query, fragment, or userinfo of the returned URL reaches any text.
 - **Partitions:** The response that completes the statement carries partition 0 in its `data`. When `resultSetMetaData.partitionInfo` lists more than one partition, each additional partition (1 through the last, within `max_partitions`) is fetched with `GET /api/v2/statements/{handle}?partition=N`.
-- **Errors:** `429` and `5xx` responses are retried with exponential backoff. HTTP timeouts abort the request. Error messages are scrubbed as described under Export bundle.
+- **Errors:** `429` and `5xx` responses are retried with exponential backoff. HTTP timeouts abort the request. Error messages are scrubbed by the [error text rules](#error-text-carriers).
 
 Every statement outcome carries `status` (`ok`, `denied`, `error`, `timeout`, or `not_requested`). The outcome carries `numRows`, `partitionCount`, `fetchedPartitions`, and `truncated` only when `ok`. A statement that did not complete has all four set to `null` rather than `0` or `false`.
 
