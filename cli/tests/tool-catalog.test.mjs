@@ -147,7 +147,13 @@ test("tool catalog docs markdown is generated from registered tools", () => {
   const markdown = buildToolCatalogMarkdown(tools);
 
   assert.match(markdown, /title: Tool Catalog/);
-  assert.match(markdown, new RegExp(`- ${countTools(tools, "domain")} domain tools`));
+  assert.match(
+    markdown,
+    new RegExp(
+      `grclanker ships ${countTools(tools, "domain")} domain tools and ${countTools(tools, "compute")} compute backend tools\\.`,
+    ),
+  );
+  assert.match(markdown, /`grclanker tools <name>` shows one tool's parameters/);
   assert.match(markdown, /## Ansible AAP/);
   assert.match(markdown, /\| `ansible_export_audit_bundle` \| Export Ansible AAP audit bundle \|/);
   assert.match(markdown, /## AWS/);
@@ -166,4 +172,18 @@ test("tool catalog docs markdown is generated from registered tools", () => {
   assert.match(markdown, /\| `webex_export_audit_bundle` \| Export Webex audit bundle \|/);
   assert.match(markdown, /## Zoom/);
   assert.match(markdown, /\| `zoom_export_audit_bundle` \| Export Zoom audit bundle \|/);
+});
+
+test("tool catalog docs list the compute backend tools last, each with a purpose", () => {
+  const markdown = buildToolCatalogMarkdown(getRegisteredToolSummaries());
+  const headings = [...markdown.matchAll(/^## (.+)$/gm)].map((match) => match[1]);
+
+  assert.equal(headings.at(-1), "Compute Backend");
+  assert.match(
+    markdown,
+    /\n## Compute Backend\n\nYour \[compute backend\]\(\/docs\/getting-started\/compute-backends\/\) decides where these run\.\n\n\| Tool \| Purpose \|/,
+  );
+  assert.match(markdown, /\| `bash` \| Execute a bash command in the current working directory \|/);
+  assert.match(markdown, /\| `edit` \| Edit a single file using exact text replacement \|/);
+  assert.doesNotMatch(markdown, /\(compute backend\)/);
 });

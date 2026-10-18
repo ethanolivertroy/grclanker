@@ -1,26 +1,11 @@
 ---
 title: Tool Catalog
-description: Bundled grclanker GRC and compute tools grouped by domain.
+description: Every tool grclanker ships, with a one-line purpose for each, grouped by integration and data source.
 ---
 
-`grclanker tools` lists the same bundled extension registration surface the agent uses at runtime. Use `grclanker tools <name>` for detailed parameter help, or `grclanker tools --json` for automation.
+grclanker ships 241 domain tools and 7 compute backend tools. The domain tools do the GRC work and are grouped below by name prefix, such as `aws_` for AWS or `fedramp_` for FedRAMP. The compute backend tools, listed last, run shell commands and read, search, and change files.
 
-Current bundled surface:
-
-- 241 domain tools
-- 7 compute backend tools
-
-## Compute Backend
-
-| Tool | Purpose |
-|---|---|
-| `bash` | bash (compute backend) |
-| `edit` | edit (compute backend) |
-| `find` | find (compute backend) |
-| `grep` | grep (compute backend) |
-| `ls` | ls (compute backend) |
-| `read` | read (compute backend) |
-| `write` | write (compute backend) |
+From a terminal, `grclanker tools` prints the same list, `grclanker tools <name>` shows one tool's parameters, and `grclanker tools --json` prints the list as JSON for scripts.
 
 ## Ansible AAP
 
@@ -462,3 +447,17 @@ Current bundled surface:
 | `zscaler_assess_zpa` | Assess ZPA zero trust access |
 | `zscaler_check_access` | Check Zscaler audit access |
 | `zscaler_export_audit_bundle` | Export Zscaler audit bundle |
+
+## Compute Backend
+
+Your [compute backend](/docs/getting-started/compute-backends/) decides where these run.
+
+| Tool | Purpose |
+|---|---|
+| `bash` | Execute a bash command in the current working directory |
+| `edit` | Edit a single file using exact text replacement |
+| `find` | Search for files by glob pattern |
+| `grep` | Search file contents for a pattern |
+| `ls` | List directory contents |
+| `read` | Read the contents of a file |
+| `write` | Write content to a file |
