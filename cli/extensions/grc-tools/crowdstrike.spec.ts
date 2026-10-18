@@ -522,6 +522,7 @@ const lte = (left: string | VerdictOperand, right: PortableValue | VerdictOperan
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const some = (name: string, condition: VerdictCondition): VerdictCondition => ({ op: "some", path: name, condition });
+const none = (name: string, condition: VerdictCondition): VerdictCondition => ({ op: "not", condition: some(name, condition) });
 const always: VerdictCondition = { op: "always" };
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
 // Whole tenths of a percent: the runtime compares Math.round(part / total * 1000) / 10.
@@ -692,10 +693,12 @@ const CROWDSTRIKE_INPUTS: Readonly<Record<string, string>> = {
   below_threshold_host_count: `The meta.pagination.total of the read under the below-threshold filter alone, ${AS_NUMBER}; when it does not read as one, the number of JSON objects the walk sorted by score under that filter returned. ${ZTA_THRESHOLD}`,
   below_threshold_total_reported: `True when the read under the below-threshold filter alone reported a meta.pagination.total that reads as a number. ${ZTA_THRESHOLD}`,
   users_readable: "True when the GET /user-management/queries/users/v1 walk and every POST /user-management/entities/users/GET/v1 lookup of the UUIDs it listed returned without a refusal.",
+  users_complete: "User list coverage.",
   users: `One entry per returned user, in the order returned, whatever its status. local_part is the user's uid, else its email, read as text and cut before its first @, or empty when neither reads as text. roles_readable is true when the user's role grant walk, GET /user-management/combined/user-roles/v2 for its uuid, else its id, read as text, returned without a refusal. role_list_partial is true when that walk ${walkStops("500 role grants")}, or a returned grant is not a JSON object. role_count is the number of distinct texts among the user's returned role grants' role_id, else role_name, read as text. admin_role_count is the number of distinct labels, role_name, else role_id, read as text, among the user's returned role grants whose role_name or role_id contains admin in any letter case. last_login_age_ms is the milliseconds from the user's last_login_at to the assessment time when last_login_at parses as a date, else null. ${READS_AS_TEXT} ${PARSES_AS_DATE}`,
   admin_user_count: "Number of entries in users whose admin_role_count is above 0.",
   max_admins: `The ${optionValue("max_admins", 5, 10000, 0)}.`,
   role_catalog_readable: "True when GET /user-management/queries/roles/v1 and every GET /user-management/entities/roles/v1 lookup of the IDs it listed returned without a refusal.",
+  role_catalog_complete: "Role catalog coverage.",
   max_roles_per_user: `The ${optionValue("max_roles_per_user", 5, 100)}.`,
   api_clients_readable: "True when the GET /api-clients/queries/api-clients/v1 walk and every GET /api-clients/entities/api-clients/v1 lookup of the IDs it listed returned without a refusal.",
   api_clients_complete: "API client list coverage.",
@@ -770,12 +773,28 @@ const API_CLIENTS_COMPLETE = lookupWalkComplete("api_client_ids", "api_clients",
 const IOA_EXCLUSIONS_COMPLETE = lookupWalkComplete("ioa_exclusion_ids", "ioa_exclusions", "IOA exclusion list", "exclusions", "exclusion_limit IDs");
 const ML_EXCLUSIONS_COMPLETE = lookupWalkComplete("ml_exclusion_ids", "ml_exclusions", "machine learning exclusion list", "exclusions", "exclusion_limit IDs");
 const SENSOR_VISIBILITY_EXCLUSIONS_COMPLETE = lookupWalkComplete("sensor_visibility_exclusion_ids", "sensor_visibility_exclusions", "sensor visibility exclusion list", "exclusions", "exclusion_limit IDs");
-const IDENTITY_PROTECTION_RULES_COMPLETE = completeFrom(
-  "false when the identity protection policy rule list is partial: its one ID read reported no meta.pagination.total, or a total larger than the number of IDs it returned, or the lookups of the IDs it listed returned fewer rules than it listed.",
+const singleReadComplete = (
+  idSurfaceId: string,
+  recordSurfaceId: string,
+  list: string,
+  records: string,
+): BatchCompletenessDefinition => completeFrom(
+  `false when the ${list} is partial: its one ID read reported no meta.pagination.total, or a total larger than the number of IDs it returned, or the lookups of the IDs it listed returned fewer ${records} than it listed.`,
   [
-    { surfaceId: "identity_protection_rule_ids", falseWhen: ["truncated"] },
-    { surfaceId: "identity_protection_rules", falseWhen: ["truncated"], scope: "fewer rules returned than IDs listed" },
+    { surfaceId: idSurfaceId, falseWhen: ["truncated"] },
+    { surfaceId: recordSurfaceId, falseWhen: ["truncated"], scope: `fewer ${records} returned than IDs listed` },
   ],
+);
+const USERS_COMPLETE = completeFrom(
+  `false when the user list is partial: its UUID walk ${walkStops("user_limit UUIDs")}.`,
+  [{ surfaceId: "user_uuids", falseWhen: ["truncated"] }],
+);
+const ROLE_CATALOG_COMPLETE = singleReadComplete("role_ids", "roles", "role catalog", "roles");
+const IDENTITY_PROTECTION_RULES_COMPLETE = singleReadComplete(
+  "identity_protection_rule_ids",
+  "identity_protection_rules",
+  "identity protection policy rule list",
+  "rules",
 );
 
 type CrowdstrikeCheck = {
@@ -1668,8 +1687,10 @@ const withAdmins = (count: number) => ({
   users: [...Array.from({ length: count }, (_, index) => person(`analyst${index + 1}`, ADMIN_ROLE)), person("li.wei")],
   admin_user_count: count,
 });
-const ADMIN_COUNT_HEALTHY = { users_readable: true, ...withAdmins(2), max_admins: 5 };
-const LEAST_PRIVILEGE_HEALTHY = { users_readable: true, users: ADMIN_COUNT_HEALTHY.users, role_catalog_readable: true, max_roles_per_user: 5 };
+const USER_VISIBILITY_HEALTHY = { users_readable: true, users_complete: true, role_catalog_readable: true, role_catalog_complete: true };
+const ADMIN_COUNT_HEALTHY = { ...USER_VISIBILITY_HEALTHY, ...withAdmins(2), max_admins: 5 };
+const LEAST_PRIVILEGE_HEALTHY = { ...USER_VISIBILITY_HEALTHY, users: ADMIN_COUNT_HEALTHY.users, max_roles_per_user: 5 };
+const UNREAD_ROLES = { roles_readable: false, role_count: 0 };
 const API_CLIENTS_HEALTHY = {
   api_clients_readable: true,
   api_clients_complete: true,
@@ -1689,6 +1710,11 @@ const IDENTITY_HEALTHY = {
 const NO_ACTIVE_RULE = { active_identity_protection_rule_count: 0, enforcing_identity_protection_rule_count: 0 };
 const LOOKS_SHARED = matchesAny("$.local_part", SHARED_ACCOUNT_PATTERNS);
 const HOLDS_ADMIN = gt("$.admin_role_count", 0);
+const USERS_UNKNOWN = any(ne("users_readable", true), none("users", eq("$.roles_readable", true)));
+const ROLE_GRANTS_GAP = any(ne("$.roles_readable", true), eq("$.role_list_partial", true));
+const USER_INVENTORY_GAP = any(ne("role_catalog_readable", true), incomplete("users_complete", "role_catalog_complete"));
+const USERS_UNKNOWN_TEXT = "Manual when the user list is unreadable, returned no user, or returned no user whose role grants could be read.";
+const VISIBILITY_TEXT = "a user's role grants are unreadable or partial, when the user list or the role catalog is partial, or when the role catalog is unreadable";
 const SHARED_LOCAL_PART = "A local part looks shared when it contains shared in any letter case, or holds admin, administrator, root, shared, service, svc, soc, security, ops, team, helpdesk, noreply, generic, or test in any letter case as a token that starts the text or follows a dot, underscore, or hyphen, and ends the text or precedes a dot, underscore, hyphen, or @.";
 
 type ExclusionCheck = {
@@ -1743,18 +1769,23 @@ const ACCESS_GOVERNANCE_CHECKS: readonly CrowdstrikeCheck[] = [
     title: "RBAC - Admin Count",
     severity: "medium",
     owner: ACCESS_GOVERNANCE,
-    surfaces: ["user_uuids", "users", "user_roles"],
+    surfaces: ["user_uuids", "users", "user_roles", "role_ids", "roles"],
     inputs: Object.keys(ADMIN_COUNT_HEALTHY),
     rules: [
-      rule("manual", ne("users_readable", true)),
+      rule("manual", USERS_UNKNOWN),
       rule("fail", any(
         some("users", all(HOLDS_ADMIN, LOOKS_SHARED)),
         gt(minus("admin_user_count", "max_admins"), path("max_admins")),
       )),
-      rule("warn", any(gt("admin_user_count", path("max_admins")), some("users", LOOKS_SHARED))),
+      rule("warn", any(
+        gt("admin_user_count", path("max_admins")),
+        some("users", any(LOOKS_SHARED, ROLE_GRANTS_GAP)),
+        USER_INVENTORY_GAP,
+      )),
       rule("pass", always),
     ],
-    decision: `Manual when the user list is unreadable. Fail when a user with an admin role has a local part that looks shared, or when more than twice max_admins users hold an admin role (admin_user_count minus max_admins is above max_admins). Warn when more than max_admins users hold an admin role, or when a user without an admin role has a local part that looks shared. Otherwise pass. Every returned user counts, whatever its status, and a user whose role grants are unreadable holds no admin role. ${SHARED_LOCAL_PART}`,
+    completeness: { users_complete: USERS_COMPLETE, role_catalog_complete: ROLE_CATALOG_COMPLETE },
+    decision: `${USERS_UNKNOWN_TEXT} Fail when a user with an admin role has a local part that looks shared, or when more than twice max_admins users hold an admin role (admin_user_count minus max_admins is above max_admins). Warn when more than max_admins users hold an admin role, or when a user without an admin role has a local part that looks shared. Warn instead of pass when ${VISIBILITY_TEXT}. Otherwise pass. Every returned user counts, whatever its status, and a user whose role grants are unreadable holds no admin role. ${SHARED_LOCAL_PART}`,
     examples: [
       example("compliant", "pass", "Two users hold an admin role, within max_admins, and no local part looks shared.", ADMIN_COUNT_HEALTHY),
       example("partial", "warn", "Ten admins are above max_admins (5) but not above twice it.", { ...ADMIN_COUNT_HEALTHY, ...withAdmins(10) }),
@@ -1772,6 +1803,20 @@ const ACCESS_GOVERNANCE_CHECKS: readonly CrowdstrikeCheck[] = [
       example("compliant", "pass", "An admin whose local part holds admin only inside a word does not look shared.", {
         ...ADMIN_COUNT_HEALTHY, users: [...ADMIN_COUNT_HEALTHY.users, person("badminton.fan", ADMIN_ROLE)], admin_user_count: 3,
       }),
+      example("noncompliant", "fail", "Eleven admins fail on a partial user list too.", { ...ADMIN_COUNT_HEALTHY, ...withAdmins(11), users_complete: false }),
+      example("partial", "warn", "One user's role grants were refused, so the admin count is a lower bound.", {
+        ...ADMIN_COUNT_HEALTHY, users: [...ADMIN_COUNT_HEALTHY.users, person("ana.ruiz", UNREAD_ROLES)],
+      }),
+      example("partial", "warn", "One user's role grant walk is partial.", {
+        ...ADMIN_COUNT_HEALTHY, users: [...ADMIN_COUNT_HEALTHY.users, person("ana.ruiz", { role_list_partial: true })],
+      }),
+      example("partial", "warn", "The user list stopped at user_limit.", { ...ADMIN_COUNT_HEALTHY, users_complete: false }),
+      example("partial", "warn", "The role catalog was refused.", { ...ADMIN_COUNT_HEALTHY, role_catalog_readable: false }),
+      example("partial", "warn", "The role catalog read is partial.", { ...ADMIN_COUNT_HEALTHY, role_catalog_complete: false }),
+      example("partial", "manual", "The user list returned no user.", { ...ADMIN_COUNT_HEALTHY, users: [], admin_user_count: 0 }),
+      example("unreadable", "manual", "No returned user's role grants could be read.", {
+        ...ADMIN_COUNT_HEALTHY, users: [person("li.wei", UNREAD_ROLES)], admin_user_count: 0,
+      }),
       example("unreadable", "manual", "The user list was refused.", { users_readable: false }),
     ],
   },
@@ -1785,21 +1830,21 @@ const ACCESS_GOVERNANCE_CHECKS: readonly CrowdstrikeCheck[] = [
     inputs: Object.keys(LEAST_PRIVILEGE_HEALTHY),
     constants: { stale_admin_login_after_ms: 7776000000 },
     rules: [
-      rule("manual", ne("users_readable", true)),
+      rule("manual", USERS_UNKNOWN),
       rule("fail", some("users", all(HOLDS_ADMIN, reported("$.last_login_age_ms"), gt("$.last_login_age_ms", path("stale_admin_login_after_ms"))))),
       rule("warn", any(
         some("users", any(
           gt("$.role_count", path("max_roles_per_user")),
           all(HOLDS_ADMIN, gt(minus("$.role_count", "$.admin_role_count"), 1)),
           all(HOLDS_ADMIN, unreported("$.last_login_age_ms")),
-          ne("$.roles_readable", true),
-          eq("$.role_list_partial", true),
+          ROLE_GRANTS_GAP,
         )),
-        ne("role_catalog_readable", true),
+        USER_INVENTORY_GAP,
       )),
       rule("pass", always),
     ],
-    decision: "Manual when the user list is unreadable. Fail when a user with an admin role last logged in more than stale_admin_login_after_ms (7776000000 milliseconds, 90 days) before the assessment time; that period is fixed and cannot be configured. Warn when a user holds more than max_roles_per_user roles, or holds an admin role and more than one role beyond its admin roles (role_count minus admin_role_count is above 1); when a user with an admin role has no last_login_at that parses as a date; or instead of pass when a user's role grants are unreadable or partial, or when the role catalog is unreadable. Otherwise pass. Every returned user counts, whatever its status.",
+    completeness: { users_complete: USERS_COMPLETE, role_catalog_complete: ROLE_CATALOG_COMPLETE },
+    decision: `${USERS_UNKNOWN_TEXT} Fail when a user with an admin role last logged in more than stale_admin_login_after_ms (7776000000 milliseconds, 90 days) before the assessment time; that period is fixed and cannot be configured. Warn when a user holds more than max_roles_per_user roles, or holds an admin role and more than one role beyond its admin roles (role_count minus admin_role_count is above 1), or when a user with an admin role has no last_login_at that parses as a date. Warn instead of pass when ${VISIBILITY_TEXT}. Otherwise pass. Every returned user counts, whatever its status.`,
     examples: [
       example("compliant", "pass", "Every admin logged in within 90 days and holds one role beyond its admin role.", LEAST_PRIVILEGE_HEALTHY),
       example("compliant", "pass", "An admin who last logged in exactly 90 days ago is not stale.", {
@@ -1821,12 +1866,18 @@ const ACCESS_GOVERNANCE_CHECKS: readonly CrowdstrikeCheck[] = [
         ...LEAST_PRIVILEGE_HEALTHY, users: [person("li.wei", { last_login_age_ms: null })],
       }),
       example("partial", "warn", "One user's role grants were refused.", {
-        ...LEAST_PRIVILEGE_HEALTHY, users: [person("li.wei", { roles_readable: false, role_count: 0 })],
+        ...LEAST_PRIVILEGE_HEALTHY, users: [...LEAST_PRIVILEGE_HEALTHY.users, person("ana.ruiz", UNREAD_ROLES)],
       }),
       example("partial", "warn", "One user's role grant walk is partial.", {
         ...LEAST_PRIVILEGE_HEALTHY, users: [person("li.wei", { role_list_partial: true })],
       }),
+      example("partial", "warn", "The user list stopped at user_limit.", { ...LEAST_PRIVILEGE_HEALTHY, users_complete: false }),
       example("partial", "warn", "The role catalog was refused.", { ...LEAST_PRIVILEGE_HEALTHY, role_catalog_readable: false }),
+      example("partial", "warn", "The role catalog read is partial.", { ...LEAST_PRIVILEGE_HEALTHY, role_catalog_complete: false }),
+      example("partial", "manual", "The user list returned no user.", { ...LEAST_PRIVILEGE_HEALTHY, users: [] }),
+      example("unreadable", "manual", "No returned user's role grants could be read.", {
+        ...LEAST_PRIVILEGE_HEALTHY, users: [person("li.wei", UNREAD_ROLES)],
+      }),
       example("unreadable", "manual", "The user list was refused.", { users_readable: false }),
     ],
   },
