@@ -7,6 +7,7 @@ import {
   type BatchCriterionExample,
   type BatchPaginationDefinition,
   type BatchSurfaceDefinition,
+  type PortableInputType,
 } from "./batch-spec-builder.js";
 import { CROWDSTRIKE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, RequestParameterContract, VerdictCondition, VerdictOperand, VerdictRule } from "./spec-model.js";
@@ -296,10 +297,93 @@ const DEVICE_FIREWALL_SURFACES: readonly BatchSurfaceDefinition[] = [
   ),
 ];
 
+const UNMANAGED_FILTER = "entity_type:'unmanaged'";
+const ZTA_BELOW_FILTER = "score:<{min_zta_score}";
+const countStage = (probed: boolean): string =>
+  `Never exported: the read keeps only meta.pagination.total as the count${probed ? ", and the crowdstrike_check_access probe sends the same read and keeps meta.pagination.total, else the number of returned results, as the surface's count" : ""}.`;
+const countSurface = (id: string, path: string, collection: string, records: string, probed = false): BatchSurfaceDefinition =>
+  apiSurface(id, path, collection, ["meta.pagination.total"], [param("limit", "query", "1")], resourcesResponse(records, "total"), { projectionStage: countStage(probed) });
+
+const SENSOR_COVERAGE_SURFACES: readonly BatchSurfaceDefinition[] = [
+  apiSurface(
+    "sensor_update_policies",
+    "/policy/combined/sensor-update/v2",
+    "sensor-update-policy",
+    [...POLICY_FIELDS, "platform_name", "settings.build", "settings.variants.build", "settings.uninstall_protection"],
+    offsetParameters("policies", 500, 5000, true),
+    resourcesResponse("one sensor update policy per entry"),
+  ),
+  apiSurface(
+    "sensor_update_builds",
+    "/policy/combined/sensor-update-builds/v1",
+    "sensor-update-policy",
+    ["build", "sensor_version"],
+    [param("platform", "query", "A platform_name of the assigned sensor update policies, trimmed and lowercased; one read per distinct non-blank value, in the order first seen")],
+    lookupResponse("one sensor build per entry"),
+    { projectionStage: "The collector exports every returned build as read, grouped under the platform it was read for, after the data redaction pass has rewritten every string in it; decision facts read the listed fields." },
+  ),
+  apiSurface(
+    "hosts",
+    "/devices/combined/devices/v1",
+    "hosts",
+    ["last_seen", "groups"],
+    [
+      param("sort", "query", "device_id.asc", true, EXCEPT_PROBE),
+      param("fields", "query", HOST_FIELDS, true, EXCEPT_PROBE),
+      ...offsetParameters("hosts", 1000, HOST_LIMIT, true),
+    ],
+    resourcesResponse("one host per entry"),
+  ),
+  apiSurface(
+    "host_groups",
+    "/devices/combined/host-groups/v1",
+    "host-group",
+    ["id", "group_type"],
+    offsetParameters("host groups", 500, 5000, true),
+    resourcesResponse("one host group per entry"),
+  ),
+  apiSurface(
+    "discover_host_ids",
+    "/discover/queries/hosts/v1",
+    "discover",
+    ["meta.pagination.total", "resources"],
+    [param("limit", "query", "1")],
+    resourcesResponse("Falcon Discover host IDs", "total"),
+    { projectionStage: PROBE_STAGE },
+  ),
+  countSurface("discover_unmanaged_count", `/discover/queries/hosts/v1?filter=${UNMANAGED_FILTER}`, "discover", "Falcon Discover host IDs"),
+  countSurface("discover_managed_count", "/discover/queries/hosts/v1?filter=entity_type:'managed'", "discover", "Falcon Discover host IDs"),
+  apiSurface(
+    "discover_unmanaged_hosts",
+    `/discover/combined/hosts/v1?filter=${UNMANAGED_FILTER}`,
+    "discover",
+    ["hostname", "platform_name", "last_seen_timestamp", "local_ip_addresses"],
+    [
+      param("limit", "query", `100, or the hosts left under ${capText(100)} when fewer`),
+      param("after", "query", "The previous page's meta.pagination.after", false, "On every page after the first"),
+    ],
+    resourcesResponse("one Falcon Discover host per entry", "total and after"),
+  ),
+  countSurface("zero_trust_scored_count", "/zero-trust-assessment/queries/assessments/v1?filter=score:>=0", "zero-trust-assessment", "Zero Trust Assessment results", true),
+  apiSurface(
+    "zero_trust_below_threshold",
+    `/zero-trust-assessment/queries/assessments/v1?filter=${ZTA_BELOW_FILTER}&sort=score|asc`,
+    "zero-trust-assessment",
+    ["aid", "score"],
+    [
+      param("limit", "query", `1000, or the results left under ${capText(1000)} when fewer`),
+      param("after", "query", "The previous page's meta.pagination.after", false, "On every page after the first"),
+    ],
+    resourcesResponse("one Zero Trust Assessment result per entry", "total and after"),
+  ),
+  countSurface("zero_trust_below_threshold_count", `/zero-trust-assessment/queries/assessments/v1?filter=${ZTA_BELOW_FILTER}`, "zero-trust-assessment", "Zero Trust Assessment results"),
+];
+
 const CROWDSTRIKE_SURFACES: readonly BatchSurfaceDefinition[] = [
   ...PREVENTION_SURFACES,
   ...RESPONSE_SURFACES,
   ...DEVICE_FIREWALL_SURFACES,
+  ...SENSOR_COVERAGE_SURFACES,
 ];
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
@@ -321,15 +405,18 @@ const some = (name: string, condition: VerdictCondition): VerdictCondition => ({
 const always: VerdictCondition = { op: "always" };
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
 // Whole tenths of a percent: the runtime compares Math.round(part / total * 1000) / 10.
-const perMilleBelow = (numerator: string, denominator: string, threshold: string): VerdictCondition => ({
+const perMille = (comparator: "lt" | "gt") => (numerator: string, denominator: string, threshold: string): VerdictCondition => ({
   op: "ratio",
   numerator: path(numerator),
   denominator: path(denominator),
-  comparator: "lt",
+  comparator,
   threshold: path(threshold),
   scale: 1000,
   roundDigits: 0,
 });
+const perMilleBelow = perMille("lt");
+const perMilleAbove = perMille("gt");
+const unreported = (name: string): VerdictCondition => ({ op: "not", condition: { op: "defined", operand: path(name) } });
 
 const incomplete = (...complete: string[]): VerdictCondition =>
   complete.length === 1 ? ne(complete[0], true) : any(...complete.map((name) => ne(name, true)));
@@ -373,6 +460,12 @@ const ASSIGNED_FIREWALL = "assigned firewall policies, as counted by assigned_fi
 const CONTAINER = `A policy's container is the last returned firewall policy container whose policy_id and the policy's id ${SAME_ID}. ${READS_AS_TEXT}`;
 const RULE_GROUPS = `A container's rule groups are the entries of its rule_group_ids array that read as text. One is unknown when no returned firewall rule group has an id that reads as that text, and active when the last returned rule group whose id does has an enabled of ${TRUTHY} and a non-empty rule_ids array.`;
 const ASSIGNED_CONTAINERS = "containers counted by assigned_firewall_container_count";
+const ASSIGNED_SENSOR = "assigned sensor update policies, as counted by assigned_sensor_update_policy_count";
+const JUDGED_BUILDS = `A policy's judged builds are its settings.build, whether or not it reads as text, plus the build of each JSON object in its settings.variants array whose build reads as text. ${READS_AS_TEXT}`;
+const BUILD_FORMS = "A build that does not read as text turns updates off. Otherwise, trimmed and lowercased, it auto-updates when one of its pipe-separated segments is n, n-1, or n-2; else it is pinned when it starts with a run of digits, or with two runs of digits each followed by a dot and then a run of digits (as in 7.10.16004), and that last run ends the build or is followed by a pipe, the run being its build number; else its form is unknown.";
+const BUILD_CATALOG = "A policy's platform is its platform_name read as text and lowercased, and its catalog is the GET /policy/combined/sensor-update-builds/v1 read for that platform. A catalog's supported build numbers come from its returned build records whose build, trimmed and lowercased, has a pipe-separated segment of n, n-1, or n-2: the leading run of digits of that build, else the trailing run of digits of the record's sensor_version, both read as text; a record with neither offers none.";
+const SENSOR_BUILDS = `${JUDGED_BUILDS} ${BUILD_FORMS} ${BUILD_CATALOG}`;
+const ZTA_THRESHOLD = `The below-threshold filter is score:<N, where N is the ${optionValue("min_zta_score", 60, 100)}.`;
 
 const CROWDSTRIKE_INPUTS: Readonly<Record<string, string>> = {
   prevention_policies_readable: "True when GET /policy/combined/prevention/v1 returned its prevention policy list without a refusal.",
@@ -434,6 +527,31 @@ const CROWDSTRIKE_INPUTS: Readonly<Record<string, string>> = {
   firewall_rules_complete: "Firewall rule list coverage.",
   firewall_rule_count: "Number of firewall rules returned by the GET /fwmgr/entities/rules/v1 lookups.",
   undocumented_allow_rule_count: `Number of returned firewall rules whose action reads as ALLOW in any letter case, whose enabled is ${TRUTHY}, and whose description does not read as text. ${READS_AS_TEXT}`,
+  sensor_update_policies_readable: "True when GET /policy/combined/sensor-update/v2 returned its sensor update policy list without a refusal.",
+  sensor_update_policies_complete: "Sensor update policy list coverage.",
+  assigned_sensor_update_policy_count: assignedPolicyCount("sensor update"),
+  sensor_update_builds_readable: "True when every GET /policy/combined/sensor-update-builds/v1 read, one per distinct platform of the assigned sensor update policies, returned without a refusal, including when no platform was read.",
+  policies_with_updates_off: `Number of ${ASSIGNED_SENSOR} whose settings.build does not read as text. ${READS_AS_TEXT}`,
+  policies_pinned_to_unsupported_build: `Number of ${ASSIGNED_SENSOR} with a pinned judged build whose build number is not among the supported build numbers of the policy's catalog, counted only when that catalog was read without a refusal. ${SENSOR_BUILDS}`,
+  policies_with_unverified_builds: `Number of ${ASSIGNED_SENSOR} with a judged build whose form is unknown, or that is pinned while the policy has no platform or its catalog read was refused. ${SENSOR_BUILDS}`,
+  policies_without_uninstall_protection: `Number of ${ASSIGNED_SENSOR} whose settings.uninstall_protection does not read as ENABLED in any letter case. ${READS_AS_TEXT}`,
+  hosts_readable: "True when GET /devices/combined/devices/v1 without a filter returned its host list without a refusal.",
+  hosts_complete: "Host list coverage.",
+  host_count: "Number of hosts returned by the unfiltered host read.",
+  dated_host_count: `Number of returned hosts whose last_seen parses as a date. ${PARSES_AS_DATE}`,
+  recently_seen_host_count: `Number of returned hosts whose last_seen parses as a date no more than N days before the assessment time, where N is the ${optionValue("stale_sensor_days", 7, 365)}. ${PARSES_AS_DATE}`,
+  grouped_host_count: "Number of returned hosts with a non-empty groups array.",
+  host_groups_readable: "True when GET /devices/combined/host-groups/v1 returned its host group list without a refusal.",
+  host_groups_complete: "Host group list coverage.",
+  host_group_count: "Number of host groups returned by GET /devices/combined/host-groups/v1.",
+  discover_counts_readable: `True when GET /discover/queries/hosts/v1 filtered to ${UNMANAGED_FILTER}, and then the same read filtered to entity_type:'managed', returned without a refusal.`,
+  unmanaged_asset_total: `The meta.pagination.total of the Falcon Discover read filtered to ${UNMANAGED_FILTER}, ${AS_NUMBER}; null when it does not read as one.`,
+  unmanaged_per_mille: `Unmanaged share of the discovered assets in tenths of a percent: unmanaged_asset_total divided by the sum of unmanaged_asset_total and the managed total, multiplied by 1000, and rounded half up; null when either total does not read as a number or the two sum to 0. The managed total is the meta.pagination.total of the read filtered to entity_type:'managed', ${AS_NUMBER}.`,
+  discover_samples_readable: `True when the GET /discover/combined/hosts/v1 walk filtered to ${UNMANAGED_FILTER} returned without a refusal.`,
+  zero_trust_readable: `True when GET /zero-trust-assessment/queries/assessments/v1 filtered to score:>=0, then the walk sorted by score under the below-threshold filter, then the read under that filter alone, all returned without a refusal. ${ZTA_THRESHOLD}`,
+  scored_host_total: `The meta.pagination.total of the Zero Trust Assessment read filtered to score:>=0, ${AS_NUMBER}; null when it does not read as one.`,
+  below_threshold_host_count: `The meta.pagination.total of the read under the below-threshold filter alone, ${AS_NUMBER}; when it does not read as one, the number of JSON objects the walk sorted by score under that filter returned. ${ZTA_THRESHOLD}`,
+  below_threshold_total_reported: `True when the read under the below-threshold filter alone reported a meta.pagination.total that reads as a number. ${ZTA_THRESHOLD}`,
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -472,6 +590,9 @@ const ALERTS_COMPLETE = completeFrom(
   "false when the alert list is partial: fewer alerts were kept than meta.pagination.total; or, without a total, the walk stopped at alert_limit alerts, at an empty page, or at an after cursor equal to the one the page was requested with, on a page that still carried meta.pagination.after; or a returned resource is not a JSON object.",
   [{ surfaceId: "alerts", falseWhen: ["truncated"] }],
 );
+const SENSOR_UPDATE_POLICIES_COMPLETE = offsetWalkComplete("sensor_update_policies", "sensor update policy list", "5000 policies");
+const HOSTS_COMPLETE = offsetWalkComplete("hosts", "host list", "host_limit hosts");
+const HOST_GROUPS_COMPLETE = offsetWalkComplete("host_groups", "host group list", "5000 host groups");
 
 type CrowdstrikeCheck = {
   id: string;
@@ -481,6 +602,7 @@ type CrowdstrikeCheck = {
   owner: string;
   surfaces: readonly string[];
   inputs: readonly string[];
+  inputTypes?: Readonly<Record<string, readonly PortableInputType[]>>;
   constants?: Readonly<Record<string, PortableValue>>;
   rules: readonly VerdictRule[];
   completeness?: Readonly<Record<string, BatchCompletenessDefinition>>;
@@ -1097,6 +1219,255 @@ const DEVICE_FIREWALL_CHECKS: readonly CrowdstrikeCheck[] = [
   },
 ];
 
+const SENSOR_COVERAGE = "crowdstrike_assess_sensor_coverage";
+
+const SENSOR_UPDATE_HEALTHY = {
+  sensor_update_policies_readable: true,
+  sensor_update_policies_complete: true,
+  assigned_sensor_update_policy_count: 2,
+  sensor_update_builds_readable: true,
+  policies_with_updates_off: 0,
+  policies_pinned_to_unsupported_build: 0,
+  policies_with_unverified_builds: 0,
+  policies_without_uninstall_protection: 0,
+};
+const HOSTS_HEALTHY = { hosts_readable: true, hosts_complete: true, host_count: 1000 };
+const DEPLOYMENT_HEALTHY = { ...HOSTS_HEALTHY, dated_host_count: 1000, recently_seen_host_count: 1000 };
+const GROUPING_HEALTHY = { ...HOSTS_HEALTHY, grouped_host_count: 1000, host_groups_readable: true, host_groups_complete: true, host_group_count: 12 };
+const DISCOVER_HEALTHY = { discover_counts_readable: true, unmanaged_asset_total: 0, unmanaged_per_mille: 0, discover_samples_readable: true };
+const ZERO_TRUST_HEALTHY = { zero_trust_readable: true, scored_host_total: 2000, below_threshold_host_count: 0, below_threshold_total_reported: true };
+
+const SENSOR_COVERAGE_CHECKS: readonly CrowdstrikeCheck[] = [
+  {
+    id: "CS-12",
+    control: 12,
+    title: "Sensor Update - Auto-Update Enabled",
+    severity: "high",
+    owner: SENSOR_COVERAGE,
+    surfaces: ["sensor_update_policies", "sensor_update_builds"],
+    inputs: Object.keys(SENSOR_UPDATE_HEALTHY),
+    rules: [
+      rule("manual", ne("sensor_update_policies_readable", true)),
+      ...noneAssigned("assigned_sensor_update_policy_count", "sensor_update_policies_complete"),
+      rule("fail", any(gt("policies_with_updates_off", 0), gt("policies_pinned_to_unsupported_build", 0))),
+      rule("warn", any(
+        gt("policies_with_unverified_builds", 0),
+        gt("policies_without_uninstall_protection", 0),
+        ne("sensor_update_builds_readable", true),
+        ne("sensor_update_policies_complete", true),
+      )),
+      rule("pass", always),
+    ],
+    completeness: { sensor_update_policies_complete: SENSOR_UPDATE_POLICIES_COMPLETE },
+    decision: "Manual when the sensor update policy list is unreadable, or when it is partial and shows no assigned policy. Fail when no sensor update policy is assigned. Fail when an assigned policy turns updates off, or pins a build whose number is not supported in its platform's readable catalog, even on a partial list. Warn when an assigned policy has a build of unknown form, pins a build that no readable catalog can check, or lacks uninstall protection, or when a catalog read was refused. Warn instead of pass when the sensor update policy list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Both assigned policies auto-update within N-2 and enable uninstall protection.", SENSOR_UPDATE_HEALTHY),
+      example("noncompliant", "fail", "One assigned policy has no settings.build, so its sensors never update.", {
+        ...SENSOR_UPDATE_HEALTHY, policies_with_updates_off: 1,
+      }),
+      example("noncompliant", "fail", "One assigned policy pins a build its platform's catalog no longer offers as n, n-1, or n-2.", {
+        ...SENSOR_UPDATE_HEALTHY, policies_pinned_to_unsupported_build: 1,
+      }),
+      example("noncompliant", "fail", "A visible assigned policy turns updates off, and the list stopped at the cap.", {
+        ...SENSOR_UPDATE_HEALTHY, sensor_update_policies_complete: false, policies_with_updates_off: 1,
+      }),
+      example("partial", "warn", "One assigned policy pins a build while its catalog read was refused.", {
+        ...SENSOR_UPDATE_HEALTHY, sensor_update_builds_readable: false, policies_with_unverified_builds: 1,
+      }),
+      example("partial", "warn", "Every assigned policy auto-updates, but one catalog read was refused.", {
+        ...SENSOR_UPDATE_HEALTHY, sensor_update_builds_readable: false,
+      }),
+      example("partial", "warn", "One assigned policy leaves uninstall protection off.", {
+        ...SENSOR_UPDATE_HEALTHY, policies_without_uninstall_protection: 1,
+      }),
+      example("partial", "warn", "The visible policies pass, but the list stopped at the cap.", {
+        ...SENSOR_UPDATE_HEALTHY, sensor_update_policies_complete: false,
+      }),
+      example("noncompliant", "fail", "The complete sensor update policy list holds no enabled policy that reaches hosts.", {
+        sensor_update_policies_readable: true, sensor_update_policies_complete: true, assigned_sensor_update_policy_count: 0,
+      }),
+      example("partial", "manual", "The list stopped at the cap before any assigned policy was visible.", {
+        sensor_update_policies_readable: true, sensor_update_policies_complete: false, assigned_sensor_update_policy_count: 0,
+      }),
+      example("unreadable", "manual", "The sensor update policy list was refused.", { sensor_update_policies_readable: false }),
+    ],
+  },
+  {
+    id: "CS-13",
+    control: 13,
+    title: "Sensor Coverage - Deployment Completeness",
+    severity: "high",
+    owner: SENSOR_COVERAGE,
+    surfaces: ["hosts"],
+    inputs: Object.keys(DEPLOYMENT_HEALTHY),
+    constants: { deployment_fail_below_per_mille: 850, deployment_warn_below_per_mille: 950 },
+    rules: [
+      rule("manual", ne("hosts_readable", true)),
+      rule("manual", all(eq("host_count", 0), incomplete("hosts_complete"))),
+      rule("fail", eq("host_count", 0)),
+      rule("fail", perMilleBelow("recently_seen_host_count", "dated_host_count", "deployment_fail_below_per_mille")),
+      rule("warn", any(
+        perMilleBelow("recently_seen_host_count", "dated_host_count", "deployment_warn_below_per_mille"),
+        lt("dated_host_count", path("host_count")),
+        incomplete("hosts_complete"),
+      )),
+      rule("pass", always),
+    ],
+    completeness: { hosts_complete: HOSTS_COMPLETE },
+    decision: "Manual when the host list is unreadable, or when it is partial and returned no host. Fail when the complete host list returned no host. When at least one returned host has a last_seen that parses as a date, divide those seen within stale_sensor_days by all of them, multiply by 1000, and round halves up: fail below deployment_fail_below_per_mille (850, so 84.95 percent rounds to 85.0 and does not fail) and warn below deployment_warn_below_per_mille (950). Warn instead of pass when a returned host has no last_seen that parses as a date, including when none has one, or when the host list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "1899 of 2000 dated hosts seen within stale_sensor_days round to 950 per mille.", {
+        ...DEPLOYMENT_HEALTHY, host_count: 2000, dated_host_count: 2000, recently_seen_host_count: 1899,
+      }),
+      example("partial", "warn", "949 of 1000 dated hosts were seen within stale_sensor_days.", {
+        ...DEPLOYMENT_HEALTHY, recently_seen_host_count: 949,
+      }),
+      example("partial", "warn", "1699 of 2000 dated hosts round to 850 per mille, which does not fail.", {
+        ...DEPLOYMENT_HEALTHY, host_count: 2000, dated_host_count: 2000, recently_seen_host_count: 1699,
+      }),
+      example("noncompliant", "fail", "1698 of 2000 dated hosts are 849 per mille.", {
+        ...DEPLOYMENT_HEALTHY, host_count: 2000, dated_host_count: 2000, recently_seen_host_count: 1698,
+      }),
+      example("noncompliant", "fail", "Half the visible hosts are stale, and the list stopped at host_limit.", {
+        ...DEPLOYMENT_HEALTHY, hosts_complete: false, host_count: 100, dated_host_count: 100, recently_seen_host_count: 50,
+      }),
+      example("partial", "warn", "Every dated host is fresh, but two returned hosts carry no last_seen.", {
+        ...DEPLOYMENT_HEALTHY, host_count: 1002,
+      }),
+      example("partial", "warn", "No returned host carries a last_seen that parses as a date.", {
+        ...DEPLOYMENT_HEALTHY, host_count: 5, dated_host_count: 0, recently_seen_host_count: 0,
+      }),
+      example("partial", "warn", "Every visible host is fresh, but the list stopped at host_limit.", {
+        ...DEPLOYMENT_HEALTHY, hosts_complete: false,
+      }),
+      example("noncompliant", "fail", "The complete host list is empty.", {
+        ...DEPLOYMENT_HEALTHY, host_count: 0, dated_host_count: 0, recently_seen_host_count: 0,
+      }),
+      example("partial", "manual", "The list stopped at host_limit before any host was visible.", {
+        ...DEPLOYMENT_HEALTHY, hosts_complete: false, host_count: 0, dated_host_count: 0, recently_seen_host_count: 0,
+      }),
+      example("unreadable", "manual", "The host list was refused.", { hosts_readable: false }),
+    ],
+  },
+  {
+    id: "CS-14",
+    control: 14,
+    title: "Sensor Coverage - Host Group Assignment",
+    severity: "medium",
+    owner: SENSOR_COVERAGE,
+    surfaces: ["hosts", "host_groups"],
+    inputs: Object.keys(GROUPING_HEALTHY),
+    constants: { grouping_fail_below_per_mille: 800, grouping_warn_below_per_mille: 950 },
+    rules: [
+      rule("manual", any(ne("hosts_readable", true), ne("host_groups_readable", true))),
+      rule("manual", all(eq("host_group_count", 0), incomplete("host_groups_complete"))),
+      rule("fail", eq("host_group_count", 0)),
+      rule("manual", all(eq("host_count", 0), incomplete("hosts_complete"))),
+      rule("fail", eq("host_count", 0)),
+      rule("fail", perMilleBelow("grouped_host_count", "host_count", "grouping_fail_below_per_mille")),
+      rule("warn", any(
+        perMilleBelow("grouped_host_count", "host_count", "grouping_warn_below_per_mille"),
+        incomplete("hosts_complete", "host_groups_complete"),
+      )),
+      rule("pass", always),
+    ],
+    completeness: { hosts_complete: HOSTS_COMPLETE, host_groups_complete: HOST_GROUPS_COMPLETE },
+    decision: "Manual when the host list or the host group list is unreadable. Manual when the host group list is partial and returned no host group, and fail when the complete host group list returned none. Then manual when the host list is partial and returned no host, and fail when the complete host list returned none. Divide the returned hosts with a non-empty groups array by all returned hosts, multiply by 1000, and round halves up: fail below grouping_fail_below_per_mille (800, so 79.95 percent rounds to 80.0 and does not fail) and warn below grouping_warn_below_per_mille (950). Warn instead of pass when the host list or the host group list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "950 of 1000 hosts belong to a host group.", { ...GROUPING_HEALTHY, grouped_host_count: 950 }),
+      example("partial", "warn", "949 of 1000 hosts belong to a host group.", { ...GROUPING_HEALTHY, grouped_host_count: 949 }),
+      example("partial", "warn", "1599 of 2000 grouped hosts round to 800 per mille, which does not fail.", {
+        ...GROUPING_HEALTHY, host_count: 2000, grouped_host_count: 1599,
+      }),
+      example("noncompliant", "fail", "799 of 1000 hosts belong to a host group.", { ...GROUPING_HEALTHY, grouped_host_count: 799 }),
+      example("partial", "warn", "Every visible host is grouped, but the host group list stopped at the cap.", {
+        ...GROUPING_HEALTHY, host_groups_complete: false,
+      }),
+      example("noncompliant", "fail", "The complete host group list is empty.", { ...GROUPING_HEALTHY, host_group_count: 0 }),
+      example("partial", "manual", "The host group list stopped at the cap before any group was visible.", {
+        ...GROUPING_HEALTHY, host_groups_complete: false, host_group_count: 0,
+      }),
+      example("noncompliant", "fail", "The complete host list is empty.", { ...GROUPING_HEALTHY, host_count: 0, grouped_host_count: 0 }),
+      example("partial", "manual", "The host list stopped at host_limit before any host was visible.", {
+        ...GROUPING_HEALTHY, hosts_complete: false, host_count: 0, grouped_host_count: 0,
+      }),
+      example("unreadable", "manual", "The host group list was refused.", { hosts_readable: true, host_groups_readable: false }),
+      example("unreadable", "manual", "The host list was refused.", { hosts_readable: false }),
+    ],
+  },
+  {
+    id: "CS-15",
+    control: 15,
+    title: "Unmanaged Asset Detection",
+    severity: "medium",
+    owner: SENSOR_COVERAGE,
+    surfaces: ["discover_unmanaged_count", "discover_managed_count", "discover_unmanaged_hosts"],
+    inputs: Object.keys(DISCOVER_HEALTHY),
+    inputTypes: { unmanaged_asset_total: ["null"], unmanaged_per_mille: ["null"] },
+    constants: { unmanaged_fail_above_per_mille: 50 },
+    rules: [
+      rule("manual", any(ne("discover_counts_readable", true), unreported("unmanaged_per_mille"))),
+      rule("fail", gt("unmanaged_per_mille", path("unmanaged_fail_above_per_mille"))),
+      rule("warn", any(ne("unmanaged_asset_total", 0), ne("discover_samples_readable", true))),
+      rule("pass", always),
+    ],
+    decision: "Manual when either Falcon Discover count read is unreadable, which includes a tenant without Falcon Discover, when either read reports no total, or when the two totals sum to 0. Fail when unmanaged_per_mille is above unmanaged_fail_above_per_mille (50, so 5.04 percent rounds to 5.0 and does not fail). Warn when any unmanaged asset is reported, or when the unmanaged sample walk was refused. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Falcon Discover reports no unmanaged asset.", DISCOVER_HEALTHY),
+      example("partial", "warn", "1 of 20 discovered assets is unmanaged, exactly 50 per mille.", {
+        ...DISCOVER_HEALTHY, unmanaged_asset_total: 1, unmanaged_per_mille: 50,
+      }),
+      example("noncompliant", "fail", "101 of 2000 discovered assets are unmanaged, which rounds to 51 per mille.", {
+        ...DISCOVER_HEALTHY, unmanaged_asset_total: 101, unmanaged_per_mille: 51,
+      }),
+      example("partial", "warn", "No unmanaged asset is reported, but the sample walk was refused.", {
+        ...DISCOVER_HEALTHY, discover_samples_readable: false,
+      }),
+      example("unreadable", "manual", "The managed count read reported no total.", {
+        ...DISCOVER_HEALTHY, unmanaged_asset_total: 3, unmanaged_per_mille: null,
+      }),
+      example("unreadable", "manual", "Both totals are 0, so Discover is not collecting.", { ...DISCOVER_HEALTHY, unmanaged_per_mille: null }),
+      example("unreadable", "manual", "The unmanaged count read was refused.", { discover_counts_readable: false }),
+    ],
+  },
+  {
+    id: "CS-25",
+    control: 25,
+    title: "Zero Trust Assessment",
+    severity: "low",
+    owner: SENSOR_COVERAGE,
+    surfaces: ["zero_trust_scored_count", "zero_trust_below_threshold", "zero_trust_below_threshold_count"],
+    inputs: Object.keys(ZERO_TRUST_HEALTHY),
+    inputTypes: { scored_host_total: ["null"] },
+    constants: { zta_fail_above_per_mille: 100 },
+    rules: [
+      rule("manual", any(ne("zero_trust_readable", true), unreported("scored_host_total"), eq("scored_host_total", 0))),
+      rule("fail", perMilleAbove("below_threshold_host_count", "scored_host_total", "zta_fail_above_per_mille")),
+      rule("warn", any(ne("below_threshold_host_count", 0), ne("below_threshold_total_reported", true))),
+      rule("pass", always),
+    ],
+    decision: "Manual when a Zero Trust Assessment read is unreadable, which includes a tenant without Zero Trust Assessment, or when the scored read reports no total or a total of 0. Divide below_threshold_host_count by scored_host_total, multiply by 1000, and round halves up: fail above zta_fail_above_per_mille (100, so 10.05 percent rounds to 10.1 and fails). Warn when any host scores below the threshold, or when the below-threshold read reported no total, since the walk's count is then only a lower bound. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "No scored host is below the threshold.", ZERO_TRUST_HEALTHY),
+      example("partial", "warn", "200 of 2000 scored hosts are below the threshold, exactly 100 per mille.", {
+        ...ZERO_TRUST_HEALTHY, below_threshold_host_count: 200,
+      }),
+      example("noncompliant", "fail", "201 of 2000 scored hosts are below the threshold, which rounds to 101 per mille.", {
+        ...ZERO_TRUST_HEALTHY, below_threshold_host_count: 201,
+      }),
+      example("noncompliant", "fail", "The walk alone found 400 of 2000 scored hosts below the threshold, a lower bound that already fails.", {
+        ...ZERO_TRUST_HEALTHY, below_threshold_host_count: 400, below_threshold_total_reported: false,
+      }),
+      example("partial", "warn", "The walk found no host below the threshold, but the below-threshold read reported no total.", {
+        ...ZERO_TRUST_HEALTHY, below_threshold_total_reported: false,
+      }),
+      example("unreadable", "manual", "The scored read reported no total.", { ...ZERO_TRUST_HEALTHY, scored_host_total: null }),
+      example("unreadable", "manual", "Zero Trust Assessment scored no host.", { ...ZERO_TRUST_HEALTHY, scored_host_total: 0 }),
+      example("unreadable", "manual", "The scored read was refused.", { zero_trust_readable: false }),
+    ],
+  },
+];
+
 const toCheck = (check: CrowdstrikeCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -1108,6 +1479,7 @@ const toCheck = (check: CrowdstrikeCheck): BatchCheckDefinition => {
     surfaces: check.surfaces,
     evidenceFields: check.inputs,
     decisionInputs: inputs(...check.inputs),
+    ...(check.inputTypes ? { decisionInputTypes: check.inputTypes } : {}),
     decisionConstants: check.constants ?? {},
     decisionRules: executable.rules,
     derivedFactRules: executable.derivedFactRules,
@@ -1121,6 +1493,7 @@ const checks: readonly BatchCheckDefinition[] = [
   ...PREVENTION_CHECKS,
   ...RESPONSE_CHECKS,
   ...DEVICE_FIREWALL_CHECKS,
+  ...SENSOR_COVERAGE_CHECKS,
 ].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
@@ -1176,6 +1549,14 @@ const RAW_DATA_FILES: Readonly<Record<string, readonly string[]>> = {
     "firewall_rule_groups",
     "firewall_rules",
   ],
+  sensor_coverage: [
+    "sensor_update_policies",
+    "sensor_update_builds",
+    "hosts",
+    "host_groups",
+    "discover_unmanaged_samples",
+    "zero_trust_assessments_below_threshold",
+  ],
 };
 
 export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
@@ -1216,7 +1597,7 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
       id: "hosts-read",
       kind: "oauth-scope",
       value: "Hosts: Read",
-      unlocks: ["contained_hosts"],
+      unlocks: ["contained_hosts", "hosts"],
     },
     {
       id: "device-control-policies-read",
@@ -1230,6 +1611,30 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
       value: "Firewall management: Read",
       unlocks: ["firewall_policies", "firewall_policy_containers", "firewall_rule_group_ids", "firewall_rule_groups", "firewall_rule_ids", "firewall_rules"],
     },
+    {
+      id: "sensor-update-policies-read",
+      kind: "oauth-scope",
+      value: "Sensor update policies: Read",
+      unlocks: ["sensor_update_policies", "sensor_update_builds"],
+    },
+    {
+      id: "host-groups-read",
+      kind: "oauth-scope",
+      value: "Host groups: Read",
+      unlocks: ["host_groups"],
+    },
+    {
+      id: "discover-read",
+      kind: "oauth-scope",
+      value: "Assets (Falcon Discover): Read",
+      unlocks: ["discover_host_ids", "discover_unmanaged_count", "discover_managed_count", "discover_unmanaged_hosts"],
+    },
+    {
+      id: "zero-trust-assessment-read",
+      kind: "oauth-scope",
+      value: "Zero Trust Assessment: Read",
+      unlocks: ["zero_trust_scored_count", "zero_trust_below_threshold", "zero_trust_below_threshold_count"],
+    },
   ],
   surfaces: CROWDSTRIKE_SURFACES,
   checks,
@@ -1238,13 +1643,17 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
     crowdstrike_assess_prevention_policies: idsFor(PREVENTION),
     crowdstrike_assess_response_readiness: idsFor(RESPONSE),
     crowdstrike_assess_device_firewall: idsFor(DEVICE_FIREWALL),
+    crowdstrike_assess_sensor_coverage: idsFor(SENSOR_COVERAGE),
     crowdstrike_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
-    offsetWalk(["prevention_policies", "response_policies", "device_control_policies", "firewall_policies"], "policies", 500, 5000),
+    offsetWalk(["prevention_policies", "response_policies", "device_control_policies", "firewall_policies", "sensor_update_policies"], "policies", 500, 5000),
+    offsetWalk(["host_groups"], "host groups", 500, 5000),
     offsetWalk(["rtr_audit_sessions"], "sessions", 500, 500),
     afterWalk(["alerts"], "alerts", 1000, ALERT_LIMIT),
-    offsetWalk(["contained_hosts"], "hosts", 1000, HOST_LIMIT),
+    offsetWalk(["contained_hosts", "hosts"], "hosts", 1000, HOST_LIMIT),
+    afterWalk(["discover_unmanaged_hosts"], "hosts", 100, 100),
+    afterWalk(["zero_trust_below_threshold"], "results", 1000, 1000),
     offsetWalk(["firewall_rule_group_ids", "firewall_rule_ids"], "IDs", 500, RULE_LIMIT, LOOKED_UP),
     {
       surfaceIds: ["device_control_policy_details", "firewall_policy_containers", "firewall_rule_groups", "firewall_rules"],
@@ -1256,13 +1665,31 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
       stopConditions: ["Every batch of up to 100 IDs requested"],
     },
     {
-      surfaceIds: ["alert_ids"],
+      surfaceIds: ["alert_ids", "discover_host_ids"],
       cursorFields: ["meta.pagination.total"],
       pageSize: 1,
       itemCap: "none",
       pageCap: 1,
-      totalSemantics: "One read of a single alert ID on the crowdstrike_check_access probe; meta.pagination.total, else the number of returned IDs, is the surface's count.",
+      totalSemantics: "One read of a single ID on the crowdstrike_check_access probe; meta.pagination.total, else the number of returned IDs, is the surface's count.",
       stopConditions: ["The first response"],
+    },
+    {
+      surfaceIds: ["discover_unmanaged_count", "discover_managed_count", "zero_trust_scored_count", "zero_trust_below_threshold_count"],
+      cursorFields: ["meta.pagination.total"],
+      pageSize: 1,
+      itemCap: "none",
+      pageCap: 1,
+      totalSemantics: "One read of a single ID whose meta.pagination.total is the count; the returned ID is never kept, and no cursor in the response is followed.",
+      stopConditions: ["The first response"],
+    },
+    {
+      surfaceIds: ["sensor_update_builds"],
+      cursorFields: [],
+      pageSize: null,
+      itemCap: "none",
+      pageCap: 1,
+      totalSemantics: "One read per distinct platform keeps every returned build; no cursor in its response is followed.",
+      stopConditions: ["The first response for each platform"],
     },
   ],
   rateLimit: {
