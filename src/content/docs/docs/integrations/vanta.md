@@ -23,6 +23,18 @@ The silent `read` keeps the secret value out of interactive Bash and Zsh history
 
 The tools accept `client_id` and `client_secret` arguments, but passing the secret as a tool argument can expose it to prompts, traces, or session storage.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools. Vanta has no assessment tools, so ask for audits and an export:
+
+```text
+Check whether my Vanta auditor credentials can see any audits.
+List my Vanta audits for SOC 2.
+Export the Vanta audit for Acme Corp's SOC 2 report.
+```
+
+The [audit](/docs/workflows/audit/) workflow takes the same path, for example `grclanker audit "the Acme Corp SOC 2 audit in Vanta"`: `vanta_check_access`, then `vanta_list_audits` and `vanta_export_audit`.
+
 ## Tools
 
 | Tool | Behavior |
@@ -70,3 +82,6 @@ The smoke test skips when `VANTA_CLIENT_ID` or `VANTA_CLIENT_SECRET` is missing.
 - The integration exposes the Auditor API only. It does not manage Vanta controls, tests, users, or integrations.
 - Visibility is limited to audits granted to the OAuth client.
 - A partial download still produces the package and records each failure in `_errors.log`.
+- Incomplete Auditor API pagination fails the request. A missing `endCursor`, a repeated cursor, a later 404 (including after a page that returned no items), or the 500-page cap does not return the pages already read as a complete list. When evidence URL pagination fails, the evidence item is recorded in `_errors.log` and its files are not treated as absent.
+- Authentication and API error text redacts the client id, client secret, and access token before the response body is shortened for display.
+- A download that redirects off HTTPS records the destination host and path in `_errors.log` and omits userinfo and the query string, so a signed URL is not written into the package.

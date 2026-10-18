@@ -1,5 +1,5 @@
 ---
-title: "Certification Data Sharing: FedRAMP Process"
+title: "Certification Data Sharing"
 description: "Official Consolidated Rules summary for the CDS FedRAMP process, including applicability and requirements."
 ---
 

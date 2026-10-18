@@ -1,4 +1,4 @@
-import { constants, existsSync, readFileSync, realpathSync } from "node:fs";
+import { constants, existsSync, realpathSync } from "node:fs";
 import {
   access,
   mkdir,
@@ -16,6 +16,7 @@ import {
   type SandboxRuntimeConfig,
 } from "@anthropic-ai/sandbox-runtime";
 import { getGrclankerSandboxConfigPath } from "../config/paths.js";
+import { ConfigFileError, readJsonConfig } from "../extensions/grc-tools/hardening/config-file.js";
 
 export type GrclankerSandboxConfig = SandboxRuntimeConfig & {
   enabled?: boolean;
@@ -67,12 +68,12 @@ function deepMergeConfig(
 }
 
 function readConfigFile(path: string): Partial<GrclankerSandboxConfig> {
-  if (!existsSync(path)) return {};
-  try {
-    return JSON.parse(readFileSync(path, "utf8")) as Partial<GrclankerSandboxConfig>;
-  } catch {
-    return {};
+  const result = readJsonConfig(path);
+  if (!result.ok) return {};
+  if (!result.value || typeof result.value !== "object" || Array.isArray(result.value)) {
+    throw new ConfigFileError({ kind: "parse", path, format: "JSON", code: "INVALID_JSON" });
   }
+  return result.value as Partial<GrclankerSandboxConfig>;
 }
 
 export function getProjectSandboxConfigPath(cwd: string): string {

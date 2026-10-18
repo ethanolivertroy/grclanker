@@ -114,6 +114,18 @@ Re-authorize the app in the Admin Console after changing scopes.
 
 `box_check_access` reports each surface separately, so partial grants are visible before you run an assessment.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Box credentials can read everything grclanker needs.
+Run the Box assessments and list the failing findings first.
+Export a Box audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Box enterprise"`. Both start with `box_check_access`, then run the assessments or `box_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

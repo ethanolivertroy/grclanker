@@ -46,6 +46,18 @@ Requests are signed per the documented `VERACODE-HMAC-SHA-256` scheme:
 
 The key ID and secret are removed from error messages as described under Export bundle. They are never written into bundles.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Veracode credentials can read everything grclanker needs.
+Run the Veracode assessments and list the failing findings first.
+Export a Veracode audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Veracode application security program"`. Both start with `veracode_check_access`, then run the assessments or `veracode_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

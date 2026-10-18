@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,8 +26,28 @@ import {
   scrubDataText,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/veracode.js";
+import { VERACODE_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
+import { VERACODE_SPEC } from "../dist/extensions/grc-tools/veracode.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  portableContractTest,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
+import {
+  assertRequestConformance,
+  certifyRuntimeBoundaryCoverage,
+  certifyRuntimeRuleDecisiveness,
+  observeRuntimeDecisionFacts,
+  recordFetchRequests,
+  sweepCheckCompleteness,
+} from "./helpers/spec-conformance.mjs";
+
+const observedDecisionFacts = observeRuntimeDecisionFacts(VERACODE_SPEC);
+const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const API_ID = "dbb6f2a2ed0b6890bbd32e949f72c8c8";
@@ -145,6 +166,36 @@ function healthyFixture() {
     self: { user_id: "u-2", user_name: "svc-api", roles: [{ role_name: "Results API" }, { role_name: "Administrator" }] },
     credentials: { api_id: "abc123", created_ts: daysAgo(30), expiration_ts: new Date(NOW.getTime() + 300 * 86_400_000).toISOString() },
   };
+}
+
+/** Every check with a fail rule fails, VERACODE-10, 16, and 18 warn, and the manual-only checks stay manual. */
+function failingFixture() {
+  const fixture = healthyFixture();
+  const [payments, portal] = fixture.applications;
+  payments.last_completed_scan_date = daysAgo(200);
+  payments.scans = [{ scan_type: "STATIC", status: "PUBLISHED", modified_date: daysAgo(200) }];
+  payments.profile.policies = [{ guid: "pol-builtin", name: "Veracode Recommended", is_default: true, policy_compliance_status: "DID_NOT_PASS" }];
+  portal.profile.policies = [];
+  portal.scans = [{ scan_type: "STATIC", status: "ANALYSIS_ERRORS" }];
+  fixture.policies = [{ guid: "pol-builtin", name: "Veracode Recommended", type: "BUILTIN", finding_rules: [] }];
+  fixture.sandboxes = [];
+  fixture.findings = [
+    { issue_id: 1, finding_status: { status: "OPEN", resolution: "UNRESOLVED", resolution_status: "NONE", first_found_date: daysAgo(45) }, finding_details: { severity: 5 }, annotations: [] },
+    { issue_id: 2, finding_status: { status: "OPEN", resolution_status: "PROPOSED" }, finding_details: { severity: 4 }, annotations: [{ action: "FP", comment: "" }] },
+    { issue_id: 3, finding_status: { status: "CLOSED", resolution_status: "APPROVED" }, finding_details: { severity: 3 }, annotations: [{ action: "FP", comment: "Encoded input" }, { action: "APPROVED", comment: "Reviewed" }] },
+  ];
+  fixture.summaryReport = { static_analysis: { modules: { module: [{ loc: 1000, numflawssev5: 3, numflawssev4: 2 }] } } };
+  fixture.vulnerabilityIssues = [{ id: "i1", issue_type: "vulnerability", severity: 9.8, library: { name: "log4j" }, vulnerability: { cve: "CVE-2021-44228", cvss3_score: 10 } }];
+  fixture.licenseIssues = [{ id: "i2", issue_type: "license", license: { name: "GPL-3.0", risk: "HIGH" }, library: { name: "gpl-lib" } }];
+  fixture.scaProjects = { application: { guid: "app-2", name: "Portal" }, linked_projects: [] };
+  fixture.scanConfiguration = { auth_configuration: { authentications: {} }, crawl_configuration: { disabled: false } };
+  fixture.users.push(
+    { user_id: "u-3", user_name: "stale", active: true, login_enabled: true, account_type: "USER", saml_user: false, last_login: daysAgo(400), roles: [{ role_name: "Administrator" }], teams: [] },
+    { user_id: "u-4", user_name: "orphan-api", active: true, login_enabled: false, account_type: "API", api_user: true, roles: [{ role_name: "Results API" }], teams: [] },
+  );
+  fixture.credentials = { api_id: "old", created_ts: daysAgo(500), expiration_ts: daysAgo(10) };
+  fixture.teams = [];
+  return fixture;
 }
 
 function mockClient(fixture = healthyFixture(), overrides = {}) {
@@ -1414,7 +1465,7 @@ function veracodeRoutes(fixture) {
     [/^\/appsec\/v1\/applications$/, () => page("applications", fixture.applications)],
     [/^\/appsec\/v1\/applications\/[^/]+\/sandboxes$/, () => page("sandboxes", fixture.sandboxes)],
     [/^\/appsec\/v2\/applications\/[^/]+\/findings$/, () => page("findings", fixture.findings)],
-    [/^\/appsec\/v2\/applications\/[^/]+\/summary_report$/, () => fixture.summaryReport],
+    [/^\/appsec\/v2\/applications\/[^/]+\/summary_report$/, (url) => fixture.summaryReportsByApplication?.[url.pathname.split("/")[4]] ?? fixture.summaryReport],
     [/^\/appsec\/v1\/policies$/, () => page("policy_versions", fixture.policies)],
     [/^\/srcclr\/v3\/workspaces$/, () => page("workspaces", fixture.workspaces)],
     [/^\/srcclr\/v3\/workspaces\/[^/]+\/issues$/, (url) => page("issues", url.searchParams.get("type") === "vulnerability" ? fixture.vulnerabilityIssues : fixture.licenseIssues)],
@@ -2990,4 +3041,598 @@ test("class 10: a single object carrying a documented member is kept whatever el
   const [, , , , accessControls] = await runVeracodeAssessments(client);
   assert.deepEqual(accessControls.rawData.self, fixture.self, "the record is kept whole");
   assert.equal(accessControls.rawData.api_credentials_by_user["u-2"].api_id, "abc123", "the credential record is projected, not marked");
+});
+
+portableContractTest("the auth resolver contract names exactly the environment the resolver reads, and each variable reaches the resolved configuration", () => {
+  assert.deepEqual(VERACODE_SPEC.authentication.environmentVariables, VERACODE_AUTH_RESOLVER.environment);
+  assert.deepEqual(VERACODE_SPEC.authentication.configLocations, VERACODE_AUTH_RESOLVER.configLocations);
+  assert.deepEqual(VERACODE_SPEC.authentication.configFields, VERACODE_AUTH_RESOLVER.configFields);
+
+  const home = createTempBase("grclanker-veracode-resolver-contract-");
+  mkdirSync(join(home, ".veracode"));
+  writeFileSync(join(home, ".veracode", "credentials"), [
+    "[default]",
+    "veracode_api_key_id = <default-key-id>",
+    "veracode_api_key_secret = 0a1b2c3d",
+    "[audit]",
+    "veracode_api_key_id = <audit-key-id>",
+    "veracode_api_key_secret = 4e5f6a7b",
+  ].join("\n"));
+  const otherFile = join(home, "other-credentials");
+  writeFileSync(otherFile, "[default]\nveracode_api_key_id = <other-file-key-id>\nveracode_api_key_secret = 9a8b7c6d\n");
+  const basic = { VERACODE_API_KEY_ID: "<env-key-id>", VERACODE_API_KEY_SECRET: "8c9d0e1f" };
+
+  const accessed = new Set();
+  const tracked = new Proxy({ ...basic }, {
+    get(target, property) {
+      if (typeof property === "string") accessed.add(property);
+      return target[property];
+    },
+  });
+  resolveVeracodeConfiguration({}, tracked, { homeDir: home });
+  assert.deepEqual([...accessed].sort(), [...VERACODE_AUTH_RESOLVER.environment].sort());
+
+  const reached = {
+    VERACODE_API_PROFILE: [{ VERACODE_API_PROFILE: "audit" }, (config) => config.profile === "audit" && config.apiKeyId === "<audit-key-id>" && config.apiKeySecret === "4e5f6a7b"],
+    VERACODE_API_CREDENTIALS_FILE: [{ VERACODE_API_CREDENTIALS_FILE: otherFile }, (config) => config.apiKeyId === "<other-file-key-id>" && config.apiKeySecret === "9a8b7c6d"],
+    VERACODE_API_KEY_ID: [{ VERACODE_API_KEY_ID: "<env-key-id>" }, (config) => config.apiKeyId === "<env-key-id>" && config.apiKeySecret === "0a1b2c3d"],
+    VERACODE_API_KEY_SECRET: [{ VERACODE_API_KEY_SECRET: "8c9d0e1f" }, (config) => config.apiKeySecret === "8c9d0e1f" && config.apiKeyId === "<default-key-id>"],
+    VERACODE_REGION: [{ ...basic, VERACODE_REGION: "eu" }, (config) => config.region === "eu" && config.baseUrl === "https://api.veracode.eu"],
+    VERACODE_API_BASE_URL: [{ ...basic, VERACODE_API_BASE_URL: "https://veracode.example.internal" }, (config) => config.baseUrl === "https://veracode.example.internal"],
+    VERACODE_TIMEOUT: [{ ...basic, VERACODE_TIMEOUT: "45" }, (config) => config.timeoutMs === 45_000],
+  };
+  assert.deepEqual(Object.keys(reached).sort(), [...VERACODE_AUTH_RESOLVER.environment].sort());
+  for (const [name, [environment, applied]] of Object.entries(reached)) {
+    assert.ok(applied(resolveVeracodeConfiguration({}, environment, { homeDir: home })), `${name} reaches the resolved configuration`);
+  }
+});
+
+function veracodeHttpClient(fetchImpl) {
+  return new VeracodeApiClient(sampleConfig({ retries: 0 }), { fetchImpl, sleep: async () => {} });
+}
+
+portableContractTest("every request the access check, the five assessments, and the export send matches a declared surface, parameter, and header", async () => {
+  const recorder = recordFetchRequests(recordingVeracodeFetch().fetchImpl);
+  const client = veracodeHttpClient(recorder.fetch);
+  await checkVeracodeAccess(client);
+  await runVeracodeAssessments(client);
+  await exportVeracodeAuditBundle(client, sampleConfig(), createTempBase("grclanker-veracode-request-conformance-"), { now: NOW });
+
+  const { fetchImpl } = recordingVeracodeFetch();
+  const memberOnly = recordFetchRequests(async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/authn/v2/teams" && url.searchParams.has("all_for_org")) return jsonResponse({ message: "Forbidden" }, { status: 403 });
+    return fetchImpl(input, init);
+  });
+  const fallbackClient = veracodeHttpClient(memberOnly.fetch);
+  await checkVeracodeAccess(fallbackClient);
+  await assessVeracodeAccessControls(fallbackClient, { now: NOW });
+  const teamRequests = memberOnly.requests.filter((request) => new URL(request.url).pathname === "/api/authn/v2/teams");
+  assert.ok(teamRequests.some((request) => !new URL(request.url).searchParams.has("all_for_org")), "the refused organization-wide team list falls back to the member-only request");
+
+  assertRequestConformance(assert, VERACODE_SPEC, [...recorder.requests, ...memberOnly.requests]);
+});
+
+// The requests that read each swept surface: the vulnerability and license issue lists share a path and differ by type.
+const VERACODE_SWEEP_TARGETS = {
+  applications: { path: /^\/appsec\/v1\/applications$/ },
+  policies: { path: /^\/appsec\/v1\/policies$/ },
+  sandboxes: { path: /^\/appsec\/v1\/applications\/[^/]+\/sandboxes$/ },
+  findings: { path: /^\/appsec\/v2\/applications\/[^/]+\/findings$/ },
+  summary_reports: { path: /^\/appsec\/v2\/applications\/[^/]+\/summary_report$/ },
+  users: { path: /^\/api\/authn\/v2\/users$/ },
+  teams: { path: /^\/api\/authn\/v2\/teams$/ },
+  roles: { path: /^\/api\/authn\/v2\/roles$/ },
+  api_credentials: { path: /^\/api\/authn\/v2\/api_credentials\/user_id\/[^/]+$/ },
+  sca_workspaces: { path: /^\/srcclr\/v3\/workspaces$/ },
+  sca_vulnerability_issues: { path: /^\/srcclr\/v3\/workspaces\/[^/]+\/issues$/, reads: (url) => url.searchParams.get("type") === "vulnerability" },
+  sca_license_issues: { path: /^\/srcclr\/v3\/workspaces\/[^/]+\/issues$/, reads: (url) => url.searchParams.get("type") === "license" },
+  sca_libraries: { path: /^\/srcclr\/v3\/workspaces\/[^/]+\/libraries$/ },
+  sca_application_projects: { path: /^\/srcclr\/v3\/applications\/[^/]+\/projects$/ },
+  dynamic_analyses: { path: /^\/was\/configservice\/v1\/analyses$/ },
+  dynamic_analysis_scans: { path: /^\/was\/configservice\/v1\/analyses\/[^/]+\/scans$/ },
+  dynamic_scan_configurations: { path: /^\/was\/configservice\/v1\/scans\/[^/]+\/configuration$/ },
+};
+
+/**
+ * Serves the healthy route table with at most one surface failed: a refused read answers 403, a failed one 500, and a
+ * truncated list reports one record more in total_elements than its only page holds.
+ */
+function sweepVeracodeFetch(fixture, failure) {
+  const routes = veracodeRoutes(fixture);
+  const target = failure && VERACODE_SWEEP_TARGETS[failure.surfaceId];
+  return async (input) => {
+    const url = new URL(String(input));
+    const route = routes.find(([pattern]) => pattern.test(url.pathname));
+    assert.ok(route, `unexpected request to ${url.pathname}`);
+    if (!target || !target.path.test(url.pathname) || (target.reads && !target.reads(url))) return jsonResponse(route[1](url));
+    if (failure.mode === "denied") return jsonResponse({ message: "Forbidden" }, { status: 403 });
+    if (failure.mode === "error") return jsonResponse({ message: "Internal Server Error" }, { status: 500 });
+    const body = route[1](url);
+    return jsonResponse({ ...body, page: { ...body.page, total_elements: body.page.total_elements + 1 } });
+  };
+}
+
+async function assessVeracodeCompletenessInput({ fixture, failure, options }) {
+  const client = veracodeHttpClient(sweepVeracodeFetch(fixture, failure));
+  const settings = { now: NOW, ...options };
+  const results = await Promise.all([
+    assessVeracodeScanCoverage(client, settings),
+    assessVeracodePolicyCompliance(client, settings),
+    assessVeracodeFindingsHygiene(client, settings),
+    assessVeracodeScaPosture(client, settings),
+    assessVeracodeAccessControls(client, settings),
+  ]);
+  return results.flatMap((result) => result.findings);
+}
+
+const unsampledApplication = (input) => ({ ...input, options: { maxApplications: 1 } });
+const unsampledWorkspace = (input) => ({
+  ...input,
+  fixture: { ...input.fixture, workspaces: [...input.fixture.workspaces, { id: "ws-2", name: "Workspace B", projects_count: 1 }] },
+  options: { maxWorkspaces: 1 },
+});
+
+// Reads go uncollected past the sampling caps: the second application past max_applications, the second workspace
+// past max_workspaces, the second analysis past max_analyses, the eleventh scan of an analysis, and the 201st active
+// API account.
+const VERACODE_UNCOLLECTED = {
+  sandboxes: unsampledApplication,
+  findings: unsampledApplication,
+  summary_reports: unsampledApplication,
+  sca_application_projects: unsampledApplication,
+  sca_vulnerability_issues: unsampledWorkspace,
+  sca_license_issues: unsampledWorkspace,
+  sca_libraries: unsampledWorkspace,
+  dynamic_analysis_scans: (input) => ({
+    ...input,
+    fixture: { ...input.fixture, analyses: [...input.fixture.analyses, { analysis_id: "an-2", name: "Admin DAST", latest_occurrence_status: { status_type: "FINISHED_RESULTS_AVAILABLE" } }] },
+    options: { maxAnalyses: 1 },
+  }),
+  dynamic_scan_configurations: (input) => ({
+    ...input,
+    fixture: { ...input.fixture, scans: Array.from({ length: 11 }, (_, index) => ({ scan_id: `scan-${index + 1}`, target_url: "https://portal.example.com", analysis_id: "an-1" })) },
+  }),
+  api_credentials: (input) => {
+    const apiAccount = input.fixture.users.find((user) => user.account_type === "API");
+    const more = Array.from({ length: 200 }, (_, index) => ({ ...apiAccount, user_id: `u-api-${index}`, user_name: `svc-api-${index}` }));
+    return { ...input, fixture: { ...input.fixture, users: [...input.fixture.users, ...more] } };
+  },
+};
+
+function failVeracodeCompletenessSource(input, { surfaceId, mode }) {
+  if (mode === "not-collected") return VERACODE_UNCOLLECTED[surfaceId]?.(input);
+  if (!VERACODE_SWEEP_TARGETS[surfaceId] || !["truncated", "denied", "error"].includes(mode)) return undefined;
+  return { ...input, failure: { surfaceId, mode } };
+}
+
+portableContractTest("completeness sweep: a truncated, refused, failed, or uncollected source never lets a check that reads it pass", async () => {
+  const report = await sweepCheckCompleteness({
+    spec: VERACODE_SPEC,
+    createInput: () => ({ fixture: healthyFixture(), failure: undefined, options: {} }),
+    applyFailure: failVeracodeCompletenessSource,
+    assess: assessVeracodeCompletenessInput,
+  });
+  assert.deepEqual(report.baselineNotPassing, []);
+  assert.deepEqual(report.unreachable, []);
+  assert.deepEqual(report.undemoted, []);
+  assert.ok(report.combinations > 0);
+});
+
+portableContractTest("the export writes every declared bundle path and nothing else, with and without collection errors", async () => {
+  const complete = veracodeHttpClient(recordingVeracodeFetch().fetchImpl);
+  const completeExport = await exportVeracodeAuditBundle(complete, sampleConfig(), createTempBase("grclanker-veracode-bundle-paths-"), { now: NOW });
+  assertBundlePathsMatchSpec(assert, completeExport.outputDir, VERACODE_SPEC);
+  assert.ok(!readBundleFiles(completeExport.outputDir).has("_errors.log"));
+
+  const partial = veracodeHttpClient(recordingVeracodeFetch({ denied: [/^\/api\/authn\/v2\/teams$/] }).fetchImpl);
+  const partialExport = await exportVeracodeAuditBundle(partial, sampleConfig(), createTempBase("grclanker-veracode-bundle-paths-"), { now: NOW });
+  assertBundlePathsMatchSpec(assert, partialExport.outputDir, VERACODE_SPEC);
+  assert.ok(readBundleFiles(partialExport.outputDir).has("_errors.log"));
+});
+
+const VERACODE_ASSESSMENT_TOOLS = [
+  ["veracode_assess_scan_coverage", assessVeracodeScanCoverage, [1, 4, 10, 11, 13, 14, 19]],
+  ["veracode_assess_policy_compliance", assessVeracodePolicyCompliance, [2, 15, 20]],
+  ["veracode_assess_findings_hygiene", assessVeracodeFindingsHygiene, [3, 12, 16, 17]],
+  ["veracode_assess_sca_posture", assessVeracodeScaPosture, [5, 6, 18]],
+  ["veracode_assess_access_controls", assessVeracodeAccessControls, [7, 8, 9]],
+];
+
+function veracodeCheckId(number) {
+  return `VERACODE-${String(number).padStart(2, "0")}`;
+}
+
+portableContractTest("every control and finding carries the title, severity, and tool of its spec check, whether it passes, fails, or cannot be read", async () => {
+  const checks = new Map(VERACODE_SPEC.checks.map((check) => [check.id, check]));
+  assert.equal(checks.size, VERACODE_CONTROLS.length);
+  const owners = new Map();
+  for (const [tool, assess, numbers] of VERACODE_ASSESSMENT_TOOLS) {
+    const { findings } = await assess(veracodeHttpClient(recordingVeracodeFetch().fetchImpl), { now: NOW });
+    assert.deepEqual(findings.map((item) => item.id), numbers.map(veracodeCheckId), `${tool} emits its controls`);
+    for (const number of numbers) owners.set(veracodeCheckId(number), tool);
+  }
+  for (const control of VERACODE_CONTROLS) {
+    const id = veracodeCheckId(control.number);
+    const check = checks.get(id);
+    assert.deepEqual(
+      { title: check.title, controls: check.controlNumbers, tool: check.owningTool },
+      { title: control.title, controls: [control.number], tool: owners.get(id) },
+    );
+  }
+
+  const runs = {
+    healthy: recordingVeracodeFetch(),
+    failing: recordingVeracodeFetch({ fixture: failingFixture() }),
+    empty: recordingVeracodeFetch({ fixture: { ...healthyFixture(), applications: [] } }),
+    denied: recordingVeracodeFetch({ denied: [/./] }),
+  };
+  const statuses = new Set();
+  const severityDeviations = {};
+  for (const [name, { fetchImpl }] of Object.entries(runs)) {
+    severityDeviations[name] = [];
+    for (const item of (await runVeracodeAssessments(veracodeHttpClient(fetchImpl))).flatMap((result) => result.findings)) {
+      const check = checks.get(item.id);
+      assert.equal(item.title, check.title, `${name} run: ${item.id}`);
+      if (item.severity !== check.severity) severityDeviations[name].push(`${item.id} ${item.severity}`);
+      statuses.add(item.status);
+    }
+  }
+  assert.deepEqual([...statuses].sort(), ["fail", "manual", "pass", "warn"]);
+  assert.ok(VERACODE_SPEC.knownGaps.some((gap) => gap.includes("reports VERACODE-16 and VERACODE-17 at high severity")));
+  const blocked = ["VERACODE-16 high", "VERACODE-17 high"];
+  assert.deepEqual(severityDeviations, { healthy: [], failing: [], empty: blocked, denied: blocked });
+});
+
+portableContractTest("the spec module carries its framework mappings, and loading the runtime leaves the spec unchanged", () => {
+  const specUrl = new URL("../dist/extensions/grc-tools/veracode.spec.js", import.meta.url).href;
+  const script = `import { VERACODE_SPEC } from ${JSON.stringify(specUrl)};\nprocess.stdout.write(JSON.stringify(VERACODE_SPEC));`;
+  const specOnly = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: 30_000,
+  });
+  assert.equal(specOnly.status, 0, specOnly.stderr);
+  assert.deepEqual(JSON.parse(specOnly.stdout), JSON.parse(JSON.stringify(VERACODE_SPEC)));
+
+  for (const control of VERACODE_SPEC.controls) {
+    const { mappings } = VERACODE_CONTROLS.find((entry) => entry.number === control.number);
+    const reference = (label) => {
+      const mapping = mappings.find((entry) => entry.startsWith(`${label} `));
+      assert.ok(mapping, `control ${control.number} carries a ${label} mapping`);
+      return mapping.slice(label.length + 1);
+    };
+    assert.deepEqual(control.frameworks, {
+      fedramp: [reference("FedRAMP")],
+      cmmc: [reference("CMMC")],
+      soc2: [reference("SOC 2")],
+      cis: [reference("CIS Controls v8")],
+      pci_dss: [reference("PCI-DSS")],
+      disa_stig: [reference("STIG")],
+      irap: [reference("IRAP")],
+      ismap: [reference("ISMAP")],
+    }, `control ${control.number}`);
+  }
+});
+
+function boundaryScenario(check, expected, edge, fixture, options = {}, denied = []) {
+  return { name: `${check} ${expected} when ${edge}`, check, expected, fixture, options, denied };
+}
+
+function fixtureWith(change) {
+  return () => {
+    const fixture = healthyFixture();
+    change(fixture);
+    return fixture;
+  };
+}
+
+function publishedStaticScan(days) {
+  return fixtureWith((fixture) => {
+    fixture.applications[0].scans = [{ scan_type: "STATIC", status: "PUBLISHED", modified_date: daysAgo(days) }];
+  });
+}
+
+function lastCompletedScan(applicationIndex, days) {
+  return fixtureWith((fixture) => {
+    fixture.applications[applicationIndex].last_completed_scan_date = daysAgo(days);
+  });
+}
+
+function policyStatus(status) {
+  return fixtureWith((fixture) => {
+    fixture.applications[0].profile.policies[0].policy_compliance_status = status;
+  });
+}
+
+function dynamicAnalyses(count) {
+  return fixtureWith((fixture) => {
+    fixture.analyses = Array.from({ length: count }, (_, index) => ({ analysis_id: `an-${index + 1}`, name: `DAST ${index + 1}`, latest_occurrence_status: { status_type: "FINISHED_RESULTS_AVAILABLE" } }));
+  });
+}
+
+function dynamicScans(count) {
+  return fixtureWith((fixture) => {
+    fixture.scans = Array.from({ length: count }, (_, index) => ({ scan_id: `scan-${index + 1}`, target_url: "https://portal.example.com", analysis_id: "an-1" }));
+  });
+}
+
+function openFlaw(severity, firstFoundDate) {
+  return fixtureWith((fixture) => {
+    fixture.findings[0].finding_details.severity = severity;
+    fixture.findings[0].finding_status.first_found_date = firstFoundDate;
+  });
+}
+
+function mitigation(annotation) {
+  return fixtureWith((fixture) => {
+    fixture.findings[0].annotations = [annotation];
+  });
+}
+
+function falsePositives(flagged, total) {
+  return fixtureWith((fixture) => {
+    fixture.findings = Array.from({ length: total }, (_, index) => ({
+      issue_id: 200 + index,
+      finding_status: { status: "OPEN", resolution: "UNRESOLVED", resolution_status: "NONE", first_found_date: daysAgo(5) },
+      finding_details: { severity: 3 },
+      annotations: index < flagged ? [{ action: "FP", comment: "Input is encoded before rendering" }] : [],
+    }));
+  });
+}
+
+function flawDensity(highFlaws, loc) {
+  return fixtureWith((fixture) => {
+    fixture.summaryReport.static_analysis.modules.module = [{ name: "app.jar", loc, numflawssev5: highFlaws, numflawssev4: 0 }];
+  });
+}
+
+function openVulnerability(issue) {
+  return fixtureWith((fixture) => {
+    fixture.vulnerabilityIssues = [{ id: "i1", issue_type: "vulnerability", library: { name: "log4j" }, vulnerability: { cve: "CVE-2026-0001" }, ...issue }];
+  });
+}
+
+function licenseIssue(license) {
+  return fixtureWith((fixture) => {
+    fixture.licenseIssues = [{ id: "i2", issue_type: "license", library: { name: "gpl-lib" }, license }];
+  });
+}
+
+function humanLastLogin(lastLogin) {
+  return fixtureWith((fixture) => {
+    fixture.users[0].last_login = lastLogin;
+  });
+}
+
+function apiCredential(fields) {
+  return fixtureWith((fixture) => {
+    Object.assign(fixture.credentials, fields);
+  });
+}
+
+const withoutFindings = fixtureWith((fixture) => {
+  fixture.findings = [];
+});
+
+const withoutUploadAndScan = fixtureWith((fixture) => {
+  fixture.applications[0].profile.upload_and_scan_sca_enabled = false;
+});
+
+const SCA_WORKSPACE_LIST = /^\/srcclr\/v3\/workspaces$/;
+const LINKED_PROJECT_LISTS = /^\/srcclr\/v3\/applications\/[^/]+\/projects$/;
+
+const BOUNDARY_SCENARIOS = [
+  boundaryScenario("VERACODE-01", "pass", "the newest published static scan is exactly the 90-day maximum age", publishedStaticScan(90)),
+  boundaryScenario("VERACODE-01", "pass", "the newest published static scan is 90.9 days old, which counts as 90 whole days", publishedStaticScan(90.9)),
+  boundaryScenario("VERACODE-01", "fail", "the newest published static scan is 91 days old", publishedStaticScan(91)),
+  boundaryScenario("VERACODE-01", "fail", "the maximum age is 30 days and the newest published static scan is 31 days old", publishedStaticScan(31), { maxScanAgeDays: 30 }),
+  boundaryScenario("VERACODE-01", "warn", "an application's only static scan is still in progress", fixtureWith((fixture) => {
+    fixture.applications[0].scans = [{ scan_type: "STATIC", status: "IN_PROGRESS", modified_date: daysAgo(1) }];
+  })),
+  boundaryScenario("VERACODE-02", "warn", "an application is in conditional pass", policyStatus("CONDITIONAL_PASS")),
+  boundaryScenario("VERACODE-02", "warn", "an application's policy is not yet assessed", policyStatus("NOT_ASSESSED")),
+  boundaryScenario("VERACODE-02", "fail", "an application did not pass its policy", policyStatus("DID_NOT_PASS")),
+  boundaryScenario("VERACODE-02", "fail", "an application has no policy assigned", fixtureWith((fixture) => {
+    fixture.applications[1].profile.policies = [];
+  })),
+  boundaryScenario("VERACODE-03", "pass", "a Very High open flaw was first found exactly 30 days ago, its age limit", openFlaw(5, daysAgo(30))),
+  boundaryScenario("VERACODE-03", "pass", "a Very High open flaw was first found 30.99 days ago, which counts as 30 whole days", openFlaw(5, daysAgo(30.99))),
+  boundaryScenario("VERACODE-03", "fail", "a Very High open flaw was first found 31 days ago", openFlaw(5, daysAgo(31))),
+  boundaryScenario("VERACODE-03", "pass", "a Low open flaw was first found exactly 180 days ago, its age limit", openFlaw(2, daysAgo(180))),
+  boundaryScenario("VERACODE-03", "fail", "a Low open flaw was first found 181 days ago", openFlaw(2, daysAgo(181))),
+  boundaryScenario("VERACODE-03", "pass", "the only open flaw is Very Low, which has no age limit, and was first found 1000 days ago", openFlaw(1, daysAgo(1000))),
+  boundaryScenario("VERACODE-03", "warn", "a Very High open flaw carries no first found date", openFlaw(5, null)),
+  boundaryScenario("VERACODE-03", "manual", "every sampled finding list is empty", withoutFindings),
+  boundaryScenario("VERACODE-04", "pass", "the VERY_HIGH application's last completed scan was exactly 7 days ago, the critical interval", lastCompletedScan(0, 7)),
+  boundaryScenario("VERACODE-04", "fail", "the VERY_HIGH application's last completed scan was 8 days ago", lastCompletedScan(0, 8)),
+  boundaryScenario("VERACODE-04", "pass", "the critical interval is 10 days and the VERY_HIGH application's last completed scan was 8 days ago", lastCompletedScan(0, 8), { criticalScanIntervalDays: 10 }),
+  boundaryScenario("VERACODE-04", "pass", "the HIGH application's last completed scan was exactly 31 days ago, the standard interval", lastCompletedScan(1, 31)),
+  boundaryScenario("VERACODE-04", "fail", "the HIGH application's last completed scan was 32 days ago", lastCompletedScan(1, 32)),
+  boundaryScenario("VERACODE-04", "pass", "the last published static scan is exactly 31 days old, the MONTHLY policy rule's interval", publishedStaticScan(31)),
+  boundaryScenario("VERACODE-04", "fail", "the last published static scan is 32 days old against the MONTHLY policy rule", publishedStaticScan(32)),
+  boundaryScenario("VERACODE-04", "warn", "no application has a policy scan frequency rule or a business criticality", fixtureWith((fixture) => {
+    fixture.policies[0].scan_frequency_rules = [];
+    for (const application of fixture.applications) delete application.profile.business_criticality;
+  })),
+  boundaryScenario("VERACODE-05", "fail", "an open vulnerability scores exactly the CVSS 7 threshold", openVulnerability({ severity: 7 })),
+  boundaryScenario("VERACODE-05", "pass", "the highest open vulnerability scores 6.9", openVulnerability({ severity: 6.9 })),
+  boundaryScenario("VERACODE-05", "fail", "an open vulnerability with no severity carries a CVSS 3 score of exactly 7", openVulnerability({ vulnerability: { cve: "CVE-2026-0001", cvss3_score: 7 } })),
+  boundaryScenario("VERACODE-05", "pass", "the threshold is CVSS 9 and the highest open vulnerability scores 8.9", openVulnerability({ severity: 8.9 }), { scaCvssThreshold: 9 }),
+  boundaryScenario("VERACODE-05", "manual", "no open vulnerability is returned and the sampled workspace holds no library", fixtureWith((fixture) => {
+    fixture.libraries = [];
+  })),
+  boundaryScenario("VERACODE-06", "warn", "an open license issue carries UNKNOWN license risk", licenseIssue({ name: "Custom-1.0", risk: "UNKNOWN" })),
+  boundaryScenario("VERACODE-06", "warn", "an open license issue carries no license risk", licenseIssue({ name: "Custom-1.0" })),
+  boundaryScenario("VERACODE-06", "pass", "the only open license issue carries MEDIUM license risk", licenseIssue({ name: "MPL-2.0", risk: "MEDIUM" })),
+  boundaryScenario("VERACODE-06", "fail", "an open license issue carries HIGH license risk", licenseIssue({ name: "GPL-3.0", risk: "HIGH" })),
+  boundaryScenario("VERACODE-07", "manual", "the role list is empty", fixtureWith((fixture) => {
+    fixture.roles = [];
+  })),
+  boundaryScenario("VERACODE-07", "pass", "1 active user holds a team-unrestricted role, exactly the maximum", healthyFixture, { maxUnrestrictedUsers: 1 }),
+  boundaryScenario("VERACODE-07", "fail", "the maximum is 0 and 1 active user holds a team-unrestricted role", healthyFixture, { maxUnrestrictedUsers: 0 }),
+  boundaryScenario("VERACODE-07", "warn", "an application has no team", fixtureWith((fixture) => {
+    fixture.applications[1].profile.teams = [];
+  })),
+  boundaryScenario("VERACODE-07", "fail", "the organization-wide team list holds no team", fixtureWith((fixture) => {
+    fixture.teams = [];
+  })),
+  boundaryScenario("VERACODE-08", "pass", "the account has 1 administrator, exactly the maximum", healthyFixture, { maxAdmins: 1 }),
+  boundaryScenario("VERACODE-08", "fail", "the maximum is 0 administrators and the account has 1", healthyFixture, { maxAdmins: 0 }),
+  boundaryScenario("VERACODE-08", "pass", "an active user last signed in exactly 90 days ago, the inactivity limit", humanLastLogin(daysAgo(90))),
+  boundaryScenario("VERACODE-08", "fail", "an active user last signed in 91 days ago", humanLastLogin(daysAgo(91))),
+  boundaryScenario("VERACODE-08", "pass", "the inactivity limit is 120 days and an active user last signed in 91 days ago", humanLastLogin(daysAgo(91)), { inactiveDays: 120 }),
+  boundaryScenario("VERACODE-08", "warn", "an active user has never signed in", humanLastLogin(null)),
+  boundaryScenario("VERACODE-08", "fail", "an active API account belongs to no team", fixtureWith((fixture) => {
+    fixture.users[1].teams = [];
+  })),
+  boundaryScenario("VERACODE-09", "pass", "the API credential was created exactly 365 days ago, the maximum age", apiCredential({ created_ts: daysAgo(365) })),
+  boundaryScenario("VERACODE-09", "fail", "the API credential was created 366 days ago", apiCredential({ created_ts: daysAgo(366) })),
+  boundaryScenario("VERACODE-09", "fail", "the maximum age is 29 days and the API credential was created 30 days ago", healthyFixture, { maxCredentialAgeDays: 29 }),
+  boundaryScenario("VERACODE-09", "warn", "the API credential expired a day ago without being revoked", apiCredential({ expiration_ts: daysAgo(1) })),
+  boundaryScenario("VERACODE-09", "warn", "the API credential carries no expiration date", apiCredential({ expiration_ts: null })),
+  boundaryScenario("VERACODE-09", "pass", "the only API credential is revoked", apiCredential({ revocation_ts: daysAgo(1) })),
+  boundaryScenario("VERACODE-09", "manual", "no active API account is listed", fixtureWith((fixture) => {
+    fixture.users = fixture.users.slice(0, 1);
+  })),
+  boundaryScenario("VERACODE-10", "warn", "no sampled application has a development sandbox", fixtureWith((fixture) => {
+    fixture.sandboxes = [];
+  })),
+  boundaryScenario("VERACODE-10", "pass", "max_applications samples both applications", healthyFixture, { maxApplications: 2 }),
+  boundaryScenario("VERACODE-10", "warn", "max_applications samples one of the two applications", healthyFixture, { maxApplications: 1 }),
+  boundaryScenario("VERACODE-12", "manual", "every sampled finding list is empty", withoutFindings),
+  boundaryScenario("VERACODE-12", "fail", "a mitigation is proposed but not reviewed", fixtureWith((fixture) => {
+    fixture.findings[0].finding_status.resolution_status = "PROPOSED";
+  })),
+  boundaryScenario("VERACODE-12", "fail", "a mitigation annotation carries no justification comment", mitigation({ action: "APPDESIGN", comment: "" })),
+  boundaryScenario("VERACODE-12", "pass", "the only mitigation annotation carries a justification comment", mitigation({ action: "APPDESIGN", comment: "Input is validated upstream" })),
+  boundaryScenario("VERACODE-13", "pass", "an analysis has exactly 10 scans, the most the inspection reads", dynamicScans(10)),
+  boundaryScenario("VERACODE-13", "warn", "an analysis has 11 scans, one more than the inspection reads", dynamicScans(11)),
+  boundaryScenario("VERACODE-13", "pass", "max_analyses samples both Dynamic Analyses", dynamicAnalyses(2), { maxAnalyses: 2 }),
+  boundaryScenario("VERACODE-13", "warn", "max_analyses samples one of the two Dynamic Analyses", dynamicAnalyses(2), { maxAnalyses: 1 }),
+  boundaryScenario("VERACODE-13", "fail", "an inspected scan has crawling disabled", fixtureWith((fixture) => {
+    fixture.scanConfiguration.crawl_configuration.disabled = true;
+  })),
+  boundaryScenario("VERACODE-13", "fail", "an inspected scan has no authentication configured", fixtureWith((fixture) => {
+    fixture.scanConfiguration.auth_configuration.authentications = {};
+  })),
+  boundaryScenario("VERACODE-15", "warn", "the only custom policy defines no finding rules", fixtureWith((fixture) => {
+    fixture.policies[0].finding_rules = [];
+  })),
+  boundaryScenario("VERACODE-15", "warn", "an application is assigned only a built-in policy", fixtureWith((fixture) => {
+    fixture.policies.push({ guid: "pol-builtin", name: "Veracode Recommended", type: "BUILTIN", finding_rules: [] });
+    fixture.applications[1].profile.policies = [{ guid: "pol-builtin", name: "Veracode Recommended", is_default: true, policy_compliance_status: "PASSED" }];
+  })),
+  boundaryScenario("VERACODE-15", "fail", "every policy is a built-in policy", fixtureWith((fixture) => {
+    fixture.policies = [{ guid: "pol-builtin", name: "Veracode Recommended", type: "BUILTIN", finding_rules: [] }];
+  })),
+  boundaryScenario("VERACODE-15", "pass", "the application inventory is read and empty", fixtureWith((fixture) => {
+    fixture.applications = [];
+  })),
+  boundaryScenario("VERACODE-16", "pass", "1 of 5 findings carries a false positive annotation, exactly the 20 percent maximum", falsePositives(1, 5)),
+  boundaryScenario("VERACODE-16", "warn", "1 of 4 findings carries a false positive annotation", falsePositives(1, 4)),
+  boundaryScenario("VERACODE-16", "pass", "the maximum is 25 percent and 1 of 4 findings carries a false positive annotation", falsePositives(1, 4), { maxFpRatePercent: 25 }),
+  boundaryScenario("VERACODE-16", "manual", "every sampled finding list is empty", withoutFindings),
+  boundaryScenario("VERACODE-17", "pass", "the summary report holds 1 Very High or High flaw per thousand lines of code, exactly the maximum density", flawDensity(1, 1000)),
+  boundaryScenario("VERACODE-17", "fail", "the summary report holds 2 Very High or High flaws in 1999 lines of code", flawDensity(2, 1999)),
+  boundaryScenario("VERACODE-17", "pass", "the maximum density is 2 and the summary report holds 2 Very High or High flaws in 1000 lines of code", flawDensity(2, 1000), { maxFlawDensityPerKloc: 2 }),
+  boundaryScenario("VERACODE-17", "warn", "one application's summary report exposes no lines of code", fixtureWith((fixture) => {
+    fixture.summaryReportsByApplication = { "app-2": { static_analysis: { modules: { module: [] } } } };
+  })),
+  boundaryScenario("VERACODE-17", "manual", "no summary report exposes lines of code", fixtureWith((fixture) => {
+    fixture.summaryReport = { static_analysis: {} };
+  })),
+  boundaryScenario("VERACODE-18", "manual", "the SCA workspace list is refused and no application enables upload-and-scan SCA", withoutUploadAndScan, {}, [SCA_WORKSPACE_LIST]),
+  boundaryScenario("VERACODE-18", "warn", "the SCA workspace list is refused, so the application without upload-and-scan SCA goes unchecked", healthyFixture, {}, [SCA_WORKSPACE_LIST]),
+  boundaryScenario("VERACODE-18", "warn", "an application has neither upload-and-scan SCA nor a linked SCA agent project", fixtureWith((fixture) => {
+    fixture.scaProjects.linked_projects = [];
+  })),
+  boundaryScenario("VERACODE-18", "manual", "every linked project list is refused and no application enables upload-and-scan SCA", withoutUploadAndScan, {}, [LINKED_PROJECT_LISTS]),
+  boundaryScenario("VERACODE-19", "manual", "no application lists a scan", fixtureWith((fixture) => {
+    for (const application of fixture.applications) application.scans = [];
+  })),
+  boundaryScenario("VERACODE-19", "warn", "one application lists no scan", fixtureWith((fixture) => {
+    fixture.applications[1].scans = [];
+  })),
+  boundaryScenario("VERACODE-19", "fail", "an application lists a scan in ANALYSIS_ERRORS", fixtureWith((fixture) => {
+    fixture.applications[1].scans.push({ scan_type: "DYNAMIC", status: "ANALYSIS_ERRORS" });
+  })),
+];
+
+async function runBoundaryScenario({ check, fixture, options, denied }) {
+  const [, assess] = VERACODE_ASSESSMENT_TOOLS.find(([, , numbers]) => numbers.map(veracodeCheckId).includes(check));
+  const { fetchImpl } = recordingVeracodeFetch({ fixture: fixture(), denied });
+  return assess(veracodeHttpClient(fetchImpl), { ...options, now: NOW });
+}
+
+test("boundary scenarios: each threshold edge reaches the verdict on either side of it", async () => {
+  const names = BOUNDARY_SCENARIOS.map((scenario) => scenario.name);
+  assert.equal(new Set(names).size, names.length, "scenario names key the byte differential fixture");
+  const mismatches = [];
+  for (const scenario of BOUNDARY_SCENARIOS) {
+    const result = await runBoundaryScenario(scenario);
+    const status = result.findings.find((item) => item.id === scenario.check)?.status;
+    if (status !== scenario.expected) mismatches.push(`${scenario.name}: ${status}`);
+  }
+  assert.deepEqual(mismatches, []);
+});
+
+function missingNullFixture() {
+  return {
+    applications: [{
+      guid: "app-1",
+      last_completed_scan_date: null,
+      profile: { name: null, business_criticality: null, business_unit: null, upload_and_scan_sca_enabled: null, policies: [{ guid: "pol-1", name: null, is_default: null, policy_compliance_status: null }], teams: null },
+      scans: [{ scan_type: "STATIC", status: "PUBLISHED", modified_date: null }],
+    }],
+    policies: [{ guid: "pol-1", name: null, type: null, finding_rules: null, scan_frequency_rules: null }],
+    sandboxes: [{ guid: "sb-1", name: null, created: null, modified: null }],
+    findings: [{ issue_id: null, finding_status: { status: "OPEN", resolution: "UNRESOLVED", resolution_status: null, first_found_date: null }, finding_details: { severity: 5 }, annotations: null }],
+    summaryReport: { static_analysis: { modules: { module: [{ name: null, loc: null, numflawssev5: null, numflawssev4: null }] } } },
+    workspaces: [{ id: "ws-1", name: null }],
+    vulnerabilityIssues: [{ id: "i1", issue_type: "vulnerability", severity: null, library: null, vulnerability: null }],
+    licenseIssues: [{ id: "i2", issue_type: "license", license: null, library: null }],
+    libraries: [{ id: "lib-1", name: null, version: null }],
+    scaProjects: { application: null, linked_projects: null },
+    analyses: [{ analysis_id: "an-1", name: null, latest_occurrence_status: null }],
+    scans: [{ scan_id: "scan-1", target_url: null, analysis_id: "an-1" }],
+    scanConfiguration: { target_url: null, auth_configuration: null, crawl_configuration: null },
+    users: [
+      { user_id: "u-1", user_name: null, email_address: null, active: true, login_enabled: true, account_type: null, saml_user: null, last_login: null, roles: null, teams: null },
+      { user_id: "u-2", user_name: null, active: true, account_type: "API", api_user: null, roles: null, teams: null },
+    ],
+    teams: [{ team_id: "t1", team_name: null }],
+    roles: [{ role_id: "r-1", role_name: null, ignore_team_restrictions: null }],
+    self: { user_id: "u-2", user_name: null, roles: null },
+    credentials: { api_id: null, created_ts: null, expiration_ts: null },
+  };
+}
+
+const PARTIAL_DENIALS = [
+  /^\/appsec\/v2\/applications\/app-2\/findings$/,
+  /^\/appsec\/v2\/applications\/app-2\/summary_report$/,
+  /^\/srcclr\/v3\/workspaces\/[^/]+\/libraries$/,
+];
+
+test("byte differential fixtures: Veracode assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  const client = (fixture, denied) => veracodeHttpClient(recordingVeracodeFetch({ fixture, denied }).fetchImpl);
+  writeByteDifferentialFixture("veracode", "representative", await runVeracodeAssessments(client(failingFixture())));
+  writeByteDifferentialFixture("veracode", "compliant", await runVeracodeAssessments(client(healthyFixture())));
+  writeByteDifferentialFixture("veracode", "denied", await runVeracodeAssessments(client(healthyFixture(), [/./])));
+  writeByteDifferentialFixture("veracode", "partial", await runVeracodeAssessments(client(healthyFixture(), PARTIAL_DENIALS)));
+  writeByteDifferentialFixture("veracode", "missing-null", await runVeracodeAssessments(client(missingNullFixture())));
+  const boundary = {};
+  for (const scenario of BOUNDARY_SCENARIOS) boundary[scenario.name] = await runBoundaryScenario(scenario);
+  writeByteDifferentialFixture("veracode", "boundary", boundary);
+  const exported = await exportVeracodeAuditBundle(client(failingFixture(), PARTIAL_DENIALS), sampleConfig(), prepareByteDifferentialExportRoot("veracode"), { now: NOW });
+  writeByteDifferentialFixture("veracode", "export", snapshotExportBundle(exported));
+});
+
+portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", {
+  skip: testFilterActive && "a test filter ran only part of this file",
+}, () => {
+  observedDecisionFacts.stop();
+  const boundaries = certifyRuntimeBoundaryCoverage(VERACODE_SPEC, observedDecisionFacts.factsByCheck);
+  const rules = certifyRuntimeRuleDecisiveness(VERACODE_SPEC, observedDecisionFacts.factsByCheck);
+  assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
 });

@@ -140,7 +140,7 @@ function processPage(
   const counts = requirementCountsByApplicability(catalog, process.id);
   const lines = [
     frontmatter(
-      `${process.name}: FedRAMP Process`,
+      process.name,
       `Official Consolidated Rules summary for the ${process.shortName} FedRAMP process, including applicability and requirements.`,
     ),
     "",
@@ -224,7 +224,7 @@ function ksiDomainPage(
   const indicators = domainIndicators(catalog, domain.id);
   const lines = [
     frontmatter(
-      `${domain.name}: FedRAMP KSI Domain`,
+      domain.name,
       `Official Consolidated Rules summary for the ${domain.shortName} FedRAMP key security indicator domain.`,
     ),
     "",
@@ -304,6 +304,8 @@ export function buildFedrampDocsSnapshot(
     sourceBanner(primary, secondary),
     "",
     "This section is generated from the official FedRAMP GitHub organization. grclanker uses these machine-readable materials for both CLI lookups and reviewed docs snapshots so the public site stays fast without drifting away from upstream.",
+    "",
+    "To check readiness against these rules, plan the artifacts, and draft a Certification Data Sharing bundle and trust-center site, follow the [FedRAMP Readiness guide](/docs/guides/fedramp-readiness/).",
     "",
     "## Current Grounding",
     "",

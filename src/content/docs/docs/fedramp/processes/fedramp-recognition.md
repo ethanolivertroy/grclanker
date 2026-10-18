@@ -1,5 +1,5 @@
 ---
-title: "FedRAMP Recognition of Independent Assessment Services: FedRAMP Process"
+title: "FedRAMP Recognition of Independent Assessment Services"
 description: "Official Consolidated Rules summary for the REC FedRAMP process, including applicability and requirements."
 ---
 

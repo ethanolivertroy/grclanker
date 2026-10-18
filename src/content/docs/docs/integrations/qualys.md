@@ -133,6 +133,18 @@ Every error string passes through one scrub before it exists. The scrub removes:
 
 Every bundle file is scrubbed again on write with the same rules minus the long-token rule, so QIDs, asset ids, and tag ids survive as evidence.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Qualys credentials can read everything grclanker needs.
+Run the Qualys assessments and list the failing findings first.
+Export a Qualys audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Qualys scanning program"`. Both start with `qualys_check_access`, then run the assessments or `qualys_export_audit_bundle`.
+
 ## Tools
 
 All tools accept the same connection arguments: `username`, `password`, `token`, `platform`, `base_url`, `gateway_url`, `use_oauth`, `config_file`, `timeout_seconds`, and `lookback_days`.

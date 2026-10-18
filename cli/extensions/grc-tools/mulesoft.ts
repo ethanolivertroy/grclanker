@@ -758,6 +758,24 @@ function extractCollection(payload: unknown, keys: string[] = ["data"]): JsonRec
   return [];
 }
 
+/**
+ * A list read whose body is not the documented collection (a bare array, or an object
+ * carrying one of the named array members). An empty array is a real empty inventory.
+ * A 200 object that omits the member is not: callers must not report it as complete
+ * and empty.
+ */
+function requireCollection(payload: unknown, keys: string[], path: string): JsonRecord[] {
+  if (Array.isArray(payload)) return asRecordArray(payload);
+  const object = asObject(payload);
+  if (object) {
+    for (const key of keys) {
+      if (Array.isArray(object[key])) return asRecordArray(object[key]);
+    }
+  }
+  const expected = keys.length === 1 ? `a ${keys[0]} array` : `a ${keys.join(" or ")} array`;
+  throw new Error(`Anypoint response for ${path} did not include ${expected}, so the listing cannot be treated as an empty inventory.`);
+}
+
 // Runtime Manager (ARM) wraps each server and alert as {"data":[{"data":{...}}]}; merge the inner record over the outer one.
 function unwrapDataEnvelope(items: JsonRecord[]): JsonRecord[] {
   return items.map((item) => {
@@ -1631,7 +1649,7 @@ export class MulesoftApiClient {
     for (;;) {
       const requested = Math.min(pageSize, limit - items.length);
       const payload = await this.get(path, { ...(options.query ?? {}), limit: requested, offset }, options.headers);
-      const pageItems = extractCollection(payload, collectionKeys);
+      const pageItems = requireCollection(payload, collectionKeys, path);
       total = asNumber(asObject(payload)?.total) ?? total;
       items.push(...pageItems.slice(0, limit - items.length));
       offset += pageItems.length;
@@ -1655,7 +1673,7 @@ export class MulesoftApiClient {
 
   private async hasMoreItems(path: string, options: ListOptions, collectionKeys: string[], offset: number): Promise<boolean> {
     const payload = await this.get(path, { ...(options.query ?? {}), limit: 1, offset }, options.headers);
-    return extractCollection(payload, collectionKeys).length > 0;
+    return requireCollection(payload, collectionKeys, path).length > 0;
   }
 
   private orgPath(suffix = ""): string {
@@ -1752,7 +1770,7 @@ export class MulesoftApiClient {
       `/apimanager/api/v1/organizations/${encodeURIComponent(this.config.organizationId)}/environments/${encodeURIComponent(environmentId)}/apis/${encodeURIComponent(apiId)}/policies`,
       { fullInfo: false },
     );
-    return extractCollection(payload, ["policies", "data"]);
+    return requireCollection(payload, ["policies", "data"], `/apimanager/api/v1/organizations/${this.config.organizationId}/environments/${environmentId}/apis/${apiId}/policies`);
   }
 
   async listExchangeAssets(limit = DEFAULT_LIST_LIMIT): Promise<MulesoftPage> {
@@ -1761,11 +1779,11 @@ export class MulesoftApiClient {
 
   // retrieveStatistics defaults to false, which leaves workers.recentStatistics (CPU) out of every application record.
   async listCloudhubApplications(environmentId: string): Promise<JsonRecord[]> {
-    return extractCollection(await this.get("/cloudhub/api/v2/applications", { retrieveStatistics: true }, this.environmentHeaders(environmentId)));
+    return requireCollection(await this.get("/cloudhub/api/v2/applications", { retrieveStatistics: true }, this.environmentHeaders(environmentId)), ["data"], "/cloudhub/api/v2/applications");
   }
 
   async listCloudhubAlerts(environmentId: string): Promise<JsonRecord[]> {
-    return extractCollection(await this.get("/cloudhub/api/v2/alerts", {}, this.environmentHeaders(environmentId)));
+    return requireCollection(await this.get("/cloudhub/api/v2/alerts", {}, this.environmentHeaders(environmentId)), ["data"], "/cloudhub/api/v2/alerts");
   }
 
   async listVpcs(limit = DEFAULT_VPC_LIMIT): Promise<MulesoftPage> {
@@ -1795,19 +1813,19 @@ export class MulesoftApiClient {
   }
 
   async listHybridServers(environmentId: string): Promise<JsonRecord[]> {
-    return unwrapDataEnvelope(extractCollection(await this.get("/hybrid/api/v1/servers", {}, this.environmentHeaders(environmentId))));
+    return unwrapDataEnvelope(requireCollection(await this.get("/hybrid/api/v1/servers", {}, this.environmentHeaders(environmentId)), ["data"], "/hybrid/api/v1/servers"));
   }
 
   async listHybridAlerts(environmentId: string): Promise<JsonRecord[]> {
-    return unwrapDataEnvelope(extractCollection(await this.get("/hybrid/api/v1/alerts", {}, this.environmentHeaders(environmentId))));
+    return unwrapDataEnvelope(requireCollection(await this.get("/hybrid/api/v1/alerts", {}, this.environmentHeaders(environmentId)), ["data"], "/hybrid/api/v1/alerts"));
   }
 
   async listAuditPlatforms(): Promise<JsonRecord[]> {
-    return extractCollection(await this.get(`/audit/v2/organizations/${encodeURIComponent(this.config.organizationId)}/platforms`));
+    return requireCollection(await this.get(`/audit/v2/organizations/${encodeURIComponent(this.config.organizationId)}/platforms`), ["data"], `/audit/v2/organizations/${this.config.organizationId}/platforms`);
   }
 
   async getAuditRetentionSettings(): Promise<JsonRecord[]> {
-    return extractCollection(await this.get(`/audit/v2/organizations/${encodeURIComponent(this.config.organizationId)}/retentionSettings`));
+    return requireCollection(await this.get(`/audit/v2/organizations/${encodeURIComponent(this.config.organizationId)}/retentionSettings`), ["data"], `/audit/v2/organizations/${this.config.organizationId}/retentionSettings`);
   }
 
   async queryAuditLogs(query: { startDate: string; endDate?: string; limit?: number; offset?: number }): Promise<JsonRecord> {
@@ -1817,7 +1835,11 @@ export class MulesoftApiClient {
       limit: clampNumber(query.limit, AUDIT_QUERY_PAGE_LIMIT, 1, AUDIT_QUERY_PAGE_LIMIT),
       offset: query.offset ?? 0,
     });
-    return asObject(payload) ?? {};
+    const record = asObject(payload) ?? {};
+    if (!Array.isArray(record.data)) {
+      throw new Error(`Anypoint response for /audit/v2/organizations/${this.config.organizationId}/query did not include a data array, so the listing cannot be treated as an empty inventory.`);
+    }
+    return record;
   }
 
   private mqPath(environmentId: string, suffix = ""): string {
@@ -1825,21 +1847,23 @@ export class MulesoftApiClient {
   }
 
   async listMqRegions(environmentId: string): Promise<JsonRecord[]> {
-    return extractCollection(await this.get(this.mqPath(environmentId, "/regions")));
+    const path = this.mqPath(environmentId, "/regions");
+    return requireCollection(await this.get(path), ["data"], path);
   }
 
   async listMqQueues(environmentId: string, regionId: string): Promise<JsonRecord[]> {
-    return extractCollection(await this.get(this.mqPath(environmentId, `/regions/${encodeURIComponent(regionId)}/destinations/queues`)));
+    const path = this.mqPath(environmentId, `/regions/${encodeURIComponent(regionId)}/destinations/queues`);
+    return requireCollection(await this.get(path), ["data"], path);
   }
 
   async listMqClients(environmentId: string): Promise<JsonRecord[]> {
-    return extractCollection(await this.get(this.mqPath(environmentId, "/clients")));
+    const path = this.mqPath(environmentId, "/clients");
+    return requireCollection(await this.get(path), ["data"], path);
   }
 
   async listSecretGroups(environmentId: string): Promise<JsonRecord[]> {
-    return extractCollection(
-      await this.get(`/secrets-manager/api/v1/organizations/${encodeURIComponent(this.config.organizationId)}/environments/${encodeURIComponent(environmentId)}/secretGroups`),
-    );
+    const path = `/secrets-manager/api/v1/organizations/${encodeURIComponent(this.config.organizationId)}/environments/${encodeURIComponent(environmentId)}/secretGroups`;
+    return requireCollection(await this.get(path), ["data"], path);
   }
 }
 

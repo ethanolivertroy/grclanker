@@ -252,6 +252,18 @@ Every assessment summary carries a `collection` object with one entry per snapsh
 
 Every endpoint or status code named anywhere in a finding, summary, tool result, or `_errors.log` line is the request that actually failed and the status it actually returned. The request's method and path are taken from the thrown error.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Zendesk credentials can read everything grclanker needs.
+Run the Zendesk assessments and list the failing findings first.
+Export a Zendesk audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Zendesk instance"`. Both start with `zendesk_check_access`, then run the assessments or `zendesk_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

@@ -90,6 +90,18 @@ The client also:
 
 A full URL such as `https://api.eu.sumologic.com` is normalized to end in `/api`.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Sumo Logic credentials can read everything grclanker needs.
+Run the Sumo Logic assessments and list the failing findings first.
+Export a Sumo Logic audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Sumo Logic organization"`. Both start with `sumologic_check_access`, then run the assessments or `sumologic_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

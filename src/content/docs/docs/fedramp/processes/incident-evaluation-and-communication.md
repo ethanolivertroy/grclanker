@@ -1,5 +1,5 @@
 ---
-title: "Incident Evaluation and Communication: FedRAMP Process"
+title: "Incident Evaluation and Communication"
 description: "Official Consolidated Rules summary for the IEC FedRAMP process, including applicability and requirements."
 ---
 

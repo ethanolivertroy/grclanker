@@ -5,6 +5,7 @@ import { KeyboardShortcuts } from '../components/keyboard-shortcuts';
 import { SiteFooter } from '../components/site-footer';
 import { SiteHeader } from '../components/site-header';
 import { SiteSearchDialog } from '../components/site-search';
+import { SkipLink } from '../components/skip-link';
 import { pageMetadata } from '../lib/metadata';
 import { siteName } from '../lib/site';
 import '../styles/global.css';
@@ -24,9 +25,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           theme={{ enabled: false }}
           search={{ SearchDialog: SiteSearchDialog }}
         >
-          <a href="#main-content" className="skip-link">
-            Skip to content
-          </a>
+          <SkipLink />
           <div id="app-shell" className="flex min-h-screen flex-col">
             <SiteHeader />
             <main id="main-content" className="flex-1">

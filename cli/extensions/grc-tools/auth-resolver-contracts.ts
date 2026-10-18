@@ -425,3 +425,94 @@ export const QUALYS_AUTH_RESOLVER = {
   configFields: ["username", "user", "password", "token", "use_oauth", "platform", "hostname", "base_url", "gateway_url", "timeout"],
   refreshRequest: "POST {gateway}/auth with the form fields username, password, and token=true when use_oauth is set and no token is configured; the returned token is reused for 3.5 hours.",
 } as const satisfies ResolverAuthenticationContract;
+
+export const CROWDSTRIKE_AUTH_RESOLVER = {
+  modes: ["OAuth2 client credentials: client_id and client_secret are exchanged for a bearer token, sent as Authorization: Bearer on every API read"],
+  precedence: [
+    "Explicit tool arguments",
+    "CS_* environment variables, then their FALCON_* aliases",
+    "CrowdStrike JSON config file",
+    "A base_url from any source takes precedence over a cloud from any source; with neither, the us-1 API host is used",
+  ],
+  environment: [
+    "CS_CONFIG_FILE",
+    "CS_CLIENT_ID",
+    "FALCON_CLIENT_ID",
+    "CS_CLIENT_SECRET",
+    "FALCON_CLIENT_SECRET",
+    "CS_CLOUD",
+    "FALCON_CLOUD",
+    "CS_BASE_URL",
+    "FALCON_BASE_URL",
+    "CS_MEMBER_CID",
+    "FALCON_MEMBER_CID",
+    "CS_TIMEOUT",
+  ],
+  configLocations: ["~/.crowdstrike/config.json", "Explicit path from config_file or CS_CONFIG_FILE"],
+  variants: [
+    "Named clouds us-1 (the default, https://api.crowdstrike.com), us-2, eu-1, us-gov-1, and us-gov-2, each with its own API host",
+    "Cloud aliases us1, us2, eu1, usgov1, usgov2, gov-1, gov, and laggar, matched case-insensitively with underscores read as hyphens",
+    "An explicit https base_url (the scheme may be omitted; http is rejected) replaces the cloud's API host, and a base_url equal to a named cloud's host reports that cloud",
+    "A Flight Control child CID (member_cid) is sent only in the token request, so the token and every read made with it cover that CID only",
+  ],
+  configFields: ["client_id", "clientId", "client_secret", "clientSecret", "cloud", "region", "base_url", "baseUrl", "member_cid", "memberCid", "timeout_seconds"],
+  refreshRequest: "POST {base_url}/oauth2/token with Accept: application/json and an application/x-www-form-urlencoded body of client_id, client_secret, and member_cid when configured; the access_token is reused until 60 seconds before its expires_in (1799 seconds when absent) runs out, and for at least 60 seconds.",
+} as const satisfies ResolverAuthenticationContract;
+
+export const KNOWBE4_AUTH_RESOLVER = {
+  modes: [
+    "Reporting API token: sent as Authorization: Bearer on every KnowBe4 Reporting API read",
+    "Optional PhishER API token: sent as Authorization: Bearer on every PhishER GraphQL request; PhishER is not read without it",
+  ],
+  precedence: [
+    "Explicit tool arguments (api_token, else token, for the Reporting API token)",
+    "KNOWBE4_* environment variables",
+    "KnowBe4 YAML config file",
+    "A base_url or phisher_graphql_url from any source takes precedence over the region's default; with no region, us is used",
+  ],
+  environment: [
+    "KNOWBE4_CONFIG_FILE",
+    "KNOWBE4_API_TOKEN",
+    "KNOWBE4_REGION",
+    "KNOWBE4_BASE_URL",
+    "KNOWBE4_PHISHER_API_TOKEN",
+    "KNOWBE4_PHISHER_GRAPHQL_URL",
+    "KNOWBE4_TIMEOUT",
+    "KNOWBE4_REDACT_PII",
+  ],
+  configLocations: ["~/.knowbe4-inspector/config.yaml", "Explicit path from config_file or KNOWBE4_CONFIG_FILE"],
+  variants: [
+    "Regions us (the default), eu, ca, uk, and de, matched after trimming and lowercasing; any other region is rejected",
+    "Each region's Reporting API host is https://{region}.api.knowbe4.com; its PhishER GraphQL URL is https://training.knowbe4.com/graphql for us and https://{region}.knowbe4.com/graphql otherwise",
+    "An explicit base_url or phisher_graphql_url replaces the region's URL, with any user information, query, fragment, and trailing slashes removed",
+  ],
+  configFields: ["api_token", "region", "base_url", "phisher_api_token", "phisher_graphql_url", "timeout_seconds", "redact_pii"],
+} as const satisfies ResolverAuthenticationContract;
+
+export const VERACODE_AUTH_RESOLVER = {
+  modes: [
+    "HMAC-signed API key pair: every request carries Authorization: VERACODE-HMAC-SHA-256 id={api_key_id},ts={timestamp},nonce={nonce},sig={signature}, where timestamp is the current time in epoch milliseconds, nonce is 16 random bytes as 32 lowercase hex digits, and signature is the lowercase hex HMAC-SHA256 of id={api_key_id}&host={host}&url={path and query}&method={METHOD} under a signing key derived from the hex-decoded api_key_secret by three chained HMAC-SHA256 steps over the nonce bytes, the timestamp digits, and vcode_request_version_1",
+  ],
+  precedence: [
+    "Explicit tool arguments",
+    "VERACODE_* environment variables",
+    "The selected profile of the Veracode credentials file, read only for whichever of the key ID and secret is still missing",
+    "A base_url from any source takes precedence over the region; with no region, us is used",
+  ],
+  environment: [
+    "VERACODE_API_PROFILE",
+    "VERACODE_API_CREDENTIALS_FILE",
+    "VERACODE_API_KEY_ID",
+    "VERACODE_API_KEY_SECRET",
+    "VERACODE_REGION",
+    "VERACODE_API_BASE_URL",
+    "VERACODE_TIMEOUT",
+  ],
+  configLocations: ["~/.veracode/credentials", "Explicit path from credentials_file or VERACODE_API_CREDENTIALS_FILE"],
+  variants: [
+    "Regions us and commercial (https://api.veracode.com, the default), eu, europe, and european (https://api.veracode.eu), and fedramp, us-fed, and federal (https://api.veracode.us), matched after trimming and lowercasing; any other region is rejected unless a base_url is given",
+    "An explicit base_url replaces the region's host, with any query, fragment, and trailing slashes removed",
+    "Named INI profiles in the credentials file, selected by profile or VERACODE_API_PROFILE, else the default profile; the api_key_secret must be a hex string",
+  ],
+  configFields: ["veracode_api_key_id", "veracode_api_key_secret"],
+} as const satisfies ResolverAuthenticationContract;

@@ -179,6 +179,30 @@ test("createOscalModel creates the expected file path", async () => {
   assert.equal(existsSync(result.filePath), true);
 });
 
+test("OSCAL output names stay inside the trestle workspace", async () => {
+  const root = createTempDir("grclanker-oscal-escape-");
+  createWorkspace(root);
+  const runner = async () => {
+    throw new Error("runner should not be called");
+  };
+
+  await assert.rejects(
+    () => createOscalModel({ workspace_dir: root, model_type: "catalog", name: "../escape" }, runner),
+    /model name must be a single name inside the workspace/,
+  );
+  await assert.rejects(
+    () => importOscalModel({ workspace_dir: root, file: "profile.json", output: "/tmp/escape" }, runner),
+    /output name must be a single name inside the workspace/,
+  );
+  await assert.rejects(
+    () => generateOscalSspMarkdown(
+      { workspace_dir: root, profile: "fedramp-moderate", output: "..\\escape" },
+      runner,
+    ),
+    /output directory name must be a single name inside the workspace/,
+  );
+});
+
 test("validateOscalModel builds workspace validation selectors", async () => {
   const root = createTempDir("grclanker-oscal-validate-");
   createWorkspace(root);

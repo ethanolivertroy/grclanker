@@ -91,6 +91,18 @@ Scope IDs come from the Anypoint OpenID discovery document. When MuleSoft public
 
 Grant the scopes for each environment the assessment should sample, because Anypoint scopes are environment-specific for most products.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my MuleSoft credentials can read everything grclanker needs.
+Run the MuleSoft assessments and list the failing findings first.
+Export a MuleSoft audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our MuleSoft Anypoint organization"`. Both start with `mulesoft_check_access`, then run the assessments or `mulesoft_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

@@ -1,5 +1,5 @@
 ---
-title: "Recovery Planning: FedRAMP KSI Domain"
+title: "Recovery Planning"
 description: "Official Consolidated Rules summary for the RPL FedRAMP key security indicator domain."
 ---
 

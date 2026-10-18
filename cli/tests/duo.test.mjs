@@ -8,9 +8,10 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 
 import {
   DuoAuditorClient,
@@ -1677,6 +1678,16 @@ test("exportDuoAuditBundle preserves shared output roots while keeping every cre
   ]) {
     const outputRoot = createTempBase("grclanker-duo-private-export-");
     chmodSync(outputRoot, rootMode);
+    // Record the mode the kernel stored. macOS drops the setgid bit on
+    // directories under the temp tree when the directory group is not the
+    // process group (/tmp and /private/tmp are group wheel), so a requested
+    // 02775 comes back as 0775. That still happens with TMPDIR=/private/tmp,
+    // which has no symlink in the path, so /var resolving to /private/var is
+    // not what clears the bit. The exporter must leave the stored mode alone.
+    const appliedMode = statSync(outputRoot).mode & 0o7777;
+    if (process.platform !== "darwin") {
+      assert.equal(appliedMode, rootMode, `${label} stores the requested mode on this platform`);
+    }
     const config = createSampleConfig();
     const client = new DuoAuditorClient(config, { fetchImpl: routedFetch(healthyDuoRoutes()) });
     const previousUmask = process.umask(umask);
@@ -1688,10 +1699,28 @@ test("exportDuoAuditBundle preserves shared output roots while keeping every cre
       process.umask(previousUmask);
     }
 
-    assertMode(outputRoot, rootMode, label);
+    assertMode(outputRoot, appliedMode, label);
     assertPrivateTree(result.outputDir);
     assertMode(result.zipPath, 0o600, "archive");
   }
+});
+
+test("resolveSecureOutputPath writes a child when an ancestor of the output root is a symlink", () => {
+  const realTmp = createTempBase("grclanker-duo-real-tmp-");
+  const linkParent = createTempBase("grclanker-duo-link-parent-");
+  const linkedTmp = join(linkParent, "var");
+  symlinkSync(realTmp, linkedTmp, "dir");
+  const outputRoot = mkdtempSync(join(linkedTmp, "grclanker-duo-via-symlink-"));
+
+  const child = resolveSecureOutputPath(outputRoot, join("nested", "file.txt"));
+  const childRelative = relative(outputRoot, child);
+  assert.equal(childRelative.startsWith("..") || childRelative.startsWith("/"), false);
+  assert.equal(existsSync(join(outputRoot, "nested")), true);
+
+  assert.throws(
+    () => resolveSecureOutputPath(outputRoot, "../escape"),
+    /outside output root|symlinked output path/,
+  );
 });
 
 function okEnvelope(response, metadata) {

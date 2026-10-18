@@ -1,5 +1,5 @@
 ---
-title: "Cybersecurity Education: FedRAMP KSI Domain"
+title: "Cybersecurity Education"
 description: "Official Consolidated Rules summary for the CED FedRAMP key security indicator domain."
 ---
 

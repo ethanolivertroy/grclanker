@@ -1,5 +1,5 @@
 ---
-title: "Agency Use of FedRAMP Certified Cloud Services: FedRAMP Process"
+title: "Agency Use of FedRAMP Certified Cloud Services"
 description: "Official Consolidated Rules summary for the AGU FedRAMP process, including applicability and requirements."
 ---
 

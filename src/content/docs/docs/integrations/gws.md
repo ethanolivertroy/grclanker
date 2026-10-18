@@ -74,6 +74,18 @@ Explicit tool arguments override the environment: `auth_mode`, `credentials_file
 
 The interactive installed-app OAuth mode described in the spec is not shipped. See Limitations.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Google Workspace credentials can read everything grclanker needs.
+Run the Google Workspace assessments and list the failing findings first.
+Export a Google Workspace audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Google Workspace tenant"`. Both start with `gws_check_access`, then run the assessments or `gws_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

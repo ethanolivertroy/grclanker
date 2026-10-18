@@ -231,6 +231,81 @@ test("kevs_get_epss keeps the original table when no score date is provided", as
   });
 });
 
+function datedKev(index, dateAdded, ransomware = "Unknown") {
+  const entry = kevEntry(index);
+  return { ...entry, dateAdded, knownRansomwareCampaignUse: ransomware };
+}
+
+function cutoffDay(days) {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  return cutoff.toISOString().split("T")[0];
+}
+
+async function runCatalogTool(name, args, vulnerabilities) {
+  const catalog = {
+    title: "KEV",
+    catalogVersion: "1",
+    dateReleased: cutoffDay(0),
+    count: vulnerabilities.length,
+    vulnerabilities,
+  };
+  const tools = new Map();
+  registerKevsTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const tool = tools.get(name);
+  clearGrcSharedCachesForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const href = String(url);
+    if (href === KEV_URL) return new Response(JSON.stringify(catalog));
+    const cves = new URL(href).searchParams.get("cve")?.split(",") ?? [];
+    return new Response(JSON.stringify({
+      status: "OK",
+      total: cves.length,
+      data: cves.map((cve) => ({ cve, epss: "0.125", percentile: "0.9", date: EPSS_DATE })),
+    }));
+  };
+  try {
+    const result = await tool.execute("call-1", tool.prepareArguments(args));
+    return result.content[0].text;
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearGrcSharedCachesForTests();
+  }
+}
+
+test("kevs_recent and kevs_check_ransomware treat a non-positive limit as the default instead of an empty or tail-trimmed result", async () => {
+  const today = cutoffDay(0);
+  const recent = Array.from({ length: 12 }, (_, index) => datedKev(index + 1, today));
+  const ransomware = Array.from({ length: 3 }, (_, index) => datedKev(index + 1, "2024-01-01", "Known"));
+
+  for (const limit of [0, -1, 0.5, "0", "-1"]) {
+    const recentText = await runCatalogTool("kevs_recent", { days: 30, limit }, recent);
+    const label = `recent limit ${JSON.stringify(limit)}`;
+    assert.ok(recentText.startsWith("10 KEV entries added in the last 30 days:"), label);
+    assert.equal(recentText.includes("CVE-2024-0010"), true, label);
+    assert.equal(recentText.includes("CVE-2024-0011"), false, `${label} still honors the default cap`);
+    assert.doesNotMatch(recentText, /No new KEV entries/, label);
+
+    const ransomwareText = await runCatalogTool("kevs_check_ransomware", { limit }, ransomware);
+    const ransomwareLabel = `ransomware limit ${JSON.stringify(limit)}`;
+    assert.ok(ransomwareText.startsWith("3 ransomware-linked vulnerabilities (of 3 total ransomware-linked KEVs):"), ransomwareLabel);
+    assert.equal(ransomwareText.includes("CVE-2024-0003"), true, ransomwareLabel);
+    assert.doesNotMatch(ransomwareText, /No ransomware-linked KEV entries/, ransomwareLabel);
+  }
+});
+
+test("kevs_recent treats a negative lookback as the default of 30 days", async () => {
+  const today = cutoffDay(0);
+  for (const days of [-5, -0.5, -0.1, "-0.5"]) {
+    const text = await runCatalogTool("kevs_recent", { days, limit: 10 }, [datedKev(1, today)]);
+    const label = `days ${JSON.stringify(days)}`;
+    assert.ok(text.startsWith("1 KEV entry added in the last 30 days:"), label);
+    assert.equal(text.includes("CVE-2024-0001"), true, label);
+    assert.doesNotMatch(text, /No new KEV entries/, label);
+  }
+});
+
 test("kevs_search EPSS lines include the score date only when the API provides it", async () => {
   await withMockedFetch(async (tools) => {
     const dated = await tools.get("kevs_search").execute("call-3", { query: "CVE-2024-3400" });

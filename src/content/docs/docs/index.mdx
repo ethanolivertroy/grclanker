@@ -1,0 +1,38 @@
+---
+title: grclanker Docs
+description: Install grclanker, choose a runtime, and use 241 domain tools with 35 documented GRC integrations.
+---
+
+`grclanker` is an experimental open source AI GRC companion. Its 241 domain tools and 35 vendor integrations run in the Pi terminal CLI, as a Cursor Agent SDK project, or under Flue.
+
+To start, [install grclanker](/docs/getting-started/installation/), run `grclanker setup`, and follow the [Quick Start](/docs/getting-started/quick-start/).
+
+<DocsRoutes />
+
+## What ships
+
+- 241 domain tools and 7 compute backend tools, grouped in the [tool catalog](/docs/tools/catalog/).
+- 35 vendor integrations covering cloud, identity, collaboration, security, monitoring, vulnerability management, and enterprise platforms.
+- Four structured workflows: `/investigate`, `/audit`, `/assess`, and `/validate`.
+- Official FedRAMP Consolidated Rules lookups and generated reference docs under [`/docs/fedramp/`](/docs/fedramp/).
+- [FedRAMP readiness](/docs/guides/fedramp-readiness/), artifact planning, ADS bundle generation, and portable trust-center site generation.
+- [Vanta](/docs/integrations/vanta/) audit export, [SCF crosswalk](/docs/guides/scf-crosswalks/) lookups, and trestle-backed [OSCAL workspaces](/docs/guides/oscal-workspaces/).
+- Optional Google Workspace CLI evidence collection.
+
+Each integration guide describes its authentication, collected surfaces, findings, export layout, limitations, and live smoke command.
+
+## Safety and hardening
+
+The current tool families share hardening for credential-aware error scrubbing, fixed-shape config errors, incomplete collection markers, and pagination status.
+
+Runtime adapters validate schemas at their boundaries. The Cursor Agent SDK marks 199 tools as read-only and approval-gates 42 writers. Flue redacts credential-shaped activity log arguments and documents its persistence risks.
+
+Evidence exporters allocate a new bundle path on each rerun instead of overwriting a prior export. Each integration guide documents its export layout and sensitive-data handling. Review it before handling tenant data.
+
+## Repository specs
+
+The repository holds 35 raw specs: one for each vendor integration except Vanta, plus one for the compute backends. The spec files are separate from the runtime tool registry. Each remains useful as a design record and build input. Browse them under [`/specs`](/specs) or read [Using Specs as Inputs](/docs/specs/using-specs-as-inputs/).
+
+## Status
+
+grclanker is still early: expect breaking changes between minor versions before 1.0. macOS and Linux are the recommended platforms. Windows support is best-effort.

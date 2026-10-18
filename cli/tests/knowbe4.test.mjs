@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -36,11 +37,31 @@ import {
   resolveSecureOutputPath,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/knowbe4.js";
+import { KNOWBE4_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
+import { KNOWBE4_SPEC } from "../dist/extensions/grc-tools/knowbe4.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertBundlePathsMatchSpec, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  portableContractTest,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
+import {
+  assertRequestConformance,
+  certifyRuntimeBoundaryCoverage,
+  certifyRuntimeRuleDecisiveness,
+  observeRuntimeDecisionFacts,
+  recordFetchRequests,
+  sweepCheckCompleteness,
+} from "./helpers/spec-conformance.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
+
+const observedDecisionFacts = observeRuntimeDecisionFacts(KNOWBE4_SPEC);
+const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const DAY_MS = 86_400_000;
@@ -1743,6 +1764,43 @@ test("verdict rule 10: Knowbe4ApiClient reports Reporting API listings truncated
   assert.equal(listing.truncated, true);
 });
 
+test("verdict rule 10: a Reporting API page holding an entry that is not a JSON object ends the walk partial and names the page", async () => {
+  const served = (pages) => new Knowbe4ApiClient(sampleConfig(), {
+    fetchImpl: async (input) => jsonResponse(pages[new URL(typeof input === "string" ? input : input.toString()).searchParams.get("page")] ?? []),
+    minRequestIntervalMs: 0,
+  });
+
+  // A full page that kept fewer records than it held is not a last page, so the list cannot read as complete.
+  const fullPage = served({ 1: [{ id: 1 }, { id: 2 }], 2: [{ id: 3 }, null], 3: [{ id: 5 }, { id: 6 }] });
+  const stopped = await fullPage.list("/v1/users", {}, { limit: 10, pageSize: 2 });
+  assert.deepEqual(stopped.items.map((item) => item.id), [1, 2, 3], "the page's JSON object entries are kept");
+  assert.equal(stopped.truncated, true);
+  assert.equal(stopped.truncationReason, "the server returned an entry that is not a JSON object on page 2");
+  assert.equal(fullPage.getRequestCount(), 2, "the walk stops at the page that held the entry");
+
+  // A short page ends the walk anyway, but the entries it dropped still leave the list partial.
+  const shortPage = served({ 1: [{ id: 1 }, "user", 7] });
+  const short = await shortPage.list("/v1/groups", {}, { limit: 10, pageSize: 5 });
+  assert.deepEqual(short.items.map((item) => item.id), [1]);
+  assert.equal(short.truncated, true);
+  assert.equal(short.truncationReason, "the server returned 2 entries that are not JSON objects on page 1");
+
+  // The reason names the cap as well when the walk reached it on that page, so a cap stop is never hidden behind the entry.
+  const cutPage = served({ 1: [{ id: 1 }, { id: 2 }, { id: 3 }], 2: [{ id: 4 }, { id: 5 }, null] });
+  const cut = await cutPage.list("/v1/users", {}, { limit: 4, pageSize: 3 });
+  assert.deepEqual(cut.items.map((item) => item.id), [1, 2, 3, 4], "the cap still keeps only the records it has room for");
+  assert.equal(cut.truncated, true);
+  assert.equal(cut.truncationReason, "the server returned an entry that is not a JSON object on page 2, where the walk also reached its cap of 4 records");
+  const filled = await served({ 1: [{ id: 1 }, { id: 2 }, null] }).list("/v1/users", {}, { limit: 2, pageSize: 3 });
+  assert.equal(filled.truncationReason, "the server returned an entry that is not a JSON object on page 1, where the walk also reached its cap of 2 records", "a full page that brings the records kept to the cap names the cap");
+  const ended = await served({ 1: [{ id: 1 }, { id: 2 }, null] }).list("/v1/users", {}, { limit: 2, pageSize: 5 });
+  assert.equal(ended.truncationReason, "the server returned an entry that is not a JSON object on page 1", "a short page that fits under the cap ends the list, so the cap is not named");
+
+  const probed = served({ 1: [null] });
+  assert.deepEqual(await probed.probe("/v1/users"), []);
+  assert.equal(probed.getRequestCount(), 1, "the access probe still makes one request");
+});
+
 test("verdict rule 10: Knowbe4ApiClient reports PhishER connections truncated on caps, stuck page keys, and unreached totals", async () => {
   const phisherClient = (respond, field = "phisherMessages") => new Knowbe4ApiClient(sampleConfig({ phisherApiToken: "phisher-token" }), {
     fetchImpl: async (_input, init = {}) => jsonResponse({ data: { [field]: respond(JSON.parse(init.body).variables) } }),
@@ -2131,11 +2189,9 @@ function kbRoutes(fixture) {
   };
 }
 
-/** The real Knowbe4ApiClient over a fetch router that records the method, path, URL, and status of every request served. */
-function httpKnowbe4(fixture, options = {}) {
-  const routes = { ...kbRoutes(fixture), ...(options.routes ?? {}) };
-  const log = [];
-  const fetchImpl = async (input, init = {}) => {
+/** A fetch router over the routes that records the method, path, URL, and status of every request served. */
+function kbRouter(routes, log = []) {
+  return async (input, init = {}) => {
     const url = new URL(typeof input === "string" ? input : input.url);
     const method = (init.method ?? "GET").toUpperCase();
     const recipients = url.pathname.match(/^\/v1\/phishing\/security_tests\/([^/]+)\/recipients$/);
@@ -2147,9 +2203,17 @@ function httpKnowbe4(fixture, options = {}) {
     log.push({ method, path: url.pathname, url: url.toString(), status: response.status });
     return response;
   };
+}
+
+function kbClient(config, fetchImpl) {
+  return new Knowbe4ApiClient(config, { fetchImpl, sleepImpl: async () => {}, maxRetries: 0, minRequestIntervalMs: 0 });
+}
+
+function httpKnowbe4(fixture, options = {}) {
+  const log = [];
+  const fetchImpl = kbRouter({ ...kbRoutes(fixture), ...(options.routes ?? {}) }, log);
   const config = sampleConfig({ apiToken: KB_TEST_TOKEN, phisherApiToken: options.phisher === false ? undefined : KB_PHISHER_TOKEN, ...(options.config ?? {}) });
-  const client = new Knowbe4ApiClient(config, { fetchImpl, sleepImpl: async () => {}, maxRetries: 0, minRequestIntervalMs: 0 });
-  return { client, config, log };
+  return { client: kbClient(config, fetchImpl), config, log };
 }
 
 const KB_AREAS = [
@@ -2948,8 +3012,505 @@ test("silent success: a 2xx whose body is empty, an HTML page, or JSON of anothe
   await assert.rejects(() => phisher.client.graphql("query { x }"), /returned 200 OK with a JSON body that is not the documented GraphQL response object \(data or errors\) \(\d+ bytes, not echoed\)/);
 });
 
+test("verdict rule 10: an entry that is not a JSON object in the user, enrollment, or recipient walk keeps every check built on that list from passing, and the caveat names the page", async () => {
+  const reason = "the server returned an entry that is not a JSON object on page 1";
+  const statuses = (result) => Object.fromEntries(result.findings.map((item) => [item.control, item.status]));
+  const caveat = (inventory, seen, stop) => `Truncated listing: ${inventory} (${seen} of unknown loaded; ${stop}), so this verdict only covers the records that were loaded.`;
+  const assess = async (fixture, scope, assessArea) => {
+    const snapshot = await collectKnowbe4Snapshot(httpKnowbe4(fixture).client, { scopes: [scope], now: NOW });
+    return { snapshot, result: assessArea(snapshot, { now: NOW }) };
+  };
+  const healthyPhishing = statuses((await assess(healthyFixture(), "phishing", assessKnowbe4PhishingProgram)).result);
+  const healthyTraining = statuses((await assess(healthyFixture(), "training", assessKnowbe4TrainingProgram)).result);
+  assert.ok([...Object.values(healthyPhishing), ...Object.values(healthyTraining)].every((status) => status === "pass"));
+
+  const usersFixture = healthyFixture();
+  usersFixture.users.splice(1, 0, null);
+  const users = await assess(usersFixture, "phishing", assessKnowbe4PhishingProgram);
+  assert.deepEqual(statuses(users.result), { ...healthyPhishing, 2: "warn", 9: "warn" });
+  for (const control of [2, 9]) {
+    const item = findingFor(users.result, control);
+    assert.ok(item.summary.endsWith(caveat("users", 10, reason)), `KNOWBE4-${control}: ${item.summary}`);
+    assert.doesNotMatch(item.summary, /user_limit/, "a stop the cap did not cause is not attributed to it");
+  }
+  const usersRow = knowbe4CollectionStatus(users.snapshot).inventories.find((row) => row.inventory === "users");
+  assert.deepEqual({ complete: usersRow.complete, truncated: usersRow.truncated, truncation_reason: usersRow.truncation_reason }, { complete: false, truncated: true, truncation_reason: reason });
+
+  const enrollmentFixture = healthyFixture();
+  enrollmentFixture.enrollments.push(null);
+  const enrollments = await assess(enrollmentFixture, "training", assessKnowbe4TrainingProgram);
+  assert.deepEqual(statuses(enrollments.result), { ...healthyTraining, 4: "warn", 10: "warn", 17: "warn" });
+  assert.match(findingFor(enrollments.result, 17).summary, new RegExp(`but enrollment data is partial because ${reason}, so the completion figures cover only the loaded enrollments`));
+  for (const item of enrollments.result.findings) assert.doesNotMatch(item.summary, /enrollment_limit/, `KNOWBE4-${item.control}: ${item.summary}`);
+
+  const recipientFixture = healthyFixture();
+  const [pstId, recipients] = [...recipientFixture.recipientsByTest.entries()][0];
+  recipients.push(null);
+  const recipientRun = await assess(recipientFixture, "phishing", assessKnowbe4PhishingProgram);
+  assert.deepEqual(statuses(recipientRun.result), { ...healthyPhishing, 2: "warn" });
+  const recipientCoverage = findingFor(recipientRun.result, 2);
+  assert.ok(recipientCoverage.summary.endsWith(caveat("security_test_recipients", 3, `security test ${pstId}: ${reason}`)), recipientCoverage.summary);
+
+  // Once one walk stopped for a reason, a walk the cap stopped is named beside it rather than left out.
+  const mixed = mockClient(healthyFixture());
+  mixed.listSecurityTestRecipients = async (id) => ({ items: [], truncated: id !== "902", limit: 20000, pages: 1, ...(id === "901" ? { truncationReason: reason } : {}) });
+  const mixedSnapshot = await collectKnowbe4Snapshot(mixed, { scopes: ["phishing"], now: NOW });
+  assert.equal(mixedSnapshot.securityTestRecipients.truncationReason, `security test 900: the walk reached its cap of 20000 recipients; security test 901: ${reason}`);
+});
+
 test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through the KnowBe4 error text and record scrubbers", () => {
   assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "knowbe4 scrubErrorText");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "knowbe4 redactCredentialValues");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "knowbe4 redactCredentialValues, error list");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Portable contract: auth resolver, requests, completeness, bundle paths, check identity
+// ---------------------------------------------------------------------------------------------
+
+portableContractTest("the auth resolver contract names exactly the environment the resolver reads, and each variable reaches the resolved configuration", () => {
+  assert.deepEqual(KNOWBE4_SPEC.authentication.environmentVariables, KNOWBE4_AUTH_RESOLVER.environment);
+  assert.deepEqual(KNOWBE4_SPEC.authentication.configLocations, KNOWBE4_AUTH_RESOLVER.configLocations);
+  assert.deepEqual(KNOWBE4_SPEC.authentication.configFields, KNOWBE4_AUTH_RESOLVER.configFields);
+
+  const home = createTempBase("grclanker-knowbe4-resolver-contract-");
+  const configFile = join(home, "file.yaml");
+  writeFileSync(configFile, "api_token: <file-token>\n");
+  const basic = { KNOWBE4_API_TOKEN: "<env-token>" };
+
+  const accessed = new Set();
+  const tracked = new Proxy({ ...basic }, {
+    get(target, property) {
+      if (typeof property === "string") accessed.add(property);
+      return target[property];
+    },
+  });
+  resolveKnowbe4Configuration({}, tracked, home);
+  assert.deepEqual([...accessed].sort(), [...KNOWBE4_AUTH_RESOLVER.environment].sort());
+
+  const reached = {
+    KNOWBE4_CONFIG_FILE: [{ KNOWBE4_CONFIG_FILE: configFile }, (config) => config.apiToken === "<file-token>" && config.configFile === configFile],
+    KNOWBE4_API_TOKEN: [basic, (config) => config.apiToken === "<env-token>"],
+    KNOWBE4_REGION: [{ ...basic, KNOWBE4_REGION: "eu" }, (config) => config.region === "eu" && config.baseUrl === "https://eu.api.knowbe4.com" && config.phisherGraphqlUrl === "https://eu.knowbe4.com/graphql"],
+    KNOWBE4_BASE_URL: [{ ...basic, KNOWBE4_BASE_URL: "https://reporting.example.internal" }, (config) => config.baseUrl === "https://reporting.example.internal"],
+    KNOWBE4_PHISHER_API_TOKEN: [{ ...basic, KNOWBE4_PHISHER_API_TOKEN: "<env-phisher-token>" }, (config) => config.phisherApiToken === "<env-phisher-token>"],
+    KNOWBE4_PHISHER_GRAPHQL_URL: [{ ...basic, KNOWBE4_PHISHER_GRAPHQL_URL: "https://phisher.example.internal/graphql" }, (config) => config.phisherGraphqlUrl === "https://phisher.example.internal/graphql"],
+    KNOWBE4_TIMEOUT: [{ ...basic, KNOWBE4_TIMEOUT: "45" }, (config) => config.timeoutMs === 45_000],
+    KNOWBE4_REDACT_PII: [{ ...basic, KNOWBE4_REDACT_PII: "true" }, (config) => config.redactPii === true],
+  };
+  assert.deepEqual(Object.keys(reached).sort(), [...KNOWBE4_AUTH_RESOLVER.environment].sort());
+  for (const [name, [environment, applied]] of Object.entries(reached)) {
+    assert.ok(applied(resolveKnowbe4Configuration({}, environment, home)), `${name} reaches the resolved configuration`);
+  }
+});
+
+portableContractTest("every request the access check, the four assessments, and the export send matches a declared surface, parameter, and header", async () => {
+  const recorder = recordFetchRequests(kbRouter(kbRoutes(healthyFixture())));
+  const config = sampleConfig({ apiToken: KB_TEST_TOKEN, phisherApiToken: KB_PHISHER_TOKEN });
+  const client = kbClient(config, recorder.fetch);
+  await checkKnowbe4Access(client);
+  await runAllKnowbe4Assessments(client);
+  await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-request-conformance-"), { now: NOW });
+  assertRequestConformance(assert, KNOWBE4_SPEC, recorder.requests);
+});
+
+const KB_LIST_CAP = 20_000;
+
+// The route serving each swept list surface, and which of its requests read that surface: the two security test lists
+// share a path, and a failed recipient read targets only pst_id 900, the newest test, which every sample window holds.
+const KB_SWEEP_TARGETS = {
+  users: { route: "GET /v1/users" },
+  groups: { route: "GET /v1/groups" },
+  phishing_campaigns: { route: "GET /v1/phishing/campaigns" },
+  security_tests: { route: "GET /v1/phishing/security_tests", reads: (url) => !url.searchParams.has("campaign_type") },
+  callback_security_tests: { route: "GET /v1/phishing/security_tests", reads: (url) => url.searchParams.get("campaign_type") === "callback" },
+  security_test_recipients: { route: KB_RECIPIENTS_ROUTE, reads: (url, pstId) => pstId === "900" },
+  training_campaigns: { route: "GET /v1/training/campaigns" },
+  training_enrollments: { route: "GET /v1/training/enrollments" },
+  store_purchases: { route: "GET /v1/training/store_purchases" },
+};
+
+async function assessKbCompletenessInput({ fixture, routes, options }) {
+  const { client } = httpKnowbe4(fixture, { routes });
+  const findings = [];
+  for (const [area, assess] of KB_AREAS) {
+    const snapshot = await collectKnowbe4Snapshot(client, { scopes: [area], now: NOW, ...options });
+    findings.push(...assess(snapshot, { now: NOW }).findings);
+  }
+  return findings;
+}
+
+/**
+ * A truncated list serves a first page holding one record more than the 20000-record cap leaves room for, which is
+ * past user_limit too; a refused one answers 403 and a failed one 500. Recipient reads go uncollected when the sample
+ * holds fewer tests than ran in the window.
+ */
+function failKbCompletenessSource(input, { surfaceId, mode }) {
+  if (mode === "not-collected") {
+    return surfaceId === "security_test_recipients" ? { ...input, options: { securityTestSampleLimit: 1 } } : undefined;
+  }
+  const target = KB_SWEEP_TARGETS[surfaceId];
+  if (!target || !["truncated", "denied", "error"].includes(mode)) return undefined;
+  const healthy = kbRoutes(input.fixture)[target.route];
+  const failing = async (url, pstId, init) => {
+    if (target.reads && !target.reads(url, pstId)) return healthy(url, pstId, init);
+    if (mode === "denied") return jsonResponse({ message: "Forbidden" }, { status: 403, statusText: "Forbidden" });
+    if (mode === "error") return jsonResponse({ message: "Internal Server Error" }, { status: 500, statusText: "Internal Server Error" });
+    const records = await healthy(url, pstId, init).json();
+    return jsonResponse([...records, ...Array.from({ length: KB_LIST_CAP + 1 - records.length }, (_, index) => ({ filler_id: index }))]);
+  };
+  return { ...input, routes: { ...input.routes, [target.route]: failing } };
+}
+
+const kbCompletenessInput = () => ({ fixture: healthyFixture(), routes: {}, options: {} });
+
+portableContractTest("completeness sweep: a truncated, refused, failed, or uncollected source never lets a check that reads it pass", async () => {
+  const report = await sweepCheckCompleteness({
+    spec: KNOWBE4_SPEC,
+    createInput: kbCompletenessInput,
+    applyFailure: failKbCompletenessSource,
+    assess: assessKbCompletenessInput,
+  });
+  assert.deepEqual(report.baselineNotPassing, []);
+  assert.deepEqual(report.unreachable, []);
+  // The spec's one declared exception: with no user lacking activity, tests left out of the recipient sample could
+  // only clear more users, so KNOWBE4-18 passes and states the partial sample in its evidence.
+  assert.deepEqual(report.undemoted, ["KNOWBE4-18 security_test_recipients not-collected: pass"]);
+  assert.ok(report.combinations > 0);
+  const unsampled = failKbCompletenessSource(kbCompletenessInput(), { surfaceId: "security_test_recipients", mode: "not-collected" });
+  const inactive = (await assessKbCompletenessInput(unsampled)).find((item) => item.id === "KNOWBE4-18");
+  assert.deepEqual(
+    { status: inactive.status, partial: inactive.evidence.partial_activity_data, unsampled: inactive.evidence.unsampled_security_tests },
+    { status: "pass", partial: true, unsampled: 5 },
+  );
+});
+
+portableContractTest("the export writes every declared bundle path and nothing else, with and without collection errors or PhishER", async () => {
+  const complete = httpKnowbe4(healthyFixture());
+  const completeExport = await exportKnowbe4AuditBundle(complete.client, complete.config, createTempBase("grclanker-knowbe4-bundle-paths-"), { now: NOW });
+  assertBundlePathsMatchSpec(assert, completeExport.outputDir, KNOWBE4_SPEC);
+  assert.ok(!readBundleFiles(completeExport.outputDir).has("_errors.log"));
+
+  const partial = httpKnowbe4(healthyFixture(), { phisher: false, routes: { "GET /v1/groups": jsonForbiddenWithUrl() } });
+  const partialExport = await exportKnowbe4AuditBundle(partial.client, partial.config, createTempBase("grclanker-knowbe4-bundle-paths-"), { now: NOW });
+  assertBundlePathsMatchSpec(assert, partialExport.outputDir, KNOWBE4_SPEC);
+  assert.ok(readBundleFiles(partialExport.outputDir).has("_errors.log"));
+});
+
+function kbDeniedRoutes() {
+  const refuse = () => jsonResponse({ message: "Forbidden" }, { status: 403, statusText: "Forbidden" });
+  return Object.fromEntries(Object.keys(kbRoutes(healthyFixture())).map((route) => [route, refuse]));
+}
+
+portableContractTest("every control and finding carries the title, severity, and tool of its spec check, whether it passes, fails, or cannot be read", async () => {
+  const checks = new Map(KNOWBE4_SPEC.checks.map((check) => [check.id, check]));
+  assert.equal(checks.size, KNOWBE4_CONTROLS.length);
+  for (const control of KNOWBE4_CONTROLS) {
+    const check = checks.get(`KNOWBE4-${String(control.number).padStart(2, "0")}`);
+    assert.deepEqual(
+      { title: check.title, controls: check.controlNumbers, tool: check.owningTool },
+      { title: control.title, controls: [control.number], tool: knowbe4ToolForArea(control.area) },
+    );
+  }
+
+  const runs = [httpKnowbe4(healthyFixture()), httpKnowbe4(failingFixture()), httpKnowbe4(healthyFixture(), { routes: kbDeniedRoutes() })];
+  const statuses = new Set();
+  for (const { client } of runs) {
+    for (const item of (await runAllKnowbe4Assessments(client)).flatMap((result) => result.findings)) {
+      const check = checks.get(item.id);
+      assert.deepEqual({ id: item.id, title: item.title, severity: item.severity }, { id: item.id, title: check.title, severity: check.severity });
+      statuses.add(item.status);
+    }
+  }
+  assert.deepEqual([...statuses].sort(), ["fail", "manual", "pass", "warn"]);
+});
+
+portableContractTest("the spec module carries its framework mappings, and loading the runtime leaves the spec unchanged", () => {
+  const specUrl = new URL("../dist/extensions/grc-tools/knowbe4.spec.js", import.meta.url).href;
+  const script = `import { KNOWBE4_SPEC } from ${JSON.stringify(specUrl)};\nprocess.stdout.write(JSON.stringify(KNOWBE4_SPEC));`;
+  const specOnly = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: 30_000,
+  });
+  assert.equal(specOnly.status, 0, specOnly.stderr);
+  assert.deepEqual(JSON.parse(specOnly.stdout), JSON.parse(JSON.stringify(KNOWBE4_SPEC)));
+
+  for (const control of KNOWBE4_SPEC.controls) {
+    const { frameworks } = KNOWBE4_CONTROLS.find((entry) => entry.number === control.number);
+    assert.deepEqual(control.frameworks, {
+      fedramp: [frameworks.fedramp],
+      cmmc: [frameworks.cmmc],
+      soc2: [frameworks.soc2],
+      cis: [frameworks.cis_v8],
+      pci_dss: [frameworks.pci_dss],
+      disa_stig: [frameworks.disa_stig],
+      irap: [frameworks.irap],
+      ismap: [frameworks.ismap],
+    }, `control ${control.number}`);
+  }
+});
+
+function boundaryScenario(check, expected, edge, fixture, options = {}) {
+  return { name: `${check} ${expected} when ${edge}`, check, expected, fixture, options };
+}
+
+function fixtureWith(change) {
+  return () => {
+    const fixture = healthyFixture();
+    change(fixture);
+    return fixture;
+  };
+}
+
+function activeUsers(count, change = () => ({})) {
+  return Array.from({ length: count }, (_, index) => user(index + 1, change(index)));
+}
+
+function withoutRecipients(userIds) {
+  return fixtureWith((fixture) => {
+    for (const [pstId, rows] of fixture.recipientsByTest) fixture.recipientsByTest.set(pstId, rows.filter((row) => !userIds.includes(row.user.id)));
+  });
+}
+
+function endedCampaignCompletion(completion) {
+  return fixtureWith((fixture) => {
+    fixture.trainingCampaigns[0].completion_percentage = completion;
+  });
+}
+
+/** Users who joined 100 days ago, past the 30-day enrollment grace period; the first `late` have no enrollment. */
+function newHires(total, late) {
+  return fixtureWith((fixture) => {
+    fixture.users = activeUsers(total, () => ({ joined_on: daysAgo(100) }));
+    fixture.enrollments = fixture.users.slice(late).map((record, index) => enrollment(index + 1, record, 701, "Security Awareness Fundamentals", daysAgo(98)));
+  });
+}
+
+function riskScores(scores) {
+  return fixtureWith((fixture) => {
+    fixture.users = fixture.users.map((record, index) => ({ ...record, current_risk_score: scores[index] }));
+  });
+}
+
+function evenSplit(low, high) {
+  return [...Array(5).fill(low), ...Array(5).fill(high)];
+}
+
+/** Sets the phish-prone percentage of the three tests in the 90-day lookback and, optionally, of the three oldest tests. */
+function phishProne(current, baseline) {
+  return fixtureWith((fixture) => {
+    for (const index of [0, 1, 2]) fixture.securityTests[index].phish_prone_percentage = current;
+    if (baseline !== undefined) for (const index of [9, 10, 11]) fixture.securityTests[index].phish_prone_percentage = baseline;
+  });
+}
+
+/** The six tests in the 180-day trend window: the older three at `earlier`, the newer three at `later`. */
+function phishProneTrend(earlier, later) {
+  return fixtureWith((fixture) => {
+    for (const index of [3, 4, 5]) fixture.securityTests[index].phish_prone_percentage = earlier;
+    for (const index of [0, 1, 2]) fixture.securityTests[index].phish_prone_percentage = later;
+  });
+}
+
+/** The active phishing campaign targets only the Finance group, which holds `targeted` of `active` users. */
+function partialTargeting(targeted, active = 10) {
+  return fixtureWith((fixture) => {
+    fixture.users = activeUsers(active);
+    fixture.phishingCampaigns[0].groups = [{ group_id: 100, name: "Finance" }];
+    fixture.groups[0].member_count = targeted;
+  });
+}
+
+/** Every user failed the test 37 days ago; the first `enrolled` users were enrolled in training two days later. */
+function remediatedFailures(enrolled) {
+  return fixtureWith((fixture) => {
+    const failed = fixture.securityTests[1];
+    fixture.recipientsByTest.set(String(failed.pst_id), fixture.users.map((record) => recipient(failed.pst_id, record, failed.started_at, { clicked_at: failed.started_at })));
+    fixture.users.slice(0, enrolled).forEach((record, index) => {
+      fixture.enrollments.push(enrollment(100 + index, record, 701, "Security Awareness Fundamentals", daysAgo(35)));
+    });
+  });
+}
+
+function admins(count) {
+  return fixtureWith((fixture) => {
+    fixture.account.admins = activeUsers(count).map(({ id, first_name, last_name, email }) => ({ id, first_name, last_name, email }));
+  });
+}
+
+/** Adds enrollments in the PCI module, whose eight healthy enrollments have all passed. */
+function complianceEnrollments(statuses) {
+  return fixtureWith((fixture) => {
+    statuses.forEach((status, index) => {
+      fixture.enrollments.push(enrollment(200 + index, fixture.users[8 + index], 701, "PCI DSS Compliance Basics", daysAgo(8), { store_purchase_id: 2, status }));
+    });
+  });
+}
+
+/** Long-standing users who all signed in three days ago except the last, who never did and received no test. */
+function inactiveLongStanding(total) {
+  return fixtureWith((fixture) => {
+    fixture.users = activeUsers(total, (index) => (index === total - 1 ? { last_sign_in: null } : {}));
+  });
+}
+
+/** The three tests in the 90-day lookback: the newest delivers and reports the given counts, the other two deliver nothing. */
+function reportRate(delivered, reported) {
+  return fixtureWith((fixture) => {
+    fixture.securityTests.slice(0, 3).forEach((item, index) => {
+      item.delivered_count = index === 0 ? delivered : 0;
+      item.reported_count = index === 0 ? reported : 0;
+    });
+  });
+}
+
+const BOUNDARY_SCENARIOS = [
+  boundaryScenario("KNOWBE4-01", "pass", "the newest security test started 30.04 days ago, which rounds to the 30-day maximum gap", fixtureWith((fixture) => {
+    fixture.securityTests[0].started_at = daysAgo(30.04);
+  })),
+  boundaryScenario("KNOWBE4-01", "fail", "the newest security test started 30.05 days ago, which rounds past the 30-day maximum gap", fixtureWith((fixture) => {
+    fixture.securityTests[0].started_at = daysAgo(30.05);
+  })),
+  boundaryScenario("KNOWBE4-02", "pass", "9 of 10 active users received a security test in the lookback, exactly the 90 percent minimum", withoutRecipients([10])),
+  boundaryScenario("KNOWBE4-02", "fail", "8 of 10 active users received a security test in the lookback", withoutRecipients([9, 10])),
+  boundaryScenario("KNOWBE4-03", "pass", "the ended training campaign reports exactly the 90 percent minimum completion", endedCampaignCompletion(90)),
+  boundaryScenario("KNOWBE4-03", "warn", "the ended training campaign reports 89.9 percent completion", endedCampaignCompletion(89.9)),
+  boundaryScenario("KNOWBE4-03", "warn", "the ended training campaign reports exactly the 80 percent fail line", endedCampaignCompletion(80)),
+  boundaryScenario("KNOWBE4-03", "fail", "the ended training campaign reports 79.9 percent completion", endedCampaignCompletion(79.9)),
+  boundaryScenario("KNOWBE4-03", "warn", "a second ended training campaign reports no completion and has no loaded enrollments", fixtureWith((fixture) => {
+    fixture.trainingCampaigns.push({ ...fixture.trainingCampaigns[0], campaign_id: 702, name: "Phishing Refresher", start_date: daysAgo(60), end_date: daysAgo(30), completion_percentage: null });
+  })),
+  boundaryScenario("KNOWBE4-04", "warn", "1 of 20 new users had no training enrollment within the grace period, exactly the 5 percent maximum", newHires(20, 1)),
+  boundaryScenario("KNOWBE4-04", "fail", "1 of 19 new users had no training enrollment within the grace period", newHires(19, 1)),
+  boundaryScenario("KNOWBE4-04", "warn", "26 of 519 new users had no training enrollment within the grace period, which rounds to the 5 percent maximum", newHires(519, 26)),
+  boundaryScenario("KNOWBE4-04", "warn", "26 of the 519 new users loaded before the user list stopped at the user limit had no training enrollment within the grace period", newHires(520, 26), { userLimit: 519 }),
+  boundaryScenario("KNOWBE4-05", "pass", "risk scores split evenly between 25 and 75, a mean of exactly 50 and a standard deviation of exactly 25", riskScores(evenSplit(25, 75))),
+  boundaryScenario("KNOWBE4-05", "warn", "risk scores split evenly between 20 and 80, a standard deviation of 30", riskScores(evenSplit(20, 80))),
+  boundaryScenario("KNOWBE4-05", "fail", "the mean active user risk score is 50.1", riskScores([...Array(9).fill(50), 51])),
+  boundaryScenario("KNOWBE4-05", "warn", "no active user carries a numeric risk score", riskScores(Array(10).fill(null))),
+  boundaryScenario("KNOWBE4-06", "pass", "the lookback phish-prone percentage is exactly the 15 percent maximum and below the earliest baseline", phishProne(0.15, 0.2)),
+  boundaryScenario("KNOWBE4-06", "fail", "the lookback phish-prone percentage is 15.01", phishProne(0.1501, 0.2)),
+  boundaryScenario("KNOWBE4-06", "warn", "the lookback phish-prone percentage is within the maximum but above the earliest baseline", phishProne(0.15)),
+  boundaryScenario("KNOWBE4-07", "pass", "the newer half of the trend window averages exactly 0.5 points above the older half", phishProneTrend(0.1, 0.105)),
+  boundaryScenario("KNOWBE4-07", "warn", "the newer half of the trend window averages 0.51 points above the older half", phishProneTrend(0.1, 0.1051)),
+  boundaryScenario("KNOWBE4-07", "warn", "the newer half of the trend window averages exactly 2 points above the older half", phishProneTrend(0.1, 0.12)),
+  boundaryScenario("KNOWBE4-07", "fail", "the newer half of the trend window averages 2.01 points above the older half", phishProneTrend(0.1, 0.1201)),
+  boundaryScenario("KNOWBE4-08", "warn", "a group has no phishing campaign and the phishing campaign list stopped at its limit", fixtureWith((fixture) => {
+    const [campaign] = fixture.phishingCampaigns;
+    campaign.groups = [{ group_id: 100, name: "Finance" }];
+    fixture.phishingCampaigns = { items: [campaign], truncated: true, limit: 1, pages: 1 };
+  })),
+  boundaryScenario("KNOWBE4-08", "warn", "every group with members is covered and the group list stopped at its limit", fixtureWith((fixture) => {
+    fixture.groups = { items: fixture.groups, truncated: true, limit: fixture.groups.length, pages: 1 };
+  })),
+  boundaryScenario("KNOWBE4-09", "pass", "the active phishing campaign's groups hold 1799 of 2000 active users, which rounds to the 90 percent minimum", partialTargeting(1799, 2000)),
+  boundaryScenario("KNOWBE4-09", "fail", "the active phishing campaign's groups hold 1798 of 2000 active users", partialTargeting(1798, 2000)),
+  boundaryScenario("KNOWBE4-09", "pass", "full targeting is not required and the active phishing campaign's groups hold half the active users", partialTargeting(5), { requireFullTargeting: false }),
+  boundaryScenario("KNOWBE4-10", "pass", "9 of 10 users who failed a test more than 14 days ago were enrolled in training afterward, exactly the 90 percent target", remediatedFailures(9)),
+  boundaryScenario("KNOWBE4-10", "warn", "8 of 10 users who failed a test more than 14 days ago were enrolled in training afterward", remediatedFailures(8)),
+  boundaryScenario("KNOWBE4-10", "warn", "the only failed test result is newer than the 14-day remedial window", fixtureWith((fixture) => {
+    const older = fixture.recipientsByTest.get(String(fixture.securityTests[1].pst_id));
+    older[2] = { ...older[2], opened_at: null, clicked_at: null };
+    const newest = fixture.securityTests[0];
+    const recent = fixture.recipientsByTest.get(String(newest.pst_id));
+    recent[0] = { ...recent[0], clicked_at: newest.started_at };
+  })),
+  boundaryScenario("KNOWBE4-10", "pass", "a failed user was enrolled within the remedial window and again, in unrelated training, 27 days after the failure", fixtureWith((fixture) => {
+    fixture.enrollments.push(enrollment(100, fixture.users[2], 700, "PCI DSS Compliance Basics", daysAgo(10), { store_purchase_id: 2 }));
+  })),
+  boundaryScenario("KNOWBE4-11", "warn", "no training campaign in the lookback assigns a store purchase module", fixtureWith((fixture) => {
+    for (const campaign of fixture.trainingCampaigns) campaign.content = [{ policy_id: 1, content_type: "Uploaded Policy", name: "Acceptable Use Policy" }];
+  })),
+  boundaryScenario("KNOWBE4-12", "warn", "the account lists no admins", admins(0)),
+  boundaryScenario("KNOWBE4-12", "pass", "the account has exactly the 3-admin maximum, all in its domains", admins(3)),
+  boundaryScenario("KNOWBE4-12", "fail", "the account has 4 admins", admins(4)),
+  boundaryScenario("KNOWBE4-16", "warn", "the callback test list stopped at its limit with no callback test inside the lookback", fixtureWith((fixture) => {
+    fixture.callbackTests = { items: [securityTest(950, daysAgo(200), 0.05, { campaign_id: 501, name: "Callback Q1" })], truncated: true, limit: 1, pages: 1 };
+  })),
+  boundaryScenario("KNOWBE4-16", "warn", "a callback test ran inside the lookback and the callback test list stopped at its limit", fixtureWith((fixture) => {
+    fixture.callbackTests = { items: fixture.callbackTests, truncated: true, limit: fixture.callbackTests.length, pages: 1 };
+  })),
+  boundaryScenario("KNOWBE4-17", "pass", "9 of 10 enrollments in the compliance module are complete, exactly the 90 percent minimum", complianceEnrollments(["Passed", "In Progress"])),
+  boundaryScenario("KNOWBE4-17", "warn", "8 of 10 enrollments in the compliance module are complete", complianceEnrollments(["In Progress", "In Progress"])),
+  boundaryScenario("KNOWBE4-18", "warn", "1 of 20 long-standing users shows no activity in the 180-day window, exactly the 5 percent maximum", inactiveLongStanding(20)),
+  boundaryScenario("KNOWBE4-18", "fail", "1 of 19 long-standing users shows no activity in the 180-day window", inactiveLongStanding(19)),
+  boundaryScenario("KNOWBE4-19", "pass", "exactly the 50 percent minimum of delivered emails were reported", reportRate(1000, 500)),
+  boundaryScenario("KNOWBE4-19", "pass", "999 of 2000 delivered emails were reported, which rounds to the 50 percent minimum", reportRate(2000, 999)),
+  boundaryScenario("KNOWBE4-19", "warn", "998 of 2000 delivered emails were reported", reportRate(2000, 998)),
+  boundaryScenario("KNOWBE4-19", "warn", "exactly 25 percent of delivered emails were reported, half the minimum", reportRate(1000, 250)),
+  boundaryScenario("KNOWBE4-19", "fail", "24.9 percent of delivered emails were reported", reportRate(1000, 249)),
+  boundaryScenario("KNOWBE4-19", "pass", "the minimum is 20 percent and 22 percent of delivered emails were reported", reportRate(1000, 220), { minReportRatePct: 20 }),
+  boundaryScenario("KNOWBE4-19", "warn", "the minimum is 40 percent and exactly half of it, 20 percent, of delivered emails were reported", reportRate(1000, 200), { minReportRatePct: 40 }),
+  boundaryScenario("KNOWBE4-19", "fail", "the minimum is 40 percent and 19.9 percent of delivered emails were reported", reportRate(1000, 199), { minReportRatePct: 40 }),
+  boundaryScenario("KNOWBE4-20", "pass", "the largest gap between consecutive security tests is exactly the 45-day maximum", fixtureWith((fixture) => {
+    fixture.securityTests[1].started_at = daysAgo(23);
+  })),
+  boundaryScenario("KNOWBE4-20", "fail", "the largest gap between consecutive security tests is 45.1 days", fixtureWith((fixture) => {
+    fixture.securityTests[1].started_at = daysAgo(22.9);
+  })),
+];
+
+const KB_ASSESSORS = new Map(KB_AREAS);
+
+async function runBoundaryScenario({ check, fixture, options }) {
+  const { area } = KNOWBE4_CONTROLS.find((control) => control.number === Number(check.slice(-2)));
+  const snapshot = await collectKnowbe4Snapshot(mockClient(fixture()), { ...options, scopes: [area], now: NOW });
+  return KB_ASSESSORS.get(area)(snapshot, { ...options, now: NOW });
+}
+
+test("boundary scenarios: each threshold edge reaches the verdict on either side of it", async () => {
+  const names = BOUNDARY_SCENARIOS.map((scenario) => scenario.name);
+  assert.equal(new Set(names).size, names.length, "scenario names key the byte differential fixture");
+  const mismatches = [];
+  for (const scenario of BOUNDARY_SCENARIOS) {
+    const result = await runBoundaryScenario(scenario);
+    const status = result.findings.find((item) => item.id === scenario.check)?.status;
+    if (status !== scenario.expected) mismatches.push(`${scenario.name}: ${status}`);
+  }
+  assert.deepEqual(mismatches, []);
+});
+
+function missingNullFixture() {
+  const users = [1, 2, 3].map((id) => ({ id, email: `user${id}@acme.example`, status: "active", joined_on: null, last_sign_in: null, current_risk_score: null, groups: null }));
+  return {
+    account: { name: null, domains: null, admins: null, current_risk_score: null },
+    riskHistory: [{ risk_score: null, date: null }],
+    users,
+    groups: [{ id: 100, name: null, member_count: null }],
+    phishingCampaigns: [{ campaign_id: 500, name: null, groups: null, status: "Active", hidden: null, last_run: null }],
+    securityTests: [{ pst_id: 900, campaign_id: 500, status: "Closed", started_at: daysAgo(6), phish_prone_percentage: null, delivered_count: null, reported_count: null, groups: null }],
+    recipientsByTest: new Map([["900", users.map((record) => ({ recipient_id: Number(`900${record.id}`), pst_id: 900, user: { id: record.id, email: record.email }, delivered_at: null }))]]),
+    callbackTests: [{ pst_id: 950, campaign_id: 501, status: null, started_at: null }],
+    trainingCampaigns: [{ campaign_id: 700, name: null, groups: null, status: "Completed", content: null, start_date: null, end_date: null, completion_percentage: null }],
+    enrollments: [{ enrollment_id: 1, user: { id: 1, email: "user1@acme.example" }, module_name: null, campaign_id: 700, enrollment_date: null, status: null }],
+    storePurchases: [{ store_purchase_id: 1, name: null, retired: null, publish_date: null }],
+    trainingPolicies: [{ policy_id: 1, name: null, status: null }],
+    phisherMessages: [{ id: "msg-1", reportedAt: null, category: null, severity: null, actionStatus: null }],
+  };
+}
+
+test("byte differential fixtures: KnowBe4 assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  const assess = (fixture, options) => runAllKnowbe4Assessments(httpKnowbe4(fixture, options).client);
+  const partialRoutes = { "GET /v1/groups": jsonForbiddenWithUrl(), "GET /v1/training/enrollments": jsonForbiddenWithUrl() };
+  writeByteDifferentialFixture("knowbe4", "representative", await assess(failingFixture()));
+  writeByteDifferentialFixture("knowbe4", "compliant", await assess(healthyFixture()));
+  writeByteDifferentialFixture("knowbe4", "denied", await assess(healthyFixture(), { routes: kbDeniedRoutes() }));
+  writeByteDifferentialFixture("knowbe4", "partial", await assess(healthyFixture(), { routes: partialRoutes }));
+  writeByteDifferentialFixture("knowbe4", "missing-null", await assess(missingNullFixture()));
+  const boundary = {};
+  for (const scenario of BOUNDARY_SCENARIOS) boundary[scenario.name] = await runBoundaryScenario(scenario);
+  writeByteDifferentialFixture("knowbe4", "boundary", boundary);
+  const { client, config } = httpKnowbe4(healthyFixture());
+  const exported = await exportKnowbe4AuditBundle(client, config, prepareByteDifferentialExportRoot("knowbe4"), { now: NOW });
+  writeByteDifferentialFixture("knowbe4", "export", snapshotExportBundle(exported));
+});
+
+portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", {
+  skip: testFilterActive && "a test filter ran only part of this file",
+}, () => {
+  observedDecisionFacts.stop();
+  const boundaries = certifyRuntimeBoundaryCoverage(KNOWBE4_SPEC, observedDecisionFacts.factsByCheck);
+  const rules = certifyRuntimeRuleDecisiveness(KNOWBE4_SPEC, observedDecisionFacts.factsByCheck);
+  assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
 });

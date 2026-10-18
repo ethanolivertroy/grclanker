@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { HeroImage } from '../../components/hero-image';
 import { pageMetadata } from '../../lib/metadata';
 import { githubUrl } from '../../lib/site';
 
@@ -14,7 +15,7 @@ export default function AboutPage() {
     <>
       <section className="relative overflow-hidden">
         <div className="absolute inset-0 w-full h-full">
-          <img
+          <HeroImage
             src="/about-clanker.webp"
             alt="A clanker robot working at a compliance workstation"
             className="w-full h-full object-cover object-center"
@@ -116,7 +117,9 @@ export default function AboutPage() {
               </div>
               <div className="about-robot-figure">
                 <img
-                  src="/about/grclanker-robot-v1-transparent.png"
+                  src="/about/grclanker-robot-v1.webp"
+                  width={896}
+                  height={1200}
                   alt="Full-body illustration of the grclanker robot"
                   className="about-robot-image"
                   loading="lazy"

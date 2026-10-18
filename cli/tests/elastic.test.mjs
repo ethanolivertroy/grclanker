@@ -7,11 +7,12 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 import {
@@ -1472,7 +1473,7 @@ test("exportElasticAuditBundle writes the full layout and zip without leaking cr
 
   assert.equal(result.findingCount, 23);
   assert.equal(result.errorCount, 0);
-  assert.ok(result.outputDir.startsWith(base));
+  assert.ok(result.outputDir.startsWith(realpathSync(base)));
   assert.ok(existsSync(result.zipPath));
   assert.ok(result.zipPath.endsWith("es.example.com-audit-bundle.zip"));
   const expectedFiles = [
@@ -2475,7 +2476,18 @@ test("resolveSecureOutputPath rejects traversal and symlinked parents", () => {
   assert.throws(() => resolveSecureOutputPath(base, join("linked", "bundle")), /symlinked parent/);
 
   const safe = resolveSecureOutputPath(base, join("nested", "bundle"));
-  assert.ok(safe.startsWith(base));
+  assert.ok(safe.startsWith(realpathSync(base)));
+
+  // macOS temp roots sit behind a symlink (/var -> /private/var, /tmp -> /private/tmp).
+  // The returned path is the real path, so a prefix check against the symlink path fails.
+  const realTmp = createTempBase("elastic-real-tmp-");
+  const linkParent = createTempBase("elastic-link-parent-");
+  const linkedTmp = join(linkParent, "var");
+  symlinkSync(realTmp, linkedTmp, "dir");
+  const linkedBase = mkdtempSync(join(linkedTmp, "elastic-via-symlink-"));
+  const throughLink = resolveSecureOutputPath(linkedBase, join("nested", "bundle"));
+  assert.equal(relative(realpathSync(linkedBase), throughLink).startsWith(".."), false);
+  assert.equal(throughLink.startsWith(linkedBase), false);
 });
 
 test("registerElasticTools exposes the check, assessment, and export tools with normalized arguments", async () => {

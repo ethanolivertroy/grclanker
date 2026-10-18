@@ -31,8 +31,25 @@ import {
   resolveSecureOutputPath,
   runAllCrowdstrikeAssessments,
 } from "../dist/extensions/grc-tools/crowdstrike.js";
+import { CROWDSTRIKE_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
+import { CROWDSTRIKE_SPEC } from "../dist/extensions/grc-tools/crowdstrike.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertBundlePathsMatchSpec, assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  portableContractTest,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
+import {
+  assertRequestConformance,
+  certifyRuntimeBoundaryCoverage,
+  certifyRuntimeRuleDecisiveness,
+  observeRuntimeDecisionFacts,
+  recordFetchRequests,
+  sweepCheckCompleteness,
+} from "./helpers/spec-conformance.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
@@ -40,6 +57,9 @@ import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, inj
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
+
+const observedDecisionFacts = observeRuntimeDecisionFacts(CROWDSTRIKE_SPEC);
+const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
 
 const ALL_CONTROL_IDS = Array.from({ length: 25 }, (_, index) => `CS-${String(index + 1).padStart(2, "0")}`);
 const EXPECTED_TOOLS = [
@@ -1301,6 +1321,21 @@ test("verdict safety rule 5: partial inventories never pass and report seen vers
   assert.equal(sensorCoverage.summary.reported_total_hosts, 43);
 });
 
+test("verdict safety rule 5: a user the details lookup omits makes the user inventory partial, so CS-16 and CS-17 cannot pass", async () => {
+  const result = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listUserUuids: async () => [...passingUsers().users.map((user) => user.uuid), "u-deleted"],
+  }));
+  for (const id of ["CS-16", "CS-17"]) {
+    const finding = findingById(result, id);
+    assert.equal(finding.status, "warn", finding.summary);
+    assert.deepEqual(finding.evidence.partial_inventory, [{ dataset: "users", seen: 2, total: 3 }]);
+    assert.match(finding.summary, /Partial inventory: only 2 of 3 users were read/);
+  }
+  assert.equal(result.summary.users_reviewed, 2);
+  assert.equal(result.summary.reported_total_users, 3);
+  assert.equal(result.summary.users_truncated, true);
+});
+
 test("verdict safety rule 6: disabled, unassigned, or incomplete enabling flags never support pass", async () => {
   const disabledOnly = await assessCrowdstrikePreventionPolicies(createFakeClient({
     listPreventionPolicies: async () => [preventionPolicy({ enabled: false })],
@@ -2315,7 +2350,7 @@ test("round 2 SEND BACK 5: under a capped list CS-17 and CS-23 scope their sente
   }));
   const staleLeastPrivilege = findingById(staleCapped, "CS-17");
   assert.equal(staleLeastPrivilege.status, "fail", "a fail observed on a visible row stands under a cap");
-  assert.match(staleLeastPrivilege.summary, /^1 users reviewed; 0 carry more than 5 roles or redundant roles on top of an admin grant, and 1 of 1 admin accounts have a last login older than 90 days\. Partial inventory: only 1 of 43 users were read/);
+  assert.equal(staleLeastPrivilege.summary, "1 users reviewed; 0 carry more than 5 roles or redundant roles on top of an admin grant, and 1 of 1 admin accounts have a last login older than 90 days. Partial inventory: only 1 of 43 users were read (sampled or truncated); the failure observed in the rows read stands.");
 
   // CS-23 under CAP listHosts: the containment status filter reports 40 hosts and none is visible.
   const cappedHosts = await assessCrowdstrikeResponseReadiness(createFakeClient({
@@ -2446,7 +2481,7 @@ test("round 3 rulings (a) and (b): a truncated page with zero visible rows never
   const noGroups = findingById(await assessCrowdstrikeSensorCoverage(createFakeClient({ listHostGroups: async () => [], listHosts: async () => truncatedPage([host()], 41) })), "CS-14");
   assert.equal(noGroups.status, "fail", "zero host groups on a complete read is a fail whatever the host list did");
   assert.equal(noGroups.evidence.absence_claim, undefined);
-  assert.equal(noGroups.summary, "The host groups endpoint was readable but returned zero host groups, so no policy assignment coverage can be demonstrated; emptiness fails this control. Partial inventory: only 1 of 41 hosts were read (sampled or truncated), so this verdict cannot exceed warn.");
+  assert.equal(noGroups.summary, "The host groups endpoint was readable but returned zero host groups, so no policy assignment coverage can be demonstrated; emptiness fails this control. Partial inventory: only 1 of 41 hosts were read (sampled or truncated); the failure observed in the rows read stands.");
 
   // CS-22 with one visible but undated alert of 40: no dated alert is visible, so the scoped sentence carries the
   // undated clause and the partial clause, and the verdict is warn.
@@ -3021,4 +3056,466 @@ test("CrowdStrike tools are registered in the tool catalog under the CrowdStrike
   }
   const exportTool = tools.find((entry) => entry.name === "crowdstrike_export_audit_bundle");
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "output_dir"));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Portable contract: auth resolver, requests, completeness, bundle paths
+// ---------------------------------------------------------------------------------------------
+
+portableContractTest("the auth resolver contract names exactly the environment the resolver reads, and each variable reaches the resolved configuration", () => {
+  assert.deepEqual(CROWDSTRIKE_SPEC.authentication.environmentVariables, CROWDSTRIKE_AUTH_RESOLVER.environment);
+  assert.deepEqual(CROWDSTRIKE_SPEC.authentication.configLocations, CROWDSTRIKE_AUTH_RESOLVER.configLocations);
+  assert.deepEqual(CROWDSTRIKE_SPEC.authentication.configFields, CROWDSTRIKE_AUTH_RESOLVER.configFields);
+
+  const home = createTempBase("grclanker-cs-resolver-contract-");
+  const configFile = join(home, "file.json");
+  writeFileSync(configFile, JSON.stringify({ client_id: "file-client", client_secret: "<file-secret>" }));
+  const basic = { CS_CLIENT_ID: "env-client", CS_CLIENT_SECRET: "<env-secret>" };
+
+  const accessed = new Set();
+  const tracked = new Proxy({ ...basic }, {
+    get(target, property) {
+      if (typeof property === "string") accessed.add(property);
+      return target[property];
+    },
+  });
+  resolveCrowdstrikeConfiguration({}, tracked, home);
+  assert.deepEqual([...accessed].sort(), [...CROWDSTRIKE_AUTH_RESOLVER.environment].sort());
+
+  const reached = {
+    CS_CONFIG_FILE: [{ CS_CONFIG_FILE: configFile }, (config) => config.clientId === "file-client" && config.clientSecret === "<file-secret>"],
+    CS_CLIENT_ID: [basic, (config) => config.clientId === "env-client"],
+    FALCON_CLIENT_ID: [{ FALCON_CLIENT_ID: "falcon-client", CS_CLIENT_SECRET: "<env-secret>" }, (config) => config.clientId === "falcon-client"],
+    CS_CLIENT_SECRET: [basic, (config) => config.clientSecret === "<env-secret>"],
+    FALCON_CLIENT_SECRET: [{ CS_CLIENT_ID: "env-client", FALCON_CLIENT_SECRET: "<falcon-secret>" }, (config) => config.clientSecret === "<falcon-secret>"],
+    CS_CLOUD: [{ ...basic, CS_CLOUD: "eu-1" }, (config) => config.cloud === "eu-1" && config.baseUrl === CROWDSTRIKE_CLOUDS["eu-1"]],
+    FALCON_CLOUD: [{ ...basic, FALCON_CLOUD: "us-2" }, (config) => config.cloud === "us-2" && config.baseUrl === CROWDSTRIKE_CLOUDS["us-2"]],
+    CS_BASE_URL: [{ ...basic, CS_BASE_URL: "https://falcon.example.internal" }, (config) => config.baseUrl === "https://falcon.example.internal"],
+    FALCON_BASE_URL: [{ ...basic, FALCON_BASE_URL: "https://falcon-alias.example.internal" }, (config) => config.baseUrl === "https://falcon-alias.example.internal"],
+    CS_MEMBER_CID: [{ ...basic, CS_MEMBER_CID: "child-cid" }, (config) => config.memberCid === "child-cid"],
+    FALCON_MEMBER_CID: [{ ...basic, FALCON_MEMBER_CID: "falcon-child-cid" }, (config) => config.memberCid === "falcon-child-cid"],
+    CS_TIMEOUT: [{ ...basic, CS_TIMEOUT: "45" }, (config) => config.timeoutMs === 45_000],
+  };
+  assert.deepEqual(Object.keys(reached).sort(), [...CROWDSTRIKE_AUTH_RESOLVER.environment].sort());
+  for (const [name, [environment, applied]] of Object.entries(reached)) {
+    assert.ok(applied(resolveCrowdstrikeConfiguration({}, environment, home)), `${name} reaches the resolved configuration`);
+  }
+});
+
+function contractClient(fetchImpl, config = sampleConfig()) {
+  return new CrowdstrikeApiClient(config, { fetchImpl, sleep: async () => {}, retryLimit: 0 });
+}
+
+portableContractTest("every request the access check, the five assessments, and the export send matches a declared surface, parameter, and header", async () => {
+  const recorder = recordFetchRequests((input) => csHealthyResponse(new URL(String(input)).pathname));
+  const config = sampleConfig({ memberCid: "child-cid" });
+  const client = contractClient(recorder.fetch, config);
+  await checkCrowdstrikeAccess(client);
+  await runAllCrowdstrikeAssessments(client);
+  await exportCrowdstrikeAuditBundle(client, config, createTempBase("grclanker-cs-request-conformance-"));
+
+  // The token exchange is the auth contract's refresh request, not an API surface.
+  const tokenRequests = recorder.requests.filter((request) => new URL(request.url).pathname === "/oauth2/token");
+  assert.equal(tokenRequests.length, 1, "one token serves every read while it is valid");
+  const [token] = tokenRequests;
+  assert.equal(`${token.method} ${token.url}`, `POST ${config.baseUrl}/oauth2/token`);
+  assert.equal(token.headers.accept, "application/json");
+  assert.match(token.headers["content-type"], /^application\/x-www-form-urlencoded/);
+  assert.deepEqual(token.body, { client_id: config.clientId, client_secret: config.clientSecret, member_cid: "child-cid" });
+
+  const reads = recorder.requests.filter((request) => request !== token);
+  assert.ok(reads.every((request) => !JSON.stringify(request).includes("child-cid")), "member_cid travels only in the token request");
+  assertRequestConformance(assert, CROWDSTRIKE_SPEC, reads);
+});
+
+// Built on first use: differential runs load this file against a baseline that has no spec module.
+let contractSurfaces;
+
+function declaredSurfaces() {
+  contractSurfaces ??= CROWDSTRIKE_SPEC.apiSurfaces.map((surface) => {
+    const [path, query = ""] = surface.path.split("?");
+    const embedded = [...new URLSearchParams(query)].map(([name, value]) => {
+      const pattern = value.split(/\{[^}]+\}/).map(escapeRegExp).join(".+");
+      return { name, pattern: new RegExp(`^${pattern}$`) };
+    });
+    return { id: surface.id, method: surface.method ?? "GET", path, embedded };
+  });
+  return contractSurfaces;
+}
+
+// The most specific declared surface wins, so a host walk with the containment filter is contained_hosts.
+function requestedSurface(method, url) {
+  const matches = declaredSurfaces().filter((surface) => surface.method === method && surface.path === url.pathname
+    && surface.embedded.every(({ name, pattern }) => pattern.test(url.searchParams.get(name) ?? "")));
+  return matches.sort((left, right) => right.embedded.length - left.embedded.length)[0]?.id;
+}
+
+const ids = (records, field = "id") => async (fake) => (await records(fake)).items.map((record) => record[field]);
+
+const CONTRACT_READS = {
+  prevention_policies: (fake) => fake.listPreventionPolicies(),
+  response_policies: (fake) => fake.listResponsePolicies(),
+  rtr_audit_sessions: (fake) => fake.listRtrSessions(),
+  alerts: (fake) => fake.listAlerts(),
+  alert_ids: ids((fake) => fake.listAlerts(), "composite_id"),
+  contained_hosts: (fake, url) => fake.listHosts(undefined, url.searchParams.get("filter")),
+  device_control_policies: (fake) => fake.listDeviceControlPolicies(),
+  device_control_policy_details: (fake) => fake.getDeviceControlPoliciesV2(),
+  firewall_policies: (fake) => fake.listFirewallPolicies(),
+  firewall_policy_containers: (fake) => fake.getFirewallPolicyContainers(),
+  firewall_rule_group_ids: ids((fake) => fake.listFirewallRuleGroups()),
+  firewall_rule_groups: (fake) => fake.listFirewallRuleGroups(),
+  firewall_rule_ids: ids((fake) => fake.listFirewallRules()),
+  firewall_rules: (fake) => fake.listFirewallRules(),
+  sensor_update_policies: (fake) => fake.listSensorUpdatePolicies(),
+  sensor_update_builds: (fake) => fake.listSensorUpdateBuilds(),
+  hosts: (fake) => fake.listHosts(),
+  host_groups: (fake) => fake.listHostGroups(),
+  discover_host_ids: async (fake) => ({ count: await fake.countDiscoverHosts("") }),
+  discover_unmanaged_count: async (fake, url) => ({ count: await fake.countDiscoverHosts(url.searchParams.get("filter")) }),
+  discover_managed_count: async (fake, url) => ({ count: await fake.countDiscoverHosts(url.searchParams.get("filter")) }),
+  discover_unmanaged_hosts: (fake) => fake.listDiscoverHosts(),
+  zero_trust_scored_count: async (fake, url) => ({ count: await fake.countZtaAssessments(url.searchParams.get("filter")) }),
+  zero_trust_below_threshold: (fake) => fake.listZtaAssessments(),
+  zero_trust_below_threshold_count: async (fake, url) => ({ count: await fake.countZtaAssessments(url.searchParams.get("filter")) }),
+  user_uuids: (fake) => fake.listUserUuids(),
+  users: (fake) => fake.getUsers(),
+  user_roles: (fake, url) => fake.listUserRoles(url.searchParams.get("user_uuid")),
+  role_ids: ids((fake) => fake.listRoles()),
+  roles: (fake) => fake.listRoles(),
+  api_client_ids: ids((fake) => fake.listApiClients()),
+  api_clients: (fake) => fake.listApiClients(),
+  ioa_exclusion_ids: ids((fake) => fake.listIoaExclusions()),
+  ioa_exclusions: (fake) => fake.listIoaExclusions(),
+  ml_exclusion_ids: ids((fake) => fake.listMlExclusions()),
+  ml_exclusions: (fake) => fake.listMlExclusions(),
+  sensor_visibility_exclusion_ids: ids((fake) => fake.listSensorVisibilityExclusions()),
+  sensor_visibility_exclusions: (fake) => fake.listSensorVisibilityExclusions(),
+  identity_protection_rule_ids: ids((fake) => fake.listIdentityProtectionRules()),
+  identity_protection_rules: (fake) => fake.listIdentityProtectionRules(),
+};
+
+function contractFetch(transforms = {}) {
+  const fake = createFakeClient();
+  return async (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: "contract-token", expires_in: 1799 });
+    const body = typeof init.body === "string" ? JSON.parse(init.body) : undefined;
+    const surfaceId = requestedSurface((init.method ?? "GET").toUpperCase(), url);
+    assert.ok(surfaceId, `undeclared request ${url.pathname}`);
+    const read = await CONTRACT_READS[surfaceId](fake, url, body);
+    const resources = read.count === undefined ? (Array.isArray(read) ? read : read.items) : [];
+    const response = { resources, meta: { pagination: { total: read.count ?? resources.length } } };
+    const transform = transforms[surfaceId];
+    const served = transform ? transform(response, url, body) : response;
+    return served instanceof Response ? served : jsonResponse(served);
+  };
+}
+
+const refusedRead = () => jsonResponse({ errors: [{ code: 403, message: "access denied, authorization failed" }] }, { status: 403 });
+
+// Leaves a read partial the way Falcon does: an ID lookup returns fewer entities than it was asked for,
+// a single-page ID query reports more IDs than it returned, and a walk reports one more record than it
+// delivers and then answers the next page empty.
+function truncatedRead(response, url, body) {
+  const total = response.meta.pagination.total + 1;
+  if (url.searchParams.has("ids") || body?.ids) return { ...response, resources: response.resources.slice(0, -1) };
+  if (url.searchParams.has("offset") || url.searchParams.has("after") || body?.after) return { resources: [], meta: { pagination: { total } } };
+  return { ...response, meta: { pagination: { total, after: "next-page" } } };
+}
+
+portableContractTest("completeness sweep: a truncated source never lets a check that reads it pass", async () => {
+  const report = await sweepCheckCompleteness({
+    spec: CROWDSTRIKE_SPEC,
+    createInput: () => ({}),
+    applyFailure: (transforms, { surfaceId, mode }) => (mode === "truncated" ? { ...transforms, [surfaceId]: truncatedRead } : undefined),
+    assess: async (transforms) => (await runAllCrowdstrikeAssessments(contractClient(contractFetch(transforms)))).flatMap((assessment) => assessment.findings),
+  });
+  assert.deepEqual(report.baselineNotPassing, []);
+  assert.deepEqual(report.unreachable, []);
+  assert.deepEqual(report.undemoted, []);
+  assert.ok(report.combinations > 0);
+});
+
+portableContractTest("the export writes every declared bundle path and nothing else, with and without collection errors", async () => {
+  const complete = await exportCrowdstrikeAuditBundle(contractClient(contractFetch()), sampleConfig(), createTempBase("grclanker-cs-bundle-paths-"));
+  assertBundlePathsMatchSpec(assert, complete.outputDir, CROWDSTRIKE_SPEC);
+  assert.ok(!readBundleFiles(complete.outputDir).has("_errors.log"));
+
+  const partial = await exportCrowdstrikeAuditBundle(contractClient(contractFetch({ host_groups: refusedRead })), sampleConfig(), createTempBase("grclanker-cs-bundle-paths-"));
+  assertBundlePathsMatchSpec(assert, partial.outputDir, CROWDSTRIKE_SPEC);
+  assert.ok(readBundleFiles(partial.outputDir).has("_errors.log"));
+});
+
+portableContractTest("without a cloud the bundle is named from the base_url host and the member CID, normalized as the overwrite policy states", async () => {
+  const config = sampleConfig({ cloud: undefined, baseUrl: "https://Falcon.Example.internal", memberCid: "Child CID/01" });
+  const result = await exportCrowdstrikeAuditBundle(contractClient(contractFetch(), config), config, createTempBase("grclanker-cs-bundle-name-"));
+  assert.match(result.outputDir, /\/falcon\.example\.internal-child-cid-01-audit-bundle$/);
+  assert.equal(result.zipPath, `${result.outputDir}.zip`);
+});
+
+// Builds a scenario's fixtures and runs it at one instant, so ages measured from the
+// assessment time land exactly on millisecond thresholds.
+async function atFixedInstant(run) {
+  const NativeDate = Date;
+  const now = NativeDate.now();
+  globalThis.Date = class FixedDate extends NativeDate {
+    constructor(...args) {
+      super(...(args.length === 0 ? [now] : args));
+    }
+
+    static now() {
+      return now;
+    }
+  };
+  try {
+    return await run();
+  } finally {
+    globalThis.Date = NativeDate;
+  }
+}
+
+function boundaryScenario(check, expected, edge, overrides) {
+  return { name: `${check} ${expected} when ${edge}`, check, expected, overrides };
+}
+
+function manyHosts(count, change) {
+  return Array.from({ length: count }, (_, index) => host({ device_id: `aid-${index + 1}`, hostname: `ws-${index + 1}`, ...change(index) }));
+}
+
+function hostsWith(hosts) {
+  return { listHosts: async (_limit, filter) => (filter ? [] : hosts) };
+}
+
+function recentlySeenHosts(total, recent) {
+  return hostsWith(manyHosts(total, (index) => (index < recent ? {} : { last_seen: isoDaysAgo(30) })));
+}
+
+function groupedHosts(total, grouped) {
+  return hostsWith(manyHosts(total, (index) => (index < grouped ? {} : { groups: [] })));
+}
+
+function discoveredAssets(unmanaged, managed) {
+  return { countDiscoverHosts: async (filter) => (filter.includes("unmanaged") ? unmanaged : managed) };
+}
+
+function slaAlerts(total, compliant) {
+  const alerts = Array.from({ length: total }, (_, index) => ({
+    composite_id: `a-${index + 1}`,
+    severity: 90,
+    severity_name: "Critical",
+    status: "closed",
+    created_timestamp: isoHoursAgo(200),
+    seconds_to_resolved: index < compliant ? 3600 : 360_000,
+  }));
+  return { listAlerts: async () => alerts };
+}
+
+function ztaScores(below, total) {
+  return { countZtaAssessments: async (filter) => (filter.startsWith("score:<") ? below : total) };
+}
+
+function rtrSession(id, startedMinutesAgo, endedMinutesAgo, extra = {}) {
+  return {
+    id,
+    user_id: "alice@example.com",
+    hostname: "ws-01",
+    created_at: isoHoursAgo(startedMinutesAgo / 60),
+    deleted_at: isoHoursAgo(endedMinutesAgo / 60),
+    ...extra,
+  };
+}
+
+function rtrSessions(...sessions) {
+  return { listRtrSessions: async () => sessions };
+}
+
+function usbExceptions(count) {
+  return Array.from({ length: count }, (_, index) => ({ id: `exc-${index + 1}` }));
+}
+
+function adminUsers(count) {
+  const users = Array.from({ length: count }, (_, index) => ({ uuid: `u-${index + 1}`, uid: `analyst${index + 1}@example.com`, status: "active", last_login_at: isoDaysAgo(1) }));
+  return {
+    listUserUuids: async () => users.map((user) => user.uuid),
+    getUsers: async () => users,
+    listUserRoles: async () => [{ role_id: "falcon_administrator", role_name: "Falcon Administrator" }],
+  };
+}
+
+function usersWith(change) {
+  const users = passingUsers();
+  change(users);
+  return {
+    getUsers: async () => users.users,
+    listUserRoles: async (uuid) => users.roles[uuid] ?? [],
+  };
+}
+
+function nonAdminRoles(count) {
+  return Array.from({ length: count }, (_, index) => ({ role_id: `analyst_role_${index + 1}`, role_name: `Analyst Role ${index + 1}` }));
+}
+
+function preventionWith(change) {
+  const policies = passingPreventionPolicies();
+  change(policies);
+  return { listPreventionPolicies: async () => policies };
+}
+
+function deviceControlWith(change) {
+  const { details } = passingDeviceControl();
+  change(details[0]);
+  return { getDeviceControlPoliciesV2: async () => details };
+}
+
+function firewallWith(change) {
+  const firewall = passingFirewall();
+  change(firewall);
+  return {
+    listFirewallPolicies: async () => firewall.policies,
+    getFirewallPolicyContainers: async () => firewall.containers,
+  };
+}
+
+// Inputs that put each threshold at and beside its edge. They run as plain tests, so the byte
+// differential replays them through the baseline runtime and compares every result.
+const BOUNDARY_SCENARIOS = [
+  boundaryScenario("CS-02", "warn", "only the extended ProcessHollowing mitigation is disabled", () => preventionWith((policies) => {
+    const exploit = policies[0].prevention_settings.find((category) => category.name === "Exploit Mitigation");
+    exploit.settings.find((setting) => setting.id === "ProcessHollowing").value.enabled = false;
+  })),
+  boundaryScenario("CS-08", "fail", "USB enforcement is MONITOR_ONLY although mass storage is blocked", () => deviceControlWith((details) => {
+    details.usb_settings.enforcement_mode = "MONITOR_ONLY";
+  })),
+  boundaryScenario("CS-10", "fail", "the firewall container does not enforce although its rule group is active", () => firewallWith((firewall) => {
+    firewall.containers[0].enforce = false;
+  })),
+  boundaryScenario("CS-10", "fail", "the firewall container enforces with no rule group", () => firewallWith((firewall) => {
+    firewall.containers[0].rule_group_ids = [];
+  })),
+  boundaryScenario("CS-13", "pass", "1 of 100 hosts is stale", () => recentlySeenHosts(100, 99)),
+  boundaryScenario("CS-13", "warn", "10 of 100 hosts are stale", () => recentlySeenHosts(100, 90)),
+  boundaryScenario("CS-14", "warn", "1599 of 2000 hosts are in a host group (79.95 percent rounds up to the fail edge)", () => groupedHosts(2000, 1599)),
+  boundaryScenario("CS-14", "pass", "1899 of 2000 hosts are in a host group (94.95 percent rounds up to the warn edge)", () => groupedHosts(2000, 1899)),
+  boundaryScenario("CS-22", "warn", "1599 of 2000 alerts met their SLA (79.95 percent rounds up to the fail edge)", () => slaAlerts(2000, 1599)),
+  boundaryScenario("CS-25", "warn", "5 of 100 scored hosts are below min_zta_score", () => ztaScores(5, 100)),
+  boundaryScenario("CS-13", "warn", "1699 of 2000 hosts were seen within stale_sensor_days (84.95 percent rounds up to the fail edge)", () => recentlySeenHosts(2000, 1699)),
+  boundaryScenario("CS-13", "fail", "1698 of 2000 hosts were seen within stale_sensor_days", () => recentlySeenHosts(2000, 1698)),
+  boundaryScenario("CS-13", "pass", "1899 of 2000 hosts were seen within stale_sensor_days (94.95 percent rounds up to the warn edge)", () => recentlySeenHosts(2000, 1899)),
+  boundaryScenario("CS-13", "warn", "1898 of 2000 hosts were seen within stale_sensor_days", () => recentlySeenHosts(2000, 1898)),
+  boundaryScenario("CS-14", "fail", "1598 of 2000 hosts are in a host group", () => groupedHosts(2000, 1598)),
+  boundaryScenario("CS-14", "warn", "1898 of 2000 hosts are in a host group", () => groupedHosts(2000, 1898)),
+  boundaryScenario("CS-15", "warn", "1 of 20 discovered assets is unmanaged (exactly unmanaged_fail_above_per_mille)", () => discoveredAssets(1, 19)),
+  boundaryScenario("CS-15", "fail", "1 of 19 discovered assets is unmanaged", () => discoveredAssets(1, 18)),
+  boundaryScenario("CS-22", "fail", "1598 of 2000 alerts met their SLA", () => slaAlerts(2000, 1598)),
+  boundaryScenario("CS-22", "pass", "1899 of 2000 alerts met their SLA (94.95 percent rounds up to the warn edge)", () => slaAlerts(2000, 1899)),
+  boundaryScenario("CS-22", "warn", "1898 of 2000 alerts met their SLA", () => slaAlerts(2000, 1898)),
+  boundaryScenario("CS-25", "warn", "10 of 100 scored hosts are below min_zta_score (exactly zta_fail_above_per_mille)", () => ztaScores(10, 100)),
+  boundaryScenario("CS-25", "fail", "11 of 100 scored hosts are below min_zta_score", () => ztaScores(11, 100)),
+  boundaryScenario("CS-07", "manual", "the longest RTR session lasts exactly max_session_minutes", () => rtrSessions(rtrSession("s-1", 60, 20, { duration: 1800 }))),
+  boundaryScenario("CS-07", "warn", "the longest RTR session lasts a second past max_session_minutes", () => rtrSessions(rtrSession("s-1", 60, 20, { duration: 1801 }))),
+  boundaryScenario("CS-07", "manual", "one user has exactly max_concurrent_sessions RTR sessions open at once", () => rtrSessions(
+    rtrSession("s-1", 25, 5),
+    rtrSession("s-2", 20, 5),
+    rtrSession("s-3", 15, 5),
+  )),
+  boundaryScenario("CS-07", "warn", "one user has one RTR session past max_concurrent_sessions open at once", () => rtrSessions(
+    rtrSession("s-1", 25, 5),
+    rtrSession("s-2", 20, 5),
+    rtrSession("s-3", 15, 5),
+    rtrSession("s-4", 10, 5),
+  )),
+  boundaryScenario("CS-08", "pass", "mass storage carries exactly max_usb_exceptions exceptions", () => deviceControlWith((details) => {
+    details.usb_settings.classes[0].exceptions = usbExceptions(25);
+  })),
+  boundaryScenario("CS-08", "warn", "mass storage carries one exception past max_usb_exceptions", () => deviceControlWith((details) => {
+    details.usb_settings.classes[0].exceptions = usbExceptions(26);
+  })),
+  boundaryScenario("CS-16", "pass", "exactly max_admins users hold an admin role", () => adminUsers(5)),
+  boundaryScenario("CS-16", "warn", "one user past max_admins holds an admin role", () => adminUsers(6)),
+  boundaryScenario("CS-16", "warn", "exactly twice max_admins users hold an admin role", () => adminUsers(10)),
+  boundaryScenario("CS-16", "fail", "one user past twice max_admins holds an admin role", () => adminUsers(11)),
+  boundaryScenario("CS-17", "pass", "an admin last logged in exactly 90 days before the assessment", () => usersWith((users) => {
+    users.users[0].last_login_at = new Date(Date.now() - 7_776_000_000).toISOString();
+  })),
+  boundaryScenario("CS-17", "fail", "an admin last logged in a millisecond more than 90 days before the assessment", () => usersWith((users) => {
+    users.users[0].last_login_at = new Date(Date.now() - 7_776_000_001).toISOString();
+  })),
+  boundaryScenario("CS-17", "pass", "a user holds exactly max_roles_per_user roles", () => usersWith((users) => {
+    users.roles["u-analyst"] = nonAdminRoles(5);
+  })),
+  boundaryScenario("CS-17", "warn", "a user holds one role past max_roles_per_user", () => usersWith((users) => {
+    users.roles["u-analyst"] = nonAdminRoles(6);
+  })),
+  boundaryScenario("CS-09", "warn", "Bluetooth is monitored but not enforced while PCIe and mass storage are", () => deviceControlWith((details) => {
+    details.bluetooth_settings.enforcement_mode = "MONITOR_ONLY";
+  })),
+  boundaryScenario("CS-10", "warn", "a second assigned firewall policy has no container", () => firewallWith((firewall) => {
+    firewall.policies.push({ id: "fw-2", name: "Server Firewall", platform_name: "Windows", enabled: true, groups: [{ id: "hg-1" }] });
+  })),
+  boundaryScenario("CS-12", "warn", "the assigned sensor update policy's build has an unknown form", () => ({
+    listSensorUpdatePolicies: async () => [sensorUpdatePolicy({ settings: { build: "latest|tagged", uninstall_protection: "ENABLED", stage: "prod" } })],
+  })),
+  boundaryScenario("CS-14", "fail", "a host group exists but the complete host list is empty", () => hostsWith([])),
+  boundaryScenario("CS-18", "warn", "an API client has no scope list", () => ({
+    listApiClients: async () => [
+      { id: "api-1", name: "grclanker audit", scopes: [apiScope("prevention-policies", "read")] },
+      { id: "api-2", name: "legacy exporter" },
+    ],
+  })),
+];
+
+async function runBoundaryScenario({ overrides }) {
+  return atFixedInstant(() => runAllCrowdstrikeAssessments(createFakeClient(overrides())));
+}
+
+test("boundary scenarios: each threshold edge reaches the verdict on either side of it", async () => {
+  const names = BOUNDARY_SCENARIOS.map((scenario) => scenario.name);
+  assert.equal(new Set(names).size, names.length, "scenario names key the byte differential fixture");
+  const mismatches = [];
+  for (const scenario of BOUNDARY_SCENARIOS) {
+    const status = statusMap(await runBoundaryScenario(scenario))[scenario.check];
+    if (status !== scenario.expected) mismatches.push(`${scenario.name}: ${status}`);
+  }
+  assert.deepEqual(mismatches, []);
+});
+
+function representativeOverrides() {
+  return {
+    ...preventionWith((policies) => {
+      const exploit = policies[0].prevention_settings.find((category) => category.name === "Exploit Mitigation");
+      exploit.settings.find((setting) => setting.id === "ProcessHollowing").value.enabled = false;
+    }),
+    ...deviceControlWith((details) => {
+      details.usb_settings.enforcement_mode = "MONITOR_ONLY";
+    }),
+    ...firewallWith((firewall) => {
+      firewall.containers[0].enforce = false;
+    }),
+    ...recentlySeenHosts(2000, 1698),
+    ...slaAlerts(2000, 1599),
+    ...adminUsers(11),
+  };
+}
+
+test("byte differential fixtures: CrowdStrike assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("crowdstrike", "representative", await runAllCrowdstrikeAssessments(createFakeClient(representativeOverrides())));
+  writeByteDifferentialFixture("crowdstrike", "compliant", await runAllCrowdstrikeAssessments(createFakeClient()));
+  writeByteDifferentialFixture("crowdstrike", "denied", await runAllCrowdstrikeAssessments(createForbiddenClient()));
+  writeByteDifferentialFixture("crowdstrike", "partial", await runAllCrowdstrikeAssessments(createPartialClient()));
+  writeByteDifferentialFixture("crowdstrike", "missing-null", await runAllCrowdstrikeAssessments(createEmptyClient()));
+  const boundary = {};
+  for (const scenario of BOUNDARY_SCENARIOS) boundary[scenario.name] = await runBoundaryScenario(scenario);
+  writeByteDifferentialFixture("crowdstrike", "boundary", boundary);
+  const exported = await exportCrowdstrikeAuditBundle(createFakeClient(), sampleConfig(), prepareByteDifferentialExportRoot("crowdstrike"));
+  writeByteDifferentialFixture("crowdstrike", "export", snapshotExportBundle(exported));
+});
+
+portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", {
+  skip: testFilterActive && "a test filter ran only part of this file",
+}, () => {
+  observedDecisionFacts.stop();
+  const boundaries = certifyRuntimeBoundaryCoverage(CROWDSTRIKE_SPEC, observedDecisionFacts.factsByCheck);
+  const rules = certifyRuntimeRuleDecisiveness(CROWDSTRIKE_SPEC, observedDecisionFacts.factsByCheck);
+  assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
 });

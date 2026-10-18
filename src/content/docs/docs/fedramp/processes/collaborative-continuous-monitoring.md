@@ -1,5 +1,5 @@
 ---
-title: "Collaborative Continuous Monitoring: FedRAMP Process"
+title: "Collaborative Continuous Monitoring"
 description: "Official Consolidated Rules summary for the CCM FedRAMP process, including applicability and requirements."
 ---
 

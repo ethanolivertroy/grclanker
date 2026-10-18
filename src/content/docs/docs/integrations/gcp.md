@@ -87,6 +87,18 @@ The projects you inventory must have the relevant APIs enabled:
 
 When an API is disabled in a project, the dependent finding is rendered `manual` for that project, never `pass`.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my GCP credentials can read everything grclanker needs.
+Run the GCP assessments and list the failing findings first.
+Export a GCP audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our GCP organization"`. Both start with `gcp_check_access`, then run the assessments or `gcp_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose | Notable arguments |

@@ -13,9 +13,13 @@ curl -fsSL https://grclanker.com/install | bash
 
 This installs the newest release bundle, currently `v0.1.2`, with all 241 domain tools, `grclanker tools`, and `grclanker flue run`. To run unreleased changes from `main` instead, [install from source](/docs/getting-started/installation#install-from-source) and `npm link` it so the `grclanker` commands below run that build.
 
-## 2. Prepare the local-first path
+## 2. Set up a model
 
-The recommended first local backend is Ollama with Gemma 4. Install Ollama from [ollama.com/download](https://ollama.com/download). The grclanker installer does not install it.
+The recommended first backend is local: Ollama with Gemma 4 on your own machine. A higher-memory Apple Silicon Mac is a strong local target. A 64 GB MacBook is an especially comfortable fit for the experimental local-first path, but it is not a hard requirement.
+
+To use a hosted model instead, skip Ollama: run `grclanker setup`, choose `Hosted`, and pick OpenAI, Anthropic, or Google. Your prompts and tool output then go to that provider. grclanker reads the provider's key from `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`, or from a key you store with `/login` inside a session. The [hosted path](/docs/getting-started/setup#hosted-path) on the Setup page lists each provider's default model. Then go to [step 3](#3-start-the-companion).
+
+For the local path, install Ollama from [ollama.com/download](https://ollama.com/download). The grclanker installer does not install it.
 
 If the Ollama app or background service is already running, skip this command. Otherwise start the server in its own terminal and leave it running:
 
@@ -31,8 +35,6 @@ grclanker setup
 ```
 
 Choose `Local-first` when prompted. Setup defaults to the Ollama endpoint at `http://localhost:11434/v1`.
-
-> A higher-memory Apple Silicon Mac is a strong local target. A 64 GB MacBook is an especially comfortable fit for the experimental local-first path, but it is not a hard requirement.
 
 ## 3. Start the companion
 
@@ -76,7 +78,7 @@ Is CVE-2024-3400 in the CISA KEV catalog, and what is its EPSS score?
 Which vulnerabilities were added to the CISA KEV catalog in the last 30 days?
 ```
 
-Both are answered by the KEV and EPSS tools (`kevs_search`, `kevs_get_epss`, `kevs_recent`), which ship in every release bundle.
+Both are answered by `kevs_search`, `kevs_get_epss`, and `kevs_recent`. `kevs_check_ransomware` is the fourth KEV tool. All four ship in every release bundle. See [KEV / EPSS](/docs/integrations/kevs/).
 
 ## 5. Review or extend a shipped integration
 

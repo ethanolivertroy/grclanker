@@ -68,7 +68,12 @@ export function HeroInstall() {
           </button>
         ))}
       </div>
-      <button type="button" className="hero-install-command" aria-label="Copy install command" onClick={() => copy(command)}>
+      <button
+        type="button"
+        className="hero-install-command"
+        aria-label={`Copy install command: ${command}`}
+        onClick={() => copy(command)}
+      >
         <span className="hero-install-command-text">{command}</span>
         {copied ? <CheckIcon className="hero-install-icon" /> : <CopyIcon className="hero-install-icon" />}
       </button>

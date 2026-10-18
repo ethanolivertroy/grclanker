@@ -91,6 +91,18 @@ The TLS verification opt-out is implemented with a per-request `node:https` agen
 
 Error messages are scrubbed as described under Export bundle layout.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Splunk credentials can read everything grclanker needs.
+Run the Splunk assessments and list the failing findings first.
+Export a Splunk audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Splunk deployment"`. Both start with `splunk_check_access`, then run the assessments or `splunk_export_audit_bundle`.
+
 ## Tools
 
 All tools accept the shared connection arguments (`url`, `token`, `username`, `password`, `stack`, `acs_token`, `acs_base_url`, `verify_ssl`, `config_file`, `timeout_seconds`).

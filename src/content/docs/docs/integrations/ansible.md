@@ -51,6 +51,18 @@ Required roles: grant the audit account the System Auditor role. A plain user or
 
 Tokens on AAP 2.5 are issued by the platform gateway. A controller token still works against `/api/v2/`.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Ansible credentials can read everything grclanker needs.
+Run the Ansible assessments and list the failing findings first.
+Export an Ansible audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Ansible Automation Platform"`. Both start with `ansible_check_access`, then run the assessments or `ansible_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Controls | What it does |

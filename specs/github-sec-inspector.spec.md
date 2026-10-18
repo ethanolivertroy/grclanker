@@ -7,7 +7,7 @@ language: "typescript"
 status: "implemented"
 version: "1.0"
 last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
 ---
 
 # github-sec-inspector — Architecture Specification

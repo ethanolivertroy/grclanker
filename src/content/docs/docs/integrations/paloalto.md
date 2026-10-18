@@ -306,6 +306,18 @@ Response bodies are never echoed.
 - A PAN-OS response without a `<response>` element is described as `returned a non-XML {content-type} response (status {n}, {n} bytes, not echoed)`.
 - An XML error contributes only the `<msg>` or `<line>` text and the response `code`, scrubbed before the 300-character cap.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Palo Alto credentials can read everything grclanker needs.
+Run the Palo Alto assessments and list the failing findings first.
+Export a Palo Alto audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Prisma Cloud tenant and PAN-OS firewalls"`. Both start with `paloalto_check_access`, then run the assessments or `paloalto_export_audit_bundle`.
+
 ## Tools
 
 <!-- The probe counts and surface names in the paloalto_check_access row are asserted against checkPaloaltoAccess (cli/extensions/grc-tools/paloalto.ts) by cli/tests/paloalto.test.mjs; change the code and this row together. -->

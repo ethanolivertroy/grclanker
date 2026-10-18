@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { HeroImage } from '../components/hero-image';
 import { HeroBrandRail, HeroImageBreak } from '../components/hero-images';
 import { HeroInstall } from '../components/hero-install';
 import { pageMetadata } from '../lib/metadata';
@@ -38,17 +39,18 @@ const workflowCards = [
     command: '/audit',
     color: 'text-yellow',
     description:
-      'Map gathered evidence against the requested framework and classify what is satisfied, partial, absent, or unverifiable.',
+      'Map gathered evidence to the requested framework and classify each control as satisfied, partially satisfied, not satisfied, or unable to assess.',
   },
   {
     command: '/assess',
     color: 'text-peach',
-    description: 'Produce an evidence-backed posture readout with top risks, confidence notes, and remediation order.',
+    description: 'Classify the subject as strong, mixed, at risk, or critical, then name the top risks and the next actions.',
   },
   {
     command: '/validate',
     color: 'text-green',
-    description: 'Answer the narrow FIPS question cleanly: active, historical, in process, or absent.',
+    description:
+      'Answer the narrow FIPS question: actively validated, previously validated but expired, in process, or not found.',
   },
 ];
 
@@ -124,7 +126,7 @@ export default function HomePage() {
     <>
       <section className="relative overflow-hidden border-b border-surface0/60">
         <div className="absolute inset-0 w-full h-full">
-          <img
+          <HeroImage
             src="/hero/command-center.webp"
             alt="Clanker command center"
             className="w-full h-full object-cover object-center"
@@ -176,8 +178,10 @@ export default function HomePage() {
       <section className="hero-preview-section">
         <div className="max-w-content mx-auto px-6">
           <div className="hero-preview-shell">
-            <img
-              src="/hero/grclanker-terminal.png"
+            <HeroImage
+              src="/hero/grclanker-terminal.webp"
+              width={1750}
+              height={1316}
               alt="grclanker CLI start screen from the v0.1.2 release bundle: 248 tools and 2 agents, the investigate, audit, assess, and validate workflows, and 241 domain tools ready"
               className="hero-preview-image"
               loading="eager"

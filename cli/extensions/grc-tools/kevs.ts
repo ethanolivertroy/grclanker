@@ -18,6 +18,9 @@ const EPSS_URL = "https://api.first.org/data/v1/epss";
 const KEV_TTL = 4 * 60 * 60 * 1000;
 
 const DEFAULT_SEARCH_LIMIT = 10;
+const DEFAULT_RECENT_DAYS = 30;
+const DEFAULT_RECENT_LIMIT = 10;
+const DEFAULT_RANSOMWARE_LIMIT = 20;
 // Each rendered entry is about 11 lines and 1.1 KB with EPSS, so 50 keeps a broad search near 60 KB.
 const MAX_SEARCH_LIMIT = 50;
 
@@ -105,6 +108,27 @@ function asStringArray(value: unknown): string[] {
     .split(/[\s,]+/)
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+/**
+ * A limit below 1 is not a result window. Array.prototype.slice treats 0 as an
+ * empty range and a negative end as "drop this many from the tail", which would
+ * report no KEV entries, or drop the newest ones, for a catalog that has them.
+ */
+function positiveLimit(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const truncated = Math.trunc(value);
+  return truncated < 1 ? fallback : truncated;
+}
+
+/**
+ * A negative lookback moves the cutoff into the future and reports that nothing was added.
+ * The sign is checked before truncating: Math.trunc(-0.5) is -0, and -0 < 0 is false, so a
+ * fraction between -1 and 0 would otherwise become a zero-day window.
+ */
+function lookbackDays(value: number | undefined): number {
+  if (value === undefined || value < 0) return DEFAULT_RECENT_DAYS;
+  return Math.trunc(value);
 }
 
 function normalizeSearchArgs(args: unknown): SearchArgs {
@@ -419,8 +443,8 @@ export function registerKevsTools(pi: any): void {
     async execute(_toolCallId: string, args: RecentArgs) {
       try {
         const catalog = await cachedFetch<KevCatalog>(KEV_URL, KEV_TTL);
-        const days = args.days ?? 30;
-        const limit = args.limit ?? 10;
+        const days = lookbackDays(args.days);
+        const limit = positiveLimit(args.limit, DEFAULT_RECENT_LIMIT);
         const cutoff = new Date();
         cutoff.setDate(cutoff.getDate() - days);
         const cutoffString = cutoff.toISOString().split("T")[0];
@@ -451,7 +475,7 @@ export function registerKevsTools(pi: any): void {
       } catch (error) {
         return errorResult(
           `KEV fetch error: ${error instanceof Error ? error.message : String(error)}`,
-          { days: args.days ?? 30 },
+          { days: lookbackDays(args.days) },
         );
       }
     },
@@ -491,7 +515,7 @@ export function registerKevsTools(pi: any): void {
 
         const results = ransomwareEntries
           .sort((left, right) => right.dateAdded.localeCompare(left.dateAdded))
-          .slice(0, args.limit ?? 20);
+          .slice(0, positiveLimit(args.limit, DEFAULT_RANSOMWARE_LIMIT));
 
         if (results.length === 0) {
           return textResult(

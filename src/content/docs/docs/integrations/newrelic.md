@@ -93,6 +93,18 @@ Other API behavior:
   - New Relic documents a REST API v2 limit of 1000 calls per minute per key.
 - Every request has a timeout (30 seconds by default).
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my New Relic credentials can read everything grclanker needs.
+Run the New Relic assessments and list the failing findings first.
+Export a New Relic audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our New Relic organization"`. Both start with `newrelic_check_access`, then run the assessments or `newrelic_export_audit_bundle`.
+
 ## Tools
 
 All tools accept the shared authentication arguments `api_key`, `account_id`, `region`, `config_file`, `timeout_seconds`, and `audit_window_days`.

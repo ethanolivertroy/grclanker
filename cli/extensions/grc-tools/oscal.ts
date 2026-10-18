@@ -11,7 +11,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { readdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -602,6 +602,23 @@ async function countMarkdownFiles(
   return count;
 }
 
+function assertWorkspaceSegment(value: string, label: string): void {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error(`A non-empty ${label} is required.`);
+  }
+  if (
+    isAbsolute(trimmed) ||
+    trimmed === "." ||
+    trimmed === ".." ||
+    trimmed.includes("/") ||
+    trimmed.includes("\\") ||
+    trimmed.includes("\0")
+  ) {
+    throw new Error(`${label} must be a single name inside the workspace, not a path.`);
+  }
+}
+
 function findImportedModelPath(workspaceDir: string, outputName: string): {
   modelType: OscalModelType | null;
   filePath: string | null;
@@ -795,6 +812,7 @@ export async function importOscalModel(
   if (!args.file.trim()) {
     throw new Error("A file path or URL is required for oscal_import_model.");
   }
+  assertWorkspaceSegment(args.output, "output name");
 
   ensureTrestleWorkspace(args.workspace_dir);
 
@@ -828,9 +846,7 @@ export async function createOscalModel(
   runner: TrestleRunner = runTrestleCommand,
 ): Promise<OscalCreateResult> {
   const modelType = resolveOscalModelType(args.model_type);
-  if (!args.name.trim()) {
-    throw new Error("A non-empty model name is required.");
-  }
+  assertWorkspaceSegment(args.name, "model name");
 
   ensureTrestleWorkspace(args.workspace_dir);
 
@@ -892,6 +908,7 @@ export async function validateOscalModel(
     selector = resolveRelativeToWorkspace(args.workspace_dir, args.file);
   } else if (args.model_type && args.name) {
     const modelType = resolveOscalModelType(args.model_type);
+    assertWorkspaceSegment(args.name, "model name");
     commandArgs.push("-t", modelType, "-n", args.name);
     selector = `${modelType}:${args.name}`;
   } else if (args.model_type) {
@@ -927,9 +944,11 @@ export async function generateOscalSspMarkdown(
   if (!args.profile.trim()) {
     throw new Error("A profile name or href is required for oscal_generate_ssp_markdown.");
   }
-  if (!args.output.trim()) {
-    throw new Error("A non-empty output directory name is required.");
+  assertWorkspaceSegment(args.output, "output directory name");
+  for (const name of args.component_definitions ?? []) {
+    assertWorkspaceSegment(name, "component definition name");
   }
+  if (args.leveraged_ssp) assertWorkspaceSegment(args.leveraged_ssp, "leveraged SSP name");
 
   const commandArgs = [
     "author",
@@ -978,9 +997,11 @@ export async function assembleOscalSsp(
   if (!args.markdown.trim()) {
     throw new Error("A markdown directory is required for oscal_assemble_ssp.");
   }
-  if (!args.output.trim()) {
-    throw new Error("A non-empty output name is required for oscal_assemble_ssp.");
+  assertWorkspaceSegment(args.output, "output name");
+  for (const name of args.component_definitions ?? []) {
+    assertWorkspaceSegment(name, "component definition name");
   }
+  if (args.source_ssp_name) assertWorkspaceSegment(args.source_ssp_name, "source SSP name");
 
   const commandArgs = [
     "author",

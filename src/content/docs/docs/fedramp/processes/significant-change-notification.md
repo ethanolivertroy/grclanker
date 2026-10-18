@@ -1,5 +1,5 @@
 ---
-title: "Significant Change Notification: FedRAMP Process"
+title: "Significant Change Notification"
 description: "Official Consolidated Rules summary for the SCN FedRAMP process, including applicability and requirements."
 ---
 

@@ -103,6 +103,18 @@ Control 22 therefore passes only under `ACCOUNTADMIN`.
 
 `ACCESS_HISTORY` requires Enterprise Edition or higher.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Snowflake credentials can read everything grclanker needs.
+Run the Snowflake assessments and list the failing findings first.
+Export a Snowflake audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Snowflake account"`. Both start with `snowflake_check_access`, then run the assessments or `snowflake_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |
@@ -385,7 +397,7 @@ Two further rules apply to every finding:
 | # | Spec control | Tool | Finding | Status semantics |
 |---|--------------|------|---------|------------------|
 | 1 | Network policy configured and applied to account | network_and_authentication | SNOWFLAKE-01 | pass when `SHOW PARAMETERS LIKE 'NETWORK_POLICY' IN ACCOUNT` reports a policy at `ACCOUNT` level and `SHOW NETWORK POLICIES` listed it on a complete page; warn when only user-level `POLICY_REFERENCES` exist, or when the account parameter names a policy but `SHOW NETWORK POLICIES` returned zero rows under a role without full visibility; fail on zero policies (a limited role is noted) or no activation; manual when any of the three statements is denied, fails, or times out; a `SHOW NETWORK POLICIES` page that fills the 10,000-row cap drops a pass to warn with `Partial inventory` |
-| 2 | Network policy IP allowlist is restrictive | network_and_authentication | SNOWFLAKE-02 | fail on `0.0.0.0/0`, `::/0`, or CIDRs broader than `/8`, or zero policies in `NETWORK_POLICIES`; warn when every `ALLOWED_IP_LIST` is empty |
+| 2 | Network policy IP allowlist is restrictive | network_and_authentication | SNOWFLAKE-02 | fail on `0.0.0.0/0`, `::/0`, or CIDRs broader than `/8`, or zero policies in `NETWORK_POLICIES`; warn when any `ALLOWED_IP_LIST` is empty, including when other policies in the same result are restrictive |
 | 3 | MFA enforced for all human users | network_and_authentication | SNOWFLAKE-03 | reads `TYPE`, `DISABLED`, `HAS_PASSWORD`, `HAS_MFA`, `EXT_AUTHN_DUO`; fail if any enabled person user with a password lacks both flags; manual on zero users |
 | 4 | Password policy meets complexity requirements | network_and_authentication | SNOWFLAKE-04 | discovers policies in `ACCOUNT_USAGE.PASSWORD_POLICIES`, then runs the `INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => ...)` table function per policy (the `ACCOUNT_USAGE.POLICY_REFERENCES` view does not cover password policies); requires a `REF_ENTITY_DOMAIN = 'ACCOUNT'` row and a policy meeting `min_password_length`, one of each character class, and retries <= 10; manual when a lookup is denied or a limited role sees no account row |
 | 5 | Key pair authentication used for service accounts | network_and_authentication | SNOWFLAKE-05 | fail if any `SERVICE`, `SERVICE_AGENT`, or `LEGACY_SERVICE` user lacks `HAS_RSA_PUBLIC_KEY` or `HAS_WORKLOAD_IDENTITY`, or still has a password; `SNOWFLAKE_SERVICE` users are Snowflake managed and listed in evidence; an unrecognized `TYPE` value is surfaced and blocks `pass`; manual when no user is typed as a service user |

@@ -13,6 +13,8 @@ description: "Official GitHub-grounded FedRAMP 20x and Rev5 reference material g
 
 This section is generated from the official FedRAMP GitHub organization. grclanker uses these machine-readable materials for both CLI lookups and reviewed docs snapshots so the public site stays fast without drifting away from upstream.
 
+To check readiness against these rules, plan the artifacts, and draft a Certification Data Sharing bundle and trust-center site, follow the [FedRAMP Readiness guide](/docs/guides/fedramp-readiness/).
+
 ## Current Grounding
 
 - Primary source: [FedRAMP/rules](https://github.com/FedRAMP/rules) → [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main`

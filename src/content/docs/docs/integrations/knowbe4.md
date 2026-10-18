@@ -99,6 +99,18 @@ curl -s -X POST 'https://training.knowbe4.com/graphql?scope=phisher' \
   -d '{"query":"{ __schema { queryType { fields { name args { name } } } } }"}'
 ```
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my KnowBe4 credentials can read everything grclanker needs.
+Run the KnowBe4 assessments and list the failing findings first.
+Export a KnowBe4 audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our KnowBe4 account"`. Both start with `knowbe4_check_access`, then run the assessments or `knowbe4_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose | Notable parameters |

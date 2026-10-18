@@ -3558,3 +3558,20 @@ test("reviewer B round 4 verdict N3: PD-04, PD-20, and PD-21 are manual, not fai
   assert.match(findingById(quietAudit, 11).summary, /returned zero records/);
   assert.match(findingById(quietAudit, 12).summary, /No audit records were returned/);
 });
+
+test("PagerdutyApiClient refuses a 200 listing that omits the documented collection", async () => {
+  const client = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ unexpected: true }),
+  });
+  await assert.rejects(
+    () => client.listUsers(5),
+    /did not include a users array, so the listing cannot be treated as an empty inventory/,
+  );
+
+  const empty = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ users: [], more: false, total: 0 }),
+  });
+  const users = await empty.listUsers(5);
+  assert.deepEqual(users.items, []);
+  assert.equal(users.complete, true);
+});

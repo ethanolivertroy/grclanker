@@ -1,5 +1,5 @@
 ---
-title: "Certification Package Overview: FedRAMP Process"
+title: "Certification Package Overview"
 description: "Official Consolidated Rules summary for the CPO FedRAMP process, including applicability and requirements."
 ---
 

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 import {
@@ -20,6 +20,7 @@ import {
 import {
   type GrclankerSettings,
   readGrclankerSettings,
+  readModelsConfig,
   resolveSkillDiscoveryMode,
   type SkillDiscoveryMode,
   writeGrclankerSettings,
@@ -149,22 +150,6 @@ function isConfigured(settings: GrclankerSettings): boolean {
     isNonEmptyString(settings.defaultModel) &&
     isNonEmptyString(settings.providerKind)
   );
-}
-
-function loadModelsConfig(path: string): Record<string, unknown> {
-  if (!existsSync(path)) {
-    return { providers: {} };
-  }
-
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    if (!parsed.providers || typeof parsed.providers !== "object") {
-      parsed.providers = {};
-    }
-    return parsed;
-  } catch {
-    return { providers: {} };
-  }
 }
 
 function writeModelsConfig(path: string, config: Record<string, unknown>): void {
@@ -780,7 +765,7 @@ function localModelsConfig(baseUrl: string, modelId: string): LocalProviderConfi
   };
 }
 
-function saveLocalSetup(
+export function saveLocalSetup(
   settingsPath: string,
   modelsPath: string,
   baseSettings: GrclankerSettings,
@@ -788,6 +773,14 @@ function saveLocalSetup(
   modelId: string,
   computeSettings: Partial<GrclankerSettings>,
 ): void {
+  const modelsConfig = readModelsConfig(modelsPath);
+  const providers =
+    modelsConfig.providers && typeof modelsConfig.providers === "object"
+      ? (modelsConfig.providers as Record<string, unknown>)
+      : {};
+  providers[LOCAL_PROVIDER] = localModelsConfig(baseUrl, modelId).providers.ollama;
+  const nextModels = { ...modelsConfig, providers };
+
   const settings: GrclankerSettings = {
     ...baseSettings,
     modelMode: "local",
@@ -797,15 +790,8 @@ function saveLocalSetup(
     defaultModel: modelId,
     ...computeSettings,
   };
+  writeModelsConfig(modelsPath, nextModels);
   writeGrclankerSettings(settingsPath, settings);
-
-  const modelsConfig = loadModelsConfig(modelsPath);
-  const providers =
-    modelsConfig.providers && typeof modelsConfig.providers === "object"
-      ? (modelsConfig.providers as Record<string, unknown>)
-      : {};
-  providers[LOCAL_PROVIDER] = localModelsConfig(baseUrl, modelId).providers.ollama;
-  writeModelsConfig(modelsPath, { ...modelsConfig, providers });
 }
 
 function saveHostedSetup(

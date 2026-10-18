@@ -1166,6 +1166,14 @@ async function collectPaged(product: ZscalerProduct, loader: () => Promise<Paged
   };
 }
 
+// ZIA lists with no documented page or pageSize are one response. Record that read as a single
+// complete page so a later partial marker (seen versus total) can cap the dependent verdict.
+async function collectWholeList(product: ZscalerProduct, loader: () => Promise<JsonRecord[]>): Promise<CollectedDataset<JsonRecord[]>> {
+  const collected = await collect(product, loader, [] as JsonRecord[]);
+  if (collected.error) return collected;
+  return { ...collected, truncated: false, seen: 1 };
+}
+
 function datasetErrors(label: string, dataset: CollectedDataset<unknown>): string[] {
   return dataset.error ? [`${label}: ${dataset.error}`] : [];
 }
@@ -1264,12 +1272,22 @@ function notConfiguredFinding(controlNumber: number, product: ZscalerProduct, ma
   );
 }
 
-function partialSuffix(dataset: CollectedDataset<JsonRecord[]>, label: string): string {
+function partialSuffix(dataset: CollectedDataset<unknown>, label: string, capped = true): string {
   if (!dataset.truncated) return "";
   const extent = dataset.total !== undefined
     ? `${dataset.seen ?? 0} of ${dataset.total} pages`
     : `${dataset.seen ?? 0} pages, total unknown`;
-  return ` The ${label} inventory is partial (${dataset.data.length} records over ${extent}), so this verdict is capped at warn.`;
+  const seenRecords = Array.isArray(dataset.data) ? `${dataset.data.length} records over ` : "";
+  const cap = capped ? ", so this verdict is capped at warn" : "";
+  return ` The ${label} inventory is partial (${seenRecords}${extent})${cap}.`;
+}
+
+function joinedPartialSuffix(entries: Array<[CollectedDataset<unknown>, string]>, capped = true): string {
+  return entries.map(([dataset, label]) => partialSuffix(dataset, label, capped)).join("");
+}
+
+function datasetsComplete(...datasets: Array<CollectedDataset<unknown>>): boolean {
+  return datasets.every((dataset) => dataset.truncated !== true);
 }
 
 function capForPartial(status: ZscalerFindingStatus, dataset: CollectedDataset<JsonRecord[]>): ZscalerFindingStatus {
@@ -1351,11 +1369,11 @@ export interface ZiaAccessControlData {
 export async function collectZiaAccessControlData(client: ZiaReadClient): Promise<ZiaAccessControlData> {
   return {
     adminUsers: await collectPaged("zia", () => client.listAdminUsers()),
-    adminRoles: await collect("zia", () => client.listAdminRoles(), []),
+    adminRoles: await collectWholeList("zia", () => client.listAdminRoles()),
     authSettings: await collect("zia", () => client.getAuthSettings(), {}),
     passwordExpiry: await collect("zia", () => client.getPasswordExpirySettings(), {}),
     auditLogReport: await collect("zia", () => client.getAuditLogReportStatus(), {}),
-    nssFeeds: await collect("zia", () => client.listNssFeeds(), []),
+    nssFeeds: await collectWholeList("zia", () => client.listNssFeeds()),
   };
 }
 
@@ -1449,7 +1467,12 @@ export function assessZiaAccessControlData(
       status = "warn";
       summary = `Every one of the ${enabledAdmins.length} enabled administrators holds a Super Admin role; no least-privilege roles are in use.`;
     }
-    verdicts.push(finding(7, capForPartial(status, data.adminUsers), summary + partialSuffix(data.adminUsers, "administrator"), {
+    const rbacPartial = joinedPartialSuffix([
+      [data.adminUsers, "administrator"],
+      [data.adminRoles, "administrator role"],
+      [data.passwordExpiry, "password expiry"],
+    ]);
+    verdicts.push(finding(7, capForPartial(status, data.adminUsers), summary + rbacPartial, {
       enabled_admins: enabledAdmins.length,
       disabled_admins: disabledAdmins,
       super_admins: truncateList(superAdmins.map(adminLabel)),
@@ -1460,12 +1483,12 @@ export function assessZiaAccessControlData(
       admin_scope_field_source: "adminScope.Type per the published reference; adminScopeType is accepted only as zscaler-sdk-go legacy evidence",
       password_expiration_enabled: asBoolean(data.passwordExpiry.data.passwordExpirationEnabled) ?? null,
       password_expiry_days: asNumber(data.passwordExpiry.data.passwordExpiryDays) ?? null,
-      partial_inventory: data.adminUsers.truncated === true,
+      partial_inventory: !datasetsComplete(data.adminUsers, data.adminRoles, data.passwordExpiry),
     }, undefined, zscalerDecisionFacts(
       admins.length + data.adminRoles.data.length,
       superAdmins.length > maxSuperAdmins ? superAdmins.length - maxSuperAdmins : 0,
       superRoleIds.size === 0 || superAdmins.length === enabledAdmins.length ? 1 : 0,
-      { complete: !data.adminUsers.truncated },
+      { complete: datasetsComplete(data.adminUsers, data.adminRoles, data.passwordExpiry) },
     )));
   }
 
@@ -1484,26 +1507,34 @@ export function assessZiaAccessControlData(
     const feeds = data.nssFeeds.data;
     const enabledFeeds = feeds.filter((feed) => (asString(feed.feedStatus) ?? "").toUpperCase() === "ENABLED");
     const adminAuditFeeds = enabledFeeds.filter((feed) => /ADMIN_AUDIT|AUDIT/i.test(asString(feed.nssLogType) ?? ""));
+    const auditSources: Array<[CollectedDataset<unknown>, string]> = [
+      [data.auditLogReport, "audit log report"],
+      [data.nssFeeds, "NSS feed"],
+    ];
     if (data.nssFeeds.error) {
       verdicts.push(finding(14, "manual", `The audit log report interface is reachable (GET /auditlogEntryReport status ${asString(data.auditLogReport.data.status) ?? "unknown"}), but the NSS feed inventory could not be read, so log export configuration is unverified. ${auditEvidence}`, { audit_report_status: asString(data.auditLogReport.data.status) ?? null }, auditEvidence, zscalerManualFacts(1)));
     } else if (adminAuditFeeds.length > 0) {
-      verdicts.push(finding(14, "pass", `Admin audit logging is reachable and ${adminAuditFeeds.length} enabled NSS feed(s) export admin audit logs (${adminAuditFeeds.map(ruleLabel).join(", ")}). Retention is enforced by the receiving SIEM and must be documented separately.`, {
+      const auditPartial = joinedPartialSuffix(auditSources);
+      verdicts.push(finding(14, "pass", `Admin audit logging is reachable and ${adminAuditFeeds.length} enabled NSS feed(s) export admin audit logs (${adminAuditFeeds.map(ruleLabel).join(", ")}). Retention is enforced by the receiving SIEM and must be documented separately.${auditPartial}`, {
         audit_report_status: asString(data.auditLogReport.data.status) ?? null,
         nss_feeds: feeds.length,
         enabled_feeds: enabledFeeds.length,
         admin_audit_feeds: truncateList(adminAuditFeeds.map((feed) => ({ name: ruleLabel(feed), nssLogType: asString(feed.nssLogType) ?? null, feedStatus: asString(feed.feedStatus) ?? null }))),
-      }, undefined, zscalerDecisionFacts(feeds.length + 1, 0, 0, { complete: !data.nssFeeds.truncated })));
+        partial_inventory: !datasetsComplete(data.auditLogReport, data.nssFeeds),
+      }, auditPartial ? auditEvidence : undefined, zscalerDecisionFacts(feeds.length + 1, 0, 0, { complete: datasetsComplete(data.auditLogReport, data.nssFeeds) })));
     } else {
-      verdicts.push(finding(14, feeds.length === 0 ? "warn" : "fail", feeds.length === 0
+      const noExport = feeds.length === 0;
+      verdicts.push(finding(14, noExport ? "warn" : "fail", `${noExport
         ? "Admin audit logging is reachable, but zero NSS feeds are configured, so audit logs are only retained inside the Zscaler portal window and are not exported for long-term retention."
-        : `${feeds.length} NSS feed(s) exist but none that is enabled exports admin audit logs (nssLogType ADMIN_AUDIT).`, {
+        : `${feeds.length} NSS feed(s) exist but none that is enabled exports admin audit logs (nssLogType ADMIN_AUDIT).`}${joinedPartialSuffix(auditSources, noExport)}`, {
         audit_report_status: asString(data.auditLogReport.data.status) ?? null,
         nss_feeds: truncateList(feeds.map((feed) => ({ name: ruleLabel(feed), nssLogType: asString(feed.nssLogType) ?? null, feedStatus: asString(feed.feedStatus) ?? null }))),
+        partial_inventory: !datasetsComplete(data.auditLogReport, data.nssFeeds),
       }, auditEvidence, zscalerDecisionFacts(
         feeds.length + 1,
         feeds.length > 0 ? 1 : 0,
         feeds.length === 0 ? 1 : 0,
-        { complete: !data.nssFeeds.truncated },
+        { complete: datasetsComplete(data.auditLogReport, data.nssFeeds) },
       )));
     }
   }
@@ -2110,13 +2141,13 @@ export async function collectZiaPolicyData(client: ZiaReadClient): Promise<ZiaPo
   return {
     urlFilteringRules: await collectPaged("zia", () => client.listUrlFilteringRules()),
     firewallRules: await collectPaged("zia", () => client.listFirewallFilteringRules()),
-    dnsRules: await collect("zia", () => client.listFirewallDnsRules(), []),
-    dlpEngines: await collect("zia", () => client.listDlpEngines(), []),
-    dlpDictionaries: await collect("zia", () => client.listDlpDictionaries(), []),
-    webDlpRules: await collect("zia", () => client.listWebDlpRules(), []),
-    sslInspectionRules: await collect("zia", () => client.listSslInspectionRules(), []),
+    dnsRules: await collectWholeList("zia", () => client.listFirewallDnsRules()),
+    dlpEngines: await collectWholeList("zia", () => client.listDlpEngines()),
+    dlpDictionaries: await collectWholeList("zia", () => client.listDlpDictionaries()),
+    webDlpRules: await collectWholeList("zia", () => client.listWebDlpRules()),
+    sslInspectionRules: await collectWholeList("zia", () => client.listSslInspectionRules()),
     sslExemptedUrls: await collect("zia", () => client.getSslExemptedUrls(), {}),
-    sandboxRules: await collect("zia", () => client.listSandboxRules(), []),
+    sandboxRules: await collectWholeList("zia", () => client.listSandboxRules()),
     sandboxSettings: await collect("zia", () => client.getSandboxAdvancedSettings(), {}),
     advancedThreatSettings: await collect("zia", () => client.getAdvancedThreatSettings(), {}),
     malwarePolicy: await collect("zia", () => client.getMalwarePolicy(), {}),
@@ -2127,8 +2158,8 @@ export async function collectZiaPolicyData(client: ZiaReadClient): Promise<ZiaPo
     subLocations: await collectSubLocations(client, locations),
     greTunnels: await collectPaged("zia", () => client.listGreTunnels()),
     vpnCredentials: await collectPaged("zia", () => client.listVpnCredentials()),
-    bandwidthRules: await collect("zia", () => client.listBandwidthControlRules(), []),
-    isolationProfiles: await collect("zia", () => client.listBrowserIsolationProfiles(), []),
+    bandwidthRules: await collectWholeList("zia", () => client.listBandwidthControlRules()),
+    isolationProfiles: await collectWholeList("zia", () => client.listBrowserIsolationProfiles()),
     cloudAppRules: await collectCloudAppRules(client),
   };
 }
@@ -2283,6 +2314,11 @@ function dlpVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
   const active = enabledRules(rules);
   const blocking = active.filter((rule) => ["BLOCK", "ICAP_RESPONSE"].includes((asString(rule.action) ?? "").toUpperCase()));
   const withEngines = blocking.filter((rule) => asArray(rule.dlpEngines).length > 0 || asBoolean(rule.withoutContentInspection) === true);
+  const dlpSources: Array<[CollectedDataset<unknown>, string]> = [
+    [data.webDlpRules, "web DLP rule"],
+    [data.dlpEngines, "DLP engine"],
+    [data.dlpDictionaries, "DLP dictionary"],
+  ];
   const evidence = {
     engine_count: engines.length,
     dictionary_count: data.dlpDictionaries.error ? null : data.dlpDictionaries.data.length,
@@ -2290,30 +2326,31 @@ function dlpVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
     enabled_rules: active.length,
     blocking_rules: blocking.length,
     rules: ruleSummaries(rules),
+    partial_inventory: !datasetsComplete(data.webDlpRules, data.dlpEngines, data.dlpDictionaries),
   };
   const facts = zscalerDecisionFacts(
     rules.length + engines.length,
     rules.length === 0 || engines.length === 0 || active.length === 0 ? 1 : 0,
     blocking.length === 0 || withEngines.length === 0 ? 1 : 0,
-    // Parent parity: these primary truncation flags are disclosed but do not cap this legacy verdict.
-    { complete: true },
+    { complete: datasetsComplete(data.webDlpRules, data.dlpEngines, data.dlpDictionaries) },
   );
+  const dlpNote = (capped: boolean) => joinedPartialSuffix(dlpSources, capped);
   if (rules.length === 0) {
-    return finding(3, "fail", `Empty inventory: zero web DLP rules exist (${engines.length} engines defined), so no data loss prevention is enforced on web traffic.`, evidence, evidenceNote, facts);
+    return finding(3, "fail", `Empty inventory: zero web DLP rules exist (${engines.length} engines defined), so no data loss prevention is enforced on web traffic.${dlpNote(false)}`, evidence, evidenceNote, facts);
   }
   if (engines.length === 0) {
-    return finding(3, "fail", `${rules.length} web DLP rules exist but zero DLP engines are defined, so rules cannot match sensitive content.`, evidence, evidenceNote, facts);
+    return finding(3, "fail", `${rules.length} web DLP rules exist but zero DLP engines are defined, so rules cannot match sensitive content.${dlpNote(false)}`, evidence, evidenceNote, facts);
   }
   if (active.length === 0) {
-    return finding(3, "fail", `${rules.length} web DLP rules exist but all are DISABLED.`, evidence, evidenceNote, facts);
+    return finding(3, "fail", `${rules.length} web DLP rules exist but all are DISABLED.${dlpNote(false)}`, evidence, evidenceNote, facts);
   }
   if (blocking.length === 0) {
-    return finding(3, "warn", `${active.length} enabled web DLP rules only monitor (action ALLOW); no rule blocks or quarantines sensitive data.`, evidence, evidenceNote, facts);
+    return finding(3, "warn", `${active.length} enabled web DLP rules only monitor (action ALLOW); no rule blocks or quarantines sensitive data.${dlpNote(true)}`, evidence, evidenceNote, facts);
   }
   if (withEngines.length === 0) {
-    return finding(3, "warn", `${blocking.length} blocking DLP rules reference no DLP engine and do not use withoutContentInspection, so they may never match.`, evidence, evidenceNote, facts);
+    return finding(3, "warn", `${blocking.length} blocking DLP rules reference no DLP engine and do not use withoutContentInspection, so they may never match.${dlpNote(true)}`, evidence, evidenceNote, facts);
   }
-  return finding(3, "pass", `${engines.length} DLP engines and ${blocking.length} enabled blocking web DLP rules are in force (${active.length} enabled rules total).`, evidence, undefined, facts);
+  return finding(3, "pass", `${engines.length} DLP engines and ${blocking.length} enabled blocking web DLP rules are in force (${active.length} enabled rules total).${dlpNote(true)}`, evidence, dlpNote(true) ? evidenceNote : undefined, facts);
 }
 
 function assessSslInspection(data: ZiaPolicyData, maxExemptions: number): ZscalerFinding {
@@ -2342,12 +2379,18 @@ function sslInspectionVerdict(data: ZiaPolicyData, maxExemptions: number, eviden
     exempted_urls_readable: exempted !== undefined,
     locations_without_ssl_scan: locationsWithoutScan ?? null,
     location_inventory_partial: data.locations.truncated === true,
+    partial_inventory: !datasetsComplete(rules, data.sslExemptedUrls, data.locations),
     rules: ruleSummaries(rules.data),
   };
+  const sslSources: Array<[CollectedDataset<unknown>, string]> = [
+    [rules, "SSL inspection rule"],
+    [data.sslExemptedUrls, "SSL exemption"],
+    [data.locations, "location"],
+  ];
+  const sslNote = (capped: boolean) => joinedPartialSuffix(sslSources, capped);
   const facts = {
     evidence_readable: true,
-    // Parent parity: only the location inventory capped the legacy pass; SSL-rule truncation did not.
-    evidence_complete: !data.locations.truncated,
+    evidence_complete: datasetsComplete(rules, data.sslExemptedUrls, data.locations),
     rule_count: rules.data.length,
     decrypt_rule_count: decrypt.length,
     blanket_bypass_rule_count: blanketBypass.length,
@@ -2357,25 +2400,24 @@ function sslInspectionVerdict(data: ZiaPolicyData, maxExemptions: number, eviden
     location_without_ssl_scan_count: locationsWithoutScan ?? null,
   };
   if (rules.data.length === 0) {
-    return finding(4, "fail", "Empty inventory: zero SSL inspection rules exist, so encrypted traffic is not decrypted for inspection.", evidence, evidenceNote, facts);
+    return finding(4, "fail", `Empty inventory: zero SSL inspection rules exist, so encrypted traffic is not decrypted for inspection.${sslNote(false)}`, evidence, evidenceNote, facts);
   }
   if (decrypt.length === 0) {
-    return finding(4, "fail", `${active.length} enabled SSL inspection rules exist but none has action type DECRYPT.`, evidence, evidenceNote, facts);
+    return finding(4, "fail", `${active.length} enabled SSL inspection rules exist but none has action type DECRYPT.${sslNote(false)}`, evidence, evidenceNote, facts);
   }
   if (blanketBypass.length > 0) {
-    return finding(4, "fail", `${blanketBypass.length} enabled DO_NOT_DECRYPT rule(s) apply to all traffic with no category, application, location, or user scope: ${blanketBypass.map(ruleLabel).join(", ")}.`, evidence, evidenceNote, facts);
+    return finding(4, "fail", `${blanketBypass.length} enabled DO_NOT_DECRYPT rule(s) apply to all traffic with no category, application, location, or user scope: ${blanketBypass.map(ruleLabel).join(", ")}.${sslNote(false)}`, evidence, evidenceNote, facts);
   }
   if (exempted === undefined) {
-    return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules exist, but the exempted URL list could not be read, so exemption hygiene is unverified.`, evidence, evidenceNote, facts);
+    return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules exist, but the exempted URL list could not be read, so exemption hygiene is unverified.${sslNote(true)}`, evidence, evidenceNote, facts);
   }
   if (exempted.length > maxExemptions) {
-    return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules exist, but ${exempted.length} URLs are exempted from inspection (threshold ${maxExemptions}).`, evidence, evidenceNote, facts);
+    return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules exist, but ${exempted.length} URLs are exempted from inspection (threshold ${maxExemptions}).${sslNote(true)}`, evidence, evidenceNote, facts);
   }
   if ((locationsWithoutScan ?? 0) > 0) {
-    return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules and ${exempted.length} exemptions, but ${locationsWithoutScan} location(s) have sslScanEnabled=false.`, evidence, evidenceNote, facts);
+    return finding(4, "warn", `${decrypt.length} enabled DECRYPT rules and ${exempted.length} exemptions, but ${locationsWithoutScan} location(s) have sslScanEnabled=false.${sslNote(true)}`, evidence, evidenceNote, facts);
   }
-  const status = capForPartial("pass", data.locations);
-  return finding(4, status, `${decrypt.length} enabled DECRYPT rules, ${exempted.length} exempted URLs (threshold ${maxExemptions}), no blanket bypass rules${locationsWithoutScan === undefined ? "" : ", and SSL scanning enabled on every location that was read"}.${partialSuffix(data.locations, "location")}`, evidence, status === "warn" ? evidenceNote : undefined, facts);
+  return finding(4, "pass", `${decrypt.length} enabled DECRYPT rules, ${exempted.length} exempted URLs (threshold ${maxExemptions}), no blanket bypass rules${locationsWithoutScan === undefined ? "" : ", and SSL scanning enabled on every location that was read"}.${sslNote(true)}`, evidence, sslNote(true) ? evidenceNote : undefined, facts);
 }
 
 function assessSandbox(data: ZiaPolicyData): ZscalerFinding {
@@ -2400,24 +2442,29 @@ function sandboxVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFindi
     blocked_file_hashes: data.sandboxSettings.error ? null : asArray(data.sandboxSettings.data.md5HashValueList).length,
     legacy_file_hashes_to_be_blocked: legacyHashes.length > 0 ? legacyHashes.length : null,
     rules: ruleSummaries(rules.data, "baRuleAction"),
+    partial_inventory: !datasetsComplete(rules, data.sandboxSettings),
   };
   const facts = zscalerDecisionFacts(
     rules.data.length,
     rules.data.length > 0 && active.length === 0 ? 1 : 0,
     rules.data.length > 0 && active.length > 0 && blocking.length === 0 ? 1 : 0,
-    // Parent parity: sandbox-rule truncation was disclosed without capping a legacy pass.
-    { complete: true },
+    { complete: datasetsComplete(rules, data.sandboxSettings) },
   );
+  const sandboxSources: Array<[CollectedDataset<unknown>, string]> = [
+    [rules, "sandbox rule"],
+    [data.sandboxSettings, "sandbox settings"],
+  ];
+  const sandboxNote = (capped: boolean) => joinedPartialSuffix(sandboxSources, capped);
   if (rules.data.length === 0) {
-    return finding(5, "manual", "Not configured: zero sandbox rules were returned, which means Cloud Sandbox is either unlicensed or unconfigured; the control cannot pass until a rule inventory exists.", evidence, evidenceNote, facts);
+    return finding(5, "manual", `Not configured: zero sandbox rules were returned, which means Cloud Sandbox is either unlicensed or unconfigured; the control cannot pass until a rule inventory exists.${sandboxNote(false)}`, evidence, evidenceNote, facts);
   }
   if (active.length === 0) {
-    return finding(5, "fail", `${rules.data.length} sandbox rules exist but all are DISABLED.`, evidence, evidenceNote, facts);
+    return finding(5, "fail", `${rules.data.length} sandbox rules exist but all are DISABLED.${sandboxNote(false)}`, evidence, evidenceNote, facts);
   }
   if (blocking.length === 0) {
-    return finding(5, "warn", `${active.length} enabled sandbox rules only ALLOW; no rule blocks malicious verdicts.`, evidence, evidenceNote, facts);
+    return finding(5, "warn", `${active.length} enabled sandbox rules only ALLOW; no rule blocks malicious verdicts.${sandboxNote(true)}`, evidence, evidenceNote, facts);
   }
-  return finding(5, "pass", `${blocking.length} enabled sandbox rules block malicious verdicts (${quarantineFirst.length} quarantine first-time files).`, evidence, undefined, facts);
+  return finding(5, "pass", `${blocking.length} enabled sandbox rules block malicious verdicts (${quarantineFirst.length} quarantine first-time files).${sandboxNote(true)}`, evidence, sandboxNote(true) ? evidenceNote : undefined, facts);
 }
 
 function assessBandwidth(data: ZiaPolicyData): ZscalerFinding {
@@ -2425,16 +2472,21 @@ function assessBandwidth(data: ZiaPolicyData): ZscalerFinding {
   const rules = data.bandwidthRules;
   if (rules.error) return unreadableFinding(16, "GET /bandwidthControlRules", rules, evidenceNote);
   const active = enabledRules(rules.data);
-  const evidence = { rule_count: rules.data.length, enabled_rules: active.length, rules: truncateList(rules.data.map((rule) => ({ name: ruleLabel(rule), state: asString(rule.state) ?? null, minBandwidth: asNumber(rule.minBandwidth) ?? null, maxBandwidth: asNumber(rule.maxBandwidth) ?? null }))) };
-  // Parent parity: bandwidth-rule truncation was disclosed without capping a legacy pass.
-  const facts = zscalerDecisionFacts(rules.data.length, 0, rules.data.length > 0 && active.length === 0 ? 1 : 0, { complete: true });
+  const evidence = {
+    rule_count: rules.data.length,
+    enabled_rules: active.length,
+    rules: truncateList(rules.data.map((rule) => ({ name: ruleLabel(rule), state: asString(rule.state) ?? null, minBandwidth: asNumber(rule.minBandwidth) ?? null, maxBandwidth: asNumber(rule.maxBandwidth) ?? null }))),
+    partial_inventory: rules.truncated === true,
+  };
+  const facts = zscalerDecisionFacts(rules.data.length, 0, rules.data.length > 0 && active.length === 0 ? 1 : 0, { complete: datasetsComplete(rules) });
+  const bandwidthNote = (capped: boolean) => partialSuffix(rules, "bandwidth control rule", capped);
   if (rules.data.length === 0) {
-    return finding(16, "manual", "Not configured: zero bandwidth control rules exist; confirm whether bandwidth control is licensed and required for this tenant before treating this as compliant.", evidence, evidenceNote, facts);
+    return finding(16, "manual", `Not configured: zero bandwidth control rules exist; confirm whether bandwidth control is licensed and required for this tenant before treating this as compliant.${bandwidthNote(false)}`, evidence, evidenceNote, facts);
   }
   if (active.length === 0) {
-    return finding(16, "warn", `${rules.data.length} bandwidth control rules exist but all are DISABLED.`, evidence, evidenceNote, facts);
+    return finding(16, "warn", `${rules.data.length} bandwidth control rules exist but all are DISABLED.${bandwidthNote(true)}`, evidence, evidenceNote, facts);
   }
-  return finding(16, "pass", `${active.length} enabled bandwidth control rules are in force.`, evidence, undefined, facts);
+  return finding(16, "pass", `${active.length} enabled bandwidth control rules are in force.${bandwidthNote(true)}`, evidence, bandwidthNote(true) ? evidenceNote : undefined, facts);
 }
 
 function assessBrowserIsolation(data: ZiaPolicyData): ZscalerFinding {
@@ -2449,22 +2501,26 @@ function assessBrowserIsolation(data: ZiaPolicyData): ZscalerFinding {
     profiles: truncateList(profiles.data.map((profile) => asString(profile.name) ?? asString(profile.id) ?? "profile")),
     isolate_url_rules: truncateList(isolateRules.map(ruleLabel)),
     url_rule_inventory_partial: urlRules.truncated === true,
-    partial_inventory: urlRules.truncated === true,
+    partial_inventory: !datasetsComplete(profiles, urlRules),
   };
   const facts = zscalerDecisionFacts(
     profiles.data.length,
     0,
     profiles.data.length > 0 && isolateRules.length === 0 ? 1 : 0,
-    // Parent parity: URL-rule truncation capped the legacy pass; isolation-profile truncation did not.
-    { complete: !urlRules.truncated },
+    { complete: datasetsComplete(profiles, urlRules) },
   );
+  const isolationSources: Array<[CollectedDataset<unknown>, string]> = [
+    [profiles, "isolation profile"],
+    [urlRules, "URL filtering rule"],
+  ];
+  const isolationNote = (capped: boolean) => joinedPartialSuffix(isolationSources, capped);
   if (profiles.data.length === 0) {
-    return finding(17, "manual", "Not configured: zero browser isolation profiles exist, so Cloud Browser Isolation is unlicensed or unconfigured.", evidence, evidenceNote, facts);
+    return finding(17, "manual", `Not configured: zero browser isolation profiles exist, so Cloud Browser Isolation is unlicensed or unconfigured.${isolationNote(false)}`, evidence, evidenceNote, facts);
   }
   if (isolateRules.length === 0) {
-    return finding(17, "warn", `${profiles.data.length} isolation profile(s) exist but no enabled URL filtering rule uses action ISOLATE, so isolation is never applied.${partialSuffix(urlRules, "URL filtering rule")}`, evidence, evidenceNote, facts);
+    return finding(17, "warn", `${profiles.data.length} isolation profile(s) exist but no enabled URL filtering rule uses action ISOLATE, so isolation is never applied.${isolationNote(true)}`, evidence, evidenceNote, facts);
   }
-  return finding(17, capForPartial("pass", urlRules), `${profiles.data.length} isolation profile(s) are applied by ${isolateRules.length} enabled ISOLATE URL filtering rule(s).${partialSuffix(urlRules, "URL filtering rule")}`, evidence, urlRules.truncated ? evidenceNote : undefined, facts);
+  return finding(17, "pass", `${profiles.data.length} isolation profile(s) are applied by ${isolateRules.length} enabled ISOLATE URL filtering rule(s).${isolationNote(true)}`, evidence, isolationNote(true) ? evidenceNote : undefined, facts);
 }
 
 function locationLabel(location: JsonRecord): string {
@@ -2589,24 +2645,29 @@ function dnsSecurityVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerF
     default_rule_action: defaultRule ? asString(defaultRule.action) ?? null : null,
     dga_domains_blocked: dgaBlocked ?? null,
     rules: ruleSummaries(rules.data),
+    partial_inventory: !datasetsComplete(rules, data.advancedThreatSettings),
   };
   const facts = zscalerDecisionFacts(
     rules.data.length,
     rules.data.length === 0 || protective.length === 0 ? 1 : 0,
     dgaBlocked === true ? 0 : 1,
-    // Parent parity: DNS-rule truncation was disclosed without capping a legacy pass.
-    { complete: true },
+    { complete: datasetsComplete(rules, data.advancedThreatSettings) },
   );
+  const dnsSources: Array<[CollectedDataset<unknown>, string]> = [
+    [rules, "DNS rule"],
+    [data.advancedThreatSettings, "advanced threat protection settings"],
+  ];
+  const dnsNote = (capped: boolean) => joinedPartialSuffix(dnsSources, capped);
   if (rules.data.length === 0) {
-    return finding(20, "fail", "Empty inventory: zero DNS control rules were returned, so DNS traffic is not filtered by the cloud firewall.", evidence, evidenceNote, facts);
+    return finding(20, "fail", `Empty inventory: zero DNS control rules were returned, so DNS traffic is not filtered by the cloud firewall.${dnsNote(false)}`, evidence, evidenceNote, facts);
   }
   if (protective.length === 0) {
-    return finding(20, "fail", `${active.length} enabled DNS control rules exist but none blocks or redirects DNS requests beyond the default rule.`, evidence, evidenceNote, facts);
+    return finding(20, "fail", `${active.length} enabled DNS control rules exist but none blocks or redirects DNS requests beyond the default rule.${dnsNote(false)}`, evidence, evidenceNote, facts);
   }
   if (dgaBlocked !== true) {
-    return finding(20, "warn", `${protective.length} protective DNS rules are enabled, but dgaDomainsBlocked is ${dgaBlocked === undefined ? "unreadable" : "false"} in Advanced Threat Protection.`, evidence, evidenceNote, facts);
+    return finding(20, "warn", `${protective.length} protective DNS rules are enabled, but dgaDomainsBlocked is ${dgaBlocked === undefined ? "unreadable" : "false"} in Advanced Threat Protection.${dnsNote(true)}`, evidence, evidenceNote, facts);
   }
-  return finding(20, "pass", `${protective.length} enabled DNS control rules block or redirect DNS requests and DGA domains are blocked.`, evidence, undefined, facts);
+  return finding(20, "pass", `${protective.length} enabled DNS control rules block or redirect DNS requests and DGA domains are blocked.${dnsNote(true)}`, evidence, dnsNote(true) ? evidenceNote : undefined, facts);
 }
 
 function assessSecurityBaseline(data: ZiaPolicyData): ZscalerFinding {
@@ -2636,12 +2697,23 @@ function securityBaselineVerdict(data: ZiaPolicyData, evidenceNote: string): Zsc
     block_password_protected_archives: data.malwarePolicy.error ? null : asBoolean(data.malwarePolicy.data.blockPasswordProtectedArchiveFiles) ?? null,
     allowlist_urls: allowlist ? allowlist.length : null,
     denylist_urls: denylist ? denylist.length : null,
+    partial_inventory: !datasetsComplete(
+      data.advancedThreatSettings,
+      data.malwareSettings,
+      data.malwarePolicy,
+      data.securityAllowlist,
+      data.securityDenylist,
+    ),
   };
   const facts = {
     evidence_readable: true,
-    // Parent parity: single-dataset truncation is disclosed but does not gate
-    // this legacy verdict; capForUnreadableAll overrides this for failed reads.
-    evidence_complete: true,
+    evidence_complete: datasetsComplete(
+      data.advancedThreatSettings,
+      data.malwareSettings,
+      data.malwarePolicy,
+      data.securityAllowlist,
+      data.securityDenylist,
+    ),
     atp_setting_count: Object.keys(atp).length,
     malware_setting_count: Object.keys(malware).length,
     missing_atp_flag_count: missingAtp.length,
@@ -2649,19 +2721,27 @@ function securityBaselineVerdict(data: ZiaPolicyData, evidenceNote: string): Zsc
     block_unscannable_files: blockUnscannable,
     allowlist_url_count: allowlist?.length ?? null,
   };
+  const baselineSources: Array<[CollectedDataset<unknown>, string]> = [
+    [data.advancedThreatSettings, "advanced threat protection settings"],
+    [data.malwareSettings, "malware settings"],
+    [data.malwarePolicy, "malware policy"],
+    [data.securityAllowlist, "security allowlist"],
+    [data.securityDenylist, "security denylist"],
+  ];
+  const baselineNote = (capped: boolean) => joinedPartialSuffix(baselineSources, capped);
   if (Object.keys(atp).length === 0 || Object.keys(malware).length === 0) {
-    return finding(25, "fail", "Empty response: the ATP or malware settings object contained no flags, so none of the required protections can be confirmed enabled.", evidence, evidenceNote, facts);
+    return finding(25, "fail", `Empty response: the ATP or malware settings object contained no flags, so none of the required protections can be confirmed enabled.${baselineNote(false)}`, evidence, evidenceNote, facts);
   }
   if (missingAtp.length > 0 || missingMalware.length > 0) {
-    return finding(25, "fail", `Required protections are not enabled: ${[...missingAtp, ...missingMalware].join(", ")}.`, evidence, evidenceNote, facts);
+    return finding(25, "fail", `Required protections are not enabled: ${[...missingAtp, ...missingMalware].join(", ")}.${baselineNote(false)}`, evidence, evidenceNote, facts);
   }
   if (blockUnscannable !== true) {
-    return finding(25, "warn", `All ${REQUIRED_ATP_FLAGS.length + REQUIRED_MALWARE_FLAGS.length} required ATP and malware protections are enabled, but blockUnscannableFiles is ${blockUnscannable === undefined ? "unreadable" : "false"}.`, evidence, evidenceNote, facts);
+    return finding(25, "warn", `All ${REQUIRED_ATP_FLAGS.length + REQUIRED_MALWARE_FLAGS.length} required ATP and malware protections are enabled, but blockUnscannableFiles is ${blockUnscannable === undefined ? "unreadable" : "false"}.${baselineNote(true)}`, evidence, evidenceNote, facts);
   }
   if ((allowlist?.length ?? 0) > MAX_SECURITY_ALLOWLIST_URLS) {
-    return finding(25, "warn", `All required protections are enabled, but ${allowlist?.length} URLs bypass security policy via the allowlist.`, evidence, evidenceNote, facts);
+    return finding(25, "warn", `All required protections are enabled, but ${allowlist?.length} URLs bypass security policy via the allowlist.${baselineNote(true)}`, evidence, evidenceNote, facts);
   }
-  return finding(25, "pass", `All ${REQUIRED_ATP_FLAGS.length} required ATP protections and ${REQUIRED_MALWARE_FLAGS.length} malware protections are enabled, unscannable files are blocked, and the allowlist holds ${allowlist?.length ?? "an unreadable number of"} URLs.`, evidence, undefined, facts);
+  return finding(25, "pass", `All ${REQUIRED_ATP_FLAGS.length} required ATP protections and ${REQUIRED_MALWARE_FLAGS.length} malware protections are enabled, unscannable files are blocked, and the allowlist holds ${allowlist?.length ?? "an unreadable number of"} URLs.${baselineNote(true)}`, evidence, baselineNote(true) ? evidenceNote : undefined, facts);
 }
 
 export function assessZiaPolicyData(data: ZiaPolicyData, options: { maxSslExemptions?: number } = {}): ZscalerAssessmentResult {

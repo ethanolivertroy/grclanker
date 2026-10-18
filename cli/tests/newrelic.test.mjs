@@ -4851,3 +4851,20 @@ test("New Relic tools are registered in the tool catalog under the New Relic gro
   const exportTool = tools.find((tool) => tool.name === "newrelic_export_audit_bundle");
   assert.match(exportTool.description, /20 spec controls/);
 });
+
+test("NewrelicApiClient refuses a 200 REST listing that omits the documented collection", async () => {
+  const client = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ unexpected: true }),
+  });
+  await assert.rejects(
+    () => client.listRestUsers(),
+    /did not include a users array, so the listing cannot be treated as an empty inventory/,
+  );
+
+  const empty = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ users: [] }),
+  });
+  const users = await empty.listRestUsers();
+  assert.deepEqual(users.items, []);
+  assert.equal(users.complete, true);
+});
