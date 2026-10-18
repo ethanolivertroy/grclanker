@@ -1390,10 +1390,19 @@ details[open] > .agent-group-toggle::before {
   }
 }
 
+/* Padding alone would leave the trigger's box, and its focus ring, under the Docs button. */
 @media (max-width: 1023.98px) {
   .docs-contents-bar [data-toc-popover-trigger] {
-    padding-inline-start: calc(var(--docs-menu-width) + 0.75rem);
+    width: calc(100% - var(--docs-menu-width));
+    margin-inline-start: var(--docs-menu-width);
+    padding-inline-start: 0.75rem;
   }
+}
+
+/* The bar runs edge to edge under the sticky header, which would hide the sides and top of an outer ring. */
+.docs-menu-button:focus-visible,
+.docs-contents-bar [data-toc-popover-trigger]:focus-visible {
+  outline-offset: -2px;
 }
 
 .docs-article-title {

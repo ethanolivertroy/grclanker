@@ -2,11 +2,14 @@ import Link from 'next/link';
 import { HeroImage } from '../components/hero-image';
 import { pageMetadata } from '../lib/metadata';
 
-export const metadata = pageMetadata({
-  title: 'Signal Lost: grclanker',
-  description: 'This page does not exist. Head back to the grclanker homepage, docs, or spec catalog.',
-  path: null,
-});
+export const metadata = {
+  ...pageMetadata({
+    title: 'Signal Lost: grclanker',
+    description: 'This page does not exist. Head back to the grclanker homepage, docs, or spec catalog.',
+    path: null,
+  }),
+  robots: { index: false, follow: false },
+};
 
 export default function NotFound() {
   return (

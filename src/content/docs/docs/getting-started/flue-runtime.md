@@ -12,10 +12,10 @@ The adapter lives in `cli/flue/` and is additive. Nothing in the Pi CLI path cha
 | grclanker asset | Flue surface |
 | --- | --- |
 | 241 native domain tools from `cli/extensions/grc-tools/` | `useTool()` definitions built with `defineTool()` |
-| `.grclanker/SYSTEM.md` | The agent function's returned instructions, plus a short Flue runtime note |
-| `prompts/investigate.md`, `audit.md`, `assess.md`, `validate.md` | Skills named `investigate`, `audit`, `assess`, `validate` (activated through Flue's `activate_skill` tool) |
-| `skills/crypto-validation/SKILL.md` | A skill named `crypto-validation` |
-| `.grclanker/agents/auditor.md` and `verifier.md` | Subagents reachable through Flue's `task` tool, each mounting only the tools its persona allows |
+| `cli/.grclanker/SYSTEM.md` | The agent function's returned instructions, plus a short Flue runtime note |
+| `cli/prompts/investigate.md`, `audit.md`, `assess.md`, `validate.md` | Skills named `investigate`, `audit`, `assess`, `validate` (activated through Flue's `activate_skill` tool) |
+| `cli/skills/crypto-validation/SKILL.md` | A skill named `crypto-validation` |
+| `cli/.grclanker/agents/auditor.md` and `verifier.md` | Subagents reachable through Flue's `task` tool, each mounting only the tools its persona allows |
 | Pi compute backends (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) | Not mapped. Flue's own `local()` sandbox provides file and shell tools instead |
 
 ### Schemas and validation

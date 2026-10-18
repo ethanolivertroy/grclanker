@@ -1,6 +1,6 @@
-import { copyFileSync, lstatSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { systemErrorCode } from "../../extensions/grc-tools/hardening/config-file.js";
 import {
   assertSafeSessionId,
@@ -428,12 +428,38 @@ function escapesRoot(relativePath: string): boolean {
   return relativePath.startsWith("/") || relativePath.split("/").includes("..");
 }
 
-function isRegularFile(path: string): boolean {
+function isInsideRoot(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+type StagingFile = { ok: true; path: string } | { ok: false; reason: "missing" | "escape" };
+
+// A tracked path is eligible only when every path component, including
+// intermediate directories, resolves to a regular file inside localRoot.
+// lstat follows intermediate symlinks, so a directory link to a file of the
+// same name outside the repo would otherwise be copied.
+function locateStagingFile(root: string, relativePath: string): StagingFile {
+  let rootReal: string;
   try {
-    return lstatSync(path).isFile();
+    rootReal = realpathSync(root);
   } catch {
-    return false;
+    return { ok: false, reason: "missing" };
   }
+  const candidate = join(rootReal, relativePath);
+  try {
+    if (!lstatSync(candidate).isFile()) return { ok: false, reason: "missing" };
+  } catch {
+    return { ok: false, reason: "missing" };
+  }
+  let real: string;
+  try {
+    real = realpathSync(candidate);
+  } catch {
+    return { ok: false, reason: "missing" };
+  }
+  if (!isInsideRoot(rootReal, real)) return { ok: false, reason: "escape" };
+  return { ok: true, path: real };
 }
 
 // Lists the git index of localRoot through the injected runner. Git's stderr is never quoted:
@@ -465,7 +491,7 @@ export async function planPodWorkspaceStaging(localRoot: string, runner: Command
       plan.excluded.push(entry);
       continue;
     }
-    if (!isRegularFile(join(localRoot, entry))) {
+    if (!locateStagingFile(localRoot, entry).ok) {
       plan.skipped.push(entry);
       continue;
     }
@@ -506,15 +532,33 @@ function appendLocalRemnant(error: unknown, remnant: string): unknown {
 export function materializePodStagingPlan(plan: PodStagingPlan, remove: LocalDirectoryRemover = removeLocalDirectorySync): string {
   const stageRoot = mkdtempSync(join(tmpdir(), "grclanker-runpod-stage-"));
   try {
+    const stageReal = realpathSync(stageRoot);
     for (const relativePath of plan.files) {
-      const destination = join(stageRoot, relativePath);
+      if (escapesRoot(relativePath)) {
+        throw new ExecutionBackendError(`Refusing to stage ${relativePath} because it is not a path inside ${plan.localRoot}.`);
+      }
+      const source = locateStagingFile(plan.localRoot, relativePath);
+      if (!source.ok) {
+        throw new ExecutionBackendError(
+          source.reason === "escape"
+            ? `Refusing to stage ${relativePath} because it resolves outside ${plan.localRoot}.`
+            : `Could not build the local staging copy of ${plan.localRoot} (ENOENT).`,
+        );
+      }
+      const destination = resolve(stageReal, relativePath);
+      if (!isInsideRoot(stageReal, destination)) {
+        throw new ExecutionBackendError(`Refusing to stage ${relativePath} because it resolves outside the staging directory.`);
+      }
       mkdirSync(dirname(destination), { recursive: true });
-      copyFileSync(join(plan.localRoot, relativePath), destination);
+      copyFileSync(source.path, destination);
     }
   } catch (error) {
+    const remnant = removeLocalStagingCopy(stageRoot, remove);
+    if (error instanceof ExecutionBackendError) {
+      throw remnant ? appendLocalRemnant(error, remnant) : error;
+    }
     const code = systemErrorCode(error);
     const failure = new ExecutionBackendError(`Could not build the local staging copy of ${plan.localRoot}${code ? ` (${code})` : ""}.`);
-    const remnant = removeLocalStagingCopy(stageRoot, remove);
     throw remnant ? appendLocalRemnant(failure, remnant) : failure;
   }
   return stageRoot;

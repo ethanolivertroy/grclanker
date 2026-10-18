@@ -45,7 +45,7 @@ ZIA list endpoints that document `page` and `pageSize` are paged to completion:
 - `/urlFilteringRules` at the documented default of 100 (no maximum is published)
 - `/firewallFilteringRules` at the documented default of 5000
 
-A read that reaches the internal ceiling of 50 pages is recorded as partial and caps the dependent verdicts at `warn`. Endpoints without documented paging parameters return the whole array in one call.
+A read that reaches the internal ceiling of 50 pages is recorded as partial and caps the dependent verdicts at `warn`. Endpoints without documented paging parameters return the whole array in one call, recorded as a single complete page (`seen: 1`). If that dataset is partial, the dependent check is capped at `warn` and the summary names the pages seen versus the total. That covers web DLP rules, DLP engines and dictionaries, SSL inspection rules and exemptions, sandbox rules and settings, bandwidth rules, isolation profiles, DNS rules, the ATP and malware baseline reads, administrator roles, password-expiry settings, and the audit log report.
 
 Sub-locations are fetched for at most 100 parent locations. Beyond that, control 18 reports how many parents were read versus the total and caps at `warn`.
 
