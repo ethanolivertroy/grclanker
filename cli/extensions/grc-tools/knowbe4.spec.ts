@@ -820,7 +820,7 @@ const TRAINING_CHECKS: readonly Knowbe4Check[] = [
   {
     id: "KNOWBE4-03",
     control: 3,
-    title: "Training completion rate",
+    title: "Training completion rates",
     severity: "high",
     owner: TRAINING,
     surfaces: ["training_campaigns", "training_enrollments"],
@@ -865,7 +865,7 @@ const TRAINING_CHECKS: readonly Knowbe4Check[] = [
   {
     id: "KNOWBE4-04",
     control: 4,
-    title: "New user training enrollment timeliness",
+    title: "Training enrollment timeliness",
     severity: "medium",
     owner: TRAINING,
     surfaces: ["users", "training_enrollments"],
@@ -912,7 +912,7 @@ const TRAINING_CHECKS: readonly Knowbe4Check[] = [
   {
     id: "KNOWBE4-10",
     control: 10,
-    title: "Remedial training after phishing failures",
+    title: "Remedial training triggers",
     severity: "medium",
     owner: TRAINING,
     surfaces: ["security_tests", "security_test_recipients", "training_enrollments", "training_campaigns"],
