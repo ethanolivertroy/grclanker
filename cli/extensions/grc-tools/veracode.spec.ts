@@ -90,20 +90,26 @@ const APPLICATIONS_SERVICE = "Veracode Applications REST API";
 const POLICY_SERVICE = "Veracode Policy REST API";
 const IDENTITY_SERVICE = "Veracode Identity REST API";
 const DYNAMIC_SERVICE = "Veracode Dynamic Analysis REST API";
+const FINDINGS_SERVICE = "Veracode Findings REST API";
+const SUMMARY_REPORT_SERVICE = "Veracode Summary Report REST API";
 const APPLICATIONS_DOCS = "https://docs.veracode.com/r/c_apps_intro";
 const POLICY_DOCS = "https://api.swaggerhub.com/apis/Veracode/veracode-policy_api_specification/1.0";
 const IDENTITY_DOCS = "https://docs.veracode.com/r/c_identity_intro";
 const DYNAMIC_DOCS = "https://docs.veracode.com/r/c_dynamic_intro";
+const FINDINGS_DOCS = "https://docs.veracode.com/r/c_findings_v2_intro";
+const SUMMARY_REPORT_DOCS = "https://docs.veracode.com/r/c_rest_summary_report_intro";
 const API_HOST = "Use the resolved API base URL: base_url, else VERACODE_API_BASE_URL, else the region's host, with any query, fragment, and trailing slashes removed. The region is the region argument, else VERACODE_REGION, else us, trimmed and lowercased: us or commercial is https://api.veracode.com, eu, europe, or european is https://api.veracode.eu, and us-fed, fedramp, or federal is https://api.veracode.us.";
 const API_HEADERS = ["Accept: application/json", "Authorization: VERACODE-HMAC-SHA-256 id={api_key_id},ts={timestamp},nonce={nonce},sig={signature}"];
 const CREDENTIAL_PASS = "the export's credential pass";
 const LIST_STAGE = `The collector exports the walk's result as read, every returned record with all its fields alongside pagesFetched, complete, and, when known, totalPages, totalElements, and notes, through ${CREDENTIAL_PASS}; decision facts read the listed fields.`;
+const BY_APPLICATION = "keyed by the application's guid read as text (empty text when it has none)";
 
 const REFUSAL = "a status outside 200 through 299 after retries, or a 2xx body that is not JSON, is a refusal";
 const halResponse = (key: string, records: string): string =>
   `A JSON object whose _embedded.${key} array holds ${records}, an entry that is not a JSON object being dropped (an _embedded that is itself an array is read in place of that array), and whose page object reports total_pages (else totalPages) and total_elements (else totalElements), each read as a number when present. An empty 2xx body, or JSON that is not an object, is read as a page holding no records; ${REFUSAL}.`;
 const SELF_RESPONSE = `A JSON object carrying at least one of ${series(USER_MEMBERS, "or")}; any other 2xx body, an empty one included, is a refusal, as is a status outside 200 through 299 after retries.`;
 const SCAN_CONFIGURATION_RESPONSE = `A JSON object read for auth_configuration.authentications, whose members name the configured authentication methods, crawl_configuration.disabled and crawl_script_data, target_url (its url when it is an object), and scan_setting.allowed_hosts, else allowed_hosts. An empty 2xx body, or JSON that is not an object, is read as a configuration without authentication; ${REFUSAL}.`;
+const SUMMARY_REPORT_RESPONSE = `A JSON object whose static_analysis.modules.module array holds one static module per JSON object entry, each read for loc, numflawssev5, and numflawssev4. An empty 2xx body, or JSON that is not an object, is read as a report without static modules; ${REFUSAL}.`;
 
 const param = (
   name: string,
@@ -195,7 +201,7 @@ const SCAN_COVERAGE_SURFACES: readonly BatchSurfaceDefinition[] = [
     [],
     [pathId("application_guid", "sampled application"), ...HAL_PAGE_PARAMETERS],
     halResponse("sandboxes", "one development sandbox per entry"),
-    `The collector exports each sampled application's sandbox records as read, keyed by the application's guid read as text (empty text when it has none), without the walk's pagination state, through ${CREDENTIAL_PASS}; decisions count the records and read no field.`,
+    `The collector exports each sampled application's sandbox records as read, ${BY_APPLICATION}, without the walk's pagination state, through ${CREDENTIAL_PASS}; decisions count the records and read no field.`,
   ),
   surface(
     "dynamic_analyses",
@@ -237,7 +243,39 @@ const SCAN_COVERAGE_SURFACES: readonly BatchSurfaceDefinition[] = [
   ),
 ];
 
-const VERACODE_SURFACES: readonly BatchSurfaceDefinition[] = [...SCAN_COVERAGE_SURFACES];
+const FINDINGS_HYGIENE_SURFACES: readonly BatchSurfaceDefinition[] = [
+  surface(
+    "findings",
+    FINDINGS_SERVICE,
+    FINDINGS_DOCS,
+    "/appsec/v2/applications/{application_guid}/findings",
+    [
+      "issue_id",
+      "finding_details.severity",
+      "finding_status.status",
+      "finding_status.resolution",
+      "finding_status.resolution_status",
+      "finding_status.first_found_date",
+      "annotations.action",
+      "annotations.comment",
+    ],
+    [pathId("application_guid", "sampled application"), param("include_annot", "query", "TRUE"), param("page", "query", PAGE_INDEX), param("size", "query", "500")],
+    halResponse("findings", "one finding per entry"),
+    `The collector exports each sampled application's finding list as the walk returned it, every returned record with all its fields alongside pagesFetched, complete, and, when known, totalPages, totalElements, and notes, ${BY_APPLICATION}, through ${CREDENTIAL_PASS}; decision facts read the listed fields.`,
+  ),
+  surface(
+    "summary_reports",
+    SUMMARY_REPORT_SERVICE,
+    SUMMARY_REPORT_DOCS,
+    "/appsec/v2/applications/{application_guid}/summary_report",
+    ["static_analysis.modules.module.loc", "static_analysis.modules.module.numflawssev5", "static_analysis.modules.module.numflawssev4"],
+    [pathId("application_guid", "sampled application")],
+    SUMMARY_REPORT_RESPONSE,
+    `The collector exports each sampled application's summary report as read, ${BY_APPLICATION}, through ${CREDENTIAL_PASS}; decision facts read the listed fields.`,
+  ),
+];
+
+const VERACODE_SURFACES: readonly BatchSurfaceDefinition[] = [...SCAN_COVERAGE_SURFACES, ...FINDINGS_HYGIENE_SURFACES];
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
 const path = (name: string): VerdictOperand => ({ kind: "path", path: name });
@@ -273,6 +311,17 @@ const REQUIREMENT_OUTCOMES = `A counted requirement of type ANY is unconfirmed w
 const SANDBOX_SAMPLE = `The sampled applications are the first N returned applications, N being ${option("max_applications", 100, 5000)}; each sampled application's sandbox list is read from GET /appsec/v1/applications/{application_guid}/sandboxes, its records being the entries that are JSON objects.`;
 const DYNAMIC_SAMPLE = `The sampled analyses are the first N returned Dynamic Analysis records, N being ${option("max_analyses", 25, 500)}. Each sampled analysis's scan list is read from GET /was/configservice/v1/analyses/{analysis_id}/scans, and the first ${MAX_DYNAMIC_SCANS_PER_ANALYSIS} returned scans of each are inspected by reading GET /was/configservice/v1/scans/{scan_id}/configuration.`;
 const SCAN_AUTH = "An inspected scan is unauthenticated when its configuration's auth_configuration.authentications is not a JSON object with at least one member, and crawl-disabled when it is not unauthenticated and its configuration's crawl_configuration.disabled is the boolean true or a string that trims to true in any letter case.";
+const limit = (name: string, fallback: number, max: number): string => `the ${name} argument ${AS_NUMBER}, else ${fallback}, clamped to 0 through ${max}`;
+const FINDING_SAMPLE = `The sampled applications are the first N returned applications, N being ${option("max_applications", 100, 5000)}; each sampled application's finding list is read from GET /appsec/v2/applications/{application_guid}/findings with include_annot=TRUE, its findings being the entries that are JSON objects.`;
+const AGED_SEVERITIES = series(Object.keys(FLAW_AGE_THRESHOLDS), "or");
+const FLAW_AGE_LIMITS = series(Object.entries(FLAW_AGE_THRESHOLDS).reverse().map(([severity, days]) => `${days} days for severity ${severity}`));
+const OPEN_FINDING = `A finding is open when its finding_status.status, read as text and uppercased, is OPEN and its finding_status.resolution, read as text and uppercased, is UNRESOLVED. ${READS_AS_TEXT}`;
+const OVERDUE_FINDING = `An open finding is overdue when its finding_details.severity, ${AS_NUMBER}, is ${AGED_SEVERITIES} and its finding_status.first_found_date parses as a date that is more whole days before the assessment time than the limit for that severity: ${FLAW_AGE_LIMITS}. ${OPEN_FINDING} ${PARSES_AS_DATE} ${WHOLE_DAYS}`;
+const MITIGATION_ANNOTATION = `A mitigation annotation is a JSON object entry of a finding's annotations whose action, read as text and uppercased, is ${series(MITIGATION_ACTIONS, "or")}. ${READS_AS_TEXT}`;
+const FP_RATE = `An application's false positive rate is (F / N) * 100 in IEEE 754 double precision, N being the number of findings in its finding list and F the number of those with an annotation, a JSON object entry of their annotations, whose action, read as text and uppercased, is FP. ${READS_AS_TEXT}`;
+const SUMMARY_SAMPLE = `The sampled applications are the first N returned applications, N being ${option("max_applications", 100, 5000)}; each sampled application's summary report is read from GET /appsec/v2/applications/{application_guid}/summary_report.`;
+const STATIC_MODULES = `A summary report's static modules are the JSON object entries of its static_analysis.modules.module array, and its lines of code are the sum of their loc values, each ${AS_NUMBER}, else 0. A summary report counts lines of code when it has a static module and its lines of code are more than 0. ${SUMMARY_SAMPLE}`;
+const FLAW_DENSITY = `A summary report's flaw density is H / (L / 1000) in IEEE 754 double precision, L being its lines of code and H the sum of its static modules' numflawssev5 and numflawssev4 values, each ${AS_NUMBER}, else 0. ${STATIC_MODULES}`;
 
 const VERACODE_INPUTS: Readonly<Record<string, string>> = {
   applications_readable: "True when the GET /appsec/v1/applications walk returned without a refusal.",
@@ -307,6 +356,20 @@ const VERACODE_INPUTS: Readonly<Record<string, string>> = {
   custom_policy_count: `Number of custom policies. ${CUSTOM_POLICY}`,
   custom_policy_without_finding_rules_count: `Number of custom policies whose finding_rules holds no JSON object entry. ${CUSTOM_POLICY}`,
   no_custom_policy_application_count: `Number of applications none of whose assigned policies resolves to a custom policy, applications without an assigned policy included; 0 when the GET /appsec/v1/applications walk was refused. ${ASSIGNED_POLICIES} ${CUSTOM_POLICY}`,
+  finding_list_read_count: `Number of sampled applications whose finding list was read without a refusal. ${FINDING_SAMPLE}`,
+  finding_count: `Number of findings in the finding lists read without a refusal. ${FINDING_SAMPLE}`,
+  overdue_finding_count: `Number of overdue findings in the finding lists read without a refusal. ${OVERDUE_FINDING} ${FINDING_SAMPLE}`,
+  undated_open_finding_count: `Number of open findings in the finding lists read without a refusal whose finding_details.severity, ${AS_NUMBER}, is ${AGED_SEVERITIES} and whose finding_status.first_found_date does not parse as a date. ${OPEN_FINDING} ${PARSES_AS_DATE} ${FINDING_SAMPLE}`,
+  pending_mitigation_count: `Number of findings in the finding lists read without a refusal whose finding_status.resolution_status, read as text and uppercased, is PROPOSED. ${READS_AS_TEXT} ${FINDING_SAMPLE}`,
+  unjustified_mitigation_count: `Number of mitigation annotations in the finding lists read without a refusal whose comment does not read as text. ${MITIGATION_ANNOTATION} ${FINDING_SAMPLE}`,
+  finding_reads_complete: "Finding read coverage.",
+  fp_rate_exceeding_application_count: `Number of sampled applications whose finding list was read without a refusal and holds a finding, and whose false positive rate is more than M, M being ${limit("max_fp_rate_percent", 20, 100)}. ${FP_RATE} ${FINDING_SAMPLE}`,
+  fp_rate_coverage_complete: "False positive rate coverage.",
+  summary_report_read_count: `Number of sampled applications whose summary report was read without a refusal. ${SUMMARY_SAMPLE}`,
+  density_evaluated_application_count: `Number of sampled applications whose summary report was read without a refusal and counts lines of code. ${STATIC_MODULES}`,
+  density_exceeding_application_count: `Number of sampled applications whose summary report was read without a refusal, counts lines of code, and has a flaw density of more than D, D being ${limit("max_flaw_density_per_kloc", 1, 1000)}. ${FLAW_DENSITY}`,
+  no_loc_application_count: `Number of sampled applications whose summary report was read without a refusal and does not count lines of code. ${STATIC_MODULES}`,
+  summary_reports_complete: "Summary report coverage.",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -323,8 +386,9 @@ const halWalkComplete = (surfaceId: string, list: string): BatchCompletenessDefi
 });
 const APPLICATIONS_COMPLETE = halWalkComplete("applications", "application inventory");
 const POLICIES_COMPLETE = halWalkComplete("policies", "policy list");
+const INVENTORY_UNCOVERED = `the inventory read was refused or is partial because ${walkPartial(50)}, the inventory holds more applications than were sampled`;
 const SANDBOX_READS_COMPLETE: BatchCompletenessDefinition = {
-  semantics: `false when the sandbox reads do not cover the whole application inventory: the inventory read was refused or is partial because ${walkPartial(50)}, the inventory holds more applications than were sampled, or a sampled application's sandbox list was refused. A sandbox list that stopped at its 10-page cap still holds records, so its truncation does not lower this fact. ${SANDBOX_SAMPLE}`,
+  semantics: `false when the sandbox reads do not cover the whole application inventory: ${INVENTORY_UNCOVERED}, or a sampled application's sandbox list was refused. A sandbox list that stopped at its 10-page cap still holds records, so its truncation does not lower this fact. ${SANDBOX_SAMPLE}`,
   sources: [
     { surfaceId: "applications", falseWhen: ["truncated", "error", "denied"] },
     { surfaceId: "sandboxes", falseWhen: ["error", "denied", "not-collected"] },
@@ -336,6 +400,25 @@ const DYNAMIC_SCAN_COVERAGE_COMPLETE: BatchCompletenessDefinition = {
     { surfaceId: "dynamic_analyses", falseWhen: ["truncated", "error", "denied"] },
     { surfaceId: "dynamic_analysis_scans", falseWhen: ["truncated", "error", "denied", "not-collected"] },
     { surfaceId: "dynamic_scan_configurations", falseWhen: ["error", "denied", "not-collected"] },
+  ],
+};
+const FINDING_SOURCES: BatchCompletenessDefinition["sources"] = [
+  { surfaceId: "applications", falseWhen: ["truncated", "error", "denied"] },
+  { surfaceId: "findings", falseWhen: ["truncated", "error", "denied", "not-collected"] },
+];
+const FINDING_READS_COMPLETE: BatchCompletenessDefinition = {
+  semantics: `false when the finding reads do not cover the whole application inventory: ${INVENTORY_UNCOVERED}, or a sampled application's finding list was refused or is partial because ${walkPartial(50)}. ${FINDING_SAMPLE}`,
+  sources: FINDING_SOURCES,
+};
+const FP_RATE_COVERAGE_COMPLETE: BatchCompletenessDefinition = {
+  semantics: `false when the false positive rates do not cover the whole application inventory: ${INVENTORY_UNCOVERED}, a sampled application's finding list was refused, or a finding list that holds a finding is partial because ${walkPartial(50)}. A partial finding list that holds no finding does not lower this fact. ${FINDING_SAMPLE}`,
+  sources: FINDING_SOURCES,
+};
+const SUMMARY_REPORTS_COMPLETE: BatchCompletenessDefinition = {
+  semantics: `false when the summary reports do not cover the whole application inventory: ${INVENTORY_UNCOVERED}, or a sampled application's summary report was refused. ${SUMMARY_SAMPLE}`,
+  sources: [
+    { surfaceId: "applications", falseWhen: ["truncated", "error", "denied"] },
+    { surfaceId: "summary_reports", falseWhen: ["error", "denied", "not-collected"] },
   ],
 };
 
@@ -735,6 +818,217 @@ const POLICY_COMPLIANCE_CHECKS: readonly VeracodeCheck[] = [
   },
 ];
 
+const FINDINGS_HYGIENE = "veracode_assess_findings_hygiene";
+const FINDING_LISTS_GATE = [
+  ...APPLICATIONS_GATE,
+  rule("manual", not(gt("finding_list_read_count", 0))),
+];
+const FINDING_LISTS_READ = { ...APPLICATIONS_READ, finding_list_read_count: 12, finding_count: 340 };
+const NO_FINDINGS = { finding_count: 0 };
+const REFUSED_FINDING_LISTS = { finding_list_read_count: 0, finding_count: 0 };
+const AGING_HEALTHY = { ...FINDING_LISTS_READ, overdue_finding_count: 0, undated_open_finding_count: 0, finding_reads_complete: true };
+const MITIGATIONS_HEALTHY = { ...FINDING_LISTS_READ, pending_mitigation_count: 0, unjustified_mitigation_count: 0, finding_reads_complete: true };
+const FP_RATES_HEALTHY = { ...FINDING_LISTS_READ, fp_rate_exceeding_application_count: 0, fp_rate_coverage_complete: true };
+const DENSITY_HEALTHY = {
+  ...APPLICATIONS_READ,
+  summary_report_read_count: 12,
+  density_evaluated_application_count: 12,
+  density_exceeding_application_count: 0,
+  no_loc_application_count: 0,
+  summary_reports_complete: true,
+};
+
+const FINDINGS_HYGIENE_CHECKS: readonly VeracodeCheck[] = [
+  {
+    id: "VERACODE-03",
+    control: 3,
+    title: "Flaw aging",
+    severity: "high",
+    owner: FINDINGS_HYGIENE,
+    surfaces: ["applications", "findings"],
+    inputs: [
+      "applications_readable",
+      "application_count",
+      "finding_list_read_count",
+      "finding_count",
+      "overdue_finding_count",
+      "undated_open_finding_count",
+      "finding_reads_complete",
+    ],
+    rules: [
+      ...FINDING_LISTS_GATE,
+      rule("fail", gt("overdue_finding_count", 0)),
+      rule("warn", gt("undated_open_finding_count", 0)),
+      rule("manual", not(gt("finding_count", 0))),
+      rule("warn", incomplete("finding_reads_complete")),
+      rule("pass", always),
+    ],
+    completeness: { finding_reads_complete: FINDING_READS_COMPLETE },
+    decision: `Manual when the application inventory is unreadable or empty, or no sampled application's finding list could be read. Fail when an open, unresolved finding has been open longer than its severity allows: ${FLAW_AGE_LIMITS}. Warn when such a finding carries no readable first_found_date. Otherwise manual when the finding lists read hold no finding, since an empty list does not show that flaws are remediated. Warn instead of pass when the finding reads do not cover the whole application inventory. Otherwise pass.`,
+    examples: [
+      example("compliant", "pass", "Every open finding is within its severity's age limit.", AGING_HEALTHY),
+      example("noncompliant", "fail", "Three open Very High findings have been open for more than 30 days.", { ...AGING_HEALTHY, overdue_finding_count: 3 }),
+      example("partial", "warn", "Two open findings carry no first_found_date, so they cannot be aged.", { ...AGING_HEALTHY, undated_open_finding_count: 2 }),
+      example("partial", "warn", "One application's finding list stopped at its page cap.", { ...AGING_HEALTHY, finding_reads_complete: false }),
+      example("partial", "manual", "The sampled applications returned no findings, so there is nothing to age.", { ...AGING_HEALTHY, ...NO_FINDINGS }),
+      example("unreadable", "manual", "Every sampled application's finding list was refused.", {
+        ...AGING_HEALTHY,
+        ...REFUSED_FINDING_LISTS,
+        finding_reads_complete: false,
+      }),
+      EMPTY_APPLICATIONS,
+      UNREADABLE_APPLICATIONS,
+    ],
+  },
+  {
+    id: "VERACODE-12",
+    control: 12,
+    title: "Mitigation approval workflow",
+    severity: "high",
+    owner: FINDINGS_HYGIENE,
+    surfaces: ["applications", "findings"],
+    inputs: [
+      "applications_readable",
+      "application_count",
+      "finding_list_read_count",
+      "finding_count",
+      "pending_mitigation_count",
+      "unjustified_mitigation_count",
+      "finding_reads_complete",
+    ],
+    rules: [
+      ...FINDING_LISTS_GATE,
+      rule("manual", not(gt("finding_count", 0))),
+      rule("fail", any(gt("pending_mitigation_count", 0), gt("unjustified_mitigation_count", 0))),
+      rule("warn", incomplete("finding_reads_complete")),
+      rule("pass", always),
+    ],
+    completeness: { finding_reads_complete: FINDING_READS_COMPLETE },
+    decision: "Manual when the application inventory is unreadable or empty, no sampled application's finding list could be read, or the finding lists read hold no finding. Fail when a mitigation is proposed but not reviewed, or a mitigation annotation carries no justification comment. Warn instead of pass when the finding reads do not cover the whole application inventory. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "No mitigation awaits review and every mitigation annotation carries a comment.", MITIGATIONS_HEALTHY),
+      example("noncompliant", "fail", "Four mitigations are proposed but not reviewed.", { ...MITIGATIONS_HEALTHY, pending_mitigation_count: 4 }),
+      example("noncompliant", "fail", "Two accepted-risk annotations carry no justification comment.", { ...MITIGATIONS_HEALTHY, unjustified_mitigation_count: 2 }),
+      example("partial", "warn", "The inventory holds more applications than max_applications lets the assessment sample.", {
+        ...MITIGATIONS_HEALTHY,
+        finding_reads_complete: false,
+      }),
+      example("partial", "manual", "The sampled applications returned no findings, so there is no mitigation to audit.", { ...MITIGATIONS_HEALTHY, ...NO_FINDINGS }),
+      example("unreadable", "manual", "Every sampled application's finding list was refused.", {
+        ...MITIGATIONS_HEALTHY,
+        ...REFUSED_FINDING_LISTS,
+        finding_reads_complete: false,
+      }),
+      EMPTY_APPLICATIONS,
+      UNREADABLE_APPLICATIONS,
+    ],
+  },
+  {
+    id: "VERACODE-16",
+    control: 16,
+    title: "Finding false positive rate",
+    severity: "medium",
+    owner: FINDINGS_HYGIENE,
+    surfaces: ["applications", "findings"],
+    inputs: [
+      "applications_readable",
+      "application_count",
+      "finding_list_read_count",
+      "finding_count",
+      "fp_rate_exceeding_application_count",
+      "fp_rate_coverage_complete",
+    ],
+    rules: [
+      ...FINDING_LISTS_GATE,
+      rule("manual", not(gt("finding_count", 0))),
+      rule("warn", gt("fp_rate_exceeding_application_count", 0)),
+      rule("warn", incomplete("fp_rate_coverage_complete")),
+      rule("pass", always),
+    ],
+    completeness: { fp_rate_coverage_complete: FP_RATE_COVERAGE_COMPLETE },
+    decision: "Manual when the application inventory is unreadable or empty, no sampled application's finding list could be read, or the finding lists read hold no finding. Warn when an application marks more than max_fp_rate_percent percent of its findings with an FP mitigation annotation, which may point to scan tuning issues. Warn instead of pass when the false positive rates do not cover the whole application inventory. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every application with findings stays at or below max_fp_rate_percent.", FP_RATES_HEALTHY),
+      example("noncompliant", "warn", "Two applications mark more than max_fp_rate_percent of their findings as false positives.", {
+        ...FP_RATES_HEALTHY,
+        fp_rate_exceeding_application_count: 2,
+      }),
+      example("partial", "warn", "One sampled application's finding list was refused.", {
+        ...FP_RATES_HEALTHY,
+        finding_list_read_count: 11,
+        fp_rate_coverage_complete: false,
+      }),
+      example("partial", "manual", "The sampled applications returned no findings, so no false positive rate exists.", { ...FP_RATES_HEALTHY, ...NO_FINDINGS }),
+      example("unreadable", "manual", "Every sampled application's finding list was refused.", {
+        ...FP_RATES_HEALTHY,
+        ...REFUSED_FINDING_LISTS,
+        fp_rate_coverage_complete: false,
+      }),
+      EMPTY_APPLICATIONS,
+      UNREADABLE_APPLICATIONS,
+    ],
+  },
+  {
+    id: "VERACODE-17",
+    control: 17,
+    title: "Very High/High flaw density",
+    severity: "medium",
+    owner: FINDINGS_HYGIENE,
+    surfaces: ["applications", "summary_reports"],
+    inputs: [
+      "applications_readable",
+      "application_count",
+      "summary_report_read_count",
+      "density_evaluated_application_count",
+      "density_exceeding_application_count",
+      "no_loc_application_count",
+      "summary_reports_complete",
+    ],
+    rules: [
+      ...APPLICATIONS_GATE,
+      rule("manual", not(gt("summary_report_read_count", 0))),
+      rule("fail", gt("density_exceeding_application_count", 0)),
+      rule("manual", not(gt("density_evaluated_application_count", 0))),
+      rule("warn", gt("no_loc_application_count", 0)),
+      rule("warn", incomplete("summary_reports_complete")),
+      rule("pass", always),
+    ],
+    completeness: { summary_reports_complete: SUMMARY_REPORTS_COMPLETE },
+    decision: "Manual when the application inventory is unreadable or empty, or no sampled application's summary report could be read. Fail when an application has more than max_flaw_density_per_kloc Very High and High static flaws per thousand lines of code. Otherwise manual when no summary report exposes static module lines of code. Warn when an application's summary report exposes none. Warn instead of pass when the summary reports do not cover the whole application inventory. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Every application with static module data stays within max_flaw_density_per_kloc.", DENSITY_HEALTHY),
+      example("noncompliant", "fail", "One application has 2.4 Very High and High flaws per thousand lines of code.", {
+        ...DENSITY_HEALTHY,
+        density_exceeding_application_count: 1,
+      }),
+      example("partial", "warn", "Two applications' summary reports expose no static module lines of code.", {
+        ...DENSITY_HEALTHY,
+        density_evaluated_application_count: 10,
+        no_loc_application_count: 2,
+      }),
+      example("partial", "warn", "One sampled application's summary report was refused.", {
+        ...DENSITY_HEALTHY,
+        summary_report_read_count: 11,
+        density_evaluated_application_count: 11,
+        summary_reports_complete: false,
+      }),
+      example("partial", "manual", "No summary report exposes static module lines of code, so no density can be computed.", {
+        ...DENSITY_HEALTHY,
+        density_evaluated_application_count: 0,
+        no_loc_application_count: 12,
+      }),
+      example("unreadable", "manual", "Every sampled application's summary report was refused.", {
+        ...DENSITY_HEALTHY,
+        summary_report_read_count: 0,
+        density_evaluated_application_count: 0,
+        summary_reports_complete: false,
+      }),
+      EMPTY_APPLICATIONS,
+      UNREADABLE_APPLICATIONS,
+    ],
+  },
+];
+
 const toCheck = (check: VeracodeCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   const [fedramp, cmmc, soc2, cis, pciDss, disaStig, irap, ismap] = VERACODE_FRAMEWORK_MAPPINGS[check.control];
@@ -765,24 +1059,34 @@ const toCheck = (check: VeracodeCheck): BatchCheckDefinition => {
   };
 };
 
-const checks: readonly BatchCheckDefinition[] = [...SCAN_COVERAGE_CHECKS, ...POLICY_COMPLIANCE_CHECKS].map(toCheck);
+const checks: readonly BatchCheckDefinition[] = [...SCAN_COVERAGE_CHECKS, ...POLICY_COMPLIANCE_CHECKS, ...FINDINGS_HYGIENE_CHECKS].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
-const RECORD_KEY = "a record's key being the first of its guid, id, user_id, team_id, issue_id, and scan_id that is not null, else the whole record";
-const halWalk = (surfaceIds: readonly string[], records: string, pageCap: number, probed: boolean, scope = ""): BatchPaginationDefinition => ({
+const RECORD_KEY = "a record's key being the first of its guid, id, user_id, team_id, issue_id, and scan_id that is present and not null, else the whole record";
+type HalWalkOptions = { pageCap: number; pageSize?: number; probed?: boolean; scope?: string };
+const halWalk = (surfaceIds: readonly string[], records: string, { pageCap, pageSize = 100, probed = false, scope = "" }: HalWalkOptions): BatchPaginationDefinition => ({
   surfaceIds,
   cursorFields: ["page", "page.total_pages", "page.total_elements"],
-  pageSize: 100,
+  pageSize,
   itemCap: "none",
   pageCap,
-  totalSemantics: `${scope}Pages of 100 ${records} (size), indexed from 0 (page), up to ${pageCap} pages${probed ? "; the veracode_check_access probe reads only page 0" : ""}. A page's total_pages and total_elements replace the values read before when present, and no _links.next link is read. An entry that is not a JSON object is dropped without marking the list partial. The list is partial when ${walkPartial(pageCap)}.`,
+  totalSemantics: `${scope}Pages of ${pageSize} ${records} (size), indexed from 0 (page), up to ${pageCap} pages${probed ? "; the veracode_check_access probe reads only page 0" : ""}. A page's total_pages and total_elements replace the values read before when present, and no _links.next link is read. An entry that is not a JSON object is dropped without marking the list partial. The list is partial when ${walkPartial(pageCap)}.`,
   stopConditions: [
     "Once a page has reported total_pages, the page whose index plus one reaches the last reported total_pages",
-    `Before any page has reported total_pages, a page holding fewer than 100 ${records}, entries that are not JSON objects not counting`,
+    `Before any page has reported total_pages, a page holding fewer than ${pageSize} ${records}, entries that are not JSON objects not counting`,
     `A non-empty page whose ${records}' keys, in order, equal the previous page's, ${RECORD_KEY}; the repeated page is not kept, and the list is partial`,
     `${pageCap} pages read without another stop, which leaves the list partial unless the last reported total_pages was reached`,
     "A refused page, which makes the whole list a refusal",
   ],
+});
+const singleRead = (surfaceIds: readonly string[], totalSemantics: string): BatchPaginationDefinition => ({
+  surfaceIds,
+  cursorFields: [],
+  pageSize: null,
+  itemCap: "none",
+  pageCap: 1,
+  totalSemantics,
+  stopConditions: ["The first response"],
 });
 
 const FRAMEWORK_REPORT_FILES = [
@@ -820,9 +1124,9 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
   displayName: "Veracode Security Inspector",
   vendor: "Veracode",
   category: "application-security",
-  summary: "Portable contract for the shipped Veracode scan coverage and policy compliance assessments over the Veracode Applications, Policy, Identity, and Dynamic Analysis REST APIs.",
+  summary: "Portable contract for the shipped Veracode scan coverage, policy compliance, and findings hygiene assessments over the Veracode Applications, Policy, Identity, Dynamic Analysis, Findings, and Summary Report REST APIs.",
   sourceModule: "cli/extensions/grc-tools/veracode.ts",
-  baseServices: [APPLICATIONS_SERVICE, POLICY_SERVICE, IDENTITY_SERVICE, DYNAMIC_SERVICE],
+  baseServices: [APPLICATIONS_SERVICE, POLICY_SERVICE, IDENTITY_SERVICE, DYNAMIC_SERVICE, FINDINGS_SERVICE, SUMMARY_REPORT_SERVICE],
   authentication: VERACODE_AUTH_RESOLVER,
   permissions: [
     {
@@ -845,6 +1149,13 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
       unlocks: ["dynamic_analyses", "dynamic_analysis_scans", "dynamic_scan_configurations"],
       notes: "veracode_check_access names this role; the Dynamic Analysis REST API documentation names an API user account with the Upload and Scan API role.",
     },
+    {
+      id: "results-reader",
+      kind: "role",
+      value: "Results API role",
+      unlocks: ["findings", "summary_reports"],
+      notes: "veracode_check_access does not probe these APIs; the Findings and Summary Report REST API documentation names an API user account with the Results API role, or a user account with the Reviewer or Security Lead role.",
+    },
   ],
   surfaces: VERACODE_SURFACES,
   checks,
@@ -852,30 +1163,17 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
     veracode_check_access: [],
     veracode_assess_scan_coverage: idsFor(SCAN_COVERAGE),
     veracode_assess_policy_compliance: idsFor(POLICY_COMPLIANCE),
+    veracode_assess_findings_hygiene: idsFor(FINDINGS_HYGIENE),
     veracode_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
-    halWalk(["applications", "policies", "dynamic_analyses"], "records", 50, true),
-    halWalk(["sandboxes"], "sandboxes", 10, false, "Each sampled application's sandbox list is walked separately. "),
-    halWalk(["dynamic_analysis_scans"], "scans", 5, false, "Each sampled analysis's scan list is walked separately. "),
-    {
-      surfaceIds: ["self"],
-      cursorFields: [],
-      pageSize: null,
-      itemCap: "none",
-      pageCap: 1,
-      totalSemantics: "One read of the API user's own record.",
-      stopConditions: ["The first response"],
-    },
-    {
-      surfaceIds: ["dynamic_scan_configurations"],
-      cursorFields: [],
-      pageSize: null,
-      itemCap: "none",
-      pageCap: 1,
-      totalSemantics: "One read of each inspected scan's configuration.",
-      stopConditions: ["The first response"],
-    },
+    halWalk(["applications", "policies", "dynamic_analyses"], "records", { pageCap: 50, probed: true }),
+    halWalk(["sandboxes"], "sandboxes", { pageCap: 10, scope: "Each sampled application's sandbox list is walked separately. " }),
+    halWalk(["findings"], "findings", { pageCap: 50, pageSize: 500, scope: "Each sampled application's finding list is walked separately. " }),
+    halWalk(["dynamic_analysis_scans"], "scans", { pageCap: 5, scope: "Each sampled analysis's scan list is walked separately. " }),
+    singleRead(["self"], "One read of the API user's own record."),
+    singleRead(["summary_reports"], "One read of each sampled application's summary report."),
+    singleRead(["dynamic_scan_configurations"], "One read of each inspected scan's configuration."),
   ],
   rateLimit: {
     documentedLimit: "Veracode documents 500 REST API calls per minute from one IP address, answering a 429 with a retry-after time in seconds beyond it; the collector reads neither the limit nor the retry-after time.",
@@ -889,6 +1187,8 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
     "A list entry that is not a JSON object is dropped without marking the list partial, and before any page reports total_pages a full page holding one counts as short and ends the walk with the list complete.",
     "An empty 2xx list page, or one whose JSON is not an object, is read as a page holding no records, which ends the walk with the list complete when no total_pages has been reported.",
     "VERACODE-15 can pass when the application inventory is read and empty, though the other application checks treat an empty inventory as unverifiable.",
+    "When the application inventory is unreadable or empty, the findings hygiene assessment reports VERACODE-16 and VERACODE-17 at high severity, copied from VERACODE-03's manual finding, instead of their own medium severity.",
+    "VERACODE-16 skips a finding list that kept no finding before checking whether that list is partial, so a truncated empty list does not lower fp_rate_coverage_complete and the check can pass without that application's rate; changing that behavior requires a separate runtime fix.",
   ],
   sensitiveFields: ["api_key_id", "api_key_secret", "veracode_api_key_id", "veracode_api_key_secret", "Authorization", "authentications", "crawl_script_data"],
   credentialFormats: ["Veracode API key ID and hex API key secret, used to sign every request with VERACODE-HMAC-SHA-256"],
