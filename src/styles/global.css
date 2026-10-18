@@ -1135,10 +1135,6 @@ details[open] > .agent-group-toggle::before {
   filter: drop-shadow(0 24px 28px rgba(35, 38, 52, 0.38));
 }
 
-.docs-index-break {
-  margin: 0 0 1.75rem;
-}
-
 .footer-image-strip {
   position: relative;
   overflow: hidden;
@@ -1716,6 +1712,82 @@ details[open] > .agent-group-toggle::before {
 .docs-prose .copy-code:hover {
   color: var(--docs-accent);
   border-color: color-mix(in srgb, var(--color-blue) 35%, transparent);
+}
+
+/* Docs landing page route map */
+.docs-prose .docs-route-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--docs-border);
+}
+
+.docs-prose .docs-route-list > li {
+  margin: 0;
+  border-bottom: 1px solid var(--docs-border);
+}
+
+.docs-prose .docs-route-list a {
+  display: block;
+  padding: 0.75rem 0;
+  text-decoration: none;
+}
+
+.docs-route-label {
+  color: var(--docs-accent);
+  font-weight: 600;
+}
+
+.docs-route-description {
+  display: block;
+  margin-top: 0.125rem;
+  color: var(--docs-subtle);
+  font-size: 0.9375rem;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.docs-prose .docs-route-list a:hover .docs-route-label {
+  color: var(--color-lavender);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+
+.docs-prose .docs-route-list[data-names-only] {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 1.5rem;
+  border-top: 0;
+}
+
+.docs-prose .docs-route-list[data-names-only] > li {
+  border-bottom: 0;
+}
+
+.docs-prose .docs-route-list[data-names-only] a {
+  padding: 0.3rem 0;
+}
+
+.docs-prose .docs-route-list[data-names-only] .docs-route-label {
+  font-weight: 400;
+}
+
+@media (min-width: 721px) {
+  .docs-prose .docs-route-list:not([data-names-only]) a {
+    display: grid;
+    grid-template-columns: 11rem minmax(0, 1fr);
+    column-gap: 1.5rem;
+    align-items: baseline;
+  }
+
+  .docs-prose .docs-route-list:not([data-names-only]) .docs-route-description {
+    margin-top: 0;
+  }
+
+  .docs-prose .docs-route-list[data-names-only] {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
 }
 
 .nav-action-btn,
