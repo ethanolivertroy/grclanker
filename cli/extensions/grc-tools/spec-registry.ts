@@ -16,6 +16,8 @@ import { GCP_SPEC } from "./gcp.spec.js";
 import { registerGwsTools } from "./gws.js";
 import { GWS_SPEC } from "./gws.spec.js";
 import type { IntegrationSpecContract } from "./spec-model.js";
+import { registerKnowbe4Tools } from "./knowbe4.js";
+import { KNOWBE4_SPEC } from "./knowbe4.spec.js";
 import { registerOciTools } from "./oci.js";
 import { OCI_SPEC } from "./oci.spec.js";
 import { registerOktaTools } from "./okta.js";
@@ -96,6 +98,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     narrativePath: "specs/narratives/gws.md",
     outputPath: "specs/gws-inspector-go.spec.md",
     registerTools: registerGwsTools,
+  },
+  {
+    contract: KNOWBE4_SPEC,
+    narrativePath: "specs/narratives/knowbe4.md",
+    outputPath: "specs/knowbe4-sec-inspector.spec.md",
+    registerTools: registerKnowbe4Tools,
   },
   {
     contract: OCI_SPEC,

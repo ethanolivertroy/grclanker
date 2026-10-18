@@ -458,3 +458,33 @@ export const CROWDSTRIKE_AUTH_RESOLVER = {
   configFields: ["client_id", "clientId", "client_secret", "clientSecret", "cloud", "region", "base_url", "baseUrl", "member_cid", "memberCid", "timeout_seconds"],
   refreshRequest: "POST {base_url}/oauth2/token with Accept: application/json and an application/x-www-form-urlencoded body of client_id, client_secret, and member_cid when configured; the access_token is reused until 60 seconds before its expires_in (1799 seconds when absent) runs out, and for at least 60 seconds.",
 } as const satisfies ResolverAuthenticationContract;
+
+export const KNOWBE4_AUTH_RESOLVER = {
+  modes: [
+    "Reporting API token: sent as Authorization: Bearer on every KnowBe4 Reporting API read",
+    "Optional PhishER API token: sent as Authorization: Bearer on every PhishER GraphQL request; PhishER is not read without it",
+  ],
+  precedence: [
+    "Explicit tool arguments (api_token, else token, for the Reporting API token)",
+    "KNOWBE4_* environment variables",
+    "KnowBe4 YAML config file",
+    "A base_url or phisher_graphql_url from any source takes precedence over the region's default; with no region, us is used",
+  ],
+  environment: [
+    "KNOWBE4_CONFIG_FILE",
+    "KNOWBE4_API_TOKEN",
+    "KNOWBE4_REGION",
+    "KNOWBE4_BASE_URL",
+    "KNOWBE4_PHISHER_API_TOKEN",
+    "KNOWBE4_PHISHER_GRAPHQL_URL",
+    "KNOWBE4_TIMEOUT",
+    "KNOWBE4_REDACT_PII",
+  ],
+  configLocations: ["~/.knowbe4-inspector/config.yaml", "Explicit path from config_file or KNOWBE4_CONFIG_FILE"],
+  variants: [
+    "Regions us (the default), eu, ca, uk, and de, matched after trimming and lowercasing; any other region is rejected",
+    "Each region's Reporting API host is https://{region}.api.knowbe4.com; its PhishER GraphQL URL is https://training.knowbe4.com/graphql for us and https://{region}.knowbe4.com/graphql otherwise",
+    "An explicit base_url or phisher_graphql_url replaces the region's URL, with any user information, query, fragment, and trailing slashes removed",
+  ],
+  configFields: ["api_token", "region", "base_url", "phisher_api_token", "phisher_graphql_url", "timeout_seconds", "redact_pii"],
+} as const satisfies ResolverAuthenticationContract;
