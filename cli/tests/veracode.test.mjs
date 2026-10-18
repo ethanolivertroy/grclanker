@@ -25,8 +25,12 @@ import {
   scrubDataText,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/veracode.js";
+import { VERACODE_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
+import { VERACODE_SPEC } from "../dist/extensions/grc-tools/veracode.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
+import { assertRequestConformance, recordFetchRequests, sweepCheckCompleteness } from "./helpers/spec-conformance.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const API_ID = "dbb6f2a2ed0b6890bbd32e949f72c8c8";
@@ -2990,4 +2994,48 @@ test("class 10: a single object carrying a documented member is kept whatever el
   const [, , , , accessControls] = await runVeracodeAssessments(client);
   assert.deepEqual(accessControls.rawData.self, fixture.self, "the record is kept whole");
   assert.equal(accessControls.rawData.api_credentials_by_user["u-2"].api_id, "abc123", "the credential record is projected, not marked");
+});
+
+portableContractTest("the auth resolver contract names exactly the environment the resolver reads, and each variable reaches the resolved configuration", () => {
+  assert.deepEqual(VERACODE_SPEC.authentication.environmentVariables, VERACODE_AUTH_RESOLVER.environment);
+  assert.deepEqual(VERACODE_SPEC.authentication.configLocations, VERACODE_AUTH_RESOLVER.configLocations);
+  assert.deepEqual(VERACODE_SPEC.authentication.configFields, VERACODE_AUTH_RESOLVER.configFields);
+
+  const home = createTempBase("grclanker-veracode-resolver-contract-");
+  mkdirSync(join(home, ".veracode"));
+  writeFileSync(join(home, ".veracode", "credentials"), [
+    "[default]",
+    "veracode_api_key_id = <default-key-id>",
+    "veracode_api_key_secret = 0a1b2c3d",
+    "[audit]",
+    "veracode_api_key_id = <audit-key-id>",
+    "veracode_api_key_secret = 4e5f6a7b",
+  ].join("\n"));
+  const otherFile = join(home, "other-credentials");
+  writeFileSync(otherFile, "[default]\nveracode_api_key_id = <other-file-key-id>\nveracode_api_key_secret = 9a8b7c6d\n");
+  const basic = { VERACODE_API_KEY_ID: "<env-key-id>", VERACODE_API_KEY_SECRET: "8c9d0e1f" };
+
+  const accessed = new Set();
+  const tracked = new Proxy({ ...basic }, {
+    get(target, property) {
+      if (typeof property === "string") accessed.add(property);
+      return target[property];
+    },
+  });
+  resolveVeracodeConfiguration({}, tracked, { homeDir: home });
+  assert.deepEqual([...accessed].sort(), [...VERACODE_AUTH_RESOLVER.environment].sort());
+
+  const reached = {
+    VERACODE_API_PROFILE: [{ VERACODE_API_PROFILE: "audit" }, (config) => config.profile === "audit" && config.apiKeyId === "<audit-key-id>" && config.apiKeySecret === "4e5f6a7b"],
+    VERACODE_API_CREDENTIALS_FILE: [{ VERACODE_API_CREDENTIALS_FILE: otherFile }, (config) => config.apiKeyId === "<other-file-key-id>" && config.apiKeySecret === "9a8b7c6d"],
+    VERACODE_API_KEY_ID: [{ VERACODE_API_KEY_ID: "<env-key-id>" }, (config) => config.apiKeyId === "<env-key-id>" && config.apiKeySecret === "0a1b2c3d"],
+    VERACODE_API_KEY_SECRET: [{ VERACODE_API_KEY_SECRET: "8c9d0e1f" }, (config) => config.apiKeySecret === "8c9d0e1f" && config.apiKeyId === "<default-key-id>"],
+    VERACODE_REGION: [{ ...basic, VERACODE_REGION: "eu" }, (config) => config.region === "eu" && config.baseUrl === "https://api.veracode.eu"],
+    VERACODE_API_BASE_URL: [{ ...basic, VERACODE_API_BASE_URL: "https://veracode.example.internal" }, (config) => config.baseUrl === "https://veracode.example.internal"],
+    VERACODE_TIMEOUT: [{ ...basic, VERACODE_TIMEOUT: "45" }, (config) => config.timeoutMs === 45_000],
+  };
+  assert.deepEqual(Object.keys(reached).sort(), [...VERACODE_AUTH_RESOLVER.environment].sort());
+  for (const [name, [environment, applied]] of Object.entries(reached)) {
+    assert.ok(applied(resolveVeracodeConfiguration({}, environment, { homeDir: home })), `${name} reaches the resolved configuration`);
+  }
 });
