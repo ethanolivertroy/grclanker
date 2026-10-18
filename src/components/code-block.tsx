@@ -9,7 +9,9 @@ export function CodeBlock({ children, ...props }: ComponentProps<'pre'>) {
   const { copied, copy } = useCopy('Code copied to clipboard', 1800);
 
   return (
-    <pre ref={ref} {...props}>
+    // Docs code wraps instead of scrolling, so the tabindex Shiki gives every
+    // block would only add a Tab stop before the Copy button.
+    <pre ref={ref} {...props} tabIndex={undefined}>
       {children}
       <button
         type="button"
