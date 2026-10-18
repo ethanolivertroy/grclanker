@@ -9,9 +9,9 @@ const brandFrames = [
 ];
 
 const railImages = [
-  '/hero/assembly.webp',
-  '/hero/holographic.webp',
-  '/about-clanker.webp',
+  '/hero/rail/assembly.webp',
+  '/hero/rail/holographic.webp',
+  '/hero/rail/about.webp',
   '/mid-break.webp',
   '/footer/closeup.webp',
   '/footer/skyline.webp',
