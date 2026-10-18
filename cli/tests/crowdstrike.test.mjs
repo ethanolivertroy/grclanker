@@ -1321,6 +1321,19 @@ test("verdict safety rule 5: partial inventories never pass and report seen vers
   assert.equal(sensorCoverage.summary.reported_total_hosts, 43);
 });
 
+test("known gap: a user the details lookup omits drops out of CS-16 and CS-17 without making the user inventory partial", async () => {
+  assert.ok(CROWDSTRIKE_SPEC.knownGaps.some((gap) => /user details lookup.*left out of CS-16 and CS-17 without marking the user inventory partial/.test(gap)));
+  const result = await assessCrowdstrikeAccessGovernance(createFakeClient({
+    listUserUuids: async () => [...passingUsers().users.map((user) => user.uuid), "u-deleted"],
+  }));
+  for (const id of ["CS-16", "CS-17"]) {
+    assert.equal(findingById(result, id).status, "pass", findingById(result, id).summary);
+    assert.equal(findingById(result, id).evidence.partial_inventory, undefined);
+  }
+  assert.equal(result.summary.users_reviewed, 2);
+  assert.equal(result.summary.reported_total_users, 3);
+});
+
 test("verdict safety rule 6: disabled, unassigned, or incomplete enabling flags never support pass", async () => {
   const disabledOnly = await assessCrowdstrikePreventionPolicies(createFakeClient({
     listPreventionPolicies: async () => [preventionPolicy({ enabled: false })],
