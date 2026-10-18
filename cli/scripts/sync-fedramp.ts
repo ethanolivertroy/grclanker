@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildFedrampDocsSnapshot } from "../extensions/grc-tools/fedramp-docs.js";
-import { inspectFedrampOfficialSources, loadFedrampCatalog } from "../extensions/grc-tools/fedramp-source.js";
+import { fetchFedrampDocsSources } from "../extensions/grc-tools/fedramp-source.js";
 
 async function writeGeneratedFiles(
   baseDir: string,
@@ -21,26 +21,24 @@ async function main() {
   const repoRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
   const targetDir = resolve(repoRoot, "src/content/docs/docs/fedramp");
 
-  const [loaded, sourceStatus] = await Promise.all([
-    loadFedrampCatalog({ refresh: true }),
-    inspectFedrampOfficialSources({ refresh: true }),
-  ]);
-
-  const files = buildFedrampDocsSnapshot(loaded.catalog, {
-    primary: sourceStatus.primary,
-    secondary: sourceStatus.secondary,
-  });
+  const { catalog, primary, secondary } = await fetchFedrampDocsSources();
+  const files = buildFedrampDocsSnapshot(catalog, { primary, secondary });
   await writeGeneratedFiles(targetDir, files);
 
   process.stdout.write(
     [
       `Wrote ${files.length} generated FedRAMP docs file(s) to ${targetDir}.`,
-      `Source: ${sourceStatus.primary.repoUrl}/${sourceStatus.primary.path}`,
-      `Consolidated Rules version: ${sourceStatus.primary.version}`,
-      `Upstream last_updated: ${sourceStatus.primary.upstreamLastUpdated}`,
-      `Narrative source state: ${sourceStatus.secondary.state}`,
+      `Source: ${primary.repoUrl}/${primary.path}`,
+      `Consolidated Rules version: ${primary.version}`,
+      `Upstream last_updated: ${primary.upstreamLastUpdated}`,
+      `Narrative source state: ${secondary.state}`,
     ].join("\n") + "\n",
   );
 }
 
-await main();
+try {
+  await main();
+} catch (error) {
+  process.stderr.write(`FedRAMP sync failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+}
