@@ -4359,7 +4359,7 @@ portableContractTest("the auth resolver contract names exactly the environment t
   writeFileSync(emptyConfigFile, "");
   const configFile = join(directory, "file.qcrc");
   writeFileSync(configFile, "[info]\nusername = file_user\npassword = file_pass\n");
-  const basic = { QUALYS_CONFIG_FILE: emptyConfigFile, QUALYS_USERNAME: "env_user", QUALYS_PASSWORD: "env-pass" };
+  const basic = { QUALYS_CONFIG_FILE: emptyConfigFile, QUALYS_USERNAME: "env_user", QUALYS_PASSWORD: "<env-password>" };
 
   const accessed = new Set();
   const tracked = new Proxy({ ...basic }, {
@@ -4374,8 +4374,8 @@ portableContractTest("the auth resolver contract names exactly the environment t
   const reached = {
     QUALYS_CONFIG_FILE: [{ QUALYS_CONFIG_FILE: configFile }, (config) => config.username === "file_user" && config.password === "file_pass"],
     QUALYS_USERNAME: [basic, (config) => config.username === "env_user"],
-    QUALYS_USER: [{ QUALYS_CONFIG_FILE: emptyConfigFile, QUALYS_USER: "env_alias", QUALYS_PASSWORD: "env-pass" }, (config) => config.username === "env_alias"],
-    QUALYS_PASSWORD: [basic, (config) => config.password === "env-pass"],
+    QUALYS_USER: [{ QUALYS_CONFIG_FILE: emptyConfigFile, QUALYS_USER: "env_alias", QUALYS_PASSWORD: "<env-password>" }, (config) => config.username === "env_alias"],
+    QUALYS_PASSWORD: [basic, (config) => config.password === "<env-password>"],
     QUALYS_TOKEN: [{ QUALYS_CONFIG_FILE: emptyConfigFile, QUALYS_TOKEN: "env-token" }, (config) => config.authMode === "bearer" && config.token === "env-token"],
     QUALYS_ACCESS_TOKEN: [{ QUALYS_CONFIG_FILE: emptyConfigFile, QUALYS_ACCESS_TOKEN: "env-access-token" }, (config) => config.authMode === "bearer" && config.token === "env-access-token"],
     QUALYS_USE_OAUTH: [{ ...basic, QUALYS_USE_OAUTH: "true" }, (config) => config.authMode === "oauth"],
