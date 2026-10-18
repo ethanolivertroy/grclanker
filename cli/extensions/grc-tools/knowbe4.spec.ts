@@ -1558,7 +1558,7 @@ export const KNOWBE4_SPEC = buildBatchIntegrationSpec({
   },
   runtimeBehavior: [],
   knownGaps: [
-    "A Reporting API page counts only its entries that are JSON objects, so a full page of 500 holding an entry that is not a JSON object ends the walk as a last page and leaves the list complete; the records on later pages are never read, and any check can pass on the records that were.",
+    "A Reporting API page counts only its entries that are JSON objects, so a full page of 500 holding an entry that is not a JSON object ends the walk as a last page and leaves the list complete; the records on later pages are never read, and a check built on that list can pass on the records that were.",
   ],
   sensitiveFields: ["api_token", "phisher_api_token", "Authorization", ...PII_HASH_FIELDS, ...PII_MASK_FIELDS],
   credentialFormats: [
