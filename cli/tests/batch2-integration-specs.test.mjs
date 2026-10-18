@@ -230,8 +230,8 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
     "prisma-policies", "panos-system-info", "panos-policy-config",
   ]);
   assert.match(check(PALOALTO_SPEC, "PA-19").completeness.evidence_complete.semantics, /unconfigured product is omitted/);
-  assert.match(check(ZSCALER_SPEC, "ZS-04").completeness.evidence_complete.semantics, /zia-ssl-inspection-rules: truncation leaves evidence_complete true/);
-  assert.match(check(ZSCALER_SPEC, "ZS-25").completeness.evidence_complete.semantics, /zia-security-allowlist: truncation leaves evidence_complete true; an error, 403 denial, or not-collected read makes evidence_complete false/);
+  assert.match(check(ZSCALER_SPEC, "ZS-04").completeness.evidence_complete.semantics, /zia-ssl-inspection-rules: truncation makes evidence_complete false/);
+  assert.match(check(ZSCALER_SPEC, "ZS-25").completeness.evidence_complete.semantics, /zia-security-allowlist: truncation makes evidence_complete false; an error, 403 denial, or not-collected read makes evidence_complete false/);
   assert.match(check(ZSCALER_SPEC, "ZS-07").criteria.pass, /Remain manual when the administrator or role inventory is empty/);
 });
 
