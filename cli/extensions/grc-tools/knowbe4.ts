@@ -4788,6 +4788,7 @@ function assessmentTool(
 }
 
 export function registerKnowbe4Tools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, KNOWBE4_SPEC);
   pi.registerTool({
     name: "knowbe4_check_access",
     label: "Check KnowBe4 audit access",
