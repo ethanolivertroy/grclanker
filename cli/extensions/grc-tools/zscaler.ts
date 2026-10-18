@@ -1286,6 +1286,19 @@ function joinedPartialSuffix(entries: Array<[CollectedDataset<unknown>, string]>
   return entries.map(([dataset, label]) => partialSuffix(dataset, label, capped)).join("");
 }
 
+function notePartialInventories(item: ZscalerFinding, entries: Array<[CollectedDataset<unknown>, string]>): ZscalerFinding {
+  const note = joinedPartialSuffix(entries, false);
+  if (!note) return item;
+  const facts = (item as ZscalerFindingWithFacts)[ZSCALER_DECISION_FACTS];
+  const result: ZscalerFindingWithFacts = {
+    ...item,
+    summary: `${item.summary}${note}`,
+    evidence: { ...(item.evidence ?? {}), partial_inventory: true },
+  };
+  if (facts !== undefined) Object.defineProperty(result, ZSCALER_DECISION_FACTS, { value: facts });
+  return result;
+}
+
 function datasetsComplete(...datasets: Array<CollectedDataset<unknown>>): boolean {
   return datasets.every((dataset) => dataset.truncated !== true);
 }
@@ -1437,12 +1450,17 @@ export function assessZiaAccessControlData(
   }
 
   const rbacEvidence = "Export Administration > Role Management and Administrator Management, confirm each administrator maps to a least-privilege role, and list Cloud Service API keys with their owners (the API key inventory is not part of the verified read surface).";
+  const rbacSources: Array<[CollectedDataset<unknown>, string]> = [
+    [data.adminUsers, "administrator"],
+    [data.adminRoles, "administrator role"],
+    [data.passwordExpiry, "password expiry"],
+  ];
   if (data.adminUsers.error) {
-    verdicts.push(unreadableFinding(7, "GET /adminUsers", data.adminUsers, rbacEvidence));
+    verdicts.push(notePartialInventories(unreadableFinding(7, "GET /adminUsers", data.adminUsers, rbacEvidence), rbacSources));
   } else if (data.adminRoles.error) {
-    verdicts.push(unreadableFinding(7, "GET /adminRoles/lite", data.adminRoles, rbacEvidence));
+    verdicts.push(notePartialInventories(unreadableFinding(7, "GET /adminRoles/lite", data.adminRoles, rbacEvidence), rbacSources));
   } else if (admins.length === 0 || data.adminRoles.data.length === 0) {
-    verdicts.push(finding(7, "manual", `Empty inventory: ${admins.length} administrators and ${data.adminRoles.data.length} roles were returned, so the role assignment picture is incomplete. ${rbacEvidence}`, { admin_count: admins.length, role_count: data.adminRoles.data.length }, rbacEvidence, zscalerManualFacts(admins.length + data.adminRoles.data.length)));
+    verdicts.push(notePartialInventories(finding(7, "manual", `Empty inventory: ${admins.length} administrators and ${data.adminRoles.data.length} roles were returned, so the role assignment picture is incomplete. ${rbacEvidence}`, { admin_count: admins.length, role_count: data.adminRoles.data.length }, rbacEvidence, zscalerManualFacts(admins.length + data.adminRoles.data.length)), rbacSources));
   } else {
     const superRoleIds = new Set(data.adminRoles.data.filter(isSuperAdminRole).map((role) => asString(role.id)).filter((id): id is string => Boolean(id)));
     const superAdmins = enabledAdmins.filter((admin) => {
@@ -1467,11 +1485,7 @@ export function assessZiaAccessControlData(
       status = "warn";
       summary = `Every one of the ${enabledAdmins.length} enabled administrators holds a Super Admin role; no least-privilege roles are in use.`;
     }
-    const rbacPartial = joinedPartialSuffix([
-      [data.adminUsers, "administrator"],
-      [data.adminRoles, "administrator role"],
-      [data.passwordExpiry, "password expiry"],
-    ]);
+    const rbacPartial = joinedPartialSuffix(rbacSources);
     verdicts.push(finding(7, capForPartial(status, data.adminUsers), summary + rbacPartial, {
       enabled_admins: enabledAdmins.length,
       disabled_admins: disabledAdmins,
@@ -1493,26 +1507,26 @@ export function assessZiaAccessControlData(
   }
 
   const auditEvidence = "Confirm in Analytics > Insights > Audit Logs that administrator actions are recorded, and document the NSS or Cloud NSS feed (Administration > Nanolog Streaming Service) that exports admin audit logs plus the SIEM retention period.";
+  const auditSources: Array<[CollectedDataset<unknown>, string]> = [
+    [data.auditLogReport, "audit log report"],
+    [data.nssFeeds, "NSS feed"],
+  ];
   if (data.auditLogReport.statusCode === 400) {
-    verdicts.push(finding(14, "manual", `Verdict unknown: GET /auditlogEntryReport returned 400 (${data.auditLogReport.error ?? "bad request"}); ${AUDIT_REPORT_STATUS_ID_NOTE}. The tenant enforces the documented statusId requirement, so audit log reachability cannot be verified through the API. ${auditEvidence}`, {
+    verdicts.push(notePartialInventories(finding(14, "manual", `Verdict unknown: GET /auditlogEntryReport returned 400 (${data.auditLogReport.error ?? "bad request"}); ${AUDIT_REPORT_STATUS_ID_NOTE}. The tenant enforces the documented statusId requirement, so audit log reachability cannot be verified through the API. ${auditEvidence}`, {
       status_code: 400,
       error: data.auditLogReport.error ?? null,
       documented_request_shape: "GET /auditlogEntryReport?statusId={export task id}",
       request_sent: "GET /auditlogEntryReport (bare, matching zscaler-sdk-go and zscaler-sdk-python)",
       nss_feeds: data.nssFeeds.error ? null : data.nssFeeds.data.length,
-    }, auditEvidence, zscalerManualFacts()));
+    }, auditEvidence, zscalerManualFacts()), auditSources));
   } else if (data.auditLogReport.error) {
-    verdicts.push(unreadableFinding(14, "GET /auditlogEntryReport", data.auditLogReport, auditEvidence));
+    verdicts.push(notePartialInventories(unreadableFinding(14, "GET /auditlogEntryReport", data.auditLogReport, auditEvidence), auditSources));
   } else {
     const feeds = data.nssFeeds.data;
     const enabledFeeds = feeds.filter((feed) => (asString(feed.feedStatus) ?? "").toUpperCase() === "ENABLED");
     const adminAuditFeeds = enabledFeeds.filter((feed) => /ADMIN_AUDIT|AUDIT/i.test(asString(feed.nssLogType) ?? ""));
-    const auditSources: Array<[CollectedDataset<unknown>, string]> = [
-      [data.auditLogReport, "audit log report"],
-      [data.nssFeeds, "NSS feed"],
-    ];
     if (data.nssFeeds.error) {
-      verdicts.push(finding(14, "manual", `The audit log report interface is reachable (GET /auditlogEntryReport status ${asString(data.auditLogReport.data.status) ?? "unknown"}), but the NSS feed inventory could not be read, so log export configuration is unverified. ${auditEvidence}`, { audit_report_status: asString(data.auditLogReport.data.status) ?? null }, auditEvidence, zscalerManualFacts(1)));
+      verdicts.push(notePartialInventories(finding(14, "manual", `The audit log report interface is reachable (GET /auditlogEntryReport status ${asString(data.auditLogReport.data.status) ?? "unknown"}), but the NSS feed inventory could not be read, so log export configuration is unverified. ${auditEvidence}`, { audit_report_status: asString(data.auditLogReport.data.status) ?? null }, auditEvidence, zscalerManualFacts(1)), auditSources));
     } else if (adminAuditFeeds.length > 0) {
       const auditPartial = joinedPartialSuffix(auditSources);
       verdicts.push(finding(14, "pass", `Admin audit logging is reachable and ${adminAuditFeeds.length} enabled NSS feed(s) export admin audit logs (${adminAuditFeeds.map(ruleLabel).join(", ")}). Retention is enforced by the receiving SIEM and must be documented separately.${auditPartial}`, {
@@ -2307,18 +2321,18 @@ function assessDlp(data: ZiaPolicyData): ZscalerFinding {
 }
 
 function dlpVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
-  if (data.webDlpRules.error) return unreadableFinding(3, "GET /webDlpRules", data.webDlpRules, evidenceNote);
-  if (data.dlpEngines.error) return unreadableFinding(3, "GET /dlpEngines", data.dlpEngines, evidenceNote);
-  const rules = data.webDlpRules.data;
-  const engines = data.dlpEngines.data;
-  const active = enabledRules(rules);
-  const blocking = active.filter((rule) => ["BLOCK", "ICAP_RESPONSE"].includes((asString(rule.action) ?? "").toUpperCase()));
-  const withEngines = blocking.filter((rule) => asArray(rule.dlpEngines).length > 0 || asBoolean(rule.withoutContentInspection) === true);
   const dlpSources: Array<[CollectedDataset<unknown>, string]> = [
     [data.webDlpRules, "web DLP rule"],
     [data.dlpEngines, "DLP engine"],
     [data.dlpDictionaries, "DLP dictionary"],
   ];
+  if (data.webDlpRules.error) return notePartialInventories(unreadableFinding(3, "GET /webDlpRules", data.webDlpRules, evidenceNote), dlpSources);
+  if (data.dlpEngines.error) return notePartialInventories(unreadableFinding(3, "GET /dlpEngines", data.dlpEngines, evidenceNote), dlpSources);
+  const rules = data.webDlpRules.data;
+  const engines = data.dlpEngines.data;
+  const active = enabledRules(rules);
+  const blocking = active.filter((rule) => ["BLOCK", "ICAP_RESPONSE"].includes((asString(rule.action) ?? "").toUpperCase()));
+  const withEngines = blocking.filter((rule) => asArray(rule.dlpEngines).length > 0 || asBoolean(rule.withoutContentInspection) === true);
   const evidence = {
     engine_count: engines.length,
     dictionary_count: data.dlpDictionaries.error ? null : data.dlpDictionaries.data.length,
@@ -2363,7 +2377,12 @@ function assessSslInspection(data: ZiaPolicyData, maxExemptions: number): Zscale
 
 function sslInspectionVerdict(data: ZiaPolicyData, maxExemptions: number, evidenceNote: string): ZscalerFinding {
   const rules = data.sslInspectionRules;
-  if (rules.error) return unreadableFinding(4, "GET /sslInspectionRules", rules, evidenceNote);
+  const sslSources: Array<[CollectedDataset<unknown>, string]> = [
+    [rules, "SSL inspection rule"],
+    [data.sslExemptedUrls, "SSL exemption"],
+    [data.locations, "location"],
+  ];
+  if (rules.error) return notePartialInventories(unreadableFinding(4, "GET /sslInspectionRules", rules, evidenceNote), sslSources);
   const exempted = data.sslExemptedUrls.error ? undefined : asStringList(data.sslExemptedUrls.data.urls);
   const active = enabledRules(rules.data);
   const actionType = (rule: JsonRecord): string => (asString(asObject(rule.action)?.type) ?? asString(rule.action) ?? "").toUpperCase();
@@ -2382,11 +2401,6 @@ function sslInspectionVerdict(data: ZiaPolicyData, maxExemptions: number, eviden
     partial_inventory: !datasetsComplete(rules, data.sslExemptedUrls, data.locations),
     rules: ruleSummaries(rules.data),
   };
-  const sslSources: Array<[CollectedDataset<unknown>, string]> = [
-    [rules, "SSL inspection rule"],
-    [data.sslExemptedUrls, "SSL exemption"],
-    [data.locations, "location"],
-  ];
   const sslNote = (capped: boolean) => joinedPartialSuffix(sslSources, capped);
   const facts = {
     evidence_readable: true,
@@ -2427,7 +2441,11 @@ function assessSandbox(data: ZiaPolicyData): ZscalerFinding {
 
 function sandboxVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
   const rules = data.sandboxRules;
-  if (rules.error) return unreadableFinding(5, "GET /sandboxRules", rules, `${evidenceNote} A 4xx here can also mean Cloud Sandbox is not licensed.`);
+  const sandboxSources: Array<[CollectedDataset<unknown>, string]> = [
+    [rules, "sandbox rule"],
+    [data.sandboxSettings, "sandbox settings"],
+  ];
+  if (rules.error) return notePartialInventories(unreadableFinding(5, "GET /sandboxRules", rules, `${evidenceNote} A 4xx here can also mean Cloud Sandbox is not licensed.`), sandboxSources);
   const active = enabledRules(rules.data);
   const blocking = active.filter((rule) => (asString(rule.baRuleAction) ?? "").toUpperCase() === "BLOCK");
   const quarantineFirst = active.filter((rule) => asBoolean(rule.firstTimeEnable) === true && (asString(rule.firstTimeOperation) ?? "").toUpperCase() === "QUARANTINE");
@@ -2450,10 +2468,6 @@ function sandboxVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFindi
     rules.data.length > 0 && active.length > 0 && blocking.length === 0 ? 1 : 0,
     { complete: datasetsComplete(rules, data.sandboxSettings) },
   );
-  const sandboxSources: Array<[CollectedDataset<unknown>, string]> = [
-    [rules, "sandbox rule"],
-    [data.sandboxSettings, "sandbox settings"],
-  ];
   const sandboxNote = (capped: boolean) => joinedPartialSuffix(sandboxSources, capped);
   if (rules.data.length === 0) {
     return finding(5, "manual", `Not configured: zero sandbox rules were returned, which means Cloud Sandbox is either unlicensed or unconfigured; the control cannot pass until a rule inventory exists.${sandboxNote(false)}`, evidence, evidenceNote, facts);
@@ -2470,7 +2484,7 @@ function sandboxVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFindi
 function assessBandwidth(data: ZiaPolicyData): ZscalerFinding {
   const evidenceNote = "Confirm whether Bandwidth Control is licensed and, if so, export Policy > Bandwidth Control showing enabled rules for critical application classes.";
   const rules = data.bandwidthRules;
-  if (rules.error) return unreadableFinding(16, "GET /bandwidthControlRules", rules, evidenceNote);
+  if (rules.error) return notePartialInventories(unreadableFinding(16, "GET /bandwidthControlRules", rules, evidenceNote), [[rules, "bandwidth control rule"]]);
   const active = enabledRules(rules.data);
   const evidence = {
     rule_count: rules.data.length,
@@ -2492,8 +2506,12 @@ function assessBandwidth(data: ZiaPolicyData): ZscalerFinding {
 function assessBrowserIsolation(data: ZiaPolicyData): ZscalerFinding {
   const evidenceNote = "Confirm the Cloud Browser Isolation subscription and export the URL filtering rules that use the Isolate action together with the isolation profiles under Administration > Isolation Profile.";
   const profiles = data.isolationProfiles;
-  if (profiles.error) return unreadableFinding(17, "GET /browserIsolation/profiles", profiles, `${evidenceNote} A 4xx here can also mean Cloud Browser Isolation is not licensed.`);
-  if (data.urlFilteringRules.error) return unreadableFinding(17, "GET /urlFilteringRules", data.urlFilteringRules, evidenceNote);
+  const isolationSources: Array<[CollectedDataset<unknown>, string]> = [
+    [profiles, "isolation profile"],
+    [data.urlFilteringRules, "URL filtering rule"],
+  ];
+  if (profiles.error) return notePartialInventories(unreadableFinding(17, "GET /browserIsolation/profiles", profiles, `${evidenceNote} A 4xx here can also mean Cloud Browser Isolation is not licensed.`), isolationSources);
+  if (data.urlFilteringRules.error) return notePartialInventories(unreadableFinding(17, "GET /urlFilteringRules", data.urlFilteringRules, evidenceNote), isolationSources);
   const urlRules = data.urlFilteringRules;
   const isolateRules = enabledRules(urlRules.data).filter((rule) => (asString(rule.action) ?? "").toUpperCase() === "ISOLATE");
   const evidence = {
@@ -2509,10 +2527,6 @@ function assessBrowserIsolation(data: ZiaPolicyData): ZscalerFinding {
     profiles.data.length > 0 && isolateRules.length === 0 ? 1 : 0,
     { complete: datasetsComplete(profiles, urlRules) },
   );
-  const isolationSources: Array<[CollectedDataset<unknown>, string]> = [
-    [profiles, "isolation profile"],
-    [urlRules, "URL filtering rule"],
-  ];
   const isolationNote = (capped: boolean) => joinedPartialSuffix(isolationSources, capped);
   if (profiles.data.length === 0) {
     return finding(17, "manual", `Not configured: zero browser isolation profiles exist, so Cloud Browser Isolation is unlicensed or unconfigured.${isolationNote(false)}`, evidence, evidenceNote, facts);
@@ -2633,7 +2647,11 @@ function assessDnsSecurity(data: ZiaPolicyData): ZscalerFinding {
 
 function dnsSecurityVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
   const rules = data.dnsRules;
-  if (rules.error) return unreadableFinding(20, "GET /firewallDnsRules", rules, evidenceNote);
+  const dnsSources: Array<[CollectedDataset<unknown>, string]> = [
+    [rules, "DNS rule"],
+    [data.advancedThreatSettings, "advanced threat protection settings"],
+  ];
+  if (rules.error) return notePartialInventories(unreadableFinding(20, "GET /firewallDnsRules", rules, evidenceNote), dnsSources);
   const active = enabledRules(rules.data);
   const protective = active.filter((rule) => asBoolean(rule.defaultRule) !== true && /^(BLOCK|REDIR)/i.test(asString(rule.action) ?? ""));
   const defaultRule = rules.data.find((rule) => asBoolean(rule.defaultRule) === true);
@@ -2653,10 +2671,6 @@ function dnsSecurityVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerF
     dgaBlocked === true ? 0 : 1,
     { complete: datasetsComplete(rules, data.advancedThreatSettings) },
   );
-  const dnsSources: Array<[CollectedDataset<unknown>, string]> = [
-    [rules, "DNS rule"],
-    [data.advancedThreatSettings, "advanced threat protection settings"],
-  ];
   const dnsNote = (capped: boolean) => joinedPartialSuffix(dnsSources, capped);
   if (rules.data.length === 0) {
     return finding(20, "fail", `Empty inventory: zero DNS control rules were returned, so DNS traffic is not filtered by the cloud firewall.${dnsNote(false)}`, evidence, evidenceNote, facts);
@@ -2680,8 +2694,15 @@ function assessSecurityBaseline(data: ZiaPolicyData): ZscalerFinding {
 }
 
 function securityBaselineVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
-  if (data.advancedThreatSettings.error) return unreadableFinding(25, "GET /cyberThreatProtection/advancedThreatSettings", data.advancedThreatSettings, evidenceNote);
-  if (data.malwareSettings.error) return unreadableFinding(25, "GET /cyberThreatProtection/malwareSettings", data.malwareSettings, evidenceNote);
+  const baselineSources: Array<[CollectedDataset<unknown>, string]> = [
+    [data.advancedThreatSettings, "advanced threat protection settings"],
+    [data.malwareSettings, "malware settings"],
+    [data.malwarePolicy, "malware policy"],
+    [data.securityAllowlist, "security allowlist"],
+    [data.securityDenylist, "security denylist"],
+  ];
+  if (data.advancedThreatSettings.error) return notePartialInventories(unreadableFinding(25, "GET /cyberThreatProtection/advancedThreatSettings", data.advancedThreatSettings, evidenceNote), baselineSources);
+  if (data.malwareSettings.error) return notePartialInventories(unreadableFinding(25, "GET /cyberThreatProtection/malwareSettings", data.malwareSettings, evidenceNote), baselineSources);
   const atp = data.advancedThreatSettings.data;
   const malware = data.malwareSettings.data;
   const missingAtp = REQUIRED_ATP_FLAGS.filter((flag) => asBoolean(atp[flag]) !== true);
@@ -2721,13 +2742,6 @@ function securityBaselineVerdict(data: ZiaPolicyData, evidenceNote: string): Zsc
     block_unscannable_files: blockUnscannable,
     allowlist_url_count: allowlist?.length ?? null,
   };
-  const baselineSources: Array<[CollectedDataset<unknown>, string]> = [
-    [data.advancedThreatSettings, "advanced threat protection settings"],
-    [data.malwareSettings, "malware settings"],
-    [data.malwarePolicy, "malware policy"],
-    [data.securityAllowlist, "security allowlist"],
-    [data.securityDenylist, "security denylist"],
-  ];
   const baselineNote = (capped: boolean) => joinedPartialSuffix(baselineSources, capped);
   if (Object.keys(atp).length === 0 || Object.keys(malware).length === 0) {
     return finding(25, "fail", `Empty response: the ATP or malware settings object contained no flags, so none of the required protections can be confirmed enabled.${baselineNote(false)}`, evidence, evidenceNote, facts);
