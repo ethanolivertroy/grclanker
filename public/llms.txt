@@ -9,7 +9,6 @@ Use a spec to inspect, extend, or reimplement an integration. Specs document des
 All specs are available as raw markdown. Point your agent at any URL below.
 
 - [Ansible AAP Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/ansible-sec-inspector.spec.md): Community spec for auditing Ansible Automation Platform security posture
-- [CrowdStrike Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/crowdstrike-sec-inspector.spec.md): Falcon EDR prevention policies, sensor deployment, device control
 - [Datadog Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/datadog-sec-inspector.spec.md): RBAC, API key management, log pipelines, security monitoring
 - [Elastic Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/elastic-sec-inspector.spec.md): Authentication realms, TLS configs, RBAC, field/document-level security
 - [GitHub Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/github-sec-inspector.spec.md): Enterprise Cloud SSO, branch protection, code security, Actions workflows
@@ -32,6 +31,7 @@ All specs are available as raw markdown. Point your agent at any URL below.
 - [Azure Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/azure-sec-inspector.spec.md): Portable contract for the shipped Microsoft Entra ID, Microsoft Graph, and Azure Resource Manager security assessments.
 - [Box Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/box-sec-inspector.spec.md): Portable contract for the shipped Box identity, sharing, governance, Shield, and monitoring assessments.
 - [Cloudflare Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/cloudflare-sec-inspector.spec.md): Portable contract for the shipped Cloudflare identity, zone-security, and traffic-control assessments.
+- [CrowdStrike Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/crowdstrike-sec-inspector.spec.md): Portable contract for the shipped CrowdStrike Falcon prevention policy, response readiness, device control and firewall, sensor coverage, and access governance assessments over the CrowdStrike Falcon API.
 - [Duo Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/duo-sec-inspector.spec.md): Portable contract for the shipped Duo authentication, administrator, protected-application, and monitoring assessments.
 - [GCP Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/gcp-sec-inspector.spec.md): Portable contract for the shipped Google Cloud identity, logging, organization, data-protection, and network assessments.
 - [Google Workspace Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/gws-inspector-go.spec.md): Portable contract for the shipped Google Workspace tenant inspector, distinct from the gws operator bridge.

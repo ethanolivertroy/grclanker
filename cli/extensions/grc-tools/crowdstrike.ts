@@ -9,6 +9,7 @@
  * modules, undated records, and partial (truncated or sampled) reads never
  * produce a pass. Each of those conditions is surfaced in the finding.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   createWriteStream,
   existsSync,
@@ -22,6 +23,14 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { CROWDSTRIKE_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import {
+  ALERT_DEVICE_SNAPSHOT_FIELDS,
+  ALERT_SNAPSHOT_FIELDS,
+  CROWDSTRIKE_SPEC,
+  RTR_SESSION_SNAPSHOT_FIELDS,
+} from "./crowdstrike.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -345,6 +354,11 @@ export const CROWDSTRIKE_CONTROLS: ReadonlyArray<ControlDefinition> = [
 ];
 
 const CONTROL_BY_ID = new Map(CROWDSTRIKE_CONTROLS.map((definition) => [definition.id, definition]));
+
+hydrateBatchFrameworkMappings(CROWDSTRIKE_SPEC, Object.fromEntries(CROWDSTRIKE_CONTROLS.map((definition) => [
+  definition.id,
+  definition.frameworks,
+])));
 
 export interface CrowdstrikeResolvedConfig {
   clientId: string;
@@ -774,6 +788,14 @@ function unlicensedFinding(id: ControlId, module: string, error: string, console
   );
 }
 
+const CROWDSTRIKE_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordCrowdstrikeDecisionFacts(id: ControlId, facts: Readonly<Record<string, unknown>>): void {
+  const store = CROWDSTRIKE_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside a CrowdStrike assessment`);
+  store.set(id, { ...store.get(id), ...facts });
+}
+
 /**
  * The single point where a thrown error becomes a recorded string (dataset errors, access-check
  * surfaces, role-lookup errors, errors arrays, _errors.log); it re-applies the redaction pass so a
@@ -1142,6 +1164,7 @@ export function resolveCrowdstrikeConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   homeDir: string = homedir(),
 ): CrowdstrikeResolvedConfig {
+  env = readResolverEnvironment(CROWDSTRIKE_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const explicitConfigPath = asString(input.config_file) ?? asString(env.CS_CONFIG_FILE);
   const configPath = explicitConfigPath ?? join(homeDir, ".crowdstrike", "config.json");
@@ -2125,6 +2148,57 @@ function evaluateOnWriteDetection(policies: JsonRecord[]): CrowdstrikeFinding {
   );
 }
 
+const PREVENTION_CONTROLS: ControlId[] = ["CS-01", "CS-02", "CS-03", "CS-04", "CS-05"];
+
+function recordPreventionFacts(dataset: CollectedDataset<CrowdstrikePage<JsonRecord>>): void {
+  if (dataset.error) {
+    for (const id of PREVENTION_CONTROLS) recordCrowdstrikeDecisionFacts(id, { prevention_policies_readable: false });
+    return;
+  }
+  const applied = assignedPolicies(dataset.data.items);
+  const complete = !dataset.data.truncated;
+  const base = { prevention_policies_readable: true, prevention_policies_complete: complete, assigned_prevention_policy_count: applied.length };
+  const settings = applied.map((policy) => flattenPolicySettings(policy, "prevention_settings"));
+  const carrying = (ids: readonly string[]) => settings.filter((entry) => ids.some((id) => entry.has(id))).length;
+  const disabling = (ids: readonly string[]) => settings.filter((entry) => ids.some((id) => entry.has(id) && toggleState(entry, id) !== true)).length;
+  const ranked = settings.map((entry) => PRIMARY_ML_SLIDERS
+    .flatMap((id) => {
+      const levels = sliderLevels(entry, id);
+      return levels ? [sliderRank(levels.detection), sliderRank(levels.prevention)] : [undefined];
+    })
+    .filter((rank): rank is number => rank !== undefined));
+  const onWrite = (id: string) => settings.map((entry) => toggleState(entry, id));
+
+  recordCrowdstrikeDecisionFacts("CS-01", {
+    ...base,
+    assigned_policy_min_ml_ranks: ranked.filter((ranks) => ranks.length > 0).map((ranks) => Math.min(...ranks)),
+    assigned_policies_with_unranked_sliders: ranked.filter((ranks) => ranks.length < PRIMARY_ML_SLIDERS.length * 2).length,
+    ...(complete ? { platforms_without_assigned_policy_count: missingPlatforms(applied).length } : {}),
+  });
+  recordCrowdstrikeDecisionFacts("CS-02", {
+    ...base,
+    exploit_mitigation_policy_count: carrying([...CORE_EXPLOIT_MITIGATIONS, ...EXTENDED_EXPLOIT_MITIGATIONS]),
+    policies_with_core_mitigation_disabled: disabling(CORE_EXPLOIT_MITIGATIONS),
+    policies_with_extended_mitigation_disabled: disabling(EXTENDED_EXPLOIT_MITIGATIONS),
+  });
+  recordCrowdstrikeDecisionFacts("CS-03", {
+    ...base,
+    script_control_policy_count: carrying(SCRIPT_CONTROL_SETTINGS),
+    policies_with_script_control_disabled: disabling(SCRIPT_CONTROL_SETTINGS),
+  });
+  recordCrowdstrikeDecisionFacts("CS-04", {
+    ...base,
+    policies_with_tamper_protection_disabled: disabling([TAMPER_PROTECTION_SETTING]),
+    policies_without_tamper_protection_setting: settings.length - carrying([TAMPER_PROTECTION_SETTING]),
+  });
+  recordCrowdstrikeDecisionFacts("CS-05", {
+    ...base,
+    policies_with_detect_on_write_disabled: onWrite(ON_WRITE_DETECT_SETTING).filter((state) => state === false).length,
+    policies_with_detect_on_write_unknown: onWrite(ON_WRITE_DETECT_SETTING).filter((state) => state === undefined).length,
+    policies_without_quarantine_on_write: onWrite(ON_WRITE_QUARANTINE_SETTING).filter((state) => state !== true).length,
+  });
+}
+
 function assessmentSummaryBase(config: CrowdstrikeResolvedConfig): JsonRecord {
   return {
     base_url: config.baseUrl,
@@ -2146,13 +2220,19 @@ const PREVENTION_CONSOLE_EVIDENCE = "export each prevention policy from Falcon c
 export async function assessCrowdstrikePreventionPolicies(
   client: Pick<CrowdstrikeApiClient, "getResolvedConfig" | "listPreventionPolicies">,
 ): Promise<CrowdstrikeAssessmentResult> {
+  return runBatchVerdictContext(CROWDSTRIKE_DECISION_CONTEXT, CROWDSTRIKE_SPEC, () => assessCrowdstrikePreventionPoliciesWithDecisionContext(client));
+}
+
+async function assessCrowdstrikePreventionPoliciesWithDecisionContext(
+  client: Pick<CrowdstrikeApiClient, "getResolvedConfig" | "listPreventionPolicies">,
+): Promise<CrowdstrikeAssessmentResult> {
   const policiesDataset = await collectDataset(() => client.listPreventionPolicies(), emptyPage<JsonRecord>(), "prevention policies", "/policy/combined/prevention/v1");
   const policies = policiesDataset.data.items;
   const partial = partialInventory(policiesDataset.data, "prevention policies");
-  const controls: ControlId[] = ["CS-01", "CS-02", "CS-03", "CS-04", "CS-05"];
+  recordPreventionFacts(policiesDataset);
 
   const findings = policiesDataset.error
-    ? controls.map((id) => unreadableFinding(id, "prevention policies", policiesDataset.error ?? "unknown error", PREVENTION_CONSOLE_EVIDENCE))
+    ? PREVENTION_CONTROLS.map((id) => unreadableFinding(id, "prevention policies", policiesDataset.error ?? "unknown error", PREVENTION_CONSOLE_EVIDENCE))
     : [
       evaluateMlDetectionLevels(policies, partial !== undefined),
       evaluateToggleControl("CS-02", policies, [...CORE_EXPLOIT_MITIGATIONS, ...EXTENDED_EXPLOIT_MITIGATIONS], [], {
@@ -2229,6 +2309,23 @@ function evaluateRtrPolicies(policies: JsonRecord[]): CrowdstrikeFinding {
   );
 }
 
+function recordResponsePolicyFacts(dataset: CollectedDataset<CrowdstrikePage<JsonRecord>>): void {
+  if (dataset.error) {
+    recordCrowdstrikeDecisionFacts("CS-06", { response_policies_readable: false });
+    return;
+  }
+  const settings = assignedPolicies(dataset.data.items).map((policy) => flattenPolicySettings(policy, "settings"));
+  const rtrEnabled = settings.filter((entry) => toggleState(entry, "RealTimeFunctionality") === true).length;
+  recordCrowdstrikeDecisionFacts("CS-06", {
+    response_policies_readable: true,
+    response_policies_complete: !dataset.data.truncated,
+    assigned_response_policy_count: settings.length,
+    rtr_enabled_policy_count: rtrEnabled,
+    policies_without_rtr: settings.length - rtrEnabled,
+    policies_with_custom_scripts: settings.filter((entry) => toggleState(entry, "CustomScripts") === true).length,
+  });
+}
+
 function sessionWindow(session: JsonRecord): { start?: number; end?: number; minutes?: number } {
   const start = parseTimestamp(session.created_at);
   const end = parseTimestamp(session.deleted_at) ?? parseTimestamp(session.updated_at);
@@ -2270,18 +2367,27 @@ function evaluateSessionLimits(
   lookbackDays: number,
 ): CrowdstrikeFinding {
   if (sessions.error) {
+    recordCrowdstrikeDecisionFacts("CS-07", { rtr_audit_sessions_readable: false });
     return unreadableFinding("CS-07", "RTR audit sessions", sessions.error, SESSION_CONSOLE_EVIDENCE);
   }
   const windows = sessions.data.items.map((session) => ({ session, window: sessionWindow(session) }));
   const undated = windows.filter((item) => item.window.start === undefined).length;
   const long = windows.filter((item) => item.window.minutes !== undefined && item.window.minutes > maxSessionMinutes);
   const concurrency = maxConcurrentSessionsPerUser(sessions.data.items);
+  const longestMinutes = Math.max(0, ...windows.map((item) => item.window.minutes ?? 0));
+  recordCrowdstrikeDecisionFacts("CS-07", {
+    rtr_audit_sessions_readable: true,
+    longest_rtr_session_minutes: longestMinutes,
+    peak_concurrent_rtr_sessions: concurrency.concurrent,
+    max_session_minutes: maxSessionMinutes,
+    max_concurrent_sessions: maxConcurrentSessions,
+  });
   const evidence: JsonRecord = {
     lookback_days: lookbackDays,
     sessions_reviewed: sessions.data.items.length,
     sessions_without_created_at: undated,
     sessions_over_limit: long.length,
-    longest_session_minutes: Math.round(Math.max(0, ...windows.map((item) => item.window.minutes ?? 0))),
+    longest_session_minutes: Math.round(longestMinutes),
     max_session_minutes: maxSessionMinutes,
     max_concurrent_sessions: maxConcurrentSessions,
     peak_concurrent_sessions: concurrency,
@@ -2331,6 +2437,7 @@ const ALERT_CONSOLE_EVIDENCE = "export critical and high detections for the revi
 
 function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecord>>, lookbackDays: number, now = Date.now()): CrowdstrikeFinding {
   if (alerts.error) {
+    recordCrowdstrikeDecisionFacts("CS-22", { alerts_readable: false });
     return unreadableFinding("CS-22", "alerts", alerts.error, ALERT_CONSOLE_EVIDENCE);
   }
   let withinSla = 0;
@@ -2363,6 +2470,13 @@ function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecor
   const openBreaches = breaches.filter((item) => item.status !== "closed").length;
   const openWithinSla = Math.max(0, dated - resolvedCount - openBreaches);
   const compliant = withinSla + openWithinSla;
+  recordCrowdstrikeDecisionFacts("CS-22", {
+    alerts_readable: true,
+    alerts_complete: !alerts.data.truncated,
+    dated_alert_count: dated,
+    undated_alert_count: undated,
+    sla_compliant_alert_count: compliant,
+  });
   const pct = percentage(compliant, dated);
   const partial = partialInventory(alerts.data, "critical/high alerts");
   // Emptiness is compliant only for a complete read; a truncated page with no dated alert visible cannot
@@ -2393,8 +2507,14 @@ const CONTAINMENT_CONSOLE_EVIDENCE = "export the contained host list from Falcon
 
 function evaluateContainment(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>>, maxContainmentHours: number, now = Date.now()): CrowdstrikeFinding {
   if (hosts.error) {
+    recordCrowdstrikeDecisionFacts("CS-23", { contained_hosts_readable: false });
     return unreadableFinding("CS-23", "contained hosts", hosts.error, CONTAINMENT_CONSOLE_EVIDENCE);
   }
+  recordCrowdstrikeDecisionFacts("CS-23", {
+    contained_hosts_readable: true,
+    contained_hosts_complete: !hosts.data.truncated,
+    contained_host_count: hosts.data.items.length,
+  });
   const contained = hosts.data.items.map((host) => {
     const modified = parseTimestamp(host.modified_timestamp);
     return {
@@ -2424,54 +2544,7 @@ function evaluateContainment(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>
   return withPartialInventory(withUndatedItems(base, undated, "contained hosts", "modified_timestamp"), [partial]);
 }
 
-const ALERT_SNAPSHOT_FIELDS = [
-  "id",
-  "composite_id",
-  "aggregate_id",
-  "cid",
-  "agent_id",
-  "product",
-  "type",
-  "scenario",
-  "objective",
-  "tactic",
-  "tactic_id",
-  "technique",
-  "technique_id",
-  "pattern_id",
-  "name",
-  "display_name",
-  "severity",
-  "severity_name",
-  "confidence",
-  "status",
-  "assigned_to_name",
-  "resolution",
-  "created_timestamp",
-  "updated_timestamp",
-  "timestamp",
-  "seconds_to_triaged",
-  "seconds_to_resolved",
-  "data_domains",
-  "tags",
-];
-const ALERT_DEVICE_SNAPSHOT_FIELDS = ["device_id", "hostname", "platform_name", "os_version", "agent_version"];
-const RTR_SESSION_SNAPSHOT_FIELDS = [
-  "id",
-  "cid",
-  "device_id",
-  "hostname",
-  "platform_name",
-  "platform_id",
-  "user_id",
-  "user_uuid",
-  "created_at",
-  "updated_at",
-  "deleted_at",
-  "duration",
-];
-
-function pickFields(record: JsonRecord, fields: string[]): JsonRecord {
+function pickFields(record: JsonRecord, fields: readonly string[]): JsonRecord {
   const output: JsonRecord = {};
   for (const field of fields) {
     if (record[field] !== undefined) output[field] = record[field];
@@ -2507,6 +2580,13 @@ export async function assessCrowdstrikeResponseReadiness(
   client: Pick<CrowdstrikeApiClient, "getResolvedConfig" | "listResponsePolicies" | "listRtrSessions" | "listAlerts" | "listHosts">,
   options: CrowdstrikeAssessmentOptions = {},
 ): Promise<CrowdstrikeAssessmentResult> {
+  return runBatchVerdictContext(CROWDSTRIKE_DECISION_CONTEXT, CROWDSTRIKE_SPEC, () => assessCrowdstrikeResponseReadinessWithDecisionContext(client, options));
+}
+
+async function assessCrowdstrikeResponseReadinessWithDecisionContext(
+  client: Pick<CrowdstrikeApiClient, "getResolvedConfig" | "listResponsePolicies" | "listRtrSessions" | "listAlerts" | "listHosts">,
+  options: CrowdstrikeAssessmentOptions,
+): Promise<CrowdstrikeAssessmentResult> {
   const lookbackDays = clampNumber(options.lookbackDays, DEFAULT_LOOKBACK_DAYS, 1, 365);
   const alertLimit = clampNumber(options.alertLimit, DEFAULT_ALERT_LIMIT, 1, 10_000);
   const hostLimit = clampNumber(options.hostLimit, DEFAULT_HOST_LIMIT, 1, 100_000);
@@ -2533,6 +2613,7 @@ export async function assessCrowdstrikeResponseReadiness(
     "contained hosts",
     "/devices/combined/devices/v1",
   );
+  recordResponsePolicyFacts(policies);
 
   const findings = [
     policies.error
@@ -2666,6 +2747,63 @@ function evaluatePeripheralRestrictions(views: DeviceControlView[], policies: Js
   );
 }
 
+function recordDeviceControlFacts(
+  views: DeviceControlView[],
+  dataset: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+  error: string | undefined,
+  maxUsbExceptions: number,
+): void {
+  if (error) {
+    for (const id of ["CS-08", "CS-09"] as const) recordCrowdstrikeDecisionFacts(id, { device_control_policies_readable: false });
+    return;
+  }
+  const applied = views.filter((view) => view.applied);
+  const blocksMassStorage = (view: DeviceControlView) => view.mass_storage_action !== undefined && view.mass_storage_action !== "FULL_ACCESS";
+  const restrictions = applied.map((view) => [
+    view.bluetooth_enforcement_mode === "MONITOR_ENFORCE" && view.bluetooth_restricted_classes > 0,
+    view.pcie_enforcement_mode === "MONITOR_ENFORCE",
+    blocksMassStorage(view),
+  ].filter(Boolean).length);
+  const base = {
+    device_control_policies_readable: true,
+    device_control_policies_complete: !dataset.data.truncated,
+    assigned_device_control_policy_count: applied.length,
+  };
+  recordCrowdstrikeDecisionFacts("CS-08", {
+    ...base,
+    policies_without_usb_blocking: applied.filter((view) => view.usb_enforcement_mode !== "MONITOR_ENFORCE" || !blocksMassStorage(view)).length,
+    most_mass_storage_exceptions: Math.max(0, ...applied.map((view) => view.mass_storage_exceptions)),
+    max_usb_exceptions: maxUsbExceptions,
+  });
+  recordCrowdstrikeDecisionFacts("CS-09", {
+    ...base,
+    policies_without_peripheral_restrictions: restrictions.filter((count) => count === 0).length,
+    policies_missing_a_peripheral_restriction: restrictions.filter((count) => count < 3).length,
+  });
+}
+
+function recordFirewallReadFacts(
+  policies: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+  containers: CollectedDataset<JsonRecord[]>,
+  ruleGroups: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+  rules: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+): void {
+  const policyFacts = policies.error ?? containers.error
+    ? { firewall_policies_readable: false }
+    : { firewall_policies_readable: true, firewall_policies_complete: !policies.data.truncated };
+  recordCrowdstrikeDecisionFacts("CS-10", {
+    ...policyFacts,
+    ...(policyFacts.firewall_policies_readable ? { assigned_firewall_policy_count: assignedPolicies(policies.data.items).length } : {}),
+    ...(ruleGroups.error
+      ? { firewall_rule_groups_readable: false }
+      : { firewall_rule_groups_readable: true, firewall_rule_groups_complete: !ruleGroups.data.truncated }),
+  });
+  recordCrowdstrikeDecisionFacts("CS-11", {
+    ...policyFacts,
+    ...(rules.error ? { firewall_rules_readable: false } : { firewall_rules_readable: true, firewall_rules_complete: !rules.data.truncated }),
+  });
+}
+
 function evaluateHostFirewall(policies: JsonRecord[], containers: JsonRecord[], ruleGroups: JsonRecord[]): CrowdstrikeFinding {
   const applied = assignedPolicies(policies);
   if (applied.length === 0) return noAssignedPolicyFinding("CS-10", "firewall", policies);
@@ -2702,6 +2840,12 @@ function evaluateHostFirewall(policies: JsonRecord[], containers: JsonRecord[], 
       host_groups: asArray(policy.groups).length,
     };
   });
+  recordCrowdstrikeDecisionFacts("CS-10", {
+    firewall_policies_without_container: perPolicy.filter((item) => !item.container_returned).length,
+    firewall_policies_not_enforcing: perPolicy.filter((item) => item.container_returned && (item.enforce !== true || item.active_rule_groups + item.unknown_rule_groups === 0)).length,
+    firewall_policies_in_test_mode: perPolicy.filter((item) => item.container_returned && item.test_mode === true).length,
+    firewall_policies_without_active_rule_group: perPolicy.filter((item) => item.container_returned && item.active_rule_groups === 0).length,
+  });
   const status = worstStatus(perPolicy.map((item) => item.status));
   const weak = perPolicy.filter((item) => item.status !== "pass");
   return finding(
@@ -2717,6 +2861,7 @@ function evaluateHostFirewall(policies: JsonRecord[], containers: JsonRecord[], 
 function evaluateDefaultDeny(policies: JsonRecord[], containers: JsonRecord[], rules: JsonRecord[]): CrowdstrikeFinding {
   const appliedIds = new Set(assignedPolicies(policies).map((policy) => asString(policy.id) ?? ""));
   const activeContainers = containers.filter((container) => appliedIds.has(asString(container.policy_id) ?? ""));
+  recordCrowdstrikeDecisionFacts("CS-11", { assigned_firewall_container_count: activeContainers.length });
   if (activeContainers.length === 0) {
     return finding("CS-11", "fail", `No firewall policy containers were returned for enabled and host-assigned firewall policies (${appliedIds.size} applied policies, ${containers.length} containers), so a default deny posture cannot be demonstrated.`, { ...policyInventory(policies), containers: containers.length, absence_claim: true });
   }
@@ -2728,6 +2873,12 @@ function evaluateDefaultDeny(policies: JsonRecord[], containers: JsonRecord[], r
   });
   const allowRules = rules.filter((rule) => asString(rule.action)?.toUpperCase() === "ALLOW" && asBoolean(rule.enabled) === true);
   const undocumentedAllows = allowRules.filter((rule) => !asString(rule.description));
+  recordCrowdstrikeDecisionFacts("CS-11", {
+    containers_without_inbound_deny: perContainer.filter((item) => item.default_inbound !== "DENY").length,
+    containers_not_enforced: perContainer.filter((item) => item.enforce !== true).length,
+    undocumented_allow_rule_count: undocumentedAllows.length,
+    firewall_rule_count: rules.length,
+  });
   const statuses = perContainer.map((item) => item.status);
   if (undocumentedAllows.length > 0) statuses.push("warn");
   if (rules.length === 0) statuses.push("warn");
@@ -2752,18 +2903,27 @@ function evaluateDefaultDeny(policies: JsonRecord[], containers: JsonRecord[], r
 const DEVICE_CONTROL_CONSOLE_EVIDENCE = "export each device control policy from Falcon console > Endpoint security > Device control policies showing USB, Bluetooth, and PCIe enforcement, class actions, exceptions, and assigned host groups.";
 const FIREWALL_CONSOLE_EVIDENCE = "export firewall policies with their default inbound and outbound actions, enforcement state, assigned rule groups, documented allow rules, and assigned host groups from Falcon console > Endpoint security > Firewall policies.";
 
+type DeviceFirewallClient = Pick<
+  CrowdstrikeApiClient,
+  | "getResolvedConfig"
+  | "listDeviceControlPolicies"
+  | "getDeviceControlPoliciesV2"
+  | "listFirewallPolicies"
+  | "getFirewallPolicyContainers"
+  | "listFirewallRuleGroups"
+  | "listFirewallRules"
+>;
+
 export async function assessCrowdstrikeDeviceFirewall(
-  client: Pick<
-    CrowdstrikeApiClient,
-    | "getResolvedConfig"
-    | "listDeviceControlPolicies"
-    | "getDeviceControlPoliciesV2"
-    | "listFirewallPolicies"
-    | "getFirewallPolicyContainers"
-    | "listFirewallRuleGroups"
-    | "listFirewallRules"
-  >,
+  client: DeviceFirewallClient,
   options: CrowdstrikeAssessmentOptions = {},
+): Promise<CrowdstrikeAssessmentResult> {
+  return runBatchVerdictContext(CROWDSTRIKE_DECISION_CONTEXT, CROWDSTRIKE_SPEC, () => assessCrowdstrikeDeviceFirewallWithDecisionContext(client, options));
+}
+
+async function assessCrowdstrikeDeviceFirewallWithDecisionContext(
+  client: DeviceFirewallClient,
+  options: CrowdstrikeAssessmentOptions,
 ): Promise<CrowdstrikeAssessmentResult> {
   const maxUsbExceptions = clampNumber(options.maxUsbExceptions, DEFAULT_MAX_USB_EXCEPTIONS, 0, 10_000);
   const ruleLimit = clampNumber(options.ruleLimit, DEFAULT_RULE_LIMIT, 1, 10_000);
@@ -2798,6 +2958,8 @@ export async function assessCrowdstrikeDeviceFirewall(
   const firewallPartial = partialInventory(firewallPolicies.data, "firewall policies");
   const ruleGroupPartial = partialInventory(ruleGroups.data, "firewall rule groups");
   const rulePartial = partialInventory(rules.data, "firewall rules");
+  recordDeviceControlFacts(views, deviceControl, deviceControlError, maxUsbExceptions);
+  recordFirewallReadFacts(firewallPolicies, containers, ruleGroups, rules);
 
   const findings = [
     deviceControlError
@@ -2935,10 +3097,45 @@ function evaluateSensorUpdate(policies: JsonRecord[], buildsByPlatform: Map<stri
   );
 }
 
+function recordSensorUpdateFacts(dataset: CollectedDataset<CrowdstrikePage<JsonRecord>>, buildsByPlatform: Map<string, CollectedDataset<JsonRecord[]>>): void {
+  if (dataset.error) {
+    recordCrowdstrikeDecisionFacts("CS-12", { sensor_update_policies_readable: false });
+    return;
+  }
+  const policies = assignedPolicies(dataset.data.items).map((policy) => {
+    const settings = asObject(policy.settings) ?? {};
+    const catalog = buildsByPlatform.get((asString(policy.platform_name) ?? "").toLowerCase());
+    const supported = catalog && !catalog.error ? supportedBuildNumbers(catalog.data) : undefined;
+    const main = classifyBuild(asString(settings.build));
+    const variants = asRecordArray(settings.variants)
+      .map((variant) => asString(variant.build))
+      .filter((build): build is string => build !== undefined)
+      .map(classifyBuild);
+    const judged = [main, ...variants];
+    return {
+      off: main.mode === "off",
+      unsupported: supported !== undefined && judged.some((build) => build.mode === "pinned" && !supported.has(build.number ?? "")),
+      unverified: judged.some((build) => build.mode === "unknown" || (build.mode === "pinned" && supported === undefined)),
+      unprotected: asString(settings.uninstall_protection)?.toUpperCase() !== "ENABLED",
+    };
+  });
+  recordCrowdstrikeDecisionFacts("CS-12", {
+    sensor_update_policies_readable: true,
+    sensor_update_policies_complete: !dataset.data.truncated,
+    assigned_sensor_update_policy_count: policies.length,
+    sensor_update_builds_readable: [...buildsByPlatform.values()].every((catalog) => !catalog.error),
+    policies_with_updates_off: policies.filter((policy) => policy.off).length,
+    policies_pinned_to_unsupported_build: policies.filter((policy) => policy.unsupported).length,
+    policies_with_unverified_builds: policies.filter((policy) => policy.unverified).length,
+    policies_without_uninstall_protection: policies.filter((policy) => policy.unprotected).length,
+  });
+}
+
 const HOST_CONSOLE_EVIDENCE = "export the host inventory from Falcon console > Host setup and management > Host management with last seen timestamps and compare it to the authoritative asset inventory.";
 
 function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>>, staleDays: number, now = Date.now()): CrowdstrikeFinding {
   if (hosts.error) {
+    recordCrowdstrikeDecisionFacts("CS-13", { hosts_readable: false });
     return unreadableFinding("CS-13", "hosts", hosts.error, HOST_CONSOLE_EVIDENCE);
   }
   const items = hosts.data.items;
@@ -2946,6 +3143,13 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
   const dated = items.filter((host) => parseTimestamp(host.last_seen) !== undefined);
   const undated = items.length - dated.length;
   const active = dated.filter((host) => (parseTimestamp(host.last_seen) ?? 0) >= staleCutoff);
+  recordCrowdstrikeDecisionFacts("CS-13", {
+    hosts_readable: true,
+    hosts_complete: !hosts.data.truncated,
+    host_count: items.length,
+    dated_host_count: dated.length,
+    recently_seen_host_count: active.length,
+  });
   const stale = dated.filter((host) => (parseTimestamp(host.last_seen) ?? 0) < staleCutoff);
   const rfm = items.filter((host) => asBoolean(host.reduced_functionality_mode) === true);
   const versions = new Map<string, number>();
@@ -2997,13 +3201,24 @@ const HOST_GROUP_CONSOLE_EVIDENCE = "export host group membership from Falcon co
 
 function evaluateHostGroupAssignment(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>>, groups: CollectedDataset<CrowdstrikePage<JsonRecord>>): CrowdstrikeFinding {
   if (hosts.error) {
+    recordCrowdstrikeDecisionFacts("CS-14", { hosts_readable: false });
     return unreadableFinding("CS-14", "hosts", hosts.error, HOST_GROUP_CONSOLE_EVIDENCE);
   }
   if (groups.error) {
+    recordCrowdstrikeDecisionFacts("CS-14", { hosts_readable: true, host_groups_readable: false });
     return unreadableFinding("CS-14", "host groups", groups.error, HOST_GROUP_CONSOLE_EVIDENCE);
   }
   const items = hosts.data.items;
   const assigned = items.filter((host) => asArray(host.groups).length > 0);
+  recordCrowdstrikeDecisionFacts("CS-14", {
+    hosts_readable: true,
+    hosts_complete: !hosts.data.truncated,
+    host_count: items.length,
+    grouped_host_count: assigned.length,
+    host_groups_readable: true,
+    host_groups_complete: !groups.data.truncated,
+    host_group_count: groups.data.items.length,
+  });
   const pct = percentage(assigned.length, items.length);
   const groupTypes = new Map<string, number>();
   for (const group of groups.data.items) {
@@ -3051,16 +3266,26 @@ function evaluateUnmanagedAssets(
   samples: CollectedDataset<CrowdstrikePage<JsonRecord>>,
 ): CrowdstrikeFinding {
   if (unmanagedCount.error) {
+    recordCrowdstrikeDecisionFacts("CS-15", { discover_counts_readable: false });
     if (isForbiddenOrMissing(unmanagedCount)) {
       return unlicensedFinding("CS-15", "Falcon Discover", unmanagedCount.error, DISCOVER_CONSOLE_EVIDENCE);
     }
     return unreadableFinding("CS-15", "Falcon Discover unmanaged asset count", unmanagedCount.error, DISCOVER_CONSOLE_EVIDENCE);
   }
   if (managedCount.error) {
+    recordCrowdstrikeDecisionFacts("CS-15", { discover_counts_readable: false });
     return unreadableFinding("CS-15", "Falcon Discover managed asset count", managedCount.error, DISCOVER_CONSOLE_EVIDENCE);
   }
   const unmanaged = unmanagedCount.data;
   const managed = managedCount.data;
+  recordCrowdstrikeDecisionFacts("CS-15", {
+    discover_counts_readable: true,
+    unmanaged_asset_total: unmanaged ?? null,
+    unmanaged_per_mille: unmanaged === undefined || managed === undefined || managed + unmanaged === 0
+      ? null
+      : Math.round((unmanaged / (managed + unmanaged)) * 1000),
+    discover_samples_readable: !samples.error,
+  });
   if (unmanaged === undefined || managed === undefined) {
     const missingTotals = [
       unmanaged === undefined ? "unmanaged" : undefined,
@@ -3119,15 +3344,25 @@ function evaluateZeroTrust(
   minScore: number,
 ): CrowdstrikeFinding {
   if (total.error) {
+    recordCrowdstrikeDecisionFacts("CS-25", { zero_trust_readable: false });
     if (isForbiddenOrMissing(total)) {
       return unlicensedFinding("CS-25", "Zero Trust Assessment", total.error, ZTA_CONSOLE_EVIDENCE);
     }
     return unreadableFinding("CS-25", "Zero Trust Assessment score totals", total.error, ZTA_CONSOLE_EVIDENCE);
   }
   if (belowTotal.error ?? belowThreshold.error) {
+    recordCrowdstrikeDecisionFacts("CS-25", { zero_trust_readable: false });
     return unreadableFinding("CS-25", "Zero Trust Assessment below-threshold scores", belowTotal.error ?? belowThreshold.error ?? "unknown error", ZTA_CONSOLE_EVIDENCE);
   }
   const scored = total.data;
+  const belowTotalReported = belowTotal.data !== undefined;
+  const below = belowTotal.data ?? belowThreshold.data.items.length;
+  recordCrowdstrikeDecisionFacts("CS-25", {
+    zero_trust_readable: true,
+    scored_host_total: scored ?? null,
+    below_threshold_host_count: below,
+    below_threshold_total_reported: belowTotalReported,
+  });
   if (scored === undefined) {
     return manualFinding(
       "CS-25",
@@ -3144,8 +3379,6 @@ function evaluateZeroTrust(
       { min_score: minScore, scored_hosts: 0 },
     );
   }
-  const belowTotalReported = belowTotal.data !== undefined;
-  const below = belowTotal.data ?? belowThreshold.data.items.length;
   const pct = percentage(below, scored);
   const computed: CrowdstrikeFinding["status"] = below === 0 ? "pass" : pct <= 10 ? "warn" : "fail";
   const status: CrowdstrikeFinding["status"] = belowTotalReported ? computed : computed === "pass" ? "warn" : computed;
@@ -3166,20 +3399,29 @@ function evaluateZeroTrust(
   );
 }
 
+type SensorCoverageClient = Pick<
+  CrowdstrikeApiClient,
+  | "getResolvedConfig"
+  | "listSensorUpdatePolicies"
+  | "listSensorUpdateBuilds"
+  | "listHosts"
+  | "listHostGroups"
+  | "countDiscoverHosts"
+  | "listDiscoverHosts"
+  | "countZtaAssessments"
+  | "listZtaAssessments"
+>;
+
 export async function assessCrowdstrikeSensorCoverage(
-  client: Pick<
-    CrowdstrikeApiClient,
-    | "getResolvedConfig"
-    | "listSensorUpdatePolicies"
-    | "listSensorUpdateBuilds"
-    | "listHosts"
-    | "listHostGroups"
-    | "countDiscoverHosts"
-    | "listDiscoverHosts"
-    | "countZtaAssessments"
-    | "listZtaAssessments"
-  >,
+  client: SensorCoverageClient,
   options: CrowdstrikeAssessmentOptions = {},
+): Promise<CrowdstrikeAssessmentResult> {
+  return runBatchVerdictContext(CROWDSTRIKE_DECISION_CONTEXT, CROWDSTRIKE_SPEC, () => assessCrowdstrikeSensorCoverageWithDecisionContext(client, options));
+}
+
+async function assessCrowdstrikeSensorCoverageWithDecisionContext(
+  client: SensorCoverageClient,
+  options: CrowdstrikeAssessmentOptions,
 ): Promise<CrowdstrikeAssessmentResult> {
   const hostLimit = clampNumber(options.hostLimit, DEFAULT_HOST_LIMIT, 1, 100_000);
   const staleDays = clampNumber(options.staleSensorDays, DEFAULT_STALE_SENSOR_DAYS, 1, 365);
@@ -3215,6 +3457,7 @@ export async function assessCrowdstrikeSensorCoverage(
       isCollected(sensorUpdate) ? "no enabled and host-assigned sensor update policy named a platform to look up" : "the sensor update policies list was not read",
       "/policy/combined/sensor-update-builds/v1",
     );
+  recordSensorUpdateFacts(sensorUpdate, buildsByPlatform);
 
   const findings = [
     sensorUpdate.error
@@ -3276,6 +3519,7 @@ export async function assessCrowdstrikeSensorCoverage(
 interface UserView {
   uuid: string;
   uid?: string;
+  local_part: string;
   status?: string;
   last_login_at?: string;
   roles: string[];
@@ -3301,6 +3545,7 @@ function buildUserViews(users: JsonRecord[], rolesByUser: Map<string, JsonRecord
     return {
       uuid,
       uid,
+      local_part: localPart,
       status: asString(user.status),
       last_login_at: asString(user.last_login_at),
       roles,
@@ -3334,7 +3579,7 @@ function evaluateAdminCount(views: UserView[], maxAdmins: number): CrowdstrikeFi
   );
 }
 
-function evaluateLeastPrivilege(views: UserView[], maxRoles: number, staleLoginDays: number, now = Date.now()): CrowdstrikeFinding {
+function evaluateLeastPrivilege(views: UserView[], maxRoles: number, staleLoginDays: number, now: number): CrowdstrikeFinding {
   const staleCutoff = now - staleLoginDays * 86_400_000;
   const overprivileged = views.filter((view) => view.roles.length > maxRoles || (view.admin_roles.length > 0 && view.roles.length > view.admin_roles.length + 1));
   const admins = views.filter((view) => view.admin_roles.length > 0);
@@ -3380,6 +3625,46 @@ function withRoleVisibility(item: CrowdstrikeFinding, views: UserView[], roleErr
       role_lookup_errors: roleErrors.slice(0, 10),
     },
   };
+}
+
+interface UserReadState {
+  readable: boolean;
+  users_complete: boolean;
+  role_catalog_readable: boolean;
+  role_catalog_complete: boolean;
+  truncated_role_users: ReadonlySet<string>;
+}
+
+function recordUserFacts(views: UserView[], state: UserReadState, maxAdmins: number, maxRoles: number, now: number): void {
+  if (!state.readable) {
+    recordCrowdstrikeDecisionFacts("CS-16", { users_readable: false });
+    recordCrowdstrikeDecisionFacts("CS-17", { users_readable: false });
+    return;
+  }
+  const users = views.map((view) => {
+    const lastLogin = parseTimestamp(view.last_login_at);
+    return {
+      local_part: view.local_part,
+      roles_readable: view.roles_readable,
+      role_list_partial: state.truncated_role_users.has(view.uuid),
+      role_count: view.roles.length,
+      admin_role_count: view.admin_roles.length,
+      last_login_age_ms: lastLogin === undefined ? null : now - lastLogin,
+    };
+  });
+  const shared = {
+    users_readable: true,
+    users_complete: state.users_complete,
+    role_catalog_readable: state.role_catalog_readable,
+    role_catalog_complete: state.role_catalog_complete,
+    users,
+  };
+  recordCrowdstrikeDecisionFacts("CS-16", {
+    ...shared,
+    admin_user_count: users.filter((user) => user.admin_role_count > 0).length,
+    max_admins: maxAdmins,
+  });
+  recordCrowdstrikeDecisionFacts("CS-17", { ...shared, max_roles_per_user: maxRoles });
 }
 
 interface ApiClientScope {
@@ -3434,15 +3719,8 @@ const API_CLIENT_CONSOLE_EVIDENCE = "export the API client list with scopes and 
 
 function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord>>, maxWriteClients: number, staleDays: number, now = Date.now()): CrowdstrikeFinding {
   if (clients.error) {
+    recordCrowdstrikeDecisionFacts("CS-18", { api_clients_readable: false });
     return unreadableFinding("CS-18", "API clients", clients.error, API_CLIENT_CONSOLE_EVIDENCE);
-  }
-  if (clients.data.items.length === 0) {
-    return manualFinding(
-      "CS-18",
-      "The API clients endpoint was readable but returned zero clients, which cannot be true for a tenant that issued the credential running this assessment; the inventory is not visible to this credential.",
-      API_CLIENT_CONSOLE_EVIDENCE,
-      { api_clients: 0 },
-    );
   }
   const staleCutoff = now - staleDays * 86_400_000;
   const views = clients.data.items.map((client) => {
@@ -3465,6 +3743,23 @@ function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord
   const writeClients = views.filter((view) => view.sensitive_write_scopes.length > 0);
   const unexposed = views.filter((view) => !view.scopes_exposed);
   const actionsUnreadable = views.filter((view) => view.scopes_exposed && !view.scope_actions_readable);
+  recordCrowdstrikeDecisionFacts("CS-18", {
+    api_clients_readable: true,
+    api_clients_complete: !clients.data.truncated,
+    api_client_count: views.length,
+    write_client_count: writeClients.length,
+    clients_without_scope_list: unexposed.length,
+    clients_with_actionless_scopes: actionsUnreadable.length,
+    max_write_clients: maxWriteClients,
+  });
+  if (views.length === 0) {
+    return manualFinding(
+      "CS-18",
+      "The API clients endpoint was readable but returned zero clients, which cannot be true for a tenant that issued the credential running this assessment; the inventory is not visible to this credential.",
+      API_CLIENT_CONSOLE_EVIDENCE,
+      { api_clients: 0 },
+    );
+  }
   const staleWriteClients = writeClients.filter((view) => view.stale);
   const withoutLastUsed = views.filter((view) => view.last_used_at === undefined).length;
   const lastUsedCoverage = withoutLastUsed === views.length
@@ -3499,6 +3794,23 @@ function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord
   ), [partialInventory(clients.data, "API clients")]);
 }
 
+function recordExclusionFacts(
+  id: ControlId,
+  prefix: string,
+  count: string,
+  exclusions: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+  matching: ReadonlyArray<{ applied_globally: boolean }> = [],
+): void {
+  recordCrowdstrikeDecisionFacts(id, exclusions.error
+    ? { [`${prefix}_exclusions_readable`]: false }
+    : {
+      [`${prefix}_exclusions_readable`]: true,
+      [`${prefix}_exclusions_complete`]: !exclusions.data.truncated,
+      [count]: matching.length,
+      [`global_${count}`]: matching.filter((view) => view.applied_globally).length,
+    });
+}
+
 function isBroadRegex(value: string | undefined): boolean {
   if (!value) return false;
   const trimmed = value.trim();
@@ -3507,6 +3819,7 @@ function isBroadRegex(value: string | undefined): boolean {
 
 function evaluateIoaExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonRecord>>): CrowdstrikeFinding {
   if (exclusions.error) {
+    recordExclusionFacts("CS-19", "ioa", "broad_ioa_exclusion_count", exclusions);
     return unreadableFinding("CS-19", "IOA exclusions", exclusions.error, "export the IOA exclusion list from Falcon console > Endpoint security > Exclusions > IOA exclusions with patterns and scope.");
   }
   const views = exclusions.data.items.map((exclusion) => ({
@@ -3521,6 +3834,7 @@ function evaluateIoaExclusions(exclusions: CollectedDataset<CrowdstrikePage<Json
   }));
   const broad = views.filter((view) => view.broad);
   const broadGlobal = broad.filter((view) => view.applied_globally);
+  recordExclusionFacts("CS-19", "ioa", "broad_ioa_exclusion_count", exclusions, broad);
   const partial = partialInventory(exclusions.data, "IOA exclusions");
   // Emptiness is compliant only for a complete read (the CS-23 rule).
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : broadGlobal.length > 0 ? "fail" : broad.length > 0 ? "warn" : "pass";
@@ -3545,6 +3859,7 @@ function isSensitivePath(value: string | undefined): boolean {
 
 function evaluateMlExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonRecord>>): CrowdstrikeFinding {
   if (exclusions.error) {
+    recordExclusionFacts("CS-20", "ml", "sensitive_ml_exclusion_count", exclusions);
     return unreadableFinding("CS-20", "ML exclusions", exclusions.error, "export the machine learning exclusion list from Falcon console > Endpoint security > Exclusions > Machine learning exclusions.");
   }
   const views = exclusions.data.items.map((exclusion) => ({
@@ -3557,6 +3872,7 @@ function evaluateMlExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonR
   }));
   const sensitive = views.filter((view) => view.sensitive);
   const sensitiveGlobal = sensitive.filter((view) => view.applied_globally);
+  recordExclusionFacts("CS-20", "ml", "sensitive_ml_exclusion_count", exclusions, sensitive);
   const partial = partialInventory(exclusions.data, "ML exclusions");
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : sensitiveGlobal.length > 0 ? "fail" : sensitive.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
@@ -3579,6 +3895,7 @@ function hidesDirectory(value: string | undefined): boolean {
 
 function evaluateSensorVisibilityExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonRecord>>): CrowdstrikeFinding {
   if (exclusions.error) {
+    recordExclusionFacts("CS-21", "sensor_visibility", "hiding_sensor_visibility_exclusion_count", exclusions);
     return unreadableFinding("CS-21", "sensor visibility exclusions", exclusions.error, "export the sensor visibility exclusion list from Falcon console > Endpoint security > Exclusions > Sensor visibility exclusions with paths and scope.");
   }
   const views = exclusions.data.items.map((exclusion) => ({
@@ -3591,6 +3908,7 @@ function evaluateSensorVisibilityExclusions(exclusions: CollectedDataset<Crowdst
   }));
   const hiding = views.filter((view) => view.hides_directory);
   const hidingGlobal = hiding.filter((view) => view.applied_globally);
+  recordExclusionFacts("CS-21", "sensor_visibility", "hiding_sensor_visibility_exclusion_count", exclusions, hiding);
   const partial = partialInventory(exclusions.data, "sensor visibility exclusions");
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : hidingGlobal.length > 0 ? "fail" : hiding.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
@@ -3609,6 +3927,7 @@ const IDENTITY_CONSOLE_EVIDENCE = "capture the Identity Protection policy rule l
 
 function evaluateIdentityProtection(rules: CollectedDataset<CrowdstrikePage<JsonRecord>>): CrowdstrikeFinding {
   if (rules.error) {
+    recordCrowdstrikeDecisionFacts("CS-24", { identity_protection_rules_readable: false });
     if (isForbiddenOrMissing(rules)) {
       return unlicensedFinding("CS-24", "Falcon Identity Protection", rules.error, IDENTITY_CONSOLE_EVIDENCE);
     }
@@ -3630,6 +3949,13 @@ function evaluateIdentityProtection(rules: CollectedDataset<CrowdstrikePage<Json
   });
   const active = views.filter((view) => view.enabled && !view.simulation_mode);
   const enforcing = views.filter((view) => view.enforcing);
+  recordCrowdstrikeDecisionFacts("CS-24", {
+    identity_protection_rules_readable: true,
+    identity_protection_rules_complete: !rules.data.truncated,
+    identity_protection_rule_count: views.length,
+    active_identity_protection_rule_count: active.length,
+    enforcing_identity_protection_rule_count: enforcing.length,
+  });
   const partial = partialInventory(rules.data, "Identity Protection policy rules");
   // Zero visible rules of a truncated list is a claim about the unread rules (`absence_claim`, rendered
   // manual by withPartialInventory); zero rules on a complete read fails.
@@ -3649,21 +3975,30 @@ function evaluateIdentityProtection(rules: CollectedDataset<CrowdstrikePage<Json
 
 const USER_CONSOLE_EVIDENCE = "export the user list with roles and last login dates from Falcon console > Users and roles and count Falcon Administrator grants.";
 
+type AccessGovernanceClient = Pick<
+  CrowdstrikeApiClient,
+  | "getResolvedConfig"
+  | "listUserUuids"
+  | "getUsers"
+  | "listUserRoles"
+  | "listRoles"
+  | "listApiClients"
+  | "listIoaExclusions"
+  | "listMlExclusions"
+  | "listSensorVisibilityExclusions"
+  | "listIdentityProtectionRules"
+>;
+
 export async function assessCrowdstrikeAccessGovernance(
-  client: Pick<
-    CrowdstrikeApiClient,
-    | "getResolvedConfig"
-    | "listUserUuids"
-    | "getUsers"
-    | "listUserRoles"
-    | "listRoles"
-    | "listApiClients"
-    | "listIoaExclusions"
-    | "listMlExclusions"
-    | "listSensorVisibilityExclusions"
-    | "listIdentityProtectionRules"
-  >,
+  client: AccessGovernanceClient,
   options: CrowdstrikeAssessmentOptions = {},
+): Promise<CrowdstrikeAssessmentResult> {
+  return runBatchVerdictContext(CROWDSTRIKE_DECISION_CONTEXT, CROWDSTRIKE_SPEC, () => assessCrowdstrikeAccessGovernanceWithDecisionContext(client, options));
+}
+
+async function assessCrowdstrikeAccessGovernanceWithDecisionContext(
+  client: AccessGovernanceClient,
+  options: CrowdstrikeAssessmentOptions,
 ): Promise<CrowdstrikeAssessmentResult> {
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 10_000);
   const exclusionLimit = clampNumber(options.exclusionLimit, DEFAULT_EXCLUSION_LIMIT, 1, 10_000);
@@ -3678,7 +4013,7 @@ export async function assessCrowdstrikeAccessGovernance(
   const rolesByUser = new Map<string, JsonRecord[]>();
   const roleSnapshots: Record<string, unknown> = {};
   const roleErrors: string[] = [];
-  let rolesTruncated = 0;
+  const truncatedRoleUsers = new Set<string>();
   for (const user of users.data) {
     const uuid = asString(user.uuid) ?? asString(user.id);
     if (!uuid) continue;
@@ -3689,7 +4024,7 @@ export async function assessCrowdstrikeAccessGovernance(
       continue;
     }
     rolesByUser.set(uuid, rolePage.data.items);
-    if (rolePage.data.truncated) rolesTruncated += 1;
+    if (rolePage.data.truncated) truncatedRoleUsers.add(uuid);
   }
   const roleCatalog = await collectDataset(() => client.listRoles(), emptyPage<JsonRecord>(), "role catalog", "/user-management/queries/roles/v1");
   const apiClients = await collectDataset(() => client.listApiClients(userLimit), emptyPage<JsonRecord>(), "api clients", "/api-clients/queries/api-clients/v1");
@@ -3702,6 +4037,14 @@ export async function assessCrowdstrikeAccessGovernance(
 
   const views = buildUserViews(users.data, rolesByUser);
   const usersUnavailable = uuids.error ?? users.error;
+  const now = Date.now();
+  recordUserFacts(views, {
+    readable: !usersUnavailable,
+    users_complete: !uuids.data.truncated,
+    role_catalog_readable: !roleCatalog.error,
+    role_catalog_complete: !roleCatalog.data.truncated,
+    truncated_role_users: truncatedRoleUsers,
+  }, maxAdmins, maxRoles, now);
   const allRolesFailed = views.length > 0 && views.every((view) => !view.roles_readable);
   const userRoles: CollectedDataset<Record<string, unknown>> = usersUnavailable
     ? skippedDataset<Record<string, unknown>>({}, "user roles", uuids.error ? "the user uuid list was not read" : "the user details were not read", "/user-management/combined/user-roles/v2")
@@ -3724,7 +4067,7 @@ export async function assessCrowdstrikeAccessGovernance(
     }
     return withUnreadableSecondary(
       withPartialInventory(
-        withRoleVisibility(evaluate(), views, roleErrors, rolesTruncated),
+        withRoleVisibility(evaluate(), views, roleErrors, truncatedRoleUsers.size),
         [userPartial, partialInventory(roleCatalog.data, "roles in the role catalog")],
       ),
       "role catalog",
@@ -3735,7 +4078,7 @@ export async function assessCrowdstrikeAccessGovernance(
 
   const findings = [
     userFinding("CS-16", () => evaluateAdminCount(views, maxAdmins)),
-    userFinding("CS-17", () => evaluateLeastPrivilege(views, maxRoles, DEFAULT_STALE_ADMIN_LOGIN_DAYS)),
+    userFinding("CS-17", () => evaluateLeastPrivilege(views, maxRoles, DEFAULT_STALE_ADMIN_LOGIN_DAYS, now)),
     evaluateApiClients(apiClients, maxWriteClients, DEFAULT_STALE_API_CLIENT_DAYS),
     evaluateIoaExclusions(ioa),
     evaluateMlExclusions(ml),
@@ -3752,7 +4095,7 @@ export async function assessCrowdstrikeAccessGovernance(
       reported_total_users: derived(uuids.data.total ?? "unknown", uuids),
       users_truncated: derived(uuids.data.truncated, uuids),
       role_lookups_failed: derived(roleErrors.length, uuids, users),
-      role_pages_truncated: derived(rolesTruncated, uuids, users),
+      role_pages_truncated: derived(truncatedRoleUsers.size, uuids, users),
       // Admin grants come from the per-user role lookups; with none readable the count is unknown, not zero.
       admin_users: allRolesFailed ? null : derived(views.filter((view) => view.admin_roles.length > 0).length, uuids, users),
       roles_in_catalog: roleCatalog.error ? "unavailable" : roleCatalog.data.items.length,
@@ -3769,7 +4112,7 @@ export async function assessCrowdstrikeAccessGovernance(
         users: describeDataset(users),
         user_roles: usersUnavailable
           ? describeDataset(userRoles)
-          : `read for ${rolesByUser.size} of ${views.length} users (${roleErrors.length} lookups failed, ${rolesTruncated} truncated)`,
+          : `read for ${rolesByUser.size} of ${views.length} users (${roleErrors.length} lookups failed, ${truncatedRoleUsers.size} truncated)`,
         roles: describeDataset(roleCatalog),
         api_clients: describeDataset(apiClients),
         ioa_exclusions: describeDataset(ioa),
@@ -4167,6 +4510,7 @@ const hostParams = {
 };
 
 export function registerCrowdstrikeTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, CROWDSTRIKE_SPEC);
   pi.registerTool({
     name: "crowdstrike_check_access",
     label: "Check CrowdStrike Falcon audit access",

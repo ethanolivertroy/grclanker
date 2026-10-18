@@ -7,6 +7,8 @@ import { registerBoxTools } from "./box.js";
 import { BOX_SPEC } from "./box.spec.js";
 import { registerCloudflareTools } from "./cloudflare.js";
 import { CLOUDFLARE_SPEC } from "./cloudflare.spec.js";
+import { registerCrowdstrikeTools } from "./crowdstrike.js";
+import { CROWDSTRIKE_SPEC } from "./crowdstrike.spec.js";
 import { registerDuoTools } from "./duo.js";
 import { DUO_SPEC } from "./duo.spec.js";
 import { registerGcpTools } from "./gcp.js";
@@ -70,6 +72,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     narrativePath: "specs/narratives/cloudflare.md",
     outputPath: "specs/cloudflare-sec-inspector.spec.md",
     registerTools: registerCloudflareTools,
+  },
+  {
+    contract: CROWDSTRIKE_SPEC,
+    narrativePath: "specs/narratives/crowdstrike.md",
+    outputPath: "specs/crowdstrike-sec-inspector.spec.md",
+    registerTools: registerCrowdstrikeTools,
   },
   {
     contract: DUO_SPEC,
