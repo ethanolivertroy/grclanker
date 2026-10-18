@@ -40,11 +40,27 @@ import { KNOWBE4_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolve
 import { KNOWBE4_SPEC } from "../dist/extensions/grc-tools/knowbe4.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertBundlePathsMatchSpec, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
-import { assertRequestConformance, recordFetchRequests, sweepCheckCompleteness } from "./helpers/spec-conformance.mjs";
+import {
+  byteDifferentialEnabled,
+  portableContractTest,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
+import {
+  assertRequestConformance,
+  certifyRuntimeBoundaryCoverage,
+  certifyRuntimeRuleDecisiveness,
+  observeRuntimeDecisionFacts,
+  recordFetchRequests,
+  sweepCheckCompleteness,
+} from "./helpers/spec-conformance.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
+
+const observedDecisionFacts = observeRuntimeDecisionFacts(KNOWBE4_SPEC);
+const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const DAY_MS = 86_400_000;
@@ -2966,7 +2982,7 @@ test("cookie attribute class: a later cookie whose name holds a dot or another t
 });
 
 // ---------------------------------------------------------------------------------------------
-// Portable contract: auth resolver, requests, completeness, bundle paths
+// Portable contract: auth resolver, requests, completeness, bundle paths, check identity
 // ---------------------------------------------------------------------------------------------
 
 portableContractTest("the auth resolver contract names exactly the environment the resolver reads, and each variable reaches the resolved configuration", () => {
@@ -3125,4 +3141,13 @@ portableContractTest("every control and finding carries the title, severity, and
     }
   }
   assert.deepEqual([...statuses].sort(), ["fail", "manual", "pass", "warn"]);
+});
+
+portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", {
+  skip: testFilterActive && "a test filter ran only part of this file",
+}, () => {
+  observedDecisionFacts.stop();
+  const boundaries = certifyRuntimeBoundaryCoverage(KNOWBE4_SPEC, observedDecisionFacts.factsByCheck);
+  const rules = certifyRuntimeRuleDecisiveness(KNOWBE4_SPEC, observedDecisionFacts.factsByCheck);
+  assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
 });
