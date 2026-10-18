@@ -3,8 +3,12 @@ const identifierPatterns = [
   /[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+/,
   // CMMC practices: AC.L2-3.1.1
   /[A-Z]{2}\.L[1-3]-\d+(?:\.\d+)+/,
-  // Check, finding, and control IDs: AWS-IAM-01, ZS-07, AC-2
-  /[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*-\d+/,
+  // Check, finding, and control IDs, with a digit after the first hyphen:
+  // AWS-IAM-01, ZS-07, AC-2, QUALYS-C01, NR-05-API-KEY-AGE
+  /[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*-[A-Z]*\d[A-Z0-9]*(?:-[A-Z0-9]+)*/,
+  // FedRAMP rule, indicator, and domain IDs, never part of a longer ID:
+  // FRC-CSO-POP, KSI-IAM-AAM, KSI-IAM
+  /(?<!-)[A-Z]{3}-[A-Z]{3}(?:-[A-Z]{3})?(?!-)/,
   // Rev5 control IDs as the FedRAMP rules write them: ac-2.13
   /(?:ac|at|au|ca|cm|cp|ia|ir|ma|mp|pe|pl|pm|ps|pt|ra|sa|sc|si|sr)-\d+(?:\.\d+)?/,
   // Tool names: zscaler_check_access

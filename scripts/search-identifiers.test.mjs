@@ -19,6 +19,29 @@ test('each section lists the identifiers it mentions once, in the order they fir
   ]);
 });
 
+test('FedRAMP rule, indicator, and domain IDs count, but not three-letter parts of a longer name', () => {
+  const contents = [
+    { heading: 'pain-ratings', content: 'Estimate the PAIN rating following the rule in IEC-CSO-EFI (Estimate Federal Impact).' },
+    { heading: 'class-a', content: 'Address all rules in the Class A subset (FRC-CLA), including FRC-CSO-POP.' },
+    { heading: undefined, content: 'Domain ID: `KSI-IAM`. KSI-IAM-AAM automates account management.' },
+    { heading: 'auth', content: 'Send the key in the X-PAN-KEY header.' },
+  ];
+  assert.deepEqual(identifierContents(contents, tools), [
+    { heading: 'pain-ratings', content: '`IEC-CSO-EFI`' },
+    { heading: 'class-a', content: '`FRC-CLA` `FRC-CSO-POP`' },
+    { heading: undefined, content: '`KSI-IAM` `KSI-IAM-AAM`' },
+  ]);
+});
+
+test('an ID keeps the parts after its number', () => {
+  const contents = [
+    { heading: 'control-coverage', content: 'QUALYS-C01 and NR-05-API-KEY-AGE apply to PAN-OS. Dates use YYYY-MM-DD.' },
+  ];
+  assert.deepEqual(identifierContents(contents, tools), [
+    { heading: 'control-coverage', content: '`QUALYS-C01` `NR-05-API-KEY-AGE`' },
+  ]);
+});
+
 test('snake case names count only when they name a tool', () => {
   const contents = [{ heading: 'run-it', content: 'Pass output_dir to zscaler_export_audit_bundle, or set stale_host_days.' }];
   assert.deepEqual(identifierContents(contents, tools), [{ heading: 'run-it', content: '`zscaler_export_audit_bundle`' }]);
