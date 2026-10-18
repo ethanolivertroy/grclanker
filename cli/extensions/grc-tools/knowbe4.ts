@@ -23,6 +23,7 @@ import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { KNOWBE4_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
+import { ACCOUNT_ADMIN_FIELDS, ACCOUNT_FIELDS, USER_FREE_FORM_FIELDS } from "./knowbe4.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -641,8 +642,7 @@ const CREDENTIAL_KEY_QUALIFIERS = new Set(["api", "app", "application", "private
 const URL_KEY_SEGMENTS = new Set(["url", "urls", "uri", "endpoint", "link", "href"]);
 const CREDENTIAL_QUERY_PATTERN = /token|secret|password|key|signature|sig|credential|auth/i;
 const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
-// Free-form buckets on the user record that the assessments never read and that could carry anything an admin typed.
-const USER_FREE_FORM_KEYS = new Set(["comment", "custom_field_1", "custom_field_2", "custom_field_3", "custom_field_4", "custom_date_1", "custom_date_2"]);
+const USER_FREE_FORM_KEYS = new Set(USER_FREE_FORM_FIELDS);
 
 function keySegments(name: string): string[] {
   return name
@@ -702,12 +702,9 @@ export function projectKnowbe4User(user: JsonRecord): JsonRecord {
   return Object.fromEntries(Object.entries(user).filter(([key]) => !USER_FREE_FORM_KEYS.has(key)));
 }
 
-/** The account fields the findings read; every other field of the account record is dropped at collection time. */
-const ACCOUNT_FIELDS = ["name", "type", "domains", "subscription_level", "subscription_end_date", "number_of_seats", "current_risk_score"];
-const ACCOUNT_ADMIN_FIELDS = ["id", "first_name", "last_name", "email"];
 const CERTIFICATE_KEY_PATTERN = /cert|fingerprint|thumbprint/i;
 
-function pickFields(record: JsonRecord, fields: string[]): JsonRecord {
+function pickFields(record: JsonRecord, fields: readonly string[]): JsonRecord {
   return Object.fromEntries(fields.filter((field) => record[field] !== undefined).map((field) => [field, record[field]]));
 }
 
