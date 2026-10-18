@@ -96,6 +96,8 @@ const capReached = (cap: ItemCap, records: string): string =>
 const HOST_LIMIT: ItemCap = { option: "host_limit", fallback: 5000, max: 100000 };
 const ALERT_LIMIT: ItemCap = { option: "alert_limit", fallback: 2000, max: 10000 };
 const RULE_LIMIT: ItemCap = { option: "rule_limit", fallback: 1000, max: 10000 };
+const USER_LIMIT: ItemCap = { option: "user_limit", fallback: 500, max: 10000 };
+const EXCLUSION_LIMIT: ItemCap = { option: "exclusion_limit", fallback: 500, max: 10000 };
 
 const ACCESS_PROBE = "1 on the crowdstrike_check_access probe";
 const nextOffset = (records: string): string =>
@@ -379,11 +381,129 @@ const SENSOR_COVERAGE_SURFACES: readonly BatchSurfaceDefinition[] = [
   countSurface("zero_trust_below_threshold_count", `/zero-trust-assessment/queries/assessments/v1?filter=${ZTA_BELOW_FILTER}`, "zero-trust-assessment", "Zero Trust Assessment results"),
 ];
 
+const EXCLUSION_TEXT_FIELDS = "cl_regex, ifn_regex, value, name, description, and comment";
+const EXCLUSION_STAGE = `The collector exports every returned exclusion after the data redaction pass has rewritten every string in it and the exclusion text pass has then rewritten its ${EXCLUSION_TEXT_FIELDS}; decision facts read the listed fields as rewritten.`;
+const exclusionSurfaces = (
+  prefix: string,
+  kind: string,
+  collection: string,
+  label: string,
+  fields: readonly string[],
+): BatchSurfaceDefinition[] => [
+  apiSurface(
+    `${prefix}_exclusion_ids`,
+    `/policy/queries/${kind}-exclusions/v1`,
+    collection,
+    ["resources"],
+    offsetParameters(`${label} exclusion IDs`, 500, EXCLUSION_LIMIT, true),
+    resourcesResponse(`${label} exclusion IDs`),
+    { projectionStage: idWalkStage(`GET /policy/entities/${kind}-exclusions/v1`, true) },
+  ),
+  apiSurface(
+    `${prefix}_exclusions`,
+    `/policy/entities/${kind}-exclusions/v1`,
+    collection,
+    fields,
+    [idsParameter(`the ${label} exclusion IDs listed by GET /policy/queries/${kind}-exclusions/v1 that are ${LISTED_TEXT_IDS}`)],
+    lookupResponse(`one ${label} exclusion per entry`),
+    { projectionStage: EXCLUSION_STAGE },
+  ),
+];
+
+const ACCESS_GOVERNANCE_SURFACES: readonly BatchSurfaceDefinition[] = [
+  apiSurface(
+    "user_uuids",
+    "/user-management/queries/users/v1",
+    "user-management",
+    ["resources"],
+    offsetParameters("user UUIDs", 500, USER_LIMIT, true),
+    resourcesResponse("user UUIDs"),
+    { projectionStage: idWalkStage("POST /user-management/entities/users/GET/v1", true) },
+  ),
+  apiSurface(
+    "users",
+    "/user-management/entities/users/GET/v1",
+    "user-management",
+    ["uuid", "id", "uid", "email", "last_login_at"],
+    [param("ids", "json-body", `Up to 100 of the user UUIDs listed by GET /user-management/queries/users/v1 that are ${LISTED_TEXT_IDS}, as a JSON array`)],
+    lookupResponse("one user per entry"),
+    { method: "POST" },
+  ),
+  apiSurface(
+    "user_roles",
+    "/user-management/combined/user-roles/v2",
+    "user-management",
+    ["role_id", "role_name"],
+    [
+      param("user_uuid", "query", "The user's uuid, else its id, read as text; one walk per returned user"),
+      param("direct_only", "query", "false"),
+      ...offsetParameters("role grants", 500, 500, false),
+    ],
+    resourcesResponse("one role grant of the user per entry"),
+    { projectionStage: "The collector exports each returned user's role grants as read, after the data redaction pass has rewritten every string in them; decision facts read the listed fields." },
+  ),
+  apiSurface(
+    "role_ids",
+    "/user-management/queries/roles/v1",
+    "user-management",
+    ["meta.pagination.total", "resources"],
+    [],
+    resourcesResponse("role IDs", "total"),
+    { projectionStage: idWalkStage("GET /user-management/entities/roles/v1", true) },
+  ),
+  apiSurface(
+    "roles",
+    "/user-management/entities/roles/v1",
+    "user-management",
+    ["id"],
+    [idsParameter(`the role IDs listed by GET /user-management/queries/roles/v1 that are ${LISTED_TEXT_IDS}`)],
+    lookupResponse("one role per entry"),
+  ),
+  apiSurface(
+    "api_client_ids",
+    "/api-clients/queries/api-clients/v1",
+    "api-clients",
+    ["resources"],
+    offsetParameters("API client IDs", 500, USER_LIMIT, true),
+    resourcesResponse("API client IDs"),
+    { projectionStage: idWalkStage("GET /api-clients/entities/api-clients/v1", true) },
+  ),
+  apiSurface(
+    "api_clients",
+    "/api-clients/entities/api-clients/v1",
+    "api-clients",
+    ["scopes", "scopes.id", "scopes.name", "scopes.scope", "scopes.group", "scopes.action"],
+    [idsParameter(`the API client IDs listed by GET /api-clients/queries/api-clients/v1 that are ${LISTED_TEXT_IDS}`)],
+    lookupResponse("one API client per entry"),
+  ),
+  ...exclusionSurfaces("ioa", "ioa", "ioa-exclusions", "IOA", ["ifn_regex", "cl_regex", "applied_globally"]),
+  ...exclusionSurfaces("ml", "ml", "ml-exclusions", "machine learning", ["value", "applied_globally"]),
+  ...exclusionSurfaces("sensor_visibility", "sv", "sensor-visibility-exclusions", "sensor visibility", ["value", "applied_globally"]),
+  apiSurface(
+    "identity_protection_rule_ids",
+    "/identity-protection/queries/policy-rules/v1",
+    "identity-protection",
+    ["meta.pagination.total", "resources"],
+    [],
+    resourcesResponse("identity protection policy rule IDs", "total"),
+    { projectionStage: idWalkStage("GET /identity-protection/entities/policy-rules/v1", true) },
+  ),
+  apiSurface(
+    "identity_protection_rules",
+    "/identity-protection/entities/policy-rules/v1",
+    "identity-protection",
+    ["enabled", "simulationMode", "simulation_mode", "action"],
+    [idsParameter(`the policy rule IDs listed by GET /identity-protection/queries/policy-rules/v1 that are ${LISTED_TEXT_IDS}`)],
+    lookupResponse("one identity protection policy rule per entry"),
+  ),
+];
+
 const CROWDSTRIKE_SURFACES: readonly BatchSurfaceDefinition[] = [
   ...PREVENTION_SURFACES,
   ...RESPONSE_SURFACES,
   ...DEVICE_FIREWALL_SURFACES,
   ...SENSOR_COVERAGE_SURFACES,
+  ...ACCESS_GOVERNANCE_SURFACES,
 ];
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
@@ -1468,6 +1588,8 @@ const SENSOR_COVERAGE_CHECKS: readonly CrowdstrikeCheck[] = [
   },
 ];
 
+const ACCESS_GOVERNANCE = "crowdstrike_assess_access_governance";
+
 const toCheck = (check: CrowdstrikeCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -1557,6 +1679,16 @@ const RAW_DATA_FILES: Readonly<Record<string, readonly string[]>> = {
     "discover_unmanaged_samples",
     "zero_trust_assessments_below_threshold",
   ],
+  access_governance: [
+    "users",
+    "user_roles",
+    "roles",
+    "api_clients",
+    "ioa_exclusions",
+    "ml_exclusions",
+    "sensor_visibility_exclusions",
+    "identity_protection_rules",
+  ],
 };
 
 export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
@@ -1635,6 +1767,42 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
       value: "Zero Trust Assessment: Read",
       unlocks: ["zero_trust_scored_count", "zero_trust_below_threshold", "zero_trust_below_threshold_count"],
     },
+    {
+      id: "user-management-read",
+      kind: "oauth-scope",
+      value: "User management: Read",
+      unlocks: ["user_uuids", "users", "user_roles", "role_ids", "roles"],
+    },
+    {
+      id: "api-clients-read",
+      kind: "oauth-scope",
+      value: "API integrations (Api Client Mgmt): Read",
+      unlocks: ["api_client_ids", "api_clients"],
+    },
+    {
+      id: "ioa-exclusions-read",
+      kind: "oauth-scope",
+      value: "IOA Exclusions: Read",
+      unlocks: ["ioa_exclusion_ids", "ioa_exclusions"],
+    },
+    {
+      id: "ml-exclusions-read",
+      kind: "oauth-scope",
+      value: "Machine Learning Exclusions: Read",
+      unlocks: ["ml_exclusion_ids", "ml_exclusions"],
+    },
+    {
+      id: "sensor-visibility-exclusions-read",
+      kind: "oauth-scope",
+      value: "Sensor Visibility Exclusions: Read",
+      unlocks: ["sensor_visibility_exclusion_ids", "sensor_visibility_exclusions"],
+    },
+    {
+      id: "identity-protection-rules-read",
+      kind: "oauth-scope",
+      value: "Identity Protection Policy Rules: Read",
+      unlocks: ["identity_protection_rule_ids", "identity_protection_rules"],
+    },
   ],
   surfaces: CROWDSTRIKE_SURFACES,
   checks,
@@ -1644,6 +1812,7 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
     crowdstrike_assess_response_readiness: idsFor(RESPONSE),
     crowdstrike_assess_device_firewall: idsFor(DEVICE_FIREWALL),
     crowdstrike_assess_sensor_coverage: idsFor(SENSOR_COVERAGE),
+    crowdstrike_assess_access_governance: idsFor(ACCESS_GOVERNANCE),
     crowdstrike_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
@@ -1655,13 +1824,45 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
     afterWalk(["discover_unmanaged_hosts"], "hosts", 100, 100),
     afterWalk(["zero_trust_below_threshold"], "results", 1000, 1000),
     offsetWalk(["firewall_rule_group_ids", "firewall_rule_ids"], "IDs", 500, RULE_LIMIT, LOOKED_UP),
+    offsetWalk(["user_uuids", "api_client_ids"], "IDs", 500, USER_LIMIT, LOOKED_UP),
+    offsetWalk(["ioa_exclusion_ids", "ml_exclusion_ids", "sensor_visibility_exclusion_ids"], "IDs", 500, EXCLUSION_LIMIT, LOOKED_UP),
+    offsetWalk(["user_roles"], "role grants", 500, 500, `Each returned user's role grants are walked separately. ${DROPPED_RESOURCE}`),
     {
-      surfaceIds: ["device_control_policy_details", "firewall_policy_containers", "firewall_rule_groups", "firewall_rules"],
+      surfaceIds: ["role_ids", "identity_protection_rule_ids"],
+      cursorFields: ["meta.pagination.total"],
+      pageSize: null,
+      itemCap: "none",
+      pageCap: 1,
+      totalSemantics: `One read without limit or offset keeps every returned ID, and the list is partial when meta.pagination.total is absent or larger than the number of IDs returned. ${LOOKED_UP}`,
+      stopConditions: ["The first response"],
+    },
+    {
+      surfaceIds: [
+        "device_control_policy_details",
+        "firewall_policy_containers",
+        "firewall_rule_groups",
+        "firewall_rules",
+        "roles",
+        "api_clients",
+        "ioa_exclusions",
+        "ml_exclusions",
+        "sensor_visibility_exclusions",
+        "identity_protection_rules",
+      ],
       cursorFields: ["ids"],
       pageSize: null,
       itemCap: "none",
       pageCap: null,
       totalSemantics: "Every ID to look up is requested in batches of 100, each ID sent as its own ids query parameter; each batch is one read, and no cursor in its response is followed.",
+      stopConditions: ["Every batch of up to 100 IDs requested"],
+    },
+    {
+      surfaceIds: ["users"],
+      cursorFields: ["ids"],
+      pageSize: null,
+      itemCap: "none",
+      pageCap: null,
+      totalSemantics: "Every user UUID to look up is requested in batches of 100, sent as the ids array of a JSON body; each batch is one read, and no cursor in its response is followed.",
       stopConditions: ["Every batch of up to 100 IDs requested"],
     },
     {
@@ -1725,6 +1926,6 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
   }),
   lastUpdated: "2026-10-18",
   redaction: {
-    projectionStage: "Every response passes the data redaction pass when it is read, which rewrites remembered credential values in raw and encoded forms, credential carriers, and token-shaped text in every string. Alerts and RTR sessions are then exported projected to their declared snapshot fields, and every other dataset is exported as read.",
+    projectionStage: `Every response passes the data redaction pass when it is read, which rewrites remembered credential values in raw and encoded forms, credential carriers, and token-shaped text in every string. Alerts and RTR sessions are then exported projected to their declared snapshot fields, exclusions are exported after the exclusion text pass rewrites their ${EXCLUSION_TEXT_FIELDS}, and every other dataset is exported as read.`,
   },
 });
