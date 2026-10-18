@@ -2072,6 +2072,38 @@ test("a non-pass Zscaler finding still names a truncated dependency and sets par
   assert.match(rbac.summary, /password expiry inventory is partial/);
 });
 
+test("an unreadable Zscaler finding still names a truncated sibling inventory", () => {
+  const partial = (dataset) => ({ ...dataset, truncated: true, seen: 200, total: 201 });
+  const unreadable = (dataset) => ({ data: Array.isArray(dataset.data) ? [] : {}, error: "ZIA GET failed (403): forbidden", statusCode: 403 });
+  const policy = policyFixture();
+
+  const dlp = findingById(assessZiaPolicyData(policyFixture({
+    webDlpRules: unreadable(policy.webDlpRules),
+    dlpDictionaries: partial(policy.dlpDictionaries),
+  })), "ZS-03");
+  assert.equal(dlp.status, "manual");
+  assert.match(dlp.summary, /GET \/webDlpRules could not be read/);
+  assert.match(dlp.summary, /DLP dictionary inventory is partial \(1 records over 200 of 201 pages\)/);
+  assert.equal(dlp.evidence.partial_inventory, true);
+  assert.doesNotMatch(dlp.summary, /capped at warn/);
+
+  const ssl = findingById(assessZiaPolicyData(policyFixture({
+    sslInspectionRules: unreadable(policy.sslInspectionRules),
+    locations: partial(policy.locations),
+  })), "ZS-04");
+  assert.equal(ssl.status, "manual");
+  assert.match(ssl.summary, /location inventory is partial \(1 records over 200 of 201 pages\)/);
+  assert.equal(ssl.evidence.partial_inventory, true);
+
+  const access = accessControlFixture();
+  access.adminUsers = unreadable(access.adminUsers);
+  access.adminRoles = partial(access.adminRoles);
+  const rbac = findingById(assessZiaAccessControlData(access), "ZS-07");
+  assert.equal(rbac.status, "manual");
+  assert.match(rbac.summary, /administrator role inventory is partial \(2 records over 200 of 201 pages\)/);
+  assert.equal(rbac.evidence.partial_inventory, true);
+});
+
 test("truncated admin roles, password expiry, and the audit log report cap ZS-07 and ZS-14 at warn", () => {
   const partial = (dataset) => ({ ...dataset, truncated: true, seen: 200, total: 201 });
   const roles = accessControlFixture();

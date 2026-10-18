@@ -267,7 +267,7 @@ The release installers look for GitHub Release assets named like:
 - `grclanker-<version>-win32-arm64.zip`
 - `grclanker-<version>-win32-x64.zip`
 
-plus a `SHA256SUMS.txt`. When that file has an entry for the downloaded archive, the installers check the archive's SHA-256 against it and abort on a mismatch. When the file cannot be fetched, has no entry for the archive, no `sha256sum` or `shasum` is available (`install` only), or a custom `GRCLANKER_ASSET_URL` is set, they print a warning and install without verifying.
+plus a `SHA256SUMS.txt`. Official GitHub downloads and `GRCLANKER_RELEASE_BASE_URL` installs abort when that file cannot be fetched, has no entry for the archive, the entry is not a SHA-256 digest, the digest does not match, or (`install` only) neither `sha256sum` nor `shasum` is available. A custom `GRCLANKER_ASSET_URL` prints a warning and installs without verifying. A local archive prints that same warning when no `SHA256SUMS.txt` sits beside it. When that file is present, a missing entry, a bad digest, a mismatch, or (`install` only) neither `sha256sum` nor `shasum` aborts the install.
 
 Build them locally:
 

@@ -10,7 +10,7 @@ export default function Layout({ children }: { children: ReactNode }) {
       nav={{ enabled: false }}
       searchToggle={{ enabled: false }}
       themeSwitch={{ enabled: false }}
-      sidebar={{ collapsible: false }}
+      sidebar={{ collapsible: false, 'aria-label': 'Docs navigation' }}
       tabs={false}
       slots={{ navTitle: NoNavTitle }}
     >
