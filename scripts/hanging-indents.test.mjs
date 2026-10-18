@@ -153,6 +153,14 @@ test('a deeper line continues a description only when the line above has one', (
   ]);
 });
 
+test('a line of several words that runs into the column puts no description on the next line', () => {
+  assert.deepEqual(styles('foo: 1  # comment', 'if condition:', '        long_variable_identifier'), [
+    '--hang:8ch;--word:7ch;--word-2:1ch',
+    '--word:10ch',
+    '--hang:10ch',
+  ]);
+});
+
 test('lines are found by className as well as class, inside any wrapper', () => {
   const node = line('  indented', { className: ['line'] });
   const pre = el('pre', [el('code', [node])]);

@@ -42,7 +42,7 @@ function descriptionColumn(text) {
 
 // `description` is where the line's description starts, if it has one. `above`
 // is the nearest line above that has any text: where its description starts,
-// if it has one, and where its text ends.
+// if it has one, where its text ends, and whether that text is a single name.
 function lineHang(text, columns, above = {}) {
   const own = descriptionColumn(text);
   if (own !== undefined) return { hang: own, description: own };
@@ -53,7 +53,7 @@ function lineHang(text, columns, above = {}) {
   const continues = above.description !== undefined && indent >= above.description;
   // A name that runs into the column leaves no room for its description, which
   // starts the next line instead.
-  const spills = above.description === undefined && above.end >= indent && columns.includes(indent);
+  const spills = above.name && above.end >= indent && columns.includes(indent);
   if (continues || spills) return { hang: indent, description: indent, indent };
   return { hang: indent + DEFAULT_HANG };
 }
@@ -95,7 +95,7 @@ function setHangs(lines) {
   const hangs = texts.map((text) => {
     if (!text.trim()) return undefined;
     const hang = lineHang(text, columns, above);
-    above = { description: hang.description, end: text.trimEnd().length };
+    above = { description: hang.description, end: text.trimEnd().length, name: /^\s*\S+\s*$/.test(text) };
     return hang;
   });
   const descriptionWords = longestWords(
