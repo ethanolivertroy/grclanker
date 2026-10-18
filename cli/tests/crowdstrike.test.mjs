@@ -3097,18 +3097,24 @@ portableContractTest("every request the access check, the five assessments, and 
   assertRequestConformance(assert, CROWDSTRIKE_SPEC, reads);
 });
 
-const CONTRACT_SURFACES = CROWDSTRIKE_SPEC.apiSurfaces.map((surface) => {
-  const [path, query = ""] = surface.path.split("?");
-  const embedded = [...new URLSearchParams(query)].map(([name, value]) => {
-    const pattern = value.split(/\{[^}]+\}/).map(escapeRegExp).join(".+");
-    return { name, pattern: new RegExp(`^${pattern}$`) };
+// Built on first use: differential runs load this file against a baseline that has no spec module.
+let contractSurfaces;
+
+function declaredSurfaces() {
+  contractSurfaces ??= CROWDSTRIKE_SPEC.apiSurfaces.map((surface) => {
+    const [path, query = ""] = surface.path.split("?");
+    const embedded = [...new URLSearchParams(query)].map(([name, value]) => {
+      const pattern = value.split(/\{[^}]+\}/).map(escapeRegExp).join(".+");
+      return { name, pattern: new RegExp(`^${pattern}$`) };
+    });
+    return { id: surface.id, method: surface.method ?? "GET", path, embedded };
   });
-  return { id: surface.id, method: surface.method ?? "GET", path, embedded };
-});
+  return contractSurfaces;
+}
 
 // The most specific declared surface wins, so a host walk with the containment filter is contained_hosts.
 function requestedSurface(method, url) {
-  const matches = CONTRACT_SURFACES.filter((surface) => surface.method === method && surface.path === url.pathname
+  const matches = declaredSurfaces().filter((surface) => surface.method === method && surface.path === url.pathname
     && surface.embedded.every(({ name, pattern }) => pattern.test(url.searchParams.get(name) ?? "")));
   return matches.sort((left, right) => right.embedded.length - left.embedded.length)[0]?.id;
 }
