@@ -239,7 +239,7 @@ export interface Knowbe4Collected<T> {
   httpStatus?: number | null;
   /** The request the read made (for a failed read, the one that failed), as "METHOD /path"; unset when nothing identified one. */
   endpoint?: string;
-  /** The read stopped at a cap while the API could still hold more records. */
+  /** The read is partial: it stopped at a cap while the API could still hold more records, or for truncationReason. */
   truncated?: boolean;
   /** Why a truncated read stopped when the reason was not its cap (see Knowbe4Listing.truncationReason). */
   truncationReason?: string;
@@ -258,7 +258,8 @@ export interface Knowbe4Listing {
   total?: number;
   /**
    * Present when the listing stopped short for a reason other than its cap: the server returned an empty page or
-   * ended paging while still reporting more records, or repeated its page key. Raising the cap does not read further.
+   * ended paging while still reporting more records, repeated its page key, or returned an entry that is not a JSON
+   * object. Raising the cap does not read further.
    */
   truncationReason?: string;
   /** The request the listing made, as "METHOD /path[?filters]" without the pagination parameters. */
@@ -1380,7 +1381,10 @@ export class Knowbe4ApiClient {
   /**
    * Walks page/per_page pagination up to limit items. The Reporting API returns bare arrays with no total, so the
    * only completion signal is a short page: the listing is reported truncated whenever the loop stopped at the cap
-   * while the last page was still full (more pages may exist) or while items were dropped from it.
+   * while the last page was still full (more pages may exist) or while items were dropped from it. A page holding an
+   * entry that is not a JSON object ends the walk truncated as well, with a truncationReason: the entry may be a
+   * record no check can read, and paging on would let a server returning only such entries, which never count toward
+   * the cap, keep the walk going without end.
    */
   async list(
     path: string,
@@ -1391,15 +1395,23 @@ export class Knowbe4ApiClient {
     const pageSize = clampInteger(options.pageSize, DEFAULT_PAGE_SIZE, 1, DEFAULT_PAGE_SIZE);
     const items: JsonRecord[] = [];
     let truncated = false;
+    let truncationReason: string | undefined;
     let pages = 0;
     const endpoint = `GET ${path}${describeQuery(query)}`;
 
     for (let page = 1; ; page += 1) {
       const payload = await this.get(path, { ...query, page, per_page: pageSize }, ARRAY_SHAPE);
       pages += 1;
-      const pageItems = asRecordArray(payload);
+      const entries = Array.isArray(payload) ? payload : [];
+      const pageItems = asRecordArray(entries);
+      const dropped = entries.length - pageItems.length;
       const room = limit - items.length;
       items.push(...pageItems.slice(0, room));
+      if (dropped > 0) {
+        truncated = true;
+        truncationReason = `the server returned ${dropped === 1 ? "an entry that is not a JSON object" : `${dropped} entries that are not JSON objects`} on page ${page}`;
+        break;
+      }
       if (pageItems.length > room) {
         truncated = true;
         break;
@@ -1411,7 +1423,7 @@ export class Knowbe4ApiClient {
       }
     }
 
-    return { items, truncated, limit, pages, endpoint };
+    return { items, truncated, limit, pages, ...(truncationReason ? { truncationReason } : {}), endpoint };
   }
 
   async probe(path: string, query: JsonRecord = {}): Promise<JsonRecord[]> {
@@ -2105,14 +2117,14 @@ export async function collectKnowbe4Snapshot(
     const failedEndpoints: string[] = [];
     const requestedEndpoints: string[] = [];
     const failedStatuses = new Set<number | null>();
-    let recipientsTruncated = false;
+    const stoppedWalks: Array<{ id: string; limit: number; reason?: string }> = [];
     for (const item of sampled) {
       const id = testId(item.test);
       if (!id) continue;
       try {
         const listing = toListing(await client.listSecurityTestRecipients(id), DEFAULT_LIST_LIMIT);
         requestedEndpoints.push(listing.endpoint ?? recipientsEndpoint(id));
-        recipientsTruncated = recipientsTruncated || listing.truncated;
+        if (listing.truncated) stoppedWalks.push({ id, limit: listing.limit, reason: listing.truncationReason });
         samples.push({
           pst_id: id,
           campaign_id: asString(item.test.campaign_id),
@@ -2136,11 +2148,16 @@ export async function collectKnowbe4Snapshot(
     // every request made; the failures share one status only when every failure observed the same one.
     const singleStatus = failedStatuses.size === 1 ? [...failedStatuses][0] : null;
     const namedEndpoints = recipientErrors.length > 0 ? failedEndpoints : requestedEndpoints;
+    // A cap stop is stated by the cap; once any walk stopped for another reason, the reason accounts for every stop.
+    const truncationReason = stoppedWalks.some((walk) => walk.reason)
+      ? stoppedWalks.map((walk) => `security test ${walk.id}: ${walk.reason ?? `the walk reached its cap of ${walk.limit} recipients`}`).join("; ")
+      : undefined;
     securityTestRecipients = {
       ...collected(samples, recipientErrors.length > 0 ? recipientErrors.join("; ") : undefined),
       ...(recipientErrors.length > 0 ? { httpStatus: singleStatus } : {}),
       ...(namedEndpoints.length > 0 ? { endpoint: namedEndpoints.join(", ") } : {}),
-      truncated: recipientsTruncated,
+      truncated: stoppedWalks.length > 0,
+      ...(truncationReason ? { truncationReason } : {}),
       limit: DEFAULT_LIST_LIMIT,
     };
   }
@@ -2294,6 +2311,13 @@ function truncationCaveat(item: Knowbe4TruncatedInventory): string {
   // Raising the cap reads further only when the cap was the exit; a server stop needs the console export.
   const raise = item.argument && !item.reason ? `; raise ${item.argument} to cover the full inventory` : "";
   return `Truncated listing: ${item.inventory} (${truncationClause(item)}), so this verdict only covers the records that were loaded${raise}.`;
+}
+
+/** How a partial enrollment listing ended, naming enrollment_limit only when the cap was the exit. */
+function enrollmentCut(snapshot: Knowbe4Snapshot, withLimit = true): string {
+  const reason = snapshot.trainingEnrollments.truncationReason;
+  if (reason) return `partial because ${reason}`;
+  return withLimit ? `truncated at enrollment_limit (${snapshot.enrollmentLimit})` : "truncated at enrollment_limit";
 }
 
 /**
@@ -3207,7 +3231,7 @@ function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookback
     summary = `${warning.length} of ${evaluated.length} completed training campaigns finished between ${failCompletionPct}% and ${minCompletionPct}% completion.`;
   } else if (truncated.length > 0) {
     status = "warn";
-    summary = `${truncated.length} completed training campaigns report the -1 completion sentinel and the enrollment list was truncated at enrollment_limit (${snapshot.enrollmentLimit}), so their completion cannot be measured: ${truncated.map((item) => item.name).join(", ")}. Raise enrollment_limit or export the campaign report from the console.`;
+    summary = `${truncated.length} completed training campaigns report the -1 completion sentinel and the enrollment list was ${enrollmentCut(snapshot)}, so their completion cannot be measured: ${truncated.map((item) => item.name).join(", ")}. ${snapshot.trainingEnrollments.truncationReason ? "Export" : "Raise enrollment_limit or export"} the campaign report from the console.`;
   } else if (unmeasured.length > 0) {
     // A campaign the API reports as "too large to calculate" with no enrollments loaded for it is not shown to meet the target.
     status = "warn";
@@ -3298,7 +3322,7 @@ function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookba
   } else if (!enrollmentsComplete) {
     // A missing enrollment in a truncated list is not a missing enrollment, so nobody is named late from it.
     status = "warn";
-    summary = `${late.length} of ${newUsers.length} recently joined users have no training enrollment within ${graceDays} days among the ${snapshot.trainingEnrollments.data.length} enrollments loaded; the enrollment listing was truncated at enrollment_limit (${snapshot.enrollmentLimit}), so their enrollments may not have been read and they are not asserted late.`;
+    summary = `${late.length} of ${newUsers.length} recently joined users have no training enrollment within ${graceDays} days among the ${snapshot.trainingEnrollments.data.length} enrollments loaded; the enrollment listing was ${enrollmentCut(snapshot)}, so their enrollments may not have been read and they are not asserted late.`;
   } else if (latePct !== undefined && latePct <= 5) {
     status = "warn";
     summary = `${late.length} of ${newUsers.length} recently joined users had no training enrollment within ${graceDays} days.`;
@@ -3390,7 +3414,7 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
       : `${failures.size} users failed sampled tests within the last ${remedialWindowDays} days; their remedial enrollment window is still open.`;
   } else if (!enrollmentsComplete && unremediated.length > 0) {
     status = "warn";
-    summary = `${unremediated.length} of ${evaluable.length} users who failed a sampled phishing test have no training enrollment after the failure among the ${snapshot.trainingEnrollments.data.length} enrollments loaded; the enrollment listing was truncated at enrollment_limit (${snapshot.enrollmentLimit}), so their remedial enrollments may not have been read and they are not asserted unremediated.`;
+    summary = `${unremediated.length} of ${evaluable.length} users who failed a sampled phishing test have no training enrollment after the failure among the ${snapshot.trainingEnrollments.data.length} enrollments loaded; the enrollment listing was ${enrollmentCut(snapshot)}, so their remedial enrollments may not have been read and they are not asserted unremediated.`;
   } else if (remediatedPct !== undefined && remediatedPct >= 90 && unsampled > 0) {
     // Mirror controls 2 and 18: a clean result on a partial sample cannot pass outright.
     status = "warn";
@@ -3610,15 +3634,15 @@ function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackD
   } else if (unenrolled.length > 0) {
     status = "warn";
     summary = enrollmentDataPartial
-      ? `Compliance topics are assigned but no enrollments were loaded for ${topicList(unenrolled)}; enrollment data is ${enrollmentsUnavailable ? "unavailable" : "truncated at enrollment_limit"}, so completion could not be verified.`
+      ? `Compliance topics are assigned but no enrollments were loaded for ${topicList(unenrolled)}; enrollment data is ${enrollmentsUnavailable ? "unavailable" : enrollmentCut(snapshot, false)}, so completion could not be verified.`
       : `Compliance-themed modules are assigned but have zero training enrollments, so nobody has completed them: ${topicList(unenrolled)}.`;
   } else if (lowCompletion.length > 0) {
     status = "warn";
-    summary = `Compliance modules are assigned but completion is below ${minCompletionPct}% for: ${lowCompletion.map((item) => `${item.topic} (${item.completion}%)`).join(", ")}${enrollmentDataPartial ? `; the figures cover only the ${enrollmentList.data.length} enrollments loaded before the listing was truncated at enrollment_limit (${snapshot.enrollmentLimit})` : ""}.`;
+    summary = `Compliance modules are assigned but completion is below ${minCompletionPct}% for: ${lowCompletion.map((item) => `${item.topic} (${item.completion}%)`).join(", ")}${enrollmentDataPartial ? `; the figures cover only the ${enrollmentList.data.length} enrollments loaded before the listing ${enrollmentList.truncationReason ? `stopped, because ${enrollmentList.truncationReason}` : `was truncated at enrollment_limit (${snapshot.enrollmentLimit})`}` : ""}.`;
   } else if (enrollmentDataPartial) {
     // Completion figures computed over a truncated enrollment list cannot back a passing verdict.
     status = "warn";
-    summary = `Compliance training modules are assigned and enrolled for ${topicList(topicResults)}, but enrollment data is ${enrollmentsUnavailable ? "unavailable" : `truncated at enrollment_limit (${snapshot.enrollmentLimit})`}, so the completion figures cover only the loaded enrollments and cannot be verified.`;
+    summary = `Compliance training modules are assigned and enrolled for ${topicList(topicResults)}, but enrollment data is ${enrollmentsUnavailable ? "unavailable" : enrollmentCut(snapshot)}, so the completion figures cover only the loaded enrollments and cannot be verified.`;
   } else {
     status = "pass";
     summary = `Compliance training modules are assigned and enrolled for ${topicList(topicResults)} with completion at or above ${minCompletionPct}%.`;

@@ -9,7 +9,7 @@ KnowBe4 Security Inspector gives auditors a read-only view of a KnowBe4 Security
 
 ## Rationale
 
-The Reporting API pages by page number and returns no total, Link header, or cursor, so a short page is the only sign that a list has ended. Every walk also stops at a record cap, and reaching it marks the list partial, so a check built on that list cannot pass: where it would have passed, it reports warn. A fail that rests on something being absent from a partial list, such as a group with no training or a user with no recorded activity, is reported as warn instead.
+The Reporting API pages by page number and returns no total, Link header, or cursor, so a short page is the only sign that a list has ended. Every walk also stops at a record cap, and at a page holding an entry that is not a JSON object, since that entry may be a record no check can read. Either stop marks the list partial, so a check built on that list cannot pass: where it would have passed, it reports warn. A fail that rests on something being absent from a partial list, such as a group with no training or a user with no recorded activity, is reported as warn instead.
 
 Recipient-level checks read a sample: by default, the recipient lists of the newest 12 security tests in the window. Coverage and remedial training cannot pass unless the recipients of every test that ran in the lookback window were read in full.
 
