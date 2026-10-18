@@ -1266,6 +1266,16 @@ details[open] > .agent-group-toggle::before {
   color: var(--docs-title);
 }
 
+.docs-sidebar-children {
+  margin-left: 0.75rem;
+  border-left: 1px solid var(--docs-border-strong);
+}
+
+/* Pull each link's 2px edge over the guide line so the active marker sits on it. */
+.docs-sidebar-children .docs-sidebar-link {
+  margin-left: -1px;
+}
+
 .docs-mobile-nav {
   margin-bottom: 1.5rem;
   border: 1px solid var(--docs-border);

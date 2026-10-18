@@ -2,7 +2,20 @@
 
 import Link from 'next/link';
 import { useRef, type SyntheticEvent } from 'react';
-import { getDocHref, type DocsSection } from '../lib/docs';
+import { getDocHref, type DocsSection, type DocsSectionItem } from '../lib/docs';
+
+function DocsNavLink({ item, currentSlug }: { item: DocsSectionItem; currentSlug: string }) {
+  const active = item.slug === currentSlug;
+  return (
+    <Link
+      href={getDocHref(item.slug)}
+      className={active ? 'docs-sidebar-link is-active' : 'docs-sidebar-link'}
+      aria-current={active ? 'page' : undefined}
+    >
+      {item.label}
+    </Link>
+  );
+}
 
 export function DocsMobileNav({
   sections,
@@ -29,16 +42,19 @@ export function DocsMobileNav({
           <div key={section.title} className="docs-sidebar-section">
             <div className="docs-sidebar-title">{section.title}</div>
             {section.items.map((item) => {
-              const active = item.slug === currentSlug;
+              const open =
+                item.slug === currentSlug || item.items?.some((child) => child.slug === currentSlug);
               return (
-                <Link
-                  key={item.slug}
-                  href={getDocHref(item.slug)}
-                  className={active ? 'docs-sidebar-link is-active' : 'docs-sidebar-link'}
-                  aria-current={active ? 'page' : undefined}
-                >
-                  {item.label}
-                </Link>
+                <div key={item.slug}>
+                  <DocsNavLink item={item} currentSlug={currentSlug} />
+                  {open && item.items ? (
+                    <div className="docs-sidebar-children">
+                      {item.items.map((child) => (
+                        <DocsNavLink key={child.slug} item={child} currentSlug={currentSlug} />
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
               );
             })}
           </div>
