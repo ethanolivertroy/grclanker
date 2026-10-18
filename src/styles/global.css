@@ -1426,15 +1426,24 @@ details[open] > .agent-group-toggle::before {
 }
 
 .docs-prose code {
-  padding: 0.1em 0.35em;
+  padding: 0;
   border: 0;
-  border-radius: 0.3rem;
-  background: var(--docs-inline-bg);
+  background: none;
   color: var(--color-yellow);
   font-family: var(--font-mono);
   font-size: 0.875em;
-  -webkit-box-decoration-break: clone;
-  box-decoration-break: clone;
+}
+
+/* Set by src/lib/code-breaks.mjs on code with no letters or digits. */
+.docs-prose code[data-symbol] {
+  padding: 0.1em 0.35em;
+  border-radius: 0.3rem;
+  background: var(--docs-inline-bg);
+}
+
+/* Headings already use the code face, so code in them keeps the heading size. */
+.docs-prose :is(h2, h3, h4) code {
+  font-size: 1em;
 }
 
 /* Set by src/lib/code-breaks.mjs on short code and hyphenated segments. */
