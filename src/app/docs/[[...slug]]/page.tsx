@@ -1,15 +1,16 @@
 import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import { DocsPage } from 'fumadocs-ui/layouts/docs/page';
+import { TOC, TOCProvider } from 'fumadocs-ui/layouts/docs/page/slots/toc';
 import { AgentCommandsSection } from '../../../components/agent-commands-section';
+import { DocsContentsBar } from '../../../components/docs-contents-bar';
 import { getDocsFooterItems } from '../../../components/docs-footer';
-import { DocsMobileNav } from '../../../components/docs-mobile-nav';
 import { getDocsRoutesToc } from '../../../components/docs-routes';
 import { DocsPageContainer } from '../../../components/docs-slots';
 import { mdxComponents } from '../../../components/mdx';
 import { getDocHref } from '../../../lib/docs';
 import { pageMetadata } from '../../../lib/metadata';
-import { getDocSlug, getDocsSections, source } from '../../../lib/source';
+import { getDocSlug, source } from '../../../lib/source';
 
 interface PageProps {
   params: Promise<{ slug?: string[] }>;
@@ -33,10 +34,14 @@ export default async function Page(props: PageProps) {
     <DocsPage
       toc={toc}
       breadcrumb={{ enabled: false }}
-      slots={{ container: DocsPageContainer }}
+      // The bar carries the docs menu, so pages without headings need it too.
+      tableOfContentPopover={{ enabled: true }}
+      slots={{
+        container: DocsPageContainer,
+        toc: { provider: TOCProvider, main: TOC, popover: DocsContentsBar },
+      }}
       footer={{ items: getDocsFooterItems(slug) }}
     >
-      <DocsMobileNav sections={getDocsSections()} currentSlug={slug} />
       <h1 className="docs-article-title">{page.data.title}</h1>
       <div className="docs-prose">
         <Content components={mdxComponents} />
