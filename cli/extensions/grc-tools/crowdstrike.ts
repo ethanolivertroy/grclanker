@@ -3098,10 +3098,45 @@ function evaluateSensorUpdate(policies: JsonRecord[], buildsByPlatform: Map<stri
   );
 }
 
+function recordSensorUpdateFacts(dataset: CollectedDataset<CrowdstrikePage<JsonRecord>>, buildsByPlatform: Map<string, CollectedDataset<JsonRecord[]>>): void {
+  if (dataset.error) {
+    recordCrowdstrikeDecisionFacts("CS-12", { sensor_update_policies_readable: false });
+    return;
+  }
+  const policies = assignedPolicies(dataset.data.items).map((policy) => {
+    const settings = asObject(policy.settings) ?? {};
+    const catalog = buildsByPlatform.get((asString(policy.platform_name) ?? "").toLowerCase());
+    const supported = catalog && !catalog.error ? supportedBuildNumbers(catalog.data) : undefined;
+    const main = classifyBuild(asString(settings.build));
+    const variants = asRecordArray(settings.variants)
+      .map((variant) => asString(variant.build))
+      .filter((build): build is string => build !== undefined)
+      .map(classifyBuild);
+    const judged = [main, ...variants];
+    return {
+      off: main.mode === "off",
+      unsupported: supported !== undefined && judged.some((build) => build.mode === "pinned" && !supported.has(build.number ?? "")),
+      unverified: judged.some((build) => build.mode === "unknown" || (build.mode === "pinned" && supported === undefined)),
+      unprotected: asString(settings.uninstall_protection)?.toUpperCase() !== "ENABLED",
+    };
+  });
+  recordCrowdstrikeDecisionFacts("CS-12", {
+    sensor_update_policies_readable: true,
+    sensor_update_policies_complete: !dataset.data.truncated,
+    assigned_sensor_update_policy_count: policies.length,
+    sensor_update_builds_readable: [...buildsByPlatform.values()].every((catalog) => !catalog.error),
+    policies_with_updates_off: policies.filter((policy) => policy.off).length,
+    policies_pinned_to_unsupported_build: policies.filter((policy) => policy.unsupported).length,
+    policies_with_unverified_builds: policies.filter((policy) => policy.unverified).length,
+    policies_without_uninstall_protection: policies.filter((policy) => policy.unprotected).length,
+  });
+}
+
 const HOST_CONSOLE_EVIDENCE = "export the host inventory from Falcon console > Host setup and management > Host management with last seen timestamps and compare it to the authoritative asset inventory.";
 
 function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>>, staleDays: number, now = Date.now()): CrowdstrikeFinding {
   if (hosts.error) {
+    recordCrowdstrikeDecisionFacts("CS-13", { hosts_readable: false });
     return unreadableFinding("CS-13", "hosts", hosts.error, HOST_CONSOLE_EVIDENCE);
   }
   const items = hosts.data.items;
@@ -3109,6 +3144,13 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
   const dated = items.filter((host) => parseTimestamp(host.last_seen) !== undefined);
   const undated = items.length - dated.length;
   const active = dated.filter((host) => (parseTimestamp(host.last_seen) ?? 0) >= staleCutoff);
+  recordCrowdstrikeDecisionFacts("CS-13", {
+    hosts_readable: true,
+    hosts_complete: !hosts.data.truncated,
+    host_count: items.length,
+    dated_host_count: dated.length,
+    recently_seen_host_count: active.length,
+  });
   const stale = dated.filter((host) => (parseTimestamp(host.last_seen) ?? 0) < staleCutoff);
   const rfm = items.filter((host) => asBoolean(host.reduced_functionality_mode) === true);
   const versions = new Map<string, number>();
@@ -3160,13 +3202,24 @@ const HOST_GROUP_CONSOLE_EVIDENCE = "export host group membership from Falcon co
 
 function evaluateHostGroupAssignment(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>>, groups: CollectedDataset<CrowdstrikePage<JsonRecord>>): CrowdstrikeFinding {
   if (hosts.error) {
+    recordCrowdstrikeDecisionFacts("CS-14", { hosts_readable: false });
     return unreadableFinding("CS-14", "hosts", hosts.error, HOST_GROUP_CONSOLE_EVIDENCE);
   }
   if (groups.error) {
+    recordCrowdstrikeDecisionFacts("CS-14", { hosts_readable: true, host_groups_readable: false });
     return unreadableFinding("CS-14", "host groups", groups.error, HOST_GROUP_CONSOLE_EVIDENCE);
   }
   const items = hosts.data.items;
   const assigned = items.filter((host) => asArray(host.groups).length > 0);
+  recordCrowdstrikeDecisionFacts("CS-14", {
+    hosts_readable: true,
+    hosts_complete: !hosts.data.truncated,
+    host_count: items.length,
+    grouped_host_count: assigned.length,
+    host_groups_readable: true,
+    host_groups_complete: !groups.data.truncated,
+    host_group_count: groups.data.items.length,
+  });
   const pct = percentage(assigned.length, items.length);
   const groupTypes = new Map<string, number>();
   for (const group of groups.data.items) {
@@ -3214,16 +3267,26 @@ function evaluateUnmanagedAssets(
   samples: CollectedDataset<CrowdstrikePage<JsonRecord>>,
 ): CrowdstrikeFinding {
   if (unmanagedCount.error) {
+    recordCrowdstrikeDecisionFacts("CS-15", { discover_counts_readable: false });
     if (isForbiddenOrMissing(unmanagedCount)) {
       return unlicensedFinding("CS-15", "Falcon Discover", unmanagedCount.error, DISCOVER_CONSOLE_EVIDENCE);
     }
     return unreadableFinding("CS-15", "Falcon Discover unmanaged asset count", unmanagedCount.error, DISCOVER_CONSOLE_EVIDENCE);
   }
   if (managedCount.error) {
+    recordCrowdstrikeDecisionFacts("CS-15", { discover_counts_readable: false });
     return unreadableFinding("CS-15", "Falcon Discover managed asset count", managedCount.error, DISCOVER_CONSOLE_EVIDENCE);
   }
   const unmanaged = unmanagedCount.data;
   const managed = managedCount.data;
+  recordCrowdstrikeDecisionFacts("CS-15", {
+    discover_counts_readable: true,
+    unmanaged_asset_total: unmanaged ?? null,
+    unmanaged_per_mille: unmanaged === undefined || managed === undefined || managed + unmanaged === 0
+      ? null
+      : Math.round((unmanaged / (managed + unmanaged)) * 1000),
+    discover_samples_readable: !samples.error,
+  });
   if (unmanaged === undefined || managed === undefined) {
     const missingTotals = [
       unmanaged === undefined ? "unmanaged" : undefined,
@@ -3282,15 +3345,25 @@ function evaluateZeroTrust(
   minScore: number,
 ): CrowdstrikeFinding {
   if (total.error) {
+    recordCrowdstrikeDecisionFacts("CS-25", { zero_trust_readable: false });
     if (isForbiddenOrMissing(total)) {
       return unlicensedFinding("CS-25", "Zero Trust Assessment", total.error, ZTA_CONSOLE_EVIDENCE);
     }
     return unreadableFinding("CS-25", "Zero Trust Assessment score totals", total.error, ZTA_CONSOLE_EVIDENCE);
   }
   if (belowTotal.error ?? belowThreshold.error) {
+    recordCrowdstrikeDecisionFacts("CS-25", { zero_trust_readable: false });
     return unreadableFinding("CS-25", "Zero Trust Assessment below-threshold scores", belowTotal.error ?? belowThreshold.error ?? "unknown error", ZTA_CONSOLE_EVIDENCE);
   }
   const scored = total.data;
+  const belowTotalReported = belowTotal.data !== undefined;
+  const below = belowTotal.data ?? belowThreshold.data.items.length;
+  recordCrowdstrikeDecisionFacts("CS-25", {
+    zero_trust_readable: true,
+    scored_host_total: scored ?? null,
+    below_threshold_host_count: below,
+    below_threshold_total_reported: belowTotalReported,
+  });
   if (scored === undefined) {
     return manualFinding(
       "CS-25",
@@ -3307,8 +3380,6 @@ function evaluateZeroTrust(
       { min_score: minScore, scored_hosts: 0 },
     );
   }
-  const belowTotalReported = belowTotal.data !== undefined;
-  const below = belowTotal.data ?? belowThreshold.data.items.length;
   const pct = percentage(below, scored);
   const computed: CrowdstrikeFinding["status"] = below === 0 ? "pass" : pct <= 10 ? "warn" : "fail";
   const status: CrowdstrikeFinding["status"] = belowTotalReported ? computed : computed === "pass" ? "warn" : computed;
@@ -3329,20 +3400,29 @@ function evaluateZeroTrust(
   );
 }
 
+type SensorCoverageClient = Pick<
+  CrowdstrikeApiClient,
+  | "getResolvedConfig"
+  | "listSensorUpdatePolicies"
+  | "listSensorUpdateBuilds"
+  | "listHosts"
+  | "listHostGroups"
+  | "countDiscoverHosts"
+  | "listDiscoverHosts"
+  | "countZtaAssessments"
+  | "listZtaAssessments"
+>;
+
 export async function assessCrowdstrikeSensorCoverage(
-  client: Pick<
-    CrowdstrikeApiClient,
-    | "getResolvedConfig"
-    | "listSensorUpdatePolicies"
-    | "listSensorUpdateBuilds"
-    | "listHosts"
-    | "listHostGroups"
-    | "countDiscoverHosts"
-    | "listDiscoverHosts"
-    | "countZtaAssessments"
-    | "listZtaAssessments"
-  >,
+  client: SensorCoverageClient,
   options: CrowdstrikeAssessmentOptions = {},
+): Promise<CrowdstrikeAssessmentResult> {
+  return runBatchVerdictContext(CROWDSTRIKE_DECISION_CONTEXT, CROWDSTRIKE_SPEC, () => assessCrowdstrikeSensorCoverageWithDecisionContext(client, options));
+}
+
+async function assessCrowdstrikeSensorCoverageWithDecisionContext(
+  client: SensorCoverageClient,
+  options: CrowdstrikeAssessmentOptions,
 ): Promise<CrowdstrikeAssessmentResult> {
   const hostLimit = clampNumber(options.hostLimit, DEFAULT_HOST_LIMIT, 1, 100_000);
   const staleDays = clampNumber(options.staleSensorDays, DEFAULT_STALE_SENSOR_DAYS, 1, 365);
@@ -3378,6 +3458,7 @@ export async function assessCrowdstrikeSensorCoverage(
       isCollected(sensorUpdate) ? "no enabled and host-assigned sensor update policy named a platform to look up" : "the sensor update policies list was not read",
       "/policy/combined/sensor-update-builds/v1",
     );
+  recordSensorUpdateFacts(sensorUpdate, buildsByPlatform);
 
   const findings = [
     sensorUpdate.error
