@@ -3579,7 +3579,7 @@ function evaluateAdminCount(views: UserView[], maxAdmins: number): CrowdstrikeFi
   );
 }
 
-function evaluateLeastPrivilege(views: UserView[], maxRoles: number, staleLoginDays: number, now = Date.now()): CrowdstrikeFinding {
+function evaluateLeastPrivilege(views: UserView[], maxRoles: number, staleLoginDays: number, now: number): CrowdstrikeFinding {
   const staleCutoff = now - staleLoginDays * 86_400_000;
   const overprivileged = views.filter((view) => view.roles.length > maxRoles || (view.admin_roles.length > 0 && view.roles.length > view.admin_roles.length + 1));
   const admins = views.filter((view) => view.admin_roles.length > 0);
