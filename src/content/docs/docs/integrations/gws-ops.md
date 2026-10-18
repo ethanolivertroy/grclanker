@@ -137,7 +137,7 @@ When `gws` is not installed or not authenticated, the script prints a skip messa
 
 ## How the tools handle evidence
 
-This section is reference for reviewing findings and bundles: how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+This section is reference for reviewing tool results and evidence bundles: how credentials are kept out of them and out of error text. You don't need it to set up or run the integration.
 
 ### Bundle secret hygiene
 
