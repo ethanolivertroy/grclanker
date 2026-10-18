@@ -3253,6 +3253,18 @@ function hostsWith(hosts) {
   return { listHosts: async (_limit, filter) => (filter ? [] : hosts) };
 }
 
+function recentlySeenHosts(total, recent) {
+  return hostsWith(manyHosts(total, (index) => (index < recent ? {} : { last_seen: isoDaysAgo(30) })));
+}
+
+function groupedHosts(total, grouped) {
+  return hostsWith(manyHosts(total, (index) => (index < grouped ? {} : { groups: [] })));
+}
+
+function discoveredAssets(unmanaged, managed) {
+  return { countDiscoverHosts: async (filter) => (filter.includes("unmanaged") ? unmanaged : managed) };
+}
+
 function slaAlerts(total, compliant) {
   const alerts = Array.from({ length: total }, (_, index) => ({
     composite_id: `a-${index + 1}`,
@@ -3307,12 +3319,25 @@ const BOUNDARY_SCENARIOS = [
   boundaryScenario("CS-10", "fail", "the firewall container enforces with no rule group", () => firewallWith((firewall) => {
     firewall.containers[0].rule_group_ids = [];
   })),
-  boundaryScenario("CS-13", "pass", "1 of 100 hosts is stale", () => hostsWith(manyHosts(100, (index) => (index < 99 ? {} : { last_seen: isoDaysAgo(30) })))),
-  boundaryScenario("CS-13", "warn", "10 of 100 hosts are stale", () => hostsWith(manyHosts(100, (index) => (index < 90 ? {} : { last_seen: isoDaysAgo(30) })))),
-  boundaryScenario("CS-14", "warn", "1599 of 2000 hosts are in a host group (79.95 percent rounds up to the fail edge)", () => hostsWith(manyHosts(2000, (index) => (index < 1599 ? {} : { groups: [] })))),
-  boundaryScenario("CS-14", "pass", "1899 of 2000 hosts are in a host group (94.95 percent rounds up to the warn edge)", () => hostsWith(manyHosts(2000, (index) => (index < 1899 ? {} : { groups: [] })))),
+  boundaryScenario("CS-13", "pass", "1 of 100 hosts is stale", () => recentlySeenHosts(100, 99)),
+  boundaryScenario("CS-13", "warn", "10 of 100 hosts are stale", () => recentlySeenHosts(100, 90)),
+  boundaryScenario("CS-14", "warn", "1599 of 2000 hosts are in a host group (79.95 percent rounds up to the fail edge)", () => groupedHosts(2000, 1599)),
+  boundaryScenario("CS-14", "pass", "1899 of 2000 hosts are in a host group (94.95 percent rounds up to the warn edge)", () => groupedHosts(2000, 1899)),
   boundaryScenario("CS-22", "warn", "1599 of 2000 alerts met their SLA (79.95 percent rounds up to the fail edge)", () => slaAlerts(2000, 1599)),
   boundaryScenario("CS-25", "warn", "5 of 100 scored hosts are below min_zta_score", () => ztaScores(5, 100)),
+  boundaryScenario("CS-13", "warn", "1699 of 2000 hosts were seen within stale_sensor_days (84.95 percent rounds up to the fail edge)", () => recentlySeenHosts(2000, 1699)),
+  boundaryScenario("CS-13", "fail", "1698 of 2000 hosts were seen within stale_sensor_days", () => recentlySeenHosts(2000, 1698)),
+  boundaryScenario("CS-13", "pass", "1899 of 2000 hosts were seen within stale_sensor_days (94.95 percent rounds up to the warn edge)", () => recentlySeenHosts(2000, 1899)),
+  boundaryScenario("CS-13", "warn", "1898 of 2000 hosts were seen within stale_sensor_days", () => recentlySeenHosts(2000, 1898)),
+  boundaryScenario("CS-14", "fail", "1598 of 2000 hosts are in a host group", () => groupedHosts(2000, 1598)),
+  boundaryScenario("CS-14", "warn", "1898 of 2000 hosts are in a host group", () => groupedHosts(2000, 1898)),
+  boundaryScenario("CS-15", "warn", "1 of 20 discovered assets is unmanaged (exactly unmanaged_fail_above_per_mille)", () => discoveredAssets(1, 19)),
+  boundaryScenario("CS-15", "fail", "1 of 19 discovered assets is unmanaged", () => discoveredAssets(1, 18)),
+  boundaryScenario("CS-22", "fail", "1598 of 2000 alerts met their SLA", () => slaAlerts(2000, 1598)),
+  boundaryScenario("CS-22", "pass", "1899 of 2000 alerts met their SLA (94.95 percent rounds up to the warn edge)", () => slaAlerts(2000, 1899)),
+  boundaryScenario("CS-22", "warn", "1898 of 2000 alerts met their SLA", () => slaAlerts(2000, 1898)),
+  boundaryScenario("CS-25", "warn", "10 of 100 scored hosts are below min_zta_score (exactly zta_fail_above_per_mille)", () => ztaScores(10, 100)),
+  boundaryScenario("CS-25", "fail", "11 of 100 scored hosts are below min_zta_score", () => ztaScores(11, 100)),
 ];
 
 async function runBoundaryScenario({ overrides }) {
