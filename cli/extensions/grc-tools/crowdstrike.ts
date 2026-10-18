@@ -3520,6 +3520,7 @@ async function assessCrowdstrikeSensorCoverageWithDecisionContext(
 interface UserView {
   uuid: string;
   uid?: string;
+  local_part: string;
   status?: string;
   last_login_at?: string;
   roles: string[];
@@ -3545,6 +3546,7 @@ function buildUserViews(users: JsonRecord[], rolesByUser: Map<string, JsonRecord
     return {
       uuid,
       uid,
+      local_part: localPart,
       status: asString(user.status),
       last_login_at: asString(user.last_login_at),
       roles,
@@ -3626,6 +3628,46 @@ function withRoleVisibility(item: CrowdstrikeFinding, views: UserView[], roleErr
   };
 }
 
+interface UserReadState {
+  readable: boolean;
+  users_complete: boolean;
+  role_catalog_readable: boolean;
+  role_catalog_complete: boolean;
+  truncated_role_users: ReadonlySet<string>;
+}
+
+function recordUserFacts(views: UserView[], state: UserReadState, maxAdmins: number, maxRoles: number, now: number): void {
+  if (!state.readable) {
+    recordCrowdstrikeDecisionFacts("CS-16", { users_readable: false });
+    recordCrowdstrikeDecisionFacts("CS-17", { users_readable: false });
+    return;
+  }
+  const users = views.map((view) => {
+    const lastLogin = parseTimestamp(view.last_login_at);
+    return {
+      local_part: view.local_part,
+      roles_readable: view.roles_readable,
+      role_list_partial: state.truncated_role_users.has(view.uuid),
+      role_count: view.roles.length,
+      admin_role_count: view.admin_roles.length,
+      last_login_age_ms: lastLogin === undefined ? null : now - lastLogin,
+    };
+  });
+  const shared = {
+    users_readable: true,
+    users_complete: state.users_complete,
+    role_catalog_readable: state.role_catalog_readable,
+    role_catalog_complete: state.role_catalog_complete,
+    users,
+  };
+  recordCrowdstrikeDecisionFacts("CS-16", {
+    ...shared,
+    admin_user_count: users.filter((user) => user.admin_role_count > 0).length,
+    max_admins: maxAdmins,
+  });
+  recordCrowdstrikeDecisionFacts("CS-17", { ...shared, max_roles_per_user: maxRoles });
+}
+
 interface ApiClientScope {
   id?: string;
   group?: string;
@@ -3678,15 +3720,8 @@ const API_CLIENT_CONSOLE_EVIDENCE = "export the API client list with scopes and 
 
 function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord>>, maxWriteClients: number, staleDays: number, now = Date.now()): CrowdstrikeFinding {
   if (clients.error) {
+    recordCrowdstrikeDecisionFacts("CS-18", { api_clients_readable: false });
     return unreadableFinding("CS-18", "API clients", clients.error, API_CLIENT_CONSOLE_EVIDENCE);
-  }
-  if (clients.data.items.length === 0) {
-    return manualFinding(
-      "CS-18",
-      "The API clients endpoint was readable but returned zero clients, which cannot be true for a tenant that issued the credential running this assessment; the inventory is not visible to this credential.",
-      API_CLIENT_CONSOLE_EVIDENCE,
-      { api_clients: 0 },
-    );
   }
   const staleCutoff = now - staleDays * 86_400_000;
   const views = clients.data.items.map((client) => {
@@ -3709,6 +3744,23 @@ function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord
   const writeClients = views.filter((view) => view.sensitive_write_scopes.length > 0);
   const unexposed = views.filter((view) => !view.scopes_exposed);
   const actionsUnreadable = views.filter((view) => view.scopes_exposed && !view.scope_actions_readable);
+  recordCrowdstrikeDecisionFacts("CS-18", {
+    api_clients_readable: true,
+    api_clients_complete: !clients.data.truncated,
+    api_client_count: views.length,
+    write_client_count: writeClients.length,
+    clients_without_scope_list: unexposed.length,
+    clients_with_actionless_scopes: actionsUnreadable.length,
+    max_write_clients: maxWriteClients,
+  });
+  if (views.length === 0) {
+    return manualFinding(
+      "CS-18",
+      "The API clients endpoint was readable but returned zero clients, which cannot be true for a tenant that issued the credential running this assessment; the inventory is not visible to this credential.",
+      API_CLIENT_CONSOLE_EVIDENCE,
+      { api_clients: 0 },
+    );
+  }
   const staleWriteClients = writeClients.filter((view) => view.stale);
   const withoutLastUsed = views.filter((view) => view.last_used_at === undefined).length;
   const lastUsedCoverage = withoutLastUsed === views.length
@@ -3743,6 +3795,23 @@ function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord
   ), [partialInventory(clients.data, "API clients")]);
 }
 
+function recordExclusionFacts(
+  id: ControlId,
+  prefix: string,
+  count: string,
+  exclusions: CollectedDataset<CrowdstrikePage<JsonRecord>>,
+  matching: ReadonlyArray<{ applied_globally: boolean }> = [],
+): void {
+  recordCrowdstrikeDecisionFacts(id, exclusions.error
+    ? { [`${prefix}_exclusions_readable`]: false }
+    : {
+      [`${prefix}_exclusions_readable`]: true,
+      [`${prefix}_exclusions_complete`]: !exclusions.data.truncated,
+      [count]: matching.length,
+      [`global_${count}`]: matching.filter((view) => view.applied_globally).length,
+    });
+}
+
 function isBroadRegex(value: string | undefined): boolean {
   if (!value) return false;
   const trimmed = value.trim();
@@ -3751,6 +3820,7 @@ function isBroadRegex(value: string | undefined): boolean {
 
 function evaluateIoaExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonRecord>>): CrowdstrikeFinding {
   if (exclusions.error) {
+    recordExclusionFacts("CS-19", "ioa", "broad_ioa_exclusion_count", exclusions);
     return unreadableFinding("CS-19", "IOA exclusions", exclusions.error, "export the IOA exclusion list from Falcon console > Endpoint security > Exclusions > IOA exclusions with patterns and scope.");
   }
   const views = exclusions.data.items.map((exclusion) => ({
@@ -3765,6 +3835,7 @@ function evaluateIoaExclusions(exclusions: CollectedDataset<CrowdstrikePage<Json
   }));
   const broad = views.filter((view) => view.broad);
   const broadGlobal = broad.filter((view) => view.applied_globally);
+  recordExclusionFacts("CS-19", "ioa", "broad_ioa_exclusion_count", exclusions, broad);
   const partial = partialInventory(exclusions.data, "IOA exclusions");
   // Emptiness is compliant only for a complete read (the CS-23 rule).
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : broadGlobal.length > 0 ? "fail" : broad.length > 0 ? "warn" : "pass";
@@ -3789,6 +3860,7 @@ function isSensitivePath(value: string | undefined): boolean {
 
 function evaluateMlExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonRecord>>): CrowdstrikeFinding {
   if (exclusions.error) {
+    recordExclusionFacts("CS-20", "ml", "sensitive_ml_exclusion_count", exclusions);
     return unreadableFinding("CS-20", "ML exclusions", exclusions.error, "export the machine learning exclusion list from Falcon console > Endpoint security > Exclusions > Machine learning exclusions.");
   }
   const views = exclusions.data.items.map((exclusion) => ({
@@ -3801,6 +3873,7 @@ function evaluateMlExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonR
   }));
   const sensitive = views.filter((view) => view.sensitive);
   const sensitiveGlobal = sensitive.filter((view) => view.applied_globally);
+  recordExclusionFacts("CS-20", "ml", "sensitive_ml_exclusion_count", exclusions, sensitive);
   const partial = partialInventory(exclusions.data, "ML exclusions");
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : sensitiveGlobal.length > 0 ? "fail" : sensitive.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
@@ -3823,6 +3896,7 @@ function hidesDirectory(value: string | undefined): boolean {
 
 function evaluateSensorVisibilityExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonRecord>>): CrowdstrikeFinding {
   if (exclusions.error) {
+    recordExclusionFacts("CS-21", "sensor_visibility", "hiding_sensor_visibility_exclusion_count", exclusions);
     return unreadableFinding("CS-21", "sensor visibility exclusions", exclusions.error, "export the sensor visibility exclusion list from Falcon console > Endpoint security > Exclusions > Sensor visibility exclusions with paths and scope.");
   }
   const views = exclusions.data.items.map((exclusion) => ({
@@ -3835,6 +3909,7 @@ function evaluateSensorVisibilityExclusions(exclusions: CollectedDataset<Crowdst
   }));
   const hiding = views.filter((view) => view.hides_directory);
   const hidingGlobal = hiding.filter((view) => view.applied_globally);
+  recordExclusionFacts("CS-21", "sensor_visibility", "hiding_sensor_visibility_exclusion_count", exclusions, hiding);
   const partial = partialInventory(exclusions.data, "sensor visibility exclusions");
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : hidingGlobal.length > 0 ? "fail" : hiding.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
@@ -3853,6 +3928,7 @@ const IDENTITY_CONSOLE_EVIDENCE = "capture the Identity Protection policy rule l
 
 function evaluateIdentityProtection(rules: CollectedDataset<CrowdstrikePage<JsonRecord>>): CrowdstrikeFinding {
   if (rules.error) {
+    recordCrowdstrikeDecisionFacts("CS-24", { identity_protection_rules_readable: false });
     if (isForbiddenOrMissing(rules)) {
       return unlicensedFinding("CS-24", "Falcon Identity Protection", rules.error, IDENTITY_CONSOLE_EVIDENCE);
     }
@@ -3874,6 +3950,13 @@ function evaluateIdentityProtection(rules: CollectedDataset<CrowdstrikePage<Json
   });
   const active = views.filter((view) => view.enabled && !view.simulation_mode);
   const enforcing = views.filter((view) => view.enforcing);
+  recordCrowdstrikeDecisionFacts("CS-24", {
+    identity_protection_rules_readable: true,
+    identity_protection_rules_complete: !rules.data.truncated,
+    identity_protection_rule_count: views.length,
+    active_identity_protection_rule_count: active.length,
+    enforcing_identity_protection_rule_count: enforcing.length,
+  });
   const partial = partialInventory(rules.data, "Identity Protection policy rules");
   // Zero visible rules of a truncated list is a claim about the unread rules (`absence_claim`, rendered
   // manual by withPartialInventory); zero rules on a complete read fails.
@@ -3893,21 +3976,30 @@ function evaluateIdentityProtection(rules: CollectedDataset<CrowdstrikePage<Json
 
 const USER_CONSOLE_EVIDENCE = "export the user list with roles and last login dates from Falcon console > Users and roles and count Falcon Administrator grants.";
 
+type AccessGovernanceClient = Pick<
+  CrowdstrikeApiClient,
+  | "getResolvedConfig"
+  | "listUserUuids"
+  | "getUsers"
+  | "listUserRoles"
+  | "listRoles"
+  | "listApiClients"
+  | "listIoaExclusions"
+  | "listMlExclusions"
+  | "listSensorVisibilityExclusions"
+  | "listIdentityProtectionRules"
+>;
+
 export async function assessCrowdstrikeAccessGovernance(
-  client: Pick<
-    CrowdstrikeApiClient,
-    | "getResolvedConfig"
-    | "listUserUuids"
-    | "getUsers"
-    | "listUserRoles"
-    | "listRoles"
-    | "listApiClients"
-    | "listIoaExclusions"
-    | "listMlExclusions"
-    | "listSensorVisibilityExclusions"
-    | "listIdentityProtectionRules"
-  >,
+  client: AccessGovernanceClient,
   options: CrowdstrikeAssessmentOptions = {},
+): Promise<CrowdstrikeAssessmentResult> {
+  return runBatchVerdictContext(CROWDSTRIKE_DECISION_CONTEXT, CROWDSTRIKE_SPEC, () => assessCrowdstrikeAccessGovernanceWithDecisionContext(client, options));
+}
+
+async function assessCrowdstrikeAccessGovernanceWithDecisionContext(
+  client: AccessGovernanceClient,
+  options: CrowdstrikeAssessmentOptions,
 ): Promise<CrowdstrikeAssessmentResult> {
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 10_000);
   const exclusionLimit = clampNumber(options.exclusionLimit, DEFAULT_EXCLUSION_LIMIT, 1, 10_000);
@@ -3922,7 +4014,7 @@ export async function assessCrowdstrikeAccessGovernance(
   const rolesByUser = new Map<string, JsonRecord[]>();
   const roleSnapshots: Record<string, unknown> = {};
   const roleErrors: string[] = [];
-  let rolesTruncated = 0;
+  const truncatedRoleUsers = new Set<string>();
   for (const user of users.data) {
     const uuid = asString(user.uuid) ?? asString(user.id);
     if (!uuid) continue;
@@ -3933,7 +4025,7 @@ export async function assessCrowdstrikeAccessGovernance(
       continue;
     }
     rolesByUser.set(uuid, rolePage.data.items);
-    if (rolePage.data.truncated) rolesTruncated += 1;
+    if (rolePage.data.truncated) truncatedRoleUsers.add(uuid);
   }
   const roleCatalog = await collectDataset(() => client.listRoles(), emptyPage<JsonRecord>(), "role catalog", "/user-management/queries/roles/v1");
   const apiClients = await collectDataset(() => client.listApiClients(userLimit), emptyPage<JsonRecord>(), "api clients", "/api-clients/queries/api-clients/v1");
@@ -3946,6 +4038,14 @@ export async function assessCrowdstrikeAccessGovernance(
 
   const views = buildUserViews(users.data, rolesByUser);
   const usersUnavailable = uuids.error ?? users.error;
+  const now = Date.now();
+  recordUserFacts(views, {
+    readable: !usersUnavailable,
+    users_complete: !uuids.data.truncated,
+    role_catalog_readable: !roleCatalog.error,
+    role_catalog_complete: !roleCatalog.data.truncated,
+    truncated_role_users: truncatedRoleUsers,
+  }, maxAdmins, maxRoles, now);
   const allRolesFailed = views.length > 0 && views.every((view) => !view.roles_readable);
   const userRoles: CollectedDataset<Record<string, unknown>> = usersUnavailable
     ? skippedDataset<Record<string, unknown>>({}, "user roles", uuids.error ? "the user uuid list was not read" : "the user details were not read", "/user-management/combined/user-roles/v2")
@@ -3968,7 +4068,7 @@ export async function assessCrowdstrikeAccessGovernance(
     }
     return withUnreadableSecondary(
       withPartialInventory(
-        withRoleVisibility(evaluate(), views, roleErrors, rolesTruncated),
+        withRoleVisibility(evaluate(), views, roleErrors, truncatedRoleUsers.size),
         [userPartial, partialInventory(roleCatalog.data, "roles in the role catalog")],
       ),
       "role catalog",
@@ -3979,7 +4079,7 @@ export async function assessCrowdstrikeAccessGovernance(
 
   const findings = [
     userFinding("CS-16", () => evaluateAdminCount(views, maxAdmins)),
-    userFinding("CS-17", () => evaluateLeastPrivilege(views, maxRoles, DEFAULT_STALE_ADMIN_LOGIN_DAYS)),
+    userFinding("CS-17", () => evaluateLeastPrivilege(views, maxRoles, DEFAULT_STALE_ADMIN_LOGIN_DAYS, now)),
     evaluateApiClients(apiClients, maxWriteClients, DEFAULT_STALE_API_CLIENT_DAYS),
     evaluateIoaExclusions(ioa),
     evaluateMlExclusions(ml),
@@ -3996,7 +4096,7 @@ export async function assessCrowdstrikeAccessGovernance(
       reported_total_users: derived(uuids.data.total ?? "unknown", uuids),
       users_truncated: derived(uuids.data.truncated, uuids),
       role_lookups_failed: derived(roleErrors.length, uuids, users),
-      role_pages_truncated: derived(rolesTruncated, uuids, users),
+      role_pages_truncated: derived(truncatedRoleUsers.size, uuids, users),
       // Admin grants come from the per-user role lookups; with none readable the count is unknown, not zero.
       admin_users: allRolesFailed ? null : derived(views.filter((view) => view.admin_roles.length > 0).length, uuids, users),
       roles_in_catalog: roleCatalog.error ? "unavailable" : roleCatalog.data.items.length,
@@ -4013,7 +4113,7 @@ export async function assessCrowdstrikeAccessGovernance(
         users: describeDataset(users),
         user_roles: usersUnavailable
           ? describeDataset(userRoles)
-          : `read for ${rolesByUser.size} of ${views.length} users (${roleErrors.length} lookups failed, ${rolesTruncated} truncated)`,
+          : `read for ${rolesByUser.size} of ${views.length} users (${roleErrors.length} lookups failed, ${truncatedRoleUsers.size} truncated)`,
         roles: describeDataset(roleCatalog),
         api_clients: describeDataset(apiClients),
         ioa_exclusions: describeDataset(ioa),
