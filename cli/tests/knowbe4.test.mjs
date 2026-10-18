@@ -41,6 +41,7 @@ import { KNOWBE4_SPEC } from "../dist/extensions/grc-tools/knowbe4.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
+import { assertRequestConformance, recordFetchRequests } from "./helpers/spec-conformance.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
@@ -2134,11 +2135,9 @@ function kbRoutes(fixture) {
   };
 }
 
-/** The real Knowbe4ApiClient over a fetch router that records the method, path, URL, and status of every request served. */
-function httpKnowbe4(fixture, options = {}) {
-  const routes = { ...kbRoutes(fixture), ...(options.routes ?? {}) };
-  const log = [];
-  const fetchImpl = async (input, init = {}) => {
+/** A fetch router over the routes that records the method, path, URL, and status of every request served. */
+function kbRouter(routes, log = []) {
+  return async (input, init = {}) => {
     const url = new URL(typeof input === "string" ? input : input.url);
     const method = (init.method ?? "GET").toUpperCase();
     const recipients = url.pathname.match(/^\/v1\/phishing\/security_tests\/([^/]+)\/recipients$/);
@@ -2150,9 +2149,18 @@ function httpKnowbe4(fixture, options = {}) {
     log.push({ method, path: url.pathname, url: url.toString(), status: response.status });
     return response;
   };
+}
+
+function kbClient(config, fetchImpl) {
+  return new Knowbe4ApiClient(config, { fetchImpl, sleepImpl: async () => {}, maxRetries: 0, minRequestIntervalMs: 0 });
+}
+
+/** The real Knowbe4ApiClient over the fixture's router. */
+function httpKnowbe4(fixture, options = {}) {
+  const log = [];
+  const fetchImpl = kbRouter({ ...kbRoutes(fixture), ...(options.routes ?? {}) }, log);
   const config = sampleConfig({ apiToken: KB_TEST_TOKEN, phisherApiToken: options.phisher === false ? undefined : KB_PHISHER_TOKEN, ...(options.config ?? {}) });
-  const client = new Knowbe4ApiClient(config, { fetchImpl, sleepImpl: async () => {}, maxRetries: 0, minRequestIntervalMs: 0 });
-  return { client, config, log };
+  return { client: kbClient(config, fetchImpl), config, log };
 }
 
 const KB_AREAS = [
@@ -2995,4 +3003,14 @@ portableContractTest("the auth resolver contract names exactly the environment t
   for (const [name, [environment, applied]] of Object.entries(reached)) {
     assert.ok(applied(resolveKnowbe4Configuration({}, environment, home)), `${name} reaches the resolved configuration`);
   }
+});
+
+portableContractTest("every request the access check, the four assessments, and the export send matches a declared surface, parameter, and header", async () => {
+  const recorder = recordFetchRequests(kbRouter(kbRoutes(healthyFixture())));
+  const config = sampleConfig({ apiToken: KB_TEST_TOKEN, phisherApiToken: KB_PHISHER_TOKEN });
+  const client = kbClient(config, recorder.fetch);
+  await checkKnowbe4Access(client);
+  await runAllKnowbe4Assessments(client);
+  await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-request-conformance-"), { now: NOW });
+  assertRequestConformance(assert, KNOWBE4_SPEC, recorder.requests);
 });
