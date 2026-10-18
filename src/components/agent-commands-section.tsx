@@ -73,13 +73,7 @@ const groups = [
 
 export function AgentCommandsSection() {
   return (
-    <section className="mb-8" data-agent-commands>
-      <h2 className="mb-2 text-sm font-semibold uppercase tracking-widest text-blue">
-        Review or Extend With Any Agent
-      </h2>
-      <p className="mb-5 text-sm italic text-subtext0">
-        The native tool family already ships. Use the spec to inspect coverage or plan the next change.
-      </p>
+    <div className="mb-8" data-agent-commands>
       {groups.map((group) => (
         <details key={group.title} className="agent-group mb-3" open={group.open}>
           <summary className="agent-group-toggle">{group.title}</summary>
@@ -90,6 +84,6 @@ export function AgentCommandsSection() {
           </div>
         </details>
       ))}
-    </section>
+    </div>
   );
 }
