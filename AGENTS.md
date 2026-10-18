@@ -43,7 +43,7 @@ Tests use Node’s built-in runner (`node --test`) with `.test.mjs` files in `cl
 Recent history uses short imperative subjects like `Add Okta compliance assessment tools` and `Add Google Workspace CLI operator bridge`. Keep commits scoped to one feature or hardening pass. PRs should include:
 
 - a clear summary of user-facing changes
-- linked Linear issue(s)
+- Maintainer pull requests link the Linear issue (`Resolves ABC-123`). An outside contributor links the GitHub issue.
 - validation commands run
 - screenshots only when site/docs UI changed
 

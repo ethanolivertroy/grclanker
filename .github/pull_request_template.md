@@ -11,6 +11,8 @@ Commands you ran:
 
 ## Issue
 
-Link the GitHub issue this closes. Repository layout and how to add an integration are in AGENTS.md.
+Maintainer pull requests link the Linear issue (`Resolves ABC-123`). An outside contributor links the GitHub issue.
+
+Repository layout and how to add an integration are in AGENTS.md.
 
 Add screenshots when the site or docs UI changes.

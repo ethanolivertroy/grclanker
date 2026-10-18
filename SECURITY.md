@@ -11,11 +11,13 @@ A source checkout of `main` moves ahead of the release. Report the commit you ra
 
 ## Reporting a vulnerability
 
+Report a vulnerability through GitHub private vulnerability reporting:
+
+https://github.com/ethanolivertroy/grclanker/security/advisories/new
+
 Do not open a public GitHub issue, discussion, or pull request for a vulnerability. Those are public, and the report would expose the details before a fix exists. Do not paste tokens, tenant data, or exploit details into a public place.
 
-The reporting channel for this repository is GitHub private vulnerability reporting. That feature is turned off on `ethanolivertroy/grclanker`, so GitHub is not accepting private reports. The maintainer has to enable it before this file can point reporters at the form. Until then, do not send the report through a public issue.
-
-When the channel is open, a useful report names:
+A useful report names:
 
 - the version or commit you ran, and the platform
 - the command or tool, and what you observed
