@@ -8,14 +8,15 @@
 // --word, or --word-2 where --word is too long for any row. For description
 // lines, these are the longest words in any of the block's descriptions, which
 // moves the column as one; for other lines, the longest after their first. A
-// line that continues the description above it also gets --indent, so narrow
-// screens can pull it in to the column where the other descriptions wrap.
+// description on a line of its own, below a description or a name too long for
+// the column, also gets --indent, so narrow screens can pull it in to the
+// column where the other descriptions wrap.
 //
 // Each line's indentation goes in an .indent span that must not wrap, which
 // keeps a long first word on the indented row instead of a row of its own.
-// Except on a continued description, the span also gets --spaces, its width,
-// and --first, the length of that first word, so narrow screens can shrink the
-// indentation until the word fits beside it.
+// Except on a line that holds only a description, the span also gets --spaces,
+// its width, and --first, the length of that first word, so narrow screens can
+// shrink the indentation until the word fits beside it.
 
 // Further right than this, a description column leaves too little room for
 // the rows that hang under it, so the line hangs from its indentation instead.
@@ -39,15 +40,21 @@ function descriptionColumn(text) {
   return match && match[0].length <= MAX_DESCRIPTION_COLUMN ? match[0].length : undefined;
 }
 
-// `description` is where the line's description starts, if it has one.
-function lineHang(text, columns) {
+// `description` is where the line's description starts, if it has one. `above`
+// is the nearest line above that has any text: where its description starts,
+// if it has one, and where its text ends.
+function lineHang(text, columns, above = {}) {
   const own = descriptionColumn(text);
   if (own !== undefined) return { hang: own, description: own };
   // A name as wide as the gap keeps a single space before its description.
   const single = /^\s*\S+ (?=\S)/.exec(text);
   if (single && columns.includes(single[0].length)) return { hang: single[0].length, description: single[0].length };
   const indent = /^\s*/.exec(text)[0].length;
-  if (columns.length > 0 && indent >= columns[0]) return { hang: indent, description: indent, indent };
+  const continues = above.description !== undefined && indent >= above.description;
+  // A name that runs into the column leaves no room for its description, which
+  // starts the next line instead.
+  const spills = above.description === undefined && above.end >= indent && columns.includes(indent);
+  if (continues || spills) return { hang: indent, description: indent, indent };
   return { hang: indent + DEFAULT_HANG };
 }
 
@@ -83,10 +90,14 @@ function holdIndent(node, first) {
 
 function setHangs(lines) {
   const texts = lines.map(textContent);
-  const columns = [...new Set(texts.map(descriptionColumn))]
-    .filter((column) => column !== undefined)
-    .sort((a, b) => a - b);
-  const hangs = texts.map((text) => (text.trim() ? lineHang(text, columns) : undefined));
+  const columns = [...new Set(texts.map(descriptionColumn))].filter((column) => column !== undefined);
+  let above;
+  const hangs = texts.map((text) => {
+    if (!text.trim()) return undefined;
+    const hang = lineHang(text, columns, above);
+    above = { description: hang.description, end: text.trimEnd().length };
+    return hang;
+  });
   const descriptionWords = longestWords(
     ...hangs.map((line, index) => (line?.description === undefined ? '' : texts[index].slice(line.description))),
   );

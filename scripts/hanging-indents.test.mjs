@@ -130,6 +130,29 @@ test('a continued description keeps its indentation, which narrow screens pull i
   assert.deepEqual(lines[1].children[0].children, [indent(' '.repeat(13)), text('read fails')]);
 });
 
+test('a name too long for the column puts its description on the next line', () => {
+  assert.deepEqual(
+    styles(
+      '  core_data/'.padEnd(22) + 'raw API snapshots',
+      '  core_data/collection_status.json',
+      ' '.repeat(22) + 'one row per inventory: readable, truncated',
+    ),
+    [
+      '--hang:22ch;--word:10ch;--word-2:9ch',
+      '--hang:4ch',
+      '--hang:22ch;--indent:22ch;--word:10ch;--word-2:9ch',
+    ],
+  );
+});
+
+test('a deeper line continues a description only when the line above has one', () => {
+  assert.deepEqual(styles('foo: 1  # comment', 'bar:', '        nested: true'), [
+    '--hang:8ch;--word:7ch;--word-2:1ch',
+    undefined,
+    '--hang:10ch;--word:4ch',
+  ]);
+});
+
 test('lines are found by className as well as class, inside any wrapper', () => {
   const node = line('  indented', { className: ['line'] });
   const pre = el('pre', [el('code', [node])]);
