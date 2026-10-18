@@ -50,6 +50,8 @@ The admin needs a role that can view the policy areas above. Unreadable areas pr
 
 The client posts `client_id` and `client_secret` as a form body to `POST /signin` and sends the returned bearer token.
 
+### Other variables
+
 `zscaler_check_access` detects and reports `ZSCALER_CLIENT_ID`, `ZSCALER_CLIENT_SECRET` (OneAPI) and `ZDX_CLIENT_ID`, `ZDX_CLIENT_SECRET`. OneAPI OAuth mode and ZDX enrichment are not implemented in this release.
 
 Optional tuning:
