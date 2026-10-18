@@ -3143,6 +3143,221 @@ portableContractTest("every control and finding carries the title, severity, and
   assert.deepEqual([...statuses].sort(), ["fail", "manual", "pass", "warn"]);
 });
 
+function boundaryScenario(check, expected, edge, fixture, options = {}) {
+  return { name: `${check} ${expected} when ${edge}`, check, expected, fixture, options };
+}
+
+function fixtureWith(change) {
+  return () => {
+    const fixture = healthyFixture();
+    change(fixture);
+    return fixture;
+  };
+}
+
+function activeUsers(count, change = () => ({})) {
+  return Array.from({ length: count }, (_, index) => user(index + 1, change(index)));
+}
+
+function withoutRecipients(userIds) {
+  return fixtureWith((fixture) => {
+    for (const [pstId, rows] of fixture.recipientsByTest) fixture.recipientsByTest.set(pstId, rows.filter((row) => !userIds.includes(row.user.id)));
+  });
+}
+
+function endedCampaignCompletion(completion) {
+  return fixtureWith((fixture) => {
+    fixture.trainingCampaigns[0].completion_percentage = completion;
+  });
+}
+
+/** Users who joined 100 days ago, past the 30-day enrollment grace period; the first `late` have no enrollment. */
+function newHires(total, late) {
+  return fixtureWith((fixture) => {
+    fixture.users = activeUsers(total, () => ({ joined_on: daysAgo(100) }));
+    fixture.enrollments = fixture.users.slice(late).map((record, index) => enrollment(index + 1, record, 701, "Security Awareness Fundamentals", daysAgo(98)));
+  });
+}
+
+function riskScores(scores) {
+  return fixtureWith((fixture) => {
+    fixture.users = fixture.users.map((record, index) => ({ ...record, current_risk_score: scores[index] }));
+  });
+}
+
+function evenSplit(low, high) {
+  return [...Array(5).fill(low), ...Array(5).fill(high)];
+}
+
+/** Sets the phish-prone percentage of the three tests in the 90-day lookback and, optionally, of the three oldest tests. */
+function phishProne(current, baseline) {
+  return fixtureWith((fixture) => {
+    for (const index of [0, 1, 2]) fixture.securityTests[index].phish_prone_percentage = current;
+    if (baseline !== undefined) for (const index of [9, 10, 11]) fixture.securityTests[index].phish_prone_percentage = baseline;
+  });
+}
+
+/** The six tests in the 180-day trend window: the older three at `earlier`, the newer three at `later`. */
+function phishProneTrend(earlier, later) {
+  return fixtureWith((fixture) => {
+    for (const index of [3, 4, 5]) fixture.securityTests[index].phish_prone_percentage = earlier;
+    for (const index of [0, 1, 2]) fixture.securityTests[index].phish_prone_percentage = later;
+  });
+}
+
+/** The active phishing campaign targets only the Finance group, which holds `targeted` of `active` users. */
+function partialTargeting(targeted, active = 10) {
+  return fixtureWith((fixture) => {
+    fixture.users = activeUsers(active);
+    fixture.phishingCampaigns[0].groups = [{ group_id: 100, name: "Finance" }];
+    fixture.groups[0].member_count = targeted;
+  });
+}
+
+/** Every user failed the test 37 days ago; the first `enrolled` users were enrolled in training two days later. */
+function remediatedFailures(enrolled) {
+  return fixtureWith((fixture) => {
+    const failed = fixture.securityTests[1];
+    fixture.recipientsByTest.set(String(failed.pst_id), fixture.users.map((record) => recipient(failed.pst_id, record, failed.started_at, { clicked_at: failed.started_at })));
+    fixture.users.slice(0, enrolled).forEach((record, index) => {
+      fixture.enrollments.push(enrollment(100 + index, record, 701, "Security Awareness Fundamentals", daysAgo(35)));
+    });
+  });
+}
+
+function admins(count) {
+  return fixtureWith((fixture) => {
+    fixture.account.admins = activeUsers(count).map(({ id, first_name, last_name, email }) => ({ id, first_name, last_name, email }));
+  });
+}
+
+/** Adds enrollments in the PCI module, whose eight healthy enrollments have all passed. */
+function complianceEnrollments(statuses) {
+  return fixtureWith((fixture) => {
+    statuses.forEach((status, index) => {
+      fixture.enrollments.push(enrollment(200 + index, fixture.users[8 + index], 701, "PCI DSS Compliance Basics", daysAgo(8), { store_purchase_id: 2, status }));
+    });
+  });
+}
+
+/** Long-standing users who all signed in three days ago except the last, who never did and received no test. */
+function inactiveLongStanding(total) {
+  return fixtureWith((fixture) => {
+    fixture.users = activeUsers(total, (index) => (index === total - 1 ? { last_sign_in: null } : {}));
+  });
+}
+
+/** The three tests in the 90-day lookback: the newest delivers and reports the given counts, the other two deliver nothing. */
+function reportRate(delivered, reported) {
+  return fixtureWith((fixture) => {
+    fixture.securityTests.slice(0, 3).forEach((item, index) => {
+      item.delivered_count = index === 0 ? delivered : 0;
+      item.reported_count = index === 0 ? reported : 0;
+    });
+  });
+}
+
+const BOUNDARY_SCENARIOS = [
+  boundaryScenario("KNOWBE4-01", "pass", "the newest security test started 30.04 days ago, which rounds to the 30-day maximum gap", fixtureWith((fixture) => {
+    fixture.securityTests[0].started_at = daysAgo(30.04);
+  })),
+  boundaryScenario("KNOWBE4-01", "fail", "the newest security test started 30.05 days ago, which rounds past the 30-day maximum gap", fixtureWith((fixture) => {
+    fixture.securityTests[0].started_at = daysAgo(30.05);
+  })),
+  boundaryScenario("KNOWBE4-02", "pass", "9 of 10 active users received a security test in the lookback, exactly the 90 percent minimum", withoutRecipients([10])),
+  boundaryScenario("KNOWBE4-02", "fail", "8 of 10 active users received a security test in the lookback", withoutRecipients([9, 10])),
+  boundaryScenario("KNOWBE4-03", "pass", "the ended training campaign reports exactly the 90 percent minimum completion", endedCampaignCompletion(90)),
+  boundaryScenario("KNOWBE4-03", "warn", "the ended training campaign reports 89.9 percent completion", endedCampaignCompletion(89.9)),
+  boundaryScenario("KNOWBE4-03", "warn", "the ended training campaign reports exactly the 80 percent fail line", endedCampaignCompletion(80)),
+  boundaryScenario("KNOWBE4-03", "fail", "the ended training campaign reports 79.9 percent completion", endedCampaignCompletion(79.9)),
+  boundaryScenario("KNOWBE4-03", "warn", "a second ended training campaign reports no completion and has no loaded enrollments", fixtureWith((fixture) => {
+    fixture.trainingCampaigns.push({ ...fixture.trainingCampaigns[0], campaign_id: 702, name: "Phishing Refresher", start_date: daysAgo(60), end_date: daysAgo(30), completion_percentage: null });
+  })),
+  boundaryScenario("KNOWBE4-04", "warn", "1 of 20 new users had no training enrollment within the grace period, exactly the 5 percent maximum", newHires(20, 1)),
+  boundaryScenario("KNOWBE4-04", "fail", "1 of 19 new users had no training enrollment within the grace period", newHires(19, 1)),
+  boundaryScenario("KNOWBE4-04", "warn", "26 of 519 new users had no training enrollment within the grace period, which rounds to the 5 percent maximum", newHires(519, 26)),
+  boundaryScenario("KNOWBE4-04", "warn", "26 of the 519 new users loaded before the user list stopped at the user limit had no training enrollment within the grace period", newHires(520, 26), { userLimit: 519 }),
+  boundaryScenario("KNOWBE4-05", "pass", "risk scores split evenly between 25 and 75, a mean of exactly 50 and a standard deviation of exactly 25", riskScores(evenSplit(25, 75))),
+  boundaryScenario("KNOWBE4-05", "warn", "risk scores split evenly between 20 and 80, a standard deviation of 30", riskScores(evenSplit(20, 80))),
+  boundaryScenario("KNOWBE4-05", "fail", "the mean active user risk score is 50.1", riskScores([...Array(9).fill(50), 51])),
+  boundaryScenario("KNOWBE4-05", "warn", "no active user carries a numeric risk score", riskScores(Array(10).fill(null))),
+  boundaryScenario("KNOWBE4-06", "pass", "the lookback phish-prone percentage is exactly the 15 percent maximum and below the earliest baseline", phishProne(0.15, 0.2)),
+  boundaryScenario("KNOWBE4-06", "fail", "the lookback phish-prone percentage is 15.01", phishProne(0.1501, 0.2)),
+  boundaryScenario("KNOWBE4-06", "warn", "the lookback phish-prone percentage is within the maximum but above the earliest baseline", phishProne(0.15)),
+  boundaryScenario("KNOWBE4-07", "pass", "the newer half of the trend window averages exactly 0.5 points above the older half", phishProneTrend(0.1, 0.105)),
+  boundaryScenario("KNOWBE4-07", "warn", "the newer half of the trend window averages 0.51 points above the older half", phishProneTrend(0.1, 0.1051)),
+  boundaryScenario("KNOWBE4-07", "warn", "the newer half of the trend window averages exactly 2 points above the older half", phishProneTrend(0.1, 0.12)),
+  boundaryScenario("KNOWBE4-07", "fail", "the newer half of the trend window averages 2.01 points above the older half", phishProneTrend(0.1, 0.1201)),
+  boundaryScenario("KNOWBE4-08", "warn", "a group has no phishing campaign and the phishing campaign list stopped at its limit", fixtureWith((fixture) => {
+    const [campaign] = fixture.phishingCampaigns;
+    campaign.groups = [{ group_id: 100, name: "Finance" }];
+    fixture.phishingCampaigns = { items: [campaign], truncated: true, limit: 1, pages: 1 };
+  })),
+  boundaryScenario("KNOWBE4-09", "pass", "the active phishing campaign's groups hold 1799 of 2000 active users, which rounds to the 90 percent minimum", partialTargeting(1799, 2000)),
+  boundaryScenario("KNOWBE4-09", "fail", "the active phishing campaign's groups hold 1798 of 2000 active users", partialTargeting(1798, 2000)),
+  boundaryScenario("KNOWBE4-09", "pass", "full targeting is not required and the active phishing campaign's groups hold half the active users", partialTargeting(5), { requireFullTargeting: false }),
+  boundaryScenario("KNOWBE4-10", "pass", "9 of 10 users who failed a test more than 14 days ago were enrolled in training afterward, exactly the 90 percent target", remediatedFailures(9)),
+  boundaryScenario("KNOWBE4-10", "warn", "8 of 10 users who failed a test more than 14 days ago were enrolled in training afterward", remediatedFailures(8)),
+  boundaryScenario("KNOWBE4-10", "warn", "the only failed test result is newer than the 14-day remedial window", fixtureWith((fixture) => {
+    const older = fixture.recipientsByTest.get(String(fixture.securityTests[1].pst_id));
+    older[2] = { ...older[2], opened_at: null, clicked_at: null };
+    const newest = fixture.securityTests[0];
+    const recent = fixture.recipientsByTest.get(String(newest.pst_id));
+    recent[0] = { ...recent[0], clicked_at: newest.started_at };
+  })),
+  boundaryScenario("KNOWBE4-10", "pass", "a failed user was enrolled within the remedial window and again, in unrelated training, 27 days after the failure", fixtureWith((fixture) => {
+    fixture.enrollments.push(enrollment(100, fixture.users[2], 700, "PCI DSS Compliance Basics", daysAgo(10), { store_purchase_id: 2 }));
+  })),
+  boundaryScenario("KNOWBE4-11", "warn", "no training campaign in the lookback assigns a store purchase module", fixtureWith((fixture) => {
+    for (const campaign of fixture.trainingCampaigns) campaign.content = [{ policy_id: 1, content_type: "Uploaded Policy", name: "Acceptable Use Policy" }];
+  })),
+  boundaryScenario("KNOWBE4-12", "warn", "the account lists no admins", admins(0)),
+  boundaryScenario("KNOWBE4-12", "pass", "the account has exactly the 3-admin maximum, all in its domains", admins(3)),
+  boundaryScenario("KNOWBE4-12", "fail", "the account has 4 admins", admins(4)),
+  boundaryScenario("KNOWBE4-16", "warn", "the callback test list stopped at its limit with no callback test inside the lookback", fixtureWith((fixture) => {
+    fixture.callbackTests = { items: [securityTest(950, daysAgo(200), 0.05, { campaign_id: 501, name: "Callback Q1" })], truncated: true, limit: 1, pages: 1 };
+  })),
+  boundaryScenario("KNOWBE4-17", "pass", "9 of 10 enrollments in the compliance module are complete, exactly the 90 percent minimum", complianceEnrollments(["Passed", "In Progress"])),
+  boundaryScenario("KNOWBE4-17", "warn", "8 of 10 enrollments in the compliance module are complete", complianceEnrollments(["In Progress", "In Progress"])),
+  boundaryScenario("KNOWBE4-18", "warn", "1 of 20 long-standing users shows no activity in the 180-day window, exactly the 5 percent maximum", inactiveLongStanding(20)),
+  boundaryScenario("KNOWBE4-18", "fail", "1 of 19 long-standing users shows no activity in the 180-day window", inactiveLongStanding(19)),
+  boundaryScenario("KNOWBE4-19", "pass", "exactly the 50 percent minimum of delivered emails were reported", reportRate(1000, 500)),
+  boundaryScenario("KNOWBE4-19", "pass", "999 of 2000 delivered emails were reported, which rounds to the 50 percent minimum", reportRate(2000, 999)),
+  boundaryScenario("KNOWBE4-19", "warn", "998 of 2000 delivered emails were reported", reportRate(2000, 998)),
+  boundaryScenario("KNOWBE4-19", "warn", "exactly 25 percent of delivered emails were reported, half the minimum", reportRate(1000, 250)),
+  boundaryScenario("KNOWBE4-19", "fail", "24.9 percent of delivered emails were reported", reportRate(1000, 249)),
+  boundaryScenario("KNOWBE4-19", "pass", "the minimum is 20 percent and 22 percent of delivered emails were reported", reportRate(1000, 220), { minReportRatePct: 20 }),
+  boundaryScenario("KNOWBE4-19", "warn", "the minimum is 40 percent and exactly half of it, 20 percent, of delivered emails were reported", reportRate(1000, 200), { minReportRatePct: 40 }),
+  boundaryScenario("KNOWBE4-19", "fail", "the minimum is 40 percent and 19.9 percent of delivered emails were reported", reportRate(1000, 199), { minReportRatePct: 40 }),
+  boundaryScenario("KNOWBE4-20", "pass", "the largest gap between consecutive security tests is exactly the 45-day maximum", fixtureWith((fixture) => {
+    fixture.securityTests[1].started_at = daysAgo(23);
+  })),
+  boundaryScenario("KNOWBE4-20", "fail", "the largest gap between consecutive security tests is 45.1 days", fixtureWith((fixture) => {
+    fixture.securityTests[1].started_at = daysAgo(22.9);
+  })),
+];
+
+const KB_ASSESSORS = new Map(KB_AREAS);
+
+/** Collects only the area that owns the check and assesses it, with the scenario's options on both calls. */
+async function runBoundaryScenario({ check, fixture, options }) {
+  const { area } = KNOWBE4_CONTROLS.find((control) => control.number === Number(check.slice(-2)));
+  const snapshot = await collectKnowbe4Snapshot(mockClient(fixture()), { ...options, scopes: [area], now: NOW });
+  return KB_ASSESSORS.get(area)(snapshot, { ...options, now: NOW });
+}
+
+test("boundary scenarios: each threshold edge reaches the verdict on either side of it", async () => {
+  const names = BOUNDARY_SCENARIOS.map((scenario) => scenario.name);
+  assert.equal(new Set(names).size, names.length, "scenario names key the byte differential fixture");
+  const mismatches = [];
+  for (const scenario of BOUNDARY_SCENARIOS) {
+    const result = await runBoundaryScenario(scenario);
+    const status = result.findings.find((item) => item.id === scenario.check)?.status;
+    if (status !== scenario.expected) mismatches.push(`${scenario.name}: ${status}`);
+  }
+  assert.deepEqual(mismatches, []);
+});
+
 portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", {
   skip: testFilterActive && "a test filter ran only part of this file",
 }, () => {
