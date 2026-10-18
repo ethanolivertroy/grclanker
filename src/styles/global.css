@@ -1472,28 +1472,20 @@ details[open] > .agent-group-toggle::before {
   line-height: inherit;
 }
 
-/* Without hover the link would show on every heading, and on phones the room
-   it takes would push a word of some headings onto a new line. The contents
-   list links each section there instead. */
+/* Without hover the link would show on every heading, and below 1280px the
+   column's side margin can be narrower than the link. The contents bar links
+   each section there instead. */
 .docs-prose .docs-heading-anchor {
   display: none;
 }
 
-@media (hover: hover) {
-  .docs-prose .docs-heading {
+@media (hover: hover) and (min-width: 1280px) {
+  /* The end margin cancels the link's width, so headings wrap as if it were not
+     there. The link hangs past the last word, at most into the column's side
+     margin. */
+  .docs-prose .docs-heading-anchor {
     --docs-anchor-gap: 0.35em;
     --docs-anchor-size: 0.75em;
-    padding-inline-end: calc(var(--docs-anchor-gap) + var(--docs-anchor-size));
-  }
-
-  /* The end padding sits outside the heading's 60ch measure. */
-  .docs-prose > .docs-heading {
-    max-width: calc(60ch + var(--docs-anchor-gap) + var(--docs-anchor-size));
-  }
-
-  /* The end margin cancels the link's width, so it never wraps onto a line of
-     its own; the wrapper's end padding leaves room for it to hang into. */
-  .docs-prose .docs-heading-anchor {
     position: relative;
     display: inline-block;
     margin-inline: var(--docs-anchor-gap) calc(-1 * (var(--docs-anchor-gap) + var(--docs-anchor-size)));
@@ -1504,11 +1496,12 @@ details[open] > .agent-group-toggle::before {
     transition: opacity 0.15s ease;
   }
 
-  /* Enlarges the link's hit area around the icon without moving it. */
+  /* Enlarges the link's hit area without moving it. It stops at the icon's end
+     edge so it never reaches past the column's side margin. */
   .docs-prose .docs-heading-anchor::after {
     content: '';
     position: absolute;
-    inset: -0.4em -0.4em -0.4em calc(-1 * var(--docs-anchor-gap));
+    inset: -0.4em 0 -0.4em calc(-1 * var(--docs-anchor-gap));
   }
 
   .docs-prose .docs-heading-anchor svg {
