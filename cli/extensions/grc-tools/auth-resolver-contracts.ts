@@ -425,3 +425,36 @@ export const QUALYS_AUTH_RESOLVER = {
   configFields: ["username", "user", "password", "token", "use_oauth", "platform", "hostname", "base_url", "gateway_url", "timeout"],
   refreshRequest: "POST {gateway}/auth with the form fields username, password, and token=true when use_oauth is set and no token is configured; the returned token is reused for 3.5 hours.",
 } as const satisfies ResolverAuthenticationContract;
+
+export const CROWDSTRIKE_AUTH_RESOLVER = {
+  modes: ["OAuth2 client credentials: client_id and client_secret are exchanged for a bearer token, sent as Authorization: Bearer on every API read"],
+  precedence: [
+    "Explicit tool arguments",
+    "CS_* environment variables, then their FALCON_* aliases",
+    "CrowdStrike JSON config file",
+    "A base_url from any source takes precedence over a cloud from any source; with neither, the us-1 API host is used",
+  ],
+  environment: [
+    "CS_CONFIG_FILE",
+    "CS_CLIENT_ID",
+    "FALCON_CLIENT_ID",
+    "CS_CLIENT_SECRET",
+    "FALCON_CLIENT_SECRET",
+    "CS_CLOUD",
+    "FALCON_CLOUD",
+    "CS_BASE_URL",
+    "FALCON_BASE_URL",
+    "CS_MEMBER_CID",
+    "FALCON_MEMBER_CID",
+    "CS_TIMEOUT",
+  ],
+  configLocations: ["~/.crowdstrike/config.json", "Explicit path from config_file or CS_CONFIG_FILE"],
+  variants: [
+    "Named clouds us-1 (the default, https://api.crowdstrike.com), us-2, eu-1, us-gov-1, and us-gov-2, each with its own API host",
+    "Cloud aliases us1, us2, eu1, usgov1, usgov2, gov-1, gov, and laggar, matched case-insensitively with underscores read as hyphens",
+    "An explicit https base_url (the scheme may be omitted; http is rejected) replaces the cloud's API host, and a base_url equal to a named cloud's host reports that cloud",
+    "A Flight Control child CID (member_cid) is sent only in the token request, so the token and every read made with it cover that CID only",
+  ],
+  configFields: ["client_id", "clientId", "client_secret", "clientSecret", "cloud", "region", "base_url", "baseUrl", "member_cid", "memberCid", "timeout_seconds"],
+  refreshRequest: "POST {base_url}/oauth2/token with Accept: application/json and an application/x-www-form-urlencoded body of client_id, client_secret, and member_cid when configured; the access_token is reused until 60 seconds before its expires_in (1799 seconds when absent) runs out, and for at least 60 seconds.",
+} as const satisfies ResolverAuthenticationContract;

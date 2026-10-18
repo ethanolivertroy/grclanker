@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { CROWDSTRIKE_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -1142,6 +1143,7 @@ export function resolveCrowdstrikeConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   homeDir: string = homedir(),
 ): CrowdstrikeResolvedConfig {
+  env = readResolverEnvironment(CROWDSTRIKE_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const explicitConfigPath = asString(input.config_file) ?? asString(env.CS_CONFIG_FILE);
   const configPath = explicitConfigPath ?? join(homeDir, ".crowdstrike", "config.json");
