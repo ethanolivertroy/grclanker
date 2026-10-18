@@ -2,6 +2,7 @@ import Link from 'next/link';
 import type { ComponentProps } from 'react';
 import type { MDXComponents } from 'mdx/types';
 import { CodeBlock } from './code-block';
+import { DocsHeading } from './docs-heading';
 import { DocsRoutes } from './docs-routes';
 
 function MdxLink({ href = '', ...props }: ComponentProps<'a'>) {
@@ -21,6 +22,9 @@ function MdxTable(props: ComponentProps<'table'>) {
 
 export const mdxComponents: MDXComponents = {
   a: MdxLink,
+  h2: (props) => <DocsHeading as="h2" {...props} />,
+  h3: (props) => <DocsHeading as="h3" {...props} />,
+  h4: (props) => <DocsHeading as="h4" {...props} />,
   pre: CodeBlock,
   table: MdxTable,
   DocsRoutes,
