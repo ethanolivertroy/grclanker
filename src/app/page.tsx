@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { HeroImage } from '../components/hero-image';
 import { HeroBrandRail, HeroImageBreak } from '../components/hero-images';
 import { HeroInstall } from '../components/hero-install';
 import { pageMetadata } from '../lib/metadata';
@@ -124,7 +125,7 @@ export default function HomePage() {
     <>
       <section className="relative overflow-hidden border-b border-surface0/60">
         <div className="absolute inset-0 w-full h-full">
-          <img
+          <HeroImage
             src="/hero/command-center.webp"
             alt="Clanker command center"
             className="w-full h-full object-cover object-center"
@@ -176,7 +177,7 @@ export default function HomePage() {
       <section className="hero-preview-section">
         <div className="max-w-content mx-auto px-6">
           <div className="hero-preview-shell">
-            <img
+            <HeroImage
               src="/hero/grclanker-terminal.png"
               alt="grclanker CLI start screen from the v0.1.2 release bundle: 248 tools and 2 agents, the investigate, audit, assess, and validate workflows, and 241 domain tools ready"
               className="hero-preview-image"

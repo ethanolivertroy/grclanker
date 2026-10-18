@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { HeroImage } from '../components/hero-image';
 import { pageMetadata } from '../lib/metadata';
 
 export const metadata = pageMetadata({
@@ -11,7 +12,7 @@ export default function NotFound() {
   return (
     <section className="relative overflow-hidden">
       <div className="absolute inset-0 w-full h-full">
-        <img src="/404-cockpit.webp" alt="" className="w-full h-full object-cover object-center" loading="eager" />
+        <HeroImage src="/404-cockpit.webp" alt="" className="w-full h-full object-cover object-center" loading="eager" />
       </div>
       <div className="absolute inset-0 bg-gradient-to-b from-base/30 via-base/50 to-base pointer-events-none" />
       <div className="relative z-10 max-w-content mx-auto px-6 py-32 text-center">

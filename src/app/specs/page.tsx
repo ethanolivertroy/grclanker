@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { HeroImage } from '../../components/hero-image';
 import { SpecCatalogSection } from '../../components/spec-catalog-section';
 import { SpecCommandHero } from '../../components/spec-copy';
 import { pageMetadata } from '../../lib/metadata';
@@ -19,7 +20,7 @@ export default function SpecsPage() {
     <>
       <section className="relative overflow-hidden border-b border-surface0/60">
         <div className="absolute inset-0 w-full h-full">
-          <img
+          <HeroImage
             src="/hero/holographic.webp"
             alt="Spec catalog cockpit display"
             className="w-full h-full object-cover object-center"

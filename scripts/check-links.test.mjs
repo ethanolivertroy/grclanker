@@ -255,6 +255,17 @@ test('every page except the 404 pages must be in the search index', () => {
   assert.match(noIndex[0], /api\/search\.json: search index not found/);
 });
 
+test('images preloaded by prefetch data are reported once each', () => {
+  const problems = problemsFor({
+    'index.txt': '0:HL["/_next/static/chunks/app.css","style"]\n1:HL["/hero.webp","image"]\n',
+    '__next.__PAGE__.txt': '1:HL["/hero.webp","image",{"fetchPriority":"high"}]\n',
+    'about/index.txt': '2:I["/client.js",[],"HeroImage"]\n',
+    'robots.txt': 'User-agent: *\n',
+  });
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /\.txt: prefetch data preloads \/hero\.webp \(render the image with HeroImage/);
+});
+
 test('the CLI exits 1 on problems and 0 on a clean site', () => {
   const broken = site({ 'page/index.html': '<a href="/nowhere">x</a>' });
   const brokenRun = spawnSync(process.execPath, [script, broken], { encoding: 'utf8' });
