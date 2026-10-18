@@ -488,3 +488,31 @@ export const KNOWBE4_AUTH_RESOLVER = {
   ],
   configFields: ["api_token", "region", "base_url", "phisher_api_token", "phisher_graphql_url", "timeout_seconds", "redact_pii"],
 } as const satisfies ResolverAuthenticationContract;
+
+export const VERACODE_AUTH_RESOLVER = {
+  modes: [
+    "HMAC-signed API key pair: every request carries Authorization: VERACODE-HMAC-SHA-256 id={api_key_id},ts={timestamp},nonce={nonce},sig={signature}, where timestamp is the current time in epoch milliseconds, nonce is 16 random bytes as 32 lowercase hex digits, and signature is the lowercase hex HMAC-SHA256 of id={api_key_id}&host={host}&url={path and query}&method={METHOD} under a signing key derived from the hex-decoded api_key_secret by three chained HMAC-SHA256 steps over the nonce bytes, the timestamp digits, and vcode_request_version_1",
+  ],
+  precedence: [
+    "Explicit tool arguments",
+    "VERACODE_* environment variables",
+    "The selected profile of the Veracode credentials file, read only for whichever of the key ID and secret is still missing",
+    "A base_url from any source takes precedence over the region; with no region, us is used",
+  ],
+  environment: [
+    "VERACODE_API_PROFILE",
+    "VERACODE_API_CREDENTIALS_FILE",
+    "VERACODE_API_KEY_ID",
+    "VERACODE_API_KEY_SECRET",
+    "VERACODE_REGION",
+    "VERACODE_API_BASE_URL",
+    "VERACODE_TIMEOUT",
+  ],
+  configLocations: ["~/.veracode/credentials", "Explicit path from credentials_file or VERACODE_API_CREDENTIALS_FILE"],
+  variants: [
+    "Regions us and commercial (https://api.veracode.com, the default), eu, europe, and european (https://api.veracode.eu), and fedramp, us-fed, and federal (https://api.veracode.us), matched after trimming and lowercasing; any other region is rejected unless a base_url is given",
+    "An explicit base_url replaces the region's host, with any query, fragment, and trailing slashes removed",
+    "Named INI profiles in the credentials file, selected by profile or VERACODE_API_PROFILE, else the default profile; the api_key_secret must be a hex string",
+  ],
+  configFields: ["veracode_api_key_id", "veracode_api_key_secret"],
+} as const satisfies ResolverAuthenticationContract;

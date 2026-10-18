@@ -34,6 +34,8 @@ import { registerSlackTools } from "./slack.js";
 import { SLACK_SPEC } from "./slack.spec.js";
 import { registerTenableTools } from "./tenable.js";
 import { TENABLE_SPEC } from "./tenable.spec.js";
+import { registerVeracodeTools } from "./veracode.js";
+import { VERACODE_SPEC } from "./veracode.spec.js";
 import { registerWebexTools } from "./webex.js";
 import { WEBEX_SPEC } from "./webex.spec.js";
 import { registerZendeskTools } from "./zendesk.js";
@@ -152,6 +154,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     narrativePath: "specs/narratives/tenable.md",
     outputPath: "specs/tenable-sec-inspector.spec.md",
     registerTools: registerTenableTools,
+  },
+  {
+    contract: VERACODE_SPEC,
+    narrativePath: "specs/narratives/veracode.md",
+    outputPath: "specs/veracode-sec-inspector.spec.md",
+    registerTools: registerVeracodeTools,
   },
   {
     contract: WEBEX_SPEC,
