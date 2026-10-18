@@ -1,5 +1,5 @@
 ---
-title: "Independent Verification and Validation: FedRAMP Process"
+title: "Independent Verification and Validation"
 description: "Official Consolidated Rules summary for the IVV FedRAMP process, including applicability and requirements."
 ---
 

@@ -1,5 +1,5 @@
 ---
-title: "Minimum Assessment Scope: FedRAMP Process"
+title: "Minimum Assessment Scope"
 description: "Official Consolidated Rules summary for the MAS FedRAMP process, including applicability and requirements."
 ---
 

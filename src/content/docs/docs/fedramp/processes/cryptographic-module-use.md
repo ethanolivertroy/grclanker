@@ -1,5 +1,5 @@
 ---
-title: "Cryptographic Module Use: FedRAMP Process"
+title: "Cryptographic Module Use"
 description: "Official Consolidated Rules summary for the CMU FedRAMP process, including applicability and requirements."
 ---
 

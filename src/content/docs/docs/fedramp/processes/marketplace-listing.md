@@ -1,5 +1,5 @@
 ---
-title: "Marketplace Listing: FedRAMP Process"
+title: "Marketplace Listing"
 description: "Official Consolidated Rules summary for the MKT FedRAMP process, including applicability and requirements."
 ---
 

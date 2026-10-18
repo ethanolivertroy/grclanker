@@ -1,5 +1,5 @@
 ---
-title: "FedRAMP Certification: FedRAMP Process"
+title: "FedRAMP Certification"
 description: "Official Consolidated Rules summary for the FRC FedRAMP process, including applicability and requirements."
 ---
 

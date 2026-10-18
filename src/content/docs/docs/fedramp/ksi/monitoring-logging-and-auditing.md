@@ -1,5 +1,5 @@
 ---
-title: "Monitoring, Logging, and Auditing: FedRAMP KSI Domain"
+title: "Monitoring, Logging, and Auditing"
 description: "Official Consolidated Rules summary for the MLA FedRAMP key security indicator domain."
 ---
 

@@ -1,5 +1,5 @@
 ---
-title: "Secure Configuration Guide: FedRAMP Process"
+title: "Secure Configuration Guide"
 description: "Official Consolidated Rules summary for the SCG FedRAMP process, including applicability and requirements."
 ---
 

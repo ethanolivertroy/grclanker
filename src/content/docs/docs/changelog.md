@@ -1,6 +1,6 @@
 ---
 title: What's New
-description: What shipped in grclanker v0.1.2, v0.1.1, v0.1.0, and v0.0.1.
+description: "The grclanker changelog: what shipped in v0.1.2, v0.1.1, v0.1.0, and v0.0.1."
 ---
 
 ## v0.1.2 (October 17, 2026)

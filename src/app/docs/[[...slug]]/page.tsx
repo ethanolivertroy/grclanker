@@ -8,7 +8,7 @@ import { getDocsFooterItems } from '../../../components/docs-footer';
 import { getDocsRoutesToc } from '../../../components/docs-routes';
 import { DocsPageContainer } from '../../../components/docs-slots';
 import { mdxComponents } from '../../../components/mdx';
-import { getDocHref } from '../../../lib/docs';
+import { getDocHref, getDocMetadataTitle } from '../../../lib/docs';
 import { pageMetadata } from '../../../lib/metadata';
 import { getDocSlug, source } from '../../../lib/source';
 
@@ -63,7 +63,7 @@ export async function generateMetadata(props: PageProps): Promise<Metadata> {
   const page = await getPageOrNotFound(props);
   const slug = getDocSlug(page);
   return pageMetadata({
-    title: slug === '' ? page.data.title : `${page.data.title}: grclanker docs`,
+    title: getDocMetadataTitle(slug, page.data.title),
     description: page.data.description,
     path: getDocHref(slug),
   });

@@ -1,5 +1,5 @@
 ---
-title: "Addressing FedRAMP Communication: FedRAMP Process"
+title: "Addressing FedRAMP Communication"
 description: "Official Consolidated Rules summary for the AFC FedRAMP process, including applicability and requirements."
 ---
 

@@ -1,5 +1,5 @@
 ---
-title: "Security Decision Record: FedRAMP Process"
+title: "Security Decision Record"
 description: "Official Consolidated Rules summary for the SDR FedRAMP process, including applicability and requirements."
 ---
 

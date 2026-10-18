@@ -1,6 +1,6 @@
 import { createSearchAPI } from 'fumadocs-core/search/server';
 import { getDocHref } from '../../../lib/docs';
-import { getDocSlug, source } from '../../../lib/source';
+import { getDocSlug, getDocsSections, source } from '../../../lib/source';
 import { categoryLabels, loadSpecs } from '../../../lib/specs';
 
 export const revalidate = false;
@@ -20,6 +20,16 @@ const sitePages = [
 // headings only.
 const headingsOnlySections = new Set(['integrations', 'fedramp']);
 
+// A hit shows its sidebar section above the page title. That is what tells a
+// FedRAMP KSI domain such as "Incident Response" apart from the guides.
+const sectionTrails = new Map<string, string[]>();
+for (const section of getDocsSections()) {
+  for (const item of section.items) {
+    sectionTrails.set(item.slug, [section.title]);
+    for (const child of item.items ?? []) sectionTrails.set(child.slug, [section.title, item.label]);
+  }
+}
+
 const docs = source.getPages().map((page) => {
   const slug = getDocSlug(page);
   const url = getDocHref(slug);
@@ -29,7 +39,7 @@ const docs = source.getPages().map((page) => {
     title: page.data.title,
     description: page.data.description,
     url,
-    breadcrumbs: ['Docs'],
+    breadcrumbs: ['Docs', ...(sectionTrails.get(slug) ?? [])],
     structuredData: { headings, contents: headingsOnlySections.has(slug.split('/')[0]) ? [] : contents },
   };
 });
