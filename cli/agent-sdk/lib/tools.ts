@@ -2,7 +2,7 @@ import type { JsonObject, JsonSchemaObject } from "@cursor/bdk";
 import type { ToolContext, ToolExecuteResult } from "@cursor/bdk/tools";
 import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import { runWithoutPersistentCaches } from "../../extensions/grc-tools/shared.js";
-import { collectSensitiveValues, scrubSensitiveValues, withholdEchoedArguments } from "../../flue/redact.js";
+import { redactToolErrorText } from "../../flue/redact.js";
 import { classifyGrcToolEffect, type GrcToolEffect, isGrcWriteTool } from "./effects.js";
 import { getRegisteredGrcTool, type RegisteredGrcTool } from "./registry.js";
 import { errorEnvelope, type SdkToolEnvelope, toSdkToolResult } from "./results.js";
@@ -37,9 +37,7 @@ function describeError(error: unknown): string {
 }
 
 function sanitizeErrorText(tool: RegisteredGrcTool, input: JsonObject, errorText: string): string {
-  const withoutArguments = withholdEchoedArguments(errorText);
-  const sensitiveValues = collectSensitiveValues(input, tool.parameters);
-  return scrubSensitiveValues(withoutArguments, sensitiveValues);
+  return redactToolErrorText(errorText, input, tool.parameters);
 }
 
 function safeErrorEnvelope(tool: RegisteredGrcTool, input: JsonObject, errorText: string): ToolExecuteResult {

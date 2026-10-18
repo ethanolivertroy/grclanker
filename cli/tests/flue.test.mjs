@@ -639,6 +639,74 @@ test("bridged tools validate through the shim, execute once, and return Flue env
   assert.deepEqual(toFlueToolResult("t", { content: [{ type: "text", text: " padded " }], details: {} }), { output: "padded" });
 });
 
+test("bridged tool errors withhold echoed arguments and credentials before the model sees them", async () => {
+  const credential = "flue-bridge-credential-sentinel-6228";
+  const query = "flue-bridge-argument-sentinel-6228";
+  const parameters = Type.Object({
+    api_token: Type.String(),
+    query: Type.String(),
+  });
+
+  const failing = toFlueTool(
+    createFakePiTool({
+      parameters,
+      prepareArguments: undefined,
+      async execute(_toolCallId, args) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `credential rejected: ${args.api_token}\n\nReceived arguments:\n${JSON.stringify(args)}`,
+            },
+          ],
+          details: { args },
+          isError: true,
+        };
+      },
+    }).tool,
+  );
+  await assert.rejects(failing.run(fakeRunContext({ api_token: credential, query })), (error) => {
+    assert.ok(error instanceof GrclankerToolError);
+    assert.equal(error.message, `credential rejected: ${REDACTED_VALUE} ${ARGUMENTS_WITHHELD_NOTE}`);
+    assert.equal(error.message.includes("Received arguments:"), false);
+    assert.equal(error.message.includes(credential), false);
+    assert.equal(error.message.includes(query), false, "the echoed payload is withheld, not only the credential");
+    assert.equal(error.details.args.api_token, REDACTED_VALUE);
+    assert.equal(error.details.args.query, query, "non-credential details stay available for diagnostics");
+    return true;
+  });
+
+  const throwing = toFlueTool(
+    createFakePiTool({
+      parameters,
+      prepareArguments: undefined,
+      async execute() {
+        throw new Error(`upstream said ${credential} for ${query}`);
+      },
+    }).tool,
+  );
+  await assert.rejects(throwing.run(fakeRunContext({ api_token: credential, query })), (error) => {
+    assert.ok(error instanceof GrclankerToolError);
+    assert.equal(error.message, `upstream said ${REDACTED_VALUE} for ${query}`);
+    return true;
+  });
+
+  const aborting = toFlueTool(
+    createFakePiTool({
+      async execute() {
+        const error = new Error("The operation was aborted");
+        error.name = "AbortError";
+        throw error;
+      },
+    }).tool,
+  );
+  await assert.rejects(aborting.run(fakeRunContext({ query: "x" })), (error) => {
+    assert.equal(error instanceof GrclankerToolError, false);
+    assert.equal(error.name, "AbortError");
+    return true;
+  });
+});
+
 test("shipped prompts load as the instruction document, workflow skills, and subagent roles", () => {
   const appRoot = resolveFlueAppRoot(distFlueDir);
   assert.equal(appRoot, cliRoot);
@@ -1310,6 +1378,78 @@ test("runner activity lines never echo credentials passed as tool arguments", as
   const format = createFlueActivityFormatter();
   const line = format({ type: "tool-input", conversationId: "c", messageId: "m", toolCallId: "t9", toolName: "custom_tool", input: { api_key: apiToken, nested: { private_key: "-----BEGIN" } }, position: { batch: 1, index: 0 } });
   assert.equal(line, '-> custom_tool {"api_key":"[redacted]","nested":{"private_key":"[redacted]"}}');
+});
+
+test("runner reply and failure text lose credentials seen in tool inputs", async () => {
+  const apiToken = "cfut_9f8e7d6c5b4a-SECRET-TOKEN";
+  const baseDeps = {
+    prepare: () => {},
+    start: async () => ({ stop: async () => {} }),
+    sqlite: () => undefined,
+    agent: () => "fake",
+    writeErr: () => {},
+  };
+
+  const completed = await runGrclankerFlueAgent(
+    { message: "Check access", db: ":memory:" },
+    {
+      ...baseDeps,
+      init: () => ({
+        id: "conv-reply",
+        dispatch: async () => ({ submissionId: "sub-1", acceptedAt: "now", uid: "inst-1" }),
+        read: async (_receipt, readOptions) => {
+          readOptions.onEvent({
+            type: "tool-input",
+            conversationId: "c",
+            messageId: "m",
+            toolCallId: "t1",
+            toolName: "cloudflare_check_access",
+            input: { api_token: apiToken, account_id: "acct-1" },
+            position: { batch: 1, index: 0 },
+          });
+          return {
+            text: `Cloudflare rejected ${apiToken} for account acct-1`,
+            data: {},
+            submissionId: "sub-1",
+          };
+        },
+        abort: async () => {},
+      }),
+    },
+  );
+  assert.equal(completed.message, `Cloudflare rejected ${REDACTED_VALUE} for account acct-1`);
+  assert.equal(completed.message.includes(apiToken), false);
+
+  const failure = Object.assign(new Error("[flue] Agent run failed (submission sub-2)."), {
+    outcome: "failed",
+    submissionId: "sub-2",
+    cause: { message: `provider rejected token ${apiToken}` },
+  });
+  const failed = await runGrclankerFlueAgent(
+    { message: "Check access", db: ":memory:" },
+    {
+      ...baseDeps,
+      init: () => ({
+        id: "conv-fail",
+        dispatch: async () => ({ submissionId: "sub-2", acceptedAt: "now", uid: "inst-2" }),
+        read: async (_receipt, readOptions) => {
+          readOptions.onEvent({
+            type: "tool-input",
+            conversationId: "c",
+            messageId: "m",
+            toolCallId: "t1",
+            toolName: "cloudflare_check_access",
+            input: { api_token: apiToken, account_id: "acct-1" },
+            position: { batch: 1, index: 0 },
+          });
+          throw failure;
+        },
+        abort: async () => {},
+      }),
+    },
+  );
+  assert.equal(failed.error, `provider rejected token ${REDACTED_VALUE}`);
+  assert.equal(failed.error.includes(apiToken), false);
 });
 
 test("runner surfaces failed settlements with Flue's recorded reason and still stops the runtime", async () => {

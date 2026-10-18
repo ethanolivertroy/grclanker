@@ -273,3 +273,12 @@ export function withholdEchoedArguments(errorText: string): string {
   if (index === -1) return errorText;
   return `${errorText.slice(0, index).trimEnd()} ${ARGUMENTS_WITHHELD_NOTE}`;
 }
+
+/**
+ * Error text safe to show the model or the user: drop Pi's echoed payload,
+ * then replace any sensitive value from `input` (and its encodings) with
+ * `[redacted]`. `schema` is the tool's JSON Schema parameters, when known.
+ */
+export function redactToolErrorText(errorText: string, input: unknown, schema?: unknown): string {
+  return scrubSensitiveValues(withholdEchoedArguments(errorText), collectSensitiveValues(input, schema));
+}

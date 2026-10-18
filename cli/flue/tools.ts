@@ -13,6 +13,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { defineTool, type ToolDefinition as FlueToolDefinition } from "@flue/runtime";
 import { collectRegisteredToolDefinitions, resolveToolGroup } from "../pi/tool-catalog.js";
+import { redactSensitiveArguments, redactToolErrorText } from "./redact.js";
 import { jsonSchemaToToolInput } from "./schema.js";
 
 /** The subset of a Pi tool definition the bridge relies on. */
@@ -72,6 +73,21 @@ export function toFlueToolResult(toolName: string, result: PiBridgeToolResult): 
   return result.terminate ? { output, terminate: true } : { output };
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function sanitizedToolResult(tool: PiBridgeableTool, input: unknown, result: PiBridgeToolResult): PiBridgeToolResult {
+  if (result.isError !== true) return result;
+  const rendered = renderPiToolContent(result.content);
+  const text = redactToolErrorText(rendered || `${tool.name} failed without a message.`, input, tool.parameters);
+  return {
+    ...result,
+    content: [{ type: "text", text }],
+    details: redactSensitiveArguments(result.details, tool.parameters),
+  };
+}
+
 export function toFlueTool(tool: PiBridgeableTool): FlueToolDefinition {
   const input = jsonSchemaToToolInput(tool.parameters, tool.name, tool.prepareArguments);
   return defineTool({
@@ -79,14 +95,21 @@ export function toFlueTool(tool: PiBridgeableTool): FlueToolDefinition {
     description: tool.description,
     input,
     async run({ data, signal, toolCallId }) {
-      const result = (await tool.execute(
-        toolCallId,
-        data,
-        signal,
-        undefined,
-        DETACHED_EXTENSION_CONTEXT,
-      )) as PiBridgeToolResult;
-      return toFlueToolResult(tool.name, result);
+      let result: PiBridgeToolResult;
+      try {
+        result = (await tool.execute(
+          toolCallId,
+          data,
+          signal,
+          undefined,
+          DETACHED_EXTENSION_CONTEXT,
+        )) as PiBridgeToolResult;
+      } catch (error) {
+        if (signal?.aborted || isAbortError(error)) throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        throw new GrclankerToolError(tool.name, redactToolErrorText(message, data, tool.parameters), undefined);
+      }
+      return toFlueToolResult(tool.name, sanitizedToolResult(tool, data, result));
     },
   });
 }

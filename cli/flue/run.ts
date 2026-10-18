@@ -54,6 +54,8 @@ export interface FlueRunDeps {
 
 export interface FlueActivityFormatterOptions {
   parameterSchemas?: ReadonlyMap<string, unknown>;
+  /** Called with the sensitive values of each tool input, so a later reply can be scrubbed too. */
+  onSensitiveValues?: (values: readonly string[]) => void;
 }
 
 interface AgentRunErrorLike extends Error {
@@ -106,7 +108,9 @@ export function createFlueActivityFormatter(
         toolNames.set(chunk.toolCallId, chunk.toolName);
         const schema = options.parameterSchemas?.get(chunk.toolName);
         const input = chunk.input ?? {};
-        sensitiveValues.set(chunk.toolCallId, collectSensitiveValues(input, schema));
+        const values = collectSensitiveValues(input, schema);
+        sensitiveValues.set(chunk.toolCallId, values);
+        options.onSensitiveValues?.(values);
         return `-> ${chunk.toolName} ${truncate(JSON.stringify(redactSensitiveArguments(input, schema)))}`;
       }
       case "tool-output": {
@@ -194,7 +198,13 @@ export async function runGrclankerFlueAgent(
     const handle = deps.init(deps.agent, request.id ? { id: request.id } : undefined);
     deps.writeErr(`conversation: ${handle.id}`);
     const receipt = await handle.dispatch(request.message);
-    const formatActivity = createFlueActivityFormatter({ parameterSchemas: deps.toolParameterSchemas?.() });
+    const rememberedSensitiveValues: string[] = [];
+    const formatActivity = createFlueActivityFormatter({
+      parameterSchemas: deps.toolParameterSchemas?.(),
+      onSensitiveValues: (values) => {
+        rememberedSensitiveValues.push(...values);
+      },
+    });
 
     try {
       const reply = await handle.read(receipt, {
@@ -208,7 +218,7 @@ export async function runGrclankerFlueAgent(
         agent: FLUE_AGENT_NAME,
         submissionId: reply.submissionId,
         outcome: "completed",
-        message: reply.text,
+        message: scrubSensitiveValues(reply.text, rememberedSensitiveValues),
       };
     } catch (error) {
       if (!isAgentRunError(error)) throw error;
@@ -217,7 +227,7 @@ export async function runGrclankerFlueAgent(
         agent: FLUE_AGENT_NAME,
         submissionId: error.submissionId,
         outcome: error.outcome,
-        error: describeAgentRunError(error),
+        error: scrubSensitiveValues(describeAgentRunError(error), rememberedSensitiveValues),
       };
     }
   } finally {
