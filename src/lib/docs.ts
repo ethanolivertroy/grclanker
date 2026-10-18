@@ -13,6 +13,8 @@ export interface DocsSection {
 interface DocsSectionEntry extends DocsSectionItem {
   /** Lists every page under this slug prefix beneath the item. */
   childPrefix?: string;
+  /** What each page under `childPrefix` is, for titles shown without the sidebar. */
+  childKind?: string;
 }
 
 export const docsSections: Array<{ title: string; items: DocsSectionEntry[] }> = [
@@ -55,8 +57,8 @@ export const docsSections: Array<{ title: string; items: DocsSectionEntry[] }> =
     title: 'FedRAMP',
     items: [
       { label: 'Official Sources', slug: 'fedramp' },
-      { label: 'Processes', slug: 'fedramp/processes', childPrefix: 'fedramp/processes/' },
-      { label: 'KSI Domains', slug: 'fedramp/ksis', childPrefix: 'fedramp/ksi/' },
+      { label: 'Processes', slug: 'fedramp/processes', childPrefix: 'fedramp/processes/', childKind: 'FedRAMP Process' },
+      { label: 'KSI Domains', slug: 'fedramp/ksis', childPrefix: 'fedramp/ksi/', childKind: 'FedRAMP KSI Domain' },
     ],
   },
 ];
@@ -79,7 +81,7 @@ export function buildDocsSections(
 
   const sections: DocsSection[] = docsSections.map((section) => ({
     title: section.title,
-    items: section.items.map(({ childPrefix, ...item }) => {
+    items: section.items.map(({ childPrefix, childKind, ...item }) => {
       const items = childPrefix ? pagesUnder(childPrefix) : [];
       return items.length ? { ...item, items } : item;
     }),
@@ -87,6 +89,18 @@ export function buildDocsSections(
   const integrations = pagesUnder(integrationsDocsPrefix);
   if (integrations.length) sections.push({ title: 'Integrations', items: integrations });
   return sections;
+}
+
+/**
+ * The title for a docs page's browser tab, link previews, and search engine
+ * results. Away from the sidebar, a bare "Incident Response" needs its kind.
+ */
+export function getDocMetadataTitle(slug: string, title: string) {
+  if (slug === '') return title;
+  const kind = docsSections
+    .flatMap((section) => section.items)
+    .find((item) => item.childPrefix && slug.startsWith(item.childPrefix))?.childKind;
+  return [title, kind, 'grclanker docs'].filter(Boolean).join(': ');
 }
 
 export function getDocHref(slug: string) {
