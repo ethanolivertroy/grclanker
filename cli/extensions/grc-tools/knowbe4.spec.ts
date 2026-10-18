@@ -1,3 +1,16 @@
+import {
+  buildBatchIntegrationSpec,
+  buildBatchOutputContract,
+  deriveDecisionRules,
+  type BatchCheckDefinition,
+  type BatchCompletenessDefinition,
+  type BatchCriterionExample,
+  type BatchPaginationDefinition,
+  type BatchSurfaceDefinition,
+} from "./batch-spec-builder.js";
+import { KNOWBE4_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
+import type { PortableValue, RequestParameterContract, VerdictCondition, VerdictOperand, VerdictRule } from "./spec-model.js";
+
 // The account record is exported cut to these fields, each admin to its own list; certificate-shaped account fields are
 // summarized as present with their length.
 export const ACCOUNT_FIELDS: readonly string[] = [
@@ -42,3 +55,766 @@ export const PII_MASK_FIELDS: readonly string[] = [
   "custom_date_1",
   "custom_date_2",
 ];
+
+const series = (items: readonly string[], conjunction = "and"): string =>
+  items.length <= 2 ? items.join(` ${conjunction} `) : `${items.slice(0, -1).join(", ")}, ${conjunction} ${items[items.length - 1]}`;
+
+const REPORTING_SERVICE = "KnowBe4 Reporting API";
+const PHISHER_SERVICE = "KnowBe4 PhishER GraphQL API";
+const REPORTING_DOCS = "https://developer.knowbe4.com/rest/reporting";
+const PHISHER_DOCS = "https://developer.knowbe4.com/graphql/phisher";
+const REPORTING_HOST = "Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com.";
+const PHISHER_HOST = "Use the resolved PhishER GraphQL URL: phisher_graphql_url, else https://training.knowbe4.com/graphql for the us region and https://{region}.knowbe4.com/graphql for the others.";
+const REPORTING_HEADERS = ["Accept: application/json", "Authorization: Bearer {api_token}"];
+const PHISHER_HEADERS = ["Accept: application/json", "Authorization: Bearer {phisher_api_token}", "Content-Type: application/json"];
+const EXPORT_PASSES = "the export's PII pass, when redact_pii is set, and its credential pass";
+const RAW_EXPORT_STAGE = `The collector exports every returned record as read, through ${EXPORT_PASSES}; decision facts read the listed fields.`;
+const withoutFreeForm = (records: string): string =>
+  `The collector exports ${records} without its ${series(USER_FREE_FORM_FIELDS)}, through ${EXPORT_PASSES}; decision facts read the listed fields.`;
+const ACCOUNT_STAGE = `The collector keeps the account's ${series(ACCOUNT_FIELDS)} when present, each entry of admins that is a JSON object cut to its ${series(ACCOUNT_ADMIN_FIELDS)}, and, under certificates, only whether each field whose name contains cert, fingerprint, or thumbprint in any letter case is present and the length of its text; every other field is dropped, and the result is exported through ${EXPORT_PASSES}.`;
+
+const REFUSAL = "a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal";
+const arrayResponse = (records: string): string =>
+  `A JSON array holding ${records}, an entry that is not a JSON object being dropped; ${REFUSAL}, as is JSON that is not an array.`;
+const ACCOUNT_RESPONSE = `A JSON object carrying at least one of ${series(["name", "type", "domains", "admins", "subscription_level", "subscription_end_date", "number_of_seats", "current_risk_score"], "or")}; ${REFUSAL}, as is any other JSON.`;
+const GRAPHQL_RESPONSE = `A JSON object carrying data or errors, whose data.phisherMessages may carry nodes, one reported message per entry (an entry that is not a JSON object being dropped), and pagination with page, pages, per, totalCount, and nextPageKey; ${REFUSAL}, as is any other JSON or a non-empty errors array.`;
+
+const param = (
+  name: string,
+  location: RequestParameterContract["location"],
+  value: string,
+  required = true,
+  when?: string,
+): RequestParameterContract => ({ name, location, required, value, ...(when ? { when } : {}) });
+
+const PAGE_NUMBER = "The page number: 1 for the first page, then one more than the previous page's";
+const listParameters = (probed: boolean, ...filters: RequestParameterContract[]): RequestParameterContract[] => [
+  ...filters,
+  param("page", "query", PAGE_NUMBER),
+  param("per_page", "query", probed ? "500, or 1 on the knowbe4_check_access probe" : "500"),
+];
+const EXCEPT_COUNT = "On every read except the knowbe4_check_access count";
+const PHISHER_PARAMETERS: readonly RequestParameterContract[] = [
+  param("query", "json-body", "The phisherMessages query document, sorted by REPORTED_AT DESCENDING; the count-only document on the knowbe4_check_access count"),
+  param("variables.query", "json-body", "The PhishER filter reported_at:[{date} TO *], {date} being the UTC calendar date (YYYY-MM-DD) of the assessment time minus the lookback days; an empty string on the knowbe4_check_access count"),
+  param("variables.per", "json-body", "200, or phisher_message_limit when that is smaller", true, EXCEPT_COUNT),
+  param("variables.page", "json-body", PAGE_NUMBER, true, EXCEPT_COUNT),
+  param("variables.nextPageKey", "json-body", "The previous page's pagination.nextPageKey", false, "On a page after the first, when the previous page returned a nextPageKey"),
+];
+
+const reportingSurface = (
+  id: string,
+  path: string,
+  fields: readonly string[],
+  parameters: readonly RequestParameterContract[],
+  responseShape: string,
+  projectionStage = RAW_EXPORT_STAGE,
+): BatchSurfaceDefinition => ({
+  id,
+  path,
+  service: REPORTING_SERVICE,
+  documentationUrl: REPORTING_DOCS,
+  fields,
+  request: { clientRegion: REPORTING_HOST, headers: REPORTING_HEADERS, parameters, responseShape },
+  projectionStage,
+});
+
+const ACTIVE_STATUS = param("status", "query", "active");
+
+const PHISHING_SURFACES: readonly BatchSurfaceDefinition[] = [
+  reportingSurface(
+    "account",
+    "/v1/account",
+    [...ACCOUNT_FIELDS, ...ACCOUNT_ADMIN_FIELDS.map((field) => `admins.${field}`)],
+    [],
+    ACCOUNT_RESPONSE,
+    ACCOUNT_STAGE,
+  ),
+  reportingSurface(
+    "account_risk_score_history",
+    "/v1/account/risk_score_history",
+    ["risk_score", "date"],
+    listParameters(false, param("full", "query", "true")),
+    arrayResponse("one organization risk score point per entry"),
+  ),
+  reportingSurface(
+    "users",
+    "/v1/users",
+    ["id"],
+    listParameters(true, ACTIVE_STATUS),
+    arrayResponse("one user per entry"),
+    withoutFreeForm("each returned user"),
+  ),
+  reportingSurface("groups", "/v1/groups", ["id", "member_count"], listParameters(true, ACTIVE_STATUS), arrayResponse("one group per entry")),
+  reportingSurface(
+    "phishing_campaigns",
+    "/v1/phishing/campaigns",
+    ["campaign_id", "hidden", "last_run", "status", "groups.group_id", "groups.name"],
+    listParameters(true),
+    arrayResponse("one phishing campaign per entry"),
+  ),
+  reportingSurface(
+    "security_tests",
+    "/v1/phishing/security_tests",
+    ["pst_id", "campaign_id", "started_at", "start_date", "phish_prone_percentage", "delivered_count", "scheduled_count", "reported_count"],
+    listParameters(true),
+    arrayResponse("one phishing security test per entry"),
+  ),
+  reportingSurface(
+    "security_test_recipients",
+    "/v1/phishing/security_tests/{pst_id}/recipients",
+    ["user.id"],
+    [param("pst_id", "path", "The sampled test's pst_id read as text"), ...listParameters(false)],
+    arrayResponse("one recipient per entry"),
+    withoutFreeForm("each sampled test's recipients, each embedded user"),
+  ),
+  {
+    id: "phisher_messages",
+    method: "POST",
+    path: "/graphql",
+    service: PHISHER_SERVICE,
+    documentationUrl: PHISHER_DOCS,
+    fields: ["id", "reportedAt", "reportedBy", "from", "subject", "category", "severity", "actionStatus", "pipelineStatus"],
+    request: { clientRegion: PHISHER_HOST, headers: PHISHER_HEADERS, parameters: PHISHER_PARAMETERS, responseShape: GRAPHQL_RESPONSE },
+    projectionStage: RAW_EXPORT_STAGE,
+  },
+];
+
+const KNOWBE4_SURFACES: readonly BatchSurfaceDefinition[] = [...PHISHING_SURFACES];
+
+const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
+const path = (name: string): VerdictOperand => ({ kind: "path", path: name });
+type Comparator = "eq" | "ne" | "gt" | "lt";
+const cmp = (op: Comparator, left: string | VerdictOperand, right: PortableValue | VerdictOperand): VerdictCondition => ({
+  op,
+  left: typeof left === "string" ? path(left) : left,
+  right: right !== null && typeof right === "object" && !Array.isArray(right) ? right as VerdictOperand : value(right as PortableValue),
+});
+const eq = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("eq", left, right);
+const ne = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("ne", left, right);
+const gt = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("gt", left, right);
+const lt = (left: string | VerdictOperand, right: PortableValue | VerdictOperand) => cmp("lt", left, right);
+const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const not = (condition: VerdictCondition): VerdictCondition => ({ op: "not", condition });
+const always: VerdictCondition = { op: "always" };
+const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
+const unreported = (name: string): VerdictCondition => not({ op: "defined", operand: path(name) });
+const incomplete = (...complete: string[]): VerdictCondition =>
+  complete.length === 1 ? ne(complete[0], true) : any(...complete.map((name) => ne(name, true)));
+// The runtime's percentage(): part / total * 100 rounded half up to one decimal place, and no value (false here) when
+// total is not above 0.
+const percentAtLeast = (numerator: string, denominator: string, threshold: string): VerdictCondition => ({
+  op: "ratio",
+  numerator: path(numerator),
+  denominator: path(denominator),
+  comparator: "gte",
+  threshold: path(threshold),
+  scale: 100,
+  roundDigits: 1,
+});
+
+const AS_NUMBER = "read as a number (a finite number, or a string that is not blank and parses as one)";
+const READS_AS_TEXT = "A value reads as text when it is a string that is not blank, trimmed, or a finite number, in decimal.";
+const PARSES_AS_DATE = "A value parses as a date when ECMAScript Date.parse reads its trimmed text, a finite number being read as its decimal text.";
+const dayOption = (name: string, fallback: number, max = 3650): string =>
+  `${name} argument when it is a finite number, else ${fallback}, clamped to 1 through ${max} and then truncated to a whole number`;
+const percentOption = (name: string, fallback: number): string =>
+  `${name} argument when it is a finite number, else ${fallback}, clamped to 0 through 100`;
+const DAY = "a day being 86400000 milliseconds";
+const LOOKBACK = `The lookback window runs from N days before the assessment time to the assessment time, ${DAY} and N being the ${dayOption("lookback_days", 90)}.`;
+const TEST_START = `A security test's start is the first of its started_at and start_date that parses as a date; the test ran when it has a start no later than the assessment time, and ran in a window when that start also falls in the window. ${PARSES_AS_DATE}`;
+const OLDEST_FIRST = "ordered oldest first by start, tests of equal start in the reverse of their returned order";
+const TEST_PERCENTAGE = `A test's percentage is its phish_prone_percentage, ${AS_NUMBER}, times 100 and rounded half up to 2 decimal places.`;
+const WEIGHTED = `${TEST_PERCENTAGE} Its weight is its delivered_count when that reads as a number, else its scheduled_count when that does, else 0. A weighted percentage over a set of tests is the sum of percentage times weight over the tests with a percentage and a weight above 0, divided by the sum of those weights, rounded half up to 2 decimal places.`;
+const RECIPIENT_SAMPLE = `The recipient sample is the first N security tests that ran in the sample window, newest first by start with tests of equal start in their returned order, N being the ${dayOption("security_test_sample_limit", 12, 200).replace("clamped to 1", "clamped to 0")}. The sample window is the lookback window, or the last M days when the user risk assessment runs in the same call and M is larger, M being the ${dayOption("inactive_days", 180)}. A sampled test is read only when its pst_id reads as text, from GET /v1/phishing/security_tests/{pst_id}/recipients. ${READS_AS_TEXT}`;
+const ACTIVE_CAMPAIGN = `A campaign is active when it is not hidden and its campaign_id, read as text, is the campaign_id, read as text, of a security test that ran in the lookback window; or its last_run parses as a date at or after the start of the lookback window; or its status, read as text, contains active, scheduled, or in progress in any letter case. A campaign is hidden when its hidden is the boolean true, the number 1, or a string that trims to true, 1, yes, or on in any letter case. ${TEST_START} ${LOOKBACK} ${READS_AS_TEXT}`;
+const ALL_USERS = `A campaign targets All Users when one of the JSON object entries of its groups array has a group_id that, ${AS_NUMBER}, is 0, or a name that trims to All Users in any letter case.`;
+
+const KNOWBE4_INPUTS: Readonly<Record<string, string>> = {
+  security_tests_readable: "True when the GET /v1/phishing/security_tests walk returned without a refusal.",
+  security_tests_complete: "Security test list coverage.",
+  days_since_latest_test: `Days from the start of the newest security test that ran to the assessment time, rounded half up to 1 decimal place; unreported when no security test ran. ${TEST_START}`,
+  max_campaign_gap_days: `The ${dayOption("max_campaign_gap_days", 30)}.`,
+  users_readable: "True when the GET /v1/users walk filtered to status=active returned without a refusal.",
+  users_complete: "Active user list coverage.",
+  user_record_count: "Number of user records the active user walk kept, entries that are not JSON objects being dropped.",
+  active_user_count: `Number of distinct IDs among the returned active users, a user's ID being its id read as text; users without one are not counted, and the value is unreported when the active user walk was refused. ${READS_AS_TEXT}`,
+  security_tests_in_window: `Number of security tests that ran in the lookback window. ${TEST_START} ${LOOKBACK}`,
+  sampled_test_count: `Number of sampled security tests whose recipient list was read without a refusal and whose start falls in the lookback window. ${RECIPIENT_SAMPLE} ${TEST_START} ${LOOKBACK}`,
+  tested_user_count: `Number of distinct IDs, among those counted by active_user_count, that are the user.id, read as text, of a recipient of a sampled test counted by sampled_test_count. ${READS_AS_TEXT}`,
+  recipient_reads_complete: "Recipient read coverage of the lookback window.",
+  min_coverage_pct: `The ${percentOption("min_coverage_pct", 90)}.`,
+  current_phish_prone_pct: `Weighted percentage over the security tests that ran in the lookback window; unreported when none of them has a percentage and a weight above 0. ${WEIGHTED} ${TEST_START} ${LOOKBACK}`,
+  baseline_phish_prone_pct: `Weighted percentage over the first three security tests that ran, ${OLDEST_FIRST}, when at least four ran; unreported when fewer than four ran or none of those three has a percentage and a weight above 0. ${WEIGHTED} ${TEST_START}`,
+  max_phish_prone_pct: `The ${percentOption("max_phish_prone_pct", 15)}.`,
+  account_readable: "True when GET /v1/account returned the account record without a refusal.",
+  trend_test_count: `Number of security tests that ran in the trend window and have a percentage. The trend window runs from 2N days before the assessment time to the assessment time, ${DAY} and N being the ${dayOption("lookback_days", 90)}. ${TEST_PERCENTAGE} ${TEST_START}`,
+  phish_prone_delta_points: `Mean percentage of the later part minus mean percentage of the earlier part of the tests counted by trend_test_count, ${OLDEST_FIRST} and split after the first floor(n / 2) of the n tests, rounded half up to 2 decimal places; unreported when fewer than four such tests ran. ${TEST_PERCENTAGE} ${TEST_START}`,
+  account_risk_score_history_readable: "True when the GET /v1/account/risk_score_history walk with full=true returned without a refusal.",
+  phishing_campaigns_readable: "True when the GET /v1/phishing/campaigns walk returned without a refusal.",
+  phishing_campaigns_complete: "Phishing campaign list coverage.",
+  active_campaign_count: `Number of returned phishing campaigns that are active. ${ACTIVE_CAMPAIGN}`,
+  full_targeting_campaign_count: `Number of active campaigns that target All Users. ${ALL_USERS} ${ACTIVE_CAMPAIGN}`,
+  groups_readable: "True when the GET /v1/groups walk filtered to status=active returned without a refusal.",
+  groups_complete: "Active group list coverage.",
+  targeted_member_count: `Sum, over the distinct group IDs that active campaigns not targeting All Users target, of each ID's member count; unreported when the active group walk was refused. A campaign's targeted group IDs are the group_id values, read as text, of the JSON object entries of its groups array. An ID's member count is the member_count, ${AS_NUMBER}, of the last returned group whose id reads as that text and whose member_count reads as a number, else 0. ${ALL_USERS} ${ACTIVE_CAMPAIGN}`,
+  require_full_targeting: "The require_full_targeting argument, true when it is absent.",
+  delivered_count: `Sum of the delivered_count, ${AS_NUMBER} (0 when it does not read as one), of the security tests that ran in the lookback window. ${TEST_START} ${LOOKBACK}`,
+  reported_count: `Sum of the reported_count, ${AS_NUMBER} (0 when it does not read as one), of the security tests that ran in the lookback window. ${TEST_START} ${LOOKBACK}`,
+  min_report_rate_pct: `The ${percentOption("min_report_rate_pct", 50)}.`,
+  report_rate_warn_floor_pct: `Half of the ${percentOption("min_report_rate_pct", 50)}, unrounded.`,
+  phisher_messages_readable: "True when the PhishER GraphQL phisherMessages walk over the messages reported in the lookback window returned without a refusal; unreported when no PhishER API token is configured.",
+  largest_schedule_gap_days: `Largest gap, in days rounded half up to 1 decimal place, between consecutive starts in the series formed by the newest security test that ran before the lookback window, when there is one, followed by the tests that ran in the lookback window oldest first, and between the start of the newest test that ran and the assessment time; unreported when no security test ran. ${TEST_START} ${LOOKBACK}`,
+  max_schedule_gap_days: `The ${dayOption("max_schedule_gap_days", 45)}.`,
+};
+
+const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
+  const definition = KNOWBE4_INPUTS[name];
+  if (!definition) throw new Error(`KnowBe4 decision input ${name} has no portable definition`);
+  return [name, definition];
+}));
+
+const USER_LIMIT = `user_limit (the ${dayOption("user_limit", 5000, 200000)})`;
+// Check KNOWBE4-09 reads these lists without a manual gate, so a refused read must make them incomplete too.
+const pageWalkComplete = (surfaceId: string, list: string, cap: string): BatchCompletenessDefinition => ({
+  semantics: `false when the ${list} read was refused, or the list is partial because a page held more records than were left under ${cap} or a full page brought the records kept to ${cap}.`,
+  sources: [{ surfaceId, falseWhen: ["truncated", "error", "denied"] }],
+});
+const SECURITY_TESTS_COMPLETE = pageWalkComplete("security_tests", "security test list", "20000 records");
+const USERS_COMPLETE = pageWalkComplete("users", "active user list", USER_LIMIT);
+const GROUPS_COMPLETE = pageWalkComplete("groups", "active group list", "20000 records");
+const PHISHING_CAMPAIGNS_COMPLETE = pageWalkComplete("phishing_campaigns", "phishing campaign list", "20000 records");
+const RECIPIENT_READS_COMPLETE: BatchCompletenessDefinition = {
+  semantics: `false when the recipient reads do not cover every security test that ran in the lookback window: fewer sampled tests with a start in that window were read than ran in it (the sample holds at most security_test_sample_limit tests, and a sampled test whose pst_id does not read as text takes a place without being read), a recipient read was refused or never made, or a recipient walk was partial because a page held more recipients than were left under 20000 or a full page brought the recipients kept to 20000. ${RECIPIENT_SAMPLE} ${TEST_START} ${LOOKBACK}`,
+  sources: [{ surfaceId: "security_test_recipients", falseWhen: ["truncated", "error", "denied", "not-collected"] }],
+};
+
+type Knowbe4Check = {
+  id: string;
+  control: number;
+  title: string;
+  severity: BatchCheckDefinition["severity"];
+  owner: string;
+  surfaces: readonly string[];
+  inputs: readonly string[];
+  constants?: Readonly<Record<string, PortableValue>>;
+  rules: readonly VerdictRule[];
+  completeness?: Readonly<Record<string, BatchCompletenessDefinition>>;
+  decision: string;
+  examples: readonly BatchCriterionExample[];
+};
+
+const example = (
+  kind: BatchCriterionExample["kind"],
+  expected: BatchCriterionExample["expected"],
+  reason: string,
+  facts: Readonly<Record<string, unknown>>,
+): BatchCriterionExample => ({ kind, expected, reason, facts });
+
+const PHISHING = "knowbe4_assess_phishing_program";
+const TESTS_READ = { security_tests_readable: true, security_tests_complete: true };
+const COVERAGE_HEALTHY = {
+  ...TESTS_READ,
+  users_readable: true,
+  users_complete: true,
+  security_tests_in_window: 3,
+  user_record_count: 200,
+  active_user_count: 200,
+  sampled_test_count: 3,
+  recipient_reads_complete: true,
+  min_coverage_pct: 90,
+};
+const PHISH_PRONE_HEALTHY = { ...TESTS_READ, users_readable: true, account_readable: true, max_phish_prone_pct: 15, baseline_phish_prone_pct: 9.75 };
+const TREND_HEALTHY = { ...TESTS_READ, account_risk_score_history_readable: true, trend_test_count: 6 };
+const TARGETING_HEALTHY = {
+  phishing_campaigns_readable: true,
+  phishing_campaigns_complete: true,
+  security_tests_complete: true,
+  users_readable: true,
+  users_complete: true,
+  groups_readable: true,
+  groups_complete: true,
+  active_user_count: 500,
+  min_coverage_pct: 90,
+  require_full_targeting: true,
+};
+const PARTIAL_TARGETING = { ...TARGETING_HEALTHY, active_campaign_count: 3, full_targeting_campaign_count: 0 };
+const REPORT_HEALTHY = { ...TESTS_READ, delivered_count: 1000, min_report_rate_pct: 50, report_rate_warn_floor_pct: 25, phisher_messages_readable: true };
+const UNREADABLE_TESTS = example("unreadable", "manual", "The security test list was refused.", { security_tests_readable: false });
+
+const PHISHING_CHECKS: readonly Knowbe4Check[] = [
+  {
+    id: "KNOWBE4-01",
+    control: 1,
+    title: "Phishing simulation frequency",
+    severity: "high",
+    owner: PHISHING,
+    surfaces: ["security_tests"],
+    inputs: ["security_tests_readable", "security_tests_complete", "days_since_latest_test", "max_campaign_gap_days"],
+    rules: [
+      rule("manual", ne("security_tests_readable", true)),
+      rule("fail", unreported("days_since_latest_test")),
+      rule("fail", gt("days_since_latest_test", path("max_campaign_gap_days"))),
+      rule("warn", ne("security_tests_complete", true)),
+      rule("pass", always),
+    ],
+    completeness: { security_tests_complete: SECURITY_TESTS_COMPLETE },
+    decision: "Manual when the security test list is unreadable. Fail when no security test has run, or when more than max_campaign_gap_days days have passed since the newest one started. Warn instead of pass when the security test list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "The newest test started 12.5 days ago, within the 30-day maximum.", { ...TESTS_READ, days_since_latest_test: 12.5, max_campaign_gap_days: 30 }),
+      example("noncompliant", "fail", "The newest test started 41 days ago.", { ...TESTS_READ, days_since_latest_test: 41, max_campaign_gap_days: 30 }),
+      example("noncompliant", "fail", "No security test has ever run.", { ...TESTS_READ, max_campaign_gap_days: 30 }),
+      example("partial", "warn", "The newest returned test is recent, but the list stopped at the 20000-record cap.", {
+        security_tests_readable: true, security_tests_complete: false, days_since_latest_test: 3, max_campaign_gap_days: 30,
+      }),
+      UNREADABLE_TESTS,
+    ],
+  },
+  {
+    id: "KNOWBE4-02",
+    control: 2,
+    title: "Phishing simulation coverage",
+    severity: "high",
+    owner: PHISHING,
+    surfaces: ["security_tests", "users", "security_test_recipients"],
+    inputs: [
+      "security_tests_readable",
+      "users_readable",
+      "security_tests_in_window",
+      "user_record_count",
+      "sampled_test_count",
+      "users_complete",
+      "recipient_reads_complete",
+      "tested_user_count",
+      "active_user_count",
+      "min_coverage_pct",
+      "security_tests_complete",
+    ],
+    rules: [
+      rule("manual", ne("security_tests_readable", true)),
+      rule("manual", ne("users_readable", true)),
+      rule("warn", all(gt("security_tests_in_window", 0), eq("user_record_count", 0))),
+      rule("fail", eq("security_tests_in_window", 0)),
+      rule("warn", eq("sampled_test_count", 0)),
+      rule("warn", incomplete("users_complete", "recipient_reads_complete")),
+      rule("fail", not(percentAtLeast("tested_user_count", "active_user_count", "min_coverage_pct"))),
+      rule("warn", ne("security_tests_complete", true)),
+      rule("pass", always),
+    ],
+    completeness: {
+      users_complete: USERS_COMPLETE,
+      recipient_reads_complete: RECIPIENT_READS_COMPLETE,
+      security_tests_complete: SECURITY_TESTS_COMPLETE,
+    },
+    decision: "Manual when the security test list or the active user list is unreadable. Warn when tests ran in the lookback window but the active user list returned no user. Fail when no test ran in the lookback window. Warn when no recipient list of a test in the window was read, or when the active user list or the recipient reads are partial. Fail when the active users who appear as recipients of the sampled tests in the window are fewer than min_coverage_pct percent of active users, rounded half up to 1 decimal place. Warn instead of pass when the security test list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "190 of 200 active users received a sampled test in the window.", { ...COVERAGE_HEALTHY, tested_user_count: 190 }),
+      example("noncompliant", "fail", "150 of 200 active users received a sampled test.", { ...COVERAGE_HEALTHY, tested_user_count: 150 }),
+      example("noncompliant", "fail", "No security test ran in the lookback window.", {
+        ...COVERAGE_HEALTHY, security_tests_in_window: 0, sampled_test_count: 0, tested_user_count: 0,
+      }),
+      example("partial", "warn", "13 tests ran in the window and only the 12 newest were sampled, so coverage is unknown.", {
+        ...COVERAGE_HEALTHY, security_tests_in_window: 13, sampled_test_count: 12, recipient_reads_complete: false, tested_user_count: 150,
+      }),
+      example("partial", "warn", "Tests ran, but the active user list returned no user, as it does for an anonymized account.", {
+        ...COVERAGE_HEALTHY, user_record_count: 0, active_user_count: 0, tested_user_count: 0,
+      }),
+      example("partial", "warn", "Every recipient read failed, so no test in the window was sampled.", {
+        ...COVERAGE_HEALTHY, sampled_test_count: 0, recipient_reads_complete: false, tested_user_count: 0,
+      }),
+      UNREADABLE_TESTS,
+      example("unreadable", "manual", "The active user list was refused.", { security_tests_readable: true, users_readable: false }),
+    ],
+  },
+  {
+    id: "KNOWBE4-06",
+    control: 6,
+    title: "Phish-prone percentage tracking",
+    severity: "high",
+    owner: PHISHING,
+    surfaces: ["security_tests", "users", "account"],
+    inputs: [
+      "security_tests_readable",
+      "security_tests_complete",
+      "current_phish_prone_pct",
+      "baseline_phish_prone_pct",
+      "max_phish_prone_pct",
+      "users_readable",
+      "account_readable",
+    ],
+    rules: [
+      rule("manual", ne("security_tests_readable", true)),
+      rule("warn", unreported("current_phish_prone_pct")),
+      rule("fail", gt("current_phish_prone_pct", path("max_phish_prone_pct"))),
+      rule("warn", gt("current_phish_prone_pct", path("baseline_phish_prone_pct"))),
+      rule("warn", any(ne("security_tests_complete", true), ne("users_readable", true), ne("account_readable", true))),
+      rule("pass", always),
+    ],
+    completeness: { security_tests_complete: SECURITY_TESTS_COMPLETE },
+    decision: "Manual when the security test list is unreadable. Warn when no security test that ran in the lookback window has a percentage and a weight above 0. Fail when the weighted phish-prone percentage of those tests is above max_phish_prone_pct. Warn when it is above the baseline, the weighted percentage of the three oldest tests that ran, which exists once at least four have run. Warn instead of pass when the security test list is partial or the active user list or the account record is unreadable. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "The window's weighted phish-prone percentage is 4.2, under the maximum and the 9.75 baseline.", {
+        ...PHISH_PRONE_HEALTHY, current_phish_prone_pct: 4.2,
+      }),
+      example("noncompliant", "fail", "The window's weighted phish-prone percentage is 18.4.", { ...PHISH_PRONE_HEALTHY, current_phish_prone_pct: 18.4 }),
+      example("partial", "warn", "The window's percentage, 11.5, is above the 9.75 baseline.", { ...PHISH_PRONE_HEALTHY, current_phish_prone_pct: 11.5 }),
+      example("partial", "warn", "No test in the window carries a percentage and a delivered or scheduled count.", { ...PHISH_PRONE_HEALTHY }),
+      example("partial", "warn", "The account record was refused.", { ...PHISH_PRONE_HEALTHY, current_phish_prone_pct: 4.2, account_readable: false }),
+      UNREADABLE_TESTS,
+    ],
+  },
+  {
+    id: "KNOWBE4-07",
+    control: 7,
+    title: "Phishing failure rate trending",
+    severity: "medium",
+    owner: PHISHING,
+    surfaces: ["security_tests", "account_risk_score_history"],
+    inputs: [
+      "security_tests_readable",
+      "security_tests_complete",
+      "trend_test_count",
+      "phish_prone_delta_points",
+      "account_risk_score_history_readable",
+    ],
+    constants: { min_trend_tests: 4, trend_fail_delta_points: 2, trend_warn_delta_points: 0.5 },
+    rules: [
+      rule("manual", ne("security_tests_readable", true)),
+      rule("warn", lt("trend_test_count", path("min_trend_tests"))),
+      rule("fail", gt("phish_prone_delta_points", path("trend_fail_delta_points"))),
+      rule("warn", gt("phish_prone_delta_points", path("trend_warn_delta_points"))),
+      rule("warn", any(ne("security_tests_complete", true), ne("account_risk_score_history_readable", true))),
+      rule("pass", always),
+    ],
+    completeness: { security_tests_complete: SECURITY_TESTS_COMPLETE },
+    decision: "Manual when the security test list is unreadable. Warn when fewer than 4 tests with a percentage ran in twice the lookback window. Fail when the later half's mean percentage exceeds the earlier half's by more than 2 points, and warn when it does by more than 0.5 points. Warn instead of pass when the security test list is partial or the organization risk score history is unreadable. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "The later half's mean percentage rose by exactly 0.5 points, which is not above the warning delta.", {
+        ...TREND_HEALTHY, phish_prone_delta_points: 0.5,
+      }),
+      example("noncompliant", "fail", "The later half's mean percentage rose by 2.01 points.", { ...TREND_HEALTHY, phish_prone_delta_points: 2.01 }),
+      example("partial", "warn", "The later half's mean percentage rose by 1.25 points.", { ...TREND_HEALTHY, phish_prone_delta_points: 1.25 }),
+      example("partial", "warn", "Only 3 tests with a percentage ran in the trend window.", { ...TREND_HEALTHY, trend_test_count: 3 }),
+      UNREADABLE_TESTS,
+    ],
+  },
+  {
+    id: "KNOWBE4-09",
+    control: 9,
+    title: "Campaign targeting completeness",
+    severity: "medium",
+    owner: PHISHING,
+    surfaces: ["phishing_campaigns", "security_tests", "users", "groups"],
+    inputs: [
+      "phishing_campaigns_readable",
+      "phishing_campaigns_complete",
+      "active_campaign_count",
+      "full_targeting_campaign_count",
+      "users_readable",
+      "groups_readable",
+      "targeted_member_count",
+      "active_user_count",
+      "min_coverage_pct",
+      "require_full_targeting",
+      "security_tests_complete",
+      "users_complete",
+      "groups_complete",
+    ],
+    rules: [
+      rule("manual", ne("phishing_campaigns_readable", true)),
+      rule("manual", all(
+        gt("active_campaign_count", 0),
+        eq("full_targeting_campaign_count", 0),
+        any(ne("users_readable", true), ne("groups_readable", true)),
+      )),
+      rule("fail", eq("active_campaign_count", 0)),
+      rule("fail", all(
+        eq("full_targeting_campaign_count", 0),
+        not(percentAtLeast("targeted_member_count", "active_user_count", "min_coverage_pct")),
+        eq("require_full_targeting", true),
+      )),
+      rule("warn", incomplete("phishing_campaigns_complete", "security_tests_complete", "users_complete", "groups_complete")),
+      rule("pass", always),
+    ],
+    completeness: {
+      phishing_campaigns_complete: PHISHING_CAMPAIGNS_COMPLETE,
+      security_tests_complete: SECURITY_TESTS_COMPLETE,
+      users_complete: USERS_COMPLETE,
+      groups_complete: GROUPS_COMPLETE,
+    },
+    decision: "Manual when the phishing campaign list is unreadable, or when no active campaign targets All Users and the active user list or the active group list is unreadable. Fail when no campaign is active. Fail when no active campaign targets All Users, require_full_targeting is true, and the member counts of the groups the active campaigns target add up to less than min_coverage_pct percent of active users, rounded half up to 1 decimal place. Warn instead of pass when the phishing campaign, security test, active user, or active group list is partial or unreadable. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "One of the two active campaigns targets All Users.", {
+        ...TARGETING_HEALTHY, active_campaign_count: 2, full_targeting_campaign_count: 1, targeted_member_count: 0,
+      }),
+      example("compliant", "pass", "The targeted groups hold 460 members against 500 active users, 92 percent.", { ...PARTIAL_TARGETING, targeted_member_count: 460 }),
+      example("noncompliant", "fail", "No phishing campaign is active.", { ...TARGETING_HEALTHY, active_campaign_count: 0, full_targeting_campaign_count: 0, targeted_member_count: 0 }),
+      example("noncompliant", "fail", "The targeted groups hold 300 members against 500 active users, 60 percent.", { ...PARTIAL_TARGETING, targeted_member_count: 300 }),
+      example("compliant", "pass", "Coverage is 60 percent, but require_full_targeting is false.", {
+        ...PARTIAL_TARGETING, targeted_member_count: 300, require_full_targeting: false,
+      }),
+      example("partial", "warn", "A campaign targets All Users, but the group list stopped at the 20000-record cap.", {
+        ...TARGETING_HEALTHY, active_campaign_count: 2, full_targeting_campaign_count: 1, targeted_member_count: 0, groups_complete: false,
+      }),
+      example("unreadable", "manual", "The phishing campaign list was refused.", { phishing_campaigns_readable: false }),
+      example("unreadable", "manual", "No active campaign targets All Users and the group list was refused.", {
+        ...PARTIAL_TARGETING, groups_readable: false, groups_complete: false,
+      }),
+    ],
+  },
+  {
+    id: "KNOWBE4-19",
+    control: 19,
+    title: "Phishing report rate",
+    severity: "medium",
+    owner: PHISHING,
+    surfaces: ["security_tests", "phisher_messages"],
+    inputs: [
+      "security_tests_readable",
+      "security_tests_complete",
+      "delivered_count",
+      "reported_count",
+      "min_report_rate_pct",
+      "report_rate_warn_floor_pct",
+      "phisher_messages_readable",
+    ],
+    rules: [
+      rule("manual", ne("security_tests_readable", true)),
+      rule("warn", eq("delivered_count", 0)),
+      rule("fail", not(percentAtLeast("reported_count", "delivered_count", "report_rate_warn_floor_pct"))),
+      rule("warn", not(percentAtLeast("reported_count", "delivered_count", "min_report_rate_pct"))),
+      rule("warn", any(ne("security_tests_complete", true), eq("phisher_messages_readable", false))),
+      rule("pass", always),
+    ],
+    completeness: { security_tests_complete: SECURITY_TESTS_COMPLETE },
+    decision: "Manual when the security test list is unreadable. Warn when the tests that ran in the lookback window delivered no message. Fail when the reported share of delivered messages, rounded half up to 1 decimal place, is below half of min_report_rate_pct, and warn when it is below min_report_rate_pct. Warn instead of pass when the security test list is partial or the PhishER message read was refused. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "620 of 1000 delivered messages were reported, 62 percent.", { ...REPORT_HEALTHY, reported_count: 620 }),
+      example("compliant", "pass", "The report rate meets the minimum and no PhishER API token is configured.", {
+        ...TESTS_READ, delivered_count: 1000, reported_count: 620, min_report_rate_pct: 50, report_rate_warn_floor_pct: 25,
+      }),
+      example("noncompliant", "fail", "200 of 1000 delivered messages were reported, below half the minimum.", { ...REPORT_HEALTHY, reported_count: 200 }),
+      example("partial", "warn", "400 of 1000 delivered messages were reported, below the minimum but above half of it.", { ...REPORT_HEALTHY, reported_count: 400 }),
+      example("partial", "warn", "The tests in the window delivered no message.", { ...REPORT_HEALTHY, delivered_count: 0, reported_count: 0 }),
+      example("partial", "warn", "The report rate meets the minimum, but the PhishER read was refused.", {
+        ...REPORT_HEALTHY, reported_count: 620, phisher_messages_readable: false,
+      }),
+      UNREADABLE_TESTS,
+    ],
+  },
+  {
+    id: "KNOWBE4-20",
+    control: 20,
+    title: "Campaign scheduling regularity",
+    severity: "medium",
+    owner: PHISHING,
+    surfaces: ["security_tests"],
+    inputs: ["security_tests_readable", "security_tests_complete", "largest_schedule_gap_days", "max_schedule_gap_days"],
+    rules: [
+      rule("manual", ne("security_tests_readable", true)),
+      rule("fail", unreported("largest_schedule_gap_days")),
+      rule("fail", gt("largest_schedule_gap_days", path("max_schedule_gap_days"))),
+      rule("warn", ne("security_tests_complete", true)),
+      rule("pass", always),
+    ],
+    completeness: { security_tests_complete: SECURITY_TESTS_COMPLETE },
+    decision: "Manual when the security test list is unreadable. Fail when no security test has run, or when a gap between consecutive test starts, counted from the newest test before the lookback window through the assessment time, is longer than max_schedule_gap_days days. Warn instead of pass when the security test list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "The largest gap, including the one since the newest test, is 31.5 days.", { ...TESTS_READ, largest_schedule_gap_days: 31.5, max_schedule_gap_days: 45 }),
+      example("noncompliant", "fail", "A 52-day gap separates two tests.", { ...TESTS_READ, largest_schedule_gap_days: 52, max_schedule_gap_days: 45 }),
+      example("noncompliant", "fail", "No security test has ever run.", { ...TESTS_READ, max_schedule_gap_days: 45 }),
+      example("partial", "warn", "The returned tests are evenly spaced, but the list stopped at the 20000-record cap.", {
+        security_tests_readable: true, security_tests_complete: false, largest_schedule_gap_days: 20, max_schedule_gap_days: 45,
+      }),
+      UNREADABLE_TESTS,
+    ],
+  },
+];
+
+const toCheck = (check: Knowbe4Check): BatchCheckDefinition => {
+  const executable = deriveDecisionRules(check.id, check.rules);
+  return {
+    id: check.id,
+    control: check.control,
+    title: check.title,
+    severity: check.severity,
+    owner: check.owner,
+    surfaces: check.surfaces,
+    evidenceFields: check.inputs,
+    decisionInputs: inputs(...check.inputs),
+    decisionConstants: check.constants ?? {},
+    decisionRules: executable.rules,
+    derivedFactRules: executable.derivedFactRules,
+    ...(check.completeness ? { completeness: check.completeness } : {}),
+    decision: check.decision,
+    examples: check.examples,
+  };
+};
+
+const checks: readonly BatchCheckDefinition[] = [...PHISHING_CHECKS].map(toCheck);
+const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
+
+const NOT_OBJECTS = "Entries that are not JSON objects are dropped before a page is counted.";
+const pageWalk = (
+  surfaceIds: readonly string[],
+  records: string,
+  cap: string,
+  itemCap: number | null,
+  probed: boolean,
+  scope = "",
+): BatchPaginationDefinition => ({
+  surfaceIds,
+  cursorFields: ["page"],
+  pageSize: probed ? null : 500,
+  itemCap,
+  pageCap: null,
+  totalSemantics: `${scope}Pages of 500 ${records} (per_page), numbered from 1 (page)${probed ? "; the knowbe4_check_access probe reads only page 1 with per_page 1" : ""}. ${NOT_OBJECTS} Up to ${cap} ${records} are kept; no total, Link header, or cursor is read.`,
+  stopConditions: [
+    `A page holding fewer than 500 ${records}`,
+    `A page holding more ${records} than were left under ${cap}, which marks the list partial`,
+    `A full page that brings the ${records} kept to ${cap}, which marks the list partial`,
+  ],
+});
+
+const FRAMEWORK_REPORT_FILES = [
+  "compliance/fedramp/fedramp_compliance_report.md",
+  "compliance/cmmc/cmmc_compliance_report.md",
+  "compliance/soc2/soc2_compliance_report.md",
+  "compliance/cis_controls/cis_controls_v8_report.md",
+  "compliance/pci_dss/pci_dss_compliance_report.md",
+  "compliance/disa_stig/stig_compliance_checklist.md",
+  "compliance/irap/irap_compliance_report.md",
+  "compliance/ismap/ismap_compliance_report.md",
+];
+const CORE_DATA_FILES = [
+  "access",
+  "collection_status",
+  "account",
+  "account_risk_score_history",
+  "users_active",
+  "groups",
+  "phishing_campaigns",
+  "security_tests",
+  "security_test_recipients",
+  "callback_security_tests",
+  "training_campaigns",
+  "training_enrollments",
+  "store_purchases",
+  "training_policies",
+  "phisher_messages",
+];
+const ASSESSMENT_AREAS = ["phishing", "training", "risk", "governance"];
+
+export const KNOWBE4_SPEC = buildBatchIntegrationSpec({
+  slug: "knowbe4-sec-inspector",
+  displayName: "KnowBe4 Security Inspector",
+  vendor: "KnowBe4",
+  category: "security-awareness",
+  summary: "Portable contract for the shipped KnowBe4 phishing program, training program, user risk, and account governance assessments over the KnowBe4 Reporting API and the optional PhishER GraphQL API.",
+  sourceModule: "cli/extensions/grc-tools/knowbe4.ts",
+  baseServices: [REPORTING_SERVICE, PHISHER_SERVICE],
+  authentication: KNOWBE4_AUTH_RESOLVER,
+  permissions: [
+    {
+      id: "reporting-api",
+      kind: "license",
+      value: "KnowBe4 Reporting API access and a Reporting API key",
+      unlocks: [
+        "account",
+        "account_risk_score_history",
+        "users",
+        "groups",
+        "phishing_campaigns",
+        "security_tests",
+        "security_test_recipients",
+      ],
+    },
+    {
+      id: "phisher-api",
+      kind: "license",
+      value: "PhishER and a PhishER Product API key; without the key PhishER is not read",
+      unlocks: ["phisher_messages"],
+    },
+  ],
+  surfaces: KNOWBE4_SURFACES,
+  checks,
+  tools: {
+    knowbe4_check_access: [],
+    knowbe4_assess_phishing_program: idsFor(PHISHING),
+    knowbe4_export_audit_bundle: checks.map((check) => check.id),
+  },
+  pagination: [
+    pageWalk(["users"], "users", USER_LIMIT, null, true),
+    pageWalk(["groups", "phishing_campaigns", "security_tests"], "records", "20000", 20000, true),
+    pageWalk(["account_risk_score_history"], "points", "20000", 20000, false),
+    pageWalk(["security_test_recipients"], "recipients", "20000", 20000, false, "Each sampled test's recipient list is walked separately. "),
+    {
+      surfaceIds: ["phisher_messages"],
+      cursorFields: ["pagination.totalCount", "pagination.pages", "pagination.nextPageKey"],
+      pageSize: null,
+      itemCap: null,
+      pageCap: null,
+      totalSemantics: `Pages of 200 messages, or phisher_message_limit when that is smaller (variables.per), numbered from 1 (variables.page), each later page also sending the previous page's pagination.nextPageKey when it returned one. Up to phisher_message_limit messages are kept, the ${dayOption("phisher_message_limit", 1000, 100000)}, and the list is partial whenever the walk ends with fewer messages kept than the last reported pagination.totalCount. The knowbe4_check_access count reads pagination.totalCount from one count-only request.`,
+      stopConditions: [
+        "A page holding more messages than were left under phisher_message_limit, which marks the list partial",
+        "An empty page",
+        "A page numbered pagination.pages or higher that returned no nextPageKey",
+        "A nextPageKey equal to the one the page was requested with, which marks the list partial",
+        "phisher_message_limit messages kept, which marks the list partial",
+      ],
+    },
+    {
+      surfaceIds: ["account"],
+      cursorFields: [],
+      pageSize: null,
+      itemCap: "none",
+      pageCap: 1,
+      totalSemantics: "One read of the account record.",
+      stopConditions: ["The first response"],
+    },
+  ],
+  rateLimit: {
+    documentedLimit: "KnowBe4 documents per-second, burst, and daily request limits per account for the Reporting API; the collector does not read rate-limit headers.",
+    retryHeaders: ["Retry-After"],
+    retryableStatuses: [429, 503],
+    backoffPolicy: "Retry 429 and 503 up to 3 times after the first attempt. A Retry-After whose ECMAScript Number value is finite and 0 or more waits that many seconds; one that Date.parse reads as a date waits until then, or not at all when it has passed; otherwise the wait is 1 second, doubling on each later retry. Every wait is capped at 60 seconds, and every attempt starts at least 250 milliseconds after the previous one. Requests that time out (30 seconds unless timeout_seconds or KNOWBE4_TIMEOUT sets it), network errors, and PhishER responses carrying GraphQL errors are not retried.",
+  },
+  runtimeBehavior: [],
+  knownGaps: [
+    "A Reporting API page counts only its entries that are JSON objects, so a full page of 500 holding an entry that is not a JSON object ends the walk as a last page and leaves the list complete; the records on later pages are never read, and any check can pass on the records that were.",
+  ],
+  sensitiveFields: ["api_token", "phisher_api_token", "Authorization", ...PII_HASH_FIELDS, ...PII_MASK_FIELDS],
+  credentialFormats: [
+    "KnowBe4 Reporting API key, sent as a bearer token",
+    "KnowBe4 PhishER Product API key, sent as a bearer token",
+  ],
+  output: buildBatchOutputContract({
+    files: [
+      "QUICK_REFERENCE.md",
+      "metadata.json",
+      ...CORE_DATA_FILES.map((name) => `core_data/${name}.json`),
+      ...ASSESSMENT_AREAS.flatMap((area) => [`analysis/${area}.json`, `analysis/${area}.md`]),
+      "analysis/findings.json",
+      "analysis/control_coverage.json",
+      "analysis/access_check.md",
+      "compliance/executive_summary.md",
+      "compliance/unified_compliance_matrix.md",
+      ...FRAMEWORK_REPORT_FILES,
+    ],
+    conditionalFiles: ["_errors.log"],
+    conditionalFileConditions: { "_errors.log": "Only when some reads fail but the bundle still completes." },
+    overwritePolicy: "Allocate the account name read as text, else knowbe4-{region}, lowercased with every run of characters outside a-z, 0-9, dot, underscore, and hyphen replaced by one hyphen, trimmed of leading and trailing hyphens, and cut to 80 characters (knowbe4 when nothing is left), followed by -knowbe4-audit-bundle, or by that and the first of -2 through -6 whose directory and zip are both free, and fail rather than overwrite.",
+    archivePairing: "Write a sibling zip named from the exact allocated bundle-directory path plus .zip.",
+  }),
+  lastUpdated: "2026-10-18",
+  redaction: {
+    projectionStage: `Responses are kept as read, except that the account record is cut to its listed fields with certificate-like fields summarized, and every user, including each recipient's embedded user, loses its ${series(USER_FREE_FORM_FIELDS)}. The export writes every core_data dataset through the PII pass when redact_pii is set, which replaces each ${series(PII_HASH_FIELDS, "or")} value that reads as text with user- followed by the first 12 hexadecimal digits of the SHA-256 of its trimmed, lowercased text and each non-null ${series(PII_MASK_FIELDS, "or")} value with [redacted], and always through the credential pass, which replaces the values of credential-shaped keys with [REDACTED], cuts the values of URL-shaped keys to their scheme and host, and scrubs token-shaped text from every other string. Analysis and compliance files skip both passes.`,
+    integrationRules: [
+      "A refused Reporting API or PhishER response is reported with its status line and, when its body is a JSON object, the text of its message, error, and errors[].message fields joined by semicolons, whitespace runs collapsed, credential values scrubbed, and cut to 300 characters; any other body is described by its status line, media type, and byte length and never echoed.",
+      "A 2xx response whose body is not JSON is described by its media type and byte length and never echoed.",
+      "PhishER GraphQL errors are reported as each error's message, else unknown error, joined by semicolons and scrubbed, without the 300-character cut.",
+      "An inventory that was not requested, not readable, or not configured is exported as an explicit marker naming the reason, never as an empty dataset.",
+    ],
+  },
+});
