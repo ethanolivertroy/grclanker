@@ -23,6 +23,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { CROWDSTRIKE_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
+import { ALERT_DEVICE_SNAPSHOT_FIELDS, ALERT_SNAPSHOT_FIELDS, RTR_SESSION_SNAPSHOT_FIELDS } from "./crowdstrike.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -2426,54 +2427,7 @@ function evaluateContainment(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>
   return withPartialInventory(withUndatedItems(base, undated, "contained hosts", "modified_timestamp"), [partial]);
 }
 
-const ALERT_SNAPSHOT_FIELDS = [
-  "id",
-  "composite_id",
-  "aggregate_id",
-  "cid",
-  "agent_id",
-  "product",
-  "type",
-  "scenario",
-  "objective",
-  "tactic",
-  "tactic_id",
-  "technique",
-  "technique_id",
-  "pattern_id",
-  "name",
-  "display_name",
-  "severity",
-  "severity_name",
-  "confidence",
-  "status",
-  "assigned_to_name",
-  "resolution",
-  "created_timestamp",
-  "updated_timestamp",
-  "timestamp",
-  "seconds_to_triaged",
-  "seconds_to_resolved",
-  "data_domains",
-  "tags",
-];
-const ALERT_DEVICE_SNAPSHOT_FIELDS = ["device_id", "hostname", "platform_name", "os_version", "agent_version"];
-const RTR_SESSION_SNAPSHOT_FIELDS = [
-  "id",
-  "cid",
-  "device_id",
-  "hostname",
-  "platform_name",
-  "platform_id",
-  "user_id",
-  "user_uuid",
-  "created_at",
-  "updated_at",
-  "deleted_at",
-  "duration",
-];
-
-function pickFields(record: JsonRecord, fields: string[]): JsonRecord {
+function pickFields(record: JsonRecord, fields: readonly string[]): JsonRecord {
   const output: JsonRecord = {};
   for (const field of fields) {
     if (record[field] !== undefined) output[field] = record[field];
