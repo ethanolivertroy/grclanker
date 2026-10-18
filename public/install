@@ -79,6 +79,121 @@ normalize_version() {
   printf "%s" "${1#v}"
 }
 
+version_core() {
+  printf "%s" "${1%%-*}"
+}
+
+version_prerelease() {
+  case "$1" in
+    *-*) printf "%s" "${1#*-}" ;;
+  esac
+}
+
+# macOS ships BSD sort, which rejects GNU sort -V and aborts this script under
+# set -e. Compare the version embedded in the archive name instead.
+version_is_newer() {
+  local left="$1" right="$2"
+  local left_core right_core l1 l2 l3 r1 r2 r3
+  left_core="$(version_core "$left")"
+  right_core="$(version_core "$right")"
+  local IFS=.
+  # shellcheck disable=SC2086
+  set -- $left_core
+  l1="${1:-0}"; l2="${2:-0}"; l3="${3:-0}"
+  # shellcheck disable=SC2086
+  set -- $right_core
+  r1="${1:-0}"; r2="${2:-0}"; r3="${3:-0}"
+  if ! printf "%s%s%s%s%s%s" "$l1" "$l2" "$l3" "$r1" "$r2" "$r3" | grep -Eq "^[0-9]+$"; then
+    return 1
+  fi
+  if [ "$l1" -ne "$r1" ]; then [ "$l1" -gt "$r1" ]; return; fi
+  if [ "$l2" -ne "$r2" ]; then [ "$l2" -gt "$r2" ]; return; fi
+  if [ "$l3" -ne "$r3" ]; then [ "$l3" -gt "$r3" ]; return; fi
+
+  local left_pre right_pre
+  left_pre="$(version_prerelease "$left")"
+  right_pre="$(version_prerelease "$right")"
+  if [ -z "$left_pre" ] && [ -z "$right_pre" ]; then
+    return 1
+  fi
+  if [ -z "$left_pre" ]; then
+    return 0
+  fi
+  if [ -z "$right_pre" ]; then
+    return 1
+  fi
+
+  local -a left_ids right_ids
+  local i=0 count a b
+  IFS=.
+  # shellcheck disable=SC2086
+  set -- $left_pre
+  left_ids=("$@")
+  # shellcheck disable=SC2086
+  set -- $right_pre
+  right_ids=("$@")
+  count=${#left_ids[@]}
+  if [ "${#right_ids[@]}" -gt "$count" ]; then
+    count=${#right_ids[@]}
+  fi
+  while [ "$i" -lt "$count" ]; do
+    a=""
+    b=""
+    if [ "$i" -lt "${#left_ids[@]}" ]; then
+      a="${left_ids[$i]}"
+    fi
+    if [ "$i" -lt "${#right_ids[@]}" ]; then
+      b="${right_ids[$i]}"
+    fi
+    if [ "$a" = "$b" ]; then
+      i=$((i + 1))
+      continue
+    fi
+    if [ -z "$a" ]; then return 1; fi
+    if [ -z "$b" ]; then return 0; fi
+    case "$a$b" in
+      *[!0-9]*)
+        [ "$a" \> "$b" ]
+        return
+        ;;
+    esac
+    [ "$a" -gt "$b" ]
+    return
+  done
+  return 1
+}
+
+archive_version() {
+  local path="$1" target="$2" archive_ext="$3" name suffix
+  name="$(basename "$path")"
+  suffix="-${target}.${archive_ext}"
+  case "$name" in
+    grclanker-*"$suffix") ;;
+    *) return 1 ;;
+  esac
+  name="${name#grclanker-}"
+  name="${name%"$suffix"}"
+  [ -n "$name" ] || return 1
+  printf "%s" "$name"
+}
+
+newest_local_archive() {
+  local dir="$1" target="$2" archive_ext="$3"
+  local newest="" newest_version="" path version
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    version="$(archive_version "$path" "$target" "$archive_ext")" || continue
+    if [ -z "$newest" ] || version_is_newer "$version" "$newest_version"; then
+      newest="$path"
+      newest_version="$version"
+    fi
+  done <<EOF
+$(find "$dir" -maxdepth 1 -type f -name "grclanker-*-${target}.${archive_ext}")
+EOF
+  [ -n "$newest" ] || return 1
+  printf "%s\n" "$newest"
+}
+
 resolve_script_dir() {
   if [ -z "$SCRIPT_PATH" ]; then
     return 1
@@ -143,8 +258,7 @@ find_local_asset() {
       fi
     fi
 
-    candidate="$(find "$dir" -maxdepth 1 -type f -name "grclanker-*-${target}.${archive_ext}" | sort -V | tail -n 1)"
-    if [ -n "$candidate" ]; then
+    if candidate="$(newest_local_archive "$dir" "$target" "$archive_ext")"; then
       printf "%s\n" "$candidate"
       return 0
     fi
@@ -240,15 +354,7 @@ detect_target() {
     Darwin) os="darwin" ;;
     Linux)
       os="linux"
-      if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
-        :
-      elif ldd --version 2>&1 | grep -qi 'musl'; then
-        printf "\n" >&2
-        warn "Linux musl hosts are not supported by release bundles yet."
-        source_instructions
-        printf "\n" >&2
-        fail "Install aborted."
-      fi
+      confirm_linux_libc
       ;;
     *) fail "unsupported operating system: $os" ;;
   esac
@@ -267,6 +373,34 @@ asset_extension_for_target() {
     win32-*) printf "zip" ;;
     *) printf "tar.gz" ;;
   esac
+}
+
+# Release bundles ship a glibc Node binary. musl is rejected on purpose.
+# A host whose C library cannot be identified used to continue and then fail
+# later with "bundle unavailable", which sends the reader to the wrong fix.
+confirm_linux_libc() {
+  local ldd_version=""
+  if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v ldd >/dev/null 2>&1; then
+    ldd_version="$(ldd --version 2>&1 || true)"
+  fi
+  if printf "%s" "$ldd_version" | grep -qi "musl"; then
+    printf "\n" >&2
+    warn "Linux musl hosts are not supported by release bundles yet."
+    source_instructions
+    printf "\n" >&2
+    fail "Install aborted."
+  fi
+  if printf "%s" "$ldd_version" | grep -Eqi "glibc|gnu libc"; then
+    return 0
+  fi
+  printf "\n" >&2
+  warn "Release bundles need glibc. This host's C library could not be confirmed."
+  source_instructions
+  printf "\n" >&2
+  fail "Install aborted."
 }
 
 # Writes to stderr because detect_target runs inside a command substitution.
@@ -316,14 +450,27 @@ EOF
   tar -xzf "$archive_path" -C "$install_dir"
 }
 
+checksum_entry_hash() {
+  local checksums_path="$1" archive_name="$2" line hash=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      *"  ${archive_name}") hash="${line%%  ${archive_name}}" ;;
+      *" ${archive_name}") hash="${line%% ${archive_name}}" ;;
+    esac
+  done < "$checksums_path"
+  printf "%s" "$hash"
+}
+
 verify_checksum() {
   local archive_path="$1"
   local archive_name="$2"
   local checksums_path="${tmp_dir}/SHA256SUMS.txt"
   local checksums_url=""
+  local strict=0
 
-  # Determine where to fetch checksums from
-  # Returns 0 = verified, 2 = skipped (1 reserved for hard failure via fail())
+  # Returns 0 when verified, 2 when a local or custom source skips the check.
+  # Official GitHub downloads and GRCLANKER_RELEASE_BASE_URL fail closed.
   if [ -n "$ASSET_URL_OVERRIDE" ]; then
     warn "Skipping checksum verification: custom GRCLANKER_ASSET_URL in use"
     return 2
@@ -332,40 +479,48 @@ verify_checksum() {
     local_dir="$(dirname "${ASSET_URL#file://}")"
     if [ -f "${local_dir}/SHA256SUMS.txt" ]; then
       cp "${local_dir}/SHA256SUMS.txt" "$checksums_path"
+      # A checksum file that is present has to cover this archive. Only a
+      # missing file is an unverified local artifact.
+      strict=1
     else
       warn "No SHA256SUMS.txt found alongside local artifact, skipping verification"
       return 2
     fi
   elif [ -n "$RELEASE_BASE_URL" ]; then
+    strict=1
     checksums_url="${RELEASE_BASE_URL%/}/SHA256SUMS.txt"
   else
+    strict=1
     checksums_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${TAG}/SHA256SUMS.txt"
   fi
 
   if [ -n "$checksums_url" ]; then
-    if ! curl -fsSL "$checksums_url" -o "$checksums_path" 2>/dev/null; then
-      warn "Could not fetch SHA256SUMS.txt, skipping checksum verification"
-      return 2
+    if ! curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 20 "$checksums_url" -o "$checksums_path"; then
+      fail "Could not fetch SHA256SUMS.txt from ${checksums_url}. Refusing to install ${archive_name} without a checksum."
     fi
   fi
 
-  # Verify the archive against the checksum file
-  local expected
-  expected="$(grep "  ${archive_name}\$" "$checksums_path" 2>/dev/null || grep " ${archive_name}\$" "$checksums_path" 2>/dev/null || true)"
-
-  if [ -z "$expected" ]; then
+  local expected_hash
+  expected_hash="$(checksum_entry_hash "$checksums_path" "$archive_name")"
+  if [ -z "$expected_hash" ]; then
+    if [ "$strict" -eq 1 ]; then
+      fail "No checksum entry for ${archive_name} in SHA256SUMS.txt. Refusing to install without a checksum."
+    fi
     warn "No checksum entry for ${archive_name} in SHA256SUMS.txt, skipping verification"
     return 2
   fi
-
-  local expected_hash
-  expected_hash="$(printf "%s" "$expected" | awk '{print $1}')"
+  if ! printf "%s" "$expected_hash" | grep -Eq "^[0-9a-fA-F]{64}$"; then
+    fail "Checksum entry for ${archive_name} is not a SHA-256 hex digest."
+  fi
+  expected_hash="$(printf "%s" "$expected_hash" | tr "A-F" "a-f")"
 
   local actual_hash
   if command -v sha256sum >/dev/null 2>&1; then
     actual_hash="$(sha256sum "$archive_path" | awk '{print $1}')"
   elif command -v shasum >/dev/null 2>&1; then
     actual_hash="$(shasum -a 256 "$archive_path" | awk '{print $1}')"
+  elif [ "$strict" -eq 1 ]; then
+    fail "Neither sha256sum nor shasum is available. Refusing to install ${archive_name} without verifying its checksum."
   else
     warn "Neither sha256sum nor shasum found, skipping checksum verification"
     return 2
@@ -397,7 +552,7 @@ fi
 
 if [ "${ASSET_URL:-}" = "" ] && [ "$VERSION" = "latest" ]; then
   if LOCAL_ASSET_PATH="$(find_local_asset "$TARGET" "$ARCHIVE_EXT" latest)" && [ -n "$LOCAL_ASSET_PATH" ]; then
-    VERSION="$(basename "$LOCAL_ASSET_PATH" | sed -E "s/^grclanker-([^-]+)-${TARGET//\//\\/}\.${ARCHIVE_EXT//./\\.}$/\\1/")"
+    VERSION="$(archive_version "$LOCAL_ASSET_PATH" "$TARGET" "$ARCHIVE_EXT")" || fail "Could not read a version from local artifact $(basename "$LOCAL_ASSET_PATH")"
     ASSET_URL="file://${LOCAL_ASSET_PATH}"
     ASSET_NAME="$(basename "$LOCAL_ASSET_PATH")"
     TAG="v${VERSION}"
@@ -446,7 +601,7 @@ archive_path="${tmp_dir}/${ASSET_NAME}"
 ok "Detected ${LAVENDER}${TARGET}${R}"
 
 if [ -t 1 ]; then
-  curl -fsSL "$ASSET_URL" -o "$archive_path" &
+  curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 20 "$ASSET_URL" -o "$archive_path" &
   if ! spin $! "Downloading ${ASSET_NAME}"; then
     printf "\r\033[K"
     fallback_instructions "$TARGET"
@@ -455,7 +610,7 @@ if [ -t 1 ]; then
   ok "Downloaded ${DIM}${ASSET_NAME}${R}"
 else
   log "Downloading ${ASSET_NAME}"
-  if ! curl -fsSL "$ASSET_URL" -o "$archive_path"; then
+  if ! curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 20 "$ASSET_URL" -o "$archive_path"; then
     fallback_instructions "$TARGET"
   fi
   ok "Downloaded"

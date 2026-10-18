@@ -98,11 +98,20 @@ function Find-LocalAsset([string]$Target, [string]$ArchiveExt, [string]$VersionF
       }
     }
 
-    $candidate = Get-ChildItem -Path $dir -File -Filter "grclanker-*-$Target.$ArchiveExt" |
-      Sort-Object Name |
-      Select-Object -Last 1
+    $candidate = $null
+    $candidateVersion = $null
+    foreach ($file in (Get-ChildItem -Path $dir -File -Filter "grclanker-*-$Target.$ArchiveExt")) {
+      $version = Get-ArchiveVersion -Name $file.Name -Target $Target -ArchiveExt $ArchiveExt
+      if (-not $version) {
+        continue
+      }
+      if (-not $candidate -or (Test-VersionNewer -Left $version -Right $candidateVersion)) {
+        $candidate = $file.FullName
+        $candidateVersion = $version
+      }
+    }
     if ($candidate) {
-      return $candidate.FullName
+      return $candidate
     }
   }
 
@@ -171,6 +180,68 @@ function Resolve-LatestReleaseAssetFromRedirect([string]$Target, [string]$Archiv
   }
 }
 
+function Get-ArchiveVersion([string]$Name, [string]$Target, [string]$ArchiveExt) {
+  $prefix = "grclanker-"
+  $suffix = "-$Target.$ArchiveExt"
+  if (-not $Name.StartsWith($prefix) -or -not $Name.EndsWith($suffix)) {
+    return $null
+  }
+  return $Name.Substring($prefix.Length, $Name.Length - $prefix.Length - $suffix.Length)
+}
+
+function Get-VersionCore([string]$Version) {
+  $dash = $Version.IndexOf("-")
+  if ($dash -ge 0) {
+    return $Version.Substring(0, $dash)
+  }
+  return $Version
+}
+
+function Get-VersionPrerelease([string]$Version) {
+  $dash = $Version.IndexOf("-")
+  if ($dash -ge 0) {
+    return $Version.Substring($dash + 1)
+  }
+  return ""
+}
+
+# BSD and Windows name sorts put 0.1.10 before 0.1.2. Compare the numeric version.
+function Test-VersionNewer([string]$Left, [string]$Right) {
+  $leftParts = (Get-VersionCore $Left).Split(".")
+  $rightParts = (Get-VersionCore $Right).Split(".")
+  for ($i = 0; $i -lt 3; $i++) {
+    $l = 0
+    $r = 0
+    if ($i -lt $leftParts.Length) { [void][int]::TryParse($leftParts[$i], [ref]$l) }
+    if ($i -lt $rightParts.Length) { [void][int]::TryParse($rightParts[$i], [ref]$r) }
+    if ($l -ne $r) { return $l -gt $r }
+  }
+
+  $leftPre = Get-VersionPrerelease $Left
+  $rightPre = Get-VersionPrerelease $Right
+  if (-not $leftPre -and -not $rightPre) { return $false }
+  if (-not $leftPre) { return $true }
+  if (-not $rightPre) { return $false }
+
+  $leftIds = $leftPre.Split(".")
+  $rightIds = $rightPre.Split(".")
+  $count = [Math]::Max($leftIds.Length, $rightIds.Length)
+  for ($i = 0; $i -lt $count; $i++) {
+    $a = if ($i -lt $leftIds.Length) { $leftIds[$i] } else { "" }
+    $b = if ($i -lt $rightIds.Length) { $rightIds[$i] } else { "" }
+    if ($a -eq $b) { continue }
+    if (-not $a) { return $false }
+    if (-not $b) { return $true }
+    $aNum = 0
+    $bNum = 0
+    $aIsNum = [int]::TryParse($a, [ref]$aNum)
+    $bIsNum = [int]::TryParse($b, [ref]$bNum)
+    if ($aIsNum -and $bIsNum) { return $aNum -gt $bNum }
+    return [string]::CompareOrdinal($a, $b) -gt 0
+  }
+  return $false
+}
+
 function Get-Target {
   if ($TargetOverride) {
     return $TargetOverride
@@ -203,6 +274,21 @@ function Fallback-And-Fail([string]$Target) {
   throw "Install aborted."
 }
 
+function Assert-ZipEntriesSafe([string]$ArchivePath) {
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+  try {
+    foreach ($entry in $zip.Entries) {
+      $name = ($entry.FullName -replace "\\", "/")
+      if ($name.StartsWith("/") -or $name -match "^[A-Za-z]:" -or $name -match "(^|/)\.\.(/|$)") {
+        throw "Refusing to extract unsafe archive entry: $name"
+      }
+    }
+  } finally {
+    $zip.Dispose()
+  }
+}
+
 function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag, [string]$AssetSourcePath, [string]$AssetUrl) {
   $ChecksumsPath = Join-Path $TempRoot "SHA256SUMS.txt"
   $ChecksumsUrl = $null
@@ -212,40 +298,51 @@ function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag,
     return $false
   }
 
+  $Strict = $false
   if ($AssetSourcePath) {
     $LocalDir = Split-Path $AssetSourcePath -Parent
     $LocalChecksums = Join-Path $LocalDir "SHA256SUMS.txt"
     if (Test-Path $LocalChecksums) {
       Copy-Item -LiteralPath $LocalChecksums -Destination $ChecksumsPath -Force
+      # A checksum file that is present has to cover this archive. Only a
+      # missing file is an unverified local artifact.
+      $Strict = $true
     } else {
       Write-Warn "No SHA256SUMS.txt found alongside local artifact, skipping verification"
       return $false
     }
   } elseif ($ReleaseBaseUrl) {
     $ChecksumsUrl = ($ReleaseBaseUrl.TrimEnd("/")) + "/SHA256SUMS.txt"
+    $Strict = $true
   } else {
     $ChecksumsUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$Tag/SHA256SUMS.txt"
+    $Strict = $true
   }
 
   if ($ChecksumsUrl) {
     try {
       Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $ChecksumsPath | Out-Null
     } catch {
-      Write-Warn "Could not fetch SHA256SUMS.txt, skipping checksum verification"
-      return $false
+      throw "Could not fetch SHA256SUMS.txt from $ChecksumsUrl. Refusing to install $AssetName without a checksum."
     }
   }
 
-  $Entry = Get-Content -Path $ChecksumsPath | Where-Object {
+  $Entry = Get-Content -Path $ChecksumsPath | ForEach-Object { $_.TrimEnd("`r") } | Where-Object {
     $_ -match "\s+$([regex]::Escape($AssetName))$"
   } | Select-Object -First 1
 
   if (-not $Entry) {
+    if ($Strict) {
+      throw "No checksum entry for $AssetName in SHA256SUMS.txt. Refusing to install without a checksum."
+    }
     Write-Warn "No checksum entry for $AssetName in SHA256SUMS.txt, skipping verification"
     return $false
   }
 
   $ExpectedHash = ($Entry -split "\s+")[0].ToLowerInvariant()
+  if ($ExpectedHash -notmatch "^[0-9a-f]{64}$") {
+    throw "Checksum entry for $AssetName is not a SHA-256 hex digest."
+  }
   $ActualHash = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
   if ($ActualHash -ne $ExpectedHash) {
     throw "Checksum mismatch for ${AssetName}: expected $ExpectedHash, got $ActualHash. The download may be corrupted or tampered with."
@@ -344,6 +441,7 @@ try {
   }
 
   New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+  Assert-ZipEntriesSafe -ArchivePath $ArchivePath
   Expand-Archive -Path $ArchivePath -DestinationPath $InstallDir -Force
   Write-Ok "Installed bundle into $InstallDir"
 

@@ -12,6 +12,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -26,7 +27,9 @@ const cacheDir = resolve(companionDir, ".cache", "node");
 const packageJson = JSON.parse(readFileSync(join(companionDir, "package.json"), "utf8"));
 
 const companionVersion = process.env.GRCLANKER_VERSION || packageJson.version;
-const nodeVersion = process.env.GRCLANKER_NODE_VERSION || "22.23.3";
+// Node 24 Krypton is the active LTS. Node 22 reaches end of life on 2027-04-30.
+export const DEFAULT_NODE_VERSION = "24.22.0";
+const nodeVersion = process.env.GRCLANKER_NODE_VERSION || DEFAULT_NODE_VERSION;
 // Zip entries store DOS timestamps, which cannot represent anything before 1980-01-01.
 const MIN_ARCHIVE_EPOCH = 315532800;
 
@@ -171,6 +174,92 @@ function detectHostTarget(definitions) {
   return key;
 }
 
+export function readNodeArchiveChecksum(checksumsText, archiveName) {
+  const suffix = `  ${archiveName}`;
+  const line = checksumsText.split(/\r?\n/).find((entry) => entry.endsWith(suffix));
+  if (!line) {
+    return null;
+  }
+  const hash = line.slice(0, line.length - suffix.length);
+  return /^[0-9a-f]{64}$/.test(hash) ? hash : null;
+}
+
+// curl writes the destination as it goes. A failed download must not leave that
+// partial file, or the next build treats it as a finished archive.
+export function downloadVerifiedUrl(url, destination, runCommand = run) {
+  const partial = `${destination}.partial`;
+  rmSync(partial, { force: true });
+  try {
+    runCommand("curl", [
+      "-fsSL",
+      "--retry", "3",
+      "--retry-delay", "1",
+      "--connect-timeout", "20",
+      url,
+      "-o",
+      partial,
+    ]);
+  } catch (error) {
+    rmSync(partial, { force: true });
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Download failed for ${url}: ${reason}`);
+  }
+  if (!existsSync(partial)) {
+    throw new Error(`Download failed for ${url}: curl did not write a file`);
+  }
+  rmSync(destination, { force: true });
+  renameSync(partial, destination);
+}
+
+export function loadExpectedNodeChecksum({ checksumsPath, archiveName, checksumsUrl, runCommand = run }) {
+  const readHash = () => (
+    existsSync(checksumsPath)
+      ? readNodeArchiveChecksum(readFileSync(checksumsPath, "utf8"), archiveName)
+      : null
+  );
+
+  const cached = readHash();
+  if (cached) {
+    return cached;
+  }
+
+  rmSync(checksumsPath, { force: true });
+  downloadVerifiedUrl(checksumsUrl, checksumsPath, runCommand);
+  const downloaded = readHash();
+  if (!downloaded) {
+    rmSync(checksumsPath, { force: true });
+    throw new Error(`Missing checksum entry for ${archiveName} in SHASUMS256.txt`);
+  }
+  return downloaded;
+}
+
+export function verifyOrRedownloadNodeArchive({
+  archivePath,
+  archiveUrl,
+  expectedHash,
+  runCommand = run,
+  onReject,
+}) {
+  const archiveName = basename(archivePath);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!existsSync(archivePath)) {
+      downloadVerifiedUrl(archiveUrl, archivePath, runCommand);
+    }
+    if (sha256(archivePath) === expectedHash) {
+      return;
+    }
+    rmSync(archivePath, { force: true });
+    if (onReject) {
+      onReject();
+    }
+    if (attempt === 0) {
+      console.warn(`Checksum mismatch for ${archiveName}; downloading it again.`);
+      continue;
+    }
+    throw new Error(`Checksum mismatch for ${archiveName} after a fresh download.`);
+  }
+}
+
 function ensureNodeArchive(target, pythonCommand) {
   const archivePath = join(cacheDir, target.nodeArchive);
   const extractedRoot = join(cacheDir, target.nodeRootDir);
@@ -178,29 +267,19 @@ function ensureNodeArchive(target, pythonCommand) {
 
   mkdirSync(cacheDir, { recursive: true });
 
-  if (!existsSync(archivePath)) {
-    const url = `https://nodejs.org/dist/v${nodeVersion}/${target.nodeArchive}`;
-    console.log(`Downloading ${target.nodeArchive}`);
-    run("curl", ["-fsSL", url, "-o", archivePath]);
-  }
-
-  if (!existsSync(checksumsPath)) {
-    const url = `https://nodejs.org/dist/v${nodeVersion}/SHASUMS256.txt`;
-    run("curl", ["-fsSL", url, "-o", checksumsPath]);
-  }
-
-  const checksumLines = readFileSync(checksumsPath, "utf8").split("\n");
-  const expectedLine = checksumLines.find((line) => line.endsWith(`  ${target.nodeArchive}`));
-  if (!expectedLine) {
-    throw new Error(`Missing checksum entry for ${target.nodeArchive} in SHASUMS256.txt`);
-  }
-
-  const expectedHash = expectedLine.split(/\s+/)[0];
-  const actualHash = sha256(archivePath);
-  if (actualHash !== expectedHash) {
-    rmSync(archivePath, { force: true });
-    throw new Error(`Checksum mismatch for ${target.nodeArchive}`);
-  }
+  const expectedHash = loadExpectedNodeChecksum({
+    checksumsPath,
+    archiveName: target.nodeArchive,
+    checksumsUrl: `https://nodejs.org/dist/v${nodeVersion}/SHASUMS256.txt`,
+  });
+  verifyOrRedownloadNodeArchive({
+    archivePath,
+    archiveUrl: `https://nodejs.org/dist/v${nodeVersion}/${target.nodeArchive}`,
+    expectedHash,
+    onReject() {
+      rmSync(extractedRoot, { recursive: true, force: true });
+    },
+  });
 
   if (!existsSync(extractedRoot)) {
     const extractParent = dirname(extractedRoot);
