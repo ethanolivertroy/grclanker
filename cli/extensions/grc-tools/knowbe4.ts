@@ -23,13 +23,14 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { KNOWBE4_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import {
   ACCOUNT_ADMIN_FIELDS,
   ACCOUNT_FIELDS,
   COMPLIANCE_TOPIC_PATTERN,
   FAILURE_TIMESTAMP_KEYS,
+  KNOWBE4_FRAMEWORK_MAPPINGS,
   KNOWBE4_SPEC,
   PII_HASH_FIELDS,
   PII_MASK_FIELDS,
@@ -140,13 +141,8 @@ export interface Knowbe4ControlDefinition {
   frameworks: Record<Knowbe4FrameworkKey, string>;
 }
 
-function controlDefinition(
-  number: number,
-  title: string,
-  area: Knowbe4Scope,
-  mappings: [string, string, string, string, string, string, string, string],
-): Knowbe4ControlDefinition {
-  const [fedramp, cmmc, soc2, cisV8, pciDss, disaStig, irap, ismap] = mappings;
+function controlDefinition(number: number, title: string, area: Knowbe4Scope): Knowbe4ControlDefinition {
+  const [fedramp, cmmc, soc2, cisV8, pciDss, disaStig, irap, ismap] = KNOWBE4_FRAMEWORK_MAPPINGS[number];
   return {
     number,
     title,
@@ -156,41 +152,27 @@ function controlDefinition(
 }
 
 export const KNOWBE4_CONTROLS: readonly Knowbe4ControlDefinition[] = [
-  controlDefinition(1, "Phishing simulation frequency", "phishing", ["AT-2(1)", "L2 3.2.1", "CC1.4", "14.1", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-01"]),
-  controlDefinition(2, "Phishing simulation coverage", "phishing", ["AT-2(1)", "L2 3.2.2", "CC1.4", "14.2", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-01"]),
-  controlDefinition(3, "Training completion rates", "training", ["AT-2", "L2 3.2.1", "CC1.4", "14.1", "12.6.1", "SRG-APP-000516", "ISM-0252", "HR-02"]),
-  controlDefinition(4, "Training enrollment timeliness", "training", ["AT-2", "L2 3.2.2", "CC1.4", "14.2", "12.6.1", "SRG-APP-000516", "ISM-0252", "HR-02"]),
-  controlDefinition(5, "User risk score distribution", "risk", ["RA-3", "L2 3.11.1", "CC3.2", "14.4", "12.6.2", "SRG-APP-000516", "ISM-0253", "RA-01"]),
-  controlDefinition(6, "Phish-prone percentage tracking", "phishing", ["AT-2(1)", "L2 3.2.3", "CC1.4", "14.4", "12.6.3.1", "SRG-APP-000516", "ISM-0252", "HR-03"]),
-  controlDefinition(7, "Phishing failure rate trending", "phishing", ["AT-2(1)", "L2 3.2.3", "CC1.4", "14.4", "12.6.3.1", "SRG-APP-000516", "ISM-0252", "HR-03"]),
-  controlDefinition(8, "Group coverage analysis", "risk", ["AT-2", "L2 3.2.2", "CC1.4", "14.2", "12.6.1", "SRG-APP-000516", "ISM-0252", "HR-01"]),
-  controlDefinition(9, "Campaign targeting completeness", "phishing", ["AT-2", "L2 3.2.2", "CC1.4", "14.2", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-01"]),
-  controlDefinition(10, "Remedial training triggers", "training", ["AT-2(2)", "L2 3.2.3", "CC1.4", "14.3", "12.6.3", "SRG-APP-000516", "ISM-0253", "HR-04"]),
-  controlDefinition(11, "Training content currency", "training", ["AT-3", "L2 3.2.1", "CC1.4", "14.1", "12.6.1", "SRG-APP-000516", "ISM-0252", "HR-02"]),
-  controlDefinition(12, "Admin role audit", "governance", ["AC-6(5)", "L2 3.1.5", "CC6.3", "5.4", "7.2.2", "SRG-APP-000340", "ISM-0432", "AC-01"]),
-  controlDefinition(13, "SSO integration status", "governance", ["IA-2(1)", "L2 3.5.3", "CC6.1", "6.5", "8.4.2", "SRG-APP-000149", "ISM-1401", "AM-01"]),
-  controlDefinition(14, "Reporting frequency", "governance", ["CA-7", "L2 3.12.3", "CC7.2", "14.4", "12.6.2", "SRG-APP-000516", "ISM-0253", "SO-01"]),
-  controlDefinition(15, "USB test campaign execution", "governance", ["AT-2(1)", "L2 3.2.1", "CC1.4", "14.1", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-05"]),
-  controlDefinition(16, "Vishing campaign execution", "governance", ["AT-2(1)", "L2 3.2.1", "CC1.4", "14.1", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-05"]),
-  controlDefinition(17, "Compliance training modules", "training", ["AT-2", "L2 3.2.1", "CC1.4", "14.1", "12.6.1", "SRG-APP-000516", "ISM-0252", "HR-06"]),
-  controlDefinition(18, "Inactive user cleanup", "risk", ["AC-2(3)", "L2 3.1.1", "CC6.2", "5.3", "8.1.4", "SRG-APP-000025", "ISM-1648", "AC-02"]),
-  controlDefinition(19, "Phishing report rate", "phishing", ["AT-2(1)", "L2 3.2.3", "CC1.4", "14.4", "12.6.3.1", "SRG-APP-000516", "ISM-0252", "HR-03"]),
-  controlDefinition(20, "Campaign scheduling regularity", "phishing", ["AT-2", "L2 3.2.1", "CC1.4", "14.1", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-01"]),
+  controlDefinition(1, "Phishing simulation frequency", "phishing"),
+  controlDefinition(2, "Phishing simulation coverage", "phishing"),
+  controlDefinition(3, "Training completion rates", "training"),
+  controlDefinition(4, "Training enrollment timeliness", "training"),
+  controlDefinition(5, "User risk score distribution", "risk"),
+  controlDefinition(6, "Phish-prone percentage tracking", "phishing"),
+  controlDefinition(7, "Phishing failure rate trending", "phishing"),
+  controlDefinition(8, "Group coverage analysis", "risk"),
+  controlDefinition(9, "Campaign targeting completeness", "phishing"),
+  controlDefinition(10, "Remedial training triggers", "training"),
+  controlDefinition(11, "Training content currency", "training"),
+  controlDefinition(12, "Admin role audit", "governance"),
+  controlDefinition(13, "SSO integration status", "governance"),
+  controlDefinition(14, "Reporting frequency", "governance"),
+  controlDefinition(15, "USB test campaign execution", "governance"),
+  controlDefinition(16, "Vishing campaign execution", "governance"),
+  controlDefinition(17, "Compliance training modules", "training"),
+  controlDefinition(18, "Inactive user cleanup", "risk"),
+  controlDefinition(19, "Phishing report rate", "phishing"),
+  controlDefinition(20, "Campaign scheduling regularity", "phishing"),
 ];
-
-hydrateBatchFrameworkMappings(KNOWBE4_SPEC, Object.fromEntries(KNOWBE4_CONTROLS.map(({ number, frameworks }) => [
-  findingId(number),
-  {
-    fedramp: [frameworks.fedramp],
-    cmmc: [frameworks.cmmc],
-    soc2: [frameworks.soc2],
-    cis: [frameworks.cis_v8],
-    pci_dss: [frameworks.pci_dss],
-    disa_stig: [frameworks.disa_stig],
-    irap: [frameworks.irap],
-    ismap: [frameworks.ismap],
-  },
-])));
 
 export interface Knowbe4ResolvedConfig {
   apiToken: string;

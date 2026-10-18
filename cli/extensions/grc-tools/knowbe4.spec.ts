@@ -66,6 +66,29 @@ export const FAILURE_TIMESTAMP_KEYS: readonly string[] = [
 ];
 // Without required_compliance_topics, an assigned training module counts as compliance content when its name matches.
 export const COMPLIANCE_TOPIC_PATTERN = /\b(hipaa|pci|gdpr|sox|ferpa|ccpa|cpra|glba|cmmc|nist|iso\s?27001|fedramp|privacy|compliance|acceptable use|insider threat)\b/i;
+// Each control's framework references, in the order FedRAMP, CMMC, SOC 2, CIS Controls v8, PCI-DSS, DISA STIG, IRAP, ISMAP.
+export const KNOWBE4_FRAMEWORK_MAPPINGS: Readonly<Record<number, readonly [string, string, string, string, string, string, string, string]>> = {
+  1: ["AT-2(1)", "L2 3.2.1", "CC1.4", "14.1", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-01"],
+  2: ["AT-2(1)", "L2 3.2.2", "CC1.4", "14.2", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-01"],
+  3: ["AT-2", "L2 3.2.1", "CC1.4", "14.1", "12.6.1", "SRG-APP-000516", "ISM-0252", "HR-02"],
+  4: ["AT-2", "L2 3.2.2", "CC1.4", "14.2", "12.6.1", "SRG-APP-000516", "ISM-0252", "HR-02"],
+  5: ["RA-3", "L2 3.11.1", "CC3.2", "14.4", "12.6.2", "SRG-APP-000516", "ISM-0253", "RA-01"],
+  6: ["AT-2(1)", "L2 3.2.3", "CC1.4", "14.4", "12.6.3.1", "SRG-APP-000516", "ISM-0252", "HR-03"],
+  7: ["AT-2(1)", "L2 3.2.3", "CC1.4", "14.4", "12.6.3.1", "SRG-APP-000516", "ISM-0252", "HR-03"],
+  8: ["AT-2", "L2 3.2.2", "CC1.4", "14.2", "12.6.1", "SRG-APP-000516", "ISM-0252", "HR-01"],
+  9: ["AT-2", "L2 3.2.2", "CC1.4", "14.2", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-01"],
+  10: ["AT-2(2)", "L2 3.2.3", "CC1.4", "14.3", "12.6.3", "SRG-APP-000516", "ISM-0253", "HR-04"],
+  11: ["AT-3", "L2 3.2.1", "CC1.4", "14.1", "12.6.1", "SRG-APP-000516", "ISM-0252", "HR-02"],
+  12: ["AC-6(5)", "L2 3.1.5", "CC6.3", "5.4", "7.2.2", "SRG-APP-000340", "ISM-0432", "AC-01"],
+  13: ["IA-2(1)", "L2 3.5.3", "CC6.1", "6.5", "8.4.2", "SRG-APP-000149", "ISM-1401", "AM-01"],
+  14: ["CA-7", "L2 3.12.3", "CC7.2", "14.4", "12.6.2", "SRG-APP-000516", "ISM-0253", "SO-01"],
+  15: ["AT-2(1)", "L2 3.2.1", "CC1.4", "14.1", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-05"],
+  16: ["AT-2(1)", "L2 3.2.1", "CC1.4", "14.1", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-05"],
+  17: ["AT-2", "L2 3.2.1", "CC1.4", "14.1", "12.6.1", "SRG-APP-000516", "ISM-0252", "HR-06"],
+  18: ["AC-2(3)", "L2 3.1.1", "CC6.2", "5.3", "8.1.4", "SRG-APP-000025", "ISM-1648", "AC-02"],
+  19: ["AT-2(1)", "L2 3.2.3", "CC1.4", "14.4", "12.6.3.1", "SRG-APP-000516", "ISM-0252", "HR-03"],
+  20: ["AT-2", "L2 3.2.1", "CC1.4", "14.1", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-01"],
+};
 
 const series = (items: readonly string[], conjunction = "and"): string =>
   items.length <= 2 ? items.join(` ${conjunction} `) : `${items.slice(0, -1).join(", ")}, ${conjunction} ${items[items.length - 1]}`;
@@ -1364,6 +1387,7 @@ const GOVERNANCE_CHECKS: readonly Knowbe4Check[] = [
 
 const toCheck = (check: Knowbe4Check): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
+  const [fedramp, cmmc, soc2, cis, pciDss, disaStig, irap, ismap] = KNOWBE4_FRAMEWORK_MAPPINGS[check.control];
   return {
     id: check.id,
     control: check.control,
@@ -1371,6 +1395,16 @@ const toCheck = (check: Knowbe4Check): BatchCheckDefinition => {
     severity: check.severity,
     owner: check.owner,
     surfaces: check.surfaces,
+    frameworks: {
+      fedramp: [fedramp],
+      cmmc: [cmmc],
+      soc2: [soc2],
+      cis: [cis],
+      pci_dss: [pciDss],
+      disa_stig: [disaStig],
+      irap: [irap],
+      ismap: [ismap],
+    },
     evidenceFields: check.inputs,
     decisionInputs: inputs(...check.inputs),
     decisionConstants: check.constants ?? {},

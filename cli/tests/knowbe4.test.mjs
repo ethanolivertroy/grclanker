@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -3141,6 +3142,32 @@ portableContractTest("every control and finding carries the title, severity, and
     }
   }
   assert.deepEqual([...statuses].sort(), ["fail", "manual", "pass", "warn"]);
+});
+
+portableContractTest("the spec module carries its framework mappings, and loading the runtime leaves the spec unchanged", () => {
+  const specUrl = new URL("../dist/extensions/grc-tools/knowbe4.spec.js", import.meta.url).href;
+  const script = `import { KNOWBE4_SPEC } from ${JSON.stringify(specUrl)};\nprocess.stdout.write(JSON.stringify(KNOWBE4_SPEC));`;
+  const specOnly = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: 30_000,
+  });
+  assert.equal(specOnly.status, 0, specOnly.stderr);
+  assert.deepEqual(JSON.parse(specOnly.stdout), JSON.parse(JSON.stringify(KNOWBE4_SPEC)));
+
+  for (const control of KNOWBE4_SPEC.controls) {
+    const { frameworks } = KNOWBE4_CONTROLS.find((entry) => entry.number === control.number);
+    assert.deepEqual(control.frameworks, {
+      fedramp: [frameworks.fedramp],
+      cmmc: [frameworks.cmmc],
+      soc2: [frameworks.soc2],
+      cis: [frameworks.cis_v8],
+      pci_dss: [frameworks.pci_dss],
+      disa_stig: [frameworks.disa_stig],
+      irap: [frameworks.irap],
+      ismap: [frameworks.ismap],
+    }, `control ${control.number}`);
+  }
 });
 
 function boundaryScenario(check, expected, edge, fixture, options = {}) {
