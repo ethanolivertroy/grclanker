@@ -2240,7 +2240,7 @@ export function rawDataSurfaceNames(): string[] {
   return Object.keys(QUALYS_RAW_DATA_ALLOWLISTS);
 }
 
-export function assessQualysScanCoverage(
+export async function assessQualysScanCoverage(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
 ): Promise<QualysAssessmentResult> {
@@ -2657,7 +2657,7 @@ function agentHasActivationKey(agent: JsonRecord): boolean {
   return Boolean(key && (asString(key.activationId) ?? asString(key.title) ?? asString(key.id)));
 }
 
-export function assessQualysAssetInventory(
+export async function assessQualysAssetInventory(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
 ): Promise<QualysAssessmentResult> {
@@ -3048,7 +3048,7 @@ function policyIsAssigned(policy: JsonRecord): boolean {
 const NETWORK_DEVICE_OS_PATTERN = /cisco|nx-os|ios[- ]?xe|junos|juniper|palo alto|pan-os|fortinet|fortios|fortigate|arista|big-ip|f5 |check ?point|gaia|router|switch|firewall|screenos|brocade|huawei/i;
 const NETWORK_AUTH_TYPE_PATTERN = /snmp|cisco|checkpoint|check_point|palo|fortinet|juniper|arista|network|f5|huawei|brocade/i;
 
-export function assessQualysVulnerabilityManagement(
+export async function assessQualysVulnerabilityManagement(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
 ): Promise<QualysAssessmentResult> {
@@ -3575,7 +3575,7 @@ function classifyWebAppScans(webApps: JsonRecord[], recentScans: JsonRecord[], h
 
 const SENSITIVE_ACTIVITY_PATTERN = /user|delete|remove|policy|exclu|schedule|option profile|permission|role|password/i;
 
-export function assessQualysAdministration(
+export async function assessQualysAdministration(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
 ): Promise<QualysAssessmentResult> {
