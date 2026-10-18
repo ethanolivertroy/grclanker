@@ -4704,7 +4704,7 @@ const authParams = {
   api_token: Type.Optional(Type.String({ description: "KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml." })),
   region: Type.Optional(Type.Union(
     KNOWBE4_REGIONS.map((region) => Type.Literal(region)),
-    { description: "KnowBe4 hosting region that selects the API base URL. Defaults to KNOWBE4_REGION, then the config file, then us." },
+    { description: "KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us." },
   )),
   base_url: Type.Optional(Type.String({ description: "Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL." })),
   phisher_api_token: Type.Optional(Type.String({ description: "Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file." })),

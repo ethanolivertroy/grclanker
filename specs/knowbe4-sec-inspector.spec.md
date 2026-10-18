@@ -83,7 +83,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
-| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL. Defaults to KNOWBE4_REGION, then the config file, then us. |
+| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
 | `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
 | `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
@@ -96,7 +96,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
-| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL. Defaults to KNOWBE4_REGION, then the config file, then us. |
+| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
 | `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
 | `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
@@ -119,7 +119,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
-| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL. Defaults to KNOWBE4_REGION, then the config file, then us. |
+| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
 | `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
 | `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
@@ -143,7 +143,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
-| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL. Defaults to KNOWBE4_REGION, then the config file, then us. |
+| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
 | `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
 | `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
@@ -163,7 +163,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
-| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL. Defaults to KNOWBE4_REGION, then the config file, then us. |
+| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
 | `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
 | `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
@@ -181,7 +181,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
-| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL. Defaults to KNOWBE4_REGION, then the config file, then us. |
+| `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
 | `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
 | `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
