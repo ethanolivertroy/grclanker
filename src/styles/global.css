@@ -2310,6 +2310,48 @@ details[open] > .agent-group-toggle::before {
   color: var(--ui-accent);
 }
 
+/* Fumadocs shows a table hit as a grid whose inline column template caps every
+   column but the last at 30% of the row, and it truncates those cells, which
+   cuts most tool names short. */
+@media (max-width: 767.98px) {
+  /* Each row stacks instead: its first cell on one line, then the other cells
+     in column order, separated by dots like the column names above them. */
+  .site-search [role='group'] > div > [role='option'],
+  .site-search [role='group'] > div > [aria-hidden='true'] {
+    display: block;
+  }
+
+  .site-search [role='group'] > div > [role='option'] > div > div,
+  .site-search [role='group'] > div > [aria-hidden='true'] > div {
+    display: inline;
+    overflow: visible;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .site-search [role='group'] > div > [role='option'] > div > div:first-child {
+    display: block;
+  }
+
+  .site-search [role='group'] > div > [role='option'] > div > div:nth-child(n + 3)::before,
+  .site-search [role='group'] > div > [aria-hidden='true'] > div:not(:first-child)::before {
+    content: ' · ';
+  }
+}
+
+@media (min-width: 768px) {
+  /* Two-column tables, such as Tool and Purpose, give the first column up to
+     60% of the row, enough for the longest tool name. */
+  .site-search [role='group'] > div:has(> [aria-hidden='true'] > :last-child:nth-child(2)) {
+    grid-template-columns: fit-content(60%) minmax(0, 1fr) !important;
+  }
+
+  .site-search [role='group'] > div:has(> [aria-hidden='true'] > :last-child:nth-child(2)) > [role='option'] > div > div:first-child {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
 .search-hints {
   display: flex;
   align-items: center;
