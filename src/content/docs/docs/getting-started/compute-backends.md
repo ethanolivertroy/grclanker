@@ -5,7 +5,7 @@ description: Configure host, sandbox-runtime, Docker, Parallels, Modal, or RunPo
 
 grclanker separates model choice from execution environment on purpose.
 
-This split is similar to how Feynman presents model/provider setup separately from compute choices. The difference is that grclanker does not stop at a badge. Use `env doctor` and `env smoke-test` to verify the selected backend can actually execute the tool surface you expect.
+Use `env doctor` and `env smoke-test` to verify the selected backend can actually execute the tool surface you expect.
 
 This page describes the `v0.1.2` release and `main`.
 
@@ -32,7 +32,7 @@ Model/provider settings still decide which LLM answers questions. Compute backen
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `host` | host | shipped | Pi's native local shell operations wrapped in the output redaction guard (the `createHostBackend` contract adapter is exercised by tests and `env list` only) | no | no | in place | in place |
 | `sandbox-runtime` | sandboxed | shipped | contract adapter for bash, grep, and find; file tools stay local with the same FS policy | no | no | in place | in place |
-| `docker` | sandboxed | shipped | contract adapter (`docker run` args unchanged from phase 1) | no | no | bind mount | bind mount |
+| `docker` | sandboxed | shipped | contract adapter over `docker run` | no | no | bind mount | bind mount |
 | `parallels-vm` | sandboxed | shipped | contract adapter (disposable clone, `prlctl exec`) | yes (`prlctl snapshot`, `prlctl snapshot-switch`), exercised by `env smoke-test` | no | shared folder | shared folder |
 | `modal` | gpu-burst | shipped (CLI) | contract adapter over `modal shell`, one-shot: bash only, file tools stay local | no | yes | `--add-local` copy per command | not available |
 | `runpod-pod` | persistent-remote | shipped | contract adapter over the REST API plus `ssh`/`scp` | no | yes | `scp` of the git index (tracked files minus the deny list) into a per-session directory | `scp` (manual) |
@@ -103,8 +103,6 @@ Every adapter takes an injected command runner or `fetch`, which is how the unit
 `modal` and `runpod-serverless` set `capabilities.oneShot`. Every `exec` on them runs in a fresh container or a stateless job, so a file written by one execution does not exist for the next one.
 
 The runtime therefore offers only `bash` (and the user's `!` commands) on a one-shot backend. `read`, `write`, `edit`, `ls`, `grep`, and `find` are not routed through it. They fall back to the host-local tools, which operate on the local workspace and keep their state there.
-
-Before this change, a remote `write` reported success and the next `read` returned the original file. Agent edits disappeared silently.
 
 The system prompt note spells out the consequence for agents:
 
