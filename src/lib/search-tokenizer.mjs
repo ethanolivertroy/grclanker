@@ -48,9 +48,11 @@ export function createSearchTokenizer() {
 }
 
 /**
- * Runs a search that matches hyphenated identifiers whole. When that finds
- * nothing, such as SOC-2 where the docs write SOC 2, it searches the query's
- * parts instead, as the default tokenizer would.
+ * Runs a search that matches hyphenated identifiers whole. An identifier that
+ * finds nothing whole, such as SOC-2 where the docs write SOC 2, is searched by
+ * its parts instead, as the default tokenizer would. Each identifier is checked
+ * with a search of its own: a search lists pages that match any one word, so in
+ * SOC-2 audit, the pages that mention audit would hide that SOC-2 found nothing.
  *
  * @template Result
  * @param {(query: string) => Result[] | PromiseLike<Result[]>} search
@@ -58,7 +60,12 @@ export function createSearchTokenizer() {
  * @returns {Promise<Result[]>}
  */
 export async function searchWholeIdentifiersFirst(search, query) {
-  const results = await search(query);
-  if (results.length > 0 || !query.includes('-')) return results;
-  return search(query.replaceAll('-', ' '));
+  const unmatched = new Set();
+  for (const match of new Set(query.match(hyphenated))) {
+    if (!isIdentifier(match)) continue;
+    const results = await search(match);
+    if (results.length === 0) unmatched.add(match);
+    else if (match === query.trim()) return results;
+  }
+  return search(query.replace(hyphenated, (match) => (unmatched.has(match) ? match.replaceAll('-', ' ') : match)));
 }

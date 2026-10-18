@@ -69,3 +69,21 @@ test('a hyphenated query that finds nothing whole searches its parts', async () 
   assert.deepEqual(await searchWholeIdentifiersFirst(record, 'HIPAA'), []);
   assert.deepEqual(searched, ['ISO-9001', 'SOC-2', 'SOC 2', 'HIPAA']);
 });
+
+test('an identifier that finds nothing whole searches its parts even when other words find pages', async () => {
+  const find = await exportAndLoad([
+    'Audit logs export nightly',
+    'Audit trails record each change',
+    'Map controls to SOC 2 audit criteria',
+    'Export ISO-9001 audit evidence',
+  ]);
+  const searched = [];
+  const record = async (query) => {
+    searched.push(query);
+    return find(query);
+  };
+  assert.equal((await searchWholeIdentifiersFirst(record, 'SOC-2 audit'))[0], 'Map controls to SOC 2 audit criteria');
+  assert.equal((await searchWholeIdentifiersFirst(record, 'ISO-9001 audit'))[0], 'Export ISO-9001 audit evidence');
+  await searchWholeIdentifiersFirst(record, 'ISO-9001 or SOC-2');
+  assert.deepEqual(searched, ['SOC-2', 'SOC 2 audit', 'ISO-9001', 'ISO-9001 audit', 'ISO-9001', 'SOC-2', 'ISO-9001 or SOC 2']);
+});
