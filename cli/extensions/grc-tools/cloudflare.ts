@@ -2502,7 +2502,8 @@ export async function assessCloudflareIdentity(
       return Object.keys(resources).some((key) => /^com\.cloudflare\.api\.account\.zone\.\*$|^com\.cloudflare\.api\.account\.\*$|^com\.cloudflare\.api\.user\.\*$/.test(key));
     });
     const permissionGroups = policies.flatMap((policy) => asRecordArray(policy.permission_groups).map((group) => asString(group.name) ?? asString(group.id) ?? "unknown"));
-    const writeGroups = permissionGroups.filter((name) => /write|edit|admin/i.test(name));
+    // A permission group is write-capable when its name does not end in "Read" (Cache Purge, DNS Write).
+    const writeGroups = permissionGroups.filter((name) => !name.endsWith("Read"));
     const status: CloudflareFindingStatus = policies.length === 0 ? "fail" : writeGroups.length > 0 ? "warn" : "pass";
     findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", status,
       policies.length === 0
@@ -2539,6 +2540,11 @@ export async function assessCloudflareIdentity(
   });
   const unknownStatusTokens = allTokens.filter((token) => !["active", "disabled", "expired"].includes(asString(token.status) ?? ""));
   const neverUsedTokens = activeTokens.filter((token) => !asDate(token.last_used_on));
+  // A missing last_used_on is a review only when the token is not already a violation (no expiry, or active past expiry).
+  const unusedWithExpiry = activeTokens.filter((token) => {
+    const expires = asDate(token.expires_on);
+    return expires !== undefined && expires.getTime() >= now.getTime() && !asDate(token.last_used_on);
+  });
 
   let tokenExpiryStatus: CloudflareFindingStatus;
   let tokenExpirySummary: string;
@@ -2559,7 +2565,7 @@ export async function assessCloudflareIdentity(
   } else if (tokensWithoutExpiry.length > 0 || expiredButActive.length > 0) {
     tokenExpiryStatus = "fail";
     tokenExpirySummary = `${tokensWithoutExpiry.length} of ${activeTokens.length} active API tokens have no expires_on date${expiredButActive.length > 0 ? ` and ${expiredButActive.length} report active past their expiry` : ""}.`;
-  } else if (unknownStatusTokens.length > 0 || truncatedTokenLists.length > 0 || failedTokenLists.length > 0) {
+  } else if (unknownStatusTokens.length > 0 || unusedWithExpiry.length > 0 || truncatedTokenLists.length > 0 || failedTokenLists.length > 0) {
     tokenExpiryStatus = "warn";
     // Counts are scoped to the sources this run could read; a denied or truncated source is named as the
     // reason the verdict is capped rather than folded into the tally as zero.
@@ -2568,6 +2574,7 @@ export async function assessCloudflareIdentity(
       : `all ${allTokens.length} inventoried tokens`;
     const caveats = [
       unknownStatusTokens.length > 0 ? `${unknownStatusTokens.length} ${unknownStatusTokens.length === 1 ? "has" : "have"} an undocumented status` : "",
+      unusedWithExpiry.length > 0 ? `${unusedWithExpiry.length} active ${unusedWithExpiry.length === 1 ? "token has" : "tokens have"} a future expires_on and no last_used_on` : "",
       truncatedTokenLists.length > 0 ? `the token list was truncated (${truncatedTokenLists.map((source) => `${source.label}: ${readList(source.outcome)?.items.length ?? "unknown"} seen of ${readList(source.outcome)?.totalCount ?? "unknown"}`).join("; ")})` : "",
       failedTokenLists.length > 0 ? `${failedTokenLists.map((source) => source.label).join(", ")} could not be read, so tokens listed there were not assessed` : "",
     ].filter(Boolean);
@@ -2593,13 +2600,14 @@ export async function assessCloudflareIdentity(
       http_status: source.outcome && !source.outcome.ok ? source.outcome.status ?? null : null,
       error: source.outcome && !source.outcome.ok ? source.outcome.error : null,
     })),
-  }, cloudflareDecisionFacts(tokensReadable, truncatedTokenLists.length === 0 && failedTokenLists.length === 0, allTokens.length, tokensWithoutExpiry.length + expiredButActive.length, unknownStatusTokens.length)));
+  }, cloudflareDecisionFacts(tokensReadable, truncatedTokenLists.length === 0 && failedTokenLists.length === 0, allTokens.length, tokensWithoutExpiry.length + expiredButActive.length, unknownStatusTokens.length + unusedWithExpiry.length)));
 
   const memberList = readList(members);
   const superAdmins = (memberList?.items ?? []).filter((member) =>
     collectMemberRoleNames(member).some((role) => /super/i.test(role) && /admin/i.test(role)),
   );
-  const membersWithout2fa = (memberList?.items ?? []).filter((member) => asBoolean(asObject(member.user)?.two_factor_authentication_enabled) === false);
+  // A missing or non-boolean two_factor_authentication_enabled is not true, so it is not evidence of MFA.
+  const membersWithout2fa = (memberList?.items ?? []).filter((member) => asBoolean(asObject(member.user)?.two_factor_authentication_enabled) !== true);
   const membersPartial = memberList ? partialInventoryNote("member", memberList) : undefined;
   let memberStatus: CloudflareFindingStatus;
   let memberSummary: string;
@@ -2617,7 +2625,7 @@ export async function assessCloudflareIdentity(
     memberSummary = `${superAdmins.length} Super Administrator assignments exceeded the configured threshold of ${maxSuperAdmins}.${membersPartial ? ` ${membersPartial}` : ""}`;
   } else {
     memberStatus = membersPartial || membersWithout2fa.length > 0 ? "warn" : "pass";
-    memberSummary = `${superAdmins.length} Super Administrator assignments across ${memberList.items.length} members, within the threshold of ${maxSuperAdmins}.${membersWithout2fa.length > 0 ? ` ${membersWithout2fa.length} members have two_factor_authentication_enabled false.` : ""}${membersPartial ? ` ${membersPartial}` : ""}`;
+    memberSummary = `${superAdmins.length} Super Administrator assignments across ${memberList.items.length} members, within the threshold of ${maxSuperAdmins}.${membersWithout2fa.length > 0 ? ` ${membersWithout2fa.length} members do not have two_factor_authentication_enabled set to true.` : ""}${membersPartial ? ` ${membersPartial}` : ""}`;
   }
   findings.push(finding("CF-IAM-03", "Account member privilege concentration", "medium", memberStatus, memberSummary, 14, {
     account_id: accountId ?? null,
@@ -3134,13 +3142,13 @@ export async function assessCloudflareTrafficControls(
     const newest = auditLogs!.items.map((event) => asDate(event.when)).filter((item): item is Date => Boolean(item)).sort((a, b) => b.getTime() - a.getTime())[0];
     const failedActions = auditLogs!.items.filter((event) => asBoolean(asObject(event.action)?.result) === false).length;
     const partial = partialInventoryNote("audit event", auditLogs!);
-    findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", partial ? "warn" : "pass", `${auditLogs!.items.length} audit log events were readable for the last ${AUDIT_LOG_LOOKBACK_DAYS} days${newest ? ` (newest ${newest.toISOString()})` : ""}; ${failedActions} recorded failed actions. Retention beyond the API window is a manual check.${partial ? ` ${partial}` : ""}`, 11, {
+    findings.push(finding("CF-TRF-04", "Account audit log visibility", "high", partial || failedActions > 0 ? "warn" : "pass", `${auditLogs!.items.length} audit log events were readable for the last ${AUDIT_LOG_LOOKBACK_DAYS} days${newest ? ` (newest ${newest.toISOString()})` : ""}; ${failedActions} recorded failed actions. Retention beyond the API window is a manual check.${partial ? ` ${partial}` : ""}`, 11, {
       account_id: accountId,
       audit_events: auditLogs!.items.length,
       newest_event: newest?.toISOString() ?? null,
       failed_actions: failedActions,
       truncated: auditLogs!.truncated,
-    }, cloudflareDecisionFacts(true, !auditLogs!.truncated, auditLogs!.items.length, 0)));
+    }, cloudflareDecisionFacts(true, !auditLogs!.truncated, auditLogs!.items.length, 0, failedActions)));
   }
 
   const ipRules = readList(ipRulesOutcome);
@@ -3156,9 +3164,11 @@ export async function assessCloudflareTrafficControls(
     const allowRules = ipRules!.items.filter((rule) => asString(rule.mode) === "whitelist");
     const undocumented = ipRules!.items.filter((rule) => !asString(rule.notes));
     const partial = partialInventoryNote("IP access rule", ipRules!);
+    // Allow mode (API value whitelist) is a review even when the rule is dated and noted. One rule counts once.
+    const reviewCount = new Set([...stale, ...allowRules, ...undocumented]).size;
     const status: CloudflareFindingStatus = ipRules!.items.length === 0
       ? "pass"
-      : stale.length > 0 || undocumented.length > 0 || partial
+      : reviewCount > 0 || partial
         ? "warn"
         : "pass";
     findings.push(finding("CF-TRF-05", "IP access rules", "medium", status,
@@ -3167,7 +3177,7 @@ export async function assessCloudflareTrafficControls(
         : `${ipRules!.items.length} IP access rules (${allowRules.length} allow, ${stale.length} unmodified for over ${STALE_IP_RULE_DAYS} days or undated, ${undocumented.length} without notes).${partial ? ` ${partial}` : ""}`,
       17,
       { account_id: accountId, ip_access_rules: ipRules!.items.length, allow_rules: allowRules.length, stale_rules: stale.length, rules_without_notes: undocumented.length, truncated: ipRules!.truncated },
-      cloudflareDecisionFacts(true, !ipRules!.truncated, ipRules!.items.length, 0, stale.length + undocumented.length)));
+      cloudflareDecisionFacts(true, !ipRules!.truncated, ipRules!.items.length, 0, reviewCount)));
   }
 
   const gatewayRules = readList(gatewayOutcome);
@@ -3178,7 +3188,8 @@ export async function assessCloudflareTrafficControls(
   } else {
     const enabled = gatewayRules!.items.filter((rule) => asBoolean(rule.enabled) !== false);
     const filters = new Set(enabled.flatMap((rule) => asArray(rule.filters).map((item) => asString(item) ?? "")));
-    const blocking = enabled.filter((rule) => ["block", "isolate", "override", "quarantine"].includes(asString(rule.action) ?? ""));
+    // quarantine is not a blocking action; only block, isolate, and override satisfy the control.
+    const blocking = enabled.filter((rule) => ["block", "isolate", "override"].includes(asString(rule.action) ?? ""));
     if (gatewayRules!.items.length === 0) {
       const gatewayTag = gatewayAccountOutcome!.ok ? asString(gatewayAccountOutcome!.value?.gateway_tag) : undefined;
       if (gatewayTag) {
