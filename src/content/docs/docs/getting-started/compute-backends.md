@@ -42,167 +42,23 @@ Model/provider settings still decide which LLM answers questions. Compute backen
 
 `grclanker env list` lists every kind with its bucket, its readiness on this machine right now, and a one-line detail. The state, snapshot, GPU, and staging columns above are reference only and are not part of its output.
 
-### Session lifecycle and teardown
+## Choose the right backend
 
-Every shipped backend except `host` stages a session lazily on the first command and owns a teardown. The `vercel-sandbox` and `cloudflare-sandbox` stubs fail fast instead and never stage a session.
+- Use `host` when you want speed.
+- Use `sandbox-runtime` when you want local-first execution with policy.
+- Use `docker` when you want reproducible container isolation and easy reset.
+- Use `parallels-vm` when you want a full guest OS and coarse-grained isolation without risking one of your existing VMs.
+- Use `modal` or `runpod-serverless` when a step needs a GPU or more compute than the laptop has and does not need to write back into the repo.
+- Use `runpod-pod` when you want a persistent remote workstation with SSH that you can inspect and repair by hand.
 
-Cleanup paths:
+## Recommended operator flow
 
-- `grclanker env smoke-test` and `grclanker env exec` await that teardown after the run, on success and on failure. The teardown tries to remove the RunPod pod session directory or Parallels clone before the command returns. If the RunPod removal fails, the command reports the remnant (see [Confirmed removal](#confirmed-removal)).
-- The interactive agent session tears every active backend session down on `session_shutdown` through `shutdownComputeSessions`, regardless of which backend `settings.json` prefers.
-  - A run started with a per-run `--compute runpod-pod` override is therefore cleaned up even when the saved preference is `host`.
-  - The sandbox-runtime reset still runs only when that backend is preferred.
-- As a last resort, a synchronous `process.on("exit")` hook runs each adapter's `teardownSync`: a blocking `ssh rm -rf` for RunPod pods, and `prlctl stop --kill` and `prlctl delete` for Parallels.
-  - Node cannot await asynchronous work in exit handlers, so this hook is only a fallback for hard exits, not the primary cleanup path.
-
-#### Confirmed removal
-
-A session is untracked only when its removal is confirmed.
-
-The command runner resolves with the exit code rather than rejecting, so the RunPod pod adapter inspects the result of every `rm -rf` it issues: the normal teardown and the cleanup after a failed `scp`.
-
-- Exit code 0 untracks the session.
-- Anything else is retried once and then raised as an `ExecutionBackendCleanupError`.
-  - The error names the pod id, the remote path, and the exact `ssh ... rm -rf` command to run by hand, with the remote's stderr scrubbed.
-  - The session stays in the adapter's staged set and in the runtime registry (`activeComputeSessionCount()` still counts it).
-  - The next teardown, whether from `env exec`, `env smoke-test`, or the `session_shutdown` sweep, therefore retries the removal instead of returning early.
-
-How cleanup failures are reported:
-
-- On the success path of `env exec` and `env smoke-test`, the cleanup failure is the command's result.
-- When the run itself failed, its own error stays primary and the cleanup failure is appended to it (`Cleanup also failed: ...`).
-- The shutdown sweep tears down every registered session, keeps the ones that failed, and raises a `ComputeSessionTeardownError` listing them. Pi shows that error as an extension error.
-- A partial upload left behind by a failed `scp` whose removal also failed is reported the same way (`The workspace copy failed (...) and the partial upload could not be removed (...)`) and keeps the session tracked.
-- The synchronous exit hook cannot retry, so it inspects the exit code and writes the remnant's location and delete command to stderr.
-
-## The ExecutionBackend contract
-
-Every adapter implements one TypeScript interface in `cli/pi/execution-backend.ts`:
-
-```ts
-interface ExecutionBackend {
-  readonly kind: ExecutionBackendKind;
-  readonly capabilities: { snapshot: boolean; restore: boolean; gpu: boolean; stageWorkspace: boolean; artifactSync: boolean; interactive: boolean; oneShot: boolean };
-  healthcheck(): Promise<void>;
-  stageWorkspace(input: { localPath: string; sessionId: string; mountMode?: "ro" | "rw" }): Promise<{ remotePath: string; detail: string; warnings?: string[] }>;
-  exec(request: ExecutionRequest): Promise<ExecutionResult>;
-  snapshot(sessionId: string): Promise<string>;
-  restore(sessionId: string, snapshotId: string): Promise<void>;
-  teardown(sessionId: string): Promise<void>;
-}
-```
-
-Adapters that do not support an operation throw a clear "does not support" error instead of pretending.
-
-A successful `stageWorkspace` may carry `warnings`. These are non-fatal, already scrubbed conditions, such as a local staging copy that could not be deleted. The runtime prints them to stderr while treating the session exactly like one without them.
-
-Every adapter takes an injected command runner or `fetch`, which is how the unit tests exercise Docker, Parallels, Modal, and RunPod without touching real binaries or the network.
-
-### One-shot backends
-
-`modal` and `runpod-serverless` set `capabilities.oneShot`. Every `exec` on them runs in a fresh container or a stateless job, so a file written by one execution does not exist for the next one.
-
-The runtime therefore offers only `bash` (and the user's `!` commands) on a one-shot backend. `read`, `write`, `edit`, `ls`, `grep`, and `find` are not routed through it. They fall back to the host-local tools, which operate on the local workspace and keep their state there.
-
-The system prompt note spells out the consequence for agents:
-
-- A file written by `bash` on a one-shot backend is gone afterwards.
-- On Modal, local edits are what the next `bash` command sees. The workspace is copied in per command with `--add-local`.
-- On RunPod serverless, local edits are not uploaded at all, because the worker image has to contain the workspace.
-
-On a one-shot backend, `env smoke-test` prints:
-
-- `tool_adapter=skipped (one-shot backend, stateful file operations not offered)`
-- `tool_find=skipped` and `tool_grep=skipped`, with the same reason
-
-It never prints `tool_write=ok` or `tool_read=ok`. It verifies only that a single execution can write and read back its own file (`tool_one_shot_round_trip=ok`).
-
-### Credential hygiene in output
-
-Every adapter routes its output through one redaction guard before anything is streamed, returned, printed, or persisted. Command output is untrusted text: a container, VM, worker, or pod can echo its own environment, and the host shell inherits yours.
-
-Redaction rules:
-
-- Exact values of `RUNPOD_API_KEY`, `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `VERCEL_TOKEN`, and `CLOUDFLARE_API_TOKEN` from your environment are replaced with `[REDACTED]`.
-  - Token values stored in the Modal CLI profile (`~/.modal.toml`) never enter grclanker's output at all. The profile loader records only whether `token_id` and `token_secret` are present (see "Modal").
-- Format-based patterns catch the same credentials when they arrive from the remote without being set locally:
-  - `Bearer <token>` headers
-  - RunPod keys (`rpa_...`)
-  - Modal token ids and secrets (`ak-...`, `as-...`)
-  - `NAME=value` assignments of those variables (quoted or not)
-  - PEM private key blocks, from `-----BEGIN ... PRIVATE KEY-----` through `-----END ...-----`, replaced with `[REDACTED PRIVATE KEY]`
-- Generic shapes that carry credentials without announcing a provider:
-  - In any `scheme://...` URL, the userinfo, every query value, and the fragment are replaced (`https://x/callback?access_token=[REDACTED]&state=[REDACTED]`). The path and parameter names stay so the URL is still recognizable, and a URL without a query is untouched.
-  - `Cookie:` and `Set-Cookie:` header values
-  - Credential-named fields in header, assignment, or JSON form (`X-Api-Key: v`, `session_id=v`, `"token": "v"`, also `api_key`, `access_token`, `refresh_token`, `client_secret`, `password`, `sid`, `signature`, and similar names), with values of four or more characters
-
-Query values are redacted regardless of name because a session token does not label itself, so a `curl -v` of a URL with a harmless query also shows `[REDACTED]` values in bash output.
-
-#### Streamed output
-
-Streamed output is scrubbed per completed line, so a credential split across two chunks is still caught. The trailing partial line is held until the next newline or the end of the command.
-
-The stream is the only channel the bash tool and `env exec` surface, so the sink also refuses to flush through an open PEM block. From a `-----BEGIN ... PRIVATE KEY-----` marker onward, output is held until the matching `END` marker arrives.
-
-That hold is what stops a line-at-a-time producer from leaking the header and body one line at a time. Such producers include a tty-attached `docker exec -t`, a script that flushes per line, and a slow remote. A line that ends in `Bearer` is held for the token on the next line for the same reason.
-
-A block whose `END` never arrives (a truncated key file, a command killed by its timeout mid-key, or a held buffer that reaches the 256 KiB cap) is flushed at that point. In the flushed output, the `BEGIN` marker and the contiguous run of body-shaped lines after it are replaced by `[REDACTED PRIVATE KEY: unterminated block, body withheld]`.
-
-- Body-shaped lines are base64 with 16 or more characters, plus a trailing base64 fragment cut off by the end of the output.
-- When nothing followed the marker, the replacement is `[REDACTED PRIVATE KEY: unterminated block]`.
-- The replacement names the withholding because that truncation would otherwise be invisible in the stream.
-
-Ordinary output after the body survives. A short line such as `ok` or a log line is not body shaped and ends the run, so `cat` of a truncated key followed by `done` streams as `[REDACTED PRIVATE KEY: unterminated block, body withheld]` then `done`.
-
-The cap exists so a never-closed block cannot pin memory. A block still open at 256 KiB is not a real key (those are a few KB), and only its body-shaped lines are withheld.
-
-#### Error messages
-
-Error messages have their own choke point. Thrown errors do not pass through the output guard: the bash tool rethrows them to the agent, and `env exec` prints them.
-
-Every `ExecutionBackendError` therefore scrubs its message in its constructor with `redactErrorMessage`. Every adapter error (`prlctl`, `ssh`, and `scp` stderr quoted into a failure, the file tools' failing remote command, RunPod job errors) is constructed through it, and `env exec` applies it again to whatever it re-throws.
-
-The scrub applies the same values and patterns as command output, plus these rules:
-
-- An HTML document anywhere in the message is replaced wholesale with `[HTML document withheld (N chars)]`.
-- A truncated PEM block is neutralized.
-
-A provider body that is not JSON is never quoted into an error message at all.
-
-- RunPod responses go through one `readJson` that reports a non-JSON body (a gateway's 502 page, a login page returned with HTTP 200) as `failed with HTTP 502 from api.runpod.ai/v2/<endpoint>/health: non-JSON text/html body (166 bytes) withheld`. The message carries status, endpoint, content type, and length, and nothing from the page.
-- A 200 with a non-JSON body becomes the same kind of typed error instead of a raw `SyntaxError` quoting body characters.
-- A JSON error body contributes only its message-bearing fields (`error`, `message`, `detail`, `reason`, and similar), scrubbed by the constructor. Other fields are named, never serialized (`JSON body with keys upstream, session`).
-- A `FAILED` job's `error` is summarized the same way.
-
-#### Covered surfaces
-
-`env exec` scrubs the command line it echoes.
-
-The redaction covers:
-
-- `env smoke-test`
-- `env exec`
-- the agent's bash tool on every backend, including `host`
-- the RunPod serverless worker output that `/status` returns
-- every error the adapters throw
-
-`env list` and `env doctor` print variable names only, never values. Session records in `compute-sessions.ts` hold teardown handles, not credentials.
-
-File operations are the one deliberate exception. `read`, `edit`, `write`, `ls`, `grep`, and `find` on a non-host backend fetch file content through the same adapter with `redactOutput: false`.
-
-The reason is the edit round trip: Pi's edit tool reads a file and writes it back, and a redaction marker must never be written into a file.
-
-`grep`, `find`, and `ls` never write anything back, but they inherit the exception. That way, file content reads the same whether it reaches the model through `read`, a grep match, a directory listing, or a find result. Their failure text is still scrubbed.
-
-### Deadlines and caps are never reported as success
-
-Every loop in the backends that can stop early says why:
-
-- The RunPod serverless status poll raises `ExecutionBackendTimeoutError` (`runpod-serverless timed out after Ns: ...`) when its deadline passes, after cancelling the job. An aborted request raises an explicit `aborted` error. Any terminal status other than `COMPLETED` (`FAILED`, `CANCELLED`, `TIMED_OUT`) raises with that status.
-- The Parallels mount wait raises `ExecutionBackendTimeoutError` (`parallels-vm timed out after Ns: could not locate the repo share ... before the mount deadline. Tried: ...`) and destroys the clone it created.
-- Backend `grep` returns `matchLimitReached: true` when more matches exist than the limit. Backend `find` returns exactly the limit so Pi's find tool prints its results-limit warning.
-
-The adapters never call the RunPod pod or endpoint list APIs or `prlctl snapshot-list`, so there is no paginated listing that could stop on a missing total. `env list` enumerates every kind.
+1. Run `grclanker setup`.
+2. Pick the model/provider path you want.
+3. Pick the compute backend you want.
+4. Run `grclanker env doctor`.
+5. Run `grclanker env smoke-test`.
+6. Only then start relying on that backend for normal work.
 
 ## Validate the backend
 
@@ -661,6 +517,179 @@ State: Stubs. Both kinds exist in settings and `env list`, but selecting them fa
 
 `env list` reports both as `not available`.
 
+## Troubleshooting
+
+- If `env doctor` says Docker is unavailable, make sure the daemon is running, not just the CLI.
+- If `env smoke-test --backend docker` fails immediately, check the image name and confirm the image can run `bash`.
+- If Parallels fails before sandbox creation, confirm either `parallelsTemplateName` exists in `prlctl list -a -t` or `parallelsBaseVmName` points at a stopped VM. Also confirm `parallelsAutoStart` is `true`.
+- If Parallels fails after the sandbox starts, confirm the template/base image has Parallels Tools plus `prlctl exec` guest access working. Set `parallelsWorkspacePath` if your guest does not mount shared folders at one of the common auto-detected paths.
+- If `sandbox-runtime` blocks something unexpectedly, inspect both `~/.grclanker/sandbox.json` and `.grclanker/sandbox.json` in the directory you launched from. `env doctor` prints both paths as `sandbox.global` and `sandbox.project`.
+- If you want to switch back to a simpler path, run `grclanker setup --compute host`.
+
+## The ExecutionBackend contract
+
+The rest of this page explains how the adapters work and how contributors test them. You do not need it to choose, configure, or validate a backend.
+
+Every adapter implements one TypeScript interface in `cli/pi/execution-backend.ts`:
+
+```ts
+interface ExecutionBackend {
+  readonly kind: ExecutionBackendKind;
+  readonly capabilities: { snapshot: boolean; restore: boolean; gpu: boolean; stageWorkspace: boolean; artifactSync: boolean; interactive: boolean; oneShot: boolean };
+  healthcheck(): Promise<void>;
+  stageWorkspace(input: { localPath: string; sessionId: string; mountMode?: "ro" | "rw" }): Promise<{ remotePath: string; detail: string; warnings?: string[] }>;
+  exec(request: ExecutionRequest): Promise<ExecutionResult>;
+  snapshot(sessionId: string): Promise<string>;
+  restore(sessionId: string, snapshotId: string): Promise<void>;
+  teardown(sessionId: string): Promise<void>;
+}
+```
+
+Adapters that do not support an operation throw a clear "does not support" error instead of pretending.
+
+A successful `stageWorkspace` may carry `warnings`. These are non-fatal, already scrubbed conditions, such as a local staging copy that could not be deleted. The runtime prints them to stderr while treating the session exactly like one without them.
+
+Every adapter takes an injected command runner or `fetch`, which is how the unit tests exercise Docker, Parallels, Modal, and RunPod without touching real binaries or the network.
+
+### Session lifecycle and teardown
+
+Every shipped backend except `host` stages a session lazily on the first command and owns a teardown. The `vercel-sandbox` and `cloudflare-sandbox` stubs fail fast instead and never stage a session.
+
+Cleanup paths:
+
+- `grclanker env smoke-test` and `grclanker env exec` await that teardown after the run, on success and on failure. The teardown tries to remove the RunPod pod session directory or Parallels clone before the command returns. If the RunPod removal fails, the command reports the remnant (see [Confirmed removal](#confirmed-removal)).
+- The interactive agent session tears every active backend session down on `session_shutdown` through `shutdownComputeSessions`, regardless of which backend `settings.json` prefers.
+  - A run started with a per-run `--compute runpod-pod` override is therefore cleaned up even when the saved preference is `host`.
+  - The sandbox-runtime reset still runs only when that backend is preferred.
+- As a last resort, a synchronous `process.on("exit")` hook runs each adapter's `teardownSync`: a blocking `ssh rm -rf` for RunPod pods, and `prlctl stop --kill` and `prlctl delete` for Parallels.
+  - Node cannot await asynchronous work in exit handlers, so this hook is only a fallback for hard exits, not the primary cleanup path.
+
+#### Confirmed removal
+
+A session is untracked only when its removal is confirmed.
+
+The command runner resolves with the exit code rather than rejecting, so the RunPod pod adapter inspects the result of every `rm -rf` it issues: the normal teardown and the cleanup after a failed `scp`.
+
+- Exit code 0 untracks the session.
+- Anything else is retried once and then raised as an `ExecutionBackendCleanupError`.
+  - The error names the pod id, the remote path, and the exact `ssh ... rm -rf` command to run by hand, with the remote's stderr scrubbed.
+  - The session stays in the adapter's staged set and in the runtime registry (`activeComputeSessionCount()` still counts it).
+  - The next teardown, whether from `env exec`, `env smoke-test`, or the `session_shutdown` sweep, therefore retries the removal instead of returning early.
+
+How cleanup failures are reported:
+
+- On the success path of `env exec` and `env smoke-test`, the cleanup failure is the command's result.
+- When the run itself failed, its own error stays primary and the cleanup failure is appended to it (`Cleanup also failed: ...`).
+- The shutdown sweep tears down every registered session, keeps the ones that failed, and raises a `ComputeSessionTeardownError` listing them. Pi shows that error as an extension error.
+- A partial upload left behind by a failed `scp` whose removal also failed is reported the same way (`The workspace copy failed (...) and the partial upload could not be removed (...)`) and keeps the session tracked.
+- The synchronous exit hook cannot retry, so it inspects the exit code and writes the remnant's location and delete command to stderr.
+
+### One-shot backends
+
+`modal` and `runpod-serverless` set `capabilities.oneShot`. Every `exec` on them runs in a fresh container or a stateless job, so a file written by one execution does not exist for the next one.
+
+The runtime therefore offers only `bash` (and the user's `!` commands) on a one-shot backend. `read`, `write`, `edit`, `ls`, `grep`, and `find` are not routed through it. They fall back to the host-local tools, which operate on the local workspace and keep their state there.
+
+The system prompt note spells out the consequence for agents:
+
+- A file written by `bash` on a one-shot backend is gone afterwards.
+- On Modal, local edits are what the next `bash` command sees. The workspace is copied in per command with `--add-local`.
+- On RunPod serverless, local edits are not uploaded at all, because the worker image has to contain the workspace.
+
+On a one-shot backend, `env smoke-test` prints:
+
+- `tool_adapter=skipped (one-shot backend, stateful file operations not offered)`
+- `tool_find=skipped` and `tool_grep=skipped`, with the same reason
+
+It never prints `tool_write=ok` or `tool_read=ok`. It verifies only that a single execution can write and read back its own file (`tool_one_shot_round_trip=ok`).
+
+### Credential hygiene in output
+
+Every adapter routes its output through one redaction guard before anything is streamed, returned, printed, or persisted. Command output is untrusted text: a container, VM, worker, or pod can echo its own environment, and the host shell inherits yours.
+
+Redaction rules:
+
+- Exact values of `RUNPOD_API_KEY`, `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `VERCEL_TOKEN`, and `CLOUDFLARE_API_TOKEN` from your environment are replaced with `[REDACTED]`.
+  - Token values stored in the Modal CLI profile (`~/.modal.toml`) never enter grclanker's output at all. The profile loader records only whether `token_id` and `token_secret` are present (see "Modal").
+- Format-based patterns catch the same credentials when they arrive from the remote without being set locally:
+  - `Bearer <token>` headers
+  - RunPod keys (`rpa_...`)
+  - Modal token ids and secrets (`ak-...`, `as-...`)
+  - `NAME=value` assignments of those variables (quoted or not)
+  - PEM private key blocks, from `-----BEGIN ... PRIVATE KEY-----` through `-----END ...-----`, replaced with `[REDACTED PRIVATE KEY]`
+- Generic shapes that carry credentials without announcing a provider:
+  - In any `scheme://...` URL, the userinfo, every query value, and the fragment are replaced (`https://x/callback?access_token=[REDACTED]&state=[REDACTED]`). The path and parameter names stay so the URL is still recognizable, and a URL without a query is untouched.
+  - `Cookie:` and `Set-Cookie:` header values
+  - Credential-named fields in header, assignment, or JSON form (`X-Api-Key: v`, `session_id=v`, `"token": "v"`, also `api_key`, `access_token`, `refresh_token`, `client_secret`, `password`, `sid`, `signature`, and similar names), with values of four or more characters
+
+Query values are redacted regardless of name because a session token does not label itself, so a `curl -v` of a URL with a harmless query also shows `[REDACTED]` values in bash output.
+
+#### Streamed output
+
+Streamed output is scrubbed per completed line, so a credential split across two chunks is still caught. The trailing partial line is held until the next newline or the end of the command.
+
+The stream is the only channel the bash tool and `env exec` surface, so the sink also refuses to flush through an open PEM block. From a `-----BEGIN ... PRIVATE KEY-----` marker onward, output is held until the matching `END` marker arrives.
+
+That hold is what stops a line-at-a-time producer from leaking the header and body one line at a time. Such producers include a tty-attached `docker exec -t`, a script that flushes per line, and a slow remote. A line that ends in `Bearer` is held for the token on the next line for the same reason.
+
+A block whose `END` never arrives (a truncated key file, a command killed by its timeout mid-key, or a held buffer that reaches the 256 KiB cap) is flushed at that point. In the flushed output, the `BEGIN` marker and the contiguous run of body-shaped lines after it are replaced by `[REDACTED PRIVATE KEY: unterminated block, body withheld]`.
+
+- Body-shaped lines are base64 with 16 or more characters, plus a trailing base64 fragment cut off by the end of the output.
+- When nothing followed the marker, the replacement is `[REDACTED PRIVATE KEY: unterminated block]`.
+- The replacement names the withholding because that truncation would otherwise be invisible in the stream.
+
+Ordinary output after the body survives. A short line such as `ok` or a log line is not body shaped and ends the run, so `cat` of a truncated key followed by `done` streams as `[REDACTED PRIVATE KEY: unterminated block, body withheld]` then `done`.
+
+The cap exists so a never-closed block cannot pin memory. A block still open at 256 KiB is not a real key (those are a few KB), and only its body-shaped lines are withheld.
+
+#### Error messages
+
+Error messages have their own choke point. Thrown errors do not pass through the output guard: the bash tool rethrows them to the agent, and `env exec` prints them.
+
+Every `ExecutionBackendError` therefore scrubs its message in its constructor with `redactErrorMessage`. Every adapter error (`prlctl`, `ssh`, and `scp` stderr quoted into a failure, the file tools' failing remote command, RunPod job errors) is constructed through it, and `env exec` applies it again to whatever it re-throws.
+
+The scrub applies the same values and patterns as command output, plus these rules:
+
+- An HTML document anywhere in the message is replaced wholesale with `[HTML document withheld (N chars)]`.
+- A truncated PEM block is neutralized.
+
+A provider body that is not JSON is never quoted into an error message at all.
+
+- RunPod responses go through one `readJson` that reports a non-JSON body (a gateway's 502 page, a login page returned with HTTP 200) as `failed with HTTP 502 from api.runpod.ai/v2/<endpoint>/health: non-JSON text/html body (166 bytes) withheld`. The message carries status, endpoint, content type, and length, and nothing from the page.
+- A 200 with a non-JSON body becomes the same kind of typed error instead of a raw `SyntaxError` quoting body characters.
+- A JSON error body contributes only its message-bearing fields (`error`, `message`, `detail`, `reason`, and similar), scrubbed by the constructor. Other fields are named, never serialized (`JSON body with keys upstream, session`).
+- A `FAILED` job's `error` is summarized the same way.
+
+#### Covered surfaces
+
+`env exec` scrubs the command line it echoes.
+
+The redaction covers:
+
+- `env smoke-test`
+- `env exec`
+- the agent's bash tool on every backend, including `host`
+- the RunPod serverless worker output that `/status` returns
+- every error the adapters throw
+
+`env list` and `env doctor` print variable names only, never values. Session records in `compute-sessions.ts` hold teardown handles, not credentials.
+
+File operations are the one deliberate exception. `read`, `edit`, `write`, `ls`, `grep`, and `find` on a non-host backend fetch file content through the same adapter with `redactOutput: false`.
+
+The reason is the edit round trip: Pi's edit tool reads a file and writes it back, and a redaction marker must never be written into a file.
+
+`grep`, `find`, and `ls` never write anything back, but they inherit the exception. That way, file content reads the same whether it reaches the model through `read`, a grep match, a directory listing, or a find result. Their failure text is still scrubbed.
+
+### Deadlines and caps are never reported as success
+
+Every loop in the backends that can stop early says why:
+
+- The RunPod serverless status poll raises `ExecutionBackendTimeoutError` (`runpod-serverless timed out after Ns: ...`) when its deadline passes, after cancelling the job. An aborted request raises an explicit `aborted` error. Any terminal status other than `COMPLETED` (`FAILED`, `CANCELLED`, `TIMED_OUT`) raises with that status.
+- The Parallels mount wait raises `ExecutionBackendTimeoutError` (`parallels-vm timed out after Ns: could not locate the repo share ... before the mount deadline. Tried: ...`) and destroys the clone it created.
+- Backend `grep` returns `matchLimitReached: true` when more matches exist than the limit. Backend `find` returns exactly the limit so Pi's find tool prints its results-limit warning.
+
+The adapters never call the RunPod pod or endpoint list APIs or `prlctl snapshot-list`, so there is no paginated listing that could stop on a missing total. `env list` enumerates every kind.
+
 ## Live smoke
 
 ```bash
@@ -678,30 +707,3 @@ The script runs `env doctor`, then `env smoke-test --backend <kind>` for every n
 The selection is `selectLiveSmokeCandidates` in `cli/pi/env.ts`, the same readiness the list command uses.
 
 It exits 0 with a skip message when nothing is available. Set `GRCLANKER_LIVE_BACKENDS=docker,modal` to restrict the run, or include `sandbox-runtime` to exercise the local sandbox.
-
-## Choose the right backend
-
-- Use `host` when you want speed.
-- Use `sandbox-runtime` when you want local-first execution with policy.
-- Use `docker` when you want reproducible container isolation and easy reset.
-- Use `parallels-vm` when you want a full guest OS and coarse-grained isolation without risking one of your existing VMs.
-- Use `modal` or `runpod-serverless` when a step needs a GPU or more compute than the laptop has and does not need to write back into the repo.
-- Use `runpod-pod` when you want a persistent remote workstation with SSH that you can inspect and repair by hand.
-
-## Troubleshooting
-
-- If `env doctor` says Docker is unavailable, make sure the daemon is running, not just the CLI.
-- If `env smoke-test --backend docker` fails immediately, check the image name and confirm the image can run `bash`.
-- If Parallels fails before sandbox creation, confirm either `parallelsTemplateName` exists in `prlctl list -a -t` or `parallelsBaseVmName` points at a stopped VM. Also confirm `parallelsAutoStart` is `true`.
-- If Parallels fails after the sandbox starts, confirm the template/base image has Parallels Tools plus `prlctl exec` guest access working. Set `parallelsWorkspacePath` if your guest does not mount shared folders at one of the common auto-detected paths.
-- If `sandbox-runtime` blocks something unexpectedly, inspect both `~/.grclanker/sandbox.json` and `.grclanker/sandbox.json` in the directory you launched from. `env doctor` prints both paths as `sandbox.global` and `sandbox.project`.
-- If you want to switch back to a simpler path, run `grclanker setup --compute host`.
-
-## Recommended operator flow
-
-1. Run `grclanker setup`.
-2. Pick the model/provider path you want.
-3. Pick the compute backend you want.
-4. Run `grclanker env doctor`.
-5. Run `grclanker env smoke-test`.
-6. Only then start relying on that backend for normal work.
