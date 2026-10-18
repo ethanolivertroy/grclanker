@@ -2,9 +2,9 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { useEffect, useRef, useState, type FocusEvent, type MouseEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FocusEvent, type MouseEvent } from 'react';
 import type * as PageTree from 'fumadocs-core/page-tree';
-import { useTOCItems } from 'fumadocs-ui/components/toc';
+import { useItems, useTOCItems } from 'fumadocs-ui/components/toc';
 import { useTreeContext, useTreePath } from 'fumadocs-ui/contexts/tree';
 import { TOCPopover, type TOCPopoverProps } from 'fumadocs-ui/layouts/docs/page/slots/toc';
 import { CloseIcon, MenuIcon } from './icons';
@@ -126,6 +126,24 @@ function DocsMenu() {
   );
 }
 
+/**
+ * Names the contents trigger after the heading it shows. Its own content would
+ * read as the reading-progress value, then the page title and the heading run
+ * together, since Fumadocs keeps both in the button and fades one out. The
+ * name stays rendered, out of sight and out of the accessibility tree, because
+ * Chrome spaces out a `hidden` element's text ("KSI-PIY-GIV : Generating").
+ */
+function ContentsTriggerName({ id }: { id: string }) {
+  const page = useTreePath().at(-1)?.name;
+  const heading = useItems().find((item) => item.active)?.original.title;
+  const shown = heading ?? page;
+  return (
+    <span id={id} className="sr-only" aria-hidden="true">
+      On this page{shown ? <>: {shown}</> : null}
+    </span>
+  );
+}
+
 const barClassName = 'docs-contents-bar sticky top-(--fd-docs-row-2) z-10 grid [grid-area:toc-popover] h-(--fd-toc-popover-height)';
 
 /**
@@ -134,6 +152,7 @@ const barClassName = 'docs-contents-bar sticky top-(--fd-docs-row-2) z-10 grid [
  */
 export function DocsContentsBar(props: TOCPopoverProps) {
   const hasToc = useTOCItems().length > 0;
+  const triggerNameId = useId();
   // Without headings the bar holds only the menu, which the sidebar replaces from 1024px.
   const shownBelow = hasToc
     ? 'xl:hidden max-xl:layout:[--fd-toc-popover-height:--spacing(10)]'
@@ -142,7 +161,14 @@ export function DocsContentsBar(props: TOCPopoverProps) {
     <div className={`${barClassName} ${shownBelow}`}>
       <DocsMenu />
       {hasToc ? (
-        <TOCPopover {...props} container={{ className: 'static z-auto' }} />
+        <>
+          <TOCPopover
+            {...props}
+            trigger={{ ...props.trigger, 'aria-labelledby': triggerNameId }}
+            container={{ className: 'static z-auto' }}
+          />
+          <ContentsTriggerName id={triggerNameId} />
+        </>
       ) : (
         <div className="docs-contents-bar-fill" />
       )}
