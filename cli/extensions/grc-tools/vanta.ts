@@ -31,6 +31,7 @@ const VANTA_TOKEN_URL = "https://api.vanta.com/oauth/token";
 const VANTA_BASE_URL = "https://api.vanta.com/v1";
 const VANTA_AUDITOR_READ_SCOPE = "auditor-api.audit:read auditor-api.auditor:read";
 const PAGE_SIZE = 100;
+const MAX_LIST_PAGES = 500;
 const DEFAULT_AUDIT_LIMIT = 10;
 const DEFAULT_OUTPUT_DIR = "./export/vanta";
 const DOWNLOAD_REDIRECT_LIMIT = 5;
@@ -262,6 +263,20 @@ function limitErrorBody(body: string): string {
   const compact = body.replace(/\s+/g, " ").trim();
   if (compact.length <= 240) return compact;
   return `${compact.slice(0, 237)}...`;
+}
+
+function redactKnownSecrets(message: string, secrets: Array<string | undefined>): string {
+  let redacted = message;
+  for (const secret of secrets) {
+    if (secret === undefined || secret.length < 4) continue;
+    redacted = redacted.split(secret).join("[redacted]");
+  }
+  return redacted;
+}
+
+/** Host and path only: signed download URLs keep the signature in the query string. */
+function urlForError(url: URL): string {
+  return `${url.protocol}//${url.host}${url.pathname}`;
 }
 
 function formatDate(dateText: string): string {
@@ -536,7 +551,7 @@ export class VantaAuditorClient {
     });
 
     if (!response.ok) {
-      const detail = await readResponseBody(response);
+      const detail = this.redact(await readResponseBody(response));
       throw new Error(
         `Vanta authentication failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
       );
@@ -584,6 +599,14 @@ export class VantaAuditorClient {
     tokenCache.delete(this.cacheKey);
   }
 
+  private redact(message: string, extra: Array<string | undefined> = []): string {
+    return redactKnownSecrets(message, [
+      this.credentials.clientId,
+      this.credentials.clientSecret,
+      ...extra,
+    ]);
+  }
+
   private async requestJson<T>(
     path: string,
     options: {
@@ -615,7 +638,7 @@ export class VantaAuditorClient {
     }
 
     if (!response.ok) {
-      const detail = await readResponseBody(response);
+      const detail = this.redact(await readResponseBody(response), [token]);
       throw new Error(
         `Vanta API request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
       );
@@ -632,9 +655,10 @@ export class VantaAuditorClient {
     } = {},
   ): Promise<T[]> {
     const items: T[] = [];
+    const seenCursors = new Set<string>();
     let cursor: string | undefined;
 
-    for (;;) {
+    for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
       const payload = await this.requestJson<PaginatedResults<T>>(path, {
         params: {
           pageSize: PAGE_SIZE,
@@ -645,18 +669,39 @@ export class VantaAuditorClient {
       });
 
       if (payload === null) {
-        return [];
+        if (items.length === 0) return [];
+        throw new Error(
+          `Vanta API request for ${path} returned 404 after ${items.length} item(s); refusing to treat a partial page as a complete list.`,
+        );
       }
 
-      items.push(...payload.results.data);
-      if (!payload.results.pageInfo.hasNextPage) {
-        return items;
+      const data = payload.results?.data;
+      const pageInfo = payload.results?.pageInfo;
+      if (!Array.isArray(data) || !pageInfo || typeof pageInfo.hasNextPage !== "boolean") {
+        throw new Error(`Vanta API response for ${path} did not include a results page.`);
       }
-      cursor = payload.results.pageInfo.endCursor ?? undefined;
-      if (!cursor) {
-        return items;
+
+      items.push(...data);
+      if (!pageInfo.hasNextPage) return items;
+
+      const next = pageInfo.endCursor;
+      if (typeof next !== "string" || next.trim().length === 0) {
+        throw new Error(
+          `Vanta API pagination for ${path} reported another page but no endCursor after ${items.length} item(s).`,
+        );
       }
+      if (seenCursors.has(next)) {
+        throw new Error(
+          `Vanta API pagination for ${path} repeated a page cursor after ${items.length} item(s).`,
+        );
+      }
+      seenCursors.add(next);
+      cursor = next;
     }
+
+    throw new Error(
+      `Vanta API pagination for ${path} exceeded ${MAX_LIST_PAGES} pages after ${items.length} item(s).`,
+    );
   }
 
   async listAudits(): Promise<VantaAudit[]> {
@@ -757,7 +802,7 @@ async function followDownloadRedirects(
 
       const next = new URL(location, current);
       if (next.protocol !== "https:") {
-        throw new Error(`Redirected to non-HTTPS URL: ${next.toString()}`);
+        throw new Error(`Redirected to non-HTTPS URL: ${urlForError(next)}`);
       }
       if (!sameHostOrSubdomain(next.hostname, expectedHost)) {
         throw new Error(`Redirected to unexpected host: ${next.hostname}`);

@@ -26,6 +26,47 @@ function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function vantaClient(fetchImpl, credentials = { clientId: "client-id", clientSecret: "client-secret" }) {
+  return new VantaAuditorClient(credentials, {
+    baseUrl: "http://vanta.test/v1",
+    tokenUrl: "http://vanta.test/oauth/token",
+    fetchImpl,
+  });
+}
+
+function withVantaToken(handleApi) {
+  return async (input, init = {}) => {
+    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
+    if ((init.method ?? "GET") === "POST" && requestUrl.pathname === "/oauth/token") {
+      return jsonResponse({ access_token: "token-1", expires_in: 3600 });
+    }
+    return handleApi(requestUrl, init);
+  };
+}
+
+function auditPage(id, pageInfo) {
+  return {
+    results: {
+      data: [{
+        id,
+        customerDisplayName: "Acme Security",
+        customerOrganizationName: "Acme Security LLC",
+        framework: "SOC 2",
+        auditStartDate: "2026-01-01T00:00:00.000Z",
+        auditEndDate: "2026-12-31T00:00:00.000Z",
+      }],
+      pageInfo,
+    },
+  };
+}
+
 test("resolveVantaCredentials prefers explicit args and falls back per field to env", () => {
   const explicit = resolveVantaCredentials(
     { clientId: " arg-id ", clientSecret: " arg-secret " },
@@ -199,6 +240,111 @@ test("VantaAuditorClient paginates audits, retries on 401, and treats 404 eviden
   assert.equal(evidence.length, 1);
   assert.deepEqual(urls, []);
   assert.equal(state.tokenRequests, 2);
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient refuses a next page with no cursor instead of returning a partial list", async () => {
+  clearVantaTokenCacheForTests();
+  let auditRequests = 0;
+  const client = vantaClient(withVantaToken(async (url) => {
+    if (url.pathname !== "/v1/audits") return jsonResponse({ error: "not found" }, 404);
+    auditRequests += 1;
+    return jsonResponse(auditPage("audit-1", { hasNextPage: true, endCursor: null }));
+  }));
+
+  await assert.rejects(client.listAudits(), /reported another page but no endCursor after 1 item/);
+  assert.equal(auditRequests, 1);
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient refuses a repeated page cursor instead of looping", async () => {
+  clearVantaTokenCacheForTests();
+  let auditRequests = 0;
+  const client = vantaClient(withVantaToken(async (url) => {
+    if (url.pathname !== "/v1/audits") return jsonResponse({ error: "not found" }, 404);
+    auditRequests += 1;
+    return jsonResponse(auditPage(`audit-${auditRequests}`, { hasNextPage: true, endCursor: "stuck" }));
+  }));
+
+  await assert.rejects(client.listAudits(), /repeated a page cursor after 2 item/);
+  assert.equal(auditRequests, 2);
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient stops at the page cap instead of following an endless new cursor", async () => {
+  clearVantaTokenCacheForTests();
+  let auditRequests = 0;
+  const client = vantaClient(withVantaToken(async (url) => {
+    if (url.pathname !== "/v1/audits") return jsonResponse({ error: "not found" }, 404);
+    auditRequests += 1;
+    return jsonResponse(auditPage(`audit-${auditRequests}`, { hasNextPage: true, endCursor: `cursor-${auditRequests}` }));
+  }));
+
+  await assert.rejects(client.listAudits(), /exceeded 500 pages after 500 item/);
+  assert.equal(auditRequests, 500);
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient does not drop earlier pages when a later evidence URL page is 404", async () => {
+  clearVantaTokenCacheForTests();
+  const client = vantaClient(withVantaToken(async (url) => {
+    if (url.pathname !== "/v1/audits/audit-1/evidence/ae-1/urls") {
+      return jsonResponse({ error: "not found" }, 404);
+    }
+    if (!url.searchParams.get("pageCursor")) {
+      return jsonResponse({
+        results: {
+          data: [{
+            id: "url-1",
+            url: "https://downloads.example.com/evidence-1.pdf",
+            filename: "evidence-1.pdf",
+            isDownloadable: true,
+          }],
+          pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+        },
+      });
+    }
+    return jsonResponse({ error: "missing page" }, 404);
+  }));
+
+  await assert.rejects(
+    client.listEvidenceUrls("audit-1", "ae-1"),
+    /returned 404 after 1 item\(s\); refusing to treat a partial page as a complete list/,
+  );
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient redacts credentials echoed in authentication and API errors", async () => {
+  clearVantaTokenCacheForTests();
+  const clientSecret = "vanta-client-secret-should-not-leak";
+  const accessToken = "vanta-access-token-should-not-leak";
+  let tokenCalls = 0;
+  const fetchImpl = async (input, init = {}) => {
+    const requestUrl = new URL(typeof input === "string" ? input : input.toString());
+    if ((init.method ?? "GET") === "POST" && requestUrl.pathname === "/oauth/token") {
+      tokenCalls += 1;
+      if (tokenCalls === 1) {
+        return jsonResponse({ error: "invalid_client", client_secret: clientSecret }, 401);
+      }
+      return jsonResponse({ access_token: accessToken, expires_in: 3600 });
+    }
+    return jsonResponse({ error: "boom", access_token: accessToken, client_secret: clientSecret }, 500);
+  };
+  const client = vantaClient(fetchImpl, { clientId: "vanta-client-id-value", clientSecret });
+
+  await assert.rejects(client.listAudits(), (error) => {
+    assert.match(error.message, /Vanta authentication failed/);
+    assert.equal(error.message.includes(clientSecret), false);
+    assert.match(error.message, /\[redacted\]/);
+    return true;
+  });
+  await assert.rejects(client.listAudits(), (error) => {
+    assert.match(error.message, /Vanta API request failed/);
+    assert.equal(error.message.includes(clientSecret), false);
+    assert.equal(error.message.includes(accessToken), false);
+    assert.match(error.message, /\[redacted\]/);
+    return true;
+  });
   clearVantaTokenCacheForTests();
 });
 
@@ -554,6 +700,56 @@ test("exportVantaAuditPackage allocates distinct bundles for concurrent exports"
   assert.ok(existsSync(second.outputDir));
   assert.ok(existsSync(first.zipPath));
   assert.ok(existsSync(second.zipPath));
+});
+
+test("exportVantaAuditPackage omits signed URL secrets from redirect errors", async () => {
+  const signature = "super-secret-signature";
+  const audit = {
+    id: "audit-redirect-1234",
+    customerDisplayName: "Redirect Test",
+    customerOrganizationName: "Redirect Test LLC",
+    framework: "SOC 2",
+    auditStartDate: "2026-01-01T00:00:00.000Z",
+    auditEndDate: "2026-12-31T00:00:00.000Z",
+  };
+  const client = {
+    async listEvidence() {
+      return [{
+        id: "ae-redirect",
+        evidenceId: "ev-redirect",
+        name: "Signed file",
+        status: "SUBMITTED",
+        description: null,
+        evidenceType: "UPLOADED_DOCUMENT",
+        testStatus: null,
+        relatedControls: [{ name: "IAM" }],
+        creationDate: "2026-01-02T00:00:00.000Z",
+        statusUpdatedDate: "2026-01-03T00:00:00.000Z",
+      }];
+    },
+    async listEvidenceUrls() {
+      return [{
+        id: "url-redirect",
+        url: "https://downloads.example.com/file.pdf",
+        filename: "file.pdf",
+        isDownloadable: true,
+      }];
+    },
+  };
+  const fetchImpl = async () => new Response(null, {
+    status: 302,
+    headers: {
+      location: `http://signed-user:${signature}@downloads.example.com/file.pdf?X-Amz-Signature=${signature}`,
+    },
+  });
+  const base = createTempBase("grclanker-vanta-redirect-");
+  const result = await exportVantaAuditPackage(client, audit, resolve(base, "exports"), { fetchImpl });
+  const log = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
+
+  assert.equal(result.errorCount, 1);
+  assert.match(log, /Redirected to non-HTTPS URL: http:\/\/downloads\.example\.com\/file\.pdf/);
+  assert.equal(log.includes(signature), false);
+  assert.equal(log.includes("signed-user"), false);
 });
 
 test("secure output helpers reject symlink escapes and filename helpers stay safe", () => {
