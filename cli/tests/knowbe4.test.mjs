@@ -3318,6 +3318,9 @@ const BOUNDARY_SCENARIOS = [
     campaign.groups = [{ group_id: 100, name: "Finance" }];
     fixture.phishingCampaigns = { items: [campaign], truncated: true, limit: 1, pages: 1 };
   })),
+  boundaryScenario("KNOWBE4-08", "warn", "every group with members is covered and the group list stopped at its limit", fixtureWith((fixture) => {
+    fixture.groups = { items: fixture.groups, truncated: true, limit: fixture.groups.length, pages: 1 };
+  })),
   boundaryScenario("KNOWBE4-09", "pass", "the active phishing campaign's groups hold 1799 of 2000 active users, which rounds to the 90 percent minimum", partialTargeting(1799, 2000)),
   boundaryScenario("KNOWBE4-09", "fail", "the active phishing campaign's groups hold 1798 of 2000 active users", partialTargeting(1798, 2000)),
   boundaryScenario("KNOWBE4-09", "pass", "full targeting is not required and the active phishing campaign's groups hold half the active users", partialTargeting(5), { requireFullTargeting: false }),
@@ -3341,6 +3344,9 @@ const BOUNDARY_SCENARIOS = [
   boundaryScenario("KNOWBE4-12", "fail", "the account has 4 admins", admins(4)),
   boundaryScenario("KNOWBE4-16", "warn", "the callback test list stopped at its limit with no callback test inside the lookback", fixtureWith((fixture) => {
     fixture.callbackTests = { items: [securityTest(950, daysAgo(200), 0.05, { campaign_id: 501, name: "Callback Q1" })], truncated: true, limit: 1, pages: 1 };
+  })),
+  boundaryScenario("KNOWBE4-16", "warn", "a callback test ran inside the lookback and the callback test list stopped at its limit", fixtureWith((fixture) => {
+    fixture.callbackTests = { items: fixture.callbackTests, truncated: true, limit: fixture.callbackTests.length, pages: 1 };
   })),
   boundaryScenario("KNOWBE4-17", "pass", "9 of 10 enrollments in the compliance module are complete, exactly the 90 percent minimum", complianceEnrollments(["Passed", "In Progress"])),
   boundaryScenario("KNOWBE4-17", "warn", "8 of 10 enrollments in the compliance module are complete", complianceEnrollments(["In Progress", "In Progress"])),
