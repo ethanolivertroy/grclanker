@@ -785,8 +785,11 @@ const singleReadComplete = (
   ],
 );
 const USERS_COMPLETE = completeFrom(
-  `false when the user list is partial: its UUID walk ${walkStops("user_limit UUIDs")}.`,
-  [{ surfaceId: "user_uuids", falseWhen: ["truncated"] }],
+  `false when the user list is partial: its UUID walk ${walkStops("user_limit UUIDs")}, or the user details lookup returned fewer users than the UUIDs it was sent.`,
+  [
+    { surfaceId: "user_uuids", falseWhen: ["truncated"] },
+    { surfaceId: "users", falseWhen: ["truncated"], scope: "fewer users returned than UUIDs sent" },
+  ],
 );
 const ROLE_CATALOG_COMPLETE = singleReadComplete("role_ids", "roles", "role catalog", "roles");
 const IDENTITY_PROTECTION_RULES_COMPLETE = singleReadComplete(
@@ -2021,7 +2024,7 @@ const idsFor = (owner: string): string[] => checks.filter((check) => check.owner
 
 const DROPPED_RESOURCE = "A returned resource that is not a JSON object is dropped and marks the list partial.";
 const LOOKED_UP = "The listed IDs that are non-blank strings or finite numbers are then looked up by ID, and fewer returned records than listed IDs marks the list partial.";
-const UNCHECKED_USER_LOOKUP = "The listed UUIDs that are non-blank strings or finite numbers are then looked up, and the user details lookup is not compared with the UUIDs it was sent, so a listed user it does not return leaves the list complete.";
+const USER_LOOKUP = "The listed UUIDs that are non-blank strings or finite numbers are then looked up, and a user details lookup that returns fewer users than the UUIDs it was sent marks the list partial.";
 
 // pageSize stays null: the limit sent shrinks on the last page under the cap, so no single value is always sent.
 const offsetWalk = (
@@ -2225,7 +2228,7 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
     afterWalk(["discover_unmanaged_hosts"], "hosts", 100, 100),
     afterWalk(["zero_trust_below_threshold"], "results", 1000, 1000),
     offsetWalk(["firewall_rule_group_ids", "firewall_rule_ids"], "IDs", 500, RULE_LIMIT, LOOKED_UP),
-    offsetWalk(["user_uuids"], "UUIDs", 500, USER_LIMIT, UNCHECKED_USER_LOOKUP),
+    offsetWalk(["user_uuids"], "UUIDs", 500, USER_LIMIT, USER_LOOKUP),
     offsetWalk(["api_client_ids"], "IDs", 500, USER_LIMIT, LOOKED_UP),
     offsetWalk(["ioa_exclusion_ids", "ml_exclusion_ids", "sensor_visibility_exclusion_ids"], "IDs", 500, EXCLUSION_LIMIT, LOOKED_UP),
     offsetWalk(["user_roles"], "role grants", 500, 500, `Each returned user's role grants are walked separately. ${DROPPED_RESOURCE}`),
@@ -2303,9 +2306,7 @@ export const CROWDSTRIKE_SPEC = buildBatchIntegrationSpec({
     backoffPolicy: "Retry 429 and every status of 500 or above up to 4 times after the first attempt. The wait comes from X-Ratelimit-RetryAfter when the response carries it, else from Retry-After: a number above 1000000000000 is an epoch time in milliseconds, a number above 1000000000 an epoch time in seconds, any other non-negative number a count of seconds, and a value that is not a number is read as an HTTP date; an absent or unreadable value waits 250 milliseconds times 2 to the power of the number of earlier attempts. Every wait is clamped to 250 milliseconds through 15 seconds. A 401 discards the cached token and repeats the request once with a new one, and that repeat counts as one of the 4 retries. Requests that time out (30 seconds unless timeout_seconds or CS_TIMEOUT sets it) and network errors are not retried.",
   },
   runtimeBehavior: [],
-  knownGaps: [
-    "A user the UUID query lists but the user details lookup, POST /user-management/entities/users/GET/v1, does not return (deleted or hidden between the two reads) is left out of CS-16 and CS-17 without marking the user inventory partial, so both checks can pass on the users the lookup returned.",
-  ],
+  knownGaps: [],
   sensitiveFields: ["client_secret", "access_token", "Authorization"],
   credentialFormats: [
     "CrowdStrike Falcon API client ID and client secret, exchanged at /oauth2/token for a bearer token",

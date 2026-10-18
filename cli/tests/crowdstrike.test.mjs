@@ -1321,20 +1321,19 @@ test("verdict safety rule 5: partial inventories never pass and report seen vers
   assert.equal(sensorCoverage.summary.reported_total_hosts, 43);
 });
 
-portableContractTest("known gap: the spec declares that a user the details lookup omits is left out of CS-16 and CS-17", () => {
-  assert.ok(CROWDSTRIKE_SPEC.knownGaps.some((gap) => /user details lookup.*left out of CS-16 and CS-17 without marking the user inventory partial/.test(gap)));
-});
-
-test("known gap: a user the details lookup omits drops out of CS-16 and CS-17 without making the user inventory partial", async () => {
+test("verdict safety rule 5: a user the details lookup omits makes the user inventory partial, so CS-16 and CS-17 cannot pass", async () => {
   const result = await assessCrowdstrikeAccessGovernance(createFakeClient({
     listUserUuids: async () => [...passingUsers().users.map((user) => user.uuid), "u-deleted"],
   }));
   for (const id of ["CS-16", "CS-17"]) {
-    assert.equal(findingById(result, id).status, "pass", findingById(result, id).summary);
-    assert.equal(findingById(result, id).evidence.partial_inventory, undefined);
+    const finding = findingById(result, id);
+    assert.equal(finding.status, "warn", finding.summary);
+    assert.deepEqual(finding.evidence.partial_inventory, [{ dataset: "users", seen: 2, total: 3 }]);
+    assert.match(finding.summary, /Partial inventory: only 2 of 3 users were read/);
   }
   assert.equal(result.summary.users_reviewed, 2);
   assert.equal(result.summary.reported_total_users, 3);
+  assert.equal(result.summary.users_truncated, true);
 });
 
 test("verdict safety rule 6: disabled, unassigned, or incomplete enabling flags never support pass", async () => {
@@ -2351,7 +2350,7 @@ test("round 2 SEND BACK 5: under a capped list CS-17 and CS-23 scope their sente
   }));
   const staleLeastPrivilege = findingById(staleCapped, "CS-17");
   assert.equal(staleLeastPrivilege.status, "fail", "a fail observed on a visible row stands under a cap");
-  assert.match(staleLeastPrivilege.summary, /^1 users reviewed; 0 carry more than 5 roles or redundant roles on top of an admin grant, and 1 of 1 admin accounts have a last login older than 90 days\. Partial inventory: only 1 of 43 users were read/);
+  assert.equal(staleLeastPrivilege.summary, "1 users reviewed; 0 carry more than 5 roles or redundant roles on top of an admin grant, and 1 of 1 admin accounts have a last login older than 90 days. Partial inventory: only 1 of 43 users were read (sampled or truncated); the failure observed in the rows read stands.");
 
   // CS-23 under CAP listHosts: the containment status filter reports 40 hosts and none is visible.
   const cappedHosts = await assessCrowdstrikeResponseReadiness(createFakeClient({
@@ -2482,7 +2481,7 @@ test("round 3 rulings (a) and (b): a truncated page with zero visible rows never
   const noGroups = findingById(await assessCrowdstrikeSensorCoverage(createFakeClient({ listHostGroups: async () => [], listHosts: async () => truncatedPage([host()], 41) })), "CS-14");
   assert.equal(noGroups.status, "fail", "zero host groups on a complete read is a fail whatever the host list did");
   assert.equal(noGroups.evidence.absence_claim, undefined);
-  assert.equal(noGroups.summary, "The host groups endpoint was readable but returned zero host groups, so no policy assignment coverage can be demonstrated; emptiness fails this control. Partial inventory: only 1 of 41 hosts were read (sampled or truncated), so this verdict cannot exceed warn.");
+  assert.equal(noGroups.summary, "The host groups endpoint was readable but returned zero host groups, so no policy assignment coverage can be demonstrated; emptiness fails this control. Partial inventory: only 1 of 41 hosts were read (sampled or truncated); the failure observed in the rows read stands.");
 
   // CS-22 with one visible but undated alert of 40: no dated alert is visible, so the scoped sentence carries the
   // undated clause and the partial clause, and the verdict is warn.
