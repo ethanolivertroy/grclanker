@@ -12,7 +12,8 @@ Most evidence comes from HAL lists walked page by page and from per-application,
 
 - The tool only reads. Every request is a GET signed with VERACODE-HMAC-SHA-256 from the API key ID and secret.
 - Sampled reads cover the first max_applications applications (100 by default) for sandboxes, findings, summary reports, and linked SCA projects, the first max_workspaces SCA workspaces (25 by default), the first max_analyses Dynamic Analysis analyses (25 by default) with at most 10 scans each, and at most 200 active API accounts for credential records.
-- The policy compliance assessment reads no per-application data, so its max_applications argument has no effect.
+- Finding evidence lists keep their first 50 entries, except the overdue flaws, unreviewed and unjustified mitigations, high-severity SCA issues, high-risk license issues, users with access to every application, inactive users, users without a last login, and credentials over the maximum age, which keep 100. VERACODE-18 shows at most 20 linked projects per application. Every count and verdict comes from the full read, not from these previews.
+- The policy compliance assessment makes no per-application requests, so its max_applications argument has no effect.
 - Flaw age limits are fixed by severity at 30 days for Very High, 60 for High, 90 for Medium, and 180 for Low, and cannot be configured.
 - The organization-wide team list is read with all_for_org=true. When Veracode refuses that, only the teams the API user belongs to are listed, and that view is treated as partial.
 - Prescan module selection, Pipeline Scan and IDE scan use, and Collections compliance are not exposed by the REST APIs the tool reads, so VERACODE-11, VERACODE-14, and VERACODE-20 always return manual and name the evidence a reviewer must collect from the Veracode Platform.

@@ -1901,7 +1901,6 @@ function recordVeracodeDecisionFacts(number: number, facts: Readonly<Record<stri
   store.set(id, { ...store.get(id), ...facts });
 }
 
-/** The readable flag and kept-record count a list gate decides on; a refused walk has no count. */
 function listGateFacts(list: Surface<HalListResult>, readable: string, count: string): Record<string, unknown> {
   return list.status === "ok" ? { [readable]: true, [count]: list.value.items.length } : { [readable]: false };
 }
