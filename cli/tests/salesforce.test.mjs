@@ -2654,3 +2654,20 @@ test("byte differential fixtures: Salesforce assessments and export", { skip: !b
   const exported = await exportSalesforceAuditBundle(createFullMockClient(), sampleConfig(), outputRoot, { now: NOW });
   writeByteDifferentialFixture("salesforce", "export", snapshotExportBundle(exported));
 });
+
+test("SalesforceApiClient refuses a 200 query that omits the records array", async () => {
+  const client = new SalesforceApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ totalSize: 0, done: true }),
+  });
+  await assert.rejects(
+    () => client.query("SELECT Id FROM User"),
+    /without a records array, so the result cannot be treated as an empty inventory/,
+  );
+
+  const empty = new SalesforceApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ totalSize: 0, done: true, records: [] }),
+  });
+  const result = await empty.query("SELECT Id FROM User");
+  assert.deepEqual(result.records, []);
+  assert.equal(result.done, true);
+});

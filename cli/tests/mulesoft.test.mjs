@@ -4289,3 +4289,20 @@ test("the registered assessment tools return the bounded details over HTTP and s
     globalThis.fetch = originalFetch;
   }
 });
+
+test("MulesoftApiClient refuses a 200 listing that omits the documented collection", async () => {
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ unexpected: true }),
+  });
+  await assert.rejects(
+    () => client.listRoleGroups(),
+    /did not include a data array, so the listing cannot be treated as an empty inventory/,
+  );
+
+  const empty = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ data: [], total: 0 }),
+  });
+  const roleGroups = await empty.listRoleGroups();
+  assert.deepEqual(roleGroups.items, []);
+  assert.equal(roleGroups.truncated, false);
+});
