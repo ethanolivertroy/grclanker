@@ -35,7 +35,13 @@ import { CROWDSTRIKE_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-res
 import { CROWDSTRIKE_SPEC } from "../dist/extensions/grc-tools/crowdstrike.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertBundlePathsMatchSpec, assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
+import {
+  byteDifferentialEnabled,
+  portableContractTest,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 import { assertRequestConformance, recordFetchRequests, sweepCheckCompleteness } from "./helpers/spec-conformance.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
@@ -3451,4 +3457,35 @@ test("boundary scenarios: each threshold edge reaches the verdict on either side
     if (status !== scenario.expected) mismatches.push(`${scenario.name}: ${status}`);
   }
   assert.deepEqual(mismatches, []);
+});
+
+function representativeOverrides() {
+  return {
+    ...preventionWith((policies) => {
+      const exploit = policies[0].prevention_settings.find((category) => category.name === "Exploit Mitigation");
+      exploit.settings.find((setting) => setting.id === "ProcessHollowing").value.enabled = false;
+    }),
+    ...deviceControlWith((details) => {
+      details.usb_settings.enforcement_mode = "MONITOR_ONLY";
+    }),
+    ...firewallWith((firewall) => {
+      firewall.containers[0].enforce = false;
+    }),
+    ...recentlySeenHosts(2000, 1698),
+    ...slaAlerts(2000, 1599),
+    ...adminUsers(11),
+  };
+}
+
+test("byte differential fixtures: CrowdStrike assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("crowdstrike", "representative", await runAllCrowdstrikeAssessments(createFakeClient(representativeOverrides())));
+  writeByteDifferentialFixture("crowdstrike", "compliant", await runAllCrowdstrikeAssessments(createFakeClient()));
+  writeByteDifferentialFixture("crowdstrike", "denied", await runAllCrowdstrikeAssessments(createForbiddenClient()));
+  writeByteDifferentialFixture("crowdstrike", "partial", await runAllCrowdstrikeAssessments(createPartialClient()));
+  writeByteDifferentialFixture("crowdstrike", "missing-null", await runAllCrowdstrikeAssessments(createEmptyClient()));
+  const boundary = {};
+  for (const scenario of BOUNDARY_SCENARIOS) boundary[scenario.name] = await runBoundaryScenario(scenario);
+  writeByteDifferentialFixture("crowdstrike", "boundary", boundary);
+  const exported = await exportCrowdstrikeAuditBundle(createFakeClient(), sampleConfig(), prepareByteDifferentialExportRoot("crowdstrike"));
+  writeByteDifferentialFixture("crowdstrike", "export", snapshotExportBundle(exported));
 });
