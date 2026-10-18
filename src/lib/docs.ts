@@ -47,6 +47,14 @@ export const docsSections: Array<{ title: string; items: DocsSectionEntry[] }> =
     ],
   },
   {
+    title: 'Guides',
+    items: [
+      { label: 'FedRAMP Readiness', slug: 'guides/fedramp-readiness' },
+      { label: 'OSCAL Workspaces', slug: 'guides/oscal-workspaces' },
+      { label: 'SCF Crosswalks', slug: 'guides/scf-crosswalks' },
+    ],
+  },
+  {
     title: 'Reference',
     items: [
       { label: 'Tool Catalog', slug: 'tools/catalog' },
