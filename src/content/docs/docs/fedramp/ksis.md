@@ -3,13 +3,9 @@ title: "FedRAMP KSI Domains"
 description: "Browse official Consolidated Rules key security indicator domains and indicator summaries."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
+
+The FedRAMP Consolidated Rules for 2026 define 10 key security indicator (KSI) domains for 20x. Each line gives a domain's short name and its number of indicators.
 
 - [Cybersecurity Education](/docs/fedramp/ksi/cybersecurity-education/) · `CED` · 1 indicator
 - [Change Management](/docs/fedramp/ksi/change-management/) · `CMT` · 4 indicators
@@ -21,3 +17,10 @@ description: "Browse official Consolidated Rules key security indicator domains 
 - [Recovery Planning](/docs/fedramp/ksi/recovery-planning/) · `RPL` · 4 indicators
 - [Supply Chain Risk](/docs/fedramp/ksi/supply-chain-risk/) · `SCR` · 2 indicators
 - [Service Configuration](/docs/fedramp/ksi/service-configuration/) · `SVC` · 8 indicators
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

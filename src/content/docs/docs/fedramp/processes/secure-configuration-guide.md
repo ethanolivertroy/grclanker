@@ -3,40 +3,26 @@ title: "Secure Configuration Guide"
 description: "Official Consolidated Rules summary for the SCG FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Short name: `SCG` · Process ID: `SCG` · Web slug: `secure-configuration-guide`
+The Secure Configuration Guide rules help agencies and other customers understand how to configure a cloud service offering securely. These rules require providers to clearly explain the security impact of common settings so customers can make informed configuration choices.
 
-Applies to: 20x and Rev5
+## At a Glance
 
-Status: `stable`
-
-Official page: [https://www.fedramp.gov/2026/reference/secure-configuration-guide/](https://www.fedramp.gov/2026/reference/secure-configuration-guide/)
-
-## Effective Status
-
+- Applies to: 20x and Rev5
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-03-01 · grace through 2026-07-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2026-03-01 · grace through 2026-07-01
 - Requirements: 9 for 20x and Rev5
-
-## Purpose
-
-The Secure Configuration Guide rules help agencies and other customers understand how to configure a cloud service offering securely. These rules require providers to clearly explain the security impact of common settings so customers can make informed configuration choices.
+- Status: `stable`
+- Short name: `SCG`
+- Official page: [https://www.fedramp.gov/2026/reference/secure-configuration-guide/](https://www.fedramp.gov/2026/reference/secure-configuration-guide/)
 
 ## Rule Subsets
 
 - `CSO` · General Provider Responsibilities: These rules apply to providers with FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
 - `ENH` · Enhanced Capabilities: These recommendations apply to providers with FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
 
-## Requirements and Recommendations
-
-## 20x and Rev5
+## Requirements for 20x and Rev5
 
 ### `SCG-CSO-AUP` MUST: Use Instructions
 
@@ -138,3 +124,10 @@ Terms: `Privileged Account`, `Top-Level Administrative Account`
 Affects: Providers
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

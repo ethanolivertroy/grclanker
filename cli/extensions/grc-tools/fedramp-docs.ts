@@ -37,7 +37,11 @@ function markdownList(values: string[], indent = ""): string {
   return values.map((value) => `${indent}- ${value}`).join("\n");
 }
 
-function sourceBanner(
+function versionNote(primary: FedrampPrimarySourceStatus): string {
+  return `> Generated from the official FedRAMP Consolidated Rules \`${primary.version}\`, last updated upstream on ${primary.upstreamLastUpdated}. [Source details](#source)`;
+}
+
+function sourceSection(
   primary: FedrampPrimarySourceStatus,
   secondary: FedrampRulesSourceStatus,
 ): string {
@@ -50,11 +54,13 @@ function sourceBanner(
         : "The official `FedRAMP/2026-markdown` repository could not be inspected during this sync.";
 
   return [
-    `> Generated from the official [${primary.org}/${primary.repo}](${primary.repoUrl}) GitHub repo.`,
-    `> Source path: [\`${primary.path}\`](${primary.fileHtmlUrl ?? primary.rawUrl}) on \`${primary.branch}\` at blob ${blobRef}.`,
-    `> Consolidated Rules version: \`${primary.version}\` · upstream \`last_updated\`: \`${primary.upstreamLastUpdated}\`.`,
-    `> ${supportingNote}`,
-  ].join("\n>\n");
+    "## Source",
+    "",
+    `- Generated from the official [${primary.org}/${primary.repo}](${primary.repoUrl}) GitHub repo.`,
+    `- Source path: [\`${primary.path}\`](${primary.fileHtmlUrl ?? primary.rawUrl}) on \`${primary.branch}\` at blob ${blobRef}.`,
+    `- Consolidated Rules version: \`${primary.version}\` · upstream \`last_updated\`: \`${primary.upstreamLastUpdated}\`.`,
+    `- ${supportingNote}`,
+  ].join("\n");
 }
 
 function frontmatter(title: string, description: string): string {
@@ -169,34 +175,36 @@ function processPage(
       `Official Consolidated Rules summary for the ${process.shortName} FedRAMP process, including applicability and requirements.`,
     ),
     "",
-    sourceBanner(primary, secondary),
-    "",
-    `Short name: \`${process.shortName}\` · Process ID: \`${process.id}\` · Web slug: \`${process.webName}\``,
-    "",
-    `Applies to: ${applicabilitySummary(process.applicability)}`,
+    versionNote(primary),
     "",
   ];
 
-  if (process.status) {
-    lines.push(`Status: \`${process.status}\``, "");
-  }
-
-  if (process.sourceUrl) {
-    lines.push(`Official page: [${process.sourceUrl}](${process.sourceUrl})`, "");
+  if (process.purpose) {
+    lines.push(paragraphs(process.purpose), "");
   }
 
   lines.push(
-    "## Effective Status",
+    "## At a Glance",
     "",
+    `- Applies to: ${applicabilitySummary(process.applicability)}`,
     `- 20x: ${process.effective["20x"]?.is ?? "n/a"}${process.effective["20x"]?.currentStatus ? ` · ${process.effective["20x"]?.currentStatus}` : ""}${process.effective["20x"]?.startDate ? ` · obtain ${process.effective["20x"]?.startDate}` : ""}${process.effective["20x"]?.graceDate ? ` · grace through ${process.effective["20x"]?.graceDate}` : ""}`,
     `- Rev5: ${process.effective.rev5?.is ?? "n/a"}${process.effective.rev5?.currentStatus ? ` · ${process.effective.rev5?.currentStatus}` : ""}${process.effective.rev5?.startDate ? ` · obtain ${process.effective.rev5?.startDate}` : ""}${process.effective.rev5?.graceDate ? ` · grace through ${process.effective.rev5?.graceDate}` : ""}`,
     `- Requirements: ${requirementSummary(counts)}`,
-    "",
   );
 
-  if (process.purpose) {
-    lines.push("## Purpose", "", paragraphs(process.purpose), "");
+  if (process.status) {
+    lines.push(`- Status: \`${process.status}\``);
   }
+
+  lines.push(`- Short name: \`${process.shortName}\``);
+  if (process.id !== process.shortName) {
+    lines.push(`- Process ID: \`${process.id}\``);
+  }
+
+  if (process.sourceUrl) {
+    lines.push(`- Official page: [${process.sourceUrl}](${process.sourceUrl})`);
+  }
+  lines.push("");
 
   if (process.expectedOutcomes.length > 0) {
     lines.push("## Expected Outcomes", "", markdownList(process.expectedOutcomes), "");
@@ -224,15 +232,15 @@ function processPage(
     lines.push("");
   }
 
-  lines.push("## Requirements and Recommendations", "");
-
   for (const group of REQUIREMENT_GROUPS) {
     if (grouped[group].length === 0) continue;
-    lines.push(`## ${REQUIREMENT_GROUP_NAMES[group]}`, "");
+    lines.push(`## Requirements for ${REQUIREMENT_GROUP_NAMES[group]}`, "");
     for (const requirement of grouped[group]) {
       lines.push(requirementMarkdown(requirement), "");
     }
   }
+
+  lines.push(sourceSection(primary, secondary), "");
 
   return {
     path: `fedramp/processes/${process.webName}.md`,
@@ -253,15 +261,24 @@ function ksiDomainPage(
       `Official Consolidated Rules summary for the ${domain.shortName} FedRAMP key security indicator domain.`,
     ),
     "",
-    sourceBanner(primary, secondary),
-    "",
-    `Domain code: \`${domain.code}\` · Domain ID: \`${domain.id}\` · Web slug: \`${domain.webName}\``,
+    versionNote(primary),
     "",
   ];
 
   if (domain.theme) {
-    lines.push("## Theme", "", paragraphs(domain.theme), "");
+    lines.push(paragraphs(domain.theme), "");
   }
+
+  lines.push(
+    "## At a Glance",
+    "",
+    `- Applies to: ${applicabilitySummary([domain.appliesTo])}`,
+    `- Indicators: ${indicators.length}`,
+  );
+  if (domain.status) {
+    lines.push(`- Status: \`${domain.status}\``);
+  }
+  lines.push(`- Domain ID: \`${domain.id}\``, "");
 
   lines.push("## Indicators", "");
 
@@ -292,6 +309,8 @@ function ksiDomainPage(
       lines.push(...fedrampUpdateLines(indicator.updated), "");
     }
   }
+
+  lines.push(sourceSection(primary, secondary), "");
 
   return {
     path: `fedramp/ksi/${domain.webName}.md`,
@@ -326,20 +345,13 @@ export function buildFedrampDocsSnapshot(
       "Official GitHub-grounded FedRAMP 20x and Rev5 reference material generated from the Consolidated Rules.",
     ),
     "",
-    sourceBanner(primary, secondary),
+    versionNote(primary),
     "",
-    "This section is generated from the official FedRAMP GitHub organization. grclanker uses these machine-readable materials for both CLI lookups and reviewed docs snapshots so the public site stays fast without drifting away from upstream.",
+    `These pages are generated from the official FedRAMP GitHub organization. They cover each process in the ${catalog.info.title}, with its requirements for 20x and Rev5, and each key security indicator (KSI) domain for 20x. The grclanker FedRAMP tools read the same rules live, cached for up to a day, so their answers can be newer than these pages.`,
     "",
     "To check readiness against these rules, plan the artifacts, and draft a Certification Data Sharing bundle and trust-center site, follow the [FedRAMP Readiness guide](/docs/guides/fedramp-readiness/).",
     "",
-    "## Current Grounding",
-    "",
-    `- Primary source: [${primary.org}/${primary.repo}](${primary.repoUrl}) → [\`${primary.path}\`](${primary.fileHtmlUrl ?? primary.rawUrl}) on \`${primary.branch}\``,
-    `- Consolidated Rules version: \`${primary.version}\``,
-    `- Upstream \`last_updated\`: \`${primary.upstreamLastUpdated}\``,
-    `- Rev5 remains a first-class lane beside 20x in grclanker.`,
-    "",
-    "## Process Docs",
+    "## Processes",
     "",
     processRows,
     "",
@@ -347,29 +359,41 @@ export function buildFedrampDocsSnapshot(
     "",
     ksiRows,
     "",
+    sourceSection(primary, secondary),
+    "",
   ].join("\n");
 
+  const processCount = catalog.processes.length;
   const processesIndex = [
     frontmatter(
       "FedRAMP Processes",
       "Browse official Consolidated Rules process documents such as CDS, IVV, SCG, VDR, and CCM.",
     ),
     "",
-    sourceBanner(primary, secondary),
+    versionNote(primary),
+    "",
+    `The ${catalog.info.title} define ${processCount} process${processCount === 1 ? "" : "es"}. Each line gives a process's short name and its requirement counts for 20x and Rev5.`,
     "",
     processRows,
     "",
+    sourceSection(primary, secondary),
+    "",
   ].join("\n");
 
+  const domainCount = catalog.ksiDomains.length;
   const ksiIndex = [
     frontmatter(
       "FedRAMP KSI Domains",
       "Browse official Consolidated Rules key security indicator domains and indicator summaries.",
     ),
     "",
-    sourceBanner(primary, secondary),
+    versionNote(primary),
+    "",
+    `The ${catalog.info.title} define ${domainCount} key security indicator (KSI) domain${domainCount === 1 ? "" : "s"} for 20x. Each line gives a domain's short name and its number of indicators.`,
     "",
     ksiRows,
+    "",
+    sourceSection(primary, secondary),
     "",
   ].join("\n");
 

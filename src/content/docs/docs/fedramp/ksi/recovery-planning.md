@@ -3,15 +3,14 @@ title: "Recovery Planning"
 description: "Official Consolidated Rules summary for the RPL FedRAMP key security indicator domain."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Domain code: `RPL` · Domain ID: `KSI-RPL` · Web slug: `recovery-planning`
+## At a Glance
+
+- Applies to: 20x only
+- Indicators: 4
+- Status: `stable`
+- Domain ID: `KSI-RPL`
 
 ## Indicators
 
@@ -58,3 +57,10 @@ Terms: `Incident`, `Persistently`
 Updates:
 - 2026-10-13: Updated control mappings: added ir-9.3, sc-12.1.
 - 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

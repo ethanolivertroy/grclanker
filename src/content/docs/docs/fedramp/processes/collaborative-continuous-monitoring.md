@@ -3,31 +3,19 @@ title: "Collaborative Continuous Monitoring"
 description: "Official Consolidated Rules summary for the CCM FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Short name: `CCM` · Process ID: `CCM` · Web slug: `collaborative-continuous-monitoring`
+The Collaborative Continuous Monitoring rules help agencies use shared, current authorization information from providers as part of each agency's own Information Security Continuous Monitoring strategy. These rules reduce unnecessary manual burden by encouraging automated monitoring and review while allowing each agency to make its own risk-based decisions about ongoing authorization.
 
-Applies to: 20x and Rev5
+## At a Glance
 
-Status: `stable`
-
-Official page: [https://www.fedramp.gov/2026/reference/collaborative-continuous-monitoring/](https://www.fedramp.gov/2026/reference/collaborative-continuous-monitoring/)
-
-## Effective Status
-
+- Applies to: 20x and Rev5
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-10-01
 - Requirements: 19 for 20x and Rev5
-
-## Purpose
-
-The Collaborative Continuous Monitoring rules help agencies use shared, current authorization information from providers as part of each agency's own Information Security Continuous Monitoring strategy. These rules reduce unnecessary manual burden by encouraging automated monitoring and review while allowing each agency to make its own risk-based decisions about ongoing authorization.
+- Status: `stable`
+- Short name: `CCM`
+- Official page: [https://www.fedramp.gov/2026/reference/collaborative-continuous-monitoring/](https://www.fedramp.gov/2026/reference/collaborative-continuous-monitoring/)
 
 ## Rule Subsets
 
@@ -35,9 +23,7 @@ The Collaborative Continuous Monitoring rules help agencies use shared, current 
 - `OCR` · Ongoing Certification Reports: These rules for Ongoing Certification Reports apply to providers with any type of FedRAMP Certification. · types: 20x, Rev5 · classes: B, C, D
 - `QTR` · Quarterly Reviews: These rules for Quarterly Reviews apply to providers with any type of FedRAMP Certification. · types: 20x, Rev5 · classes: B, C, D
 
-## Requirements and Recommendations
-
-## 20x and Rev5
+## Requirements for 20x and Rev5
 
 ### `CCM-AGM-CSC` SHOULD: Consider Security Category
 
@@ -270,3 +256,10 @@ Terms: `Cloud Service Offering`, `Likely`, `Quarterly Review`, `Responsibly`
 Affects: Providers
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

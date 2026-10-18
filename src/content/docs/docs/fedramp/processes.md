@@ -3,13 +3,9 @@ title: "FedRAMP Processes"
 description: "Browse official Consolidated Rules process documents such as CDS, IVV, SCG, VDR, and CCM."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
+
+The FedRAMP Consolidated Rules for 2026 define 17 processes. Each line gives a process's short name and its requirement counts for 20x and Rev5.
 
 - [Addressing FedRAMP Communication](/docs/fedramp/processes/addressing-fedramp-communication/) · `AFC` · requirements: 16 for 20x and Rev5
 - [Agency Use of FedRAMP Certified Cloud Services](/docs/fedramp/processes/agency-use/) · `AGU` · requirements: 20 for 20x and Rev5
@@ -28,3 +24,10 @@ description: "Browse official Consolidated Rules process documents such as CDS, 
 - [Security Decision Record](/docs/fedramp/processes/security-decision-record/) · `SDR` · requirements: 2 for 20x and Rev5, 2 for 20x only, 1 for Rev5 only
 - [Vulnerability Detection and Response](/docs/fedramp/processes/vulnerability-detection-and-response/) · `VDR` · requirements: 16 for 20x and Rev5, 1 for 20x only, 1 for Rev5 only
 - [Vulnerability Evaluation and Reporting](/docs/fedramp/processes/vulnerability-evaluation-and-reporting/) · `VER` · requirements: 23 for 20x and Rev5
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

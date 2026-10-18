@@ -3,40 +3,26 @@ title: "FedRAMP Recognition of Independent Assessment Services"
 description: "Official Consolidated Rules summary for the REC FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Short name: `REC` · Process ID: `REC` · Web slug: `fedramp-recognition`
+The FedRAMP Recognition of independent assessment services rules explain the requirements for assessors to obtain and maintain FedRAMP Recognition in order to support the FedRAMP Certification process.
 
-Applies to: 20x and Rev5
+## At a Glance
 
-Status: `stable`
-
-Official page: [https://www.fedramp.gov/2026/reference/fedramp-recognition/](https://www.fedramp.gov/2026/reference/fedramp-recognition/)
-
-## Effective Status
-
+- Applies to: 20x and Rev5
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
 - Rev5: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2026-07-04
 - Requirements: 16 for 20x and Rev5
-
-## Purpose
-
-The FedRAMP Recognition of independent assessment services rules explain the requirements for assessors to obtain and maintain FedRAMP Recognition in order to support the FedRAMP Certification process.
+- Status: `stable`
+- Short name: `REC`
+- Official page: [https://www.fedramp.gov/2026/reference/fedramp-recognition/](https://www.fedramp.gov/2026/reference/fedramp-recognition/)
 
 ## Rule Subsets
 
 - `FRP` · FedRAMP Responsibilities: These rules apply to FedRAMP when evaluating independent assessment services for initial or ongoing FedRAMP Recognition.
 - `IAS` · General Independent Assessor Responsibilities: These rules apply to independent assessment services seeking to obtain or maintain FedRAMP Recognition.
 
-## Requirements and Recommendations
-
-## 20x and Rev5
+## Requirements for 20x and Rev5
 
 ### `REC-FRP-DRD` MUST NOT: Double Revocation Disqualification
 
@@ -220,3 +206,10 @@ Affects: Assessors
 Structured timeframe: `2` years
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

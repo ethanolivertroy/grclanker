@@ -3,40 +3,26 @@ title: "Incident Evaluation and Communication"
 description: "Official Consolidated Rules summary for the IEC FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
->
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
->
-> Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
->
-> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
+> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
 
-Short name: `IEC` · Process ID: `IEC` · Web slug: `incident-evaluation-and-communication`
+The Incident Evaluation and Communication rules explain how providers must communicate incident information to FedRAMP and government customers when they are affected by an incident or likely to be affected by an incident.
 
-Applies to: 20x and Rev5
+## At a Glance
 
-Status: `stable`
-
-Official page: [https://www.fedramp.gov/2026/reference/incident-evaluation-and-communication/](https://www.fedramp.gov/2026/reference/incident-evaluation-and-communication/)
-
-## Effective Status
-
+- Applies to: 20x and Rev5
 - 20x: required · Consolidated Rules for 2026 · obtain 2026-07-04 · grace through 2027-01-01
 - Rev5: required · Consolidated Rules for 2026 · obtain 2027-01-01 · grace through 2027-06-01
 - Requirements: 8 for 20x and Rev5
-
-## Purpose
-
-The Incident Evaluation and Communication rules explain how providers must communicate incident information to FedRAMP and government customers when they are affected by an incident or likely to be affected by an incident.
+- Status: `stable`
+- Short name: `IEC`
+- Official page: [https://www.fedramp.gov/2026/reference/incident-evaluation-and-communication/](https://www.fedramp.gov/2026/reference/incident-evaluation-and-communication/)
 
 ## Rule Subsets
 
 - `CSO` · General Provider Responsibilities: These rules apply to providers with FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
 - `FRP` · FedRAMP Responsibilities: These rules apply to FedRAMP. · types: 20x, Rev5 · classes: B, C, D
 
-## Requirements and Recommendations
-
-## 20x and Rev5
+## Requirements for 20x and Rev5
 
 ### `IEC-CSO-AIR` SHOULD: Automated Incident Reporting
 
@@ -232,3 +218,10 @@ Affects: FedRAMP
 Updates:
 - 2026-07-02: Update terminology from "Response" to "Communication" in FedRAMP Incident Evaluation rules.
 - 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
+
+## Source
+
+- Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
+- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

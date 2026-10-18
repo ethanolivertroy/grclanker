@@ -682,7 +682,7 @@ test("buildFedrampDocsSnapshot links the overview to the FedRAMP readiness guide
   assert.match(overview, /\[FedRAMP Readiness guide\]\(\/docs\/guides\/fedramp-readiness\/\)/);
 });
 
-test("buildFedrampDocsSnapshot puts banner lines, status, and each note in separate paragraphs", () => {
+test("buildFedrampDocsSnapshot puts source lines and status on their own lines and each note in its own paragraph", () => {
   const fixture = structuredClone(consolidatedRulesFixture);
   fixture.FRR.CDS.data.all.CSO["CDS-CSO-PUB"].notes = [
     "Agencies rely on this information.",
@@ -697,12 +697,23 @@ test("buildFedrampDocsSnapshot puts banner lines, status, and each note in separ
     files.find((file) => file.path === "fedramp/processes/certification-data-sharing.md")
       ?.content ?? "";
 
-  assert.match(page, /GitHub repo\.\n>\n> Source path: /);
-  assert.match(page, /\nApplies to: [^\n]+\n\nStatus: `stable`\n/);
+  assert.match(page, /GitHub repo\.\n- Source path: /);
+  assert.match(page, /\n- Requirements: [^\n]+\n- Status: `stable`\n/);
   assert.match(page, /\nNote: Agencies rely on this information\.\n\nKeep both formats in sync\.\n/);
 });
 
 test("buildFedrampDocsSnapshot leaves the H1 to the docs page title", () => {
+  const files = buildFedrampDocsSnapshot(
+    normalizeFedrampConsolidatedRules(consolidatedRulesFixture),
+    docsSnapshotSources,
+  );
+
+  for (const file of files) {
+    assert.doesNotMatch(file.content, /^# /m, file.path);
+  }
+});
+
+test("buildFedrampDocsSnapshot leads with each page's purpose and ends with its source", () => {
   const fixture = structuredClone(consolidatedRulesFixture);
   fixture.KSI.CNA.theme = "Cloud services are built to keep their intended state.";
 
@@ -710,20 +721,46 @@ test("buildFedrampDocsSnapshot leaves the H1 to the docs page title", () => {
     normalizeFedrampConsolidatedRules(fixture),
     docsSnapshotSources,
   );
-  const processPage =
-    files.find((file) => file.path === "fedramp/processes/certification-data-sharing.md")
-      ?.content ?? "";
-  const ksiPage =
-    files.find((file) => file.path === "fedramp/ksi/cloud-native-architecture.md")?.content ?? "";
+  const content = (path) => files.find((file) => file.path === path)?.content ?? "";
+  const versionNote =
+    "> Generated from the official FedRAMP Consolidated Rules `2026.07.02.02`, last updated upstream on 2026-07-02. [Source details](#source)";
+
+  assert.ok(
+    content("fedramp/processes/certification-data-sharing.md").includes(
+      [
+        `---\n\n${versionNote}`,
+        "Providers share certification data in human-readable and machine-readable form.",
+        "## At a Glance",
+      ].join("\n\n"),
+    ),
+  );
+  assert.match(
+    content("fedramp/processes/certification-data-sharing.md"),
+    /\n- Short name: `CDS`\n- Official page: \[[^\n]+\n\n/,
+  );
+  assert.ok(
+    content("fedramp/ksi/cloud-native-architecture.md").includes(
+      [
+        `---\n\n${versionNote}`,
+        "Cloud services are built to keep their intended state.",
+        "## At a Glance",
+        "- Applies to: 20x only\n- Indicators: 2\n- Status: `stable`\n- Domain ID: `KSI-CNA`",
+        "## Indicators",
+      ].join("\n\n"),
+    ),
+  );
+  assert.match(content("fedramp/ksis.md"), /define 1 key security indicator \(KSI\) domain for 20x\./);
+  assert.match(content("fedramp/processes.md"), /define 2 processes\./);
 
   for (const file of files) {
-    assert.doesNotMatch(file.content, /^# /m, file.path);
+    assert.ok(file.content.includes(`---\n\n${versionNote}\n\n`), file.path);
+    assert.match(
+      file.content,
+      /\n## Source\n\n- Generated from the official \[FedRAMP\/rules\]\([^\n]+\n- Source path: [^\n]+ at blob `abcdef123456`\.\n- Consolidated Rules version: [^\n]+\n- Supporting narrative [^\n]+\n$/,
+      file.path,
+    );
+    assert.doesNotMatch(file.content, /^> Source path|Web slug|Requirements and Recommendations|Current Grounding/m, file.path);
   }
-  assert.match(processPage, /repository\.\n\nShort name: /);
-  assert.match(
-    ksiPage,
-    /repository\.\n\nDomain code: [^\n]+\n\n## Theme\n\nCloud services are built to keep their intended state\.\n\n## Indicators\n/,
-  );
 });
 
 test("buildFedrampDocsSnapshot titles process and KSI pages with their bare names", () => {
@@ -758,9 +795,12 @@ test("buildFedrampDocsSnapshot names requirement groups in words and skips empty
       index,
     );
   }
-  assert.match(cdsPage, /\nApplies to: 20x and Rev5\n/);
+  assert.match(cdsPage, /\n- Applies to: 20x and Rev5\n/);
   assert.match(cdsPage, /\n- Requirements: 1 for 20x and Rev5, 1 for 20x only, 1 for Rev5 only\n/);
-  assert.match(cdsPage, /\n## 20x and Rev5\n[\s\S]*\n## 20x only\n[\s\S]*\n## Rev5 only\n/);
+  assert.match(
+    cdsPage,
+    /\n## Requirements for 20x and Rev5\n[\s\S]*\n## Requirements for 20x only\n[\s\S]*\n## Requirements for Rev5 only\n/,
+  );
   for (const file of files) {
     assert.doesNotMatch(file.content, /`both`|applies to `|^## (BOTH|20X|REV5)$/m, file.path);
   }
