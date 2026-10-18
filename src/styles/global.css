@@ -1203,7 +1203,7 @@ details[open] > .agent-group-toggle::before {
   text-transform: uppercase;
 }
 
-/* Hide the Fumadocs sidebar below 1024px; "Browse docs" covers narrower screens. */
+/* Hide the Fumadocs sidebar below 1024px; the docs menu in the contents bar covers narrower screens. */
 @media (max-width: 1023.98px) {
   #nd-docs-layout {
     --fd-sidebar-width: 0px;
@@ -1218,7 +1218,6 @@ details[open] > .agent-group-toggle::before {
 .docs-sidebar-nav {
   display: flex;
   flex-direction: column;
-  gap: 1.5rem;
 }
 
 .docs-sidebar-title {
@@ -1229,6 +1228,10 @@ details[open] > .agent-group-toggle::before {
   font-weight: 700;
   letter-spacing: 0.1em;
   text-transform: uppercase;
+}
+
+.docs-sidebar-title:not(:first-child) {
+  margin-top: 1.5rem;
 }
 
 .docs-sidebar-link {
@@ -1243,6 +1246,7 @@ details[open] > .agent-group-toggle::before {
 
 #nd-sidebar a,
 .docs-sidebar-link,
+.docs-sidebar-folder,
 #nd-toc a,
 [data-toc-popover-content] a {
   font-family: var(--docs-font-body);
@@ -1263,6 +1267,14 @@ details[open] > .agent-group-toggle::before {
   color: var(--docs-title);
 }
 
+.docs-sidebar-folder {
+  padding: 0.38rem 0.75rem;
+  border-left: 2px solid transparent;
+  color: var(--docs-label);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
 .docs-sidebar-children {
   margin-left: 0.75rem;
   border-left: 1px solid var(--docs-border-strong);
@@ -1273,49 +1285,96 @@ details[open] > .agent-group-toggle::before {
   margin-left: -1px;
 }
 
-.docs-mobile-nav {
-  margin-bottom: 1.5rem;
-  border: 1px solid var(--docs-border);
-  border-radius: 0.75rem;
-  background: color-mix(in srgb, var(--color-mantle) 92%, transparent);
+/* The docs menu button sits over the start of the table-of-contents bar. */
+.docs-contents-bar {
+  --docs-menu-width: 5.5rem;
 }
 
-.docs-mobile-nav summary {
+.docs-contents-bar > * {
+  grid-area: 1 / 1;
+}
+
+.docs-contents-bar-fill {
+  height: 2.5rem;
+  border-bottom: 1px solid var(--color-fd-border);
+  background-color: var(--color-fd-background);
+}
+
+.docs-menu {
+  justify-self: start;
+}
+
+.docs-menu-button {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  min-height: 2.75rem;
-  padding: 0.8rem 1rem;
+  gap: 0.5rem;
+  width: var(--docs-menu-width);
+  height: 2.5rem;
+  padding-inline: 1rem 0.75rem;
+  color: var(--docs-label);
+  font-size: var(--text-sm);
+}
+
+/* Fumadocs only closes its contents list for clicks that target an HTML element, not an SVG. */
+.docs-menu-button svg {
+  pointer-events: none;
+}
+
+.docs-menu-button::after {
+  content: '';
+  position: absolute;
+  inset-block: 0.625rem;
+  inset-inline-end: 0;
+  border-inline-end: 1px solid var(--color-fd-border);
+}
+
+.docs-contents-bar:has(.docs-contents-bar-fill) .docs-menu-button::after {
+  content: none;
+}
+
+.docs-menu-button:hover,
+.docs-menu-button[aria-expanded='true'] {
   color: var(--docs-title);
-  cursor: pointer;
-  list-style: none;
 }
 
-.docs-mobile-nav summary::-webkit-details-marker {
-  display: none;
-}
-
-.docs-mobile-nav summary::after {
-  content: '+';
-  color: var(--docs-accent);
-  font-size: 1rem;
-  line-height: 1;
-}
-
-.docs-mobile-nav[open] summary::after {
-  content: '−';
-}
-
-.docs-mobile-nav nav {
-  position: relative;
-  max-height: 60vh;
+.docs-menu-panel {
+  position: absolute;
+  top: calc(100% + 1px);
+  inset-inline: 0;
+  max-height: calc(100dvh - var(--fd-docs-row-3) - 3rem);
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 0 0.75rem 0.85rem;
+  padding: 1rem 1rem 1.25rem;
+  border-bottom: 1px solid var(--color-fd-border);
+  background-color: var(--color-fd-background);
+  box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.25), 0 4px 6px -4px rgb(0 0 0 / 0.25);
 }
 
-.docs-mobile-nav .docs-sidebar-link {
+.docs-menu-panel .docs-sidebar-link,
+.docs-menu-panel .docs-sidebar-folder {
   padding-block: 0.75rem;
+}
+
+@media (min-width: 40rem) {
+  .docs-contents-bar {
+    --docs-menu-width: 6rem;
+  }
+
+  .docs-menu-button {
+    padding-inline-start: 1.5rem;
+  }
+
+  .docs-menu-panel {
+    padding-inline: 1.5rem;
+  }
+}
+
+@media (max-width: 1023.98px) {
+  .docs-contents-bar [data-toc-popover-trigger] {
+    padding-inline-start: calc(var(--docs-menu-width) + 0.75rem);
+  }
 }
 
 .docs-article-title {
