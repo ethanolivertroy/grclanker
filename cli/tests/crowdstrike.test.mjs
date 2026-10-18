@@ -3219,3 +3219,113 @@ portableContractTest("without a cloud the bundle is named from the base_url host
   assert.match(result.outputDir, /\/falcon\.example\.internal-child-cid-01-audit-bundle$/);
   assert.equal(result.zipPath, `${result.outputDir}.zip`);
 });
+
+// Builds a scenario's fixtures and runs it at one instant, so ages measured from the
+// assessment time land exactly on millisecond thresholds.
+async function atFixedInstant(run) {
+  const NativeDate = Date;
+  const now = NativeDate.now();
+  globalThis.Date = class FixedDate extends NativeDate {
+    constructor(...args) {
+      super(...(args.length === 0 ? [now] : args));
+    }
+
+    static now() {
+      return now;
+    }
+  };
+  try {
+    return await run();
+  } finally {
+    globalThis.Date = NativeDate;
+  }
+}
+
+function boundaryScenario(check, expected, edge, overrides) {
+  return { name: `${check} ${expected} when ${edge}`, check, expected, overrides };
+}
+
+function manyHosts(count, change) {
+  return Array.from({ length: count }, (_, index) => host({ device_id: `aid-${index + 1}`, hostname: `ws-${index + 1}`, ...change(index) }));
+}
+
+function hostsWith(hosts) {
+  return { listHosts: async (_limit, filter) => (filter ? [] : hosts) };
+}
+
+function slaAlerts(total, compliant) {
+  const alerts = Array.from({ length: total }, (_, index) => ({
+    composite_id: `a-${index + 1}`,
+    severity: 90,
+    severity_name: "Critical",
+    status: "closed",
+    created_timestamp: isoHoursAgo(200),
+    seconds_to_resolved: index < compliant ? 3600 : 360_000,
+  }));
+  return { listAlerts: async () => alerts };
+}
+
+function ztaScores(below, total) {
+  return { countZtaAssessments: async (filter) => (filter.startsWith("score:<") ? below : total) };
+}
+
+function preventionWith(change) {
+  const policies = passingPreventionPolicies();
+  change(policies);
+  return { listPreventionPolicies: async () => policies };
+}
+
+function deviceControlWith(change) {
+  const { details } = passingDeviceControl();
+  change(details[0]);
+  return { getDeviceControlPoliciesV2: async () => details };
+}
+
+function firewallWith(change) {
+  const firewall = passingFirewall();
+  change(firewall);
+  return {
+    listFirewallPolicies: async () => firewall.policies,
+    getFirewallPolicyContainers: async () => firewall.containers,
+  };
+}
+
+// Inputs that put each threshold at and beside its edge, starting with the ten verdicts the
+// rebuilt spec keeps from main. They run as plain tests, so the byte differential replays them
+// through the baseline runtime and compares every result.
+const BOUNDARY_SCENARIOS = [
+  boundaryScenario("CS-02", "warn", "only the extended ProcessHollowing mitigation is disabled", () => preventionWith((policies) => {
+    const exploit = policies[0].prevention_settings.find((category) => category.name === "Exploit Mitigation");
+    exploit.settings.find((setting) => setting.id === "ProcessHollowing").value.enabled = false;
+  })),
+  boundaryScenario("CS-08", "fail", "USB enforcement is MONITOR_ONLY although mass storage is blocked", () => deviceControlWith((details) => {
+    details.usb_settings.enforcement_mode = "MONITOR_ONLY";
+  })),
+  boundaryScenario("CS-10", "fail", "the firewall container does not enforce although its rule group is active", () => firewallWith((firewall) => {
+    firewall.containers[0].enforce = false;
+  })),
+  boundaryScenario("CS-10", "fail", "the firewall container enforces with no rule group", () => firewallWith((firewall) => {
+    firewall.containers[0].rule_group_ids = [];
+  })),
+  boundaryScenario("CS-13", "pass", "1 of 100 hosts is stale", () => hostsWith(manyHosts(100, (index) => (index < 99 ? {} : { last_seen: isoDaysAgo(30) })))),
+  boundaryScenario("CS-13", "warn", "10 of 100 hosts are stale", () => hostsWith(manyHosts(100, (index) => (index < 90 ? {} : { last_seen: isoDaysAgo(30) })))),
+  boundaryScenario("CS-14", "warn", "1599 of 2000 hosts are in a host group (79.95 percent rounds up to the fail edge)", () => hostsWith(manyHosts(2000, (index) => (index < 1599 ? {} : { groups: [] })))),
+  boundaryScenario("CS-14", "pass", "1899 of 2000 hosts are in a host group (94.95 percent rounds up to the warn edge)", () => hostsWith(manyHosts(2000, (index) => (index < 1899 ? {} : { groups: [] })))),
+  boundaryScenario("CS-22", "warn", "1599 of 2000 alerts met their SLA (79.95 percent rounds up to the fail edge)", () => slaAlerts(2000, 1599)),
+  boundaryScenario("CS-25", "warn", "5 of 100 scored hosts are below min_zta_score", () => ztaScores(5, 100)),
+];
+
+async function runBoundaryScenario({ overrides }) {
+  return atFixedInstant(() => runAllCrowdstrikeAssessments(createFakeClient(overrides())));
+}
+
+test("boundary scenarios: each threshold edge reaches the verdict on either side of it", async () => {
+  const names = BOUNDARY_SCENARIOS.map((scenario) => scenario.name);
+  assert.equal(new Set(names).size, names.length, "scenario names key the byte differential fixture");
+  const mismatches = [];
+  for (const scenario of BOUNDARY_SCENARIOS) {
+    const status = statusMap(await runBoundaryScenario(scenario))[scenario.check];
+    if (status !== scenario.expected) mismatches.push(`${scenario.name}: ${status}`);
+  }
+  assert.deepEqual(mismatches, []);
+});
