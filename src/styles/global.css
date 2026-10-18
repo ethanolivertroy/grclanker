@@ -1329,6 +1329,11 @@ details[open] > .agent-group-toggle::before {
   margin-top: 0;
 }
 
+/* Fumadocs' sticky rows (site header, then the table-of-contents bar below 1280px) end at --fd-docs-row-3. */
+.docs-prose [id] {
+  scroll-margin-top: calc(var(--fd-docs-row-3) + 1rem);
+}
+
 /* Reading measure for running text; tables and code blocks use the full column. */
 .docs-prose > :is(p, ul, ol, blockquote, h2, h3, h4) {
   max-width: 60ch;
@@ -1968,11 +1973,6 @@ details[open] > .agent-group-toggle::before {
 
   .docs-prose {
     overflow-wrap: anywhere;
-  }
-
-  /* Anchor jumps land below the sticky site nav. */
-  .docs-prose [id] {
-    scroll-margin-top: 5rem;
   }
 
   .docs-prose h2 {
