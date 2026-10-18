@@ -87,7 +87,6 @@ const param = (
   when?: string,
 ): RequestParameterContract => ({ name, location, required, value, ...(when ? { when } : {}) });
 
-// A number is a fixed item cap; an option is a caller-supplied one.
 type ItemCap = number | { option: string; fallback: number; max: number };
 const capText = (cap: ItemCap): string =>
   typeof cap === "number" ? `the ${cap} cap` : `${cap.option} (default ${cap.fallback}, set from 1 through ${cap.max})`;

@@ -3137,7 +3137,6 @@ function requestedSurface(method, url) {
 
 const ids = (records, field = "id") => async (fake) => (await records(fake)).items.map((record) => record[field]);
 
-// The passing fake client's records behind each declared surface; counts answer with a total only.
 const CONTRACT_READS = {
   prevention_policies: (fake) => fake.listPreventionPolicies(),
   response_policies: (fake) => fake.listResponsePolicies(),
@@ -3181,8 +3180,6 @@ const CONTRACT_READS = {
   identity_protection_rules: (fake) => fake.listIdentityProtectionRules(),
 };
 
-// Serves the passing tenant through the real client and passes each response through the transform
-// registered for the surface it answers.
 function contractFetch(transforms = {}) {
   const fake = createFakeClient();
   return async (input, init = {}) => {
@@ -3365,9 +3362,8 @@ function firewallWith(change) {
   };
 }
 
-// Inputs that put each threshold at and beside its edge, starting with the ten verdicts the
-// rebuilt spec keeps from main. They run as plain tests, so the byte differential replays them
-// through the baseline runtime and compares every result.
+// Inputs that put each threshold at and beside its edge. They run as plain tests, so the byte
+// differential replays them through the baseline runtime and compares every result.
 const BOUNDARY_SCENARIOS = [
   boundaryScenario("CS-02", "warn", "only the extended ProcessHollowing mitigation is disabled", () => preventionWith((policies) => {
     const exploit = policies[0].prevention_settings.find((category) => category.name === "Exploit Mitigation");

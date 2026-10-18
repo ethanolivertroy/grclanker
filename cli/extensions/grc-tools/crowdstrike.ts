@@ -790,7 +790,6 @@ function unlicensedFinding(id: ControlId, module: string, error: string, console
 
 const CROWDSTRIKE_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
 
-// Decorators record their completeness facts after the evaluator recorded its own, so facts merge per check.
 function recordCrowdstrikeDecisionFacts(id: ControlId, facts: Readonly<Record<string, unknown>>): void {
   const store = CROWDSTRIKE_DECISION_CONTEXT.getStore();
   if (!store) throw new Error(`${id} decision facts were recorded outside a CrowdStrike assessment`);
