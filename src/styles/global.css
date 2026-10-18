@@ -1261,6 +1261,16 @@ details[open] > .agent-group-toggle::before {
   font-family: var(--docs-font-body);
 }
 
+/* Unboxed and in the entry's color, as code in article links is. The boxed blue missed AA contrast. */
+#nd-toc code,
+[data-toc-popover-content] code {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-size: 0.875em;
+}
+
 /* Fumadocs leaves this bar translucent, so scrolled text shows through it. */
 #nd-docs-layout [data-toc-popover] > header {
   background-color: var(--color-fd-background);
