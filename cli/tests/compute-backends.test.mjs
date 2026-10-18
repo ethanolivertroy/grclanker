@@ -55,6 +55,7 @@ import {
   DEFAULT_RUNPOD_JOB_TIMEOUT_MS,
   isSensitiveStagingPath,
   parseRunpodWorkerOutput,
+  materializePodStagingPlan,
   planPodWorkspaceStaging,
   RUNPOD_CLEANUP_ATTEMPTS,
   RUNPOD_STAGING_DENYLIST,
@@ -1331,6 +1332,41 @@ test("runpod pod staging uploads the git index only and never a planted secret",
     assert.ok(RUNPOD_STAGING_DENYLIST.includes("*service-account*.json"));
   } finally {
     rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("runpod pod staging skips a tracked path that resolves outside the repo through a symlink", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "grclanker-pod-symlink-"));
+  const outside = mkdtempSync(join(tmpdir(), "grclanker-pod-outside-"));
+  const secret = "fake-symlink-escape-canary-zz9\n";
+  try {
+    git(repo, "init", "-q");
+    plant(repo, "docs/readme.txt", "tracked\n");
+    plant(repo, "notes.txt", "tracked note\n");
+    git(repo, "add", "docs/readme.txt", "notes.txt");
+    git(repo, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-q", "-m", "init");
+    rmSync(join(repo, "docs"), { recursive: true });
+    writeFileSync(join(outside, "readme.txt"), secret);
+    symlinkSync(outside, join(repo, "docs"));
+    rmSync(join(repo, "notes.txt"));
+    symlinkSync(join(outside, "readme.txt"), join(repo, "notes.txt"));
+
+    const plan = await planPodWorkspaceStaging(repo, createProcessCommandRunner());
+    assert.deepEqual(plan.files, []);
+    assert.deepEqual(plan.excluded, []);
+    assert.deepEqual([...plan.skipped].sort(), ["docs/readme.txt", "notes.txt"]);
+
+    assert.throws(
+      () => materializePodStagingPlan({ localRoot: repo, files: ["docs/readme.txt"], excluded: [], skipped: [] }),
+      /resolves outside/,
+    );
+    assert.throws(
+      () => materializePodStagingPlan({ localRoot: repo, files: ["../../escaped-canary.txt"], excluded: [], skipped: [] }),
+      /not a path inside/,
+    );
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
   }
 });
 

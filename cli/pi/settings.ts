@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { ConfigFileError, readJsonConfig } from "../extensions/grc-tools/hardening/config-file.js";
 import {
   DEFAULT_COMPUTE_BACKEND,
   isComputeBackendKind,
@@ -50,14 +51,28 @@ export function resolveSkillDiscoveryMode(settings: GrclankerSettings): SkillDis
   return normalizeSkillDiscoveryMode(settings.skillDiscoveryMode);
 }
 
-export function readJson(path: string): Record<string, unknown> {
-  if (!existsSync(path)) return {};
-
-  try {
-    return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-  } catch {
-    return {};
+function assertJsonObject(path: string, value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ConfigFileError({ kind: "parse", path, format: "JSON", code: "INVALID_JSON" });
   }
+  return value as Record<string, unknown>;
+}
+
+// A missing file is an empty object. Malformed JSON, or JSON that is not an
+// object, throws ConfigFileError with a fixed message so a credential on the
+// bad line is not quoted and the caller does not replace the file.
+export function readJson(path: string): Record<string, unknown> {
+  const result = readJsonConfig(path);
+  if (!result.ok) return {};
+  return assertJsonObject(path, result.value);
+}
+
+export function readModelsConfig(path: string): Record<string, unknown> {
+  const parsed = readJson(path);
+  if (!parsed.providers || typeof parsed.providers !== "object") {
+    parsed.providers = {};
+  }
+  return parsed;
 }
 
 export function normalizeGrclankerSettings(

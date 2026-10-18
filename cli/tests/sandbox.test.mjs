@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   mkdtempSync,
   mkdirSync,
+  readFileSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -12,6 +13,7 @@ import { join, resolve } from "node:path";
 import {
   createSandboxReadOperations,
   createSandboxWriteOperations,
+  loadSandboxConfig,
 } from "../dist/pi/sandbox.js";
 
 function createTempBase(prefix) {
@@ -71,4 +73,31 @@ test("sandbox write rules reject paths that escape through symlinked directories
     () => writeOps.writeFile(escapedPath, "escaped\n"),
     /Sandbox denied write access/,
   );
+});
+
+test("malformed sandbox.json fails closed without quoting the file", () => {
+  const base = createTempBase("grclanker-sandbox-bad-json-");
+  const cwd = resolve(base, "project");
+  const configPath = resolve(cwd, ".grclanker", "sandbox.json");
+  mkdirSync(resolve(cwd, ".grclanker"), { recursive: true });
+  const body = '{ "filesystem": { "denyRead": ["CANARYSANDBOXSECRET99"] \n';
+  writeFileSync(configPath, body, "utf8");
+  const previous = process.env.GRCLANKER_HOME;
+  process.env.GRCLANKER_HOME = base;
+
+  try {
+    assert.throws(
+      () => loadSandboxConfig(cwd),
+      (error) => {
+        assert.match(error.message, /Unable to parse config file: invalid JSON/);
+        assert.equal(error.message.includes("CANARYSANDBOXSECRET99"), false);
+        return true;
+      },
+    );
+  } finally {
+    if (previous === undefined) delete process.env.GRCLANKER_HOME;
+    else process.env.GRCLANKER_HOME = previous;
+  }
+
+  assert.equal(readFileSync(configPath, "utf8"), body);
 });
