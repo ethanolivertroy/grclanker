@@ -49,7 +49,16 @@ Explicit tool arguments win, then environment variables, then SDK defaults.
 
 The resolved source chain (for example `arguments-region -> environment-profile`) is reported by `aws_check_access` and recorded in `metadata.json`.
 
-`AWS_ROLE_ARN` and `AWS_EXTERNAL_ID` are honored only through the SDK's own `credential_process` and `role_arn` profile settings. The tools do not perform their own `AssumeRole` fan-out across accounts yet (see Limitations).
+To assume a role, define it as a profile in `~/.aws/config` and select that profile with `profile` or `AWS_PROFILE`. The SDK makes the `AssumeRole` call. If the role's trust policy requires an external ID, set it as `external_id` in that profile:
+
+```ini
+[profile audit]
+role_arn = arn:aws:iam::111122223333:role/audit
+source_profile = default
+external_id = your-external-id
+```
+
+There is no `AWS_EXTERNAL_ID` environment variable. `AWS_ROLE_ARN` is read only together with `AWS_WEB_IDENTITY_TOKEN_FILE`, for web identity federation. The tools do not make their own `AssumeRole` calls to fan out across accounts yet (see [Limitations](#limitations-and-manual-controls)).
 
 ### Region scope
 
@@ -665,7 +674,7 @@ Otherwise it:
   - Grant `cloudtrail:LookupEvents` in `us-east-1`. Otherwise the finding caps at `warn`.
   - `LookupEvents` keeps 90 days of history.
 - `aws_assess_logging_detection` and `aws_assess_org_guardrails` inspect the configured region only. Security Hub, GuardDuty, and Config are regional. Assess each in-scope region separately.
-- Cross-account fan-out through `AssumeRole` (`AWS_ROLE_ARN`, `AWS_EXTERNAL_ID`) is not implemented. Run the tools once per account with a profile that assumes the audit role.
+- Cross-account fan-out through `AssumeRole` is not implemented. Run the tools once per account with a profile that assumes the audit role in that account.
 
 ### Collection limits
 
