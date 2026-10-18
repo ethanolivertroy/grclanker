@@ -39,16 +39,6 @@ The session is a `JSESSIONID` cookie. It is closed with `DELETE /api/v1/authenti
 
 The admin needs a role that can view the policy areas above. Unreadable areas produce manual findings, never passes.
 
-ZIA list endpoints that document `page` and `pageSize` are paged to completion:
-
-- `/adminUsers`, `/locations`, `/greTunnels`, and `/vpnCredentials` at the documented maximum of 1000 per page
-- `/urlFilteringRules` at the documented default of 100 (no maximum is published)
-- `/firewallFilteringRules` at the documented default of 5000
-
-A read that reaches the internal ceiling of 50 pages is recorded as partial and caps the dependent verdicts at `warn`. Endpoints without documented paging parameters return the whole array in one call, recorded as a single complete page (`seen: 1`). If that dataset is partial, the dependent check is capped at `warn` and the summary names the pages seen versus the total. That covers web DLP rules, DLP engines and dictionaries, SSL inspection rules and exemptions, sandbox rules and settings, bandwidth rules, isolation profiles, DNS rules, the ATP and malware baseline reads, administrator roles, password-expiry settings, and the audit log report.
-
-Sub-locations are fetched for at most 100 parent locations. Beyond that, control 18 reports how many parents were read versus the total and caps at `warn`.
-
 ### ZPA (client credentials)
 
 | Variable | Purpose |
@@ -58,21 +48,7 @@ Sub-locations are fetched for at most 100 parent locations. Beyond that, control
 | `ZPA_CLOUD` | `PRODUCTION` (`https://config.private.zscaler.com`, default), `ZPATWO` (`https://config.zpatwo.net`), `BETA` (`https://config.zpabeta.net`), `GOV` (`https://config.zpagov.net`), `GOVUS` (`https://config.zpagov.us`), `PREVIEW` (`https://config.zpapreview.net`) |
 | `ZPA_BASE_URL` | Optional explicit base URL |
 
-The client posts `client_id` and `client_secret` as a form body to `POST /signin` and sends the returned bearer token. It pages every list with `page` and `pagesize` (documented maximum 500) until the response `totalPages` is reached.
-
-A response that omits `totalPages` (or returns a bare array) leaves the total unknown. In that case, the client:
-
-- Keeps paging while pages are full.
-- Stops on a short page.
-- Treats a page identical to the previous one as a server that stopped advancing.
-
-`GET /emergencyAccess/users` is the one surface documented with a `pageId` cursor and an `items`/`nextPage` wrapper. For that surface, the client:
-
-- Follows `nextPage`.
-- Deduplicates users by `userId` or `emailId`.
-- Treats a cursor that repeats or cycles as the end of what can be read.
-
-Every one of these exits, plus the 200-page ceiling, is recorded as partial with the pages read versus the total (or "total unknown") and caps the dependent verdicts at `warn`.
+The client posts `client_id` and `client_secret` as a form body to `POST /signin` and sends the returned bearer token.
 
 `zscaler_check_access` detects and reports `ZSCALER_CLIENT_ID`, `ZSCALER_CLIENT_SECRET` (OneAPI) and `ZDX_CLIENT_ID`, `ZDX_CLIENT_SECRET`. OneAPI OAuth mode and ZDX enrichment are not implemented in this release.
 
@@ -112,44 +88,13 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 - `_errors.log` when collection partially failed
 - A zip named after the allocated directory (reruns allocate a new directory)
 
-### Findings and verdict rules
+### Findings
 
 Findings are normalized as `{id, control, title, severity, status, summary, evidence, mappings, manualEvidence}`. `status` is `pass`, `warn`, `fail`, or `manual`.
 
-- A 401, 403, or errored endpoint never yields `pass`.
-  - When it is the finding's primary inventory, the finding is `manual` and names the cause.
-  - When it is a secondary inventory the finding also reads, the finding caps at `warn`. It names the inventory and endpoint with the HTTP status in its summary, and lists it under `evidence.unreadable_inventories`.
-  - Examples of secondary inventories are ZPA `GET /serviceEdgeGroup` for control 21 and `GET /dlpDictionaries` for control 3.
-- An empty inventory fails or is `manual` per the control's intent. The summary says which.
-- Products that are not configured or not licensed render `manual`.
-- Undated items (no last connect time, no certificate validity) never count as healthy and cap at `warn`.
-- Every inventory a finding reads, primary or secondary, that came back partial sets `evidence.partial_inventory` and names that inventory in the summary. A result that would otherwise pass is capped at `warn`. A fail, manual, empty, disabled, or unreadable result keeps that status and does not say the verdict was capped at warn.
-  - The name includes the records read over the pages read versus the total pages, or "total unknown" when the API published no total.
-  - Sub-locations name parents read versus total. Cloud app control names rule types read versus total.
-
-### Bundle secret hygiene
-
-Every object written to the bundle, including `core_data/access_check.json` and `analysis/findings.json`, passes through export redaction.
-
-Redaction replaces the value with `[REDACTED]` for:
-
-- The credential fields the published schemas document: `kerberosPwd` on `GET /authSettings`, `scimSharedSecret` on `GET .../idp`, `preSharedKey`, `authenticationToken`, `password`, `tmpPassword`, `privateKey`, `zrsaencryptedprivatekey`, `zrsaencryptedsessionkey`.
-- The free-text `comment` and `comments` fields on GRE tunnels and VPN credentials, where operators record pre-shared keys.
-- Any other key whose normalized name contains `password`, `passwd`, `pwd`, `secret`, `token`, `passphrase`, `credential`, `private`, `community`, `preshared`, `apikey`, or ends in `key`.
-  - This rule has a short exception list for benign schema fields: `isPasswordLoginAllowed`, `passwordExpirationEnabled`, `passwordExpiryDays`, `passwordStrength`, `publicKey`, `privateIp`, `tokenType`, and the module's own `passwordExpiry` and `vpnCredentials` datasets.
-
-Booleans are never redacted.
-
-API error text is scrubbed at the client:
-
-- Raw non-JSON bodies are never echoed (only their byte count).
-- The documented `message`, `code`, `reason`, and `error` fields are capped at 160 characters.
-- Secret-named `key=value` pairs lose their value.
-- Any token of 16 or more characters that is not an uppercase error code is dropped.
-
-The regression suite seeds 32 canaries across the configured secrets, every documented credential field, credential-shaped undocumented fields, comment fields, and echoed error bodies. It then walks every bundle file and every zip entry.
-
 ## Control coverage
+
+Verdicts on unread, partial, or undated data follow the [verdict safety rules](#verdict-safety-rules).
 
 | # | Control | Tool | Finding | Status semantics |
 | --- | --- | --- | --- | --- |
@@ -270,3 +215,72 @@ Reference links below are relative to `https://automate.zscaler.com/docs/api-ref
 - Cloud Service API key inventory, ZDX metrics, and OneAPI OAuth mode are not implemented in this release.
 - Empty inventories that are plausibly intentional render `manual` and say what to confirm. The cases are no sandbox rules, no bandwidth rules, no isolation profiles, no locations, no trusted networks, no private service edges, no forwarding rules, and no emergency access users.
 - Inventories that must never be empty fail. They are URL, firewall, DNS, DLP, SSL, cloud app rules, segments, access rules, posture profiles, connectors, IdPs, and timeout rules.
+
+## How the tools handle evidence
+
+This section is reference for reviewing findings and bundles: how the tools page through ZIA and ZPA lists and record incomplete reads, how unread, partial, or undated data limits a verdict, and how credentials are kept out of bundles and error text. You don't need it to set up or run the integration.
+
+### ZIA pagination
+
+ZIA list endpoints that document `page` and `pageSize` are paged to completion:
+
+- `/adminUsers`, `/locations`, `/greTunnels`, and `/vpnCredentials` at the documented maximum of 1000 per page
+- `/urlFilteringRules` at the documented default of 100 (no maximum is published)
+- `/firewallFilteringRules` at the documented default of 5000
+
+A read that reaches the internal ceiling of 50 pages is recorded as partial and caps the dependent verdicts at `warn`. Endpoints without documented paging parameters return the whole array in one call, recorded as a single complete page (`seen: 1`). If that dataset is partial, the dependent check is capped at `warn` and the summary names the pages seen versus the total. That covers web DLP rules, DLP engines and dictionaries, SSL inspection rules and exemptions, sandbox rules and settings, bandwidth rules, isolation profiles, DNS rules, the ATP and malware baseline reads, administrator roles, password-expiry settings, and the audit log report.
+
+Sub-locations are fetched for at most 100 parent locations. Beyond that, control 18 reports how many parents were read versus the total and caps at `warn`.
+
+### ZPA pagination
+
+The ZPA client pages every list with `page` and `pagesize` (documented maximum 500) until the response `totalPages` is reached.
+
+A response that omits `totalPages` (or returns a bare array) leaves the total unknown. In that case, the client:
+
+- Keeps paging while pages are full.
+- Stops on a short page.
+- Treats a page identical to the previous one as a server that stopped advancing.
+
+`GET /emergencyAccess/users` is the one surface documented with a `pageId` cursor and an `items`/`nextPage` wrapper. For that surface, the client:
+
+- Follows `nextPage`.
+- Deduplicates users by `userId` or `emailId`.
+- Treats a cursor that repeats or cycles as the end of what can be read.
+
+Every one of these exits, plus the 200-page ceiling, is recorded as partial with the pages read versus the total (or "total unknown") and caps the dependent verdicts at `warn`.
+
+### Verdict safety rules
+
+- A 401, 403, or errored endpoint never yields `pass`.
+  - When it is the finding's primary inventory, the finding is `manual` and names the cause.
+  - When it is a secondary inventory the finding also reads, the finding caps at `warn`. It names the inventory and endpoint with the HTTP status in its summary, and lists it under `evidence.unreadable_inventories`.
+  - Examples of secondary inventories are ZPA `GET /serviceEdgeGroup` for control 21 and `GET /dlpDictionaries` for control 3.
+- An empty inventory fails or is `manual` per the control's intent. The summary says which.
+- Products that are not configured or not licensed render `manual`.
+- Undated items (no last connect time, no certificate validity) never count as healthy and cap at `warn`.
+- Every inventory a finding reads, primary or secondary, that came back partial sets `evidence.partial_inventory` and names that inventory in the summary. A result that would otherwise pass is capped at `warn`. A fail, manual, empty, disabled, or unreadable result keeps that status and does not say the verdict was capped at warn.
+  - The name includes the records read over the pages read versus the total pages, or "total unknown" when the API published no total.
+  - Sub-locations name parents read versus total. Cloud app control names rule types read versus total.
+
+### Bundle secret hygiene
+
+Every object written to the bundle, including `core_data/access_check.json` and `analysis/findings.json`, passes through export redaction.
+
+Redaction replaces the value with `[REDACTED]` for:
+
+- The credential fields the published schemas document: `kerberosPwd` on `GET /authSettings`, `scimSharedSecret` on `GET .../idp`, `preSharedKey`, `authenticationToken`, `password`, `tmpPassword`, `privateKey`, `zrsaencryptedprivatekey`, `zrsaencryptedsessionkey`.
+- The free-text `comment` and `comments` fields on GRE tunnels and VPN credentials, where operators record pre-shared keys.
+- Any other key whose normalized name contains `password`, `passwd`, `pwd`, `secret`, `token`, `passphrase`, `credential`, `private`, `community`, `preshared`, `apikey`, or ends in `key`.
+  - This rule has a short exception list for benign schema fields: `isPasswordLoginAllowed`, `passwordExpirationEnabled`, `passwordExpiryDays`, `passwordStrength`, `publicKey`, `privateIp`, `tokenType`, and the module's own `passwordExpiry` and `vpnCredentials` datasets.
+
+Booleans are never redacted.
+
+API error text is scrubbed at the client:
+
+- Raw non-JSON bodies are never echoed (only their byte count).
+- The documented `message`, `code`, `reason`, and `error` fields are capped at 160 characters.
+- Secret-named `key=value` pairs lose their value.
+- Any token of 16 or more characters that is not an uppercase error code is dropped.
+
+The regression suite seeds 32 canaries across the configured secrets, every documented credential field, credential-shaped undocumented fields, comment fields, and echoed error bodies. It then walks every bundle file and every zip entry.
