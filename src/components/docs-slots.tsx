@@ -8,12 +8,12 @@ export function NoNavTitle() {
 }
 
 /**
- * Fumadocs' page container renders a `<main>`; the root layout already has
- * one, so this keeps the same grid placement on a plain `<div>`.
+ * Fumadocs' page container with this site's spacing. Its `<main>` is the docs
+ * page's only one (see SiteMain), and the skip link's target.
  */
 export function DocsPageContainer({ className, ...props }: ComponentProps<'article'>) {
   return (
-    <div className="grid justify-items-center [grid-area:main]" data-layout-main="">
+    <main id="main-content" className="grid justify-items-center [grid-area:main]" data-layout-main="">
       <article
         id="nd-page"
         data-layout-content=""
@@ -25,6 +25,6 @@ export function DocsPageContainer({ className, ...props }: ComponentProps<'artic
           .filter(Boolean)
           .join(' ')}
       />
-    </div>
+    </main>
   );
 }
