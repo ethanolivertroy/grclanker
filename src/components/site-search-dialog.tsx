@@ -20,11 +20,15 @@ import {
   SearchDialogOverlay,
   type SharedProps,
 } from 'fumadocs-ui/components/dialog/search';
+import { create } from 'zbsearch';
 import { rankTitleMatchesFirst } from '../lib/search-ranking.mjs';
+import { createSearchTokenizer, searchWholeIdentifiersFirst } from '../lib/search-tokenizer.mjs';
 import { primaryLinks } from '../lib/site';
 
 const staticSearch = staticClient({
   from: '/api/search.json',
+  // The exported index brings its own fields, but queries must be tokenized the way it was built.
+  initDB: () => create({ schema: { _: 'string' }, components: { tokenizer: createSearchTokenizer() } }),
   // Fumadocs defaults to 60 hits, up to 8 per page, so one long page with many
   // matching sections can crowd the rest out of the list.
   search: { limit: 200, groupBy: { properties: ['page_id'], maxResult: 3 } },
@@ -32,7 +36,7 @@ const staticSearch = staticClient({
 
 const client: SearchClient = {
   deps: staticSearch.deps,
-  search: async (query) => rankTitleMatchesFirst(query, await staticSearch.search(query)),
+  search: async (query) => rankTitleMatchesFirst(query, await searchWholeIdentifiersFirst(staticSearch.search, query)),
 };
 
 const defaultItems = primaryLinks.map((link) => ({

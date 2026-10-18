@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { createSearchAPI } from 'fumadocs-core/search/server';
 import { getDocHref } from '../../../lib/docs';
 import { identifierContents } from '../../../lib/search-identifiers.mjs';
+import { createSearchTokenizer } from '../../../lib/search-tokenizer.mjs';
 import { getDocSlug, getDocsSections, source } from '../../../lib/source';
 import { categoryLabels, loadSpecs } from '../../../lib/specs';
 
@@ -70,6 +71,7 @@ const specs = loadSpecs().map((spec) => {
 
 export const { staticGET: GET } = createSearchAPI('advanced', {
   indexes: [...sitePages, ...docs, ...specs],
+  tokenizer: createSearchTokenizer(),
   // Search never sorts by a field, so the sort index would only add to the download.
   sort: { enabled: false },
 });
