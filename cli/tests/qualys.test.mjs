@@ -4448,11 +4448,22 @@ function withFullUserList() {
   return xmlResponse(fullUserListXml);
 }
 
+let fullActivityLogCsv;
+function withFullActivityLog() {
+  fullActivityLogCsv ??= activityCsv([
+    ...tenant.activityRows,
+    ...Array.from({ length: 5000 - tenant.activityRows.length }, (_, index) => ({ ...tenant.activityRows[0], action: "request", details: `API request ${index}` })),
+  ]);
+  return csvResponse(fullActivityLogCsv);
+}
+
 // Each truncation keeps the healthy records and only leaves the read partial. excluded_ips and auth_records never
 // follow a WARNING/URL, the other XML lists refuse a continuation to another origin, a QPS search that reports more
-// records without a lastId cannot continue, and the User List API stops at 5000 users.
+// records without a lastId cannot continue, the User List API stops at 5000 users, and the activity log CSV stops at
+// its 5000-row truncation_limit.
 function truncation(surfaceId) {
   if (surfaceId === "user_list") return withFullUserList;
+  if (surfaceId === "activity_log") return withFullActivityLog;
   return SURFACE_ENDPOINTS[surfaceId].startsWith("/qps/") ? withMoreRecordsAndNoLastId : withForeignContinuation;
 }
 
