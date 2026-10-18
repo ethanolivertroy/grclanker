@@ -3414,6 +3414,22 @@ const BOUNDARY_SCENARIOS = [
   boundaryScenario("CS-17", "warn", "a user holds one role past max_roles_per_user", () => usersWith((users) => {
     users.roles["u-analyst"] = nonAdminRoles(6);
   })),
+  boundaryScenario("CS-09", "warn", "Bluetooth is monitored but not enforced while PCIe and mass storage are", () => deviceControlWith((details) => {
+    details.bluetooth_settings.enforcement_mode = "MONITOR_ONLY";
+  })),
+  boundaryScenario("CS-10", "warn", "a second assigned firewall policy has no container", () => firewallWith((firewall) => {
+    firewall.policies.push({ id: "fw-2", name: "Server Firewall", platform_name: "Windows", enabled: true, groups: [{ id: "hg-1" }] });
+  })),
+  boundaryScenario("CS-12", "warn", "the assigned sensor update policy's build has an unknown form", () => ({
+    listSensorUpdatePolicies: async () => [sensorUpdatePolicy({ settings: { build: "latest|tagged", uninstall_protection: "ENABLED", stage: "prod" } })],
+  })),
+  boundaryScenario("CS-14", "fail", "a host group exists but the complete host list is empty", () => hostsWith([])),
+  boundaryScenario("CS-18", "warn", "an API client has no scope list", () => ({
+    listApiClients: async () => [
+      { id: "api-1", name: "grclanker audit", scopes: [apiScope("prevention-policies", "read")] },
+      { id: "api-2", name: "legacy exporter" },
+    ],
+  })),
 ];
 
 async function runBoundaryScenario({ overrides }) {
