@@ -8,6 +8,7 @@
  */
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { inspect } from "node:util";
 import {
   init as flueInit,
   type Agent,
@@ -18,6 +19,7 @@ import {
 import { sqlite as flueSqlite, start as flueStart, type Flue, type StartOptions } from "@flue/runtime/node";
 import { getGrclankerHome } from "../config/paths.js";
 import { Grclanker, prepareGrclankerAgent } from "./agent.js";
+import { flueConversationStreamPath, readPriorSensitiveValues } from "./history.js";
 import { collectSensitiveValues, redactSensitiveArguments, scrubSensitiveValues, withholdEchoedArguments } from "./redact.js";
 import { collectGrclankerDomainTools } from "./tools.js";
 
@@ -54,6 +56,8 @@ export interface FlueRunDeps {
 
 export interface FlueActivityFormatterOptions {
   parameterSchemas?: ReadonlyMap<string, unknown>;
+  /** Called with the sensitive values of each tool input, so a later reply can be scrubbed too. */
+  onSensitiveValues?: (values: readonly string[]) => void;
 }
 
 interface AgentRunErrorLike extends Error {
@@ -106,7 +110,9 @@ export function createFlueActivityFormatter(
         toolNames.set(chunk.toolCallId, chunk.toolName);
         const schema = options.parameterSchemas?.get(chunk.toolName);
         const input = chunk.input ?? {};
-        sensitiveValues.set(chunk.toolCallId, collectSensitiveValues(input, schema));
+        const values = collectSensitiveValues(input, schema);
+        sensitiveValues.set(chunk.toolCallId, values);
+        options.onSensitiveValues?.(values);
         return `-> ${chunk.toolName} ${truncate(JSON.stringify(redactSensitiveArguments(input, schema)))}`;
       }
       case "tool-output": {
@@ -189,12 +195,28 @@ export async function runGrclankerFlueAgent(
   const dbPath = resolveFlueDatabasePath(request.db);
   if (dbPath !== FLUE_MEMORY_DATABASE) mkdirSync(dirname(dbPath), { recursive: true });
 
+  const parameterSchemas = deps.toolParameterSchemas?.();
+  // A resumed `--id` does not replay earlier tool-input events, so rebuild the
+  // redaction list from the conversation file before this turn starts.
+  const rememberedSensitiveValues: string[] = request.id
+    ? readPriorSensitiveValues({
+        dbPath,
+        streamPath: flueConversationStreamPath(FLUE_AGENT_NAME, request.id),
+        schemas: parameterSchemas,
+      })
+    : [];
+
   const flue = await deps.start({ agents: [deps.agent], db: deps.sqlite(dbPath) });
   try {
     const handle = deps.init(deps.agent, request.id ? { id: request.id } : undefined);
     deps.writeErr(`conversation: ${handle.id}`);
     const receipt = await handle.dispatch(request.message);
-    const formatActivity = createFlueActivityFormatter({ parameterSchemas: deps.toolParameterSchemas?.() });
+    const formatActivity = createFlueActivityFormatter({
+      parameterSchemas,
+      onSensitiveValues: (values) => {
+        rememberedSensitiveValues.push(...values);
+      },
+    });
 
     try {
       const reply = await handle.read(receipt, {
@@ -208,18 +230,25 @@ export async function runGrclankerFlueAgent(
         agent: FLUE_AGENT_NAME,
         submissionId: reply.submissionId,
         outcome: "completed",
-        message: reply.text,
+        message: scrubSensitiveValues(reply.text, rememberedSensitiveValues),
       };
     } catch (error) {
-      if (!isAgentRunError(error)) throw error;
-      return {
-        id: handle.id,
-        agent: FLUE_AGENT_NAME,
-        submissionId: error.submissionId,
-        outcome: error.outcome,
-        error: describeAgentRunError(error),
-      };
+      if (isAgentRunError(error)) {
+        return {
+          id: handle.id,
+          agent: FLUE_AGENT_NAME,
+          submissionId: error.submissionId,
+          outcome: error.outcome,
+          error: scrubSensitiveValues(describeAgentRunError(error), rememberedSensitiveValues),
+        };
+      }
+      // Formatted by the runtime catch below, which also covers dispatch.
+      throw error;
     }
+  } catch (error) {
+    // Both CLI sinks use console.error, which prints the cached stack, custom
+    // fields, and cause, and inspects a non-Error. Scrub that rendering.
+    throw scrubSensitiveValues(inspect(error), rememberedSensitiveValues);
   } finally {
     await flue.stop();
   }

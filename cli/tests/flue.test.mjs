@@ -1,15 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { URLSearchParams, fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
 import * as v from "valibot";
 import { init, setProvider, useModel, useSandbox, useSkill, useSubagent, useTool } from "@flue/runtime";
-import { start } from "@flue/runtime/node";
+import { sqlite, start } from "@flue/runtime/node";
 
 import {
   isToolInputObjectSchema,
@@ -50,6 +51,7 @@ import {
   resolveFlueDatabasePath,
   runGrclankerFlueAgent,
 } from "../dist/flue/run.js";
+import { flueConversationStreamPath, readPriorSensitiveValues, sensitiveValuesFromConversationRecords } from "../dist/flue/history.js";
 import {
   ARGUMENTS_WITHHELD_NOTE,
   REDACTED_VALUE,
@@ -637,6 +639,74 @@ test("bridged tools validate through the shim, execute once, and return Flue env
     "first\n[image content omitted: image/png]",
   );
   assert.deepEqual(toFlueToolResult("t", { content: [{ type: "text", text: " padded " }], details: {} }), { output: "padded" });
+});
+
+test("bridged tool errors withhold echoed arguments and credentials before the model sees them", async () => {
+  const credential = "flue-bridge-credential-sentinel-6228";
+  const query = "flue-bridge-argument-sentinel-6228";
+  const parameters = Type.Object({
+    api_token: Type.String(),
+    query: Type.String(),
+  });
+
+  const failing = toFlueTool(
+    createFakePiTool({
+      parameters,
+      prepareArguments: undefined,
+      async execute(_toolCallId, args) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `credential rejected: ${args.api_token}\n\nReceived arguments:\n${JSON.stringify(args)}`,
+            },
+          ],
+          details: { args },
+          isError: true,
+        };
+      },
+    }).tool,
+  );
+  await assert.rejects(failing.run(fakeRunContext({ api_token: credential, query })), (error) => {
+    assert.ok(error instanceof GrclankerToolError);
+    assert.equal(error.message, `credential rejected: ${REDACTED_VALUE} ${ARGUMENTS_WITHHELD_NOTE}`);
+    assert.equal(error.message.includes("Received arguments:"), false);
+    assert.equal(error.message.includes(credential), false);
+    assert.equal(error.message.includes(query), false, "the echoed payload is withheld, not only the credential");
+    assert.equal(error.details.args.api_token, REDACTED_VALUE);
+    assert.equal(error.details.args.query, query, "non-credential details stay available for diagnostics");
+    return true;
+  });
+
+  const throwing = toFlueTool(
+    createFakePiTool({
+      parameters,
+      prepareArguments: undefined,
+      async execute() {
+        throw new Error(`upstream said ${credential} for ${query}`);
+      },
+    }).tool,
+  );
+  await assert.rejects(throwing.run(fakeRunContext({ api_token: credential, query })), (error) => {
+    assert.ok(error instanceof GrclankerToolError);
+    assert.equal(error.message, `upstream said ${REDACTED_VALUE} for ${query}`);
+    return true;
+  });
+
+  const aborting = toFlueTool(
+    createFakePiTool({
+      async execute() {
+        const error = new Error("The operation was aborted");
+        error.name = "AbortError";
+        throw error;
+      },
+    }).tool,
+  );
+  await assert.rejects(aborting.run(fakeRunContext({ query: "x" })), (error) => {
+    assert.equal(error instanceof GrclankerToolError, false);
+    assert.equal(error.name, "AbortError");
+    return true;
+  });
 });
 
 test("shipped prompts load as the instruction document, workflow skills, and subagent roles", () => {
@@ -1312,6 +1382,172 @@ test("runner activity lines never echo credentials passed as tool arguments", as
   assert.equal(line, '-> custom_tool {"api_key":"[redacted]","nested":{"private_key":"[redacted]"}}');
 });
 
+test("runner reply and failure text lose credentials seen in tool inputs", async () => {
+  const apiToken = "cfut_9f8e7d6c5b4a-SECRET-TOKEN";
+  const baseDeps = {
+    prepare: () => {},
+    start: async () => ({ stop: async () => {} }),
+    sqlite: () => undefined,
+    agent: () => "fake",
+    writeErr: () => {},
+  };
+
+  const completed = await runGrclankerFlueAgent(
+    { message: "Check access", db: ":memory:" },
+    {
+      ...baseDeps,
+      init: () => ({
+        id: "conv-reply",
+        dispatch: async () => ({ submissionId: "sub-1", acceptedAt: "now", uid: "inst-1" }),
+        read: async (_receipt, readOptions) => {
+          readOptions.onEvent({
+            type: "tool-input",
+            conversationId: "c",
+            messageId: "m",
+            toolCallId: "t1",
+            toolName: "cloudflare_check_access",
+            input: { api_token: apiToken, account_id: "acct-1" },
+            position: { batch: 1, index: 0 },
+          });
+          return {
+            text: `Cloudflare rejected ${apiToken} for account acct-1`,
+            data: {},
+            submissionId: "sub-1",
+          };
+        },
+        abort: async () => {},
+      }),
+    },
+  );
+  assert.equal(completed.message, `Cloudflare rejected ${REDACTED_VALUE} for account acct-1`);
+  assert.equal(completed.message.includes(apiToken), false);
+
+  const failure = Object.assign(new Error("[flue] Agent run failed (submission sub-2)."), {
+    outcome: "failed",
+    submissionId: "sub-2",
+    cause: { message: `provider rejected token ${apiToken}` },
+  });
+  const failed = await runGrclankerFlueAgent(
+    { message: "Check access", db: ":memory:" },
+    {
+      ...baseDeps,
+      init: () => ({
+        id: "conv-fail",
+        dispatch: async () => ({ submissionId: "sub-2", acceptedAt: "now", uid: "inst-2" }),
+        read: async (_receipt, readOptions) => {
+          readOptions.onEvent({
+            type: "tool-input",
+            conversationId: "c",
+            messageId: "m",
+            toolCallId: "t1",
+            toolName: "cloudflare_check_access",
+            input: { api_token: apiToken, account_id: "acct-1" },
+            position: { batch: 1, index: 0 },
+          });
+          throw failure;
+        },
+        abort: async () => {},
+      }),
+    },
+  );
+  assert.equal(failed.error, `provider rejected token ${REDACTED_VALUE}`);
+  assert.equal(failed.error.includes(apiToken), false);
+});
+
+test("a resumed conversation redacts credentials from earlier stored tool inputs", async () => {
+  const priorToken = "cfut_prior_turn_SECRET_token";
+  const otherToken = "cfut_other_conversation_SECRET";
+  const passcode = "otp-prior-SECRET-passcode";
+  const dir = mkdtempSync(join(tmpdir(), "flue-resume-"));
+  const dbPath = join(dir, "conversations.db");
+  const streamPath = flueConversationStreamPath("grclanker", "resume-1");
+  const records = JSON.stringify([
+    { type: "user_message", text: "ignored" },
+    {
+      type: "assistant_tool_call",
+      name: "cloudflare_check_access",
+      arguments: { api_token: priorToken, account_id: "acct-1" },
+    },
+    {
+      type: "assistant_tool_call",
+      name: "vault_probe",
+      arguments: JSON.stringify({ badge: passcode, region: "eu" }),
+    },
+  ]);
+  const midpoint = Math.floor(records.length / 2);
+  const db = new DatabaseSync(dbPath);
+  db.exec(`CREATE TABLE flue_conversation_stream_batches (
+    path TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    data TEXT NOT NULL
+  )`);
+  db.exec(`CREATE TABLE flue_conversation_stream_batch_chunks (
+    path TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    data TEXT NOT NULL
+  )`);
+  db.prepare("INSERT INTO flue_conversation_stream_batches (path, seq, data) VALUES (?, ?, ?)").run(
+    streamPath,
+    0,
+    JSON.stringify({ $flueChunkCount: 2 }),
+  );
+  const insertChunk = db.prepare(
+    "INSERT INTO flue_conversation_stream_batch_chunks (path, seq, chunk_index, data) VALUES (?, ?, ?, ?)",
+  );
+  insertChunk.run(streamPath, 0, 0, records.slice(0, midpoint));
+  insertChunk.run(streamPath, 0, 1, records.slice(midpoint));
+  db.prepare("INSERT INTO flue_conversation_stream_batches (path, seq, data) VALUES (?, ?, ?)").run(
+    flueConversationStreamPath("grclanker", "other"),
+    0,
+    JSON.stringify([{ type: "assistant_tool_call", name: "cloudflare_check_access", arguments: { api_token: otherToken } }]),
+  );
+  db.close();
+
+  const schemas = new Map([
+    ["vault_probe", { type: "object", properties: { badge: { type: "string", writeOnly: true } } }],
+  ]);
+  assert.deepEqual(
+    sensitiveValuesFromConversationRecords(
+      [{ type: "assistant_tool_call", name: "vault_probe", arguments: { badge: passcode, region: "eu" } }, { type: "note" }],
+      schemas,
+    ).filter((value) => value === passcode),
+    [passcode],
+  );
+
+  const deps = {
+    prepare: () => {},
+    start: async () => ({ stop: async () => {} }),
+    sqlite: () => undefined,
+    agent: () => "fake",
+    writeErr: () => {},
+    toolParameterSchemas: () => schemas,
+    init: () => ({
+      id: "resume-1",
+      dispatch: async () => ({ submissionId: "sub-resume", acceptedAt: "now", uid: "inst-resume" }),
+      read: async () => ({
+        text: `still ${priorToken} and badge ${passcode}; leave ${otherToken}`,
+        data: {},
+        submissionId: "sub-resume",
+      }),
+      abort: async () => {},
+    }),
+  };
+
+  try {
+    const resumed = await runGrclankerFlueAgent({ message: "What was the token?", id: "resume-1", db: dbPath }, deps);
+    assert.equal(resumed.outcome, "completed");
+    assert.equal(resumed.message.includes(priorToken), false);
+    assert.equal(resumed.message.includes(passcode), false);
+    assert.equal(resumed.message, `still ${REDACTED_VALUE} and badge ${REDACTED_VALUE}; leave ${otherToken}`);
+
+    const fresh = await runGrclankerFlueAgent({ message: "new chat", db: dbPath }, deps);
+    assert.equal(fresh.message, `still ${priorToken} and badge ${passcode}; leave ${otherToken}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("runner surfaces failed settlements with Flue's recorded reason and still stops the runtime", async () => {
   let stopped = 0;
   const failure = Object.assign(new Error("[flue] Agent run failed (submission sub-9)."), {
@@ -1373,9 +1609,92 @@ test("runner surfaces failed settlements with Flue's recorded reason and still s
         writeErr: () => {},
       },
     ),
-    TypeError,
-    "non-settlement errors propagate",
+    (error) => {
+      assert.equal(typeof error, "string");
+      assert.match(error, /TypeError: unexpected/);
+      return true;
+    },
   );
+});
+
+test("unexpected read failures are rethrown as scrubbed formatted errors", async () => {
+  const secret = "cfut_unexpected_SECRET_token";
+  const failure = new Error("read failed");
+  failure.stack = `Error: read failed\n    at parse (${secret}:1:1)`;
+  failure.credential = secret;
+  failure.cause = new Error(`provider rejected ${secret}`);
+
+  function harness(thrown) {
+    let stopped = 0;
+    const stderr = [];
+    return {
+      stopped: () => stopped,
+      stderr,
+      deps: {
+        prepare: () => {},
+        start: async () => ({
+          stop: async () => {
+            stopped += 1;
+          },
+        }),
+        sqlite: () => undefined,
+        agent: () => "fake",
+        writeErr: (line) => stderr.push(line),
+        init: () => ({
+          id: "unexpected-1",
+          dispatch: async () => ({ submissionId: "sub-u", acceptedAt: "now", uid: "u" }),
+          read: async (_receipt, options) => {
+            options.onEvent({
+              type: "tool-input",
+              conversationId: "c",
+              messageId: "m",
+              toolCallId: "t1",
+              toolName: "cloudflare_check_access",
+              input: { api_token: secret },
+              position: { batch: 0, index: 0 },
+            });
+            throw thrown;
+          },
+          abort: async () => {},
+        }),
+      },
+    };
+  }
+
+  function assertScrubbed(error) {
+    assert.equal(typeof error, "string");
+    assert.equal(error.includes(secret), false);
+    return error;
+  }
+
+  const errorRun = harness(failure);
+  await assert.rejects(runGrclankerFlueAgent({ message: "hi", db: ":memory:" }, errorRun.deps), (error) => {
+    const text = assertScrubbed(error);
+    assert.ok(text.includes(`at parse (${REDACTED_VALUE}:1:1)`), text);
+    assert.ok(text.includes(`credential: '${REDACTED_VALUE}'`), text);
+    assert.ok(text.includes(`provider rejected ${REDACTED_VALUE}`), text);
+    return true;
+  });
+  assert.equal(errorRun.stopped(), 1);
+  assert.equal(errorRun.stderr.some((line) => line.includes(secret)), false);
+
+  const plainRun = harness({ detail: secret, note: "not an Error" });
+  await assert.rejects(runGrclankerFlueAgent({ message: "hi", db: ":memory:" }, plainRun.deps), (error) => {
+    const text = assertScrubbed(error);
+    assert.ok(text.includes(`detail: '${REDACTED_VALUE}'`), text);
+    return true;
+  });
+
+  const cliRun = harness(failure);
+  const io = { writeOut() {}, writeErr(line) { cliRun.stderr.push(line); } };
+  await assert.rejects(runFlueCommand(["run", "-m", "hi", "--db", ":memory:"], io, cliRun.deps), (error) => {
+    const text = assertScrubbed(error);
+    assert.ok(text.includes(`at parse (${REDACTED_VALUE}:1:1)`), text);
+    assert.ok(text.includes(`credential: '${REDACTED_VALUE}'`), text);
+    assert.ok(text.includes(`provider rejected ${REDACTED_VALUE}`), text);
+    return true;
+  });
+  assert.equal(cliRun.stderr.some((line) => line.includes(secret)), false);
 });
 
 test("runner helpers resolve database paths, activity lines, and exit codes", () => {
@@ -1556,6 +1875,74 @@ test("the agent runs end-to-end on the real Flue runtime with a faux model (no l
   assert.ok(chunks.some((chunk) => chunk.type === "tool-output"));
   assert.ok(chunks.some((chunk) => chunk.type === "tool-output-error"));
   assert.ok(chunks.some((chunk) => chunk.type === "submission-settled" && chunk.outcome === "completed"));
+});
+
+test("prior sensitive values are read back from a real Flue conversation file", async () => {
+  const { fauxProvider, fauxAssistantMessage, fauxToolCall } = await importFluePiAi();
+  const faux = fauxProvider({ models: [{ id: "grc-test" }] });
+  const secret = "cfut_stored_turn_SECRET_token";
+  const probe = createFakePiTool({
+    name: "vault_probe",
+    parameters: Type.Object({
+      api_token: Type.String({ description: "API token." }),
+      note: Type.Optional(Type.String()),
+    }),
+    prepareArguments: (args) => args,
+  });
+  const content = loadGrclankerAgentContent(cliRoot);
+
+  function GrclankerHistoryTest() {
+    return renderGrclankerAgent(
+      { useModel, useSandbox, useSkill, useSubagent, useTool },
+      {
+        model: "faux/grc-test",
+        sandbox: "none",
+        cwd: process.cwd(),
+        content,
+        tools: [toFlueTool(probe.tool)],
+        createLocalSandbox: () => {
+          throw new Error("no sandbox in this test");
+        },
+      },
+    );
+  }
+  GrclankerHistoryTest.agentName = "grclanker-history-test";
+
+  faux.setResponses([
+    () => fauxAssistantMessage([fauxToolCall("vault_probe", { api_token: secret, note: "ok" })], { stopReason: "toolUse" }),
+    () => fauxAssistantMessage("stored"),
+  ]);
+
+  const dir = mkdtempSync(join(tmpdir(), "flue-history-"));
+  const dbPath = join(dir, "conversations.db");
+  const instanceId = "history-1";
+  const flue = await start({ agents: [GrclankerHistoryTest], db: sqlite(dbPath), providers: [faux.provider] });
+  try {
+    const handle = init(GrclankerHistoryTest, { id: instanceId });
+    const receipt = await handle.dispatch("Store the token check.");
+    const reply = await handle.read(receipt);
+    assert.equal(reply.text, "stored");
+  } finally {
+    await flue.stop();
+  }
+
+  try {
+    const streamPath = flueConversationStreamPath(GrclankerHistoryTest.agentName, instanceId);
+    const values = readPriorSensitiveValues({ dbPath, streamPath });
+    if (!values.includes(secret)) {
+      const probe = new DatabaseSync(dbPath, { readOnly: true });
+      const paths = probe.prepare("SELECT path FROM flue_conversation_streams").all();
+      probe.close();
+      assert.fail(`stored tool input should yield the token (path ${streamPath}); streams ${JSON.stringify(paths)}`);
+    }
+    const elsewhere = readPriorSensitiveValues({
+      dbPath,
+      streamPath: flueConversationStreamPath(GrclankerHistoryTest.agentName, "nobody"),
+    });
+    assert.equal(elsewhere.includes(secret), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 const OLLAMA_MODELS_JSON = {
