@@ -20,6 +20,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { readResolverEnvironment, VERACODE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -1387,6 +1388,7 @@ export function resolveVeracodeConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   options: { homeDir?: string } = {},
 ): VeracodeResolvedConfig {
+  env = readResolverEnvironment(VERACODE_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const profile = asString(input.profile) ?? asString(env.VERACODE_API_PROFILE) ?? "default";
   const credentialsFile = asString(input.credentials_file)
