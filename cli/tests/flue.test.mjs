@@ -1609,9 +1609,92 @@ test("runner surfaces failed settlements with Flue's recorded reason and still s
         writeErr: () => {},
       },
     ),
-    TypeError,
-    "non-settlement errors propagate",
+    (error) => {
+      assert.equal(typeof error, "string");
+      assert.match(error, /TypeError: unexpected/);
+      return true;
+    },
   );
+});
+
+test("unexpected read failures are rethrown as scrubbed formatted errors", async () => {
+  const secret = "cfut_unexpected_SECRET_token";
+  const failure = new Error("read failed");
+  failure.stack = `Error: read failed\n    at parse (${secret}:1:1)`;
+  failure.credential = secret;
+  failure.cause = new Error(`provider rejected ${secret}`);
+
+  function harness(thrown) {
+    let stopped = 0;
+    const stderr = [];
+    return {
+      stopped: () => stopped,
+      stderr,
+      deps: {
+        prepare: () => {},
+        start: async () => ({
+          stop: async () => {
+            stopped += 1;
+          },
+        }),
+        sqlite: () => undefined,
+        agent: () => "fake",
+        writeErr: (line) => stderr.push(line),
+        init: () => ({
+          id: "unexpected-1",
+          dispatch: async () => ({ submissionId: "sub-u", acceptedAt: "now", uid: "u" }),
+          read: async (_receipt, options) => {
+            options.onEvent({
+              type: "tool-input",
+              conversationId: "c",
+              messageId: "m",
+              toolCallId: "t1",
+              toolName: "cloudflare_check_access",
+              input: { api_token: secret },
+              position: { batch: 0, index: 0 },
+            });
+            throw thrown;
+          },
+          abort: async () => {},
+        }),
+      },
+    };
+  }
+
+  function assertScrubbed(error) {
+    assert.equal(typeof error, "string");
+    assert.equal(error.includes(secret), false);
+    return error;
+  }
+
+  const errorRun = harness(failure);
+  await assert.rejects(runGrclankerFlueAgent({ message: "hi", db: ":memory:" }, errorRun.deps), (error) => {
+    const text = assertScrubbed(error);
+    assert.ok(text.includes(`at parse (${REDACTED_VALUE}:1:1)`), text);
+    assert.ok(text.includes(`credential: '${REDACTED_VALUE}'`), text);
+    assert.ok(text.includes(`provider rejected ${REDACTED_VALUE}`), text);
+    return true;
+  });
+  assert.equal(errorRun.stopped(), 1);
+  assert.equal(errorRun.stderr.some((line) => line.includes(secret)), false);
+
+  const plainRun = harness({ detail: secret, note: "not an Error" });
+  await assert.rejects(runGrclankerFlueAgent({ message: "hi", db: ":memory:" }, plainRun.deps), (error) => {
+    const text = assertScrubbed(error);
+    assert.ok(text.includes(`detail: '${REDACTED_VALUE}'`), text);
+    return true;
+  });
+
+  const cliRun = harness(failure);
+  const io = { writeOut() {}, writeErr(line) { cliRun.stderr.push(line); } };
+  await assert.rejects(runFlueCommand(["run", "-m", "hi", "--db", ":memory:"], io, cliRun.deps), (error) => {
+    const text = assertScrubbed(error);
+    assert.ok(text.includes(`at parse (${REDACTED_VALUE}:1:1)`), text);
+    assert.ok(text.includes(`credential: '${REDACTED_VALUE}'`), text);
+    assert.ok(text.includes(`provider rejected ${REDACTED_VALUE}`), text);
+    return true;
+  });
+  assert.equal(cliRun.stderr.some((line) => line.includes(secret)), false);
 });
 
 test("runner helpers resolve database paths, activity lines, and exit codes", () => {

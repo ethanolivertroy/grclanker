@@ -8,6 +8,7 @@
  */
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { inspect } from "node:util";
 import {
   init as flueInit,
   type Agent,
@@ -232,15 +233,22 @@ export async function runGrclankerFlueAgent(
         message: scrubSensitiveValues(reply.text, rememberedSensitiveValues),
       };
     } catch (error) {
-      if (!isAgentRunError(error)) throw error;
-      return {
-        id: handle.id,
-        agent: FLUE_AGENT_NAME,
-        submissionId: error.submissionId,
-        outcome: error.outcome,
-        error: scrubSensitiveValues(describeAgentRunError(error), rememberedSensitiveValues),
-      };
+      if (isAgentRunError(error)) {
+        return {
+          id: handle.id,
+          agent: FLUE_AGENT_NAME,
+          submissionId: error.submissionId,
+          outcome: error.outcome,
+          error: scrubSensitiveValues(describeAgentRunError(error), rememberedSensitiveValues),
+        };
+      }
+      // Formatted by the runtime catch below, which also covers dispatch.
+      throw error;
     }
+  } catch (error) {
+    // Both CLI sinks use console.error, which prints the cached stack, custom
+    // fields, and cause, and inspects a non-Error. Scrub that rendering.
+    throw scrubSensitiveValues(inspect(error), rememberedSensitiveValues);
   } finally {
     await flue.stop();
   }
