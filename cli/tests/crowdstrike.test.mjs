@@ -3281,6 +3281,47 @@ function ztaScores(below, total) {
   return { countZtaAssessments: async (filter) => (filter.startsWith("score:<") ? below : total) };
 }
 
+function rtrSession(id, startedMinutesAgo, endedMinutesAgo, extra = {}) {
+  return {
+    id,
+    user_id: "alice@example.com",
+    hostname: "ws-01",
+    created_at: isoHoursAgo(startedMinutesAgo / 60),
+    deleted_at: isoHoursAgo(endedMinutesAgo / 60),
+    ...extra,
+  };
+}
+
+function rtrSessions(...sessions) {
+  return { listRtrSessions: async () => sessions };
+}
+
+function usbExceptions(count) {
+  return Array.from({ length: count }, (_, index) => ({ id: `exc-${index + 1}` }));
+}
+
+function adminUsers(count) {
+  const users = Array.from({ length: count }, (_, index) => ({ uuid: `u-${index + 1}`, uid: `analyst${index + 1}@example.com`, status: "active", last_login_at: isoDaysAgo(1) }));
+  return {
+    listUserUuids: async () => users.map((user) => user.uuid),
+    getUsers: async () => users,
+    listUserRoles: async () => [{ role_id: "falcon_administrator", role_name: "Falcon Administrator" }],
+  };
+}
+
+function usersWith(change) {
+  const users = passingUsers();
+  change(users);
+  return {
+    getUsers: async () => users.users,
+    listUserRoles: async (uuid) => users.roles[uuid] ?? [],
+  };
+}
+
+function nonAdminRoles(count) {
+  return Array.from({ length: count }, (_, index) => ({ role_id: `analyst_role_${index + 1}`, role_name: `Analyst Role ${index + 1}` }));
+}
+
 function preventionWith(change) {
   const policies = passingPreventionPolicies();
   change(policies);
@@ -3338,6 +3379,41 @@ const BOUNDARY_SCENARIOS = [
   boundaryScenario("CS-22", "warn", "1898 of 2000 alerts met their SLA", () => slaAlerts(2000, 1898)),
   boundaryScenario("CS-25", "warn", "10 of 100 scored hosts are below min_zta_score (exactly zta_fail_above_per_mille)", () => ztaScores(10, 100)),
   boundaryScenario("CS-25", "fail", "11 of 100 scored hosts are below min_zta_score", () => ztaScores(11, 100)),
+  boundaryScenario("CS-07", "manual", "the longest RTR session lasts exactly max_session_minutes", () => rtrSessions(rtrSession("s-1", 60, 20, { duration: 1800 }))),
+  boundaryScenario("CS-07", "warn", "the longest RTR session lasts a second past max_session_minutes", () => rtrSessions(rtrSession("s-1", 60, 20, { duration: 1801 }))),
+  boundaryScenario("CS-07", "manual", "one user has exactly max_concurrent_sessions RTR sessions open at once", () => rtrSessions(
+    rtrSession("s-1", 25, 5),
+    rtrSession("s-2", 20, 5),
+    rtrSession("s-3", 15, 5),
+  )),
+  boundaryScenario("CS-07", "warn", "one user has one RTR session past max_concurrent_sessions open at once", () => rtrSessions(
+    rtrSession("s-1", 25, 5),
+    rtrSession("s-2", 20, 5),
+    rtrSession("s-3", 15, 5),
+    rtrSession("s-4", 10, 5),
+  )),
+  boundaryScenario("CS-08", "pass", "mass storage carries exactly max_usb_exceptions exceptions", () => deviceControlWith((details) => {
+    details.usb_settings.classes[0].exceptions = usbExceptions(25);
+  })),
+  boundaryScenario("CS-08", "warn", "mass storage carries one exception past max_usb_exceptions", () => deviceControlWith((details) => {
+    details.usb_settings.classes[0].exceptions = usbExceptions(26);
+  })),
+  boundaryScenario("CS-16", "pass", "exactly max_admins users hold an admin role", () => adminUsers(5)),
+  boundaryScenario("CS-16", "warn", "one user past max_admins holds an admin role", () => adminUsers(6)),
+  boundaryScenario("CS-16", "warn", "exactly twice max_admins users hold an admin role", () => adminUsers(10)),
+  boundaryScenario("CS-16", "fail", "one user past twice max_admins holds an admin role", () => adminUsers(11)),
+  boundaryScenario("CS-17", "pass", "an admin last logged in exactly 90 days before the assessment", () => usersWith((users) => {
+    users.users[0].last_login_at = new Date(Date.now() - 7_776_000_000).toISOString();
+  })),
+  boundaryScenario("CS-17", "fail", "an admin last logged in a millisecond more than 90 days before the assessment", () => usersWith((users) => {
+    users.users[0].last_login_at = new Date(Date.now() - 7_776_000_001).toISOString();
+  })),
+  boundaryScenario("CS-17", "pass", "a user holds exactly max_roles_per_user roles", () => usersWith((users) => {
+    users.roles["u-analyst"] = nonAdminRoles(5);
+  })),
+  boundaryScenario("CS-17", "warn", "a user holds one role past max_roles_per_user", () => usersWith((users) => {
+    users.roles["u-analyst"] = nonAdminRoles(6);
+  })),
 ];
 
 async function runBoundaryScenario({ overrides }) {
