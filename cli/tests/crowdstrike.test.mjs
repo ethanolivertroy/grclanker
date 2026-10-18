@@ -34,7 +34,7 @@ import {
 import { CROWDSTRIKE_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
 import { CROWDSTRIKE_SPEC } from "../dist/extensions/grc-tools/crowdstrike.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertBundlePathsMatchSpec, assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
 import { assertRequestConformance, recordFetchRequests, sweepCheckCompleteness } from "./helpers/spec-conformance.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
@@ -3173,9 +3173,12 @@ function contractFetch(transforms = {}) {
     const resources = read.count === undefined ? (Array.isArray(read) ? read : read.items) : [];
     const response = { resources, meta: { pagination: { total: read.count ?? resources.length } } };
     const transform = transforms[surfaceId];
-    return jsonResponse(transform ? transform(response, url, body) : response);
+    const served = transform ? transform(response, url, body) : response;
+    return served instanceof Response ? served : jsonResponse(served);
   };
 }
+
+const refusedRead = () => jsonResponse({ errors: [{ code: 403, message: "access denied, authorization failed" }] }, { status: 403 });
 
 // Leaves a read partial the way Falcon does: an ID lookup returns fewer entities than it was asked for,
 // a single-page ID query reports more IDs than it returned, and a walk reports one more record than it
@@ -3198,4 +3201,21 @@ portableContractTest("completeness sweep: a truncated source never lets a check 
   assert.deepEqual(report.unreachable, []);
   assert.deepEqual(report.undemoted, []);
   assert.ok(report.combinations > 0);
+});
+
+portableContractTest("the export writes every declared bundle path and nothing else, with and without collection errors", async () => {
+  const complete = await exportCrowdstrikeAuditBundle(contractClient(contractFetch()), sampleConfig(), createTempBase("grclanker-cs-bundle-paths-"));
+  assertBundlePathsMatchSpec(assert, complete.outputDir, CROWDSTRIKE_SPEC);
+  assert.ok(!readBundleFiles(complete.outputDir).has("_errors.log"));
+
+  const partial = await exportCrowdstrikeAuditBundle(contractClient(contractFetch({ host_groups: refusedRead })), sampleConfig(), createTempBase("grclanker-cs-bundle-paths-"));
+  assertBundlePathsMatchSpec(assert, partial.outputDir, CROWDSTRIKE_SPEC);
+  assert.ok(readBundleFiles(partial.outputDir).has("_errors.log"));
+});
+
+portableContractTest("without a cloud the bundle is named from the base_url host and the member CID, normalized as the overwrite policy states", async () => {
+  const config = sampleConfig({ cloud: undefined, baseUrl: "https://Falcon.Example.internal", memberCid: "Child CID/01" });
+  const result = await exportCrowdstrikeAuditBundle(contractClient(contractFetch(), config), config, createTempBase("grclanker-cs-bundle-name-"));
+  assert.match(result.outputDir, /\/falcon\.example\.internal-child-cid-01-audit-bundle$/);
+  assert.equal(result.zipPath, `${result.outputDir}.zip`);
 });
