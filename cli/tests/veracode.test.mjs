@@ -3065,3 +3065,109 @@ portableContractTest("every request the access check, the five assessments, and 
 
   assertRequestConformance(assert, VERACODE_SPEC, [...recorder.requests, ...memberOnly.requests]);
 });
+
+// The requests that read each swept surface: the vulnerability and license issue lists share a path and differ by type.
+const VERACODE_SWEEP_TARGETS = {
+  applications: { path: /^\/appsec\/v1\/applications$/ },
+  policies: { path: /^\/appsec\/v1\/policies$/ },
+  sandboxes: { path: /^\/appsec\/v1\/applications\/[^/]+\/sandboxes$/ },
+  findings: { path: /^\/appsec\/v2\/applications\/[^/]+\/findings$/ },
+  summary_reports: { path: /^\/appsec\/v2\/applications\/[^/]+\/summary_report$/ },
+  users: { path: /^\/api\/authn\/v2\/users$/ },
+  teams: { path: /^\/api\/authn\/v2\/teams$/ },
+  roles: { path: /^\/api\/authn\/v2\/roles$/ },
+  api_credentials: { path: /^\/api\/authn\/v2\/api_credentials\/user_id\/[^/]+$/ },
+  sca_workspaces: { path: /^\/srcclr\/v3\/workspaces$/ },
+  sca_vulnerability_issues: { path: /^\/srcclr\/v3\/workspaces\/[^/]+\/issues$/, reads: (url) => url.searchParams.get("type") === "vulnerability" },
+  sca_license_issues: { path: /^\/srcclr\/v3\/workspaces\/[^/]+\/issues$/, reads: (url) => url.searchParams.get("type") === "license" },
+  sca_libraries: { path: /^\/srcclr\/v3\/workspaces\/[^/]+\/libraries$/ },
+  sca_application_projects: { path: /^\/srcclr\/v3\/applications\/[^/]+\/projects$/ },
+  dynamic_analyses: { path: /^\/was\/configservice\/v1\/analyses$/ },
+  dynamic_analysis_scans: { path: /^\/was\/configservice\/v1\/analyses\/[^/]+\/scans$/ },
+  dynamic_scan_configurations: { path: /^\/was\/configservice\/v1\/scans\/[^/]+\/configuration$/ },
+};
+
+/**
+ * Serves the healthy route table with at most one surface failed: a refused read answers 403, a failed one 500, and a
+ * truncated list reports one record more in total_elements than its only page holds.
+ */
+function sweepVeracodeFetch(fixture, failure) {
+  const routes = veracodeRoutes(fixture);
+  const target = failure && VERACODE_SWEEP_TARGETS[failure.surfaceId];
+  return async (input) => {
+    const url = new URL(String(input));
+    const route = routes.find(([pattern]) => pattern.test(url.pathname));
+    assert.ok(route, `unexpected request to ${url.pathname}`);
+    if (!target || !target.path.test(url.pathname) || (target.reads && !target.reads(url))) return jsonResponse(route[1](url));
+    if (failure.mode === "denied") return jsonResponse({ message: "Forbidden" }, { status: 403 });
+    if (failure.mode === "error") return jsonResponse({ message: "Internal Server Error" }, { status: 500 });
+    const body = route[1](url);
+    return jsonResponse({ ...body, page: { ...body.page, total_elements: body.page.total_elements + 1 } });
+  };
+}
+
+async function assessVeracodeCompletenessInput({ fixture, failure, options }) {
+  const client = veracodeHttpClient(sweepVeracodeFetch(fixture, failure));
+  const settings = { now: NOW, ...options };
+  const results = await Promise.all([
+    assessVeracodeScanCoverage(client, settings),
+    assessVeracodePolicyCompliance(client, settings),
+    assessVeracodeFindingsHygiene(client, settings),
+    assessVeracodeScaPosture(client, settings),
+    assessVeracodeAccessControls(client, settings),
+  ]);
+  return results.flatMap((result) => result.findings);
+}
+
+const unsampledApplication = (input) => ({ ...input, options: { maxApplications: 1 } });
+const unsampledWorkspace = (input) => ({
+  ...input,
+  fixture: { ...input.fixture, workspaces: [...input.fixture.workspaces, { id: "ws-2", name: "Workspace B", projects_count: 1 }] },
+  options: { maxWorkspaces: 1 },
+});
+
+// Reads go uncollected past the sampling caps: the second application past max_applications, the second workspace
+// past max_workspaces, the second analysis past max_analyses, the eleventh scan of an analysis, and the 201st active
+// API account.
+const VERACODE_UNCOLLECTED = {
+  sandboxes: unsampledApplication,
+  findings: unsampledApplication,
+  summary_reports: unsampledApplication,
+  sca_application_projects: unsampledApplication,
+  sca_vulnerability_issues: unsampledWorkspace,
+  sca_license_issues: unsampledWorkspace,
+  sca_libraries: unsampledWorkspace,
+  dynamic_analysis_scans: (input) => ({
+    ...input,
+    fixture: { ...input.fixture, analyses: [...input.fixture.analyses, { analysis_id: "an-2", name: "Admin DAST", latest_occurrence_status: { status_type: "FINISHED_RESULTS_AVAILABLE" } }] },
+    options: { maxAnalyses: 1 },
+  }),
+  dynamic_scan_configurations: (input) => ({
+    ...input,
+    fixture: { ...input.fixture, scans: Array.from({ length: 11 }, (_, index) => ({ scan_id: `scan-${index + 1}`, target_url: "https://portal.example.com", analysis_id: "an-1" })) },
+  }),
+  api_credentials: (input) => {
+    const apiAccount = input.fixture.users.find((user) => user.account_type === "API");
+    const more = Array.from({ length: 200 }, (_, index) => ({ ...apiAccount, user_id: `u-api-${index}`, user_name: `svc-api-${index}` }));
+    return { ...input, fixture: { ...input.fixture, users: [...input.fixture.users, ...more] } };
+  },
+};
+
+function failVeracodeCompletenessSource(input, { surfaceId, mode }) {
+  if (mode === "not-collected") return VERACODE_UNCOLLECTED[surfaceId]?.(input);
+  if (!VERACODE_SWEEP_TARGETS[surfaceId] || !["truncated", "denied", "error"].includes(mode)) return undefined;
+  return { ...input, failure: { surfaceId, mode } };
+}
+
+portableContractTest("completeness sweep: a truncated, refused, failed, or uncollected source never lets a check that reads it pass", async () => {
+  const report = await sweepCheckCompleteness({
+    spec: VERACODE_SPEC,
+    createInput: () => ({ fixture: healthyFixture(), failure: undefined, options: {} }),
+    applyFailure: failVeracodeCompletenessSource,
+    assess: assessVeracodeCompletenessInput,
+  });
+  assert.deepEqual(report.baselineNotPassing, []);
+  assert.deepEqual(report.unreachable, []);
+  assert.deepEqual(report.undemoted, []);
+  assert.ok(report.combinations > 0);
+});
