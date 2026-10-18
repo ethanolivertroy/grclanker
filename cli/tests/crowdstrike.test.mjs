@@ -42,7 +42,14 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
-import { assertRequestConformance, recordFetchRequests, sweepCheckCompleteness } from "./helpers/spec-conformance.mjs";
+import {
+  assertRequestConformance,
+  certifyRuntimeBoundaryCoverage,
+  certifyRuntimeRuleDecisiveness,
+  observeRuntimeDecisionFacts,
+  recordFetchRequests,
+  sweepCheckCompleteness,
+} from "./helpers/spec-conformance.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
@@ -50,6 +57,9 @@ import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, inj
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
+
+const observedDecisionFacts = observeRuntimeDecisionFacts(CROWDSTRIKE_SPEC);
+const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
 
 const ALL_CONTROL_IDS = Array.from({ length: 25 }, (_, index) => `CS-${String(index + 1).padStart(2, "0")}`);
 const EXPECTED_TOOLS = [
@@ -3488,4 +3498,13 @@ test("byte differential fixtures: CrowdStrike assessments and export", { skip: !
   writeByteDifferentialFixture("crowdstrike", "boundary", boundary);
   const exported = await exportCrowdstrikeAuditBundle(createFakeClient(), sampleConfig(), prepareByteDifferentialExportRoot("crowdstrike"));
   writeByteDifferentialFixture("crowdstrike", "export", snapshotExportBundle(exported));
+});
+
+portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", {
+  skip: testFilterActive && "a test filter ran only part of this file",
+}, () => {
+  observedDecisionFacts.stop();
+  const boundaries = certifyRuntimeBoundaryCoverage(CROWDSTRIKE_SPEC, observedDecisionFacts.factsByCheck);
+  const rules = certifyRuntimeRuleDecisiveness(CROWDSTRIKE_SPEC, observedDecisionFacts.factsByCheck);
+  assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
 });
