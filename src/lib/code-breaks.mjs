@@ -2,6 +2,10 @@
 // Browsers fill each line greedily, so any break point inside an identifier
 // gets used whenever the identifier reaches a line end; each context gets only
 // the break points it needs.
+//
+// Inline code with no letters or digits, such as `;` or `: `, also gets
+// data-symbol, which keeps it in a box: the code face and color alone cannot
+// show where punctuation or a space starts and ends.
 
 // After a slash, or after a dot that does not start a file extension.
 const PATH_BREAK = String.raw`(?<=[^\s./_][/])(?=[^\s./_])|(?<=[^\s./_][.])(?=[^\s./_])(?![A-Za-z0-9]{1,4}$)`;
@@ -78,6 +82,7 @@ function visit(node, mode) {
   if (node.tagName === 'table') mode = columnCount(node) >= DENSE_COLUMNS ? DENSE_TABLE : TABLE;
   if (node.tagName === 'code') {
     const value = textContent(node);
+    if (!/[\p{L}\p{N}]/u.test(value)) node.properties.dataSymbol = '';
     if (value.length < mode.shortLength && !/\s/.test(value)) {
       node.properties.dataNowrap = '';
       return;

@@ -80,6 +80,16 @@ test('hyphenated numbers stay whole in running text', () => {
   assert.equal(render(item), '[1-300] rows, 30-day window, Rev5-Specific');
 });
 
+test('inline code with no letters or digits is marked as symbols', () => {
+  const marked = (value) => {
+    const code = el('code', [text(value)]);
+    run(el('p', [code]));
+    return 'dataSymbol' in code.properties;
+  };
+  assert.deepEqual([';', ': ', '[]', '->', '\\"'].map(marked), [true, true, true, true, true]);
+  assert.deepEqual(['a', 'x;', '0', '--debug', 'é'].map(marked), [false, false, false, false, false]);
+});
+
 test('code blocks are left alone', () => {
   const code = el('code', [text('cli/extensions/grc-tools/')]);
   run(el('pre', [code]));

@@ -1191,6 +1191,7 @@ details[open] > .agent-group-toggle::before {
   --docs-inline-bg: color-mix(in srgb, var(--color-surface0) 72%, transparent);
   --docs-quote-bg: color-mix(in srgb, var(--color-crust) 58%, transparent);
   --docs-subtle: var(--color-subtext0);
+  --docs-label: var(--color-subtext1);
   --docs-body: var(--color-text);
   --docs-title: var(--color-text);
   --docs-accent: var(--color-blue);
@@ -1431,15 +1432,24 @@ details[open] > .agent-group-toggle::before {
 }
 
 .docs-prose code {
-  padding: 0.1em 0.35em;
+  padding: 0;
   border: 0;
-  border-radius: 0.3rem;
-  background: var(--docs-inline-bg);
+  background: none;
   color: var(--color-yellow);
   font-family: var(--font-mono);
   font-size: 0.875em;
-  -webkit-box-decoration-break: clone;
-  box-decoration-break: clone;
+}
+
+/* Set by src/lib/code-breaks.mjs on code with no letters or digits. */
+.docs-prose code[data-symbol] {
+  padding: 0.1em 0.35em;
+  border-radius: 0.3rem;
+  background: var(--docs-inline-bg);
+}
+
+/* Headings already use the code face, so code in them keeps the heading size. */
+.docs-prose :is(h2, h3, h4) code {
+  font-size: 1em;
 }
 
 /* Set by src/lib/code-breaks.mjs on short code and hyphenated segments. */
@@ -1529,11 +1539,11 @@ details[open] > .agent-group-toggle::before {
 /* Column headers, and the labels that replace them where cells stack. */
 .docs-prose th,
 .docs-prose td[data-label]::before {
-  color: var(--docs-accent);
+  color: var(--docs-label);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   font-weight: 700;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.06em;
   line-height: 1.4;
   text-transform: uppercase;
 }
