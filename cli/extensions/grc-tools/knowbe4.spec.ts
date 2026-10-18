@@ -154,7 +154,7 @@ const PHISHING_SURFACES: readonly BatchSurfaceDefinition[] = [
   reportingSurface(
     "users",
     "/v1/users",
-    ["id"],
+    ["id", "joined_on", "last_sign_in", "current_risk_score"],
     listParameters(true, ACTIVE_STATUS),
     arrayResponse("one user per entry"),
     withoutFreeForm("each returned user"),
@@ -163,7 +163,7 @@ const PHISHING_SURFACES: readonly BatchSurfaceDefinition[] = [
   reportingSurface(
     "phishing_campaigns",
     "/v1/phishing/campaigns",
-    ["campaign_id", "hidden", "last_run", "status", "groups.group_id", "groups.name"],
+    ["campaign_id", "hidden", "last_run", "status", "groups.group_id", "groups.name", "psts.start_date"],
     listParameters(true),
     arrayResponse("one phishing campaign per entry"),
   ),
@@ -177,7 +177,7 @@ const PHISHING_SURFACES: readonly BatchSurfaceDefinition[] = [
   reportingSurface(
     "security_test_recipients",
     "/v1/phishing/security_tests/{pst_id}/recipients",
-    ["user.id"],
+    ["user.id", ...FAILURE_TIMESTAMP_KEYS, "delivered_at", "bounced_at", "scheduled_at"],
     [param("pst_id", "path", "The sampled test's pst_id read as text"), ...listParameters(false)],
     arrayResponse("one recipient per entry"),
     withoutFreeForm("each sampled test's recipients, each embedded user"),
@@ -204,6 +204,8 @@ const TRAINING_SURFACES: readonly BatchSurfaceDefinition[] = [
       "start_date",
       "end_date",
       "completion_percentage",
+      "groups.group_id",
+      "groups.name",
       ...["name", "content_type", "store_purchase_id", "store_purchased_id", "retired", "publish_date"].map((field) => `content.${field}`),
     ],
     pagedParameters(10, true, []),
@@ -212,7 +214,7 @@ const TRAINING_SURFACES: readonly BatchSurfaceDefinition[] = [
   reportingSurface(
     "training_enrollments",
     "/v1/training/enrollments",
-    ["campaign_id", "module_name", "status", "user.id", "enrollment_date", "start_date"],
+    ["campaign_id", "module_name", "status", "user.id", "enrollment_date", "start_date", "completion_date"],
     listParameters(
       true,
       param("exclude_archived_users", "query", "true", true, EXCEPT_PROBE),
