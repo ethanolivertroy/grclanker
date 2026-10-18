@@ -1,4 +1,21 @@
-export const docsSections = [
+export interface DocsSectionItem {
+  label: string;
+  slug: string;
+  /** Pages listed under this one, such as the FedRAMP processes under their hub. */
+  items?: DocsSectionItem[];
+}
+
+export interface DocsSection {
+  title: string;
+  items: DocsSectionItem[];
+}
+
+interface DocsSectionEntry extends DocsSectionItem {
+  /** Lists every page under this slug prefix beneath the item. */
+  childPrefix?: string;
+}
+
+export const docsSections: Array<{ title: string; items: DocsSectionEntry[] }> = [
   {
     title: 'Getting Started',
     items: [
@@ -8,6 +25,11 @@ export const docsSections = [
       { label: 'Quick Start', slug: 'getting-started/quick-start' },
       { label: 'Setup', slug: 'getting-started/setup' },
       { label: 'Configuration', slug: 'getting-started/configuration' },
+    ],
+  },
+  {
+    title: 'Runtimes',
+    items: [
       { label: 'Compute Backends', slug: 'getting-started/compute-backends' },
       { label: 'Cursor Agent SDK', slug: 'getting-started/agent-sdk' },
       { label: 'Flue Runtime', slug: 'getting-started/flue-runtime' },
@@ -23,14 +45,9 @@ export const docsSections = [
     ],
   },
   {
-    title: 'Tools',
+    title: 'Reference',
     items: [
       { label: 'Tool Catalog', slug: 'tools/catalog' },
-    ],
-  },
-  {
-    title: 'Specs',
-    items: [
       { label: 'Using Specs as Inputs', slug: 'specs/using-specs-as-inputs' },
     ],
   },
@@ -38,21 +55,11 @@ export const docsSections = [
     title: 'FedRAMP',
     items: [
       { label: 'Official Sources', slug: 'fedramp' },
-      { label: 'Processes', slug: 'fedramp/processes' },
-      { label: 'KSI Domains', slug: 'fedramp/ksis' },
+      { label: 'Processes', slug: 'fedramp/processes', childPrefix: 'fedramp/processes/' },
+      { label: 'KSI Domains', slug: 'fedramp/ksis', childPrefix: 'fedramp/ksi/' },
     ],
   },
 ];
-
-export interface DocsSectionItem {
-  label: string;
-  slug: string;
-}
-
-export interface DocsSection {
-  title: string;
-  items: DocsSectionItem[];
-}
 
 /**
  * Docs under this prefix are integration guides (one file per grclanker
@@ -64,20 +71,23 @@ export const integrationsDocsPrefix = 'integrations/';
 export function buildDocsSections(
   entries: Array<{ id: string; data: { title: string } }>,
 ): DocsSection[] {
-  const integrations = entries
-    .filter((entry) => entry.id.startsWith(integrationsDocsPrefix))
-    .map((entry) => ({ label: entry.data.title, slug: entry.id }))
-    .sort((a, b) => a.label.localeCompare(b.label));
+  // Generated FedRAMP pages are titled `<Name>: FedRAMP Process`, and their
+  // place in the sidebar already says what they are.
+  const pagesUnder = (prefix: string) =>
+    entries
+      .filter((entry) => entry.id.startsWith(prefix))
+      .map((entry) => ({ label: entry.data.title.replace(/: FedRAMP [^:]+$/, ''), slug: entry.id }))
+      .sort((a, b) => a.label.localeCompare(b.label));
 
-  if (integrations.length === 0) return docsSections;
-
-  const sections: DocsSection[] = [];
-  for (const section of docsSections) {
-    sections.push(section);
-    if (section.title === 'Tools') {
-      sections.push({ title: 'Integrations', items: integrations });
-    }
-  }
+  const sections: DocsSection[] = docsSections.map((section) => ({
+    title: section.title,
+    items: section.items.map(({ childPrefix, ...item }) => {
+      const items = childPrefix ? pagesUnder(childPrefix) : [];
+      return items.length ? { ...item, items } : item;
+    }),
+  }));
+  const integrations = pagesUnder(integrationsDocsPrefix);
+  if (integrations.length) sections.push({ title: 'Integrations', items: integrations });
   return sections;
 }
 
