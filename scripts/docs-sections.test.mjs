@@ -5,11 +5,11 @@ import { buildDocsSections } from '../src/lib/docs.ts';
 
 const page = (id, title) => ({ id, data: { title } });
 
-test('FedRAMP processes and KSI domains sit under their hubs without the generated suffix', () => {
+test('FedRAMP processes and KSI domains sit under their hubs, sorted by title', () => {
   const sections = buildDocsSections([
-    page('fedramp/processes/vulnerability-detection-and-response', 'Vulnerability Detection and Response: FedRAMP Process'),
-    page('fedramp/processes/agency-use', 'Agency Use of FedRAMP Certified Cloud Services: FedRAMP Process'),
-    page('fedramp/ksi/change-management', 'Change Management: FedRAMP KSI Domain'),
+    page('fedramp/processes/vulnerability-detection-and-response', 'Vulnerability Detection and Response'),
+    page('fedramp/processes/agency-use', 'Agency Use of FedRAMP Certified Cloud Services'),
+    page('fedramp/ksi/change-management', 'Change Management'),
   ]);
   const fedramp = sections.find((section) => section.title === 'FedRAMP');
   assert.deepEqual(fedramp.items, [

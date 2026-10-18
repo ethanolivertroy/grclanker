@@ -1,5 +1,5 @@
 ---
-title: "Policy and Inventory: FedRAMP KSI Domain"
+title: "Policy and Inventory"
 description: "Official Consolidated Rules summary for the PIY FedRAMP key security indicator domain."
 ---
 

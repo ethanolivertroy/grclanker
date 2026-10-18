@@ -1,5 +1,5 @@
 ---
-title: "Incident Response: FedRAMP KSI Domain"
+title: "Incident Response"
 description: "Official Consolidated Rules summary for the INR FedRAMP key security indicator domain."
 ---
 

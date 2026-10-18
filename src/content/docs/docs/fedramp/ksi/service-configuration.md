@@ -1,5 +1,5 @@
 ---
-title: "Service Configuration: FedRAMP KSI Domain"
+title: "Service Configuration"
 description: "Official Consolidated Rules summary for the SVC FedRAMP key security indicator domain."
 ---
 

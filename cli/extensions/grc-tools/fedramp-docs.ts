@@ -140,7 +140,7 @@ function processPage(
   const counts = requirementCountsByApplicability(catalog, process.id);
   const lines = [
     frontmatter(
-      `${process.name}: FedRAMP Process`,
+      process.name,
       `Official Consolidated Rules summary for the ${process.shortName} FedRAMP process, including applicability and requirements.`,
     ),
     "",
@@ -224,7 +224,7 @@ function ksiDomainPage(
   const indicators = domainIndicators(catalog, domain.id);
   const lines = [
     frontmatter(
-      `${domain.name}: FedRAMP KSI Domain`,
+      domain.name,
       `Official Consolidated Rules summary for the ${domain.shortName} FedRAMP key security indicator domain.`,
     ),
     "",

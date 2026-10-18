@@ -701,6 +701,18 @@ test("buildFedrampDocsSnapshot leaves the H1 to the docs page title", () => {
   );
 });
 
+test("buildFedrampDocsSnapshot titles process and KSI pages with their bare names", () => {
+  const files = buildFedrampDocsSnapshot(
+    normalizeFedrampConsolidatedRules(consolidatedRulesFixture),
+    docsSnapshotSources,
+  );
+  const title = (path) =>
+    files.find((file) => file.path === path)?.content.match(/^---\ntitle: (.*)\n/)?.[1];
+
+  assert.equal(title("fedramp/processes/certification-data-sharing.md"), '"Certification Data Sharing"');
+  assert.equal(title("fedramp/ksi/cloud-native-architecture.md"), '"Cloud Native Architecture"');
+});
+
 test("buildFedrampDocsSnapshot renders notifications, control mappings, and every update", () => {
   const fixture = structuredClone(consolidatedRulesFixture);
   const rule = fixture.FRR.CDS.data.all.CSO["CDS-CSO-PUB"];

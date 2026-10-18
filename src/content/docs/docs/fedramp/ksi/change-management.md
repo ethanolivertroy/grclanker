@@ -1,5 +1,5 @@
 ---
-title: "Change Management: FedRAMP KSI Domain"
+title: "Change Management"
 description: "Official Consolidated Rules summary for the CMT FedRAMP key security indicator domain."
 ---
 

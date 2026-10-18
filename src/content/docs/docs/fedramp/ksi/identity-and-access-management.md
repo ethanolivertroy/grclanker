@@ -1,5 +1,5 @@
 ---
-title: "Identity and Access Management: FedRAMP KSI Domain"
+title: "Identity and Access Management"
 description: "Official Consolidated Rules summary for the IAM FedRAMP key security indicator domain."
 ---
 

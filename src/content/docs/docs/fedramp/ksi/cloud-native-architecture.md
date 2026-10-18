@@ -1,5 +1,5 @@
 ---
-title: "Cloud Native Architecture: FedRAMP KSI Domain"
+title: "Cloud Native Architecture"
 description: "Official Consolidated Rules summary for the CNA FedRAMP key security indicator domain."
 ---
 

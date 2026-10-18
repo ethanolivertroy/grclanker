@@ -71,12 +71,10 @@ export const integrationsDocsPrefix = 'integrations/';
 export function buildDocsSections(
   entries: Array<{ id: string; data: { title: string } }>,
 ): DocsSection[] {
-  // Generated FedRAMP pages are titled `<Name>: FedRAMP Process`, and their
-  // place in the sidebar already says what they are.
   const pagesUnder = (prefix: string) =>
     entries
       .filter((entry) => entry.id.startsWith(prefix))
-      .map((entry) => ({ label: entry.data.title.replace(/: FedRAMP [^:]+$/, ''), slug: entry.id }))
+      .map((entry) => ({ label: entry.data.title, slug: entry.id }))
       .sort((a, b) => a.label.localeCompare(b.label));
 
   const sections: DocsSection[] = docsSections.map((section) => ({

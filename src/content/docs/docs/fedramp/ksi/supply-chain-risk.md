@@ -1,5 +1,5 @@
 ---
-title: "Supply Chain Risk: FedRAMP KSI Domain"
+title: "Supply Chain Risk"
 description: "Official Consolidated Rules summary for the SCR FedRAMP key security indicator domain."
 ---
 
