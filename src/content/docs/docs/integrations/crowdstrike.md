@@ -63,12 +63,7 @@ The client:
 - Caches the bearer token until shortly before `expires_in`.
 - Refreshes once on a 401.
 - Retries 429 and 5xx responses with exponential backoff while honoring `X-RateLimit-RetryAfter` and `Retry-After`.
-- Passes every error message through a redaction pass. The pass removes:
-  - The client secret and every bearer token obtained, in their encoded forms too.
-  - Any value inside a credential carrier: `Authorization` and cookie headers; auth schemes; credential-named fields, assignments, and command-line flags; URL userinfo and query strings.
-  - Bare values with a real token shape.
-
-See "Limitations and manual controls" below for the full boundary.
+- Passes every error message through a redaction pass that removes the client secret, every bearer token, and other credential values. [Error string redaction](#error-string-redaction) lists exactly what it removes.
 
 Required API client scopes (all Read):
 

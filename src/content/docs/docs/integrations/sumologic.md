@@ -60,13 +60,8 @@ The message never repeats a line, key, or value from the file.
 
 Requests use HTTP Basic authentication (`Authorization: Basic base64(accessId:accessKey)`).
 
-The client follows `token` continuation cursors on paginated endpoints. Page size is 1000 where the OpenAPI allows it, and 100 for `/v2/dashboards`, whose `limit` maximum is 100.
+The client:
 
-The `next` value is sent back only as the `token` query value of the same path on the configured base URL. It is never requested as a URL, so a URL-shaped cursor cannot send the Basic credential to another origin.
-
-The client also:
-
-- Uses `limit`/`offset` for the Collector Management and monitor search APIs.
 - Retries 429 and 5xx responses with backoff, honoring `Retry-After` when present.
 - Enforces a request timeout.
 - Scrubs error messages by the [error text rules](#error-text-carriers).
@@ -200,7 +195,11 @@ The script skips with exit code 0 when `SUMOLOGIC_ACCESS_ID` or `SUMOLOGIC_ACCES
 
 This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
 
-### Truncation
+### Pagination and truncation
+
+The client follows `token` continuation cursors on paginated endpoints. Page size is 1000 where the OpenAPI allows it, and 100 for `/v2/dashboards`, whose `limit` maximum is 100. The Collector Management and monitor search APIs page with `limit` and `offset` instead.
+
+The `next` value is sent back only as the `token` query value of the same path on the configured base URL. It is never requested as a URL, so a URL-shaped cursor cannot send the Basic credential to another origin.
 
 Truncation is reported per list.
 

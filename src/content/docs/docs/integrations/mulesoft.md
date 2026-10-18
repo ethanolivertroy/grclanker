@@ -35,13 +35,7 @@ Auth mode is chosen in this order: pre-issued token, connected app client creden
 - Connected apps exchange credentials with `POST /accounts/api/v2/oauth2/token` using `grant_type=client_credentials`.
 - Username and password log in with `POST /accounts/login`.
 - Tokens are held in memory only and refreshed before `expires_in` elapses.
-- Secrets, bearer tokens, and every secret-bearing response field are redacted from errors, tool output, and bundle snapshots. The secret-bearing fields are:
-  - `client_secret`, `clientSecret`, `password`, and tokens.
-  - Authorization values, and API and access keys.
-  - VPN `presharedKey` values and hybrid server `registrationKey` values.
-  - Signing and text keys, SNMP `community` strings, and hashes.
-  - `name`/`value` property pairs whose name matches.
-- URL-valued fields (alert and webhook `url`/`uri` values) are reduced to scheme and host.
+- Secrets, bearer tokens, and every secret-bearing response field are redacted from errors, tool output, and bundle snapshots. [Snapshot redaction](#snapshot-redaction) and [Error strings](#error-strings) list what is removed.
 
 ### Control planes
 

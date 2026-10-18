@@ -157,12 +157,6 @@ The assessments additionally read:
 - `POST /qps/rest/3.0/search/was/webappauthrecord`
 - `POST /qps/rest/3.0/search/was/wasscanschedule`
 
-Pagination rules:
-
-- Every XML list follows its `WARNING/URL` continuation.
-- Every QPS search pages with `hasMoreRecords` and `lastId`.
-- A page that fills `limitResults` without `hasMoreRecords` is treated as a possible continuation and recorded as truncated when it cannot be followed.
-
 ### `qualys_assess_scan_coverage`
 
 Controls 1, 2, 3, 14, 16, 20:
@@ -297,7 +291,13 @@ The script skips with exit code 0 when no credentials are present. With `QUALYS_
 
 ## How the tools handle evidence
 
-This section is reference for reviewing findings and bundles: how the client handles rate limits and retries and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+This section is reference for reviewing findings and bundles: how the client pages through lists and handles rate limits and retries, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Pagination
+
+- Every XML list follows its `WARNING/URL` continuation.
+- Every QPS search pages with `hasMoreRecords` and `lastId`.
+- A page that fills `limitResults` without `hasMoreRecords` is treated as a possible continuation and recorded as truncated when it cannot be followed.
 
 ### Rate limits and retries
 

@@ -12,25 +12,7 @@ Every finding carries the references from the compliance mapping table in `specs
 
 ## Setup and authentication
 
-Configure one product or both. When only one product is configured, the other product's controls become `manual` findings that state exactly which evidence a human must collect.
-
-The cross-product controls are the exception: PA-19 (admin roles), PA-20 (logging and SIEM), and PA-21 (data loss prevention). Each evaluates whichever product is configured and caps at `warn` when only one is. As a result, a single configured product that is compliant renders `warn`, not `manual` and not `pass`.
-
-The verdict for a non-compliant product depends on the finding:
-
-- **PA-21:** Fails when no configured product is compliant, whichever product that is.
-  - A Prisma Cloud tenant alone with no enabled data security policy fails.
-  - A PAN-OS estate alone with no data filtering profile attached to an allow rule fails too.
-  - PA-21 warns when one of two configured products is compliant.
-- **PA-19 and PA-20:** Fail only on their PAN-OS half. A non-compliant Prisma Cloud half warns, so a Prisma Cloud tenant alone never renders worse than `warn` on those two.
-  - PAN-OS half: Superusers above the threshold or password complexity disabled (PA-19), and rules with `log-end=no` or no syslog or Panorama forwarding (PA-20).
-  - Prisma Cloud half: System Admin roles above the threshold or zero roles returned (PA-19), and no SIEM integration (PA-20).
-
-The `manual` cases are:
-
-- The absence of both products.
-- A failed read of a surface the finding depends on (the partial-view rule under [Unreadable surfaces](#unreadable-surfaces)).
-- For PA-19, zero readable PAN-OS administrators.
+Configure one product or both. When only one product is configured, the other product's controls become `manual` findings that state exactly which evidence a human must collect. The three [cross-product controls](#cross-product-controls) are the exception.
 
 ### Prisma Cloud
 
@@ -59,13 +41,6 @@ The client first calls `POST /api/v1/authenticate` with the access key ID and se
 Only System Admin users (mapped to the Compute Administrator role) can call the Compute API.
 
 Read endpoints used: `/defenders`, `/policies/runtime/container`, `/policies/compliance/container`, `/policies/compliance/host`, `/policies/vulnerability/images`, `/settings/registry`, `/registry`, `/images`, `/stats/vulnerabilities`, `/stats/compliance`, `/cloud/discovery`, and `/scans`.
-
-List endpoints (`/defenders`, `/registry`, `/images`, `/cloud/discovery`, `/scans`) are paged with `limit` and `offset` (50 per page, 500 records per surface). The loop records truncation, with the reason, in these cases:
-
-- The 500-record cap is reached while full pages are still being returned.
-- The console answers consecutive offsets with the same page (a stuck offset).
-
-Either case caps the dependent findings at `warn` and names the reason in the summary.
 
 ### PAN-OS firewalls and Panorama
 
@@ -189,6 +164,26 @@ Status semantics:
 - `warn`: Partial evidence or a heuristic concern.
 - `fail`: The evidence contradicted the control.
 - `manual`: The control cannot be verified through the configured APIs, and the summary states the evidence a human must collect.
+
+### Cross-product controls
+
+Most controls read one product and become `manual` when that product is not configured. The cross-product controls, PA-19 (admin roles), PA-20 (logging and SIEM), and PA-21 (data loss prevention), evaluate whichever product is configured and cap at `warn` when only one is. As a result, a single configured product that is compliant renders `warn`, not `manual` and not `pass`.
+
+The verdict for a non-compliant product depends on the finding:
+
+- **PA-21:** Fails when no configured product is compliant, whichever product that is.
+  - A Prisma Cloud tenant alone with no enabled data security policy fails.
+  - A PAN-OS estate alone with no data filtering profile attached to an allow rule fails too.
+  - PA-21 warns when one of two configured products is compliant.
+- **PA-19 and PA-20:** Fail only on their PAN-OS half. A non-compliant Prisma Cloud half warns, so a Prisma Cloud tenant alone never renders worse than `warn` on those two.
+  - PAN-OS half: Superusers above the threshold or password complexity disabled (PA-19), and rules with `log-end=no` or no syslog or Panorama forwarding (PA-20).
+  - Prisma Cloud half: System Admin roles above the threshold or zero roles returned (PA-19), and no SIEM integration (PA-20).
+
+The `manual` cases are:
+
+- The absence of both products.
+- A failed read of a surface the finding depends on (the partial-view rule under [Unreadable surfaces](#unreadable-surfaces)).
+- For PA-19, zero readable PAN-OS administrators.
 
 ### Per-control evaluation
 
@@ -505,7 +500,10 @@ Alert pagination follows `nextPageToken` to completion. The loop records truncat
 - A token repeats (a stuck cursor).
 - `totalRows` exceeds what was read.
 
-Compute lists record truncation at the 500-record cap or on a stuck offset.
+Compute list endpoints (`/defenders`, `/registry`, `/images`, `/cloud/discovery`, `/scans`) are paged with `limit` and `offset` (50 per page, 500 records per surface). The loop records truncation, with the reason, when either of these happens:
+
+- The 500-record cap is reached while full pages are still being returned.
+- The console answers consecutive offsets with the same page (a stuck offset).
 
 Truncation caps these findings at `warn`: PA-02, PA-03, PA-05, PA-06 (alerts), and the Compute findings that read the truncated list. The summary and `partial_inventory` evidence name the reason.
 
