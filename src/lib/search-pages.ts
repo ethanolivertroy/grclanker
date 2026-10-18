@@ -19,7 +19,8 @@ const sitePages = [
 // docs text. Their body text would make the static index the browser downloads
 // about eight times larger, so they are indexed by title, description,
 // headings, and the identifiers each section mentions, such as environment
-// variables, tool names, finding IDs, and control IDs.
+// variables, tool names, finding IDs, and control IDs. The word index lists
+// the sections that use their other words.
 const identifiersOnlySections = ['/docs/integrations/', '/docs/fedramp/'];
 
 // `sync:agent-sdk-tools` writes one file per registered tool, named after it.
@@ -37,7 +38,8 @@ for (const section of getDocsSections()) {
   }
 }
 
-const docsSearchPages: AdvancedIndex[] = source.getPages().map((page) => {
+/** Every docs page with all of its text. */
+export const docsSearchPages: AdvancedIndex[] = source.getPages().map((page) => {
   const slug = getDocSlug(page);
   const url = getDocHref(slug);
   return {
