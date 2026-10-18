@@ -14,29 +14,47 @@ function escapePipe(value) {
   return String(value).replaceAll("|", "\\|");
 }
 
+// Compute tool labels only repeat the tool name, so their purpose comes from
+// the first sentence of the upstream description instead.
+function toolPurpose(tool) {
+  if (tool.kind !== "compute") return tool.label;
+  const sentence = String(tool.description).match(/^.*?\.(?=\s|$)/s)?.[0] ?? tool.description;
+  return sentence.trim().replace(/\.$/, "");
+}
+
 export function buildToolCatalogMarkdown(tools = getRegisteredToolSummaries()) {
   const domainCount = tools.filter((tool) => tool.kind === "domain").length;
   const computeCount = tools.filter((tool) => tool.kind === "compute").length;
   const lines = [
     "---",
     "title: Tool Catalog",
-    "description: Bundled grclanker GRC and compute tools grouped by domain.",
+    "description: Every tool grclanker ships, with a one-line purpose for each, grouped by integration and data source.",
     "---",
     "",
-    "`grclanker tools` lists the same bundled extension registration surface the agent uses at runtime. Use `grclanker tools <name>` for detailed parameter help, or `grclanker tools --json` for automation.",
+    `grclanker ships ${domainCount} domain tools and ${computeCount} compute backend tools. The domain tools do the GRC work and are grouped below by name prefix, such as \`aws_\` for AWS or \`fedramp_\` for FedRAMP. The compute backend tools, listed last, run shell commands and read, search, and change files.`,
     "",
-    "Current bundled surface:",
-    "",
-    `- ${domainCount} domain tools`,
-    `- ${computeCount} compute backend tools`,
+    "From a terminal, `grclanker tools` prints the same list, `grclanker tools <name>` shows one tool's parameters, and `grclanker tools --json` prints the list as JSON for scripts.",
     "",
   ];
 
-  for (const group of groupRegisteredTools(tools)) {
+  const groups = groupRegisteredTools(tools);
+  const orderedGroups = [
+    ...groups.filter((group) => group.kind === "domain"),
+    ...groups.filter((group) => group.kind === "compute"),
+  ];
+
+  for (const group of orderedGroups) {
     const sortedTools = [...group.tools].sort((left, right) => left.name.localeCompare(right.name));
-    lines.push(`## ${group.group}`, "", "| Tool | Purpose |", "|---|---|");
+    lines.push(`## ${group.group}`, "");
+    if (group.kind === "compute") {
+      lines.push(
+        "Your [compute backend](/docs/getting-started/compute-backends/) decides where these run.",
+        "",
+      );
+    }
+    lines.push("| Tool | Purpose |", "|---|---|");
     for (const tool of sortedTools) {
-      lines.push(`| \`${tool.name}\` | ${escapePipe(tool.label)} |`);
+      lines.push(`| \`${tool.name}\` | ${escapePipe(toolPurpose(tool))} |`);
     }
     lines.push("");
   }
