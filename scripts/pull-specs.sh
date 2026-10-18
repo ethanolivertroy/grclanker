@@ -8,7 +8,9 @@
 set -euo pipefail
 
 SPECS_DIR="$(cd "$(dirname "$0")/.." && pwd)/specs"
-OWNER="hackIDLE"
+# The per-vendor inspector repos live under hackIDLE; grclanker itself lives under ethanolivertroy.
+LEGACY_OWNER="hackIDLE"
+SOURCE_REPO="https://github.com/ethanolivertroy/grclanker"
 SUCCESS=0
 FAIL=0
 
@@ -24,7 +26,7 @@ fetch_spec() {
   echo "Fetching ${repo}..."
 
   local content
-  content=$(gh api "repos/${OWNER}/${repo}/contents/spec.md" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null) || {
+  content=$(gh api "repos/${LEGACY_OWNER}/${repo}/contents/spec.md" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null) || {
     echo "  FAILED: ${repo}"
     FAIL=$((FAIL + 1))
     return 1
@@ -39,7 +41,8 @@ category: "${category}"
 language: "go"
 status: "spec-only"
 version: "1.0"
-source_repo: "https://github.com/${OWNER}/${repo}"
+source_repo: "${SOURCE_REPO}"
+legacy_repo: "https://github.com/${LEGACY_OWNER}/${repo}"
 ---
 
 FRONTMATTER
