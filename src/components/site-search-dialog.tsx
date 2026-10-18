@@ -20,14 +20,21 @@ import {
   SearchDialogOverlay,
   type SharedProps,
 } from 'fumadocs-ui/components/dialog/search';
-import { create } from 'zbsearch';
+import { type AnyZBSearch, create } from 'zbsearch';
 import { rankTitleMatchesFirst } from '../lib/search-ranking.mjs';
 import { createSearchTokenizer, searchWholeIdentifiersFirst } from '../lib/search-tokenizer.mjs';
+import { correctTypos } from '../lib/search-typos.mjs';
 import { searchUnknownWords } from '../lib/search-words.mjs';
 import { primaryLinks } from '../lib/site';
 
+// Typo corrections come from the words of every loaded index.
+const indexes: AnyZBSearch[] = [];
 // The exported indexes bring their own fields, but queries must be tokenized the way they were built.
-const initDB = () => create({ schema: { _: 'string' }, components: { tokenizer: createSearchTokenizer() } });
+const initDB = () => {
+  const index = create({ schema: { _: 'string' }, components: { tokenizer: createSearchTokenizer() } });
+  indexes.push(index);
+  return index;
+};
 // Fumadocs defaults to 60 hits, up to 8 per page, so one long page with many
 // matching sections can crowd the rest out of the list.
 const searchOptions = { limit: 200, groupBy: { properties: ['page_id'], maxResult: 3 } };
@@ -38,9 +45,17 @@ const wordSearch = staticClient({ from: '/api/search-words.json', initDB, search
 
 const searchMain = (query: string) => searchWholeIdentifiersFirst(staticSearch.search, query);
 
+// What each corrected query was searched as, so the dialog can say so.
+const corrections = new Map<string, string>();
+
 const client: SearchClient = {
   deps: staticSearch.deps,
-  search: async (query) => rankTitleMatchesFirst(query, await searchUnknownWords(query, searchMain, wordSearch.search)),
+  search: async (query) => {
+    const corrected = await correctTypos(query, searchMain, wordSearch.search, indexes);
+    if (corrected === query) corrections.delete(query);
+    else corrections.set(query, corrected);
+    return rankTitleMatchesFirst(corrected, await searchUnknownWords(corrected, searchMain, wordSearch.search));
+  },
 };
 
 const defaultItems = primaryLinks.map((link) => ({
@@ -67,7 +82,7 @@ function countResults(items: SearchResultItem[]) {
  * Says how many results the list holds once typing pauses. Fumadocs' own
  * status line in the dialog only reports failed searches.
  */
-function ResultCount({ search, isLoading, data, error }: UseSearchReturn) {
+function ResultCount({ search, isLoading, data, error, corrected }: UseSearchReturn & { corrected?: string }) {
   const [message, setMessage] = useState('');
 
   useEffect(() => {
@@ -76,10 +91,11 @@ function ResultCount({ search, isLoading, data, error }: UseSearchReturn) {
     if (!search || isLoading || error || data?.query !== search) return;
     const count = countResults(data.items);
     const timer = setTimeout(() => {
-      setMessage(count === 0 ? 'No pages found' : `${count} ${count === 1 ? 'result' : 'results'}`);
+      const results = `${count} ${count === 1 ? 'result' : 'results'}`;
+      setMessage(count === 0 ? 'No pages found' : corrected ? `Showing ${results} for ${corrected}` : results);
     }, 1000);
     return () => clearTimeout(timer);
-  }, [search, isLoading, data, error]);
+  }, [search, isLoading, data, error, corrected]);
 
   return (
     <p role="status" className="sr-only">
@@ -90,17 +106,25 @@ function ResultCount({ search, isLoading, data, error }: UseSearchReturn) {
 
 export default function SiteSearchDialog(props: SharedProps) {
   const search = useDocsSearch({ client });
+  const corrected = search.data && corrections.get(search.data.query);
+  // Fumadocs highlights the words of data.query in the results.
+  const data = search.data && corrected ? { ...search.data, query: corrected } : search.data;
 
   return (
-    <SearchDialog {...search} {...props}>
+    <SearchDialog {...search} data={data} {...props}>
       <SearchDialogOverlay className="site-search-overlay" />
       <SearchDialogContent className="site-search">
         <SearchDialogHeader>
           <SearchDialogIcon />
           <SearchDialogInput />
-          <ResultCount {...search} />
+          <ResultCount {...search} corrected={corrected} />
           <SearchDialogClose className="overlay-close">Close</SearchDialogClose>
         </SearchDialogHeader>
+        {corrected && (
+          <p className="search-correction">
+            Showing results for <strong>{corrected}</strong>
+          </p>
+        )}
         <SearchDialogList defaultItems={defaultItems} Empty={Empty} />
         <SearchDialogFooter className="search-hints">
           <span>
