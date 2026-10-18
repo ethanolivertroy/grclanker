@@ -22,6 +22,16 @@ import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
 import { readResolverEnvironment, VERACODE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import {
+  API_CREDENTIAL_MEMBERS,
+  COMPLETED_SCAN_STATUSES,
+  FAILED_SCAN_STATUSES,
+  FLAW_AGE_THRESHOLDS,
+  FREQUENCY_DAYS,
+  MITIGATION_ACTIONS,
+  USER_MEMBERS,
+  VERACODE_FRAMEWORK_MAPPINGS,
+} from "./veracode.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -30,9 +40,6 @@ const DEFAULT_OUTPUT_DIR = "./export/veracode";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 50;
-/** The members the documented user and API credential records carry; a 200 body with none of them is not the resource and is never read as evidence. */
-const USER_MEMBERS: readonly string[] = ["user_id", "user_name", "email_address", "roles"];
-const API_CREDENTIAL_MEMBERS: readonly string[] = ["api_id", "created_ts", "expiration_ts", "revocation_ts"];
 const DEFAULT_MAX_APPLICATIONS = 100;
 const DEFAULT_MAX_WORKSPACES = 25;
 const DEFAULT_MAX_ANALYSES = 25;
@@ -97,27 +104,32 @@ interface ControlDescriptor {
   mappings: string[];
 }
 
+function controlDefinition(number: number, title: string): ControlDescriptor {
+  const references = VERACODE_FRAMEWORK_MAPPINGS[number];
+  return { number, title, mappings: VERACODE_FRAMEWORKS.map((framework, index) => `${framework.label} ${references[index]}`) };
+}
+
 export const VERACODE_CONTROLS: ReadonlyArray<ControlDescriptor> = [
-  { number: 1, title: "Application scan coverage", mappings: ["FedRAMP SA-11", "CMMC L2 3.14.1", "SOC 2 CC7.1", "CIS Controls v8 16.12", "PCI-DSS 6.5", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-01"] },
-  { number: 2, title: "Policy compliance status", mappings: ["FedRAMP SA-11(1)", "CMMC L2 3.14.3", "SOC 2 CC7.1", "CIS Controls v8 16.2", "PCI-DSS 6.3", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-02"] },
-  { number: 3, title: "Flaw aging", mappings: ["FedRAMP SI-2", "CMMC L2 3.14.1", "SOC 2 CC7.1", "CIS Controls v8 7.4", "PCI-DSS 6.3.3", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-03"] },
-  { number: 4, title: "Scan frequency compliance", mappings: ["FedRAMP SA-11", "CMMC L2 3.14.1", "SOC 2 CC7.1", "CIS Controls v8 16.12", "PCI-DSS 6.5.6", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-01"] },
-  { number: 5, title: "SCA library currency", mappings: ["FedRAMP SA-11(2)", "CMMC L2 3.14.2", "SOC 2 CC7.1", "CIS Controls v8 16.4", "PCI-DSS 6.3.2", "STIG SRG-APP-000454", "IRAP ISM-1490", "ISMAP VM-04"] },
-  { number: 6, title: "SCA license risk", mappings: ["FedRAMP SA-4(2)", "CMMC L2 3.4.2", "SOC 2 CC3.2", "CIS Controls v8 2.2", "PCI-DSS 6.3.2", "STIG SRG-APP-000516", "IRAP ISM-1490", "ISMAP RM-01"] },
-  { number: 7, title: "Team access controls", mappings: ["FedRAMP AC-6", "CMMC L2 3.1.5", "SOC 2 CC6.3", "CIS Controls v8 6.8", "PCI-DSS 7.2.2", "STIG SRG-APP-000340", "IRAP ISM-0432", "ISMAP AC-01"] },
-  { number: 8, title: "User role audit", mappings: ["FedRAMP AC-6(5)", "CMMC L2 3.1.5", "SOC 2 CC6.3", "CIS Controls v8 5.4", "PCI-DSS 7.2.1", "STIG SRG-APP-000340", "IRAP ISM-0432", "ISMAP AC-02"] },
-  { number: 9, title: "API credential management", mappings: ["FedRAMP IA-5(1)", "CMMC L2 3.5.8", "SOC 2 CC6.1", "CIS Controls v8 5.2", "PCI-DSS 8.6.3", "STIG SRG-APP-000174", "IRAP ISM-1590", "ISMAP AM-01"] },
-  { number: 10, title: "Sandbox usage", mappings: ["FedRAMP SA-11", "CMMC L2 3.14.1", "SOC 2 CC8.1", "CIS Controls v8 16.7", "PCI-DSS 6.5", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP SD-01"] },
-  { number: 11, title: "Prescan module coverage", mappings: ["FedRAMP SA-11", "CMMC L2 3.14.1", "SOC 2 CC7.1", "CIS Controls v8 16.12", "PCI-DSS 6.5", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-01"] },
-  { number: 12, title: "Mitigation approval workflow", mappings: ["FedRAMP SI-2", "CMMC L2 3.14.1", "SOC 2 CC7.4", "CIS Controls v8 7.2", "PCI-DSS 6.3.3", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-05"] },
-  { number: 13, title: "Dynamic scan configuration", mappings: ["FedRAMP SA-11(8)", "CMMC L2 3.14.6", "SOC 2 CC7.1", "CIS Controls v8 16.6", "PCI-DSS 6.6", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-06"] },
-  { number: 14, title: "Pipeline integration status", mappings: ["FedRAMP SA-11", "CMMC L2 3.14.1", "SOC 2 CC8.1", "CIS Controls v8 16.12", "PCI-DSS 6.5.6", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP SD-02"] },
-  { number: 15, title: "Custom policy profiles", mappings: ["FedRAMP SA-11(1)", "CMMC L2 3.14.3", "SOC 2 CC7.1", "CIS Controls v8 16.2", "PCI-DSS 6.3", "STIG SRG-APP-000516", "IRAP ISM-1143", "ISMAP VM-02"] },
-  { number: 16, title: "Finding false positive rate", mappings: ["FedRAMP SA-11", "CMMC L2 3.14.1", "SOC 2 CC7.1", "CIS Controls v8 16.12", "PCI-DSS 6.5", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-07"] },
-  { number: 17, title: "Very High/High flaw density", mappings: ["FedRAMP SA-11", "CMMC L2 3.14.1", "SOC 2 CC7.1", "CIS Controls v8 16.12", "PCI-DSS 6.5", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-03"] },
-  { number: 18, title: "SCA workspace coverage", mappings: ["FedRAMP SA-11(2)", "CMMC L2 3.14.2", "SOC 2 CC7.1", "CIS Controls v8 16.4", "PCI-DSS 6.3.2", "STIG SRG-APP-000454", "IRAP ISM-1490", "ISMAP VM-04"] },
-  { number: 19, title: "Scan completion rate", mappings: ["FedRAMP SA-11", "CMMC L2 3.14.1", "SOC 2 CC7.1", "CIS Controls v8 16.12", "PCI-DSS 6.5", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-01"] },
-  { number: 20, title: "Collections compliance posture", mappings: ["FedRAMP SA-11(1)", "CMMC L2 3.14.3", "SOC 2 CC7.1", "CIS Controls v8 16.2", "PCI-DSS 6.3", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-02"] },
+  controlDefinition(1, "Application scan coverage"),
+  controlDefinition(2, "Policy compliance status"),
+  controlDefinition(3, "Flaw aging"),
+  controlDefinition(4, "Scan frequency compliance"),
+  controlDefinition(5, "SCA library currency"),
+  controlDefinition(6, "SCA license risk"),
+  controlDefinition(7, "Team access controls"),
+  controlDefinition(8, "User role audit"),
+  controlDefinition(9, "API credential management"),
+  controlDefinition(10, "Sandbox usage"),
+  controlDefinition(11, "Prescan module coverage"),
+  controlDefinition(12, "Mitigation approval workflow"),
+  controlDefinition(13, "Dynamic scan configuration"),
+  controlDefinition(14, "Pipeline integration status"),
+  controlDefinition(15, "Custom policy profiles"),
+  controlDefinition(16, "Finding false positive rate"),
+  controlDefinition(17, "Very High/High flaw density"),
+  controlDefinition(18, "SCA workspace coverage"),
+  controlDefinition(19, "Scan completion rate"),
+  controlDefinition(20, "Collections compliance posture"),
 ];
 
 export interface VeracodeFinding {
@@ -1982,23 +1994,6 @@ function businessCriticality(app: JsonRecord): string | undefined {
   return asString(asObject(app.profile)?.business_criticality)?.toUpperCase();
 }
 
-const FAILED_SCAN_STATUSES = new Set([
-  "ANALYSIS_ERRORS",
-  "SCAN_CANCELED",
-  "PRE_SCAN_FAILED",
-  "PRE_SCAN_CANCELED",
-  "NTO_PRE_SCAN_CANCELED",
-  "INCOMPLETE",
-  "MODULE_SELECTION_REQUIRED",
-]);
-
-const COMPLETED_SCAN_STATUSES = new Set([
-  "PUBLISHED",
-  "PUBLISHED_TO_VENDOR",
-  "PUBLISHED_TO_ENTERPRISE",
-  "PUBLISHED_TO_ENTERPRISEINT",
-]);
-
 type LatestScanState =
   | { kind: "none" }
   | { kind: "not_completed"; status: string }
@@ -2008,27 +2003,12 @@ type LatestScanState =
 function latestScanState(app: JsonRecord, scanType: string): LatestScanState {
   const scans = applicationScans(app).filter((scan) => asString(scan.scan_type)?.toUpperCase() === scanType);
   if (scans.length === 0) return { kind: "none" };
-  const completed = scans.filter((scan) => COMPLETED_SCAN_STATUSES.has(asString(scan.status)?.toUpperCase() ?? ""));
+  const completed = scans.filter((scan) => COMPLETED_SCAN_STATUSES.includes(asString(scan.status)?.toUpperCase() ?? ""));
   if (completed.length === 0) return { kind: "not_completed", status: asString(scans[0].status)?.toUpperCase() ?? "UNKNOWN" };
   const dates = completed.map((scan) => parseDate(scan.modified_date)).filter((date): date is Date => date !== undefined);
   if (dates.length === 0) return { kind: "missing_date" };
   return { kind: "completed", date: new Date(Math.max(...dates.map((date) => date.getTime()))) };
 }
-
-const FREQUENCY_DAYS: Readonly<Record<string, number>> = {
-  WEEKLY: 7,
-  MONTHLY: 31,
-  QUARTERLY: 92,
-  SEMI_ANNUALLY: 183,
-  ANNUALLY: 366,
-  EVERY_18_MONTHS: 548,
-  EVERY_2_YEARS: 731,
-  EVERY_3_YEARS: 1096,
-};
-
-const MITIGATION_ACTIONS = new Set(["FP", "APPDESIGN", "OSENV", "NETENV", "ACCEPTRISK", "BYENV", "BYDESIGN", "LIBRARY", "DEFER", "CUSTOMCLEANSERPROPOSED"]);
-
-const FLAW_AGE_THRESHOLDS: Readonly<Record<number, number>> = { 5: 30, 4: 60, 3: 90, 2: 180 };
 
 interface ApplicationSnapshot {
   applications: Surface<HalListResult>;
@@ -2275,7 +2255,7 @@ function evaluateScanCompletion(snapshot: ApplicationSnapshot): VeracodeFinding 
       continue;
     }
     const statuses = scans.map((scan) => asString(scan.status)?.toUpperCase() ?? "UNKNOWN");
-    const failures = statuses.filter((status) => FAILED_SCAN_STATUSES.has(status));
+    const failures = statuses.filter((status) => FAILED_SCAN_STATUSES.includes(status));
     if (failures.length > 0) failed.push({ application: applicationName(app), statuses: failures });
     else healthy += 1;
   }
@@ -2711,7 +2691,7 @@ function evaluateMitigationWorkflow(samples: ApplicationFindingsSample[], invent
       if (resolutionStatus === "PROPOSED") pendingReview.push({ application: sample.application, issue_id: asString(item.issue_id) ?? null });
       for (const annotation of asRecords(item.annotations)) {
         const action = asString(annotation.action)?.toUpperCase() ?? "";
-        if (!MITIGATION_ACTIONS.has(action)) continue;
+        if (!MITIGATION_ACTIONS.includes(action)) continue;
         mitigationsSeen += 1;
         if (!asString(annotation.comment)) unjustified.push({ application: sample.application, issue_id: asString(item.issue_id) ?? null, action });
       }
