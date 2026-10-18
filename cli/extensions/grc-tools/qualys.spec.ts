@@ -778,7 +778,7 @@ const QUALYS_SURFACES: readonly BatchSurfaceDefinition[] = [
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
 const path = (name: string): VerdictOperand => ({ kind: "path", path: name });
-type Comparator = "eq" | "ne" | "gt" | "gte" | "lt" | "lte";
+type Comparator = "eq" | "ne" | "gt" | "lt" | "lte";
 const cmp = (op: Comparator, left: string | VerdictOperand, right: PortableValue | VerdictOperand): VerdictCondition => ({
   op,
   left: typeof left === "string" ? path(left) : left,

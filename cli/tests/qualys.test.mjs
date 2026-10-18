@@ -1099,8 +1099,6 @@ const partialRouter = async (url, init) => {
   return xmlPage((id) => partialXmlRecord(url, id), url);
 };
 
-// Serves one tenant through the documented response shapes. A tenant that sets wasScanHistory answers the history
-// search (the scan search filtered by webApp.id) from it; any other tenant answers every scan search from wasScans.
 function tenantRouter(state) {
   return async (url, init) => {
     if (url.includes("/qps/rest/")) {
@@ -4421,7 +4419,6 @@ function requestedSurface(url, init) {
   return criteria.some((item) => item.field === "webApp.id") ? "was_scan_history" : surface;
 }
 
-// Serves the tenant and passes each response through the transform registered for the surface it answers.
 function contractRouter(state = contractTenant(), transforms = {}) {
   const route = tenantRouter(state);
   return async (url, init) => {
@@ -4539,7 +4536,6 @@ function scannedOn(days) {
 const UNAUTHENTICATED = { LAST_VM_AUTH_SCANNED_DATE: undefined, LAST_VM_AUTH_SCANNED_DURATION: undefined };
 const UNSCANNED = { ...UNAUTHENTICATED, LAST_VULN_SCAN_DATETIME: undefined, LAST_VM_SCANNED_DATE: undefined, LAST_VM_SCANNED_DURATION: undefined };
 
-// One open severity 5 detection of QID 91000, patchable in the knowledge base, per host, first found the given days ago.
 function detectionHostsFirstFound(...days) {
   return days.map((age, index) => ({
     ID: String(300 + index),
