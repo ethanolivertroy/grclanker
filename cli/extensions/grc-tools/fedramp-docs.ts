@@ -305,6 +305,8 @@ export function buildFedrampDocsSnapshot(
     "",
     "This section is generated from the official FedRAMP GitHub organization. grclanker uses these machine-readable materials for both CLI lookups and reviewed docs snapshots so the public site stays fast without drifting away from upstream.",
     "",
+    "To check readiness against these rules, plan the artifacts, and draft a Certification Data Sharing bundle and trust-center site, follow the [FedRAMP Readiness guide](/docs/guides/fedramp-readiness/).",
+    "",
     "## Current Grounding",
     "",
     `- Primary source: [${primary.org}/${primary.repo}](${primary.repoUrl}) → [\`${primary.path}\`](${primary.fileHtmlUrl ?? primary.rawUrl}) on \`${primary.branch}\``,

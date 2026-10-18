@@ -28,12 +28,12 @@ In the older `v0.0.1` release bundle, text after `/assess` and arguments after `
 
 1. Baseline: what system is being assessed, which frameworks matter most, and whether the focus is cryptography, vulnerabilities, or general posture.
 2. Signal gathering:
-   - CMVP status (active and historical), KEV exposure, EPSS likelihood, and ransomware linkage, plus the FedRAMP tools when FedRAMP framing matters.
+   - CMVP status (active and historical), KEV exposure, EPSS likelihood, and ransomware linkage, plus the [FedRAMP tools](/docs/guides/fedramp-readiness/) when FedRAMP framing matters.
    - For each platform in scope, the integration's `*_check_access` tool, then its `*_assess_*` tools or `*_export_audit_bundle`.
    - Two integrations differ:
      - For operator-side Google Workspace investigation or raw evidence collection with the `gws` CLI installed, the prompt switches from the posture tools to `gws_ops_check_cli` and the focused `gws_ops_*` tools. Those are `gws_ops_investigate_alerts`, `gws_ops_trace_admin_activity`, `gws_ops_review_tokens`, and `gws_ops_collect_evidence_bundle` for a separate operator evidence bundle.
      - Vanta has no assessment tools. To reconcile posture claims with a Vanta audit, the prompt uses `vanta_check_access`, then `vanta_list_audits` and `vanta_export_audit`.
-   - SCF control language, and the OSCAL tools when the assessment must roll into OSCAL artifacts.
+   - [SCF control language](/docs/guides/scf-crosswalks/), and the [OSCAL tools](/docs/guides/oscal-workspaces/) when the assessment must roll into OSCAL artifacts.
 3. Posture classification: Strong, Mixed, At Risk, or Critical, justified with evidence.
 4. Findings grouped into cryptographic assurance, exploit exposure, framework impact, and operational risk. The findings call out expired certifications, missing validation, overdue KEV remediation, and high-EPSS CVEs.
 
