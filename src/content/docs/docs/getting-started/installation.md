@@ -57,11 +57,9 @@ That setup step is where you choose the local-first or hosted model path.
 
 - Detects your OS and architecture. Bundles exist for `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64` (glibc), `win32-arm64`, and `win32-x64`. Linux musl hosts (such as Alpine) are not supported. Use a [source checkout](#install-from-source) there.
 - Downloads the bundle for your platform from the newest full release, skipping prereleases such as `v0.2.0-rc.1`. If the GitHub API is unavailable or rate limited, it follows the `releases/latest` link on github.com instead.
-- Checks the archive against the release's `SHA256SUMS.txt` when it can, and aborts on a mismatch. It prints a warning and installs without verification if any of these is true:
-  - The checksum file cannot be fetched.
-  - The checksum file has no entry for the archive.
-  - No SHA-256 tool is available.
-  - `GRCLANKER_ASSET_URL` points at a custom archive.
+- Checks the archive against `SHA256SUMS.txt`. An official GitHub download or a `GRCLANKER_RELEASE_BASE_URL` install aborts when that file cannot be fetched, has no entry for the archive, the entry is not a SHA-256 digest, the digest does not match, or (the shell installer only) neither `sha256sum` nor `shasum` is available.
+  - A custom `GRCLANKER_ASSET_URL` prints a warning and installs without verifying.
+  - A local archive with no `SHA256SUMS.txt` beside it prints a warning and installs without verifying. When that file is present, a missing entry, a digest that is not SHA-256, or a mismatch aborts the install, and the shell installer also aborts if neither `sha256sum` nor `shasum` is available.
 - Replaces `~/.local/share/grclanker` with the unpacked bundle. The bundle includes its own Node.js runtime, so you do not need Node installed.
 - Links `grclanker` into `~/.local/bin`. On Windows it writes a `grclanker.cmd` launcher there instead.
 - Warns if `~/.local/bin` is not on your `PATH`. On macOS and Linux it prints the `export PATH=...` line to add to your shell profile.
@@ -127,7 +125,7 @@ npm --prefix cli run build:bundle
 bash public/install
 ```
 
-When run from a checkout, the installer uses the newest matching bundle in `cli/release/` instead of downloading one. It checks that bundle against the `SHA256SUMS.txt` that `build:bundle` writes next to it. The install banner shows the version in `cli/package.json`.
+When run from a checkout, the installer uses the newest matching bundle in `cli/release/` instead of downloading one. If `build:bundle` wrote `SHA256SUMS.txt` next to that bundle, the installer checks the archive against it and aborts when the file does not cover the archive. If that checksum file is missing, it prints a warning and installs without verifying. The install banner shows the version in `cli/package.json`.
 
 To update a source install:
 
