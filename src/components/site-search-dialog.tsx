@@ -1,6 +1,6 @@
 'use client';
 
-import { useDocsSearch } from 'fumadocs-core/search/client';
+import { type SearchClient, useDocsSearch } from 'fumadocs-core/search/client';
 import { staticClient } from 'fumadocs-core/search/client/orama-static';
 import {
   SearchDialog,
@@ -14,9 +14,20 @@ import {
   SearchDialogOverlay,
   type SharedProps,
 } from 'fumadocs-ui/components/dialog/search';
+import { rankTitleMatchesFirst } from '../lib/search-ranking.mjs';
 import { primaryLinks } from '../lib/site';
 
-const client = staticClient({ from: '/api/search.json' });
+const staticSearch = staticClient({
+  from: '/api/search.json',
+  // Fumadocs defaults to 60 hits, up to 8 per page, so one long page with many
+  // matching sections can crowd the rest out of the list.
+  search: { limit: 200, groupBy: { properties: ['page_id'], maxResult: 3 } },
+});
+
+const client: SearchClient = {
+  deps: staticSearch.deps,
+  search: async (query) => rankTitleMatchesFirst(query, await staticSearch.search(query)),
+};
 
 const defaultItems = primaryLinks.map((link) => ({
   type: 'page' as const,
