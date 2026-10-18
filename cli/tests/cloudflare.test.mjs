@@ -2276,3 +2276,68 @@ test("byte differential fixtures: Cloudflare assessments and export artifacts", 
   const exported = await exportCloudflareAuditBundle(fixtureClient("compliant"), sampleConfig(), exportRoot);
   writeByteDifferentialFixture("cloudflare", "export", snapshotExportBundle(exported));
 });
+
+test("review conditions do not pass: missing MFA, non-Read token scopes, unused tokens, failed audits, allow rules, quarantine-only Gateway", async () => {
+  const missingMfa = await assessCloudflareIdentity(fixtureClient("compliant", {
+    async listMembers() {
+      return [{ id: "m1", status: "accepted", user: { email: "owner@example.com" }, roles: [{ name: "Administrator Read Only" }] }];
+    },
+  }));
+  assert.equal(byId(missingMfa, "CF-IAM-03").status, "warn");
+  assert.match(byId(missingMfa, "CF-IAM-03").summary, /do not have two_factor_authentication_enabled set to true/);
+
+  const falseMfa = await assessCloudflareIdentity(fixtureClient("compliant", {
+    async listMembers() {
+      return [{ id: "m1", status: "accepted", user: { email: "owner@example.com", two_factor_authentication_enabled: false }, roles: [{ name: "Administrator Read Only" }] }];
+    },
+  }));
+  assert.equal(byId(falseMfa, "CF-IAM-03").status, "warn");
+
+  const purgeToken = await assessCloudflareIdentity(fixtureClient("compliant", {
+    async getUserToken(tokenId) {
+      return {
+        id: tokenId,
+        status: "active",
+        expires_on: FUTURE,
+        policies: [{ id: "p1", permission_groups: [{ id: "pg1", name: "Cache Purge" }], resources: { "com.cloudflare.api.account.zone.zone-1": "*" } }],
+      };
+    },
+  }));
+  assert.equal(byId(purgeToken, "CF-IAM-02").status, "warn");
+  assert.match(byId(purgeToken, "CF-IAM-02").summary, /Cache Purge/);
+  assert.equal(byId(await assessCloudflareIdentity(fixtureClient("compliant")), "CF-IAM-02").status, "pass");
+
+  const unused = await assessCloudflareIdentity(fixtureClient("compliant", {
+    async listUserTokens() {
+      return [{ id: "tok-1", name: "audit", status: "active", expires_on: FUTURE, policies: [] }];
+    },
+    async listAccountTokens() {
+      return [];
+    },
+  }));
+  assert.equal(byId(unused, "CF-IAM-06").status, "warn");
+  assert.match(byId(unused, "CF-IAM-06").summary, /no last_used_on/);
+
+  const failedAudit = await assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listAuditLogs() {
+      return [{ id: "evt-1", when: RECENT, action: { type: "change_setting", result: false } }];
+    },
+  }));
+  assert.equal(byId(failedAudit, "CF-TRF-04").status, "warn");
+  assert.equal(byId(failedAudit, "CF-TRF-04").evidence.failed_actions, 1);
+
+  const allowIp = await assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listIpAccessRules() {
+      return [{ id: "ip-1", mode: "whitelist", notes: "office", modified_on: RECENT, configuration: { target: "ip", value: "192.0.2.1" } }];
+    },
+  }));
+  assert.equal(byId(allowIp, "CF-TRF-05").status, "warn");
+  assert.equal(byId(allowIp, "CF-TRF-05").evidence.allow_rules, 1);
+
+  const quarantine = await assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listGatewayRules() {
+      return [{ id: "gw-1", name: "Quarantine", action: "quarantine", enabled: true, filters: ["http"] }];
+    },
+  }));
+  assert.equal(byId(quarantine, "CF-TRF-06").status, "fail");
+});

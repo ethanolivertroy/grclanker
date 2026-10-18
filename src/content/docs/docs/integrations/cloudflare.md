@@ -204,19 +204,19 @@ CF-IAM-04 applies that to both the application list and the reusable policy list
 | 9 | Access policies | identity | CF-IAM-04 | apps carry policies, no `decision: bypass` |
 | 10 | Identity providers | identity | CF-IAM-05 | at least one non `onetimepin` provider |
 | 11 | Audit logging | traffic_controls | CF-TRF-04 | events in the last 30 days from `/audit_logs`; retention is manual |
-| 12 | Token scoping | identity | CF-IAM-01, CF-IAM-02 | auth method; `/user/tokens/verify` `status`, token `policies[].permission_groups` |
-| 13 | Token expiration | identity | CF-IAM-06 | active tokens without `expires_on` fail; manual when no token source is readable, with every token count `null`; warn with counts scoped to the readable source when `/user/tokens` or `/accounts/{account_id}/tokens` is denied or truncated |
-| 14 | Member roles | identity | CF-IAM-03 | Super Administrator role count, `two_factor_authentication_enabled` |
+| 12 | Token scoping | identity | CF-IAM-01, CF-IAM-02 | auth method; `/user/tokens/verify` `status`, token `policies[].permission_groups` whose names do not end in `Read` |
+| 13 | Token expiration | identity | CF-IAM-06 | active tokens without `expires_on`, or active past expiry, fail; an active token with a future `expires_on` and no `last_used_on` warns; manual when no token source is readable, with every token count `null`; warn with counts scoped to the readable source when `/user/tokens` or `/accounts/{account_id}/tokens` is denied or truncated |
+| 14 | Member roles | identity | CF-IAM-03 | Super Administrator role count; `two_factor_authentication_enabled` must be boolean true |
 | 15 | Page rules | traffic_controls | CF-TRF-02 | rules requested with `status=active`; `disable_security`, `security_level` essentially_off, `ssl` off/flexible, cache_everything on sensitive paths fail |
 | 16 | Rate limiting | traffic_controls | CF-TRF-01 | enabled rules with `ratelimit` in `http_ratelimit`; none fails; legacy `/rate_limits` is read only when the entry point is unreadable and caps at warn |
-| 17 | IP access rules | traffic_controls | CF-TRF-05 | `mode`, `notes`, `modified_on` staleness over 365 days |
+| 17 | IP access rules | traffic_controls | CF-TRF-05 | allow mode (`whitelist`), missing `notes`, or `modified_on` missing or older than 365 days |
 | 18 | Authenticated Origin Pulls | zone_security | CF-ZONE-11 | zone-level `/origin_tls_client_auth/settings` `enabled` or setting `tls_client_auth`, plus per-hostname associations (`enabled`, `status`, `created_at`, `updated_at`); disabled, non-active, undated, or truncated associations cap at warn |
 | 19 | Browser Integrity Check | zone_security | CF-ZONE-12 | setting `browser_check` = `on` |
 | 20 | Email obfuscation | zone_security | CF-ZONE-13 | setting `email_obfuscation` = `on` |
 | 21 | Always Use HTTPS | zone_security | CF-ZONE-08 | setting `always_use_https` = `on` |
 | 22 | Automatic HTTPS Rewrites | zone_security | CF-ZONE-09 | setting `automatic_https_rewrites` = `on` |
 | 23 | Security headers | zone_security | CF-ZONE-14 | `rewrite` rules in `http_response_headers_transform` setting CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy |
-| 24 | Gateway policies | traffic_controls | CF-TRF-06 | enabled block/isolate rules with `dns` or `http` filters; no rules fails when `/accounts/{account_id}/gateway` returns a `gateway_tag`, otherwise manual (plan) |
+| 24 | Gateway policies | traffic_controls | CF-TRF-06 | enabled `block`, `isolate`, or `override` rules with `dns` or `http` filters (`quarantine` alone does not pass); no rules fails when `/accounts/{account_id}/gateway` returns a `gateway_tag`, otherwise manual (plan) |
 | 25 | Universal SSL | zone_security | CF-ZONE-10 | `/ssl/universal/settings` `enabled`, certificate pack `status` active, certificate `expires_on` |
 | extra | DNS origin exposure | zone_security | CF-ZONE-15 | unproxied A/AAAA/CNAME records from `/dns_records` |
 
