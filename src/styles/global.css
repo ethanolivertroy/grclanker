@@ -1447,9 +1447,11 @@ details[open] > .agent-group-toggle::before {
 }
 
 .docs-prose pre {
+  --code-pad-y: 1rem;
+  --corner-width: 3rem;
   position: relative;
   margin: 1.25rem 0 1.5rem;
-  padding: 1rem 4rem 1rem 1.25rem;
+  padding: var(--code-pad-y) 1.25rem;
   overflow-x: auto;
   border: 1px solid var(--docs-border-strong);
   border-radius: 0.6rem;
@@ -1458,6 +1460,17 @@ details[open] > .agent-group-toggle::before {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   line-height: 1.7;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Holds the copy button's corner, so only the first rows wrap around it and a
+   one-row block is just tall enough for the button and its 0.5rem inset. */
+.docs-prose pre::before {
+  content: '';
+  float: right;
+  width: var(--corner-width);
+  height: calc(2.75rem + 2 * 0.5rem - 2 * var(--code-pad-y));
 }
 
 .docs-prose .shiki {
@@ -1982,16 +1995,8 @@ details[open] > .agent-group-toggle::before {
   }
 
   .docs-prose pre {
-    padding: 0.75rem 0.875rem;
-    word-break: normal;
-  }
-
-  /* Holds the copy button's corner so only the first lines wrap around it. */
-  .docs-prose pre::before {
-    content: '';
-    float: right;
-    width: 3rem;
-    height: 2.25rem;
+    --code-pad-y: 0.75rem;
+    padding: var(--code-pad-y) 0.875rem;
   }
 
   /* Each table row becomes a block, each cell labeled from its column header (data-label). */
