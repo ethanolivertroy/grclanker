@@ -3171,3 +3171,15 @@ portableContractTest("completeness sweep: a truncated, refused, failed, or uncol
   assert.deepEqual(report.undemoted, []);
   assert.ok(report.combinations > 0);
 });
+
+portableContractTest("the export writes every declared bundle path and nothing else, with and without collection errors", async () => {
+  const complete = veracodeHttpClient(recordingVeracodeFetch().fetchImpl);
+  const completeExport = await exportVeracodeAuditBundle(complete, sampleConfig(), createTempBase("grclanker-veracode-bundle-paths-"), { now: NOW });
+  assertBundlePathsMatchSpec(assert, completeExport.outputDir, VERACODE_SPEC);
+  assert.ok(!readBundleFiles(completeExport.outputDir).has("_errors.log"));
+
+  const partial = veracodeHttpClient(recordingVeracodeFetch({ denied: [/^\/api\/authn\/v2\/teams$/] }).fetchImpl);
+  const partialExport = await exportVeracodeAuditBundle(partial, sampleConfig(), createTempBase("grclanker-veracode-bundle-paths-"), { now: NOW });
+  assertBundlePathsMatchSpec(assert, partialExport.outputDir, VERACODE_SPEC);
+  assert.ok(readBundleFiles(partialExport.outputDir).has("_errors.log"));
+});
