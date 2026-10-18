@@ -30,7 +30,13 @@ import { VERACODE_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolv
 import { VERACODE_SPEC } from "../dist/extensions/grc-tools/veracode.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
-import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
+import {
+  byteDifferentialEnabled,
+  portableContractTest,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 import {
   assertRequestConformance,
   certifyRuntimeBoundaryCoverage,
@@ -3569,6 +3575,57 @@ test("boundary scenarios: each threshold edge reaches the verdict on either side
     if (status !== scenario.expected) mismatches.push(`${scenario.name}: ${status}`);
   }
   assert.deepEqual(mismatches, []);
+});
+
+function missingNullFixture() {
+  return {
+    applications: [{
+      guid: "app-1",
+      last_completed_scan_date: null,
+      profile: { name: null, business_criticality: null, business_unit: null, upload_and_scan_sca_enabled: null, policies: [{ guid: "pol-1", name: null, is_default: null, policy_compliance_status: null }], teams: null },
+      scans: [{ scan_type: "STATIC", status: "PUBLISHED", modified_date: null }],
+    }],
+    policies: [{ guid: "pol-1", name: null, type: null, finding_rules: null, scan_frequency_rules: null }],
+    sandboxes: [{ guid: "sb-1", name: null, created: null, modified: null }],
+    findings: [{ issue_id: null, finding_status: { status: "OPEN", resolution: "UNRESOLVED", resolution_status: null, first_found_date: null }, finding_details: { severity: 5 }, annotations: null }],
+    summaryReport: { static_analysis: { modules: { module: [{ name: null, loc: null, numflawssev5: null, numflawssev4: null }] } } },
+    workspaces: [{ id: "ws-1", name: null }],
+    vulnerabilityIssues: [{ id: "i1", issue_type: "vulnerability", severity: null, library: null, vulnerability: null }],
+    licenseIssues: [{ id: "i2", issue_type: "license", license: null, library: null }],
+    libraries: [{ id: "lib-1", name: null, version: null }],
+    scaProjects: { application: null, linked_projects: null },
+    analyses: [{ analysis_id: "an-1", name: null, latest_occurrence_status: null }],
+    scans: [{ scan_id: "scan-1", target_url: null, analysis_id: "an-1" }],
+    scanConfiguration: { target_url: null, auth_configuration: null, crawl_configuration: null },
+    users: [
+      { user_id: "u-1", user_name: null, email_address: null, active: true, login_enabled: true, account_type: null, saml_user: null, last_login: null, roles: null, teams: null },
+      { user_id: "u-2", user_name: null, active: true, account_type: "API", api_user: null, roles: null, teams: null },
+    ],
+    teams: [{ team_id: "t1", team_name: null }],
+    roles: [{ role_id: "r-1", role_name: null, ignore_team_restrictions: null }],
+    self: { user_id: "u-2", user_name: null, roles: null },
+    credentials: { api_id: null, created_ts: null, expiration_ts: null },
+  };
+}
+
+const PARTIAL_DENIALS = [
+  /^\/appsec\/v2\/applications\/app-2\/findings$/,
+  /^\/appsec\/v2\/applications\/app-2\/summary_report$/,
+  /^\/srcclr\/v3\/workspaces\/[^/]+\/libraries$/,
+];
+
+test("byte differential fixtures: Veracode assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  const client = (fixture, denied) => veracodeHttpClient(recordingVeracodeFetch({ fixture, denied }).fetchImpl);
+  writeByteDifferentialFixture("veracode", "representative", await runVeracodeAssessments(client(failingFixture())));
+  writeByteDifferentialFixture("veracode", "compliant", await runVeracodeAssessments(client(healthyFixture())));
+  writeByteDifferentialFixture("veracode", "denied", await runVeracodeAssessments(client(healthyFixture(), [/./])));
+  writeByteDifferentialFixture("veracode", "partial", await runVeracodeAssessments(client(healthyFixture(), PARTIAL_DENIALS)));
+  writeByteDifferentialFixture("veracode", "missing-null", await runVeracodeAssessments(client(missingNullFixture())));
+  const boundary = {};
+  for (const scenario of BOUNDARY_SCENARIOS) boundary[scenario.name] = await runBoundaryScenario(scenario);
+  writeByteDifferentialFixture("veracode", "boundary", boundary);
+  const exported = await exportVeracodeAuditBundle(client(failingFixture(), PARTIAL_DENIALS), sampleConfig(), prepareByteDifferentialExportRoot("veracode"), { now: NOW });
+  writeByteDifferentialFixture("veracode", "export", snapshotExportBundle(exported));
 });
 
 portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", {
