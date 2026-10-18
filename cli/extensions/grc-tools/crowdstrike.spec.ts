@@ -537,6 +537,10 @@ const perMille = (comparator: "lt" | "gt") => (numerator: string, denominator: s
 const perMilleBelow = perMille("lt");
 const perMilleAbove = perMille("gt");
 const unreported = (name: string): VerdictCondition => ({ op: "not", condition: { op: "defined", operand: path(name) } });
+const reported = (name: string): VerdictCondition => ({ op: "defined", operand: path(name) });
+const minus = (left: string, right: string): VerdictOperand => ({ kind: "subtract", left: path(left), right: path(right) });
+const matchesAny = (name: string, patterns: readonly string[]): VerdictCondition =>
+  any(...patterns.map((pattern): VerdictCondition => ({ op: "matches", operand: path(name), pattern, flags: "i" })));
 
 const incomplete = (...complete: string[]): VerdictCondition =>
   complete.length === 1 ? ne(complete[0], true) : any(...complete.map((name) => ne(name, true)));
@@ -586,6 +590,14 @@ const BUILD_FORMS = "A build that does not read as text turns updates off. Other
 const BUILD_CATALOG = "A policy's platform is its platform_name read as text and lowercased, and its catalog is the GET /policy/combined/sensor-update-builds/v1 read for that platform. A catalog's supported build numbers come from its returned build records whose build, trimmed and lowercased, has a pipe-separated segment of n, n-1, or n-2: the leading run of digits of that build, else the trailing run of digits of the record's sensor_version, both read as text; a record with neither offers none.";
 const SENSOR_BUILDS = `${JUDGED_BUILDS} ${BUILD_FORMS} ${BUILD_CATALOG}`;
 const ZTA_THRESHOLD = `The below-threshold filter is score:<N, where N is the ${optionValue("min_zta_score", 60, 100)}.`;
+const walkStops = (cap: string): string =>
+  `stopped at ${cap} below meta.pagination.total (or, without a total, after a full last page or a cursor that is not a whole number), at an empty page before meta.pagination.total, or at a repeated cursor that is not a whole number`;
+const SHARED_ACCOUNT_PATTERNS = [
+  "(^|[._-])(admin|administrator|root|shared|service|svc|soc|security|ops|team|helpdesk|noreply|generic|test)([._-]|$|@)",
+  "shared",
+];
+const API_CLIENT_SCOPES = "A client's scopes are the entries of its scopes array. A JSON object scope's id is its id, else name, else scope, read as text; its group is its group read as text, else the group parsed from its id; and its action is its action read as text, else the action parsed from its id. Any other scope's id is the scope read as text, with its group and action parsed from that id. Text made of a group without a colon, a colon, and an action of letters, underscores, and hyphens, with optional whitespace around each, parses to that group and action; other text parses to the whole text as the group and no action; a scope whose id does not read as text parses to neither.";
+const SENSITIVE_WRITE_SCOPE = "A scope is a sensitive write scope when its action contains write or admin in any letter case, and its group or its id, trimmed, lowercased, and with every run of whitespace or underscores turned into one hyphen, contains prevention, response, sensor-update, device-control, firewall, user-management, api-client, host, exclusion, identity-protection, alert, detect, or incident.";
 
 const CROWDSTRIKE_INPUTS: Readonly<Record<string, string>> = {
   prevention_policies_readable: "True when GET /policy/combined/prevention/v1 returned its prevention policy list without a refusal.",
@@ -672,6 +684,19 @@ const CROWDSTRIKE_INPUTS: Readonly<Record<string, string>> = {
   scored_host_total: `The meta.pagination.total of the Zero Trust Assessment read filtered to score:>=0, ${AS_NUMBER}; null when it does not read as one.`,
   below_threshold_host_count: `The meta.pagination.total of the read under the below-threshold filter alone, ${AS_NUMBER}; when it does not read as one, the number of JSON objects the walk sorted by score under that filter returned. ${ZTA_THRESHOLD}`,
   below_threshold_total_reported: `True when the read under the below-threshold filter alone reported a meta.pagination.total that reads as a number. ${ZTA_THRESHOLD}`,
+  users_readable: "True when the GET /user-management/queries/users/v1 walk and every POST /user-management/entities/users/GET/v1 lookup of the UUIDs it listed returned without a refusal.",
+  users: `One entry per returned user, in the order returned, whatever its status. local_part is the user's uid, else its email, read as text and cut before its first @, or empty when neither reads as text. roles_readable is true when the user's role grant walk, GET /user-management/combined/user-roles/v2 for its uuid, else its id, read as text, returned without a refusal. role_list_partial is true when that walk ${walkStops("500 role grants")}, or a returned grant is not a JSON object. role_count is the number of distinct texts among the user's returned role grants' role_id, else role_name, read as text. admin_role_count is the number of distinct labels, role_name, else role_id, read as text, among the user's returned role grants whose role_name or role_id contains admin in any letter case. last_login_age_ms is the milliseconds from the user's last_login_at to the assessment time when last_login_at parses as a date, else null. ${READS_AS_TEXT} ${PARSES_AS_DATE}`,
+  admin_user_count: "Number of entries in users whose admin_role_count is above 0.",
+  max_admins: `The ${optionValue("max_admins", 5, 10000, 0)}.`,
+  role_catalog_readable: "True when GET /user-management/queries/roles/v1 and every GET /user-management/entities/roles/v1 lookup of the IDs it listed returned without a refusal.",
+  max_roles_per_user: `The ${optionValue("max_roles_per_user", 5, 100)}.`,
+  api_clients_readable: "True when the GET /api-clients/queries/api-clients/v1 walk and every GET /api-clients/entities/api-clients/v1 lookup of the IDs it listed returned without a refusal.",
+  api_clients_complete: "API client list coverage.",
+  api_client_count: "Number of API clients returned by the GET /api-clients/entities/api-clients/v1 lookups.",
+  write_client_count: `Number of returned API clients with at least one sensitive write scope. ${API_CLIENT_SCOPES} ${SENSITIVE_WRITE_SCOPE}`,
+  clients_without_scope_list: "Number of returned API clients whose scopes is not an array.",
+  clients_with_actionless_scopes: `Number of returned API clients whose scopes array holds a scope without an action. ${API_CLIENT_SCOPES}`,
+  max_write_clients: `The ${optionValue("max_write_clients", 3, 10000, 0)}.`,
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -685,14 +710,18 @@ const completeFrom = (
   sources: BatchCompletenessDefinition["sources"],
 ): BatchCompletenessDefinition => ({ semantics, sources });
 
-const walkStops = (cap: string): string =>
-  `stopped at ${cap} below meta.pagination.total (or, without a total, after a full last page or a cursor that is not a whole number), at an empty page before meta.pagination.total, or at a repeated cursor that is not a whole number`;
 const offsetWalkComplete = (surfaceId: string, list: string, cap: string): BatchCompletenessDefinition => completeFrom(
   `false when the ${list} is partial: it ${walkStops(cap)}, or a returned resource is not a JSON object.`,
   [{ surfaceId, falseWhen: ["truncated"] }],
 );
-const lookupWalkComplete = (idSurfaceId: string, recordSurfaceId: string, list: string, records: string): BatchCompletenessDefinition => completeFrom(
-  `false when the ${list} is partial: its ID walk ${walkStops("rule_limit IDs")}, or the lookups of the IDs it listed returned fewer ${records} than it listed.`,
+const lookupWalkComplete = (
+  idSurfaceId: string,
+  recordSurfaceId: string,
+  list: string,
+  records: string,
+  cap = "rule_limit IDs",
+): BatchCompletenessDefinition => completeFrom(
+  `false when the ${list} is partial: its ID walk ${walkStops(cap)}, or the lookups of the IDs it listed returned fewer ${records} than it listed.`,
   [
     { surfaceId: idSurfaceId, falseWhen: ["truncated"] },
     { surfaceId: recordSurfaceId, falseWhen: ["truncated"], scope: `fewer ${records} returned than IDs listed` },
@@ -713,6 +742,7 @@ const ALERTS_COMPLETE = completeFrom(
 const SENSOR_UPDATE_POLICIES_COMPLETE = offsetWalkComplete("sensor_update_policies", "sensor update policy list", "5000 policies");
 const HOSTS_COMPLETE = offsetWalkComplete("hosts", "host list", "host_limit hosts");
 const HOST_GROUPS_COMPLETE = offsetWalkComplete("host_groups", "host group list", "5000 host groups");
+const API_CLIENTS_COMPLETE = lookupWalkComplete("api_client_ids", "api_clients", "API client list", "API clients", "user_limit IDs");
 
 type CrowdstrikeCheck = {
   id: string;
@@ -1590,6 +1620,165 @@ const SENSOR_COVERAGE_CHECKS: readonly CrowdstrikeCheck[] = [
 
 const ACCESS_GOVERNANCE = "crowdstrike_assess_access_governance";
 
+const person = (localPart: string, overrides: Readonly<Record<string, unknown>> = {}) => ({
+  local_part: localPart,
+  roles_readable: true,
+  role_list_partial: false,
+  role_count: 1,
+  admin_role_count: 0,
+  last_login_age_ms: 86400000,
+  ...overrides,
+});
+const ADMIN_ROLE = { role_count: 2, admin_role_count: 1 };
+const withAdmins = (count: number) => ({
+  users: [...Array.from({ length: count }, (_, index) => person(`analyst${index + 1}`, ADMIN_ROLE)), person("li.wei")],
+  admin_user_count: count,
+});
+const ADMIN_COUNT_HEALTHY = { users_readable: true, ...withAdmins(2), max_admins: 5 };
+const LEAST_PRIVILEGE_HEALTHY = { users_readable: true, users: ADMIN_COUNT_HEALTHY.users, role_catalog_readable: true, max_roles_per_user: 5 };
+const API_CLIENTS_HEALTHY = {
+  api_clients_readable: true,
+  api_clients_complete: true,
+  api_client_count: 4,
+  write_client_count: 0,
+  clients_without_scope_list: 0,
+  clients_with_actionless_scopes: 0,
+  max_write_clients: 3,
+};
+const LOOKS_SHARED = matchesAny("$.local_part", SHARED_ACCOUNT_PATTERNS);
+const HOLDS_ADMIN = gt("$.admin_role_count", 0);
+const SHARED_LOCAL_PART = "A local part looks shared when it contains shared in any letter case, or holds admin, administrator, root, shared, service, svc, soc, security, ops, team, helpdesk, noreply, generic, or test in any letter case as a token that starts the text or follows a dot, underscore, or hyphen, and ends the text or precedes a dot, underscore, hyphen, or @.";
+
+const ACCESS_GOVERNANCE_CHECKS: readonly CrowdstrikeCheck[] = [
+  {
+    id: "CS-16",
+    control: 16,
+    title: "RBAC - Admin Count",
+    severity: "medium",
+    owner: ACCESS_GOVERNANCE,
+    surfaces: ["user_uuids", "users", "user_roles"],
+    inputs: Object.keys(ADMIN_COUNT_HEALTHY),
+    rules: [
+      rule("manual", ne("users_readable", true)),
+      rule("fail", any(
+        some("users", all(HOLDS_ADMIN, LOOKS_SHARED)),
+        gt(minus("admin_user_count", "max_admins"), path("max_admins")),
+      )),
+      rule("warn", any(gt("admin_user_count", path("max_admins")), some("users", LOOKS_SHARED))),
+      rule("pass", always),
+    ],
+    decision: `Manual when the user list is unreadable. Fail when a user with an admin role has a local part that looks shared, or when more than twice max_admins users hold an admin role (admin_user_count minus max_admins is above max_admins). Warn when more than max_admins users hold an admin role, or when a user without an admin role has a local part that looks shared. Otherwise pass. Every returned user counts, whatever its status, and a user whose role grants are unreadable holds no admin role. ${SHARED_LOCAL_PART}`,
+    examples: [
+      example("compliant", "pass", "Two users hold an admin role, within max_admins, and no local part looks shared.", ADMIN_COUNT_HEALTHY),
+      example("partial", "warn", "Ten admins are above max_admins (5) but not above twice it.", { ...ADMIN_COUNT_HEALTHY, ...withAdmins(10) }),
+      example("noncompliant", "fail", "Eleven admins are above twice max_admins.", { ...ADMIN_COUNT_HEALTHY, ...withAdmins(11) }),
+      example("noncompliant", "fail", "With max_admins 0, a single admin is above twice it.", { ...ADMIN_COUNT_HEALTHY, ...withAdmins(1), max_admins: 0 }),
+      example("noncompliant", "fail", "An admin signs in as svc-falcon.", {
+        ...ADMIN_COUNT_HEALTHY, users: [person("svc-falcon", ADMIN_ROLE), person("li.wei")], admin_user_count: 1,
+      }),
+      example("partial", "warn", "A user without an admin role signs in as soc.team.", {
+        ...ADMIN_COUNT_HEALTHY, users: [...ADMIN_COUNT_HEALTHY.users, person("soc.team")],
+      }),
+      example("partial", "warn", "A user's local part contains shared inside a word.", {
+        ...ADMIN_COUNT_HEALTHY, users: [...ADMIN_COUNT_HEALTHY.users, person("jsharedmailbox")],
+      }),
+      example("compliant", "pass", "An admin whose local part holds admin only inside a word does not look shared.", {
+        ...ADMIN_COUNT_HEALTHY, users: [...ADMIN_COUNT_HEALTHY.users, person("badminton.fan", ADMIN_ROLE)], admin_user_count: 3,
+      }),
+      example("unreadable", "manual", "The user list was refused.", { users_readable: false }),
+    ],
+  },
+  {
+    id: "CS-17",
+    control: 17,
+    title: "RBAC - Least Privilege",
+    severity: "medium",
+    owner: ACCESS_GOVERNANCE,
+    surfaces: ["user_uuids", "users", "user_roles", "role_ids", "roles"],
+    inputs: Object.keys(LEAST_PRIVILEGE_HEALTHY),
+    constants: { stale_admin_login_after_ms: 7776000000 },
+    rules: [
+      rule("manual", ne("users_readable", true)),
+      rule("fail", some("users", all(HOLDS_ADMIN, reported("$.last_login_age_ms"), gt("$.last_login_age_ms", path("stale_admin_login_after_ms"))))),
+      rule("warn", any(
+        some("users", any(
+          gt("$.role_count", path("max_roles_per_user")),
+          all(HOLDS_ADMIN, gt(minus("$.role_count", "$.admin_role_count"), 1)),
+          all(HOLDS_ADMIN, unreported("$.last_login_age_ms")),
+          ne("$.roles_readable", true),
+          eq("$.role_list_partial", true),
+        )),
+        ne("role_catalog_readable", true),
+      )),
+      rule("pass", always),
+    ],
+    decision: "Manual when the user list is unreadable. Fail when a user with an admin role last logged in more than stale_admin_login_after_ms (7776000000 milliseconds, 90 days) before the assessment time; that period is fixed and cannot be configured. Warn when a user holds more than max_roles_per_user roles, or holds an admin role and more than one role beyond its admin roles (role_count minus admin_role_count is above 1); when a user with an admin role has no last_login_at that parses as a date; or instead of pass when a user's role grants are unreadable or partial, or when the role catalog is unreadable. Otherwise pass. Every returned user counts, whatever its status.",
+    examples: [
+      example("compliant", "pass", "Every admin logged in within 90 days and holds one role beyond its admin role.", LEAST_PRIVILEGE_HEALTHY),
+      example("compliant", "pass", "An admin who last logged in exactly 90 days ago is not stale.", {
+        ...LEAST_PRIVILEGE_HEALTHY, users: [person("jane.doe", { ...ADMIN_ROLE, last_login_age_ms: 7776000000 })],
+      }),
+      example("noncompliant", "fail", "An admin last logged in 90 days and one millisecond ago.", {
+        ...LEAST_PRIVILEGE_HEALTHY, users: [person("jane.doe", { ...ADMIN_ROLE, last_login_age_ms: 7776000001 })],
+      }),
+      example("partial", "warn", "A user holds six roles, above max_roles_per_user.", {
+        ...LEAST_PRIVILEGE_HEALTHY, users: [person("li.wei", { role_count: 6 })],
+      }),
+      example("partial", "warn", "An admin holds two roles beyond its admin role.", {
+        ...LEAST_PRIVILEGE_HEALTHY, users: [person("jane.doe", { role_count: 3, admin_role_count: 1 })],
+      }),
+      example("partial", "warn", "An admin has no last_login_at that parses as a date.", {
+        ...LEAST_PRIVILEGE_HEALTHY, users: [person("jane.doe", { ...ADMIN_ROLE, last_login_age_ms: null })],
+      }),
+      example("compliant", "pass", "Only a user without an admin role lacks a last_login_at that parses as a date.", {
+        ...LEAST_PRIVILEGE_HEALTHY, users: [person("li.wei", { last_login_age_ms: null })],
+      }),
+      example("partial", "warn", "One user's role grants were refused.", {
+        ...LEAST_PRIVILEGE_HEALTHY, users: [person("li.wei", { roles_readable: false, role_count: 0 })],
+      }),
+      example("partial", "warn", "One user's role grant walk is partial.", {
+        ...LEAST_PRIVILEGE_HEALTHY, users: [person("li.wei", { role_list_partial: true })],
+      }),
+      example("partial", "warn", "The role catalog was refused.", { ...LEAST_PRIVILEGE_HEALTHY, role_catalog_readable: false }),
+      example("unreadable", "manual", "The user list was refused.", { users_readable: false }),
+    ],
+  },
+  {
+    id: "CS-18",
+    control: 18,
+    title: "RBAC - API Client Permissions",
+    severity: "high",
+    owner: ACCESS_GOVERNANCE,
+    surfaces: ["api_client_ids", "api_clients"],
+    inputs: Object.keys(API_CLIENTS_HEALTHY),
+    rules: [
+      rule("manual", any(ne("api_clients_readable", true), eq("api_client_count", 0))),
+      rule("fail", gt("write_client_count", path("max_write_clients"))),
+      rule("warn", any(
+        gt("write_client_count", 0),
+        gt("clients_without_scope_list", 0),
+        gt("clients_with_actionless_scopes", 0),
+        incomplete("api_clients_complete"),
+      )),
+      rule("pass", always),
+    ],
+    completeness: { api_clients_complete: API_CLIENTS_COMPLETE },
+    decision: "Manual when the API client list is unreadable or returned no API client. Fail when more than max_write_clients API clients hold a sensitive write scope. Warn when at least one does, when a client has no scopes array, or when a client has a scope without an action. Warn instead of pass when the API client list is partial. Otherwise pass. The evidence reports when each client was last used, from the first of its last_used_at, last_used, and last_used_timestamp that parses as a date, against a fixed 90-day staleness period that cannot be configured; staleness never changes the verdict.",
+    examples: [
+      example("compliant", "pass", "No API client holds a sensitive write scope.", API_CLIENTS_HEALTHY),
+      example("partial", "warn", "Three clients hold a sensitive write scope, at max_write_clients.", { ...API_CLIENTS_HEALTHY, write_client_count: 3 }),
+      example("noncompliant", "fail", "Four clients hold a sensitive write scope, above max_write_clients.", { ...API_CLIENTS_HEALTHY, write_client_count: 4 }),
+      example("noncompliant", "fail", "With max_write_clients 0, one write client fails.", { ...API_CLIENTS_HEALTHY, write_client_count: 1, max_write_clients: 0 }),
+      example("noncompliant", "fail", "Four write clients fail on a partial list too.", { ...API_CLIENTS_HEALTHY, api_clients_complete: false, write_client_count: 4 }),
+      example("partial", "warn", "A client returned no scopes array.", { ...API_CLIENTS_HEALTHY, clients_without_scope_list: 1 }),
+      example("partial", "warn", "A client has a scope without an action.", { ...API_CLIENTS_HEALTHY, clients_with_actionless_scopes: 1 }),
+      example("partial", "warn", "No visible client writes, but the API client list stopped at user_limit.", { ...API_CLIENTS_HEALTHY, api_clients_complete: false }),
+      example("partial", "manual", "The API client lookups returned no client.", { ...API_CLIENTS_HEALTHY, api_client_count: 0 }),
+      example("unreadable", "manual", "The API client list was refused.", { api_clients_readable: false }),
+    ],
+  },
+];
+
 const toCheck = (check: CrowdstrikeCheck): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -1616,6 +1805,7 @@ const checks: readonly BatchCheckDefinition[] = [
   ...RESPONSE_CHECKS,
   ...DEVICE_FIREWALL_CHECKS,
   ...SENSOR_COVERAGE_CHECKS,
+  ...ACCESS_GOVERNANCE_CHECKS,
 ].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
