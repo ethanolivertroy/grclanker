@@ -2449,6 +2449,17 @@ details[open] > .agent-group-toggle::before {
   font-size: var(--text-xs);
 }
 
+.search-correction {
+  padding: 0.5rem 0.75rem;
+  color: var(--ui-muted);
+  font-size: var(--text-sm);
+}
+
+.search-correction strong {
+  color: var(--ui-text);
+  font-weight: 600;
+}
+
 @media (max-width: 767.98px) {
   .search-hints {
     display: none;
