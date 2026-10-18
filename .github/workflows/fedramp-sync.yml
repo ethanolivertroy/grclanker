@@ -37,6 +37,8 @@ jobs:
 
       - name: Sync official FedRAMP sources
         run: npm run sync:fedramp
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       # Workflows on PRs opened with GITHUB_TOKEN do not run automatically and
       # may wait for approval, so the sync must pass the CLI tests and site
