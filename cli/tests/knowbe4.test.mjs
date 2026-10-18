@@ -41,7 +41,7 @@ import { KNOWBE4_SPEC } from "../dist/extensions/grc-tools/knowbe4.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
-import { assertRequestConformance, recordFetchRequests } from "./helpers/spec-conformance.mjs";
+import { assertRequestConformance, recordFetchRequests, sweepCheckCompleteness } from "./helpers/spec-conformance.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
@@ -3013,4 +3013,76 @@ portableContractTest("every request the access check, the four assessments, and 
   await runAllKnowbe4Assessments(client);
   await exportKnowbe4AuditBundle(client, config, createTempBase("grclanker-knowbe4-request-conformance-"), { now: NOW });
   assertRequestConformance(assert, KNOWBE4_SPEC, recorder.requests);
+});
+
+const KB_LIST_CAP = 20_000;
+
+// The route serving each swept list surface, and which of its requests read that surface: the two security test lists
+// share a path, and a failed recipient read targets only pst_id 900, the newest test, which every sample window holds.
+const KB_SWEEP_TARGETS = {
+  users: { route: "GET /v1/users" },
+  groups: { route: "GET /v1/groups" },
+  phishing_campaigns: { route: "GET /v1/phishing/campaigns" },
+  security_tests: { route: "GET /v1/phishing/security_tests", reads: (url) => !url.searchParams.has("campaign_type") },
+  callback_security_tests: { route: "GET /v1/phishing/security_tests", reads: (url) => url.searchParams.get("campaign_type") === "callback" },
+  security_test_recipients: { route: KB_RECIPIENTS_ROUTE, reads: (url, pstId) => pstId === "900" },
+  training_campaigns: { route: "GET /v1/training/campaigns" },
+  training_enrollments: { route: "GET /v1/training/enrollments" },
+  store_purchases: { route: "GET /v1/training/store_purchases" },
+};
+
+/** What each assess tool returns for the input, flattened: one snapshot per area over the real client. */
+async function assessKbCompletenessInput({ fixture, routes, options }) {
+  const { client } = httpKnowbe4(fixture, { routes });
+  const findings = [];
+  for (const [area, assess] of KB_AREAS) {
+    const snapshot = await collectKnowbe4Snapshot(client, { scopes: [area], now: NOW, ...options });
+    findings.push(...assess(snapshot, { now: NOW }).findings);
+  }
+  return findings;
+}
+
+/**
+ * A truncated list serves a first page holding one record more than the 20000-record cap leaves room for, which is
+ * past user_limit too; a refused one answers 403 and a failed one 500. Recipient reads go uncollected when the sample
+ * holds fewer tests than ran in the window.
+ */
+function failKbCompletenessSource(input, { surfaceId, mode }) {
+  if (mode === "not-collected") {
+    return surfaceId === "security_test_recipients" ? { ...input, options: { securityTestSampleLimit: 1 } } : undefined;
+  }
+  const target = KB_SWEEP_TARGETS[surfaceId];
+  if (!target || !["truncated", "denied", "error"].includes(mode)) return undefined;
+  const healthy = kbRoutes(input.fixture)[target.route];
+  const failing = async (url, pstId, init) => {
+    if (target.reads && !target.reads(url, pstId)) return healthy(url, pstId, init);
+    if (mode === "denied") return jsonResponse({ message: "Forbidden" }, { status: 403, statusText: "Forbidden" });
+    if (mode === "error") return jsonResponse({ message: "Internal Server Error" }, { status: 500, statusText: "Internal Server Error" });
+    const records = await healthy(url, pstId, init).json();
+    return jsonResponse([...records, ...Array.from({ length: KB_LIST_CAP + 1 - records.length }, (_, index) => ({ filler_id: index }))]);
+  };
+  return { ...input, routes: { ...input.routes, [target.route]: failing } };
+}
+
+const kbCompletenessInput = () => ({ fixture: healthyFixture(), routes: {}, options: {} });
+
+portableContractTest("completeness sweep: a truncated, refused, failed, or uncollected source never lets a check that reads it pass", async () => {
+  const report = await sweepCheckCompleteness({
+    spec: KNOWBE4_SPEC,
+    createInput: kbCompletenessInput,
+    applyFailure: failKbCompletenessSource,
+    assess: assessKbCompletenessInput,
+  });
+  assert.deepEqual(report.baselineNotPassing, []);
+  assert.deepEqual(report.unreachable, []);
+  // The spec's one declared exception: with no user lacking activity, tests left out of the recipient sample could
+  // only clear more users, so KNOWBE4-18 passes and states the partial sample in its evidence.
+  assert.deepEqual(report.undemoted, ["KNOWBE4-18 security_test_recipients not-collected: pass"]);
+  assert.ok(report.combinations > 0);
+  const unsampled = failKbCompletenessSource(kbCompletenessInput(), { surfaceId: "security_test_recipients", mode: "not-collected" });
+  const inactive = (await assessKbCompletenessInput(unsampled)).find((item) => item.id === "KNOWBE4-18");
+  assert.deepEqual(
+    { status: inactive.status, partial: inactive.evidence.partial_activity_data, unsampled: inactive.evidence.unsampled_security_tests },
+    { status: "pass", partial: true, unsampled: 5 },
+  );
 });
