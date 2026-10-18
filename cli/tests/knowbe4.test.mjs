@@ -1764,6 +1764,43 @@ test("verdict rule 10: Knowbe4ApiClient reports Reporting API listings truncated
   assert.equal(listing.truncated, true);
 });
 
+test("verdict rule 10: a Reporting API page holding an entry that is not a JSON object ends the walk partial and names the page", async () => {
+  const served = (pages) => new Knowbe4ApiClient(sampleConfig(), {
+    fetchImpl: async (input) => jsonResponse(pages[new URL(typeof input === "string" ? input : input.toString()).searchParams.get("page")] ?? []),
+    minRequestIntervalMs: 0,
+  });
+
+  // A full page that kept fewer records than it held is not a last page, so the list cannot read as complete.
+  const fullPage = served({ 1: [{ id: 1 }, { id: 2 }], 2: [{ id: 3 }, null], 3: [{ id: 5 }, { id: 6 }] });
+  const stopped = await fullPage.list("/v1/users", {}, { limit: 10, pageSize: 2 });
+  assert.deepEqual(stopped.items.map((item) => item.id), [1, 2, 3], "the page's JSON object entries are kept");
+  assert.equal(stopped.truncated, true);
+  assert.equal(stopped.truncationReason, "the server returned an entry that is not a JSON object on page 2");
+  assert.equal(fullPage.getRequestCount(), 2, "the walk stops at the page that held the entry");
+
+  // A short page ends the walk anyway, but the entries it dropped still leave the list partial.
+  const shortPage = served({ 1: [{ id: 1 }, "user", 7] });
+  const short = await shortPage.list("/v1/groups", {}, { limit: 10, pageSize: 5 });
+  assert.deepEqual(short.items.map((item) => item.id), [1]);
+  assert.equal(short.truncated, true);
+  assert.equal(short.truncationReason, "the server returned 2 entries that are not JSON objects on page 1");
+
+  // The reason names the cap as well when the walk reached it on that page, so a cap stop is never hidden behind the entry.
+  const cutPage = served({ 1: [{ id: 1 }, { id: 2 }, { id: 3 }], 2: [{ id: 4 }, { id: 5 }, null] });
+  const cut = await cutPage.list("/v1/users", {}, { limit: 4, pageSize: 3 });
+  assert.deepEqual(cut.items.map((item) => item.id), [1, 2, 3, 4], "the cap still keeps only the records it has room for");
+  assert.equal(cut.truncated, true);
+  assert.equal(cut.truncationReason, "the server returned an entry that is not a JSON object on page 2, where the walk also reached its cap of 4 records");
+  const filled = await served({ 1: [{ id: 1 }, { id: 2 }, null] }).list("/v1/users", {}, { limit: 2, pageSize: 3 });
+  assert.equal(filled.truncationReason, "the server returned an entry that is not a JSON object on page 1, where the walk also reached its cap of 2 records", "a full page that brings the records kept to the cap names the cap");
+  const ended = await served({ 1: [{ id: 1 }, { id: 2 }, null] }).list("/v1/users", {}, { limit: 2, pageSize: 5 });
+  assert.equal(ended.truncationReason, "the server returned an entry that is not a JSON object on page 1", "a short page that fits under the cap ends the list, so the cap is not named");
+
+  const probed = served({ 1: [null] });
+  assert.deepEqual(await probed.probe("/v1/users"), []);
+  assert.equal(probed.getRequestCount(), 1, "the access probe still makes one request");
+});
+
 test("verdict rule 10: Knowbe4ApiClient reports PhishER connections truncated on caps, stuck page keys, and unreached totals", async () => {
   const phisherClient = (respond, field = "phisherMessages") => new Knowbe4ApiClient(sampleConfig({ phisherApiToken: "phisher-token" }), {
     fetchImpl: async (_input, init = {}) => jsonResponse({ data: { [field]: respond(JSON.parse(init.body).variables) } }),
@@ -2973,6 +3010,52 @@ test("silent success: a 2xx whose body is empty, an HTML page, or JSON of anothe
   await assert.rejects(() => account.client.getAccount(), /returned 200 OK with a JSON body that is not the documented JSON object \(one of name, type, domains, admins, subscription_level, subscription_end_date, number_of_seats, current_risk_score\) \(\d+ bytes, not echoed\)/);
   const phisher = httpKnowbe4(healthyFixture(), { routes: { [KB_PHISHER_ROUTE]: () => jsonResponse({ hello: "world" }) } });
   await assert.rejects(() => phisher.client.graphql("query { x }"), /returned 200 OK with a JSON body that is not the documented GraphQL response object \(data or errors\) \(\d+ bytes, not echoed\)/);
+});
+
+test("verdict rule 10: an entry that is not a JSON object in the user, enrollment, or recipient walk keeps every check built on that list from passing, and the caveat names the page", async () => {
+  const reason = "the server returned an entry that is not a JSON object on page 1";
+  const statuses = (result) => Object.fromEntries(result.findings.map((item) => [item.control, item.status]));
+  const caveat = (inventory, seen, stop) => `Truncated listing: ${inventory} (${seen} of unknown loaded; ${stop}), so this verdict only covers the records that were loaded.`;
+  const assess = async (fixture, scope, assessArea) => {
+    const snapshot = await collectKnowbe4Snapshot(httpKnowbe4(fixture).client, { scopes: [scope], now: NOW });
+    return { snapshot, result: assessArea(snapshot, { now: NOW }) };
+  };
+  const healthyPhishing = statuses((await assess(healthyFixture(), "phishing", assessKnowbe4PhishingProgram)).result);
+  const healthyTraining = statuses((await assess(healthyFixture(), "training", assessKnowbe4TrainingProgram)).result);
+  assert.ok([...Object.values(healthyPhishing), ...Object.values(healthyTraining)].every((status) => status === "pass"));
+
+  const usersFixture = healthyFixture();
+  usersFixture.users.splice(1, 0, null);
+  const users = await assess(usersFixture, "phishing", assessKnowbe4PhishingProgram);
+  assert.deepEqual(statuses(users.result), { ...healthyPhishing, 2: "warn", 9: "warn" });
+  for (const control of [2, 9]) {
+    const item = findingFor(users.result, control);
+    assert.ok(item.summary.endsWith(caveat("users", 10, reason)), `KNOWBE4-${control}: ${item.summary}`);
+    assert.doesNotMatch(item.summary, /user_limit/, "a stop the cap did not cause is not attributed to it");
+  }
+  const usersRow = knowbe4CollectionStatus(users.snapshot).inventories.find((row) => row.inventory === "users");
+  assert.deepEqual({ complete: usersRow.complete, truncated: usersRow.truncated, truncation_reason: usersRow.truncation_reason }, { complete: false, truncated: true, truncation_reason: reason });
+
+  const enrollmentFixture = healthyFixture();
+  enrollmentFixture.enrollments.push(null);
+  const enrollments = await assess(enrollmentFixture, "training", assessKnowbe4TrainingProgram);
+  assert.deepEqual(statuses(enrollments.result), { ...healthyTraining, 4: "warn", 10: "warn", 17: "warn" });
+  assert.match(findingFor(enrollments.result, 17).summary, new RegExp(`but enrollment data is partial because ${reason}, so the completion figures cover only the loaded enrollments`));
+  for (const item of enrollments.result.findings) assert.doesNotMatch(item.summary, /enrollment_limit/, `KNOWBE4-${item.control}: ${item.summary}`);
+
+  const recipientFixture = healthyFixture();
+  const [pstId, recipients] = [...recipientFixture.recipientsByTest.entries()][0];
+  recipients.push(null);
+  const recipientRun = await assess(recipientFixture, "phishing", assessKnowbe4PhishingProgram);
+  assert.deepEqual(statuses(recipientRun.result), { ...healthyPhishing, 2: "warn" });
+  const recipientCoverage = findingFor(recipientRun.result, 2);
+  assert.ok(recipientCoverage.summary.endsWith(caveat("security_test_recipients", 3, `security test ${pstId}: ${reason}`)), recipientCoverage.summary);
+
+  // Once one walk stopped for a reason, a walk the cap stopped is named beside it rather than left out.
+  const mixed = mockClient(healthyFixture());
+  mixed.listSecurityTestRecipients = async (id) => ({ items: [], truncated: id !== "902", limit: 20000, pages: 1, ...(id === "901" ? { truncationReason: reason } : {}) });
+  const mixedSnapshot = await collectKnowbe4Snapshot(mixed, { scopes: ["phishing"], now: NOW });
+  assert.equal(mixedSnapshot.securityTestRecipients.truncationReason, `security test 900: the walk reached its cap of 20000 recipients; security test 901: ${reason}`);
 });
 
 test("cookie attribute class: a later cookie whose name holds a dot or another token character goes with the header value through the KnowBe4 error text and record scrubbers", () => {

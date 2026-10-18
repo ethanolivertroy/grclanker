@@ -323,7 +323,8 @@ const TRAINING_CAMPAIGN = trainingCampaign("training lookback window", TRAINING_
 const COMPLETED_ENROLLMENT = "An enrollment is completed when its status reads as text that is completed or passed in any letter case.";
 const CAMPAIGN_COMPLETION = `A campaign's loaded enrollments are the returned enrollments whose campaign_id, read as text, is the campaign's campaign_id, read as text; a campaign without one has none. Its completion is its completion_percentage, ${AS_NUMBER}, when that is at or above 0, and otherwise the percentage of its loaded enrollments that are completed, rounded half up to 1 decimal place, when it has any. ${COMPLETED_ENROLLMENT}`;
 const ENROLLMENT_LIMIT = `enrollment_limit (the ${dayOption("enrollment_limit", 20000, 1000000)})`;
-const ENROLLMENTS_CUT = `the enrollment list was read but is partial because a page held more enrollments than were left under ${ENROLLMENT_LIMIT} or a full page brought the enrollments kept to it`;
+const NOT_OBJECT_PAGE = "a page held an entry that is not a JSON object";
+const ENROLLMENTS_CUT = `the enrollment list was read but is partial because a page held more enrollments than were left under ${ENROLLMENT_LIMIT}, a full page brought the enrollments kept to it, or ${NOT_OBJECT_PAGE}`;
 const ENROLLMENT_DATE = "An enrollment belongs to the user whose ID is its user.id read as text, and its date is its enrollment_date when that parses as a date, else its start_date when that does.";
 const GRACE_DAYS = `the ${dayOption("enrollment_grace_days", 30, 365)}`;
 const FAILED_USERS = `A failed user is a distinct ID that is the user.id, read as text, of a recipient with a failure time among the recipients of the sampled tests counted by sampled_test_count, a recipient's failure time being the earliest of its ${series(FAILURE_TIMESTAMP_KEYS)} that parse as dates; the user's failure time is the earliest across those recipients. ${PARSES_AS_DATE} ${READS_AS_TEXT}`;
@@ -427,7 +428,7 @@ const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.
 const USER_LIMIT = `user_limit (the ${dayOption("user_limit", 5000, 200000)})`;
 // Some checks read these lists without a manual gate, so a refused read must make them incomplete too.
 const pageWalkComplete = (surfaceId: string, list: string, cap: string): BatchCompletenessDefinition => ({
-  semantics: `false when the ${list} read was refused, or the list is partial because a page held more records than were left under ${cap} or a full page brought the records kept to ${cap}.`,
+  semantics: `false when the ${list} read was refused, or the list is partial because a page held more records than were left under ${cap}, a full page brought the records kept to ${cap}, or ${NOT_OBJECT_PAGE}.`,
   sources: [{ surfaceId, falseWhen: ["truncated", "error", "denied"] }],
 });
 const SECURITY_TESTS_COMPLETE = pageWalkComplete("security_tests", "security test list", "20000 records");
@@ -438,7 +439,7 @@ const TRAINING_CAMPAIGNS_COMPLETE = pageWalkComplete("training_campaigns", "trai
 const TRAINING_ENROLLMENTS_COMPLETE = pageWalkComplete("training_enrollments", "training enrollment list", ENROLLMENT_LIMIT);
 const STORE_PURCHASES_COMPLETE = pageWalkComplete("store_purchases", "store purchase list", "20000 records");
 const CALLBACK_TESTS_COMPLETE = pageWalkComplete("callback_security_tests", "callback security test list", "20000 records");
-const RECIPIENT_WALK = "a recipient walk was partial because a page held more recipients than were left under 20000 or a full page brought the recipients kept to 20000";
+const RECIPIENT_WALK = `a recipient walk was partial because a page held more recipients than were left under 20000, a full page brought the recipients kept to 20000, or ${NOT_OBJECT_PAGE}`;
 const RECIPIENT_READS_COMPLETE: BatchCompletenessDefinition = {
   semantics: `false when the recipient reads do not cover every security test that ran in the lookback window: fewer sampled tests with a start in that window were read than ran in it (the sample holds at most security_test_sample_limit tests, and a sampled test whose pst_id does not read as text takes a place without being read), a recipient read was refused or never made, or ${RECIPIENT_WALK}. ${RECIPIENT_SAMPLE} ${TEST_START} ${LOOKBACK}`,
   sources: [{ surfaceId: "security_test_recipients", falseWhen: ["truncated", "error", "denied", "not-collected"] }],
@@ -866,7 +867,7 @@ const TRAINING_CHECKS: readonly Knowbe4Check[] = [
       rule("pass", always),
     ],
     completeness: { training_campaigns_complete: TRAINING_CAMPAIGNS_COMPLETE },
-    decision: "Manual when the training campaign list is unreadable. Fail when a closed, uncancelled campaign in the training lookback window finished below fail_completion_pct percent completion, and warn when one finished below min_completion_pct percent. Warn when such a campaign's completion could only come from enrollments and the enrollment list stopped at enrollment_limit, when such a campaign has neither a completion_percentage of 0 or more nor a loaded enrollment, or when no such campaign has a completion. Warn instead of pass when the training campaign list is partial or the enrollment list is unreadable. Otherwise pass.",
+    decision: "Manual when the training campaign list is unreadable. Fail when a closed, uncancelled campaign in the training lookback window finished below fail_completion_pct percent completion, and warn when one finished below min_completion_pct percent. Warn when such a campaign's completion could only come from enrollments and the enrollment list is partial, when such a campaign has neither a completion_percentage of 0 or more nor a loaded enrollment, or when no such campaign has a completion. Warn instead of pass when the training campaign list is partial or the enrollment list is unreadable. Otherwise pass.",
     examples: [
       example("compliant", "pass", "Every closed campaign in the window met the target; the lowest finished at 93.5 percent.", { ...COMPLETION_HEALTHY, lowest_completion_pct: 93.5 }),
       example("compliant", "pass", "The lowest closed campaign finished exactly at the 90 percent target.", { ...COMPLETION_HEALTHY, lowest_completion_pct: 90 }),
@@ -1419,7 +1420,7 @@ const toCheck = (check: Knowbe4Check): BatchCheckDefinition => {
 const checks: readonly BatchCheckDefinition[] = [...PHISHING_CHECKS, ...TRAINING_CHECKS, ...RISK_CHECKS, ...GOVERNANCE_CHECKS].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
-const NOT_OBJECTS = "Entries that are not JSON objects are dropped before a page is counted.";
+const NOT_OBJECTS = "An entry that is not a JSON object is dropped, and the page holding it ends the walk with the list partial.";
 const pageWalk = (
   surfaceIds: readonly string[],
   records: string,
@@ -1439,6 +1440,7 @@ const pageWalk = (
     `A page holding fewer than ${pageSize} ${records}`,
     `A page holding more ${records} than were left under ${cap}, which marks the list partial`,
     `A full page that brings the ${records} kept to ${cap}, which marks the list partial`,
+    "A page holding an entry that is not a JSON object, which marks the list partial",
   ],
 });
 
@@ -1557,9 +1559,7 @@ export const KNOWBE4_SPEC = buildBatchIntegrationSpec({
     backoffPolicy: "Retry 429 and 503 up to 3 times after the first attempt. A Retry-After whose ECMAScript Number value is finite and 0 or more waits that many seconds; one that Date.parse reads as a date waits until then, or not at all when it has passed; otherwise the wait is 1 second, doubling on each later retry. Every wait is capped at 60 seconds, and every attempt starts at least 250 milliseconds after the previous one. Requests that time out (30 seconds unless timeout_seconds or KNOWBE4_TIMEOUT sets it), network errors, and PhishER responses carrying GraphQL errors are not retried.",
   },
   runtimeBehavior: [],
-  knownGaps: [
-    "A Reporting API page counts only its entries that are JSON objects, so a full page of 500 holding an entry that is not a JSON object ends the walk as a last page and leaves the list complete; the records on later pages are never read, and a check built on that list can pass on the records that were.",
-  ],
+  knownGaps: [],
   sensitiveFields: ["api_token", "phisher_api_token", "Authorization", ...PII_HASH_FIELDS, ...PII_MASK_FIELDS],
   credentialFormats: [
     "KnowBe4 Reporting API key, sent as a bearer token",
