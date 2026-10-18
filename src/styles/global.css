@@ -1625,7 +1625,7 @@ details[open] > .agent-group-toggle::before {
   border-color: color-mix(in srgb, var(--color-blue) 35%, transparent);
 }
 
-/* Docs landing page route map (src/components/docs-routes.tsx). */
+/* Docs landing page route map */
 .docs-prose .docs-route-list {
   margin: 0;
   padding: 0;
