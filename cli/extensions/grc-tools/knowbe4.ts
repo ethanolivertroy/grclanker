@@ -3158,6 +3158,7 @@ function completionFromEnrollments(enrollments: JsonRecord[]): number | undefine
 }
 
 function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCompletionPct: number, failCompletionPct: number, enrollmentLimitReached: boolean | null): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(3, { training_campaigns_readable: isRead(snapshot.trainingCampaigns) });
   if (snapshot.trainingCampaigns.error) return unavailableFinding(3, "high", "training_campaigns", snapshot);
   const enrollmentsByCampaign = new Map<string, JsonRecord[]>();
   for (const enrollment of snapshot.trainingEnrollments.data) {
@@ -3203,6 +3204,15 @@ function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookback
     });
   }
 
+  recordKnowbe4DecisionFacts(3, {
+    lowest_completion_pct: evaluated.length > 0 ? Math.min(...evaluated.map((item) => item.completion_pct)) : undefined,
+    fail_completion_pct: failCompletionPct,
+    min_completion_pct: minCompletionPct,
+    enrollment_cut_campaign_count: truncated.length,
+    unmeasured_campaign_count: unmeasured.length,
+    training_campaigns_complete: isComplete(snapshot.trainingCampaigns),
+    training_enrollments_readable: isRead(snapshot.trainingEnrollments),
+  });
   const failing = evaluated.filter((item) => item.completion_pct < failCompletionPct);
   const warning = evaluated.filter((item) => item.completion_pct < minCompletionPct && item.completion_pct >= failCompletionPct);
   let status: Knowbe4Finding["status"];
@@ -3249,8 +3259,11 @@ const ENROLLMENT_READ: Knowbe4InventoryRead = { inventory: "training_enrollments
 
 function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, graceDays: number, enrollmentLimitReached: boolean | null, redact: boolean): Knowbe4Finding {
   const reads: Knowbe4InventoryRead[] = [USERS_READ, ENROLLMENT_READ];
+  recordKnowbe4DecisionFacts(4, { users_readable: isRead(snapshot.activeUsers) });
   if (snapshot.activeUsers.error) return unavailableFinding(4, "medium", "users", snapshot);
+  recordKnowbe4DecisionFacts(4, { training_enrollments_readable: isRead(snapshot.trainingEnrollments) });
   if (snapshot.trainingEnrollments.error) return unavailableFinding(4, "medium", "training_enrollments", snapshot);
+  recordKnowbe4DecisionFacts(4, { user_record_count: snapshot.activeUsers.data.length });
   if (snapshot.activeUsers.data.length === 0) {
     return withInventoryCaveats(emptyUserListFinding(4, "medium", "training enrollment timeliness for new users", {
       new_users_evaluated: 0,
@@ -3285,6 +3298,12 @@ function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookba
     return !enrolled || daysBetween(joined, enrolled) > graceDays;
   });
   const latePct = percentage(late.length, newUsers.length);
+  recordKnowbe4DecisionFacts(4, {
+    late_user_count: late.length,
+    new_user_count: newUsers.length,
+    training_enrollments_complete: enrollmentsComplete,
+    users_complete: isComplete(snapshot.activeUsers),
+  });
 
   let status: Knowbe4Finding["status"];
   let summary: string;
@@ -3321,7 +3340,9 @@ function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookba
 }
 
 function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, remedialWindowDays: number, redact: boolean): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(10, { security_tests_readable: isRead(snapshot.securityTests) });
   if (snapshot.securityTests.error) return unavailableFinding(10, "medium", "security_tests", snapshot);
+  recordKnowbe4DecisionFacts(10, { training_enrollments_readable: isRead(snapshot.trainingEnrollments) });
   if (snapshot.trainingEnrollments.error) return unavailableFinding(10, "medium", "training_enrollments", snapshot);
   const enrollmentsByUser = new Map<string, Date[]>();
   for (const enrollment of snapshot.trainingEnrollments.data) {
@@ -3362,6 +3383,16 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
   // real observations, but the population of failures is only known once every test in the window was read.
   const enrollmentsComplete = isComplete(snapshot.trainingEnrollments);
   const recipients = recipientReadState(snapshot, samples, testsInWindow.length);
+  recordKnowbe4DecisionFacts(10, {
+    sampled_test_count: samples.length,
+    overdue_failed_user_count: evaluable.length,
+    failed_user_count: failures.size,
+    remediated_user_count: remediated.length,
+    training_enrollments_complete: enrollmentsComplete,
+    recipient_reads_complete: recipients.complete,
+    security_tests_complete: isComplete(snapshot.securityTests),
+    training_campaigns_readable: isRead(snapshot.trainingCampaigns),
+  });
 
   let status: Knowbe4Finding["status"];
   let summary: string;
@@ -3433,6 +3464,7 @@ function storePurchaseId(item: JsonRecord): string | undefined {
 }
 
 function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, maxContentAgeDays: number): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(11, { training_campaigns_readable: isRead(snapshot.trainingCampaigns) });
   if (snapshot.trainingCampaigns.error) return unavailableFinding(11, "low", "training_campaigns", snapshot);
   const retiredPurchases = new Set<string>();
   const catalogPublishDates = new Map<string, Date>();
@@ -3476,6 +3508,14 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
   // Retirement and publish dates come from the campaign content or the ModStore catalog: a module found retired or
   // stale is a real observation, but "none retired" and "undated" need the catalog to have been read in full.
   const catalogRead = isRead(snapshot.storePurchases);
+  recordKnowbe4DecisionFacts(11, {
+    assigned_module_count: reviewed,
+    retired_module_count: retired.length,
+    stale_module_count: stale.length,
+    undated_module_count: undated.length,
+    training_campaigns_complete: isComplete(snapshot.trainingCampaigns),
+    store_purchases_complete: isComplete(snapshot.storePurchases),
+  });
   let status: Knowbe4Finding["status"];
   let summary: string;
   if (reviewed === 0) {
@@ -3518,6 +3558,7 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
 }
 
 function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, minCompletionPct: number, requiredTopics: string[], enrollmentLimitReached: boolean | null): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(17, { training_campaigns_readable: isRead(snapshot.trainingCampaigns) });
   if (snapshot.trainingCampaigns.error) return unavailableFinding(17, "medium", "training_campaigns", snapshot);
   const enrollmentList = snapshot.trainingEnrollments;
   const enrollmentsUnavailable = !isRead(enrollmentList);
@@ -3561,6 +3602,17 @@ function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackD
   const unenrolled = topicResults.filter((item) => item.modules.length > 0 && item.loaded === 0);
   const lowCompletion = topicResults.filter((item) => item.completion !== undefined && item.completion < minCompletionPct);
   const enrollmentDataPartial = !isComplete(enrollmentList);
+  const measuredCompletions = topicResults.map((item) => item.completion).filter((value): value is number => value !== undefined);
+  recordKnowbe4DecisionFacts(17, {
+    topics_without_modules: missing.length,
+    required_topic_count: requiredTopics.length,
+    topics_without_enrollments: unenrolled.length,
+    training_enrollments_complete: !enrollmentDataPartial,
+    lowest_topic_completion_pct: measuredCompletions.length > 0 ? Math.min(...measuredCompletions) : undefined,
+    min_completion_pct: minCompletionPct,
+    training_campaigns_complete: isComplete(snapshot.trainingCampaigns),
+    training_policies_readable: isRead(snapshot.trainingPolicies),
+  });
   const topicList = (items: typeof topicResults): string => items.map((item) => item.topic).join(", ");
 
   let status: Knowbe4Finding["status"];
@@ -3621,6 +3673,13 @@ function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackD
 export function assessKnowbe4TrainingProgram(
   snapshot: Knowbe4Snapshot,
   options: Knowbe4AssessmentOptions = {},
+): Knowbe4AssessmentResult {
+  return runBatchVerdictContext(KNOWBE4_DECISION_CONTEXT, KNOWBE4_SPEC, () => assessKnowbe4TrainingProgramWithDecisionContext(snapshot, options));
+}
+
+function assessKnowbe4TrainingProgramWithDecisionContext(
+  snapshot: Knowbe4Snapshot,
+  options: Knowbe4AssessmentOptions,
 ): Knowbe4AssessmentResult {
   const now = options.now ?? new Date();
   const redact = options.redactPii ?? false;
