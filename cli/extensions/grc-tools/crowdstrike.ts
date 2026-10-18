@@ -9,6 +9,7 @@
  * modules, undated records, and partial (truncated or sampled) reads never
  * produce a pass. Each of those conditions is surfaced in the finding.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   createWriteStream,
   existsSync,
@@ -23,7 +24,13 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { CROWDSTRIKE_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { ALERT_DEVICE_SNAPSHOT_FIELDS, ALERT_SNAPSHOT_FIELDS, RTR_SESSION_SNAPSHOT_FIELDS } from "./crowdstrike.spec.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import {
+  ALERT_DEVICE_SNAPSHOT_FIELDS,
+  ALERT_SNAPSHOT_FIELDS,
+  CROWDSTRIKE_SPEC,
+  RTR_SESSION_SNAPSHOT_FIELDS,
+} from "./crowdstrike.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -347,6 +354,11 @@ export const CROWDSTRIKE_CONTROLS: ReadonlyArray<ControlDefinition> = [
 ];
 
 const CONTROL_BY_ID = new Map(CROWDSTRIKE_CONTROLS.map((definition) => [definition.id, definition]));
+
+hydrateBatchFrameworkMappings(CROWDSTRIKE_SPEC, Object.fromEntries(CROWDSTRIKE_CONTROLS.map((definition) => [
+  definition.id,
+  definition.frameworks,
+])));
 
 export interface CrowdstrikeResolvedConfig {
   clientId: string;
@@ -774,6 +786,15 @@ function unlicensedFinding(id: ControlId, module: string, error: string, console
     consoleEvidence,
     { module, error, not_applicable: true },
   );
+}
+
+const CROWDSTRIKE_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+// Decorators record their completeness facts after the evaluator recorded its own, so facts merge per check.
+function recordCrowdstrikeDecisionFacts(id: ControlId, facts: Readonly<Record<string, unknown>>): void {
+  const store = CROWDSTRIKE_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside a CrowdStrike assessment`);
+  store.set(id, { ...store.get(id), ...facts });
 }
 
 /**
@@ -4123,6 +4144,7 @@ const hostParams = {
 };
 
 export function registerCrowdstrikeTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, CROWDSTRIKE_SPEC);
   pi.registerTool({
     name: "crowdstrike_check_access",
     label: "Check CrowdStrike Falcon audit access",
