@@ -121,11 +121,14 @@ function positiveLimit(value: number | undefined, fallback: number): number {
   return truncated < 1 ? fallback : truncated;
 }
 
-/** A negative lookback moves the cutoff into the future and reports that nothing was added. */
+/**
+ * A negative lookback moves the cutoff into the future and reports that nothing was added.
+ * The sign is checked before truncating: Math.trunc(-0.5) is -0, and -0 < 0 is false, so a
+ * fraction between -1 and 0 would otherwise become a zero-day window.
+ */
 function lookbackDays(value: number | undefined): number {
-  if (value === undefined) return DEFAULT_RECENT_DAYS;
-  const truncated = Math.trunc(value);
-  return truncated < 0 ? DEFAULT_RECENT_DAYS : truncated;
+  if (value === undefined || value < 0) return DEFAULT_RECENT_DAYS;
+  return Math.trunc(value);
 }
 
 function normalizeSearchArgs(args: unknown): SearchArgs {

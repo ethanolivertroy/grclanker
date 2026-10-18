@@ -297,10 +297,13 @@ test("kevs_recent and kevs_check_ransomware treat a non-positive limit as the de
 
 test("kevs_recent treats a negative lookback as the default of 30 days", async () => {
   const today = cutoffDay(0);
-  const text = await runCatalogTool("kevs_recent", { days: -5, limit: 10 }, [datedKev(1, today)]);
-  assert.ok(text.startsWith("1 KEV entry added in the last 30 days:"));
-  assert.equal(text.includes("CVE-2024-0001"), true);
-  assert.doesNotMatch(text, /No new KEV entries/);
+  for (const days of [-5, -0.5, -0.1, "-0.5"]) {
+    const text = await runCatalogTool("kevs_recent", { days, limit: 10 }, [datedKev(1, today)]);
+    const label = `days ${JSON.stringify(days)}`;
+    assert.ok(text.startsWith("1 KEV entry added in the last 30 days:"), label);
+    assert.equal(text.includes("CVE-2024-0001"), true, label);
+    assert.doesNotMatch(text, /No new KEV entries/, label);
+  }
 });
 
 test("kevs_search EPSS lines include the score date only when the API provides it", async () => {
