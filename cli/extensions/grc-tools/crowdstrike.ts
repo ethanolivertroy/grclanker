@@ -2310,6 +2310,23 @@ function evaluateRtrPolicies(policies: JsonRecord[]): CrowdstrikeFinding {
   );
 }
 
+function recordResponsePolicyFacts(dataset: CollectedDataset<CrowdstrikePage<JsonRecord>>): void {
+  if (dataset.error) {
+    recordCrowdstrikeDecisionFacts("CS-06", { response_policies_readable: false });
+    return;
+  }
+  const settings = assignedPolicies(dataset.data.items).map((policy) => flattenPolicySettings(policy, "settings"));
+  const rtrEnabled = settings.filter((entry) => toggleState(entry, "RealTimeFunctionality") === true).length;
+  recordCrowdstrikeDecisionFacts("CS-06", {
+    response_policies_readable: true,
+    response_policies_complete: !dataset.data.truncated,
+    assigned_response_policy_count: settings.length,
+    rtr_enabled_policy_count: rtrEnabled,
+    policies_without_rtr: settings.length - rtrEnabled,
+    policies_with_custom_scripts: settings.filter((entry) => toggleState(entry, "CustomScripts") === true).length,
+  });
+}
+
 function sessionWindow(session: JsonRecord): { start?: number; end?: number; minutes?: number } {
   const start = parseTimestamp(session.created_at);
   const end = parseTimestamp(session.deleted_at) ?? parseTimestamp(session.updated_at);
@@ -2351,18 +2368,27 @@ function evaluateSessionLimits(
   lookbackDays: number,
 ): CrowdstrikeFinding {
   if (sessions.error) {
+    recordCrowdstrikeDecisionFacts("CS-07", { rtr_audit_sessions_readable: false });
     return unreadableFinding("CS-07", "RTR audit sessions", sessions.error, SESSION_CONSOLE_EVIDENCE);
   }
   const windows = sessions.data.items.map((session) => ({ session, window: sessionWindow(session) }));
   const undated = windows.filter((item) => item.window.start === undefined).length;
   const long = windows.filter((item) => item.window.minutes !== undefined && item.window.minutes > maxSessionMinutes);
   const concurrency = maxConcurrentSessionsPerUser(sessions.data.items);
+  const longestMinutes = Math.max(0, ...windows.map((item) => item.window.minutes ?? 0));
+  recordCrowdstrikeDecisionFacts("CS-07", {
+    rtr_audit_sessions_readable: true,
+    longest_rtr_session_minutes: longestMinutes,
+    peak_concurrent_rtr_sessions: concurrency.concurrent,
+    max_session_minutes: maxSessionMinutes,
+    max_concurrent_sessions: maxConcurrentSessions,
+  });
   const evidence: JsonRecord = {
     lookback_days: lookbackDays,
     sessions_reviewed: sessions.data.items.length,
     sessions_without_created_at: undated,
     sessions_over_limit: long.length,
-    longest_session_minutes: Math.round(Math.max(0, ...windows.map((item) => item.window.minutes ?? 0))),
+    longest_session_minutes: Math.round(longestMinutes),
     max_session_minutes: maxSessionMinutes,
     max_concurrent_sessions: maxConcurrentSessions,
     peak_concurrent_sessions: concurrency,
@@ -2412,6 +2438,7 @@ const ALERT_CONSOLE_EVIDENCE = "export critical and high detections for the revi
 
 function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecord>>, lookbackDays: number, now = Date.now()): CrowdstrikeFinding {
   if (alerts.error) {
+    recordCrowdstrikeDecisionFacts("CS-22", { alerts_readable: false });
     return unreadableFinding("CS-22", "alerts", alerts.error, ALERT_CONSOLE_EVIDENCE);
   }
   let withinSla = 0;
@@ -2444,6 +2471,13 @@ function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecor
   const openBreaches = breaches.filter((item) => item.status !== "closed").length;
   const openWithinSla = Math.max(0, dated - resolvedCount - openBreaches);
   const compliant = withinSla + openWithinSla;
+  recordCrowdstrikeDecisionFacts("CS-22", {
+    alerts_readable: true,
+    alerts_complete: !alerts.data.truncated,
+    dated_alert_count: dated,
+    undated_alert_count: undated,
+    sla_compliant_alert_count: compliant,
+  });
   const pct = percentage(compliant, dated);
   const partial = partialInventory(alerts.data, "critical/high alerts");
   // Emptiness is compliant only for a complete read; a truncated page with no dated alert visible cannot
@@ -2474,8 +2508,14 @@ const CONTAINMENT_CONSOLE_EVIDENCE = "export the contained host list from Falcon
 
 function evaluateContainment(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>>, maxContainmentHours: number, now = Date.now()): CrowdstrikeFinding {
   if (hosts.error) {
+    recordCrowdstrikeDecisionFacts("CS-23", { contained_hosts_readable: false });
     return unreadableFinding("CS-23", "contained hosts", hosts.error, CONTAINMENT_CONSOLE_EVIDENCE);
   }
+  recordCrowdstrikeDecisionFacts("CS-23", {
+    contained_hosts_readable: true,
+    contained_hosts_complete: !hosts.data.truncated,
+    contained_host_count: hosts.data.items.length,
+  });
   const contained = hosts.data.items.map((host) => {
     const modified = parseTimestamp(host.modified_timestamp);
     return {
@@ -2541,6 +2581,13 @@ export async function assessCrowdstrikeResponseReadiness(
   client: Pick<CrowdstrikeApiClient, "getResolvedConfig" | "listResponsePolicies" | "listRtrSessions" | "listAlerts" | "listHosts">,
   options: CrowdstrikeAssessmentOptions = {},
 ): Promise<CrowdstrikeAssessmentResult> {
+  return runBatchVerdictContext(CROWDSTRIKE_DECISION_CONTEXT, CROWDSTRIKE_SPEC, () => assessCrowdstrikeResponseReadinessWithDecisionContext(client, options));
+}
+
+async function assessCrowdstrikeResponseReadinessWithDecisionContext(
+  client: Pick<CrowdstrikeApiClient, "getResolvedConfig" | "listResponsePolicies" | "listRtrSessions" | "listAlerts" | "listHosts">,
+  options: CrowdstrikeAssessmentOptions,
+): Promise<CrowdstrikeAssessmentResult> {
   const lookbackDays = clampNumber(options.lookbackDays, DEFAULT_LOOKBACK_DAYS, 1, 365);
   const alertLimit = clampNumber(options.alertLimit, DEFAULT_ALERT_LIMIT, 1, 10_000);
   const hostLimit = clampNumber(options.hostLimit, DEFAULT_HOST_LIMIT, 1, 100_000);
@@ -2567,6 +2614,7 @@ export async function assessCrowdstrikeResponseReadiness(
     "contained hosts",
     "/devices/combined/devices/v1",
   );
+  recordResponsePolicyFacts(policies);
 
   const findings = [
     policies.error
