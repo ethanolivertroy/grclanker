@@ -233,7 +233,17 @@ const TRAINING_SURFACES: readonly BatchSurfaceDefinition[] = [
   reportingSurface("training_policies", "/v1/training/policies", [], listParameters(true), arrayResponse("one uploaded policy per entry")),
 ];
 
-const KNOWBE4_SURFACES: readonly BatchSurfaceDefinition[] = [...PHISHING_SURFACES, ...TRAINING_SURFACES];
+const GOVERNANCE_SURFACES: readonly BatchSurfaceDefinition[] = [
+  reportingSurface(
+    "callback_security_tests",
+    "/v1/phishing/security_tests",
+    ["started_at", "start_date"],
+    listParameters(false, param("campaign_type", "query", "callback")),
+    arrayResponse("one callback phishing security test per entry"),
+  ),
+];
+
+const KNOWBE4_SURFACES: readonly BatchSurfaceDefinition[] = [...PHISHING_SURFACES, ...TRAINING_SURFACES, ...GOVERNANCE_SURFACES];
 
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
 const path = (name: string): VerdictOperand => ({ kind: "path", path: name });
@@ -304,6 +314,7 @@ const PHISHING_CAMPAIGN_IN_WINDOW = "A phishing campaign is in the lookback wind
 const GROUP_COVERED = "A set of campaigns covers a group when one of them targets All Users, or the group's id, read as text, is one of their targeted group IDs, a campaign's targeted group IDs being the group_id values, read as text, of the JSON object entries of its groups array.";
 const INACTIVITY_WINDOW = `The inactivity window runs from N days before the assessment time to the assessment time, ${DAY} and N being the ${dayOption("inactive_days", 180)}.`;
 const ACTIVE_ID = "An active ID is the user.id, read as text, of a delivered recipient of a sampled security test whose recipient list was read without a refusal and whose start falls in the inactivity window, or the user.id, read as text, of a returned training enrollment whose activity date is at or after the start of the inactivity window. A recipient is delivered when its delivered_at parses as a date, or its bounced_at does not and its scheduled_at does. An enrollment's activity date is its completion_date when that parses as a date, else its start_date when that does.";
+const ACCOUNT_DOMAINS = "The account's allowed domains are the entries of the account record's domains that read as text, trimmed, when it is an array, or the non-blank comma-separated pieces of its text, trimmed, when it reads as text, each lowercased by ECMAScript toLowerCase.";
 
 const KNOWBE4_INPUTS: Readonly<Record<string, string>> = {
   security_tests_readable: "True when the GET /v1/phishing/security_tests walk returned without a refusal.",
@@ -375,6 +386,13 @@ const KNOWBE4_INPUTS: Readonly<Record<string, string>> = {
   inactive_user_count: `Number of the users counted by long_standing_user_count whose last_sign_in does not parse as a date at or after the start of the inactivity window, and whose id, read as text, is missing or is not an active ID. ${ACTIVE_ID} ${RECIPIENT_SAMPLE} ${TEST_START} ${INACTIVITY_WINDOW} ${PARSES_AS_DATE} ${READS_AS_TEXT}`,
   recipient_walks_complete: "Recipient walk completeness.",
   activity_data_complete: "Activity signal coverage.",
+  admin_count: "Number of the JSON object entries of the account record's admins array; 0 when admins is not an array.",
+  max_admin_count: `The ${dayOption("max_admin_count", 3, 10000).replace("clamped to 1", "clamped to 0")}.`,
+  external_admin_count: `Number of the admins counted by admin_count whose email reads as text containing an @ and whose email domain, the text after its last @ lowercased by ECMAScript toLowerCase, is not empty and is not an allowed domain; 0 when the account has no allowed domain. ${ACCOUNT_DOMAINS} ${READS_AS_TEXT}`,
+  callback_security_tests_readable: "True when the GET /v1/phishing/security_tests walk filtered to campaign_type=callback returned without a refusal.",
+  callback_security_tests_complete: "Callback security test list coverage.",
+  require_vishing_tests: "The require_vishing_tests argument, true when it is absent.",
+  callback_tests_in_window: `Number of returned callback security tests that ran in the lookback window. ${TEST_START} ${LOOKBACK}`,
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -396,6 +414,7 @@ const PHISHING_CAMPAIGNS_COMPLETE = pageWalkComplete("phishing_campaigns", "phis
 const TRAINING_CAMPAIGNS_COMPLETE = pageWalkComplete("training_campaigns", "training campaign list", "20000 records");
 const TRAINING_ENROLLMENTS_COMPLETE = pageWalkComplete("training_enrollments", "training enrollment list", ENROLLMENT_LIMIT);
 const STORE_PURCHASES_COMPLETE = pageWalkComplete("store_purchases", "store purchase list", "20000 records");
+const CALLBACK_TESTS_COMPLETE = pageWalkComplete("callback_security_tests", "callback security test list", "20000 records");
 const RECIPIENT_WALK = "a recipient walk was partial because a page held more recipients than were left under 20000 or a full page brought the recipients kept to 20000";
 const RECIPIENT_READS_COMPLETE: BatchCompletenessDefinition = {
   semantics: `false when the recipient reads do not cover every security test that ran in the lookback window: fewer sampled tests with a start in that window were read than ran in it (the sample holds at most security_test_sample_limit tests, and a sampled test whose pst_id does not read as text takes a place without being read), a recipient read was refused or never made, or ${RECIPIENT_WALK}. ${RECIPIENT_SAMPLE} ${TEST_START} ${LOOKBACK}`,
@@ -1237,6 +1256,112 @@ const RISK_CHECKS: readonly Knowbe4Check[] = [
   },
 ];
 
+const GOVERNANCE = "knowbe4_assess_account_governance";
+const ADMINS_HEALTHY = { account_readable: true, admin_count: 3, max_admin_count: 3, external_admin_count: 0 };
+const VISHING_HEALTHY = {
+  require_vishing_tests: true,
+  callback_security_tests_readable: true,
+  callback_security_tests_complete: true,
+  callback_tests_in_window: 2,
+};
+
+const GOVERNANCE_CHECKS: readonly Knowbe4Check[] = [
+  {
+    id: "KNOWBE4-12",
+    control: 12,
+    title: "Admin role audit",
+    severity: "high",
+    owner: GOVERNANCE,
+    surfaces: ["account"],
+    inputs: ["account_readable", "admin_count", "max_admin_count", "external_admin_count"],
+    rules: [
+      rule("manual", ne("account_readable", true)),
+      rule("warn", eq("admin_count", 0)),
+      rule("fail", gt("admin_count", path("max_admin_count"))),
+      rule("warn", gt("external_admin_count", 0)),
+      rule("pass", always),
+    ],
+    decision: "Manual when the account record is unreadable. Warn when it lists no admin, since console administrator membership cannot then be enumerated. Fail when it lists more admins than max_admin_count. Warn when an admin's email domain is outside the account's allowed domains. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Three admins, all on allowed domains, meet the maximum of 3.", { ...ADMINS_HEALTHY }),
+      example("noncompliant", "fail", "Five admins exceed the maximum of 3.", { ...ADMINS_HEALTHY, admin_count: 5 }),
+      example("noncompliant", "fail", "Five admins exceed the maximum of 3, one of them on an outside domain.", { ...ADMINS_HEALTHY, admin_count: 5, external_admin_count: 1 }),
+      example("partial", "warn", "Two admins are within the maximum, but one uses an outside email domain.", { ...ADMINS_HEALTHY, admin_count: 2, external_admin_count: 1 }),
+      example("partial", "warn", "The account record lists no admin.", { ...ADMINS_HEALTHY, admin_count: 0 }),
+      example("unreadable", "manual", "The account record was refused.", { account_readable: false }),
+    ],
+  },
+  {
+    id: "KNOWBE4-13",
+    control: 13,
+    title: "SSO integration status",
+    severity: "high",
+    owner: GOVERNANCE,
+    surfaces: ["account"],
+    inputs: [],
+    rules: [rule("manual", always)],
+    decision: "Always return manual, because the Reporting API does not expose SAML SSO or admin MFA settings, so a reviewer must verify SSO enforcement in the console.",
+    examples: [example("partial", "manual", "SSO enforcement is left to a reviewer whatever the account record holds.", {})],
+  },
+  {
+    id: "KNOWBE4-14",
+    control: 14,
+    title: "Reporting frequency",
+    severity: "medium",
+    owner: GOVERNANCE,
+    surfaces: ["security_tests", "training_campaigns"],
+    inputs: [],
+    rules: [rule("manual", always)],
+    decision: "Always return manual, because the Reporting API keeps no log of generated or reviewed reports, so a reviewer must evidence report cadence from console report schedules and review records.",
+    examples: [example("partial", "manual", "Report cadence is left to a reviewer whatever the security test and training campaign lists hold.", {})],
+  },
+  {
+    id: "KNOWBE4-15",
+    control: 15,
+    title: "USB test campaign execution",
+    severity: "low",
+    owner: GOVERNANCE,
+    surfaces: [],
+    inputs: [],
+    rules: [rule("manual", always)],
+    decision: "Always return manual, because the Reporting API does not expose USB drive tests, so a reviewer needs the console's USB drive test list, or the recorded decision scoping physical media testing out when require_usb_tests is false.",
+    examples: [example("partial", "manual", "USB drive testing is left to a reviewer whatever require_usb_tests holds.", {})],
+  },
+  {
+    id: "KNOWBE4-16",
+    control: 16,
+    title: "Vishing campaign execution",
+    severity: "low",
+    owner: GOVERNANCE,
+    surfaces: ["callback_security_tests"],
+    inputs: ["require_vishing_tests", "callback_security_tests_readable", "callback_security_tests_complete", "callback_tests_in_window"],
+    rules: [
+      rule("manual", ne("require_vishing_tests", true)),
+      rule("manual", ne("callback_security_tests_readable", true)),
+      rule("fail", all(eq("callback_tests_in_window", 0), eq("callback_security_tests_complete", true))),
+      rule("warn", eq("callback_tests_in_window", 0)),
+      rule("warn", incomplete("callback_security_tests_complete")),
+      rule("pass", always),
+    ],
+    completeness: { callback_security_tests_complete: CALLBACK_TESTS_COMPLETE },
+    decision: "Manual when require_vishing_tests is false, which scopes voice-channel testing out, or when the callback security test list is unreadable. Fail when no callback test ran in the lookback window and the list is complete, and warn when none did but the list is partial. Warn instead of pass when the list is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "Two callback tests ran in the lookback window.", { ...VISHING_HEALTHY }),
+      example("noncompliant", "fail", "No callback test ran in the lookback window, and the list is complete.", { ...VISHING_HEALTHY, callback_tests_in_window: 0 }),
+      example("partial", "warn", "No loaded callback test ran in the lookback window, but the list stopped at 20000 records.", {
+        ...VISHING_HEALTHY, callback_tests_in_window: 0, callback_security_tests_complete: false,
+      }),
+      example("partial", "warn", "Two callback tests ran in the lookback window, though the list stopped at 20000 records.", {
+        ...VISHING_HEALTHY, callback_security_tests_complete: false,
+      }),
+      example("partial", "manual", "Voice-channel testing was scoped out with require_vishing_tests false.", {
+        ...VISHING_HEALTHY, require_vishing_tests: false, callback_tests_in_window: 0,
+      }),
+      example("unreadable", "manual", "The callback security test list was refused.", { require_vishing_tests: true, callback_security_tests_readable: false }),
+    ],
+  },
+];
+
 const toCheck = (check: Knowbe4Check): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -1257,7 +1382,7 @@ const toCheck = (check: Knowbe4Check): BatchCheckDefinition => {
   };
 };
 
-const checks: readonly BatchCheckDefinition[] = [...PHISHING_CHECKS, ...TRAINING_CHECKS, ...RISK_CHECKS].map(toCheck);
+const checks: readonly BatchCheckDefinition[] = [...PHISHING_CHECKS, ...TRAINING_CHECKS, ...RISK_CHECKS, ...GOVERNANCE_CHECKS].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
 const NOT_OBJECTS = "Entries that are not JSON objects are dropped before a page is counted.";
@@ -1334,6 +1459,7 @@ export const KNOWBE4_SPEC = buildBatchIntegrationSpec({
         "phishing_campaigns",
         "security_tests",
         "security_test_recipients",
+        "callback_security_tests",
         "training_campaigns",
         "training_enrollments",
         "store_purchases",
@@ -1354,12 +1480,14 @@ export const KNOWBE4_SPEC = buildBatchIntegrationSpec({
     knowbe4_assess_phishing_program: idsFor(PHISHING),
     knowbe4_assess_training_program: idsFor(TRAINING),
     knowbe4_assess_user_risk: idsFor(RISK),
+    knowbe4_assess_account_governance: idsFor(GOVERNANCE),
     knowbe4_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
     pageWalk(["users"], "users", USER_LIMIT, null, true),
     pageWalk(["training_enrollments"], "enrollments", ENROLLMENT_LIMIT, null, true),
     pageWalk(["groups", "phishing_campaigns", "security_tests", "store_purchases", "training_policies"], "records", "20000", 20000, true),
+    pageWalk(["callback_security_tests"], "records", "20000", 20000, false),
     pageWalk(["training_campaigns"], "campaigns", "20000", 20000, true, "", 10),
     pageWalk(["account_risk_score_history"], "points", "20000", 20000, false),
     pageWalk(["security_test_recipients"], "recipients", "20000", 20000, false, "Each sampled test's recipient list is walked separately. "),
