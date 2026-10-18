@@ -37,12 +37,17 @@ git clone https://github.com/ethanolivertroy/grclanker.git
 cd grclanker
 npm --prefix cli ci
 npm --prefix cli run build
-node cli/bin/grclanker.js tools
+cd cli
+npm link
+cd ..
+grclanker tools
 ```
 
-`grclanker tools` should report `241 domain tools + 7 compute backend tools`. `cli/bin/grclanker.js` is the launcher the `grclanker` bin points at. From inside `cli/`, `npm link` puts that launcher on your `PATH`. `npm --prefix cli link` does not, because `--prefix` also redirects npm's global link directory into the checkout.
+`grclanker tools` should report `241 domain tools + 7 compute backend tools`. `npm link` has to run from inside `cli/`, where it puts the `cli/bin/grclanker.js` launcher on your `PATH`. `npm --prefix cli link` does not, because `--prefix` also redirects npm's global link directory into the checkout.
 
 ## Quick start
+
+The release installer links `grclanker` into `~/.local/bin`. A source checkout does the same with the `npm link` step above. The commands below use that name.
 
 Install [Ollama](https://ollama.com/download) yourself. The grclanker installer does not install it. If Ollama is not already serving, start it and leave that terminal running:
 
