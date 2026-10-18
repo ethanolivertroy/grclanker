@@ -283,7 +283,8 @@ const IS_TRUE = "the boolean true, the number 1, or a string that trims to true,
 const ACTIVE_CAMPAIGN = `A campaign is active when it is not hidden and its campaign_id, read as text, is the campaign_id, read as text, of a security test that ran in the lookback window; or its last_run parses as a date at or after the start of the lookback window; or its status, read as text, contains active, scheduled, or in progress in any letter case. A campaign is hidden when its hidden is ${IS_TRUE}. ${TEST_START} ${LOOKBACK} ${READS_AS_TEXT}`;
 const ALL_USERS = `A campaign targets All Users when one of the JSON object entries of its groups array has a group_id that, ${AS_NUMBER}, is 0, or a name that trims to All Users in any letter case.`;
 const TRAINING_LOOKBACK = `The training lookback window runs from N days before the assessment time to the assessment time, ${DAY} and N being the ${dayOption("training_lookback_days", 365)}.`;
-const TRAINING_CAMPAIGN = `A training campaign is cancelled when its status, read as text, contains cancelled or canceled in any letter case, and closed when its status, read as text, contains completed in any letter case or its end_date parses as a date no later than the assessment time. It is in the training lookback window when its start_date parses as a date in the window, its end_date parses as a date at or after the window's start, or its status, read as text, contains in progress, enrolling, or created in any letter case and its end_date does not parse as a date or parses as one at or after the window's start. ${TRAINING_LOOKBACK} ${PARSES_AS_DATE} ${READS_AS_TEXT}`;
+const trainingCampaign = (window: string, windowDefinition: string): string => `A training campaign is cancelled when its status, read as text, contains cancelled or canceled in any letter case, and closed when its status, read as text, contains completed in any letter case or its end_date parses as a date no later than the assessment time. It is in the ${window} when its start_date parses as a date in the window, its end_date parses as a date at or after the window's start, or its status, read as text, contains in progress, enrolling, or created in any letter case and its end_date does not parse as a date or parses as one at or after the window's start. ${windowDefinition} ${PARSES_AS_DATE} ${READS_AS_TEXT}`;
+const TRAINING_CAMPAIGN = trainingCampaign("training lookback window", TRAINING_LOOKBACK);
 const COMPLETED_ENROLLMENT = "An enrollment is completed when its status reads as text that is completed or passed in any letter case.";
 const CAMPAIGN_COMPLETION = `A campaign's loaded enrollments are the returned enrollments whose campaign_id, read as text, is the campaign's campaign_id, read as text; a campaign without one has none. Its completion is its completion_percentage, ${AS_NUMBER}, when that is at or above 0, and otherwise the percentage of its loaded enrollments that are completed, rounded half up to 1 decimal place, when it has any. ${COMPLETED_ENROLLMENT}`;
 const ENROLLMENT_LIMIT = `enrollment_limit (the ${dayOption("enrollment_limit", 20000, 1000000)})`;
@@ -297,6 +298,10 @@ const MODULE_PUBLISHED = "A module's publish date is its publish_date when that 
 const REQUIRED_TOPICS = "The required compliance topics are the entries of the required_compliance_topics argument that read as text, trimmed, when it is an array, or the non-blank comma-separated pieces of its text, trimmed, when it reads as text; a repeated topic counts each time.";
 const COMPLIANCE_TOPICS = `The compliance topics are the required compliance topics, each matching the assigned modules whose name, lowercased by ECMAScript toLowerCase, contains the topic so lowercased; when no topic is required, a single topic matching the assigned modules whose name matches the ECMAScript regular expression /${COMPLIANCE_TOPIC_PATTERN.source}/${COMPLIANCE_TOPIC_PATTERN.flags}. The assigned modules are the distinct names, read as text, of the JSON object entries of the content arrays of the training campaigns that are not cancelled and are in the training lookback window. ${REQUIRED_TOPICS} ${TRAINING_CAMPAIGN}`;
 const TOPIC_COMPLETION = `A topic's loaded enrollments are the returned enrollments whose module_name, read as text, is the name of one of its matching modules, and its completion is the percentage of them that are completed, rounded half up to 1 decimal place. ${COMPLETED_ENROLLMENT}`;
+const PHISHING_CAMPAIGN_IN_WINDOW = "A phishing campaign is in the lookback window when its last_run, or the start_date of one of the JSON object entries of its psts array, parses as a date in the window.";
+const GROUP_COVERED = "A set of campaigns covers a group when one of them targets All Users, or the group's id, read as text, is one of their targeted group IDs, a campaign's targeted group IDs being the group_id values, read as text, of the JSON object entries of its groups array.";
+const INACTIVITY_WINDOW = `The inactivity window runs from N days before the assessment time to the assessment time, ${DAY} and N being the ${dayOption("inactive_days", 180)}.`;
+const ACTIVE_ID = "An active ID is the user.id, read as text, of a delivered recipient of a sampled security test whose recipient list was read without a refusal and whose start falls in the inactivity window, or the user.id, read as text, of a returned training enrollment whose activity date is at or after the start of the inactivity window. A recipient is delivered when its delivered_at parses as a date, or its bounced_at does not and its scheduled_at does. An enrollment's activity date is its completion_date when that parses as a date, else its start_date when that does.";
 
 const KNOWBE4_INPUTS: Readonly<Record<string, string>> = {
   security_tests_readable: "True when the GET /v1/phishing/security_tests walk returned without a refusal.",
@@ -358,6 +363,16 @@ const KNOWBE4_INPUTS: Readonly<Record<string, string>> = {
   topics_without_enrollments: `Number of compliance topics with a matching assigned module but no loaded enrollment. ${TOPIC_COMPLETION} ${COMPLIANCE_TOPICS}`,
   lowest_topic_completion_pct: `Lowest completion among the compliance topics with a loaded enrollment; unreported when none has one. ${TOPIC_COMPLETION} ${COMPLIANCE_TOPICS}`,
   training_policies_readable: "True when the GET /v1/training/policies walk returned without a refusal.",
+  mean_risk_score: `Arithmetic mean, unrounded, of the current_risk_score values, ${AS_NUMBER}, of the returned active users whose current_risk_score reads as one; unreported when none does.`,
+  risk_score_stddev: "Population standard deviation, unrounded, of the values averaged by mean_risk_score: the square root of the mean of their squared differences from that mean; unreported when there is no such value.",
+  max_mean_risk_score: `The ${percentOption("max_mean_risk_score", 50)}.`,
+  max_risk_score_stddev: `The ${percentOption("max_risk_score_stddev", 25)}.`,
+  active_group_count: `Number of returned active groups whose member_count, ${AS_NUMBER}, is above 0 or does not read as one.`,
+  uncovered_group_count: `Number of the groups counted by active_group_count that are not covered both by the phishing campaigns in the lookback window and by the training campaigns that are not cancelled and are in the lookback window. ${GROUP_COVERED} ${ALL_USERS} ${PHISHING_CAMPAIGN_IN_WINDOW} ${trainingCampaign("lookback window", LOOKBACK)}`,
+  long_standing_user_count: `Number of returned active users whose joined_on does not parse as a date, or parses as one at or before the start of the inactivity window. ${INACTIVITY_WINDOW} ${PARSES_AS_DATE}`,
+  inactive_user_count: `Number of the users counted by long_standing_user_count whose last_sign_in does not parse as a date at or after the start of the inactivity window, and whose id, read as text, is missing or is not an active ID. ${ACTIVE_ID} ${RECIPIENT_SAMPLE} ${TEST_START} ${INACTIVITY_WINDOW} ${PARSES_AS_DATE} ${READS_AS_TEXT}`,
+  recipient_walks_complete: "Recipient walk completeness.",
+  activity_data_complete: "Activity signal coverage.",
 };
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(names.map((name) => {
@@ -379,9 +394,22 @@ const PHISHING_CAMPAIGNS_COMPLETE = pageWalkComplete("phishing_campaigns", "phis
 const TRAINING_CAMPAIGNS_COMPLETE = pageWalkComplete("training_campaigns", "training campaign list", "20000 records");
 const TRAINING_ENROLLMENTS_COMPLETE = pageWalkComplete("training_enrollments", "training enrollment list", ENROLLMENT_LIMIT);
 const STORE_PURCHASES_COMPLETE = pageWalkComplete("store_purchases", "store purchase list", "20000 records");
+const RECIPIENT_WALK = "a recipient walk was partial because a page held more recipients than were left under 20000 or a full page brought the recipients kept to 20000";
 const RECIPIENT_READS_COMPLETE: BatchCompletenessDefinition = {
-  semantics: `false when the recipient reads do not cover every security test that ran in the lookback window: fewer sampled tests with a start in that window were read than ran in it (the sample holds at most security_test_sample_limit tests, and a sampled test whose pst_id does not read as text takes a place without being read), a recipient read was refused or never made, or a recipient walk was partial because a page held more recipients than were left under 20000 or a full page brought the recipients kept to 20000. ${RECIPIENT_SAMPLE} ${TEST_START} ${LOOKBACK}`,
+  semantics: `false when the recipient reads do not cover every security test that ran in the lookback window: fewer sampled tests with a start in that window were read than ran in it (the sample holds at most security_test_sample_limit tests, and a sampled test whose pst_id does not read as text takes a place without being read), a recipient read was refused or never made, or ${RECIPIENT_WALK}. ${RECIPIENT_SAMPLE} ${TEST_START} ${LOOKBACK}`,
   sources: [{ surfaceId: "security_test_recipients", falseWhen: ["truncated", "error", "denied", "not-collected"] }],
+};
+const RECIPIENT_WALKS_COMPLETE: BatchCompletenessDefinition = {
+  semantics: `false when a recipient read was refused, or ${RECIPIENT_WALK}; true when no recipient read was made.`,
+  sources: [{ surfaceId: "security_test_recipients", falseWhen: ["truncated", "error", "denied"] }],
+};
+const ACTIVITY_DATA_COMPLETE: BatchCompletenessDefinition = {
+  semantics: `false when an activity signal may be missing: a security test that ran in the sample window and has a pst_id that reads as text was left out of the recipient sample, a recipient read was refused or, the security test list being refused, never made, ${RECIPIENT_WALK}, or the security test or training enrollment list read was refused or is partial. ${RECIPIENT_SAMPLE} ${TEST_START} ${LOOKBACK}`,
+  sources: [
+    { surfaceId: "security_tests", falseWhen: ["truncated", "error", "denied"] },
+    { surfaceId: "security_test_recipients", falseWhen: ["truncated", "error", "denied", "not-collected"] },
+    { surfaceId: "training_enrollments", falseWhen: ["truncated", "error", "denied"] },
+  ],
 };
 
 type Knowbe4Check = {
@@ -1014,6 +1042,199 @@ const TRAINING_CHECKS: readonly Knowbe4Check[] = [
   },
 ];
 
+const RISK = "knowbe4_assess_user_risk";
+const ACTIVE_USERS_READ = { users_readable: true, users_complete: true, user_record_count: 400 };
+const RISK_SCORES_HEALTHY = {
+  ...ACTIVE_USERS_READ,
+  account_readable: true,
+  account_risk_score_history_readable: true,
+  mean_risk_score: 31.4,
+  risk_score_stddev: 12.8,
+  max_mean_risk_score: 50,
+  max_risk_score_stddev: 25,
+};
+const GROUP_COVERAGE_HEALTHY = {
+  groups_readable: true,
+  groups_complete: true,
+  phishing_campaigns_readable: true,
+  phishing_campaigns_complete: true,
+  ...CAMPAIGNS_READ,
+  active_group_count: 14,
+  uncovered_group_count: 0,
+};
+const INACTIVITY_HEALTHY = {
+  ...ACTIVE_USERS_READ,
+  security_tests_complete: true,
+  recipient_walks_complete: true,
+  training_enrollments_complete: true,
+  activity_data_complete: true,
+  long_standing_user_count: 360,
+  inactive_user_count: 0,
+};
+const UNREADABLE_USERS = example("unreadable", "manual", "The active user list was refused.", { users_readable: false });
+const EMPTY_USERS = example("partial", "warn", "The active user list came back empty.", { users_readable: true, users_complete: true, user_record_count: 0 });
+
+const RISK_CHECKS: readonly Knowbe4Check[] = [
+  {
+    id: "KNOWBE4-05",
+    control: 5,
+    title: "User risk score distribution",
+    severity: "medium",
+    owner: RISK,
+    surfaces: ["users", "account", "account_risk_score_history"],
+    inputs: [
+      "users_readable",
+      "user_record_count",
+      "mean_risk_score",
+      "max_mean_risk_score",
+      "risk_score_stddev",
+      "max_risk_score_stddev",
+      "users_complete",
+      "account_readable",
+      "account_risk_score_history_readable",
+    ],
+    rules: [
+      rule("manual", ne("users_readable", true)),
+      rule("warn", eq("user_record_count", 0)),
+      rule("warn", unreported("mean_risk_score")),
+      rule("fail", gt("mean_risk_score", path("max_mean_risk_score"))),
+      rule("warn", gt("risk_score_stddev", path("max_risk_score_stddev"))),
+      rule("warn", any(ne("users_complete", true), ne("account_readable", true), ne("account_risk_score_history_readable", true))),
+      rule("pass", always),
+    ],
+    completeness: { users_complete: USERS_COMPLETE },
+    decision: "Manual when the active user list is unreadable. Warn when it is empty or no returned user has a current_risk_score that reads as a number. Fail when the mean score of the users read is above max_mean_risk_score, and warn when their population standard deviation is above max_risk_score_stddev. Warn instead of pass when the active user list is partial, or the account record or the account risk score history is unreadable. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "The mean risk score is 31.4 with a standard deviation of 12.8.", { ...RISK_SCORES_HEALTHY }),
+      example("compliant", "pass", "The mean and the deviation sit exactly at their ceilings of 50 and 25.", { ...RISK_SCORES_HEALTHY, mean_risk_score: 50, risk_score_stddev: 25 }),
+      example("noncompliant", "fail", "The mean risk score of 57.2 is above the 50 ceiling.", { ...RISK_SCORES_HEALTHY, mean_risk_score: 57.2 }),
+      example("noncompliant", "fail", "The users read average 57.2, above the ceiling, though the active user list stopped at user_limit.", {
+        ...RISK_SCORES_HEALTHY, mean_risk_score: 57.2, users_complete: false,
+      }),
+      example("partial", "warn", "The mean is under the ceiling, but the standard deviation of 31.6 exceeds 25.", { ...RISK_SCORES_HEALTHY, risk_score_stddev: 31.6 }),
+      example("partial", "warn", "No returned user has a current_risk_score that reads as a number.", {
+        ...ACTIVE_USERS_READ, account_readable: true, account_risk_score_history_readable: true, max_mean_risk_score: 50, max_risk_score_stddev: 25,
+      }),
+      example("partial", "warn", "The scores are within policy, but the active user list stopped at user_limit.", { ...RISK_SCORES_HEALTHY, users_complete: false }),
+      example("partial", "warn", "The scores are within policy, but the account risk score history was refused.", {
+        ...RISK_SCORES_HEALTHY, account_risk_score_history_readable: false,
+      }),
+      EMPTY_USERS,
+      UNREADABLE_USERS,
+    ],
+  },
+  {
+    id: "KNOWBE4-08",
+    control: 8,
+    title: "Group coverage analysis",
+    severity: "medium",
+    owner: RISK,
+    surfaces: ["groups", "phishing_campaigns", "training_campaigns"],
+    inputs: [
+      "groups_readable",
+      "phishing_campaigns_readable",
+      "training_campaigns_readable",
+      "active_group_count",
+      "uncovered_group_count",
+      "groups_complete",
+      "phishing_campaigns_complete",
+      "training_campaigns_complete",
+    ],
+    rules: [
+      rule("manual", ne("groups_readable", true)),
+      rule("manual", ne("phishing_campaigns_readable", true)),
+      rule("manual", ne("training_campaigns_readable", true)),
+      rule("warn", eq("active_group_count", 0)),
+      rule("warn", all(gt("uncovered_group_count", 0), incomplete("phishing_campaigns_complete", "training_campaigns_complete"))),
+      rule("fail", gt("uncovered_group_count", 0)),
+      rule("warn", incomplete("groups_complete", "phishing_campaigns_complete", "training_campaigns_complete")),
+      rule("pass", always),
+    ],
+    completeness: {
+      groups_complete: GROUPS_COMPLETE,
+      phishing_campaigns_complete: PHISHING_CAMPAIGNS_COMPLETE,
+      training_campaigns_complete: TRAINING_CAMPAIGNS_COMPLETE,
+    },
+    decision: "Manual when the active group, phishing campaign, or training campaign list is unreadable. Warn when no returned active group has members. Fail when a group with members is not covered both by a phishing campaign and by an uncancelled training campaign in the lookback window, through an All Users target or its group ID, and warn instead when the phishing or training campaign list is partial. Warn instead of pass when any of the three lists is partial. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "All 14 active groups with members are covered by phishing and training campaigns in the lookback window.", { ...GROUP_COVERAGE_HEALTHY }),
+      example("noncompliant", "fail", "3 groups lack a phishing or a training campaign in the lookback window.", { ...GROUP_COVERAGE_HEALTHY, uncovered_group_count: 3 }),
+      example("noncompliant", "fail", "3 groups are uncovered by complete campaign lists, though the group list stopped at 20000 records.", {
+        ...GROUP_COVERAGE_HEALTHY, uncovered_group_count: 3, groups_complete: false,
+      }),
+      example("partial", "warn", "3 groups look uncovered, but the phishing campaign list stopped at 20000 records.", {
+        ...GROUP_COVERAGE_HEALTHY, uncovered_group_count: 3, phishing_campaigns_complete: false,
+      }),
+      example("partial", "warn", "No returned active group has members.", { ...GROUP_COVERAGE_HEALTHY, active_group_count: 0 }),
+      example("partial", "warn", "Every group read is covered, but the group list stopped at 20000 records.", { ...GROUP_COVERAGE_HEALTHY, groups_complete: false }),
+      example("unreadable", "manual", "The active group list was refused.", { groups_readable: false }),
+      example("unreadable", "manual", "The phishing campaign list was refused.", { groups_readable: true, phishing_campaigns_readable: false }),
+      example("unreadable", "manual", "The training campaign list was refused.", { groups_readable: true, phishing_campaigns_readable: true, training_campaigns_readable: false }),
+    ],
+  },
+  {
+    id: "KNOWBE4-18",
+    control: 18,
+    title: "Inactive user cleanup",
+    severity: "medium",
+    owner: RISK,
+    surfaces: ["users", "security_tests", "security_test_recipients", "training_enrollments"],
+    inputs: [
+      "users_readable",
+      "user_record_count",
+      "long_standing_user_count",
+      "inactive_user_count",
+      "activity_data_complete",
+      "users_complete",
+      "security_tests_complete",
+      "recipient_walks_complete",
+      "training_enrollments_complete",
+    ],
+    constants: { max_inactive_pct: 5 },
+    rules: [
+      rule("manual", ne("users_readable", true)),
+      rule("warn", eq("user_record_count", 0)),
+      rule("warn", all(gt("inactive_user_count", 0), ne("activity_data_complete", true))),
+      rule("fail", percent("gt", "inactive_user_count", "long_standing_user_count", "max_inactive_pct")),
+      rule("warn", gt("inactive_user_count", 0)),
+      rule("warn", incomplete("users_complete", "security_tests_complete", "recipient_walks_complete", "training_enrollments_complete")),
+      rule("pass", always),
+    ],
+    completeness: {
+      activity_data_complete: ACTIVITY_DATA_COMPLETE,
+      users_complete: USERS_COMPLETE,
+      security_tests_complete: SECURITY_TESTS_COMPLETE,
+      recipient_walks_complete: RECIPIENT_WALKS_COMPLETE,
+      training_enrollments_complete: TRAINING_ENROLLMENTS_COMPLETE,
+    },
+    decision: "Manual when the active user list is unreadable. Warn when it is empty. A long-standing user, one whose joined_on is missing or at or before the start of the inactivity window, is inactive when they have not signed in since that start, received no delivered phishing test that ran in the window among the sampled tests, and have no training enrollment activity since that start. When any is inactive, warn when an activity source is incomplete; otherwise fail when more than 5 percent of long-standing users are inactive, and warn at 5 percent or less. Warn instead of pass when the active user, security test, recipient, or training enrollment read is partial or refused. Otherwise pass.",
+    examples: [
+      example("compliant", "pass", "All 360 long-standing users show sign-in, phishing, or training activity in the inactivity window.", { ...INACTIVITY_HEALTHY }),
+      example("compliant", "pass", "Every active user joined within the inactivity window.", { ...INACTIVITY_HEALTHY, long_standing_user_count: 0 }),
+      example("compliant", "pass", "No long-standing user lacks activity, and the tests left out of the sample could only have added more.", {
+        ...INACTIVITY_HEALTHY, activity_data_complete: false,
+      }),
+      example("noncompliant", "fail", "27 of 360 long-standing users (7.5 percent) show no activity.", { ...INACTIVITY_HEALTHY, inactive_user_count: 27 }),
+      example("noncompliant", "fail", "27 of the 360 long-standing users read show no activity, though the active user list stopped at user_limit.", {
+        ...INACTIVITY_HEALTHY, inactive_user_count: 27, users_complete: false,
+      }),
+      example("partial", "warn", "18 of 360 long-standing users (5 percent) show no activity, within the 5 percent tolerance.", { ...INACTIVITY_HEALTHY, inactive_user_count: 18 }),
+      example("partial", "warn", "27 users show no loaded activity, but tests in the sample window were left out of the sample.", {
+        ...INACTIVITY_HEALTHY, inactive_user_count: 27, activity_data_complete: false,
+      }),
+      example("partial", "warn", "No user is inactive, but a recipient read was refused.", {
+        ...INACTIVITY_HEALTHY, recipient_walks_complete: false, activity_data_complete: false,
+      }),
+      example("partial", "warn", "No user is inactive, but the training enrollment list stopped at enrollment_limit.", {
+        ...INACTIVITY_HEALTHY, training_enrollments_complete: false, activity_data_complete: false,
+      }),
+      example("partial", "warn", "No user is inactive, but the active user list stopped at user_limit.", { ...INACTIVITY_HEALTHY, users_complete: false }),
+      EMPTY_USERS,
+      UNREADABLE_USERS,
+    ],
+  },
+];
+
 const toCheck = (check: Knowbe4Check): BatchCheckDefinition => {
   const executable = deriveDecisionRules(check.id, check.rules);
   return {
@@ -1034,7 +1255,7 @@ const toCheck = (check: Knowbe4Check): BatchCheckDefinition => {
   };
 };
 
-const checks: readonly BatchCheckDefinition[] = [...PHISHING_CHECKS, ...TRAINING_CHECKS].map(toCheck);
+const checks: readonly BatchCheckDefinition[] = [...PHISHING_CHECKS, ...TRAINING_CHECKS, ...RISK_CHECKS].map(toCheck);
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
 const NOT_OBJECTS = "Entries that are not JSON objects are dropped before a page is counted.";
@@ -1130,6 +1351,7 @@ export const KNOWBE4_SPEC = buildBatchIntegrationSpec({
     knowbe4_check_access: [],
     knowbe4_assess_phishing_program: idsFor(PHISHING),
     knowbe4_assess_training_program: idsFor(TRAINING),
+    knowbe4_assess_user_risk: idsFor(RISK),
     knowbe4_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [
