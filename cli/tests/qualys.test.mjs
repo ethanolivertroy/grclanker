@@ -37,7 +37,12 @@ import {
   vendorErrorCode,
   xmlToRecord,
 } from "../dist/extensions/grc-tools/qualys.js";
+import { QUALYS_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
+import { QUALYS_SPEC } from "../dist/extensions/grc-tools/qualys.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertBundlePathsMatchSpec, readBundleFiles } from "./helpers/bundle-contents.mjs";
+import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
+import { assertRequestConformance, recordFetchRequests, sweepCheckCompleteness } from "./helpers/spec-conformance.mjs";
 
 const NOW = new Date();
 const daysAgo = (days) => new Date(NOW.getTime() - days * 86_400_000).toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -1078,35 +1083,44 @@ const partialRouter = async (url, init) => {
   return xmlPage((id) => partialXmlRecord(url, id), url);
 };
 
-const compliantRouter = async (url) => {
-  if (url.includes("/qps/rest/")) {
-    if (url.includes("/am/user")) return jsonResponse(qpsResponse("User", tenant.adminUsers));
-    if (url.includes("/am/hostasset")) return jsonResponse(qpsResponse("HostAsset", tenant.agents));
-    if (url.includes("/am/assetdataconnector")) return jsonResponse(qpsResponse("AwsAssetDataConnector", tenant.connectors));
-    if (url.includes("/am/tag")) return jsonResponse(qpsResponse("Tag", tenant.tags));
-    if (url.includes("/was/webappauthrecord")) return jsonResponse(qpsResponse("WebAppAuthRecord", tenant.wasAuthRecords));
-    if (url.includes("/was/wasscanschedule")) return jsonResponse(qpsResponse("WasScanSchedule", tenant.wasSchedules));
-    if (url.includes("/was/wasscan")) return jsonResponse(qpsResponse("WasScan", tenant.wasScans));
-    if (url.includes("/was/webapp")) return jsonResponse(qpsResponse("WebApp", tenant.webApps));
-    throw new Error(`unexpected QPS url ${url}`);
-  }
-  if (url.includes("/activity_log/")) return csvResponse(activityCsv(tenant.activityRows));
-  if (url.includes("/msp/user_list.php")) return xmlResponse(userListXml(tenant.legacyUsers));
-  if (url.includes("/schedule/scan/")) return xmlResponse(listOutputXml("SCHEDULE_SCAN_LIST_OUTPUT", "SCHEDULE_SCAN_LIST", "SCAN", tenant.schedules));
-  if (url.includes("/fo/scan/")) return xmlResponse(listOutputXml("SCAN_LIST_OUTPUT", "SCAN_LIST", "SCAN", tenant.scans));
-  if (url.includes("/vm/detection/")) return xmlResponse(listOutputXml("HOST_LIST_VM_DETECTION_OUTPUT", "HOST_LIST", "HOST", tenant.detectionHosts));
-  if (url.includes("/asset/host/")) return xmlResponse(listOutputXml("HOST_LIST_OUTPUT", "HOST_LIST", "HOST", tenant.hosts));
-  if (url.includes("/option_profile/vm/")) return xmlResponse(`<?xml version="1.0" encoding="UTF-8" ?><OPTION_PROFILES>${xmlFromRecord("OPTION_PROFILE", tenant.profiles)}</OPTION_PROFILES>`);
-  if (url.includes("/excluded_ip/")) return xmlResponse(`<?xml version="1.0" encoding="UTF-8" ?><IP_LIST_OUTPUT><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME></RESPONSE></IP_LIST_OUTPUT>`);
-  if (url.includes("/asset/group/")) return xmlResponse(listOutputXml("ASSET_GROUP_LIST_OUTPUT", "ASSET_GROUP_LIST", "ASSET_GROUP", tenant.groups));
-  if (url.includes("/appliance/")) return xmlResponse(listOutputXml("APPLIANCE_LIST_OUTPUT", "APPLIANCE_LIST", "APPLIANCE", tenant.appliances));
-  if (url.includes("/fo/auth/")) return xmlResponse(AUTH_RECORDS_SAMPLE);
-  if (url.includes("/compliance/policy/")) return xmlResponse(listOutputXml("POLICY_LIST_OUTPUT", "POLICY_LIST", "POLICY", tenant.policies));
-  if (url.includes("/knowledge_base/")) return xmlResponse(listOutputXml("KNOWLEDGE_BASE_VULN_LIST_OUTPUT", "VULN_LIST", "VULN", tenant.knowledgeBase));
-  if (url.includes("/schedule/report/")) return xmlResponse(listOutputXml("SCHEDULE_REPORT_LIST_OUTPUT", "SCHEDULE_REPORT_LIST", "REPORT", tenant.scheduledReports));
-  if (url.includes("/fo/report/")) return xmlResponse(listOutputXml("REPORT_LIST_OUTPUT", "REPORT_LIST", "REPORT", tenant.reports));
-  throw new Error(`unexpected url ${url}`);
-};
+// Serves one tenant through the documented response shapes. A tenant that sets wasScanHistory answers the history
+// search (the scan search filtered by webApp.id) from it; any other tenant answers every scan search from wasScans.
+function tenantRouter(state) {
+  return async (url, init) => {
+    if (url.includes("/qps/rest/")) {
+      if (url.includes("/am/user")) return jsonResponse(qpsResponse("User", state.adminUsers));
+      if (url.includes("/am/hostasset")) return jsonResponse(qpsResponse("HostAsset", state.agents));
+      if (url.includes("/am/assetdataconnector")) return jsonResponse(qpsResponse("AwsAssetDataConnector", state.connectors));
+      if (url.includes("/am/tag")) return jsonResponse(qpsResponse("Tag", state.tags));
+      if (url.includes("/was/webappauthrecord")) return jsonResponse(qpsResponse("WebAppAuthRecord", state.wasAuthRecords));
+      if (url.includes("/was/wasscanschedule")) return jsonResponse(qpsResponse("WasScanSchedule", state.wasSchedules));
+      if (url.includes("/was/wasscan")) {
+        const history = state.wasScanHistory && JSON.parse(init.body).ServiceRequest.filters.Criteria.some((item) => item.field === "webApp.id");
+        return jsonResponse(qpsResponse("WasScan", history ? state.wasScanHistory : state.wasScans));
+      }
+      if (url.includes("/was/webapp")) return jsonResponse(qpsResponse("WebApp", state.webApps));
+      throw new Error(`unexpected QPS url ${url}`);
+    }
+    if (url.includes("/activity_log/")) return csvResponse(activityCsv(state.activityRows));
+    if (url.includes("/msp/user_list.php")) return xmlResponse(userListXml(state.legacyUsers));
+    if (url.includes("/schedule/scan/")) return xmlResponse(listOutputXml("SCHEDULE_SCAN_LIST_OUTPUT", "SCHEDULE_SCAN_LIST", "SCAN", state.schedules));
+    if (url.includes("/fo/scan/")) return xmlResponse(listOutputXml("SCAN_LIST_OUTPUT", "SCAN_LIST", "SCAN", state.scans));
+    if (url.includes("/vm/detection/")) return xmlResponse(listOutputXml("HOST_LIST_VM_DETECTION_OUTPUT", "HOST_LIST", "HOST", state.detectionHosts));
+    if (url.includes("/asset/host/")) return xmlResponse(listOutputXml("HOST_LIST_OUTPUT", "HOST_LIST", "HOST", state.hosts));
+    if (url.includes("/option_profile/vm/")) return xmlResponse(`<?xml version="1.0" encoding="UTF-8" ?><OPTION_PROFILES>${xmlFromRecord("OPTION_PROFILE", state.profiles)}</OPTION_PROFILES>`);
+    if (url.includes("/excluded_ip/")) return xmlResponse(`<?xml version="1.0" encoding="UTF-8" ?><IP_LIST_OUTPUT><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME></RESPONSE></IP_LIST_OUTPUT>`);
+    if (url.includes("/asset/group/")) return xmlResponse(listOutputXml("ASSET_GROUP_LIST_OUTPUT", "ASSET_GROUP_LIST", "ASSET_GROUP", state.groups));
+    if (url.includes("/appliance/")) return xmlResponse(listOutputXml("APPLIANCE_LIST_OUTPUT", "APPLIANCE_LIST", "APPLIANCE", state.appliances));
+    if (url.includes("/fo/auth/")) return xmlResponse(AUTH_RECORDS_SAMPLE);
+    if (url.includes("/compliance/policy/")) return xmlResponse(listOutputXml("POLICY_LIST_OUTPUT", "POLICY_LIST", "POLICY", state.policies));
+    if (url.includes("/knowledge_base/")) return xmlResponse(listOutputXml("KNOWLEDGE_BASE_VULN_LIST_OUTPUT", "VULN_LIST", "VULN", state.knowledgeBase));
+    if (url.includes("/schedule/report/")) return xmlResponse(listOutputXml("SCHEDULE_REPORT_LIST_OUTPUT", "SCHEDULE_REPORT_LIST", "REPORT", state.scheduledReports));
+    if (url.includes("/fo/report/")) return xmlResponse(listOutputXml("REPORT_LIST_OUTPUT", "REPORT_LIST", "REPORT", state.reports));
+    throw new Error(`unexpected url ${url}`);
+  };
+}
+
+const compliantRouter = tenantRouter(tenant);
 
 const COMPLIANT_PASS_IDS = ["QUALYS-C01", "QUALYS-C02", "QUALYS-C05", "QUALYS-C06", "QUALYS-C07", "QUALYS-C08", "QUALYS-C09", "QUALYS-C10", "QUALYS-C11", "QUALYS-C13", "QUALYS-C14", "QUALYS-C15", "QUALYS-C16", "QUALYS-C18"];
 const CAPPED_BY_DESIGN_IDS = ["QUALYS-C03", "QUALYS-C12", "QUALYS-C17", "QUALYS-C19", "QUALYS-C20"];
@@ -4312,4 +4326,166 @@ test("Qualys tools are registered in the tool catalog under the Qualys group", (
   assert.ok(tools.every((tool) => tool.group === "Qualys"));
   assert.ok(tools.every((tool) => tool.kind === "domain"));
   assert.ok(tools.every((tool) => typeof tool.description === "string" && tool.description.length > 40));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Portable contract: auth resolver, requests, completeness, bundle paths, threshold edges, ordered rules
+// ---------------------------------------------------------------------------------------------
+
+portableContractTest("the auth resolver contract names exactly the environment the resolver reads, and each variable reaches the resolved configuration", () => {
+  assert.deepEqual(QUALYS_SPEC.authentication.environmentVariables, QUALYS_AUTH_RESOLVER.environment);
+  assert.deepEqual(QUALYS_SPEC.authentication.configLocations, QUALYS_AUTH_RESOLVER.configLocations);
+  assert.deepEqual(QUALYS_SPEC.authentication.configFields, QUALYS_AUTH_RESOLVER.configFields);
+
+  const directory = createTempBase("qualys-resolver-contract-");
+  const emptyConfigFile = join(directory, "empty.qcrc");
+  writeFileSync(emptyConfigFile, "");
+  const configFile = join(directory, "file.qcrc");
+  writeFileSync(configFile, "[info]\nusername = file_user\npassword = file_pass\n");
+  const basic = { QUALYS_CONFIG_FILE: emptyConfigFile, QUALYS_USERNAME: "env_user", QUALYS_PASSWORD: "env-pass" };
+
+  const accessed = new Set();
+  const tracked = new Proxy({ ...basic }, {
+    get(target, property) {
+      if (typeof property === "string") accessed.add(property);
+      return target[property];
+    },
+  });
+  resolveQualysConfiguration({}, tracked);
+  assert.deepEqual([...accessed].sort(), [...QUALYS_AUTH_RESOLVER.environment].sort());
+
+  const reached = {
+    QUALYS_CONFIG_FILE: [{ QUALYS_CONFIG_FILE: configFile }, (config) => config.username === "file_user" && config.password === "file_pass"],
+    QUALYS_USERNAME: [basic, (config) => config.username === "env_user"],
+    QUALYS_USER: [{ QUALYS_CONFIG_FILE: emptyConfigFile, QUALYS_USER: "env_alias", QUALYS_PASSWORD: "env-pass" }, (config) => config.username === "env_alias"],
+    QUALYS_PASSWORD: [basic, (config) => config.password === "env-pass"],
+    QUALYS_TOKEN: [{ QUALYS_CONFIG_FILE: emptyConfigFile, QUALYS_TOKEN: "env-token" }, (config) => config.authMode === "bearer" && config.token === "env-token"],
+    QUALYS_ACCESS_TOKEN: [{ QUALYS_CONFIG_FILE: emptyConfigFile, QUALYS_ACCESS_TOKEN: "env-access-token" }, (config) => config.authMode === "bearer" && config.token === "env-access-token"],
+    QUALYS_USE_OAUTH: [{ ...basic, QUALYS_USE_OAUTH: "true" }, (config) => config.authMode === "oauth"],
+    QUALYS_PLATFORM: [{ ...basic, QUALYS_PLATFORM: "EU2" }, (config) => config.platform === "EU2"],
+    QUALYS_API_SERVER: [{ ...basic, QUALYS_API_SERVER: "qualysapi.qg3.apps.qualys.com" }, (config) => config.platform === "US3"],
+    QUALYS_BASE_URL: [{ ...basic, QUALYS_BASE_URL: "https://qualysapi.qualys.eu" }, (config) => config.platform === "EU1"],
+    QUALYS_API_URL: [{ ...basic, QUALYS_API_URL: "https://qualysapi.qg1.apps.qualys.ca" }, (config) => config.platform === "CA1"],
+    QUALYS_GATEWAY_URL: [{ ...basic, QUALYS_GATEWAY_URL: "https://gateway.example.internal" }, (config) => config.gatewayUrl === "https://gateway.example.internal"],
+    QUALYS_TIMEOUT: [{ ...basic, QUALYS_TIMEOUT: "45" }, (config) => config.timeoutMs === 45_000],
+    QUALYS_MAX_RETRIES: [{ ...basic, QUALYS_MAX_RETRIES: "4" }, (config) => config.maxRetries === 4],
+    QUALYS_LOOKBACK_DAYS: [{ ...basic, QUALYS_LOOKBACK_DAYS: "14" }, (config) => config.lookbackDays === 14],
+  };
+  assert.deepEqual(Object.keys(reached).sort(), [...QUALYS_AUTH_RESOLVER.environment].sort());
+  for (const [name, [environment, applied]] of Object.entries(reached)) {
+    assert.ok(applied(resolveQualysConfiguration({}, environment)), `${name} reaches the resolved configuration`);
+  }
+});
+
+// The compliant tenant plus a web application whose only finished scan launched an hour before the lookback window
+// opened: the bounded scan search cannot return it, so the history search runs and resolves it at lookback_days.
+function contractTenant() {
+  const state = structuredClone(tenant);
+  state.webApps.push(documentedWebApp({ id: 501, name: "Billing", url: "https://billing.example.com", lastScan: { id: 2, name: "Billing monthly" } }));
+  state.wasScanHistory = [documentedWasScan({
+    id: 2,
+    name: "Billing monthly",
+    target: { webApp: { id: 501, name: "Billing", url: "https://billing.example.com" } },
+    launchedDate: daysAgo(30 + 1 / 24),
+  })];
+  return state;
+}
+
+const SURFACE_BY_ENDPOINT = new Map(Object.entries(SURFACE_ENDPOINTS)
+  .filter(([name]) => !name.startsWith("api_") && name !== "was_scan_history")
+  .map(([name, endpoint]) => [endpoint, name]));
+
+// The history search posts to the scan search's path and differs only by its webApp.id criterion.
+function requestedSurface(url, init) {
+  const surface = SURFACE_BY_ENDPOINT.get(new URL(url).pathname);
+  const criteria = surface === "was_scans" ? JSON.parse(init.body).ServiceRequest.filters.Criteria : [];
+  return criteria.some((item) => item.field === "webApp.id") ? "was_scan_history" : surface;
+}
+
+// Serves the tenant and passes each response through the transform registered for the surface it answers.
+function contractRouter(state = contractTenant(), transforms = {}) {
+  const route = tenantRouter(state);
+  return async (url, init) => {
+    const response = await route(url, init);
+    const transform = transforms[requestedSurface(url, init)];
+    return transform ? transform(response) : response;
+  };
+}
+
+const FOREIGN_CONTINUATION = "<WARNING><CODE>1980</CODE><TEXT>1000 record limit exceeded. Use URL to get next batch of results.</TEXT><URL><![CDATA[https://qualysapi.example.net/api/2.0/fo/asset/host/?action=list&id_min=2]]></URL></WARNING>";
+
+async function withForeignContinuation(response) {
+  return xmlResponse((await response.text()).replace(/(<\/[A-Z_]+>)\s*$/, `${FOREIGN_CONTINUATION}$1`));
+}
+
+async function withMoreRecordsAndNoLastId(response) {
+  const { ServiceResponse } = await response.json();
+  return jsonResponse({ ServiceResponse: { ...ServiceResponse, hasMoreRecords: "true" } });
+}
+
+let fullUserListXml;
+function withFullUserList() {
+  fullUserListXml ??= userListXml([
+    ...tenant.legacyUsers,
+    ...Array.from({ length: 5000 - tenant.legacyUsers.length }, (_, index) => legacyUser({ login: `analyst_${index}`, id: String(3000 + index), firstName: "Avery", lastName: `Analyst${index}` })),
+  ]);
+  return xmlResponse(fullUserListXml);
+}
+
+// Each truncation keeps the healthy records and only leaves the read partial. excluded_ips and auth_records never
+// follow a WARNING/URL, the other XML lists refuse a continuation to another origin, a QPS search that reports more
+// records without a lastId cannot continue, and the User List API stops at 5000 users.
+function truncation(surfaceId) {
+  if (surfaceId === "user_list") return withFullUserList;
+  return SURFACE_ENDPOINTS[surfaceId].startsWith("/qps/") ? withMoreRecordsAndNoLastId : withForeignContinuation;
+}
+
+const refusal = () => xmlResponse("<SIMPLE_RETURN><RESPONSE><CODE>2010</CODE><TEXT>Forbidden: module not subscribed</TEXT></RESPONSE></SIMPLE_RETURN>", { status: 403 });
+
+portableContractTest("every request the access check, the four assessments, and the export send matches a declared surface, parameter, and header", async () => {
+  const route = contractRouter();
+  const recorder = recordFetchRequests((url, init) => route(String(url), init ?? {}));
+  const client = new QualysApiClient(sampleConfig(), { fetchImpl: recorder.fetch, sleepImpl: async () => {} });
+  await checkQualysAccess(client);
+  await runAllAssessments(client);
+  await exportQualysAuditBundle(client, client.getResolvedConfig(), createTempBase("qualys-request-conformance-"));
+  assertRequestConformance(assert, QUALYS_SPEC, recorder.requests, {
+    uncalled: { was_scan_history: "the history search posts to the scan search's path, so the matcher assigns its requests to was_scans; this test checks their criteria directly" },
+  });
+
+  const history = QUALYS_SPEC.apiSurfaces.find((surface) => surface.id === "was_scan_history");
+  const historyRequests = recorder.requests.filter((request) => request.body?.ServiceRequest?.filters?.Criteria?.some((item) => item.field === "webApp.id"));
+  assert.ok(historyRequests.length > 0, "the history search ran");
+  for (const request of historyRequests) {
+    assert.equal(`${request.method} ${new URL(request.url).pathname}`, `${history.method} ${history.path}`);
+    assert.equal(request.body.ServiceRequest.preferences.limitResults, 100);
+    assert.deepEqual(request.body.ServiceRequest.filters.Criteria, [
+      { field: "webApp.id", operator: "IN", value: "501" },
+      { field: "type", operator: "EQUALS", value: "VULNERABILITY" },
+      { field: "status", operator: "EQUALS", value: "FINISHED" },
+    ]);
+  }
+});
+
+portableContractTest("completeness sweep: a truncated source never lets a check that reads it pass", async () => {
+  const report = await sweepCheckCompleteness({
+    spec: QUALYS_SPEC,
+    createInput: () => ({}),
+    applyFailure: (transforms, { surfaceId, mode }) => (mode === "truncated" ? { ...transforms, [surfaceId]: truncation(surfaceId) } : undefined),
+    assess: async (transforms) => allFindings(await runAllAssessments(routedClient(contractRouter(contractTenant(), transforms)))),
+  });
+  assert.deepEqual(report.baselineNotPassing, []);
+  assert.deepEqual(report.unreachable, []);
+  assert.deepEqual(report.undemoted, []);
+  assert.ok(report.combinations > 0);
+});
+
+portableContractTest("the export writes every declared bundle path and nothing else, with and without collection errors", async () => {
+  const complete = await exportQualysAuditBundle(routedClient(contractRouter()), sampleConfig(), createTempBase("qualys-bundle-paths-"));
+  assertBundlePathsMatchSpec(assert, complete.outputDir, QUALYS_SPEC);
+  assert.ok(!readBundleFiles(complete.outputDir).has("_errors.log"));
+
+  const partial = await exportQualysAuditBundle(routedClient(contractRouter(contractTenant(), { compliance_policies: refusal })), sampleConfig(), createTempBase("qualys-bundle-paths-"));
+  assertBundlePathsMatchSpec(assert, partial.outputDir, QUALYS_SPEC);
+  assert.ok(readBundleFiles(partial.outputDir).has("_errors.log"));
 });
