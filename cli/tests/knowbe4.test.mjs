@@ -3358,6 +3358,42 @@ test("boundary scenarios: each threshold edge reaches the verdict on either side
   assert.deepEqual(mismatches, []);
 });
 
+/** Every inventory holds a record whose optional fields are null or absent. */
+function missingNullFixture() {
+  const users = [1, 2, 3].map((id) => ({ id, email: `user${id}@acme.example`, status: "active", joined_on: null, last_sign_in: null, current_risk_score: null, groups: null }));
+  return {
+    account: { name: null, domains: null, admins: null, current_risk_score: null },
+    riskHistory: [{ risk_score: null, date: null }],
+    users,
+    groups: [{ id: 100, name: null, member_count: null }],
+    phishingCampaigns: [{ campaign_id: 500, name: null, groups: null, status: "Active", hidden: null, last_run: null }],
+    securityTests: [{ pst_id: 900, campaign_id: 500, status: "Closed", started_at: daysAgo(6), phish_prone_percentage: null, delivered_count: null, reported_count: null, groups: null }],
+    recipientsByTest: new Map([["900", users.map((record) => ({ recipient_id: Number(`900${record.id}`), pst_id: 900, user: { id: record.id, email: record.email }, delivered_at: null }))]]),
+    callbackTests: [{ pst_id: 950, campaign_id: 501, status: null, started_at: null }],
+    trainingCampaigns: [{ campaign_id: 700, name: null, groups: null, status: "Completed", content: null, start_date: null, end_date: null, completion_percentage: null }],
+    enrollments: [{ enrollment_id: 1, user: { id: 1, email: "user1@acme.example" }, module_name: null, campaign_id: 700, enrollment_date: null, status: null }],
+    storePurchases: [{ store_purchase_id: 1, name: null, retired: null, publish_date: null }],
+    trainingPolicies: [{ policy_id: 1, name: null, status: null }],
+    phisherMessages: [{ id: "msg-1", reportedAt: null, category: null, severity: null, actionStatus: null }],
+  };
+}
+
+test("byte differential fixtures: KnowBe4 assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  const assess = (fixture, options) => runAllKnowbe4Assessments(httpKnowbe4(fixture, options).client);
+  const partialRoutes = { "GET /v1/groups": jsonForbiddenWithUrl(), "GET /v1/training/enrollments": jsonForbiddenWithUrl() };
+  writeByteDifferentialFixture("knowbe4", "representative", await assess(failingFixture()));
+  writeByteDifferentialFixture("knowbe4", "compliant", await assess(healthyFixture()));
+  writeByteDifferentialFixture("knowbe4", "denied", await assess(healthyFixture(), { routes: kbDeniedRoutes() }));
+  writeByteDifferentialFixture("knowbe4", "partial", await assess(healthyFixture(), { routes: partialRoutes }));
+  writeByteDifferentialFixture("knowbe4", "missing-null", await assess(missingNullFixture()));
+  const boundary = {};
+  for (const scenario of BOUNDARY_SCENARIOS) boundary[scenario.name] = await runBoundaryScenario(scenario);
+  writeByteDifferentialFixture("knowbe4", "boundary", boundary);
+  const { client, config } = httpKnowbe4(healthyFixture());
+  const exported = await exportKnowbe4AuditBundle(client, config, prepareByteDifferentialExportRoot("knowbe4"), { now: NOW });
+  writeByteDifferentialFixture("knowbe4", "export", snapshotExportBundle(exported));
+});
+
 portableContractTest("every threshold edge and ordered rule in the spec is reached by an assessment in this file", {
   skip: testFilterActive && "a test filter ran only part of this file",
 }, () => {
