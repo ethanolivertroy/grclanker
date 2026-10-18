@@ -236,9 +236,9 @@ const TRAINING_SURFACES: readonly BatchSurfaceDefinition[] = [
 const GOVERNANCE_SURFACES: readonly BatchSurfaceDefinition[] = [
   reportingSurface(
     "callback_security_tests",
-    "/v1/phishing/security_tests",
+    "/v1/phishing/security_tests?campaign_type=callback",
     ["started_at", "start_date"],
-    listParameters(false, param("campaign_type", "query", "callback")),
+    listParameters(false),
     arrayResponse("one callback phishing security test per entry"),
   ),
 ];
