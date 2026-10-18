@@ -4042,6 +4042,7 @@ function accountDomains(snapshot: Knowbe4Snapshot): string[] {
 }
 
 function assessAdminRoles(snapshot: Knowbe4Snapshot, maxAdminCount: number, redact: boolean): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(12, { account_readable: isRead(snapshot.account) });
   if (snapshot.account.error) return unavailableFinding(12, "high", "account", snapshot);
   const admins = asRecordArray(snapshot.account.data.admins);
   const allowedDomains = new Set(accountDomains(snapshot).map((domain) => domain.toLowerCase()));
@@ -4051,6 +4052,11 @@ function assessAdminRoles(snapshot: Knowbe4Snapshot, maxAdminCount: number, reda
       return Boolean(domain && !allowedDomains.has(domain));
     })
     : [];
+  recordKnowbe4DecisionFacts(12, {
+    admin_count: admins.length,
+    max_admin_count: maxAdminCount,
+    external_admin_count: externalAdmins.length,
+  });
 
   let status: Knowbe4Finding["status"];
   let summary: string;
@@ -4079,6 +4085,7 @@ function assessAdminRoles(snapshot: Knowbe4Snapshot, maxAdminCount: number, reda
 }
 
 function assessSsoStatus(snapshot: Knowbe4Snapshot): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(13, {});
   return finding(
     13,
     "high",
@@ -4095,6 +4102,7 @@ function assessSsoStatus(snapshot: Knowbe4Snapshot): Knowbe4Finding {
 }
 
 function assessReportingFrequency(snapshot: Knowbe4Snapshot, now: Date): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(14, {});
   const latestTest = runTests(snapshot.securityTests.data, now)[0];
   const completedCampaigns = snapshot.trainingCampaigns.data
     .filter((campaign) => campaignCompletedOrEnded(campaign, now) && !campaignCancelled(campaign))
@@ -4125,6 +4133,7 @@ function assessReportingFrequency(snapshot: Knowbe4Snapshot, now: Date): Knowbe4
 }
 
 function assessUsbTests(now: Date, lookbackDays: number, requireUsbTests: boolean): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(15, {});
   if (!requireUsbTests) {
     // Scoping a control out by configuration is not evidence that it is met, so it stays a manual item.
     return finding(
@@ -4158,6 +4167,7 @@ function assessUsbTests(now: Date, lookbackDays: number, requireUsbTests: boolea
 }
 
 function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, requireVishingTests: boolean): Knowbe4Finding {
+  recordKnowbe4DecisionFacts(16, { require_vishing_tests: requireVishingTests });
   if (!requireVishingTests) {
     return finding(
       16,
@@ -4174,6 +4184,7 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
       "Attach the approved policy or risk-acceptance record stating that voice-channel (vishing) testing is out of scope for the awareness program. If it is in scope, export the Callback Phishing campaign list from the KnowBe4 console (Phishing, Callback Phishing) showing tests started in the assessment period.",
     );
   }
+  recordKnowbe4DecisionFacts(16, { callback_security_tests_readable: isRead(snapshot.callbackSecurityTests) });
   if (snapshot.callbackSecurityTests.error) return unavailableFinding(16, "low", "callback_security_tests", snapshot);
   if (!snapshot.callbackSecurityTests.collected) {
     // The governance scope was not collected, so no request was made and no endpoint or status is named.
@@ -4193,6 +4204,10 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
   const recent = testsWithin(snapshot.callbackSecurityTests.data, lookbackDays, now);
   const allTime = runTests(snapshot.callbackSecurityTests.data, now);
   const listComplete = isComplete(snapshot.callbackSecurityTests);
+  recordKnowbe4DecisionFacts(16, {
+    callback_security_tests_complete: listComplete,
+    callback_tests_in_window: recent.length,
+  });
   // A test found in the window is a real observation; "none ran" is only known from a complete list.
   const status = recent.length > 0 ? "pass" : listComplete ? "fail" : "warn";
 
@@ -4221,6 +4236,13 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
 export function assessKnowbe4AccountGovernance(
   snapshot: Knowbe4Snapshot,
   options: Knowbe4AssessmentOptions = {},
+): Knowbe4AssessmentResult {
+  return runBatchVerdictContext(KNOWBE4_DECISION_CONTEXT, KNOWBE4_SPEC, () => assessKnowbe4AccountGovernanceWithDecisionContext(snapshot, options));
+}
+
+function assessKnowbe4AccountGovernanceWithDecisionContext(
+  snapshot: Knowbe4Snapshot,
+  options: Knowbe4AssessmentOptions,
 ): Knowbe4AssessmentResult {
   const now = options.now ?? new Date();
   const redact = options.redactPii ?? false;
