@@ -47,7 +47,7 @@ export default async function Page(props: PageProps) {
         <Content components={mdxComponents} />
       </div>
       {slug === 'specs/using-specs-as-inputs' && (
-        <div className="mt-8">
+        <div className="mt-5">
           <AgentCommandsSection />
         </div>
       )}
