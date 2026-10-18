@@ -48,6 +48,18 @@ export function createSearchTokenizer() {
 }
 
 /**
+ * Picks the fields of a search document to index. Searches match only the
+ * content field, and they read each hit, and the page it is grouped under,
+ * from the stored documents. Indexes of the other fields would only add to
+ * the download. A search that filtered by another field would need it indexed.
+ *
+ * @param {{ content: string }} doc
+ */
+export function getIndexedProperties(doc) {
+  return { content: doc.content };
+}
+
+/**
  * Runs a search that matches hyphenated identifiers whole. An identifier that
  * finds nothing whole, such as SOC-2 where the docs write SOC 2, is searched by
  * its parts instead, as the default tokenizer would. Each identifier is checked
