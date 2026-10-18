@@ -1,7 +1,7 @@
-// Line-break control for inline code and link text. Browsers fill each line
-// greedily, so any break point inside an identifier gets used whenever the
-// identifier reaches a line end; each context gets only the break points it
-// needs.
+// Line-break control for inline code, link text, and numbers in running text.
+// Browsers fill each line greedily, so any break point inside an identifier
+// gets used whenever the identifier reaches a line end; each context gets only
+// the break points it needs.
 
 // After a slash, or after a dot that does not start a file extension.
 const PATH_BREAK = String.raw`(?<=[^\s./_][/])(?=[^\s./_])|(?<=[^\s./_][.])(?=[^\s./_])(?![A-Za-z0-9]{1,4}$)`;
@@ -21,6 +21,10 @@ const PROSE = { shortLength: 16, wordLength: Infinity, breakHyphens: false };
 const TABLE = { shortLength: 16, wordLength: LONG_LENGTH, breakHyphens: false };
 const DENSE_COLUMNS = 4;
 const DENSE_TABLE = { shortLength: 12, wordLength: 12, breakHyphens: true };
+
+// Numbers joined by hyphens, such as 2027-01-01, 800-53, SHA-256, or 1-300.
+// Words such as 30-day still break at their hyphen, as they do in print.
+const HYPHENATED_NUMBER = /((?<![\w.])(?:[A-Za-z]+|\d+)(?:-\d+)+(?![\w-]))/;
 
 const text = (value) => ({ type: 'text', value });
 const wbr = () => ({ type: 'element', tagName: 'wbr', properties: {}, children: [] });
@@ -62,8 +66,15 @@ function breakText(value, mode, isCode) {
   });
 }
 
+function keepNumbersWhole(value) {
+  return value.split(HYPHENATED_NUMBER).flatMap((piece, index) => {
+    if (!piece) return [];
+    return index % 2 ? [nowrap(piece)] : [text(piece)];
+  });
+}
+
 function visit(node, mode) {
-  if (node.type !== 'element' || node.tagName === 'pre') return;
+  if (node.type !== 'element' || node.tagName === 'pre' || 'dataNowrap' in node.properties) return;
   if (node.tagName === 'table') mode = columnCount(node) >= DENSE_COLUMNS ? DENSE_TABLE : TABLE;
   if (node.tagName === 'code') {
     const value = textContent(node);
@@ -76,6 +87,10 @@ function visit(node, mode) {
     const isCode = node.tagName === 'code';
     node.children = node.children.flatMap((child) =>
       child.type === 'text' ? breakText(child.value, mode, isCode) : [child],
+    );
+  } else {
+    node.children = node.children.flatMap((child) =>
+      child.type === 'text' ? keepNumbersWhole(child.value) : [child],
     );
   }
   for (const child of node.children) visit(child, mode);
