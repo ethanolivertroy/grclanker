@@ -71,6 +71,15 @@ test('link text wraps after slashes', () => {
   assert.equal(render(link), 'cli/|extensions/|grc-tools.ts');
 });
 
+test('hyphenated numbers stay whole in running text', () => {
+  const cell = el('td', [text('Grace through 2027-01-01 under 800-53, M-24-15, and SHA-256.')]);
+  const item = el('li', [el('strong', [text('1-300')]), text(' rows, 30-day window, Rev5-Specific')]);
+  run(el('table', [el('tbody', [el('tr', [cell])])]));
+  run(el('ul', [item]));
+  assert.equal(render(cell), 'Grace through [2027-01-01] under [800-53], [M-24-15], and [SHA-256].');
+  assert.equal(render(item), '[1-300] rows, 30-day window, Rev5-Specific');
+});
+
 test('code blocks are left alone', () => {
   const code = el('code', [text('cli/extensions/grc-tools/')]);
   run(el('pre', [code]));

@@ -1191,7 +1191,7 @@ details[open] > .agent-group-toggle::before {
   --docs-inline-bg: color-mix(in srgb, var(--color-surface0) 72%, transparent);
   --docs-quote-bg: color-mix(in srgb, var(--color-crust) 58%, transparent);
   --docs-subtle: var(--color-subtext0);
-  --docs-body: var(--color-subtext1);
+  --docs-body: var(--color-text);
   --docs-title: var(--color-text);
   --docs-accent: var(--color-blue);
   --docs-accent-strong: var(--color-green);
@@ -1331,7 +1331,7 @@ details[open] > .agent-group-toggle::before {
 
 /* Reading measure for running text; tables and code blocks use the full column. */
 .docs-prose > :is(p, ul, ol, blockquote, h2, h3, h4) {
-  max-width: 65ch;
+  max-width: 60ch;
 }
 
 .docs-prose :is(h2, h3, h4) {
@@ -1349,7 +1349,7 @@ details[open] > .agent-group-toggle::before {
 
 .docs-prose h3 {
   margin: 2.25rem 0 0.75rem;
-  color: var(--docs-accent);
+  color: var(--docs-title);
   font-size: 1.125rem;
   line-height: 1.4;
 }
@@ -1364,6 +1364,7 @@ details[open] > .agent-group-toggle::before {
 .docs-prose p {
   margin: 0 0 1.25rem;
   color: var(--docs-body);
+  text-wrap: pretty;
 }
 
 .docs-prose ul,
@@ -1403,6 +1404,7 @@ details[open] > .agent-group-toggle::before {
 .docs-prose li {
   margin: 0.4rem 0;
   color: var(--docs-body);
+  text-wrap: pretty;
 }
 
 .docs-prose strong {
