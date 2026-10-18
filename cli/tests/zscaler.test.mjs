@@ -2011,6 +2011,67 @@ test("single-dataset truncation caps every dependent ZIA-policy and ZPA finding 
   assert.deepEqual(stillPassing, []);
 });
 
+test("a non-pass Zscaler finding still names a truncated dependency and sets partial_inventory", () => {
+  const partial = (dataset) => ({ ...dataset, truncated: true, seen: 200, total: 201 });
+  const cases = [
+    {
+      id: "ZS-03",
+      data: policyFixture({ webDlpRules: partial(readable([])) }),
+      status: "fail",
+      summary: /web DLP rule inventory is partial \(0 records over 200 of 201 pages\)/,
+    },
+    {
+      id: "ZS-04",
+      data: policyFixture({ sslInspectionRules: partial(readable([])) }),
+      status: "fail",
+      summary: /SSL inspection rule inventory is partial \(0 records over 200 of 201 pages\)/,
+    },
+    {
+      id: "ZS-05",
+      data: policyFixture({ sandboxRules: partial(readable([{ id: 1, name: "Off", state: "DISABLED", baRuleAction: "BLOCK" }])) }),
+      status: "fail",
+      summary: /sandbox rule inventory is partial \(1 records over 200 of 201 pages\)/,
+    },
+    {
+      id: "ZS-16",
+      data: policyFixture({ bandwidthRules: partial(readable([{ id: 1, name: "Off", state: "DISABLED" }])) }),
+      status: "warn",
+      summary: /bandwidth control rule inventory is partial \(1 records over 200 of 201 pages\)/,
+    },
+    {
+      id: "ZS-17",
+      data: policyFixture({ isolationProfiles: partial(policyFixture().isolationProfiles) }),
+      status: "warn",
+      summary: /isolation profile inventory is partial \(1 records over 200 of 201 pages\)/,
+    },
+    {
+      id: "ZS-20",
+      data: policyFixture({ dnsRules: partial(readable([{ id: 1, name: "Allow DNS", state: "ENABLED", action: "ALLOW" }])) }),
+      status: "fail",
+      summary: /DNS rule inventory is partial \(1 records over 200 of 201 pages\)/,
+    },
+    {
+      id: "ZS-25",
+      data: policyFixture({ malwareSettings: partial(readable({ virusBlocked: false })) }),
+      status: "fail",
+      summary: /malware settings inventory is partial \(200 of 201 pages\)/,
+    },
+  ];
+  for (const item of cases) {
+    const finding = findingById(assessZiaPolicyData(item.data), item.id);
+    assert.equal(finding.status, item.status, `${item.id}: ${finding.summary}`);
+    assert.equal(finding.evidence.partial_inventory, true, `${item.id}: ${JSON.stringify(finding.evidence)}`);
+    assert.match(finding.summary, item.summary, `${item.id}: ${finding.summary}`);
+    if (item.status === "fail") assert.doesNotMatch(finding.summary, /capped at warn/, `${item.id}: ${finding.summary}`);
+  }
+
+  const rolesOnly = accessControlFixture();
+  rolesOnly.passwordExpiry = partial(rolesOnly.passwordExpiry);
+  const rbac = findingById(assessZiaAccessControlData(rolesOnly), "ZS-07");
+  assert.equal(rbac.evidence.partial_inventory, true);
+  assert.match(rbac.summary, /password expiry inventory is partial/);
+});
+
 test("truncated admin roles, password expiry, and the audit log report cap ZS-07 and ZS-14 at warn", () => {
   const partial = (dataset) => ({ ...dataset, truncated: true, seen: 200, total: 201 });
   const roles = accessControlFixture();
