@@ -118,8 +118,17 @@
 }
 
 /* === Base === */
+/* Scroll padding keeps focused elements and link targets clear of the sticky site header. */
 html {
   scroll-behavior: smooth;
+  scroll-padding-top: var(--fd-banner-height);
+}
+
+/* Below 1280px docs pages also pin Fumadocs' table-of-contents bar (--fd-toc-popover-height) under it. */
+@media (max-width: 1279.98px) {
+  html:has(#nd-docs-layout) {
+    scroll-padding-top: calc(var(--fd-banner-height) + 2.5rem);
+  }
 }
 
 body {
@@ -1252,6 +1261,16 @@ details[open] > .agent-group-toggle::before {
   font-family: var(--docs-font-body);
 }
 
+/* Unboxed and in the entry's color, as code in article links is. The boxed blue missed AA contrast. */
+#nd-toc code,
+[data-toc-popover-content] code {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-size: 0.875em;
+}
+
 /* Fumadocs leaves this bar translucent, so scrolled text shows through it. */
 #nd-docs-layout [data-toc-popover] > header {
   background-color: var(--color-fd-background);
@@ -1395,9 +1414,9 @@ details[open] > .agent-group-toggle::before {
   margin-top: 0;
 }
 
-/* Fumadocs' sticky rows (site header, then the table-of-contents bar below 1280px) end at --fd-docs-row-3. */
+/* The page's scroll padding clears the sticky bars; this adds room above a linked heading. */
 .docs-prose [id] {
-  scroll-margin-top: calc(var(--fd-docs-row-3) + 1rem);
+  scroll-margin-top: 1rem;
 }
 
 /* Reading measure for running text; tables and code blocks use the full column. */
