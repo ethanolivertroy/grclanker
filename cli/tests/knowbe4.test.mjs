@@ -36,8 +36,11 @@ import {
   resolveSecureOutputPath,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/knowbe4.js";
+import { KNOWBE4_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
+import { KNOWBE4_SPEC } from "../dist/extensions/grc-tools/knowbe4.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
@@ -2952,4 +2955,44 @@ test("cookie attribute class: a later cookie whose name holds a dot or another t
   assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "knowbe4 scrubErrorText");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "knowbe4 redactCredentialValues");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "knowbe4 redactCredentialValues, error list");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Portable contract: auth resolver, requests, completeness, bundle paths
+// ---------------------------------------------------------------------------------------------
+
+portableContractTest("the auth resolver contract names exactly the environment the resolver reads, and each variable reaches the resolved configuration", () => {
+  assert.deepEqual(KNOWBE4_SPEC.authentication.environmentVariables, KNOWBE4_AUTH_RESOLVER.environment);
+  assert.deepEqual(KNOWBE4_SPEC.authentication.configLocations, KNOWBE4_AUTH_RESOLVER.configLocations);
+  assert.deepEqual(KNOWBE4_SPEC.authentication.configFields, KNOWBE4_AUTH_RESOLVER.configFields);
+
+  const home = createTempBase("grclanker-knowbe4-resolver-contract-");
+  const configFile = join(home, "file.yaml");
+  writeFileSync(configFile, "api_token: <file-token>\n");
+  const basic = { KNOWBE4_API_TOKEN: "<env-token>" };
+
+  const accessed = new Set();
+  const tracked = new Proxy({ ...basic }, {
+    get(target, property) {
+      if (typeof property === "string") accessed.add(property);
+      return target[property];
+    },
+  });
+  resolveKnowbe4Configuration({}, tracked, home);
+  assert.deepEqual([...accessed].sort(), [...KNOWBE4_AUTH_RESOLVER.environment].sort());
+
+  const reached = {
+    KNOWBE4_CONFIG_FILE: [{ KNOWBE4_CONFIG_FILE: configFile }, (config) => config.apiToken === "<file-token>" && config.configFile === configFile],
+    KNOWBE4_API_TOKEN: [basic, (config) => config.apiToken === "<env-token>"],
+    KNOWBE4_REGION: [{ ...basic, KNOWBE4_REGION: "eu" }, (config) => config.region === "eu" && config.baseUrl === "https://eu.api.knowbe4.com" && config.phisherGraphqlUrl === "https://eu.knowbe4.com/graphql"],
+    KNOWBE4_BASE_URL: [{ ...basic, KNOWBE4_BASE_URL: "https://reporting.example.internal" }, (config) => config.baseUrl === "https://reporting.example.internal"],
+    KNOWBE4_PHISHER_API_TOKEN: [{ ...basic, KNOWBE4_PHISHER_API_TOKEN: "<env-phisher-token>" }, (config) => config.phisherApiToken === "<env-phisher-token>"],
+    KNOWBE4_PHISHER_GRAPHQL_URL: [{ ...basic, KNOWBE4_PHISHER_GRAPHQL_URL: "https://phisher.example.internal/graphql" }, (config) => config.phisherGraphqlUrl === "https://phisher.example.internal/graphql"],
+    KNOWBE4_TIMEOUT: [{ ...basic, KNOWBE4_TIMEOUT: "45" }, (config) => config.timeoutMs === 45_000],
+    KNOWBE4_REDACT_PII: [{ ...basic, KNOWBE4_REDACT_PII: "true" }, (config) => config.redactPii === true],
+  };
+  assert.deepEqual(Object.keys(reached).sort(), [...KNOWBE4_AUTH_RESOLVER.environment].sort());
+  for (const [name, [environment, applied]] of Object.entries(reached)) {
+    assert.ok(applied(resolveKnowbe4Configuration({}, environment, home)), `${name} reaches the resolved configuration`);
+  }
 });
