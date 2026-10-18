@@ -81,6 +81,18 @@ For Kibana, grant read access to these features across the spaces you intend to 
 
 Elastic Cloud deployment inventory needs an organization-level Cloud API key with viewer access.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Elastic auditing key can read everything grclanker needs.
+Assess Elastic access control with sensitive_index_patterns customers-* and tenant_index_patterns tenant-*.
+Export an Elastic audit bundle to ./export/elastic.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Elasticsearch cluster"`. Both start with `elastic_check_access`, then run the assessments or `elastic_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |
@@ -108,14 +120,6 @@ Assessment tools add these thresholds:
 - `max_enrollment_keys_per_policy` (3)
 
 The export tool adds `output_dir` (default `./export/elastic`).
-
-Example prompts:
-
-```text
-Check whether my Elastic auditing key can read everything grclanker needs.
-Assess Elastic access control with sensitive_index_patterns customers-* and tenant_index_patterns tenant-*.
-Export an Elastic audit bundle to ./export/elastic.
-```
 
 ## Control coverage
 

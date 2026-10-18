@@ -66,6 +66,18 @@ Allow group SecurityInspectors to read instance-family in tenancy
 
 A surface the principal cannot read never yields `pass`. When none of it can be read, its control is `manual`, with the failing command in the summary. A denied compartment or some failed sub-reads, such as a denied `key get`, demote a would-be `pass` to `warn` instead.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my OCI credentials can read everything grclanker needs.
+Run the OCI assessments and list the failing findings first.
+Export an OCI audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our OCI tenancy"`. Both start with `oci_check_access`, then run the assessments or `oci_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose | Key arguments |

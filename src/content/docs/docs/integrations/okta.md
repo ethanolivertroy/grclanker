@@ -169,6 +169,18 @@ okta:
 
 Run `okta_check_access` first. It probes users, policies, logs, role assignees, and API tokens. It reports each surface separately, so partial grants are visible before you run an assessment.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Okta credentials can read everything grclanker needs.
+Run the Okta assessments and list the failing findings first.
+Export an Okta audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Okta tenant"`. Both start with `okta_check_access`, then run the assessments or `okta_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

@@ -144,6 +144,18 @@ Any other value renders the fixed prefix `unknown` with `rotating_format: false`
 - A proxy or gateway token.
 - A pasted OAuth code.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Slack credentials can read everything grclanker needs.
+Run the Slack assessments and list the failing findings first.
+Export a Slack audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Slack Enterprise Grid tenant"`. Both start with `slack_check_access`, then run the assessments or `slack_export_audit_bundle`.
+
 ## Tools
 
 | Tool | What it does |

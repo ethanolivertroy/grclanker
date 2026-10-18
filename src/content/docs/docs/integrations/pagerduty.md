@@ -60,6 +60,18 @@ The client follows classic `limit`/`offset` pagination using the `more` flag (10
 
 The client retries 429 and 5xx responses, waiting for the `ratelimit-reset` or `Retry-After` value when present. It redacts tokens from error messages.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my PagerDuty credentials can read everything grclanker needs.
+Run the PagerDuty assessments and list the failing findings first.
+Export a PagerDuty audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our PagerDuty account"`. Both start with `pagerduty_check_access`, then run the assessments or `pagerduty_export_audit_bundle`.
+
 ## Tools
 
 | Tool | What it does |

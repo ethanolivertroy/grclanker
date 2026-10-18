@@ -100,6 +100,18 @@ Every error string is then scrubbed once, at the point it is created. Scrubbing:
 
 Scrubbing runs as `scrubErrorText` in the `WebexApiError` constructor, in the surface collectors, and on the config loader's fixed messages. No consumer downstream can therefore receive an unscrubbed error.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Webex credentials can read everything grclanker needs.
+Run the Webex assessments and list the failing findings first.
+Export a Webex audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Webex organization"`. Both start with `webex_check_access`, then run the assessments or `webex_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

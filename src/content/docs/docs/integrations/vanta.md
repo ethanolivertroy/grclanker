@@ -23,6 +23,18 @@ The silent `read` keeps the secret value out of interactive Bash and Zsh history
 
 The tools accept `client_id` and `client_secret` arguments, but passing the secret as a tool argument can expose it to prompts, traces, or session storage.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools. Vanta has no assessment tools, so ask for audits and an export:
+
+```text
+Check whether my Vanta auditor credentials can see any audits.
+List my Vanta audits for SOC 2.
+Export the Vanta audit for Acme Corp's SOC 2 report.
+```
+
+The [audit](/docs/workflows/audit/) workflow takes the same path, for example `grclanker audit "the Acme Corp SOC 2 audit in Vanta"`: `vanta_check_access`, then `vanta_list_audits` and `vanta_export_audit`.
+
 ## Tools
 
 | Tool | Behavior |

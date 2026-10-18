@@ -63,6 +63,18 @@ When a client ID is set with `AZURE_CLIENT_CERTIFICATE_PATH` but no client secre
 
 `Reader` on the subscription plus `Security Reader` for Defender for Cloud pricings and security contacts.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Azure credentials can read everything grclanker needs.
+Run the Azure assessments and list the failing findings first.
+Export an Azure audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Azure tenant"`. Both start with `azure_check_access`, then run the assessments or `azure_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Findings |

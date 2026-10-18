@@ -81,6 +81,18 @@ Optional tuning:
 - `ZSCALER_TIMEOUT` (seconds, default 30)
 - `ZSCALER_MAX_RETRIES` (default 3, honoring `Retry-After` on 429 and 5xx responses)
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Zscaler credentials can read everything grclanker needs.
+Run the Zscaler assessments and list the failing findings first.
+Export a Zscaler audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Zscaler tenant"`. Both start with `zscaler_check_access`, then run the assessments or `zscaler_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |
