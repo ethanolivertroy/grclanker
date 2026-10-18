@@ -3389,7 +3389,7 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     failed_user_count: failures.size,
     remediated_user_count: remediated.length,
     training_enrollments_complete: enrollmentsComplete,
-    recipient_reads_complete: recipients.complete,
+    recipient_reads_complete: unsampled === 0 && isComplete(snapshot.securityTestRecipients),
     security_tests_complete: isComplete(snapshot.securityTests),
     training_campaigns_readable: isRead(snapshot.trainingCampaigns),
   });
@@ -3946,7 +3946,7 @@ function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays:
     activity_data_complete: !partialData,
     users_complete: isComplete(snapshot.activeUsers),
     security_tests_complete: isComplete(snapshot.securityTests),
-    recipient_walks_complete: isComplete(snapshot.securityTestRecipients),
+    recipient_walks_complete: !snapshot.securityTestRecipients.collected || isComplete(snapshot.securityTestRecipients),
     training_enrollments_complete: isComplete(snapshot.trainingEnrollments),
   });
 
