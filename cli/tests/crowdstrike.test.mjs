@@ -36,6 +36,7 @@ import { CROWDSTRIKE_SPEC } from "../dist/extensions/grc-tools/crowdstrike.spec.
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { portableContractTest } from "./helpers/byte-differential-fixtures.mjs";
+import { assertRequestConformance, recordFetchRequests } from "./helpers/spec-conformance.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
@@ -3068,4 +3069,30 @@ portableContractTest("the auth resolver contract names exactly the environment t
   for (const [name, [environment, applied]] of Object.entries(reached)) {
     assert.ok(applied(resolveCrowdstrikeConfiguration({}, environment, home)), `${name} reaches the resolved configuration`);
   }
+});
+
+function contractClient(fetchImpl, config = sampleConfig()) {
+  return new CrowdstrikeApiClient(config, { fetchImpl, sleep: async () => {}, retryLimit: 0 });
+}
+
+portableContractTest("every request the access check, the five assessments, and the export send matches a declared surface, parameter, and header", async () => {
+  const recorder = recordFetchRequests((input) => csHealthyResponse(new URL(String(input)).pathname));
+  const config = sampleConfig({ memberCid: "child-cid" });
+  const client = contractClient(recorder.fetch, config);
+  await checkCrowdstrikeAccess(client);
+  await runAllCrowdstrikeAssessments(client);
+  await exportCrowdstrikeAuditBundle(client, config, createTempBase("grclanker-cs-request-conformance-"));
+
+  // The token exchange is the auth contract's refresh request, not an API surface.
+  const tokenRequests = recorder.requests.filter((request) => new URL(request.url).pathname === "/oauth2/token");
+  assert.equal(tokenRequests.length, 1, "one token serves every read while it is valid");
+  const [token] = tokenRequests;
+  assert.equal(`${token.method} ${token.url}`, `POST ${config.baseUrl}/oauth2/token`);
+  assert.equal(token.headers.accept, "application/json");
+  assert.match(token.headers["content-type"], /^application\/x-www-form-urlencoded/);
+  assert.deepEqual(token.body, { client_id: config.clientId, client_secret: config.clientSecret, member_cid: "child-cid" });
+
+  const reads = recorder.requests.filter((request) => request !== token);
+  assert.ok(reads.every((request) => !JSON.stringify(request).includes("child-cid")), "member_cid travels only in the token request");
+  assertRequestConformance(assert, CROWDSTRIKE_SPEC, reads);
 });
