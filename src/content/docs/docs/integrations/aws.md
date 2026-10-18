@@ -342,6 +342,18 @@ A count is `0` and a list `[]` only when the read completed and came back empty.
 
 When every per-item read under a readable list failed (trail status, event selectors, detector detail, SCP targets, analyzer findings, key metadata, access key lists), the derived count is `null` as well.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my AWS credentials can read everything grclanker needs.
+Run the AWS assessments and list the failing findings first.
+Export an AWS audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our AWS organization"`. Both start with `aws_check_access`, then run the assessments or `aws_export_audit_bundle`.
+
 ## Tools
 
 All tools accept `region`, `profile`, and `account_id`.

@@ -64,6 +64,18 @@ projects = ["web", "mobile"]
 
 The SDK keys endpoint (`/api/v2/projects/{projectKey}/environments/{environmentKey}/sdk-keys`) is beta and may not be available on every plan. When it is unreadable, control 19 is reported as `manual` with the evidence a human needs to collect.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my LaunchDarkly credentials can read everything grclanker needs.
+Run the LaunchDarkly assessments and list the failing findings first.
+Export a LaunchDarkly audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our LaunchDarkly account"`. Both start with `launchdarkly_check_access`, then run the assessments or `launchdarkly_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

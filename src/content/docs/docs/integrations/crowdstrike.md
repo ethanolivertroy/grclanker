@@ -84,6 +84,18 @@ Required API client scopes (all Read):
 
 `crowdstrike_check_access` probes each of these surfaces and lists the scopes that returned 403.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my CrowdStrike credentials can read everything grclanker needs.
+Run the CrowdStrike assessments and list the failing findings first.
+Export a CrowdStrike audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our CrowdStrike Falcon tenant"`. Both start with `crowdstrike_check_access`, then run the assessments or `crowdstrike_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

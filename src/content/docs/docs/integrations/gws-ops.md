@@ -31,6 +31,19 @@ The bridge inherits the CLI's credential precedence and adds only two knobs:
 
 Every other `GOOGLE_WORKSPACE_CLI_*` variable in grclanker's environment is passed through unchanged. `cli/tests/gws-ops.test.mjs` asserts this precedence.
 
+## Run it
+
+With `gws` installed and signed in, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check that the gws CLI works for grclanker.
+List recent Alert Center alerts.
+Trace Google Workspace admin activity for the last 30 days.
+Collect a Google Workspace operator evidence bundle.
+```
+
+The [assess](/docs/workflows/assess/) and [audit](/docs/workflows/audit/) workflows use these tools for operator-side investigation and raw evidence, starting with `gws_ops_check_cli`. For framework-mapped findings, use the [Google Workspace](/docs/integrations/gws/) tools.
+
 ## Workflows
 
 | Tool | Underlying command | Read-only? | Output |

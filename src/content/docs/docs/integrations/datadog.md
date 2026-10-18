@@ -119,6 +119,18 @@ Permission names come from the [Datadog RBAC permissions list](https://docs.data
   - JSON error messages are capped at 240 characters.
   - A `base_url` or `DD_HOST` that carries `user:password@` userinfo has it stripped before the URL is stored or logged.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Datadog credentials can read everything grclanker needs.
+Run the Datadog assessments and list the failing findings first.
+Export a Datadog audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Datadog organization"`. Both start with `datadog_check_access`, then run the assessments or `datadog_export_audit_bundle`.
+
 ## Tools
 
 All tools accept the credential arguments above (`api_key`, `app_key`, `site`, `base_url`, `config_file`, `timeout_seconds`, `max_retries`).

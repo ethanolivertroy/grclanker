@@ -75,6 +75,18 @@ Every truncated list demotes its dependent findings to warn with seen versus tot
 - The header is honored when present (delta-seconds or HTTP-date, capped at 30 seconds per wait).
 - The wait otherwise defaults to one second.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Zoom credentials can read everything grclanker needs.
+Run the Zoom assessments and list the failing findings first.
+Export a Zoom audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Zoom account"`. Both start with `zoom_check_access`, then run the assessments or `zoom_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose | Notable arguments |

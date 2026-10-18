@@ -111,6 +111,18 @@ Tokens are exchanged at `POST https://<instance>.service-now.com/oauth_token.do`
 
 `SERVICENOW_AUTH_METHOD=mtls` is recognized but rejected with a clear error: the runtime's `fetch` client cannot present a client certificate. Use basic or OAuth for now.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my ServiceNow credentials can read everything grclanker needs.
+Run the ServiceNow assessments and list the failing findings first.
+Export a ServiceNow audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our ServiceNow instance"`. Both start with `servicenow_check_access`, then run the assessments or `servicenow_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

@@ -88,6 +88,18 @@ Other inputs:
 
 Precedence is explicit tool arguments, then environment variables, then the credentials file.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Salesforce credentials can read everything grclanker needs.
+Run the Salesforce assessments and list the failing findings first.
+Export a Salesforce audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Salesforce org"`. Both start with `salesforce_check_access`, then run the assessments or `salesforce_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |

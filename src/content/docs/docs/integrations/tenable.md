@@ -236,6 +236,18 @@ Loader errors use fixed text and never quote the file:
 
 Neither the filesystem message nor the parser message is ever interpolated, so a misplaced key in a malformed file cannot leak through the error. The parser message quotes the offending source line, or the alias value itself.
 
+## Run it
+
+After setup, start `grclanker` and ask in plain words. The agent calls the matching tools, for example:
+
+```text
+Check whether my Tenable credentials can read everything grclanker needs.
+Run the Tenable assessments and list the failing findings first.
+Export a Tenable audit bundle.
+```
+
+For a posture readout or a framework mapping, use the [assess](/docs/workflows/assess/) or [audit](/docs/workflows/audit/) workflow, for example `grclanker assess "our Tenable deployment"`. Both start with `tenable_check_access`, then run the assessments or `tenable_export_audit_bundle`.
+
 ## Tools
 
 | Tool | Purpose |
