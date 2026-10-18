@@ -201,7 +201,11 @@ npx flue run flue/agent.ts --message "Is CVE-2021-44228 in the CISA KEV catalog?
 
 `GRCLANKER_FLUE_MODEL` sets the `provider/model` specifier. Without it, Flue reuses the `grclanker setup` choice, or `anthropic/claude-sonnet-4-6` when setup has not chosen one. Hosted provider API keys come from the environment. `GRCLANKER_FLUE_SANDBOX=none` turns off Flue's local file and shell sandbox. Pi compute backends do not apply here.
 
-Flue stores conversations verbatim in `~/.grclanker/flue/conversations.db`, including raw tool arguments and credentials. Pass `--db <path>` or `--db :memory:` to change that. Use `:memory:` in CI. See [Flue runtime](https://grclanker.com/docs/getting-started/flue-runtime/).
+`grclanker flue run` stores conversations in `~/.grclanker/flue/conversations.db`, including tool arguments and credentials. `GRCLANKER_HOME` moves that directory. Pass `--db <path>` to use another file, or `--db :memory:` in CI so the run keeps nothing.
+
+`npx flue run` has no `--db` option. With no `flue.config.*` database entry, a run from `cli/` stores conversations in `cli/node_modules/.cache/flue/run.db`. That file can hold the same credentials, and a CI cache of `node_modules` keeps it. Delete `node_modules/.cache/flue` after the job, or leave that directory out of the cache.
+
+See [Flue runtime](https://grclanker.com/docs/getting-started/flue-runtime/).
 
 ## Skills only
 
