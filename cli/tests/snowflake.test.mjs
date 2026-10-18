@@ -1978,6 +1978,25 @@ test("assessSnowflakeNetworkAndAuthentication fails on permissive network, missi
   assert.match(findingById(result, "SNOWFLAKE-25").summary, /none attached at ACCOUNT level/);
 });
 
+test("assessSnowflakeNetworkAndAuthentication warns when some network policies have an empty allowlist", async () => {
+  const result = await assessSnowflakeNetworkAndAuthentication(createMockClient((statement) => {
+    const s = normalizeStatement(statement);
+    if (s.includes("ACCOUNT_USAGE.NETWORK_POLICIES") && !s.includes("COUNT(*)")) {
+      return resultSet(statement, NETWORK_POLICY_COLUMNS, [
+        ["CORP_POLICY", "SECURITYADMIN", "['10.1.2.0/24']", "[]", "2025-01-01", "2025-06-01"],
+        ["OPEN_RULES", "SECURITYADMIN", "[]", "[]", "2025-01-01", "2025-06-01"],
+      ]);
+    }
+    return healthyFixture(statement);
+  }));
+  const control = findingById(result, "SNOWFLAKE-02");
+  assert.equal(control.status, "warn");
+  assert.match(control.summary, /1 of 2 network policies have an empty ALLOWED_IP_LIST \(OPEN_RULES\)/);
+  assert.doesNotMatch(control.summary, /define restrictive allowlists/);
+  assert.deepEqual(control.evidence.policies_without_allowed_ips, ["OPEN_RULES"]);
+  assert.deepEqual(control.evidence.permissive_policies, []);
+});
+
 test("assessSnowflakeNetworkAndAuthentication never passes when enabling flags are absent or false", async () => {
   const withoutMfaColumns = await assessSnowflakeNetworkAndAuthentication(createMockClient((statement) => {
     const base = healthyFixture(statement);
