@@ -26,7 +26,7 @@ CrowdStrike Security Inspector gives auditors a read-only view of a CrowdStrike 
 - Response: whether response policies allow Real Time Response with bounded sessions, and whether alerts are triaged and hosts contained in time.
 - Device control and firewall: whether device control and host firewall policies enforce.
 - Sensor coverage: whether sensors update automatically and cover every host, host group, and discovered asset with an acceptable Zero Trust score.
-- Access governance: who administers the tenant, which API clients can write to sensitive collections, which exclusions weaken detection, and whether Identity Protection enforces.
+- Access governance: who administers the tenant, which API clients can write to sensitive collections, which exclusions weaken detection, and whether Identity Protection has an active enforcing rule.
 
 ## Rationale
 
