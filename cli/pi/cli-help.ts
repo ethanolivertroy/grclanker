@@ -15,6 +15,8 @@ Usage:
                                 Experimental: run the GRC agent under Pi Durable, resumable after a crash
   grclanker durable resume --session <id>
                                 Experimental: finish the work an interrupted durable run left
+  grclanker durable tui [--session <id>]
+                                Experimental: chat in a terminal app on a durable session
   grclanker "<prompt>"          Send a literal free-form prompt to the GRC agent
   grclanker investigate         Trace crypto status, KEVs, and exploitability
   grclanker investigate <subject> [--compute <kind>]

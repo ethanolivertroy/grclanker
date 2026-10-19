@@ -2,20 +2,28 @@
  * `grclanker durable ...`: the experimental Pi Durable runtime.
  */
 import { randomUUID } from "node:crypto";
-import { getGrclankerSettingsPath } from "../config/paths.js";
+import type { LiveState } from "@earendil-works/pi-durable";
+import { resolveCliRoot } from "../agent-sdk/lib/paths.js";
+import { syncBundledAssets } from "../bootstrap/sync.js";
+import { getGrclankerAgentDir, getGrclankerSettingsPath } from "../config/paths.js";
 import { ConfigFileError } from "../extensions/grc-tools/hardening/config-file.js";
 import { readGrclankerSettings } from "../pi/settings.js";
 import { DurableUsageError, DurableUserError } from "./errors.js";
 import { DURABLE_MODEL_ENV, loadGrclankerModels, resolveDurableModelChoice } from "./models.js";
 import { runDurable, type DurableOutcome, type DurableRunDeps, type DurableRunReport, type DurableRunRequest } from "./run.js";
 import { durableSessionExists, durableSessionsDir, newDurableSessionId, resolveDurableSession } from "./session.js";
+import { openDurableTui, type DurableTuiRequest, type DurableView } from "./tui/runtime.js";
+import { runDurableTui } from "./tui/tui.js";
 
 export interface DurableCommandIo {
   writeOut: (line: string) => void;
   writeErr: (line: string) => void;
 }
 
-export type DurableSubcommand = DurableRunRequest["command"];
+/** `tui` opens the session in the terminal app instead of running one request. */
+export type DurableCommandRequest = DurableRunRequest | (DurableTuiRequest & { command: "tui" });
+
+export type DurableSubcommand = DurableCommandRequest["command"];
 
 export interface ParsedDurableArgs {
   command: DurableSubcommand;
@@ -42,14 +50,17 @@ Experimental: the commands, output, and session format may change between releas
 Usage:
   grclanker durable run --message <text> [--session <id>] [--request-id <id>] [--model <provider/model>] [--json]
   grclanker durable resume --session <id> [--model <provider/model>] [--json]
+  grclanker durable tui [--session <id>] [--model <provider/model>]
 
 Commands:
   run      Send a message: starts a new session, or continues the one named by --session
   resume   Finish the work an interrupted command left in a session
+  tui      Chat in a terminal app: starts a new session, or opens the one named by --session
+           and continues any work an interrupted command left in it
 
 Options:
   -m, --message <text>      The message to send (run only, required)
-  --session <id>            Session to create or continue (run), or to resume (required for resume)
+  --session <id>            Session to create or continue (run, tui), or to resume (required for resume)
   --request-id <id>         Idempotency key for the message (default: a new UUID). Reusing the id of an
                             earlier request in the session reattaches to that request; the message is not compared
   --model <provider/model>  Model for this command (default: ${DURABLE_MODEL_ENV}, else the grclanker setup choice)
@@ -59,6 +70,12 @@ Options:
 Sessions live in ~/.grclanker/durable/sessions/<id>/, and one process can use a session at a time.
 Progress lines go to stderr. The answer, or the JSON report, goes to stdout.
 Exit codes: 0 answered (or nothing to resume), 1 no answer or an error, 130 stopped by Ctrl-C.
+
+In the terminal app, Enter sends a message (it steers the turn when one is running), Alt+Enter
+(Ctrl+Q on Windows and WSL) queues a follow-up, Esc aborts the turn, and Ctrl+C, or Ctrl+D on an
+empty editor, exits with code 0. Exiting keeps the session: work in flight continues when the
+session is opened again.
+/model picks a model, /compact summarizes older context, and /tasks hides or shows the task panel.
 `.trim();
 }
 
@@ -118,6 +135,13 @@ export function parseDurableArgs(command: DurableSubcommand, argv: string[]): Pa
         );
       }
       break;
+    case "tui":
+      if (parsed.message !== undefined || parsed.requestId !== undefined || parsed.json) {
+        throw new DurableUsageError(
+          "'grclanker durable tui' takes only --session and --model. Type messages in the terminal app, or use 'grclanker durable run' to send one from the command line.",
+        );
+      }
+      break;
     default: {
       const exhaustive: never = command;
       throw new Error(`Unhandled durable command: ${String(exhaustive)}`);
@@ -127,7 +151,7 @@ export function parseDurableArgs(command: DurableSubcommand, argv: string[]): Pa
   return parsed;
 }
 
-export function buildDurableRequest(args: ParsedDurableArgs, env: NodeJS.ProcessEnv = process.env): DurableRunRequest {
+export function buildDurableRequest(args: ParsedDurableArgs, env: NodeJS.ProcessEnv = process.env): DurableCommandRequest {
   const choice = resolveDurableModelChoice({
     flag: args.model,
     env,
@@ -150,6 +174,8 @@ export function buildDurableRequest(args: ParsedDurableArgs, env: NodeJS.Process
       }
       return { command: "resume", session, ...choice };
     }
+    case "tui":
+      return { command: "tui", session: resolveDurableSession(args.session ?? newDurableSessionId()), ...choice };
     default: {
       const exhaustive: never = args.command;
       throw new Error(`Unhandled durable command: ${String(exhaustive)}`);
@@ -234,6 +260,43 @@ function defaultIo(): DurableCommandIo {
   };
 }
 
+function isBusy(view: DurableView): boolean {
+  return ((view.conversation.docs["pi.live"] ?? {}) as LiveState).run !== undefined;
+}
+
+/** Run the terminal app until the user exits. The session keeps work in flight for the next open. */
+async function runDurableTuiCommand(
+  request: DurableTuiRequest,
+  io: DurableCommandIo,
+  deps: Partial<DurableRunDeps>,
+): Promise<number> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new DurableUserError(
+      "'grclanker durable tui' needs an interactive terminal. From a script or a pipe, use 'grclanker durable run --message <text>'.",
+    );
+  }
+  const agentDir = getGrclankerAgentDir();
+  // The grclanker theme, as the interactive CLI installs it, for a home that has never launched that CLI.
+  syncBundledAssets(resolveCliRoot(), agentDir);
+  const durable = await openDurableTui(request, {
+    loadModels: deps.loadModels ?? (() => loadGrclankerModels()),
+    ...(deps.tools ? { tools: deps.tools } : {}),
+    ...(deps.settings ? { settings: deps.settings } : {}),
+  });
+  try {
+    await runDurableTui(durable.view, durable.controller, { agentDir, banner: DURABLE_EXPERIMENTAL_BANNER });
+  } finally {
+    await durable.close();
+  }
+  const id = request.session.id;
+  io.writeErr(
+    isBusy(durable.view.current())
+      ? `Closed with work in flight; it continues when session ${id} is opened again: grclanker durable tui --session ${id} (or grclanker durable resume --session ${id} to finish it without the terminal app).`
+      : `Session ${id} is saved. Open it again with: grclanker durable tui --session ${id}`,
+  );
+  return 0;
+}
+
 /** Dispatch `grclanker durable <subcommand>`; resolves with the process exit code. */
 export async function runDurableCommand(
   argv: string[],
@@ -247,7 +310,7 @@ export async function runDurableCommand(
     return 0;
   }
 
-  if (subcommand !== "run" && subcommand !== "resume") {
+  if (subcommand !== "run" && subcommand !== "resume" && subcommand !== "tui") {
     io.writeErr(`Unknown durable subcommand: ${subcommand}`);
     io.writeErr("Run 'grclanker durable --help' for usage.");
     return 1;
@@ -257,6 +320,7 @@ export async function runDurableCommand(
     const args = parseDurableArgs(subcommand, rest);
     const request = buildDurableRequest(args);
     io.writeErr(DURABLE_EXPERIMENTAL_BANNER);
+    if (request.command === "tui") return await runDurableTuiCommand(request, io, deps);
 
     const controller = new AbortController();
     const stopHandling = handleInterrupts(controller, io);
