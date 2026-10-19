@@ -1,8 +1,9 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { ensureGrclankerHome, getGrclankerHome, getGrclankerStateDir } from "../../config/paths.js";
+import { writeFileAtomically } from "./atomic-output.js";
 import { persistentCachesEnabled } from "./shared.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -425,7 +426,7 @@ async function readJsonFile<T>(path: string): Promise<T | undefined> {
 /** Persist a cache payload unless the caller disabled persistent caches. */
 async function writeCacheFile(path: string, value: unknown): Promise<void> {
   if (!persistentCachesEnabled()) return;
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await writeFileAtomically(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8" });
 }
 
 function githubHeaders(token: string | null): Record<string, string> {
