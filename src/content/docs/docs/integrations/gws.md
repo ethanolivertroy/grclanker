@@ -7,7 +7,7 @@ The Google Workspace inspector (`gws_*` tools) reviews identity, privileged acce
 
 It is read-only. Every request is a GET against a documented Google API, and nothing is written back to the tenant. Every verdict follows the [verdict-safety rules](#verdict-safety-rules).
 
-- **Spec:** `specs/gws-inspector-go.spec.md`
+- **Spec:** [Google Workspace Inspector](/specs/gws-inspector-go/)
 - **Implementation:** `cli/extensions/grc-tools/gws.ts`
 - **Tests:** `cli/tests/gws.test.mjs`
 

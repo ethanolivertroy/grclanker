@@ -5,7 +5,7 @@ description: Read-only Veracode security inspector covering scan coverage, polic
 
 The Veracode tools inspect a Veracode Application Security Platform account through the HMAC-signed REST APIs. They never mutate the platform: every call is a GET.
 
-Results are normalized into findings with FedRAMP, CMMC, SOC 2, CIS Controls v8, PCI-DSS, STIG, IRAP, and ISMAP mappings from `specs/veracode-sec-inspector.spec.md`.
+Results are normalized into findings with FedRAMP, CMMC, SOC 2, CIS Controls v8, PCI-DSS, STIG, IRAP, and ISMAP mappings from the [Veracode Security Inspector spec](/specs/veracode-sec-inspector/).
 
 ## What it inspects
 

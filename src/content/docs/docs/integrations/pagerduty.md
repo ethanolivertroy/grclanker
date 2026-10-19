@@ -3,7 +3,7 @@ title: PagerDuty
 description: Read-only PagerDuty security inspector covering access control, incident response, on-call coverage, audit logging, and integration security across 25 controls.
 ---
 
-The PagerDuty integration inspects a PagerDuty account through the REST API v2. It maps what it finds to the 25 controls in `specs/pagerduty-sec-inspector.spec.md`.
+The PagerDuty integration inspects a PagerDuty account through the REST API v2. It maps what it finds to the 25 controls in the [PagerDuty Security Inspector spec](/specs/pagerduty-sec-inspector/).
 
 Every tool is read-only. Nothing is created, updated, or deleted in the account.
 

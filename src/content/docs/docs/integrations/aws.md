@@ -13,7 +13,7 @@ The AWS integration audits one AWS account's own security configuration:
 
 It never mutates the account. Every request is a `Get`, `List`, `Describe`, or `Lookup` call against the documented AWS service APIs through the AWS SDK for JavaScript v3.
 
-It implements the 25 controls in `specs/aws-sec-inspector.spec.md`. It maps every finding to FedRAMP (NIST 800-53), CMMC 2.0, SOC 2, CIS AWS Foundations, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP references from the spec's compliance table.
+It implements the 25 controls in the [AWS Security Inspector spec](/specs/aws-sec-inspector/). It maps every finding to FedRAMP (NIST 800-53), CMMC 2.0, SOC 2, CIS AWS Foundations, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP references from the spec's compliance table.
 
 ## What it inspects
 

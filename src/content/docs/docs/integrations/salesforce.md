@@ -5,7 +5,7 @@ description: Read-only Salesforce security inspector covering Health Check, sess
 
 The Salesforce inspector audits one org through the REST API (SOQL), the Tooling API, and the Metadata API `listMetadata` and `readMetadata` calls.
 
-Every tool is read-only: nothing is created, updated, or deleted in the org.
+Every tool is read-only: nothing is created, updated, or deleted in the org. The [Salesforce Security Inspector spec](/specs/salesforce-sec-inspector/) lists each control, the finding that reports it, and its verdict rules.
 
 ## What it inspects
 

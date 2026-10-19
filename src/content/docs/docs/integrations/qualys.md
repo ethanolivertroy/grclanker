@@ -12,7 +12,7 @@ The Qualys integration audits the health of a Qualys subscription itself:
 
 The integration never launches scans, edits configuration, or modifies the subscription.
 
-Spec: `specs/qualys-sec-inspector.spec.md` (20 numbered security controls).
+Spec: [Qualys Security Inspector](/specs/qualys-sec-inspector/) (20 numbered security controls).
 
 ## What it inspects
 

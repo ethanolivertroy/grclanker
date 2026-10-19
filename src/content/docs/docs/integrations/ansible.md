@@ -3,7 +3,7 @@ title: Ansible Automation Platform
 description: Read-only Ansible Automation Platform controller inspection covering all 30 ansible-sec-inspector controls with verdict-safe findings and an auditor bundle.
 ---
 
-The Ansible tool family inspects a Red Hat Ansible Automation Platform (AAP) controller, or upstream AWX, through its read-only REST API. It implements every control in `specs/ansible-sec-inspector.spec.md`:
+The Ansible tool family inspects a Red Hat Ansible Automation Platform (AAP) controller, or upstream AWX, through its read-only REST API. It implements every control in the [Ansible AAP Security Inspector spec](/specs/ansible-sec-inspector/):
 
 - Job execution health.
 - Host coverage.

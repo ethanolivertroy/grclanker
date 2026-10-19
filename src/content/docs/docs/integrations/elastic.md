@@ -3,7 +3,7 @@ title: Elastic
 description: Read-only Elasticsearch and Kibana security posture assessment mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP.
 ---
 
-The Elastic integration inspects Elasticsearch and Kibana security configuration through their public REST APIs. It never writes to the cluster or to Kibana. Every tool uses read-only endpoints. The only POST requests are the documented query and privilege-check endpoints. Findings implement the 23 numbered controls in `specs/elastic-sec-inspector.spec.md` and carry that spec's compliance mappings.
+The Elastic integration inspects Elasticsearch and Kibana security configuration through their public REST APIs. It never writes to the cluster or to Kibana. Every tool uses read-only endpoints. The only POST requests are the documented query and privilege-check endpoints. Findings implement the 23 numbered controls in the [Elastic Security Inspector spec](/specs/elastic-sec-inspector/) and carry that spec's compliance mappings.
 
 ## What it inspects
 

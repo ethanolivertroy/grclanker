@@ -13,7 +13,7 @@ The Duo tools inspect a Cisco Duo tenant through the Duo Admin API, using one re
 - Integration coverage.
 - Authentication telemetry.
 
-They then export an evidence bundle mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP.
+They then export an evidence bundle mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP. The [Duo Security Inspector spec](/specs/duo-sec-inspector/) lists each control, the finding that reports it, and its verdict rules.
 
 Every endpoint and field the tools read is documented in the [Duo Admin API reference](https://duo.com/docs/adminapi). Where the reference is silent (for example, offline access limits), the control is rendered as Manual with the reason instead of guessing.
 
@@ -150,7 +150,7 @@ Supporting findings without a spec control number:
 
 ## Framework mappings
 
-Every finding carries FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP identifiers from the mapping table in `specs/duo-sec-inspector.spec.md`. The bundle writes one report per framework under `compliance/` and a unified matrix in `compliance/unified_compliance_matrix.md`.
+Every finding carries FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, and ISMAP identifiers from the mapping table in the [Duo Security Inspector spec](/specs/duo-sec-inspector/). The bundle writes one report per framework under `compliance/` and a unified matrix in `compliance/unified_compliance_matrix.md`.
 
 ## Audit bundle layout
 

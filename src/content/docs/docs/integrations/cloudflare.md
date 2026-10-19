@@ -3,7 +3,7 @@ title: Cloudflare
 description: Read-only Cloudflare security inspector covering WAF and DDoS rulesets, TLS, DNS, Zero Trust, API tokens, and traffic controls with evidence bundles.
 ---
 
-The Cloudflare integration inspects accounts and zones through the Cloudflare v4 API. It renders findings mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP.
+The Cloudflare integration inspects accounts and zones through the Cloudflare v4 API. It renders findings mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP. The [Cloudflare Security Inspector spec](/specs/cloudflare-sec-inspector/) lists each control, the finding that reports it, and its verdict rules.
 
 Every request path, ruleset phase, zone setting id, and response field the tools read is traceable to a page on [developers.cloudflare.com/api](https://developers.cloudflare.com/api/).
 

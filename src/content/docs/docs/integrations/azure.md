@@ -3,7 +3,7 @@ title: Azure
 description: Read-only Azure and Microsoft 365 security inspector covering Entra ID, Intune, Purview labels, Defender for Cloud, Key Vault, storage, and Azure Policy.
 ---
 
-The Azure integration audits an Entra ID tenant and one Azure subscription against the 25 controls in `specs/azure-sec-inspector.spec.md`. It calls Microsoft Graph v1.0 and Azure Resource Manager REST endpoints directly (no SDKs) and never writes.
+The Azure integration audits an Entra ID tenant and one Azure subscription against the 25 controls in the [Azure Security Inspector spec](/specs/azure-sec-inspector/). It calls Microsoft Graph v1.0 and Azure Resource Manager REST endpoints directly (no SDKs) and never writes.
 
 It renders a `manual` verdict when an endpoint errors, a license is missing, or the API does not expose the control. A few secondary reads are exceptions only while the data that was read still settles the finding. Their failure is noted in the finding or caps a would-be `pass` at `warn` (see [Verdict safety rules](#verdict-safety-rules)).
 

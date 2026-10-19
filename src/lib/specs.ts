@@ -49,6 +49,18 @@ export const categoryLabels: Record<string, string> = {
 
 export const RAW_BASE = 'https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs';
 
+/** Specs whose guide is not `integrations/<slug without -sec-inspector>`. */
+export const specGuideOverrides: Record<string, string> = {
+  'grclanker-compute-backends': 'getting-started/compute-backends',
+  'gws-inspector-go': 'integrations/gws',
+  'gws-operator-bridge': 'integrations/gws-ops',
+};
+
+/** The docs slug of the guide that sets up and runs what a spec describes. */
+export function getSpecGuideSlug(slug: string) {
+  return specGuideOverrides[slug] ?? `integrations/${slug.replace(/-sec-inspector$/, '')}`;
+}
+
 const specsDir = join(process.cwd(), 'specs');
 
 export function readSpecs(): Array<{ meta: SpecMeta; content: string }> {

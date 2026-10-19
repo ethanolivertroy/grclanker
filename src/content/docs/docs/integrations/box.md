@@ -3,7 +3,7 @@ title: Box
 description: Read-only Box Enterprise security inspector covering identity, sharing, data governance, and Shield monitoring, mapped to eight frameworks including FedRAMP.
 ---
 
-The Box integration inspects a Box Enterprise tenant through the Box Content API. It reports posture findings for the 25 controls defined in `specs/box-sec-inspector.spec.md`.
+The Box integration inspects a Box Enterprise tenant through the Box Content API. It reports posture findings for the 25 controls defined in the [Box Security Inspector spec](/specs/box-sec-inspector/).
 
 Every tool is read-only. Nothing is created, changed, or deleted in the tenant.
 

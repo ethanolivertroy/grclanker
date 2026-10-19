@@ -5,7 +5,11 @@ import { CodeBlock } from './code-block';
 import { DocsHeading } from './docs-heading';
 import { DocsRoutes } from './docs-routes';
 
+// Prefetching a spec page would download the whole rendered spec.
+const SPEC_PAGE = /^\/specs\/[^/?#]+/;
+
 function MdxLink({ href = '', ...props }: ComponentProps<'a'>) {
+  if (SPEC_PAGE.test(href)) return <Link href={href} prefetch={false} {...props} />;
   if (href.startsWith('/')) return <Link href={href} {...props} />;
   return <a href={href} {...props} />;
 }

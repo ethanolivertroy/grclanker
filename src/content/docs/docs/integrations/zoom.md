@@ -3,7 +3,7 @@ title: Zoom
 description: Read-only Zoom account inspection for identity posture, collaboration governance, meeting security, and audit bundle export.
 ---
 
-The Zoom integration inspects a Zoom Workplace or Zoom for Government account through the public Zoom REST API v2. It renders the 25 controls in `specs/zoom-sec-inspector.spec.md` as pass, warn, fail, or manual findings. They carry FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP mappings.
+The Zoom integration inspects a Zoom Workplace or Zoom for Government account through the public Zoom REST API v2. It renders the 25 controls in the [Zoom Security Inspector spec](/specs/zoom-sec-inspector/) as pass, warn, fail, or manual findings. They carry FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP mappings.
 
 Every request is a read. The tools never change account settings.
 

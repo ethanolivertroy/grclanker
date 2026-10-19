@@ -5,7 +5,7 @@ description: Read-only Cisco Webex security inspector covering identity, collabo
 
 The Webex integration inspects a Cisco Webex organization through the public REST API at `https://webexapis.com/v1`.
 
-It is read-only and never writes credentials into its output. It maps every finding to the 25 controls in `specs/webex-sec-inspector.spec.md`.
+It is read-only and never writes credentials into its output. It maps every finding to the 25 controls in the [Webex Security Inspector spec](/specs/webex-sec-inspector/).
 
 ## What it inspects
 

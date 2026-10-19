@@ -9,7 +9,7 @@ Every verdict is evidence-gated: a forbidden, ACL-filtered, truncated, or empty 
 
 ## What it inspects
 
-The tools cover the twenty security controls in `specs/servicenow-sec-inspector.spec.md`:
+The tools cover the twenty security controls in the [ServiceNow Security Inspector spec](/specs/servicenow-sec-inspector/):
 
 - **Identity and access:** Role hierarchy, user access review, password policy, MFA, LDAP and SSO integration, integration user permissions.
 - **Platform hardening:** Instance security properties, session timeout, script execution restrictions, instance hardening, debug mode, IP access restrictions, email security.

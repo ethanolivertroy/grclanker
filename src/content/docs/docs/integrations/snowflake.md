@@ -3,7 +3,7 @@ title: Snowflake
 description: Read-only Snowflake security posture checks over the SQL REST API with key-pair JWT or OAuth, covering all 25 controls in the Snowflake security inspector spec.
 ---
 
-The Snowflake integration runs read-only `SHOW` commands and `SNOWFLAKE.ACCOUNT_USAGE` queries through the Snowflake SQL REST API. It turns the results into normalized findings with FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP mappings.
+The Snowflake integration runs read-only `SHOW` commands and `SNOWFLAKE.ACCOUNT_USAGE` queries through the Snowflake SQL REST API. It turns the results into normalized findings for the 25 controls in the [Snowflake Security Inspector spec](/specs/snowflake-sec-inspector/), with FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP mappings.
 
 It never issues `CREATE`, `ALTER`, `DROP`, `GRANT`, or `USE ROLE`. The client rejects any statement that does not start with `SHOW`, `DESCRIBE`, `SELECT`, `WITH`, or `EXPLAIN`.
 
