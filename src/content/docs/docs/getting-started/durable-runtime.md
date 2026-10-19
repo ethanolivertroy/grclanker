@@ -225,9 +225,11 @@ npm --prefix cli run test:cli
 - The session lock, including its release after `SIGKILL`
 - Strict-JSON details
 - The assessment document
-- The tool adapter and redaction
+- The tool adapter, including the abort signal it passes to each tool, and redaction
 - Model selection
 - The command surface
 - In-process runs that continue, replay, stop, and resume a session
+
+`cli/tests/abort-signals.test.mjs` checks that every registry tool honors its abort signal. A call whose signal has already aborted sends, runs, and writes nothing. Each tool that requests through fetch, aborted mid-request, rejects within a second and writes nothing, while a concurrent call with the same credentials keeps running.
 
 No test makes a live model call or uses a real credential.

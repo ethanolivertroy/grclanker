@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { register } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -397,6 +397,71 @@ test("executeGrcTool withholds echoed arguments and credentials from every error
   assert.doesNotMatch(returnedEnvelope, /Received arguments:/);
   assert.ok(!returnedEnvelope.includes(credentialSentinel));
   assert.ok(!returnedEnvelope.includes(argumentSentinel));
+});
+
+test("executeGrcTool passes its abort signal on to the tool", async () => {
+  const signals = [];
+  const { tool } = fakeTool({
+    async execute(_toolCallId, args, signal) {
+      signals.push(signal);
+      return { content: [{ type: "text", text: args.query }], details: {} };
+    },
+  });
+  const controller = new AbortController();
+
+  await executeGrcTool(tool, { query: "stoppable" }, { signal: controller.signal });
+  await executeGrcTool(tool, { query: "unstoppable" });
+
+  assert.equal(signals.length, 2);
+  assert.equal(signals[0], controller.signal);
+  assert.equal(signals[1], undefined);
+});
+
+test("RegisteredGrcTool.execute passes its signal on to the tool, and executeGrcTool turns an abort mid-request into an error envelope", { timeout: 5000 }, async () => {
+  const originalFetch = globalThis.fetch;
+  const configDir = mkdtempSync(join(tmpdir(), "grclanker-agent-sdk-abort-"));
+  const configFile = join(configDir, "pagerduty.json");
+  writeFileSync(configFile, "{}\n");
+  const input = { api_token: "pd-agent-sdk-abort-token", region: "us", config_file: configFile };
+  const tool = getRegisteredGrcTool("pagerduty_check_access");
+
+  try {
+    const refusedRequests = [];
+    globalThis.fetch = async (resource) => {
+      refusedRequests.push(String(resource));
+      return jsonResponse({});
+    };
+    const refusal = new Error("stopped before it started");
+    await assert.rejects(tool.execute("call_refused", input, AbortSignal.abort(refusal)), (error) => error === refusal);
+    assert.deepEqual(refusedRequests, [], "an aborted call sends no request");
+
+    const signals = [];
+    const sent = Promise.withResolvers();
+    globalThis.fetch = (resource, init = {}) => {
+      const signal = init.signal ?? (resource instanceof Request ? resource.signal : undefined);
+      signals.push(signal);
+      sent.resolve();
+      return new Promise((_, reject) => {
+        if (signal?.aborted) reject(signal.reason);
+        else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    };
+    const controller = new AbortController();
+    const running = executeGrcTool(tool, input, { toolCallId: "call_stopped", signal: controller.signal });
+    const first = await Promise.race([sent.promise.then(() => "sent"), running]);
+    assert.equal(first, "sent", `the tool finished before its first request: ${JSON.stringify(first)}`);
+
+    controller.abort(new Error("operator stopped the call"));
+
+    assert.deepEqual(await running, {
+      content: [{ type: "text", text: "pagerduty_check_access failed: operator stopped the call" }],
+      isError: true,
+    });
+    assert.ok(signals.every((signal) => signal?.aborted), "every request in flight saw the abort");
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(configDir, { recursive: true, force: true });
+  }
 });
 
 test("executeGrcTool disables persistent caches only for dry-run sessions", async () => {
