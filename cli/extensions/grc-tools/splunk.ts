@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -1618,6 +1618,7 @@ export class SplunkApiClient {
         }
         return response;
       } catch (error) {
+        rethrowIfAborted(error);
         lastError = error;
         if (attempt < this.retryAttempts) {
           await this.sleep(this.retryDelayMs * 2 ** (attempt - 1));
@@ -1893,6 +1894,7 @@ async function collect<T>(client: SplunkInspectorClient, load: () => Promise<T>)
   try {
     return { ok: true, value: await load() };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ok: false, error: scrubErrorText(errorMessage(error), configuredSecretsOf(client)), httpStatus: errorStatus(error), endpoint: errorEndpoint(error) };
   }
 }
@@ -3330,6 +3332,7 @@ async function readableSurface(
       httpStatus: null,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name,
       endpoint: errorEndpoint(error) ?? endpoint,

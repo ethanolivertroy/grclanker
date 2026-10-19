@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { YAMLError, parse as parseYaml } from "yaml";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SERVICENOW_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1238,6 +1238,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
     try {
       return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
+      rethrowIfAborted(error);
       if (controller.signal.aborted) {
         throw new Error(`ServiceNow request timed out after ${this.config.timeoutMs}ms: ${requestPathname(url)}`);
       }
@@ -1449,6 +1450,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
         url = nextUrlText;
       }
     } catch (error) {
+      rethrowIfAborted(error);
       // The in-memory flags on a failed read are placeholders; every rendered surface (core_data,
       // evidence, summaries) reads them through tableCoreData or snapshotEvidence, which render null.
       return {
@@ -1492,6 +1494,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
       const stats = asObject(result?.stats);
       return { table, query, count: asNumber(stats?.count), endpoint };
     } catch (error) {
+      rethrowIfAborted(error);
       return {
         table,
         query,

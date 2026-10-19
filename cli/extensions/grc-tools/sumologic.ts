@@ -17,7 +17,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -1643,6 +1643,7 @@ export class SumologicApiClient implements SumologicReader {
           signal: controller.signal,
         });
       } catch (error) {
+        rethrowIfAborted(error);
         clearTimeout(timeout);
         if (attempt < this.maxRetries) {
           await this.sleepImpl(Math.min(250 * 2 ** attempt, 8_000));
@@ -1690,6 +1691,7 @@ export class SumologicApiClient implements SumologicReader {
         count: result.count ?? (Array.isArray(result.data) ? result.data.length : 1),
       };
     } catch (error) {
+      rethrowIfAborted(error);
       // Every dataset error is recorded here and nowhere else, so this is the
       // one place the redaction pass has to run for findings and the bundle.
       return {

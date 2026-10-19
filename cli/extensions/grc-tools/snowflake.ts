@@ -26,7 +26,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -1976,6 +1976,7 @@ export class SnowflakeSqlClient {
         }
         return { status: response.status, statusText: response.statusText, payload, headers: response.headers, nonJsonBody };
       } catch (error) {
+        rethrowIfAborted(error);
         const message = error instanceof Error ? error.message : String(error);
         if (controller.signal.aborted) {
           throw new SnowflakeStatementError(`Snowflake SQL API request timed out after ${this.config.timeoutMs}ms (${method} ${pathname})`, { kind: "timeout" });
@@ -2329,6 +2330,7 @@ export async function collectStatement(
       rowLimit,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     // Every statement error is recorded here and nowhere else, so this is the
     // one place the redaction pass has to run for findings and the bundle,
     // whichever constructor or throw site built the message.
