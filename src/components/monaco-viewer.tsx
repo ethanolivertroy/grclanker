@@ -135,6 +135,7 @@ export function MonacoViewer({ content }: { content: string }) {
       <pre
         ref={fallbackRef}
         className={wrap ? 'fallback-pre fallback-pre-wrap' : 'fallback-pre fallback-pre-nowrap'}
+        role="region"
         aria-label="Raw markdown"
         tabIndex={0}
       >

@@ -1189,7 +1189,8 @@ details[open] > .agent-group-toggle::before {
 /* === Docs === */
 /* Docs body text is set in the platform sans (the Fumadocs default) for long
    reading; headings, labels, and code stay in the mono brand face. */
-#nd-docs-layout {
+#nd-docs-layout,
+.spec-reader {
   --docs-font-body: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif;
   --docs-border: color-mix(in srgb, var(--color-surface1) 62%, transparent);
   --docs-border-strong: color-mix(in srgb, var(--color-surface1) 84%, transparent);
@@ -2237,6 +2238,148 @@ details[open] > .agent-group-toggle::before {
 
 .spec-action-link:hover {
   color: var(--ui-accent);
+}
+
+.spec-tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin-bottom: 1.5rem;
+  border-bottom: 1px solid var(--ui-border);
+}
+
+.spec-tab {
+  min-height: 2.75rem;
+  margin-bottom: -1px;
+  padding: 0 0.9rem;
+  border-bottom: 2px solid transparent;
+  color: var(--ui-muted);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.spec-tab:hover {
+  color: var(--ui-text);
+}
+
+.spec-tab[aria-selected='true'] {
+  border-bottom-color: var(--ui-accent);
+  color: var(--ui-accent);
+}
+
+.spec-source-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--ui-muted);
+  font-size: var(--text-sm);
+}
+
+.spec-toc-inline {
+  margin-bottom: 1.5rem;
+  border: 1px solid var(--docs-border-strong);
+  border-radius: 0.5rem;
+  background: var(--docs-panel);
+}
+
+.spec-toc-inline summary,
+.spec-toc-title {
+  color: var(--docs-label);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.spec-toc-inline summary {
+  padding: 0.75rem 1rem;
+  cursor: pointer;
+}
+
+.spec-toc-inline .spec-toc-list {
+  margin: 0 1rem 1rem;
+}
+
+.spec-toc-title {
+  margin-bottom: 0.5rem;
+}
+
+.spec-toc-list {
+  border-left: 1px solid var(--docs-border-strong);
+}
+
+.spec-toc-link {
+  display: block;
+  margin-left: -1px;
+  padding: 0.3rem 0 0.3rem 0.75rem;
+  border-left: 2px solid transparent;
+  color: var(--docs-subtle);
+  font-family: var(--docs-font-body);
+  font-size: var(--text-sm);
+  line-height: 1.4;
+}
+
+.spec-toc-link[data-depth='3'] {
+  padding-left: 1.5rem;
+}
+
+.spec-toc-link:hover {
+  color: var(--docs-title);
+}
+
+.spec-toc-link[data-active='true'] {
+  border-left-color: var(--docs-accent-strong);
+  color: var(--docs-title);
+}
+
+.spec-toc-rail {
+  display: none;
+}
+
+/* With no docs sidebar on spec pages, the section list fits beside the document from 1024px. */
+@media (min-width: 1024px) {
+  .spec-reader-columns {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 13rem;
+    gap: 2.5rem;
+    align-items: start;
+  }
+
+  .spec-toc-inline {
+    display: none;
+  }
+
+  .spec-toc-rail {
+    display: block;
+    position: sticky;
+    top: calc(var(--fd-banner-height) + 1.5rem);
+    max-height: calc(100dvh - var(--fd-banner-height) - 3rem);
+    overflow-y: auto;
+  }
+}
+
+/* Spec tables skip layout and paint until they near the viewport. Until a
+   table first renders, it holds the height src/lib/table-heights.mjs
+   estimates for the layout in use. */
+.spec-reader .docs-table-scroll {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto var(--table-wide-height);
+}
+
+@media (max-width: 720px) {
+  .spec-reader .docs-table-scroll {
+    contain-intrinsic-block-size: auto var(--table-narrow-height);
+  }
+}
+
+/* A smooth scroll renders every table it passes, and a few px of error in each
+   adds up to land a section link screens off its heading. An instant jump
+   renders only the tables around the heading, and scroll anchoring holds the
+   heading still as they take their real heights. */
+html:has(.spec-reader) {
+  scroll-behavior: auto;
 }
 
 @media (max-width: 720px) {
