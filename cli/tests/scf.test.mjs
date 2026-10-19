@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { clearGrcSharedCachesForTests } from "../dist/extensions/grc-tools/shared.js";
 import {
   findMatchingScfControls,
@@ -161,6 +162,44 @@ test("loadScfControlBundle assembles control details, objectives, evidence reque
     assert.deepEqual(bundle.framework_mappings, ["PM-01"]);
     assert.ok(calls.some((url) => url.endsWith("/controls/GOV-01.json")));
     assert.ok(calls.some((url) => url.endsWith("/crosswalks.json")));
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearGrcSharedCachesForTests();
+  }
+});
+
+test("loadScfControlBundle rethrows the tool call's abort from an evidence request instead of listing it as a failed request", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+
+    if (url.endsWith("/controls/GOV-01.json")) {
+      return jsonResponse({
+        control_id: "GOV-01",
+        title: "Security, Compliance & Resilience Program",
+        evidence_requests: ["E-GOV-01", "E-GOV-02"],
+      });
+    }
+
+    if (url.endsWith("/assessment-objectives/GOV-01.json")) {
+      return jsonResponse({ scf_control_id: "GOV-01", total: 0, assessment_objectives: [] });
+    }
+
+    if (url.endsWith("/evidence-requests/E-GOV-01.json")) {
+      throw new ToolCallAbortedError(AbortSignal.abort());
+    }
+
+    return new Response("not found", { status: 404, statusText: "Not Found" });
+  };
+
+  clearGrcSharedCachesForTests();
+
+  try {
+    // The call's own signal stays live, so only the evidence request's error can end the bundle.
+    await assert.rejects(loadScfControlBundle("GOV-01", undefined, new AbortController().signal), {
+      name: "ToolCallAbortedError",
+    });
   } finally {
     globalThis.fetch = originalFetch;
     clearGrcSharedCachesForTests();

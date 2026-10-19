@@ -5,6 +5,7 @@
  * practical GRC lookups for controls, crosswalks, and evidence requests.
  */
 import { Type } from "@sinclair/typebox";
+import { rethrowIfAborted } from "./abort.js";
 import { cachedFetch, errorResult, formatTable, textResult } from "./shared.js";
 
 const BASE = "https://hackidle.github.io/scf-api/api";
@@ -392,6 +393,7 @@ export async function loadScfControlBundle(
     if (result.status === "fulfilled") {
       evidence_requests.push(result.value);
     } else {
+      rethrowIfAborted(result.reason);
       evidence_request_errors.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
     }
   }
