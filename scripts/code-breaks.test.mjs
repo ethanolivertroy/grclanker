@@ -11,10 +11,10 @@ function run(node) {
 }
 
 // `|` marks a break opportunity and `[...]` a span that never wraps.
-function render(node) {
+function render(node, mark = '|') {
   if (node.type === 'text') return node.value;
-  if (node.tagName === 'wbr') return '|';
-  const inner = node.children.map(render).join('');
+  if (node.tagName === 'wbr') return mark;
+  const inner = node.children.map((child) => render(child, mark)).join('');
   return node.tagName === 'span' && 'dataNowrap' in node.properties ? `[${inner}]` : inner;
 }
 
@@ -63,6 +63,33 @@ test('dense tables wrap long identifiers at word boundaries and hyphens', () => 
   run(table(5, hyphenated));
   assert.equal(hyphenated.properties.dataNowrap, undefined);
   assert.equal(render(hyphenated), 'sandbox-runtime');
+});
+
+test('long patterns and lists wrap between their items, but numbers stay whole', () => {
+  const pattern = el('code', [text('(^|[._-])(admin|administrator|root)')]);
+  const fields = el('code', [text('fields=id,name,statusMessage')]);
+  const count = el('code', [text('limit=10,000,000')]);
+  run(el('p', [pattern, text(' '), fields, text(' '), count]));
+  assert.equal(render(pattern, '^'), '(^|^[[._-])(admin|]^administrator|^root)');
+  assert.equal(render(fields, '^'), 'fields=id,^name,^statusMessage');
+  assert.equal(render(count, '^'), 'limit=10,000,000');
+});
+
+test('plain text in tables wraps long paths and lists, and running text does not', () => {
+  const sentence = 'Read from GET /v1/phishing/security_tests/{pst_id}/recipients, keeping id,name,status,statusMessage.';
+  const cell = () => el('span', [text(sentence)]);
+  const [inTable, inProse] = [cell(), cell()];
+  run(table(3, inTable));
+  run(el('p', [inProse]));
+  assert.equal(
+    render(inTable),
+    'Read from GET /v1/|phishing/|security_tests/|{pst_id}/|recipients, keeping id,|name,|status,|statusMessage.',
+  );
+  assert.equal(render(inProse), sentence);
+
+  const dense = el('span', [text('Scopes: read/write/admin and v3.0/api')]);
+  run(table(5, dense));
+  assert.equal(render(dense), 'Scopes: read/|write/|admin and v3.0/api');
 });
 
 test('link text wraps after slashes', () => {
