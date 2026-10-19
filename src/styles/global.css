@@ -2983,6 +2983,12 @@ kbd {
     break-inside: avoid;
   }
 
+  /* Holding a long code block whole can leave much of a sheet blank, so blocks
+     of 16 lines or more may split. */
+  pre:has(.line:nth-child(16)) {
+    break-inside: auto;
+  }
+
   /* Rows may split across sheets, since holding a tall row whole can leave
      most of a sheet blank, but a stacked cell's label stays with its text. */
   .docs-prose td[data-label]::before {
