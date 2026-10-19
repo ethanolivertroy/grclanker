@@ -11,6 +11,8 @@ import { dirname, join } from "node:path";
 export interface BundleTarget {
   root: string;
   names: Iterable<string>;
+  /** Runs on each candidate name before it is considered; throwing refuses the export instead of moving on. */
+  checkName?: (name: string) => void;
   /** Thrown when every name is taken. */
   exhaustedMessage?: string;
 }
@@ -133,7 +135,7 @@ export async function writeBundleAtomically(
   options: AtomicBundleOptions,
   write: (staged: StagedBundle) => Promise<void>,
 ): Promise<CommittedBundle> {
-  const { root, zip = false, signal } = options;
+  const { root, zip = false, signal, checkName } = options;
   signal?.throwIfAborted();
 
   const candidates = options.names[Symbol.iterator]();
@@ -142,6 +144,7 @@ export async function writeBundleAtomically(
   const nextFreeName = (): string | undefined => {
     for (let step = candidates.next(); !step.done; step = candidates.next()) {
       assertBundleName(step.value);
+      checkName?.(step.value);
       if (!claimedTargets.has(join(root, step.value)) && !takenOnDisk(step.value)) return step.value;
     }
     return undefined;

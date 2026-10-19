@@ -233,6 +233,40 @@ test("writeBundleAtomically commits only the directory when the writer produced 
   assert.deepEqual(readdirSync(root).sort(), ["plain", "with-zip-option"]);
 });
 
+test("checkName sees each candidate in order up to the free one, and throwing refuses the export before staging", async () => {
+  const root = createTempBase("grclanker-atomic-check-");
+  mkdirSync(join(root, "bundle"));
+  const checked = [];
+
+  const result = await writeBundleAtomically(
+    { root, names: numberedNames("bundle", 4), zip: true, checkName: (name) => checked.push(name) },
+    (staged) => writeSampleBundle(staged),
+  );
+
+  assert.equal(result.outputDir, join(root, "bundle-2"));
+  assert.deepEqual(checked, ["bundle", "bundle-2"]);
+
+  let wrote = false;
+  await assert.rejects(
+    writeBundleAtomically(
+      {
+        root,
+        names: numberedNames("bundle", 4),
+        zip: true,
+        checkName: (name) => {
+          if (name === "bundle-3") throw new Error(`Refusing to use ${name}`);
+        },
+      },
+      async () => {
+        wrote = true;
+      },
+    ),
+    /Refusing to use bundle-3/,
+  );
+  assert.equal(wrote, false);
+  assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle-2", "bundle-2.zip"]);
+});
+
 test("writeBundleAtomically refuses names that are not a single path segment", async () => {
   const root = createTempBase("grclanker-atomic-names-");
   for (const name of ["../escape", "nested/bundle", "..", "", ".grclanker-staging-00000000-1-ab"]) {
