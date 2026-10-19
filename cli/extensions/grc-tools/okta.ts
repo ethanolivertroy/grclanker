@@ -18,7 +18,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
-import { ToolCallAbortedError, abortableFetch, abortableSleep, unlessAborted } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { OKTA_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -2473,6 +2473,7 @@ export class OktaAuditorClient {
         headers,
       });
     } catch (error) {
+      rethrowIfAborted(error);
       throw new OktaApiError(
         this.redactSecrets(`Okta API request failed for ${target}: ${errorText(error)}`),
         null,
@@ -2807,6 +2808,7 @@ async function collectArrayDataset(
       truncationNote,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset([], error);
   }
 }
@@ -2851,6 +2853,7 @@ async function collectObjectDataset<T extends JsonRecord | null>(
     if (data !== null && !carriesExpectedMember(data, envelope.members)) return unexpectedShapeDataset(fallback, envelope);
     return { data: redactSnapshot(data) as T };
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset(fallback, error);
   }
 }
@@ -2888,6 +2891,7 @@ async function collectRecordMap(
       const note = truncationNoteOf(page);
       if (note) notes.push(`${parentId}: ${note}`);
     } catch (error) {
+      rethrowIfAborted(error);
       errors.push(`${parentId}: ${errorText(error)}`);
       childMarkers[parentId] = notCollectedMarker(error);
     }
@@ -3083,6 +3087,7 @@ async function collectUsersDataset(
         : undefined,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset([], error);
   }
 }
@@ -3242,6 +3247,7 @@ async function collectOrgContacts(
           userLogin: user ? asString(asRecord(user.profile).login) ?? null : null,
         });
       } catch (error) {
+        rethrowIfAborted(error);
         errors.push(`${contactType}: ${errorText(error)}`);
         childMarkers[contactType] = notCollectedMarker(error);
       }
@@ -3257,6 +3263,7 @@ async function collectOrgContacts(
       ...(errors.length > 0 ? { childMarkers } : {}),
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset<JsonRecord[]>([], error);
   }
 }
@@ -5590,6 +5597,7 @@ export async function runOktaAccessCheck(
         httpStatus: null,
       });
     } catch (error) {
+      rethrowIfAborted(error);
       const httpStatus = errorStatus(error);
       probes.push({
         key: probe.key,

@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -2437,6 +2437,7 @@ async function fetchWithRetry(url: string, init: RequestInit, options: HttpOptio
       }
       return response;
     } catch (error) {
+      rethrowIfAborted(error);
       if (attempt < options.retryAttempts && !(error instanceof Error && error.name === "AbortError")) {
         attempt += 1;
         await options.sleepImpl(250 * 2 ** attempt);
@@ -3214,6 +3215,7 @@ export async function collectPanosSnapshot(client: Pick<PanosApiClient, "host" |
   const failures: Record<string, PaloaltoSurfaceFailure> = {};
   let reachable = true;
   const systemInfo = await client.showSystemInfo().catch((error: unknown) => {
+    rethrowIfAborted(error);
     errors.push(`${client.host}: ${PANOS_SYSTEM_INFO_READ} failed: ${errorMessage(error)}`);
     failures[PANOS_SYSTEM_INFO_READ] = describeFailure(error);
     reachable = false;
@@ -3222,6 +3224,7 @@ export async function collectPanosSnapshot(client: Pick<PanosApiClient, "host" |
   const platform = detectPlatform(systemInfo);
   let haStateFailed = false;
   const haState = await client.showHighAvailabilityState().catch((error: unknown) => {
+    rethrowIfAborted(error);
     errors.push(`${client.host}: ${PANOS_HA_STATE_READ} failed: ${errorMessage(error)}`);
     failures[PANOS_HA_STATE_READ] = describeFailure(error);
     haStateFailed = true;
@@ -3234,6 +3237,7 @@ export async function collectPanosSnapshot(client: Pick<PanosApiClient, "host" |
       config.push(await client.showConfig(xpath));
       configXpaths.push(xpath);
     } catch (error) {
+      rethrowIfAborted(error);
       failedXpaths.push(xpath);
       failures[xpath] = describeFailure(error);
       errors.push(`${client.host}: config show ${xpath} failed: ${errorMessage(error)}`);
@@ -3261,6 +3265,7 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
     try {
       return redactCredentialProperties(await load());
     } catch (error) {
+      rethrowIfAborted(error);
       failed.push(label);
       failures[label] = describeFailure(error);
       errors.push(`prisma-compute: ${label} failed: ${errorMessage(error)}`);
@@ -3339,6 +3344,7 @@ export async function collectPrismaSnapshot(
     try {
       return redactCredentialProperties(await load());
     } catch (error) {
+      rethrowIfAborted(error);
       failed.push(label);
       failures[label] = describeFailure(error);
       errors.push(`prisma-cloud: ${label} failed: ${errorMessage(error)}`);
@@ -3450,6 +3456,7 @@ export async function resolveComputeClient(clients: PaloaltoClients): Promise<Pr
     clients.compute = new PrismaComputeClient(consoleUrl, clients.prisma);
     return clients.compute;
   } catch (error) {
+    rethrowIfAborted(error);
     clients.computeUnavailableReason = `Compute console discovery via CSPM /meta_info failed (${errorMessage(error)}); set PRISMA_COMPUTE_URL to the Compute console path.`;
     clients.computeUnavailableFailure = describeFailure(error);
     return undefined;
@@ -5005,6 +5012,7 @@ async function readableSurface(
     const partial = partialResolver?.(value) === true;
     return { product, target, name, endpoint, status: "readable", count: countResolver?.(value) ?? null, httpStatus: null, ...(partial ? { partial } : {}) };
   } catch (error) {
+    rethrowIfAborted(error);
     // A failed probe names the request that actually failed (a login or keygen
     // request when authentication is what broke) and reads nothing, so count and
     // partial are null rather than 0 and false.
@@ -5065,7 +5073,7 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
   for (const device of clients.panos) {
     const systemInfoSurface = await readableSurface("pan-os", device.host, "system_info", PANOS_READ_ENDPOINTS[PANOS_SYSTEM_INFO_READ], () => device.showSystemInfo(), () => 1);
     surfaces.push(systemInfoSurface);
-    const systemInfo: JsonRecord = systemInfoSurface.status === "readable" ? await device.showSystemInfo().catch(() => ({})) : {};
+    const systemInfo: JsonRecord = systemInfoSurface.status === "readable" ? await device.showSystemInfo().catch(fallbackUnlessAborted({})) : {};
     const platform = detectPlatform(systemInfo);
     notes.push(`${device.host}: ${platform}${asString(systemInfo.model) ? ` ${asString(systemInfo.model)}` : ""}${asString(systemInfo["sw-version"]) ? ` PAN-OS ${asString(systemInfo["sw-version"])}` : ""}`);
     surfaces.push(await readableSurface("pan-os", device.host, "ha_state", PANOS_READ_ENDPOINTS[PANOS_HA_STATE_READ], () => device.showHighAvailabilityState(), () => 1));

@@ -23,7 +23,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { Type } from "@sinclair/typebox";
-import { ToolCallAbortedError } from "./abort.js";
+import { ToolCallAbortedError, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { evaluateBatchRuntimeCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import {
@@ -1250,6 +1250,7 @@ export async function collect<T>(load: () => Promise<T[]>): Promise<OciCollected
   try {
     return { ok: true, items: await load() };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ok: false, items: [], error: errorMessage(error) };
   }
 }
@@ -1302,6 +1303,7 @@ export async function collectAcrossCompartments<T>(
       items.push(...await load(compartmentId));
       readable = true;
     } catch (error) {
+      rethrowIfAborted(error);
       deniedCompartments.push(label);
       errors.push(`${surfaceName} in compartment ${label}: ${errorMessage(error)}`);
     }
@@ -1528,6 +1530,7 @@ async function surface(
       count: countResolver?.(value),
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name,
       service,

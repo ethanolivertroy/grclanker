@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -1482,6 +1482,7 @@ export class PagerdutyApiClient {
       if (this.config.fromEmail) headers.from = this.config.fromEmail;
       return await this.fetchImpl(url, { method: "GET", headers, signal: controller.signal });
     } catch (error) {
+      rethrowIfAborted(error);
       // A token exchange failure is already a PagerdutyRequestError carrying its status and path.
       if (error instanceof PagerdutyRequestError) throw error;
       if (error instanceof Error && error.name === "AbortError") {
@@ -1763,6 +1764,7 @@ async function capture<T>(fallback: T, load: () => Promise<T>): Promise<Snapshot
   try {
     return { data: redactSnapshot(await load()) as T };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     const status = error instanceof PagerdutyRequestError ? error.status : requestStatus(message);
     const endpoint = (error instanceof PagerdutyRequestError ? error.path : undefined) ?? requestEndpoint(message);
@@ -1876,6 +1878,7 @@ export async function checkPagerdutyAccess(client: PagerdutyClientSurface): Prom
           : undefined;
       surfaces.push({ name, endpoint, status: "readable", count });
     } catch (error) {
+      rethrowIfAborted(error);
       const message = errorMessage(error);
       const httpStatus = error instanceof PagerdutyRequestError ? error.status : requestStatus(message);
       surfaces.push({

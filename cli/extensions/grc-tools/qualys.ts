@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { QUALYS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1133,6 +1133,7 @@ export class QualysApiClient {
         }
         return { status: response.status, text, headers: response.headers };
       } catch (error) {
+        rethrowIfAborted(error);
         if (attempt < this.config.maxRetries && error instanceof Error && error.name !== "AbortError") {
           attempt += 1;
           await this.sleepImpl(Math.min(1000 * 2 ** attempt, DEFAULT_MAX_RATE_LIMIT_WAIT_MS));
@@ -1704,6 +1705,7 @@ async function collect(
     }
     return { name, endpoint, data: list.items, moduleUnavailable: false, truncated: Boolean(truncationReason), truncationReason, cap };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     errors.push(`${name}: ${message}`);
     return { name, endpoint, data: [], error: message, moduleUnavailable: isModuleUnavailableError(message), truncated: false, cap };
@@ -3937,6 +3939,7 @@ async function probeSurface(
       ...(list.truncated ? { truncation: list.truncationReason } : {}),
     };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     return {
       name,
