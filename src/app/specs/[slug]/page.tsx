@@ -49,7 +49,7 @@ export default async function SpecPage(props: PageProps) {
     <SpecViewState key={meta.slug}>
       {toc.length > 0 && <SpecContentsBar items={toc} />}
 
-      <div className="max-w-content mx-auto px-4 py-6 sm:px-6 sm:py-8">
+      <div className="spec-page max-w-content mx-auto px-4 py-6 sm:px-6 sm:py-8">
         {/* Read by the "c" keyboard shortcut. */}
         <div id="spec-page-data" data-raw-url={rawUrl} className="hidden" />
 
@@ -100,7 +100,7 @@ export default async function SpecPage(props: PageProps) {
               )}
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 lg:max-w-[18rem] lg:justify-end">
+            <div className="spec-actions flex flex-wrap items-center gap-2 lg:max-w-[18rem] lg:justify-end">
               <SpecUrlCopyButton
                 url={rawUrl}
                 label="Copy URL"

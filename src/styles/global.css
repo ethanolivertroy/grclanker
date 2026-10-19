@@ -2829,3 +2829,234 @@ kbd {
     animation: none;
   }
 }
+
+/* === Print ===
+   Browsers leave out background colors when printing, so the theme's light
+   text would print faint on white paper. Pages print black on white, across
+   the full width of the paper, without the site's navigation and controls. */
+
+/* An !important declaration in a layer outranks unlayered ones and those in
+   later layers, so in the base layer these hold over every !important color
+   the theme sets on screen, Tailwind's included, and over Shiki's inline ones. */
+@layer base {
+  @media print {
+    *,
+    *::before,
+    *::after {
+      background: transparent !important;
+      box-shadow: none !important;
+      color: #000 !important;
+      text-shadow: none !important;
+    }
+
+    html,
+    body {
+      background: #fff !important;
+    }
+  }
+}
+
+@media print {
+  :root {
+    color-scheme: light;
+  }
+
+  /* Decorative images and the photos behind hero headings would sit under
+     black text. They keep their room, so the text laid over them stays put. */
+  img[alt=''],
+  .hero-backdrop {
+    visibility: hidden;
+  }
+
+  /* A tagline over a picture, which would print as an empty frame. */
+  .hero-image-break,
+  .page-image-break {
+    display: none;
+  }
+
+  /* A brand card's picture sets its height, which would print as an empty
+     frame above the caption, so on paper the card holds only its caption. */
+  .hero-brand-card {
+    min-height: 0;
+    break-inside: avoid;
+  }
+
+  .hero-brand-image {
+    display: none;
+  }
+
+  .hero-brand-overlay {
+    position: static;
+  }
+
+  .skip-link,
+  #app-shell > nav,
+  #app-shell > footer,
+  #nd-sidebar,
+  #nd-docs-layout [data-sidebar-placeholder],
+  #nd-toc,
+  .docs-contents-bar,
+  .docs-pager,
+  .docs-heading-anchor,
+  .spec-contents-bar,
+  .spec-actions,
+  .spec-tabs,
+  .spec-toc-rail,
+  .copy-code,
+  .cmd-copy,
+  .cmd-hero-copy,
+  .spec-catalog-copy,
+  .hero-install-toggle-row,
+  .hero-install-icon,
+  .site-search-overlay,
+  .site-search,
+  .overlay-dialog,
+  .toast {
+    display: none !important;
+  }
+
+  #app-shell,
+  #nd-docs-layout {
+    min-height: 0;
+  }
+
+  #nd-docs-layout {
+    --fd-sidebar-width: 0px !important;
+    --fd-toc-width: 0px !important;
+  }
+
+  #nd-page,
+  .spec-page {
+    max-width: none;
+    padding: 0;
+  }
+
+  .spec-reader-columns {
+    display: block;
+  }
+
+  /* Collapsed sections print open. */
+  details::details-content {
+    content-visibility: visible;
+  }
+
+  .agent-group-toggle::before {
+    transform: rotate(90deg);
+  }
+
+  /* Paper can't scroll, so tables and commands print in full. */
+  .docs-prose .docs-table-scroll {
+    overflow: visible;
+    content-visibility: visible;
+  }
+
+  .cmd-line code,
+  .cmd-hero code {
+    overflow: visible;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  /* The install tabs don't print, so the command box rounds the corner they met. */
+  .hero-install-command {
+    border-top-left-radius: 0.95rem;
+  }
+
+  /* Code blocks print without the copy button, so no corner is held for it. */
+  .docs-prose pre {
+    --corner-width: 0rem;
+  }
+
+  .docs-prose pre::before {
+    content: none;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  .docs-heading,
+  summary {
+    break-after: avoid;
+    break-inside: avoid;
+  }
+
+  pre,
+  blockquote,
+  .cmd-line {
+    break-inside: avoid;
+  }
+
+  /* Holding a long code block whole can leave much of a sheet blank, so blocks
+     of 16 lines or more may split. */
+  pre:has(.line:nth-child(16)) {
+    break-inside: auto;
+  }
+
+  /* Rows may split across sheets, since holding a tall row whole can leave
+     most of a sheet blank, but a stacked cell's label stays with its text.
+     An empty cell has no text to keep, and when it ends a table its label's
+     hold would forbid a break between the table and the heading after it. */
+  .docs-prose td[data-label]:not(:empty, :has(> span:empty:only-child))::before {
+    break-after: avoid;
+  }
+}
+
+/* Chrome won't carry a heading over to the next sheet when the grid after it
+   can't start on this one, so on paper a float sets each label beside its
+   text instead, lowered to the baseline the grid aligns it to. */
+@media print and (min-width: 721px) {
+  .docs-prose table[data-layout='stacked'] td {
+    display: flow-root;
+  }
+
+  .docs-prose table[data-layout='stacked'] td[data-label]::before {
+    float: left;
+    width: 10rem;
+    margin-top: 0.375rem;
+  }
+
+  .docs-prose table[data-layout='stacked']:has(th:nth-child(7)) td[data-label]::before {
+    margin-top: 0.25rem;
+  }
+
+  .docs-prose table[data-layout='stacked'] td > span {
+    display: block;
+    margin-left: 11.25rem;
+  }
+
+  /* Chrome moves a row to the next sheet whole when only its bottom padding
+     runs past this one, so on paper the space under a cell's text is a margin
+     as tall as the padding, which the end of a sheet can cut. */
+  .docs-prose table:not([data-layout='stacked']) td {
+    padding-bottom: 0;
+  }
+
+  .docs-prose table:not([data-layout='stacked']) td::after {
+    content: '';
+    display: block;
+    margin-top: 0.8rem;
+  }
+}
+
+/* Chrome can carry a grid that would fit over to the next sheet, leaving this
+   one nearly blank. Below 768px these grids are one column, so on paper they
+   are blocks spaced as the grid gaps were. */
+@media print and (max-width: 767px) {
+  .hero-briefing-grid,
+  .hero-summary-list,
+  .hero-fact-list,
+  .workflow-grid {
+    display: flow-root;
+  }
+
+  .hero-briefing-side {
+    margin-top: 1.5rem;
+  }
+
+  .hero-summary-item + .hero-summary-item,
+  .hero-fact-row + .hero-fact-row,
+  .workflow-row + .workflow-row {
+    margin-top: 1rem;
+  }
+}
