@@ -1,0 +1,27 @@
+name: Question
+description: A question about install, setup, or a shipped tool
+title: ""
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The docs cover install, setup, workflows, and the tool catalog: https://grclanker.com/docs/
+
+        Do not paste API keys, tokens, passwords, or tenant data.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What you tried, and where you got stuck.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release bundle (for example v0.1.2) or the git commit if you built from source.
+      placeholder: v0.1.2
+    validations:
+      required: false
