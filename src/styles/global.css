@@ -2890,7 +2890,9 @@ kbd {
   .copy-code,
   .cmd-copy,
   .cmd-hero-copy,
-  .spec-catalog-copy {
+  .spec-catalog-copy,
+  .hero-install-toggle-row,
+  .hero-install-icon {
     display: none !important;
   }
 
@@ -2934,6 +2936,11 @@ kbd {
     overflow: visible;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+
+  /* The install tabs don't print, so the command box rounds the corner they met. */
+  .hero-install-command {
+    border-top-left-radius: 0.95rem;
   }
 
   /* Code blocks print without the copy button, so no corner is held for it. */
