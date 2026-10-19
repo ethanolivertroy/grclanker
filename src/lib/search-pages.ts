@@ -4,7 +4,7 @@ import type { AdvancedIndex } from 'fumadocs-core/search/server';
 import { getDocHref } from './docs';
 import { identifierContents } from './search-identifiers.mjs';
 import { getDocSlug, getDocsSections, source } from './source';
-import { categoryLabels, loadSpecs } from './specs';
+import { getCategoryLabel, loadSpecs } from './specs';
 
 const noContent = { headings: [], contents: [] };
 
@@ -66,7 +66,7 @@ const specs = loadSpecs().map((spec) => {
   return {
     id: url,
     title: spec.name,
-    description: `${spec.vendor} · ${categoryLabels[spec.category] ?? spec.category}`,
+    description: `${spec.vendor} · ${getCategoryLabel(spec.category)}`,
     url,
     breadcrumbs: ['Spec'],
     structuredData: noContent,
