@@ -79,7 +79,7 @@ The app is adapted from the experimental durable coding agent in [Pi](https://gi
 
 The keys are Pi's defaults. Override them in `~/.grclanker/agent/keybindings.json`, keyed by Pi's action names such as `app.model.select`.
 
-Exiting closes the session, prints the command that opens it again, and exits `0`. A turn still running when you exit is not cancelled: it continues the next time the session is opened, in the terminal app or with `resume`. Tool calls that were running are cut off and handled like those of a crashed process: read-only tools run again, and tools that can write are reported and not rerun.
+Exiting closes the session, prints the command that opens it again, and exits `0`. A turn still running when you exit is not cancelled: it continues the next time the session is opened, in the terminal app or with `resume`. Tool calls that were running are cancelled as the session closes, so they stop calling APIs, and an unfinished export writes nothing. The next open handles them like those of a crashed process: read-only tools run again, and tools that can write are reported and not rerun.
 
 The terminal app takes only `--session` and `--model`, and needs an interactive terminal. From a script or a pipe, it exits `1` and points to `grclanker durable run`. A usage, configuration, or lock error also exits `1` before the app opens.
 
@@ -107,7 +107,7 @@ On resume, Pi Durable treats the tool round that was in flight as follows:
 
 The model then continues the same request with those results, so the request is not asked twice. `resume` finishes every request an earlier process left unsettled and reports the last one. When every request has settled, it prints `Nothing to resume` (with `--json`, the outcome `nothing_to_resume`) and exits `0`.
 
-The first Ctrl-C (or `SIGTERM`) stops the command, closes the session with its work pending, prints the `resume` command to run (with `--json`, a report with the outcome `interrupted`), and exits `130`. A second Ctrl-C exits at once. Registry tools take no abort signal, so a tool that was running is cut off when the process exits.
+The first Ctrl-C (or `SIGTERM`) stops the command, closes the session with its work pending, prints the `resume` command to run (with `--json`, a report with the outcome `interrupted`), and exits `130`. Tool calls that were running are cancelled as the session closes, as in the terminal app. A second Ctrl-C exits at once.
 
 ## Sessions and the lock
 
@@ -209,14 +209,15 @@ npm --prefix cli run test:cli
 - The interrupted export is reported and not rerun, and no bundle is written.
 - The model is not asked the request twice.
 - A settled request id returns the stored answer without new model calls or API requests.
+- Ctrl-C at the same point aborts every API request in flight and the process exits `130` on its own, with no bundle written. `resume` then finishes the round.
 
 `cli/tests/durable-tui.test.mjs` drives the terminal app on an in-memory screen, and the real `grclanker durable tui` in a pseudo-terminal. It checks that:
 
 - A turn shows the message, tool calls, results, answer, and footer counts, and reopening the session shows them again without new model calls or tool runs.
-- An app closed partway through a tool round leaves the round in the session. Reopened, it reruns the read-only tool, reports the writer without rerunning it, and shows both notices in full on a narrow screen.
+- An app closed partway through a tool round aborts the signal of each tool still running and leaves the round in the session. Reopened, it reruns the read-only tool, reports the writer without rerunning it, and shows both notices in full on a narrow screen.
 - `/model`, Esc, and a thinking change on a model without thinking never reach the model.
 - `grclanker durable tui`, killed with `SIGKILL` partway through the PagerDuty tool round above, holds the session lock while it runs. Opened again, it keeps the finished assessment, reruns the interrupted one, and does not rerun the export.
-- `grclanker durable tui`, closed with Ctrl+C partway through that tool round, exits at once instead of waiting for the stalled tools, and `resume` finishes the round without rerunning the export.
+- `grclanker durable tui`, closed with Ctrl+C partway through that tool round, exits on its own at once: closing the session aborts the stalled API requests, and the export writes nothing, not even its output directory. `resume` then finishes the round without rerunning the export.
 
 `cli/tests/durable.test.mjs` covers:
 
