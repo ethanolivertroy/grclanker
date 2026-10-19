@@ -357,6 +357,23 @@ function isRunning(pid) {
   }
 }
 
+/** Calls tool `name` until it starts the stand-in `cli`, aborts it, and checks the abort killed `cli` and rejected the call. */
+async function abortWhileCommandRuns(name, cli, args, pids) {
+  const tool = getRegisteredGrcTool(name);
+  const controller = new AbortController();
+  const reason = new Error(`stopped ${name}`);
+  const call = tool.execute(`abort-${name}`, tool.prepareArguments?.(args) ?? args, controller.signal);
+  assert.ok(await waitUntil(() => readPid(cli.pidFile) !== undefined, 5000), `${name} started its command`);
+  const pid = readPid(cli.pidFile);
+  pids.push(pid);
+  controller.abort(reason);
+  const settling = settleWithin(call, SETTLE_MS);
+  assert.ok(await waitUntil(() => !isRunning(pid), SETTLE_MS), `${name} left its command running after the abort`);
+  const outcome = await settling;
+  assert.equal(outcome.status, "rejected", `${name} ${outcome.status} instead of rejecting`);
+  assert.equal(outcome.error, reason);
+}
+
 test("abortableFetch without a signal is the fetch it was given", () => {
   const fetchImpl = async () => new Response("ok");
   assert.equal(abortableFetch(fetchImpl, undefined), fetchImpl);
@@ -572,26 +589,33 @@ test("aborting a gws or trestle call kills the command it is running", async (t)
   const gws = hangingCli(root, "gws");
   const trestle = hangingCli(root, "trestle");
   process.env.GRCLANKER_TRESTLE_BIN = trestle.executable;
-  const calls = [
-    ["gws_ops_check_cli", gws, { gws_bin: gws.executable }],
-    ["oscal_check_trestle", trestle, { workspace_dir: root }],
-  ];
+  await abortWhileCommandRuns("gws_ops_check_cli", gws, { gws_bin: gws.executable }, pids);
+  await abortWhileCommandRuns("oscal_check_trestle", trestle, { workspace_dir: root }, pids);
+});
 
-  for (const [name, cli, args] of calls) {
-    const tool = getRegisteredGrcTool(name);
-    const controller = new AbortController();
-    const reason = new Error(`stopped ${name}`);
-    const call = tool.execute(`abort-${name}`, tool.prepareArguments?.(args) ?? args, controller.signal);
-    assert.ok(await waitUntil(() => readPid(cli.pidFile) !== undefined, 5000), `${name} started its command`);
-    const pid = readPid(cli.pidFile);
-    pids.push(pid);
-    controller.abort(reason);
-    const settling = settleWithin(call, SETTLE_MS);
-    assert.ok(await waitUntil(() => !isRunning(pid), SETTLE_MS), `${name} left its command running after the abort`);
-    const outcome = await settling;
-    assert.equal(outcome.status, "rejected", `${name} ${outcome.status} instead of rejecting`);
-    assert.equal(outcome.error, reason);
-  }
+// Without credentials in their arguments or environment, the Azure and GCP tools ask az or gcloud for them.
+test("aborting an Azure or GCP call kills the az or gcloud credential lookup it is running", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "grclanker-abort-lookup-"));
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  const credentialNames = Object.keys(process.env).filter((name) => /^(AZURE|GCP|GOOGLE|GCLOUD)_/.test(name));
+  const saved = new Map(["PATH", "CLOUDSDK_CONFIG", ...credentialNames].map((name) => [name, process.env[name]]));
+  const pids = [];
+  t.after(() => {
+    for (const pid of pids) if (isRunning(pid)) process.kill(pid, "SIGKILL");
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    rmSync(root, { recursive: true, force: true });
+  });
+  for (const name of credentialNames) delete process.env[name];
+  // gcloud's config directory, holding no application default credentials file.
+  process.env.CLOUDSDK_CONFIG = root;
+  process.env.PATH = `${bin}${delimiter}${saved.get("PATH")}`;
+
+  await abortWhileCommandRuns("azure_check_access", hangingCli(bin, "az"), {}, pids);
+  await abortWhileCommandRuns("gcp_check_access", hangingCli(bin, "gcloud"), { project_id: "example" }, pids);
 });
 
 // The oci runner blocks the event loop until its command exits, so the abort lands between commands.

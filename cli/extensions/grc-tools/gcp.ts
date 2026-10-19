@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch } from "./abort.js";
+import { abortableFetch, resolveWithCommands, type CommandLookup } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -758,15 +758,6 @@ function defaultCommandRunner(command: string, args: string[]): string | undefin
   }
 }
 
-/** execFileSync blocks until the command exits and cannot be cancelled, so an aborted call only stops before the next command starts. */
-function commandRunnerUnlessAborted(signal: AbortSignal | undefined): GcpCommandRunner {
-  if (!signal) return defaultCommandRunner;
-  return (command, args) => {
-    signal.throwIfAborted();
-    return defaultCommandRunner(command, args);
-  };
-}
-
 /** A missing file is undefined; a file that exists but cannot be read (EACCES, EISDIR) throws the system error for readCredentialsFile to describe by code. */
 function defaultFileReader(pathname: string): string | undefined {
   return existsSync(pathname) ? readFileSync(pathname, "utf8") : undefined;
@@ -972,6 +963,23 @@ export function resolveGcpConfiguration(
   commandRunner: GcpCommandRunner = defaultCommandRunner,
   fileReader: GcpFileReader = defaultFileReader,
 ): GcpResolvedConfig {
+  const steps = gcpConfigurationSteps(input, env, fileReader);
+  let step = steps.next();
+  while (!step.done) step = steps.next(commandRunner(step.value.command, step.value.args));
+  return step.value;
+}
+
+/** resolveGcpConfiguration for a tool call: aborting `signal` kills the gcloud command in flight. */
+function resolveGcpConfigurationForCall(input: Record<string, unknown>, signal: AbortSignal | undefined): Promise<GcpResolvedConfig> {
+  return resolveWithCommands(gcpConfigurationSteps(input, process.env, defaultFileReader), DEFAULT_COMMAND_TIMEOUT_MS, signal);
+}
+
+/** Yields the gcloud command the configuration needs, if any, and resumes with its output, undefined when it fails or prints nothing. */
+function* gcpConfigurationSteps(
+  input: Record<string, unknown>,
+  env: NodeJS.ProcessEnv,
+  fileReader: GcpFileReader,
+): Generator<CommandLookup, GcpResolvedConfig, string | undefined> {
   env = readResolverEnvironment(GCP_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const organizationId = asString(input.organization_id) ?? asString(env.GCP_ORGANIZATION_ID) ?? asString(env.GCP_ORG_ID);
@@ -1011,7 +1019,7 @@ export function resolveGcpConfiguration(
   }
 
   if (!accessToken && !credentials) {
-    accessToken = commandRunner("gcloud", ["auth", "print-access-token"]);
+    accessToken = yield { command: "gcloud", args: ["auth", "print-access-token"] };
     if (accessToken) sourceChain.push("gcloud-access-token");
   }
 
@@ -4284,8 +4292,8 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   };
 }
 
-function createClient(args: CheckAccessArgs, signal?: AbortSignal): GcpAuditorClient {
-  return new GcpAuditorClient(resolveGcpConfiguration(args, process.env, commandRunnerUnlessAborted(signal)), { signal });
+async function createClient(args: CheckAccessArgs, signal?: AbortSignal): Promise<GcpAuditorClient> {
+  return new GcpAuditorClient(await resolveGcpConfigurationForCall(args, signal), { signal });
 }
 
 const authParams = {
@@ -4330,7 +4338,7 @@ export function registerGcpTools(pi: any): void {
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
     execute: runTool<CheckAccessArgs>("gcp_check_access", "GCP access check failed", async (args, signal) => {
-      const result = await checkGcpAccess(createClient(args, signal));
+      const result = await checkGcpAccess(await createClient(args, signal));
       return { text: formatAccessCheckText(result), details: { ...result } };
     }),
   });
@@ -4348,7 +4356,7 @@ export function registerGcpTools(pi: any): void {
     }),
     prepareArguments: normalizeIdentityArgs,
     execute: runTool<IdentityArgs>("gcp_assess_identity", "GCP identity assessment failed", async (args, signal) => {
-      const result = await assessGcpIdentity(createClient(args, signal), { maxProjects: projectLimit(args), staleDays: args.stale_days, maxKeys: args.max_keys });
+      const result = await assessGcpIdentity(await createClient(args, signal), { maxProjects: projectLimit(args), staleDays: args.stale_days, maxKeys: args.max_keys });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4365,7 +4373,7 @@ export function registerGcpTools(pi: any): void {
     }),
     prepareArguments: normalizeLoggingArgs,
     execute: runTool<LoggingArgs>("gcp_assess_logging_detection", "GCP logging and detection assessment failed", async (args, signal) => {
-      const result = await assessGcpLoggingDetection(createClient(args, signal), { maxProjects: projectLimit(args), maxFindings: args.max_findings });
+      const result = await assessGcpLoggingDetection(await createClient(args, signal), { maxProjects: projectLimit(args), maxFindings: args.max_findings });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4378,7 +4386,7 @@ export function registerGcpTools(pi: any): void {
     parameters: Type.Object({ ...authParams, ...inventoryParams }),
     prepareArguments: normalizeInventoryArgs,
     execute: runTool<InventoryArgs>("gcp_assess_org_guardrails", "GCP organization guardrail assessment failed", async (args, signal) => {
-      const result = await assessGcpOrgGuardrails(createClient(args, signal), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
+      const result = await assessGcpOrgGuardrails(await createClient(args, signal), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4391,7 +4399,7 @@ export function registerGcpTools(pi: any): void {
     parameters: Type.Object({ ...authParams, ...inventoryParams }),
     prepareArguments: normalizeInventoryArgs,
     execute: runTool<InventoryArgs>("gcp_assess_data_protection", "GCP data protection assessment failed", async (args, signal) => {
-      const result = await assessGcpDataProtection(createClient(args, signal), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
+      const result = await assessGcpDataProtection(await createClient(args, signal), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4404,7 +4412,7 @@ export function registerGcpTools(pi: any): void {
     parameters: Type.Object({ ...authParams, ...inventoryParams }),
     prepareArguments: normalizeInventoryArgs,
     execute: runTool<InventoryArgs>("gcp_assess_network_security", "GCP network security assessment failed", async (args, signal) => {
-      const result = await assessGcpNetworkSecurity(createClient(args, signal), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
+      const result = await assessGcpNetworkSecurity(await createClient(args, signal), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4424,7 +4432,7 @@ export function registerGcpTools(pi: any): void {
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
     execute: runTool<ExportAuditBundleArgs>("gcp_export_audit_bundle", "GCP audit bundle export failed", async (args, signal) => {
-      const config = resolveGcpConfiguration(args, process.env, commandRunnerUnlessAborted(signal));
+      const config = await resolveGcpConfigurationForCall(args, signal);
       const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
       const result = await exportGcpAuditBundle(new GcpAuditorClient(config, { signal }), config, outputRoot, { ...args, signal });
       return {

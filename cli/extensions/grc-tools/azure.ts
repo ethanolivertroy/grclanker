@@ -19,7 +19,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch } from "./abort.js";
+import { abortableFetch, resolveWithCommands, type CommandLookup } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -1703,15 +1703,6 @@ function defaultCommandRunner(command: string, args: string[]): string | undefin
   }
 }
 
-/** execFileSync blocks until the command exits and cannot be cancelled, so an aborted call only stops before the next command starts. */
-function commandRunnerUnlessAborted(signal: AbortSignal | undefined): AzureCommandRunner {
-  if (!signal) return defaultCommandRunner;
-  return (command, args) => {
-    signal.throwIfAborted();
-    return defaultCommandRunner(command, args);
-  };
-}
-
 export function resolveAzureCloud(authorityHost?: string, overrides: { graphHost?: string; managementHost?: string } = {}): AzureCloudEndpoints {
   const normalizedHost = (authorityHost ?? "login.microsoftonline.com")
     .trim()
@@ -1733,6 +1724,22 @@ export function resolveAzureConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   commandRunner: AzureCommandRunner = defaultCommandRunner,
 ): AzureResolvedConfig {
+  const steps = azureConfigurationSteps(input, env);
+  let step = steps.next();
+  while (!step.done) step = steps.next(commandRunner(step.value.command, step.value.args));
+  return step.value;
+}
+
+/** resolveAzureConfiguration for a tool call: aborting `signal` kills the az command in flight. */
+function resolveAzureConfigurationForCall(input: Record<string, unknown>, signal: AbortSignal | undefined): Promise<AzureResolvedConfig> {
+  return resolveWithCommands(azureConfigurationSteps(input, process.env), DEFAULT_COMMAND_TIMEOUT_MS, signal);
+}
+
+/** Yields each az command the configuration needs and resumes with its output, undefined when it fails or prints nothing. */
+function* azureConfigurationSteps(
+  input: Record<string, unknown>,
+  env: NodeJS.ProcessEnv,
+): Generator<CommandLookup, AzureResolvedConfig, string | undefined> {
   env = readResolverEnvironment(AZURE_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const cloud = resolveAzureCloud(asString(input.authority_host) ?? asString(env.AZURE_AUTHORITY_HOST), {
@@ -1747,25 +1754,28 @@ export function resolveAzureConfiguration(
     throw new Error("AZURE_CLIENT_CERTIFICATE_PATH is documented but certificate credentials are not implemented in this slice; use AZURE_CLIENT_SECRET or pass tokens.");
   }
   const clientCredentials = clientId && clientSecret ? { clientId, clientSecret } : undefined;
-  const useCli = (command: string, args: string[]): string | undefined => (clientCredentials ? undefined : commandRunner(command, args));
+  function* useCli(command: string, args: string[]): Generator<CommandLookup, string | undefined, string | undefined> {
+    if (clientCredentials) return undefined;
+    return yield { command, args };
+  }
 
   const tenantId = asString(input.tenant_id)
     ?? asString(env.AZURE_TENANT_ID)
-    ?? useCli("az", ["account", "show", "--query", "tenantId", "-o", "tsv"]);
+    ?? (yield* useCli("az", ["account", "show", "--query", "tenantId", "-o", "tsv"]));
   if (asString(input.tenant_id)) sourceChain.push("arguments-tenant");
   else if (asString(env.AZURE_TENANT_ID)) sourceChain.push("environment-tenant");
   else if (tenantId) sourceChain.push("azure-cli-tenant");
 
   const subscriptionId = asString(input.subscription_id)
     ?? asString(env.AZURE_SUBSCRIPTION_ID)
-    ?? useCli("az", ["account", "show", "--query", "id", "-o", "tsv"]);
+    ?? (yield* useCli("az", ["account", "show", "--query", "id", "-o", "tsv"]));
   if (asString(input.subscription_id)) sourceChain.push("arguments-subscription");
   else if (asString(env.AZURE_SUBSCRIPTION_ID)) sourceChain.push("environment-subscription");
   else if (subscriptionId) sourceChain.push("azure-cli-subscription");
 
   const graphToken = asString(input.graph_token)
     ?? asString(env.AZURE_GRAPH_TOKEN)
-    ?? useCli("az", [
+    ?? (yield* useCli("az", [
       "account",
       "get-access-token",
       "--resource",
@@ -1775,7 +1785,7 @@ export function resolveAzureConfiguration(
       "-o",
       "tsv",
       ...(tenantId ? ["--tenant", tenantId] : []),
-    ]);
+    ]));
   if (asString(input.graph_token)) sourceChain.push("arguments-graph-token");
   else if (asString(env.AZURE_GRAPH_TOKEN)) sourceChain.push("environment-graph-token");
   else if (graphToken) sourceChain.push("azure-cli-graph-token");
@@ -1783,7 +1793,7 @@ export function resolveAzureConfiguration(
   const managementToken = asString(input.management_token)
     ?? asString(env.AZURE_MANAGEMENT_TOKEN)
     ?? asString(env.AZURE_ACCESS_TOKEN)
-    ?? useCli("az", [
+    ?? (yield* useCli("az", [
       "account",
       "get-access-token",
       "--resource",
@@ -1794,7 +1804,7 @@ export function resolveAzureConfiguration(
       "tsv",
       ...(tenantId ? ["--tenant", tenantId] : []),
       ...(subscriptionId ? ["--subscription", subscriptionId] : []),
-    ]);
+    ]));
   if (asString(input.management_token)) sourceChain.push("arguments-management-token");
   else if (asString(env.AZURE_MANAGEMENT_TOKEN) || asString(env.AZURE_ACCESS_TOKEN)) {
     sourceChain.push("environment-management-token");
@@ -3752,8 +3762,8 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   };
 }
 
-function createClient(args: CheckAccessArgs, signal?: AbortSignal): AzureAuditorClient {
-  return new AzureAuditorClient(resolveAzureConfiguration(args, process.env, commandRunnerUnlessAborted(signal)), { signal });
+async function createClient(args: CheckAccessArgs, signal?: AbortSignal): Promise<AzureAuditorClient> {
+  return new AzureAuditorClient(await resolveAzureConfigurationForCall(args, signal), { signal });
 }
 
 const authParams = {
@@ -3780,7 +3790,7 @@ export function registerAzureTools(pi: any): void {
     prepareArguments: normalizeCheckAccessArgs,
     async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkAzureAccess(createClient(args, signal));
+        const result = await checkAzureAccess(await createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "azure_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -3800,7 +3810,7 @@ export function registerAzureTools(pi: any): void {
     prepareArguments: normalizeCheckAccessArgs,
     async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAzureIdentity(createClient(args, signal));
+        const result = await assessAzureIdentity(await createClient(args, signal));
         return textResult(formatAssessmentText(result), { tool: "azure_assess_identity", ...result });
       } catch (error) {
         return errorResult(
@@ -3820,7 +3830,7 @@ export function registerAzureTools(pi: any): void {
     prepareArguments: normalizeCheckAccessArgs,
     async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAzureMonitoring(createClient(args, signal));
+        const result = await assessAzureMonitoring(await createClient(args, signal));
         return textResult(formatAssessmentText(result), { tool: "azure_assess_monitoring", ...result });
       } catch (error) {
         return errorResult(
@@ -3840,7 +3850,7 @@ export function registerAzureTools(pi: any): void {
     prepareArguments: normalizeSubscriptionArgs,
     async execute(_toolCallId: string, args: SubscriptionArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAzureSubscriptionGuardrails(createClient(args, signal), { maxAssignments: args.max_assignments });
+        const result = await assessAzureSubscriptionGuardrails(await createClient(args, signal), { maxAssignments: args.max_assignments });
         return textResult(formatAssessmentText(result), { tool: "azure_assess_subscription_guardrails", ...result });
       } catch (error) {
         return errorResult(
@@ -3860,7 +3870,7 @@ export function registerAzureTools(pi: any): void {
     prepareArguments: normalizeDataProtectionArgs,
     async execute(_toolCallId: string, args: DataProtectionArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAzureDataProtection(createClient(args, signal), { maxMailboxes: args.max_mailboxes });
+        const result = await assessAzureDataProtection(await createClient(args, signal), { maxMailboxes: args.max_mailboxes });
         return textResult(formatAssessmentText(result), { tool: "azure_assess_data_protection", ...result });
       } catch (error) {
         return errorResult(
@@ -3880,7 +3890,7 @@ export function registerAzureTools(pi: any): void {
     prepareArguments: normalizeCheckAccessArgs,
     async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAzureNetworkAndPolicy(createClient(args, signal));
+        const result = await assessAzureNetworkAndPolicy(await createClient(args, signal));
         return textResult(formatAssessmentText(result), { tool: "azure_assess_network_and_policy", ...result });
       } catch (error) {
         return errorResult(
@@ -3905,7 +3915,7 @@ export function registerAzureTools(pi: any): void {
     prepareArguments: normalizeExportAuditBundleArgs,
     async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
-        const config = resolveAzureConfiguration(args, process.env, commandRunnerUnlessAborted(signal));
+        const config = await resolveAzureConfigurationForCall(args, signal);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
         const result = await exportAzureAuditBundle(new AzureAuditorClient(config, { signal }), config, outputRoot, { ...args, signal });
         return textResult(
