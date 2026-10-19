@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { estimateTableHeights } from '../src/lib/table-heights.mjs';
+import { estimateTableHeights, overflowsDocsColumn } from '../src/lib/table-heights.mjs';
 
 const text = (value) => ({ type: 'text', value });
 const el = (tagName, children = [], properties = {}) => ({ type: 'element', tagName, properties, children });
@@ -44,4 +44,12 @@ test('from 721px a table of sentences sets each cell beside a 10rem label', () =
 test('tables of seven or more columns are set at 14px', () => {
   const matrix = table(['A', 'B', 'C', 'D', 'E', 'F', 'G'], [['1', '2', '3', '4', '5', '6', '7']]);
   assert.deepEqual(estimateTableHeights(matrix), { narrow: 380, wide: 77 });
+});
+
+test('a column can narrow to a break after a hyphen, even where the next element starts', () => {
+  // As in SRG-APP-000148, whose number src/lib/code-breaks.mjs keeps whole.
+  const nowrap = (value) => el('span', [text(value)], { dataNowrap: '' });
+  const labels = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+  assert.equal(overflowsDocsColumn(table(labels, [labels.map(() => [text('SRG-'), nowrap('APP-000148')])])), false);
+  assert.equal(overflowsDocsColumn(table(labels, [labels.map(() => [nowrap('SRG-APP-000148')])])), true);
 });

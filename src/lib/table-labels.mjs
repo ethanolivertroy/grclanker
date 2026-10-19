@@ -1,3 +1,5 @@
+import { overflowsDocsColumn } from './table-heights.mjs';
+
 const TABLE_ROLES = {
   table: 'table',
   thead: 'rowgroup',
@@ -23,7 +25,9 @@ function setRoles(node) {
 }
 
 // Tables of sentences at least this wide read better as one labeled line per
-// cell than as columns squeezed into the docs column.
+// cell than as columns squeezed into the docs column. So do tables whose
+// columns cannot all fit in it: on screen they would scroll sideways, and on
+// paper their last columns would be cut off.
 const STACKED_MIN_COLUMNS = 4;
 const STACKED_MIN_AVERAGE_CELL_LENGTH = 30;
 
@@ -47,7 +51,7 @@ function markStacked(table, columns) {
   const cells = bodyCells(table).flat();
   if (columns < STACKED_MIN_COLUMNS || cells.length === 0) return;
   const total = cells.reduce((sum, cell) => sum + textContent(cell).trim().length, 0);
-  if (total / cells.length < STACKED_MIN_AVERAGE_CELL_LENGTH) return;
+  if (total / cells.length < STACKED_MIN_AVERAGE_CELL_LENGTH && !overflowsDocsColumn(table)) return;
   table.properties.dataLayout = 'stacked';
   for (const cell of cells) {
     cell.children = [{ type: 'element', tagName: 'span', properties: {}, children: cell.children }];
