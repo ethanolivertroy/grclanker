@@ -52,7 +52,7 @@ export function SpecCatalogSection({ specs }: { specs: SpecMeta[] }) {
                     <th scope="col" className={`${headerClass} hidden md:table-cell`}>
                       Updated
                     </th>
-                    <th scope="col" className="text-right pb-2 hud-label !text-subtext1 !font-semibold">
+                    <th scope="col" className="spec-catalog-copy text-right pb-2 hud-label !text-subtext1 !font-semibold">
                       Raw URL
                     </th>
                   </tr>
@@ -75,7 +75,7 @@ export function SpecCatalogSection({ specs }: { specs: SpecMeta[] }) {
                       <td className="py-2.5 pr-4 align-top text-subtext0 text-[0.6875rem] font-mono uppercase tracking-[0.08em] hidden md:table-cell">
                         {spec.last_updated}
                       </td>
-                      <td className="py-2.5 text-right align-top">
+                      <td className="spec-catalog-copy py-2.5 text-right align-top">
                         <SpecUrlCopyButton
                           url={`${RAW_BASE}/${spec.slug}.spec.md`}
                           label="Copy"

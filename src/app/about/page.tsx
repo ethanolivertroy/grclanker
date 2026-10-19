@@ -14,7 +14,7 @@ export default function AboutPage() {
   return (
     <>
       <section className="relative overflow-hidden">
-        <div className="absolute inset-0 w-full h-full">
+        <div className="hero-backdrop absolute inset-0 w-full h-full">
           <HeroImage
             src="/about-clanker.webp"
             alt="A clanker robot working at a compliance workstation"

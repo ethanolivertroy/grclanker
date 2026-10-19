@@ -14,7 +14,7 @@ export const metadata = {
 export default function NotFound() {
   return (
     <section className="relative overflow-hidden">
-      <div className="absolute inset-0 w-full h-full">
+      <div className="hero-backdrop absolute inset-0 w-full h-full">
         <HeroImage src="/404-cockpit.webp" alt="" className="w-full h-full object-cover object-center" loading="eager" />
       </div>
       <div className="absolute inset-0 bg-gradient-to-b from-base/30 via-base/50 to-base pointer-events-none" />

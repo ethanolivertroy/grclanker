@@ -19,7 +19,7 @@ export default function SpecsPage() {
   return (
     <>
       <section className="relative overflow-hidden border-b border-surface0/60">
-        <div className="absolute inset-0 w-full h-full">
+        <div className="hero-backdrop absolute inset-0 w-full h-full">
           <HeroImage
             src="/hero/holographic.webp"
             alt="Spec catalog cockpit display"

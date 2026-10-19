@@ -40,7 +40,7 @@ export default async function Page(props: PageProps) {
         container: DocsPageContainer,
         toc: { provider: TOCProvider, main: TOC, popover: DocsContentsBar },
       }}
-      footer={{ items: getDocsFooterItems(slug) }}
+      footer={{ items: getDocsFooterItems(slug), className: 'docs-pager' }}
     >
       <h1 className="docs-article-title">{page.data.title}</h1>
       <div className="docs-prose">
