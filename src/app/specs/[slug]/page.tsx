@@ -14,7 +14,7 @@ interface PageProps {
 const pillClass =
   'inline-flex items-center rounded-full border px-2.5 py-1 text-[0.6875rem] font-mono uppercase tracking-[0.12em]';
 const neutralPillClass = `${pillClass} border-surface0 bg-crust/70 text-subtext0`;
-const externalLinkClass = 'text-blue hover:text-lavender';
+const externalLinkClass = 'text-blue underline! underline-offset-2 hover:text-lavender';
 
 async function getSpecOrNotFound(props: PageProps) {
   const { slug } = await props.params;
