@@ -22,7 +22,9 @@ import {
 import { PALOALTO_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 
 const PRISMA_DOCS = "https://pan.dev/prisma-cloud/api/cspm/";
-const PANOS_DOCS = "https://docs.paloaltonetworks.com/pan-os/11-2/pan-os-panorama-api";
+const PANOS_DOCS = "https://docs.paloaltonetworks.com/ngfw/api/pan-os-xml-api-request-types-and-actions";
+const PANOS_CONFIG_DOCS = `${PANOS_DOCS}/configuration-api`;
+const PANOS_OP_DOCS = `${PANOS_DOCS}/run-operational-mode-commands-api`;
 export const PALOALTO_DEFAULT_MAX_CRITICAL_CVES = 0;
 export const PALOALTO_DEFAULT_MIN_HOST_COMPLIANCE_RATE = 90;
 export const PALOALTO_DEFAULT_MAX_SUPERUSERS = 3;
@@ -33,7 +35,7 @@ const prismaSurface = (id: string, path: string, fields: readonly string[]) =>
 const computeSurface = (id: string, path: string, fields: readonly string[]) =>
   restSurface(id, path, "Prisma Cloud Compute", COMPUTE_DOCS, fields);
 const panosConfigSurface = (id: string, xpath: string, fields: readonly string[]) =>
-  restSurface(id, `/api/?type=config&action=get&xpath=${xpath}`, "PAN-OS XML API", PANOS_DOCS, fields);
+  restSurface(id, `/api/?type=config&action=get&xpath=${xpath}`, "PAN-OS XML API", PANOS_CONFIG_DOCS, fields);
 const surfaces = [
   prismaSurface("prisma-compliance-posture", "/compliance/posture", ["summary.passedResources", "summary.failedResources", "summary.totalResources", "complianceDetails"]),
   prismaSurface("prisma-alert-rules", "/alert/rule", ["name", "enabled", "alertRuleNotificationConfig"]),
@@ -59,8 +61,8 @@ const surfaces = [
   panosConfigSurface("panos-zone-config", "{/network|/template}", ["zones", "zone-protection-profile"]),
   panosConfigSurface("panos-device-config", "{/deviceconfig|/mgt-config|/config/shared|/template|/config/panorama}", ["administrators", "password complexity", "logging", "system settings", "Panorama forwarding"]),
   panosConfigSurface("panos-globalprotect-config", "{/vsys|/network|/template|/config/shared}", ["GlobalProtect portals", "GlobalProtect gateways", "authentication profiles", "multi-factor-auth"]),
-  restSurface("panos-system-info", "/api/?type=op&cmd=show system info", "PAN-OS XML API", PANOS_DOCS, ["hostname", "model", "family", "system-mode", "sw-version"]),
-  restSurface("panos-ha-state", "/api/?type=op&cmd=show high-availability state", "PAN-OS XML API", PANOS_DOCS, ["enabled", "state"]),
+  restSurface("panos-system-info", "/api/?type=op&cmd=show system info", "PAN-OS XML API", PANOS_OP_DOCS, ["hostname", "model", "family", "system-mode", "sw-version"]),
+  restSurface("panos-ha-state", "/api/?type=op&cmd=show high-availability state", "PAN-OS XML API", PANOS_OP_DOCS, ["enabled", "state"]),
 ] as const;
 
 const PF = ["error", "denied", "not-collected", "missing-required-field"] as const;

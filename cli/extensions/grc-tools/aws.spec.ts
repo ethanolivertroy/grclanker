@@ -418,23 +418,23 @@ export const AWS_REQUESTS: Readonly<Record<string, RequestContract>> = Object.fr
 function docsUrl(entry: AwsOperationContract): string {
   if (entry.documentationUrl) return entry.documentationUrl;
   const serviceDocs: Record<string, string> = {
-    "access-analyzer": "access-analyzer",
-    account: "accounts",
-    auditmanager: "auditmanager",
-    cloudtrail: "awscloudtrail",
-    config: "config",
-    ec2: "AWSEC2",
-    guardduty: "guardduty",
-    iam: "IAM",
-    kms: "kms",
-    organizations: "organizations",
-    rds: "AmazonRDS",
-    s3: "AmazonS3",
-    securityhub: "securityhub",
-    "sso-admin": "singlesignon",
-    sts: "STS",
+    "access-analyzer": "access-analyzer/latest/APIReference",
+    account: "accounts/latest/APIReference",
+    auditmanager: "audit-manager/latest/APIReference",
+    cloudtrail: "awscloudtrail/latest/APIReference",
+    config: "config/latest/APIReference",
+    ec2: "AWSEC2/latest/APIReference",
+    guardduty: "guardduty/latest/APIReference",
+    iam: "IAM/latest/APIReference",
+    kms: "kms/latest/APIReference",
+    organizations: "organizations/latest/APIReference",
+    rds: "AmazonRDS/latest/APIReference",
+    s3: "AmazonS3/latest/API",
+    securityhub: "securityhub/1.0/APIReference",
+    "sso-admin": "singlesignon/latest/APIReference",
+    sts: "STS/latest/APIReference",
   };
-  return `https://docs.aws.amazon.com/${serviceDocs[entry.documentationNamespace]}/latest/APIReference/API_${entry.operation}.html`;
+  return `https://docs.aws.amazon.com/${serviceDocs[entry.documentationNamespace]}/API_${entry.operation}.html`;
 }
 
 const AWS_CONTROLS: ControlContract[] = Object.entries(AWS_CONTROL_CATALOG).map(([number, descriptor]) => ({

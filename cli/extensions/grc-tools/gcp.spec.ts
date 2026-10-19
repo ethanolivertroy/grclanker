@@ -34,7 +34,7 @@ export const GCP_PRIVILEGED_IAM_ROLES = [
   "roles/resourcemanager.folderAdmin",
 ] as const;
 const surfaces = [
-  restSurface("organization", "cloudresourcemanager.googleapis.com/v1/organizations/{organization}", "Cloud Resource Manager", "https://cloud.google.com/resource-manager/reference/rest/v1/organizations/get", ["name", "displayName", "state"]),
+  restSurface("organization", "cloudresourcemanager.googleapis.com/v1/organizations/{organization}", "Cloud Resource Manager", "https://docs.cloud.google.com/resource-manager/reference/rest/v1/organizations/get", ["name", "displayName", "state"]),
   restSurface("projects", "cloudasset.googleapis.com/v1/{scope}:searchAllResources", "Cloud Asset Inventory", ASSET_DOCS, ["name", "displayName", "state", "project"]),
   restSurface("iam-policies", "cloudasset.googleapis.com/v1/{scope}:searchAllIamPolicies", "Cloud Asset Inventory", ASSET_DOCS, ["resource", "policy.bindings.role", "policy.bindings.members"]),
   restSurface("service-accounts", "iam.googleapis.com/v1/projects/{project}/serviceAccounts", "IAM", "https://cloud.google.com/iam/docs/reference/rest/v1/projects.serviceAccounts/list", ["name", "email", "disabled"]),
@@ -45,7 +45,7 @@ const surfaces = [
   restSurface("log-buckets", "logging.googleapis.com/v2/projects/{project}/locations/-/buckets", "Cloud Logging", "https://cloud.google.com/logging/docs/reference/v2/rest/v2/projects.locations.buckets/list", ["name", "retentionDays"]),
   restSurface("scc-sources", "securitycenter.googleapis.com/v1/organizations/{organization}/sources", "Security Command Center", "https://cloud.google.com/security-command-center/docs/reference/rest/v1/organizations.sources/list", ["name", "displayName"]),
   restSurface("scc-findings", "securitycenter.googleapis.com/v1/organizations/{organization}/sources/-/findings", "Security Command Center", "https://cloud.google.com/security-command-center/docs/reference/rest/v1/organizations.sources.findings/list", ["finding.name", "finding.state", "finding.category", "finding.severity"]),
-  restSurface("effective-org-policy", "cloudresourcemanager.googleapis.com/v1/projects/{project}:getEffectiveOrgPolicy", "Cloud Resource Manager", "https://cloud.google.com/resource-manager/reference/rest/v1/projects/getEffectiveOrgPolicy", ["constraint", "booleanPolicy.enforced", "listPolicy"]),
+  restSurface("effective-org-policy", "cloudresourcemanager.googleapis.com/v1/projects/{project}:getEffectiveOrgPolicy", "Cloud Resource Manager", "https://docs.cloud.google.com/resource-manager/reference/rest/v1/projects/getEffectiveOrgPolicy", ["constraint", "booleanPolicy.enforced", "listPolicy"]),
   restSurface("compute-project", "compute.googleapis.com/compute/v1/projects/{project}", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/projects/get", ["name", "commonInstanceMetadata"]),
   restSurface("compute-instances", "compute.googleapis.com/compute/v1/projects/{project}/aggregated/instances", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/instances/aggregatedList", ["name", "metadata", "shieldedInstanceConfig", "networkInterfaces"]),
   restSurface("compute-disks", "compute.googleapis.com/compute/v1/projects/{project}/aggregated/disks", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/disks/aggregatedList", ["name", "diskEncryptionKey.kmsKeyName"]),
