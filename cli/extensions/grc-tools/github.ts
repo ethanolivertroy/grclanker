@@ -20,7 +20,7 @@ import { Type } from "@sinclair/typebox";
 import { ToolCallAbortedError, abortableFetch, abortableSleep, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { NextLinkError, parseNextLinkHeader, resolveSameOriginUrl, systemErrorCode } from "./hardening/index.js";
-import { errorResult, formatTable, textResult } from "./shared.js";
+import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -2700,28 +2700,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
 // scrub layer on their whole body; JSON documents take it per string through serializeJson.
 async function writeBundleText(rootDir: string, relativePathname: string, content: string): Promise<void> {
   await writeSecureTextFile(rootDir, relativePathname, scrubErrorText(content));
-}
-
-async function mapWithConcurrency<T, R>(
-  values: T[],
-  limit: number,
-  worker: (value: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(values.length);
-  let index = 0;
-
-  async function runWorker(): Promise<void> {
-    while (true) {
-      const current = index;
-      index += 1;
-      if (current >= values.length) return;
-      results[current] = await worker(values[current], current);
-    }
-  }
-
-  const workers = Array.from({ length: Math.max(1, Math.min(limit, values.length)) }, () => runWorker());
-  await Promise.all(workers);
-  return results;
 }
 
 function isArchivedRepo(repo: JsonRecord): boolean {

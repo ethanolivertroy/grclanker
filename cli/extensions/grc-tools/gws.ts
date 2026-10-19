@@ -37,7 +37,7 @@ import { GWS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-cont
 import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { REDACTED, systemErrorCode } from "./hardening/index.js";
 import { GWS_SPEC } from "./gws.spec.js";
-import { errorResult, formatTable, textResult } from "./shared.js";
+import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -1030,28 +1030,6 @@ async function collectDataset(collector: () => Promise<GwsCollection>): Promise<
   } catch (error) {
     return { data: [], error: summarizeError(error), errorKind: classifyError(error), seen: 0 };
   }
-}
-
-async function mapWithConcurrency<T, R>(
-  values: T[],
-  limit: number,
-  worker: (value: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(values.length);
-  let index = 0;
-
-  async function runWorker(): Promise<void> {
-    while (true) {
-      const current = index;
-      index += 1;
-      if (current >= values.length) return;
-      results[current] = await worker(values[current], current);
-    }
-  }
-
-  const workers = Array.from({ length: Math.max(1, Math.min(limit, values.length)) }, () => runWorker());
-  await Promise.all(workers);
-  return results;
 }
 
 function isSuperAdminRole(role: JsonRecord | undefined): boolean {

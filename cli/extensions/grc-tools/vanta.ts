@@ -26,7 +26,7 @@ import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { Type } from "@sinclair/typebox";
 import { ToolCallAbortedError, abortableFetch, unlessAborted } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
-import { errorResult, formatTable, textResult } from "./shared.js";
+import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
 
 const VANTA_TOKEN_URL = "https://api.vanta.com/oauth/token";
@@ -749,28 +749,6 @@ function reserveUniquePath(path: string, usedPaths: Set<string>): string {
   return candidate;
 }
 
-async function runWithConcurrency<T>(
-  items: T[],
-  limit: number,
-  worker: (item: T, index: number) => Promise<void>,
-): Promise<void> {
-  if (items.length === 0) return;
-
-  const size = Math.max(1, Math.min(limit, items.length));
-  let cursor = 0;
-
-  await Promise.all(
-    Array.from({ length: size }, async () => {
-      for (;;) {
-        const index = cursor;
-        cursor += 1;
-        if (index >= items.length) return;
-        await worker(items[index]!, index);
-      }
-    }),
-  );
-}
-
 async function followDownloadRedirects(
   rawUrl: string,
   fetchImpl: FetchImpl,
@@ -964,7 +942,7 @@ export async function exportVantaAuditPackage(
       }
     }
 
-    await runWithConcurrency(downloads, options.downloadConcurrency ?? 5, async (task) => {
+    await mapWithConcurrency(downloads, options.downloadConcurrency ?? 5, async (task) => {
       try {
         const size = await downloadFile(task.url.url, task.filePath, staged.dir, fetchImpl, options.signal);
         totalFilesExported += 1;

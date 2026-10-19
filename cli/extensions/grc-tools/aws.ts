@@ -113,7 +113,7 @@ import type {
   AwsOutputMemberKind,
 } from "./aws.spec.js";
 import { checkContract, defineGrcTool, evaluateVerdictCriteria, toolContract } from "./spec-model.js";
-import { errorResult, formatTable, textResult } from "./shared.js";
+import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
 
 export {
@@ -1714,24 +1714,6 @@ export function maskAccessKeyId(accessKeyId: string): string {
  */
 export function labelIdentifier(id: string): string {
   return redactErrorText(id) === id ? id : maskAccessKeyId(id);
-}
-
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  limit: number,
-  worker: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  const runners = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      results[index] = await worker(items[index], index);
-    }
-  });
-  await Promise.all(runners);
-  return results;
 }
 
 function parseRegionList(value: unknown): string[] | undefined {

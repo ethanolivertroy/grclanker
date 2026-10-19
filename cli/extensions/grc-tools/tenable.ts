@@ -24,7 +24,7 @@ import { ToolCallAbortedError, abortableFetch, abortableSleep } from "./abort.js
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
-import { errorResult, formatTable, textResult } from "./shared.js";
+import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
 import type { FrameworkKey } from "./spec-model.js";
 import { TENABLE_SPEC } from "./tenable.spec.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -3134,20 +3134,6 @@ async function vmObject(clients: TenableClients, endpoint: string, load: (client
 async function vmExport(clients: TenableClients, endpoint: string, load: (client: TenableApiClient) => Promise<TenableExportResult>): Promise<TenableDataset<TenableExportResult>> {
   if (!clients.vm) return notConfiguredDataset<TenableExportResult>(EMPTY_EXPORT, VM_NOT_CONFIGURED);
   return collectExport(endpoint, () => load(clients.vm as TenableApiClient));
-}
-
-async function mapWithConcurrency<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      results[index] = await worker(items[index]);
-    }
-  });
-  await Promise.all(runners);
-  return results;
 }
 
 /**
