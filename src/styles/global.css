@@ -2375,6 +2375,24 @@ details[open] > .agent-group-toggle::before {
   }
 }
 
+/* A stacked table far from view (src/lib/spec-table-labels.mjs) leaves out its
+   cell labels but keeps the room a one-line label takes. */
+@media screen and (max-width: 720px) {
+  .spec-reader table[data-labels='lazy'] td[data-label] {
+    padding-top: calc(var(--text-xs) * 1.4 + 0.15rem);
+  }
+
+  /* In an empty cell the label's bottom margin collapses into the next cell's. */
+  .spec-reader table[data-labels='lazy'] td[data-label]:empty {
+    padding-top: calc(var(--text-xs) * 1.4);
+    margin-bottom: 0.15rem;
+  }
+
+  .spec-reader table[data-labels='lazy'] td[data-label]::before {
+    content: none;
+  }
+}
+
 /* A smooth scroll renders every table it passes, and a few px of error in each
    adds up to land a section link screens off its heading. An instant jump
    renders only the tables around the heading, and scroll anchoring holds the
