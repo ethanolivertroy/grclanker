@@ -1,6 +1,7 @@
 import { createMarkdownRenderer, type MarkdownRendererOptions } from 'fumadocs-core/content/md';
 import { getTableOfContents } from 'fumadocs-core/content/toc';
 import { rehypeCode, remarkGfm, remarkHeading } from 'fumadocs-core/mdx-plugins';
+import type { TOCItemType } from 'fumadocs-core/toc';
 import type { CSSProperties } from 'react';
 import { rehypeCodeOptions, siteRehypePlugins } from '../lib/markdown-options';
 import { githubUrl } from '../lib/site';
@@ -32,28 +33,15 @@ function StaticTable({ html, narrow, wide }: StaticTableProps) {
 
 const components = { ...mdxComponents, [STATIC_TABLE]: StaticTable };
 
-/** A spec's markdown set like a docs page, with its sections listed alongside. */
-export async function SpecDocument({ content }: { content: string }) {
-  const toc = (await getTableOfContents(content, remarkPlugins)).filter((item) => item.depth <= 3);
+/** The sections a spec lists in its contents bar and beside its document. */
+export async function specSections(content: string): Promise<TOCItemType[]> {
+  return (await getTableOfContents(content, remarkPlugins)).filter((item) => item.depth <= 3);
+}
 
+/** A spec's markdown set like a docs page, with its sections listed alongside. */
+export function SpecDocument({ content, toc }: { content: string; toc: TOCItemType[] }) {
   return (
     <div className="spec-reader">
-      {toc.length > 0 && (
-        <nav className="spec-toc-inline" aria-label="On this page">
-          <details>
-            <summary>On this page</summary>
-            <ul className="spec-toc-list">
-              {toc.map((item) => (
-                <li key={item.url}>
-                  <a href={item.url} className="spec-toc-link" data-depth={item.depth}>
-                    {item.title}
-                  </a>
-                </li>
-              ))}
-            </ul>
-          </details>
-        </nav>
-      )}
       <div className="spec-reader-columns">
         <article className="docs-prose min-w-0">
           <MarkdownServer components={components}>{content}</MarkdownServer>

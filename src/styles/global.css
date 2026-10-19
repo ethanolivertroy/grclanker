@@ -131,6 +131,13 @@ html {
   }
 }
 
+/* Below 1024px spec pages pin their contents bar under it while the document view is open. */
+@media (max-width: 1023.98px) {
+  html:has(.spec-contents-bar):has(#spec-panel-document:not([hidden])) {
+    scroll-padding-top: calc(var(--fd-banner-height) + 2.5rem);
+  }
+}
+
 body {
   background: var(--ui-bg);
   color: var(--ui-text);
@@ -1190,6 +1197,7 @@ details[open] > .agent-group-toggle::before {
 /* Docs body text is set in the platform sans (the Fumadocs default) for long
    reading; headings, labels, and code stay in the mono brand face. */
 #nd-docs-layout,
+.spec-contents-bar,
 .spec-reader {
   --docs-font-body: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif;
   --docs-border: color-mix(in srgb, var(--color-surface1) 62%, transparent);
@@ -2278,33 +2286,91 @@ details[open] > .agent-group-toggle::before {
   font-size: var(--text-sm);
 }
 
-.spec-toc-inline {
-  margin-bottom: 1.5rem;
-  border: 1px solid var(--docs-border-strong);
-  border-radius: 0.5rem;
-  background: var(--docs-panel);
+/* Below 1024px a bar under the site header names the section in view and
+   opens the section list. */
+.spec-contents-bar {
+  position: sticky;
+  top: var(--fd-banner-height);
+  /* Over the code block copy buttons (z-index 10) and under the site header (z-50). */
+  z-index: 40;
+  border-bottom: 1px solid var(--color-fd-border);
+  background-color: var(--color-fd-background);
 }
 
-.spec-toc-inline summary,
+html:has(#spec-panel-document[hidden]) .spec-contents-bar {
+  display: none;
+}
+
+.spec-contents-trigger {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  width: 100%;
+  height: 2.5rem;
+  padding-inline: 1rem;
+  color: var(--docs-subtle);
+  font-size: var(--text-sm);
+  text-align: start;
+}
+
+.spec-contents-trigger:hover,
+.spec-contents-trigger[aria-expanded='true'] {
+  color: var(--docs-title);
+}
+
+/* The bar runs edge to edge under the sticky header, which would hide the sides and top of an outer ring. */
+.spec-contents-trigger:focus-visible {
+  outline-offset: -2px;
+}
+
+.spec-contents-ring,
+.spec-contents-chevron {
+  flex-shrink: 0;
+}
+
+.spec-contents-trigger[aria-expanded='true'] .spec-contents-chevron {
+  rotate: 180deg;
+}
+
+.spec-contents-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spec-contents-panel {
+  position: absolute;
+  top: calc(100% + 1px);
+  inset-inline: 0;
+  max-height: calc(100dvh - var(--fd-banner-height) - 5.5rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 1rem 1rem 1.25rem;
+  border-bottom: 1px solid var(--color-fd-border);
+  background-color: var(--color-fd-background);
+  box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.25), 0 4px 6px -4px rgb(0 0 0 / 0.25);
+}
+
+.spec-contents-panel .spec-toc-link {
+  padding-block: 0.5rem;
+}
+
+@media (min-width: 40rem) {
+  .spec-contents-trigger,
+  .spec-contents-panel {
+    padding-inline: 1.5rem;
+  }
+}
+
 .spec-toc-title {
+  margin-bottom: 0.5rem;
   color: var(--docs-label);
   font-size: var(--text-xs);
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-}
-
-.spec-toc-inline summary {
-  padding: 0.75rem 1rem;
-  cursor: pointer;
-}
-
-.spec-toc-inline .spec-toc-list {
-  margin: 0 1rem 1rem;
-}
-
-.spec-toc-title {
-  margin-bottom: 0.5rem;
 }
 
 .spec-toc-list {
@@ -2348,7 +2414,7 @@ details[open] > .agent-group-toggle::before {
     align-items: start;
   }
 
-  .spec-toc-inline {
+  .spec-contents-bar {
     display: none;
   }
 
