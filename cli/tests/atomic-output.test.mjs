@@ -12,8 +12,9 @@ import {
   writeFileSync,
 } from "node:fs";
 import { writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import {
   numberedNames,
@@ -24,6 +25,7 @@ import { SIMULATED_CRASH, newEntries, withWriteFailure } from "./helpers/atomic-
 
 const MODULE_URL = new URL("../dist/extensions/grc-tools/atomic-output.js", import.meta.url).href;
 const HOST_TOKEN = createHash("sha256").update(hostname()).digest("hex").slice(0, 8);
+const fsPromises = createRequire(import.meta.url)("node:fs/promises");
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -64,6 +66,22 @@ async function deadPid() {
   ready.catch(() => {});
   await exited;
   return child.pid;
+}
+
+/** Runs `effect` right after this process renames something onto `target`, while `run` executes. */
+async function afterRename(target, effect, run) {
+  const original = fsPromises.rename;
+  fsPromises.rename = async (from, to) => {
+    await original(from, to);
+    if (to === target) effect();
+  };
+  syncBuiltinESMExports();
+  try {
+    return await run();
+  } finally {
+    fsPromises.rename = original;
+    syncBuiltinESMExports();
+  }
 }
 
 test("numberedNames yields the base name and then -2 through -count", () => {
@@ -174,19 +192,49 @@ test("writeBundleAtomically fails before staging when every name is taken", asyn
   assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle-2.zip"]);
 });
 
-test("writeBundleAtomically moves to the next free name when another writer claims the expected one first", async () => {
+test("when another writer takes the expected name first, the bundle is written again under the next free name", async () => {
   const root = createTempBase("grclanker-atomic-race-");
+  const targets = [];
 
   const result = await writeBundleAtomically({ root, names: numberedNames("bundle", 3), zip: true }, async (staged) => {
-    await writeSampleBundle(staged);
-    mkdirSync(join(root, "bundle"));
-    writeFileSync(join(root, "bundle-2.zip"), "claimed");
+    targets.push(staged.target.outputDir);
+    await writeFile(join(staged.dir, "location.txt"), staged.target.outputDir);
+    await writeFile(staged.zipPath, basename(staged.dir));
+    if (targets.length === 1) {
+      mkdirSync(join(root, "bundle"));
+      writeFileSync(join(root, "bundle-2.zip"), "claimed");
+    }
   });
 
-  assert.equal(result.outputDir, join(root, "bundle-3"));
-  assert.equal(readFileSync(join(root, "bundle-3", "README.md"), "utf8"), "# bundle\n");
+  assert.deepEqual(targets, [join(root, "bundle"), join(root, "bundle-3")], "the writer runs again with the new target");
+  assert.deepEqual(result, { outputDir: join(root, "bundle-3"), zipPath: join(root, "bundle-3.zip") });
+  assert.equal(readFileSync(join(result.outputDir, "location.txt"), "utf8"), result.outputDir, "a recorded location names where the bundle landed");
+  assert.equal(readFileSync(result.zipPath, "utf8"), "bundle-3", "the archive is rebuilt under the new name too");
   assert.equal(readFileSync(join(root, "bundle-2.zip"), "utf8"), "claimed");
-  assert.deepEqual(stagingEntries(root), []);
+  assert.deepEqual(readdirSync(join(root, "bundle")), [], "the other writer's directory is untouched");
+  assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle-2.zip", "bundle-3", "bundle-3.zip"]);
+});
+
+test("when the archive's name is taken after the directory moves, the directory is withdrawn and the bundle is written again", async () => {
+  const root = createTempBase("grclanker-atomic-zip-race-");
+  const targets = [];
+
+  const result = await afterRename(
+    join(root, "bundle"),
+    () => writeFileSync(join(root, "bundle.zip"), "claimed"),
+    () => writeBundleAtomically({ root, names: numberedNames("bundle", 3), zip: true }, async (staged) => {
+      targets.push(staged.target.outputDir);
+      await writeFile(join(staged.dir, "location.txt"), staged.target.outputDir);
+      await writeFile(staged.zipPath, basename(staged.dir));
+    }),
+  );
+
+  assert.deepEqual(targets, [join(root, "bundle"), join(root, "bundle-2")], "the writer runs again with the new target");
+  assert.deepEqual(result, { outputDir: join(root, "bundle-2"), zipPath: join(root, "bundle-2.zip") });
+  assert.equal(readFileSync(join(result.outputDir, "location.txt"), "utf8"), result.outputDir);
+  assert.equal(readFileSync(result.zipPath, "utf8"), "bundle-2");
+  assert.equal(readFileSync(join(root, "bundle.zip"), "utf8"), "claimed");
+  assert.deepEqual(readdirSync(root).sort(), ["bundle-2", "bundle-2.zip", "bundle.zip"], "no directory is left without its archive");
 });
 
 test("concurrent writes in one process claim different names up front, and a failed write releases its claim", async () => {

@@ -896,9 +896,6 @@ export async function exportVantaAuditPackage(
 ): Promise<VantaExportResult> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const errors: string[] = [];
-  const usedControlPaths = new Set<string>();
-  const usedFilePaths = new Set<string>();
-  const evidenceFilesByControlKey = new Map<string, string[]>();
 
   ensurePrivateDir(baseOutputDir);
 
@@ -919,6 +916,7 @@ export async function exportVantaAuditPackage(
     }
   }
 
+  const listingErrorCount = errors.length;
   let totalFilesExported = 0;
   let totalSizeBytes = 0;
   const { outputDir, zipPath } = await writeBundleAtomically({
@@ -926,6 +924,13 @@ export async function exportVantaAuditPackage(
     names: auditOutputNames(audit),
     zip: true,
   }, async (staged) => {
+    // The writer runs again under the next free name if another process takes this one first.
+    errors.splice(listingErrorCount);
+    totalFilesExported = 0;
+    totalSizeBytes = 0;
+    const usedControlPaths = new Set<string>();
+    const usedFilePaths = new Set<string>();
+    const evidenceFilesByControlKey = new Map<string, string[]>();
     const controlDirByName = new Map<string, string>();
     for (const controlName of controlMap.keys()) {
       const preferred = join(staged.dir, sanitizeFilename(controlName));

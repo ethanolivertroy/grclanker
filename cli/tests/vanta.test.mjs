@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -749,6 +750,68 @@ test("exportVantaAuditPackage allocates distinct bundles for concurrent exports"
   assert.ok(existsSync(second.outputDir));
   assert.ok(existsSync(first.zipPath));
   assert.ok(existsSync(second.zipPath));
+});
+
+test("exportVantaAuditPackage writes the bundle again with fresh counts when another process takes its name mid-export", async () => {
+  const audit = {
+    id: "audit-race-123456",
+    customerDisplayName: "Race Test",
+    customerOrganizationName: "Race Test LLC",
+    framework: "SOC 2",
+    auditStartDate: "2026-01-01T00:00:00.000Z",
+    auditEndDate: "2026-12-31T00:00:00.000Z",
+  };
+  const client = {
+    async listEvidence() {
+      return [{
+        id: "ae-race",
+        evidenceId: "ev-race",
+        name: "Race evidence",
+        status: "SUBMITTED",
+        description: null,
+        evidenceType: "UPLOADED_DOCUMENT",
+        testStatus: null,
+        relatedControls: [{ name: "IAM" }],
+        creationDate: "2026-01-02T00:00:00.000Z",
+        statusUpdatedDate: "2026-01-03T00:00:00.000Z",
+      }];
+    },
+    async listEvidenceUrls() {
+      return [
+        { id: "url-race-good", url: "https://downloads.example.com/good.txt", filename: "good.txt", isDownloadable: true },
+        { id: "url-race-bad", url: "https://downloads.example.com/bad.txt", filename: "bad.txt", isDownloadable: true },
+      ];
+    },
+  };
+  const base = createTempBase("grclanker-vanta-race-");
+  const outputRoot = resolve(base, "exports");
+  let takenName;
+  let fetches = 0;
+  const fetchImpl = async (input) => {
+    fetches += 1;
+    if (!takenName) {
+      const [staging] = readdirSync(outputRoot).filter((name) => name.startsWith(".grclanker-staging-"));
+      [takenName] = readdirSync(join(outputRoot, staging));
+      mkdirSync(join(outputRoot, takenName));
+    }
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.endsWith("/bad.txt")) return new Response("failed", { status: 500, statusText: "Internal Server Error" });
+    return new Response("evidence", { status: 200, headers: { "content-length": "8" } });
+  };
+
+  const result = await exportVantaAuditPackage(client, audit, outputRoot, { fetchImpl, downloadConcurrency: 1 });
+
+  assert.equal(result.outputDir, join(outputRoot, `${takenName}_1`));
+  assert.equal(fetches, 4, "the second run downloads the evidence again");
+  assert.equal(result.totalFilesExported, 1);
+  assert.equal(result.totalSizeBytes, 8);
+  assert.equal(result.errorCount, 1);
+  assert.equal(JSON.parse(readFileSync(join(result.outputDir, "_audit_info.json"), "utf8")).total_files_exported, 1);
+  assert.equal(readFileSync(join(result.outputDir, "_errors.log"), "utf8").trim().split("\n").length, 1);
+  assert.deepEqual(JSON.parse(readFileSync(join(result.outputDir, "IAM", "metadata.json"), "utf8")).evidence_items[0].files, ["good.txt", "bad.txt"]);
+  assert.ok([...readZipEntries(result.zipPath).keys()].every((name) => name.startsWith(`${takenName}_1/`)));
+  assert.deepEqual(readdirSync(join(outputRoot, takenName)), [], "the other process's directory is untouched");
+  assert.deepEqual(readdirSync(outputRoot).sort(), [takenName, `${takenName}_1`, `${takenName}_1.zip`].sort());
 });
 
 test("exportVantaAuditPackage omits signed URL secrets from redirect errors", async () => {

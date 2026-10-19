@@ -32,14 +32,11 @@ export interface CommittedBundle {
 
 /** The private staging paths a writer fills before the bundle is committed. */
 export interface StagedBundle {
-  /** The bundle directory; its basename is the name the bundle is expected to commit under. */
+  /** The bundle directory; its basename is the name the bundle commits under. */
   dir: string;
   /** The archive path, next to `dir` rather than inside it. */
   zipPath: string;
-  /**
-   * Where the bundle is expected to land, for writers that record their own location. It differs
-   * from the committed paths only if another process takes the name before the commit.
-   */
+  /** Where the bundle lands, for writers that record their own location. */
   target: CommittedBundle;
 }
 
@@ -126,10 +123,41 @@ async function renameUnlessTaken(from: string, to: string): Promise<boolean> {
 }
 
 /**
- * Writes a bundle into a private staging directory under `root` and renames it into place only
- * after the writer finishes, so a failure, an abort, or a crash never leaves a partial bundle at
- * the final path. The staging directory is removed on every exit path; one left by a process that
- * died is removed by the next write under the same root.
+ * Moves a finished bundle from staging to its final paths, the directory and then its archive.
+ * Returns undefined, with the bundle back in staging, when another process took the name first.
+ */
+async function commitStaged(
+  root: string,
+  stagingRoot: string,
+  name: string,
+  taken: () => boolean,
+  archived: boolean,
+): Promise<CommittedBundle | undefined> {
+  const stagedDir = join(stagingRoot, name);
+  const outputDir = join(root, name);
+  const zipPath = `${outputDir}.zip`;
+  if (taken() || !(await renameUnlessTaken(stagedDir, outputDir))) return undefined;
+  if (!archived) return { outputDir, zipPath };
+  if (!pathEntryExists(zipPath)) {
+    try {
+      await rename(`${stagedDir}.zip`, zipPath);
+    } catch (error) {
+      await rename(outputDir, stagedDir);
+      throw error;
+    }
+    return { outputDir, zipPath };
+  }
+  await rename(outputDir, stagedDir);
+  return undefined;
+}
+
+/**
+ * Writes a bundle into a private staging directory under `root` and moves it into place only after
+ * the writer finishes, so a failure, an abort, or a crash never leaves a partial bundle at the final
+ * path. If another process takes the name before the commit, the writer runs again into a fresh
+ * staged directory under the next free name, so files that record the bundle's location stay
+ * accurate; keep the writer's state local to each run. The staging directory is removed on every
+ * exit path; one left by a process that died is removed by the next write under the same root.
  */
 export async function writeBundleAtomically(
   options: AtomicBundleOptions,
@@ -162,34 +190,25 @@ export async function writeBundleAtomically(
   trackStaging(stagingRoot);
   try {
     await mkdir(stagingRoot, { mode: 0o700 });
-    const staged: StagedBundle = {
-      dir: join(stagingRoot, name),
-      zipPath: join(stagingRoot, `${name}.zip`),
-      target: { outputDir: claimed, zipPath: `${claimed}.zip` },
-    };
-    await mkdir(staged.dir, { mode: 0o700 });
-    await chmod(staged.dir, 0o700);
-    await write(staged);
-    signal?.throwIfAborted();
-
-    const archived = zip && pathEntryExists(staged.zipPath);
     for (;;) {
-      const outputDir = join(root, name);
-      const zipPath = `${outputDir}.zip`;
-      if (!takenOnDisk(name) && (await renameUnlessTaken(staged.dir, outputDir))) {
-        if (!archived) return { outputDir, zipPath };
-        if (!pathEntryExists(zipPath)) {
-          try {
-            await rename(staged.zipPath, zipPath);
-          } catch (error) {
-            await rename(outputDir, staged.dir);
-            throw error;
-          }
-          return { outputDir, zipPath };
-        }
-        await rename(outputDir, staged.dir);
-      }
-      // Another process took the name while this write ran, so the bundle lands under the next free one.
+      const current = name;
+      const staged: StagedBundle = {
+        dir: join(stagingRoot, current),
+        zipPath: join(stagingRoot, `${current}.zip`),
+        target: { outputDir: claimed, zipPath: `${claimed}.zip` },
+      };
+      await mkdir(staged.dir, { mode: 0o700 });
+      await chmod(staged.dir, 0o700);
+      await write(staged);
+      signal?.throwIfAborted();
+
+      const archived = zip && pathEntryExists(staged.zipPath);
+      if (!archived) await rm(staged.zipPath, { force: true });
+      const committed = await commitStaged(root, stagingRoot, current, () => takenOnDisk(current), archived);
+      if (committed) return committed;
+
+      await rm(staged.dir, { recursive: true, force: true });
+      await rm(staged.zipPath, { force: true });
       claimedTargets.delete(claimed);
       name = nextFreeName();
       if (name === undefined) throw exhausted();
