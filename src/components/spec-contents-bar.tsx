@@ -24,20 +24,35 @@ function useCurrentSection(items: TOCItemType[], barRef: RefObject<HTMLElement |
 
   useEffect(() => {
     const headings = items.map((item) => document.getElementById(item.url.slice(1)));
+    const top = (index: number) => headings[index]?.getBoundingClientRect().top ?? Infinity;
     let frame = 0;
+    let shown: number | undefined;
+
+    // Headings run down the page in order, so the last one to pass a test is
+    // found by bisection, reading a handful of positions a frame.
+    function lastWhere(test: (top: number) => boolean) {
+      let low = 0;
+      let high = headings.length - 1;
+      while (low <= high) {
+        const mid = (low + high) >> 1;
+        if (test(top(mid))) low = mid + 1;
+        else high = mid - 1;
+      }
+      return high;
+    }
 
     function update() {
       frame = 0;
       const bar = barRef.current;
       if (!bar?.offsetHeight) return;
       const line = bar.getBoundingClientRect().bottom + READING_LINE_GAP;
-      const tops = headings.map((heading) => heading?.getBoundingClientRect().top ?? Infinity);
-      let index = tops.findLastIndex((top) => top <= line);
+      let index = lastWhere((t) => t <= line);
       if (scrollY + innerHeight >= document.documentElement.scrollHeight - 1) {
         const target = items.findIndex((item) => item.url === location.hash);
-        const lastOnScreen = tops.findLastIndex((top) => top < innerHeight);
-        index = target > index && tops[target] < innerHeight ? target : lastOnScreen;
+        index = target > index && top(target) < innerHeight ? target : lastWhere((t) => t < innerHeight);
       }
+      if (index === shown) return;
+      shown = index;
       setCurrent(index);
     }
 
@@ -151,11 +166,12 @@ export function SpecContentsBar({ items }: { items: TOCItemType[] }) {
         <ul className="spec-toc-list">
           {items.map((item, index) => (
             <li key={item.url}>
+              {/* Marked with aria-current alone: Fumadocs CSS matches :has([data-active=true]),
+                  so each data-active change makes Chrome recheck the :has() rules on <html>. */}
               <a
                 href={item.url}
                 className="spec-toc-link"
                 data-depth={item.depth}
-                data-active={index === current}
                 aria-current={index === current ? 'location' : undefined}
               >
                 {item.title}

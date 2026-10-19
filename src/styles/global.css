@@ -2396,7 +2396,8 @@ html:has(#spec-panel-document[hidden]) .spec-contents-bar {
   color: var(--docs-title);
 }
 
-.spec-toc-link[data-active='true'] {
+.spec-toc-link[data-active='true'],
+.spec-toc-link[aria-current] {
   border-left-color: var(--docs-accent-strong);
   color: var(--docs-title);
 }
