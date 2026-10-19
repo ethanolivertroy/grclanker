@@ -1,6 +1,6 @@
 # grclanker
 
-grclanker is an experimental open source AI GRC CLI built on [Pi](https://github.com/earendil-works/pi) 1.1 (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.1.0). The current release is [`v0.1.2`](https://github.com/ethanolivertroy/grclanker/releases/tag/v0.1.2). It is early: minor versions can break before 1.0.
+grclanker is an experimental open source AI GRC CLI built on [Pi](https://github.com/earendil-works/pi) 1.3 (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.3.0). The current release is [`v0.1.3`](https://github.com/ethanolivertroy/grclanker/releases/tag/v0.1.3). It is early: minor versions can break before 1.0.
 
 macOS and Linux are the platforms with release bundles. Windows support is best effort. Linux musl hosts, including Alpine, have no bundle. Use a source checkout there.
 
@@ -18,10 +18,10 @@ On Windows PowerShell (best effort):
 powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
 ```
 
-The installer downloads the newest GitHub release bundle, today `v0.1.2`. The bundle includes its own Node.js 24.22.0 runtime. Pin that release on macOS or Linux with:
+The installer downloads the newest GitHub release bundle, today `v0.1.3`. The bundle includes its own Node.js 24.22.0 runtime. Pin that release on macOS or Linux with:
 
 ```bash
-curl -fsSL https://grclanker.com/install | bash -s -- 0.1.2
+curl -fsSL https://grclanker.com/install | bash -s -- 0.1.3
 ```
 
 An official GitHub download or a `GRCLANKER_RELEASE_BASE_URL` install checks the archive against `SHA256SUMS.txt` and aborts when that file cannot be fetched, has no entry for the archive, the entry is not a SHA-256 digest, the digest does not match, or (the shell installer only) neither `sha256sum` nor `shasum` is available. A custom `GRCLANKER_ASSET_URL` prints a warning and installs without verifying. The [installation guide](https://grclanker.com/docs/getting-started/installation/) has the Windows pin command, the local-archive rules, and the `GRCLANKER_VERSION`, `GRCLANKER_INSTALL_DIR`, and `GRCLANKER_BIN_DIR` overrides.
@@ -77,16 +77,17 @@ grclanker investigate "CVE-2021-44228"
 
 Inside a session the same four workflows are slash commands. Guides: [Investigate](https://grclanker.com/docs/workflows/investigate/), [Audit](https://grclanker.com/docs/workflows/audit/), [Assess](https://grclanker.com/docs/workflows/assess/), [Validate](https://grclanker.com/docs/workflows/validate/).
 
-## What ships in v0.1.2
+## What ships in v0.1.3
 
 - 241 domain tools. `grclanker tools` and the [tool catalog](https://grclanker.com/docs/tools/catalog/) list the same set.
 - 7 compute backend tools: `bash`, `read`, `write`, `edit`, `ls`, `find`, and `grep`.
 - 4 workflows, and 2 personas: `auditor` and `verifier`.
 - `grclanker flue run` in the release bundle.
+- `grclanker durable run`, `resume`, and `tui` in the release bundle: the experimental, opt-in [durable runtime](https://grclanker.com/docs/getting-started/durable-runtime/), which can resume a run that crashed or was stopped.
 - A Cursor Agent SDK project, from a source checkout.
 - Runtime state under `~/.grclanker/agent`.
 
-[What's New](https://grclanker.com/docs/changelog/) covers `v0.1.2`: the FedRAMP tools follow the October 2026 rules, and the `sandbox-runtime` backend is updated. The tool count is unchanged from `v0.1.1`.
+[What's New](https://grclanker.com/docs/changelog/) covers `v0.1.3`: the experimental, opt-in durable mode, Pi 1.3.0, Node.js 24.22.0 in the bundles, atomic exports, and checks that no longer pass on incomplete evidence. The tool count is unchanged from `v0.1.2`.
 
 ### Platform integrations
 

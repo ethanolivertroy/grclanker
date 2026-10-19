@@ -11,7 +11,7 @@ If you want the fast path, do this in order. For Windows notes, pinned versions,
 curl -fsSL https://grclanker.com/install | bash
 ```
 
-This installs the newest release bundle, currently `v0.1.2`, with all 241 domain tools, `grclanker tools`, and `grclanker flue run`. To run unreleased changes from `main` instead, [install from source](/docs/getting-started/installation#install-from-source) and `npm link` it so the `grclanker` commands below run that build.
+This installs the newest release bundle, currently `v0.1.3`, with all 241 domain tools, `grclanker tools`, and `grclanker flue run`. To run unreleased changes from `main` instead, [install from source](/docs/getting-started/installation#install-from-source) and `npm link` it so the `grclanker` commands below run that build.
 
 ## 2. Set up a model
 

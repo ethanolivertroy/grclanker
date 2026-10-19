@@ -27,8 +27,8 @@ body:
     id: version
     attributes:
       label: Version
-      description: The release bundle (for example v0.1.2) or the git commit if you built from source. There is no grclanker version command.
-      placeholder: v0.1.2
+      description: The release bundle (for example v0.1.3) or the git commit if you built from source. There is no grclanker version command.
+      placeholder: v0.1.3
     validations:
       required: true
   - type: input

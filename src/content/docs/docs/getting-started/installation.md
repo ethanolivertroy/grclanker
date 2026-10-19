@@ -5,7 +5,7 @@ description: Install the grclanker release bundle, build the current main branch
 
 There are two ways to install grclanker:
 
-- **Release bundle.** The one-line installer fetches the newest GitHub release bundle, currently `v0.1.2`, with all 241 domain tools and its own Node.js runtime.
+- **Release bundle.** The one-line installer fetches the newest GitHub release bundle, currently `v0.1.3`, with all 241 domain tools and its own Node.js runtime.
 - **Source checkout.** Build `main` yourself to run unreleased changes or to work on grclanker.
 
 If you just want the shortest install-to-first-run path, use the [Quick Start](/docs/getting-started/quick-start). This page is the full reference for both paths, pinned versions, skills-only installs, and troubleshooting.
@@ -14,12 +14,13 @@ If you just want the shortest install-to-first-run path, use the [Quick Start](/
 
 ## What the current release includes
 
-The `v0.1.2` bundle gives you:
+The `v0.1.3` bundle gives you:
 
 - 241 domain tools, including the 35 platform integrations (AWS, Okta, GitHub, and the rest of the [integrations](/docs/integrations/aws/) section) plus the CMVP, KEV/EPSS, FedRAMP, OSCAL, and SCF tools
 - the interactive CLI, `grclanker setup`, and the `investigate`, `audit`, `assess`, and `validate` workflows
 - `grclanker tools`, which lists every bundled tool
 - `grclanker flue run`, which runs the same agent under the [Flue runtime](/docs/getting-started/flue-runtime/)
+- `grclanker durable run`, `resume`, and `tui`, which run the domain tools under the experimental, opt-in [Durable Runtime](/docs/getting-started/durable-runtime/)
 - `grclanker env list`, `env doctor`, `env smoke-test`, and `env exec`
 - `grclanker "<prompt>"` for a free-form prompt, and a subject after `investigate`, `audit`, `assess`, or `validate`
 - `--compute <kind>` to pick a compute backend:
@@ -71,13 +72,13 @@ grclanker keeps its settings and runtime state under `~/.grclanker/agent`, separ
 Pin a release explicitly:
 
 ```bash
-curl -fsSL https://grclanker.com/install | bash -s -- 0.1.2
+curl -fsSL https://grclanker.com/install | bash -s -- 0.1.3
 ```
 
 Windows PowerShell (best effort):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "& ([scriptblock]::Create((irm https://grclanker.com/install.ps1))) -Version 0.1.2"
+powershell -ExecutionPolicy Bypass -c "& ([scriptblock]::Create((irm https://grclanker.com/install.ps1))) -Version 0.1.3"
 ```
 
 Both installers also read these environment variables:

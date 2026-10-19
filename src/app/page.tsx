@@ -59,7 +59,7 @@ function releaseFacts(integrationSpecCount: number) {
     {
       label: '241 domain tools',
       detail:
-        'Native checks, assessments, and evidence exports cover 35 vendor integrations, plus CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools. The v0.1.2 release bundle carries all of them.',
+        'Native checks, assessments, and evidence exports cover 35 vendor integrations, plus CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools. The v0.1.3 release bundle carries all of them.',
     },
     {
       label: 'Three runtime paths',
@@ -161,7 +161,7 @@ export default function HomePage() {
               </div>
 
               <p className="hero-support-copy">
-                The curl installer ships the v0.1.2 release bundle with all 241 domain tools and its own Node.js runtime.
+                The curl installer ships the v0.1.3 release bundle with all 241 domain tools and its own Node.js runtime.
                 To run unreleased changes,{' '}
                 <Link href="/docs/getting-started/installation/#install-from-source">build from source</Link> (Node 22.19
                 or newer).
@@ -182,7 +182,7 @@ export default function HomePage() {
               src="/hero/grclanker-terminal.webp"
               width={1750}
               height={1316}
-              alt="grclanker CLI start screen from the v0.1.2 release bundle: 248 tools and 2 agents, the investigate, audit, assess, and validate workflows, and 241 domain tools ready"
+              alt="grclanker CLI start screen from the v0.1.3 release bundle: 248 tools and 2 agents, the investigate, audit, assess, and validate workflows, and 241 domain tools ready"
               className="hero-preview-image"
               loading="eager"
             />
@@ -198,9 +198,9 @@ export default function HomePage() {
             <div className="hero-briefing-top">
               <div>
                 <h2 className="font-semibold text-sm tracking-widest uppercase text-blue">What You Ask → What It Does</h2>
-                <p className="text-subtext0 text-sm mt-1 italic">Shipped in v0.1.2, not a roadmap.</p>
+                <p className="text-subtext0 text-sm mt-1 italic">Shipped in v0.1.3, not a roadmap.</p>
               </div>
-              <div className="hero-briefing-version">v0.1.2 // released</div>
+              <div className="hero-briefing-version">v0.1.3 // released</div>
             </div>
 
             <div className="hero-briefing-grid">
