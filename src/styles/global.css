@@ -2874,6 +2874,21 @@ kbd {
     display: none;
   }
 
+  /* A brand card's picture sets its height, which would print as an empty
+     frame above the caption, so on paper the card holds only its caption. */
+  .hero-brand-card {
+    min-height: 0;
+    break-inside: avoid;
+  }
+
+  .hero-brand-image {
+    display: none;
+  }
+
+  .hero-brand-overlay {
+    position: static;
+  }
+
   .skip-link,
   #app-shell > nav,
   #app-shell > footer,
