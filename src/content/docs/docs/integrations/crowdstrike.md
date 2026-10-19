@@ -3,7 +3,7 @@ title: CrowdStrike Falcon
 description: Read-only CrowdStrike Falcon inspector covering prevention, response, device control, firewall, sensors, RBAC, Identity Protection, and Zero Trust Assessment.
 ---
 
-The CrowdStrike integration inspects a Falcon tenant through the public Falcon API. It maps what it finds to the 25 controls in `specs/crowdstrike-sec-inspector.spec.md` (CS-01 through CS-25).
+The CrowdStrike integration inspects a Falcon tenant through the public Falcon API. It maps what it finds to the 25 controls in the [CrowdStrike Security Inspector spec](/specs/crowdstrike-sec-inspector/) (CS-01 through CS-25).
 
 Every tool is read-only: the tools never create, update, or delete anything in the tenant.
 

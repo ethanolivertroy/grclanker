@@ -5,7 +5,7 @@ description: "Read-only Tenable Vulnerability Management and Tenable Security Ce
 
 The Tenable inspector audits a Tenable Vulnerability Management tenant (cloud.tenable.com or the FedRAMP cloud fedcloud.tenable.com) and, optionally, a Tenable Security Center deployment.
 
-The inspector is read-only. The only POST calls are the documented asset and vulnerability export requests. No scan, user, policy, or exclusion is ever modified.
+The inspector is read-only. The only POST calls are the documented asset and vulnerability export requests. No scan, user, policy, or exclusion is ever modified. The [Tenable Security Inspector spec](/specs/tenable-sec-inspector/) lists each control, the finding that reports it, and its verdict rules.
 
 ## What it inspects
 

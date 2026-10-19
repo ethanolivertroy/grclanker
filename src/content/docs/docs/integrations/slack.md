@@ -3,7 +3,7 @@ title: Slack
 description: Read-only Slack Enterprise Grid security inspector covering identity, admin access, integrations, channel governance, monitoring, and evidence export.
 ---
 
-The Slack tool family inspects a Slack Enterprise Grid organization against the 25 controls in `specs/slack-sec-inspector.spec.md`. When only a workspace token is available, it inspects a single workspace.
+The Slack tool family inspects a Slack Enterprise Grid organization against the 25 controls in the [Slack Security Inspector spec](/specs/slack-sec-inspector/). When only a workspace token is available, it inspects a single workspace.
 
 Every method call is read-only. Every field the tools read is traceable to a public Slack reference page listed in the method table below.
 

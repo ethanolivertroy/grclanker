@@ -3,7 +3,7 @@ title: Google Cloud Platform
 description: Read-only GCP security inspector covering IAM, logging, organization guardrails, data protection, and network security with multi-framework mappings.
 ---
 
-The GCP integration implements the `gcp-sec-inspector` spec as native grclanker tools. It inspects an organization (or a single project) through documented Google Cloud REST APIs and scores 23 controls.
+The GCP integration implements the [GCP Security Inspector spec](/specs/gcp-sec-inspector/) as native grclanker tools. It inspects an organization (or a single project) through documented Google Cloud REST APIs and scores 23 controls.
 
 Every finding maps to FedRAMP, CMMC 2.0, SOC 2, CIS GCP, PCI-DSS, DISA STIG, IRAP, and ISMAP. Every request is read-only.
 

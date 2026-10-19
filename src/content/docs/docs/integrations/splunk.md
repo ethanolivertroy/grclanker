@@ -10,7 +10,7 @@ The integration is read-only. The only POST requests it issues are:
 - The session-key login (`/services/auth/login`), when you supply a username and password.
 - A single read-only oneshot search against `index=_audit` that confirms audit events are flowing.
 
-Every finding carries the framework mappings from the [Splunk security inspector spec](https://github.com/ethanolivertroy/grclanker/blob/main/specs/splunk-sec-inspector.spec.md): FedRAMP / NIST 800-53 r5, CMMC 2.0, SOC 2, CIS Splunk Benchmark, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP.
+Every finding carries the framework mappings from the [Splunk Security Inspector spec](/specs/splunk-sec-inspector/): FedRAMP / NIST 800-53 r5, CMMC 2.0, SOC 2, CIS Splunk Benchmark, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP.
 
 ## What it inspects
 

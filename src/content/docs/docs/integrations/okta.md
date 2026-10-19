@@ -3,7 +3,7 @@ title: Okta
 description: Read-only Okta security inspector covering authentication, admin access, integrations, and monitoring, with framework mappings and OSCAL assessment results.
 ---
 
-The Okta integration inspects an Okta org through the Okta Management API. It reports posture findings for the controls defined in `specs/okta-sec-inspector.spec.md`.
+The Okta integration inspects an Okta org through the Okta Management API. It reports posture findings for the controls defined in the [Okta Security Inspector spec](/specs/okta-sec-inspector/).
 
 Every tool is read-only. Nothing is created, changed, or deleted in the tenant. No tenant data is written to disk unless you run `okta_export_audit_bundle`.
 

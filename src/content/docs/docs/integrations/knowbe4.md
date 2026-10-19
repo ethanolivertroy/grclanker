@@ -3,7 +3,7 @@ title: KnowBe4
 description: Read-only KnowBe4 KMSAT inspector covering phishing simulations, training campaigns, user risk, and account governance, with optional PhishER enrichment.
 ---
 
-The KnowBe4 integration audits a KnowBe4 Security Awareness Training (KMSAT) account against the twenty controls in `specs/knowbe4-sec-inspector.spec.md`.
+The KnowBe4 integration audits a KnowBe4 Security Awareness Training (KMSAT) account against the twenty controls in the [KnowBe4 Security Inspector spec](/specs/knowbe4-sec-inspector/).
 
 Through the KnowBe4 Reporting API, it reads:
 

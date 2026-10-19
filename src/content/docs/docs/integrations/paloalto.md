@@ -8,7 +8,7 @@ The Palo Alto Networks integration audits two product surfaces without ever muta
 - **Prisma Cloud CSPM** through the REST API (JWT login with an access key): Compliance posture, alert rules and open alerts, policies, cloud accounts and account groups, user roles, and tenant integrations (push channels such as Splunk, Amazon SQS, webhooks, and ServiceNow).
 - **PAN-OS firewalls and Panorama** through the XML API (`type=op` show commands and `type=config&action=show`): Security and decryption rulebases, zones, security profiles, GlobalProtect, administrators, log forwarding, system settings, HA state, and software versions.
 
-Every finding carries the references from the compliance mapping table in `specs/paloalto-sec-inspector.spec.md`: FedRAMP, CMMC 2.0, SOC 2, CIS, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP.
+Every finding carries the references from the compliance mapping table in the [Palo Alto Networks Security Inspector spec](/specs/paloalto-sec-inspector/): FedRAMP, CMMC 2.0, SOC 2, CIS, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP.
 
 ## Setup and authentication
 

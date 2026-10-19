@@ -3,7 +3,7 @@ title: Zscaler
 description: Read-only ZIA and ZPA security inspector covering the 25 controls in the Zscaler spec with verdict-safe findings and audit bundles.
 ---
 
-The Zscaler integration inspects Zscaler Internet Access (ZIA) and Zscaler Private Access (ZPA) tenants through their documented read APIs. It evaluates the 25 controls in `specs/zscaler-sec-inspector.spec.md`.
+The Zscaler integration inspects Zscaler Internet Access (ZIA) and Zscaler Private Access (ZPA) tenants through their documented read APIs. It evaluates the 25 controls in the [Zscaler Security Inspector spec](/specs/zscaler-sec-inspector/).
 
 Every tool is read-only. The only non-GET calls are the ZIA session login and logout and the ZPA OAuth sign-in.
 

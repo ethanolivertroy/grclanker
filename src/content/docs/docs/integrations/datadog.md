@@ -13,7 +13,7 @@ The Datadog integration audits a Datadog organization's own tenant configuration
 
 It never mutates the org. Every request is a `GET` against the documented v1 and v2 read endpoints.
 
-The integration implements the 20 controls in `specs/datadog-sec-inspector.spec.md`. It maps every finding to FedRAMP, CMMC 2.0, SOC 2, CIS, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP references from the spec's compliance table.
+The integration implements the 20 controls in the [Datadog Security Inspector spec](/specs/datadog-sec-inspector/). It maps every finding to FedRAMP, CMMC 2.0, SOC 2, CIS, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP references from the spec's compliance table.
 
 ## What it inspects
 

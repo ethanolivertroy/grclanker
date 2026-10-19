@@ -7,7 +7,7 @@ description: "Read-only OCI security inspector covering IAM, Cloud Guard, audit 
 
 The OCI tool family inspects a tenancy read-only through the official OCI CLI and produces framework-mapped findings.
 
-It implements the `specs/oci-sec-inspector.spec.md` control set. Of its 25 controls, 23 are automated or explicitly manual, across 21 findings (see the coverage table).
+It implements the control set in the [OCI Security Inspector spec](/specs/oci-sec-inspector/). Of its 25 controls, 23 are automated or explicitly manual, across 21 findings (see the coverage table).
 
 ## What it inspects
 

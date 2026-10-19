@@ -3,7 +3,7 @@ title: GitHub
 description: Read-only GitHub organization security inspector covering identity, repository protection, Actions, code security, integrations, and audit bundle export.
 ---
 
-The GitHub inspector reviews one GitHub organization through the REST and GraphQL APIs. It covers github.com, GitHub Enterprise Cloud, and GitHub Enterprise Server.
+The GitHub inspector reviews one GitHub organization through the REST and GraphQL APIs against the 25 controls in the [GitHub Security Inspector spec](/specs/github-sec-inspector/). It covers github.com, GitHub Enterprise Cloud, and GitHub Enterprise Server.
 
 Every tool is read-only. Nothing is written back to the tenant.
 
