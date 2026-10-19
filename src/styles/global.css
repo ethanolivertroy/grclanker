@@ -2990,8 +2990,10 @@ kbd {
   }
 
   /* Rows may split across sheets, since holding a tall row whole can leave
-     most of a sheet blank, but a stacked cell's label stays with its text. */
-  .docs-prose td[data-label]::before {
+     most of a sheet blank, but a stacked cell's label stays with its text.
+     An empty cell has no text to keep, and when it ends a table its label's
+     hold would forbid a break between the table and the heading after it. */
+  .docs-prose td[data-label]:not(:empty, :has(> span:empty:only-child))::before {
     break-after: avoid;
   }
 }
