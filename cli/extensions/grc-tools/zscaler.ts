@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -704,10 +705,6 @@ function retryDelayMs(response: Response, attempt: number): number {
   return Math.min(500 * 2 ** attempt, MAX_RETRY_AFTER_MS);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 function pageSignature(items: JsonRecord[]): string {
   return JSON.stringify(items.map((item) => item.id ?? JSON.stringify(item)));
 }
@@ -852,6 +849,7 @@ export interface ZiaReadClient {
 export class ZiaApiClient implements ZiaReadClient {
   private readonly config: ZiaResolvedConfig;
   private readonly fetchImpl: FetchImpl;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly now: () => Date;
@@ -860,10 +858,11 @@ export class ZiaApiClient implements ZiaReadClient {
 
   constructor(
     config: ZiaResolvedConfig,
-    options: { fetchImpl?: FetchImpl; timeoutMs?: number; maxRetries?: number; now?: () => Date } = {},
+    options: { fetchImpl?: FetchImpl; timeoutMs?: number; maxRetries?: number; now?: () => Date; signal?: AbortSignal } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal);
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.now = options.now ?? (() => new Date());
@@ -906,7 +905,7 @@ export class ZiaApiClient implements ZiaReadClient {
       }
       clearTimeout(timeout);
       if (isRetryableStatus(response.status) && attempt < this.maxRetries) {
-        await sleep(retryDelayMs(response, attempt));
+        await this.sleep(retryDelayMs(response, attempt));
         continue;
       }
       return response;
@@ -1835,6 +1834,7 @@ export interface ZpaReadClient {
 export class ZpaApiClient implements ZpaReadClient {
   private readonly config: ZpaResolvedConfig;
   private readonly fetchImpl: FetchImpl;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly now: () => Date;
@@ -1844,10 +1844,11 @@ export class ZpaApiClient implements ZpaReadClient {
 
   constructor(
     config: ZpaResolvedConfig,
-    options: { fetchImpl?: FetchImpl; timeoutMs?: number; maxRetries?: number; now?: () => Date } = {},
+    options: { fetchImpl?: FetchImpl; timeoutMs?: number; maxRetries?: number; now?: () => Date; signal?: AbortSignal } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal);
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.now = options.now ?? (() => new Date());
@@ -1881,7 +1882,7 @@ export class ZpaApiClient implements ZpaReadClient {
       }
       clearTimeout(timeout);
       if (isRetryableStatus(response.status) && attempt < this.maxRetries) {
-        await sleep(retryDelayMs(response, attempt));
+        await this.sleep(retryDelayMs(response, attempt));
         continue;
       }
       return response;
@@ -3730,14 +3731,13 @@ function renderQuickReference(outputDir: string, findings: ZscalerFinding[], err
   ].join("\n");
 }
 
-export async function exportZscalerAuditBundle(clients: ZscalerClients, options: ZscalerExportOptions = {}): Promise<ZscalerAuditBundleResult> {
+export async function exportZscalerAuditBundle(clients: ZscalerClients, options: ZscalerExportOptions & { signal?: AbortSignal } = {}): Promise<ZscalerAuditBundleResult> {
   const root = resolve(options.outputDir ?? DEFAULT_OUTPUT_DIR);
   const generatedAt = new Date().toISOString();
   const tenantLabel = safeDirName(clients.zia?.getResolvedConfig().cloud ?? clients.zpa?.getResolvedConfig().customerId ?? "zscaler");
   if (existsSync(root) && lstatSync(root).isSymbolicLink()) {
     throw new Error(`Refusing to use symlinked output directory: ${root}`);
   }
-  ensurePrivateDir(root);
   const access = await checkZscalerAccess(clients);
   const ziaAccessData = clients.zia ? await collectZiaAccessControlData(clients.zia) : undefined;
   const ziaPolicyData = clients.zia ? await collectZiaPolicyData(clients.zia) : undefined;
@@ -3757,10 +3757,13 @@ export async function exportZscalerAuditBundle(clients: ZscalerClients, options:
     ...assessments.flatMap((assessment) => assessment.truncated.map((note) => `${assessment.area} partial: ${note}`)),
   ];
 
+  options.signal?.throwIfAborted();
+  ensurePrivateDir(root);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(root),
     names: numberedNames(`zscaler-audit-${tenantLabel}-${generatedAt.slice(0, 10)}`, 9),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(root, name),
   }, async (staged) => {
     await writeSecureTextFile(staged.dir, "core_data/access_check.json", serializeJson(redactForExport(access)));
@@ -3877,17 +3880,17 @@ function normalizeExportArgs(args: unknown): ExportArgs {
   };
 }
 
-export function createZscalerClients(args: AuthArgs, env: NodeJS.ProcessEnv = process.env): ZscalerClients {
+export function createZscalerClients(args: AuthArgs, env: NodeJS.ProcessEnv = process.env, signal?: AbortSignal): ZscalerClients {
   const config = resolveZscalerConfiguration(args as JsonRecord, env);
   return {
     config,
-    zia: config.zia ? new ZiaApiClient(config.zia, { timeoutMs: config.timeoutMs, maxRetries: config.maxRetries }) : undefined,
-    zpa: config.zpa ? new ZpaApiClient(config.zpa, { timeoutMs: config.timeoutMs, maxRetries: config.maxRetries }) : undefined,
+    zia: config.zia ? new ZiaApiClient(config.zia, { timeoutMs: config.timeoutMs, maxRetries: config.maxRetries, signal }) : undefined,
+    zpa: config.zpa ? new ZpaApiClient(config.zpa, { timeoutMs: config.timeoutMs, maxRetries: config.maxRetries, signal }) : undefined,
   };
 }
 
-async function withClients<T>(args: AuthArgs, run: (clients: ZscalerClients) => Promise<T>): Promise<T> {
-  const clients = createZscalerClients(args);
+async function withClients<T>(args: AuthArgs, run: (clients: ZscalerClients) => Promise<T>, signal?: AbortSignal): Promise<T> {
+  const clients = createZscalerClients(args, process.env, signal);
   try {
     return await run(clients);
   } finally {
@@ -3920,9 +3923,9 @@ export function registerZscalerTools(pi: any): void {
       "Validate read-only Zscaler access: ZIA (admin users, roles, auth settings, audit log report, URL filtering, firewall, DLP, SSL inspection, ATP, locations) and ZPA (application segments, segment groups, access policy, connectors, IdP, posture, administrators). Products without credentials are reported as not configured.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
       try {
-        const result = await withClients(args, (clients) => checkZscalerAccess(clients));
+        const result = await withClients(args, (clients) => checkZscalerAccess(clients), signal);
         return textResult(formatAccessCheckText(result), { tool: "zscaler_check_access", ...result });
       } catch (error) {
         return errorResult(`Zscaler access check failed: ${errorMessage(error)}`, { tool: "zscaler_check_access" });
@@ -3940,9 +3943,9 @@ export function registerZscalerTools(pi: any): void {
       max_super_admins: Type.Optional(Type.Number({ description: "Maximum acceptable Super Admin count before failing. Defaults to 5.", default: 5 })),
     }),
     prepareArguments: normalizeAccessControlArgs,
-    async execute(_toolCallId: string, args: AccessControlArgs) {
+    async execute(_toolCallId: string, args: AccessControlArgs, signal?: AbortSignal) {
       try {
-        const result = await withClients(args, (clients) => assessZiaAccessControl(clients.zia, { maxSuperAdmins: args.max_super_admins }));
+        const result = await withClients(args, (clients) => assessZiaAccessControl(clients.zia, { maxSuperAdmins: args.max_super_admins }), signal);
         return textResult(formatAssessmentText(result), { tool: "zscaler_assess_zia_access_control", ...result });
       } catch (error) {
         return errorResult(`ZIA access control assessment failed: ${errorMessage(error)}`, { tool: "zscaler_assess_zia_access_control" });
@@ -3960,9 +3963,9 @@ export function registerZscalerTools(pi: any): void {
       max_ssl_exemptions: Type.Optional(Type.Number({ description: "Maximum acceptable SSL inspection exempted URLs before warning. Defaults to 50.", default: 50 })),
     }),
     prepareArguments: normalizePolicyArgs,
-    async execute(_toolCallId: string, args: PolicyArgs) {
+    async execute(_toolCallId: string, args: PolicyArgs, signal?: AbortSignal) {
       try {
-        const result = await withClients(args, (clients) => assessZiaPolicy(clients.zia, { maxSslExemptions: args.max_ssl_exemptions }));
+        const result = await withClients(args, (clients) => assessZiaPolicy(clients.zia, { maxSslExemptions: args.max_ssl_exemptions }), signal);
         return textResult(formatAssessmentText(result), { tool: "zscaler_assess_zia_policy", ...result });
       } catch (error) {
         return errorResult(`ZIA policy assessment failed: ${errorMessage(error)}`, { tool: "zscaler_assess_zia_policy" });
@@ -3982,13 +3985,13 @@ export function registerZscalerTools(pi: any): void {
       max_timeout_hours: Type.Optional(Type.Number({ description: "Maximum acceptable reauthentication timeout in hours. Defaults to 24.", default: 24 })),
     }),
     prepareArguments: normalizeZpaArgs,
-    async execute(_toolCallId: string, args: ZpaArgs) {
+    async execute(_toolCallId: string, args: ZpaArgs, signal?: AbortSignal) {
       try {
         const result = await withClients(args, (clients) => assessZpa(clients.zpa, {
           certExpiryWarnDays: args.cert_expiry_warn_days,
           staleConnectorDays: args.stale_connector_days,
           maxTimeoutHours: args.max_timeout_hours,
-        }));
+        }), signal);
         return textResult(formatAssessmentText(result), { tool: "zscaler_assess_zpa", ...result });
       } catch (error) {
         return errorResult(`ZPA assessment failed: ${errorMessage(error)}`, { tool: "zscaler_assess_zpa" });
@@ -4011,7 +4014,7 @@ export function registerZscalerTools(pi: any): void {
       max_timeout_hours: Type.Optional(Type.Number({ description: "Maximum acceptable reauthentication timeout in hours. Defaults to 24.", default: 24 })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportArgs) {
+    async execute(_toolCallId: string, args: ExportArgs, signal?: AbortSignal) {
       try {
         const result = await withClients(args, (clients) => exportZscalerAuditBundle(clients, {
           outputDir: args.output_dir,
@@ -4020,7 +4023,8 @@ export function registerZscalerTools(pi: any): void {
           certExpiryWarnDays: args.cert_expiry_warn_days,
           staleConnectorDays: args.stale_connector_days,
           maxTimeoutHours: args.max_timeout_hours,
-        }));
+          signal,
+        }), signal);
         return textResult(
           [
             "Zscaler audit bundle exported",

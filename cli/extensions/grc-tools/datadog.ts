@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1196,10 +1197,6 @@ function describeOpaqueBody(response: Response, rawText: string, parsedJson: boo
     : `${statusLine(response)}: non-JSON body (${size})`;
 }
 
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 export class DatadogApiClient {
   private readonly config: DatadogResolvedConfig;
   private readonly fetchImpl: FetchImpl;
@@ -1210,11 +1207,12 @@ export class DatadogApiClient {
     options: {
       fetchImpl?: FetchImpl;
       sleepImpl?: SleepImpl;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleepImpl = options.sleepImpl ?? defaultSleep;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     // The configured keys are scrubbed from every recorded error string in every encoded form from here on.
     credentialScrubber.registerSecrets([config.apiKey, config.appKey]);
   }
@@ -4542,7 +4540,7 @@ export async function exportDatadogAuditBundle(
   client: BundleReader,
   config: DatadogResolvedConfig,
   outputRoot: string,
-  options: DatadogAssessmentOptions = {},
+  options: DatadogAssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<DatadogAuditBundleResult> {
   const now = options.now ?? new Date();
   const access = await checkDatadogAccess(client);
@@ -4565,12 +4563,14 @@ export async function exportDatadogAuditBundle(
     ...dataSnapshot.errors,
   ])];
 
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const bundleName = `${safeDirName(config.site)}-audit-bundle`;
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(bundleName, 6),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await writeSecureTextFile(staged.dir, "README.md", buildBundleReadme());
@@ -4775,8 +4775,8 @@ function dataProtectionOptions(args: DataProtectionArgs): DatadogDataProtectionO
   };
 }
 
-function createClient(args: CheckAccessArgs): DatadogApiClient {
-  return new DatadogApiClient(resolveDatadogConfiguration(args));
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): DatadogApiClient {
+  return new DatadogApiClient(resolveDatadogConfiguration(args), { signal });
 }
 
 const authParams = {
@@ -4830,9 +4830,9 @@ export function registerDatadogTools(pi: any): void {
       "Validate the Datadog API key and probe every read surface the inspector needs (org settings, users, roles, API and application keys, audit events, security rules and signals, posture findings, IP allowlist, Sensitive Data Scanner, log pipelines, indexes, archives, dashboards, monitors, cloud integrations), reporting missing application key permissions.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkDatadogAccess(createClient(args));
+        const result = await checkDatadogAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "datadog_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -4850,9 +4850,9 @@ export function registerDatadogTools(pi: any): void {
       "Assess Datadog identity controls: SAML SSO enforcement (control 1), MFA status (2), custom role least privilege (3), user access review (4), session timeout (16, manual), and service account audit (19).",
     parameters: Type.Object({ ...authParams, ...identityParams }),
     prepareArguments: normalizeIdentityArgs,
-    async execute(_toolCallId: string, args: IdentityArgs) {
+    async execute(_toolCallId: string, args: IdentityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessDatadogIdentity(createClient(args), identityOptions(args));
+        const result = await assessDatadogIdentity(createClient(args, signal), identityOptions(args));
         return textResult(formatAssessmentText(result), { tool: "datadog_assess_identity", ...result });
       } catch (error) {
         return errorResult(
@@ -4870,9 +4870,9 @@ export function registerDatadogTools(pi: any): void {
       "Assess Datadog access controls: API key rotation (control 5), application key scoping and ownership (6), public dashboard restrictions (14), IP allowlisting (15), and integration permissions (18, manual with API-visible evidence).",
     parameters: Type.Object({ ...authParams, ...accessControlParams }),
     prepareArguments: normalizeAccessControlArgs,
-    async execute(_toolCallId: string, args: AccessControlArgs) {
+    async execute(_toolCallId: string, args: AccessControlArgs, signal?: AbortSignal) {
       try {
-        const result = await assessDatadogAccessControls(createClient(args), accessControlOptions(args));
+        const result = await assessDatadogAccessControls(createClient(args, signal), accessControlOptions(args));
         return textResult(formatAssessmentText(result), { tool: "datadog_assess_access_controls", ...result });
       } catch (error) {
         return errorResult(
@@ -4890,9 +4890,9 @@ export function registerDatadogTools(pi: any): void {
       "Assess Datadog security monitoring: detection rules enabled (control 8), unresolved high and critical signals against SLA (9), CSPM enablement and posture passing rate (12), compliance framework rule coverage (13), and security monitor notification channels (17).",
     parameters: Type.Object({ ...authParams, ...securityMonitoringParams }),
     prepareArguments: normalizeSecurityMonitoringArgs,
-    async execute(_toolCallId: string, args: SecurityMonitoringArgs) {
+    async execute(_toolCallId: string, args: SecurityMonitoringArgs, signal?: AbortSignal) {
       try {
-        const result = await assessDatadogSecurityMonitoring(createClient(args), securityMonitoringOptions(args));
+        const result = await assessDatadogSecurityMonitoring(createClient(args, signal), securityMonitoringOptions(args));
         return textResult(formatAssessmentText(result), { tool: "datadog_assess_security_monitoring", ...result });
       } catch (error) {
         return errorResult(
@@ -4910,9 +4910,9 @@ export function registerDatadogTools(pi: any): void {
       "Assess Datadog data protection: Audit Trail activity and inferred retention (control 7), log pipeline, index exclusion, and archive security (10), Sensitive Data Scanner coverage (11), and organization retention and sharing settings (20).",
     parameters: Type.Object({ ...authParams, ...dataProtectionParams }),
     prepareArguments: normalizeDataProtectionArgs,
-    async execute(_toolCallId: string, args: DataProtectionArgs) {
+    async execute(_toolCallId: string, args: DataProtectionArgs, signal?: AbortSignal) {
       try {
-        const result = await assessDatadogDataProtection(createClient(args), dataProtectionOptions(args));
+        const result = await assessDatadogDataProtection(createClient(args, signal), dataProtectionOptions(args));
         return textResult(formatAssessmentText(result), { tool: "datadog_assess_data_protection", ...result });
       } catch (error) {
         return errorResult(
@@ -4937,15 +4937,16 @@ export function registerDatadogTools(pi: any): void {
       ...dataProtectionParams,
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveDatadogConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportDatadogAuditBundle(new DatadogApiClient(config), config, outputRoot, {
+        const result = await exportDatadogAuditBundle(new DatadogApiClient(config, { signal }), config, outputRoot, {
           ...identityOptions(args),
           ...accessControlOptions(args),
           ...securityMonitoringOptions(args),
           ...dataProtectionOptions(args),
+          signal,
         });
         return textResult(
           [

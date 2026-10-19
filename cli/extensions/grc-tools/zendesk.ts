@@ -22,6 +22,7 @@ import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1799,11 +1800,12 @@ export class ZendeskApiClient {
     options: {
       fetchImpl?: FetchImpl;
       sleep?: (ms: number) => Promise<void>;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
   }
 
   getResolvedConfig(): ZendeskResolvedConfig {
@@ -4359,7 +4361,7 @@ export async function exportZendeskAuditBundle(
   client: ZendeskReadClient,
   config: ZendeskResolvedConfig,
   outputRoot: string,
-  options: ZendeskAssessmentOptions = {},
+  options: ZendeskAssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<ZendeskAuditBundleResult> {
   const generatedAt = (options.now ?? (() => new Date()))().toISOString();
   const access = await checkZendeskAccess(client);
@@ -4375,11 +4377,13 @@ export async function exportZendeskAuditBundle(
   // Every file passes through the configured-secret scrub (guard 2) on the way
   // out: JSON files value by value, text files as a whole.
   const secrets = configuredZendeskSecrets(config);
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(`${safeDirName(config.subdomain)}-zendesk-audit-bundle`, 50),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await writeSecureJsonFile(staged.dir, "metadata.json", {
@@ -4467,8 +4471,8 @@ function toOptions(args: AssessArgs): ZendeskAssessmentOptions {
   };
 }
 
-function createClient(args: AuthArgs): ZendeskApiClient {
-  return new ZendeskApiClient(resolveZendeskConfiguration(args as JsonRecord));
+function createClient(args: AuthArgs, signal?: AbortSignal): ZendeskApiClient {
+  return new ZendeskApiClient(resolveZendeskConfiguration(args as JsonRecord), { signal });
 }
 
 type ToolResult = ReturnType<typeof textResult> & { isError?: boolean };
@@ -4485,11 +4489,17 @@ function argumentSecrets(args: AuthArgs): string[] {
  * the catch block rendered the error. The client's secrets include the composed
  * Basic credential, which the argument list alone cannot name.
  */
-async function runSealed(label: string, tool: string, args: AuthArgs, run: (client: ZendeskApiClient) => Promise<ToolResult>): Promise<ToolResult> {
+async function runSealed(
+  label: string,
+  tool: string,
+  args: AuthArgs,
+  signal: AbortSignal | undefined,
+  run: (client: ZendeskApiClient) => Promise<ToolResult>,
+): Promise<ToolResult> {
   const secrets = new Set<string>(argumentSecrets(args));
   let client: ZendeskApiClient | undefined;
   try {
-    client = createClient(args);
+    client = createClient(args, signal);
     for (const secret of client.knownSecrets) secrets.add(secret);
     return sealValue(await run(client), [...secrets]);
   } catch (error) {
@@ -4531,8 +4541,8 @@ function registerAssessmentTool(
     description,
     parameters: Type.Object(assessParams),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
-      return runSealed(label, name, args, async (client) => {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
+      return runSealed(label, name, args, signal, async (client) => {
         const result = await run(client, toOptions(args));
         return textResult(formatAssessmentText(result), zendeskAssessmentToolDetails(name, result));
       });
@@ -4549,8 +4559,8 @@ export function registerZendeskTools(pi: any): void {
       "Validate read-only Zendesk Support API access across account settings, team members, custom roles, groups, audit logs, OAuth clients and tokens, apps, brands, webhooks, targets, triggers, automations, sharing agreements, and suspended tickets, reporting which admin-only surfaces the credential cannot read.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
-      return runSealed("Zendesk access check", "zendesk_check_access", args, async (client) => {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
+      return runSealed("Zendesk access check", "zendesk_check_access", args, signal, async (client) => {
         const result = await checkZendeskAccess(client);
         return textResult(formatAccessCheckText(result), { tool: "zendesk_check_access", ...result });
       });
@@ -4599,10 +4609,10 @@ export function registerZendeskTools(pi: any): void {
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportArgs) {
-      return runSealed("Zendesk audit bundle export", "zendesk_export_audit_bundle", args, async (client) => {
+    async execute(_toolCallId: string, args: ExportArgs, signal?: AbortSignal) {
+      return runSealed("Zendesk audit bundle export", "zendesk_export_audit_bundle", args, signal, async (client) => {
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportZendeskAuditBundle(client, client.getResolvedConfig(), outputRoot, toOptions(args));
+        const result = await exportZendeskAuditBundle(client, client.getResolvedConfig(), outputRoot, { ...toOptions(args), signal });
         return textResult(
           [
             "Zendesk audit bundle exported.",

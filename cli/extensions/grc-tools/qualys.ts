@@ -20,6 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { QUALYS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -979,8 +980,6 @@ interface QualysHttpResponse {
   headers: Headers;
 }
 
-const defaultSleep: SleepImpl = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-
 export class QualysApiClient {
   private readonly config: QualysResolvedConfig;
   private readonly fetchImpl: FetchImpl;
@@ -992,11 +991,11 @@ export class QualysApiClient {
 
   constructor(
     config: QualysResolvedConfig,
-    options: { fetchImpl?: FetchImpl; sleepImpl?: SleepImpl; now?: () => Date } = {},
+    options: { fetchImpl?: FetchImpl; sleepImpl?: SleepImpl; now?: () => Date; signal?: AbortSignal } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleepImpl = options.sleepImpl ?? defaultSleep;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     this.now = options.now ?? (() => new Date());
     if (config.token) {
       this.bearerToken = config.token;
@@ -4211,7 +4210,7 @@ export async function exportQualysAuditBundle(
   client: QualysDataClient & Partial<Pick<QualysApiClient, "lastRateLimit">>,
   config: QualysResolvedConfig,
   outputRoot: string,
-  options: QualysAssessmentOptions = {},
+  options: QualysAssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<QualysAuditBundleResult> {
   const access = await checkQualysAccess(client);
   const assessments = [
@@ -4223,11 +4222,13 @@ export async function exportQualysAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = uniqueStrings(assessments.flatMap((assessment) => assessment.errors));
 
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(safeDirName(`qualys-${config.platform}-audit-bundle`), MAX_BUNDLE_SUFFIX),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
     exhaustedMessage: `Unable to allocate output directory under ${outputRoot}: ${MAX_BUNDLE_SUFFIX} prior bundles already exist`,
   }, async (staged) => {
@@ -4332,8 +4333,8 @@ function assessmentOptionsFromArgs(args: AssessArgs): QualysAssessmentOptions {
   };
 }
 
-function createClient(args: AuthArgs): QualysApiClient {
-  return new QualysApiClient(resolveQualysConfiguration(args as JsonRecord));
+function createClient(args: AuthArgs, signal?: AbortSignal): QualysApiClient {
+  return new QualysApiClient(resolveQualysConfiguration(args as JsonRecord), { signal });
 }
 
 const authParams = {
@@ -4374,9 +4375,9 @@ function registerAssessmentTool(
     description,
     parameters: Type.Object(assessParams),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
       try {
-        const result = await run(createClient(args), assessmentOptionsFromArgs(args));
+        const result = await run(createClient(args, signal), assessmentOptionsFromArgs(args));
         return textResult(formatAssessmentText(result), {
           tool: name,
           category: result.category,
@@ -4401,9 +4402,9 @@ export function registerQualysTools(pi: any): void {
       "Validate read-only Qualys API access across VM schedules, hosts, asset groups, option profiles, appliances, authentication records, VMDR detections, Policy Compliance, Administration users and activity log, Asset Management tags and connectors, Cloud Agent inventory, and WAS web applications. Reports missing module subscriptions or roles.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
       try {
-        const result = await checkQualysAccess(createClient(args));
+        const result = await checkQualysAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "qualys_check_access", ...result });
       } catch (error) {
         return errorResult(`Qualys access check failed: ${errorMessage(error)}`, { tool: "qualys_check_access" });
@@ -4453,11 +4454,14 @@ export function registerQualysTools(pi: any): void {
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportArgs) {
+    async execute(_toolCallId: string, args: ExportArgs, signal?: AbortSignal) {
       try {
         const config = resolveQualysConfiguration(args as JsonRecord);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportQualysAuditBundle(new QualysApiClient(config), config, outputRoot, assessmentOptionsFromArgs(args));
+        const result = await exportQualysAuditBundle(new QualysApiClient(config, { signal }), config, outputRoot, {
+          ...assessmentOptionsFromArgs(args),
+          signal,
+        });
         return textResult(
           [
             "Qualys audit bundle exported.",

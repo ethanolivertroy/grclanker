@@ -23,6 +23,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { CROWDSTRIKE_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1281,10 +1282,6 @@ function retryDelayFromResponse(response: Response, attempt: number): number {
   return Math.min(DEFAULT_RETRY_BASE_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
 }
 
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 /** The parsed JSON object of a response body, or undefined when the body is empty, not JSON, or not an object. */
 function parseJsonBody(rawText: string): JsonRecord | undefined {
   if (rawText.length === 0) return undefined;
@@ -1341,11 +1338,12 @@ export class CrowdstrikeApiClient {
       fetchImpl?: FetchImpl;
       sleep?: SleepImpl;
       retryLimit?: number;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleep = options.sleep ?? defaultSleep;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
     this.retryLimit = clampNumber(options.retryLimit, DEFAULT_RETRY_LIMIT, 0, 10);
     rememberSecrets(config.clientSecret);
   }
@@ -4368,19 +4366,21 @@ export async function exportCrowdstrikeAuditBundle(
   client: BundleClient,
   config: CrowdstrikeResolvedConfig,
   outputRoot: string,
-  options: CrowdstrikeAssessmentOptions = {},
+  options: CrowdstrikeAssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<CrowdstrikeAuditBundleResult> {
   const access = await checkCrowdstrikeAccess(client);
   const assessments = await runAllCrowdstrikeAssessments(client, options);
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = assessments.flatMap((assessment) => assessment.errors.map((error) => `[${assessment.category}] ${error}`));
 
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const bundleName = safeDirName(`${config.cloud ?? new URL(config.baseUrl).hostname}${config.memberCid ? `-${config.memberCid}` : ""}-audit-bundle`);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(bundleName, 9),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference(assessments, errors.length > 0));
@@ -4486,8 +4486,8 @@ function assessmentOptions(args: AssessArgs): CrowdstrikeAssessmentOptions {
   };
 }
 
-function createClient(args: CheckAccessArgs): CrowdstrikeApiClient {
-  return new CrowdstrikeApiClient(resolveCrowdstrikeConfiguration(args));
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): CrowdstrikeApiClient {
+  return new CrowdstrikeApiClient(resolveCrowdstrikeConfiguration(args), { signal });
 }
 
 const authParams = {
@@ -4513,9 +4513,9 @@ export function registerCrowdstrikeTools(pi: any): void {
       "Validate read-only Falcon API access across prevention, response, device control, firewall, sensor update, hosts, host groups, users, API clients, Discover, alerts, exclusions, Zero Trust Assessment, Identity Protection, and RTR audit surfaces, and report missing API client scopes.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkCrowdstrikeAccess(createClient(args));
+        const result = await checkCrowdstrikeAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "crowdstrike_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -4533,9 +4533,9 @@ export function registerCrowdstrikeTools(pi: any): void {
       "Assess Falcon prevention policies for CS-01 through CS-05: ML detection and prevention slider levels, exploit mitigation toggles, script-based execution control, sensor tampering protection, and on-write detection and quarantine. Only enabled policies assigned to host groups (or platform_default) count as enforcement.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessCrowdstrikePreventionPolicies(createClient(args));
+        const result = await assessCrowdstrikePreventionPolicies(createClient(args, signal));
         return textResult(formatAssessmentText(result), { tool: "crowdstrike_assess_prevention_policies", ...stripSnapshots(result) });
       } catch (error) {
         return errorResult(
@@ -4560,9 +4560,9 @@ export function registerCrowdstrikeTools(pi: any): void {
       max_concurrent_sessions: Type.Optional(Type.Number({ description: "Per-user concurrent RTR session threshold. Defaults to 3.", default: DEFAULT_MAX_CONCURRENT_SESSIONS })),
     }),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessCrowdstrikeResponseReadiness(createClient(args), assessmentOptions(args));
+        const result = await assessCrowdstrikeResponseReadiness(createClient(args, signal), assessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: "crowdstrike_assess_response_readiness", ...stripSnapshots(result) });
       } catch (error) {
         return errorResult(
@@ -4584,9 +4584,9 @@ export function registerCrowdstrikeTools(pi: any): void {
       rule_limit: Type.Optional(Type.Number({ description: "Maximum firewall rules and rule groups to review. Defaults to 1000. A truncated read caps CS-10 and CS-11 at warn.", default: DEFAULT_RULE_LIMIT })),
     }),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessCrowdstrikeDeviceFirewall(createClient(args), assessmentOptions(args));
+        const result = await assessCrowdstrikeDeviceFirewall(createClient(args, signal), assessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: "crowdstrike_assess_device_firewall", ...stripSnapshots(result) });
       } catch (error) {
         return errorResult(
@@ -4609,9 +4609,9 @@ export function registerCrowdstrikeTools(pi: any): void {
       min_zta_score: Type.Optional(Type.Number({ description: "Minimum acceptable Zero Trust Assessment score. Defaults to 60.", default: DEFAULT_MIN_ZTA_SCORE })),
     }),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessCrowdstrikeSensorCoverage(createClient(args), assessmentOptions(args));
+        const result = await assessCrowdstrikeSensorCoverage(createClient(args, signal), assessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: "crowdstrike_assess_sensor_coverage", ...stripSnapshots(result) });
       } catch (error) {
         return errorResult(
@@ -4636,9 +4636,9 @@ export function registerCrowdstrikeTools(pi: any): void {
       max_write_clients: Type.Optional(Type.Number({ description: "Maximum API clients with sensitive write scopes before failing. Defaults to 3.", default: DEFAULT_MAX_WRITE_CLIENTS })),
     }),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessCrowdstrikeAccessGovernance(createClient(args), assessmentOptions(args));
+        const result = await assessCrowdstrikeAccessGovernance(createClient(args, signal), assessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: "crowdstrike_assess_access_governance", ...stripSnapshots(result) });
       } catch (error) {
         return errorResult(
@@ -4673,11 +4673,14 @@ export function registerCrowdstrikeTools(pi: any): void {
       max_concurrent_sessions: Type.Optional(Type.Number({ description: "Per-user concurrent RTR session threshold. Defaults to 3.", default: DEFAULT_MAX_CONCURRENT_SESSIONS })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveCrowdstrikeConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportCrowdstrikeAuditBundle(new CrowdstrikeApiClient(config), config, outputRoot, assessmentOptions(args));
+        const result = await exportCrowdstrikeAuditBundle(new CrowdstrikeApiClient(config, { signal }), config, outputRoot, {
+          ...assessmentOptions(args),
+          signal,
+        });
         return textResult(
           [
             "CrowdStrike audit bundle exported.",

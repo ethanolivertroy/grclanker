@@ -20,6 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -1365,12 +1366,13 @@ export class PagerdutyApiClient {
       now?: () => Date;
       sleep?: (ms: number) => Promise<void>;
       maxRetries?: number;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
-    this.sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.sleep = abortableSleep(options.signal, options.sleep);
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     if (config.accessToken) {
       this.bearerToken = config.accessToken;
@@ -3533,7 +3535,7 @@ export async function exportPagerdutyAuditBundle(
   client: PagerdutyClientSurface,
   config: PagerdutyResolvedConfig,
   outputRoot: string,
-  options: PagerdutyAssessmentOptions = {},
+  options: PagerdutyAssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<PagerdutyAuditBundleResult> {
   const generatedAt = client.getNow();
   const access = await checkPagerdutyAccess(client);
@@ -3553,12 +3555,14 @@ export async function exportPagerdutyAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = assessments.flatMap((assessment) => assessment.errors);
 
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const root = realpathSync(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root,
     names: numberedNames(`${safeDirName(`pagerduty-${config.region}`)}-audit-bundle`, 10),
     zip: true,
+    signal: options.signal,
     checkName: (name) => {
       resolveSecureOutputPath(root, name);
       resolveSecureOutputPath(root, `${name}.zip`);
@@ -3730,8 +3734,8 @@ function assessmentOptions(args: AssessArgs): PagerdutyAssessmentOptions {
   };
 }
 
-function createClient(args: AuthArgs): PagerdutyApiClient {
-  return new PagerdutyApiClient(resolvePagerdutyConfiguration(args as JsonRecord));
+function createClient(args: AuthArgs, signal?: AbortSignal): PagerdutyApiClient {
+  return new PagerdutyApiClient(resolvePagerdutyConfiguration(args as JsonRecord), { signal });
 }
 
 const authParams = {
@@ -3774,9 +3778,9 @@ function runAssessmentTool(
     description,
     parameters: Type.Object({ ...authParams, ...extraParams }),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
       try {
-        const result = await run(createClient(args), assessmentOptions(args));
+        const result = await run(createClient(args, signal), assessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: name, ...result });
       } catch (error) {
         return errorResult(`${label} failed: ${errorMessage(error)}`, { tool: name });
@@ -3793,9 +3797,9 @@ export function registerPagerdutyTools(pi: any): void {
       "Validate read-only PagerDuty REST API access across abilities, users, teams, services, escalation policies, schedules, on-calls, audit records, extensions, webhook subscriptions, business services, priorities, incident workflows, and change events, and report missing permissions.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
       try {
-        const result = await checkPagerdutyAccess(createClient(args));
+        const result = await checkPagerdutyAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "pagerduty_check_access", ...result });
       } catch (error) {
         return errorResult(`PagerDuty access check failed: ${errorMessage(error)}`, { tool: "pagerduty_check_access" });
@@ -3885,11 +3889,14 @@ export function registerPagerdutyTools(pi: any): void {
       change_event_days: Type.Optional(Type.Number({ description: "Days of change events to inspect. Defaults to 30.", default: 30 })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportArgs) {
+    async execute(_toolCallId: string, args: ExportArgs, signal?: AbortSignal) {
       try {
         const config = resolvePagerdutyConfiguration(args as JsonRecord);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportPagerdutyAuditBundle(new PagerdutyApiClient(config), config, outputRoot, assessmentOptions(args));
+        const result = await exportPagerdutyAuditBundle(new PagerdutyApiClient(config, { signal }), config, outputRoot, {
+          ...assessmentOptions(args),
+          signal,
+        });
         return textResult(
           [
             "PagerDuty audit bundle exported.",

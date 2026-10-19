@@ -20,6 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -1386,10 +1387,6 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 function certificateName(value: unknown): string | undefined {
   const object = asObject(value);
   return asString(object?.CN) ?? asString(object?.O);
@@ -1397,7 +1394,14 @@ function certificateName(value: unknown): string | undefined {
 
 // rejectUnauthorized stays false so a certificate with an untrusted or incomplete chain can still be read and dated;
 // socket.authorized and authorizationError record whether the chain validated against the auditor's trust store.
-export function defaultCertificateProbe(host: string, timeoutMs: number, servername = host, port = 443): Promise<MulesoftCertificateSummary> {
+export function defaultCertificateProbe(
+  host: string,
+  timeoutMs: number,
+  servername = host,
+  port = 443,
+  signal?: AbortSignal,
+): Promise<MulesoftCertificateSummary> {
+  if (signal?.aborted) return Promise.reject(new ToolCallAbortedError(signal));
   return new Promise((resolvePromise, rejectPromise) => {
     const socket = tlsConnect({ host, port, servername, rejectUnauthorized: false }, () => {
       const certificate = socket.getPeerCertificate();
@@ -1420,6 +1424,11 @@ export function defaultCertificateProbe(host: string, timeoutMs: number, servern
       socket.destroy(new Error(`TLS probe of ${host} timed out.`));
     });
     socket.on("error", (error) => rejectPromise(error));
+    if (signal) {
+      const onAbort = () => socket.destroy(new ToolCallAbortedError(signal));
+      signal.addEventListener("abort", onAbort, { once: true });
+      socket.once("close", () => signal.removeEventListener("abort", onAbort));
+    }
   });
 }
 
@@ -1430,6 +1439,7 @@ export class MulesoftApiClient {
   private readonly maxRetries: number;
   private readonly retryBaseDelayMs: number;
   private readonly certificateProbe: MulesoftCertificateProbe;
+  private readonly signal?: AbortSignal;
   private accessToken?: string;
   private accessTokenExpiresAt = 0;
   private accessTokenPromise?: Promise<string>;
@@ -1442,14 +1452,17 @@ export class MulesoftApiClient {
       maxRetries?: number;
       retryBaseDelayMs?: number;
       certificateProbe?: MulesoftCertificateProbe;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleepImpl = options.sleepImpl ?? defaultSleep;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     this.retryBaseDelayMs = clampNumber(options.retryBaseDelayMs, DEFAULT_RETRY_BASE_DELAY_MS, 0, MAX_RETRY_DELAY_MS);
-    this.certificateProbe = options.certificateProbe ?? defaultCertificateProbe;
+    this.certificateProbe = options.certificateProbe
+      ?? ((host, timeoutMs, servername) => defaultCertificateProbe(host, timeoutMs, servername, undefined, options.signal));
+    this.signal = options.signal;
     rememberSecrets(config.clientSecret, config.password, config.token);
     if (config.authMode === "token" && config.token) {
       this.accessToken = config.token;
@@ -1793,7 +1806,7 @@ export class MulesoftApiClient {
   }
 
   async probeCertificate(host: string, servername?: string): Promise<MulesoftCertificateSummary> {
-    return this.certificateProbe(host, this.config.timeoutMs, servername ?? host);
+    return unlessAborted(this.certificateProbe(host, this.config.timeoutMs, servername ?? host), this.signal);
   }
 
   async listHybridServers(environmentId: string): Promise<JsonRecord[]> {
@@ -4565,7 +4578,7 @@ export async function exportMulesoftAuditBundle(
   client: MulesoftBundleClient,
   config: MulesoftResolvedConfig,
   outputRoot: string,
-  options: MulesoftAuditBundleOptions = {},
+  options: MulesoftAuditBundleOptions & { signal?: AbortSignal } = {},
 ): Promise<MulesoftAuditBundleResult> {
   const access = await checkMulesoftAccess(client);
   const assessments = [
@@ -4577,11 +4590,13 @@ export async function exportMulesoftAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = assessments.flatMap((assessment) => assessment.errors.map((error) => `[${assessment.category}] ${error}`));
 
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(`${safeDirName(config.organizationId)}-audit-bundle`, MAX_AUDIT_DIR_SUFFIX),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
     exhaustedMessage: `Unable to allocate an unused output directory under ${outputRoot}: ${MAX_AUDIT_DIR_SUFFIX} bundle names are already taken.`,
   }, async (staged) => {
@@ -4732,8 +4747,8 @@ function toAuditOptions(args: AuditMonitoringArgs): MulesoftAuditMonitoringOptio
   return { environmentLimit: args.environment_limit, auditLookbackHours: args.audit_lookback_hours };
 }
 
-function createClient(args: CheckAccessArgs): MulesoftApiClient {
-  return new MulesoftApiClient(resolveMulesoftConfiguration(args as JsonRecord));
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): MulesoftApiClient {
+  return new MulesoftApiClient(resolveMulesoftConfiguration(args as JsonRecord), { signal });
 }
 
 const authParams = {
@@ -4783,9 +4798,9 @@ export function registerMulesoftTools(pi: any): void {
       "Validate read-only Anypoint Platform access across Access Management, API Manager, Exchange, CloudHub, Runtime Manager, audit logs, Anypoint MQ, and Secrets Manager surfaces, and report missing connected app permissions.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkMulesoftAccess(createClient(args));
+        const result = await checkMulesoftAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "mulesoft_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -4803,9 +4818,9 @@ export function registerMulesoftTools(pi: any): void {
       "Assess Anypoint Platform identity and access posture: external identity providers, MFA exemptions, Organization Administrator count, role group least privilege and environment scoping, environment isolation, connected app scopes and staleness, and business group isolation (spec controls 1-6, 18, 19, 25).",
     parameters: Type.Object({ ...authParams, ...identityParams }),
     prepareArguments: normalizeIdentityAccessArgs,
-    async execute(_toolCallId: string, args: IdentityAccessArgs) {
+    async execute(_toolCallId: string, args: IdentityAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessMulesoftIdentityAccess(createClient(args), toIdentityOptions(args));
+        const result = await assessMulesoftIdentityAccess(createClient(args, signal), toIdentityOptions(args));
         return textResult(formatAssessmentText(result), mulesoftAssessmentToolDetails("mulesoft_assess_identity_access", result));
       } catch (error) {
         return errorResult(
@@ -4823,9 +4838,9 @@ export function registerMulesoftTools(pi: any): void {
       "Assess API Manager and Exchange posture: authentication policies on production APIs, rate limiting, client credential rotation evidence, and Exchange asset governance (spec controls 7-9, 20).",
     parameters: Type.Object({ ...authParams, ...apiGatewayParams }),
     prepareArguments: normalizeApiGatewayArgs,
-    async execute(_toolCallId: string, args: ApiGatewayArgs) {
+    async execute(_toolCallId: string, args: ApiGatewayArgs, signal?: AbortSignal) {
       try {
-        const result = await assessMulesoftApiGateway(createClient(args), toApiGatewayOptions(args));
+        const result = await assessMulesoftApiGateway(createClient(args, signal), toApiGatewayOptions(args));
         return textResult(formatAssessmentText(result), mulesoftAssessmentToolDetails("mulesoft_assess_api_gateway", result));
       } catch (error) {
         return errorResult(
@@ -4843,9 +4858,9 @@ export function registerMulesoftTools(pi: any): void {
       "Assess CloudHub, VPC, dedicated load balancer, hybrid server, Anypoint MQ, and Secrets Manager posture: supported runtimes, worker sizing, persistent queue encryption, firewall rules, open ingress, TLS versions, certificate expiry, MQ access, secret usage, and server health (spec controls 10-16, 21-23).",
     parameters: Type.Object({ ...authParams, ...runtimeParams }),
     prepareArguments: normalizeRuntimeInfrastructureArgs,
-    async execute(_toolCallId: string, args: RuntimeInfrastructureArgs) {
+    async execute(_toolCallId: string, args: RuntimeInfrastructureArgs, signal?: AbortSignal) {
       try {
-        const result = await assessMulesoftRuntimeInfrastructure(createClient(args), toRuntimeOptions(args));
+        const result = await assessMulesoftRuntimeInfrastructure(createClient(args, signal), toRuntimeOptions(args));
         return textResult(formatAssessmentText(result), mulesoftAssessmentToolDetails("mulesoft_assess_runtime_infrastructure", result));
       } catch (error) {
         return errorResult(
@@ -4863,9 +4878,9 @@ export function registerMulesoftTools(pi: any): void {
       "Assess audit log availability through the Audit Log Query API and alert coverage for production applications through CloudHub and Runtime Manager alerts (spec controls 17, 24).",
     parameters: Type.Object({ ...authParams, ...auditParams }),
     prepareArguments: normalizeAuditMonitoringArgs,
-    async execute(_toolCallId: string, args: AuditMonitoringArgs) {
+    async execute(_toolCallId: string, args: AuditMonitoringArgs, signal?: AbortSignal) {
       try {
-        const result = await assessMulesoftAuditMonitoring(createClient(args), toAuditOptions(args));
+        const result = await assessMulesoftAuditMonitoring(createClient(args, signal), toAuditOptions(args));
         return textResult(formatAssessmentText(result), mulesoftAssessmentToolDetails("mulesoft_assess_audit_monitoring", result));
       } catch (error) {
         return errorResult(
@@ -4890,15 +4905,16 @@ export function registerMulesoftTools(pi: any): void {
       ...auditParams,
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveMulesoftConfiguration(args as JsonRecord);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportMulesoftAuditBundle(new MulesoftApiClient(config), config, outputRoot, {
+        const result = await exportMulesoftAuditBundle(new MulesoftApiClient(config, { signal }), config, outputRoot, {
           ...toIdentityOptions(args),
           ...toApiGatewayOptions(args),
           ...toRuntimeOptions(args),
           ...toAuditOptions(args),
+          signal,
         });
         return textResult(
           [

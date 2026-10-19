@@ -20,6 +20,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -757,6 +758,15 @@ function defaultCommandRunner(command: string, args: string[]): string | undefin
   }
 }
 
+/** execFileSync blocks until the command exits and cannot be cancelled, so an aborted call only stops before the next command starts. */
+function commandRunnerUnlessAborted(signal: AbortSignal | undefined): GcpCommandRunner {
+  if (!signal) return defaultCommandRunner;
+  return (command, args) => {
+    signal.throwIfAborted();
+    return defaultCommandRunner(command, args);
+  };
+}
+
 /** A missing file is undefined; a file that exists but cannot be read (EACCES, EISDIR) throws the system error for readCredentialsFile to describe by code. */
 function defaultFileReader(pathname: string): string | undefined {
   return existsSync(pathname) ? readFileSync(pathname, "utf8") : undefined;
@@ -1148,9 +1158,9 @@ export class GcpAuditorClient {
 
   constructor(
     private readonly config: GcpResolvedConfig,
-    options: { fetchImpl?: FetchImpl; now?: () => Date } = {},
+    options: { fetchImpl?: FetchImpl; now?: () => Date; signal?: AbortSignal } = {},
   ) {
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
   }
 
@@ -4135,7 +4145,7 @@ export async function exportGcpAuditBundle(
     & Partial<Pick<GcpAuditorClient, "getKnownSecrets">>,
   config: GcpResolvedConfig,
   outputRoot: string,
-  options: ExportAuditBundleArgs = {},
+  options: ExportAuditBundleArgs & { signal?: AbortSignal } = {},
 ): Promise<GcpAuditBundleResult> {
   const maxProjects = options.project_limit ?? options.max_projects;
   const access = await checkGcpAccess(client);
@@ -4149,11 +4159,13 @@ export async function exportGcpAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = assessments.flatMap((assessment) => assessment.errors.map((error) => `[${assessment.category}] ${error}`));
   const targetName = safeDirName(`${config.organizationId ?? config.projectId ?? "gcp-scope"}-audit`);
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(targetName, 9),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     /**
@@ -4270,8 +4282,8 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   };
 }
 
-function createClient(args: CheckAccessArgs): GcpAuditorClient {
-  return new GcpAuditorClient(resolveGcpConfiguration(args));
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): GcpAuditorClient {
+  return new GcpAuditorClient(resolveGcpConfiguration(args, process.env, commandRunnerUnlessAborted(signal)), { signal });
 }
 
 const authParams = {
@@ -4294,11 +4306,11 @@ const inventoryParams = {
 function runTool<TArgs>(
   toolName: string,
   failurePrefix: string,
-  run: (args: TArgs) => Promise<{ text: string; details: JsonRecord }>,
+  run: (args: TArgs, signal?: AbortSignal) => Promise<{ text: string; details: JsonRecord }>,
 ) {
-  return async (_toolCallId: string, args: TArgs) => {
+  return async (_toolCallId: string, args: TArgs, signal?: AbortSignal) => {
     try {
-      const result = await run(args);
+      const result = await run(args, signal);
       return textResult(result.text, { tool: toolName, ...result.details });
     } catch (error) {
       return errorResult(`${failurePrefix}: ${describeError(error)}`, { tool: toolName });
@@ -4315,8 +4327,8 @@ export function registerGcpTools(pi: any): void {
       "Validate read-only GCP audit access across Cloud Resource Manager, Cloud Asset Inventory, IAM, Logging, Compute Engine, Cloud Storage, Cloud KMS, and Security Command Center surfaces.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    execute: runTool<CheckAccessArgs>("gcp_check_access", "GCP access check failed", async (args) => {
-      const result = await checkGcpAccess(createClient(args));
+    execute: runTool<CheckAccessArgs>("gcp_check_access", "GCP access check failed", async (args, signal) => {
+      const result = await checkGcpAccess(createClient(args, signal));
       return { text: formatAccessCheckText(result), details: { ...result } };
     }),
   });
@@ -4333,8 +4345,8 @@ export function registerGcpTools(pi: any): void {
       max_keys: Type.Optional(Type.Number({ description: "Maximum service account keys to inspect. Defaults to 200.", default: 200 })),
     }),
     prepareArguments: normalizeIdentityArgs,
-    execute: runTool<IdentityArgs>("gcp_assess_identity", "GCP identity assessment failed", async (args) => {
-      const result = await assessGcpIdentity(createClient(args), { maxProjects: projectLimit(args), staleDays: args.stale_days, maxKeys: args.max_keys });
+    execute: runTool<IdentityArgs>("gcp_assess_identity", "GCP identity assessment failed", async (args, signal) => {
+      const result = await assessGcpIdentity(createClient(args, signal), { maxProjects: projectLimit(args), staleDays: args.stale_days, maxKeys: args.max_keys });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4350,8 +4362,8 @@ export function registerGcpTools(pi: any): void {
       max_findings: Type.Optional(Type.Number({ description: "Maximum Security Command Center findings to sample. Defaults to 200.", default: 200 })),
     }),
     prepareArguments: normalizeLoggingArgs,
-    execute: runTool<LoggingArgs>("gcp_assess_logging_detection", "GCP logging and detection assessment failed", async (args) => {
-      const result = await assessGcpLoggingDetection(createClient(args), { maxProjects: projectLimit(args), maxFindings: args.max_findings });
+    execute: runTool<LoggingArgs>("gcp_assess_logging_detection", "GCP logging and detection assessment failed", async (args, signal) => {
+      const result = await assessGcpLoggingDetection(createClient(args, signal), { maxProjects: projectLimit(args), maxFindings: args.max_findings });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4363,8 +4375,8 @@ export function registerGcpTools(pi: any): void {
       "Assess GCP organization and project guardrails: domain-restricted sharing, service account key constraints, serial port and Shielded VM policies, OS Login, Binary Authorization, and instance hardening.",
     parameters: Type.Object({ ...authParams, ...inventoryParams }),
     prepareArguments: normalizeInventoryArgs,
-    execute: runTool<InventoryArgs>("gcp_assess_org_guardrails", "GCP organization guardrail assessment failed", async (args) => {
-      const result = await assessGcpOrgGuardrails(createClient(args), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
+    execute: runTool<InventoryArgs>("gcp_assess_org_guardrails", "GCP organization guardrail assessment failed", async (args, signal) => {
+      const result = await assessGcpOrgGuardrails(createClient(args, signal), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4376,8 +4388,8 @@ export function registerGcpTools(pi: any): void {
       "Assess GCP data protection: uniform bucket-level access, public IAM exposure, KMS key rotation, CMEK on buckets and disks, Cloud DNS DNSSEC, API key restrictions, and VPC Service Controls perimeters.",
     parameters: Type.Object({ ...authParams, ...inventoryParams }),
     prepareArguments: normalizeInventoryArgs,
-    execute: runTool<InventoryArgs>("gcp_assess_data_protection", "GCP data protection assessment failed", async (args) => {
-      const result = await assessGcpDataProtection(createClient(args), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
+    execute: runTool<InventoryArgs>("gcp_assess_data_protection", "GCP data protection assessment failed", async (args, signal) => {
+      const result = await assessGcpDataProtection(createClient(args, signal), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4389,8 +4401,8 @@ export function registerGcpTools(pi: any): void {
       "Assess GCP network security: internet-open firewall rules on admin ports, VPC flow logs, Private Google Access, Cloud NAT and external IPs, load balancer SSL policies, and Cloud Armor coverage.",
     parameters: Type.Object({ ...authParams, ...inventoryParams }),
     prepareArguments: normalizeInventoryArgs,
-    execute: runTool<InventoryArgs>("gcp_assess_network_security", "GCP network security assessment failed", async (args) => {
-      const result = await assessGcpNetworkSecurity(createClient(args), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
+    execute: runTool<InventoryArgs>("gcp_assess_network_security", "GCP network security assessment failed", async (args, signal) => {
+      const result = await assessGcpNetworkSecurity(createClient(args, signal), { maxProjects: projectLimit(args), maxAssets: args.max_assets });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4409,10 +4421,10 @@ export function registerGcpTools(pi: any): void {
       max_findings: Type.Optional(Type.Number({ description: "Maximum Security Command Center findings to sample. Defaults to 200.", default: 200 })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    execute: runTool<ExportAuditBundleArgs>("gcp_export_audit_bundle", "GCP audit bundle export failed", async (args) => {
-      const config = resolveGcpConfiguration(args);
+    execute: runTool<ExportAuditBundleArgs>("gcp_export_audit_bundle", "GCP audit bundle export failed", async (args, signal) => {
+      const config = resolveGcpConfiguration(args, process.env, commandRunnerUnlessAborted(signal));
       const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-      const result = await exportGcpAuditBundle(new GcpAuditorClient(config), config, outputRoot, args);
+      const result = await exportGcpAuditBundle(new GcpAuditorClient(config, { signal }), config, outputRoot, { ...args, signal });
       return {
         text: [
           "GCP audit bundle exported.",

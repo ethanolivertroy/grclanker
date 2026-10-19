@@ -22,6 +22,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { KNOWBE4_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1239,11 +1240,12 @@ export class Knowbe4ApiClient {
       sleepImpl?: SleepImpl;
       maxRetries?: number;
       minRequestIntervalMs?: number;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleepImpl = options.sleepImpl ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     this.maxRetries = clampInteger(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     this.minRequestIntervalMs = clampInteger(options.minRequestIntervalMs, MIN_REQUEST_INTERVAL_MS, 0, 10_000);
     // The configured tokens are scrubbed from every recorded error string in every encoded form from here on.
@@ -4499,7 +4501,7 @@ export async function exportKnowbe4AuditBundle(
   client: Knowbe4BundleClient,
   config: Knowbe4ResolvedConfig,
   outputRoot: string,
-  options: Knowbe4CollectOptions = {},
+  options: Knowbe4CollectOptions & { signal?: AbortSignal } = {},
 ): Promise<Knowbe4AuditBundleResult> {
   const access = await checkKnowbe4Access(client);
   const snapshot = await collectKnowbe4Snapshot(client, { ...options, scopes: ["phishing", "training", "risk", "governance"] });
@@ -4514,12 +4516,14 @@ export async function exportKnowbe4AuditBundle(
   // Credential-shaped values and token-bearing URLs never leave the process regardless of the PII setting.
   const redact = (value: unknown): unknown => redactCredentialValues(config.redactPii ? redactKnowbe4Pii(value) : value);
 
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const accountName = asString(snapshot.account.data.name) ?? `knowbe4-${config.region}`;
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(`${safeDirName(accountName)}-knowbe4-audit-bundle`, 6),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", `${buildQuickReference()}\n`);
@@ -4671,16 +4675,17 @@ function toCollectOptions(args: AssessmentArgs, config: Knowbe4ResolvedConfig): 
   };
 }
 
-function createClient(args: AuthArgs): Knowbe4ApiClient {
-  return new Knowbe4ApiClient(resolveKnowbe4Configuration(args));
+function createClient(args: AuthArgs, signal?: AbortSignal): Knowbe4ApiClient {
+  return new Knowbe4ApiClient(resolveKnowbe4Configuration(args), { signal });
 }
 
 async function runAssessment(
   area: Knowbe4Scope,
   args: AssessmentArgs,
+  signal?: AbortSignal,
 ): Promise<Knowbe4AssessmentResult> {
   const config = resolveKnowbe4Configuration(args);
-  const client = new Knowbe4ApiClient(config);
+  const client = new Knowbe4ApiClient(config, { signal });
   const options = toCollectOptions(args, config);
   const snapshot = await collectKnowbe4Snapshot(client, { ...options, scopes: [area] });
   switch (area) {
@@ -4772,9 +4777,9 @@ function assessmentTool(
     description,
     parameters: Type.Object({ ...authParams, ...parameters }),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: AssessmentArgs) {
+    async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
-        const result = await runAssessment(area, args);
+        const result = await runAssessment(area, args, signal);
         return textResult(formatAssessmentText(result), { tool: name, ...result });
       } catch (error) {
         return errorResult(
@@ -4795,9 +4800,9 @@ export function registerKnowbe4Tools(pi: any): void {
       "Validate read-only KnowBe4 Reporting API access across account, users, groups, phishing campaigns, security tests, training campaigns, enrollments, store purchases, and policies, plus optional PhishER GraphQL access.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
       try {
-        const result = await checkKnowbe4Access(createClient(args));
+        const result = await checkKnowbe4Access(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "knowbe4_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -4854,11 +4859,14 @@ export function registerKnowbe4Tools(pi: any): void {
       ...governanceParams,
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveKnowbe4Configuration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportKnowbe4AuditBundle(new Knowbe4ApiClient(config), config, outputRoot, toCollectOptions(args, config));
+        const result = await exportKnowbe4AuditBundle(new Knowbe4ApiClient(config, { signal }), config, outputRoot, {
+          ...toCollectOptions(args, config),
+          signal,
+        });
         return textResult(
           [
             "KnowBe4 audit bundle exported.",

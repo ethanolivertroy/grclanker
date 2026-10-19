@@ -33,6 +33,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { GWS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -2254,10 +2255,18 @@ async function readJsonBody(response: Response): Promise<{ payload: JsonRecord; 
 }
 
 export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
+  private readonly fetchImpl: FetchImpl;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly signal?: AbortSignal;
+
   constructor(
     private readonly config: GwsResolvedConfig,
-    private readonly fetchImpl: FetchImpl = fetch,
+    fetchImpl: FetchImpl = fetch,
+    options: { signal?: AbortSignal } = {},
   ) {
+    this.fetchImpl = abortableFetch(fetchImpl, options.signal);
+    this.sleep = abortableSleep(options.signal);
+    this.signal = options.signal;
     rememberConfigSecrets(config);
   }
 
@@ -2461,7 +2470,7 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
     }
 
     if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
-      await sleep(250 * 2 ** attempt);
+      await this.sleep(250 * 2 ** attempt);
       return this.request(url, scopes, { ...options, attempt: attempt + 1 });
     }
 
@@ -2493,10 +2502,14 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
       return entry.token;
     }
     if (entry?.pending) {
-      return entry.pending;
+      return unlessAborted(entry.pending, this.signal).catch((error: unknown) => {
+        // The shared exchange carries the signal of the call that started it; that call's abort is not this call's failure.
+        if (error instanceof ToolCallAbortedError && !this.signal?.aborted) return this.getAccessToken(scopes);
+        throw error;
+      });
     }
 
-    const pending = this.fetchServiceAccountAccessToken(scopes).then((tokenEntry) => {
+    const pending = unlessAborted(this.fetchServiceAccountAccessToken(scopes), this.signal).then((tokenEntry) => {
       tokenCache.set(cacheKey, tokenEntry);
       mintedTokens.add(tokenEntry.token);
       return tokenEntry.token;
@@ -2544,10 +2557,6 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
       expiresAt: Date.now() + expiresIn * 1000,
     };
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
 export function clearGwsTokenCacheForTests(): void {
@@ -4134,6 +4143,7 @@ export async function exportGwsAuditBundle(
   config: GwsResolvedConfig,
   outputRoot: string,
   frameworks: ReportFrameworkKey[] = [...REPORT_FRAMEWORK_KEYS],
+  options: { signal?: AbortSignal } = {},
 ): Promise<GwsAuditBundleResult> {
   const data = await collectGwsAuditData(client);
   const { identity, adminAccess, integrations, monitoring } = data;
@@ -4161,11 +4171,13 @@ export async function exportGwsAuditBundle(
   const knownSecrets = knownGwsSecretValues(config);
 
   const safeName = safeDirName(`${getDisplayOrganization(config)}-gws-audit`);
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(safeName, 9),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     const coreDataFiles: Array<[string, JsonRecord]> = [
@@ -4273,10 +4285,10 @@ export function registerGwsTools(pi: any): void {
       "Validate Google Workspace read access for delegated service-account or direct access-token auth and show which security-relevant Admin SDK, Alert Center, and Cloud Identity Policy surfaces are readable.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config);
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
         const result = await runGwsAccessCheck(client, config);
         return renderAccessCheck(result, config);
       } catch (error) {
@@ -4292,10 +4304,10 @@ export function registerGwsTools(pi: any): void {
       "Review Google Workspace identity posture: 2-step verification coverage, privileged-user MFA enforcement, super-admin protection, dormant accounts, and the organization-level 2SV enforcement policy from the Cloud Identity Policy API.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config);
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
         const data = await collectGwsIdentityData(client);
         return renderAssessmentToolResult(assessGwsIdentity(data, config), config);
       } catch (error) {
@@ -4311,10 +4323,10 @@ export function registerGwsTools(pi: any): void {
       "Review Google Workspace privileged-role population, super-admin sprawl, suspended privileged accounts, delegated-admin use, admin audit visibility, and group-based grants.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config);
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
         const data = await collectGwsAdminAccessData(client);
         return renderAssessmentToolResult(assessGwsAdminAccess(data, config), config);
       } catch (error) {
@@ -4330,10 +4342,10 @@ export function registerGwsTools(pi: any): void {
       "Review third-party OAuth token inventory, privileged-user app exposure, high-scope client sprawl, and token-audit visibility in Google Workspace.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config);
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
         const data = await collectGwsIntegrationData(client);
         return renderAssessmentToolResult(assessGwsIntegrations(data, config), config);
       } catch (error) {
@@ -4349,10 +4361,10 @@ export function registerGwsTools(pi: any): void {
       "Review Google Workspace Alert Center visibility, suspicious-login signals, admin audit coverage, token audit coverage, and the current alert backlog.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config);
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
         const data = await collectGwsMonitoringData(client);
         return renderAssessmentToolResult(assessGwsMonitoring(data, config), config);
       } catch (error) {
@@ -4380,16 +4392,17 @@ export function registerGwsTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs & { output_dir?: string; frameworks?: string[] }) {
+    async execute(_toolCallId: string, args: RawConfigArgs & { output_dir?: string; frameworks?: string[] }, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config);
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
         const frameworks = normalizeFrameworkSelection(args.frameworks);
         const result = await exportGwsAuditBundle(
           client,
           config,
           args.output_dir?.trim() || DEFAULT_OUTPUT_DIR,
           frameworks,
+          { signal },
         );
         return textResult(buildExportText(config, result), {
           organization: getDisplayOrganization(config),
