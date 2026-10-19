@@ -1,7 +1,84 @@
 ---
 title: What's New
-description: "The grclanker changelog: what shipped in v0.1.2, v0.1.1, v0.1.0, and v0.0.1."
+description: "The grclanker changelog: what shipped in v0.1.3, v0.1.2, v0.1.1, v0.1.0, and v0.0.1."
 ---
+
+## v0.1.3 (October 19, 2026)
+
+Adds an experimental, opt-in durable mode, moves the CLI to Pi 1.3.0 and the release bundles to Node.js 24.22.0, makes exports atomic, and fixes checks that could pass on incomplete evidence. The tool surface is unchanged. Install or upgrade with:
+
+```bash
+curl -fsSL https://grclanker.com/install | bash
+grclanker tools
+```
+
+`grclanker tools` still reports `241 domain tools + 7 compute backend tools`.
+
+### Durable mode (experimental, opt-in)
+
+- [`grclanker durable`](/docs/getting-started/durable-runtime/) runs the GRC agent under Pi Durable 1.3.0, which writes the conversation and each tool round to SQLite as the run goes. A run that crashes, is killed, or is stopped with Ctrl-C can be resumed instead of started over.
+- It is opt-in: nothing changes unless you run it. The interactive CLI, the Cursor Agent SDK project, and the Flue runtime do not use it. `run` and `resume` print `grclanker durable (experimental)` to stderr, the terminal app shows it at the top of the screen, and the `--json` report carries `"experimental": true`. Commands, output, and the session format may change between releases.
+- `grclanker durable run --message <text>` starts or continues a session. Add `--session <id>` to name it, `--request-id <id>` to make the request idempotent, `--model <provider/model>` to pick a model, and `--json` for a report.
+- `grclanker durable resume --session <id>` finishes whatever an earlier process left unsettled. Finished tool calls keep their results, interrupted read-only tools run again, and an interrupted tool that can write is reported and never rerun. Rerunning `run` with a settled `--request-id` returns the stored answer without calling the model or any tool.
+- [`grclanker durable tui`](/docs/getting-started/durable-runtime/#terminal-app) opens a session in a terminal app adapted from Pi's experimental durable app, with grclanker's banner, theme, and assessment summary. A session moves between the app, `run`, and `resume`, one process at a time.
+- Each session is a directory under `~/.grclanker/durable/sessions/<id>/`, guarded by a lock the operating system drops on any exit. The model comes from `--model`, then `GRCLANKER_DURABLE_MODEL`, then the `grclanker setup` choice.
+- Only the 241 domain tools are available. There are no compute backends, workflow prompts, skills, or subagents. The session database keeps the whole conversation, so treat `~/.grclanker/durable/sessions/` like a credential store. See [Limitations](/docs/getting-started/durable-runtime/#limitations).
+
+### Exports and stopped runs
+
+- Every `*_export_*` tool, `gws_ops_collect_evidence_bundle`, `fedramp_generate_ads_bundle`, and `fedramp_generate_ads_site` build their bundle in a hidden staging directory under the output root and move it into place once every file is written. An export that fails, is killed, or is stopped no longer leaves a half-written bundle. Output paths, names, rerun suffixes (`-2`, `-3`), and contents are unchanged. The FedRAMP catalog cache is replaced in one rename.
+- Every domain tool honors the abort signal its runtime passes. Stopping a durable command or closing the terminal app cancels in-flight API requests, ends retry and rate-limit waits, and kills child processes: `az` and `gcloud` credential lookups, `gws`, and `trestle`. A collector ends at the read the abort interrupted, a worker pool hands out no further item, and a ZIP archive stops at once. An export stopped partway writes nothing under its output root.
+- Runs that are not stopped behave and write exactly as before.
+
+### Assessments
+
+- [Cloudflare](/docs/integrations/cloudflare/): six checks no longer pass on evidence that only supports a review. CF-IAM-02 counts every permission group whose name does not end in Read as write-capable, so groups such as Cache Purge count. CF-IAM-03 warns on members whose `two_factor_authentication_enabled` is not `true`. CF-IAM-06 warns on active tokens with a future expiry that were never used. CF-TRF-04 warns on any failed audit action. CF-TRF-05 warns on allow-mode IP access rules. CF-TRF-06 no longer counts `quarantine` as blocking.
+- [Zscaler](/docs/integrations/zscaler/): a check that passed on a truncated ZIA inventory now warns with the pages seen versus the total (ZS-03, ZS-04, ZS-05, ZS-07, ZS-14, ZS-16, ZS-17, ZS-20, and ZS-25). `evidence.partial_inventory` is true whenever an inventory a finding depends on is truncated, and fail and manual findings name truncated inventories too.
+- [Vanta](/docs/integrations/vanta/): a missing `endCursor`, a repeated cursor, a 404 after an earlier page, or the 500-page cap fails the list call instead of returning a partial list. Evidence URL pagination failures go to `_errors.log`.
+- [CrowdStrike](/docs/integrations/crowdstrike/): when the user details lookup returns fewer users than the UUIDs sent, the user list is marked partial and CS-16 and CS-17 cap at warn.
+- [KnowBe4](/docs/integrations/knowbe4/): a list stops at a page holding an entry that is not a JSON object and is marked partial, with the page named, instead of ending early as complete.
+- [Snowflake](/docs/integrations/snowflake/): SNOWFLAKE-02 warns and names the policies when some network policies have an empty `ALLOWED_IP_LIST`.
+- [Zoom](/docs/integrations/zoom/): ZOOM-COLLAB-01 warns when a non-empty trusted-domain list is truncated.
+- [MuleSoft](/docs/integrations/mulesoft/), [PagerDuty](/docs/integrations/pagerduty/), [New Relic](/docs/integrations/newrelic/), and [Salesforce](/docs/integrations/salesforce/): a 200 response that omits its documented collection fails the read. A real empty array is still an empty inventory.
+- [KEV / EPSS](/docs/integrations/kevs/): `kevs_recent` and `kevs_check_ransomware` treat a `limit` below 1 as the default (10 and 20), and `kevs_recent` treats a negative `days` as the default 30, instead of reporting no matches.
+- FedRAMP process search returns a process with both 20x and Rev5 requirement buckets under a Rev5 filter.
+
+### Runtimes
+
+- The CLI moves to Pi 1.3.0 (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai`), up from 1.1.0. Malformed final tool-call JSON now fails validation instead of running with partial fields.
+- Release bundles ship Node.js 24.22.0 LTS, up from 22.23.3, and CI runs on Node 24. Source checkouts still need Node.js 22.19 or newer.
+- The [Flue runtime](/docs/getting-started/flue-runtime/) moves to Flue 2.3.0, up from 2.2.2.
+- The [`sandbox-runtime` backend](/docs/getting-started/compute-backends/#sandbox-runtime) moves to sandbox-runtime 0.0.79, up from 0.0.78. Deny rules apply through folder names that contain glob characters, Linux write-denies names such as `.bashrc` and `.git/config` one level below the working directory, and a sandboxed command's first network call is no longer sometimes refused on Linux.
+- The [Cursor Agent SDK](/docs/getting-started/agent-sdk/) project stays on `@cursor/bdk` 0.2.26 and still serves all 241 tools: 199 read-only and 42 approval-gated writers.
+
+### Security
+
+- [Flue](/docs/getting-started/flue-runtime/#output-and-redaction) tool errors, both returned and thrown, are scrubbed of credential arguments before the model sees them. The runner scrubs the final reply and failure text of secrets from tool inputs, including encoded forms, and a resumed `flue run --id` rebuilds that list from the stored conversation.
+- Vanta authentication and API errors redact the client id, client secret, and access token before the text is shortened, and an off-HTTPS download redirect records only the destination host and path.
+- A malformed `settings.json` or `models.json`, or JSON that is not an object, is left on disk and reported with a fixed error that does not quote the file. Local setup reads `models.json` before writing either file, and a broken `sandbox.json` fails closed instead of dropping your deny rules. `GRCLANKER_HOME` is refused when it reaches `.pi` through a symlink.
+- OSCAL workspace names must be a single path segment. FedRAMP bundle writes check the destination before creating directories. RunPod pod staging skips and refuses paths that leave the repository through a symlink, and refuses `..` in a plan.
+- The installers stop when an official download's `SHA256SUMS.txt` cannot be fetched, has no entry for the archive, is not a SHA-256 digest, or does not match. Local bundle selection compares versions itself, so macOS's BSD `sort` no longer aborts the install. Linux musl hosts get source-build instructions, and Windows zip extraction rejects `..`, absolute, and drive-letter entries before it replaces an install.
+- `npm audit` is unchanged from `v0.1.2`. The CLI has 2 high advisories, both GHSA-86w9-cpqp-85rv in `node-forge`, counted once directly and once through `@anthropic-ai/sandbox-runtime`. No patched `node-forge` exists yet. The site has none.
+
+### Docs and site
+
+- Spec pages open as documents, set like docs pages with section links and an "On this page" list. The raw markdown is on a Markdown source tab. Each spec links its setup guide, and each guide links back.
+- 63 vendor reference links on 9 pages that opened an error page now point at the page they name.
+- Docs search finds body text, hyphenated IDs such as `SRG-APP-000148`, and the identifiers integration and FedRAMP pages mention. It ranks title matches first and corrects one-letter typos.
+- New guides: [FedRAMP readiness](/docs/guides/fedramp-readiness/), [OSCAL workspaces](/docs/guides/oscal-workspaces/), [SCF crosswalks](/docs/guides/scf-crosswalks/), [KEV / EPSS](/docs/integrations/kevs/), and the [Durable Runtime](/docs/getting-started/durable-runtime/). Every integration page has a Run it section, and evidence-handling internals move to a closing section.
+- The docs landing page maps every docs section, the sidebar is grouped, and headings have section links. Quick Start offers the hosted path, and Compute Backends leads with choosing a backend.
+- Docs and spec pages print black on white without the site's navigation. Tables too wide for the docs column stack on desktop, as they already did on phones.
+- Keyboard and screen reader fixes: a skip link to the article, focus kept clear of the sticky header, named navigation controls, announced search results, and fixed contrast.
+- Site images are regenerated in the inked Frappe style, and docs pages no longer download hero images they never show.
+
+### Upgrade notes
+
+- Rerun the installer to upgrade. Settings and runtime state under `~/.grclanker/agent` are kept.
+- Source checkouts should rerun `npm --prefix cli ci`, since the CLI lockfile changed.
+- Some findings change: expect `warn` where `v0.1.2` reported `pass` on the incomplete Cloudflare, Zscaler, CrowdStrike, KnowBe4, Snowflake, and Zoom evidence above, and a failed read where Vanta pagination is incomplete or a MuleSoft, PagerDuty, New Relic, or Salesforce listing omits its collection.
+- **Durable sessions and the next pi-durable.** This release pins pi-durable 1.3.0. The next pi-durable release migrates a SQLite session to schema version 2 when it opens it, and pi-durable 1.3.0 or earlier cannot open a migrated session. Once a later grclanker release ships that version, a durable session it opens can no longer be opened by `v0.1.3`, so downgrading would strand it. If you might go back, copy `~/.grclanker/durable/sessions/` before opening your sessions with the newer release.
+
+Full history: [v0.1.2...v0.1.3](https://github.com/ethanolivertroy/grclanker/compare/v0.1.2...v0.1.3). [Release notes and bundles](https://github.com/ethanolivertroy/grclanker/releases/tag/v0.1.3).
 
 ## v0.1.2 (October 17, 2026)
 
