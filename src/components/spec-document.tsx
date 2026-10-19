@@ -7,6 +7,7 @@ import { githubUrl } from '../lib/site';
 import remarkSpecSource from '../lib/spec-markdown.mjs';
 import staticTables, { STATIC_TABLE } from '../lib/static-tables.mjs';
 import { mdxComponents } from './mdx';
+import { SpecTableLabels } from './spec-table-labels';
 import { SpecToc } from './spec-toc';
 
 // The table of contents comes from a second pass over the markdown, so both
@@ -25,7 +26,8 @@ type StaticTableProps = { html: string; narrow: number; wide: number };
 
 function StaticTable({ html, narrow, wide }: StaticTableProps) {
   const heights = { '--table-narrow-height': `${narrow}px`, '--table-wide-height': `${wide}px` } as CSSProperties;
-  return <div className="docs-table-scroll" style={heights} dangerouslySetInnerHTML={{ __html: html }} />;
+  // SpecTableLabels marks far tables before hydration.
+  return <div className="docs-table-scroll" style={heights} suppressHydrationWarning dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 const components = { ...mdxComponents, [STATIC_TABLE]: StaticTable };
@@ -58,6 +60,7 @@ export async function SpecDocument({ content }: { content: string }) {
         </article>
         {toc.length > 0 && <SpecToc items={toc} />}
       </div>
+      <SpecTableLabels />
     </div>
   );
 }
