@@ -8,7 +8,6 @@
  */
 import { createPrivateKey, sign as signData, type KeyObject } from "node:crypto";
 import {
-  createWriteStream,
   lstatSync,
   mkdirSync,
   readFileSync,
@@ -17,12 +16,12 @@ import {
 import { readdir, writeFile } from "node:fs/promises";
 import { STATUS_CODES } from "node:http";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { ToolCallAbortedError, abortableFetch, abortableSleep, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { NextLinkError, parseNextLinkHeader, resolveSameOriginUrl, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type JsonRecord = Record<string, unknown>;
 type GitHubAuthMode = "pat" | "app";
@@ -2703,20 +2702,6 @@ async function writeBundleText(rootDir: string, relativePathname: string, conten
   await writeSecureTextFile(rootDir, relativePathname, scrubErrorText(content));
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-}
-
 async function mapWithConcurrency<T, R>(
   values: T[],
   limit: number,
@@ -5362,7 +5347,7 @@ export async function exportGitHubAuditBundle(
       await writeBundleText(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   const files = await readdir(outputDir, { recursive: true });

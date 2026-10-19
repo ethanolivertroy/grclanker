@@ -10,7 +10,6 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, createHmac } from "node:crypto";
 import {
   chmodSync,
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -18,7 +17,6 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { abortableFetch, abortableSleep } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
@@ -26,6 +24,7 @@ import { DUO_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-cont
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { DUO_SPEC } from "./duo.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type JsonRecord = Record<string, unknown>;
 type DuoFindingStatus = "Pass" | "Partial" | "Fail" | "Manual" | "Info";
@@ -5385,20 +5384,6 @@ async function writeText(rootDir: string, relativePathname: string, value: strin
   await chmod(destination, 0o600);
 }
 
-async function zipDirectory(sourceDir: string, zipPath: string): Promise<void> {
-  const output = createWriteStream(zipPath, { mode: 0o600 });
-  const archive = new ZipArchive({ zlib: { level: 9 } });
-
-  await new Promise<void>((resolveZip, rejectZip) => {
-    output.on("close", resolveZip);
-    archive.on("error", rejectZip);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    archive.finalize().catch(rejectZip);
-  });
-  await chmod(zipPath, 0o600);
-}
-
 async function countFiles(rootDir: string): Promise<number> {
   const entries = await readdir(rootDir, { withFileTypes: true });
   let count = 0;
@@ -5537,7 +5522,7 @@ export async function exportDuoAuditBundle(
       await writeText(staged.dir, "_errors.log", errors.join("\n"));
     }
 
-    await zipDirectory(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

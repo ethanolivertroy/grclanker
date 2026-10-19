@@ -8,7 +8,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, createPrivateKey, randomUUID, sign as signData, type KeyObject } from "node:crypto";
 import {
-  createWriteStream,
   lstatSync,
   mkdirSync,
   realpathSync,
@@ -16,7 +15,6 @@ import {
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
@@ -26,6 +24,7 @@ import { OKTA_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-con
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { OKTA_SPEC } from "./okta.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type JsonRecord = Record<string, unknown>;
 type OktaAuthMode = "SSWS" | "PrivateKey";
@@ -5802,20 +5801,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-}
-
 function oscalControlId(mapping: string): string {
   return mapping
     .trim()
@@ -6105,7 +6090,7 @@ export async function exportOktaAuditBundle(
       await writeSecureTextFile(staged.dir, "_errors.log", errors.join("\n"));
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   const files = await readdir(outputDir, { recursive: true });

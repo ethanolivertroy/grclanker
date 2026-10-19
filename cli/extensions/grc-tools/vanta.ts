@@ -23,11 +23,11 @@ import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { ToolCallAbortedError, abortableFetch, unlessAborted } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 const VANTA_TOKEN_URL = "https://api.vanta.com/oauth/token";
 const VANTA_BASE_URL = "https://api.vanta.com/v1";
@@ -870,30 +870,14 @@ async function collectRegularFiles(rootDir: string): Promise<string[]> {
   return files.sort();
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string, baseDir: string): Promise<void> {
+async function zipAuditPackage(sourceDir: string, zipPath: string, baseDir: string, signal?: AbortSignal): Promise<void> {
+  const zipRoot = basename(sourceDir);
   const files = await collectRegularFiles(sourceDir);
-  const resolvedZipPath = resolveSecureOutputPath(baseDir, zipPath);
-
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(resolvedZipPath, { mode: 0o600, flags: "wx" });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-
-    const zipRoot = basename(sourceDir);
-    for (const filePath of files) {
-      archive.file(filePath, {
-        name: join(zipRoot, relative(sourceDir, filePath)),
-      });
-    }
-
-    void archive.finalize();
-  });
-
-  await chmod(resolvedZipPath, 0o600);
+  await createZipArchive(
+    files.map((filePath) => ({ path: filePath, name: join(zipRoot, relative(sourceDir, filePath)) })),
+    resolveSecureOutputPath(baseDir, zipPath),
+    signal,
+  );
 }
 
 export async function exportVantaAuditPackage(
@@ -1086,7 +1070,7 @@ export async function exportVantaAuditPackage(
     }
 
     try {
-      await createZipArchive(staged.dir, staged.zipPath, baseOutputDir);
+      await zipAuditPackage(staged.dir, staged.zipPath, baseOutputDir, options.signal);
     } catch (error) {
       // A half-written archive must not be committed next to the bundle.
       await rm(staged.zipPath, { force: true });
