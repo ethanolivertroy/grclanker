@@ -2426,10 +2426,15 @@ details[open] > .agent-group-toggle::before {
 
 /* Spec tables skip layout and paint until they near the viewport. Until a
    table first renders, it holds the height src/lib/table-heights.mjs
-   estimates for the layout in use. */
+   estimates for the layout in use. Chrome still lays out a skipped table at
+   its true height whenever something needs its layout, such as Tab moving
+   focus or an accessibility checker. A table taller than its estimate would
+   then make the wrapper a vertical scroller, which Chrome adds to the tab
+   order. */
 .spec-reader .docs-table-scroll {
   content-visibility: auto;
   contain-intrinsic-block-size: auto var(--table-wide-height);
+  overflow-y: hidden;
 }
 
 @media (max-width: 720px) {
