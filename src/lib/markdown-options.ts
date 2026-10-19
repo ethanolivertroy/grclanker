@@ -12,5 +12,5 @@ export const rehypeCodeOptions: RehypeCodeOptions = {
   icon: false,
 };
 
-/** Run after code highlighting. */
-export const siteRehypePlugins = [tableLabels, taskListLabels, codeBreaks, hangingIndents];
+/** Run after code highlighting. tableLabels measures tables by the break points codeBreaks adds. */
+export const siteRehypePlugins = [taskListLabels, codeBreaks, tableLabels, hangingIndents];
