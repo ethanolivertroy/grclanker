@@ -2907,7 +2907,11 @@ kbd {
   .cmd-hero-copy,
   .spec-catalog-copy,
   .hero-install-toggle-row,
-  .hero-install-icon {
+  .hero-install-icon,
+  .site-search-overlay,
+  .site-search,
+  .overlay-dialog,
+  .toast {
     display: none !important;
   }
 
