@@ -85,8 +85,8 @@ export default async function SpecPage(props: PageProps) {
           <div className="flex flex-wrap items-center gap-2 lg:max-w-[18rem] lg:justify-end">
             <SpecUrlCopyButton
               url={rawUrl}
-              label="COPY URL"
-              specName={meta.name}
+              label="Copy URL"
+              detail={`of the raw ${meta.name} spec`}
               className="copy-btn spec-action-btn spec-action-btn-primary"
             />
             <a href={rawUrl} download className="spec-action-btn">
