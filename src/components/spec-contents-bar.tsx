@@ -15,9 +15,9 @@ const RING_LENGTH = 2 * Math.PI * RING_RADIUS;
  * The index of the last section whose heading has reached the reading line
  * under the bar, or -1 above the first. The last sections of a spec can be
  * too short to scroll up to the line, so at the bottom of the page the one a
- * link jumped to, or else the last one on screen, is current. Does nothing
- * while the bar is hidden from 1024px, where the rail beside the document
- * marks the section.
+ * link jumped to, or else the last one on screen, is current. Follows the
+ * page only while the bar shows: not from 1024px, where the rail beside the
+ * document marks the section, nor while the markdown source is open.
  */
 function useCurrentSection(items: TOCItemType[], barRef: RefObject<HTMLElement | null>) {
   const [current, setCurrent] = useState(-1);
@@ -28,8 +28,8 @@ function useCurrentSection(items: TOCItemType[], barRef: RefObject<HTMLElement |
     let frame = 0;
     let shown: number | undefined;
 
-    // Headings run down the page in order, so the last one to pass a test is
-    // found by bisection, reading a handful of positions a frame.
+    // Headings run down the page in order, so bisection finds the last one to
+    // pass a test in a few position reads a frame.
     function lastWhere(test: (top: number) => boolean) {
       let low = 0;
       let high = headings.length - 1;
@@ -44,7 +44,7 @@ function useCurrentSection(items: TOCItemType[], barRef: RefObject<HTMLElement |
     function update() {
       frame = 0;
       const bar = barRef.current;
-      if (!bar?.offsetHeight) return;
+      if (!bar) return;
       const line = bar.getBoundingClientRect().bottom + READING_LINE_GAP;
       let index = lastWhere((t) => t <= line);
       if (scrollY + innerHeight >= document.documentElement.scrollHeight - 1) {
@@ -60,15 +60,26 @@ function useCurrentSection(items: TOCItemType[], barRef: RefObject<HTMLElement |
       frame ||= requestAnimationFrame(update);
     }
 
-    update();
-    addEventListener('scroll', schedule, { passive: true });
-    addEventListener('resize', schedule);
-    addEventListener('hashchange', schedule);
+    function follow(shows: boolean) {
+      if (shows) {
+        addEventListener('scroll', schedule, { passive: true });
+        addEventListener('resize', schedule);
+        addEventListener('hashchange', schedule);
+        schedule();
+      } else {
+        removeEventListener('scroll', schedule);
+        removeEventListener('resize', schedule);
+        removeEventListener('hashchange', schedule);
+        cancelAnimationFrame(frame);
+        frame = 0;
+      }
+    }
+
+    const visibility = new ResizeObserver(([entry]) => follow(entry.contentRect.height > 0));
+    if (barRef.current) visibility.observe(barRef.current);
     return () => {
-      cancelAnimationFrame(frame);
-      removeEventListener('scroll', schedule);
-      removeEventListener('resize', schedule);
-      removeEventListener('hashchange', schedule);
+      visibility.disconnect();
+      follow(false);
     };
   }, [items, barRef]);
 
