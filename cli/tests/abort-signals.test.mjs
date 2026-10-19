@@ -13,6 +13,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { collectRegisteredGrcTools, getRegisteredGrcTool } from "../dist/agent-sdk/lib/registry.js";
 import { abortableFetch, abortableSleep, ToolCallAbortedError, unlessAborted } from "../dist/extensions/grc-tools/abort.js";
 import { createTlsOptOutFetch } from "../dist/extensions/grc-tools/ansible.js";
+import { collectGwsOperatorEvidenceBundle } from "../dist/extensions/grc-tools/gws-ops.js";
 import { defaultCertificateProbe } from "../dist/extensions/grc-tools/mulesoft.js";
 import { createInsecureFetch } from "../dist/extensions/grc-tools/paloalto.js";
 import { cachedFetch, clearGrcSharedCachesForTests } from "../dist/extensions/grc-tools/shared.js";
@@ -610,6 +611,27 @@ test("aborting a gws or trestle call kills the command it is running", async (t)
   process.env.GRCLANKER_TRESTLE_BIN = trestle.executable;
   await abortWhileCommandRuns("gws_ops_check_cli", gws, { gws_bin: gws.executable }, pids);
   await abortWhileCommandRuns("oscal_check_trestle", trestle, { workspace_dir: root }, pids);
+});
+
+test("collectGwsOperatorEvidenceBundle called without a runner kills its gws command when its signal aborts", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "grclanker-abort-gws-bundle-"));
+  const pids = [];
+  t.after(() => {
+    for (const pid of pids) if (isRunning(pid)) process.kill(pid, "SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  });
+  const gws = hangingCli(root, "gws");
+  const outputRoot = join(root, "export");
+  const controller = new AbortController();
+  const bundle = collectGwsOperatorEvidenceBundle({ gwsBin: gws.executable, output_dir: outputRoot, signal: controller.signal });
+  assert.ok(await waitUntil(() => readPid(gws.pidFile) !== undefined, 5000), "the bundle started gws");
+  const pid = readPid(gws.pidFile);
+  pids.push(pid);
+  controller.abort(new Error("stopped the bundle"));
+  const settling = settleWithin(bundle, SETTLE_MS);
+  assert.ok(await waitUntil(() => !isRunning(pid), SETTLE_MS), "the bundle left gws running after the abort");
+  assert.equal((await settling).status, "rejected");
+  assert.equal(existsSync(outputRoot), false, "the aborted bundle wrote nothing");
 });
 
 // Without credentials in their arguments or environment, the Azure and GCP tools ask az or gcloud for them.

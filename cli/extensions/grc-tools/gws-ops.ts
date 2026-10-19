@@ -1257,7 +1257,7 @@ function buildBundleSummary(
 
 export async function collectGwsOperatorEvidenceBundle(
   args: GwsOpsBundleArgs & { signal?: AbortSignal } = {},
-  runner: GwsCliRunner = defaultGwsCliRunner,
+  runner: GwsCliRunner = gwsCliRunnerFor(args.signal),
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<GwsOpsBundleResult | { mode: "dry_run"; commands: GwsOpsCommandPreview[] }> {
   const workflowArgs = {
