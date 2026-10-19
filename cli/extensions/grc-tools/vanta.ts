@@ -25,6 +25,7 @@ import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { ToolCallAbortedError, abortableFetch, unlessAborted } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -484,6 +485,7 @@ export class VantaAuditorClient {
   private readonly tokenUrl: string;
   private readonly scope: string;
   private readonly now: () => number;
+  private readonly signal?: AbortSignal;
 
   constructor(
     credentials: VantaAuditorCredentials,
@@ -493,14 +495,16 @@ export class VantaAuditorClient {
       tokenUrl?: string;
       scope?: string;
       now?: () => number;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.credentials = credentials;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.baseUrl = options.baseUrl ?? VANTA_BASE_URL;
     this.tokenUrl = options.tokenUrl ?? VANTA_TOKEN_URL;
     this.scope = options.scope ?? VANTA_AUDITOR_READ_SCOPE;
     this.now = options.now ?? Date.now;
+    this.signal = options.signal;
   }
 
   private get cacheKey(): string {
@@ -562,10 +566,16 @@ export class VantaAuditorClient {
     }
 
     if (!forceRefresh && entry.pending) {
-      return entry.pending;
+      try {
+        return await unlessAborted(entry.pending, this.signal);
+      } catch (error) {
+        // The shared request carries the signal of the call that started it; that call's abort is not this call's failure.
+        if (!(error instanceof ToolCallAbortedError) || this.signal?.aborted) throw error;
+        return this.authenticate();
+      }
     }
 
-    entry.pending = this.requestToken().finally(() => {
+    entry.pending = unlessAborted(this.requestToken(), this.signal).finally(() => {
       const current = tokenCache.get(this.cacheKey);
       if (current) {
         delete current.pending;
@@ -807,6 +817,7 @@ async function downloadFile(
   destPath: string,
   baseDir: string,
   fetchImpl: FetchImpl,
+  signal?: AbortSignal,
 ): Promise<number> {
   const response = await followDownloadRedirects(rawUrl, fetchImpl);
   if (!response.ok) {
@@ -819,7 +830,7 @@ async function downloadFile(
   const resolvedPath = resolveSecureOutputPath(baseDir, destPath);
   const output = createWriteStream(resolvedPath, { mode: 0o600 });
   try {
-    await pipeline(Readable.fromWeb(response.body as NodeReadableStream), output);
+    await pipeline(Readable.fromWeb(response.body as NodeReadableStream), output, { signal });
   } finally {
     await chmod(resolvedPath, 0o600);
   }
@@ -892,11 +903,13 @@ export async function exportVantaAuditPackage(
   options: {
     fetchImpl?: FetchImpl;
     downloadConcurrency?: number;
+    signal?: AbortSignal;
   } = {},
 ): Promise<VantaExportResult> {
-  const fetchImpl = options.fetchImpl ?? fetch;
+  const fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
   const errors: string[] = [];
 
+  options.signal?.throwIfAborted();
   ensurePrivateDir(baseOutputDir);
 
   const evidence = await client.listEvidence(audit.id);
@@ -923,6 +936,7 @@ export async function exportVantaAuditPackage(
     root: baseOutputDir,
     names: auditOutputNames(audit),
     zip: true,
+    signal: options.signal,
   }, async (staged) => {
     // The writer runs again under the next free name if another process takes this one first.
     errors.splice(listingErrorCount);
@@ -965,7 +979,7 @@ export async function exportVantaAuditPackage(
 
     await runWithConcurrency(downloads, options.downloadConcurrency ?? 5, async (task) => {
       try {
-        const size = await downloadFile(task.url.url, task.filePath, staged.dir, fetchImpl);
+        const size = await downloadFile(task.url.url, task.filePath, staged.dir, fetchImpl, options.signal);
         totalFilesExported += 1;
         totalSizeBytes += size;
       } catch (error) {
@@ -974,6 +988,7 @@ export async function exportVantaAuditPackage(
         );
       }
     });
+    options.signal?.throwIfAborted();
 
     const uniqueEvidence = Array.from(new Map(evidence.map((item) => [item.id, item])).values());
     const indexRows = uniqueEvidence.map((item) => [
@@ -1181,7 +1196,7 @@ export function registerVantaTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       let credentials: VantaAuditorCredentials;
       try {
         credentials = resolveVantaCredentials({
@@ -1196,7 +1211,7 @@ export function registerVantaTools(pi: any): void {
       }
 
       try {
-        const client = new VantaAuditorClient(credentials);
+        const client = new VantaAuditorClient(credentials, { signal });
         const result = await checkVantaAuditorAccess(client);
 
         return textResult(buildAccessCheckText(result), {
@@ -1256,7 +1271,7 @@ export function registerVantaTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeListAuditsArgs,
-    async execute(_toolCallId: string, args: ListAuditsArgs) {
+    async execute(_toolCallId: string, args: ListAuditsArgs, signal?: AbortSignal) {
       let credentials: VantaAuditorCredentials;
       try {
         credentials = resolveVantaCredentials({
@@ -1271,7 +1286,7 @@ export function registerVantaTools(pi: any): void {
       }
 
       try {
-        const client = new VantaAuditorClient(credentials);
+        const client = new VantaAuditorClient(credentials, { signal });
         const audits = (await client.listAudits()).sort(sortAuditsByEndDateDesc);
         const query = args.query?.trim().toLowerCase();
         const filtered = query
@@ -1345,7 +1360,7 @@ export function registerVantaTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeExportAuditArgs,
-    async execute(_toolCallId: string, args: ExportAuditArgs) {
+    async execute(_toolCallId: string, args: ExportAuditArgs, signal?: AbortSignal) {
       if (!args.audit_id.trim()) {
         return errorResult(
           'vanta_export_audit requires a non-empty audit_id. Example: {"audit_id":"audit_123"}',
@@ -1367,7 +1382,7 @@ export function registerVantaTools(pi: any): void {
       }
 
       try {
-        const client = new VantaAuditorClient(credentials);
+        const client = new VantaAuditorClient(credentials, { signal });
         const audits = await client.listAudits();
         const audit = audits.find((entry) => entry.id === args.audit_id.trim());
         if (!audit) {
@@ -1378,7 +1393,7 @@ export function registerVantaTools(pi: any): void {
         }
 
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportVantaAuditPackage(client, audit, outputRoot);
+        const result = await exportVantaAuditPackage(client, audit, outputRoot, { signal });
 
         return textResult(buildExportText(audit, result), {
           tool: "vanta_export_audit",

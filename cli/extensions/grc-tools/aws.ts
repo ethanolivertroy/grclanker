@@ -95,6 +95,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   AWS_CONTROL_CATALOG,
@@ -1518,12 +1519,15 @@ function assertOutputShape(command: unknown, output: unknown, observed: Observed
  * Overrides send() on one SDK client instance so every error it throws is rethrown as AwsApiError and every
  * output it resolves passes the shape guard. The prototype's send is looked up on each call, so the instance
  * keeps following the SDK's implementation (or a test fixture's patch of it, which the observing middleware
- * never runs under); only the shape of the thrown error changes.
+ * never runs under); only the shape of the thrown error changes. With a signal, every request carries it as its
+ * abortSignal, and an abort rejects the read at once with ToolCallAbortedError instead, even while the SDK is
+ * still resolving credentials or waiting out a retry delay, neither of which it can cancel.
  */
-function guardSdkClient<T extends object>(client: T): T {
+function guardSdkClient<T extends object>(client: T, signal?: AbortSignal): T {
   const prototype = Object.getPrototypeOf(client) as SdkClientPrototype;
   const streamCollector = asObject(asObject(client)?.config)?.streamCollector as StreamCollector | undefined;
   const guardedSend = async (command: unknown, ...rest: unknown[]): Promise<unknown> => {
+    if (signal?.aborted) throw new ToolCallAbortedError(signal);
     const observed: ObservedResponse = {};
     const stack = asObject(command)?.middlewareStack as { add?: (middleware: unknown, options: unknown) => void } | undefined;
     if (typeof stack?.add === "function") {
@@ -1535,11 +1539,16 @@ function guardSdkClient<T extends object>(client: T): T {
         override: true,
       });
     }
+    const [options, ...extra] = rest;
+    // A signal derived per request carries the SDK's abort listener, so concurrent reads do not pile listeners
+    // onto the tool call's signal.
+    const sendRest = signal ? [{ ...asObject(options), abortSignal: AbortSignal.any([signal]) }, ...extra] : rest;
     try {
-      const output = await prototype.send.apply(client, [command, ...rest]);
+      const output = await unlessAborted(prototype.send.apply(client, [command, ...sendRest]), signal);
       assertOutputShape(command, output, observed);
       return output;
     } catch (error) {
+      if (error instanceof ToolCallAbortedError) throw error;
       throw toAwsApiError(withObservedBody(error, observed, command));
     } finally {
       observed.body = undefined;
@@ -2027,10 +2036,11 @@ export class AwsAuditorClient {
   private readonly kmsClients = new Map<string, KMSClient>();
   private readonly cloudTrailClients = new Map<string, CloudTrailClient>();
   private readonly now: () => Date;
+  private readonly signal: AbortSignal | undefined;
 
   constructor(
     private readonly config: AwsResolvedConfig,
-    options: { now?: () => Date } = {},
+    options: { now?: () => Date; signal?: AbortSignal } = {},
   ) {
     // Static credentials in the environment are configured secrets from construction on, before any request
     // is signed; the guarded chain registers whatever it resolves at the first signed request as well.
@@ -2038,20 +2048,21 @@ export class AwsAuditorClient {
     const credentials = credentialProviderFor(config);
     const clientConfig = { region: config.region, credentials };
     this.credentials = credentials;
+    this.signal = options.signal;
     // Every SDK client is guarded so the error a read throws is fixed text (AwsApiError), never the SDK's message.
-    this.sts = guardSdkClient(new STSClient(clientConfig));
-    this.iam = guardSdkClient(new IAMClient(clientConfig));
-    this.cloudTrail = guardSdkClient(new CloudTrailClient(clientConfig));
-    this.securityHub = guardSdkClient(new SecurityHubClient(clientConfig));
-    this.configService = guardSdkClient(new ConfigServiceClient(clientConfig));
-    this.guardDuty = guardSdkClient(new GuardDutyClient(clientConfig));
-    this.organizations = guardSdkClient(new OrganizationsClient(clientConfig));
-    this.accessAnalyzer = guardSdkClient(new AccessAnalyzerClient(clientConfig));
-    this.ssoAdmin = guardSdkClient(new SSOAdminClient(clientConfig));
-    this.s3 = guardSdkClient(new S3Client({ ...clientConfig, followRegionRedirects: true }));
-    this.s3Control = guardSdkClient(new S3ControlClient(clientConfig));
-    this.auditManager = guardSdkClient(new AuditManagerClient(clientConfig));
-    this.account = guardSdkClient(new AccountClient(clientConfig));
+    this.sts = guardSdkClient(new STSClient(clientConfig), this.signal);
+    this.iam = guardSdkClient(new IAMClient(clientConfig), this.signal);
+    this.cloudTrail = guardSdkClient(new CloudTrailClient(clientConfig), this.signal);
+    this.securityHub = guardSdkClient(new SecurityHubClient(clientConfig), this.signal);
+    this.configService = guardSdkClient(new ConfigServiceClient(clientConfig), this.signal);
+    this.guardDuty = guardSdkClient(new GuardDutyClient(clientConfig), this.signal);
+    this.organizations = guardSdkClient(new OrganizationsClient(clientConfig), this.signal);
+    this.accessAnalyzer = guardSdkClient(new AccessAnalyzerClient(clientConfig), this.signal);
+    this.ssoAdmin = guardSdkClient(new SSOAdminClient(clientConfig), this.signal);
+    this.s3 = guardSdkClient(new S3Client({ ...clientConfig, followRegionRedirects: true }), this.signal);
+    this.s3Control = guardSdkClient(new S3ControlClient(clientConfig), this.signal);
+    this.auditManager = guardSdkClient(new AuditManagerClient(clientConfig), this.signal);
+    this.account = guardSdkClient(new AccountClient(clientConfig), this.signal);
     this.now = options.now ?? (() => new Date());
   }
 
@@ -2146,7 +2157,7 @@ export class AwsAuditorClient {
   private ec2For(region: string): EC2Client {
     let client = this.ec2Clients.get(region);
     if (!client) {
-      client = guardSdkClient(new EC2Client({ region, credentials: this.credentials }));
+      client = guardSdkClient(new EC2Client({ region, credentials: this.credentials }), this.signal);
       this.ec2Clients.set(region, client);
     }
     return client;
@@ -2156,7 +2167,7 @@ export class AwsAuditorClient {
     if (region === this.config.region) return this.cloudTrail;
     let client = this.cloudTrailClients.get(region);
     if (!client) {
-      client = guardSdkClient(new CloudTrailClient({ region, credentials: this.credentials }));
+      client = guardSdkClient(new CloudTrailClient({ region, credentials: this.credentials }), this.signal);
       this.cloudTrailClients.set(region, client);
     }
     return client;
@@ -2165,7 +2176,7 @@ export class AwsAuditorClient {
   private rdsFor(region: string): RDSClient {
     let client = this.rdsClients.get(region);
     if (!client) {
-      client = guardSdkClient(new RDSClient({ region, credentials: this.credentials }));
+      client = guardSdkClient(new RDSClient({ region, credentials: this.credentials }), this.signal);
       this.rdsClients.set(region, client);
     }
     return client;
@@ -2174,7 +2185,7 @@ export class AwsAuditorClient {
   private kmsFor(region: string): KMSClient {
     let client = this.kmsClients.get(region);
     if (!client) {
-      client = guardSdkClient(new KMSClient({ region, credentials: this.credentials }));
+      client = guardSdkClient(new KMSClient({ region, credentials: this.credentials }), this.signal);
       this.kmsClients.set(region, client);
     }
     return client;
@@ -4972,7 +4983,7 @@ export async function exportAwsAuditBundle(
   client: AwsAuditorClient,
   config: AwsResolvedConfig,
   outputRoot: string,
-  options: ExportAuditBundleArgs = {},
+  options: ExportAuditBundleArgs & { signal?: AbortSignal } = {},
 ): Promise<AwsAuditBundleResult> {
   const now = new Date();
   const access = await checkAwsAccess(client);
@@ -5008,11 +5019,13 @@ export async function exportAwsAuditBundle(
   const counts = countByStatus(findings);
   const accountId = access.accountId ?? config.accountId ?? "aws-account";
   const targetName = safeDirName(`${accountId}-${config.region}-audit`);
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(targetName, 6),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await writeSecureTextFile(staged.dir, "README.md", buildBundleReadme());
@@ -5186,8 +5199,8 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleToolArg
   };
 }
 
-function createClient(args: CheckAccessArgs): AwsAuditorClient {
-  return new AwsAuditorClient(resolveAwsConfiguration(args));
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): AwsAuditorClient {
+  return new AwsAuditorClient(resolveAwsConfiguration(args), { signal });
 }
 
 const authParams = {
@@ -5204,9 +5217,9 @@ export function registerAwsTools(pi: any): void {
       "Validate read-only AWS audit access across IAM, CloudTrail, Security Hub, Config, GuardDuty, Access Analyzer, Organizations, Identity Center, EC2, S3, KMS, RDS, Audit Manager, and Account surfaces.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkAwsAccess(createClient(args));
+        const result = await checkAwsAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "aws_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -5232,9 +5245,9 @@ export function registerAwsTools(pi: any): void {
       policy_limit: Type.Optional(Type.Number({ description: "Maximum customer-managed IAM policies to inspect before flagging truncation. Defaults to 1000.", default: 1000 })),
     }),
     prepareArguments: normalizeIdentityArgs,
-    async execute(_toolCallId: string, args: IdentityArgs) {
+    async execute(_toolCallId: string, args: IdentityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAwsIdentity(createClient(args), {
+        const result = await assessAwsIdentity(createClient(args, signal), {
           userLimit: args.user_limit,
           staleDays: args.stale_days,
           roleLimit: args.role_limit,
@@ -5259,9 +5272,9 @@ export function registerAwsTools(pi: any): void {
       "Assess AWS CloudTrail, Security Hub, GuardDuty, and Config posture, including multi-region trail coverage, log validation, data events, standards enablement, and active recording.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: LoggingArgs) {
+    async execute(_toolCallId: string, args: LoggingArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAwsLoggingDetection(createClient(args));
+        const result = await assessAwsLoggingDetection(createClient(args, signal));
         return textResult(formatAssessmentText(result), { tool: "aws_assess_logging_detection", ...result });
       } catch (error) {
         return errorResult(
@@ -5282,9 +5295,9 @@ export function registerAwsTools(pi: any): void {
       max_findings: Type.Optional(Type.Number({ description: "Maximum Access Analyzer findings to sample. Defaults to 200.", default: 200 })),
     }),
     prepareArguments: normalizeOrgGuardrailArgs,
-    async execute(_toolCallId: string, args: OrgGuardrailArgs) {
+    async execute(_toolCallId: string, args: OrgGuardrailArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAwsOrgGuardrails(createClient(args), {
+        const result = await assessAwsOrgGuardrails(createClient(args, signal), {
           maxFindings: args.max_findings,
         });
         return textResult(formatAssessmentText(result), { tool: "aws_assess_org_guardrails", ...result });
@@ -5307,9 +5320,9 @@ export function registerAwsTools(pi: any): void {
       ...dataProtectionParams,
     }),
     prepareArguments: normalizeDataProtectionArgs,
-    async execute(_toolCallId: string, args: DataProtectionArgs) {
+    async execute(_toolCallId: string, args: DataProtectionArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAwsDataProtection(createClient(args), {
+        const result = await assessAwsDataProtection(createClient(args, signal), {
           regions: parseRegionList(args.regions),
           regionLimit: args.region_limit,
           bucketLimit: args.bucket_limit,
@@ -5338,9 +5351,9 @@ export function registerAwsTools(pi: any): void {
       sensitive_ports: Type.Optional(Type.String({ description: `Comma-separated ports treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`, default: DEFAULT_SENSITIVE_PORTS.join(",") })),
     }),
     prepareArguments: normalizeNetworkSecurityArgs,
-    async execute(_toolCallId: string, args: NetworkSecurityArgs) {
+    async execute(_toolCallId: string, args: NetworkSecurityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAwsNetworkSecurity(createClient(args), {
+        const result = await assessAwsNetworkSecurity(createClient(args, signal), {
           regions: parseRegionList(args.regions),
           regionLimit: args.region_limit,
           resourceLimit: args.resource_limit,
@@ -5376,14 +5389,15 @@ export function registerAwsTools(pi: any): void {
       sensitive_ports: Type.Optional(Type.String({ description: `Comma-separated ports treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`, default: DEFAULT_SENSITIVE_PORTS.join(",") })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleToolArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleToolArgs, signal?: AbortSignal) {
       try {
         const config = resolveAwsConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportAwsAuditBundle(new AwsAuditorClient(config), config, outputRoot, {
+        const result = await exportAwsAuditBundle(new AwsAuditorClient(config, { signal }), config, outputRoot, {
           ...args,
           regions: parseRegionList(args.regions),
           sensitive_ports: parsePortList(args.sensitive_ports),
+          signal,
         });
         return textResult(
           [

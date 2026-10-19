@@ -3,6 +3,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { ensureGrclankerHome, getGrclankerHome, getGrclankerStateDir } from "../../config/paths.js";
+import { abortableFetch } from "./abort.js";
 import { writeFileAtomically } from "./atomic-output.js";
 import { persistentCachesEnabled } from "./shared.js";
 
@@ -424,9 +425,9 @@ async function readJsonFile<T>(path: string): Promise<T | undefined> {
 }
 
 /** Persist a cache payload unless the caller disabled persistent caches. */
-async function writeCacheFile(path: string, value: unknown): Promise<void> {
+async function writeCacheFile(path: string, value: unknown, signal?: AbortSignal): Promise<void> {
   if (!persistentCachesEnabled()) return;
-  await writeFileAtomically(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8" });
+  await writeFileAtomically(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", signal });
 }
 
 function githubHeaders(token: string | null): Record<string, string> {
@@ -481,7 +482,7 @@ function failedReadDetail(
  * The token goes to api.github.com only: raw.githubusercontent.com serves the
  * public catalog without one and answers a rejected token with 404.
  */
-async function fetchJson<T>(url: string, auth?: GitHubAuth): Promise<T> {
+async function fetchJson<T>(url: string, auth?: GitHubAuth, signal?: AbortSignal): Promise<T> {
   const apiRead = url.startsWith(`${GITHUB_API}/`);
   const token = apiRead ? (auth?.token ?? null) : null;
   // fetch echoes an invalid header value, token included, in its error message.
@@ -492,8 +493,9 @@ async function fetchJson<T>(url: string, auth?: GitHubAuth): Promise<T> {
 
   let response: Response;
   try {
-    response = await fetch(url, { headers: githubHeaders(token) });
+    response = await abortableFetch(fetch, signal)(url, { headers: githubHeaders(token) });
   } catch (error) {
+    if (signal?.aborted) throw error;
     throw failure(errorText(error));
   }
   if (!response.ok) {
@@ -505,11 +507,12 @@ async function fetchJson<T>(url: string, auth?: GitHubAuth): Promise<T> {
   try {
     return (await response.json()) as T;
   } catch (error) {
+    if (signal?.aborted) throw error;
     throw failure(`unreadable JSON: ${errorText(error)}`);
   }
 }
 
-async function fetchPrimarySourceMetadata(auth?: GitHubAuth): Promise<{
+async function fetchPrimarySourceMetadata(auth?: GitHubAuth, signal?: AbortSignal): Promise<{
   repo: RepoOverviewResponse;
   file: GitHubContentFileResponse;
 }> {
@@ -517,25 +520,32 @@ async function fetchPrimarySourceMetadata(auth?: GitHubAuth): Promise<{
     fetchJson<RepoOverviewResponse>(
       `${GITHUB_API}/repos/${FEDRAMP_RULES_SOURCE.org}/${FEDRAMP_RULES_SOURCE.repo}`,
       auth,
+      signal,
     ),
     fetchJson<GitHubContentFileResponse>(
       `${GITHUB_API}/repos/${FEDRAMP_RULES_SOURCE.org}/${FEDRAMP_RULES_SOURCE.repo}/contents/${FEDRAMP_RULES_SOURCE.path}?ref=${FEDRAMP_RULES_SOURCE.branch}`,
       auth,
+      signal,
     ),
   ]);
 
   return { repo, file };
 }
 
-async function fetchSupportingSourceMetadata(auth?: GitHubAuth): Promise<FedrampDocsSupportingSource> {
+async function fetchSupportingSourceMetadata(
+  auth?: GitHubAuth,
+  signal?: AbortSignal,
+): Promise<FedrampDocsSupportingSource> {
   const [repo, contents] = await Promise.all([
     fetchJson<RepoOverviewResponse>(
       `${GITHUB_API}/repos/${FEDRAMP_MARKDOWN_SOURCE.org}/${FEDRAMP_MARKDOWN_SOURCE.repo}`,
       auth,
+      signal,
     ),
     fetchJson<GitHubContentEntry[]>(
       `${GITHUB_API}/repos/${FEDRAMP_MARKDOWN_SOURCE.org}/${FEDRAMP_MARKDOWN_SOURCE.repo}/contents/?ref=${FEDRAMP_MARKDOWN_SOURCE.branch}`,
       auth,
+      signal,
     ),
   ]);
 
@@ -601,16 +611,20 @@ function primarySourceStatus(
   };
 }
 
-async function fetchPrimarySourceCatalog(): Promise<{
+async function fetchPrimarySourceCatalog(signal?: AbortSignal): Promise<{
   catalog: FedrampCatalog;
   provenance: FedrampPrimarySourceStatus;
 }> {
   const emptyRepoMetadata: RepoOverviewResponse = {};
   const emptyFileMetadata: GitHubContentFileResponse = {};
   const [rawCatalog, metadata] = await Promise.all([
-    fetchJson<Record<string, unknown>>(FEDRAMP_RULES_SOURCE.rawUrl),
-    fetchPrimarySourceMetadata().catch(() => ({ repo: emptyRepoMetadata, file: emptyFileMetadata })),
+    fetchJson<Record<string, unknown>>(FEDRAMP_RULES_SOURCE.rawUrl, undefined, signal),
+    fetchPrimarySourceMetadata(undefined, signal).catch(() => ({
+      repo: emptyRepoMetadata,
+      file: emptyFileMetadata,
+    })),
   ]);
+  signal?.throwIfAborted();
 
   const catalog = normalizeFedrampConsolidatedRules(rawCatalog);
   return { catalog, provenance: primarySourceStatus(catalog, metadata) };
@@ -1049,6 +1063,7 @@ export async function loadFedrampCatalog(options?: {
   refresh?: boolean;
   homeDir?: string;
   ttlMs?: number;
+  signal?: AbortSignal;
 }): Promise<FedrampLoadedCatalog> {
   const homeDir = options?.homeDir ?? getGrclankerHome();
   const ttlMs = options?.ttlMs ?? DAY_MS;
@@ -1090,7 +1105,7 @@ export async function loadFedrampCatalog(options?: {
   }
 
   try {
-    const live = await fetchPrimarySourceCatalog();
+    const live = await fetchPrimarySourceCatalog(options?.signal);
     const fetchedAt = new Date().toISOString();
     const payload: CatalogCachePayload = {
       schemaVersion: FEDRAMP_CACHE_SCHEMA_VERSION,
@@ -1098,7 +1113,7 @@ export async function loadFedrampCatalog(options?: {
       catalog: live.catalog,
       provenance: live.provenance,
     };
-    await writeCacheFile(cachePath, payload);
+    await writeCacheFile(cachePath, payload, options?.signal);
     const value: FedrampLoadedCatalog = {
       catalog: live.catalog,
       provenance: live.provenance,
@@ -1113,6 +1128,7 @@ export async function loadFedrampCatalog(options?: {
     };
     return value;
   } catch (error) {
+    if (options?.signal?.aborted) throw error;
     if (cached) {
       const staleValue: FedrampLoadedCatalog = {
         catalog: cached.catalog,
@@ -1137,6 +1153,7 @@ export async function loadFedrampCatalog(options?: {
 export async function inspectFedrampOfficialSources(options?: {
   refresh?: boolean;
   homeDir?: string;
+  signal?: AbortSignal;
 }): Promise<FedrampSourceStatus> {
   const homeDir = options?.homeDir ?? getGrclankerHome();
   const cacheKey = resolve(homeDir);
@@ -1178,9 +1195,10 @@ export async function inspectFedrampOfficialSources(options?: {
 
   try {
     const [catalog, secondary] = await Promise.all([
-      loadFedrampCatalog({ refresh: options?.refresh, homeDir }),
-      fetchSupportingSourceMetadata().catch(unavailableSupportingSource),
+      loadFedrampCatalog({ refresh: options?.refresh, homeDir, signal: options?.signal }),
+      fetchSupportingSourceMetadata(undefined, options?.signal).catch(unavailableSupportingSource),
     ]);
+    options?.signal?.throwIfAborted();
     const fetchedAt = new Date().toISOString();
     const payload: SourceCachePayload = {
       schemaVersion: FEDRAMP_CACHE_SCHEMA_VERSION,
@@ -1188,7 +1206,7 @@ export async function inspectFedrampOfficialSources(options?: {
       primary: catalog.provenance,
       secondary,
     };
-    await writeCacheFile(cachePath, payload);
+    await writeCacheFile(cachePath, payload, options?.signal);
     const value: FedrampSourceStatus = {
       primary: catalog.provenance,
       secondary,
@@ -1203,6 +1221,7 @@ export async function inspectFedrampOfficialSources(options?: {
     };
     return value;
   } catch (error) {
+    if (options?.signal?.aborted) throw error;
     if (cached) {
       const value: FedrampSourceStatus = {
         primary: cached.primary,

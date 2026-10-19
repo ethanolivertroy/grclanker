@@ -974,13 +974,16 @@ async function writeFileBundle(
   outputRoot: string,
   bundleName: string,
   files: BundleTemplateFile[],
+  signal?: AbortSignal,
 ): Promise<{ outputDir: string; files: string[] }> {
+  signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const canonicalOutputRoot = realpathSync(outputRoot);
   const { outputDir } = await writeBundleAtomically({
     root: canonicalOutputRoot,
     names: numberedNames(bundleName, 100),
     exhaustedMessage: `Unable to allocate bundle directory under ${canonicalOutputRoot}`,
+    signal,
   }, async (staged) => {
     for (const file of files) {
       await writeSecureTextFile(staged.dir, resolve(staged.dir, file.path), file.content);
@@ -1241,9 +1244,10 @@ export async function generateFedrampAdsStarterBundle(
   loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
   outputRoot: string,
   args: AdsBundleArgs,
+  signal?: AbortSignal,
 ): Promise<AdsStarterBundleResult> {
   const bundle = buildFedrampAdsStarterBundle(loaded, args);
-  const { outputDir, files } = await writeFileBundle(outputRoot, bundle.bundleName, bundle.files);
+  const { outputDir, files } = await writeFileBundle(outputRoot, bundle.bundleName, bundle.files, signal);
 
   return {
     outputDir,
@@ -2720,9 +2724,10 @@ export async function generateFedrampAdsSite(
   loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>,
   outputRoot: string,
   args: AdsSiteArgs,
+  signal?: AbortSignal,
 ): Promise<AdsPublicSiteResult> {
   const site = buildFedrampAdsSite(loaded, args);
-  const { outputDir, files } = await writeFileBundle(outputRoot, site.bundleName, site.files);
+  const { outputDir, files } = await writeFileBundle(outputRoot, site.bundleName, site.files, signal);
 
   return {
     outputDir,
@@ -3514,9 +3519,9 @@ export function registerFedrampTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeCheckArgs,
-    async execute(_toolCallId: string, args: CheckSourcesArgs) {
+    async execute(_toolCallId: string, args: CheckSourcesArgs, signal?: AbortSignal) {
       try {
-        const status = await inspectFedrampOfficialSources({ refresh: args.refresh });
+        const status = await inspectFedrampOfficialSources({ refresh: args.refresh, signal });
         return textResult(formatSourceCheckText(status), {
           tool: "fedramp_check_sources",
           refresh: args.refresh ?? false,
@@ -3573,13 +3578,13 @@ export function registerFedrampTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeSearchArgs,
-    async execute(_toolCallId: string, args: SearchArgs) {
+    async execute(_toolCallId: string, args: SearchArgs, signal?: AbortSignal) {
       if (!args.query.trim()) {
         return missingQueryResult("fedramp_search_frmr", '{"query":"Certification Data Sharing"}');
       }
 
       try {
-        const loaded = await loadFedrampCatalog();
+        const loaded = await loadFedrampCatalog({ signal });
         const matches = searchFedrampCatalog(loaded.catalog, args.query, {
           section: args.section ?? "any",
           appliesTo: args.applies_to ?? "any",
@@ -3628,13 +3633,13 @@ export function registerFedrampTools(pi: any): void {
       }),
     }),
     prepareArguments: normalizeQueryArgs,
-    async execute(_toolCallId: string, args: QueryArgs) {
+    async execute(_toolCallId: string, args: QueryArgs, signal?: AbortSignal) {
       if (!args.query.trim()) {
         return missingQueryResult("fedramp_get_process", '{"query":"CDS"}');
       }
 
       try {
-        const loaded = await loadFedrampCatalog();
+        const loaded = await loadFedrampCatalog({ signal });
         const process = resolveFedrampProcess(loaded.catalog, args.query);
         const requirements = processRequirements(loaded.catalog, process.id);
         const counts = requirementCountsByApplicability(loaded.catalog, process.id);
@@ -3678,13 +3683,13 @@ export function registerFedrampTools(pi: any): void {
       }),
     }),
     prepareArguments: normalizeQueryArgs,
-    async execute(_toolCallId: string, args: QueryArgs) {
+    async execute(_toolCallId: string, args: QueryArgs, signal?: AbortSignal) {
       if (!args.query.trim()) {
         return missingQueryResult("fedramp_get_requirement", '{"query":"CDS-CSO-PUB"}');
       }
 
       try {
-        const loaded = await loadFedrampCatalog();
+        const loaded = await loadFedrampCatalog({ signal });
         const requirement = resolveFedrampRequirement(loaded.catalog, args.query);
         return textResult(
           formatRequirementText(requirement, loaded.provenance, loaded.cacheStatus),
@@ -3717,13 +3722,13 @@ export function registerFedrampTools(pi: any): void {
       }),
     }),
     prepareArguments: normalizeQueryArgs,
-    async execute(_toolCallId: string, args: QueryArgs) {
+    async execute(_toolCallId: string, args: QueryArgs, signal?: AbortSignal) {
       if (!args.query.trim()) {
         return missingQueryResult("fedramp_get_ksi", '{"query":"KSI-CNA-EIS"}');
       }
 
       try {
-        const loaded = await loadFedrampCatalog();
+        const loaded = await loadFedrampCatalog({ signal });
         const match = resolveFedrampKsi(loaded.catalog, args.query);
         const indicators =
           match.kind === "domain"
@@ -3793,13 +3798,13 @@ export function registerFedrampTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeReadinessArgs,
-    async execute(_toolCallId: string, args: ReadinessArgs) {
+    async execute(_toolCallId: string, args: ReadinessArgs, signal?: AbortSignal) {
       if (!args.query.trim()) {
         return missingQueryResult("fedramp_assess_readiness", '{"query":"CDS"}');
       }
 
       try {
-        const loaded = await loadFedrampCatalog();
+        const loaded = await loadFedrampCatalog({ signal });
         const brief = buildFedrampReadinessBrief(loaded, args);
         return textResult(brief.text, {
           tool: "fedramp_assess_readiness",
@@ -3884,13 +3889,13 @@ export function registerFedrampTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizePlanningArgs,
-    async execute(_toolCallId: string, args: PlanningArgs) {
+    async execute(_toolCallId: string, args: PlanningArgs, signal?: AbortSignal) {
       if (!args.query.trim()) {
         return missingQueryResult("fedramp_plan_process_artifacts", '{"query":"CDS"}');
       }
 
       try {
-        const loaded = await loadFedrampCatalog();
+        const loaded = await loadFedrampCatalog({ signal });
         const plan = buildFedrampArtifactPlan(loaded, args);
         return textResult(plan.text, {
           tool: "fedramp_plan_process_artifacts",
@@ -3951,9 +3956,9 @@ export function registerFedrampTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeAdsPackageArgs,
-    async execute(_toolCallId: string, args: AdsPackageArgs) {
+    async execute(_toolCallId: string, args: AdsPackageArgs, signal?: AbortSignal) {
       try {
-        const loaded = await loadFedrampCatalog();
+        const loaded = await loadFedrampCatalog({ signal });
         const plan = buildFedrampAdsPackagePlan(loaded, args);
         return textResult(plan.text, {
           tool: "fedramp_plan_ads_package",
@@ -4018,11 +4023,11 @@ export function registerFedrampTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeAdsBundleArgs,
-    async execute(_toolCallId: string, args: AdsBundleArgs) {
+    async execute(_toolCallId: string, args: AdsBundleArgs, signal?: AbortSignal) {
       try {
-        const loaded = await loadFedrampCatalog();
+        const loaded = await loadFedrampCatalog({ signal });
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_FEDRAMP_OUTPUT_DIR);
-        const bundle = await generateFedrampAdsStarterBundle(loaded, outputRoot, args);
+        const bundle = await generateFedrampAdsStarterBundle(loaded, outputRoot, args, signal);
         const relativeFiles = bundle.files.map((filePath) => relative(bundle.outputDir, filePath));
         const lines = [
           "Certification Data Sharing starter bundle generated.",
@@ -4107,11 +4112,11 @@ export function registerFedrampTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeAdsSiteArgs,
-    async execute(_toolCallId: string, args: AdsSiteArgs) {
+    async execute(_toolCallId: string, args: AdsSiteArgs, signal?: AbortSignal) {
       try {
-        const loaded = await loadFedrampCatalog();
+        const loaded = await loadFedrampCatalog({ signal });
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_FEDRAMP_OUTPUT_DIR);
-        const site = await generateFedrampAdsSite(loaded, outputRoot, args);
+        const site = await generateFedrampAdsSite(loaded, outputRoot, args, signal);
         const relativeFiles = site.files.map((filePath) => relative(site.outputDir, filePath));
         const lines = [
           "Certification Data Sharing public trust-center site generated.",

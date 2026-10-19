@@ -21,6 +21,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -1561,13 +1562,10 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 export class SplunkApiClient {
   private readonly config: SplunkResolvedConfig;
   private readonly fetchImpl: FetchImpl;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly retryAttempts: number;
   private readonly retryDelayMs: number;
   private readonly pageSize: number;
@@ -1583,10 +1581,12 @@ export class SplunkApiClient {
       retryDelayMs?: number;
       pageSize?: number;
       maxEntries?: number;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? (config.verifyTls ? fetch : createInsecureTlsFetch());
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? (config.verifyTls ? fetch : createInsecureTlsFetch()), options.signal);
+    this.sleep = abortableSleep(options.signal);
     registerConfiguredSecrets([config.token, config.password, config.acsToken]);
     this.retryAttempts = clampNumber(options.retryAttempts, DEFAULT_RETRY_ATTEMPTS, 1, 10);
     this.retryDelayMs = clampNumber(options.retryDelayMs, DEFAULT_RETRY_DELAY_MS, 0, 30_000);
@@ -1628,14 +1628,14 @@ export class SplunkApiClient {
         const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
         if (isRetryableStatus(response.status) && attempt < this.retryAttempts) {
           await response.text().catch(() => "");
-          await sleep(this.retryDelayMs * 2 ** (attempt - 1));
+          await this.sleep(this.retryDelayMs * 2 ** (attempt - 1));
           continue;
         }
         return response;
       } catch (error) {
         lastError = error;
         if (attempt < this.retryAttempts) {
-          await sleep(this.retryDelayMs * 2 ** (attempt - 1));
+          await this.sleep(this.retryDelayMs * 2 ** (attempt - 1));
           continue;
         }
       } finally {
@@ -3519,7 +3519,7 @@ export async function exportSplunkAuditBundle(
   client: SplunkInspectorClient,
   config: SplunkResolvedConfig,
   outputRoot: string,
-  options: SplunkExportOptions = {},
+  options: SplunkExportOptions & { signal?: AbortSignal } = {},
 ): Promise<SplunkAuditBundleResult> {
   const access = await checkSplunkAccess(client);
   const assessments = [
@@ -3564,12 +3564,14 @@ export async function exportSplunkAuditBundle(
     }
   }
 
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(`${safeDirName(new URL(config.url).host)}-splunk-audit-${stamp}`, 50),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     for (const [pathName, value] of snapshotFiles) {
@@ -3761,8 +3763,8 @@ function normalizeExportArgs(args: unknown): ExportArgs {
   return { ...normalizeAuthenticationArgs(args), ...normalizeAccessControlArgs(args), ...normalizeAuditArgs(args), output_dir: asString(value.output_dir) ?? asString(value.output) };
 }
 
-function createClient(args: CommonArgs): SplunkApiClient {
-  return new SplunkApiClient(resolveSplunkConfiguration(args as JsonRecord));
+function createClient(args: CommonArgs, signal?: AbortSignal): SplunkApiClient {
+  return new SplunkApiClient(resolveSplunkConfiguration(args as JsonRecord), { signal });
 }
 
 const authParams = {
@@ -3794,9 +3796,9 @@ export function registerSplunkTools(pi: any): void {
     description: "Validate read-only Splunk access across server info, current-context capabilities, users, roles, tokens, authentication/server/web configuration, indexes, HEC and TCP inputs, saved searches, apps, KV Store collections, and Splunk Cloud ACS, reporting missing capabilities.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCommonArgs,
-    async execute(_toolCallId: string, args: CommonArgs) {
+    async execute(_toolCallId: string, args: CommonArgs, signal?: AbortSignal) {
       return runTool("splunk_check_access", "Splunk access check failed", async () => {
-        const result = await checkSplunkAccess(createClient(args));
+        const result = await checkSplunkAccess(createClient(args, signal));
         return { text: formatAccessCheckText(result), details: { ...result } };
       });
     },
@@ -3812,9 +3814,9 @@ export function registerSplunkTools(pi: any): void {
       max_session_minutes: Type.Optional(Type.Number({ description: "Maximum acceptable session timeout in minutes. Defaults to 60.", default: 60 })),
     }),
     prepareArguments: normalizeAuthenticationArgs,
-    async execute(_toolCallId: string, args: AuthenticationArgs) {
+    async execute(_toolCallId: string, args: AuthenticationArgs, signal?: AbortSignal) {
       return runTool("splunk_assess_authentication", "Splunk authentication assessment failed", async () => {
-        const result = await assessSplunkAuthentication(createClient(args), { maxTokenAgeDays: args.max_token_age_days, maxSessionMinutes: args.max_session_minutes });
+        const result = await assessSplunkAuthentication(createClient(args, signal), { maxTokenAgeDays: args.max_token_age_days, maxSessionMinutes: args.max_session_minutes });
         return { text: formatAssessmentText(result), details: { ...result } };
       });
     },
@@ -3829,9 +3831,9 @@ export function registerSplunkTools(pi: any): void {
       max_admins: Type.Optional(Type.Number({ description: "Maximum acceptable admin or sc_admin users. Defaults to 3.", default: 3 })),
     }),
     prepareArguments: normalizeAccessControlArgs,
-    async execute(_toolCallId: string, args: AccessControlArgs) {
+    async execute(_toolCallId: string, args: AccessControlArgs, signal?: AbortSignal) {
       return runTool("splunk_assess_access_control", "Splunk access control assessment failed", async () => {
-        const result = await assessSplunkAccessControl(createClient(args), { maxAdmins: args.max_admins });
+        const result = await assessSplunkAccessControl(createClient(args, signal), { maxAdmins: args.max_admins });
         return { text: formatAssessmentText(result), details: { ...result } };
       });
     },
@@ -3843,9 +3845,9 @@ export function registerSplunkTools(pi: any): void {
     description: "Assess Splunk controls 13-16: splunkd and Splunk Web TLS settings, encryption at rest (manual evidence), forwarder TLS in outputs.conf, and HEC token hygiene via REST or Splunk Cloud ACS.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCommonArgs,
-    async execute(_toolCallId: string, args: CommonArgs) {
+    async execute(_toolCallId: string, args: CommonArgs, signal?: AbortSignal) {
       return runTool("splunk_assess_data_protection", "Splunk data protection assessment failed", async () => {
-        const result = await assessSplunkDataProtection(createClient(args));
+        const result = await assessSplunkDataProtection(createClient(args, signal));
         return { text: formatAssessmentText(result), details: { ...result } };
       });
     },
@@ -3861,9 +3863,9 @@ export function registerSplunkTools(pi: any): void {
       min_audit_retention_days: Type.Optional(Type.Number({ description: "Minimum acceptable _audit retention in days. Defaults to 365.", default: 365 })),
     }),
     prepareArguments: normalizeAuditArgs,
-    async execute(_toolCallId: string, args: AuditArgs) {
+    async execute(_toolCallId: string, args: AuditArgs, signal?: AbortSignal) {
       return runTool("splunk_assess_audit_monitoring", "Splunk audit monitoring assessment failed", async () => {
-        const result = await assessSplunkAuditMonitoring(createClient(args), { runSearches: args.run_searches, minAuditRetentionDays: args.min_audit_retention_days });
+        const result = await assessSplunkAuditMonitoring(createClient(args, signal), { runSearches: args.run_searches, minAuditRetentionDays: args.min_audit_retention_days });
         return { text: formatAssessmentText(result), details: { ...result } };
       });
     },
@@ -3875,9 +3877,9 @@ export function registerSplunkTools(pi: any): void {
     description: "Assess Splunk controls 19-23: Splunk Cloud ACS IP allow lists, app provenance and installation rights, KV Store collection ACLs, scheduled search privileges, and splunktcp (S2S) listener TLS.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCommonArgs,
-    async execute(_toolCallId: string, args: CommonArgs) {
+    async execute(_toolCallId: string, args: CommonArgs, signal?: AbortSignal) {
       return runTool("splunk_assess_platform_hardening", "Splunk platform hardening assessment failed", async () => {
-        const result = await assessSplunkPlatformHardening(createClient(args));
+        const result = await assessSplunkPlatformHardening(createClient(args, signal));
         return { text: formatAssessmentText(result), details: { ...result } };
       });
     },
@@ -3897,16 +3899,17 @@ export function registerSplunkTools(pi: any): void {
       min_audit_retention_days: Type.Optional(Type.Number({ description: "Minimum acceptable _audit retention in days. Defaults to 365.", default: 365 })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportArgs) {
+    async execute(_toolCallId: string, args: ExportArgs, signal?: AbortSignal) {
       return runTool("splunk_export_audit_bundle", "Splunk audit bundle export failed", async () => {
         const config = resolveSplunkConfiguration(args as JsonRecord);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportSplunkAuditBundle(new SplunkApiClient(config), config, outputRoot, {
+        const result = await exportSplunkAuditBundle(new SplunkApiClient(config, { signal }), config, outputRoot, {
           maxTokenAgeDays: args.max_token_age_days,
           maxSessionMinutes: args.max_session_minutes,
           maxAdmins: args.max_admins,
           runSearches: args.run_searches,
           minAuditRetentionDays: args.min_audit_retention_days,
+          signal,
         });
         return {
           text: ["Splunk audit bundle exported.", `Output dir: ${result.outputDir}`, `Zip archive: ${result.zipPath}`, `Findings: ${result.findingCount}`, `Files: ${result.fileCount}`, `Collection errors: ${result.errorCount}`].join("\n"),

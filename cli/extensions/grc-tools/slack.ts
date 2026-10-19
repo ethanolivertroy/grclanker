@@ -20,6 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SLACK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -207,6 +208,7 @@ interface SlackApiClientOptions {
   fetchImpl?: FetchImpl;
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
+  signal?: AbortSignal;
 }
 
 export interface SlackAccessSurface {
@@ -917,9 +919,9 @@ export class SlackApiClient {
     private readonly config: SlackConfiguration,
     options: SlackApiClientOptions = {},
   ) {
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
-    this.sleep = options.sleep ?? ((ms: number) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.sleep = abortableSleep(options.signal, options.sleep);
   }
 
   private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
@@ -2858,7 +2860,7 @@ export async function exportSlackAuditBundle(
   client: SlackApiClient,
   config: SlackConfiguration,
   outputRoot: string,
-  options: ExportAuditBundleArgs = {},
+  options: ExportAuditBundleArgs & { signal?: AbortSignal } = {},
 ): Promise<SlackAuditBundleResult> {
   const access = await checkSlackAccess(client);
   const areas: Array<{ slug: string; result: SlackAssessmentResult }> = [
@@ -2881,11 +2883,13 @@ export async function exportSlackAuditBundle(
   const errors = areas.flatMap((area) => area.result.errors.map((item) => `[${area.slug}] ${item}`));
   const generatedAt = client.getNow().toISOString();
   const targetName = safeDirName(`${config.orgId ?? "slack"}-audit`);
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(targetName, 9),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     const secrets = client.knownSecrets();
@@ -2999,8 +3003,8 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   };
 }
 
-function createClient(args: CheckAccessArgs): SlackApiClient {
-  return new SlackApiClient(resolveSlackConfiguration(args as JsonRecord));
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): SlackApiClient {
+  return new SlackApiClient(resolveSlackConfiguration(args as JsonRecord), { signal });
 }
 
 function describeError(error: unknown): string {
@@ -3023,20 +3027,20 @@ type ToolName =
   | "slack_assess_channel_governance"
   | "slack_assess_monitoring";
 
-async function runAssessment(tool: ToolName, args: unknown): Promise<ReturnType<typeof textResult>> {
+async function runAssessment(tool: ToolName, args: unknown, signal?: AbortSignal): Promise<ReturnType<typeof textResult>> {
   switch (tool) {
     case "slack_check_access": {
-      const result = await checkSlackAccess(createClient(args as CheckAccessArgs));
+      const result = await checkSlackAccess(createClient(args as CheckAccessArgs, signal));
       return textResult(formatAccessCheckText(result), { tool, ...result });
     }
     case "slack_assess_identity": {
       const typed = args as IdentityArgs;
-      const result = await assessSlackIdentity(createClient(typed), { userLimit: typed.user_limit, skipScim: typed.skip_scim });
+      const result = await assessSlackIdentity(createClient(typed, signal), { userLimit: typed.user_limit, skipScim: typed.skip_scim });
       return textResult(formatAssessmentText(result), { tool, ...result });
     }
     case "slack_assess_admin_access": {
       const typed = args as AdminAccessArgs;
-      const result = await assessSlackAdminAccess(createClient(typed), {
+      const result = await assessSlackAdminAccess(createClient(typed, signal), {
         workspaceLimit: typed.workspace_limit,
         userLimit: typed.user_limit,
         maxWorkspaceAdmins: typed.max_workspace_admins,
@@ -3047,17 +3051,17 @@ async function runAssessment(tool: ToolName, args: unknown): Promise<ReturnType<
     }
     case "slack_assess_integrations": {
       const typed = args as IntegrationsArgs;
-      const result = await assessSlackIntegrations(createClient(typed), { appLimit: typed.app_limit, workspaceLimit: typed.workspace_limit });
+      const result = await assessSlackIntegrations(createClient(typed, signal), { appLimit: typed.app_limit, workspaceLimit: typed.workspace_limit });
       return textResult(formatAssessmentText(result), { tool, ...result });
     }
     case "slack_assess_channel_governance": {
       const typed = args as ChannelGovernanceArgs;
-      const result = await assessSlackChannelGovernance(createClient(typed), { channelLimit: typed.channel_limit, minRetentionDays: typed.min_retention_days });
+      const result = await assessSlackChannelGovernance(createClient(typed, signal), { channelLimit: typed.channel_limit, minRetentionDays: typed.min_retention_days });
       return textResult(formatAssessmentText(result), { tool, ...result });
     }
     case "slack_assess_monitoring": {
       const typed = args as MonitoringArgs;
-      const result = await assessSlackMonitoring(createClient(typed), { days: typed.days, auditLimit: typed.audit_limit });
+      const result = await assessSlackMonitoring(createClient(typed, signal), { days: typed.days, auditLimit: typed.audit_limit });
       return textResult(formatAssessmentText(result), { tool, ...result });
     }
     default: {
@@ -3081,9 +3085,9 @@ function registerAssessment(
     description,
     parameters,
     prepareArguments,
-    async execute(_toolCallId: string, args: unknown) {
+    async execute(_toolCallId: string, args: unknown, signal?: AbortSignal) {
       try {
-        return await runAssessment(tool, args);
+        return await runAssessment(tool, args, signal);
       } catch (error) {
         return errorResult(`${label} failed: ${describeError(error)}`, { tool });
       }
@@ -3190,11 +3194,11 @@ export function registerSlackTools(pi: any): void {
       skip_scim: Type.Optional(Type.Boolean({ description: "Skip SCIM provisioning checks. Defaults to false.", default: false })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveSlackConfiguration(args as JsonRecord);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportSlackAuditBundle(new SlackApiClient(config), config, outputRoot, args);
+        const result = await exportSlackAuditBundle(new SlackApiClient(config, { signal }), config, outputRoot, { ...args, signal });
         return textResult(
           [
             "Slack audit bundle exported.",

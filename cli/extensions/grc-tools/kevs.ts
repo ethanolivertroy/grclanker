@@ -238,7 +238,7 @@ function formatKev(vulnerability: KevVulnerability, epss?: EpssEntry): string {
   return lines.join("\n");
 }
 
-async function fetchEpss(cveIds: string[]): Promise<Map<string, EpssEntry>> {
+async function fetchEpss(cveIds: string[], signal?: AbortSignal): Promise<Map<string, EpssEntry>> {
   const scores = new Map<string, EpssEntry>();
   if (cveIds.length === 0) {
     return scores;
@@ -249,11 +249,12 @@ async function fetchEpss(cveIds: string[]): Promise<Map<string, EpssEntry>> {
     const url = `${EPSS_URL}?cve=${batch.join(",")}`;
 
     try {
-      const data = await throttledFetch<EpssResponse>(url, 100);
+      const data = await throttledFetch<EpssResponse>(url, 100, signal);
       for (const entry of data.data) {
         scores.set(entry.cve, entry);
       }
-    } catch {
+    } catch (error) {
+      if (signal?.aborted) throw error;
       // EPSS enrichment is best-effort. Keep the base KEV response working.
     }
   }
@@ -294,7 +295,7 @@ export function registerKevsTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeSearchArgs,
-    async execute(_toolCallId: string, args: SearchArgs) {
+    async execute(_toolCallId: string, args: SearchArgs, signal?: AbortSignal) {
       if (!args.query.trim()) {
         return errorResult(
           'kevs_search requires a non-empty query. Example: {"query":"CVE-2024-3400"}.',
@@ -303,7 +304,7 @@ export function registerKevsTools(pi: any): void {
       }
 
       try {
-        const catalog = await cachedFetch<KevCatalog>(KEV_URL, KEV_TTL);
+        const catalog = await cachedFetch<KevCatalog>(KEV_URL, KEV_TTL, signal);
         const normalizedQuery = args.query.toLowerCase();
         const requestedLimit = Math.trunc(args.limit ?? DEFAULT_SEARCH_LIMIT);
         const limit = requestedLimit < 1 ? DEFAULT_SEARCH_LIMIT : Math.min(requestedLimit, MAX_SEARCH_LIMIT);
@@ -327,7 +328,7 @@ export function registerKevsTools(pi: any): void {
         }
 
         const matchedCveIds = matches.map((vulnerability) => vulnerability.cveID);
-        const epssScores = await fetchEpss(matchedCveIds);
+        const epssScores = await fetchEpss(matchedCveIds, signal);
         const scoreDates = epssScoreDates(epssScores, matchedCveIds);
         const heading = capped
           ? `Showing ${matches.length} of ${allMatches.length} KEV entries matching "${args.query}" ` +
@@ -368,7 +369,7 @@ export function registerKevsTools(pi: any): void {
       }),
     }),
     prepareArguments: normalizeEpssArgs,
-    async execute(_toolCallId: string, args: EpssArgs) {
+    async execute(_toolCallId: string, args: EpssArgs, signal?: AbortSignal) {
       if (args.cve_ids.length === 0) {
         return errorResult(
           'kevs_get_epss requires at least one CVE ID. Example: {"cve_ids":["CVE-2024-3400"]}.',
@@ -377,7 +378,7 @@ export function registerKevsTools(pi: any): void {
       }
 
       try {
-        const epssScores = await fetchEpss(args.cve_ids);
+        const epssScores = await fetchEpss(args.cve_ids, signal);
 
         if (epssScores.size === 0) {
           return textResult(
@@ -440,9 +441,9 @@ export function registerKevsTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeRecentArgs,
-    async execute(_toolCallId: string, args: RecentArgs) {
+    async execute(_toolCallId: string, args: RecentArgs, signal?: AbortSignal) {
       try {
-        const catalog = await cachedFetch<KevCatalog>(KEV_URL, KEV_TTL);
+        const catalog = await cachedFetch<KevCatalog>(KEV_URL, KEV_TTL, signal);
         const days = lookbackDays(args.days);
         const limit = positiveLimit(args.limit, DEFAULT_RECENT_LIMIT);
         const cutoff = new Date();
@@ -461,7 +462,7 @@ export function registerKevsTools(pi: any): void {
           });
         }
 
-        const epssScores = await fetchEpss(recent.map((vulnerability) => vulnerability.cveID));
+        const epssScores = await fetchEpss(recent.map((vulnerability) => vulnerability.cveID), signal);
         return textResult(
           `${recent.length} KEV entr${recent.length === 1 ? "y" : "ies"} added in the last ${days} days:\n\n` +
             recent
@@ -496,9 +497,9 @@ export function registerKevsTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeRansomwareArgs,
-    async execute(_toolCallId: string, args: RansomwareArgs) {
+    async execute(_toolCallId: string, args: RansomwareArgs, signal?: AbortSignal) {
       try {
-        const catalog = await cachedFetch<KevCatalog>(KEV_URL, KEV_TTL);
+        const catalog = await cachedFetch<KevCatalog>(KEV_URL, KEV_TTL, signal);
 
         let ransomwareEntries = catalog.vulnerabilities.filter(
           (vulnerability) => vulnerability.knownRansomwareCampaignUse === "Known",

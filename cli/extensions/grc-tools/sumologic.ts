@@ -19,6 +19,7 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -1600,11 +1601,12 @@ export class SumologicApiClient implements SumologicReader {
       sleepImpl?: (ms: number) => Promise<void>;
       maxRetries?: number;
       maxPages?: number;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleepImpl = options.sleepImpl ?? ((ms) => new Promise((done) => setTimeout(done, ms)));
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     this.maxPages = clampNumber(options.maxPages, DEFAULT_MAX_PAGES, 1, 1000);
     registerConfiguredSecrets([config.accessKey, this.basicCredential()]);
@@ -3277,7 +3279,7 @@ export async function exportSumologicAuditBundle(
   client: SumologicReader,
   config: SumologicResolvedConfig,
   outputRoot: string,
-  options: SumologicAssessmentOptions = {},
+  options: SumologicAssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<SumologicAuditBundleResult> {
   const access = await checkSumologicAccess(client);
   const assessments = [
@@ -3289,11 +3291,13 @@ export async function exportSumologicAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors.map((error) => `${assessment.area}: ${error}`)))];
 
+  options.signal?.throwIfAborted();
   ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: realpathSync(outputRoot),
     names: numberedNames(`${safeDirName(config.deployment ?? new URL(config.baseUrl).hostname)}-sumologic-audit-bundle`, 50),
     zip: true,
+    signal: options.signal,
     checkName: (name) => {
       resolveSecureOutputPath(outputRoot, name);
       resolveSecureOutputPath(outputRoot, `${name}.zip`);
@@ -3419,8 +3423,8 @@ function toOptions(args: ExportAuditBundleArgs): SumologicAssessmentOptions {
   };
 }
 
-function createClient(args: AuthArgs): SumologicApiClient {
-  return new SumologicApiClient(resolveSumologicConfiguration(args as JsonRecord));
+function createClient(args: AuthArgs, signal?: AbortSignal): SumologicApiClient {
+  return new SumologicApiClient(resolveSumologicConfiguration(args as JsonRecord), { signal });
 }
 
 function errorMessage(error: unknown): string {
@@ -3469,9 +3473,9 @@ export function registerSumologicTools(pi: any): void {
       "Validate read-only Sumo Logic Management API access across users, roles, access keys, SAML, password policy, service allowlist, policies, partitions, scheduled views, ingest budgets, connections, collectors, monitors, and content surfaces, reporting missing role capabilities.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
       try {
-        const result = await checkSumologicAccess(createClient(args));
+        const result = await checkSumologicAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "sumologic_check_access", ...result });
       } catch (error) {
         return errorResult(`Sumo Logic access check failed: ${errorMessage(error)}`, { tool: "sumologic_check_access" });
@@ -3486,9 +3490,9 @@ export function registerSumologicTools(pi: any): void {
       "Assess Sumo Logic SAML SSO configuration, SAML bypass allowlist size, password policy strength, password expiration, and MFA enforcement (spec controls 1 to 5).",
     parameters: Type.Object({ ...authParams, ...identityParams }),
     prepareArguments: normalizeIdentityArgs,
-    async execute(_toolCallId: string, args: IdentityArgs) {
+    async execute(_toolCallId: string, args: IdentityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessSumologicIdentity(createClient(args), toOptions(args));
+        const result = await assessSumologicIdentity(createClient(args, signal), toOptions(args));
         return textResult(formatAssessmentText(result), { tool: "sumologic_assess_identity", ...result });
       } catch (error) {
         return errorResult(`Sumo Logic identity assessment failed: ${errorMessage(error)}`, { tool: "sumologic_assess_identity" });
@@ -3503,9 +3507,9 @@ export function registerSumologicTools(pi: any): void {
       "Assess Sumo Logic role least privilege, access key rotation, inactive access keys, service allowlist enforcement, and session timeout policy (spec controls 6, 7, 8, 13, 14).",
     parameters: Type.Object({ ...authParams, ...accessControlParams }),
     prepareArguments: normalizeAccessControlArgs,
-    async execute(_toolCallId: string, args: AccessControlArgs) {
+    async execute(_toolCallId: string, args: AccessControlArgs, signal?: AbortSignal) {
       try {
-        const result = await assessSumologicAccessControl(createClient(args), toOptions(args));
+        const result = await assessSumologicAccessControl(createClient(args, signal), toOptions(args));
         return textResult(formatAssessmentText(result), { tool: "sumologic_assess_access_control", ...result });
       } catch (error) {
         return errorResult(`Sumo Logic access control assessment failed: ${errorMessage(error)}`, { tool: "sumologic_assess_access_control" });
@@ -3520,9 +3524,9 @@ export function registerSumologicTools(pi: any): void {
       "Assess Sumo Logic audit index enablement, data forwarding destinations, collector hygiene, ingest budgets, and partition retention (spec controls 9, 10, 12, 16, 17).",
     parameters: Type.Object({ ...authParams, ...dataGovernanceParams }),
     prepareArguments: normalizeDataGovernanceArgs,
-    async execute(_toolCallId: string, args: DataGovernanceArgs) {
+    async execute(_toolCallId: string, args: DataGovernanceArgs, signal?: AbortSignal) {
       try {
-        const result = await assessSumologicDataGovernance(createClient(args), toOptions(args));
+        const result = await assessSumologicDataGovernance(createClient(args, signal), toOptions(args));
         return textResult(formatAssessmentText(result), { tool: "sumologic_assess_data_governance", ...result });
       } catch (error) {
         return errorResult(`Sumo Logic data governance assessment failed: ${errorMessage(error)}`, { tool: "sumologic_assess_data_governance" });
@@ -3537,9 +3541,9 @@ export function registerSumologicTools(pi: any): void {
       "Assess Sumo Logic content sharing permissions, scheduled search role bindings, lookup table access, dashboard sharing restrictions, and monitor alert routing (spec controls 11, 15, 18, 19, 20).",
     parameters: Type.Object({ ...authParams, ...contentSharingParams }),
     prepareArguments: normalizeContentSharingArgs,
-    async execute(_toolCallId: string, args: ContentSharingArgs) {
+    async execute(_toolCallId: string, args: ContentSharingArgs, signal?: AbortSignal) {
       try {
-        const result = await assessSumologicContentSharing(createClient(args), toOptions(args));
+        const result = await assessSumologicContentSharing(createClient(args, signal), toOptions(args));
         return textResult(formatAssessmentText(result), { tool: "sumologic_assess_content_sharing", ...result });
       } catch (error) {
         return errorResult(`Sumo Logic content sharing assessment failed: ${errorMessage(error)}`, { tool: "sumologic_assess_content_sharing" });
@@ -3561,11 +3565,14 @@ export function registerSumologicTools(pi: any): void {
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}. Each run allocates a new directory and matching zip.` })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveSumologicConfiguration(args as JsonRecord);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportSumologicAuditBundle(new SumologicApiClient(config), config, outputRoot, toOptions(args));
+        const result = await exportSumologicAuditBundle(new SumologicApiClient(config, { signal }), config, outputRoot, {
+          ...toOptions(args),
+          signal,
+        });
         return textResult(
           [
             "Sumo Logic audit bundle exported.",

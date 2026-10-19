@@ -329,49 +329,61 @@ export function resolveScfFrameworkMatch(
   );
 }
 
-async function fetchControlsIndex(): Promise<ControlsIndexResponse> {
-  return cachedFetch<ControlsIndexResponse>(`${BASE}/controls.json`, TTL);
+async function fetchControlsIndex(signal?: AbortSignal): Promise<ControlsIndexResponse> {
+  return cachedFetch<ControlsIndexResponse>(`${BASE}/controls.json`, TTL, signal);
 }
 
-async function fetchControl(controlId: string): Promise<ScfControl> {
-  return cachedFetch<ScfControl>(`${BASE}/controls/${encodeURIComponent(normalizeControlId(controlId))}.json`, TTL);
+async function fetchControl(controlId: string, signal?: AbortSignal): Promise<ScfControl> {
+  return cachedFetch<ScfControl>(
+    `${BASE}/controls/${encodeURIComponent(normalizeControlId(controlId))}.json`,
+    TTL,
+    signal,
+  );
 }
 
-async function fetchAssessmentObjectives(controlId: string): Promise<AssessmentObjectivesResponse> {
+async function fetchAssessmentObjectives(
+  controlId: string,
+  signal?: AbortSignal,
+): Promise<AssessmentObjectivesResponse> {
   return cachedFetch<AssessmentObjectivesResponse>(
     `${BASE}/assessment-objectives/${encodeURIComponent(normalizeControlId(controlId))}.json`,
     TTL,
+    signal,
   );
 }
 
-async function fetchEvidenceRequest(erlId: string): Promise<ScfEvidenceRequest> {
+async function fetchEvidenceRequest(erlId: string, signal?: AbortSignal): Promise<ScfEvidenceRequest> {
   return cachedFetch<ScfEvidenceRequest>(
     `${BASE}/evidence-requests/${encodeURIComponent(normalizeEvidenceId(erlId))}.json`,
     TTL,
+    signal,
   );
 }
 
-async function fetchCrosswalkIndex(): Promise<CrosswalkIndexResponse> {
-  return cachedFetch<CrosswalkIndexResponse>(`${BASE}/crosswalks.json`, TTL);
+async function fetchCrosswalkIndex(signal?: AbortSignal): Promise<CrosswalkIndexResponse> {
+  return cachedFetch<CrosswalkIndexResponse>(`${BASE}/crosswalks.json`, TTL, signal);
 }
 
-async function fetchCrosswalk(frameworkId: string): Promise<ScfCrosswalkFile> {
+async function fetchCrosswalk(frameworkId: string, signal?: AbortSignal): Promise<ScfCrosswalkFile> {
   return cachedFetch<ScfCrosswalkFile>(
     `${BASE}/crosswalks/${encodeURIComponent(frameworkId)}.json`,
     TTL,
+    signal,
   );
 }
 
 export async function loadScfControlBundle(
   controlId: string,
   frameworkQuery?: string,
+  signal?: AbortSignal,
 ): Promise<ScfControlBundle> {
-  const control = await fetchControl(controlId);
+  const control = await fetchControl(controlId, signal);
   const [objectivesPayload, evidenceResults, frameworkIndex] = await Promise.all([
-    fetchAssessmentObjectives(control.control_id),
-    Promise.allSettled((control.evidence_requests ?? []).map((erlId) => fetchEvidenceRequest(erlId))),
-    frameworkQuery ? fetchCrosswalkIndex() : Promise.resolve(undefined),
+    fetchAssessmentObjectives(control.control_id, signal),
+    Promise.allSettled((control.evidence_requests ?? []).map((erlId) => fetchEvidenceRequest(erlId, signal))),
+    frameworkQuery ? fetchCrosswalkIndex(signal) : Promise.resolve(undefined),
   ]);
+  signal?.throwIfAborted();
 
   const evidence_requests: ScfEvidenceRequest[] = [];
   const evidence_request_errors: string[] = [];
@@ -404,10 +416,11 @@ export async function loadScfControlBundle(
 
 export async function loadScfFrameworkCrosswalk(
   frameworkQuery: string,
+  signal?: AbortSignal,
 ): Promise<{ framework: ScfFrameworkIndexEntry; crosswalk: ScfCrosswalkFile }> {
-  const index = await fetchCrosswalkIndex();
+  const index = await fetchCrosswalkIndex(signal);
   const framework = resolveScfFrameworkMatch(index.frameworks, frameworkQuery);
-  const crosswalk = await fetchCrosswalk(framework.framework_id);
+  const crosswalk = await fetchCrosswalk(framework.framework_id, signal);
   return { framework, crosswalk };
 }
 
@@ -569,13 +582,13 @@ export function registerScfTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeSearchArgs,
-    async execute(_toolCallId: string, args: SearchArgs) {
+    async execute(_toolCallId: string, args: SearchArgs, signal?: AbortSignal) {
       if (!args.query.trim()) {
         return missingQueryResult("scf_search_controls", '{"query":"GOV-01"}');
       }
 
       try {
-        const data = await fetchControlsIndex();
+        const data = await fetchControlsIndex(signal);
         const matches = findMatchingScfControls(data.controls, args.query).slice(
           0,
           clampLimit(args.limit),
@@ -638,13 +651,13 @@ export function registerScfTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeControlArgs,
-    async execute(_toolCallId: string, args: ControlArgs) {
+    async execute(_toolCallId: string, args: ControlArgs, signal?: AbortSignal) {
       if (!args.control_id.trim()) {
         return missingQueryResult("scf_get_control", '{"control_id":"GOV-01"}');
       }
 
       try {
-        const bundle = await loadScfControlBundle(args.control_id, args.framework);
+        const bundle = await loadScfControlBundle(args.control_id, args.framework, signal);
         return textResult(buildControlBundleText(bundle), {
           tool: "scf_get_control",
           control_id: bundle.control.control_id,
@@ -698,13 +711,13 @@ export function registerScfTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeCrosswalkArgs,
-    async execute(_toolCallId: string, args: CrosswalkArgs) {
+    async execute(_toolCallId: string, args: CrosswalkArgs, signal?: AbortSignal) {
       if (!args.framework.trim()) {
         return missingQueryResult("scf_get_crosswalk", '{"framework":"NIST SP 800-53 R5"}');
       }
 
       try {
-        const { framework, crosswalk } = await loadScfFrameworkCrosswalk(args.framework);
+        const { framework, crosswalk } = await loadScfFrameworkCrosswalk(args.framework, signal);
         return textResult(buildCrosswalkText(framework, crosswalk, args), {
           tool: "scf_get_crosswalk",
           framework_id: framework.framework_id,
@@ -739,13 +752,13 @@ export function registerScfTools(pi: any): void {
       }),
     }),
     prepareArguments: normalizeEvidenceArgs,
-    async execute(_toolCallId: string, args: EvidenceArgs) {
+    async execute(_toolCallId: string, args: EvidenceArgs, signal?: AbortSignal) {
       if (!args.erl_id.trim()) {
         return missingQueryResult("scf_get_evidence_request", '{"erl_id":"E-GOV-01"}');
       }
 
       try {
-        const request = await fetchEvidenceRequest(args.erl_id);
+        const request = await fetchEvidenceRequest(args.erl_id, signal);
         return textResult(formatEvidenceRequest(request), {
           tool: "scf_get_evidence_request",
           erl_id: request.erl_id,
