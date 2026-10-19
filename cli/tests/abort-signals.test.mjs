@@ -15,6 +15,7 @@ import { abortableFetch, abortableSleep, ToolCallAbortedError, unlessAborted } f
 import { createTlsOptOutFetch } from "../dist/extensions/grc-tools/ansible.js";
 import { defaultCertificateProbe } from "../dist/extensions/grc-tools/mulesoft.js";
 import { createInsecureFetch } from "../dist/extensions/grc-tools/paloalto.js";
+import { cachedFetch, clearGrcSharedCachesForTests } from "../dist/extensions/grc-tools/shared.js";
 import { createInsecureTlsFetch } from "../dist/extensions/grc-tools/splunk.js";
 import { resolveToolGroup } from "../dist/pi/tool-catalog.js";
 
@@ -433,6 +434,24 @@ test("abortableFetch never sends a request once the call has aborted", async () 
   }, AbortSignal.abort());
   await assert.rejects(fetchWithAbort("https://api.example.test/late"), { name: "ToolCallAbortedError" });
   assert.equal(sent, 0);
+});
+
+test("cachedFetch refuses an aborted call even when its cache holds the answer", async (t) => {
+  const savedFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = savedFetch;
+    clearGrcSharedCachesForTests();
+  });
+  let sent = 0;
+  globalThis.fetch = async () => {
+    sent += 1;
+    return Response.json({ catalog: "kev" });
+  };
+  const url = `${FAKE_URL}/catalog.json`;
+  assert.deepEqual(await cachedFetch(url), { catalog: "kev" });
+  await assert.rejects(cachedFetch(url, undefined, AbortSignal.abort()), { name: "ToolCallAbortedError" });
+  assert.deepEqual(await cachedFetch(url, undefined, new AbortController().signal), { catalog: "kev" });
+  assert.equal(sent, 1, "the cache answered every call after the first");
 });
 
 test("requests and waits in flight at once add no listeners to the call's signal, so no listener leak is reported", async () => {

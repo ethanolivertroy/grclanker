@@ -1,6 +1,6 @@
 /** Shared utilities for GRC extension tools */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, ToolCallAbortedError } from "./abort.js";
 
 interface CacheEntry<T> {
   data: T;
@@ -41,6 +41,7 @@ export async function cachedFetch<T>(
   ttlMs: number = 60 * 60 * 1000, // 1 hour default
   signal?: AbortSignal,
 ): Promise<T> {
+  if (signal?.aborted) throw new ToolCallAbortedError(signal);
   const entry = cache.get(url) as CacheEntry<T> | undefined;
   if (entry && Date.now() < entry.expires) {
     return entry.data;
