@@ -19,7 +19,7 @@ import {
 } from "./batch2-spec-helpers.js";
 import { CLOUDFLARE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 
-const DOCS = "https://developers.cloudflare.com/api/resources/";
+const DOCS = "https://developers.cloudflare.com/";
 export const CLOUDFLARE_DEFAULT_MAX_SUPER_ADMINS = 2;
 export const CLOUDFLARE_HSTS_MIN_MAX_AGE_SECONDS = 15_552_000;
 export const CLOUDFLARE_STALE_IP_RULE_DAYS = 365;
@@ -27,24 +27,24 @@ export const CLOUDFLARE_CERTIFICATE_EXPIRY_WARNING_DAYS = 30;
 export const CLOUDFLARE_AUDIT_LOG_LOOKBACK_DAYS = 30;
 export const CLOUDFLARE_REQUIRED_SECURITY_HEADERS = ["content-security-policy", "x-frame-options", "x-content-type-options", "referrer-policy"] as const;
 export const CLOUDFLARE_WEAK_IDENTITY_PROVIDER_TYPES = ["onetimepin"] as const;
-const cfSurface = (id: string, path: string, fields: readonly string[]) =>
-  restSurface(id, path, "Cloudflare API v4", DOCS, fields);
+const cfSurface = (id: string, path: string, docsPath: string, fields: readonly string[]) =>
+  restSurface(id, path, "Cloudflare API v4", `${DOCS}${docsPath}`, fields);
 const surfaces = [
-  cfSurface("credential-method", "resolved API credential configuration", ["authMethod"]),
-  cfSurface("token-verification", "/user/tokens/verify", ["id", "status", "expires_on"]),
-  cfSurface("current-token-detail", "/user/tokens/{token_id}", ["policies", "permission_groups", "resources"]),
-  cfSurface("account-members", "/accounts/{account_id}/members", ["id", "roles", "user.two_factor_authentication_enabled"]),
-  cfSurface("user-token-inventory", "/user/tokens", ["id", "status", "expires_on", "last_used_on"]),
-  cfSurface("account-token-inventory", "/accounts/{account_id}/tokens", ["id", "status", "expires_on", "last_used_on"]),
-  cfSurface("access-applications", "/accounts/{account_id}/access/apps", ["id", "name", "type", "policies"]),
-  cfSurface("access-reusable-policies", "/accounts/{account_id}/access/policies", ["id", "name", "decision", "include", "exclude", "require"]),
-  cfSurface("access-identity-providers", "/accounts/{account_id}/access/identity_providers", ["id", "name", "type"]),
-  cfSurface("zone-inventory", "/zones", ["id", "name", "status", "plan"]),
-  cfSurface("zone-security-datasets", "/zones/{zone_id}/{settings|rulesets|dnssec|ssl|origin_tls_client_auth|dns_records|pagerules|rate_limits|bot_management}", ["phase", "kind", "rules", "status", "enabled", "expires_on", "content", "proxied", "value"]),
-  cfSurface("account-audit-logs", "/accounts/{account_id}/audit_logs", ["action", "when"]),
-  cfSurface("account-ip-access-rules", "/accounts/{account_id}/firewall/access_rules/rules", ["mode", "notes", "modified_on"]),
-  cfSurface("gateway-rules", "/accounts/{account_id}/gateway/rules", ["action", "enabled", "filters"]),
-  cfSurface("gateway-account", "/accounts/{account_id}/gateway", ["gateway_tag"]),
+  cfSurface("credential-method", "resolved API credential configuration", "fundamentals/api/get-started/", ["authMethod"]),
+  cfSurface("token-verification", "/user/tokens/verify", "api/resources/user/subresources/tokens/methods/verify/", ["id", "status", "expires_on"]),
+  cfSurface("current-token-detail", "/user/tokens/{token_id}", "api/resources/user/subresources/tokens/methods/get/", ["policies", "permission_groups", "resources"]),
+  cfSurface("account-members", "/accounts/{account_id}/members", "api/resources/accounts/subresources/members/methods/list/", ["id", "roles", "user.two_factor_authentication_enabled"]),
+  cfSurface("user-token-inventory", "/user/tokens", "api/resources/user/subresources/tokens/methods/list/", ["id", "status", "expires_on", "last_used_on"]),
+  cfSurface("account-token-inventory", "/accounts/{account_id}/tokens", "api/resources/accounts/subresources/tokens/methods/list/", ["id", "status", "expires_on", "last_used_on"]),
+  cfSurface("access-applications", "/accounts/{account_id}/access/apps", "api/resources/zero_trust/subresources/access/subresources/applications/methods/list/", ["id", "name", "type", "policies"]),
+  cfSurface("access-reusable-policies", "/accounts/{account_id}/access/policies", "api/resources/zero_trust/subresources/access/subresources/policies/methods/list/", ["id", "name", "decision", "include", "exclude", "require"]),
+  cfSurface("access-identity-providers", "/accounts/{account_id}/access/identity_providers", "api/resources/zero_trust/subresources/identity_providers/methods/list/", ["id", "name", "type"]),
+  cfSurface("zone-inventory", "/zones", "api/resources/zones/methods/list/", ["id", "name", "status", "plan"]),
+  cfSurface("zone-security-datasets", "/zones/{zone_id}/{settings|rulesets|dnssec|ssl|origin_tls_client_auth|dns_records|pagerules|rate_limits|bot_management}", "api/", ["phase", "kind", "rules", "status", "enabled", "expires_on", "content", "proxied", "value"]),
+  cfSurface("account-audit-logs", "/accounts/{account_id}/audit_logs", "api/resources/audit_logs/methods/list/", ["action", "when"]),
+  cfSurface("account-ip-access-rules", "/accounts/{account_id}/firewall/access_rules/rules", "api/resources/firewall/subresources/access_rules/methods/list/", ["mode", "notes", "modified_on"]),
+  cfSurface("gateway-rules", "/accounts/{account_id}/gateway/rules", "api/resources/zero_trust/subresources/gateway/subresources/rules/methods/list/", ["action", "enabled", "filters"]),
+  cfSurface("gateway-account", "/accounts/{account_id}/gateway", "api/resources/zero_trust/subresources/gateway/methods/list/", ["gateway_tag"]),
 ] as const;
 
 type Row = readonly [string, number, string, Batch2CheckRow["severity"], readonly string[]];
