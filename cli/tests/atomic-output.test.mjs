@@ -69,23 +69,25 @@ async function deadPid() {
 }
 
 /**
- * Source for a process that writes a zipped `bundle` under `root` and stops at the commit's rename
- * onto `stopAt`, before that rename happens: it prints `ready` and then hangs, or exits.
+ * Source for a process that writes a zipped `bundle` under `root` and stops at the commit's move (a
+ * rename or a link) onto `stopAt`, before the move happens or, with `afterMove`, right after it: it
+ * prints `ready` and then hangs, or exits.
  */
-function commitThatStops(root, stopAt, how) {
+function commitThatStops(root, stopAt, how, { afterMove = false } = {}) {
   return `
     import { createRequire, syncBuiltinESMExports } from "node:module";
     import { writeFile } from "node:fs/promises";
     import { join } from "node:path";
     const fsPromises = createRequire(${JSON.stringify(MODULE_URL)})("node:fs/promises");
-    const rename = fsPromises.rename;
-    fsPromises.rename = (from, to) => {
-      if (to === ${JSON.stringify(stopAt)}) {
+    for (const name of ["rename", "link"]) {
+      const move = fsPromises[name];
+      fsPromises[name] = async (from, to) => {
+        if (to !== ${JSON.stringify(stopAt)}) return move(from, to);
+        ${afterMove ? "await move(from, to);" : ""}
         process.stdout.write("ready");
         ${how === "exit" ? "process.exit(0);" : "return new Promise(() => setInterval(() => {}, 1000));"}
-      }
-      return rename(from, to);
-    };
+      };
+    }
     syncBuiltinESMExports();
     const { writeBundleAtomically } = await import(${JSON.stringify(MODULE_URL)});
     await writeBundleAtomically({ root: ${JSON.stringify(root)}, names: ["bundle"], zip: true }, async (staged) => {
@@ -109,6 +111,31 @@ async function afterRename(target, effect, run) {
     fsPromises.rename = original;
     syncBuiltinESMExports();
   }
+}
+
+/**
+ * Runs `effect` right before this process moves something onto `target` with one of `methods`, while
+ * `run` executes. An `effect` that throws refuses the move with that error.
+ */
+async function beforeMove(target, effect, run, { methods = ["rename", "link"] } = {}) {
+  const originals = Object.fromEntries(methods.map((name) => [name, fsPromises[name]]));
+  for (const [name, original] of Object.entries(originals)) {
+    fsPromises[name] = async (from, to) => {
+      if (to === target) effect();
+      return original(from, to);
+    };
+  }
+  syncBuiltinESMExports();
+  try {
+    return await run();
+  } finally {
+    Object.assign(fsPromises, originals);
+    syncBuiltinESMExports();
+  }
+}
+
+function errorWithCode(code) {
+  return Object.assign(new Error(`simulated ${code}`), { code });
 }
 
 test("numberedNames yields the base name and then -2 through -count", () => {
@@ -264,6 +291,41 @@ test("when the archive's name is taken after the directory moves, the directory 
   assert.deepEqual(readdirSync(root).sort(), ["bundle-2", "bundle-2.zip", "bundle.zip"], "no directory is left without its archive");
 });
 
+test("an archive another writer creates just before this one moves into place is never replaced", async () => {
+  const root = createTempBase("grclanker-atomic-zip-clobber-");
+  let runs = 0;
+
+  const result = await beforeMove(
+    join(root, "bundle.zip"),
+    () => writeFileSync(join(root, "bundle.zip"), "claimed"),
+    () => writeBundleAtomically({ root, names: numberedNames("bundle", 3), zip: true }, async (staged) => {
+      runs += 1;
+      await writeSampleBundle(staged);
+    }),
+  );
+
+  assert.equal(readFileSync(join(root, "bundle.zip"), "utf8"), "claimed", "the other writer's archive keeps its content");
+  assert.equal(runs, 2, "the bundle is written again under the next free name");
+  assert.deepEqual(result, { outputDir: join(root, "bundle-2"), zipPath: join(root, "bundle-2.zip") });
+  assert.equal(readFileSync(result.zipPath, "utf8"), "zip-bytes");
+  assert.deepEqual(readdirSync(root).sort(), ["bundle-2", "bundle-2.zip", "bundle.zip"], "no directory is left without its archive");
+});
+
+test("on a filesystem without hard links, the archive moves into place with a rename", async () => {
+  const root = createTempBase("grclanker-atomic-no-hard-links-");
+
+  const result = await beforeMove(
+    join(root, "bundle.zip"),
+    () => { throw errorWithCode("EPERM"); },
+    () => writeBundleAtomically({ root, names: numberedNames("bundle", 3), zip: true }, (staged) => writeSampleBundle(staged)),
+    { methods: ["link"] },
+  );
+
+  assert.deepEqual(result, { outputDir: join(root, "bundle"), zipPath: join(root, "bundle.zip") });
+  assert.equal(readFileSync(result.zipPath, "utf8"), "zip-bytes");
+  assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle.zip"]);
+});
+
 test("concurrent writes in one process claim different names up front, and a failed write releases its claim", async () => {
   const root = createTempBase("grclanker-atomic-concurrent-");
   const targets = [];
@@ -377,15 +439,22 @@ test("a process killed mid-write leaves nothing at the final path, and the next 
   assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle.zip"]);
 });
 
+const COMMIT_STOPS = [
+  { stopAt: "bundle", afterMove: false },
+  { stopAt: "bundle.zip", afterMove: false },
+  { stopAt: "bundle.zip", afterMove: true },
+];
+
 test("a commit whose process was killed partway is finished by the next write under the same root", async () => {
-  for (const stopAt of ["bundle", "bundle.zip"]) {
+  for (const { stopAt, afterMove } of COMMIT_STOPS) {
     const root = createTempBase("grclanker-atomic-commit-kill-");
-    const { child, ready, exited } = spawnModule(commitThatStops(root, join(root, stopAt), "hang"));
+    const { child, ready, exited } = spawnModule(commitThatStops(root, join(root, stopAt), "hang", { afterMove }));
     await ready;
     child.kill("SIGKILL");
     await exited;
-    assert.equal(existsSync(join(root, "bundle")), stopAt === "bundle.zip", `killed before the rename onto ${stopAt}`);
-    assert.equal(existsSync(join(root, "bundle.zip")), false);
+    const when = `killed ${afterMove ? "after" : "before"} the move onto ${stopAt}`;
+    assert.equal(existsSync(join(root, "bundle")), stopAt === "bundle.zip", when);
+    assert.equal(existsSync(join(root, "bundle.zip")), afterMove, when);
     assert.equal(stagingEntries(root).length, 1);
 
     const next = await writeBundleAtomically({ root, names: numberedNames("bundle", 6), zip: true }, (staged) => writeSampleBundle(staged));
@@ -398,13 +467,14 @@ test("a commit whose process was killed partway is finished by the next write un
 });
 
 test("a process that exits partway through a commit finishes it on the way out", async () => {
-  for (const stopAt of ["bundle", "bundle.zip"]) {
+  for (const { stopAt, afterMove } of COMMIT_STOPS) {
     const root = createTempBase("grclanker-atomic-commit-exit-");
-    const { ready, exited } = spawnModule(commitThatStops(root, join(root, stopAt), "exit"));
+    const { ready, exited } = spawnModule(commitThatStops(root, join(root, stopAt), "exit", { afterMove }));
     ready.catch(() => {});
 
     assert.equal(await exited, 0);
-    assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle.zip"], `exited before the rename onto ${stopAt}`);
+    const when = `exited ${afterMove ? "after" : "before"} the move onto ${stopAt}`;
+    assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle.zip"], when);
     assert.equal(readFileSync(join(root, "bundle", "README.md"), "utf8"), "# bundle\n");
     assert.equal(readFileSync(join(root, "bundle.zip"), "utf8"), "zip-bytes");
   }

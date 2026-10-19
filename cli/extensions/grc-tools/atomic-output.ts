@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
-import { lstatSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
-import { chmod, lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { linkSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { chmod, link, lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -116,19 +116,33 @@ function identityOf(path: string): { dev: string; ino: string } | undefined {
   return entry && { dev: String(entry.dev), ino: String(entry.ino) };
 }
 
+function sameEntry(first: string, second: string): boolean {
+  const a = identityOf(first);
+  const b = identityOf(second);
+  return a !== undefined && b !== undefined && a.dev === b.dev && a.ino === b.ino;
+}
+
 function tryRenameSync(from: string, to: string): void {
   try {
     renameSync(from, to);
   } catch {
-    // finishCommit re-reads the paths after every rename, so a failed one only changes which branch it takes.
+    // finishCommit re-reads the paths after every move, so a failed one only changes which branch it takes.
+  }
+}
+
+function linkUnlessTakenSync(from: string, to: string): void {
+  try {
+    linkSync(from, to);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST" && !pathEntryExists(to)) tryRenameSync(from, to);
   }
 }
 
 /**
  * Finishes a commit its process left partway: from the exit handler, or after a crash from the next
  * write under the same root. The directory and its archive both end up at their final paths, or
- * neither does. A rename the interrupted commit still has in flight is harmless, because whichever
- * of the two renames runs second finds its source gone.
+ * neither does. A move the interrupted commit still has in flight is harmless, because whichever
+ * of the two runs second finds its source gone or its target taken.
  */
 function finishCommit(root: string, stagingRoot: string, record: CommitRecord): void {
   const stagedDir = join(stagingRoot, record.name);
@@ -145,8 +159,9 @@ function finishCommit(root: string, stagingRoot: string, record: CommitRecord): 
     if (!pathEntryExists(outputDir) && !zipTaken) tryRenameSync(stagedDir, outputDir);
     if (!published()) return;
   }
-  if (pathEntryExists(stagedZip) && !pathEntryExists(zipPath)) tryRenameSync(stagedZip, zipPath);
-  if (pathEntryExists(stagedZip)) tryRenameSync(outputDir, stagedDir);
+  if (pathEntryExists(stagedZip) && !pathEntryExists(zipPath)) linkUnlessTakenSync(stagedZip, zipPath);
+  // A linked archive keeps its staged name too, until the staging directory is removed.
+  if (pathEntryExists(stagedZip) && !sameEntry(stagedZip, zipPath)) tryRenameSync(outputDir, stagedDir);
 }
 
 function readCommitRecord(stagingRoot: string): CommitRecord | undefined {
@@ -203,9 +218,25 @@ async function renameUnlessTaken(from: string, to: string): Promise<boolean> {
 }
 
 /**
+ * Publishes a staged archive under `to` unless that name is taken. A hard link fails with EEXIST
+ * where a rename would silently replace an archive another writer just created; on a filesystem
+ * without hard links, a rename after an existence check stands in.
+ */
+async function linkUnlessTaken(from: string, to: string): Promise<boolean> {
+  try {
+    await link(from, to);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST" || pathEntryExists(to)) return false;
+  }
+  await rename(from, to);
+  return true;
+}
+
+/**
  * Moves a finished bundle from staging to its final paths, the directory and then its archive. A
  * record written first lets the exit handler or a later write finish the commit if this process
- * stops between the two renames. Returns undefined, with the bundle back in staging, when another
+ * stops between the two moves. Returns undefined, with the bundle back in staging, when another
  * process took the name first.
  */
 async function commitStaged(
@@ -228,14 +259,11 @@ async function commitStaged(
   try {
     if (await renameUnlessTaken(stagedDir, outputDir)) {
       if (!archived) return { outputDir, zipPath };
-      if (!pathEntryExists(zipPath)) {
-        try {
-          await rename(`${stagedDir}.zip`, zipPath);
-        } catch (error) {
-          await rename(outputDir, stagedDir);
-          throw error;
-        }
-        return { outputDir, zipPath };
+      try {
+        if (await linkUnlessTaken(`${stagedDir}.zip`, zipPath)) return { outputDir, zipPath };
+      } catch (error) {
+        await rename(outputDir, stagedDir);
+        throw error;
       }
       await rename(outputDir, stagedDir);
     }
