@@ -2949,7 +2949,8 @@ kbd {
   h2,
   h3,
   h4,
-  .docs-heading {
+  .docs-heading,
+  summary {
     break-after: avoid;
     break-inside: avoid;
   }
