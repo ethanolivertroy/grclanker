@@ -318,7 +318,7 @@ Neither `JSON.parse`'s message, which quotes a window of the source, nor the fil
 
 The Falcon console documentation requires a login. Endpoint paths, parameters, and response fields were therefore verified against CrowdStrike's public API reference and the public SDKs that mirror the official operation names:
 
-- [API reference collections index](https://developer.crowdstrike.com/api-reference/collections)
+- [API reference collections index](https://developer.crowdstrike.com/api-reference/)
 - [OAuth2](https://developer.crowdstrike.com/api-reference/collections/oauth2)
 - [Prevention Policies](https://developer.crowdstrike.com/api-reference/collections/prevention-policies)
 - [Response Policies](https://developer.crowdstrike.com/api-reference/collections/response-policies)
