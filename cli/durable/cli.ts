@@ -72,9 +72,9 @@ Progress lines go to stderr. The answer, or the JSON report, goes to stdout.
 Exit codes: 0 answered (or nothing to resume), 1 no answer or an error, 130 stopped by Ctrl-C.
 
 In the terminal app, Enter sends a message (it steers the turn when one is running), Alt+Enter
-(Ctrl+Q on Windows) queues a follow-up, Esc aborts the turn, and Ctrl+C, or Ctrl+D on an empty
-editor, exits with code 0. Exiting keeps the session: work in flight continues when the session is
-opened again.
+(Ctrl+Q on Windows and WSL) queues a follow-up, Esc aborts the turn, and Ctrl+C, or Ctrl+D on an
+empty editor, exits with code 0. Exiting keeps the session: work in flight continues when the
+session is opened again.
 /model picks a model, /compact summarizes older context, and /tasks hides or shows the task panel.
 `.trim();
 }
