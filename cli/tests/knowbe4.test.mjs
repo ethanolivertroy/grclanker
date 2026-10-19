@@ -59,7 +59,7 @@ import {
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const observedDecisionFacts = observeRuntimeDecisionFacts(KNOWBE4_SPEC);
 const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
@@ -3516,7 +3516,7 @@ portableContractTest("every threshold edge and ordered rule in the spec is reach
   assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
 });
 
-test("exportKnowbe4AuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportKnowbe4AuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-knowbe4-write-failure-");
   const client = mockClient(healthyFixture(), { phisher: true });
   await assertNoPartialBundleOnWriteFailure(base, () => exportKnowbe4AuditBundle(client, client.getResolvedConfig(), base, { now: NOW }));

@@ -46,7 +46,7 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00.000Z");
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -4873,7 +4873,7 @@ test("the registered assessment tools return the bounded details over HTTP and s
   }
 });
 
-test("exportZendeskAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportZendeskAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-zendesk-write-failure-");
   await assertNoPartialBundleOnWriteFailure(base, () => exportZendeskAuditBundle(healthyClient(), sampleConfig(), base, { now: () => NOW }));
 });

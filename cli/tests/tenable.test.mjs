@@ -51,7 +51,7 @@ import {
   recordFetchRequests,
   sweepCheckCompleteness,
 } from "./helpers/spec-conformance.mjs";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 // Every assessment in this file feeds the boundary and rule certification at the end.
 const observedDecisionFacts = observeRuntimeDecisionFacts(TENABLE_SPEC);
@@ -4289,7 +4289,7 @@ portableContractTest("every threshold edge and ordered rule in the spec is reach
   assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
 });
 
-test("exportTenableAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportTenableAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = mkdtempSync(join(tmpdir(), "grclanker-tenable-write-failure-"));
   await assertNoPartialBundleOnWriteFailure(base, () => exportTenableAuditBundle(clientsFor(healthyRoutes()), base, { now: NOW }));
 });

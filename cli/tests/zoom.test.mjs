@@ -41,7 +41,7 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1879,7 +1879,7 @@ test("byte differential fixtures: Zoom assessments and export artifacts", { skip
   writeByteDifferentialFixture("zoom", "export", snapshotExportBundle(exported));
 });
 
-test("exportZoomAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportZoomAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-zoom-write-failure-");
   await assertNoPartialBundleOnWriteFailure(base, () => exportZoomAuditBundle(compliantClient(), sampleConfig(), base, { now: NOW }));
 });

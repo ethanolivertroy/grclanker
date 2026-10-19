@@ -92,7 +92,7 @@ import {
   assertMustRedactRowsBesideMustKeep,
   withPlantedRoutes,
 } from "./helpers/redaction-table.mjs";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -3045,7 +3045,7 @@ test("byte differential fixtures: Duo assessments and export artifacts", { skip:
   writeByteDifferentialFixture("duo", "export", snapshotExportBundle(exported));
 });
 
-test("exportDuoAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportDuoAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-duo-write-failure-");
   const config = createSampleConfig();
   const client = new DuoAuditorClient(config, { fetchImpl: routedFetch(healthyDuoRoutes()) });

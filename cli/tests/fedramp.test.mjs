@@ -43,7 +43,7 @@ import {
   inferFedrampWorkstreams,
   registerFedrampTools,
 } from "../dist/extensions/grc-tools/fedramp.js";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 function jsonResponse(payload) {
   return new Response(JSON.stringify(payload), {
@@ -1287,7 +1287,7 @@ test("CDS site generator writes a portable static trust-center bundle under the 
   }
 });
 
-test("CDS starter bundle and site generators leave nothing under the output root when a write fails partway", async () => {
+writeFailureTest("CDS starter bundle and site generators leave nothing under the output root when a write fails partway", async () => {
   const loaded = {
     catalog: normalizeFedrampConsolidatedRules(consolidatedRulesFixture),
     provenance: {

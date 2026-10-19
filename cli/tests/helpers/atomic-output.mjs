@@ -1,10 +1,19 @@
 import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
+import test from "node:test";
+
+import { differentialRunActive } from "./byte-differential-fixtures.mjs";
 
 const fsPromises = createRequire(import.meta.url)("node:fs/promises");
 
 export const SIMULATED_CRASH = "simulated crash mid-write";
+
+/**
+ * Registers a write-failure test. Differential runs replay branch tests on a baseline runtime that may
+ * predate staged bundle writes, so they skip these tests on both sides.
+ */
+export const writeFailureTest = differentialRunActive ? test.skip : test;
 
 /**
  * Fails the `failAt`-th node:fs/promises writeFile call while `run` executes, the way a full disk or a

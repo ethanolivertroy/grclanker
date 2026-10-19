@@ -115,7 +115,7 @@ import {
   assertMustRedactRowsBesideMustKeep,
   plantDeepProbeInPolicyDocument,
 } from "./helpers/redaction-table.mjs";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -4313,7 +4313,7 @@ test("rule 9: a 502 HTML page through the real SDK parser path is recorded on ev
   });
 });
 
-test("exportAwsAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportAwsAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-aws-write-failure-");
   await assertNoPartialBundleOnWriteFailure(base, () => exportAwsAuditBundle(compliantBundleClient(), sampleConfig(), base));
 });

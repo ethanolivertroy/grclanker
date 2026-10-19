@@ -44,7 +44,7 @@ import { BARE_TOKEN_CONTROL, CONFIGURED_SECRET_CANARIES, VENDOR_TOKEN_CANARIES, 
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ORG_ID = "org-1";
@@ -4308,7 +4308,7 @@ test("MulesoftApiClient refuses a 200 listing that omits the documented collecti
   assert.equal(roleGroups.truncated, false);
 });
 
-test("exportMulesoftAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportMulesoftAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-mulesoft-write-failure-");
   await assertNoPartialBundleOnWriteFailure(base, () => exportMulesoftAuditBundle(healthyBundleClient(), sampleConfig(), base));
 });

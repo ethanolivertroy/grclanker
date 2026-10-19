@@ -56,7 +56,7 @@ import {
   recordFetchRequests,
   sweepCheckCompleteness,
 } from "./helpers/spec-conformance.mjs";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const observedDecisionFacts = observeRuntimeDecisionFacts(QUALYS_SPEC);
 const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
@@ -4717,7 +4717,7 @@ portableContractTest("every threshold edge and ordered rule in the spec is reach
   assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
 });
 
-test("exportQualysAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportQualysAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-qualys-write-failure-");
   const config = sampleConfig();
   await assertNoPartialBundleOnWriteFailure(base, () => exportQualysAuditBundle(createFakeClient(healthyFixtures, config), config, base));

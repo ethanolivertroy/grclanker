@@ -54,7 +54,7 @@ import {
   captureBatchDecisionFacts,
   evaluateBatchCheckVerdict,
 } from "../dist/extensions/grc-tools/batch-spec-builder.js";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
 const RECENT_LOGIN = "2026-09-20 08:15:00";
@@ -3064,7 +3064,7 @@ test("byte differential fixtures: ServiceNow assessments and export", { skip: !b
   writeByteDifferentialFixture("servicenow", "export", snapshotExportBundle(exported));
 });
 
-test("exportServicenowAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportServicenowAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-servicenow-write-failure-");
   const { fetchImpl } = fixtureFetch(healthyFixture());
   await assertNoPartialBundleOnWriteFailure(base, () => exportServicenowAuditBundle(createClient(fetchImpl), sampleConfig(), base));

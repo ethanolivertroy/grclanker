@@ -47,7 +47,7 @@ import {
 import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { GCP_COMPLETENESS_SOURCES, GCP_SPEC } from "../dist/extensions/grc-tools/gcp.spec.js";
 import * as specModel from "../dist/extensions/grc-tools/spec-model.js";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 
@@ -3191,7 +3191,7 @@ test("byte differential fixtures: GCP assessments and export artifacts", { skip:
   writeByteDifferentialFixture("gcp", "export", snapshotExportBundle(exported));
 });
 
-test("exportGcpAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportGcpAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-gcp-write-failure-");
   const client = createClient(async (url, init) => jsonResponse(routeCompliant(url, init)));
   await assertNoPartialBundleOnWriteFailure(base, () => exportGcpAuditBundle(client, sampleConfig(), base, { max_projects: 5 }));

@@ -89,7 +89,7 @@ import {
   assertMustRedactRowsBesideMustKeep,
   withPlantedRoutes,
 } from "./helpers/redaction-table.mjs";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const SUPERUSER = { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false };
@@ -2820,7 +2820,7 @@ test("rule 9 (round 4 item E): a nested object or array under a documented ping 
   }
 });
 
-test("exportAnsibleAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportAnsibleAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-ansible-write-failure-");
   const config = { baseUrl: "https://aap.example.com", token: "aap-test-token", timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
   await assertNoPartialBundleOnWriteFailure(base, () => exportAnsibleAuditBundle(createMockClient(), config, base, { days: 30, job_limit: 20, host_limit: 20 }));

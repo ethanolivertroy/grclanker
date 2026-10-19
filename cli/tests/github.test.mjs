@@ -41,7 +41,7 @@ import {
   scrubBundleStrings,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/github.js";
-import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -4218,7 +4218,7 @@ for (const key of ERROR_BODY_WALK_ROWS) {
   });
 }
 
-test("exportGitHubAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+writeFailureTest("exportGitHubAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-github-write-failure-");
   await assertNoPartialBundleOnWriteFailure(base, () => exportGitHubAuditBundle(createPartialClient(), SELF_CHECK_CONFIG, base));
 });
