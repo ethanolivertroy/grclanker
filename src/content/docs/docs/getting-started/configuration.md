@@ -131,6 +131,7 @@ These are the `GRCLANKER_*` variables grclanker reads:
 | `GRCLANKER_HOME` | Base directory for runtime state instead of your home directory. grclanker uses `$GRCLANKER_HOME/.grclanker`, or the path itself when it already ends in `.grclanker`, and refuses any path inside a `.pi` directory. |
 | `GRCLANKER_FLUE_MODEL` | `provider/model` for `grclanker flue run`. See [Flue Runtime](/docs/getting-started/flue-runtime/#configuration). |
 | `GRCLANKER_FLUE_SANDBOX` | `local` (default) or `none` for `grclanker flue run`. |
+| `GRCLANKER_DURABLE_MODEL` | `provider/model` for the experimental `grclanker durable` commands. See [Durable Runtime](/docs/getting-started/durable-runtime/#configuration). |
 | `GRCLANKER_AGENT_SDK_MODEL` | Cursor model id for the [Cursor Agent SDK](/docs/getting-started/agent-sdk/) project. |
 | `GRCLANKER_TRESTLE_BIN` | Path to the `trestle` executable for the `oscal_*` tools (`TRESTLE_BIN` also works). |
 | `GRCLANKER_GWS_BIN` | Path to the `gws` executable for the `gws_ops_*` tools. |
