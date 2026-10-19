@@ -17,10 +17,11 @@ import {
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -1283,21 +1284,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    const suffix = attempt === 0 ? "" : `-${attempt + 1}`;
-    const candidate = resolveSecureOutputPath(root, `${preferredName}-${stamp}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -3564,42 +3550,52 @@ export async function exportSplunkAuditBundle(
     ["tcp_cooked_inputs", "/services/data/inputs/tcp/cooked", () => client.listCookedTcpInputs()],
   ];
 
-  ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(new URL(config.url).host)}-splunk-audit`);
-
   // A snapshot that could not be collected is still written, as a marker
   // naming the endpoint, status, and error, so the file's absence or an empty
   // list can never stand in for a denial; readable-but-empty lists stay [].
+  const snapshotFiles: Array<[string, unknown]> = [];
   for (const [name, endpoint, load] of rawSnapshots) {
     const snapshot = await collect(client, load);
     if (snapshot.ok) {
-      await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(redactSnapshot(snapshot.value)));
+      snapshotFiles.push([`core_data/${name}.json`, redactSnapshot(snapshot.value)]);
     } else {
-      await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(notCollectedMarker(snapshot, endpoint)));
+      snapshotFiles.push([`core_data/${name}.json`, notCollectedMarker(snapshot, endpoint)]);
       errors.push(`[core_data/${name}] ${snapshot.error}`);
     }
   }
 
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({ generated_at: new Date().toISOString(), url: config.url, stack: config.stack ?? null, acs_configured: Boolean(config.stack && config.acsToken), source_chain: config.sourceChain, tls_verification: config.verifyTls }));
-  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(redactSnapshot(access)));
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(redactSnapshot(findings)));
-  const areaFiles = ["authentication", "access_control", "data_protection", "audit_monitoring", "platform_hardening"];
-  for (const [index, assessment] of assessments.entries()) {
-    await writeSecureTextFile(outputDir, `analysis/${areaFiles[index]}.json`, serializeJson(redactSnapshot(assessment)));
-  }
-  await writeSecureTextFile(outputDir, "analysis/summary.md", [formatAccessCheckText(access), "", ...assessments.map(formatAssessmentText)].join("\n"));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments)}\n`);
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
-  for (const framework of Object.keys(SPLUNK_FRAMEWORK_LABELS) as SplunkFramework[]) {
-    await writeSecureTextFile(outputDir, `compliance/${framework}.md`, `${buildFrameworkReport(framework, findings)}\n`);
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference({ outputDir, findings, errors })}\n`);
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
+  ensurePrivateDir(outputRoot);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(new URL(config.url).host)}-splunk-audit-${stamp}`, 50),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    for (const [pathName, value] of snapshotFiles) {
+      await writeSecureTextFile(staged.dir, pathName, serializeJson(value));
+    }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({ generated_at: new Date().toISOString(), url: config.url, stack: config.stack ?? null, acs_configured: Boolean(config.stack && config.acsToken), source_chain: config.sourceChain, tls_verification: config.verifyTls }));
+    await writeSecureTextFile(staged.dir, "core_data/access_check.json", serializeJson(redactSnapshot(access)));
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(redactSnapshot(findings)));
+    const areaFiles = ["authentication", "access_control", "data_protection", "audit_monitoring", "platform_hardening"];
+    for (const [index, assessment] of assessments.entries()) {
+      await writeSecureTextFile(staged.dir, `analysis/${areaFiles[index]}.json`, serializeJson(redactSnapshot(assessment)));
+    }
+    await writeSecureTextFile(staged.dir, "analysis/summary.md", [formatAccessCheckText(access), "", ...assessments.map(formatAssessmentText)].join("\n"));
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments)}\n`);
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
+    for (const framework of Object.keys(SPLUNK_FRAMEWORK_LABELS) as SplunkFramework[]) {
+      await writeSecureTextFile(staged.dir, `compliance/${framework}.md`, `${buildFrameworkReport(framework, findings)}\n`);
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", `${buildQuickReference({ outputDir: staged.target.outputDir, findings, errors })}\n`);
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
+
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return { outputDir, zipPath, fileCount: await countFilesRecursively(outputDir), findingCount: findings.length, errorCount: errors.length };
 }

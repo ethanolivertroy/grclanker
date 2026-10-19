@@ -20,10 +20,11 @@ import {
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { evaluateBatchRuntimeCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import {
   OCI_AUTH_RESOLVER,
@@ -761,20 +762,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
     throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
   }
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -3641,51 +3628,56 @@ export async function exportOciAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
   if (compartments.error) errors.push(redactSensitiveText(compartments.error));
   const targetName = safeDirName(`${config.tenancyOcid}-${config.region}-audit`);
-  const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(targetName, 9),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await writeBundleText(staged.dir, "README.md", buildBundleReadme());
+    await writeBundleText(staged.dir, "QUICK_REFERENCE.md", buildQuickReference());
+    const bundleAccess: OciAccessCheckResult = {
+      ...access,
+      notes: access.notes.map((note) => note.replace(/^Using OCI config .* profile /, `Using OCI config ${REDACTED_MARKER} profile `)),
+      surfaces: access.surfaces.map((item) => (item.error === undefined ? item : { ...item, error: redactSensitiveText(item.error) })),
+    };
+    await writeBundleJson(staged.dir, "metadata.json", {
+      config_file: REDACTED_MARKER,
+      profile: config.profile,
+      region: config.region,
+      tenancy_ocid: config.tenancyOcid,
+      compartment_ocid: config.compartmentOcid,
+      source_chain: config.sourceChain,
+      generated_at: new Date().toISOString(),
+      options: {
+        stale_days: options.stale_days ?? DEFAULT_STALE_DAYS,
+        max_keys: options.max_keys ?? DEFAULT_MAX_KEYS,
+        max_policies: options.max_policies ?? DEFAULT_MAX_POLICIES,
+        max_compartments: options.max_compartments ?? DEFAULT_MAX_COMPARTMENTS,
+        max_buckets: options.max_buckets ?? DEFAULT_MAX_BUCKETS,
+        lookback_days: options.lookback_days ?? DEFAULT_LOOKBACK_DAYS,
+      },
+    });
+    await writeBundleJson(staged.dir, "core_data/access.json", bundleAccess);
+    await writeBundleJson(staged.dir, "core_data/compartments.json", compartmentSnapshotDocument(compartments));
+    await writeBundleJson(staged.dir, "analysis/findings.json", findings);
+    await writeBundleJson(staged.dir, "analysis/identity.json", identityBundle);
+    await writeBundleJson(staged.dir, "analysis/logging-detection.json", loggingDetectionBundle);
+    await writeBundleJson(staged.dir, "analysis/tenancy-guardrails.json", tenancyGuardrailsBundle);
+    await writeBundleJson(staged.dir, "analysis/compute-storage.json", computeStorageBundle);
+    await writeBundleText(staged.dir, "analysis/summary.md", assessments.map(formatAssessmentText).join("\n\n"));
+    await writeBundleText(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+    await writeBundleText(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const report of FRAMEWORK_REPORTS) {
+      await writeBundleText(staged.dir, report.path, buildFrameworkReport(report.title, report.prefix, findings));
+    }
+    if (errors.length > 0) {
+      await writeBundleText(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  await writeBundleText(outputDir, "README.md", buildBundleReadme());
-  await writeBundleText(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
-  const bundleAccess: OciAccessCheckResult = {
-    ...access,
-    notes: access.notes.map((note) => note.replace(/^Using OCI config .* profile /, `Using OCI config ${REDACTED_MARKER} profile `)),
-    surfaces: access.surfaces.map((item) => (item.error === undefined ? item : { ...item, error: redactSensitiveText(item.error) })),
-  };
-  await writeBundleJson(outputDir, "metadata.json", {
-    config_file: REDACTED_MARKER,
-    profile: config.profile,
-    region: config.region,
-    tenancy_ocid: config.tenancyOcid,
-    compartment_ocid: config.compartmentOcid,
-    source_chain: config.sourceChain,
-    generated_at: new Date().toISOString(),
-    options: {
-      stale_days: options.stale_days ?? DEFAULT_STALE_DAYS,
-      max_keys: options.max_keys ?? DEFAULT_MAX_KEYS,
-      max_policies: options.max_policies ?? DEFAULT_MAX_POLICIES,
-      max_compartments: options.max_compartments ?? DEFAULT_MAX_COMPARTMENTS,
-      max_buckets: options.max_buckets ?? DEFAULT_MAX_BUCKETS,
-      lookback_days: options.lookback_days ?? DEFAULT_LOOKBACK_DAYS,
-    },
+    await createZipArchive(staged.dir, staged.zipPath);
   });
-  await writeBundleJson(outputDir, "core_data/access.json", bundleAccess);
-  await writeBundleJson(outputDir, "core_data/compartments.json", compartmentSnapshotDocument(compartments));
-  await writeBundleJson(outputDir, "analysis/findings.json", findings);
-  await writeBundleJson(outputDir, "analysis/identity.json", identityBundle);
-  await writeBundleJson(outputDir, "analysis/logging-detection.json", loggingDetectionBundle);
-  await writeBundleJson(outputDir, "analysis/tenancy-guardrails.json", tenancyGuardrailsBundle);
-  await writeBundleJson(outputDir, "analysis/compute-storage.json", computeStorageBundle);
-  await writeBundleText(outputDir, "analysis/summary.md", assessments.map(formatAssessmentText).join("\n\n"));
-  await writeBundleText(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeBundleText(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const report of FRAMEWORK_REPORTS) {
-    await writeBundleText(outputDir, report.path, buildFrameworkReport(report.title, report.prefix, findings));
-  }
-  if (errors.length > 0) {
-    await writeBundleText(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
   const fileCount = await countFilesRecursively(outputDir);
   return {
     outputDir,

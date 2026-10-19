@@ -53,6 +53,7 @@ import {
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRAMEWORKS = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
@@ -3558,4 +3559,9 @@ test("byte differential fixtures: Box assessments and export artifacts", { skip:
   const routed = httpBox(hardenedFixture());
   const exported = await exportBoxAuditBundle(routed.client, routed.config, exportRoot);
   writeByteDifferentialFixture("box", "export", snapshotExportBundle(exported));
+});
+
+writeFailureTest("exportBoxAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-box-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportBoxAuditBundle(createStubClient(hardenedFixture()), sampleConfig(), base));
 });

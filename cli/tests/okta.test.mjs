@@ -45,6 +45,7 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -4061,4 +4062,9 @@ test("byte differential fixtures: Okta assessments and export artifacts", { skip
   const exportRoot = prepareByteDifferentialExportRoot("okta");
   const exported = await exportOktaAuditBundle(createSampleClient(), createSampleConfig(), exportRoot);
   writeByteDifferentialFixture("okta", "export", snapshotExportBundle(exported));
+});
+
+writeFailureTest("exportOktaAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-okta-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportOktaAuditBundle(createSampleClient(), createSampleConfig(), base));
 });

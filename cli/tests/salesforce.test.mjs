@@ -50,6 +50,7 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const { privateKey: TEST_PRIVATE_KEY, publicKey: TEST_PUBLIC_KEY } = generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -2670,4 +2671,9 @@ test("SalesforceApiClient refuses a 200 query that omits the records array", asy
   const result = await empty.query("SELECT Id FROM User");
   assert.deepEqual(result.records, []);
   assert.equal(result.done, true);
+});
+
+writeFailureTest("exportSalesforceAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-sf-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportSalesforceAuditBundle(createFullMockClient(), sampleConfig(), base, { now: NOW }));
 });

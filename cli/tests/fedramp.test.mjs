@@ -43,6 +43,7 @@ import {
   inferFedrampWorkstreams,
   registerFedrampTools,
 } from "../dist/extensions/grc-tools/fedramp.js";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 function jsonResponse(payload) {
   return new Response(JSON.stringify(payload), {
@@ -1281,6 +1282,31 @@ test("CDS site generator writes a portable static trust-center bundle under the 
 
     const robots = readFileSync(join(result.outputDir, "robots.txt"), "utf8");
     assert.match(robots, /Disallow: \//);
+  } finally {
+    rmSync(outputRoot, { recursive: true, force: true });
+  }
+});
+
+writeFailureTest("CDS starter bundle and site generators leave nothing under the output root when a write fails partway", async () => {
+  const loaded = {
+    catalog: normalizeFedrampConsolidatedRules(consolidatedRulesFixture),
+    provenance: {
+      repo: "rules",
+      path: "fedramp-consolidated-rules.json",
+      branch: "main",
+      blobSha: "abcdef1234567890abcdef1234567890abcdef12",
+      version: "2026.07.02.02",
+      upstreamLastUpdated: "2026-07-02",
+    },
+    cacheStatus: "live",
+    notes: [],
+  };
+  const args = { audience: "trust-center", applies_to: "20x" };
+  const outputRoot = mkdtempSync(join(tmpdir(), "grclanker-fedramp-write-failure-"));
+
+  try {
+    await assertNoPartialBundleOnWriteFailure(outputRoot, () => generateFedrampAdsStarterBundle(loaded, outputRoot, args));
+    await assertNoPartialBundleOnWriteFailure(outputRoot, () => generateFedrampAdsSite(loaded, outputRoot, args));
   } finally {
     rmSync(outputRoot, { recursive: true, force: true });
   }

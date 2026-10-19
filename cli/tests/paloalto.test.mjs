@@ -64,6 +64,7 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const noSleep = async () => {};
 
@@ -4740,4 +4741,9 @@ test("byte differential fixtures: Palo Alto assessments and export artifacts", {
     exportRoot,
   );
   writeByteDifferentialFixture("paloalto", "export", snapshotExportBundle(exported));
+});
+
+writeFailureTest("exportPaloaltoAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-paloalto-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportPaloaltoAuditBundle(createPaloaltoClients(bothProductsConfig(), mockedFetch()), base));
 });

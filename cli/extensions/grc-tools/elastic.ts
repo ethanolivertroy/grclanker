@@ -20,6 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { createCredentialScrubber, isCredentialDataKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -492,24 +493,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-function bundleZipPathFor(outputDir: string): string {
-  return `${outputDir}.zip`;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(bundleZipPathFor(candidate))) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -4684,47 +4667,48 @@ export async function exportElasticAuditBundle(
 
   ensurePrivateDir(outputRoot);
   const clusterLabel = safeDirName(new URL(config.elasticsearchUrl).hostname);
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${clusterLabel}-audit-bundle`);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${clusterLabel}-audit-bundle`, 9),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", `${buildQuickReference()}\n`);
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      generated_at: new Date().toISOString(),
+      elasticsearch_url: config.elasticsearchUrl,
+      kibana_url: config.kibanaUrl ?? null,
+      kibana_space_id: config.kibanaSpaceId ?? null,
+      cloud_api_configured: Boolean(config.cloudApiKey),
+      auth_mode: config.authMode,
+      source_chain: config.sourceChain,
+      controls_covered: ELASTIC_CONTROLS.length,
+    }));
 
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference()}\n`);
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    elasticsearch_url: config.elasticsearchUrl,
-    kibana_url: config.kibanaUrl ?? null,
-    kibana_space_id: config.kibanaSpaceId ?? null,
-    cloud_api_configured: Boolean(config.cloudApiKey),
-    auth_mode: config.authMode,
-    source_chain: config.sourceChain,
-    controls_covered: ELASTIC_CONTROLS.length,
-  }));
+    for (const dataset of Object.values(snapshot)) {
+      if (!dataset) continue;
+      await writeSecureTextFile(staged.dir, `core_data/${dataset.name}.json`, serializeJson(coreDataFile(dataset)));
+    }
+    await writeSecureTextFile(staged.dir, "collection_status.json", serializeJson(buildCollectionStatus(snapshot)));
 
-  for (const dataset of Object.values(snapshot)) {
-    if (!dataset) continue;
-    await writeSecureTextFile(outputDir, `core_data/${dataset.name}.json`, serializeJson(coreDataFile(dataset)));
-  }
-  await writeSecureTextFile(outputDir, "collection_status.json", serializeJson(buildCollectionStatus(snapshot)));
+    await writeSecureTextFile(staged.dir, "analysis/access.json", serializeJson(access));
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    for (const assessment of assessments) {
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.area}.json`, serializeJson(assessment));
+    }
 
-  await writeSecureTextFile(outputDir, "analysis/access.json", serializeJson(access));
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.json`, serializeJson(assessment));
-  }
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments, errors, truncated, notCollected)}\n`);
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
+    for (const framework of ELASTIC_FRAMEWORKS) {
+      await writeSecureTextFile(staged.dir, `compliance/frameworks/${framework.key}.md`, `${buildFrameworkReport(framework, findings)}\n`);
+    }
 
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments, errors, truncated, notCollected)}\n`);
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
-  for (const framework of ELASTIC_FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/frameworks/${framework.key}.md`, `${buildFrameworkReport(framework, findings)}\n`);
-  }
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  const zipPath = bundleZipPathFor(outputDir);
-  if (existsSync(zipPath)) {
-    throw new Error(`Refusing to overwrite an existing bundle archive: ${zipPath}`);
-  }
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

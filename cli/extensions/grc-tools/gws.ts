@@ -29,10 +29,11 @@ import {
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { GWS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { REDACTED, systemErrorCode } from "./hardening/index.js";
@@ -2007,20 +2008,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -4174,47 +4161,52 @@ export async function exportGwsAuditBundle(
   const knownSecrets = knownGwsSecretValues(config);
 
   const safeName = safeDirName(`${getDisplayOrganization(config)}-gws-audit`);
-  const outputDir = await nextAvailableAuditDir(outputRoot, safeName);
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(safeName, 9),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    const coreDataFiles: Array<[string, JsonRecord]> = [
+      ["core_data/users.json", projectDatasetFile(USERS_ENDPOINT, identity.users, projectUserSnapshot)],
+      ["core_data/roles.json", projectDatasetFile(ROLES_ENDPOINT, identity.roles, projectRoleSnapshot)],
+      ["core_data/role_assignments.json", projectDatasetFile(ROLE_ASSIGNMENTS_ENDPOINT, identity.roleAssignments, projectRoleAssignmentSnapshot)],
+      ["core_data/login_activities.json", projectDatasetFile(activitiesEndpoint("login"), identity.loginActivities, projectActivitySnapshot)],
+      ["core_data/admin_activities.json", projectDatasetFile(activitiesEndpoint("admin"), adminAccess.adminActivities, projectActivitySnapshot)],
+      ["core_data/token_activities.json", projectDatasetFile(activitiesEndpoint("token"), integrations.tokenActivities, projectActivitySnapshot)],
+      ["core_data/token_inventory.json", projectTokenInventoryFile(integrations.tokenInventory)],
+      ["core_data/alerts.json", projectDatasetFile(ALERTS_ENDPOINT, monitoring.alerts, projectAlertSnapshot)],
+      ["core_data/two_step_verification_policies.json", projectDatasetFile(POLICIES_ENDPOINT, identity.twoStepPolicies, projectPolicySnapshot)],
+    ];
+    for (const [pathName, file] of coreDataFiles) {
+      await writeBundleFile(staged.dir, pathName, serializeJson(redactSecrets(file)), knownSecrets);
+    }
 
-  const coreDataFiles: Array<[string, JsonRecord]> = [
-    ["core_data/users.json", projectDatasetFile(USERS_ENDPOINT, identity.users, projectUserSnapshot)],
-    ["core_data/roles.json", projectDatasetFile(ROLES_ENDPOINT, identity.roles, projectRoleSnapshot)],
-    ["core_data/role_assignments.json", projectDatasetFile(ROLE_ASSIGNMENTS_ENDPOINT, identity.roleAssignments, projectRoleAssignmentSnapshot)],
-    ["core_data/login_activities.json", projectDatasetFile(activitiesEndpoint("login"), identity.loginActivities, projectActivitySnapshot)],
-    ["core_data/admin_activities.json", projectDatasetFile(activitiesEndpoint("admin"), adminAccess.adminActivities, projectActivitySnapshot)],
-    ["core_data/token_activities.json", projectDatasetFile(activitiesEndpoint("token"), integrations.tokenActivities, projectActivitySnapshot)],
-    ["core_data/token_inventory.json", projectTokenInventoryFile(integrations.tokenInventory)],
-    ["core_data/alerts.json", projectDatasetFile(ALERTS_ENDPOINT, monitoring.alerts, projectAlertSnapshot)],
-    ["core_data/two_step_verification_policies.json", projectDatasetFile(POLICIES_ENDPOINT, identity.twoStepPolicies, projectPolicySnapshot)],
-  ];
-  for (const [pathName, file] of coreDataFiles) {
-    await writeBundleFile(outputDir, pathName, serializeJson(redactSecrets(file)), knownSecrets);
-  }
+    await writeBundleFile(staged.dir, "analysis/findings.json", serializeJson(allFindings), knownSecrets);
+    for (const assessment of assessments) {
+      await writeBundleFile(staged.dir, `analysis/${assessment.category}.json`, serializeJson({
+        category: assessment.category,
+        summary: assessment.summary,
+        snapshot_summary: assessment.snapshotSummary,
+        findings: assessment.findings,
+      }), knownSecrets);
+      await writeBundleFile(staged.dir, `analysis/${assessment.category}.md`, assessment.text, knownSecrets);
+    }
 
-  await writeBundleFile(outputDir, "analysis/findings.json", serializeJson(allFindings), knownSecrets);
-  for (const assessment of assessments) {
-    await writeBundleFile(outputDir, `analysis/${assessment.category}.json`, serializeJson({
-      category: assessment.category,
-      summary: assessment.summary,
-      snapshot_summary: assessment.snapshotSummary,
-      findings: assessment.findings,
-    }), knownSecrets);
-    await writeBundleFile(outputDir, `analysis/${assessment.category}.md`, assessment.text, knownSecrets);
-  }
+    await writeBundleFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors), knownSecrets);
+    await writeBundleFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(allFindings), knownSecrets);
+    for (const framework of frameworks) {
+      const report = FRAMEWORK_REPORTS[framework];
+      await writeBundleFile(staged.dir, report.file, buildFrameworkReport(report.title, allFindings, framework), knownSecrets);
+    }
+    await writeBundleFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference(frameworks), knownSecrets);
+    if (errors.length > 0) {
+      await writeBundleFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`, knownSecrets);
+    }
 
-  await writeBundleFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors), knownSecrets);
-  await writeBundleFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(allFindings), knownSecrets);
-  for (const framework of frameworks) {
-    const report = FRAMEWORK_REPORTS[framework];
-    await writeBundleFile(outputDir, report.file, buildFrameworkReport(report.title, allFindings, framework), knownSecrets);
-  }
-  await writeBundleFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(frameworks), knownSecrets);
-  if (errors.length > 0) {
-    await writeBundleFile(outputDir, "_errors.log", `${errors.join("\n")}\n`, knownSecrets);
-  }
-
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
   const fileCount = await countFilesRecursively(outputDir);
 
   return {

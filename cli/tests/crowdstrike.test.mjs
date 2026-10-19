@@ -57,6 +57,7 @@ import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, inj
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const observedDecisionFacts = observeRuntimeDecisionFacts(CROWDSTRIKE_SPEC);
 const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
@@ -3518,4 +3519,9 @@ portableContractTest("every threshold edge and ordered rule in the spec is reach
   const boundaries = certifyRuntimeBoundaryCoverage(CROWDSTRIKE_SPEC, observedDecisionFacts.factsByCheck);
   const rules = certifyRuntimeRuleDecisiveness(CROWDSTRIKE_SPEC, observedDecisionFacts.factsByCheck);
   assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
+});
+
+writeFailureTest("exportCrowdstrikeAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-cs-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportCrowdstrikeAuditBundle(createFakeClient(), sampleConfig(), base));
 });

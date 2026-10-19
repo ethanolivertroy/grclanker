@@ -17,10 +17,11 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { YAMLError, parse as parseYaml } from "yaml";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SERVICENOW_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -819,20 +820,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -4104,82 +4091,86 @@ export async function exportServicenowAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
 
   ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(config.instanceName)}-audit-bundle`);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(config.instanceName)}-audit-bundle`, 9),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    // Every table or aggregate dataset passes through tableCoreData or countCoreData, so a denied, errored,
+    // unavailable, or skipped read is written as a not-collected marker rather than as an empty snapshot.
+    const coreDataFiles: Array<[string, unknown]> = [
+      ["core_data/access_check.json", access],
+      ["core_data/sys_user.json", tableCoreData(identityData.users)],
+      ["core_data/sys_user_has_role_privileged.json", tableCoreData(identityData.privilegedAssignments)],
+      ["core_data/sys_user_role_contains.json", tableCoreData(identityData.roleInheritance)],
+      ["core_data/sys_user_role_contains_count.json", countCoreData(identityData.roleInheritanceTotal)],
+      ["core_data/sys_properties_identity.json", tableCoreData(identityData.properties)],
+      ["core_data/password_policy.json", tableCoreData(identityData.passwordPolicies)],
+      ["core_data/sso_properties.json", tableCoreData(identityData.ssoProviders)],
+      ["core_data/ldap_server_config.json", tableCoreData(identityData.ldapServers)],
+      ["core_data/sys_certificate.json", tableCoreData(identityData.certificates)],
+      ["core_data/oauth_entity.json", tableCoreData(identityData.oauthEntities)],
+      ["core_data/multi_factor_criteria.json", tableCoreData(identityData.mfaCriteria)],
+      ["core_data/sys_properties_hardening.json", tableCoreData(hardeningData.properties)],
+      ["core_data/sys_properties_debug.json", tableCoreData(hardeningData.debugProperties)],
+      ["core_data/sys_script_eval.json", tableCoreData(hardeningData.evalScripts)],
+      ["core_data/ip_access.json", tableCoreData(hardeningData.ipAccessRules)],
+      ["core_data/sys_plugins_ip_authenticator.json", tableCoreData(hardeningData.ipAuthenticatorPlugin)],
+      ["core_data/sys_email_account.json", tableCoreData(hardeningData.emailAccounts)],
+      ["core_data/sys_security_acl.json", tableCoreData(accessControlData.acls)],
+      ["core_data/sys_security_acl_role.json", tableCoreData(accessControlData.aclRoles)],
+      ["core_data/sys_security_acl_count.json", countCoreData(accessControlData.aclTotal)],
+      ["core_data/sys_public.json", tableCoreData(accessControlData.publicPages)],
+      ["core_data/sys_encryption_context.json", tableCoreData(operationsData.encryptionContexts)],
+      ["core_data/sys_kmf_crypto_module.json", tableCoreData(operationsData.cryptoModules)],
+      ["core_data/sys_dictionary_encrypted.json", tableCoreData(operationsData.encryptedFields)],
+      ["core_data/sys_dictionary_audit.json", tableCoreData(operationsData.auditDictionary)],
+      ["core_data/sys_audit_count.json", countCoreData(operationsData.recentAuditCount)],
+      ["core_data/syslog_transaction_count.json", countCoreData(operationsData.recentTransactionCount)],
+      ["core_data/sys_update_set_in_progress.json", tableCoreData(operationsData.updateSetsInProgress)],
+      ["core_data/sys_update_set_count.json", countCoreData(operationsData.updateSetTotal)],
+      ["core_data/sys_update_xml_sensitive.json", tableCoreData(operationsData.sensitiveUpdateXml)],
+      ["core_data/ecc_agent.json", tableCoreData(operationsData.midServers)],
+      ["core_data/sys_properties_mid.json", tableCoreData(operationsData.properties)],
+      ["core_data/sys_plugins.json", tableCoreData(operationsData.plugins)],
+    ];
+    for (const [pathname, value] of coreDataFiles) {
+      await writeSecureTextFile(staged.dir, pathname, serializeJson(value));
+    }
 
-  // Every table or aggregate dataset passes through tableCoreData or countCoreData, so a denied, errored,
-  // unavailable, or skipped read is written as a not-collected marker rather than as an empty snapshot.
-  const coreDataFiles: Array<[string, unknown]> = [
-    ["core_data/access_check.json", access],
-    ["core_data/sys_user.json", tableCoreData(identityData.users)],
-    ["core_data/sys_user_has_role_privileged.json", tableCoreData(identityData.privilegedAssignments)],
-    ["core_data/sys_user_role_contains.json", tableCoreData(identityData.roleInheritance)],
-    ["core_data/sys_user_role_contains_count.json", countCoreData(identityData.roleInheritanceTotal)],
-    ["core_data/sys_properties_identity.json", tableCoreData(identityData.properties)],
-    ["core_data/password_policy.json", tableCoreData(identityData.passwordPolicies)],
-    ["core_data/sso_properties.json", tableCoreData(identityData.ssoProviders)],
-    ["core_data/ldap_server_config.json", tableCoreData(identityData.ldapServers)],
-    ["core_data/sys_certificate.json", tableCoreData(identityData.certificates)],
-    ["core_data/oauth_entity.json", tableCoreData(identityData.oauthEntities)],
-    ["core_data/multi_factor_criteria.json", tableCoreData(identityData.mfaCriteria)],
-    ["core_data/sys_properties_hardening.json", tableCoreData(hardeningData.properties)],
-    ["core_data/sys_properties_debug.json", tableCoreData(hardeningData.debugProperties)],
-    ["core_data/sys_script_eval.json", tableCoreData(hardeningData.evalScripts)],
-    ["core_data/ip_access.json", tableCoreData(hardeningData.ipAccessRules)],
-    ["core_data/sys_plugins_ip_authenticator.json", tableCoreData(hardeningData.ipAuthenticatorPlugin)],
-    ["core_data/sys_email_account.json", tableCoreData(hardeningData.emailAccounts)],
-    ["core_data/sys_security_acl.json", tableCoreData(accessControlData.acls)],
-    ["core_data/sys_security_acl_role.json", tableCoreData(accessControlData.aclRoles)],
-    ["core_data/sys_security_acl_count.json", countCoreData(accessControlData.aclTotal)],
-    ["core_data/sys_public.json", tableCoreData(accessControlData.publicPages)],
-    ["core_data/sys_encryption_context.json", tableCoreData(operationsData.encryptionContexts)],
-    ["core_data/sys_kmf_crypto_module.json", tableCoreData(operationsData.cryptoModules)],
-    ["core_data/sys_dictionary_encrypted.json", tableCoreData(operationsData.encryptedFields)],
-    ["core_data/sys_dictionary_audit.json", tableCoreData(operationsData.auditDictionary)],
-    ["core_data/sys_audit_count.json", countCoreData(operationsData.recentAuditCount)],
-    ["core_data/syslog_transaction_count.json", countCoreData(operationsData.recentTransactionCount)],
-    ["core_data/sys_update_set_in_progress.json", tableCoreData(operationsData.updateSetsInProgress)],
-    ["core_data/sys_update_set_count.json", countCoreData(operationsData.updateSetTotal)],
-    ["core_data/sys_update_xml_sensitive.json", tableCoreData(operationsData.sensitiveUpdateXml)],
-    ["core_data/ecc_agent.json", tableCoreData(operationsData.midServers)],
-    ["core_data/sys_properties_mid.json", tableCoreData(operationsData.properties)],
-    ["core_data/sys_plugins.json", tableCoreData(operationsData.plugins)],
-  ];
-  for (const [pathname, value] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathname, serializeJson(value));
-  }
+    for (const assessment of assessments) {
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.area}.json`, serializeJson(assessment));
+    }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "analysis/summary.json", serializeJson({
+      generated_at: new Date().toISOString(),
+      instance_url: config.instanceUrl,
+      auth_mode: config.authMode,
+      source_chain: config.sourceChain,
+      controls_assessed: findings.length,
+      status_counts: summarizeFindingStatuses(findings),
+      errors,
+    }));
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, access.identity, assessments, errors));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const report of FRAMEWORK_REPORTS) {
+      await writeSecureTextFile(staged.dir, report.path, buildFrameworkReport(report.title, report.framework, findings));
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference());
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      generated_at: new Date().toISOString(),
+      instance_url: config.instanceUrl,
+      instance_name: config.instanceName,
+      auth_mode: config.authMode,
+      source_chain: config.sourceChain,
+    }));
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.json`, serializeJson(assessment));
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/summary.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    instance_url: config.instanceUrl,
-    auth_mode: config.authMode,
-    source_chain: config.sourceChain,
-    controls_assessed: findings.length,
-    status_counts: summarizeFindingStatuses(findings),
-    errors,
-  }));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, access.identity, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const report of FRAMEWORK_REPORTS) {
-    await writeSecureTextFile(outputDir, report.path, buildFrameworkReport(report.title, report.framework, findings));
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    instance_url: config.instanceUrl,
-    instance_name: config.instanceName,
-    auth_mode: config.authMode,
-    source_chain: config.sourceChain,
-  }));
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

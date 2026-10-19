@@ -16,11 +16,12 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, VERACODE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1283,20 +1284,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
     throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
   }
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  for (let attempt = 1; attempt <= 50; attempt += 1) {
-    const suffix = attempt === 1 ? "" : `-${attempt}`;
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -3835,35 +3822,39 @@ export async function exportVeracodeAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
 
   ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(new URL(config.baseUrl).host)}-audit-bundle`);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(new URL(config.baseUrl).host)}-audit-bundle`, 50),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference({ outputDir: staged.target.outputDir, findings, errors }));
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({ generated_at: generatedAt.toISOString(), base_url: config.baseUrl, region: config.region, profile: config.profile, source_chain: config.sourceChain, principal: access.principal ?? null }));
+    await writeSecureTextFile(staged.dir, "core_data/access.json", serializeJson(redactSnapshot(access)));
+    const assessmentFiles: Array<[string, VeracodeAssessmentResult]> = [
+      ["scan-coverage", scanCoverage],
+      ["policy-compliance", policyCompliance],
+      ["findings-hygiene", findingsHygiene],
+      ["sca-posture", scaPosture],
+      ["access-controls", accessControls],
+    ];
+    for (const [name, assessment] of assessmentFiles) {
+      await writeSecureTextFile(staged.dir, `core_data/${name}.json`, serializeJson(redactSnapshot(assessment.rawData)));
+      await writeSecureTextFile(staged.dir, `analysis/${name}.json`, serializeJson(redactSnapshot({ title: assessment.title, summary: assessment.summary, findings: assessment.findings, errors: assessment.errors })));
+    }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(redactSnapshot(findings)));
+    await writeSecureTextFile(staged.dir, "analysis/summary.md", [formatAccessCheckText(access), "", ...assessments.map(formatAssessmentText)].join("\n\n"));
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, generatedAt));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const framework of VERACODE_FRAMEWORKS) {
+      await writeSecureTextFile(staged.dir, `compliance/${framework.file}`, buildFrameworkReport(framework, findings, generatedAt));
+    }
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.map((error) => `${generatedAt.toISOString()} ${error}`).join("\n")}\n`);
+    }
 
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference({ outputDir, findings, errors }));
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({ generated_at: generatedAt.toISOString(), base_url: config.baseUrl, region: config.region, profile: config.profile, source_chain: config.sourceChain, principal: access.principal ?? null }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(redactSnapshot(access)));
-  const assessmentFiles: Array<[string, VeracodeAssessmentResult]> = [
-    ["scan-coverage", scanCoverage],
-    ["policy-compliance", policyCompliance],
-    ["findings-hygiene", findingsHygiene],
-    ["sca-posture", scaPosture],
-    ["access-controls", accessControls],
-  ];
-  for (const [name, assessment] of assessmentFiles) {
-    await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(redactSnapshot(assessment.rawData)));
-    await writeSecureTextFile(outputDir, `analysis/${name}.json`, serializeJson(redactSnapshot({ title: assessment.title, summary: assessment.summary, findings: assessment.findings, errors: assessment.errors })));
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(redactSnapshot(findings)));
-  await writeSecureTextFile(outputDir, "analysis/summary.md", [formatAccessCheckText(access), "", ...assessments.map(formatAssessmentText)].join("\n\n"));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, generatedAt));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const framework of VERACODE_FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/${framework.file}`, buildFrameworkReport(framework, findings, generatedAt));
-  }
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.map((error) => `${generatedAt.toISOString()} ${error}`).join("\n")}\n`);
-  }
-
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
   return { outputDir, zipPath, fileCount: await countFilesRecursively(outputDir), findingCount: findings.length, errorCount: errors.length };
 }
 

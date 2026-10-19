@@ -86,6 +86,7 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -2340,4 +2341,9 @@ test("review conditions do not pass: missing MFA, non-Read token scopes, unused 
     },
   }));
   assert.equal(byId(quarantine, "CF-TRF-06").status, "fail");
+});
+
+writeFailureTest("exportCloudflareAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-cloudflare-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportCloudflareAuditBundle(fixtureClient("compliant"), sampleConfig(), base));
 });

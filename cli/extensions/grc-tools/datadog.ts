@@ -15,9 +15,10 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -892,20 +893,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -4580,80 +4567,84 @@ export async function exportDatadogAuditBundle(
 
   ensurePrivateDir(outputRoot);
   const bundleName = `${safeDirName(config.site)}-audit-bundle`;
-  const outputDir = await nextAvailableAuditDir(outputRoot, bundleName);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(bundleName, 6),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "README.md", buildBundleReadme());
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference({ assessments, access, errors }));
+    await writeBundleJson(staged.dir, "metadata.json", {
+      generated_at: now.toISOString(),
+      site: config.site,
+      api_base_url: config.baseUrl,
+      source_chain: config.sourceChain,
+      controls_assessed: findings.length,
+      ...countByStatus(findings),
+    });
 
-  await writeSecureTextFile(outputDir, "README.md", buildBundleReadme());
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference({ assessments, access, errors }));
-  await writeBundleJson(outputDir, "metadata.json", {
-    generated_at: now.toISOString(),
-    site: config.site,
-    api_base_url: config.baseUrl,
-    source_chain: config.sourceChain,
-    controls_assessed: findings.length,
-    ...countByStatus(findings),
+    // A dataset that was denied or errored is written as a not-collected marker (never `[]`), so a bundle consumer
+    // cannot mistake a denial for an empty inventory; a dataset that was read and is empty stays `[]`.
+    const coreData: Array<[string, unknown]> = [
+      ["core_data/access.json", access],
+      ["core_data/collection_status.json", buildCollectionStatus(identitySnapshot, accessSnapshot, monitoringSnapshot, dataSnapshot)],
+      ["core_data/organization.json", coreDataValue("organization", identitySnapshot.organization)],
+      ["core_data/users.json", coreDataValue("users", identitySnapshot.users)],
+      ["core_data/roles.json", { roles: coreDataValue("roles", identitySnapshot.roles), permissions_by_role: rolePermissionsCoreData(identitySnapshot) }],
+      ["core_data/org_configs.json", coreDataValue("org_configs", identitySnapshot.orgConfigs)],
+      ["core_data/api_keys.json", coreDataValue("api_keys", accessSnapshot.apiKeys)],
+      ["core_data/application_keys.json", coreDataValue("application_keys", accessSnapshot.applicationKeys)],
+      ["core_data/shared_dashboards.json", coreDataValue("shared_dashboards", accessSnapshot.sharedDashboards)],
+      ["core_data/ip_allowlist.json", coreDataValue("ip_allowlist", accessSnapshot.ipAllowlist)],
+      ["core_data/cloud_integrations.json", {
+        aws: coreDataValue("aws_integrations", accessSnapshot.awsIntegrations),
+        gcp: coreDataValue("gcp_integrations", accessSnapshot.gcpIntegrations),
+        azure: coreDataValue("azure_integrations", accessSnapshot.azureIntegrations),
+      }],
+      ["core_data/security_rules.json", coreDataValue("security_rules", monitoringSnapshot.rules)],
+      ["core_data/security_signals.json", coreDataValue("security_signals", monitoringSnapshot.signals)],
+      ["core_data/posture_findings.json", {
+        failing: coreDataValue("posture_findings_fail", monitoringSnapshot.postureFailing),
+        passing: coreDataValue("posture_findings_pass", monitoringSnapshot.posturePassing),
+      }],
+      ["core_data/monitors.json", coreDataValue("monitors", monitoringSnapshot.monitors)],
+      ["core_data/audit_events.json", {
+        oldest: coreDataValue("audit_events_oldest", dataSnapshot.oldestAuditEvents),
+        recent: coreDataValue("audit_events_recent", dataSnapshot.recentAuditEvents),
+      }],
+      ["core_data/log_pipelines.json", coreDataValue("log_pipelines", dataSnapshot.pipelines)],
+      ["core_data/log_indexes.json", coreDataValue("log_indexes", dataSnapshot.indexes)],
+      ["core_data/log_archives.json", coreDataValue("log_archives", dataSnapshot.archives)],
+      ["core_data/sensitive_data_scanner.json", coreDataValue("sensitive_data_scanner", dataSnapshot.sensitiveDataScanner)],
+      ["core_data/org_connections.json", coreDataValue("org_connections", dataSnapshot.orgConnections)],
+    ];
+    for (const [pathname, value] of coreData) {
+      await writeBundleJson(staged.dir, pathname, value);
+    }
+
+    await writeBundleJson(staged.dir, "analysis/findings.json", findings);
+    for (const assessment of assessments) {
+      await writeBundleJson(staged.dir, `analysis/${assessment.category}.json`, assessment);
+    }
+    await writeBundleJson(staged.dir, "analysis/summary.json", {
+      controls_assessed: findings.length,
+      ...countByStatus(findings),
+      categories: assessments.map((assessment) => ({ category: assessment.category, ...countByStatus(assessment.findings) })),
+    });
+
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, now));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const framework of DATADOG_FRAMEWORKS) {
+      await writeSecureTextFile(staged.dir, `compliance/frameworks/${framework.file}.md`, buildFrameworkReport(framework, findings));
+    }
+
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
+
+    await createZipArchive(staged.dir, staged.zipPath);
   });
-
-  // A dataset that was denied or errored is written as a not-collected marker (never `[]`), so a bundle consumer
-  // cannot mistake a denial for an empty inventory; a dataset that was read and is empty stays `[]`.
-  const coreData: Array<[string, unknown]> = [
-    ["core_data/access.json", access],
-    ["core_data/collection_status.json", buildCollectionStatus(identitySnapshot, accessSnapshot, monitoringSnapshot, dataSnapshot)],
-    ["core_data/organization.json", coreDataValue("organization", identitySnapshot.organization)],
-    ["core_data/users.json", coreDataValue("users", identitySnapshot.users)],
-    ["core_data/roles.json", { roles: coreDataValue("roles", identitySnapshot.roles), permissions_by_role: rolePermissionsCoreData(identitySnapshot) }],
-    ["core_data/org_configs.json", coreDataValue("org_configs", identitySnapshot.orgConfigs)],
-    ["core_data/api_keys.json", coreDataValue("api_keys", accessSnapshot.apiKeys)],
-    ["core_data/application_keys.json", coreDataValue("application_keys", accessSnapshot.applicationKeys)],
-    ["core_data/shared_dashboards.json", coreDataValue("shared_dashboards", accessSnapshot.sharedDashboards)],
-    ["core_data/ip_allowlist.json", coreDataValue("ip_allowlist", accessSnapshot.ipAllowlist)],
-    ["core_data/cloud_integrations.json", {
-      aws: coreDataValue("aws_integrations", accessSnapshot.awsIntegrations),
-      gcp: coreDataValue("gcp_integrations", accessSnapshot.gcpIntegrations),
-      azure: coreDataValue("azure_integrations", accessSnapshot.azureIntegrations),
-    }],
-    ["core_data/security_rules.json", coreDataValue("security_rules", monitoringSnapshot.rules)],
-    ["core_data/security_signals.json", coreDataValue("security_signals", monitoringSnapshot.signals)],
-    ["core_data/posture_findings.json", {
-      failing: coreDataValue("posture_findings_fail", monitoringSnapshot.postureFailing),
-      passing: coreDataValue("posture_findings_pass", monitoringSnapshot.posturePassing),
-    }],
-    ["core_data/monitors.json", coreDataValue("monitors", monitoringSnapshot.monitors)],
-    ["core_data/audit_events.json", {
-      oldest: coreDataValue("audit_events_oldest", dataSnapshot.oldestAuditEvents),
-      recent: coreDataValue("audit_events_recent", dataSnapshot.recentAuditEvents),
-    }],
-    ["core_data/log_pipelines.json", coreDataValue("log_pipelines", dataSnapshot.pipelines)],
-    ["core_data/log_indexes.json", coreDataValue("log_indexes", dataSnapshot.indexes)],
-    ["core_data/log_archives.json", coreDataValue("log_archives", dataSnapshot.archives)],
-    ["core_data/sensitive_data_scanner.json", coreDataValue("sensitive_data_scanner", dataSnapshot.sensitiveDataScanner)],
-    ["core_data/org_connections.json", coreDataValue("org_connections", dataSnapshot.orgConnections)],
-  ];
-  for (const [pathname, value] of coreData) {
-    await writeBundleJson(outputDir, pathname, value);
-  }
-
-  await writeBundleJson(outputDir, "analysis/findings.json", findings);
-  for (const assessment of assessments) {
-    await writeBundleJson(outputDir, `analysis/${assessment.category}.json`, assessment);
-  }
-  await writeBundleJson(outputDir, "analysis/summary.json", {
-    controls_assessed: findings.length,
-    ...countByStatus(findings),
-    categories: assessments.map((assessment) => ({ category: assessment.category, ...countByStatus(assessment.findings) })),
-  });
-
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, now));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const framework of DATADOG_FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/frameworks/${framework.file}.md`, buildFrameworkReport(framework, findings));
-  }
-
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
 
   return {
     outputDir,

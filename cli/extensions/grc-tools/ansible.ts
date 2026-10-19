@@ -11,12 +11,13 @@ import {
   mkdirSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 const DEFAULT_LOOKBACK_DAYS = 90;
@@ -602,21 +603,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<{ outputDir: string; zipPath: string }> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9", "-10"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    const zipCandidate = resolveSecureOutputPath(root, `${preferredName}${suffix}.zip`);
-    if (!existsSync(candidate) && !existsSync(zipCandidate)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return { outputDir: candidate, zipPath: zipCandidate };
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -4181,64 +4167,73 @@ export async function exportAnsibleAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
 
   const targetName = safeDirName(`${new URL(config.baseUrl).host}-ansible-aap-audit`);
-  const { outputDir, zipPath } = await nextAvailableAuditDir(outputRoot, targetName);
-
-  const coreDataFiles = buildAnsibleCoreDataFiles(access, jobHealthData, hostCoverageData, platformData);
-  for (const [pathName, value] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathName, serializeJson(value));
-  }
-
-  await writeSecureTextFile(outputDir, "README.md", buildBundleReadme());
-  for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(assessment));
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.md`, formatAssessmentText(assessment));
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/metadata.json", serializeJson({
-    target: config.baseUrl,
-    auth_mode: config.token ? "token" : "session",
-    verify_ssl: config.verifySsl,
-    source_chain: config.sourceChain,
-    generated_at: generatedAt.toISOString(),
-    controls_assessed: findings.length,
-    controls_total: ANSIBLE_CONTROLS.length,
-    options: {
-      days: options.days ?? DEFAULT_LOOKBACK_DAYS,
-      job_limit: options.job_limit ?? DEFAULT_JOB_LIMIT,
-      host_limit: options.host_limit ?? DEFAULT_HOST_LIMIT,
-      template_limit: options.template_limit ?? DEFAULT_TEMPLATE_LIMIT,
-      user_limit: options.user_limit ?? DEFAULT_USER_LIMIT,
-      min_success_rate: options.min_success_rate ?? 90,
-      max_manual_rate: options.max_manual_rate ?? 25,
-      stale_host_days: options.stale_host_days ?? 30,
-      critical_stale_host_days: options.critical_stale_host_days ?? 60,
-      stale_template_days: options.stale_template_days ?? 90,
-      max_org_admins: options.max_org_admins ?? 3,
-      stale_credential_days: options.stale_credential_days ?? 90,
-      stale_token_days: options.stale_token_days ?? 90,
-      max_shared_templates: options.max_shared_templates ?? 5,
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(targetName, 10),
+    zip: true,
+    checkName: (name) => {
+      resolveSecureOutputPath(outputRoot, name);
+      resolveSecureOutputPath(outputRoot, `${name}.zip`);
     },
-  }));
+  }, async (staged) => {
+    const coreDataFiles = buildAnsibleCoreDataFiles(access, jobHealthData, hostCoverageData, platformData);
+    for (const [pathName, value] of coreDataFiles) {
+      await writeSecureTextFile(staged.dir, pathName, serializeJson(value));
+    }
 
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, generatedAt));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  const frameworkReports: Array<[string, string, FrameworkKey]> = [
-    ["compliance/fedramp/fedramp_compliance_report.md", "FedRAMP / NIST 800-53 r5 Compliance Report", "fedramp"],
-    ["compliance/cmmc/cmmc_compliance_report.md", "CMMC 2.0 Level 2 Compliance Report", "cmmc"],
-    ["compliance/soc2/soc2_compliance_report.md", "SOC 2 Compliance Report", "soc2"],
-    ["compliance/cis/cis_compliance_report.md", "CIS Controls v8 Compliance Report", "cis"],
-    ["compliance/pci_dss/pci_dss_compliance_report.md", "PCI-DSS 4.0 Compliance Report", "pci_dss"],
-    ["compliance/disa_stig/stig_compliance_checklist.md", "DISA STIG Compliance Checklist", "disa_stig"],
-  ];
-  for (const [pathName, title, framework] of frameworkReports) {
-    await writeSecureTextFile(outputDir, pathName, buildFrameworkReport(title, findings, framework));
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
+    await writeSecureTextFile(staged.dir, "README.md", buildBundleReadme());
+    for (const assessment of assessments) {
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.category}.json`, serializeJson(assessment));
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.category}.md`, formatAssessmentText(assessment));
+    }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "analysis/metadata.json", serializeJson({
+      target: config.baseUrl,
+      auth_mode: config.token ? "token" : "session",
+      verify_ssl: config.verifySsl,
+      source_chain: config.sourceChain,
+      generated_at: generatedAt.toISOString(),
+      controls_assessed: findings.length,
+      controls_total: ANSIBLE_CONTROLS.length,
+      options: {
+        days: options.days ?? DEFAULT_LOOKBACK_DAYS,
+        job_limit: options.job_limit ?? DEFAULT_JOB_LIMIT,
+        host_limit: options.host_limit ?? DEFAULT_HOST_LIMIT,
+        template_limit: options.template_limit ?? DEFAULT_TEMPLATE_LIMIT,
+        user_limit: options.user_limit ?? DEFAULT_USER_LIMIT,
+        min_success_rate: options.min_success_rate ?? 90,
+        max_manual_rate: options.max_manual_rate ?? 25,
+        stale_host_days: options.stale_host_days ?? 30,
+        critical_stale_host_days: options.critical_stale_host_days ?? 60,
+        stale_template_days: options.stale_template_days ?? 90,
+        max_org_admins: options.max_org_admins ?? 3,
+        stale_credential_days: options.stale_credential_days ?? 90,
+        stale_token_days: options.stale_token_days ?? 90,
+        max_shared_templates: options.max_shared_templates ?? 5,
+      },
+    }));
 
-  await createZipArchive(outputDir, zipPath);
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, generatedAt));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    const frameworkReports: Array<[string, string, FrameworkKey]> = [
+      ["compliance/fedramp/fedramp_compliance_report.md", "FedRAMP / NIST 800-53 r5 Compliance Report", "fedramp"],
+      ["compliance/cmmc/cmmc_compliance_report.md", "CMMC 2.0 Level 2 Compliance Report", "cmmc"],
+      ["compliance/soc2/soc2_compliance_report.md", "SOC 2 Compliance Report", "soc2"],
+      ["compliance/cis/cis_compliance_report.md", "CIS Controls v8 Compliance Report", "cis"],
+      ["compliance/pci_dss/pci_dss_compliance_report.md", "PCI-DSS 4.0 Compliance Report", "pci_dss"],
+      ["compliance/disa_stig/stig_compliance_checklist.md", "DISA STIG Compliance Checklist", "disa_stig"],
+    ];
+    for (const [pathName, title, framework] of frameworkReports) {
+      await writeSecureTextFile(staged.dir, pathName, buildFrameworkReport(title, findings, framework));
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference());
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
+
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

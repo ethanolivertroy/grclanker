@@ -49,6 +49,7 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const TENANCY = "ocid1.tenancy.oc1..aaaaexample";
@@ -2368,4 +2369,9 @@ test("silent success per surface: each shape on each surface the #68 review name
   } finally {
     fake.restore();
   }
+});
+
+writeFailureTest("exportOciAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-oci-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportOciAuditBundle(compliantClient(), sampleConfig(), base));
 });

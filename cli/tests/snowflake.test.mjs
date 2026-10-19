@@ -44,6 +44,7 @@ import {
 } from "../dist/extensions/grc-tools/snowflake.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const { privateKey: testPrivateKey, publicKey: testPublicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const TEST_PRIVATE_KEY_PEM = testPrivateKey.export({ type: "pkcs8", format: "pem" });
@@ -3865,4 +3866,10 @@ test("item 7: once a client is constructed its configured passphrase, token, and
     redactSnapshot({ note: leaf, nested: [{ text: `b64 ${Buffer.from(REGISTERED_SECRET).toString("base64")} end` }], count: 2 }),
     { note: "the value [REDACTED] was echoed by the proxy", nested: [{ text: "b64 [REDACTED] end" }], count: 2 },
   );
+});
+
+writeFailureTest("exportSnowflakeAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-snowflake-write-failure-");
+  const client = createMockClient((statement) => healthyFixture(statement), { role: "ACCOUNTADMIN" });
+  await assertNoPartialBundleOnWriteFailure(base, () => exportSnowflakeAuditBundle(client, sampleConfig({ role: "ACCOUNTADMIN" }), base));
 });

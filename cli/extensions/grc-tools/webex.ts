@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   ConfigFileError,
   NextLinkError,
@@ -445,20 +446,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -2243,48 +2230,50 @@ export async function exportWebexAuditBundle(
   const secrets = client.knownSecrets?.() ?? webexCredentialValues(config);
 
   ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(
-    outputRoot,
-    `${safeDirName(config.orgId ?? access.orgId ?? "webex-org")}-audit-bundle`,
-  );
-  const writeText = (relativePathname: string, content: string): Promise<void> =>
-    writeSecureTextFile(outputDir, relativePathname, scrubBundleText(content, secrets));
-  const writeJson = (relativePathname: string, value: unknown): Promise<void> =>
-    writeSecureTextFile(outputDir, relativePathname, serializeJson(redactSecrets(value, secrets)));
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(config.orgId ?? access.orgId ?? "webex-org")}-audit-bundle`, 9),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    const writeText = (relativePathname: string, content: string): Promise<void> =>
+      writeSecureTextFile(staged.dir, relativePathname, scrubBundleText(content, secrets));
+    const writeJson = (relativePathname: string, value: unknown): Promise<void> =>
+      writeSecureTextFile(staged.dir, relativePathname, serializeJson(redactSecrets(value, secrets)));
 
-  await writeText("QUICK_REFERENCE.md", buildQuickReference());
-  await writeJson("metadata.json", {
-    generated_at: new Date().toISOString(),
-    org_id: config.orgId ?? access.orgId ?? null,
-    token_type: access.tokenType,
-    source_chain: config.sourceChain,
-    config_file: config.configFile ? basename(config.configFile) : null,
-  });
-  await writeJson("core_data/access.json", access);
-  for (const assessment of assessments) {
-    for (const [name, value] of Object.entries(assessment.rawData)) {
-      await writeJson(`core_data/${assessment.category}/${name}.json`, value);
-    }
-    await writeJson(`analysis/${assessment.category}.json`, {
-      title: assessment.title,
-      category: assessment.category,
-      summary: assessment.summary,
-      findings: assessment.findings,
-      errors: assessment.errors,
+    await writeText("QUICK_REFERENCE.md", buildQuickReference());
+    await writeJson("metadata.json", {
+      generated_at: new Date().toISOString(),
+      org_id: config.orgId ?? access.orgId ?? null,
+      token_type: access.tokenType,
+      source_chain: config.sourceChain,
+      config_file: config.configFile ? basename(config.configFile) : null,
     });
-  }
-  await writeJson("analysis/findings.json", findings);
-  await writeText("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeText("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const key of Object.keys(FRAMEWORK_REPORT_PATHS) as WebexFrameworkKey[]) {
-    await writeText(FRAMEWORK_REPORT_PATHS[key], buildFrameworkReport(key, findings));
-  }
-  if (errors.length > 0) {
-    await writeText("_errors.log", `${errors.join("\n")}\n`);
-  }
+    await writeJson("core_data/access.json", access);
+    for (const assessment of assessments) {
+      for (const [name, value] of Object.entries(assessment.rawData)) {
+        await writeJson(`core_data/${assessment.category}/${name}.json`, value);
+      }
+      await writeJson(`analysis/${assessment.category}.json`, {
+        title: assessment.title,
+        category: assessment.category,
+        summary: assessment.summary,
+        findings: assessment.findings,
+        errors: assessment.errors,
+      });
+    }
+    await writeJson("analysis/findings.json", findings);
+    await writeText("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+    await writeText("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const key of Object.keys(FRAMEWORK_REPORT_PATHS) as WebexFrameworkKey[]) {
+      await writeText(FRAMEWORK_REPORT_PATHS[key], buildFrameworkReport(key, findings));
+    }
+    if (errors.length > 0) {
+      await writeText("_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

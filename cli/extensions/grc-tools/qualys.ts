@@ -20,6 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { QUALYS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { NextLinkError, readConfigText, resolveSameOriginUrl } from "./hardening/index.js";
@@ -4176,19 +4177,6 @@ export function bundleZipPath(outputDir: string): string {
   return `${outputDir}.zip`;
 }
 
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  for (let index = 1; index <= MAX_BUNDLE_SUFFIX; index += 1) {
-    const candidate = resolveSecureOutputPath(root, index === 1 ? preferredName : `${preferredName}-${index}`);
-    if (!existsSync(candidate) && !existsSync(bundleZipPath(candidate))) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}: ${MAX_BUNDLE_SUFFIX} prior bundles already exist`);
-}
-
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
@@ -4236,45 +4224,51 @@ export async function exportQualysAuditBundle(
   const errors = uniqueStrings(assessments.flatMap((assessment) => assessment.errors));
 
   ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(outputRoot, safeDirName(`qualys-${config.platform}-audit-bundle`));
-  // Second layer for every bundle file: the same scrub the error constructor applies, minus the long-token heuristic
-  // (QIDs, asset ids, and tag ids are evidence). The first layer is the constructor plus the per-surface allowlist.
-  const secrets = credentialValues(config);
-  const write = (relativePathname: string, content: string) => writeSecureTextFile(outputDir, relativePathname, scrubDataText(content, secrets));
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(safeDirName(`qualys-${config.platform}-audit-bundle`), MAX_BUNDLE_SUFFIX),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+    exhaustedMessage: `Unable to allocate output directory under ${outputRoot}: ${MAX_BUNDLE_SUFFIX} prior bundles already exist`,
+  }, async (staged) => {
+    // Second layer for every bundle file: the same scrub the error constructor applies, minus the long-token heuristic
+    // (QIDs, asset ids, and tag ids are evidence). The first layer is the constructor plus the per-surface allowlist.
+    const secrets = credentialValues(config);
+    const write = (relativePathname: string, content: string) => writeSecureTextFile(staged.dir, relativePathname, scrubDataText(content, secrets));
 
-  await write("QUICK_REFERENCE.md", `${buildQuickReference()}\n`);
-  await write("metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    platform: config.platform,
-    base_url: config.baseUrl,
-    auth_mode: config.authMode,
-    source_chain: config.sourceChain,
-  }));
-  await write("core_data/access.json", serializeJson(access));
-  for (const assessment of assessments) {
-    for (const [name, value] of Object.entries(assessment.rawData)) {
-      await write(`core_data/${assessment.category}/${name}.json`, serializeJson(value));
-    }
-    await write(`analysis/${assessment.category}.json`, serializeJson({
-      category: assessment.category,
-      title: assessment.title,
-      summary: assessment.summary,
-      findings: assessment.findings,
-      errors: assessment.errors,
+    await write("QUICK_REFERENCE.md", `${buildQuickReference()}\n`);
+    await write("metadata.json", serializeJson({
+      generated_at: new Date().toISOString(),
+      platform: config.platform,
+      base_url: config.baseUrl,
+      auth_mode: config.authMode,
+      source_chain: config.sourceChain,
     }));
-  }
-  await write("analysis/findings.json", serializeJson(findings));
-  await write("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await write("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const framework of FRAMEWORKS) {
-    await write(`compliance/${framework.dir}/${framework.file}`, buildFrameworkReport(framework.title, framework.prefix, findings));
-  }
-  if (errors.length > 0) {
-    await write("_errors.log", `${errors.join("\n")}\n`);
-  }
+    await write("core_data/access.json", serializeJson(access));
+    for (const assessment of assessments) {
+      for (const [name, value] of Object.entries(assessment.rawData)) {
+        await write(`core_data/${assessment.category}/${name}.json`, serializeJson(value));
+      }
+      await write(`analysis/${assessment.category}.json`, serializeJson({
+        category: assessment.category,
+        title: assessment.title,
+        summary: assessment.summary,
+        findings: assessment.findings,
+        errors: assessment.errors,
+      }));
+    }
+    await write("analysis/findings.json", serializeJson(findings));
+    await write("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+    await write("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const framework of FRAMEWORKS) {
+      await write(`compliance/${framework.dir}/${framework.file}`, buildFrameworkReport(framework.title, framework.prefix, findings));
+    }
+    if (errors.length > 0) {
+      await write("_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  const zipPath = bundleZipPath(outputDir);
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

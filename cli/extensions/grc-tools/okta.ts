@@ -9,18 +9,18 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, createPrivateKey, randomUUID, sign as signData, type KeyObject } from "node:crypto";
 import {
   createWriteStream,
-  existsSync,
   lstatSync,
   mkdirSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readFile, readdir, writeFile } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { OKTA_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { OKTA_SPEC } from "./okta.spec.js";
@@ -5790,20 +5790,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   return resolvedTarget;
 }
 
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9", "-10"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
-}
-
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
@@ -5993,120 +5979,123 @@ export async function exportOktaAuditBundle(
       ...Object.values(monitoring),
     ]).map((note) => `Truncated inventory: ${note}`),
   ];
-
-  const outputDir = await nextAvailableAuditDir(
-    outputRoot,
-    safeDirName(`${new URL(config.orgUrl).hostname}-audit-bundle`),
-  );
-  const coreDataFiles: OktaCoreDataFile[] = [
-    ["core_data/sign_on_policies.json", authentication.signOnPolicies, "list"],
-    ["core_data/sign_on_policy_rules.json", authentication.signOnPolicyRules, "map"],
-    ["core_data/password_policies.json", authentication.passwordPolicies, "list"],
-    ["core_data/password_policy_rules.json", authentication.passwordPolicyRules, "map"],
-    ["core_data/mfa_enrollment_policies.json", authentication.mfaPolicies, "list"],
-    ["core_data/access_policies.json", authentication.accessPolicies, "list"],
-    ["core_data/access_policy_rules.json", authentication.accessPolicyRules, "map"],
-    ["core_data/authenticators.json", authentication.authenticators, "list"],
-    ["core_data/idps.json", authentication.idps, "list"],
-    ["core_data/authorization_servers.json", authentication.authorizationServers, "list"],
-    ["core_data/default_authorization_server.json", authentication.defaultAuthorizationServer, "object"],
-    ["core_data/org_factors.json", authentication.orgFactors, "list"],
-    ["core_data/users_with_role_assignments.json", adminAccess.usersWithRoleAssignments, "list"],
-    ["core_data/user_roles.json", adminAccess.userRoles, "map"],
-    ["core_data/groups.json", adminAccess.groups, "list"],
-    ["core_data/privileged_group_roles.json", adminAccess.privilegedGroupRoles, "map"],
-    ["core_data/privileged_group_members.json", adminAccess.privilegedGroupMembers, "map"],
-    ["core_data/users.json", adminAccess.users, "list"],
-    ["core_data/privileged_user_factors.json", adminAccess.privilegedUserFactors, "map"],
-    ["core_data/okta_support_access.json", adminAccess.oktaSupportAccess, "object"],
-    ["core_data/third_party_admin_setting.json", adminAccess.thirdPartyAdminSetting, "object"],
-    ["core_data/apps.json", integrations.apps, "list"],
-    ["core_data/trusted_origins.json", integrations.trustedOrigins, "list"],
-    ["core_data/network_zones.json", integrations.networkZones, "list"],
-    ["core_data/group_rules.json", integrations.groupRules, "list"],
-    ["core_data/event_hooks.json", monitoring.eventHooks, "list"],
-    ["core_data/log_streams.json", monitoring.logStreams, "list"],
-    ["core_data/system_logs_recent.json", monitoring.systemLogs, "list"],
-    ["core_data/behaviors.json", monitoring.behaviors, "list"],
-    ["core_data/threat_insight.json", monitoring.threatInsight, "object"],
-    ["core_data/api_tokens.json", monitoring.apiTokens, "list"],
-    ["core_data/device_assurance.json", monitoring.deviceAssurance, "list"],
-    ["core_data/org_contacts.json", monitoring.orgContacts, "list"],
-  ];
-
-  for (const [pathName, dataset] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathName, serializeJson(coreDataSnapshot(dataset)));
-  }
-  await writeSecureTextFile(outputDir, "core_data/collection_status.json", serializeJson(buildCollectionStatus(coreDataFiles)));
-
-  for (const assessment of assessments) {
-    await writeSecureTextFile(
-      outputDir,
-      `analysis/${assessment.category}.json`,
-      serializeJson(assessment),
-    );
-  }
-
   const allFindings = assessments.flatMap((assessment) => assessment.findings);
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(allFindings));
-  await writeSecureTextFile(
-    outputDir,
-    "compliance/executive_summary.md",
-    buildExecutiveSummary(config, assessments, errors),
-  );
-  await writeSecureTextFile(
-    outputDir,
-    "compliance/unified_compliance_matrix.md",
-    buildUnifiedMatrix(allFindings),
-  );
-  await writeSecureTextFile(
-    outputDir,
-    "compliance/fedramp/fedramp_compliance_report.md",
-    buildFrameworkReport("FedRAMP / NIST 800-53 Compliance Report", allFindings, "fedramp"),
-  );
-  await writeSecureTextFile(
-    outputDir,
-    "compliance/fedramp/oscal_assessment_results.json",
-    serializeJson(buildOscalAssessmentResults(config, allFindings)),
-  );
-  await writeSecureTextFile(
-    outputDir,
-    "compliance/disa_stig/stig_compliance_checklist.md",
-    buildFrameworkReport("DISA STIG Compliance Checklist", allFindings, "disa_stig"),
-  );
-  await writeSecureTextFile(
-    outputDir,
-    "compliance/irap/irap_compliance_report.md",
-    buildFrameworkReport("IRAP / ISM Compliance Report", allFindings, "irap"),
-  );
-  await writeSecureTextFile(
-    outputDir,
-    "compliance/irap/essential_eight_assessment.md",
-    "# Essential Eight Assessment\n\nThis bundle keeps the multi-framework report structure, but Essential Eight remains a manual follow-on using the generated evidence.\n",
-  );
-  await writeSecureTextFile(
-    outputDir,
-    "compliance/ismap/ismap_compliance_report.md",
-    buildFrameworkReport("ISMAP / ISO 27001 Compliance Report", allFindings, "ismap"),
-  );
-  await writeSecureTextFile(
-    outputDir,
-    "compliance/soc2/soc2_compliance_report.md",
-    buildFrameworkReport("SOC 2 Compliance Report", allFindings, "soc2"),
-  );
-  await writeSecureTextFile(
-    outputDir,
-    "compliance/pci_dss/pci_dss_compliance_report.md",
-    buildFrameworkReport("PCI-DSS Compliance Report", allFindings, "pci_dss"),
-  );
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
 
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", errors.join("\n"));
-  }
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(safeDirName(`${new URL(config.orgUrl).hostname}-audit-bundle`), 10),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    const coreDataFiles: OktaCoreDataFile[] = [
+      ["core_data/sign_on_policies.json", authentication.signOnPolicies, "list"],
+      ["core_data/sign_on_policy_rules.json", authentication.signOnPolicyRules, "map"],
+      ["core_data/password_policies.json", authentication.passwordPolicies, "list"],
+      ["core_data/password_policy_rules.json", authentication.passwordPolicyRules, "map"],
+      ["core_data/mfa_enrollment_policies.json", authentication.mfaPolicies, "list"],
+      ["core_data/access_policies.json", authentication.accessPolicies, "list"],
+      ["core_data/access_policy_rules.json", authentication.accessPolicyRules, "map"],
+      ["core_data/authenticators.json", authentication.authenticators, "list"],
+      ["core_data/idps.json", authentication.idps, "list"],
+      ["core_data/authorization_servers.json", authentication.authorizationServers, "list"],
+      ["core_data/default_authorization_server.json", authentication.defaultAuthorizationServer, "object"],
+      ["core_data/org_factors.json", authentication.orgFactors, "list"],
+      ["core_data/users_with_role_assignments.json", adminAccess.usersWithRoleAssignments, "list"],
+      ["core_data/user_roles.json", adminAccess.userRoles, "map"],
+      ["core_data/groups.json", adminAccess.groups, "list"],
+      ["core_data/privileged_group_roles.json", adminAccess.privilegedGroupRoles, "map"],
+      ["core_data/privileged_group_members.json", adminAccess.privilegedGroupMembers, "map"],
+      ["core_data/users.json", adminAccess.users, "list"],
+      ["core_data/privileged_user_factors.json", adminAccess.privilegedUserFactors, "map"],
+      ["core_data/okta_support_access.json", adminAccess.oktaSupportAccess, "object"],
+      ["core_data/third_party_admin_setting.json", adminAccess.thirdPartyAdminSetting, "object"],
+      ["core_data/apps.json", integrations.apps, "list"],
+      ["core_data/trusted_origins.json", integrations.trustedOrigins, "list"],
+      ["core_data/network_zones.json", integrations.networkZones, "list"],
+      ["core_data/group_rules.json", integrations.groupRules, "list"],
+      ["core_data/event_hooks.json", monitoring.eventHooks, "list"],
+      ["core_data/log_streams.json", monitoring.logStreams, "list"],
+      ["core_data/system_logs_recent.json", monitoring.systemLogs, "list"],
+      ["core_data/behaviors.json", monitoring.behaviors, "list"],
+      ["core_data/threat_insight.json", monitoring.threatInsight, "object"],
+      ["core_data/api_tokens.json", monitoring.apiTokens, "list"],
+      ["core_data/device_assurance.json", monitoring.deviceAssurance, "list"],
+      ["core_data/org_contacts.json", monitoring.orgContacts, "list"],
+    ];
 
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
+    for (const [pathName, dataset] of coreDataFiles) {
+      await writeSecureTextFile(staged.dir, pathName, serializeJson(coreDataSnapshot(dataset)));
+    }
+    await writeSecureTextFile(staged.dir, "core_data/collection_status.json", serializeJson(buildCollectionStatus(coreDataFiles)));
+
+    for (const assessment of assessments) {
+      await writeSecureTextFile(
+        staged.dir,
+        `analysis/${assessment.category}.json`,
+        serializeJson(assessment),
+      );
+    }
+
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(allFindings));
+    await writeSecureTextFile(
+      staged.dir,
+      "compliance/executive_summary.md",
+      buildExecutiveSummary(config, assessments, errors),
+    );
+    await writeSecureTextFile(
+      staged.dir,
+      "compliance/unified_compliance_matrix.md",
+      buildUnifiedMatrix(allFindings),
+    );
+    await writeSecureTextFile(
+      staged.dir,
+      "compliance/fedramp/fedramp_compliance_report.md",
+      buildFrameworkReport("FedRAMP / NIST 800-53 Compliance Report", allFindings, "fedramp"),
+    );
+    await writeSecureTextFile(
+      staged.dir,
+      "compliance/fedramp/oscal_assessment_results.json",
+      serializeJson(buildOscalAssessmentResults(config, allFindings)),
+    );
+    await writeSecureTextFile(
+      staged.dir,
+      "compliance/disa_stig/stig_compliance_checklist.md",
+      buildFrameworkReport("DISA STIG Compliance Checklist", allFindings, "disa_stig"),
+    );
+    await writeSecureTextFile(
+      staged.dir,
+      "compliance/irap/irap_compliance_report.md",
+      buildFrameworkReport("IRAP / ISM Compliance Report", allFindings, "irap"),
+    );
+    await writeSecureTextFile(
+      staged.dir,
+      "compliance/irap/essential_eight_assessment.md",
+      "# Essential Eight Assessment\n\nThis bundle keeps the multi-framework report structure, but Essential Eight remains a manual follow-on using the generated evidence.\n",
+    );
+    await writeSecureTextFile(
+      staged.dir,
+      "compliance/ismap/ismap_compliance_report.md",
+      buildFrameworkReport("ISMAP / ISO 27001 Compliance Report", allFindings, "ismap"),
+    );
+    await writeSecureTextFile(
+      staged.dir,
+      "compliance/soc2/soc2_compliance_report.md",
+      buildFrameworkReport("SOC 2 Compliance Report", allFindings, "soc2"),
+    );
+    await writeSecureTextFile(
+      staged.dir,
+      "compliance/pci_dss/pci_dss_compliance_report.md",
+      buildFrameworkReport("PCI-DSS Compliance Report", allFindings, "pci_dss"),
+    );
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference());
+
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", errors.join("\n"));
+    }
+
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   const files = await readdir(outputDir, { recursive: true });
   return {

@@ -23,6 +23,7 @@ import {
 } from "../dist/extensions/grc-tools/splunk.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const NOW_SECONDS = Math.floor(Date.now() / 1000);
 
@@ -3016,4 +3017,10 @@ test("item 7: once a client is constructed its configured credential is removed 
 
   await api.getServerInfo();
   assert.equal(redactSnapshot("echoed session-key-abc here"), "echoed [REDACTED] here", "the session key is registered when the login answers");
+});
+
+writeFailureTest("exportSplunkAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-splunk-write-failure-");
+  const { client: api } = client(HARDENED);
+  await assertNoPartialBundleOnWriteFailure(base, () => exportSplunkAuditBundle(api, sampleConfig(), base));
 });

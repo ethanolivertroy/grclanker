@@ -89,6 +89,7 @@ import {
   assertMustRedactRowsBesideMustKeep,
   withPlantedRoutes,
 } from "./helpers/redaction-table.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const SUPERUSER = { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false };
@@ -2817,4 +2818,10 @@ test("rule 9 (round 4 item E): a nested object or array under a documented ping 
     for (const [name, text] of files) assert.doesNotMatch(text, PRIMITIVE_BODY_WORDING, `${label}: no TypeError wording reaches bundle ${name}`);
     assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), `${label}: the 200 answer was observed`);
   }
+});
+
+writeFailureTest("exportAnsibleAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-ansible-write-failure-");
+  const config = { baseUrl: "https://aap.example.com", token: "aap-test-token", timeoutMs: 30_000, verifySsl: true, sourceChain: ["tests"] };
+  await assertNoPartialBundleOnWriteFailure(base, () => exportAnsibleAuditBundle(createMockClient(), config, base, { days: 30, job_limit: 20, host_limit: 20 }));
 });

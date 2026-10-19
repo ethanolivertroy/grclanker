@@ -115,6 +115,7 @@ import {
   assertMustRedactRowsBesideMustKeep,
   plantDeepProbeInPolicyDocument,
 } from "./helpers/redaction-table.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -4310,4 +4311,9 @@ test("rule 9: a 502 HTML page through the real SDK parser path is recorded on ev
     assert.match(text, /AWS access check failed: Unknown \(HTTP 502\): non-JSON body \(text\/html, \d+ bytes\)/);
     assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, "aws_check_access payload");
   });
+});
+
+writeFailureTest("exportAwsAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-aws-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportAwsAuditBundle(compliantBundleClient(), sampleConfig(), base));
 });

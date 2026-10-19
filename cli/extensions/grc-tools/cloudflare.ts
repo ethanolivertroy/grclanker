@@ -19,6 +19,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
   hydrateBatchFrameworkMappings,
@@ -368,20 +369,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  for (let attempt = 1; attempt <= 50; attempt += 1) {
-    const suffix = attempt === 1 ? "" : `-${attempt}`;
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -3482,55 +3469,57 @@ export async function exportCloudflareAuditBundle(
   ]);
 
   ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(
-    outputRoot,
-    `${safeDirName(config.accountId ?? "cloudflare-account")}-audit-bundle`,
-  );
-  const outputDirName = basename(outputDir);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(config.accountId ?? "cloudflare-account")}-audit-bundle`, 50),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    const outputDirName = basename(staged.target.outputDir);
 
-  await writeSecureTextFile(outputDir, "README.md", `${buildBundleReadme()}\n`);
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference({ outputDirName, findings, errorCount: errors.length })}\n`);
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: generatedAt,
-    auth_method: config.authMethod,
-    account_id: config.accountId ?? null,
-    source_chain: config.sourceChain,
-    finding_count: findings.length,
-    error_count: errors.length,
-    status_counts: statusCounts(findings),
-  }));
-  await writeSecureTextFile(
-    outputDir,
-    "summary.md",
-    [
-      formatAccessCheckText(access),
-      "",
-      formatAssessmentText(identity),
-      "",
-      formatAssessmentText(zoneSecurity),
-      "",
-      formatAssessmentText(trafficControls),
-    ].join("\n"),
-  );
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments, generatedAt)}\n`);
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
-  for (const framework of CLOUDFLARE_FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/${framework.slug}/${framework.slug}_compliance_report.md`, `${buildFrameworkReport(framework, findings, generatedAt)}\n`);
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/identity.json", serializeJson(identity));
-  await writeSecureTextFile(outputDir, "analysis/zone-security.json", serializeJson(zoneSecurity));
-  await writeSecureTextFile(outputDir, "analysis/traffic-controls.json", serializeJson(trafficControls));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
-  // A denied or failed list is written as a not-collected marker carrying the observed status and path, never as an empty list.
-  await writeSecureTextFile(outputDir, "core_data/accounts.json", serializeJson(accounts.ok ? projectPagedList(accounts.value, projectAccountRecord) : uncollectedMarker(accounts, "not collected")));
-  await writeSecureTextFile(outputDir, "core_data/zones.json", serializeJson(zones.ok ? projectPagedList(zones.value, projectZoneRecord) : uncollectedMarker(zones, "not collected")));
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.map((item) => `${generatedAt} ${item}`).join("\n")}\n`);
-  }
+    await writeSecureTextFile(staged.dir, "README.md", `${buildBundleReadme()}\n`);
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", `${buildQuickReference({ outputDirName, findings, errorCount: errors.length })}\n`);
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      generated_at: generatedAt,
+      auth_method: config.authMethod,
+      account_id: config.accountId ?? null,
+      source_chain: config.sourceChain,
+      finding_count: findings.length,
+      error_count: errors.length,
+      status_counts: statusCounts(findings),
+    }));
+    await writeSecureTextFile(
+      staged.dir,
+      "summary.md",
+      [
+        formatAccessCheckText(access),
+        "",
+        formatAssessmentText(identity),
+        "",
+        formatAssessmentText(zoneSecurity),
+        "",
+        formatAssessmentText(trafficControls),
+      ].join("\n"),
+    );
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments, generatedAt)}\n`);
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
+    for (const framework of CLOUDFLARE_FRAMEWORKS) {
+      await writeSecureTextFile(staged.dir, `compliance/${framework.slug}/${framework.slug}_compliance_report.md`, `${buildFrameworkReport(framework, findings, generatedAt)}\n`);
+    }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "analysis/identity.json", serializeJson(identity));
+    await writeSecureTextFile(staged.dir, "analysis/zone-security.json", serializeJson(zoneSecurity));
+    await writeSecureTextFile(staged.dir, "analysis/traffic-controls.json", serializeJson(trafficControls));
+    await writeSecureTextFile(staged.dir, "core_data/access.json", serializeJson(access));
+    // A denied or failed list is written as a not-collected marker carrying the observed status and path, never as an empty list.
+    await writeSecureTextFile(staged.dir, "core_data/accounts.json", serializeJson(accounts.ok ? projectPagedList(accounts.value, projectAccountRecord) : uncollectedMarker(accounts, "not collected")));
+    await writeSecureTextFile(staged.dir, "core_data/zones.json", serializeJson(zones.ok ? projectPagedList(zones.value, projectZoneRecord) : uncollectedMarker(zones, "not collected")));
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.map((item) => `${generatedAt} ${item}`).join("\n")}\n`);
+    }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, `${outputDirName}.zip`);
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

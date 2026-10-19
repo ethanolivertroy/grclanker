@@ -40,6 +40,7 @@ import {
   scrubErrorText,
 } from "../dist/extensions/grc-tools/newrelic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const TEST_KEY = "NRAK-TESTKEY1234567890ABCDEF";
 const NOW = Date.UTC(2026, 8, 21, 12, 0, 0);
@@ -4867,4 +4868,9 @@ test("NewrelicApiClient refuses a 200 REST listing that omits the documented col
   const users = await empty.listRestUsers();
   assert.deepEqual(users.items, []);
   assert.equal(users.complete, true);
+});
+
+writeFailureTest("exportNewrelicAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-newrelic-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportNewrelicAuditBundle(bundleClient(), sampleConfig({ accountIds: [111] }), base, { now: NOW }));
 });

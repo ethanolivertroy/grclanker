@@ -22,6 +22,7 @@ import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -4184,19 +4185,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   return resolvedTarget;
 }
 
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  for (let index = 1; index <= 50; index += 1) {
-    const candidate = resolveSecureOutputPath(root, index === 1 ? preferredName : `${preferredName}-${index}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
-}
-
 /** Writes one bundle file; every configured secret is removed from the content first, in every encoded form (guard 2). */
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string, secrets: ReadonlyArray<string | undefined> = []): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
@@ -4387,38 +4375,44 @@ export async function exportZendeskAuditBundle(
   // Every file passes through the configured-secret scrub (guard 2) on the way
   // out: JSON files value by value, text files as a whole.
   const secrets = configuredZendeskSecrets(config);
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(config.subdomain)}-zendesk-audit-bundle`);
-  await writeSecureJsonFile(outputDir, "metadata.json", {
-    generated_at: generatedAt,
-    subdomain: config.subdomain,
-    auth_mode: config.authMode,
-    source_chain: config.sourceChain,
-    finding_count: findings.length,
-    error_count: errors.length,
-  }, secrets);
-  await writeSecureJsonFile(outputDir, "core_data/access_check.json", access, secrets);
-  // Every read gets a core_data/ file: the redacted payload when it was readable,
-  // otherwise the not-collected marker, so a refused list never appears as a
-  // missing file or an empty inventory.
-  for (const assessment of assessments) {
-    for (const [name, value] of Object.entries(assessment.snapshots)) {
-      await writeSecureJsonFile(outputDir, `core_data/${name}.json`, value ?? null, secrets);
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(config.subdomain)}-zendesk-audit-bundle`, 50),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await writeSecureJsonFile(staged.dir, "metadata.json", {
+      generated_at: generatedAt,
+      subdomain: config.subdomain,
+      auth_mode: config.authMode,
+      source_chain: config.sourceChain,
+      finding_count: findings.length,
+      error_count: errors.length,
+    }, secrets);
+    await writeSecureJsonFile(staged.dir, "core_data/access_check.json", access, secrets);
+    // Every read gets a core_data/ file: the redacted payload when it was readable,
+    // otherwise the not-collected marker, so a refused list never appears as a
+    // missing file or an empty inventory.
+    for (const assessment of assessments) {
+      for (const [name, value] of Object.entries(assessment.snapshots)) {
+        await writeSecureJsonFile(staged.dir, `core_data/${name}.json`, value ?? null, secrets);
+      }
+      await writeSecureJsonFile(staged.dir, `analysis/${assessment.category}.json`, assessment, secrets);
     }
-    await writeSecureJsonFile(outputDir, `analysis/${assessment.category}.json`, assessment, secrets);
-  }
-  await writeSecureJsonFile(outputDir, "analysis/findings.json", findings, secrets);
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, generatedAt), secrets);
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings), secrets);
-  for (const framework of FRAMEWORK_REPORTS) {
-    await writeSecureTextFile(outputDir, `compliance/${framework.slug}_compliance_report.md`, buildFrameworkReport(framework.title, framework.prefix, findings), secrets);
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(), secrets);
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`, secrets);
-  }
+    await writeSecureJsonFile(staged.dir, "analysis/findings.json", findings, secrets);
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, generatedAt), secrets);
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings), secrets);
+    for (const framework of FRAMEWORK_REPORTS) {
+      await writeSecureTextFile(staged.dir, `compliance/${framework.slug}_compliance_report.md`, buildFrameworkReport(framework.title, framework.prefix, findings), secrets);
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference(), secrets);
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`, secrets);
+    }
 
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
   return {
     outputDir,
     zipPath,

@@ -35,6 +35,7 @@ import {
 } from "../dist/extensions/grc-tools/sumologic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRESH = "2026-09-01T00:00:00Z";
@@ -3134,4 +3135,9 @@ test("class 10: a single object carrying a documented member is kept whatever el
   const governance = await assessSumologicDataGovernance(client, { now: NOW });
   assert.equal(byId(governance, "SUMO-09").status, "pass");
   assert.ok(!JSON.stringify(governance.findings).includes(FOREIGN_BODY_CANARY), "an undocumented member never reaches a finding");
+});
+
+writeFailureTest("exportSumologicAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-sumo-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportSumologicAuditBundle(readerFrom(healthyData()), sampleConfig(), base, { now: NOW }));
 });

@@ -18,10 +18,11 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
   hydrateBatchFrameworkMappings,
@@ -1715,16 +1716,6 @@ function ensurePrivateDir(pathname: string): void {
   }
 }
 
-function pathEntryExists(pathname: string): boolean {
-  try {
-    lstatSync(pathname);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
-}
-
 export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
   ensurePrivateDir(baseDir);
   const realBase = realpathSync(baseDir);
@@ -1750,20 +1741,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
     throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
   }
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  for (const suffix of ["", "-2", "-3", "-4", "-5", "-6"]) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    const zipCandidate = resolveSecureOutputPath(root, `${preferredName}${suffix}.zip`);
-    if (!pathEntryExists(candidate) && !pathEntryExists(zipCandidate)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 /** Writes one bundle file; every configured secret is removed from the content first, in every encoded form (guard 2). */
@@ -5509,45 +5486,53 @@ export async function exportPaloaltoAuditBundle(
 
   ensurePrivateDir(outputRoot);
   const label = safeDirName(config.prisma ? new URL(config.prisma.apiUrl).hostname : config.panos[0]?.host ?? "paloalto");
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${label}-audit-bundle`);
-  // Collected after the reads so the key PAN-OS keygen returned is included.
-  const secrets = configuredSecrets(clients);
-  const write = (relativePathname: string, content: string) => writeSecureTextFile(outputDir, relativePathname, content, secrets);
-  const writeJson = (relativePathname: string, value: unknown) => writeSecureJsonFile(outputDir, relativePathname, value, secrets);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${label}-audit-bundle`, 6),
+    zip: true,
+    checkName: (name) => {
+      resolveSecureOutputPath(outputRoot, name);
+      resolveSecureOutputPath(outputRoot, `${name}.zip`);
+    },
+  }, async (staged) => {
+    // Collected after the reads so the key PAN-OS keygen returned is included.
+    const secrets = configuredSecrets(clients);
+    const write = (relativePathname: string, content: string) => writeSecureTextFile(staged.dir, relativePathname, content, secrets);
+    const writeJson = (relativePathname: string, value: unknown) => writeSecureJsonFile(staged.dir, relativePathname, value, secrets);
 
-  await write("QUICK_REFERENCE.md", `${buildQuickReference(access, assessments)}\n`);
-  await writeJson("metadata.json", {
-    generated_at: new Date().toISOString(),
-    prisma_api_url: config.prisma ? displayOrigin(config.prisma.apiUrl) : null,
-    prisma_compute_url: prismaSnapshot?.compute?.consoleUrl ?? null,
-    panos_hosts: config.panos.map((item) => item.host),
-    tls_verification: config.verifyTls,
-    tls_verification_scope: config.verifyTls ? "all requests" : "disabled for PAN-OS requests only",
-    source_chain: config.sourceChain,
+    await write("QUICK_REFERENCE.md", `${buildQuickReference(access, assessments)}\n`);
+    await writeJson("metadata.json", {
+      generated_at: new Date().toISOString(),
+      prisma_api_url: config.prisma ? displayOrigin(config.prisma.apiUrl) : null,
+      prisma_compute_url: prismaSnapshot?.compute?.consoleUrl ?? null,
+      panos_hosts: config.panos.map((item) => item.host),
+      tls_verification: config.verifyTls,
+      tls_verification_scope: config.verifyTls ? "all requests" : "disabled for PAN-OS requests only",
+      source_chain: config.sourceChain,
+    });
+    await writeJson("core_data/access.json", access);
+    if (prismaSnapshot) {
+      await writeJson("core_data/prisma_cloud.json", prismaSnapshotToJson(prismaSnapshot));
+    }
+    for (const snapshot of deviceSnapshots) {
+      await writeJson(`core_data/panos_${safeDirName(snapshot.host)}.json`, panosSnapshotToJson(snapshot));
+    }
+    await writeJson("analysis/findings.json", findings);
+    const analysisNames = ["cloud_posture", "firewall_policy", "threat_prevention", "device_hardening"];
+    for (const [index, assessment] of assessments.entries()) {
+      await writeJson(`analysis/${analysisNames[index]}.json`, assessment);
+    }
+    await write("compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments)}\n`);
+    await write("compliance/unified_compliance_matrix.md", `${buildComplianceMatrix(findings)}\n`);
+    for (const framework of FRAMEWORK_ORDER) {
+      await write(`compliance/${FRAMEWORK_FILES[framework]}`, `${buildFrameworkReport(framework, findings)}\n`);
+    }
+    if (errors.length > 0) {
+      await write("_errors.log", `${errors.join("\n")}\n`);
+    }
+
+    await createZipArchive(staged.dir, staged.zipPath);
   });
-  await writeJson("core_data/access.json", access);
-  if (prismaSnapshot) {
-    await writeJson("core_data/prisma_cloud.json", prismaSnapshotToJson(prismaSnapshot));
-  }
-  for (const snapshot of deviceSnapshots) {
-    await writeJson(`core_data/panos_${safeDirName(snapshot.host)}.json`, panosSnapshotToJson(snapshot));
-  }
-  await writeJson("analysis/findings.json", findings);
-  const analysisNames = ["cloud_posture", "firewall_policy", "threat_prevention", "device_hardening"];
-  for (const [index, assessment] of assessments.entries()) {
-    await writeJson(`analysis/${analysisNames[index]}.json`, assessment);
-  }
-  await write("compliance/executive_summary.md", `${buildExecutiveSummary(config, assessments)}\n`);
-  await write("compliance/unified_compliance_matrix.md", `${buildComplianceMatrix(findings)}\n`);
-  for (const framework of FRAMEWORK_ORDER) {
-    await write(`compliance/${FRAMEWORK_FILES[framework]}`, `${buildFrameworkReport(framework, findings)}\n`);
-  }
-  if (errors.length > 0) {
-    await write("_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
   return {
     outputDir,
     zipPath,

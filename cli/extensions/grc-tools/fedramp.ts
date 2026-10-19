@@ -9,6 +9,7 @@ import { chmod, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   type FedrampApplicability,
   type FedrampKsiDomainRecord,
@@ -969,16 +970,24 @@ export async function writeSecureTextFile(baseDir: string, destPath: string, dat
   return resolvedPath;
 }
 
-function nextAvailableBundleDir(rootDir: string, baseName: string): string {
-  let attempt = 0;
-  while (attempt < 100) {
-    const candidateName = attempt === 0 ? baseName : `${baseName}-${attempt + 1}`;
-    const candidate = resolve(rootDir, candidateName);
-    if (!existsSync(candidate)) return candidate;
-    attempt += 1;
-  }
+async function writeFileBundle(
+  outputRoot: string,
+  bundleName: string,
+  files: BundleTemplateFile[],
+): Promise<{ outputDir: string; files: string[] }> {
+  ensurePrivateDir(outputRoot);
+  const canonicalOutputRoot = realpathSync(outputRoot);
+  const { outputDir } = await writeBundleAtomically({
+    root: canonicalOutputRoot,
+    names: numberedNames(bundleName, 100),
+    exhaustedMessage: `Unable to allocate bundle directory under ${canonicalOutputRoot}`,
+  }, async (staged) => {
+    for (const file of files) {
+      await writeSecureTextFile(staged.dir, resolve(staged.dir, file.path), file.content);
+    }
+  });
 
-  throw new Error(`Unable to allocate bundle directory under ${rootDir}`);
+  return { outputDir, files: files.map((file) => resolve(outputDir, file.path)) };
 }
 
 function findArtifactItem(plan: AdsPackagePlan, name: string): ArtifactPlanItem | undefined {
@@ -1233,21 +1242,12 @@ export async function generateFedrampAdsStarterBundle(
   outputRoot: string,
   args: AdsBundleArgs,
 ): Promise<AdsStarterBundleResult> {
-  ensurePrivateDir(outputRoot);
-  const canonicalOutputRoot = realpathSync(outputRoot);
   const bundle = buildFedrampAdsStarterBundle(loaded, args);
-  const outputDir = nextAvailableBundleDir(canonicalOutputRoot, bundle.bundleName);
-  ensurePrivateDir(outputDir);
-
-  const writtenFiles: string[] = [];
-  for (const file of bundle.files) {
-    const absolutePath = await writeSecureTextFile(outputDir, resolve(outputDir, file.path), file.content);
-    writtenFiles.push(absolutePath);
-  }
+  const { outputDir, files } = await writeFileBundle(outputRoot, bundle.bundleName, bundle.files);
 
   return {
     outputDir,
-    files: writtenFiles,
+    files,
     plan: bundle.plan,
   };
 }
@@ -2721,21 +2721,12 @@ export async function generateFedrampAdsSite(
   outputRoot: string,
   args: AdsSiteArgs,
 ): Promise<AdsPublicSiteResult> {
-  ensurePrivateDir(outputRoot);
-  const canonicalOutputRoot = realpathSync(outputRoot);
   const site = buildFedrampAdsSite(loaded, args);
-  const outputDir = nextAvailableBundleDir(canonicalOutputRoot, site.bundleName);
-  ensurePrivateDir(outputDir);
-
-  const writtenFiles: string[] = [];
-  for (const file of site.files) {
-    const absolutePath = await writeSecureTextFile(outputDir, resolve(outputDir, file.path), file.content);
-    writtenFiles.push(absolutePath);
-  }
+  const { outputDir, files } = await writeFileBundle(outputRoot, site.bundleName, site.files);
 
   return {
     outputDir,
-    files: writtenFiles,
+    files,
     plan: site.plan,
     metadata: site.metadata,
   };

@@ -17,10 +17,11 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { BOX_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { BOX_SPEC } from "./box.spec.js";
@@ -642,20 +643,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -4150,97 +4137,101 @@ export async function exportBoxAuditBundle(
   const enterpriseId = access.enterpriseId ?? identityData.enterpriseId;
 
   ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(enterpriseId ?? "box-enterprise")}-audit-bundle`);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(enterpriseId ?? "box-enterprise")}-audit-bundle`, 6),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    const coreDatasets: Array<[string, CollectedDataset<unknown>]> = [
+      ["core_data/current_user.json", identityData.currentUser],
+      ["core_data/users.json", identityData.users],
+      ["core_data/groups.json", groups],
+      ["core_data/enterprise_events_activity.json", projectEventDataset(identityData.events)],
+      ["core_data/enterprise_events_sharing.json", projectEventDataset(sharingData.events)],
+      ["core_data/enterprise_events_shield.json", projectEventDataset(shieldData.events)],
+      ["core_data/device_pinners.json", governanceData.devicePinners],
+      ["core_data/classification_template.json", governanceData.classificationTemplate],
+      ["core_data/metadata_templates.json", governanceData.metadataTemplates],
+      ["core_data/retention_policies.json", governanceData.retentionPolicies],
+      ["core_data/retention_policy_assignments.json", governanceData.retentionAssignments],
+      ["core_data/legal_hold_policies.json", governanceData.legalHoldPolicies],
+      ["core_data/legal_hold_policy_assignments.json", governanceData.legalHoldAssignments],
+      ["core_data/shield_information_barriers.json", shieldData.barriers],
+      ["core_data/shield_information_barrier_segments.json", shieldData.barrierSegments],
+      ["core_data/shield_lists.json", shieldData.shieldLists],
+      ["core_data/collaboration_allowlist_entries.json", sharingData.allowlistEntries],
+      ["core_data/collaboration_allowlist_exempt_targets.json", sharingData.exemptTargets],
+      ["core_data/terms_of_services.json", sharingData.termsOfServices],
+    ];
+    const configurationDatasets = [identityData.configuration, sharingData.configuration, governanceData.configuration, shieldData.configuration];
+    const readConfigurations = configurationDatasets.filter(isRead);
+    const mergedConfiguration: JsonRecord = Object.assign({}, ...readConfigurations.map((dataset) => dataset.data));
+    const configurationErrors = [...new Set(configurationDatasets.map((dataset) => dataset.error).filter((error): error is string => Boolean(error)))];
+    const failedConfiguration = configurationDatasets.find((dataset) => !isRead(dataset));
+    const coreDataFiles: Array<[string, unknown]> = [
+      ["core_data/access_check.json", access],
+      // A configuration none of the four category reads could fetch is written as a marker, never as {}.
+      ["core_data/enterprise_configuration.json", readConfigurations.length > 0 || !failedConfiguration ? mergedConfiguration : notReadableMarker(failedConfiguration)],
+      ...coreDatasets.map(([pathname, dataset]): [string, unknown] => [pathname, snapshotValue(dataset)]),
+      ["core_data/collection_status.json", {
+        generated_at: new Date().toISOString(),
+        datasets: [
+          {
+            file: "core_data/enterprise_configuration.json",
+            collected: readConfigurations.length > 0,
+            status: readConfigurations.length === 0 && failedConfiguration
+              ? collectionStatusLabel(failedConfiguration)
+              : configurationErrors.length > 0 ? "partial" : "collected",
+            count: readConfigurations.length > 0 ? Object.keys(mergedConfiguration).length : null,
+            complete: readConfigurations.length > 0 ? configurationErrors.length === 0 : null,
+            truncated: readConfigurations.length > 0 ? false : null,
+            error: configurationErrors.length > 0 ? configurationErrors.join("; ") : null,
+            status_code: failedConfiguration?.statusCode ?? null,
+            endpoint: failedConfiguration?.request ?? null,
+          },
+          ...coreDatasets.map(([pathname, dataset]) => collectionStatusEntry(pathname, dataset)),
+        ],
+        truncated_datasets: truncated,
+      }],
+    ];
+    for (const [pathname, value] of coreDataFiles) {
+      await writeSecureTextFile(staged.dir, pathname, serializeJson(redactCredentialValues(value)));
+    }
 
-  const coreDatasets: Array<[string, CollectedDataset<unknown>]> = [
-    ["core_data/current_user.json", identityData.currentUser],
-    ["core_data/users.json", identityData.users],
-    ["core_data/groups.json", groups],
-    ["core_data/enterprise_events_activity.json", projectEventDataset(identityData.events)],
-    ["core_data/enterprise_events_sharing.json", projectEventDataset(sharingData.events)],
-    ["core_data/enterprise_events_shield.json", projectEventDataset(shieldData.events)],
-    ["core_data/device_pinners.json", governanceData.devicePinners],
-    ["core_data/classification_template.json", governanceData.classificationTemplate],
-    ["core_data/metadata_templates.json", governanceData.metadataTemplates],
-    ["core_data/retention_policies.json", governanceData.retentionPolicies],
-    ["core_data/retention_policy_assignments.json", governanceData.retentionAssignments],
-    ["core_data/legal_hold_policies.json", governanceData.legalHoldPolicies],
-    ["core_data/legal_hold_policy_assignments.json", governanceData.legalHoldAssignments],
-    ["core_data/shield_information_barriers.json", shieldData.barriers],
-    ["core_data/shield_information_barrier_segments.json", shieldData.barrierSegments],
-    ["core_data/shield_lists.json", shieldData.shieldLists],
-    ["core_data/collaboration_allowlist_entries.json", sharingData.allowlistEntries],
-    ["core_data/collaboration_allowlist_exempt_targets.json", sharingData.exemptTargets],
-    ["core_data/terms_of_services.json", sharingData.termsOfServices],
-  ];
-  const configurationDatasets = [identityData.configuration, sharingData.configuration, governanceData.configuration, shieldData.configuration];
-  const readConfigurations = configurationDatasets.filter(isRead);
-  const mergedConfiguration: JsonRecord = Object.assign({}, ...readConfigurations.map((dataset) => dataset.data));
-  const configurationErrors = [...new Set(configurationDatasets.map((dataset) => dataset.error).filter((error): error is string => Boolean(error)))];
-  const failedConfiguration = configurationDatasets.find((dataset) => !isRead(dataset));
-  const coreDataFiles: Array<[string, unknown]> = [
-    ["core_data/access_check.json", access],
-    // A configuration none of the four category reads could fetch is written as a marker, never as {}.
-    ["core_data/enterprise_configuration.json", readConfigurations.length > 0 || !failedConfiguration ? mergedConfiguration : notReadableMarker(failedConfiguration)],
-    ...coreDatasets.map(([pathname, dataset]): [string, unknown] => [pathname, snapshotValue(dataset)]),
-    ["core_data/collection_status.json", {
+    for (const assessment of assessments) {
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.area}.json`, serializeJson(assessment));
+    }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "analysis/summary.json", serializeJson({
       generated_at: new Date().toISOString(),
-      datasets: [
-        {
-          file: "core_data/enterprise_configuration.json",
-          collected: readConfigurations.length > 0,
-          status: readConfigurations.length === 0 && failedConfiguration
-            ? collectionStatusLabel(failedConfiguration)
-            : configurationErrors.length > 0 ? "partial" : "collected",
-          count: readConfigurations.length > 0 ? Object.keys(mergedConfiguration).length : null,
-          complete: readConfigurations.length > 0 ? configurationErrors.length === 0 : null,
-          truncated: readConfigurations.length > 0 ? false : null,
-          error: configurationErrors.length > 0 ? configurationErrors.join("; ") : null,
-          status_code: failedConfiguration?.statusCode ?? null,
-          endpoint: failedConfiguration?.request ?? null,
-        },
-        ...coreDatasets.map(([pathname, dataset]) => collectionStatusEntry(pathname, dataset)),
-      ],
+      enterprise_id: enterpriseId ?? null,
+      auth_mode: config.authMode,
+      source_chain: config.sourceChain,
+      controls_assessed: findings.length,
+      status_counts: summarizeFindingStatuses(findings),
+      errors,
       truncated_datasets: truncated,
-    }],
-  ];
-  for (const [pathname, value] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathname, serializeJson(redactCredentialValues(value)));
-  }
+    }));
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, enterpriseId, assessments, errors, truncated));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const report of FRAMEWORK_REPORTS) {
+      await writeSecureTextFile(staged.dir, report.path, buildFrameworkReport(report.title, report.framework, findings));
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference());
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      generated_at: new Date().toISOString(),
+      enterprise_id: enterpriseId ?? null,
+      auth_mode: config.authMode,
+      source_chain: config.sourceChain,
+      base_url: config.baseUrl,
+    }));
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.json`, serializeJson(assessment));
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/summary.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    enterprise_id: enterpriseId ?? null,
-    auth_mode: config.authMode,
-    source_chain: config.sourceChain,
-    controls_assessed: findings.length,
-    status_counts: summarizeFindingStatuses(findings),
-    errors,
-    truncated_datasets: truncated,
-  }));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, enterpriseId, assessments, errors, truncated));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const report of FRAMEWORK_REPORTS) {
-    await writeSecureTextFile(outputDir, report.path, buildFrameworkReport(report.title, report.framework, findings));
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    enterprise_id: enterpriseId ?? null,
-    auth_mode: config.authMode,
-    source_chain: config.sourceChain,
-    base_url: config.baseUrl,
-  }));
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

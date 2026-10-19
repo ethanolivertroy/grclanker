@@ -22,6 +22,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1721,20 +1722,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
     throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
   }
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  for (let index = 0; index < 50; index += 1) {
-    const suffix = index === 0 ? "" : `-${index + 1}`;
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 /** Writes one bundle file with the configured secrets removed from its text in every encoded form (guard 2). */
@@ -5219,74 +5206,79 @@ export async function exportTenableAuditBundle(
   const errors = assessments.flatMap((assessment) => assessment.errors);
 
   const hostLabel = config.vm ? new URL(config.vm.baseUrl).hostname : new URL(config.securityCenter?.baseUrl ?? DEFAULT_CLOUD_URL).hostname;
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(hostLabel)}-audit-bundle`);
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(hostLabel)}-audit-bundle`, 50),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    // Every list or object that was refused, failed, or never requested is written
+    // as a not-collected marker instead of an empty inventory; a readable but empty
+    // list stays []. Readable data was redacted at collection time and is scrubbed
+    // once more here before it touches disk.
+    const exportRecords = (result: TenableExportResult) => partialExportOrRecords(result);
+    const coreData: Array<[string, unknown]> = [
+      ["core_data/access_check.json", access],
+      ["core_data/scans.json", collectedOrMarker(scanProgramData.scans)],
+      ["core_data/policies.json", collectedOrMarker(scanProgramData.policies)],
+      ["core_data/policy_details.json", collectedOrMarker(scanProgramData.policyDetails)],
+      ["core_data/scan_templates.json", collectedOrMarker(scanProgramData.templates)],
+      ["core_data/exclusions.json", collectedOrMarker(scanProgramData.exclusions)],
+      ["core_data/target_groups.json", collectedOrMarker(scanProgramData.targetGroups)],
+      ["core_data/assets_export.json", collectedOrMarker(sensorData.assetExport, exportRecords)],
+      ["core_data/server_properties.json", collectedOrMarker(sensorData.serverProperties)],
+      ["core_data/scanners.json", collectedOrMarker(sensorData.scanners)],
+      ["core_data/agents.json", collectedOrMarker(sensorData.agents)],
+      ["core_data/agent_groups.json", collectedOrMarker(sensorData.agentGroups)],
+      ["core_data/networks.json", collectedOrMarker(sensorData.networks)],
+      ["core_data/tag_categories.json", collectedOrMarker(sensorData.tagCategories)],
+      ["core_data/tag_values.json", collectedOrMarker(sensorData.tagValues)],
+      ["core_data/users.json", collectedOrMarker(accessData.users)],
+      ["core_data/groups.json", collectedOrMarker(accessData.groups)],
+      ["core_data/roles.json", collectedOrMarker(accessData.roles)],
+      ["core_data/permissions.json", collectedOrMarker(accessData.permissions)],
+      ["core_data/access_groups.json", collectedOrMarker(accessData.accessGroups)],
+      ["core_data/credentials.json", collectedOrMarker(accessData.credentials)],
+      ["core_data/audit_log_events.json", collectedOrMarker(accessData.auditLog)],
+      ["core_data/vulns_export.json", collectedOrMarker(vulnData.vulnExport, exportRecords)],
+      ["core_data/export_jobs.json", {
+        vulns: collectedOrMarker(vulnData.vulnExportJobs),
+        assets: collectedOrMarker(vulnData.assetExportJobs),
+      }],
+      ["core_data/security_center.json", {
+        scans: collectedOrMarker(scanProgramData.scScans),
+        scan_results: collectedOrMarker(scanProgramData.scScanResults),
+        scanners: collectedOrMarker(sensorData.scScanners),
+        feed: collectedOrMarker(sensorData.scFeed),
+        users: collectedOrMarker(accessData.scUsers),
+      }],
+    ];
+    for (const [pathname, value] of coreData) {
+      await writeSecureJsonFile(staged.dir, pathname, redactCredentialProperties(value), secrets);
+    }
+    for (const assessment of assessments) {
+      await writeSecureJsonFile(staged.dir, `analysis/${assessment.category}.json`, redactCredentialProperties(assessment), secrets);
+    }
+    await writeSecureJsonFile(staged.dir, "analysis/findings.json", redactCredentialProperties(findings), secrets);
+    await writeSecureJsonFile(staged.dir, "metadata.json", {
+      generated_at: new Date().toISOString(),
+      platform: access.platform,
+      source_chain: config.sourceChain,
+      caller_is_administrator: access.callerIsAdministrator,
+    }, secrets);
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors), secrets);
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings), secrets);
+    for (const framework of FRAMEWORK_REPORTS) {
+      await writeSecureTextFile(staged.dir, `compliance/${framework.slug}/${framework.slug}_compliance_report.md`, buildFrameworkReport(framework.title, framework.prefix, findings), secrets);
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference(), secrets);
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`, secrets);
+    }
 
-  // Every list or object that was refused, failed, or never requested is written
-  // as a not-collected marker instead of an empty inventory; a readable but empty
-  // list stays []. Readable data was redacted at collection time and is scrubbed
-  // once more here before it touches disk.
-  const exportRecords = (result: TenableExportResult) => partialExportOrRecords(result);
-  const coreData: Array<[string, unknown]> = [
-    ["core_data/access_check.json", access],
-    ["core_data/scans.json", collectedOrMarker(scanProgramData.scans)],
-    ["core_data/policies.json", collectedOrMarker(scanProgramData.policies)],
-    ["core_data/policy_details.json", collectedOrMarker(scanProgramData.policyDetails)],
-    ["core_data/scan_templates.json", collectedOrMarker(scanProgramData.templates)],
-    ["core_data/exclusions.json", collectedOrMarker(scanProgramData.exclusions)],
-    ["core_data/target_groups.json", collectedOrMarker(scanProgramData.targetGroups)],
-    ["core_data/assets_export.json", collectedOrMarker(sensorData.assetExport, exportRecords)],
-    ["core_data/server_properties.json", collectedOrMarker(sensorData.serverProperties)],
-    ["core_data/scanners.json", collectedOrMarker(sensorData.scanners)],
-    ["core_data/agents.json", collectedOrMarker(sensorData.agents)],
-    ["core_data/agent_groups.json", collectedOrMarker(sensorData.agentGroups)],
-    ["core_data/networks.json", collectedOrMarker(sensorData.networks)],
-    ["core_data/tag_categories.json", collectedOrMarker(sensorData.tagCategories)],
-    ["core_data/tag_values.json", collectedOrMarker(sensorData.tagValues)],
-    ["core_data/users.json", collectedOrMarker(accessData.users)],
-    ["core_data/groups.json", collectedOrMarker(accessData.groups)],
-    ["core_data/roles.json", collectedOrMarker(accessData.roles)],
-    ["core_data/permissions.json", collectedOrMarker(accessData.permissions)],
-    ["core_data/access_groups.json", collectedOrMarker(accessData.accessGroups)],
-    ["core_data/credentials.json", collectedOrMarker(accessData.credentials)],
-    ["core_data/audit_log_events.json", collectedOrMarker(accessData.auditLog)],
-    ["core_data/vulns_export.json", collectedOrMarker(vulnData.vulnExport, exportRecords)],
-    ["core_data/export_jobs.json", {
-      vulns: collectedOrMarker(vulnData.vulnExportJobs),
-      assets: collectedOrMarker(vulnData.assetExportJobs),
-    }],
-    ["core_data/security_center.json", {
-      scans: collectedOrMarker(scanProgramData.scScans),
-      scan_results: collectedOrMarker(scanProgramData.scScanResults),
-      scanners: collectedOrMarker(sensorData.scScanners),
-      feed: collectedOrMarker(sensorData.scFeed),
-      users: collectedOrMarker(accessData.scUsers),
-    }],
-  ];
-  for (const [pathname, value] of coreData) {
-    await writeSecureJsonFile(outputDir, pathname, redactCredentialProperties(value), secrets);
-  }
-  for (const assessment of assessments) {
-    await writeSecureJsonFile(outputDir, `analysis/${assessment.category}.json`, redactCredentialProperties(assessment), secrets);
-  }
-  await writeSecureJsonFile(outputDir, "analysis/findings.json", redactCredentialProperties(findings), secrets);
-  await writeSecureJsonFile(outputDir, "metadata.json", {
-    generated_at: new Date().toISOString(),
-    platform: access.platform,
-    source_chain: config.sourceChain,
-    caller_is_administrator: access.callerIsAdministrator,
-  }, secrets);
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors), secrets);
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings), secrets);
-  for (const framework of FRAMEWORK_REPORTS) {
-    await writeSecureTextFile(outputDir, `compliance/${framework.slug}/${framework.slug}_compliance_report.md`, buildFrameworkReport(framework.title, framework.prefix, findings), secrets);
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(), secrets);
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`, secrets);
-  }
-
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,
