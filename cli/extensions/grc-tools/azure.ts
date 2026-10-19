@@ -15,10 +15,11 @@ import {
   mkdirSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
   hydrateBatchFrameworkMappings,
@@ -1654,20 +1655,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
     throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
   }
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  for (let index = 1; index <= 50; index += 1) {
-    const suffix = index === 1 ? "" : `-${index}`;
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -3655,40 +3642,45 @@ export async function exportAzureAuditBundle(
   const { findings, errors } = mergeAssessments("Azure audit bundle", assessments);
   const generatedAt = new Date().toISOString();
   const targetName = safeDirName(`${config.tenantId}-${config.subscriptionId}-audit`);
-  const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(targetName, 50),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "README.md", buildBundleReadme());
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference({ assessments, errors }));
+    await writeSecureTextFile(staged.dir, "summary.md", assessments.map(formatAssessmentText).join("\n\n"));
+    await writeSecureTextFile(staged.dir, "core_data/metadata.json", serializeJson({
+      tenant_id: config.tenantId,
+      subscription_id: config.subscriptionId,
+      cloud: config.cloud?.name ?? "public",
+      source_chain: config.sourceChain,
+      generated_at: generatedAt,
+      options: {
+        max_assignments: options.max_assignments ?? DEFAULT_MAX_ASSIGNMENTS,
+        max_mailboxes: options.max_mailboxes ?? DEFAULT_MAX_MAILBOXES,
+      },
+    }));
+    await writeSecureTextFile(staged.dir, "core_data/access.json", serializeJson(access));
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "analysis/identity.json", serializeJson(identity));
+    await writeSecureTextFile(staged.dir, "analysis/monitoring.json", serializeJson(monitoring));
+    await writeSecureTextFile(staged.dir, "analysis/subscription-guardrails.json", serializeJson(subscriptionGuardrails));
+    await writeSecureTextFile(staged.dir, "analysis/data-protection.json", serializeJson(dataProtection));
+    await writeSecureTextFile(staged.dir, "analysis/network-and-policy.json", serializeJson(networkAndPolicy));
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, generatedAt));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedComplianceMatrix(findings));
+    for (const framework of AZURE_FRAMEWORKS) {
+      await writeSecureTextFile(staged.dir, `compliance/${framework.key}.md`, buildFrameworkReport(framework, findings));
+    }
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  await writeSecureTextFile(outputDir, "README.md", buildBundleReadme());
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference({ assessments, errors }));
-  await writeSecureTextFile(outputDir, "summary.md", assessments.map(formatAssessmentText).join("\n\n"));
-  await writeSecureTextFile(outputDir, "core_data/metadata.json", serializeJson({
-    tenant_id: config.tenantId,
-    subscription_id: config.subscriptionId,
-    cloud: config.cloud?.name ?? "public",
-    source_chain: config.sourceChain,
-    generated_at: generatedAt,
-    options: {
-      max_assignments: options.max_assignments ?? DEFAULT_MAX_ASSIGNMENTS,
-      max_mailboxes: options.max_mailboxes ?? DEFAULT_MAX_MAILBOXES,
-    },
-  }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/identity.json", serializeJson(identity));
-  await writeSecureTextFile(outputDir, "analysis/monitoring.json", serializeJson(monitoring));
-  await writeSecureTextFile(outputDir, "analysis/subscription-guardrails.json", serializeJson(subscriptionGuardrails));
-  await writeSecureTextFile(outputDir, "analysis/data-protection.json", serializeJson(dataProtection));
-  await writeSecureTextFile(outputDir, "analysis/network-and-policy.json", serializeJson(networkAndPolicy));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, generatedAt));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedComplianceMatrix(findings));
-  for (const framework of AZURE_FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/${framework.key}.md`, buildFrameworkReport(framework, findings));
-  }
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
   const fileCount = await countFilesRecursively(outputDir);
   return {
     outputDir,

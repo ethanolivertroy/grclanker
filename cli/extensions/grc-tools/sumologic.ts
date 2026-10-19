@@ -14,11 +14,12 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -463,21 +464,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
     throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
   }
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    const suffix = attempt === 0 ? "" : `-${attempt + 1}`;
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    const zipCandidate = resolveSecureOutputPath(root, `${preferredName}${suffix}.zip`);
-    if (!existsSync(candidate) && !existsSync(zipCandidate)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -3304,36 +3290,43 @@ export async function exportSumologicAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors.map((error) => `${assessment.area}: ${error}`)))];
 
   ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(config.deployment ?? new URL(config.baseUrl).hostname)}-sumologic-audit-bundle`);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(config.deployment ?? new URL(config.baseUrl).hostname)}-sumologic-audit-bundle`, 50),
+    zip: true,
+    checkName: (name) => {
+      resolveSecureOutputPath(outputRoot, name);
+      resolveSecureOutputPath(outputRoot, `${name}.zip`);
+    },
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", `${buildQuickReference({ findings, errors })}\n`);
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      generated_at: new Date().toISOString(),
+      base_url: config.baseUrl,
+      deployment: config.deployment ?? null,
+      access_id_prefix: config.accessId.slice(0, 4),
+      source_chain: config.sourceChain,
+      finding_count: findings.length,
+      status_counts: statusCounts(findings),
+    }));
+    await writeSecureTextFile(staged.dir, "core_data/access_check.json", serializeJson(access));
+    for (const assessment of assessments) {
+      await writeSecureTextFile(staged.dir, `core_data/${assessment.area}.json`, serializeJson(assessment.rawData));
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.area}.json`, serializeJson({ title: assessment.title, summary: assessment.summary, findings: assessment.findings, errors: assessment.errors }));
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.area}.md`, `${formatAssessmentText(assessment)}\n`);
+    }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, findings, errors)}\n`);
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
+    for (const framework of FRAMEWORKS) {
+      await writeSecureTextFile(staged.dir, `compliance/${safeDirName(framework)}.md`, `${buildFrameworkReport(framework, findings)}\n`);
+    }
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference({ findings, errors })}\n`);
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    base_url: config.baseUrl,
-    deployment: config.deployment ?? null,
-    access_id_prefix: config.accessId.slice(0, 4),
-    source_chain: config.sourceChain,
-    finding_count: findings.length,
-    status_counts: statusCounts(findings),
-  }));
-  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(access));
-  for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `core_data/${assessment.area}.json`, serializeJson(assessment.rawData));
-    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.json`, serializeJson({ title: assessment.title, summary: assessment.summary, findings: assessment.findings, errors: assessment.errors }));
-    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.md`, `${formatAssessmentText(assessment)}\n`);
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, findings, errors)}\n`);
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
-  for (const framework of FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/${safeDirName(framework)}.md`, `${buildFrameworkReport(framework, findings)}\n`);
-  }
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

@@ -22,6 +22,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { KNOWBE4_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
@@ -786,20 +787,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -4529,63 +4516,67 @@ export async function exportKnowbe4AuditBundle(
 
   ensurePrivateDir(outputRoot);
   const accountName = asString(snapshot.account.data.name) ?? `knowbe4-${config.region}`;
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(accountName)}-knowbe4-audit-bundle`);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(accountName)}-knowbe4-audit-bundle`, 6),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", `${buildQuickReference()}\n`);
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      generated_at: snapshot.collectedAt,
+      region: config.region,
+      base_url: config.baseUrl,
+      phisher_graphql_url: config.phisherGraphqlUrl,
+      phisher_configured: Boolean(config.phisherApiToken),
+      account_name: asString(snapshot.account.data.name) ?? null,
+      redact_pii: config.redactPii,
+      source_chain: config.sourceChain,
+    }));
 
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference()}\n`);
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: snapshot.collectedAt,
-    region: config.region,
-    base_url: config.baseUrl,
-    phisher_graphql_url: config.phisherGraphqlUrl,
-    phisher_configured: Boolean(config.phisherApiToken),
-    account_name: asString(snapshot.account.data.name) ?? null,
-    redact_pii: config.redactPii,
-    source_chain: config.sourceChain,
-  }));
+    // A dataset that was denied, errored, or never requested is written as a marker object, never as `[]`, so a
+    // consumer cannot mistake a denial for an empty inventory; a readable but empty inventory stays `[]`.
+    const coreDataFiles: Array<[string, unknown]> = [
+      ["core_data/access.json", access],
+      ["core_data/collection_status.json", knowbe4CollectionStatus(snapshot)],
+      ["core_data/account.json", coreDataValue("account", snapshot.account)],
+      ["core_data/account_risk_score_history.json", coreDataValue("account_risk_score_history", snapshot.accountRiskHistory)],
+      ["core_data/users_active.json", coreDataValue("users", snapshot.activeUsers)],
+      ["core_data/groups.json", coreDataValue("groups", snapshot.groups)],
+      ["core_data/phishing_campaigns.json", coreDataValue("phishing_campaigns", snapshot.phishingCampaigns)],
+      ["core_data/security_tests.json", coreDataValue("security_tests", snapshot.securityTests)],
+      ["core_data/security_test_recipients.json", recipientsCoreData(snapshot)],
+      ["core_data/callback_security_tests.json", coreDataValue("callback_security_tests", snapshot.callbackSecurityTests)],
+      ["core_data/training_campaigns.json", coreDataValue("training_campaigns", snapshot.trainingCampaigns)],
+      ["core_data/training_enrollments.json", coreDataValue("training_enrollments", snapshot.trainingEnrollments)],
+      ["core_data/store_purchases.json", coreDataValue("store_purchases", snapshot.storePurchases)],
+      ["core_data/training_policies.json", coreDataValue("training_policies", snapshot.trainingPolicies)],
+      ["core_data/phisher_messages.json", snapshot.phisherMessages.collected ? coreDataValue("phisher_messages", snapshot.phisherMessages) : notConfiguredMarker()],
+    ];
+    for (const [pathName, value] of coreDataFiles) {
+      await writeSecureTextFile(staged.dir, pathName, serializeJson(redact(value)));
+    }
 
-  // A dataset that was denied, errored, or never requested is written as a marker object, never as `[]`, so a
-  // consumer cannot mistake a denial for an empty inventory; a readable but empty inventory stays `[]`.
-  const coreDataFiles: Array<[string, unknown]> = [
-    ["core_data/access.json", access],
-    ["core_data/collection_status.json", knowbe4CollectionStatus(snapshot)],
-    ["core_data/account.json", coreDataValue("account", snapshot.account)],
-    ["core_data/account_risk_score_history.json", coreDataValue("account_risk_score_history", snapshot.accountRiskHistory)],
-    ["core_data/users_active.json", coreDataValue("users", snapshot.activeUsers)],
-    ["core_data/groups.json", coreDataValue("groups", snapshot.groups)],
-    ["core_data/phishing_campaigns.json", coreDataValue("phishing_campaigns", snapshot.phishingCampaigns)],
-    ["core_data/security_tests.json", coreDataValue("security_tests", snapshot.securityTests)],
-    ["core_data/security_test_recipients.json", recipientsCoreData(snapshot)],
-    ["core_data/callback_security_tests.json", coreDataValue("callback_security_tests", snapshot.callbackSecurityTests)],
-    ["core_data/training_campaigns.json", coreDataValue("training_campaigns", snapshot.trainingCampaigns)],
-    ["core_data/training_enrollments.json", coreDataValue("training_enrollments", snapshot.trainingEnrollments)],
-    ["core_data/store_purchases.json", coreDataValue("store_purchases", snapshot.storePurchases)],
-    ["core_data/training_policies.json", coreDataValue("training_policies", snapshot.trainingPolicies)],
-    ["core_data/phisher_messages.json", snapshot.phisherMessages.collected ? coreDataValue("phisher_messages", snapshot.phisherMessages) : notConfiguredMarker()],
-  ];
-  for (const [pathName, value] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathName, serializeJson(redact(value)));
-  }
+    for (const assessment of assessments) {
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.area}.json`, serializeJson(assessment));
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.area}.md`, `${formatAssessmentText(assessment)}\n`);
+    }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "analysis/control_coverage.json", serializeJson(buildControlCoverage(assessments)));
+    await writeSecureTextFile(staged.dir, "analysis/access_check.md", `${formatAccessCheckText(access)}\n`);
 
-  for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.json`, serializeJson(assessment));
-    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.md`, `${formatAssessmentText(assessment)}\n`);
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/control_coverage.json", serializeJson(buildControlCoverage(assessments)));
-  await writeSecureTextFile(outputDir, "analysis/access_check.md", `${formatAccessCheckText(access)}\n`);
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, snapshot, assessments));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const key of FRAMEWORK_KEYS) {
+      await writeSecureTextFile(staged.dir, frameworkReportPath(key), buildFrameworkReport(key, findings));
+    }
 
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, snapshot, assessments));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const key of FRAMEWORK_KEYS) {
-    await writeSecureTextFile(outputDir, frameworkReportPath(key), buildFrameworkReport(key, findings));
-  }
+    if (snapshot.errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${snapshot.errors.join("\n")}\n`);
+    }
 
-  if (snapshot.errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${snapshot.errors.join("\n")}\n`);
-  }
-
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

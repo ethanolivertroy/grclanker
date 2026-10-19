@@ -20,6 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -1086,21 +1087,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<{ outputDir: string; zipPath: string }> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9", "-10"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    const zipCandidate = resolveSecureOutputPath(root, `${preferredName}${suffix}.zip`);
-    if (!existsSync(candidate) && !existsSync(zipCandidate)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return { outputDir: candidate, zipPath: zipCandidate };
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -3568,74 +3554,80 @@ export async function exportPagerdutyAuditBundle(
   const errors = assessments.flatMap((assessment) => assessment.errors);
 
   ensurePrivateDir(outputRoot);
-  const { outputDir, zipPath } = await nextAvailableAuditDir(
-    outputRoot,
-    `${safeDirName(`pagerduty-${config.region}`)}-audit-bundle`,
-  );
+  const root = realpathSync(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root,
+    names: numberedNames(`${safeDirName(`pagerduty-${config.region}`)}-audit-bundle`, 10),
+    zip: true,
+    checkName: (name) => {
+      resolveSecureOutputPath(root, name);
+      resolveSecureOutputPath(root, `${name}.zip`);
+    },
+  }, async (staged) => {
+    // A denied, errored, or uncollected dataset is written as a not-collected marker, never as an empty list.
+    const coreDataFiles: Array<[string, unknown]> = [
+      ["core_data/access_check.json", access],
+      ["core_data/credential_scope.json", coreDataValue(accessControlData.scope)],
+      ["core_data/abilities.json", coreDataValue(accessControlData.abilities)],
+      ["core_data/users.json", coreDataValue(accessControlData.users)],
+      ["core_data/teams.json", coreDataValue(accessControlData.teams)],
+      ["core_data/team_members.json", coreDataValue(accessControlData.teamMembers)],
+      ["core_data/services.json", coreDataValue(incidentResponseData.services)],
+      ["core_data/escalation_policies.json", coreDataValue(incidentResponseData.escalationPolicies)],
+      ["core_data/priorities.json", coreDataValue(incidentResponseData.priorities)],
+      ["core_data/incident_workflows.json", coreDataValue(incidentResponseData.incidentWorkflows)],
+      ["core_data/incident_workflow_triggers.json", coreDataValue(incidentResponseData.workflowTriggers)],
+      ["core_data/schedules.json", coreDataValue(oncallData.schedules)],
+      ["core_data/schedule_details.json", coreDataValue(oncallData.scheduleDetails)],
+      ["core_data/oncalls.json", coreDataValue(oncallData.oncalls)],
+      ["core_data/audit_records_recent.json", coreDataValue(auditData.recentRecords)],
+      ["core_data/audit_records_retention_probe.json", coreDataValue(auditData.retentionProbe)],
+      ["core_data/extensions.json", coreDataValue(integrationData.extensions)],
+      ["core_data/webhook_subscriptions.json", coreDataValue(integrationData.webhookSubscriptions)],
+      ["core_data/business_services.json", coreDataValue(integrationData.businessServices)],
+      ["core_data/business_service_dependencies.json", coreDataValue(integrationData.businessServiceDependencies)],
+      ["core_data/change_events.json", coreDataValue(integrationData.changeEvents)],
+    ];
+    for (const [pathName, value] of coreDataFiles) {
+      await writeSecureTextFile(staged.dir, pathName, serializeJson(value));
+    }
 
-  // A denied, errored, or uncollected dataset is written as a not-collected marker, never as an empty list.
-  const coreDataFiles: Array<[string, unknown]> = [
-    ["core_data/access_check.json", access],
-    ["core_data/credential_scope.json", coreDataValue(accessControlData.scope)],
-    ["core_data/abilities.json", coreDataValue(accessControlData.abilities)],
-    ["core_data/users.json", coreDataValue(accessControlData.users)],
-    ["core_data/teams.json", coreDataValue(accessControlData.teams)],
-    ["core_data/team_members.json", coreDataValue(accessControlData.teamMembers)],
-    ["core_data/services.json", coreDataValue(incidentResponseData.services)],
-    ["core_data/escalation_policies.json", coreDataValue(incidentResponseData.escalationPolicies)],
-    ["core_data/priorities.json", coreDataValue(incidentResponseData.priorities)],
-    ["core_data/incident_workflows.json", coreDataValue(incidentResponseData.incidentWorkflows)],
-    ["core_data/incident_workflow_triggers.json", coreDataValue(incidentResponseData.workflowTriggers)],
-    ["core_data/schedules.json", coreDataValue(oncallData.schedules)],
-    ["core_data/schedule_details.json", coreDataValue(oncallData.scheduleDetails)],
-    ["core_data/oncalls.json", coreDataValue(oncallData.oncalls)],
-    ["core_data/audit_records_recent.json", coreDataValue(auditData.recentRecords)],
-    ["core_data/audit_records_retention_probe.json", coreDataValue(auditData.retentionProbe)],
-    ["core_data/extensions.json", coreDataValue(integrationData.extensions)],
-    ["core_data/webhook_subscriptions.json", coreDataValue(integrationData.webhookSubscriptions)],
-    ["core_data/business_services.json", coreDataValue(integrationData.businessServices)],
-    ["core_data/business_service_dependencies.json", coreDataValue(integrationData.businessServiceDependencies)],
-    ["core_data/change_events.json", coreDataValue(integrationData.changeEvents)],
-  ];
-  for (const [pathName, value] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathName, serializeJson(value));
-  }
+    for (const assessment of assessments) {
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.category}.json`, serializeJson(assessment));
+    }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "analysis/metadata.json", serializeJson({
+      generated_at: generatedAt.toISOString(),
+      region: config.region,
+      base_url: config.baseUrl,
+      auth_mode: config.authMode,
+      source_chain: config.sourceChain,
+      controls_assessed: findings.length,
+      controls_total: PAGERDUTY_CONTROLS.length,
+    }));
 
-  for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(assessment));
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/metadata.json", serializeJson({
-    generated_at: generatedAt.toISOString(),
-    region: config.region,
-    base_url: config.baseUrl,
-    auth_mode: config.authMode,
-    source_chain: config.sourceChain,
-    controls_assessed: findings.length,
-    controls_total: PAGERDUTY_CONTROLS.length,
-  }));
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, generatedAt));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    const frameworkReports: Array<[string, string, FrameworkKey]> = [
+      ["compliance/fedramp/fedramp_compliance_report.md", "FedRAMP / NIST 800-53 Compliance Report", "fedramp"],
+      ["compliance/cmmc/cmmc_compliance_report.md", "CMMC Level 2 Compliance Report", "cmmc"],
+      ["compliance/soc2/soc2_compliance_report.md", "SOC 2 Compliance Report", "soc2"],
+      ["compliance/cis/cis_compliance_report.md", "CIS Controls Compliance Report", "cis"],
+      ["compliance/pci_dss/pci_dss_compliance_report.md", "PCI-DSS Compliance Report", "pci_dss"],
+      ["compliance/disa_stig/stig_compliance_checklist.md", "DISA STIG Compliance Checklist", "disa_stig"],
+      ["compliance/irap/irap_compliance_report.md", "IRAP / ISM Compliance Report", "irap"],
+      ["compliance/ismap/ismap_compliance_report.md", "ISMAP Compliance Report", "ismap"],
+    ];
+    for (const [pathName, title, framework] of frameworkReports) {
+      await writeSecureTextFile(staged.dir, pathName, buildFrameworkReport(title, findings, framework));
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference());
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, generatedAt));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  const frameworkReports: Array<[string, string, FrameworkKey]> = [
-    ["compliance/fedramp/fedramp_compliance_report.md", "FedRAMP / NIST 800-53 Compliance Report", "fedramp"],
-    ["compliance/cmmc/cmmc_compliance_report.md", "CMMC Level 2 Compliance Report", "cmmc"],
-    ["compliance/soc2/soc2_compliance_report.md", "SOC 2 Compliance Report", "soc2"],
-    ["compliance/cis/cis_compliance_report.md", "CIS Controls Compliance Report", "cis"],
-    ["compliance/pci_dss/pci_dss_compliance_report.md", "PCI-DSS Compliance Report", "pci_dss"],
-    ["compliance/disa_stig/stig_compliance_checklist.md", "DISA STIG Compliance Checklist", "disa_stig"],
-    ["compliance/irap/irap_compliance_report.md", "IRAP / ISM Compliance Report", "irap"],
-    ["compliance/ismap/ismap_compliance_report.md", "ISMAP Compliance Report", "ismap"],
-  ];
-  for (const [pathName, title, framework] of frameworkReports) {
-    await writeSecureTextFile(outputDir, pathName, buildFrameworkReport(title, findings, framework));
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

@@ -20,6 +20,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SALESFORCE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -500,21 +501,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
     throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
   }
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  for (let index = 1; index <= 50; index += 1) {
-    const suffix = index === 1 ? "" : `-${index}`;
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    const zipCandidate = resolveSecureOutputPath(root, `${preferredName}${suffix}.zip`);
-    if (!existsSync(candidate) && !existsSync(zipCandidate)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -3519,72 +3505,79 @@ export async function exportSalesforceAuditBundle(
   const orgLabel = asString(platformData.organization.data?.Name) ?? asString(platformData.organization.data?.Id) ?? (platformData.instanceUrl ? new URL(platformData.instanceUrl).hostname : "salesforce-org");
 
   ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(orgLabel)}-audit-bundle`);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(orgLabel)}-audit-bundle`, 50),
+    zip: true,
+    checkName: (name) => {
+      resolveSecureOutputPath(outputRoot, name);
+      resolveSecureOutputPath(outputRoot, `${name}.zip`);
+    },
+  }, async (staged) => {
+    // Every dataset goes through datasetCoreData so a denied, unavailable, or errored read is written as a
+    // { collected: false, ... } marker instead of an empty snapshot.
+    const coreDataFiles: Array<[string, unknown]> = [
+      ["core_data/access_check.json", access],
+      ["core_data/organization.json", datasetCoreData(platformData.organization)],
+      ["core_data/security_health_check.json", datasetCoreData(platformData.healthCheck)],
+      ["core_data/security_health_check_risks.json", datasetCoreData(platformData.healthCheckRisks)],
+      ["core_data/security_settings.json", datasetCoreData(platformData.securitySettings)],
+      ["core_data/my_domain_settings.json", datasetCoreData(platformData.myDomainSettings)],
+      ["core_data/users.json", datasetCoreData(identityData.users)],
+      ["core_data/profiles.json", datasetCoreData(identityData.profiles)],
+      ["core_data/profile_metadata.json", datasetCoreData(identityData.profileMetadata)],
+      ["core_data/permission_sets.json", datasetCoreData(identityData.permissionSets)],
+      ["core_data/permission_set_assignments.json", datasetCoreData(identityData.assignments)],
+      ["core_data/two_factor_methods_info.json", datasetCoreData(identityData.twoFactorMethods)],
+      ["core_data/field_permissions_sensitive.json", datasetCoreData(dataProtection.fieldPermissions)],
+      ["core_data/tenant_secrets.json", datasetCoreData(dataProtection.tenantSecrets)],
+      ["core_data/certificates.json", datasetCoreData(dataProtection.certificates)],
+      ["core_data/connected_applications.json", datasetCoreData(monitoring.connectedApplications)],
+      ["core_data/oauth_tokens.json", datasetCoreData(monitoring.oauthTokens)],
+      ["core_data/caller_permissions.json", datasetCoreData(monitoring.callerPermissions)],
+      ["core_data/login_history.json", datasetCoreData(monitoring.loginHistory)],
+      ["core_data/setup_audit_trail.json", datasetCoreData(monitoring.setupAuditTrail)],
+      ["core_data/event_log_files.json", datasetCoreData(monitoring.eventLogFiles)],
+    ];
+    for (const [pathname, value] of coreDataFiles) {
+      await writeSecureTextFile(staged.dir, pathname, serializeJson(value));
+    }
+    for (const assessment of assessments) {
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.area}.json`, serializeJson(assessment));
+    }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "analysis/summary.json", serializeJson({
+      generated_at: now.toISOString(),
+      organization: orgLabel,
+      auth_mode: config.authMode,
+      api_version: config.apiVersion,
+      source_chain: config.sourceChain,
+      controls_assessed: findings.length,
+      controls_defined: CONTROLS.length,
+      status_counts: summarizeFindingStatuses(findings),
+      errors,
+    }));
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, orgLabel, assessments, errors));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const report of FRAMEWORK_REPORTS) {
+      await writeSecureTextFile(staged.dir, report.path, buildFrameworkReport(report.title, report.framework, findings));
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference());
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      generated_at: now.toISOString(),
+      organization: orgLabel,
+      instance_url: platformData.instanceUrl ?? null,
+      login_url: config.loginUrl,
+      auth_mode: config.authMode,
+      api_version: config.apiVersion,
+      source_chain: config.sourceChain,
+    }));
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  // Every dataset goes through datasetCoreData so a denied, unavailable, or errored read is written as a
-  // { collected: false, ... } marker instead of an empty snapshot.
-  const coreDataFiles: Array<[string, unknown]> = [
-    ["core_data/access_check.json", access],
-    ["core_data/organization.json", datasetCoreData(platformData.organization)],
-    ["core_data/security_health_check.json", datasetCoreData(platformData.healthCheck)],
-    ["core_data/security_health_check_risks.json", datasetCoreData(platformData.healthCheckRisks)],
-    ["core_data/security_settings.json", datasetCoreData(platformData.securitySettings)],
-    ["core_data/my_domain_settings.json", datasetCoreData(platformData.myDomainSettings)],
-    ["core_data/users.json", datasetCoreData(identityData.users)],
-    ["core_data/profiles.json", datasetCoreData(identityData.profiles)],
-    ["core_data/profile_metadata.json", datasetCoreData(identityData.profileMetadata)],
-    ["core_data/permission_sets.json", datasetCoreData(identityData.permissionSets)],
-    ["core_data/permission_set_assignments.json", datasetCoreData(identityData.assignments)],
-    ["core_data/two_factor_methods_info.json", datasetCoreData(identityData.twoFactorMethods)],
-    ["core_data/field_permissions_sensitive.json", datasetCoreData(dataProtection.fieldPermissions)],
-    ["core_data/tenant_secrets.json", datasetCoreData(dataProtection.tenantSecrets)],
-    ["core_data/certificates.json", datasetCoreData(dataProtection.certificates)],
-    ["core_data/connected_applications.json", datasetCoreData(monitoring.connectedApplications)],
-    ["core_data/oauth_tokens.json", datasetCoreData(monitoring.oauthTokens)],
-    ["core_data/caller_permissions.json", datasetCoreData(monitoring.callerPermissions)],
-    ["core_data/login_history.json", datasetCoreData(monitoring.loginHistory)],
-    ["core_data/setup_audit_trail.json", datasetCoreData(monitoring.setupAuditTrail)],
-    ["core_data/event_log_files.json", datasetCoreData(monitoring.eventLogFiles)],
-  ];
-  for (const [pathname, value] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathname, serializeJson(value));
-  }
-  for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.json`, serializeJson(assessment));
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/summary.json", serializeJson({
-    generated_at: now.toISOString(),
-    organization: orgLabel,
-    auth_mode: config.authMode,
-    api_version: config.apiVersion,
-    source_chain: config.sourceChain,
-    controls_assessed: findings.length,
-    controls_defined: CONTROLS.length,
-    status_counts: summarizeFindingStatuses(findings),
-    errors,
-  }));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, orgLabel, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const report of FRAMEWORK_REPORTS) {
-    await writeSecureTextFile(outputDir, report.path, buildFrameworkReport(report.title, report.framework, findings));
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: now.toISOString(),
-    organization: orgLabel,
-    instance_url: platformData.instanceUrl ?? null,
-    login_url: config.loginUrl,
-    auth_mode: config.authMode,
-    api_version: config.apiVersion,
-    source_chain: config.sourceChain,
-  }));
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

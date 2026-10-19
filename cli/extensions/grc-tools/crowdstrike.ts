@@ -20,9 +20,10 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { CROWDSTRIKE_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import {
@@ -661,20 +662,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -4390,40 +4377,44 @@ export async function exportCrowdstrikeAuditBundle(
 
   ensurePrivateDir(outputRoot);
   const bundleName = safeDirName(`${config.cloud ?? new URL(config.baseUrl).hostname}${config.memberCid ? `-${config.memberCid}` : ""}-audit-bundle`);
-  const outputDir = await nextAvailableAuditDir(outputRoot, bundleName);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(bundleName, 9),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference(assessments, errors.length > 0));
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      generated_at: new Date().toISOString(),
+      base_url: config.baseUrl,
+      cloud: config.cloud,
+      member_cid: config.memberCid,
+      scope: config.memberCid ? `member CID ${config.memberCid} only` : "issuing CID only",
+      source_chain: config.sourceChain,
+      controls_evaluated: findings.length,
+      controls_defined: CROWDSTRIKE_CONTROLS.length,
+      status_counts: countByStatus(findings),
+    }));
 
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(assessments, errors.length > 0));
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    base_url: config.baseUrl,
-    cloud: config.cloud,
-    member_cid: config.memberCid,
-    scope: config.memberCid ? `member CID ${config.memberCid} only` : "issuing CID only",
-    source_chain: config.sourceChain,
-    controls_evaluated: findings.length,
-    controls_defined: CROWDSTRIKE_CONTROLS.length,
-    status_counts: countByStatus(findings),
-  }));
-
-  for (const assessment of assessments) {
-    for (const [name, snapshot] of Object.entries(assessment.snapshots)) {
-      await writeSecureTextFile(outputDir, `core_data/${assessment.category}/${name}.json`, serializeJson(snapshot));
+    for (const assessment of assessments) {
+      for (const [name, snapshot] of Object.entries(assessment.snapshots)) {
+        await writeSecureTextFile(staged.dir, `core_data/${assessment.category}/${name}.json`, serializeJson(snapshot));
+      }
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.category}.json`, serializeJson(stripSnapshots(assessment)));
     }
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(stripSnapshots(assessment)));
-  }
-  await writeSecureTextFile(outputDir, "analysis/access_check.json", serializeJson(access));
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const framework of CROWDSTRIKE_FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/frameworks/${framework.key}.md`, buildFrameworkReport(framework, findings));
-  }
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
+    await writeSecureTextFile(staged.dir, "analysis/access_check.json", serializeJson(access));
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const framework of CROWDSTRIKE_FRAMEWORKS) {
+      await writeSecureTextFile(staged.dir, `compliance/frameworks/${framework.key}.md`, buildFrameworkReport(framework, findings));
+    }
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

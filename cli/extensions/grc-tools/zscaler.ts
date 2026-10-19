@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
   hydrateBatchFrameworkMappings,
@@ -428,23 +429,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  if (existsSync(root) && lstatSync(root).isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked output directory: ${root}`);
-  }
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -3750,8 +3734,10 @@ export async function exportZscalerAuditBundle(clients: ZscalerClients, options:
   const root = resolve(options.outputDir ?? DEFAULT_OUTPUT_DIR);
   const generatedAt = new Date().toISOString();
   const tenantLabel = safeDirName(clients.zia?.getResolvedConfig().cloud ?? clients.zpa?.getResolvedConfig().customerId ?? "zscaler");
-  const outputDir = await nextAvailableAuditDir(root, `zscaler-audit-${tenantLabel}-${generatedAt.slice(0, 10)}`);
-
+  if (existsSync(root) && lstatSync(root).isSymbolicLink()) {
+    throw new Error(`Refusing to use symlinked output directory: ${root}`);
+  }
+  ensurePrivateDir(root);
   const access = await checkZscalerAccess(clients);
   const ziaAccessData = clients.zia ? await collectZiaAccessControlData(clients.zia) : undefined;
   const ziaPolicyData = clients.zia ? await collectZiaPolicyData(clients.zia) : undefined;
@@ -3771,34 +3757,40 @@ export async function exportZscalerAuditBundle(clients: ZscalerClients, options:
     ...assessments.flatMap((assessment) => assessment.truncated.map((note) => `${assessment.area} partial: ${note}`)),
   ];
 
-  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(redactForExport(access)));
-  await writeSecureTextFile(outputDir, "core_data/zia_access_control.json", serializeJson(redactForExport(ziaAccessData ?? { configured: false })));
-  await writeSecureTextFile(outputDir, "core_data/zia_policy.json", serializeJson(redactForExport(ziaPolicyData ?? { configured: false })));
-  await writeSecureTextFile(outputDir, "core_data/zpa.json", serializeJson(redactForExport(zpaData ?? { configured: false })));
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(redactForExport(findings)));
-  await writeSecureTextFile(outputDir, "analysis/summary.json", serializeJson({
-    generated_at: generatedAt,
-    access_status: access.status,
-    products: access.products,
-    status_counts: summarizeFindingStatuses(findings),
-    controls_assessed: findings.length,
-    controls_in_spec: Object.keys(ZSCALER_CONTROLS).length,
-  }));
-  for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.json`, serializeJson({ title: assessment.title, summary: assessment.summary, errors: assessment.errors, truncated: assessment.truncated }));
-  }
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", renderExecutiveSummary(findings, access, generatedAt));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", renderComplianceMatrix(findings));
-  for (const report of FRAMEWORK_REPORTS) {
-    await writeSecureTextFile(outputDir, report.path, renderFrameworkReport(report.title, report.framework, findings, generatedAt));
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", renderQuickReference(outputDir, findings, errors, generatedAt));
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(root),
+    names: numberedNames(`zscaler-audit-${tenantLabel}-${generatedAt.slice(0, 10)}`, 9),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(root, name),
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "core_data/access_check.json", serializeJson(redactForExport(access)));
+    await writeSecureTextFile(staged.dir, "core_data/zia_access_control.json", serializeJson(redactForExport(ziaAccessData ?? { configured: false })));
+    await writeSecureTextFile(staged.dir, "core_data/zia_policy.json", serializeJson(redactForExport(ziaPolicyData ?? { configured: false })));
+    await writeSecureTextFile(staged.dir, "core_data/zpa.json", serializeJson(redactForExport(zpaData ?? { configured: false })));
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(redactForExport(findings)));
+    await writeSecureTextFile(staged.dir, "analysis/summary.json", serializeJson({
+      generated_at: generatedAt,
+      access_status: access.status,
+      products: access.products,
+      status_counts: summarizeFindingStatuses(findings),
+      controls_assessed: findings.length,
+      controls_in_spec: Object.keys(ZSCALER_CONTROLS).length,
+    }));
+    for (const assessment of assessments) {
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.area}.json`, serializeJson({ title: assessment.title, summary: assessment.summary, errors: assessment.errors, truncated: assessment.truncated }));
+    }
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", renderExecutiveSummary(findings, access, generatedAt));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", renderComplianceMatrix(findings));
+    for (const report of FRAMEWORK_REPORTS) {
+      await writeSecureTextFile(staged.dir, report.path, renderFrameworkReport(report.title, report.framework, findings, generatedAt));
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", renderQuickReference(staged.target.outputDir, findings, errors, generatedAt));
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
   return {
     outputDir,
     zipPath,

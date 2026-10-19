@@ -14,12 +14,13 @@ import {
   mkdirSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SLACK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readConfigText } from "./hardening/index.js";
@@ -693,20 +694,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -2894,50 +2881,55 @@ export async function exportSlackAuditBundle(
   const errors = areas.flatMap((area) => area.result.errors.map((item) => `[${area.slug}] ${item}`));
   const generatedAt = client.getNow().toISOString();
   const targetName = safeDirName(`${config.orgId ?? "slack"}-audit`);
-  const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
-  const zipPath = `${outputDir}.zip`;
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(targetName, 9),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    const secrets = client.knownSecrets();
+    const writeBundleFile = (rootDir: string, relativePathname: string, content: string): Promise<void> =>
+      writeSecureTextFile(rootDir, relativePathname, redactErrorText(content, secrets));
+    await writeBundleFile(staged.dir, "README.md", buildBundleReadme());
+    await writeBundleFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference(staged.target, findings, errors));
+    await writeBundleFile(staged.dir, "metadata.json", serializeJson(redactSecrets({
+      target: config.orgId ?? null,
+      auth_mode: "bearer-token",
+      token_kinds: client.getTokenKinds(),
+      scim_configured: Boolean(config.scimToken),
+      source_chain: config.sourceChain,
+      generated_at: generatedAt,
+      options: {
+        user_limit: options.user_limit ?? DEFAULT_USER_LIMIT,
+        workspace_limit: options.workspace_limit ?? DEFAULT_WORKSPACE_LIMIT,
+        app_limit: options.app_limit ?? DEFAULT_APP_LIMIT,
+        audit_limit: options.audit_limit ?? DEFAULT_AUDIT_LIMIT,
+        channel_limit: options.channel_limit ?? DEFAULT_CHANNEL_LIMIT,
+        days: options.days ?? DEFAULT_LOOKBACK_DAYS,
+        max_workspace_admins: options.max_workspace_admins ?? 5,
+        max_session_hours: options.max_session_hours ?? 24,
+        min_retention_days: options.min_retention_days ?? DEFAULT_MIN_RETENTION_DAYS,
+      },
+    }, secrets)));
+    await writeBundleFile(staged.dir, "core_data/access.json", serializeJson(redactSecrets(access, secrets)));
+    for (const area of areas) {
+      await writeBundleFile(staged.dir, `core_data/${area.slug}.json`, serializeJson(redactSecrets({ summary: area.result.summary, evidence: area.result.findings.map((item) => ({ id: item.id, evidence: item.evidence ?? null })), errors: area.result.errors }, secrets)));
+      await writeBundleFile(staged.dir, `analysis/${area.slug}.json`, serializeJson(redactSecrets({ title: area.result.title, summary: area.result.summary, status_counts: statusCounts(area.result.findings) }, secrets)));
+      await writeBundleFile(staged.dir, `reports/${area.slug}.md`, formatAssessmentText(area.result));
+    }
+    await writeBundleFile(staged.dir, "analysis/findings.json", serializeJson(redactSecrets(findings, secrets)));
+    await writeBundleFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, findings, generatedAt));
+    await writeBundleFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedComplianceMatrix(findings));
+    for (const framework of SLACK_FRAMEWORKS) {
+      await writeBundleFile(staged.dir, `compliance/${frameworkSlug(framework)}.md`, buildFrameworkReport(framework, findings));
+    }
+    if (errors.length > 0) {
+      await writeBundleFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  const secrets = client.knownSecrets();
-  const writeBundleFile = (rootDir: string, relativePathname: string, content: string): Promise<void> =>
-    writeSecureTextFile(rootDir, relativePathname, redactErrorText(content, secrets));
-  await writeBundleFile(outputDir, "README.md", buildBundleReadme());
-  await writeBundleFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference({ outputDir, zipPath }, findings, errors));
-  await writeBundleFile(outputDir, "metadata.json", serializeJson(redactSecrets({
-    target: config.orgId ?? null,
-    auth_mode: "bearer-token",
-    token_kinds: client.getTokenKinds(),
-    scim_configured: Boolean(config.scimToken),
-    source_chain: config.sourceChain,
-    generated_at: generatedAt,
-    options: {
-      user_limit: options.user_limit ?? DEFAULT_USER_LIMIT,
-      workspace_limit: options.workspace_limit ?? DEFAULT_WORKSPACE_LIMIT,
-      app_limit: options.app_limit ?? DEFAULT_APP_LIMIT,
-      audit_limit: options.audit_limit ?? DEFAULT_AUDIT_LIMIT,
-      channel_limit: options.channel_limit ?? DEFAULT_CHANNEL_LIMIT,
-      days: options.days ?? DEFAULT_LOOKBACK_DAYS,
-      max_workspace_admins: options.max_workspace_admins ?? 5,
-      max_session_hours: options.max_session_hours ?? 24,
-      min_retention_days: options.min_retention_days ?? DEFAULT_MIN_RETENTION_DAYS,
-    },
-  }, secrets)));
-  await writeBundleFile(outputDir, "core_data/access.json", serializeJson(redactSecrets(access, secrets)));
-  for (const area of areas) {
-    await writeBundleFile(outputDir, `core_data/${area.slug}.json`, serializeJson(redactSecrets({ summary: area.result.summary, evidence: area.result.findings.map((item) => ({ id: item.id, evidence: item.evidence ?? null })), errors: area.result.errors }, secrets)));
-    await writeBundleFile(outputDir, `analysis/${area.slug}.json`, serializeJson(redactSecrets({ title: area.result.title, summary: area.result.summary, status_counts: statusCounts(area.result.findings) }, secrets)));
-    await writeBundleFile(outputDir, `reports/${area.slug}.md`, formatAssessmentText(area.result));
-  }
-  await writeBundleFile(outputDir, "analysis/findings.json", serializeJson(redactSecrets(findings, secrets)));
-  await writeBundleFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, findings, generatedAt));
-  await writeBundleFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedComplianceMatrix(findings));
-  for (const framework of SLACK_FRAMEWORKS) {
-    await writeBundleFile(outputDir, `compliance/${frameworkSlug(framework)}.md`, buildFrameworkReport(framework, findings));
-  }
-  if (errors.length > 0) {
-    await writeBundleFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
   const fileCount = await countFilesRecursively(outputDir);
 
   return { outputDir, zipPath, fileCount, findingCount: findings.length, errorCount: errors.length };

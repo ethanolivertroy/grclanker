@@ -15,11 +15,12 @@ import {
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
   hydrateBatchFrameworkMappings,
@@ -709,20 +710,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
     throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
   }
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -4162,59 +4149,65 @@ export async function exportGcpAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = assessments.flatMap((assessment) => assessment.errors.map((error) => `[${assessment.category}] ${error}`));
   const targetName = safeDirName(`${config.organizationId ?? config.projectId ?? "gcp-scope"}-audit`);
-  const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
-  /**
-   * Second layer for every bundle file, .md files and _errors.log included: the same rules the error constructor
-   * applies, with the configured credentials and any exchanged token as exact secrets and without the long-token
-   * heuristic (project ids, key names, and resource names are evidence). The first layer is the constructor plus
-   * the per-control projection of every snapshot.
-   */
-  const secrets = [...new Set([...credentialValues(config), ...(client.getKnownSecrets?.() ?? [])])];
-  const write = (relativePathname: string, content: string) => writeSecureTextFile(outputDir, relativePathname, scrubDataText(content, secrets));
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(targetName, 9),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    /**
+     * Second layer for every bundle file, .md files and _errors.log included: the same rules the error constructor
+     * applies, with the configured credentials and any exchanged token as exact secrets and without the long-token
+     * heuristic (project ids, key names, and resource names are evidence). The first layer is the constructor plus
+     * the per-control projection of every snapshot.
+     */
+    const secrets = [...new Set([...credentialValues(config), ...(client.getKnownSecrets?.() ?? [])])];
+    const write = (relativePathname: string, content: string) => writeSecureTextFile(staged.dir, relativePathname, scrubDataText(content, secrets));
 
-  await write("QUICK_REFERENCE.md", buildQuickReference(assessments));
-  await write("README.md", buildQuickReference(assessments));
-  await write("metadata.json", serializeJson({
-    organization_id: config.organizationId ?? null,
-    project_id: config.projectId ?? null,
-    source_chain: config.sourceChain,
-    credentials_path: config.credentialsPath ?? null,
-    generated_at: new Date().toISOString(),
-    options: {
-      max_projects: maxProjects ?? DEFAULT_MAX_PROJECTS,
-      stale_days: options.stale_days ?? DEFAULT_STALE_DAYS,
-      max_keys: options.max_keys ?? DEFAULT_MAX_KEYS,
-      max_findings: options.max_findings ?? DEFAULT_MAX_FINDINGS,
-      max_assets: options.max_assets ?? DEFAULT_MAX_ASSETS,
-    },
-  }));
-  await write("core_data/access.json", serializeJson(redactSecrets(access)));
-  for (const assessment of assessments) {
-    await write(`core_data/${assessment.category}.json`, serializeJson(redactSecrets(assessment.snapshot)));
-    await write(`analysis/${assessment.category}.json`, serializeJson(redactSecrets({
-      title: assessment.title,
-      category: assessment.category,
-      summary: assessment.summary,
-      findings: assessment.findings,
-      errors: assessment.errors,
-    })));
-    await write(`analysis/${assessment.category}.md`, formatAssessmentText(assessment));
-  }
-  await write("analysis/findings.json", serializeJson(redactSecrets(findings)));
-  await write("analysis/category_summaries.json", serializeJson(redactSecrets(
-    assessments.map((assessment) => ({ category: assessment.category, title: assessment.title, counts: countStatuses(assessment.findings), summary: assessment.summary })),
-  )));
-  await write("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await write("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const framework of GCP_FRAMEWORKS) {
-    await write(`compliance/frameworks/${framework.slug}.md`, buildFrameworkReport(framework, findings));
-  }
-  if (errors.length > 0) {
-    await write("_errors.log", `${errors.join("\n")}\n`);
-  }
+    await write("QUICK_REFERENCE.md", buildQuickReference(assessments));
+    await write("README.md", buildQuickReference(assessments));
+    await write("metadata.json", serializeJson({
+      organization_id: config.organizationId ?? null,
+      project_id: config.projectId ?? null,
+      source_chain: config.sourceChain,
+      credentials_path: config.credentialsPath ?? null,
+      generated_at: new Date().toISOString(),
+      options: {
+        max_projects: maxProjects ?? DEFAULT_MAX_PROJECTS,
+        stale_days: options.stale_days ?? DEFAULT_STALE_DAYS,
+        max_keys: options.max_keys ?? DEFAULT_MAX_KEYS,
+        max_findings: options.max_findings ?? DEFAULT_MAX_FINDINGS,
+        max_assets: options.max_assets ?? DEFAULT_MAX_ASSETS,
+      },
+    }));
+    await write("core_data/access.json", serializeJson(redactSecrets(access)));
+    for (const assessment of assessments) {
+      await write(`core_data/${assessment.category}.json`, serializeJson(redactSecrets(assessment.snapshot)));
+      await write(`analysis/${assessment.category}.json`, serializeJson(redactSecrets({
+        title: assessment.title,
+        category: assessment.category,
+        summary: assessment.summary,
+        findings: assessment.findings,
+        errors: assessment.errors,
+      })));
+      await write(`analysis/${assessment.category}.md`, formatAssessmentText(assessment));
+    }
+    await write("analysis/findings.json", serializeJson(redactSecrets(findings)));
+    await write("analysis/category_summaries.json", serializeJson(redactSecrets(
+      assessments.map((assessment) => ({ category: assessment.category, title: assessment.title, counts: countStatuses(assessment.findings), summary: assessment.summary })),
+    )));
+    await write("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+    await write("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const framework of GCP_FRAMEWORKS) {
+      await write(`compliance/frameworks/${framework.slug}.md`, buildFrameworkReport(framework, findings));
+    }
+    if (errors.length > 0) {
+      await write("_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
   const fileCount = await countFilesRecursively(outputDir);
   return { outputDir, zipPath, fileCount, findingCount: findings.length, errorCount: errors.length };
 }

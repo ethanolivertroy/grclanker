@@ -91,10 +91,11 @@ import {
   mkdirSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { readdir, writeFile } from "node:fs/promises";
+import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   AWS_CONTROL_CATALOG,
   AWS_DEFAULTS,
@@ -1866,20 +1867,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -5021,60 +5008,65 @@ export async function exportAwsAuditBundle(
   const counts = countByStatus(findings);
   const accountId = access.accountId ?? config.accountId ?? "aws-account";
   const targetName = safeDirName(`${accountId}-${config.region}-audit`);
-  const outputDir = await nextAvailableAuditDir(outputRoot, targetName);
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(targetName, 6),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "README.md", buildBundleReadme());
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference(assessments, access, errors));
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      region: config.region,
+      profile: config.profile ?? null,
+      account_id: access.accountId ?? null,
+      account_id_hint: config.accountId ?? null,
+      source_chain: config.sourceChain,
+      generated_at: now.toISOString(),
+      findings: findings.length,
+      controls_covered: coveredAwsControls(findings),
+      controls_total: Object.keys(AWS_CONTROL_CATALOG).length,
+      ...counts,
+      options: {
+        user_limit: options.user_limit ?? DEFAULT_USER_LIMIT,
+        stale_days: options.stale_days ?? DEFAULT_STALE_DAYS,
+        role_limit: options.role_limit ?? DEFAULT_ROLE_LIMIT,
+        max_privileged_roles: options.max_privileged_roles ?? DEFAULT_MAX_PRIVILEGED_ROLES,
+        lookback_days: options.lookback_days ?? DEFAULT_ROOT_LOOKBACK_DAYS,
+        policy_limit: options.policy_limit ?? DEFAULT_POLICY_LIMIT,
+        max_findings: options.max_findings ?? DEFAULT_MAX_FINDINGS,
+        regions: options.regions ?? null,
+        region_limit: options.region_limit ?? DEFAULT_REGION_LIMIT,
+        bucket_limit: options.bucket_limit ?? DEFAULT_BUCKET_LIMIT,
+        key_limit: options.key_limit ?? DEFAULT_KEY_LIMIT,
+        instance_limit: options.instance_limit ?? DEFAULT_INSTANCE_LIMIT,
+        resource_limit: options.resource_limit ?? DEFAULT_RESOURCE_LIMIT,
+        sensitive_ports: options.sensitive_ports ?? DEFAULT_SENSITIVE_PORTS,
+      },
+    }));
+    await writeSecureTextFile(staged.dir, "core_data/access.json", serializeJson(access));
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    for (const [index, category] of ASSESSMENT_CATEGORIES.entries()) {
+      await writeSecureTextFile(staged.dir, `analysis/${category}.json`, serializeJson(assessments[index]));
+    }
+    await writeSecureTextFile(staged.dir, "analysis/summary.json", serializeJson({
+      findings: findings.length,
+      controls_covered: coveredAwsControls(findings),
+      ...counts,
+      categories: ASSESSMENT_CATEGORIES.map((category, index) => ({ category, ...countByStatus(assessments[index].findings) })),
+    }));
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, now));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const framework of AWS_FRAMEWORKS) {
+      await writeSecureTextFile(staged.dir, `compliance/frameworks/${framework.file}.md`, buildFrameworkReport(framework, findings));
+    }
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  await writeSecureTextFile(outputDir, "README.md", buildBundleReadme());
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference(assessments, access, errors));
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    region: config.region,
-    profile: config.profile ?? null,
-    account_id: access.accountId ?? null,
-    account_id_hint: config.accountId ?? null,
-    source_chain: config.sourceChain,
-    generated_at: now.toISOString(),
-    findings: findings.length,
-    controls_covered: coveredAwsControls(findings),
-    controls_total: Object.keys(AWS_CONTROL_CATALOG).length,
-    ...counts,
-    options: {
-      user_limit: options.user_limit ?? DEFAULT_USER_LIMIT,
-      stale_days: options.stale_days ?? DEFAULT_STALE_DAYS,
-      role_limit: options.role_limit ?? DEFAULT_ROLE_LIMIT,
-      max_privileged_roles: options.max_privileged_roles ?? DEFAULT_MAX_PRIVILEGED_ROLES,
-      lookback_days: options.lookback_days ?? DEFAULT_ROOT_LOOKBACK_DAYS,
-      policy_limit: options.policy_limit ?? DEFAULT_POLICY_LIMIT,
-      max_findings: options.max_findings ?? DEFAULT_MAX_FINDINGS,
-      regions: options.regions ?? null,
-      region_limit: options.region_limit ?? DEFAULT_REGION_LIMIT,
-      bucket_limit: options.bucket_limit ?? DEFAULT_BUCKET_LIMIT,
-      key_limit: options.key_limit ?? DEFAULT_KEY_LIMIT,
-      instance_limit: options.instance_limit ?? DEFAULT_INSTANCE_LIMIT,
-      resource_limit: options.resource_limit ?? DEFAULT_RESOURCE_LIMIT,
-      sensitive_ports: options.sensitive_ports ?? DEFAULT_SENSITIVE_PORTS,
-    },
-  }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  for (const [index, category] of ASSESSMENT_CATEGORIES.entries()) {
-    await writeSecureTextFile(outputDir, `analysis/${category}.json`, serializeJson(assessments[index]));
-  }
-  await writeSecureTextFile(outputDir, "analysis/summary.json", serializeJson({
-    findings: findings.length,
-    controls_covered: coveredAwsControls(findings),
-    ...counts,
-    categories: ASSESSMENT_CATEGORIES.map((category, index) => ({ category, ...countByStatus(assessments[index].findings) })),
-  }));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors, now));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const framework of AWS_FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/frameworks/${framework.file}.md`, buildFrameworkReport(framework, findings));
-  }
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
-
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
   const fileCount = await countFilesRecursively(outputDir);
 
   return {

@@ -28,6 +28,7 @@ import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -3553,20 +3554,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   return resolvedTarget;
 }
 
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  for (let index = 0; index < 50; index += 1) {
-    const suffix = index === 0 ? "" : `-${index + 1}`;
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
-}
-
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
@@ -3764,49 +3751,53 @@ export async function exportSnowflakeAuditBundle(
   const notRequestedStatements = statements.filter((statement) => statement.status === "not_requested");
 
   ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(access.account || config.account)}-audit-bundle`);
-
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    account: access.account,
-    user: access.user,
-    role: access.role ?? null,
-    authentication: access.authentication,
-    token_type: config.tokenType,
-    base_url: config.baseUrl,
-    source_chain: config.sourceChain,
-    statement_count: statements.length,
-    requested_statement_count: statements.length - notRequestedStatements.length,
-    not_requested_statement_count: notRequestedStatements.length,
-    failed_statement_count: failedStatements.length,
-  }));
-  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(access));
-  const seenKeys = new Set<string>();
-  for (const assessment of assessments) {
-    for (const statement of assessment.statements) {
-      const fileKey = seenKeys.has(statement.key) ? `${assessment.area}-${statement.key}` : statement.key;
-      seenKeys.add(statement.key);
-      await writeSecureTextFile(outputDir, `core_data/${safeDirName(fileKey)}.json`, serializeJson(statement));
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(access.account || config.account)}-audit-bundle`, 50),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      generated_at: new Date().toISOString(),
+      account: access.account,
+      user: access.user,
+      role: access.role ?? null,
+      authentication: access.authentication,
+      token_type: config.tokenType,
+      base_url: config.baseUrl,
+      source_chain: config.sourceChain,
+      statement_count: statements.length,
+      requested_statement_count: statements.length - notRequestedStatements.length,
+      not_requested_statement_count: notRequestedStatements.length,
+      failed_statement_count: failedStatements.length,
+    }));
+    await writeSecureTextFile(staged.dir, "core_data/access_check.json", serializeJson(access));
+    const seenKeys = new Set<string>();
+    for (const assessment of assessments) {
+      for (const statement of assessment.statements) {
+        const fileKey = seenKeys.has(statement.key) ? `${assessment.area}-${statement.key}` : statement.key;
+        seenKeys.add(statement.key);
+        await writeSecureTextFile(staged.dir, `core_data/${safeDirName(fileKey)}.json`, serializeJson(statement));
+      }
     }
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.json`, serializeJson({ title: assessment.title, summary: assessment.summary, findings: assessment.findings }));
-    await writeSecureTextFile(outputDir, `analysis/${assessment.area}.md`, `${formatAssessmentText(assessment)}\n`);
-  }
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, access, assessments)}\n`);
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
-  for (const framework of SNOWFLAKE_FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/${safeDirName(framework)}.md`, `${buildFrameworkReport(framework, findings)}\n`);
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference({ outputDir }, assessments, failedStatements.length)}\n`);
-  if (failedStatements.length > 0) {
-    // A statement that was never sent has no statement line: the log names only statements the run executed.
-    await writeSecureTextFile(outputDir, "_errors.log", `${failedStatements.map((statement) => `[${statement.status}] ${statement.key}: ${statement.error ?? "no detail"}${statement.statement === null ? "" : `\n  ${statement.statement}`}`).join("\n")}\n`);
-  }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    for (const assessment of assessments) {
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.area}.json`, serializeJson({ title: assessment.title, summary: assessment.summary, findings: assessment.findings }));
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.area}.md`, `${formatAssessmentText(assessment)}\n`);
+    }
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", `${buildExecutiveSummary(config, access, assessments)}\n`);
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
+    for (const framework of SNOWFLAKE_FRAMEWORKS) {
+      await writeSecureTextFile(staged.dir, `compliance/${safeDirName(framework)}.md`, `${buildFrameworkReport(framework, findings)}\n`);
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", `${buildQuickReference(staged.target, assessments, failedStatements.length)}\n`);
+    if (failedStatements.length > 0) {
+      // A statement that was never sent has no statement line: the log names only statements the run executed.
+      await writeSecureTextFile(staged.dir, "_errors.log", `${failedStatements.map((statement) => `[${statement.status}] ${statement.key}: ${statement.error ?? "no detail"}${statement.statement === null ? "" : `\n  ${statement.statement}`}`).join("\n")}\n`);
+    }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

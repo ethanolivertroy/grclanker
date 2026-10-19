@@ -15,9 +15,10 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { DEFAULT_DATA_SCRUB_DEPTH, REDACTED, createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -1018,24 +1019,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-function auditZipPath(outputDir: string): string {
-  return resolveSecureOutputPath(dirname(outputDir), `${basename(outputDir)}.zip`);
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(auditZipPath(candidate))) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -4828,48 +4811,55 @@ export async function exportLaunchdarklyAuditBundle(
 
   ensurePrivateDir(outputRoot);
   const bundleName = safeDirName(`${new URL(config.baseUrl).hostname}-${access.callerIdentity.accountId ?? "account"}-audit-bundle`);
-  const outputDir = await nextAvailableAuditDir(outputRoot, bundleName);
-
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    base_url: config.baseUrl,
-    api_version: config.apiVersion,
-    account_id: access.callerIdentity.accountId ?? null,
-    token_name: access.callerIdentity.tokenName ?? null,
-    source_chain: config.sourceChain,
-    controls_evaluated: findings.length,
-    controls_in_spec: 25,
-  }));
-  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(redactCredentialValues(access)));
-  await writeSecureTextFile(outputDir, "core_data/collection_status.json", serializeJson(launchdarklyCollectionStatus(assessments)));
-  for (const assessment of assessments) {
-    // Collectors redact at the client; this pass is defense in depth so no credential-shaped value or token-bearing URL
-    // from any collected object reaches the bundle even through a fake or future client.
-    const redactedSnapshots = Object.fromEntries(Object.entries(assessment.snapshots)
-      .map(([name, snapshot]) => [name, redactCredentialValues(snapshot)]));
-    for (const [name, snapshot] of Object.entries(redactedSnapshots)) {
-      await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(snapshot));
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(bundleName, 6),
+    zip: true,
+    checkName: (name) => {
+      resolveSecureOutputPath(outputRoot, name);
+      resolveSecureOutputPath(outputRoot, `${name}.zip`);
+    },
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      generated_at: new Date().toISOString(),
+      base_url: config.baseUrl,
+      api_version: config.apiVersion,
+      account_id: access.callerIdentity.accountId ?? null,
+      token_name: access.callerIdentity.tokenName ?? null,
+      source_chain: config.sourceChain,
+      controls_evaluated: findings.length,
+      controls_in_spec: 25,
+    }));
+    await writeSecureTextFile(staged.dir, "core_data/access_check.json", serializeJson(redactCredentialValues(access)));
+    await writeSecureTextFile(staged.dir, "core_data/collection_status.json", serializeJson(launchdarklyCollectionStatus(assessments)));
+    for (const assessment of assessments) {
+      // Collectors redact at the client; this pass is defense in depth so no credential-shaped value or token-bearing URL
+      // from any collected object reaches the bundle even through a fake or future client.
+      const redactedSnapshots = Object.fromEntries(Object.entries(assessment.snapshots)
+        .map(([name, snapshot]) => [name, redactCredentialValues(snapshot)]));
+      for (const [name, snapshot] of Object.entries(redactedSnapshots)) {
+        await writeSecureTextFile(staged.dir, `core_data/${name}.json`, serializeJson(snapshot));
+      }
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.category}.json`, serializeJson({ ...assessment, snapshots: redactedSnapshots }));
     }
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson({ ...assessment, snapshots: redactedSnapshots }));
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/summary.md", `${[
-    formatAccessCheckText(access),
-    "",
-    ...assessments.map((assessment) => `${formatAssessmentText(assessment)}\n`),
-  ].join("\n")}\n`);
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, access, assessments, uniqueErrors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const [framework, pathname, title] of FRAMEWORK_REPORTS) {
-    await writeSecureTextFile(outputDir, pathname, buildFrameworkReport(title, framework, findings));
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
-  if (uniqueErrors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${uniqueErrors.join("\n")}\n`);
-  }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "analysis/summary.md", `${[
+      formatAccessCheckText(access),
+      "",
+      ...assessments.map((assessment) => `${formatAssessmentText(assessment)}\n`),
+    ].join("\n")}\n`);
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, access, assessments, uniqueErrors));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const [framework, pathname, title] of FRAMEWORK_REPORTS) {
+      await writeSecureTextFile(staged.dir, pathname, buildFrameworkReport(title, framework, findings));
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference());
+    if (uniqueErrors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${uniqueErrors.join("\n")}\n`);
+    }
 
-  const zipPath = auditZipPath(outputDir);
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

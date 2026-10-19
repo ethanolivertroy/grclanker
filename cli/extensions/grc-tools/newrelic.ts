@@ -13,9 +13,10 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   ConfigFileError,
   NextLinkError,
@@ -577,21 +578,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    const pairedZip = resolveSecureOutputPath(root, `${preferredName}${suffix}.zip`);
-    if (!existsSync(candidate) && !existsSync(pairedZip)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -4963,51 +4949,59 @@ export async function exportNewrelicAuditBundle(
 
   ensurePrivateDir(outputRoot);
   const label = accountIds.length > 0 ? accountIds.join("-") : config.region.toLowerCase();
-  const outputDir = await nextAvailableAuditDir(outputRoot, safeDirName(`newrelic-${label}-audit-bundle`));
-  // Second layer for every bundle file: the same scrub the failure constructors and errorMessage apply, minus the
-  // long-token heuristic (account ids, entity guids, policy and rule ids are evidence). The first layer is the
-  // constructors plus the per-record projection shapes.
-  const secrets = credentialValues(config);
-  const write = (relativePathname: string, content: string) => writeSecureTextFile(outputDir, relativePathname, scrubDataText(content, secrets));
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(safeDirName(`newrelic-${label}-audit-bundle`), 6),
+    zip: true,
+    checkName: (name) => {
+      resolveSecureOutputPath(outputRoot, name);
+      resolveSecureOutputPath(outputRoot, `${name}.zip`);
+    },
+  }, async (staged) => {
+    // Second layer for every bundle file: the same scrub the failure constructors and errorMessage apply, minus the
+    // long-token heuristic (account ids, entity guids, policy and rule ids are evidence). The first layer is the
+    // constructors plus the per-record projection shapes.
+    const secrets = credentialValues(config);
+    const write = (relativePathname: string, content: string) => writeSecureTextFile(staged.dir, relativePathname, scrubDataText(content, secrets));
 
-  await write("metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    region: config.region,
-    nerdgraph_url: config.nerdgraphUrl,
-    account_ids: accountIds,
-    audit_window_days: config.auditWindowDays,
-    source_chain: config.sourceChain,
-  }));
-
-  const writtenCoreData = new Set<string>();
-  for (const assessment of assessments) {
-    for (const [pathname, value] of Object.entries(assessment.coreData)) {
-      if (writtenCoreData.has(pathname)) continue;
-      writtenCoreData.add(pathname);
-      await write(pathname, serializeJson(value));
-    }
-    await write(`analysis/${assessment.category}.json`, serializeJson({
-      category: assessment.category,
-      title: assessment.title,
-      summary: assessment.summary,
-      findings: assessment.findings,
-      errors: assessment.errors,
-      coverage: assessment.coverage,
+    await write("metadata.json", serializeJson({
+      generated_at: new Date().toISOString(),
+      region: config.region,
+      nerdgraph_url: config.nerdgraphUrl,
+      account_ids: accountIds,
+      audit_window_days: config.auditWindowDays,
+      source_chain: config.sourceChain,
     }));
-  }
-  await write("analysis/findings.json", serializeJson(findings));
-  await write("compliance/executive_summary.md", buildExecutiveSummary(config, accountIds, assessments, errors));
-  await write("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const framework of FRAMEWORKS) {
-    await write(`compliance/${framework.slug}/${framework.file}`, buildFrameworkReport(framework.title, framework.label, findings));
-  }
-  await write("QUICK_REFERENCE.md", buildQuickReference());
-  if (errors.length > 0) {
-    await write("_errors.log", `${errors.join("\n")}\n`);
-  }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  await createZipArchive(outputDir, zipPath);
+    const writtenCoreData = new Set<string>();
+    for (const assessment of assessments) {
+      for (const [pathname, value] of Object.entries(assessment.coreData)) {
+        if (writtenCoreData.has(pathname)) continue;
+        writtenCoreData.add(pathname);
+        await write(pathname, serializeJson(value));
+      }
+      await write(`analysis/${assessment.category}.json`, serializeJson({
+        category: assessment.category,
+        title: assessment.title,
+        summary: assessment.summary,
+        findings: assessment.findings,
+        errors: assessment.errors,
+        coverage: assessment.coverage,
+      }));
+    }
+    await write("analysis/findings.json", serializeJson(findings));
+    await write("compliance/executive_summary.md", buildExecutiveSummary(config, accountIds, assessments, errors));
+    await write("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const framework of FRAMEWORKS) {
+      await write(`compliance/${framework.slug}/${framework.file}`, buildFrameworkReport(framework.title, framework.label, findings));
+    }
+    await write("QUICK_REFERENCE.md", buildQuickReference());
+    if (errors.length > 0) {
+      await write("_errors.log", `${errors.join("\n")}\n`);
+    }
+
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

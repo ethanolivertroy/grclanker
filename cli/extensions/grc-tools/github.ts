@@ -9,17 +9,17 @@
 import { createPrivateKey, sign as signData, type KeyObject } from "node:crypto";
 import {
   createWriteStream,
-  existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { STATUS_CODES } from "node:http";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { NextLinkError, parseNextLinkHeader, resolveSameOriginUrl, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -2685,20 +2685,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   return resolvedTarget;
 }
 
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
-}
-
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
@@ -5318,53 +5304,55 @@ export async function exportGitHubAuditBundle(
     ...listPerRepoErrors("repoHooks", integrations.repoHooks),
     ...listPerRepoErrors("deployKeys", integrations.deployKeys),
   ];
-
-  const outputDir = await nextAvailableAuditDir(
-    outputRoot,
-    safeDirName(`${config.organization}-audit-bundle`),
-  );
-
-  await buildBundleQuickReference(outputDir);
-  await writeSecureTextFile(outputDir, "config.json", serializeJson({
-    organization: config.organization,
-    auth_mode: config.authMode,
-    api_base_url: config.apiBaseUrl,
-    lookback_days: config.lookbackDays,
-    source_chain: config.sourceChain,
-  }));
-
-  const coreDataFiles: Array<[string, unknown]> = [
-    ["core_data/org_access.json", orgAccess],
-    ["core_data/repo_protection.json", repoProtection],
-    ["core_data/actions_security.json", actions],
-    ["core_data/code_security.json", codeSecurity],
-    ["core_data/integrations.json", integrations],
-  ];
-
-  for (const [pathName, value] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathName, serializeJson(value));
-  }
-
-  for (const assessment of assessments) {
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(assessment));
-  }
-
   const allFindings = assessments.flatMap((assessment) => assessment.findings);
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(allFindings));
-  await writeBundleText(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeBundleText(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(allFindings));
 
-  const frameworkReports = buildFrameworkReports(allFindings);
-  for (const [name, report] of Object.entries(frameworkReports)) {
-    await writeBundleText(outputDir, `compliance/frameworks/${name}.md`, `${report}\n`);
-  }
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(safeDirName(`${config.organization}-audit-bundle`), 6),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await buildBundleQuickReference(staged.dir);
+    await writeSecureTextFile(staged.dir, "config.json", serializeJson({
+      organization: config.organization,
+      auth_mode: config.authMode,
+      api_base_url: config.apiBaseUrl,
+      lookback_days: config.lookbackDays,
+      source_chain: config.sourceChain,
+    }));
 
-  if (errors.length > 0) {
-    await writeBundleText(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
+    const coreDataFiles: Array<[string, unknown]> = [
+      ["core_data/org_access.json", orgAccess],
+      ["core_data/repo_protection.json", repoProtection],
+      ["core_data/actions_security.json", actions],
+      ["core_data/code_security.json", codeSecurity],
+      ["core_data/integrations.json", integrations],
+    ];
 
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
+    for (const [pathName, value] of coreDataFiles) {
+      await writeSecureTextFile(staged.dir, pathName, serializeJson(value));
+    }
+
+    for (const assessment of assessments) {
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.category}.json`, serializeJson(assessment));
+    }
+
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(allFindings));
+    await writeBundleText(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+    await writeBundleText(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(allFindings));
+
+    const frameworkReports = buildFrameworkReports(allFindings);
+    for (const [name, report] of Object.entries(frameworkReports)) {
+      await writeBundleText(staged.dir, `compliance/frameworks/${name}.md`, `${report}\n`);
+    }
+
+    if (errors.length > 0) {
+      await writeBundleText(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
+
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   const files = await readdir(outputDir, { recursive: true });
   return {

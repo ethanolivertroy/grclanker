@@ -20,6 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -919,23 +920,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
 }
 
 const MAX_AUDIT_DIR_SUFFIX = 50;
-
-export function auditBundleZipPath(outputDir: string): string {
-  return `${outputDir}.zip`;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const candidates = [preferredName, ...Array.from({ length: MAX_AUDIT_DIR_SUFFIX - 1 }, (_, index) => `${preferredName}-${index + 2}`)];
-  for (const name of candidates) {
-    const candidate = resolveSecureOutputPath(root, name);
-    if (existsSync(candidate) || existsSync(auditBundleZipPath(candidate))) continue;
-    mkdirSync(candidate, { recursive: true, mode: 0o700 });
-    await chmod(candidate, 0o700);
-    return candidate;
-  }
-  throw new Error(`Unable to allocate an unused output directory under ${root}: ${MAX_AUDIT_DIR_SUFFIX} bundle names are already taken.`);
-}
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
@@ -4594,49 +4578,54 @@ export async function exportMulesoftAuditBundle(
   const errors = assessments.flatMap((assessment) => assessment.errors.map((error) => `[${assessment.category}] ${error}`));
 
   ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(config.organizationId)}-audit-bundle`);
-
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
-    generated_at: new Date().toISOString(),
-    organization_id: config.organizationId,
-    control_plane: config.controlPlane,
-    base_url: config.baseUrl,
-    auth_mode: config.authMode,
-    environment_filter: config.environmentFilter,
-    source_chain: config.sourceChain,
-    controls_assessed: findings.length,
-    controls_in_catalog: CONTROL_CATALOG.length,
-  }));
-  await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(access));
-  for (const assessment of assessments) {
-    for (const [name, snapshot] of Object.entries(assessment.snapshots)) {
-      await writeSecureTextFile(outputDir, `core_data/${name}.json`, serializeJson(snapshot));
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(config.organizationId)}-audit-bundle`, MAX_AUDIT_DIR_SUFFIX),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+    exhaustedMessage: `Unable to allocate an unused output directory under ${outputRoot}: ${MAX_AUDIT_DIR_SUFFIX} bundle names are already taken.`,
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
+      generated_at: new Date().toISOString(),
+      organization_id: config.organizationId,
+      control_plane: config.controlPlane,
+      base_url: config.baseUrl,
+      auth_mode: config.authMode,
+      environment_filter: config.environmentFilter,
+      source_chain: config.sourceChain,
+      controls_assessed: findings.length,
+      controls_in_catalog: CONTROL_CATALOG.length,
+    }));
+    await writeSecureTextFile(staged.dir, "core_data/access_check.json", serializeJson(access));
+    for (const assessment of assessments) {
+      for (const [name, snapshot] of Object.entries(assessment.snapshots)) {
+        await writeSecureTextFile(staged.dir, `core_data/${name}.json`, serializeJson(snapshot));
+      }
+      const { snapshots: _snapshots, ...analysis } = assessment;
+      await writeSecureTextFile(staged.dir, `analysis/${assessment.category}.json`, serializeJson(analysis));
     }
-    const { snapshots: _snapshots, ...analysis } = assessment;
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson(analysis));
-  }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "analysis/summary.json", serializeJson({
-    total: statusCounts(findings),
-    categories: assessments.map((assessment) => ({
-      category: assessment.category,
-      title: assessment.title,
-      counts: statusCounts(assessment.findings),
-      summary: assessment.summary,
-    })),
-  }));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const framework of FRAMEWORKS) {
-    await writeSecureTextFile(outputDir, `compliance/${framework}/${framework}_compliance_report.md`, buildFrameworkReport(framework, findings));
-  }
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
-  if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
-  }
+    await writeSecureTextFile(staged.dir, "analysis/findings.json", serializeJson(findings));
+    await writeSecureTextFile(staged.dir, "analysis/summary.json", serializeJson({
+      total: statusCounts(findings),
+      categories: assessments.map((assessment) => ({
+        category: assessment.category,
+        title: assessment.title,
+        counts: statusCounts(assessment.findings),
+        summary: assessment.summary,
+      })),
+    }));
+    await writeSecureTextFile(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+    await writeSecureTextFile(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const framework of FRAMEWORKS) {
+      await writeSecureTextFile(staged.dir, `compliance/${framework}/${framework}_compliance_report.md`, buildFrameworkReport(framework, findings));
+    }
+    await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference());
+    if (errors.length > 0) {
+      await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  const zipPath = resolveSecureOutputPath(outputRoot, auditBundleZipPath(relative(realpathSync(outputRoot), outputDir)));
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,

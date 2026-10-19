@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZOOM_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readJsonConfig } from "./hardening/index.js";
@@ -661,21 +662,6 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   return resolvedTarget;
-}
-
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  for (let attempt = 1; attempt <= 50; attempt += 1) {
-    const suffix = attempt === 1 ? "" : `-${attempt}`;
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    const zipCandidate = resolveSecureOutputPath(root, `${preferredName}${suffix}.zip`);
-    if (!existsSync(candidate) && !existsSync(zipCandidate)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
 }
 
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
@@ -3150,101 +3136,109 @@ export async function exportZoomAuditBundle(
   const errors = surfaceErrors(snapshotSurfaces(snapshot));
 
   ensurePrivateDir(outputRoot);
-  const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(config.accountId)}-audit-bundle`);
-  const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
-  const secrets = credentialValues(config);
-  // Second layer for every bundle file: the same scrub the error constructors apply, minus the long-token heuristic (opaque Zoom ids are evidence).
-  const write = (relativePathname: string, content: string) =>
-    writeSecureTextFile(outputDir, relativePathname, scrubDataText(content, secrets));
-  const readPaths = [...snapshot.settings.readPaths].sort();
-  const lockPaths = [...snapshot.settings.lockPaths].sort();
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(`${safeDirName(config.accountId)}-audit-bundle`, 50),
+    zip: true,
+    checkName: (name) => {
+      resolveSecureOutputPath(outputRoot, name);
+      resolveSecureOutputPath(outputRoot, `${name}.zip`);
+    },
+  }, async (staged) => {
+    const secrets = credentialValues(config);
+    // Second layer for every bundle file: the same scrub the error constructors apply, minus the long-token heuristic (opaque Zoom ids are evidence).
+    const write = (relativePathname: string, content: string) =>
+      writeSecureTextFile(staged.dir, relativePathname, scrubDataText(content, secrets));
+    const readPaths = [...snapshot.settings.readPaths].sort();
+    const lockPaths = [...snapshot.settings.lockPaths].sort();
 
-  await write("README.md", `${buildQuickReference({ outputDir, zipPath }, findings, errors)}\n`);
-  await write("QUICK_REFERENCE.md", `${buildQuickReference({ outputDir, zipPath }, findings, errors)}\n`);
-  await write("metadata.json", serializeJson({
-    generated_at: (options.now ?? new Date()).toISOString(),
-    collected_at: snapshot.collectedAt,
-    account_id: config.accountId,
-    base_url: config.baseUrl,
-    source_chain: config.sourceChain,
-    config_file: config.configFile ?? null,
-    finding_count: findings.length,
-    error_count: errors.length,
-    settings_paths_read: readPaths,
-    lock_paths_read: lockPaths,
-  }));
-  await write("summary.md", [
-    formatAccessCheckText(access),
-    "",
-    formatAssessmentText(identity),
-    "",
-    formatAssessmentText(collaboration),
-    "",
-    formatAssessmentText(meetingSecurity),
-  ].join("\n"));
+    await write("README.md", `${buildQuickReference(staged.target, findings, errors)}\n`);
+    await write("QUICK_REFERENCE.md", `${buildQuickReference(staged.target, findings, errors)}\n`);
+    await write("metadata.json", serializeJson({
+      generated_at: (options.now ?? new Date()).toISOString(),
+      collected_at: snapshot.collectedAt,
+      account_id: config.accountId,
+      base_url: config.baseUrl,
+      source_chain: config.sourceChain,
+      config_file: config.configFile ?? null,
+      finding_count: findings.length,
+      error_count: errors.length,
+      settings_paths_read: readPaths,
+      lock_paths_read: lockPaths,
+    }));
+    await write("summary.md", [
+      formatAccessCheckText(access),
+      "",
+      formatAssessmentText(identity),
+      "",
+      formatAssessmentText(collaboration),
+      "",
+      formatAssessmentText(meetingSecurity),
+    ].join("\n"));
 
-  await write("core_data/access.json", serializeJson(access));
-  await write("core_data/current_user.json", serializeJson({
-    ...describeSurface(snapshot.currentUser),
-    data: snapshot.currentUser.data === undefined ? null : projectRecord(snapshot.currentUser.data, BUNDLE_RECORD_FIELDS.current_user),
-  }));
-  await write("core_data/account_settings.json", serializeJson({
-    fields_read: readPaths,
-    merged: projectPaths(snapshot.settings.settings, readPaths),
-    surfaces: snapshot.settings.settingsSurfaces.map((surface) => projectedSettingsSurface(surface, readPaths)),
-  }));
-  await write("core_data/account_lock_settings.json", serializeJson({
-    fields_read: lockPaths,
-    merged: projectPaths(snapshot.settings.locks, lockPaths),
-    surfaces: snapshot.settings.lockSurfaces.map((surface) => projectedSettingsSurface(surface, lockPaths)),
-  }));
-  await write("core_data/users.json", serializeJson(projectedListSurface(snapshot.users, BUNDLE_RECORD_FIELDS.users)));
-  await write("core_data/roles.json", serializeJson({
-    roles: projectedListSurface(snapshot.roles, BUNDLE_RECORD_FIELDS.roles),
-    members: Object.values(snapshot.roleMembers).map((surface) => projectedListSurface(surface, BUNDLE_RECORD_FIELDS.role_members)),
-  }));
-  await write("core_data/groups.json", serializeJson({
-    groups: projectedListSurface(snapshot.groups, BUNDLE_RECORD_FIELDS.groups),
-    policies: snapshot.groupPolicies.map((policy) => ({
-      id: policy.id,
-      name: policy.name,
-      settings: projectedSettingsSurface(policy.settings, readPaths),
-      lock_settings: projectedSettingsSurface(policy.locks, lockPaths),
-      settings_views: policy.settingsSurfaces.map(describeSurface),
-      lock_views: policy.lockSurfaces.map(describeSurface),
-    })),
-  }));
-  await write("core_data/im_groups.json", serializeJson(projectedListSurface(snapshot.imGroups, BUNDLE_RECORD_FIELDS.im_groups)));
-  await write("core_data/managed_domains.json", serializeJson(projectedListSurface(snapshot.managedDomains, BUNDLE_RECORD_FIELDS.managed_domains)));
-  await write("core_data/trusted_domains.json", serializeJson(projectedListSurface(snapshot.trustedDomains, [])));
-  await write("core_data/operation_logs.json", serializeJson({
-    ...projectedListSurface(snapshot.operationLogs, BUNDLE_RECORD_FIELDS.operation_logs),
-    from: snapshot.operationLogs.from,
-    to: snapshot.operationLogs.to,
-  }));
-  await write("core_data/phone_account_settings.json", serializeJson(projectedSettingsSurface(snapshot.phoneSettings, BUNDLE_PHONE_PATHS)));
+    await write("core_data/access.json", serializeJson(access));
+    await write("core_data/current_user.json", serializeJson({
+      ...describeSurface(snapshot.currentUser),
+      data: snapshot.currentUser.data === undefined ? null : projectRecord(snapshot.currentUser.data, BUNDLE_RECORD_FIELDS.current_user),
+    }));
+    await write("core_data/account_settings.json", serializeJson({
+      fields_read: readPaths,
+      merged: projectPaths(snapshot.settings.settings, readPaths),
+      surfaces: snapshot.settings.settingsSurfaces.map((surface) => projectedSettingsSurface(surface, readPaths)),
+    }));
+    await write("core_data/account_lock_settings.json", serializeJson({
+      fields_read: lockPaths,
+      merged: projectPaths(snapshot.settings.locks, lockPaths),
+      surfaces: snapshot.settings.lockSurfaces.map((surface) => projectedSettingsSurface(surface, lockPaths)),
+    }));
+    await write("core_data/users.json", serializeJson(projectedListSurface(snapshot.users, BUNDLE_RECORD_FIELDS.users)));
+    await write("core_data/roles.json", serializeJson({
+      roles: projectedListSurface(snapshot.roles, BUNDLE_RECORD_FIELDS.roles),
+      members: Object.values(snapshot.roleMembers).map((surface) => projectedListSurface(surface, BUNDLE_RECORD_FIELDS.role_members)),
+    }));
+    await write("core_data/groups.json", serializeJson({
+      groups: projectedListSurface(snapshot.groups, BUNDLE_RECORD_FIELDS.groups),
+      policies: snapshot.groupPolicies.map((policy) => ({
+        id: policy.id,
+        name: policy.name,
+        settings: projectedSettingsSurface(policy.settings, readPaths),
+        lock_settings: projectedSettingsSurface(policy.locks, lockPaths),
+        settings_views: policy.settingsSurfaces.map(describeSurface),
+        lock_views: policy.lockSurfaces.map(describeSurface),
+      })),
+    }));
+    await write("core_data/im_groups.json", serializeJson(projectedListSurface(snapshot.imGroups, BUNDLE_RECORD_FIELDS.im_groups)));
+    await write("core_data/managed_domains.json", serializeJson(projectedListSurface(snapshot.managedDomains, BUNDLE_RECORD_FIELDS.managed_domains)));
+    await write("core_data/trusted_domains.json", serializeJson(projectedListSurface(snapshot.trustedDomains, [])));
+    await write("core_data/operation_logs.json", serializeJson({
+      ...projectedListSurface(snapshot.operationLogs, BUNDLE_RECORD_FIELDS.operation_logs),
+      from: snapshot.operationLogs.from,
+      to: snapshot.operationLogs.to,
+    }));
+    await write("core_data/phone_account_settings.json", serializeJson(projectedSettingsSurface(snapshot.phoneSettings, BUNDLE_PHONE_PATHS)));
 
-  await write("analysis/findings.json", serializeJson(findings));
-  await write("analysis/identity.json", serializeJson(identity));
-  await write("analysis/collaboration-governance.json", serializeJson(collaboration));
-  await write("analysis/meeting-security.json", serializeJson(meetingSecurity));
-  await write("analysis/summary.json", serializeJson({
-    counts: statusCounts(findings),
-    controls_covered: [...new Set(findings.flatMap((item) => item.controls))].sort((a, b) => a - b),
-    controls_total: ZOOM_SPEC_CONTROLS.length,
-  }));
+    await write("analysis/findings.json", serializeJson(findings));
+    await write("analysis/identity.json", serializeJson(identity));
+    await write("analysis/collaboration-governance.json", serializeJson(collaboration));
+    await write("analysis/meeting-security.json", serializeJson(meetingSecurity));
+    await write("analysis/summary.json", serializeJson({
+      counts: statusCounts(findings),
+      controls_covered: [...new Set(findings.flatMap((item) => item.controls))].sort((a, b) => a - b),
+      controls_total: ZOOM_SPEC_CONTROLS.length,
+    }));
 
-  await write("compliance/executive_summary.md", `${buildExecutiveSummary(snapshot, assessments, errors)}\n`);
-  await write("compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
-  for (const framework of ZOOM_FRAMEWORKS) {
-    await write(`compliance/${frameworkFileName(framework)}`, `${buildFrameworkReport(framework, findings)}\n`);
-  }
+    await write("compliance/executive_summary.md", `${buildExecutiveSummary(snapshot, assessments, errors)}\n`);
+    await write("compliance/unified_compliance_matrix.md", `${buildUnifiedMatrix(findings)}\n`);
+    for (const framework of ZOOM_FRAMEWORKS) {
+      await write(`compliance/${frameworkFileName(framework)}`, `${buildFrameworkReport(framework, findings)}\n`);
+    }
 
-  if (errors.length > 0) {
-    await write("_errors.log", `${errors.join("\n")}\n`);
-  }
+    if (errors.length > 0) {
+      await write("_errors.log", `${errors.join("\n")}\n`);
+    }
 
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
 
   return {
     outputDir,
