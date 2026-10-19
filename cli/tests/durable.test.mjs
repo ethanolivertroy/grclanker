@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
+import { copyJson, isJsonValue } from "@earendil-works/chord";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 
@@ -425,7 +426,7 @@ test("the assessment document keys calls by call id and findings by domain, so a
     recordedAt: "2026-10-19T00:08:00.000Z",
     details: { zip_path: "/tmp/okta.zip", output_dir: "  " },
   });
-  assert.deepEqual(state.artifacts, { c4: { tool: "okta_export_audit_bundle", zipPath: "/tmp/okta.zip", outputDir: null } });
+  assert.deepEqual({ ...state.artifacts }, { c4: { tool: "okta_export_audit_bundle", zipPath: "/tmp/okta.zip", outputDir: null } });
 
   recordToolOutcome(state, {
     callId: "c5",
@@ -461,7 +462,8 @@ test("the assessment summary stays short: counts, open findings only, and export
       "Findings: 3 (fail 1, manual 1, Passed 1).",
       "- aws:IAM-1: fail high Root access keys exist",
       "- aws:IAM-3: manual",
-      "Export from aws_export_bundle: /tmp/aws",
+      "Exports: 1 (aws_export_bundle 1).",
+      "- aws_export_bundle: /tmp/aws",
     ].join("\n"),
   );
 
@@ -477,6 +479,121 @@ test("the assessment summary stays short: counts, open findings only, and export
   const lines = renderAssessmentSummary(many).split("\n");
   assert.equal(lines.length, 2 + 25 + 1);
   assert.equal(lines.at(-1), "- ... 5 more not shown");
+});
+
+test("the assessment summary caps exports like findings: a count per tool and the ten most recent paths", () => {
+  const toolFor = (index) => (index % 3 === 0 ? "okta_export_audit_bundle" : "aws_export_bundle");
+  const exportsOf = (count) => {
+    const state = emptyAssessmentState();
+    for (let index = 0; index < count; index += 1) {
+      recordToolOutcome(state, {
+        callId: `c${index}`,
+        tool: toolFor(index),
+        replay: "unsafe",
+        isError: false,
+        recordedAt: "t",
+        details: { zip_path: `/tmp/export-${index}.zip` },
+      });
+    }
+    return renderAssessmentSummary(state).split("\n");
+  };
+
+  assert.deepEqual(exportsOf(30), [
+    "Recorded tool calls: 30 (completed 30).",
+    "Exports: 30 (aws_export_bundle 20, okta_export_audit_bundle 10).",
+    ...Array.from({ length: 10 }, (_, offset) => `- ${toolFor(20 + offset)}: /tmp/export-${20 + offset}.zip`),
+    "- ... 20 earlier exports not shown",
+  ]);
+  assert.equal(exportsOf(300).length, exportsOf(30).length, "a longer session adds no lines");
+  assert.equal(exportsOf(10).at(-1), `- ${toolFor(9)}: /tmp/export-9.zip`, "ten exports are all listed");
+});
+
+test("the exports listed are the ten most recently recorded, even when integer-like call ids and reruns reorder the keys", () => {
+  const state = emptyAssessmentState();
+  const record = (callId, minute) =>
+    recordToolOutcome(state, {
+      callId,
+      tool: "aws_export_bundle",
+      replay: "unsafe",
+      isError: false,
+      recordedAt: new Date(Date.UTC(2026, 9, 19, 0, minute)).toISOString(),
+      details: { zip_path: `/tmp/${callId}-at-${minute}.zip` },
+    });
+  for (let minute = 0; minute < 12; minute += 1) record(`call-${minute}`, minute);
+  record("7", 12);
+  record("call-0", 13);
+  assert.deepEqual(Object.keys(state.artifacts).slice(0, 3), ["7", "call-0", "call-1"], "the two newest enumerate first");
+  assert.deepEqual(renderAssessmentSummary(state).split("\n"), [
+    "Recorded tool calls: 13 (completed 13).",
+    "Exports: 13 (aws_export_bundle 13).",
+    ...Array.from({ length: 8 }, (_, offset) => `- aws_export_bundle: /tmp/call-${4 + offset}-at-${4 + offset}.zip`),
+    "- aws_export_bundle: /tmp/7-at-12.zip",
+    "- aws_export_bundle: /tmp/call-0-at-13.zip",
+    "- ... 3 earlier exports not shown",
+  ]);
+});
+
+test("a model-chosen call id such as __proto__ is recorded as its own entry, and the state stays strict JSON", () => {
+  const state = emptyAssessmentState();
+  for (const callId of ["__proto__", "c2"]) {
+    recordToolOutcome(state, {
+      callId,
+      tool: "aws_export_bundle",
+      replay: "unsafe",
+      isError: false,
+      recordedAt: "t",
+      details: { zip_path: `/tmp/${callId}.zip` },
+    });
+  }
+  const call = { tool: "aws_export_bundle", replay: "unsafe", status: "completed", findings: 0, recordedAt: "t" };
+  const artifact = (callId) => ({ tool: "aws_export_bundle", zipPath: `/tmp/${callId}.zip`, outputDir: null });
+  assert.deepEqual(Object.keys(state.calls), ["__proto__", "c2"]);
+  assert.deepEqual(Object.keys(state.artifacts), ["__proto__", "c2"]);
+  assert.ok(isJsonValue(state), "Chord accepts the state as strict JSON");
+  assert.deepEqual(JSON.parse(JSON.stringify(copyJson(state))), {
+    calls: { ["__proto__"]: call, c2: call },
+    findings: {},
+    artifacts: { ["__proto__"]: artifact("__proto__"), c2: artifact("c2") },
+  });
+  assert.equal(
+    renderAssessmentSummary(state),
+    [
+      "Recorded tool calls: 2 (completed 2).",
+      "Exports: 2 (aws_export_bundle 2).",
+      "- aws_export_bundle: /tmp/__proto__.zip",
+      "- aws_export_bundle: /tmp/c2.zip",
+    ].join("\n"),
+  );
+});
+
+test("a __proto__ call id from the model stays in the runtime's report, summary, and stored document", async (t) => {
+  const home = scratchDir(t);
+  const session = resolveDurableSession("proto-call-id", home);
+  const model = scriptedModel((view) => {
+    if (view.toolResults.length > 0) return fauxAssistantMessage([fauxText(`answer ${view.userMessages}`)]);
+    const [tool, id] = view.userMessages === 1 ? [READ_TOOL, "call-read"] : [WRITE_TOOL, "__proto__"];
+    return fauxAssistantMessage([fauxToolCall(tool, {}, { id })], { stopReason: "toolUse" });
+  });
+  const deps = {
+    loadModels: model.loadModels,
+    tools: () => [fakeTool(READ_TOOL, async () => readResult()), fakeTool(WRITE_TOOL, async () => writeResult(home))],
+  };
+  const request = { command: "run", session, model: MODEL, message: "Assess.", requestId: "req-1" };
+  await runDurable(request, deps);
+  // The second request reopens the session, so the draft writes `__proto__` into a document reloaded as ordinary objects.
+  const report = await runDurable({ ...request, message: "Export.", requestId: "req-2" }, deps);
+  assert.deepEqual(byTool(report), { [WRITE_TOOL]: { callId: "__proto__", replay: "unsafe", status: "ok" } });
+  assert.deepEqual(Object.keys(report.assessment.calls), ["call-read", "__proto__"]);
+  assert.deepEqual(report.assessment.artifacts, {
+    ["__proto__"]: { tool: WRITE_TOOL, zipPath: join(home, "bundle.zip"), outputDir: home },
+  });
+  const summary = model.views.at(-1).sections.get("assessment_state");
+  assert.ok(summary.includes("Recorded tool calls: 2 (completed 2)."), summary);
+  assert.ok(summary.includes(`- ${WRITE_TOOL}: ${join(home, "bundle.zip")}`), summary);
+
+  const reopened = await runDurable({ command: "resume", session, model: MODEL }, deps);
+  assert.equal(reopened.outcome, "nothing_to_resume");
+  assert.deepEqual(reopened.assessment, report.assessment, "the stored document replays with the entry");
 });
 
 test("the tool adapter keeps the registry tool's name, schema, and argument repair, and adds the replay policy", () => {

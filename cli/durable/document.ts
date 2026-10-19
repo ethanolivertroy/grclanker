@@ -47,7 +47,9 @@ export type AssessmentState = {
 export const ASSESSMENT_DOC_KIND = "grclanker.assessment";
 
 export function emptyAssessmentState(): AssessmentState {
-  return { calls: {}, findings: {}, artifacts: {} };
+  // Call ids come from the model, so an id of `__proto__` must land as an entry, not on the prototype. Chord accepts and
+  // keeps null prototypes, and its drafts write own properties even into documents reloaded as ordinary objects.
+  return { calls: Object.create(null), findings: Object.create(null), artifacts: Object.create(null) };
 }
 
 export const Assessment = defineDoc<AssessmentState>({
@@ -116,6 +118,7 @@ export function recordToolOutcome(state: AssessmentState, outcome: ToolOutcome):
 }
 
 const MAX_LISTED_FINDINGS = 25;
+const MAX_LISTED_EXPORTS = 10;
 const PASSING_STATUSES = new Set(["pass", "passed", "satisfied", "compliant", "ok"]);
 
 function countBy<T>(items: readonly T[], key: (item: T) => string): string {
@@ -152,8 +155,19 @@ export function renderAssessmentSummary(state: Readonly<AssessmentState> | undef
     }
   }
 
-  for (const artifact of Object.values(state.artifacts)) {
-    lines.push(`Export from ${artifact.tool}: ${artifact.zipPath ?? artifact.outputDir}`);
+  // Key order is not recording order: integer-like call ids enumerate first, and a rerun keeps its key's place.
+  const recordedAt = (callId: string) => state.calls[callId].recordedAt;
+  const artifacts = Object.entries(state.artifacts)
+    .sort(([left], [right]) => recordedAt(left).localeCompare(recordedAt(right)))
+    .map(([, artifact]) => artifact);
+  if (artifacts.length > 0) {
+    lines.push(`Exports: ${artifacts.length} (${countBy(artifacts, (artifact) => artifact.tool)}).`);
+    for (const artifact of artifacts.slice(-MAX_LISTED_EXPORTS)) {
+      lines.push(`- ${artifact.tool}: ${artifact.zipPath ?? artifact.outputDir}`);
+    }
+    if (artifacts.length > MAX_LISTED_EXPORTS) {
+      lines.push(`- ... ${artifacts.length - MAX_LISTED_EXPORTS} earlier exports not shown`);
+    }
   }
 
   return lines.join("\n");
