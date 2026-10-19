@@ -20,6 +20,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
 import { DUO_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1130,10 +1131,6 @@ function isV5Path(path: string): boolean {
   return V5_ONLY_PATH_PATTERNS.some((pattern) => pattern.test(path));
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
-}
-
 function parseDetailFromBody(body: unknown): string | undefined {
   const record = asRecord(body);
   const message = asString(record.message);
@@ -1939,11 +1936,13 @@ export function redactBypassCodeRecords(records: JsonRecord[]): JsonRecord[] {
 export class DuoAuditorClient {
   private readonly config: DuoResolvedConfig;
   private readonly fetchImpl: FetchImpl;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly collectionStatuses = new Map<string, DuoCollectionStatus>();
 
-  constructor(config: DuoResolvedConfig, options?: { fetchImpl?: FetchImpl }) {
+  constructor(config: DuoResolvedConfig, options?: { fetchImpl?: FetchImpl; signal?: AbortSignal }) {
     this.config = config;
-    this.fetchImpl = options?.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options?.fetchImpl ?? fetch, options?.signal);
+    this.sleep = abortableSleep(options?.signal);
     registerConfiguredSecrets(config.ikey, config.skey);
   }
 
@@ -2041,7 +2040,7 @@ export class DuoAuditorClient {
         const retryAfterHeader = response.headers.get("retry-after");
         const retryAfterMs = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) * 1000 : 0;
         const backoffMs = retryAfterMs > 0 ? retryAfterMs : (attempt + 1) * 1000 + Math.floor(Math.random() * 250);
-        await sleep(backoffMs);
+        await this.sleep(backoffMs);
         continue;
       }
 
@@ -5431,6 +5430,7 @@ export async function exportDuoAuditBundle(
   client: DuoBundleClient,
   config: DuoResolvedConfig,
   outputRoot: string,
+  options: { signal?: AbortSignal } = {},
 ): Promise<DuoAuditBundleResult> {
   const authentication = await collectDuoAuthenticationData(client, config.lookbackDays);
   const adminAccess = await collectDuoAdminAccessData(client, config.lookbackDays);
@@ -5479,6 +5479,7 @@ export async function exportDuoAuditBundle(
     root: resolve(outputRoot),
     names: uniqueNameCandidates(folderName),
     zip: true,
+    signal: options.signal,
     checkName: (name) => {
       resolveSecureOutputPath(outputRoot, name);
       resolveSecureOutputPath(outputRoot, `${name}.zip`);
@@ -5649,10 +5650,10 @@ export function registerDuoTools(pi: any): void {
       "Validate Duo Admin API access for a read-only audit principal and report which core GRC surfaces are readable.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config);
+        const client = new DuoAuditorClient(config, { signal });
         const result = await runDuoAccessCheck(client, config);
         return renderAccessCheck(result);
       } catch (error) {
@@ -5671,10 +5672,10 @@ export function registerDuoTools(pi: any): void {
       "Evaluate Duo global MFA policy, factor strength, bypass-code hygiene, remembered devices, and trusted endpoint posture.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config);
+        const client = new DuoAuditorClient(config, { signal });
         const data = await collectDuoAuthenticationData(client, config.lookbackDays);
         return renderAssessmentToolResult(assessDuoAuthentication(data, config));
       } catch (error) {
@@ -5693,10 +5694,10 @@ export function registerDuoTools(pi: any): void {
       "Review Duo privileged administrators, owner concentration, admin MFA methods, help-desk bypass governance, and stale privileged accounts.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config);
+        const client = new DuoAuditorClient(config, { signal });
         const data = await collectDuoAdminAccessData(client, config.lookbackDays);
         return renderAssessmentToolResult(assessDuoAdminAccess(data, config));
       } catch (error) {
@@ -5715,10 +5716,10 @@ export function registerDuoTools(pi: any): void {
       "Review Duo protected application inventory, explicit policy attachment, Universal Prompt adoption, self-service posture, and Admin API least privilege.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config);
+        const client = new DuoAuditorClient(config, { signal });
         const data = await collectDuoIntegrationData(client);
         return renderAssessmentToolResult(assessDuoIntegrations(data, config));
       } catch (error) {
@@ -5737,10 +5738,10 @@ export function registerDuoTools(pi: any): void {
       "Review Duo authentication telemetry, Trust Monitor coverage, telephony reliance, credits, and notification posture.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config);
+        const client = new DuoAuditorClient(config, { signal });
         const data = await collectDuoMonitoringData(client, config.lookbackDays);
         return renderAssessmentToolResult(assessDuoMonitoring(data, config));
       } catch (error) {
@@ -5766,12 +5767,12 @@ export function registerDuoTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs & { output_dir?: string }) {
+    async execute(_toolCallId: string, args: RawConfigArgs & { output_dir?: string }, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config);
+        const client = new DuoAuditorClient(config, { signal });
         const outputRoot = resolve(process.cwd(), args.output_dir ?? DEFAULT_OUTPUT_DIR);
-        const result = await exportDuoAuditBundle(client, config, outputRoot);
+        const result = await exportDuoAuditBundle(client, config, outputRoot, { signal });
         return textResult(buildExportText(config, result), {
           tool: "duo_export_audit_bundle",
           output_dir: result.outputDir,

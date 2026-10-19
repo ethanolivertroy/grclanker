@@ -17,6 +17,7 @@ import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -62,6 +63,7 @@ export interface AnsibleAapConfiguration {
 interface AnsibleAapClientOptions {
   fetchImpl?: FetchImpl;
   now?: () => Date;
+  signal?: AbortSignal;
 }
 
 interface AapListResponse<T> {
@@ -1917,7 +1919,7 @@ export class AnsibleAapClient {
     private readonly config: AnsibleAapConfiguration,
     options: AnsibleAapClientOptions = {},
   ) {
-    this.fetchImpl = options.fetchImpl ?? (config.verifySsl === false ? createTlsOptOutFetch() : fetch);
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? (config.verifySsl === false ? createTlsOptOutFetch() : fetch), options.signal);
     this.now = options.now ?? (() => new Date());
     registerConfiguredSecrets(config.token, config.password);
   }
@@ -4127,7 +4129,7 @@ export async function exportAnsibleAuditBundle(
   client: AnsibleClientSurface & Pick<AnsibleAapClient, "count" | "get">,
   config: AnsibleAapConfiguration,
   outputRoot: string,
-  options: ExportAuditBundleArgs = {},
+  options: ExportAuditBundleArgs & { signal?: AbortSignal } = {},
 ): Promise<AnsibleAuditBundleResult> {
   const generatedAt = client.getNow();
   const access = await checkAnsibleAccess(client as AnsibleAapClient);
@@ -4167,11 +4169,15 @@ export async function exportAnsibleAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
 
   const targetName = safeDirName(`${new URL(config.baseUrl).host}-ansible-aap-audit`);
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(targetName, 10),
     zip: true,
+    signal: options.signal,
     checkName: (name) => {
       resolveSecureOutputPath(outputRoot, name);
       resolveSecureOutputPath(outputRoot, `${name}.zip`);
@@ -4304,7 +4310,7 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   };
 }
 
-function createClient(args: CheckAccessArgs): AnsibleAapClient {
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): AnsibleAapClient {
   return new AnsibleAapClient(
     resolveAnsibleConfiguration({
       url: args.url,
@@ -4313,6 +4319,7 @@ function createClient(args: CheckAccessArgs): AnsibleAapClient {
       timeout_seconds: args.timeout_seconds,
       verify_ssl: args.verify_ssl,
     }),
+    { signal },
   );
 }
 
@@ -4357,9 +4364,9 @@ export function registerAnsibleTools(pi: any): void {
       "Validate read-only Ansible Automation Platform API access and show which job, host, template, schedule, credential, RBAC, and audit surfaces are readable.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkAnsibleAccess(createClient(args));
+        const result = await checkAnsibleAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), {
           tool: "ansible_check_access",
           ...result,
@@ -4380,9 +4387,9 @@ export function registerAnsibleTools(pi: any): void {
       "Assess Ansible Automation Platform job execution health (spec controls 1 to 5 and 28): success rate, chronic template failures, stuck jobs versus historical runtime, manual launch rate, failed job remediation within 7 days, and concurrent job limits.",
     parameters: Type.Object({ ...authParams, ...jobHealthParams }),
     prepareArguments: normalizeJobHealthArgs,
-    async execute(_toolCallId: string, args: JobHealthArgs) {
+    async execute(_toolCallId: string, args: JobHealthArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAnsibleJobHealth(createClient(args), {
+        const result = await assessAnsibleJobHealth(createClient(args, signal), {
           days: args.days,
           jobLimit: args.job_limit,
           minSuccessRate: args.min_success_rate,
@@ -4409,9 +4416,9 @@ export function registerAnsibleTools(pi: any): void {
       ...hostCoverageParams,
     }),
     prepareArguments: normalizeHostCoverageArgs,
-    async execute(_toolCallId: string, args: HostCoverageArgs) {
+    async execute(_toolCallId: string, args: HostCoverageArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAnsibleHostCoverage(createClient(args), {
+        const result = await assessAnsibleHostCoverage(createClient(args, signal), {
           days: args.days,
           staleHostDays: args.stale_host_days,
           criticalStaleHostDays: args.critical_stale_host_days,
@@ -4437,9 +4444,9 @@ export function registerAnsibleTools(pi: any): void {
       "Assess Ansible Automation Platform platform security (spec controls 16 to 27, 29, 30): credential age, sharing, plaintext secrets and ownership, OAuth2 tokens, org admins, team roles, execute versus admin separation, auditor coverage, external auth, activity stream, notifications, project SCM health, and execution environments.",
     parameters: Type.Object({ ...authParams, ...platformSecurityParams, template_limit: hostCoverageParams.template_limit }),
     prepareArguments: normalizePlatformSecurityArgs,
-    async execute(_toolCallId: string, args: PlatformSecurityArgs) {
+    async execute(_toolCallId: string, args: PlatformSecurityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAnsiblePlatformSecurity(createClient(args), {
+        const result = await assessAnsiblePlatformSecurity(createClient(args, signal), {
           maxOrgAdmins: args.max_org_admins,
           staleCredentialDays: args.stale_credential_days,
           staleTokenDays: args.stale_token_days,
@@ -4471,7 +4478,7 @@ export function registerAnsibleTools(pi: any): void {
       ...platformSecurityParams,
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveAnsibleConfiguration({
           url: args.url,
@@ -4482,10 +4489,10 @@ export function registerAnsibleTools(pi: any): void {
         });
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
         const result = await exportAnsibleAuditBundle(
-          new AnsibleAapClient(config),
+          new AnsibleAapClient(config, { signal }),
           config,
           outputRoot,
-          args,
+          { ...args, signal },
         );
         return textResult(
           [

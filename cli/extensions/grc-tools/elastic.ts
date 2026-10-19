@@ -20,6 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { createCredentialScrubber, isCredentialDataKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1500,11 +1501,12 @@ export class ElasticApiClient {
     options: {
       fetchImpl?: FetchImpl;
       sleepImpl?: (ms: number) => Promise<void>;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleepImpl = options.sleepImpl ?? ((ms: number) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     // The configured secrets are scrubbed from every recorded error string in every encoded form from here on.
     registerConfiguredSecrets(config);
   }
@@ -4654,7 +4656,7 @@ export async function exportElasticAuditBundle(
   client: ElasticPartialReader,
   config: ElasticResolvedConfig,
   outputRoot: string,
-  options: ElasticAssessmentOptions = {},
+  options: ElasticAssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<ElasticAuditBundleResult> {
   const access = await checkElasticAccess(client);
   const snapshot = await collectElasticSnapshot(client, ELASTIC_ALL_DATASETS, options);
@@ -4665,12 +4667,16 @@ export async function exportElasticAuditBundle(
   const truncated = listSnapshotTruncations(snapshot);
   const notCollected = listSnapshotSkips(snapshot);
 
-  ensurePrivateDir(outputRoot);
   const clusterLabel = safeDirName(new URL(config.elasticsearchUrl).hostname);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${clusterLabel}-audit-bundle`, 9),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", `${buildQuickReference()}\n`);
@@ -4776,8 +4782,8 @@ function assessmentOptionsFromArgs(args: AssessmentArgs): ElasticAssessmentOptio
   };
 }
 
-function createClient(args: CheckAccessArgs): ElasticApiClient {
-  return new ElasticApiClient(resolveElasticConfiguration(args));
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): ElasticApiClient {
+  return new ElasticApiClient(resolveElasticConfiguration(args), { signal });
 }
 
 const authParams = {
@@ -4822,9 +4828,9 @@ function registerAssessmentTool(
     description: definition.description,
     parameters: Type.Object(assessmentParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: AssessmentArgs) {
+    async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
-        const result = await definition.run(createClient(args), assessmentOptionsFromArgs(args));
+        const result = await definition.run(createClient(args, signal), assessmentOptionsFromArgs(args));
         return textResult(formatAssessmentText(result), { tool: definition.name, ...result });
       } catch (error) {
         return errorResult(
@@ -4844,9 +4850,9 @@ export function registerElasticTools(pi: any): void {
       "Validate read-only access to Elasticsearch security, cluster, license, ILM/SLM, snapshot, Watcher, and ingest surfaces plus optional Kibana (spaces, roles, Fleet, detection and alerting rules, connectors) and Elastic Cloud deployment APIs, and report missing cluster or index privileges.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkElasticAccess(createClient(args));
+        const result = await checkElasticAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "elastic_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -4907,11 +4913,14 @@ export function registerElasticTools(pi: any): void {
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveElasticConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportElasticAuditBundle(new ElasticApiClient(config), config, outputRoot, assessmentOptionsFromArgs(args));
+        const result = await exportElasticAuditBundle(new ElasticApiClient(config, { signal }), config, outputRoot, {
+          ...assessmentOptionsFromArgs(args),
+          signal,
+        });
         return textResult(
           [
             "Elastic audit bundle exported.",

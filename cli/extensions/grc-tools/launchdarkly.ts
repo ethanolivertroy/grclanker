@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { DEFAULT_DATA_SCRUB_DEPTH, REDACTED, createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1395,10 +1396,6 @@ function parseJsonSafely(text: string): JsonRecord | undefined {
   }
 }
 
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 function redactEnvironment(environment: JsonRecord): JsonRecord {
   return {
     ...environment,
@@ -1477,11 +1474,12 @@ export class LaunchdarklyApiClient {
       fetchImpl?: FetchImpl;
       sleep?: SleepImpl;
       maxRetries?: number;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleep = options.sleep ?? defaultSleep;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     // The configured token is scrubbed from every recorded error string in every encoded form from here on.
     credentialScrubber.registerSecrets([config.token]);
@@ -4787,7 +4785,7 @@ export async function exportLaunchdarklyAuditBundle(
   client: LaunchdarklyAuditClient,
   config: LaunchdarklyResolvedConfig,
   outputRoot: string,
-  options: LaunchdarklyAuditBundleOptions = {},
+  options: LaunchdarklyAuditBundleOptions & { signal?: AbortSignal } = {},
 ): Promise<LaunchdarklyAuditBundleResult> {
   const errors: string[] = [];
   const access = await checkLaunchdarklyAccess(client);
@@ -4809,12 +4807,16 @@ export async function exportLaunchdarklyAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const uniqueErrors = uniqueStrings(errors);
 
-  ensurePrivateDir(outputRoot);
   const bundleName = safeDirName(`${new URL(config.baseUrl).hostname}-${access.callerIdentity.accountId ?? "account"}-audit-bundle`);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(bundleName, 6),
     zip: true,
+    signal: options.signal,
     checkName: (name) => {
       resolveSecureOutputPath(outputRoot, name);
       resolveSecureOutputPath(outputRoot, `${name}.zip`);
@@ -4975,8 +4977,8 @@ function toBundleOptions(args: ExportAuditBundleArgs): LaunchdarklyAuditBundleOp
   };
 }
 
-function createClient(args: AuthArgs): LaunchdarklyApiClient {
-  return new LaunchdarklyApiClient(resolveLaunchdarklyConfiguration(args));
+function createClient(args: AuthArgs, signal?: AbortSignal): LaunchdarklyApiClient {
+  return new LaunchdarklyApiClient(resolveLaunchdarklyConfiguration(args), { signal });
 }
 
 const authParams = {
@@ -5003,9 +5005,9 @@ export function registerLaunchdarklyTools(pi: any): void {
       "Validate read-only LaunchDarkly REST API v2 access across caller identity, members, teams, custom roles, projects, environments, flags, access tokens, audit log, webhooks, Relay Proxy configs, and integration subscriptions.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
       try {
-        const result = await checkLaunchdarklyAccess(createClient(args));
+        const result = await checkLaunchdarklyAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "launchdarkly_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -5030,9 +5032,9 @@ export function registerLaunchdarklyTools(pi: any): void {
       allowed_domains: Type.Optional(Type.String({ description: "Comma-separated approved member email domains. Defaults to LAUNCHDARKLY_ALLOWED_DOMAINS; without it control 24 is reported as manual." })),
     }),
     prepareArguments: normalizeIdentityArgs,
-    async execute(_toolCallId: string, args: IdentityArgs) {
+    async execute(_toolCallId: string, args: IdentityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessLaunchdarklyIdentity(createClient(args), {
+        const result = await assessLaunchdarklyIdentity(createClient(args, signal), {
           memberLimit: args.member_limit,
           teamLimit: args.team_limit,
           maxOwners: args.max_owners,
@@ -5061,9 +5063,9 @@ export function registerLaunchdarklyTools(pi: any): void {
       stale_token_days: Type.Optional(Type.Number({ description: "Days without use before a token is stale. Defaults to 90.", default: 90 })),
     }),
     prepareArguments: normalizeAccessControlArgs,
-    async execute(_toolCallId: string, args: AccessControlArgs) {
+    async execute(_toolCallId: string, args: AccessControlArgs, signal?: AbortSignal) {
       try {
-        const result = await assessLaunchdarklyAccessControl(createClient(args), {
+        const result = await assessLaunchdarklyAccessControl(createClient(args, signal), {
           roleLimit: args.role_limit,
           tokenLimit: args.token_limit,
           staleTokenDays: args.stale_token_days,
@@ -5093,9 +5095,9 @@ export function registerLaunchdarklyTools(pi: any): void {
       sdk_key_max_age_days: Type.Optional(Type.Number({ description: "Maximum acceptable server-side SDK key age in days. Defaults to 365.", default: 365 })),
     }),
     prepareArguments: normalizeEnvironmentGovernanceArgs,
-    async execute(_toolCallId: string, args: EnvironmentGovernanceArgs) {
+    async execute(_toolCallId: string, args: EnvironmentGovernanceArgs, signal?: AbortSignal) {
       try {
-        const result = await assessLaunchdarklyEnvironmentGovernance(createClient(args), {
+        const result = await assessLaunchdarklyEnvironmentGovernance(createClient(args, signal), {
           projectLimit: args.project_limit,
           environmentLimit: args.environment_limit,
           projectKeys: normalizeStringList(args.project_keys),
@@ -5127,9 +5129,9 @@ export function registerLaunchdarklyTools(pi: any): void {
       stale_flag_days: Type.Optional(Type.Number({ description: "Days without evaluation before a flag is stale. Defaults to 30.", default: 30 })),
     }),
     prepareArguments: normalizeFlagHygieneArgs,
-    async execute(_toolCallId: string, args: FlagHygieneArgs) {
+    async execute(_toolCallId: string, args: FlagHygieneArgs, signal?: AbortSignal) {
       try {
-        const result = await assessLaunchdarklyFlagHygiene(createClient(args), {
+        const result = await assessLaunchdarklyFlagHygiene(createClient(args, signal), {
           projectLimit: args.project_limit,
           flagLimit: args.flag_limit,
           projectKeys: normalizeStringList(args.project_keys),
@@ -5159,9 +5161,9 @@ export function registerLaunchdarklyTools(pi: any): void {
       production_pattern: productionPatternParam,
     }),
     prepareArguments: normalizeMonitoringArgs,
-    async execute(_toolCallId: string, args: MonitoringArgs) {
+    async execute(_toolCallId: string, args: MonitoringArgs, signal?: AbortSignal) {
       try {
-        const result = await assessLaunchdarklyMonitoringIntegrations(createClient(args), {
+        const result = await assessLaunchdarklyMonitoringIntegrations(createClient(args, signal), {
           retentionDays: args.retention_days,
           integrationKeys: normalizeStringList(args.integration_keys),
           relayConfigMaxAgeDays: args.relay_config_max_age_days,
@@ -5206,11 +5208,11 @@ export function registerLaunchdarklyTools(pi: any): void {
       relay_config_max_age_days: Type.Optional(Type.Number({ description: "Days before an unmodified Relay Proxy configuration is flagged. Defaults to 365.", default: 365 })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveLaunchdarklyConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportLaunchdarklyAuditBundle(new LaunchdarklyApiClient(config), config, outputRoot, toBundleOptions(args));
+        const result = await exportLaunchdarklyAuditBundle(new LaunchdarklyApiClient(config, { signal }), config, outputRoot, { ...toBundleOptions(args), signal });
         return textResult(
           [
             "LaunchDarkly audit bundle exported.",

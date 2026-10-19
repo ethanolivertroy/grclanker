@@ -28,6 +28,7 @@ import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -410,10 +411,6 @@ function upper(value: string | null | undefined): string {
 
 function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
 function parseSnowflakeTimestamp(value: string | null | undefined): Date | undefined {
@@ -1867,12 +1864,14 @@ function extractApiError(response: SnowflakeApiResponse): string {
 export class SnowflakeSqlClient {
   private readonly config: SnowflakeResolvedConfig;
   private readonly fetchImpl: FetchImpl;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => Date;
   private jwt?: { token: string; expiresAt: number };
 
-  constructor(config: SnowflakeResolvedConfig, options: { fetchImpl?: FetchImpl; now?: () => Date } = {}) {
+  constructor(config: SnowflakeResolvedConfig, options: { fetchImpl?: FetchImpl; now?: () => Date; signal?: AbortSignal } = {}) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal);
     this.now = options.now ?? (() => new Date());
     registerConfiguredSecrets([config.token, config.privateKeyPem, config.privateKeyPassphrase]);
   }
@@ -1973,7 +1972,7 @@ export class SnowflakeSqlClient {
         const retryable = response.status === 429 || response.status >= 500;
         if (retryable && attempt < this.config.maxRetries && !(response.status === 429 && method === "GET" && asString(payload.statementHandle))) {
           attempt += 1;
-          await sleep(this.retryDelay(attempt, response.headers));
+          await this.sleep(this.retryDelay(attempt, response.headers));
           continue;
         }
         return { status: response.status, statusText: response.statusText, payload, headers: response.headers, nonJsonBody };
@@ -1985,7 +1984,7 @@ export class SnowflakeSqlClient {
         if (error instanceof SnowflakeStatementError) throw error;
         if (attempt < this.config.maxRetries) {
           attempt += 1;
-          await sleep(this.retryDelay(attempt));
+          await this.sleep(this.retryDelay(attempt));
           continue;
         }
         throw new SnowflakeStatementError(`Snowflake SQL API request failed (${method} ${pathname}): ${this.redact(message)}`);
@@ -2027,7 +2026,7 @@ export class SnowflakeSqlClient {
       if (this.now().getTime() > deadline) {
         throw new SnowflakeStatementError(`Snowflake statement ${handle ?? ""} did not complete before the ${this.config.statementTimeoutSeconds}s statement timeout.`, { kind: "timeout" });
       }
-      await sleep(this.pollDelay(submit.headers));
+      await this.sleep(this.pollDelay(submit.headers));
       latest = await this.request("GET", statusUrl);
       handle = asString(latest.payload.statementHandle) ?? handle;
     }
@@ -3736,7 +3735,7 @@ export async function exportSnowflakeAuditBundle(
   client: SnowflakeQueryClient,
   config: SnowflakeResolvedConfig,
   outputRoot: string,
-  options: SnowflakeAssessmentOptions = {},
+  options: SnowflakeAssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<SnowflakeAuditBundleResult> {
   const access = await checkSnowflakeAccess(client);
   const assessments = [
@@ -3750,11 +3749,15 @@ export async function exportSnowflakeAuditBundle(
   const failedStatements = statements.filter((statement) => statement.status !== "ok");
   const notRequestedStatements = statements.filter((statement) => statement.status === "not_requested");
 
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(access.account || config.account)}-audit-bundle`, 50),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await writeSecureTextFile(staged.dir, "metadata.json", serializeJson({
@@ -3870,8 +3873,8 @@ function toAssessmentOptions(args: AssessArgs): SnowflakeAssessmentOptions {
   };
 }
 
-function createClient(args: CommonArgs): SnowflakeSqlClient {
-  return new SnowflakeSqlClient(resolveSnowflakeConfiguration(args as JsonRecord));
+function createClient(args: CommonArgs, signal?: AbortSignal): SnowflakeSqlClient {
+  return new SnowflakeSqlClient(resolveSnowflakeConfiguration(args as JsonRecord), { signal });
 }
 
 const authParams = {
@@ -3921,9 +3924,9 @@ function registerAssessTool(
     description,
     parameters: Type.Object({ ...authParams, ...thresholdParams }),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
       try {
-        const result = await assess(createClient(args), toAssessmentOptions(args));
+        const result = await assess(createClient(args, signal), toAssessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: name, ...result });
       } catch (error) {
         return errorResult(`${label} failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`, { tool: name });
@@ -3940,9 +3943,9 @@ export function registerSnowflakeTools(pi: any): void {
       "Validate read-only Snowflake SQL API access (key-pair JWT or OAuth) across SHOW NETWORK POLICIES, SHOW PARAMETERS, SHOW INTEGRATIONS, SHOW WAREHOUSES, SHOW DATABASES, SHOW SHARES, SHOW REPLICATION GROUPS, and the ACCOUNT_USAGE views used by the assessments, reporting denied surfaces and partial visibility.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCommonArgs,
-    async execute(_toolCallId: string, args: CommonArgs) {
+    async execute(_toolCallId: string, args: CommonArgs, signal?: AbortSignal) {
       try {
-        const result = await checkSnowflakeAccess(createClient(args));
+        const result = await checkSnowflakeAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "snowflake_check_access", ...result });
       } catch (error) {
         return errorResult(`Snowflake access check failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`, { tool: "snowflake_check_access" });
@@ -3990,11 +3993,14 @@ export function registerSnowflakeTools(pi: any): void {
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportArgs) {
+    async execute(_toolCallId: string, args: ExportArgs, signal?: AbortSignal) {
       try {
         const config = resolveSnowflakeConfiguration(args as JsonRecord);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportSnowflakeAuditBundle(new SnowflakeSqlClient(config), config, outputRoot, toAssessmentOptions(args));
+        const result = await exportSnowflakeAuditBundle(new SnowflakeSqlClient(config, { signal }), config, outputRoot, {
+          ...toAssessmentOptions(args),
+          signal,
+        });
         return textResult(
           [
             "Snowflake audit bundle exported.",

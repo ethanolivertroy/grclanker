@@ -22,6 +22,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -1594,10 +1595,6 @@ function splitList(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 /** The client-side scrub for a thrown message: the configured secrets in every form (guard 2), then the general scrub. */
 export function redactSecrets(message: string, secrets: ReadonlyArray<string | undefined>): string {
   return redactErrorText(redactConfiguredSecrets(message, secrets));
@@ -2382,7 +2379,7 @@ interface HttpOptions {
   retryAttempts: number;
   fetchImpl: FetchImpl;
   secrets: Array<string | undefined>;
-  sleepImpl?: (ms: number) => Promise<void>;
+  sleepImpl: (ms: number) => Promise<void>;
 }
 
 /**
@@ -2450,14 +2447,14 @@ async function fetchWithRetry(url: string, init: RequestInit, options: HttpOptio
       if ((response.status === 429 || response.status >= 500) && attempt < options.retryAttempts) {
         attempt += 1;
         const retryAfter = asNumber(response.headers.get("retry-after"));
-        await (options.sleepImpl ?? sleep)(retryAfter ? retryAfter * 1000 : 250 * 2 ** attempt);
+        await options.sleepImpl(retryAfter ? retryAfter * 1000 : 250 * 2 ** attempt);
         continue;
       }
       return response;
     } catch (error) {
       if (attempt < options.retryAttempts && !(error instanceof Error && error.name === "AbortError")) {
         attempt += 1;
-        await (options.sleepImpl ?? sleep)(250 * 2 ** attempt);
+        await options.sleepImpl(250 * 2 ** attempt);
         continue;
       }
       throw new PaloaltoApiError(redactSecrets(`Request to ${url} failed: ${errorMessage(error)}`, options.secrets), null, endpoint);
@@ -2640,15 +2637,15 @@ export class PrismaCloudClient {
 
   constructor(
     config: PaloaltoPrismaConfig,
-    options: { fetchImpl?: FetchImpl; timeoutMs?: number; retryAttempts?: number; sleepImpl?: (ms: number) => Promise<void> } = {},
+    options: { fetchImpl?: FetchImpl; timeoutMs?: number; retryAttempts?: number; sleepImpl?: (ms: number) => Promise<void>; signal?: AbortSignal } = {},
   ) {
     this.config = config;
     this.http = {
-      fetchImpl: options.fetchImpl ?? fetch,
+      fetchImpl: abortableFetch(options.fetchImpl ?? fetch, options.signal),
       timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       retryAttempts: options.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS,
       secrets: [config.secretKey, config.accessKeyId],
-      sleepImpl: options.sleepImpl,
+      sleepImpl: abortableSleep(options.signal, options.sleepImpl),
     };
   }
 
@@ -3038,17 +3035,17 @@ export class PanosApiClient {
 
   constructor(
     config: PaloaltoPanosHostConfig,
-    options: { fetchImpl?: FetchImpl; timeoutMs?: number; retryAttempts?: number; sleepImpl?: (ms: number) => Promise<void>; verifyTls?: boolean } = {},
+    options: { fetchImpl?: FetchImpl; timeoutMs?: number; retryAttempts?: number; sleepImpl?: (ms: number) => Promise<void>; verifyTls?: boolean; signal?: AbortSignal } = {},
   ) {
     this.config = config;
     this.apiKey = config.apiKey;
     this.verifyTls = options.verifyTls !== false;
     this.http = {
-      fetchImpl: options.fetchImpl ?? (this.verifyTls ? fetch : createInsecureFetch()),
+      fetchImpl: abortableFetch(options.fetchImpl ?? (this.verifyTls ? fetch : createInsecureFetch()), options.signal),
       timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       retryAttempts: options.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS,
       secrets: [config.apiKey, config.password],
-      sleepImpl: options.sleepImpl,
+      sleepImpl: abortableSleep(options.signal, options.sleepImpl),
     };
   }
 
@@ -3419,8 +3416,8 @@ export interface PaloaltoClients {
   panos: PanosApiClient[];
 }
 
-export function createPaloaltoClients(config: PaloaltoResolvedConfig, fetchImpl?: FetchImpl): PaloaltoClients {
-  const options = { fetchImpl, timeoutMs: config.timeoutMs, retryAttempts: config.retryAttempts };
+export function createPaloaltoClients(config: PaloaltoResolvedConfig, fetchImpl?: FetchImpl, signal?: AbortSignal): PaloaltoClients {
+  const options = { fetchImpl, timeoutMs: config.timeoutMs, retryAttempts: config.retryAttempts, signal };
   const prisma = config.prisma ? new PrismaCloudClient(config.prisma, options) : undefined;
   return {
     config,
@@ -5469,7 +5466,7 @@ function buildQuickReference(result: PaloaltoAccessCheckResult, assessments: Pal
 export async function exportPaloaltoAuditBundle(
   clients: PaloaltoClients,
   outputRoot: string,
-  options: { alertLimit?: number; minCompliancePassRate?: number; maxSuperusers?: number } = {},
+  options: { alertLimit?: number; minCompliancePassRate?: number; maxSuperusers?: number; signal?: AbortSignal } = {},
 ): Promise<PaloaltoAuditBundleResult> {
   const config = clients.config;
   const access = await checkPaloaltoAccess(clients);
@@ -5484,12 +5481,16 @@ export async function exportPaloaltoAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set([...(prismaSnapshot?.errors ?? []), ...deviceSnapshots.flatMap((item) => item.errors)])];
 
-  ensurePrivateDir(outputRoot);
   const label = safeDirName(config.prisma ? new URL(config.prisma.apiUrl).hostname : config.panos[0]?.host ?? "paloalto");
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${label}-audit-bundle`, 6),
     zip: true,
+    signal: options.signal,
     checkName: (name) => {
       resolveSecureOutputPath(outputRoot, name);
       resolveSecureOutputPath(outputRoot, `${name}.zip`);
@@ -5586,8 +5587,8 @@ function normalizeExportArgs(args: unknown): ExportAuditBundleArgs {
   };
 }
 
-function createClients(args: AuthArgs): PaloaltoClients {
-  return createPaloaltoClients(resolvePaloaltoConfiguration(args as JsonRecord));
+function createClients(args: AuthArgs, signal?: AbortSignal): PaloaltoClients {
+  return createPaloaltoClients(resolvePaloaltoConfiguration(args as JsonRecord), undefined, signal);
 }
 
 const authParams = {
@@ -5629,11 +5630,11 @@ function argumentSecrets(args: AuthArgs): string[] {
  * the catch block rendered the error. The secrets are gathered after the run so the
  * key PAN-OS keygen returned is included.
  */
-async function runSealed(tool: string, label: string, args: AuthArgs, run: (clients: PaloaltoClients) => Promise<ToolResult>): Promise<ToolResult> {
+async function runSealed(tool: string, label: string, args: AuthArgs, signal: AbortSignal | undefined, run: (clients: PaloaltoClients) => Promise<ToolResult>): Promise<ToolResult> {
   const secrets = new Set<string>(argumentSecrets(args));
   let clients: PaloaltoClients | undefined;
   try {
-    clients = createClients(args);
+    clients = createClients(args, signal);
     const result = await run(clients);
     for (const secret of configuredSecrets(clients)) secrets.add(secret);
     return sealValue(result, [...secrets]);
@@ -5652,8 +5653,8 @@ export function registerPaloaltoTools(pi: any): void {
       "Validate read-only access to Prisma Cloud CSPM (compliance posture, alert rules, alerts, policies, cloud accounts, roles, integrations) and PAN-OS firewalls or Panorama (system info, HA state, configuration subtrees) and report which surfaces are missing permissions.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
-      return runSealed("paloalto_check_access", "Palo Alto access check", args, async (clients) => {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
+      return runSealed("paloalto_check_access", "Palo Alto access check", args, signal, async (clients) => {
         const result = await checkPaloaltoAccess(clients);
         return textResult(formatAccessCheckText(result), { tool: "paloalto_check_access", ...result });
       });
@@ -5671,8 +5672,8 @@ export function registerPaloaltoTools(pi: any): void {
       min_compliance_pass_rate: Type.Optional(Type.Number({ description: "Minimum compliance pass rate percentage before warning. Defaults to 90.", default: 90 })),
     }),
     prepareArguments: normalizeCloudPostureArgs,
-    async execute(_toolCallId: string, args: CloudPostureArgs) {
-      return runSealed("paloalto_assess_cloud_posture", "Palo Alto cloud posture assessment", args, async (clients) => {
+    async execute(_toolCallId: string, args: CloudPostureArgs, signal?: AbortSignal) {
+      return runSealed("paloalto_assess_cloud_posture", "Palo Alto cloud posture assessment", args, signal, async (clients) => {
         const result = await assessPaloaltoCloudPosture(clients, {
           alertLimit: args.alert_limit,
           minCompliancePassRate: args.min_compliance_pass_rate,
@@ -5689,8 +5690,8 @@ export function registerPaloaltoTools(pi: any): void {
       "Assess PAN-OS firewall or Panorama security policy hygiene: any/any and shadowed rules, missing session-end logging, zone segmentation and zone protection, default rule actions, and SSL/TLS decryption coverage (spec controls 12-14).",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
-      return runSealed("paloalto_assess_firewall_policy", "Palo Alto firewall policy assessment", args, async (clients) => {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
+      return runSealed("paloalto_assess_firewall_policy", "Palo Alto firewall policy assessment", args, signal, async (clients) => {
         const result = await assessPaloaltoFirewallPolicy(clients);
         return textResult(formatAssessmentText(result), { tool: "paloalto_assess_firewall_policy", ...result });
       });
@@ -5704,8 +5705,8 @@ export function registerPaloaltoTools(pi: any): void {
       "Assess PAN-OS threat prevention profiles (antivirus, anti-spyware, vulnerability protection), WildFire analysis, URL filtering and credential phishing protection, data loss prevention across Prisma Cloud and PAN-OS, and file blocking (spec controls 16-18, 21, 22).",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
-      return runSealed("paloalto_assess_threat_prevention", "Palo Alto threat prevention assessment", args, async (clients) => {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
+      return runSealed("paloalto_assess_threat_prevention", "Palo Alto threat prevention assessment", args, signal, async (clients) => {
         const result = await assessPaloaltoThreatPrevention(clients);
         return textResult(formatAssessmentText(result), { tool: "paloalto_assess_threat_prevention", ...result });
       });
@@ -5722,8 +5723,8 @@ export function registerPaloaltoTools(pi: any): void {
       max_superusers: Type.Optional(Type.Number({ description: "Maximum acceptable superuser or System Admin accounts before failing. Defaults to 3.", default: 3 })),
     }),
     prepareArguments: normalizeDeviceHardeningArgs,
-    async execute(_toolCallId: string, args: DeviceHardeningArgs) {
-      return runSealed("paloalto_assess_device_hardening", "Palo Alto device hardening assessment", args, async (clients) => {
+    async execute(_toolCallId: string, args: DeviceHardeningArgs, signal?: AbortSignal) {
+      return runSealed("paloalto_assess_device_hardening", "Palo Alto device hardening assessment", args, signal, async (clients) => {
         const result = await assessPaloaltoDeviceHardening(clients, { maxSuperusers: args.max_superusers });
         return textResult(formatAssessmentText(result), { tool: "paloalto_assess_device_hardening", ...result });
       });
@@ -5743,13 +5744,14 @@ export function registerPaloaltoTools(pi: any): void {
       max_superusers: Type.Optional(Type.Number({ description: "Maximum acceptable superuser accounts before failing. Defaults to 3.", default: 3 })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
-      return runSealed("paloalto_export_audit_bundle", "Palo Alto audit bundle export", args, async (clients) => {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
+      return runSealed("paloalto_export_audit_bundle", "Palo Alto audit bundle export", args, signal, async (clients) => {
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
         const result = await exportPaloaltoAuditBundle(clients, outputRoot, {
           alertLimit: args.alert_limit,
           minCompliancePassRate: args.min_compliance_pass_rate,
           maxSuperusers: args.max_superusers,
+          signal,
         });
         return textResult(
           [

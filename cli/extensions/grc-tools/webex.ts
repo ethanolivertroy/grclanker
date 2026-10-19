@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   ConfigFileError,
@@ -677,12 +678,13 @@ export class WebexApiClient {
       now?: () => Date;
       sleep?: (ms: number) => Promise<void>;
       maxPages?: number;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
-    this.sleep = options.sleep ?? ((ms) => new Promise((done) => setTimeout(done, ms)));
+    this.sleep = abortableSleep(options.signal, options.sleep);
     this.maxPages = clampNumber(options.maxPages, MAX_LIST_PAGES, 1, 100_000);
     this.accessToken = config.token;
     webexCredentialScrubber.registerSecrets(webexCredentialValues(config, this.accessToken));
@@ -2218,7 +2220,7 @@ export async function exportWebexAuditBundle(
   client: WebexClientLike,
   config: WebexResolvedConfig,
   outputRoot: string,
-  options: AssessmentOptions = {},
+  options: AssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<WebexAuditBundleResult> {
   const access = await checkWebexAccess(client);
   const identity = await assessWebexIdentity(client, options);
@@ -2229,11 +2231,15 @@ export async function exportWebexAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors.map((item) => `${assessment.category}: ${item}`)))];
   const secrets = client.knownSecrets?.() ?? webexCredentialValues(config);
 
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(config.orgId ?? access.orgId ?? "webex-org")}-audit-bundle`, 9),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     const writeText = (relativePathname: string, content: string): Promise<void> =>
@@ -2352,8 +2358,8 @@ function assessmentOptions(args: ExportAuditBundleArgs): AssessmentOptions {
   };
 }
 
-function createClient(args: CheckAccessArgs): WebexApiClient {
-  return new WebexApiClient(resolveWebexConfiguration(args as JsonRecord));
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): WebexApiClient {
+  return new WebexApiClient(resolveWebexConfiguration(args as JsonRecord), { signal });
 }
 
 const authParams = {
@@ -2375,9 +2381,9 @@ export function registerWebexTools(pi: any): void {
       "Validate read-only Webex access across people, organizations, roles, licenses, recordings, events, admin audit, hybrid, devices, workspaces, rooms, webhooks, meetings, site common settings, and guest count, and report the token type.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkWebexAccess(createClient(args));
+        const result = await checkWebexAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "webex_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -2399,9 +2405,9 @@ export function registerWebexTools(pi: any): void {
       max_admins: Type.Optional(Type.Number({ description: "Maximum acceptable admin users before warning. Defaults to 10.", default: 10 })),
     }),
     prepareArguments: normalizeIdentityArgs,
-    async execute(_toolCallId: string, args: IdentityArgs) {
+    async execute(_toolCallId: string, args: IdentityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessWebexIdentity(createClient(args), assessmentOptions(args));
+        const result = await assessWebexIdentity(createClient(args, signal), assessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: "webex_assess_identity", ...result });
       } catch (error) {
         return errorResult(
@@ -2426,9 +2432,9 @@ export function registerWebexTools(pi: any): void {
       room_limit: Type.Optional(Type.Number({ description: "Maximum rooms to inspect. Defaults to 500.", default: 500 })),
     }),
     prepareArguments: normalizeCollaborationArgs,
-    async execute(_toolCallId: string, args: CollaborationArgs) {
+    async execute(_toolCallId: string, args: CollaborationArgs, signal?: AbortSignal) {
       try {
-        const result = await assessWebexCollaborationGovernance(createClient(args), assessmentOptions(args));
+        const result = await assessWebexCollaborationGovernance(createClient(args, signal), assessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: "webex_assess_collaboration_governance", ...result });
       } catch (error) {
         return errorResult(
@@ -2450,9 +2456,9 @@ export function registerWebexTools(pi: any): void {
       device_limit: Type.Optional(Type.Number({ description: "Maximum devices to inspect. Defaults to 500.", default: 500 })),
     }),
     prepareArguments: normalizeMeetingHybridArgs,
-    async execute(_toolCallId: string, args: MeetingHybridArgs) {
+    async execute(_toolCallId: string, args: MeetingHybridArgs, signal?: AbortSignal) {
       try {
-        const result = await assessWebexMeetingHybridSecurity(createClient(args), assessmentOptions(args));
+        const result = await assessWebexMeetingHybridSecurity(createClient(args, signal), assessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: "webex_assess_meeting_hybrid_security", ...result });
       } catch (error) {
         return errorResult(
@@ -2482,11 +2488,11 @@ export function registerWebexTools(pi: any): void {
       device_limit: Type.Optional(Type.Number({ description: "Maximum devices to inspect. Defaults to 500.", default: 500 })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveWebexConfiguration(args as JsonRecord);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportWebexAuditBundle(new WebexApiClient(config), config, outputRoot, assessmentOptions(args));
+        const result = await exportWebexAuditBundle(new WebexApiClient(config, { signal }), config, outputRoot, { ...assessmentOptions(args), signal });
         return textResult(
           [
             "Webex audit bundle exported.",

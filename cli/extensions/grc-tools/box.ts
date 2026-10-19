@@ -21,6 +21,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { BOX_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1381,12 +1382,13 @@ export class BoxApiClient implements BoxReadClient {
       fetchImpl?: FetchImpl;
       now?: () => Date;
       sleep?: (ms: number) => Promise<void>;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
-    this.sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.sleep = abortableSleep(options.signal, options.sleep);
     this.refreshToken = config.refreshToken;
     if (config.authMode === "oauth" && config.accessToken) {
       this.accessToken = config.accessToken;
@@ -4117,7 +4119,7 @@ export async function exportBoxAuditBundle(
   >,
   config: BoxResolvedConfig,
   outputRoot: string,
-  options: BoxExportOptions = {},
+  options: BoxExportOptions & { signal?: AbortSignal } = {},
 ): Promise<BoxAuditBundleResult> {
   const access = await checkBoxAccess(client);
   const identityData = await collectBoxIdentityData(client, options);
@@ -4136,12 +4138,16 @@ export async function exportBoxAuditBundle(
   const truncated = [...new Set([...assessments.flatMap((assessment) => assessment.truncated), ...datasetTruncations("groups", groups)])];
   const enterpriseId = access.enterpriseId ?? identityData.enterpriseId;
 
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(enterpriseId ?? "box-enterprise")}-audit-bundle`, 6),
     zip: true,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+    signal: options.signal,
   }, async (staged) => {
     const coreDatasets: Array<[string, CollectedDataset<unknown>]> = [
       ["core_data/current_user.json", identityData.currentUser],
@@ -4334,8 +4340,8 @@ function sharingOptions(args: SharingArgs): BoxSharingOptions {
   };
 }
 
-function createClient(args: AuthArgs): BoxApiClient {
-  return new BoxApiClient(resolveBoxConfiguration(args));
+function createClient(args: AuthArgs, signal?: AbortSignal): BoxApiClient {
+  return new BoxApiClient(resolveBoxConfiguration(args), { signal });
 }
 
 const authParams = {
@@ -4385,11 +4391,12 @@ function runTool<TArgs extends AuthArgs>(
   toolName: string,
   failureLabel: string,
   args: TArgs,
+  signal: AbortSignal | undefined,
   run: (client: BoxApiClient, args: TArgs) => Promise<BoxAssessmentResult>,
 ) {
   return (async () => {
     try {
-      const result = await run(createClient(args), args);
+      const result = await run(createClient(args, signal), args);
       return textResult(formatAssessmentText(result), { tool: toolName, ...result });
     } catch (error) {
       return errorResult(`${failureLabel} failed: ${errorMessage(error)}`, { tool: toolName });
@@ -4406,9 +4413,9 @@ export function registerBoxTools(pi: any): void {
       "Validate read-only Box Content API access across the current principal, enterprise configuration, users, groups, enterprise events, device pins, retention and legal hold policies, Shield barriers and lists, collaboration allowlist, metadata and classification templates, and terms of service. Supports JWT, Client Credentials Grant, and OAuth 2.0 tokens.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
       try {
-        const result = await checkBoxAccess(createClient(args));
+        const result = await checkBoxAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "box_check_access", ...result });
       } catch (error) {
         return errorResult(`Box access check failed: ${errorMessage(error)}`, { tool: "box_check_access" });
@@ -4423,8 +4430,8 @@ export function registerBoxTools(pi: any): void {
       "Assess Box identity and access controls: SSO enforcement, 2FA for admins and all users, admin role minimization, co-admin scoping, password policy strength, session duration, IP allowlisting, and inactive user detection (spec controls 1, 2, 3, 17, 18, 21, 22, 23, 24).",
     parameters: Type.Object({ ...authParams, ...identityParams }),
     prepareArguments: normalizeIdentityArgs,
-    async execute(_toolCallId: string, args: IdentityArgs) {
-      return runTool("box_assess_identity_access", "Box identity and access assessment", args, (client) =>
+    async execute(_toolCallId: string, args: IdentityArgs, signal?: AbortSignal) {
+      return runTool("box_assess_identity_access", "Box identity and access assessment", args, signal, (client) =>
         assessBoxIdentityAccess(client, identityOptions(args)));
     },
   });
@@ -4436,8 +4443,8 @@ export function registerBoxTools(pi: any): void {
       "Assess Box sharing and collaboration controls: external collaboration restrictions, allowlist audit, shared link defaults, expiration, password requirements, watermarking, app approval, and custom terms of service (spec controls 4, 5, 6, 7, 8, 9, 19, 20).",
     parameters: Type.Object({ ...authParams, ...sharingParams }),
     prepareArguments: normalizeSharingArgs,
-    async execute(_toolCallId: string, args: SharingArgs) {
-      return runTool("box_assess_sharing_collaboration", "Box sharing and collaboration assessment", args, (client) =>
+    async execute(_toolCallId: string, args: SharingArgs, signal?: AbortSignal) {
+      return runTool("box_assess_sharing_collaboration", "Box sharing and collaboration assessment", args, signal, (client) =>
         assessBoxSharingCollaboration(client, sharingOptions(args)));
     },
   });
@@ -4449,8 +4456,8 @@ export function registerBoxTools(pi: any): void {
       "Assess Box data governance controls: device trust and pins, classification labels, retention policies, and legal hold policies (spec controls 10, 11, 12, 13).",
     parameters: Type.Object({ ...authParams, ...governanceParams }),
     prepareArguments: normalizeGovernanceArgs,
-    async execute(_toolCallId: string, args: GovernanceArgs) {
-      return runTool("box_assess_data_governance", "Box data governance assessment", args, (client) =>
+    async execute(_toolCallId: string, args: GovernanceArgs, signal?: AbortSignal) {
+      return runTool("box_assess_data_governance", "Box data governance assessment", args, signal, (client) =>
         assessBoxDataGovernance(client, { listLimit: args.list_limit }));
     },
   });
@@ -4462,8 +4469,8 @@ export function registerBoxTools(pi: any): void {
       "Assess Box Shield and monitoring controls: Shield smart access and threat detection rules, information barriers, enterprise event streaming, and content access monitoring (spec controls 14, 15, 16, 25).",
     parameters: Type.Object({ ...authParams, ...eventParams }),
     prepareArguments: normalizeShieldArgs,
-    async execute(_toolCallId: string, args: ShieldArgs) {
-      return runTool("box_assess_shield_monitoring", "Box Shield and monitoring assessment", args, (client) =>
+    async execute(_toolCallId: string, args: ShieldArgs, signal?: AbortSignal) {
+      return runTool("box_assess_shield_monitoring", "Box Shield and monitoring assessment", args, signal, (client) =>
         assessBoxShieldMonitoring(client, { eventLimit: args.event_limit, lookbackDays: args.lookback_days }));
     },
   });
@@ -4481,14 +4488,15 @@ export function registerBoxTools(pi: any): void {
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportArgs) {
+    async execute(_toolCallId: string, args: ExportArgs, signal?: AbortSignal) {
       try {
         const config = resolveBoxConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportBoxAuditBundle(new BoxApiClient(config), config, outputRoot, {
+        const result = await exportBoxAuditBundle(new BoxApiClient(config, { signal }), config, outputRoot, {
           ...identityOptions(args),
           ...sharingOptions(args),
           listLimit: args.list_limit,
+          signal,
         });
         return textResult(
           [

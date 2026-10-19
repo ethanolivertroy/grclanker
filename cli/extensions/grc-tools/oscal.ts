@@ -98,6 +98,7 @@ type TrestleExecution = {
 type TrestleCommandOptions = {
   cwd: string;
   env?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
 };
 
 export type TrestleRunner = (
@@ -470,12 +471,14 @@ async function runTrestleCommand(
   args: string[],
   options: TrestleCommandOptions,
 ): Promise<TrestleExecution> {
+  options.signal?.throwIfAborted();
   const resolved = resolveTrestleExecutable(options.env);
   return new Promise((resolvePromise, reject) => {
     const child = spawn(resolved.executable, args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env },
       stdio: ["ignore", "pipe", "pipe"],
+      signal: options.signal,
     });
 
     let stdout = "";
@@ -507,6 +510,10 @@ async function runTrestleCommand(
       });
     });
   });
+}
+
+function trestleRunnerFor(signal: AbortSignal | undefined): TrestleRunner {
+  return signal ? (args, options) => runTrestleCommand(args, { ...options, signal }) : runTrestleCommand;
 }
 
 function ensureWorkspaceExists(workspaceDir: string): void {
@@ -1045,8 +1052,8 @@ export function registerOscalTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeCheckArgs,
-    async execute(_toolCallId: string, args: OscalCheckArgs) {
-      const status = await checkOscalTrestle(args);
+    async execute(_toolCallId: string, args: OscalCheckArgs, signal?: AbortSignal) {
+      const status = await checkOscalTrestle(args, trestleRunnerFor(signal));
       return textResult(buildCheckText(status), {
         tool: "oscal_check_trestle",
         installed: status.installed,
@@ -1089,9 +1096,9 @@ export function registerOscalTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeInitArgs,
-    async execute(_toolCallId: string, args: OscalInitArgs) {
+    async execute(_toolCallId: string, args: OscalInitArgs, signal?: AbortSignal) {
       try {
-        const result = await initOscalWorkspace(args);
+        const result = await initOscalWorkspace(args, trestleRunnerFor(signal));
         return textResult(
           buildInitText(result.workspace, result.mode, result.alreadyInitialized),
           {
@@ -1136,9 +1143,9 @@ export function registerOscalTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeImportArgs,
-    async execute(_toolCallId: string, args: OscalImportArgs) {
+    async execute(_toolCallId: string, args: OscalImportArgs, signal?: AbortSignal) {
       try {
-        const result = await importOscalModel(args);
+        const result = await importOscalModel(args, trestleRunnerFor(signal));
         return textResult(buildImportText(result), {
           tool: "oscal_import_model",
           workspace_dir: result.workspaceDir,
@@ -1195,9 +1202,9 @@ export function registerOscalTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeCreateArgs,
-    async execute(_toolCallId: string, args: OscalCreateArgs) {
+    async execute(_toolCallId: string, args: OscalCreateArgs, signal?: AbortSignal) {
       try {
-        const result = await createOscalModel(args);
+        const result = await createOscalModel(args, trestleRunnerFor(signal));
         return textResult(buildCreateText(result), {
           tool: "oscal_create_model",
           workspace_dir: result.workspaceDir,
@@ -1260,9 +1267,9 @@ export function registerOscalTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeValidateArgs,
-    async execute(_toolCallId: string, args: OscalValidateArgs) {
+    async execute(_toolCallId: string, args: OscalValidateArgs, signal?: AbortSignal) {
       try {
-        const result = await validateOscalModel(args);
+        const result = await validateOscalModel(args, trestleRunnerFor(signal));
         return textResult(buildValidateText(result), {
           tool: "oscal_validate_model",
           workspace_dir: result.workspaceDir,
@@ -1342,9 +1349,9 @@ export function registerOscalTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeSspGenerateArgs,
-    async execute(_toolCallId: string, args: OscalSspGenerateArgs) {
+    async execute(_toolCallId: string, args: OscalSspGenerateArgs, signal?: AbortSignal) {
       try {
-        const result = await generateOscalSspMarkdown(args);
+        const result = await generateOscalSspMarkdown(args, trestleRunnerFor(signal));
         return textResult(buildSspGenerateText(result), {
           tool: "oscal_generate_ssp_markdown",
           workspace_dir: result.workspaceDir,
@@ -1410,9 +1417,9 @@ export function registerOscalTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeSspAssembleArgs,
-    async execute(_toolCallId: string, args: OscalSspAssembleArgs) {
+    async execute(_toolCallId: string, args: OscalSspAssembleArgs, signal?: AbortSignal) {
       try {
-        const result = await assembleOscalSsp(args);
+        const result = await assembleOscalSsp(args, trestleRunnerFor(signal));
         return textResult(buildSspAssembleText(result), {
           tool: "oscal_assemble_ssp",
           workspace_dir: result.workspaceDir,

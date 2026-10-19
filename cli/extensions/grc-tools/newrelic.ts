@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   ConfigFileError,
@@ -1594,11 +1595,12 @@ export class NewrelicApiClient {
       fetchImpl?: FetchImpl;
       sleep?: SleepImpl;
       maxRetries?: number;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
   }
 
@@ -4936,7 +4938,7 @@ export async function exportNewrelicAuditBundle(
   client: IdentityClient & AccessControlClient & AlertingClient & DataGovernanceClient,
   config: NewrelicResolvedConfig,
   outputRoot: string,
-  options: NewrelicBundleOptions = {},
+  options: NewrelicBundleOptions & { signal?: AbortSignal } = {},
 ): Promise<NewrelicAuditBundleResult> {
   const identity = await assessNewrelicIdentity(client, options);
   const accessControl = await assessNewrelicAccessControl(client, options);
@@ -4947,12 +4949,16 @@ export async function exportNewrelicAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
   const accountIds = asArray(accessControl.summary.accounts_in_scope).map((id) => asNumber(id)).filter((id): id is number => id !== undefined);
 
-  ensurePrivateDir(outputRoot);
   const label = accountIds.length > 0 ? accountIds.join("-") : config.region.toLowerCase();
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(safeDirName(`newrelic-${label}-audit-bundle`), 6),
     zip: true,
+    signal: options.signal,
     checkName: (name) => {
       resolveSecureOutputPath(outputRoot, name);
       resolveSecureOutputPath(outputRoot, `${name}.zip`);
@@ -5117,8 +5123,8 @@ function dataGovernanceOptions(args: DataGovernanceArgs): NewrelicDataGovernance
   };
 }
 
-function createClient(args: AuthArgs): NewrelicApiClient {
-  return new NewrelicApiClient(resolveNewrelicConfiguration(args));
+function createClient(args: AuthArgs, signal?: AbortSignal): NewrelicApiClient {
+  return new NewrelicApiClient(resolveNewrelicConfiguration(args), { signal });
 }
 
 /**
@@ -5176,9 +5182,9 @@ export function registerNewrelicTools(pi: any): void {
       "Validate read-only New Relic access across NerdGraph actor.user, accounts, organization, user management, authorization management, API key search, NRQL (NrAuditEvent), entity search, alerts, data management, log configurations, and REST API v2 users.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
       try {
-        const result = await checkNewrelicAccess(createClient(args));
+        const result = await checkNewrelicAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "newrelic_check_access", ...result });
       } catch (error) {
         return errorResult(`New Relic access check failed: ${errorMessage(error)}`, { tool: "newrelic_check_access" });
@@ -5193,9 +5199,9 @@ export function registerNewrelicTools(pi: any): void {
       "Assess New Relic identity posture: SSO/SAML enforcement, user type least privilege, admin user minimization, authentication domain configuration, and inactive user accounts (spec controls 1, 2, 3, 18, 19).",
     parameters: Type.Object({ ...authParams, ...identityParams }),
     prepareArguments: normalizeIdentityArgs,
-    async execute(_toolCallId: string, args: IdentityArgs) {
+    async execute(_toolCallId: string, args: IdentityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessNewrelicIdentity(createClient(args), identityOptions(args));
+        const result = await assessNewrelicIdentity(createClient(args, signal), identityOptions(args));
         return textResult(formatAssessmentText(result), { tool: "newrelic_assess_identity", ...result, coreData: undefined });
       } catch (error) {
         return errorResult(`New Relic identity assessment failed: ${errorMessage(error)}`, { tool: "newrelic_assess_identity" });
@@ -5210,9 +5216,9 @@ export function registerNewrelicTools(pi: any): void {
       "Assess New Relic API key inventory, key age, unused keys, account access controls, cross-account access restrictions, and custom role permissions (spec controls 4, 5, 6, 7, 8, 20).",
     parameters: Type.Object({ ...authParams, ...accessControlParams }),
     prepareArguments: normalizeAccessControlArgs,
-    async execute(_toolCallId: string, args: AccessControlArgs) {
+    async execute(_toolCallId: string, args: AccessControlArgs, signal?: AbortSignal) {
       try {
-        const result = await assessNewrelicAccessControl(createClient(args), accessControlOptions(args));
+        const result = await assessNewrelicAccessControl(createClient(args, signal), accessControlOptions(args));
         return textResult(formatAssessmentText(result), { tool: "newrelic_assess_access_control", ...result, coreData: undefined });
       } catch (error) {
         return errorResult(`New Relic access control assessment failed: ${errorMessage(error)}`, { tool: "newrelic_assess_access_control" });
@@ -5227,9 +5233,9 @@ export function registerNewrelicTools(pi: any): void {
       "Assess New Relic alert policy coverage, notification destination hygiene, and applied intelligence enrichment exposure (spec controls 9, 10, 17).",
     parameters: Type.Object({ ...authParams, ...alertingParams }),
     prepareArguments: normalizeAlertingArgs,
-    async execute(_toolCallId: string, args: AlertingArgs) {
+    async execute(_toolCallId: string, args: AlertingArgs, signal?: AbortSignal) {
       try {
-        const result = await assessNewrelicAlerting(createClient(args), alertingOptions(args));
+        const result = await assessNewrelicAlerting(createClient(args, signal), alertingOptions(args));
         return textResult(formatAssessmentText(result), { tool: "newrelic_assess_alerting", ...result, coreData: undefined });
       } catch (error) {
         return errorResult(`New Relic alerting assessment failed: ${errorMessage(error)}`, { tool: "newrelic_assess_alerting" });
@@ -5244,9 +5250,9 @@ export function registerNewrelicTools(pi: any): void {
       "Assess New Relic data retention, log obfuscation, synthetic monitor credential handling, dashboard permissions and public live URLs, plaintext secrets in logs, and infrastructure agent configuration evidence (spec controls 11, 12, 13, 14, 15, 16).",
     parameters: Type.Object({ ...authParams, ...dataGovernanceParams }),
     prepareArguments: normalizeDataGovernanceArgs,
-    async execute(_toolCallId: string, args: DataGovernanceArgs) {
+    async execute(_toolCallId: string, args: DataGovernanceArgs, signal?: AbortSignal) {
       try {
-        const result = await assessNewrelicDataGovernance(createClient(args), dataGovernanceOptions(args));
+        const result = await assessNewrelicDataGovernance(createClient(args, signal), dataGovernanceOptions(args));
         return textResult(formatAssessmentText(result), { tool: "newrelic_assess_data_governance", ...result, coreData: undefined });
       } catch (error) {
         return errorResult(`New Relic data governance assessment failed: ${errorMessage(error)}`, { tool: "newrelic_assess_data_governance" });
@@ -5268,15 +5274,16 @@ export function registerNewrelicTools(pi: any): void {
       ...dataGovernanceParams,
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveNewrelicConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportNewrelicAuditBundle(new NewrelicApiClient(config), config, outputRoot, {
+        const result = await exportNewrelicAuditBundle(new NewrelicApiClient(config, { signal }), config, outputRoot, {
           ...identityOptions(args),
           ...accessControlOptions(args),
           ...alertingOptions(args),
           ...dataGovernanceOptions(args),
+          signal,
         });
         return textResult(
           [

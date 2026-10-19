@@ -22,6 +22,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1917,14 +1918,11 @@ function retryDelayMs(response: Response, attempt: number): number {
   return Math.min(500 * 2 ** attempt, 15_000);
 }
 
-async function defaultSleep(ms: number): Promise<void> {
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 interface HttpClientOptions {
   fetchImpl?: FetchImpl;
   sleepImpl?: SleepImpl;
   retryLimit?: number;
+  signal?: AbortSignal;
 }
 
 abstract class TenableHttpClient {
@@ -1938,8 +1936,8 @@ abstract class TenableHttpClient {
   constructor(baseUrl: string, timeoutMs: number, secrets: string[], options: HttpClientOptions = {}) {
     this.baseUrl = baseUrl;
     this.timeoutMs = timeoutMs;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleepImpl = options.sleepImpl ?? defaultSleep;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     this.retryLimit = options.retryLimit ?? DEFAULT_RETRY_LIMIT;
     this.secrets = secrets;
   }
@@ -2001,6 +1999,7 @@ abstract class TenableHttpClient {
         });
       } catch (error) {
         clearTimeout(timer);
+        if (error instanceof ToolCallAbortedError) throw error;
         const message = this.scrub(error instanceof Error ? error.message : String(error));
         const aborted = (error instanceof Error && error.name === "AbortError") || /abort/i.test(message);
         if (aborted) throw this.fail(`Tenable request ${endpoint} timed out after ${this.timeoutMs}ms.`, 0, endpoint);
@@ -5186,7 +5185,7 @@ function buildQuickReference(): string {
 export async function exportTenableAuditBundle(
   clients: TenableClients,
   outputRoot: string,
-  options: TenableAssessmentOptions = {},
+  options: TenableAssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<TenableAuditBundleResult> {
   const config = clients.config;
   // Guard 2 for every written file: the configured keys in every encoded form.
@@ -5206,11 +5205,15 @@ export async function exportTenableAuditBundle(
   const errors = assessments.flatMap((assessment) => assessment.errors);
 
   const hostLabel = config.vm ? new URL(config.vm.baseUrl).hostname : new URL(config.securityCenter?.baseUrl ?? DEFAULT_CLOUD_URL).hostname;
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(hostLabel)}-audit-bundle`, 50),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     // Every list or object that was refused, failed, or never requested is written
@@ -5352,8 +5355,8 @@ function toAssessmentOptions(args: AssessArgs): TenableAssessmentOptions {
   };
 }
 
-function createClients(args: CheckAccessArgs): TenableClients {
-  return createTenableClients(resolveTenableConfiguration(args as JsonRecord));
+function createClients(args: CheckAccessArgs, signal?: AbortSignal): TenableClients {
+  return createTenableClients(resolveTenableConfiguration(args as JsonRecord), { signal });
 }
 
 type ToolResult = ReturnType<typeof textResult> & { isError?: boolean };
@@ -5372,11 +5375,11 @@ function argumentSecrets(args: CheckAccessArgs): string[] {
  * the catch block rendered the error. The clients' secrets include the keys a config
  * file supplied, which the argument list alone cannot name.
  */
-async function runSealed(label: string, tool: string, args: CheckAccessArgs, run: (clients: TenableClients) => Promise<ToolResult>): Promise<ToolResult> {
+async function runSealed(label: string, tool: string, args: CheckAccessArgs, signal: AbortSignal | undefined, run: (clients: TenableClients) => Promise<ToolResult>): Promise<ToolResult> {
   const secrets = new Set<string>(argumentSecrets(args));
   let clients: TenableClients | undefined;
   try {
-    clients = createClients(args);
+    clients = createClients(args, signal);
     for (const secret of configuredTenableSecrets(clients.config)) secrets.add(secret);
     return sealValue(await run(clients), [...secrets]);
   } catch (error) {
@@ -5441,8 +5444,8 @@ function registerAssessmentTool(pi: ExtensionAPI, kind: AssessmentKind, name: st
     description,
     parameters: Type.Object({ ...authParams, ...thresholdParams }),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
-      return runSealed(label, name, args, async (clients) => {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
+      return runSealed(label, name, args, signal, async (clients) => {
         const result = await runAssessment(kind, clients, toAssessmentOptions(args));
         return textResult(formatAssessmentText(result), { tool: name, ...result });
       });
@@ -5459,8 +5462,8 @@ export function registerTenableTools(pi: any): void {
       "Validate read-only Tenable Vulnerability Management (cloud or FedRAMP) and optional Tenable Security Center access across scans, templates, exports, sensors, networks, exclusions, credentials, users, permissions, audit log, and tags, reporting the role each refused surface needs.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
-      return runSealed("Tenable access check", "tenable_check_access", args, async (clients) => {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
+      return runSealed("Tenable access check", "tenable_check_access", args, signal, async (clients) => {
         const result = await checkTenableAccess(clients);
         return textResult(formatAccessCheckText(result), { tool: "tenable_check_access", ...result });
       });
@@ -5507,10 +5510,10 @@ export function registerTenableTools(pi: any): void {
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
-      return runSealed("Tenable audit bundle export", "tenable_export_audit_bundle", args, async (clients) => {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
+      return runSealed("Tenable audit bundle export", "tenable_export_audit_bundle", args, signal, async (clients) => {
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportTenableAuditBundle(clients, outputRoot, toAssessmentOptions(args));
+        const result = await exportTenableAuditBundle(clients, outputRoot, { ...toAssessmentOptions(args), signal });
         return textResult(
           [
             "Tenable audit bundle exported.",

@@ -21,6 +21,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, VERACODE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1550,11 +1551,11 @@ export class VeracodeApiClient {
 
   constructor(
     config: VeracodeResolvedConfig,
-    options: { fetchImpl?: FetchImpl; sleep?: (ms: number) => Promise<void> } = {},
+    options: { fetchImpl?: FetchImpl; sleep?: (ms: number) => Promise<void>; signal?: AbortSignal } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleep = options.sleep ?? ((ms) => new Promise((done) => setTimeout(done, ms)));
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
     registerConfiguredSecrets([config.apiKeySecret]);
   }
 
@@ -3808,6 +3809,7 @@ export async function exportVeracodeAuditBundle(
     inactiveDays?: number;
     maxCredentialAgeDays?: number;
     now?: Date;
+    signal?: AbortSignal;
   } = {},
 ): Promise<VeracodeAuditBundleResult> {
   const generatedAt = options.now ?? new Date();
@@ -3821,11 +3823,15 @@ export async function exportVeracodeAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings).sort((left, right) => left.id.localeCompare(right.id));
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
 
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(new URL(config.baseUrl).host)}-audit-bundle`, 50),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await writeSecureTextFile(staged.dir, "QUICK_REFERENCE.md", buildQuickReference({ outputDir: staged.target.outputDir, findings, errors }));
@@ -3908,8 +3914,8 @@ function normalizeExportArgs(args: unknown): ExportArgs {
   return { ...normalizeScanCoverageArgs(args), ...normalizeFindingsArgs(args), ...normalizeScaArgs(args), ...normalizeAccessControlArgs(args), output_dir: asString(value.output_dir) ?? asString(value.output) };
 }
 
-function createClient(args: AuthArgs): VeracodeApiClient {
-  return new VeracodeApiClient(resolveVeracodeConfiguration(args));
+function createClient(args: AuthArgs, signal?: AbortSignal): VeracodeApiClient {
+  return new VeracodeApiClient(resolveVeracodeConfiguration(args), { signal });
 }
 
 function exportOptions(args: ExportArgs) {
@@ -3953,9 +3959,9 @@ export function registerVeracodeTools(pi: any): void {
       "Validate HMAC-signed read-only Veracode access across applications, policies, identity (users, teams, roles, API credentials), SCA Agent, and Dynamic Analysis surfaces, and report which roles are missing.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
       try {
-        const result = await checkVeracodeAccess(createClient(args));
+        const result = await checkVeracodeAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "veracode_check_access", ...result });
       } catch (error) {
         return errorResult(`Veracode access check failed: ${toolErrorText(error)}`, { tool: "veracode_check_access" });
@@ -3977,9 +3983,9 @@ export function registerVeracodeTools(pi: any): void {
       standard_scan_interval_days: Type.Optional(Type.Number({ description: "Required scan interval in days for every other business criticality tier (control 4). Defaults to 31.", default: 31 })),
     }),
     prepareArguments: normalizeScanCoverageArgs,
-    async execute(_toolCallId: string, args: ScanCoverageArgs) {
+    async execute(_toolCallId: string, args: ScanCoverageArgs, signal?: AbortSignal) {
       try {
-        const result = await assessVeracodeScanCoverage(createClient(args), {
+        const result = await assessVeracodeScanCoverage(createClient(args, signal), {
           maxApplications: args.max_applications,
           maxScanAgeDays: args.max_scan_age_days,
           maxAnalyses: args.max_analyses,
@@ -4000,9 +4006,9 @@ export function registerVeracodeTools(pi: any): void {
       "Assess Veracode policy compliance (controls 2, 15, 20): application policy_compliance_status, custom policy adoption with finding rules and grace periods, and collections posture (manual, with business-unit evidence).",
     parameters: Type.Object({ ...authParams, ...applicationParams }),
     prepareArguments: normalizePolicyArgs,
-    async execute(_toolCallId: string, args: PolicyArgs) {
+    async execute(_toolCallId: string, args: PolicyArgs, signal?: AbortSignal) {
       try {
-        const result = await assessVeracodePolicyCompliance(createClient(args), { maxApplications: args.max_applications });
+        const result = await assessVeracodePolicyCompliance(createClient(args, signal), { maxApplications: args.max_applications });
         return textResult(formatAssessmentText(result), { tool: "veracode_assess_policy_compliance", title: result.title, summary: result.summary, findings: result.findings, errors: result.errors });
       } catch (error) {
         return errorResult(`Veracode policy compliance assessment failed: ${toolErrorText(error)}`, { tool: "veracode_assess_policy_compliance" });
@@ -4022,9 +4028,9 @@ export function registerVeracodeTools(pi: any): void {
       max_flaw_density_per_kloc: Type.Optional(Type.Number({ description: "Maximum Very High/High flaws per KLOC. Defaults to 1.", default: 1 })),
     }),
     prepareArguments: normalizeFindingsArgs,
-    async execute(_toolCallId: string, args: FindingsArgs) {
+    async execute(_toolCallId: string, args: FindingsArgs, signal?: AbortSignal) {
       try {
-        const result = await assessVeracodeFindingsHygiene(createClient(args), { maxApplications: args.max_applications, maxFpRatePercent: args.max_fp_rate_percent, maxFlawDensityPerKloc: args.max_flaw_density_per_kloc });
+        const result = await assessVeracodeFindingsHygiene(createClient(args, signal), { maxApplications: args.max_applications, maxFpRatePercent: args.max_fp_rate_percent, maxFlawDensityPerKloc: args.max_flaw_density_per_kloc });
         return textResult(formatAssessmentText(result), { tool: "veracode_assess_findings_hygiene", title: result.title, summary: result.summary, findings: result.findings, errors: result.errors });
       } catch (error) {
         return errorResult(`Veracode findings hygiene assessment failed: ${toolErrorText(error)}`, { tool: "veracode_assess_findings_hygiene" });
@@ -4044,9 +4050,9 @@ export function registerVeracodeTools(pi: any): void {
       sca_cvss_threshold: Type.Optional(Type.Number({ description: "Minimum severity score that flags an open SCA vulnerability issue. Defaults to 7.", default: 7 })),
     }),
     prepareArguments: normalizeScaArgs,
-    async execute(_toolCallId: string, args: ScaArgs) {
+    async execute(_toolCallId: string, args: ScaArgs, signal?: AbortSignal) {
       try {
-        const result = await assessVeracodeScaPosture(createClient(args), { maxApplications: args.max_applications, maxWorkspaces: args.max_workspaces, scaCvssThreshold: args.sca_cvss_threshold });
+        const result = await assessVeracodeScaPosture(createClient(args, signal), { maxApplications: args.max_applications, maxWorkspaces: args.max_workspaces, scaCvssThreshold: args.sca_cvss_threshold });
         return textResult(formatAssessmentText(result), { tool: "veracode_assess_sca_posture", title: result.title, summary: result.summary, findings: result.findings, errors: result.errors });
       } catch (error) {
         return errorResult(`Veracode SCA posture assessment failed: ${toolErrorText(error)}`, { tool: "veracode_assess_sca_posture" });
@@ -4067,9 +4073,9 @@ export function registerVeracodeTools(pi: any): void {
       max_credential_age_days: Type.Optional(Type.Number({ description: "Maximum API credential age in days. Defaults to 365.", default: 365 })),
     }),
     prepareArguments: normalizeAccessControlArgs,
-    async execute(_toolCallId: string, args: AccessControlArgs) {
+    async execute(_toolCallId: string, args: AccessControlArgs, signal?: AbortSignal) {
       try {
-        const result = await assessVeracodeAccessControls(createClient(args), { maxAdmins: args.max_admins, maxUnrestrictedUsers: args.max_unrestricted_users, inactiveDays: args.inactive_days, maxCredentialAgeDays: args.max_credential_age_days });
+        const result = await assessVeracodeAccessControls(createClient(args, signal), { maxAdmins: args.max_admins, maxUnrestrictedUsers: args.max_unrestricted_users, inactiveDays: args.inactive_days, maxCredentialAgeDays: args.max_credential_age_days });
         return textResult(formatAssessmentText(result), { tool: "veracode_assess_access_controls", title: result.title, summary: result.summary, findings: result.findings, errors: result.errors });
       } catch (error) {
         return errorResult(`Veracode access controls assessment failed: ${toolErrorText(error)}`, { tool: "veracode_assess_access_controls" });
@@ -4100,11 +4106,14 @@ export function registerVeracodeTools(pi: any): void {
       max_credential_age_days: Type.Optional(Type.Number({ description: "Maximum API credential age in days. Defaults to 365.", default: 365 })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportArgs) {
+    async execute(_toolCallId: string, args: ExportArgs, signal?: AbortSignal) {
       try {
         const config = resolveVeracodeConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportVeracodeAuditBundle(new VeracodeApiClient(config), config, outputRoot, exportOptions(args));
+        const result = await exportVeracodeAuditBundle(new VeracodeApiClient(config, { signal }), config, outputRoot, {
+          ...exportOptions(args),
+          signal,
+        });
         return textResult(
           ["Veracode audit bundle exported.", `Output dir: ${result.outputDir}`, `Zip archive: ${result.zipPath}`, `Findings: ${result.findingCount}`, `Files: ${result.fileCount}`, `Collection warnings: ${result.errorCount}`].join("\n"),
           { tool: "veracode_export_audit_bundle", output_dir: result.outputDir, zip_path: result.zipPath, finding_count: result.findingCount, file_count: result.fileCount, error_count: result.errorCount },

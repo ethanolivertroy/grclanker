@@ -20,6 +20,7 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { OKTA_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1898,10 +1899,6 @@ function describeRequestTarget(config: OktaResolvedConfig, pathOrUrl: string): s
   }
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 function base64UrlEncode(input: Buffer | string): string {
   return Buffer.from(input)
     .toString("base64")
@@ -2358,10 +2355,14 @@ function retryDelayFromResponse(response: Response): number {
 export class OktaAuditorClient {
   private readonly config: OktaResolvedConfig;
   private readonly fetchImpl: FetchImpl;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly signal: AbortSignal | undefined;
 
-  constructor(config: OktaResolvedConfig, options?: { fetchImpl?: FetchImpl }) {
+  constructor(config: OktaResolvedConfig, options?: { fetchImpl?: FetchImpl; signal?: AbortSignal }) {
     this.config = config;
-    this.fetchImpl = options?.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options?.fetchImpl ?? fetch, options?.signal);
+    this.sleep = abortableSleep(options?.signal);
+    this.signal = options?.signal;
     registerConfiguredSecrets([config.token, config.privateKey, config.clientAssertion]);
   }
 
@@ -2376,10 +2377,15 @@ export class OktaAuditorClient {
       return entry.token;
     }
     if (entry.pending) {
-      return entry.pending;
+      try {
+        return await unlessAborted(entry.pending, this.signal);
+      } catch (error) {
+        // The shared request belongs to the client that started it; when that client's call was aborted, request a token here instead.
+        if (!(error instanceof ToolCallAbortedError) || this.signal?.aborted) throw error;
+      }
     }
 
-    const pending = (async () => {
+    const pending = unlessAborted((async () => {
       const clientAssertion = buildClientAssertion(this.config);
       const body = new URLSearchParams({
         grant_type: "client_credentials",
@@ -2423,7 +2429,7 @@ export class OktaAuditorClient {
         expiresAt: Date.now() + expiresIn * 1000,
       });
       return accessToken;
-    })();
+    })(), this.signal);
 
     tokenCache.set(cacheKey, { ...entry, pending });
 
@@ -2476,7 +2482,7 @@ export class OktaAuditorClient {
     }
 
     if (response.status === 429 && attempt < DEFAULT_RATE_LIMIT_RETRIES) {
-      await delay(retryDelayFromResponse(response));
+      await this.sleep(retryDelayFromResponse(response));
       return this.request(pathOrUrl, init, attempt + 1);
     }
 
@@ -5954,6 +5960,7 @@ export async function exportOktaAuditBundle(
   client: OktaAuditBundleClient,
   config: OktaResolvedConfig,
   outputRoot: string,
+  options: { signal?: AbortSignal } = {},
 ): Promise<OktaAuditBundleResult> {
   const authentication = await collectOktaAuthenticationData(client);
   const adminAccess = await collectOktaAdminAccessData(client);
@@ -5981,11 +5988,15 @@ export async function exportOktaAuditBundle(
   ];
   const allFindings = assessments.flatMap((assessment) => assessment.findings);
 
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(safeDirName(`${new URL(config.orgUrl).hostname}-audit-bundle`), 10),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     const coreDataFiles: OktaCoreDataFile[] = [
@@ -6223,10 +6234,10 @@ export function registerOktaTools(pi: any): void {
       "Validate Okta Management API access for a read-only audit principal and report which core GRC surfaces are readable.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: AssessmentArgs) {
+    async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config);
+        const client = new OktaAuditorClient(config, { signal });
         const result = await runOktaAccessCheck(client, config);
         return renderAccessCheck(result);
       } catch (error) {
@@ -6245,10 +6256,10 @@ export function registerOktaTools(pi: any): void {
       "Evaluate phishing-resistant MFA, admin MFA rules, password policies, session controls, certificate-authentication readiness, and FIPS or restricted authenticator posture in Okta.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: AssessmentArgs) {
+    async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config);
+        const client = new OktaAuditorClient(config, { signal });
         const data = await collectOktaAuthenticationData(client);
         return renderAssessmentToolResult(assessOktaAuthentication(data, config));
       } catch (error) {
@@ -6267,10 +6278,10 @@ export function registerOktaTools(pi: any): void {
       "Review Okta privileged users, super-admin concentration, stale privileged accounts, admin MFA enrollment, privileged group hygiene, workforce account lifecycle, and Okta Support or third-party admin access.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: AssessmentArgs) {
+    async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config);
+        const client = new OktaAuditorClient(config, { signal });
         const data = await collectOktaAdminAccessData(client);
         return renderAssessmentToolResult(assessOktaAdminAccess(data, config));
       } catch (error) {
@@ -6289,10 +6300,10 @@ export function registerOktaTools(pi: any): void {
       "Review Okta applications, trusted origins, network zones, OAuth grant hygiene, contextual access controls, and provisioning or deprovisioning automation.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: AssessmentArgs) {
+    async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config);
+        const client = new OktaAuditorClient(config, { signal });
         const data = await collectOktaIntegrationData(client);
         return renderAssessmentToolResult(assessOktaIntegrations(data, config));
       } catch (error) {
@@ -6311,10 +6322,10 @@ export function registerOktaTools(pi: any): void {
       "Review Okta log offloading, System Log visibility, ThreatInsight, behavior rules, API token hygiene and governance, device assurance coverage, and security contact routing.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: AssessmentArgs) {
+    async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config);
+        const client = new OktaAuditorClient(config, { signal });
         const data = await collectOktaMonitoringData(client);
         return renderAssessmentToolResult(assessOktaMonitoring(data, config));
       } catch (error) {
@@ -6340,12 +6351,12 @@ export function registerOktaTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportArgs) {
+    async execute(_toolCallId: string, args: ExportArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config);
+        const client = new OktaAuditorClient(config, { signal });
         const outputRoot = resolve(process.cwd(), args.output_dir ?? DEFAULT_OUTPUT_DIR);
-        const result = await exportOktaAuditBundle(client, config, outputRoot);
+        const result = await exportOktaAuditBundle(client, config, outputRoot, { signal });
         return textResult(buildExportText(config, result), {
           tool: "okta_export_audit_bundle",
           output_dir: result.outputDir,

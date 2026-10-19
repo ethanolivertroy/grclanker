@@ -4,15 +4,17 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
 import { copyJson, isJsonValue } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 
 import { classifyGrcToolEffect, hasWriteVerb, WRITE_VERBS } from "../dist/agent-sdk/lib/effects.js";
 import { readGrclankerSystemPrompt } from "../dist/agent-sdk/lib/instructions.js";
-import { collectRegisteredGrcTools } from "../dist/agent-sdk/lib/registry.js";
+import { collectRegisteredGrcTools, getRegisteredGrcTool } from "../dist/agent-sdk/lib/registry.js";
 import {
   DURABLE_EXPERIMENTAL_BANNER,
   exitCodeForDurableOutcome,
@@ -59,6 +61,8 @@ const MODEL = { provider: "faux", modelId: "faux-1" };
 const READ_TOOL = "fakegrc_assess_controls";
 const WRITE_TOOL = "fakegrc_export_bundle";
 const SECRET = "pd_secret_value_0123456789";
+// A registry tool that reads several PagerDuty datasets at once.
+const ONCALL_TOOL = "pagerduty_assess_oncall_coverage";
 
 function scratchDir(t) {
   const dir = mkdtempSync(join(tmpdir(), "grclanker-durable-"));
@@ -178,6 +182,72 @@ function withoutTimestamp(call) {
   const { recordedAt, ...rest } = call;
   assert.ok(Number.isFinite(Date.parse(recordedAt)), `recordedAt is a timestamp: ${recordedAt}`);
   return rest;
+}
+
+/** Replace fetch for the test with one whose requests settle only when their signal aborts, like a stalled API. */
+function hangingFetch(t, onRequest = () => {}) {
+  const saved = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = (input, init = {}) => {
+    const signal = init.signal ?? (input instanceof Request ? input.signal : undefined);
+    const request = { url: input instanceof Request ? input.url : String(input), signal };
+    requests.push(request);
+    onRequest(request);
+    return new Promise((_, reject) => {
+      if (signal?.aborted) reject(signal.reason);
+      else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = saved;
+  });
+  return requests;
+}
+
+/** Fake PagerDuty arguments, with an empty config file so the operator's own config stays out of the test. */
+function pagerdutyArgs(t) {
+  const configFile = join(scratchDir(t), "pagerduty.json");
+  writeFileSync(configFile, "{}\n");
+  return { api_token: SECRET, region: "us", config_file: configFile };
+}
+
+/** A registry tool whose calls record the signal they got and the native promise they returned. */
+function watchedRegistryTool(name) {
+  const registered = getRegisteredGrcTool(name);
+  const calls = [];
+  const tool = {
+    ...registered,
+    execute: (callId, args, signal) => {
+      const running = registered.execute(callId, args, signal);
+      calls.push({ signal, running });
+      return running;
+    },
+  };
+  return { tool, calls };
+}
+
+async function waitUntil(predicate, description) {
+  const deadline = Date.now() + 5000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, `timed out waiting for ${description}`);
+    await sleep(5);
+  }
+}
+
+/** How `promise` settles within `ms`: resolved with a value, rejected with an error, or still pending. */
+async function settleWithin(promise, ms) {
+  const timer = new AbortController();
+  try {
+    return await Promise.race([
+      promise.then(
+        (value) => ({ status: "resolved", value }),
+        (error) => ({ status: "rejected", error }),
+      ),
+      sleep(ms, { status: "pending" }, { signal: timer.signal }),
+    ]);
+  } finally {
+    timer.abort();
+  }
 }
 
 test("replay policy is derived from the registry: read-only tools replay, writers and unclassified tools never do", () => {
@@ -679,6 +749,34 @@ test("error results and thrown errors lose credential values before they reach t
   });
 });
 
+test("the tool adapter passes the invocation's abort signal to the registry tool, so an abort cancels its requests and stops it", async (t) => {
+  const requests = hangingFetch(t);
+  const { tool, calls } = watchedRegistryTool(ONCALL_TOOL);
+  const commits = [];
+  const api = { callId: "call-oncall", conversationId: "conversation", commit: async () => commits.push("commit") };
+  const controller = new AbortController();
+  const context = withAbortSignal(controller.signal, BACKGROUND_CONTEXT);
+
+  const invocation = toDurableTool(tool).execute(pagerdutyArgs(t), api, context);
+  await waitUntil(() => requests.length > 0, "the assessment's first request");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].signal, context.abortSignal, "the registry tool runs with the invocation's signal");
+
+  const reason = new Error("the harness closed");
+  controller.abort(reason);
+  await assert.rejects(invocation, (error) => error === reason);
+  const native = await settleWithin(calls[0].running, 1000);
+  assert.equal(native.status, "rejected", "the registry tool stopped instead of running on after the invocation ended");
+  assert.equal(native.error, reason);
+  assert.ok(requests.every((request) => request.signal?.aborted), "every request in flight saw the abort");
+  assert.deepEqual(commits, [], "an aborted call records nothing");
+
+  const refused = watchedRegistryTool(ONCALL_TOOL);
+  const cancelled = withAbortSignal(AbortSignal.abort(reason), BACKGROUND_CONTEXT);
+  await assert.rejects(toDurableTool(refused.tool).execute(pagerdutyArgs(t), api, cancelled), (error) => error === reason);
+  assert.equal(refused.calls.length, 0, "a cancelled invocation never starts the tool");
+});
+
 test("the durable extension carries every registry tool and the grclanker prompt with the durable runtime note", () => {
   const prompt = buildDurableSystemPrompt();
   assert.ok(prompt.startsWith(readGrclankerSystemPrompt()));
@@ -1035,6 +1133,29 @@ test("an aborted run keeps its tool round for resume: the read-only tool reruns,
   ]) {
     assert.ok(resumedLines.includes(line), `${line}\n${resumedLines.join("\n")}`);
   }
+});
+
+test("stopping a run aborts the registry tools still waiting on an API, so none keeps running after runDurable returns", async (t) => {
+  const controller = new AbortController();
+  const requests = hangingFetch(t, () => setImmediate(() => controller.abort()));
+  const { tool, calls } = watchedRegistryTool(ONCALL_TOOL);
+  const args = pagerdutyArgs(t);
+  const model = scriptedModel((view) =>
+    view.toolResults.length === 0
+      ? fauxAssistantMessage([fauxToolCall(ONCALL_TOOL, args, { id: "call-oncall" })], { stopReason: "toolUse" })
+      : fauxAssistantMessage([fauxText("done")]),
+  );
+
+  const report = await runDurable(
+    { command: "run", session: resolveDurableSession("stopped", scratchDir(t)), model: MODEL, message: "Check on-call.", requestId: "r" },
+    { loadModels: model.loadModels, tools: () => [toDurableTool(tool)], signal: controller.signal },
+  );
+  assert.equal(report.outcome, "interrupted");
+  assert.equal(calls.length, 1);
+  const native = await settleWithin(calls[0].running, 1000);
+  assert.equal(native.status, "rejected", "the registry tool stopped with the run instead of running on");
+  assert.ok(requests.length > 0, "the tool was waiting on its requests when the run stopped");
+  assert.ok(requests.every((request) => request.signal?.aborted), "every request in flight saw the abort");
 });
 
 test("a tool that throws becomes a redacted error result, recorded as an error in the assessment", async (t) => {

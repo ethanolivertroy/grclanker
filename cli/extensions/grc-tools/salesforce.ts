@@ -20,6 +20,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SALESFORCE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1226,11 +1227,12 @@ export class SalesforceApiClient {
       fetchImpl?: FetchImpl;
       sleep?: (ms: number) => Promise<void>;
       now?: () => Date;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
     this.now = options.now ?? (() => new Date());
     rememberSecrets(config.password, config.securityToken, config.consumerSecret, config.refreshToken, config.accessToken, config.privateKey);
     if (config.authMode === "access-token" && config.accessToken && config.instanceUrl) {
@@ -3486,7 +3488,7 @@ export async function exportSalesforceAuditBundle(
   client: ReadClient,
   config: SalesforceResolvedConfig,
   outputRoot: string,
-  options: SalesforceAssessmentOptions = {},
+  options: SalesforceAssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<SalesforceAuditBundleResult> {
   const access = await checkSalesforceAccess(client);
   const platformData = await collectSalesforcePlatformData(client, options);
@@ -3504,11 +3506,15 @@ export async function exportSalesforceAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
   const orgLabel = asString(platformData.organization.data?.Name) ?? asString(platformData.organization.data?.Id) ?? (platformData.instanceUrl ? new URL(platformData.instanceUrl).hostname : "salesforce-org");
 
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(orgLabel)}-audit-bundle`, 50),
     zip: true,
+    signal: options.signal,
     checkName: (name) => {
       resolveSecureOutputPath(outputRoot, name);
       resolveSecureOutputPath(outputRoot, `${name}.zip`);
@@ -3638,8 +3644,8 @@ function toOptions(args: AssessArgs): SalesforceAssessmentOptions {
   };
 }
 
-function createClient(args: AuthArgs): SalesforceApiClient {
-  return new SalesforceApiClient(resolveSalesforceConfiguration(args as JsonRecord));
+function createClient(args: AuthArgs, signal?: AbortSignal): SalesforceApiClient {
+  return new SalesforceApiClient(resolveSalesforceConfiguration(args as JsonRecord), { signal });
 }
 
 const authParams = {
@@ -3674,9 +3680,9 @@ export function registerSalesforceTools(pi: any): void {
       "Validate read-only Salesforce access across OAuth session, Organization, limits, Security Health Check, SecuritySettings metadata, users, profiles, permission sets, login history, setup audit trail, connected apps, and event log files, and report likely missing permissions.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    async execute(_toolCallId: string, args: AuthArgs) {
+    async execute(_toolCallId: string, args: AuthArgs, signal?: AbortSignal) {
       try {
-        const result = await checkSalesforceAccess(createClient(args));
+        const result = await checkSalesforceAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "salesforce_check_access", ...result });
       } catch (error) {
         return errorResult(`Salesforce access check failed: ${errorMessage(error)}`, { tool: "salesforce_check_access" });
@@ -3691,9 +3697,9 @@ export function registerSalesforceTools(pi: any): void {
       "Assess Salesforce Health Check score, session timeout, password policy, trusted IP ranges, My Domain login policy, clickjack protection, and CSRF protection (controls 1, 2, 3, 5, 18, 19, 20) via the Tooling API and Metadata API readMetadata.",
     parameters: Type.Object(assessParams),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessSalesforcePlatformSecurity(createClient(args), toOptions(args));
+        const result = await assessSalesforcePlatformSecurity(createClient(args, signal), toOptions(args));
         return textResult(formatAssessmentText(result), { tool: "salesforce_assess_platform_security", ...result });
       } catch (error) {
         return errorResult(`Salesforce platform security assessment failed: ${errorMessage(error)}`, { tool: "salesforce_assess_platform_security" });
@@ -3712,9 +3718,9 @@ export function registerSalesforceTools(pi: any): void {
       stale_login_days: Type.Optional(Type.Number({ description: "Days without login after which an administrator is stale. Defaults to 90.", default: 90 })),
     }),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessSalesforceIdentityAccess(createClient(args), toOptions(args));
+        const result = await assessSalesforceIdentityAccess(createClient(args, signal), toOptions(args));
         return textResult(formatAssessmentText(result), { tool: "salesforce_assess_identity_access", ...result });
       } catch (error) {
         return errorResult(`Salesforce identity and access assessment failed: ${errorMessage(error)}`, { tool: "salesforce_assess_identity_access" });
@@ -3732,9 +3738,9 @@ export function registerSalesforceTools(pi: any): void {
       certificate_expiry_warning_days: Type.Optional(Type.Number({ description: "Warn when a certificate expires within this many days. Defaults to 30.", default: 30 })),
     }),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessSalesforceDataProtection(createClient(args), toOptions(args));
+        const result = await assessSalesforceDataProtection(createClient(args, signal), toOptions(args));
         return textResult(formatAssessmentText(result), { tool: "salesforce_assess_data_protection", ...result });
       } catch (error) {
         return errorResult(`Salesforce data protection assessment failed: ${errorMessage(error)}`, { tool: "salesforce_assess_data_protection" });
@@ -3753,9 +3759,9 @@ export function registerSalesforceTools(pi: any): void {
       audit_trail_days: Type.Optional(Type.Number({ description: "Setup audit trail lookback window in days (max 180). Defaults to 90.", default: 90 })),
     }),
     prepareArguments: normalizeAssessArgs,
-    async execute(_toolCallId: string, args: AssessArgs) {
+    async execute(_toolCallId: string, args: AssessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessSalesforceMonitoringIntegrations(createClient(args), toOptions(args));
+        const result = await assessSalesforceMonitoringIntegrations(createClient(args, signal), toOptions(args));
         return textResult(formatAssessmentText(result), { tool: "salesforce_assess_monitoring_integrations", ...result });
       } catch (error) {
         return errorResult(`Salesforce monitoring and integrations assessment failed: ${errorMessage(error)}`, { tool: "salesforce_assess_monitoring_integrations" });
@@ -3778,11 +3784,14 @@ export function registerSalesforceTools(pi: any): void {
       stale_login_days: Type.Optional(Type.Number({ description: "Days without login after which an administrator is stale. Defaults to 90.", default: 90 })),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: ExportArgs) {
+    async execute(_toolCallId: string, args: ExportArgs, signal?: AbortSignal) {
       try {
         const config = resolveSalesforceConfiguration(args as JsonRecord);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportSalesforceAuditBundle(new SalesforceApiClient(config), config, outputRoot, toOptions(args));
+        const result = await exportSalesforceAuditBundle(new SalesforceApiClient(config, { signal }), config, outputRoot, {
+          ...toOptions(args),
+          signal,
+        });
         return textResult(
           [
             "Salesforce audit bundle exported.",

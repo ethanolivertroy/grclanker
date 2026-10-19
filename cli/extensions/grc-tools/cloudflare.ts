@@ -19,6 +19,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -1271,10 +1272,11 @@ export class CloudflareApiClient implements CloudflareReader {
     options: {
       fetchImpl?: FetchImpl;
       now?: () => Date;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
     registerConfiguredSecrets(config.apiToken, config.apiKey);
   }
@@ -3453,7 +3455,7 @@ export async function exportCloudflareAuditBundle(
   > & Partial<CloudflareReader>,
   config: CloudflareResolvedConfig,
   outputRoot: string,
-  options: AssessmentOptions = {},
+  options: AssessmentOptions & { signal?: AbortSignal } = {},
 ): Promise<CloudflareAuditBundleResult> {
   const generatedAt = new Date().toISOString();
   const access = await checkCloudflareAccess(client);
@@ -3468,11 +3470,15 @@ export async function exportCloudflareAuditBundle(
     attemptList(() => client.listZones(options.zoneLimit)),
   ]);
 
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(config.accountId ?? "cloudflare-account")}-audit-bundle`, 50),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     const outputDirName = basename(staged.target.outputDir);
@@ -3579,8 +3585,8 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   };
 }
 
-function createClient(args: CheckAccessArgs): CloudflareApiClient {
-  return new CloudflareApiClient(resolveCloudflareConfiguration(args));
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): CloudflareApiClient {
+  return new CloudflareApiClient(resolveCloudflareConfiguration(args), { signal });
 }
 
 const authParams = {
@@ -3601,9 +3607,9 @@ export function registerCloudflareTools(pi: any): void {
       "Validate read-only Cloudflare access across token verification, accounts, zones, zone settings, DNSSEC, rulesets, members, Zero Trust apps, and audit logs.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkCloudflareAccess(createClient(args));
+        const result = await checkCloudflareAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "cloudflare_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -3627,9 +3633,9 @@ export function registerCloudflareTools(pi: any): void {
       zone_limit: Type.Optional(Type.Number({ description: "Maximum zones to sample. Defaults to 20.", default: 20 })),
     }),
     prepareArguments: normalizeIdentityArgs,
-    async execute(_toolCallId: string, args: IdentityArgs) {
+    async execute(_toolCallId: string, args: IdentityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessCloudflareIdentity(createClient(args), {
+        const result = await assessCloudflareIdentity(createClient(args, signal), {
           maxSuperAdmins: args.max_super_admins,
           memberLimit: args.member_limit,
           tokenLimit: args.token_limit,
@@ -3655,9 +3661,9 @@ export function registerCloudflareTools(pi: any): void {
       zone_limit: Type.Optional(Type.Number({ description: "Maximum zones to sample. Defaults to 20.", default: 20 })),
     }),
     prepareArguments: normalizeZoneSecurityArgs,
-    async execute(_toolCallId: string, args: ZoneSecurityArgs) {
+    async execute(_toolCallId: string, args: ZoneSecurityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessCloudflareZoneSecurity(createClient(args), {
+        const result = await assessCloudflareZoneSecurity(createClient(args, signal), {
           zoneLimit: args.zone_limit,
         });
         return textResult(formatAssessmentText(result), { tool: "cloudflare_assess_zone_security", ...result });
@@ -3681,9 +3687,9 @@ export function registerCloudflareTools(pi: any): void {
       audit_limit: Type.Optional(Type.Number({ description: "Maximum audit log entries to inspect. Defaults to 200.", default: 200 })),
     }),
     prepareArguments: normalizeTrafficArgs,
-    async execute(_toolCallId: string, args: TrafficArgs) {
+    async execute(_toolCallId: string, args: TrafficArgs, signal?: AbortSignal) {
       try {
-        const result = await assessCloudflareTrafficControls(createClient(args), {
+        const result = await assessCloudflareTrafficControls(createClient(args, signal), {
           zoneLimit: args.zone_limit,
           auditLimit: args.audit_limit,
         });
@@ -3712,16 +3718,17 @@ export function registerCloudflareTools(pi: any): void {
       audit_limit: Type.Optional(Type.Number({ description: "Maximum audit log entries to inspect. Defaults to 200.", default: 200 })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveCloudflareConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportCloudflareAuditBundle(new CloudflareApiClient(config), config, outputRoot, {
+        const result = await exportCloudflareAuditBundle(new CloudflareApiClient(config, { signal }), config, outputRoot, {
           maxSuperAdmins: args.max_super_admins,
           memberLimit: args.member_limit,
           tokenLimit: args.token_limit,
           zoneLimit: args.zone_limit,
           auditLimit: args.audit_limit,
+          signal,
         });
         return textResult(
           [

@@ -19,6 +19,7 @@ import { STATUS_CODES } from "node:http";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { NextLinkError, parseNextLinkHeader, resolveSameOriginUrl, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1399,10 +1400,6 @@ async function collectDataset<T>(
   }
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 export class GitHubHttpError extends Error {
   status: number;
   method: string;
@@ -1611,10 +1608,14 @@ type ResponseEnvelope<T> = {
 export class GitHubAuditorClient {
   private readonly config: GitHubResolvedConfig;
   private readonly fetchImpl: FetchImpl;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly signal: AbortSignal | undefined;
 
-  constructor(config: GitHubResolvedConfig, fetchImpl: FetchImpl = fetch) {
+  constructor(config: GitHubResolvedConfig, fetchImpl: FetchImpl = fetch, options: { signal?: AbortSignal } = {}) {
     this.config = config;
-    this.fetchImpl = fetchImpl;
+    this.fetchImpl = abortableFetch(fetchImpl, options.signal);
+    this.sleep = abortableSleep(options.signal);
+    this.signal = options.signal;
   }
 
   private async getInstallationToken(forceRefresh: boolean = false): Promise<string> {
@@ -1629,10 +1630,15 @@ export class GitHubAuditorClient {
       return existing.token;
     }
     if (!forceRefresh && existing.pending) {
-      return existing.pending;
+      try {
+        return await unlessAborted(existing.pending, this.signal);
+      } catch (error) {
+        // The shared request belongs to the client that started it; when that client's call was aborted, request a token here instead.
+        if (!(error instanceof ToolCallAbortedError) || this.signal?.aborted) throw error;
+      }
     }
 
-    const pending = (async () => {
+    const pending = unlessAborted((async () => {
       const jwt = buildGitHubAppJwt(this.config);
       const response = await this.fetchImpl(
         `${this.config.apiBaseUrl}/app/installations/${this.config.installationId}/access_tokens`,
@@ -1663,7 +1669,7 @@ export class GitHubAuditorClient {
       const expiresAt = Date.parse(asString(asRecord(payload).expires_at) ?? "") || (Date.now() + (60 * 60 * 1000));
       installationTokenCache.set(cacheKey, { token, expiresAt });
       return token;
-    })();
+    })(), this.signal);
 
     installationTokenCache.set(cacheKey, { ...existing, pending });
     try {
@@ -1721,7 +1727,7 @@ export class GitHubAuditorClient {
       waitMs = 250 * (attempt + 1);
     }
 
-    await delay(waitMs);
+    await this.sleep(waitMs);
     return true;
   }
 
@@ -5277,6 +5283,7 @@ export async function exportGitHubAuditBundle(
   >,
   config: GitHubResolvedConfig,
   outputRoot: string,
+  options: { signal?: AbortSignal } = {},
 ): Promise<GitHubAuditBundleResult> {
   const orgAccess = await collectGitHubOrgAccessData(client, config);
   const repoProtection = await collectGitHubRepoProtectionData(client);
@@ -5306,11 +5313,15 @@ export async function exportGitHubAuditBundle(
   ];
   const allFindings = assessments.flatMap((assessment) => assessment.findings);
 
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(safeDirName(`${config.organization}-audit-bundle`), 6),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await buildBundleQuickReference(staged.dir);
@@ -5436,10 +5447,10 @@ export function registerGitHubTools(pi: any): void {
       "Validate GitHub org-read access for a PAT or GitHub App and show which security-relevant org surfaces are readable.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGitHubConfiguration(args);
-        const client = new GitHubAuditorClient(config);
+        const client = new GitHubAuditorClient(config, fetch, { signal });
         const result = await runGitHubAccessCheck(client, config);
         return renderAccessCheck(result);
       } catch (error) {
@@ -5458,10 +5469,10 @@ export function registerGitHubTools(pi: any): void {
       "Review org-level identity and access posture: 2FA enforcement and members without 2FA, SAML SSO and enterprise identity (EMU), IP allow list, base permissions, repository creation and fork policy, outside collaborators, org roles, and audit-log visibility.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGitHubConfiguration(args);
-        const client = new GitHubAuditorClient(config);
+        const client = new GitHubAuditorClient(config, fetch, { signal });
         const data = await collectGitHubOrgAccessData(client, config);
         return renderAssessmentToolResult(assessGitHubOrgAccess(data, config));
       } catch (error) {
@@ -5480,10 +5491,10 @@ export function registerGitHubTools(pi: any): void {
       "Review GitHub repository rulesets, default-branch protection, signed-commit posture, and bypass restrictions.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGitHubConfiguration(args);
-        const client = new GitHubAuditorClient(config);
+        const client = new GitHubAuditorClient(config, fetch, { signal });
         const data = await collectGitHubRepoProtectionData(client);
         return renderAssessmentToolResult(assessGitHubRepoProtection(data, config));
       } catch (error) {
@@ -5502,10 +5513,10 @@ export function registerGitHubTools(pi: any): void {
       "Review org-level Actions permissions, workflow-token defaults, self-approval posture, and self-hosted runner exposure.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGitHubConfiguration(args);
-        const client = new GitHubAuditorClient(config);
+        const client = new GitHubAuditorClient(config, fetch, { signal });
         const data = await collectGitHubActionsData(client);
         return renderAssessmentToolResult(assessGitHubActionsSecurity(data, config));
       } catch (error) {
@@ -5524,10 +5535,10 @@ export function registerGitHubTools(pi: any): void {
       "Review GitHub code-security configurations, secret scanning, push protection, Dependabot defaults, and code-scanning posture.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGitHubConfiguration(args);
-        const client = new GitHubAuditorClient(config);
+        const client = new GitHubAuditorClient(config, fetch, { signal });
         const data = await collectGitHubCodeSecurityData(client);
         return renderAssessmentToolResult(assessGitHubCodeSecurity(data, config));
       } catch (error) {
@@ -5546,10 +5557,10 @@ export function registerGitHubTools(pi: any): void {
       "Review organization and repository webhook security (HTTPS, TLS verification, secrets), deploy key hygiene, GitHub App installation permissions, and OAuth application access evidence.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAssessmentArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs) {
+    async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGitHubConfiguration(args);
-        const client = new GitHubAuditorClient(config);
+        const client = new GitHubAuditorClient(config, fetch, { signal });
         const data = await collectGitHubIntegrationsData(client);
         return renderAssessmentToolResult(assessGitHubIntegrations(data, config));
       } catch (error) {
@@ -5575,14 +5586,15 @@ export function registerGitHubTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeExportArgs,
-    async execute(_toolCallId: string, args: RawConfigArgs & { output_dir?: string }) {
+    async execute(_toolCallId: string, args: RawConfigArgs & { output_dir?: string }, signal?: AbortSignal) {
       try {
         const config = await resolveGitHubConfiguration(args);
-        const client = new GitHubAuditorClient(config);
+        const client = new GitHubAuditorClient(config, fetch, { signal });
         const result = await exportGitHubAuditBundle(
           client,
           config,
           args.output_dir?.trim() || DEFAULT_OUTPUT_DIR,
+          { signal },
         );
         return textResult(buildExportText(config, result), {
           organization: config.organization,

@@ -19,6 +19,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, resolveWithCommands, type CommandLookup } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -1723,6 +1724,22 @@ export function resolveAzureConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   commandRunner: AzureCommandRunner = defaultCommandRunner,
 ): AzureResolvedConfig {
+  const steps = azureConfigurationSteps(input, env);
+  let step = steps.next();
+  while (!step.done) step = steps.next(commandRunner(step.value.command, step.value.args));
+  return step.value;
+}
+
+/** resolveAzureConfiguration for a tool call: aborting `signal` kills the az command in flight. */
+function resolveAzureConfigurationForCall(input: Record<string, unknown>, signal: AbortSignal | undefined): Promise<AzureResolvedConfig> {
+  return resolveWithCommands(azureConfigurationSteps(input, process.env), DEFAULT_COMMAND_TIMEOUT_MS, signal);
+}
+
+/** Yields each az command the configuration needs and resumes with its output, undefined when it fails or prints nothing. */
+function* azureConfigurationSteps(
+  input: Record<string, unknown>,
+  env: NodeJS.ProcessEnv,
+): Generator<CommandLookup, AzureResolvedConfig, string | undefined> {
   env = readResolverEnvironment(AZURE_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const cloud = resolveAzureCloud(asString(input.authority_host) ?? asString(env.AZURE_AUTHORITY_HOST), {
@@ -1737,25 +1754,28 @@ export function resolveAzureConfiguration(
     throw new Error("AZURE_CLIENT_CERTIFICATE_PATH is documented but certificate credentials are not implemented in this slice; use AZURE_CLIENT_SECRET or pass tokens.");
   }
   const clientCredentials = clientId && clientSecret ? { clientId, clientSecret } : undefined;
-  const useCli = (command: string, args: string[]): string | undefined => (clientCredentials ? undefined : commandRunner(command, args));
+  function* useCli(command: string, args: string[]): Generator<CommandLookup, string | undefined, string | undefined> {
+    if (clientCredentials) return undefined;
+    return yield { command, args };
+  }
 
   const tenantId = asString(input.tenant_id)
     ?? asString(env.AZURE_TENANT_ID)
-    ?? useCli("az", ["account", "show", "--query", "tenantId", "-o", "tsv"]);
+    ?? (yield* useCli("az", ["account", "show", "--query", "tenantId", "-o", "tsv"]));
   if (asString(input.tenant_id)) sourceChain.push("arguments-tenant");
   else if (asString(env.AZURE_TENANT_ID)) sourceChain.push("environment-tenant");
   else if (tenantId) sourceChain.push("azure-cli-tenant");
 
   const subscriptionId = asString(input.subscription_id)
     ?? asString(env.AZURE_SUBSCRIPTION_ID)
-    ?? useCli("az", ["account", "show", "--query", "id", "-o", "tsv"]);
+    ?? (yield* useCli("az", ["account", "show", "--query", "id", "-o", "tsv"]));
   if (asString(input.subscription_id)) sourceChain.push("arguments-subscription");
   else if (asString(env.AZURE_SUBSCRIPTION_ID)) sourceChain.push("environment-subscription");
   else if (subscriptionId) sourceChain.push("azure-cli-subscription");
 
   const graphToken = asString(input.graph_token)
     ?? asString(env.AZURE_GRAPH_TOKEN)
-    ?? useCli("az", [
+    ?? (yield* useCli("az", [
       "account",
       "get-access-token",
       "--resource",
@@ -1765,7 +1785,7 @@ export function resolveAzureConfiguration(
       "-o",
       "tsv",
       ...(tenantId ? ["--tenant", tenantId] : []),
-    ]);
+    ]));
   if (asString(input.graph_token)) sourceChain.push("arguments-graph-token");
   else if (asString(env.AZURE_GRAPH_TOKEN)) sourceChain.push("environment-graph-token");
   else if (graphToken) sourceChain.push("azure-cli-graph-token");
@@ -1773,7 +1793,7 @@ export function resolveAzureConfiguration(
   const managementToken = asString(input.management_token)
     ?? asString(env.AZURE_MANAGEMENT_TOKEN)
     ?? asString(env.AZURE_ACCESS_TOKEN)
-    ?? useCli("az", [
+    ?? (yield* useCli("az", [
       "account",
       "get-access-token",
       "--resource",
@@ -1784,7 +1804,7 @@ export function resolveAzureConfiguration(
       "tsv",
       ...(tenantId ? ["--tenant", tenantId] : []),
       ...(subscriptionId ? ["--subscription", subscriptionId] : []),
-    ]);
+    ]));
   if (asString(input.management_token)) sourceChain.push("arguments-management-token");
   else if (asString(env.AZURE_MANAGEMENT_TOKEN) || asString(env.AZURE_ACCESS_TOKEN)) {
     sourceChain.push("environment-management-token");
@@ -1987,9 +2007,9 @@ export class AzureAuditorClient {
 
   constructor(
     private readonly config: AzureResolvedConfig,
-    options: { fetchImpl?: FetchImpl; now?: () => Date } = {},
+    options: { fetchImpl?: FetchImpl; now?: () => Date; signal?: AbortSignal } = {},
   ) {
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
     this.cloud = config.cloud ?? AZURE_CLOUDS["login.microsoftonline.com"];
     registerConfiguredSecrets(config.graphToken, config.managementToken, config.clientCredentials?.clientSecret);
@@ -3629,7 +3649,7 @@ export async function exportAzureAuditBundle(
   client: AzureAuditorClient,
   config: AzureResolvedConfig,
   outputRoot: string,
-  options: ExportAuditBundleArgs = {},
+  options: ExportAuditBundleArgs & { signal?: AbortSignal } = {},
 ): Promise<AzureAuditBundleResult> {
   const access = await checkAzureAccess(client);
   const identity = await assessAzureIdentity(client);
@@ -3642,11 +3662,15 @@ export async function exportAzureAuditBundle(
   const { findings, errors } = mergeAssessments("Azure audit bundle", assessments);
   const generatedAt = new Date().toISOString();
   const targetName = safeDirName(`${config.tenantId}-${config.subscriptionId}-audit`);
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(targetName, 50),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await writeSecureTextFile(staged.dir, "README.md", buildBundleReadme());
@@ -3738,8 +3762,8 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   };
 }
 
-function createClient(args: CheckAccessArgs): AzureAuditorClient {
-  return new AzureAuditorClient(resolveAzureConfiguration(args));
+async function createClient(args: CheckAccessArgs, signal?: AbortSignal): Promise<AzureAuditorClient> {
+  return new AzureAuditorClient(await resolveAzureConfigurationForCall(args, signal), { signal });
 }
 
 const authParams = {
@@ -3764,9 +3788,9 @@ export function registerAzureTools(pi: any): void {
       "Validate read-only Azure audit access across Entra ID, Microsoft Graph security surfaces, and subscription-level ARM posture endpoints.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkAzureAccess(createClient(args));
+        const result = await checkAzureAccess(await createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "azure_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -3784,9 +3808,9 @@ export function registerAzureTools(pi: any): void {
       "Assess Entra ID posture: Conditional Access MFA and legacy auth, MFA registration, privileged roles and PIM, guest access, sign-in and user risk policies, risky users, app registration credentials, and tenant-wide consent grants.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAzureIdentity(createClient(args));
+        const result = await assessAzureIdentity(await createClient(args, signal));
         return textResult(formatAssessmentText(result), { tool: "azure_assess_identity", ...result });
       } catch (error) {
         return errorResult(
@@ -3804,9 +3828,9 @@ export function registerAzureTools(pi: any): void {
       "Assess Secure Score, directory audit and sign-in visibility, Defender for Cloud plan coverage, subscription diagnostic settings, and Log Analytics retention depth.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAzureMonitoring(createClient(args));
+        const result = await assessAzureMonitoring(await createClient(args, signal));
         return textResult(formatAssessmentText(result), { tool: "azure_assess_monitoring", ...result });
       } catch (error) {
         return errorResult(
@@ -3824,9 +3848,9 @@ export function registerAzureTools(pi: any): void {
       "Assess Azure subscription guardrails: Owner and Contributor sprawl at subscription scope, Defender for Cloud security contacts, Network Watcher presence, and service principals holding Owner or Contributor.",
     parameters: Type.Object({ ...authParams, max_assignments: maxAssignmentsParam }),
     prepareArguments: normalizeSubscriptionArgs,
-    async execute(_toolCallId: string, args: SubscriptionArgs) {
+    async execute(_toolCallId: string, args: SubscriptionArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAzureSubscriptionGuardrails(createClient(args), { maxAssignments: args.max_assignments });
+        const result = await assessAzureSubscriptionGuardrails(await createClient(args, signal), { maxAssignments: args.max_assignments });
         return textResult(formatAssessmentText(result), { tool: "azure_assess_subscription_guardrails", ...result });
       } catch (error) {
         return errorResult(
@@ -3844,9 +3868,9 @@ export function registerAzureTools(pi: any): void {
       "Assess Intune device compliance, DLP policy evidence, sensitivity labels (Graph beta), Key Vault soft delete, purge protection, RBAC and network ACLs, storage HTTPS-only, public blob access and TLS, inbox forwarding rules, and SharePoint external sharing.",
     parameters: Type.Object({ ...authParams, max_mailboxes: maxMailboxesParam }),
     prepareArguments: normalizeDataProtectionArgs,
-    async execute(_toolCallId: string, args: DataProtectionArgs) {
+    async execute(_toolCallId: string, args: DataProtectionArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAzureDataProtection(createClient(args), { maxMailboxes: args.max_mailboxes });
+        const result = await assessAzureDataProtection(await createClient(args, signal), { maxMailboxes: args.max_mailboxes });
         return textResult(formatAssessmentText(result), { tool: "azure_assess_data_protection", ...result });
       } catch (error) {
         return errorResult(
@@ -3864,9 +3888,9 @@ export function registerAzureTools(pi: any): void {
       "Assess NSG inbound rules exposing admin ports to any source, NSG flow log coverage per Network Watcher, Azure Policy assignment enforcement, and Azure Policy compliance state.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await assessAzureNetworkAndPolicy(createClient(args));
+        const result = await assessAzureNetworkAndPolicy(await createClient(args, signal));
         return textResult(formatAssessmentText(result), { tool: "azure_assess_network_and_policy", ...result });
       } catch (error) {
         return errorResult(
@@ -3889,11 +3913,11 @@ export function registerAzureTools(pi: any): void {
       max_mailboxes: maxMailboxesParam,
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
-        const config = resolveAzureConfiguration(args);
+        const config = await resolveAzureConfigurationForCall(args, signal);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportAzureAuditBundle(new AzureAuditorClient(config), config, outputRoot, args);
+        const result = await exportAzureAuditBundle(new AzureAuditorClient(config, { signal }), config, outputRoot, { ...args, signal });
         return textResult(
           [
             "Azure audit bundle exported.",

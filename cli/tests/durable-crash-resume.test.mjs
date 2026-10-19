@@ -7,8 +7,8 @@ import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-// The real `grclanker durable` command, crashed with SIGKILL partway through a parallel tool round and
-// resumed in a new process. The preload swaps in Pi's faux provider and a mocked PagerDuty API.
+// The real `grclanker durable` command, crashed with SIGKILL or stopped with Ctrl-C partway through a parallel
+// tool round and resumed in a new process. The preload swaps in Pi's faux provider and a mocked PagerDuty API.
 const cliRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = join(cliRoot, "dist", "index.js");
 const preload = pathToFileURL(join(cliRoot, "tests", "helpers", "durable-e2e-preload.mjs")).href;
@@ -35,6 +35,8 @@ const EXPORT_ONLY_PATHS = [
   "/change_events",
 ];
 const TIMEOUT_MS = 60_000;
+// A run stopped with Ctrl-C exits well within this; a tool left running would hold the process open indefinitely.
+const STOP_MS = 10_000;
 
 function scratchHome(t) {
   const home = mkdtempSync(join(tmpdir(), "grclanker-durable-e2e-"));
@@ -72,11 +74,11 @@ function startDurable(t, home, args, extraEnv = {}) {
   return { child, output, closed };
 }
 
-async function runDurable(t, home, args) {
-  const run = startDurable(t, home, args);
+/** Wait for a started run to exit; one still running after `ms` fails the test. */
+async function exited(run, description, ms = TIMEOUT_MS) {
   const timer = new AbortController();
-  const timeout = sleep(TIMEOUT_MS, undefined, { signal: timer.signal }).then(() => {
-    throw new Error(`grclanker durable ${args.join(" ")} did not exit within ${TIMEOUT_MS} ms:\n${run.output.stderr}`);
+  const timeout = sleep(ms, undefined, { signal: timer.signal }).then(() => {
+    throw new Error(`${description} did not exit within ${ms} ms:\n${run.output.stderr}`);
   });
   timeout.catch(() => undefined);
   try {
@@ -85,6 +87,10 @@ async function runDurable(t, home, args) {
   } finally {
     timer.abort();
   }
+}
+
+async function runDurable(t, home, args) {
+  return await exited(startDurable(t, home, args), `grclanker durable ${args.join(" ")}`);
 }
 
 async function waitFor(predicate, description) {
@@ -220,6 +226,39 @@ test("a crashed durable run resumes with the same request id: finished tools kep
   assert.deepEqual(again.tools, report.tools);
   assert.deepEqual(eventsOf(home, replayed.pid, "model"), []);
   assert.deepEqual(eventsOf(home, replayed.pid, "request"), []);
+});
+
+test("Ctrl-C stops a durable run mid-round: the requests in flight are aborted, the process exits on its own, and resume finishes the round", async (t) => {
+  const home = scratchHome(t);
+  const session = "stopped-run";
+  const run = startDurable(t, home, runArgs(session, "assessment-run-3"), {
+    GRCLANKER_TEST_DURABLE_HANG: HANGING_PATHS.join(","),
+  });
+  const hanging = () => eventsOf(home, run.child.pid, "request").filter((event) => HANGING_PATHS.includes(event.path));
+  const requested = (path) => hanging().filter((event) => event.path === path).length;
+  // Both slow tools read /schedules, and the on-call assessment reads /oncalls alongside it.
+  await waitFor(
+    () => run.output.stderr.includes(`<- ${FAST_READ_TOOL} ok`) && requested("/schedules") >= 2 && requested("/oncalls") >= 1,
+    `the first tool to finish while the other two wait on the API:\n${run.output.stderr}`,
+  );
+
+  run.child.kill("SIGINT");
+  const stopped = await exited(run, "the stopped run", STOP_MS);
+  assert.equal(stopped.signal, null, "the process exited by itself");
+  assert.equal(stopped.code, 130, stopped.stderr);
+  assert.equal(stopped.stdout, "");
+  assert.ok(stopped.stderr.includes("Stopping. Press Ctrl-C again to exit at once."), stopped.stderr);
+  assert.ok(
+    stopped.stderr.includes(`Stopped. The session keeps its unfinished work: grclanker durable resume --session ${session}`),
+    stopped.stderr,
+  );
+  const aborted = eventsOf(home, stopped.pid, "request-aborted").map((event) => event.path).sort();
+  assert.deepEqual(aborted, hanging().map((event) => event.path).sort(), "every request in flight was aborted");
+  assert.ok(!existsSync(join(home, "bundles")), "the stopped export wrote nothing");
+
+  const resumed = await runDurable(t, home, ["resume", "--session", session, "--model", MODEL]);
+  assert.equal(resumed.code, 0, resumed.stderr);
+  assertResumedOnce(home, resumed.pid);
 });
 
 test("grclanker durable resume finishes a crashed run and prints the answer and the interrupted writers", async (t) => {

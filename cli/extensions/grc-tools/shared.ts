@@ -1,5 +1,6 @@
 /** Shared utilities for GRC extension tools */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { abortableFetch, abortableSleep, ToolCallAbortedError } from "./abort.js";
 
 interface CacheEntry<T> {
   data: T;
@@ -38,13 +39,15 @@ export function runWithoutPersistentCaches<T>(fn: () => Promise<T>): Promise<T> 
 export async function cachedFetch<T>(
   url: string,
   ttlMs: number = 60 * 60 * 1000, // 1 hour default
+  signal?: AbortSignal,
 ): Promise<T> {
+  if (signal?.aborted) throw new ToolCallAbortedError(signal);
   const entry = cache.get(url) as CacheEntry<T> | undefined;
   if (entry && Date.now() < entry.expires) {
     return entry.data;
   }
 
-  const res = await fetch(url);
+  const res = await abortableFetch(fetch, signal)(url);
   if (!res.ok) {
     throw new Error(`Fetch failed: ${url} (${res.status} ${res.statusText})`);
   }
@@ -68,18 +71,19 @@ export function clearGrcSharedCachesForTests(): void {
 export async function throttledFetch<T>(
   url: string,
   minDelayMs: number = 100,
+  signal?: AbortSignal,
 ): Promise<T> {
   const base = new URL(url).origin;
   const last = lastRequestTime.get(base) ?? 0;
   const elapsed = Date.now() - last;
 
   if (elapsed < minDelayMs) {
-    await new Promise((r) => setTimeout(r, minDelayMs - elapsed));
+    await abortableSleep(signal)(minDelayMs - elapsed);
   }
 
   lastRequestTime.set(base, Date.now());
 
-  const res = await fetch(url);
+  const res = await abortableFetch(fetch, signal)(url);
   if (!res.ok) {
     throw new Error(`Fetch failed: ${url} (${res.status} ${res.statusText})`);
   }

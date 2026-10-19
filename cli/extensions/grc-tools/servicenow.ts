@@ -21,6 +21,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { YAMLError, parse as parseYaml } from "yaml";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SERVICENOW_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1207,11 +1208,12 @@ export class ServicenowApiClient implements ServicenowReadClient {
       fetchImpl?: FetchImpl;
       sleep?: (ms: number) => Promise<void>;
       now?: () => Date;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleepImpl = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleepImpl = abortableSleep(options.signal, options.sleep);
     this.now = options.now ?? (() => new Date());
     if (config.accessToken) {
       this.accessToken = config.accessToken;
@@ -4074,7 +4076,7 @@ export async function exportServicenowAuditBundle(
   client: Pick<ServicenowReadClient, "getResolvedConfig" | "getNow" | "queryTable" | "countRecords">,
   config: ServicenowResolvedConfig,
   outputRoot: string,
-  options: ServicenowExportOptions = {},
+  options: ServicenowExportOptions & { signal?: AbortSignal } = {},
 ): Promise<ServicenowAuditBundleResult> {
   const access = await checkServicenowAccess(client);
   const identityData = await collectServicenowIdentityData(client, options);
@@ -4090,11 +4092,15 @@ export async function exportServicenowAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
 
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(config.instanceName)}-audit-bundle`, 9),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     // Every table or aggregate dataset passes through tableCoreData or countCoreData, so a denied, errored,
@@ -4255,8 +4261,8 @@ function hardeningOptions(args: HardeningArgs): ServicenowHardeningOptions {
   };
 }
 
-function createClient(args: AuthArgs): ServicenowApiClient {
-  return new ServicenowApiClient(resolveServicenowConfiguration(args as JsonRecord));
+function createClient(args: AuthArgs, signal?: AbortSignal): ServicenowApiClient {
+  return new ServicenowApiClient(resolveServicenowConfiguration(args as JsonRecord), { signal });
 }
 
 const authParams = {
@@ -4297,11 +4303,11 @@ const hardeningParams = {
 function runTool<TArgs extends AuthArgs>(
   toolName: string,
   failurePrefix: string,
-  handler: (args: TArgs) => Promise<{ text: string; details: JsonRecord }>,
+  handler: (args: TArgs, signal?: AbortSignal) => Promise<{ text: string; details: JsonRecord }>,
 ) {
-  return async (_toolCallId: string, args: TArgs) => {
+  return async (_toolCallId: string, args: TArgs, signal?: AbortSignal) => {
     try {
-      const result = await handler(args);
+      const result = await handler(args, signal);
       return textResult(result.text, { tool: toolName, ...result.details });
     } catch (error) {
       return errorResult(`${failurePrefix}: ${errorMessage(error)}`, { tool: toolName });
@@ -4318,8 +4324,8 @@ export function registerServicenowTools(pi: any): void {
       "Validate read-only ServiceNow Table API and Aggregate API access across the users, roles, ACL, property, SSO, audit, update set, session, OAuth, dictionary, encryption, MID Server, and plugin tables, reporting forbidden and ACL-filtered tables.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeAuthArgs,
-    execute: runTool<AuthArgs>("servicenow_check_access", "ServiceNow access check failed", async (args) => {
-      const result = await checkServicenowAccess(createClient(args));
+    execute: runTool<AuthArgs>("servicenow_check_access", "ServiceNow access check failed", async (args, signal) => {
+      const result = await checkServicenowAccess(createClient(args, signal));
       return { text: formatAccessCheckText(result), details: { ...result } };
     }),
   });
@@ -4331,8 +4337,8 @@ export function registerServicenowTools(pi: any): void {
       "Assess ServiceNow role hierarchy (control 3), user access review (4), password policy (6), MFA enforcement (7), LDAP and SSO integration (8), and integration user permissions (14) with evidence-gated verdicts.",
     parameters: Type.Object(identityParams),
     prepareArguments: normalizeIdentityArgs,
-    execute: runTool<IdentityArgs>("servicenow_assess_identity_access", "ServiceNow identity assessment failed", async (args) => {
-      const result = await assessServicenowIdentityAccess(createClient(args), identityOptions(args));
+    execute: runTool<IdentityArgs>("servicenow_assess_identity_access", "ServiceNow identity assessment failed", async (args, signal) => {
+      const result = await assessServicenowIdentityAccess(createClient(args, signal), identityOptions(args));
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4344,8 +4350,8 @@ export function registerServicenowTools(pi: any): void {
       "Assess ServiceNow instance security properties (control 1), session timeout (5), script execution restrictions (12), instance hardening (13), debug mode (16), IP access restrictions (17), and email security (18) from sys_properties and related tables.",
     parameters: Type.Object(hardeningParams),
     prepareArguments: normalizeHardeningArgs,
-    execute: runTool<HardeningArgs>("servicenow_assess_platform_hardening", "ServiceNow platform hardening assessment failed", async (args) => {
-      const result = await assessServicenowPlatformHardening(createClient(args), hardeningOptions(args));
+    execute: runTool<HardeningArgs>("servicenow_assess_platform_hardening", "ServiceNow platform hardening assessment failed", async (args, signal) => {
+      const result = await assessServicenowPlatformHardening(createClient(args, signal), hardeningOptions(args));
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4357,8 +4363,8 @@ export function registerServicenowTools(pi: any): void {
       "Assess ServiceNow ACL rule completeness including wildcard, unrestricted, and public page exposure (control 2) and table-level ACL coverage for sensitive tables (11).",
     parameters: Type.Object({ ...authParams, ...recordLimitParam }),
     prepareArguments: normalizeLimitArgs,
-    execute: runTool<LimitArgs>("servicenow_assess_access_control", "ServiceNow access control assessment failed", async (args) => {
-      const result = await assessServicenowAccessControl(createClient(args), { recordLimit: args.record_limit });
+    execute: runTool<LimitArgs>("servicenow_assess_access_control", "ServiceNow access control assessment failed", async (args, signal) => {
+      const result = await assessServicenowAccessControl(createClient(args, signal), { recordLimit: args.record_limit });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4370,8 +4376,8 @@ export function registerServicenowTools(pi: any): void {
       "Assess ServiceNow encryption at rest (control 9), audit logging configuration (10), update set management (15), MID Server security (19), and plugin inventory (20); controls whose evidence is not exposed through the API render as manual with the evidence a human must collect.",
     parameters: Type.Object({ ...authParams, ...recordLimitParam }),
     prepareArguments: normalizeLimitArgs,
-    execute: runTool<LimitArgs>("servicenow_assess_operations_governance", "ServiceNow operations governance assessment failed", async (args) => {
-      const result = await assessServicenowOperationsGovernance(createClient(args), { recordLimit: args.record_limit });
+    execute: runTool<LimitArgs>("servicenow_assess_operations_governance", "ServiceNow operations governance assessment failed", async (args, signal) => {
+      const result = await assessServicenowOperationsGovernance(createClient(args, signal), { recordLimit: args.record_limit });
       return { text: formatAssessmentText(result), details: { ...result } };
     }),
   });
@@ -4387,12 +4393,13 @@ export function registerServicenowTools(pi: any): void {
       output_dir: Type.Optional(Type.String({ description: `Output root. Defaults to ${DEFAULT_OUTPUT_DIR}.` })),
     }),
     prepareArguments: normalizeExportArgs,
-    execute: runTool<ExportArgs>("servicenow_export_audit_bundle", "ServiceNow audit bundle export failed", async (args) => {
+    execute: runTool<ExportArgs>("servicenow_export_audit_bundle", "ServiceNow audit bundle export failed", async (args, signal) => {
       const config = resolveServicenowConfiguration(args as JsonRecord);
       const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-      const result = await exportServicenowAuditBundle(new ServicenowApiClient(config), config, outputRoot, {
+      const result = await exportServicenowAuditBundle(new ServicenowApiClient(config, { signal }), config, outputRoot, {
         ...identityOptions(args),
         ...hardeningOptions(args),
+        signal,
       });
       return {
         text: [

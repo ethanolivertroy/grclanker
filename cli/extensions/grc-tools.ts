@@ -9,6 +9,7 @@ import {
   createReadTool,
   createWriteTool,
   type ExtensionAPI,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { getGrclankerSettingsPath } from "../config/paths.js";
 import {
@@ -20,6 +21,7 @@ import { shutdownComputeSessions } from "../pi/compute-shutdown.js";
 import { executeComputeAwareGrep } from "../pi/search-tools.js";
 import { readGrclankerSettings } from "../pi/settings.js";
 import { initialPromptInputResult } from "../pi/prompt-envelope.js";
+import { runToolCall, type ToolCallState } from "./grc-tools/abort.js";
 import { registerAnsibleTools } from "./grc-tools/ansible.js";
 import { registerAwsTools } from "./grc-tools/aws.js";
 import { registerAzureTools } from "./grc-tools/azure.js";
@@ -110,14 +112,42 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
   registerZscalerTools,
 ];
 
+/**
+ * Domain tools pass their abort signal into their API collection, and a
+ * collector that tolerates per-dataset failures can still finish after an
+ * abort with every dataset failed. So a call aborted before it starts never
+ * runs, and a call whose signal aborts while it runs rejects with the abort
+ * reason instead of returning that result. The exception is a call that
+ * committed its output before it returned: the output exists either way, so
+ * the call reports where it is.
+ */
+function rejectAbortedCalls(tool: ToolDefinition): ToolDefinition {
+  return {
+    ...tool,
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      signal?.throwIfAborted();
+      const call: ToolCallState = { committed: false };
+      let result: Awaited<ReturnType<ToolDefinition["execute"]>>;
+      try {
+        result = await runToolCall(call, () => tool.execute(toolCallId, params, signal, onUpdate, ctx));
+      } catch (error) {
+        signal?.throwIfAborted();
+        throw error;
+      }
+      if (!call.committed) signal?.throwIfAborted();
+      return result;
+    },
+  };
+}
+
 function registerDomainTools(pi: ExtensionAPI): number {
   let count = 0;
   const counting = new Proxy(pi, {
     get(target, property) {
       if (property === "registerTool") {
-        return (tool: Parameters<ExtensionAPI["registerTool"]>[0]) => {
+        return (tool: ToolDefinition) => {
           count += 1;
-          return target.registerTool(tool);
+          return target.registerTool(rejectAbortedCalls(tool));
         };
       }
       const value = Reflect.get(target, property, target) as unknown;

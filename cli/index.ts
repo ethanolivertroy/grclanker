@@ -44,12 +44,6 @@ function printHelp() {
   console.log(CLI_HELP);
 }
 
-/** Resolves once everything already written to stdout and stderr has been handed to the operating system. */
-function flushStandardStreams(): Promise<void> {
-  const flush = (stream: NodeJS.WriteStream) => new Promise<void>((resolve) => stream.write("", () => resolve()));
-  return Promise.all([flush(process.stdout), flush(process.stderr)]).then(() => undefined);
-}
-
 async function main() {
   const args = process.argv.slice(2);
   const command = args[0];
@@ -91,11 +85,8 @@ async function main() {
   if (command === "durable") {
     // Loaded lazily, like Flue, so the interactive CLI never pays for the Pi Durable runtime.
     const { runDurableCommand } = await import("./durable/cli.js");
-    const exitCode = await runDurableCommand(args.slice(1));
-    // Registry tools take no abort signal. One still running when the session closed, left by the terminal app or
-    // an aborted turn, would otherwise keep the process alive, and acting, after the session lock is released.
-    await flushStandardStreams();
-    process.exit(exitCode);
+    process.exitCode = await runDurableCommand(args.slice(1));
+    return;
   }
 
   if (command === "tools") {

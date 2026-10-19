@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { abortableFetch, abortableSleep } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZOOM_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -905,11 +906,12 @@ export class ZoomApiClient {
       sleep?: (ms: number) => Promise<void>;
       /** Epoch milliseconds source for Retry-After dates and token expiry; defaults to Date.now. */
       now?: () => number;
+      signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
     this.now = options.now ?? (() => Date.now());
     if (config.token) {
       this.accessToken = config.token;
@@ -3124,7 +3126,7 @@ export async function exportZoomAuditBundle(
   client: ZoomClientLike,
   config: ZoomResolvedConfig,
   outputRoot: string,
-  options: ZoomExportOptions = {},
+  options: ZoomExportOptions & { signal?: AbortSignal } = {},
 ): Promise<ZoomAuditBundleResult> {
   const snapshot = await collectZoomSnapshot(client, options);
   const access = await checkZoomAccessFromSnapshot(snapshot, config);
@@ -3135,11 +3137,15 @@ export async function exportZoomAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = surfaceErrors(snapshotSurfaces(snapshot));
 
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(config.accountId)}-audit-bundle`, 50),
     zip: true,
+    signal: options.signal,
     checkName: (name) => {
       resolveSecureOutputPath(outputRoot, name);
       resolveSecureOutputPath(outputRoot, `${name}.zip`);
@@ -3332,8 +3338,8 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   };
 }
 
-function createClient(args: CheckAccessArgs): ZoomApiClient {
-  return new ZoomApiClient(resolveZoomConfiguration(args));
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): ZoomApiClient {
+  return new ZoomApiClient(resolveZoomConfiguration(args), { signal });
 }
 
 function toExportOptions(args: ExportAuditBundleArgs): ZoomExportOptions {
@@ -3379,9 +3385,9 @@ export function registerZoomTools(pi: any): void {
       "Validate Zoom read-only access across account settings and lock settings (the default view plus the meeting_authentication, security, and meeting_security option views this tool reads; recording_authentication is not requested because no verdict reads it), users, roles, groups, operation logs, IM groups, managed and trusted domains, and Zoom Phone account settings.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkZoomAccess(createClient(args));
+        const result = await checkZoomAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "zoom_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -3399,9 +3405,9 @@ export function registerZoomTools(pi: any): void {
       "Assess Zoom identity posture: SSO enforcement, blocked personal sign-in methods, admin two-factor authentication, managed domain verification, admin privilege concentration, session inactivity timeout, and the manual vanity URL control.",
     parameters: Type.Object({ ...authParams, ...identityParams }),
     prepareArguments: normalizeIdentityArgs,
-    async execute(_toolCallId: string, args: IdentityArgs) {
+    async execute(_toolCallId: string, args: IdentityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessZoomIdentity(createClient(args), toExportOptions(args));
+        const result = await assessZoomIdentity(createClient(args, signal), toExportOptions(args));
         return textResult(formatAssessmentText(result), { tool: "zoom_assess_identity", ...result });
       } catch (error) {
         return errorResult(
@@ -3419,9 +3425,9 @@ export function registerZoomTools(pi: any): void {
       "Assess Zoom collaboration governance: trusted domains, in-meeting file transfer, cloud recording auto-delete retention, Zoom Phone recording policies, admin operation logs, IM group restrictions, external contact restrictions, and the manual chat encryption control.",
     parameters: Type.Object({ ...authParams, ...collaborationParams }),
     prepareArguments: normalizeCollaborationArgs,
-    async execute(_toolCallId: string, args: CollaborationArgs) {
+    async execute(_toolCallId: string, args: CollaborationArgs, signal?: AbortSignal) {
       try {
-        const result = await assessZoomCollaborationGovernance(createClient(args), toExportOptions(args));
+        const result = await assessZoomCollaborationGovernance(createClient(args, signal), toExportOptions(args));
         return textResult(formatAssessmentText(result), { tool: "zoom_assess_collaboration_governance", ...result });
       } catch (error) {
         return errorResult(
@@ -3442,9 +3448,9 @@ export function registerZoomTools(pi: any): void {
       group_limit: Type.Optional(Type.Number({ description: "Maximum groups to inspect for override drift. Defaults to 50.", default: 50 })),
     }),
     prepareArguments: normalizeMeetingSecurityArgs,
-    async execute(_toolCallId: string, args: MeetingSecurityArgs) {
+    async execute(_toolCallId: string, args: MeetingSecurityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessZoomMeetingSecurity(createClient(args), { groupLimit: args.group_limit });
+        const result = await assessZoomMeetingSecurity(createClient(args, signal), { groupLimit: args.group_limit });
         return textResult(formatAssessmentText(result), { tool: "zoom_assess_meeting_security", ...result });
       } catch (error) {
         return errorResult(
@@ -3467,11 +3473,14 @@ export function registerZoomTools(pi: any): void {
       ...collaborationParams,
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveZoomConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportZoomAuditBundle(new ZoomApiClient(config), config, outputRoot, toExportOptions(args));
+        const result = await exportZoomAuditBundle(new ZoomApiClient(config, { signal }), config, outputRoot, {
+          ...toExportOptions(args),
+          signal,
+        });
         return textResult(
           [
             "Zoom audit bundle exported.",

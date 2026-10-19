@@ -23,6 +23,7 @@ import {
   AWS_FRAMEWORKS,
   AWS_REQUIRED_OUTPUT_MEMBERS,
   AwsApiError,
+  AwsAuditorClient,
   AwsCredentialProviderError,
   assessAwsDataProtection,
   assessAwsIdentity,
@@ -3662,13 +3663,15 @@ const STS_IDENTITY_RESPONSE = Object.freeze({
 });
 
 /**
- * Runs `run` with the real AWS SDK sending every request to a local server that answers with respond(request). The
- * SDK reaches it through AWS_ENDPOINT_URL with static environment credentials and a single attempt per request;
- * `localhost` and its subdomains resolve to the server for the run (S3 Control prefixes the account id to the
- * endpoint host). Every request is logged as { service, action, label, status }.
+ * Runs `run` with the real AWS SDK sending every request to a local server that answers with respond(request), or
+ * never answers when respond returns null. The SDK reaches it through AWS_ENDPOINT_URL with static environment
+ * credentials and a single attempt per request; `localhost` and its subdomains resolve to the server for the run
+ * (S3 Control prefixes the account id to the endpoint host). Every request is logged as
+ * { service, action, label, status }, and `run` also gets the server side of every connection.
  */
 async function withLocalAwsEndpoint(respond, run) {
   const requests = [];
+  const connections = [];
   const server = createServer((req, res) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
@@ -3681,6 +3684,10 @@ async function withLocalAwsEndpoint(respond, run) {
         // A fixture without an answer for this request must fail the test, not leave the SDK waiting on an open socket.
         response = { status: 599, contentType: "text/plain", body: `fixture error for ${described.label}: ${error.message}` };
       }
+      if (response === null) {
+        requests.push({ ...described, status: "unanswered" });
+        return;
+      }
       requests.push({ ...described, status: response.status });
       const headers = { "content-length": String(Buffer.byteLength(response.body)) };
       if (response.contentType !== undefined) headers["content-type"] = response.contentType;
@@ -3688,6 +3695,7 @@ async function withLocalAwsEndpoint(respond, run) {
       res.end(response.body);
     });
   });
+  server.on("connection", (socket) => connections.push(socket));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const env = {
     AWS_ENDPOINT_URL: `http://localhost:${server.address().port}`,
@@ -3716,13 +3724,14 @@ async function withLocalAwsEndpoint(respond, run) {
     return originalLookup.call(dns, hostname, options, callback);
   };
   try {
-    return await run({ requests });
+    return await run({ requests, connections });
   } finally {
     dns.lookup = originalLookup;
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+    server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   }
 }
@@ -3872,6 +3881,29 @@ for (const [shape, response] of Object.entries(SILENT_SUCCESS_SHAPES)) {
     );
   });
 }
+
+test("aborting a read mid-request rejects it at once and closes the SDK's connection to the endpoint", async () => {
+  const waitFor = async (predicate, ms, message) => {
+    const deadline = Date.now() + ms;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, message);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+  await withLocalAwsEndpoint(() => null, async ({ requests, connections }) => {
+    const controller = new AbortController();
+    const client = new AwsAuditorClient(resolveAwsConfiguration({}, process.env), { signal: controller.signal });
+    const read = client.getCallerIdentity();
+    read.catch(() => undefined);
+    await waitFor(() => requests.length > 0, 5000, "the identity request reached the endpoint");
+    const [connection] = connections;
+
+    controller.abort(new Error("operator stopped the call"));
+    await assert.rejects(read, { name: "ToolCallAbortedError" });
+    await waitFor(() => connection.destroyed, 1000, "the SDK kept its connection to the endpoint open after the abort");
+    assert.deepEqual(requests.map((request) => [request.label, request.status]), [["sts:GetCallerIdentity", "unanswered"]]);
+  });
+});
 
 test("silent success: the shape guard also holds behind a patched send, so a route that answers without the command's member is IncompleteResponse rather than an empty inventory", async () => {
   const log = [];

@@ -22,8 +22,10 @@ import {
 } from "node:fs";
 import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { ToolCallAbortedError } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { evaluateBatchRuntimeCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import {
@@ -1552,13 +1554,16 @@ async function surface(
 
 export class OciAuditorClient {
   private readonly now: () => Date;
+  private readonly signal: AbortSignal | undefined;
+  private lastCommand: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly config: OciResolvedConfig,
     private readonly commandRunner: OciCommandRunner = defaultCommandRunner,
-    options: { now?: () => Date } = {},
+    options: { now?: () => Date; signal?: AbortSignal } = {},
   ) {
     this.now = options.now ?? (() => new Date());
+    this.signal = options.signal;
   }
 
   getResolvedConfig(): OciResolvedConfig {
@@ -1594,9 +1599,9 @@ export class OciAuditorClient {
    * empty stdout is taken as a documented empty result. Stdout is never
    * echoed; the marker names the command and the observed state.
    */
-  private runJson(args: string[], expectedDataShape: "default" | "collection" = "default"): JsonRecord {
+  private async runJson(args: string[], expectedDataShape: "default" | "collection" = "default"): Promise<JsonRecord> {
     const fullArgs = [...this.buildBaseArgs(), ...args];
-    const output = this.commandRunner(fullArgs);
+    const output = this.signal ? await this.runAtCommandBoundary(fullArgs, this.signal) : this.commandRunner(fullArgs);
     const failure = (stdoutShape: OciStdoutShape): OciCommandError =>
       new OciCommandError({ args: fullArgs, exitCode: 0, stderr: "", stdout: output, stdoutShape });
     if (output.trim().length === 0) throw failure(output.length === 0 ? "empty" : "whitespace");
@@ -1614,8 +1619,24 @@ export class OciAuditorClient {
     return document;
   }
 
-  private runCollection(args: string[]): JsonRecord[] {
-    const document = this.runJson(args, "collection");
+  /**
+   * The runner blocks the event loop until its command exits, so an abort is only delivered between commands, and
+   * reads started together (Promise.all) would otherwise run back to back with no event-loop turn in between. With
+   * a signal, commands run one at a time, each after a turn that follows the previous command, and none starts once
+   * the tool call is aborted; a command already running cannot be interrupted.
+   */
+  private runAtCommandBoundary(fullArgs: string[], signal: AbortSignal): Promise<string> {
+    const run = this.lastCommand.then(async () => {
+      if (!signal.aborted) await yieldToEventLoop();
+      if (signal.aborted) throw new ToolCallAbortedError(signal);
+      return this.commandRunner(fullArgs);
+    });
+    this.lastCommand = run.catch(() => undefined);
+    return run;
+  }
+
+  private async runCollection(args: string[]): Promise<JsonRecord[]> {
+    const document = await this.runJson(args, "collection");
     const records = flattenCollectionResponse(document);
     if (records === undefined) {
       throw new Error("OCI collection response passed validation without readable records.");
@@ -1625,7 +1646,7 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.compartments; --all follows opc-next-page to completion. */
   async listCompartments(): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "iam", "compartment", "list",
       "--compartment-id", this.config.tenancyOcid,
       "--all",
@@ -1636,7 +1657,7 @@ export class OciAuditorClient {
   }
 
   async listUsers(): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "iam", "user", "list",
       "--compartment-id", this.config.tenancyOcid,
       "--all",
@@ -1644,28 +1665,28 @@ export class OciAuditorClient {
   }
 
   async getAuthenticationPolicy(): Promise<JsonRecord | null> {
-    return asObject(this.runJson([
+    return asObject((await this.runJson([
       "iam", "authentication-policy", "get",
       "--compartment-id", this.config.tenancyOcid,
-    ]).data) ?? null;
+    ])).data) ?? null;
   }
 
   async listApiKeys(userOcid: string): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "iam", "user", "api-key", "list",
       "--user-id", userOcid,
     ]));
   }
 
   async listCustomerSecretKeys(userOcid: string): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "iam", "customer-secret-key", "list",
       "--user-id", userOcid,
     ]));
   }
 
   async listAuthTokens(userOcid: string): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "iam", "auth-token", "list",
       "--user-id", userOcid,
     ]));
@@ -1673,7 +1694,7 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.policies; ListPolicies has no subtree parameter, so callers iterate compartments. */
   async listPolicies(compartmentId: string = this.config.tenancyOcid): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "iam", "policy", "list",
       "--compartment-id", compartmentId,
       "--all",
@@ -1681,23 +1702,23 @@ export class OciAuditorClient {
   }
 
   async listAvailabilityDomains(): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "iam", "availability-domain", "list",
       "--compartment-id", this.config.tenancyOcid,
     ]));
   }
 
   async getAuditConfiguration(): Promise<JsonRecord | null> {
-    return asObject(this.runJson([
+    return asObject((await this.runJson([
       "audit", "config", "get",
       "--compartment-id", this.config.tenancyOcid,
-    ]).data) ?? null;
+    ])).data) ?? null;
   }
 
   async listAuditEvents(lookbackDays = DEFAULT_LOOKBACK_DAYS): Promise<JsonRecord[]> {
     const end = this.getNow();
     const start = new Date(end.getTime() - lookbackDays * 24 * 60 * 60 * 1000);
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "audit", "event", "list",
       "--compartment-id", this.config.compartmentOcid,
       "--start-time", start.toISOString(),
@@ -1707,10 +1728,10 @@ export class OciAuditorClient {
   }
 
   async getCloudGuardConfiguration(): Promise<JsonRecord | null> {
-    return asObject(this.runJson([
+    return asObject((await this.runJson([
       "cloud-guard", "configuration", "get",
       "--compartment-id", this.config.tenancyOcid,
-    ]).data) ?? null;
+    ])).data) ?? null;
   }
 
   /** OCI_SURFACE_DOCS.cloudGuardTargets; ListTargets supports compartmentIdInSubtree and accessLevel. */
@@ -1748,7 +1769,7 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.eventRules; ListRules has no subtree parameter (limit max 50, --all pages). */
   async listEventRules(compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "events", "rule", "list",
       "--compartment-id", compartmentId,
       "--all",
@@ -1757,7 +1778,7 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.securityLists; ListSecurityLists has no subtree parameter. */
   async listSecurityLists(compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "network", "security-list", "list",
       "--compartment-id", compartmentId,
       "--all",
@@ -1766,7 +1787,7 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.networkSecurityGroups; ListNetworkSecurityGroups has no subtree parameter. */
   async listNetworkSecurityGroups(compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "network", "nsg", "list",
       "--compartment-id", compartmentId,
       "--all",
@@ -1775,7 +1796,7 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.networkSecurityGroupRules; the CLI flag is --nsg-id and --direction INGRESS is a documented enum. */
   async listNetworkSecurityGroupRules(nsgOcid: string): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "network", "nsg", "rules", "list",
       "--nsg-id", nsgOcid,
       "--direction", "INGRESS",
@@ -1785,7 +1806,7 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.internetGateways; ListInternetGateways has no subtree parameter. */
   async listInternetGateways(compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "network", "internet-gateway", "list",
       "--compartment-id", compartmentId,
       "--all",
@@ -1793,7 +1814,7 @@ export class OciAuditorClient {
   }
 
   async listBastions(compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "bastion", "bastion", "list",
       "--compartment-id", compartmentId,
       "--all",
@@ -1802,14 +1823,14 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.bastionDetail; BastionSummary omits TTL and CIDR fields, so each bastion is fetched. */
   async getBastion(bastionOcid: string): Promise<JsonRecord | null> {
-    return asObject(this.runJson([
+    return asObject((await this.runJson([
       "bastion", "bastion", "get",
       "--bastion-id", bastionOcid,
-    ]).data) ?? null;
+    ])).data) ?? null;
   }
 
   async listBastionSessions(bastionOcid: string): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "bastion", "session", "list",
       "--bastion-id", bastionOcid,
       "--all",
@@ -1817,7 +1838,7 @@ export class OciAuditorClient {
   }
 
   async listVaults(compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "kms", "management", "vault", "list",
       "--compartment-id", compartmentId,
       "--all",
@@ -1831,7 +1852,7 @@ export class OciAuditorClient {
     if (!managementEndpoint) {
       throw new Error(`Vault ${asString(vault.id) ?? "unknown"} did not expose managementEndpoint.`);
     }
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "kms", "management", "key", "list",
       "--endpoint", managementEndpoint,
       "--compartment-id", compartmentId,
@@ -1845,11 +1866,11 @@ export class OciAuditorClient {
     if (!managementEndpoint) {
       throw new Error(`Vault ${asString(vault.id) ?? "unknown"} did not expose managementEndpoint.`);
     }
-    return asObject(this.runJson([
+    return asObject((await this.runJson([
       "kms", "management", "key", "get",
       "--endpoint", managementEndpoint,
       "--key-id", keyOcid,
-    ]).data) ?? null;
+    ])).data) ?? null;
   }
 
   async listKeyVersions(vault: JsonRecord, keyOcid: string): Promise<JsonRecord[]> {
@@ -1857,7 +1878,7 @@ export class OciAuditorClient {
     if (!managementEndpoint) {
       throw new Error(`Vault ${asString(vault.id) ?? "unknown"} did not expose managementEndpoint.`);
     }
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "kms", "management", "key-version", "list",
       "--endpoint", managementEndpoint,
       "--key-id", keyOcid,
@@ -1866,12 +1887,12 @@ export class OciAuditorClient {
   }
 
   async getObjectStorageNamespace(): Promise<string> {
-    const response = this.runJson(["os", "ns", "get"]);
+    const response = await this.runJson(["os", "ns", "get"]);
     return asString(response.data) ?? "";
   }
 
   async listBuckets(namespaceName: string, compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "os", "bucket", "list",
       "--namespace-name", namespaceName,
       "--compartment-id", compartmentId,
@@ -1881,15 +1902,15 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.bucketDetail; BucketSummary omits publicAccessType, so each bucket is fetched. */
   async getBucket(namespaceName: string, bucketName: string): Promise<JsonRecord | null> {
-    return asObject(this.runJson([
+    return asObject((await this.runJson([
       "os", "bucket", "get",
       "--namespace-name", namespaceName,
       "--bucket-name", bucketName,
-    ]).data) ?? null;
+    ])).data) ?? null;
   }
 
   async listPreauthenticatedRequests(namespaceName: string, bucketName: string): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "os", "preauth-request", "list",
       "--namespace-name", namespaceName,
       "--bucket-name", bucketName,
@@ -1899,7 +1920,7 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.instances; ListInstances limit max 100, --all pages. */
   async listInstances(compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "compute", "instance", "list",
       "--compartment-id", compartmentId,
       "--all",
@@ -1908,7 +1929,7 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.volumes; ListVolumes requires compartmentId and pages at limit 100. */
   async listVolumes(compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "bv", "volume", "list",
       "--compartment-id", compartmentId,
       "--all",
@@ -1917,7 +1938,7 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.bootVolumes; ListBootVolumes requires both availabilityDomain and compartmentId. */
   async listBootVolumes(compartmentId: string, availabilityDomain: string): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return flattenListResponse(await this.runJson([
       "bv", "boot-volume", "list",
       "--compartment-id", compartmentId,
       "--availability-domain", availabilityDomain,
@@ -3596,7 +3617,7 @@ export async function exportOciAuditBundle(
   client: OciAccessClient & OciIdentityClient & OciLoggingClient & OciGuardrailClient & OciComputeStorageClient,
   config: OciResolvedConfig,
   outputRoot: string,
-  options: ExportAuditBundleArgs = {},
+  options: ExportAuditBundleArgs & { signal?: AbortSignal } = {},
 ): Promise<OciAuditBundleResult> {
   const access = await checkOciAccess(client);
   const identity = await assessOciIdentity(client, {
@@ -3628,11 +3649,15 @@ export async function exportOciAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
   if (compartments.error) errors.push(redactSensitiveText(compartments.error));
   const targetName = safeDirName(`${config.tenancyOcid}-${config.region}-audit`);
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(targetName, 9),
     zip: true,
+    signal: options.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await writeBundleText(staged.dir, "README.md", buildBundleReadme());
@@ -3744,8 +3769,8 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
   };
 }
 
-function createClient(args: CheckAccessArgs): OciAuditorClient {
-  return new OciAuditorClient(resolveOciConfiguration(args));
+function createClient(args: CheckAccessArgs, signal?: AbortSignal): OciAuditorClient {
+  return new OciAuditorClient(resolveOciConfiguration(args), defaultCommandRunner, { signal });
 }
 
 const authParams = {
@@ -3770,9 +3795,9 @@ export function registerOciTools(pi: any): void {
       "Validate OCI CLI-backed read-only access across IAM, Audit, Cloud Guard, Networking, Vault, Object Storage, and Compute surfaces.",
     parameters: Type.Object(authParams),
     prepareArguments: normalizeCheckAccessArgs,
-    async execute(_toolCallId: string, args: CheckAccessArgs) {
+    async execute(_toolCallId: string, args: CheckAccessArgs, signal?: AbortSignal) {
       try {
-        const result = await checkOciAccess(createClient(args));
+        const result = await checkOciAccess(createClient(args, signal));
         return textResult(formatAccessCheckText(result), { tool: "oci_check_access", ...result });
       } catch (error) {
         return errorResult(
@@ -3795,9 +3820,9 @@ export function registerOciTools(pi: any): void {
       max_policies: Type.Optional(Type.Number({ description: "Maximum IAM policies to inspect for broad statements. Defaults to 500.", default: 500 })),
     }),
     prepareArguments: normalizeIdentityArgs,
-    async execute(_toolCallId: string, args: IdentityArgs) {
+    async execute(_toolCallId: string, args: IdentityArgs, signal?: AbortSignal) {
       try {
-        const result = await assessOciIdentity(createClient(args), {
+        const result = await assessOciIdentity(createClient(args, signal), {
           staleDays: args.stale_days,
           maxKeys: args.max_keys,
           maxPolicies: args.max_policies,
@@ -3823,9 +3848,9 @@ export function registerOciTools(pi: any): void {
       lookback_days: Type.Optional(Type.Number({ description: "Audit event lookback window in days. Defaults to 7.", default: 7 })),
     }),
     prepareArguments: normalizeLoggingArgs,
-    async execute(_toolCallId: string, args: LoggingArgs) {
+    async execute(_toolCallId: string, args: LoggingArgs, signal?: AbortSignal) {
       try {
-        const result = await assessOciLoggingDetection(createClient(args), {
+        const result = await assessOciLoggingDetection(createClient(args, signal), {
           lookbackDays: args.lookback_days,
           maxCompartments: args.max_compartments,
         });
@@ -3850,9 +3875,9 @@ export function registerOciTools(pi: any): void {
       max_keys: Type.Optional(Type.Number({ description: `Maximum ENABLED vault keys to fetch with kms key get across all vaults. Defaults to ${DEFAULT_MAX_KEYS}; hitting the cap withholds pass.`, default: DEFAULT_MAX_KEYS })),
     }),
     prepareArguments: normalizeGuardrailArgs,
-    async execute(_toolCallId: string, args: GuardrailArgs) {
+    async execute(_toolCallId: string, args: GuardrailArgs, signal?: AbortSignal) {
       try {
-        const result = await assessOciTenancyGuardrails(createClient(args), {
+        const result = await assessOciTenancyGuardrails(createClient(args, signal), {
           maxCompartments: args.max_compartments,
           maxBuckets: args.max_buckets,
           maxKeys: args.max_keys,
@@ -3874,9 +3899,9 @@ export function registerOciTools(pi: any): void {
       "Assess OCI compute instances for IMDSv2-only metadata access and block and boot volumes for customer-managed key encryption across accessible compartments and availability domains.",
     parameters: Type.Object(scopeParams),
     prepareArguments: normalizeScopeArgs,
-    async execute(_toolCallId: string, args: ScopeArgs) {
+    async execute(_toolCallId: string, args: ScopeArgs, signal?: AbortSignal) {
       try {
-        const result = await assessOciComputeAndStorage(createClient(args), {
+        const result = await assessOciComputeAndStorage(createClient(args, signal), {
           maxCompartments: args.max_compartments,
         });
         return textResult(formatAssessmentText(result), { tool: "oci_assess_compute_and_storage", ...result });
@@ -3904,11 +3929,16 @@ export function registerOciTools(pi: any): void {
       lookback_days: Type.Optional(Type.Number({ description: "Audit event lookback window in days. Defaults to 7.", default: 7 })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleArgs, signal?: AbortSignal) {
       try {
         const config = resolveOciConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportOciAuditBundle(new OciAuditorClient(config), config, outputRoot, args);
+        const result = await exportOciAuditBundle(
+          new OciAuditorClient(config, defaultCommandRunner, { signal }),
+          config,
+          outputRoot,
+          { ...args, signal },
+        );
         return textResult(
           [
             "OCI audit bundle exported.",

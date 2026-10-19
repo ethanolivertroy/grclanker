@@ -8,7 +8,9 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { writeFile } from "node:fs/promises";
@@ -16,6 +18,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
+import { runToolCall } from "../dist/extensions/grc-tools/abort.js";
 import {
   numberedNames,
   writeBundleAtomically,
@@ -224,6 +227,117 @@ test("writeBundleAtomically stages nothing when the signal is already aborted", 
   assert.deepEqual(readdirSync(root), []);
 });
 
+for (const [entry, target] of [["directory", "bundle"], ["archive", "bundle.zip"]]) {
+  test(`an abort that arrives once the bundle ${entry} starts moving into place lets the commit finish, and the write resolves and marks its tool call committed`, async () => {
+    const root = createTempBase("grclanker-atomic-late-abort-");
+    const controller = new AbortController();
+    const call = { committed: false };
+
+    const result = await beforeMove(join(root, target), () => controller.abort(), () =>
+      runToolCall(call, () =>
+        writeBundleAtomically({ root, names: ["bundle"], zip: true, signal: controller.signal }, (staged) => writeSampleBundle(staged))));
+
+    assert.equal(controller.signal.aborted, true);
+    assert.deepEqual(result, { outputDir: join(root, "bundle"), zipPath: join(root, "bundle.zip") });
+    assert.equal(call.committed, true, "the call counts as committed, so it reports the bundle instead of the abort");
+    assert.equal(readFileSync(result.zipPath, "utf8"), "zip-bytes");
+    assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle.zip"]);
+  });
+}
+
+test("a write marks the tool call it runs in as committed once its bundle is in place, and a write that commits nothing does not", async () => {
+  const root = createTempBase("grclanker-atomic-call-");
+  const call = { committed: false };
+
+  await runToolCall(call, () => writeBundleAtomically({ root, names: ["bundle"] }, async (staged) => {
+    await writeSampleBundle(staged, { zip: false });
+    assert.equal(call.committed, false, "a bundle still in staging is not committed");
+  }));
+  assert.equal(call.committed, true);
+
+  const failed = { committed: false };
+  await assert.rejects(
+    runToolCall(failed, () => writeBundleAtomically({ root, names: ["other"] }, async () => {
+      throw new Error("collector failed");
+    })),
+    /collector failed/,
+  );
+  assert.equal(failed.committed, false);
+});
+
+test("a write that commits nothing removes the directories it created on the way to its root, and keeps the ones that were there", async () => {
+  const base = createTempBase("grclanker-atomic-created-");
+  const root = join(base, "exports", "acme", "audit");
+  const failingWriter = async () => {
+    throw new Error("collector failed");
+  };
+  const controller = new AbortController();
+
+  await assert.rejects(
+    writeBundleAtomically({ root, names: ["bundle"], zip: true, signal: controller.signal }, async (staged) => {
+      await writeSampleBundle(staged);
+      controller.abort();
+    }),
+    { name: "AbortError" },
+  );
+  assert.deepEqual(readdirSync(base), [], "an aborted write");
+  await assert.rejects(writeBundleAtomically({ root, names: ["bundle"] }, failingWriter), /collector failed/);
+  assert.deepEqual(readdirSync(base), [], "a failed write");
+  await assert.rejects(
+    writeBundleAtomically({ root, names: ["bundle"], checkName: () => { throw new Error("refused"); } }, failingWriter),
+    /refused/,
+  );
+  assert.deepEqual(readdirSync(base), [], "a write whose names are refused");
+
+  mkdirSync(join(base, "exports"));
+  await assert.rejects(writeBundleAtomically({ root, names: ["bundle"] }, failingWriter), /collector failed/);
+  assert.deepEqual(readdirSync(base), ["exports"], "a directory that was there already stays");
+  assert.deepEqual(readdirSync(join(base, "exports")), []);
+
+  const result = await writeBundleAtomically({ root, names: ["bundle"] }, (staged) => writeSampleBundle(staged, { zip: false }));
+  assert.equal(result.outputDir, join(root, "bundle"));
+  assert.deepEqual(readdirSync(root), ["bundle"], "a write that commits keeps the directories it created");
+});
+
+test("createRoot makes the root in place of a plain mkdir and names the path the bundle lands under, and what it made is removed when nothing commits", async () => {
+  const base = createTempBase("grclanker-atomic-create-root-");
+  mkdirSync(join(base, "actual"));
+  const actual = realpathSync(join(base, "actual"));
+  symlinkSync(actual, join(base, "alias"));
+  const root = join(base, "alias", "exports");
+  const roots = [];
+  const createRoot = (dir) => {
+    roots.push(dir);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return realpathSync(dir);
+  };
+
+  const result = await writeBundleAtomically({ root, createRoot, names: ["bundle"] }, async (staged) => {
+    assert.equal(staged.target.outputDir, join(actual, "exports", "bundle"));
+    await writeSampleBundle(staged, { zip: false });
+  });
+  assert.deepEqual(roots, [root]);
+  assert.equal(result.outputDir, join(actual, "exports", "bundle"));
+  await assert.rejects(
+    writeBundleAtomically({ root, createRoot, names: ["bundle"], exhaustedMessage: (dir) => `No free name under ${dir}` }, async () => {}),
+    { message: `No free name under ${join(actual, "exports")}` },
+  );
+
+  const refusedRoot = join(base, "refused", "exports");
+  await assert.rejects(
+    writeBundleAtomically({
+      root: refusedRoot,
+      createRoot: (dir) => {
+        mkdirSync(dir, { recursive: true });
+        throw new Error(`Refusing to use ${dir}`);
+      },
+      names: ["bundle"],
+    }, async () => {}),
+    /Refusing to use/,
+  );
+  assert.equal(existsSync(join(base, "refused")), false);
+});
+
 test("writeBundleAtomically fails before staging when every name is taken", async () => {
   const root = createTempBase("grclanker-atomic-exhausted-");
   mkdirSync(join(root, "bundle"));
@@ -383,6 +497,44 @@ test("concurrent writes in one process claim different names up front, and a fai
 
   const next = await writeBundleAtomically({ root, names: numberedNames("bundle", 6), zip: true }, (staged) => writeSampleBundle(staged));
   assert.equal(next.outputDir, targets[1], "the failed write's name is free again");
+});
+
+test("a directory that writes in flight created stays, even empty, while one of them still needs it, and the last of them removes it", async () => {
+  const base = createTempBase("grclanker-atomic-shared-created-");
+  const shared = join(base, "exports");
+  const slowRoot = join(shared, "slow");
+  const failingWriter = async () => {
+    throw new Error("collector failed");
+  };
+  let reachedMkdir;
+  const atMkdir = new Promise((resolvePromise) => {
+    reachedMkdir = resolvePromise;
+  });
+  let resumeMkdir;
+  const resumed = new Promise((resolvePromise) => {
+    resumeMkdir = resolvePromise;
+  });
+  const originalMkdir = fsPromises.mkdir;
+  fsPromises.mkdir = async (path, options) => {
+    if (path === slowRoot) {
+      reachedMkdir();
+      await resumed;
+    }
+    return originalMkdir(path, options);
+  };
+  syncBuiltinESMExports();
+  try {
+    const slow = writeBundleAtomically({ root: slowRoot, names: ["bundle"] }, failingWriter);
+    await atMkdir;
+    await assert.rejects(writeBundleAtomically({ root: join(shared, "fast"), names: ["bundle"] }, failingWriter), /collector failed/);
+    assert.deepEqual(readdirSync(shared), [], "the failed write leaves the directory the paused one still needs, though it is empty");
+    resumeMkdir();
+    await assert.rejects(slow, /collector failed/);
+  } finally {
+    fsPromises.mkdir = originalMkdir;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(readdirSync(base), []);
 });
 
 test("writeBundleAtomically commits only the directory when the writer produced no archive", async () => {
@@ -561,8 +713,9 @@ test("writeFileAtomically replaces a file in one step and keeps the old content 
   assert.deepEqual(readdirSync(root), ["catalog.json"]);
 });
 
-test("the staging directory goes away when the process exits while a write is in flight", async () => {
-  const root = createTempBase("grclanker-atomic-exit-");
+test("the staging directory, and the directories made on the way to the root, go away when the process exits while a write is in flight", async () => {
+  const base = createTempBase("grclanker-atomic-exit-");
+  const root = join(base, "exports", "acme");
   const { ready, exited } = spawnModule(`
     import { writeBundleAtomically } from ${JSON.stringify(MODULE_URL)};
     void writeBundleAtomically({ root: ${JSON.stringify(root)}, names: ["bundle"] }, async () => {
@@ -573,5 +726,5 @@ test("the staging directory goes away when the process exits while a write is in
   `);
   await ready;
   await exited;
-  assert.deepEqual(readdirSync(root), []);
+  assert.deepEqual(readdirSync(base), []);
 });

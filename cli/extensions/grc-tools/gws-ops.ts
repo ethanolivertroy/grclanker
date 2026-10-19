@@ -112,6 +112,7 @@ interface GwsCliCommandRequest {
   env: NodeJS.ProcessEnv;
   /** `gws --version` prints plain text; every curated API command must return JSON. */
   expectJson?: boolean;
+  signal?: AbortSignal;
 }
 
 interface GwsCliExecution {
@@ -370,7 +371,8 @@ function buildGwsCliInstallGuidance(): string {
 }
 
 export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
-  const { executable, args, env } = request;
+  const { executable, args, env, signal } = request;
+  signal?.throwIfAborted();
   const expectJson = request.expectJson !== false;
   const command = buildCommandString(executable.displayExecutable, args);
   const knownSecrets = knownSecretValues(env);
@@ -379,6 +381,7 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
     const child = spawn(executable.executable, args, {
       env,
       stdio: ["ignore", "pipe", "pipe"],
+      signal,
     });
 
     let stdout = "";
@@ -449,6 +452,10 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
     });
   });
 };
+
+function gwsCliRunnerFor(signal: AbortSignal | undefined): GwsCliRunner {
+  return signal ? (request) => defaultGwsCliRunner({ ...request, signal }) : defaultGwsCliRunner;
+}
 
 /**
  * v0.22.5 emits this exact unknown-service shape because it strips the version
@@ -1249,8 +1256,8 @@ function buildBundleSummary(
 }
 
 export async function collectGwsOperatorEvidenceBundle(
-  args: GwsOpsBundleArgs = {},
-  runner: GwsCliRunner = defaultGwsCliRunner,
+  args: GwsOpsBundleArgs & { signal?: AbortSignal } = {},
+  runner: GwsCliRunner = gwsCliRunnerFor(args.signal),
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<GwsOpsBundleResult | { mode: "dry_run"; commands: GwsOpsCommandPreview[] }> {
   const workflowArgs = {
@@ -1279,11 +1286,15 @@ export async function collectGwsOperatorEvidenceBundle(
   const completion = getBundleCompletion(results);
 
   const outputRoot = args.output_dir?.trim() || DEFAULT_OUTPUT_DIR;
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(safeDirName("gws-operator-evidence"), 6),
     zip: true,
+    signal: args.signal,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),
   }, async (staged) => {
     await writeSecureTextFile(staged.dir, "README.md", buildBundleReadme());
@@ -1477,9 +1488,9 @@ export function registerGwsOperatorTools(pi: any): void {
       "Verify that the optional Google Workspace CLI bridge is installed, show the active gws version, and preview or run a harmless read-only probe command.",
     parameters: Type.Object(baseParams),
     prepareArguments: normalizeBaseArgs,
-    async execute(_toolCallId: string, args: GwsOpsBaseArgs) {
+    async execute(_toolCallId: string, args: GwsOpsBaseArgs, signal?: AbortSignal) {
       try {
-        const result = await checkGwsCliAccess(args);
+        const result = await checkGwsCliAccess(args, gwsCliRunnerFor(signal));
         return textResult(renderCheckText(result), {
           status: result.status,
           mode: result.mode,
@@ -1509,9 +1520,9 @@ export function registerGwsOperatorTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeAlertArgs,
-    async execute(_toolCallId: string, args: GwsOpsAlertArgs) {
+    async execute(_toolCallId: string, args: GwsOpsAlertArgs, signal?: AbortSignal) {
       try {
-        return renderActivityToolResult(await investigateGwsAlerts(args));
+        return renderActivityToolResult(await investigateGwsAlerts(args, gwsCliRunnerFor(signal)));
       } catch (error) {
         return renderToolError("Google Workspace alert investigation failed", error, "gws_ops_investigate_alerts");
       }
@@ -1525,9 +1536,9 @@ export function registerGwsOperatorTools(pi: any): void {
       "Use the optional Google Workspace CLI to run a curated, read-only Admin Reports workflow for recent privileged admin activity.",
     parameters: Type.Object(activityParams),
     prepareArguments: normalizeActivityArgs,
-    async execute(_toolCallId: string, args: GwsOpsActivityArgs) {
+    async execute(_toolCallId: string, args: GwsOpsActivityArgs, signal?: AbortSignal) {
       try {
-        return renderActivityToolResult(await traceGwsAdminActivity(args));
+        return renderActivityToolResult(await traceGwsAdminActivity(args, gwsCliRunnerFor(signal)));
       } catch (error) {
         return renderToolError("Google Workspace admin activity trace failed", error, "gws_ops_trace_admin_activity");
       }
@@ -1541,9 +1552,9 @@ export function registerGwsOperatorTools(pi: any): void {
       "Use the optional Google Workspace CLI to run a curated, read-only Admin Reports token activity workflow for OAuth and app-governance investigations.",
     parameters: Type.Object(activityParams),
     prepareArguments: normalizeActivityArgs,
-    async execute(_toolCallId: string, args: GwsOpsActivityArgs) {
+    async execute(_toolCallId: string, args: GwsOpsActivityArgs, signal?: AbortSignal) {
       try {
-        return renderActivityToolResult(await reviewGwsTokenActivity(args));
+        return renderActivityToolResult(await reviewGwsTokenActivity(args, gwsCliRunnerFor(signal)));
       } catch (error) {
         return renderToolError("Google Workspace token activity review failed", error, "gws_ops_review_tokens");
       }
@@ -1569,9 +1580,9 @@ export function registerGwsOperatorTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeBundleArgs,
-    async execute(_toolCallId: string, args: GwsOpsBundleArgs) {
+    async execute(_toolCallId: string, args: GwsOpsBundleArgs, signal?: AbortSignal) {
       try {
-        return renderBundleResult(await collectGwsOperatorEvidenceBundle(args));
+        return renderBundleResult(await collectGwsOperatorEvidenceBundle({ ...args, signal }, gwsCliRunnerFor(signal)));
       } catch (error) {
         return renderToolError("Google Workspace operator evidence collection failed", error, "gws_ops_collect_evidence_bundle");
       }

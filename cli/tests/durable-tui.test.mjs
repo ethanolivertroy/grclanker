@@ -262,14 +262,17 @@ test("an app closed mid tool round keeps it: on reopen the read-only tool reruns
   const session = resolveDurableSession("tui-close", home);
   const model = scriptedModel();
   const first = { read: 0, write: 0 };
+  const signals = {};
   // Never settle, like calls still waiting on an API when the operator exits.
   const hanging = () => [
-    fakeTool(READ_TOOL, () => {
+    fakeTool(READ_TOOL, (_callId, _args, signal) => {
       first.read += 1;
+      signals.read = signal;
       return new Promise(() => {});
     }),
-    fakeTool(WRITE_TOOL, () => {
+    fakeTool(WRITE_TOOL, (_callId, _args, signal) => {
       first.write += 1;
+      signals.write = signal;
       return new Promise(() => {});
     }),
   ];
@@ -277,7 +280,13 @@ test("an app closed mid tool round keeps it: on reopen the read-only tool reruns
   app.terminal.type("Assess and export.");
   app.terminal.type("\r");
   await app.terminal.waitFor(() => first.read === 1 && first.write === 1, "both tools to start");
+  assert.deepEqual({ read: signals.read?.aborted, write: signals.write?.aborted }, { read: false, write: false });
   await app.exit("\x03");
+  assert.deepEqual(
+    { read: signals.read.aborted, write: signals.write.aborted },
+    { read: true, write: true },
+    "closing the app aborts the tools still running",
+  );
 
   const second = { read: 0, write: 0 };
   const reopened = await openApp(t, session, { loadModels: model.loadModels, tools: fakeTools(home, second) }, 72);
@@ -527,7 +536,8 @@ test(
     const app = await startStalledRound(t, home, session);
 
     app.write("\x03");
-    // Waiting for the two stalled tools would keep the process alive for good.
+    // Nothing forces the exit: closing the session aborts both stalled requests, and either one left open would keep
+    // the process alive for good.
     const exit = await Promise.race([app.closed, sleep(10_000, "still running after 10s", { ref: false })]);
     assert.deepEqual(exit, { code: 0, signal: null }, stripTerminal(app.output()));
     assert.ok(

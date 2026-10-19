@@ -11,9 +11,11 @@
  *
  * Environment:
  * - GRCLANKER_TEST_DURABLE_LOG: JSONL file that receives one line per model
- *   call and per API request, each with the process id.
+ *   call, per API request, and per hanging request aborted, each with the
+ *   process id.
  * - GRCLANKER_TEST_DURABLE_HANG: comma-separated API paths that never answer in
- *   this process, so the tools that read them are still running when it is killed.
+ *   this process. A request to one stays open until its signal aborts, so the
+ *   tools that read them are still running when the process is killed or stopped.
  */
 import { appendFileSync } from "node:fs";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -96,11 +98,22 @@ const FIXTURE = {
   more: false,
 };
 
-globalThis.fetch = async (input) => {
+globalThis.fetch = async (input, init = {}) => {
   const url = new URL(input instanceof Request ? input.url : String(input));
   if (url.hostname !== "api.pagerduty.com") throw new Error(`Unexpected request in a durable test: ${url.origin}`);
   log({ kind: "request", path: url.pathname });
-  // The timer keeps the process alive the way a stalled socket would; a bare pending promise would let it exit.
-  if (hangingPaths.has(url.pathname)) return new Promise(() => setInterval(() => {}, 60_000));
-  return Response.json(FIXTURE);
+  if (!hangingPaths.has(url.pathname)) return Response.json(FIXTURE);
+  const signal = init.signal ?? (input instanceof Request ? input.signal : undefined);
+  // The timer keeps the process alive the way a stalled socket would, until the request's signal aborts; a bare
+  // pending promise would let the process exit.
+  return new Promise((_, reject) => {
+    const socket = setInterval(() => {}, 60_000);
+    const abort = () => {
+      clearInterval(socket);
+      log({ kind: "request-aborted", path: url.pathname });
+      reject(signal.reason);
+    };
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+  });
 };

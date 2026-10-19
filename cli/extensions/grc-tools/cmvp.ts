@@ -200,13 +200,13 @@ export function registerCmvpTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeSearchArgs,
-    async execute(_toolCallId: string, args: SearchArgs) {
+    async execute(_toolCallId: string, args: SearchArgs, signal?: AbortSignal) {
       if (!args.query.trim()) {
         return missingQueryResult("cmvp_search_modules");
       }
 
       try {
-        const data = await cachedFetch<ModulesResponse>(`${BASE}/modules.json`, TTL);
+        const data = await cachedFetch<ModulesResponse>(`${BASE}/modules.json`, TTL, signal);
         const limit = args.limit ?? 10;
         const matches = data.modules
           .filter((module) => matchesQuery(module, args.query))
@@ -253,7 +253,7 @@ export function registerCmvpTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeSearchArgs,
-    async execute(_toolCallId: string, args: SearchArgs) {
+    async execute(_toolCallId: string, args: SearchArgs, signal?: AbortSignal) {
       if (!args.query.trim()) {
         return missingQueryResult("cmvp_search_historical");
       }
@@ -262,6 +262,7 @@ export function registerCmvpTools(pi: any): void {
         const data = await cachedFetch<ModulesResponse>(
           `${BASE}/historical-modules.json`,
           TTL,
+          signal,
         );
         const limit = args.limit ?? 10;
         const matches = data.modules
@@ -310,7 +311,7 @@ export function registerCmvpTools(pi: any): void {
       ),
     }),
     prepareArguments: normalizeSearchArgs,
-    async execute(_toolCallId: string, args: SearchArgs) {
+    async execute(_toolCallId: string, args: SearchArgs, signal?: AbortSignal) {
       if (!args.query.trim()) {
         return missingQueryResult("cmvp_search_in_process");
       }
@@ -319,6 +320,7 @@ export function registerCmvpTools(pi: any): void {
         const data = await cachedFetch<InProcessResponse>(
           `${BASE}/modules-in-process.json`,
           TTL,
+          signal,
         );
         const normalizedQuery = args.query.toLowerCase();
         const limit = args.limit ?? 10;
@@ -377,7 +379,7 @@ export function registerCmvpTools(pi: any): void {
       }),
     }),
     prepareArguments: normalizeCertArgs,
-    async execute(_toolCallId: string, args: CertArgs) {
+    async execute(_toolCallId: string, args: CertArgs, signal?: AbortSignal) {
       if (!args.cert_number.trim()) {
         return errorResult(
           'cmvp_get_module requires a certificate number. Example: {"cert_number":"4953"}.',
@@ -386,7 +388,7 @@ export function registerCmvpTools(pi: any): void {
       }
 
       try {
-        const active = await cachedFetch<ModulesResponse>(`${BASE}/modules.json`, TTL);
+        const active = await cachedFetch<ModulesResponse>(`${BASE}/modules.json`, TTL, signal);
         let module = active.modules.find(
           (entry) => entry["Certificate Number"] === args.cert_number,
         );
@@ -396,6 +398,7 @@ export function registerCmvpTools(pi: any): void {
           const historical = await cachedFetch<ModulesResponse>(
             `${BASE}/historical-modules.json`,
             TTL,
+            signal,
           );
           module = historical.modules.find(
             (entry) => entry["Certificate Number"] === args.cert_number,
