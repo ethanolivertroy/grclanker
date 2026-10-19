@@ -24,7 +24,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { Type } from "@sinclair/typebox";
-import { ToolCallAbortedError, abortableFetch, unlessAborted } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -808,7 +808,7 @@ async function downloadFile(
   const resolvedPath = resolveSecureOutputPath(baseDir, destPath);
   const output = createWriteStream(resolvedPath, { mode: 0o600 });
   try {
-    await pipeline(Readable.fromWeb(response.body as NodeReadableStream), output, { signal });
+    await unlessAborted(pipeline(Readable.fromWeb(response.body as NodeReadableStream), output, { signal }), signal);
   } finally {
     await chmod(resolvedPath, 0o600);
   }
@@ -883,6 +883,7 @@ export async function exportVantaAuditPackage(
       const urls = await client.listEvidenceUrls(audit.id, item.id);
       uniqueEvidenceUrls.set(item.id, urls.filter((entry) => entry.isDownloadable));
     } catch (error) {
+      rethrowIfAborted(error);
       uniqueEvidenceUrls.set(item.id, []);
       errors.push(
         `Failed to list evidence URLs for ${item.name} (${item.id}): ${error instanceof Error ? error.message : String(error)}`,
@@ -948,6 +949,7 @@ export async function exportVantaAuditPackage(
         totalFilesExported += 1;
         totalSizeBytes += size;
       } catch (error) {
+        rethrowIfAborted(error);
         errors.push(
           `Failed to download ${task.fileName} for ${task.evidence.name} (${task.controlName}): ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -1050,6 +1052,7 @@ export async function exportVantaAuditPackage(
     try {
       await zipAuditPackage(staged.dir, staged.zipPath, baseOutputDir, options.signal);
     } catch (error) {
+      rethrowIfAborted(error);
       // A half-written archive must not be committed next to the bundle.
       await rm(staged.zipPath, { force: true });
       errors.push(`Failed to create zip archive: ${error instanceof Error ? error.message : String(error)}`);

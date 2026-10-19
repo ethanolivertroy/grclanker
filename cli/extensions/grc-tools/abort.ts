@@ -46,6 +46,23 @@ export class ToolCallAbortedError extends Error {
 }
 
 /**
+ * Rethrows `error` when it is the tool call's abort. A collector that records a
+ * failed read and moves on calls this first, so an abort ends the collection at
+ * the read it interrupted instead of failing every read after it.
+ */
+export function rethrowIfAborted(error: unknown): void {
+  if (error instanceof ToolCallAbortedError) throw error;
+}
+
+/** A rejection handler for an optional read: it settles on `fallback` unless the read was aborted. */
+export function fallbackUnlessAborted<T>(fallback: T): (error: unknown) => T {
+  return (error) => {
+    rethrowIfAborted(error);
+    return fallback;
+  };
+}
+
+/**
  * Settle as `promise` does, or reject with ToolCallAbortedError as soon as
  * `signal` aborts, whether or not the work behind `promise` stops.
  */

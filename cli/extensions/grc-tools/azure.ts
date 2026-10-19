@@ -17,7 +17,7 @@ import {
 import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, resolveWithCommands, type CommandLookup } from "./abort.js";
+import { abortableFetch, resolveWithCommands, rethrowIfAborted, type CommandLookup } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -1306,6 +1306,7 @@ async function attempt<T>(load: () => Promise<T>): Promise<Attempt<T>> {
   try {
     return { ok: true, value: await load() };
   } catch (error) {
+    rethrowIfAborted(error);
     const status = error instanceof AzureApiError ? error.status : undefined;
     return { ok: false, error: describeThrown(error), status, url: observedRequestUrl(error) };
   }
@@ -1858,6 +1859,7 @@ async function surface(
       ...(summary.truncated && summary.truncation ? { truncation: summary.truncation } : {}),
     };
   } catch (error) {
+    rethrowIfAborted(error);
     // A probe that never completed has no count or paging outcome; both stay null and the
     // status and URL are the ones the request observed.
     return {
@@ -2073,6 +2075,7 @@ export class AzureAuditorClient {
     try {
       return await this.fetchImpl(url, init);
     } catch (error) {
+      rethrowIfAborted(error);
       if (error instanceof AzureApiError) throw error;
       // A parser error raised inside the transport keeps its fixed note; anything else produced no response.
       throw new AzureApiError(`${prefix}${isParseError(error) ? PARSE_ERROR_NOTE : describeNoResponse(error)}`, url);

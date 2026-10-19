@@ -16,7 +16,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1254,6 +1254,7 @@ export class DatadogApiClient {
         signal: controller.signal,
       });
     } catch (error) {
+      rethrowIfAborted(error);
       if (controller.signal.aborted) {
         throw new Error(this.redact(`Datadog request timed out after ${this.config.timeoutMs}ms: ${method} ${new URL(url).pathname}`));
       }
@@ -1738,6 +1739,7 @@ async function loadSurface<T>(label: string, load: () => Promise<T>, errors: str
   try {
     return { value: redactCredentialValues(await load()) as T };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     errors.push(`${label}: ${message}`);
     const httpStatus = observedStatus(error);
@@ -2145,6 +2147,7 @@ export async function collectDatadogIdentityData(
       const permissions = await client.listRolePermissions(roleId);
       rolePermissions[roleId] = permissions.map(permissionName).filter((name): name is string => Boolean(name));
     } catch (error) {
+      rethrowIfAborted(error);
       const message = errorMessage(error);
       rolePermissionErrors[roleId] = { role: roleName(role), error: message, endpoint, http_status: observedStatus(error) ?? null };
       errors.push(`role_permissions(${roleName(role)}): ${message}`);
@@ -4060,6 +4063,7 @@ async function probeSurface(
     const value = await load();
     return { name, endpoint, permission, status: "readable", collected: true, http_status: null, count: countResolver?.(value) ?? null };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name,
       endpoint,

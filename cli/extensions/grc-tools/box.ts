@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { BOX_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1353,6 +1353,7 @@ export class BoxApiClient implements BoxReadClient {
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly signal?: AbortSignal;
   private accessToken?: string;
   private refreshToken?: string;
   private accessTokenExpiresAt = 0;
@@ -1373,6 +1374,7 @@ export class BoxApiClient implements BoxReadClient {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
     this.sleep = abortableSleep(options.signal, options.sleep);
+    this.signal = options.signal;
     this.refreshToken = config.refreshToken;
     if (config.authMode === "oauth" && config.accessToken) {
       this.accessToken = config.accessToken;
@@ -1420,6 +1422,7 @@ export class BoxApiClient implements BoxReadClient {
     try {
       return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
+      rethrowIfAborted(error);
       if (controller.signal.aborted) {
         throw new BoxTransportError(`Box request timed out after ${this.config.timeoutMs}ms: ${request}`, request);
       }
@@ -1616,6 +1619,8 @@ export class BoxApiClient implements BoxReadClient {
   }
 
   private memoized<T>(key: string, loader: () => Promise<T>): Promise<T> {
+    // A read answered from the memo sends no request, so the abort check abortableFetch makes is repeated here.
+    if (this.signal?.aborted) return Promise.reject(new ToolCallAbortedError(this.signal));
     const existing = this.memo.get(key);
     if (existing) return existing as Promise<T>;
     const pending = loader();
@@ -1905,6 +1910,7 @@ async function collect<T>(loader: () => Promise<T>, fallback: T): Promise<Collec
   try {
     return { data: await loader() };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       data: fallback,
       error: errorMessage(error),
@@ -2376,7 +2382,8 @@ function lookbackStart(now: Date, lookbackDays: number): Date {
 async function safeEnterpriseId(client: Pick<BoxReadClient, "resolveEnterpriseId">): Promise<string | undefined> {
   try {
     return await client.resolveEnterpriseId();
-  } catch {
+  } catch (error) {
+    rethrowIfAborted(error);
     return undefined;
   }
 }
@@ -3231,6 +3238,7 @@ async function collectAssignments(
         truncations.push({ reason: `for policy ${parentId}, ${page.truncation?.reason ?? "the assignment listing stopped at its cap"}`, capReached: page.truncation?.capReached ?? true });
       }
     } catch (error) {
+      rethrowIfAborted(error);
       const failed: CollectedDataset<unknown> = {
         data: undefined,
         error: errorMessage(error),
@@ -3728,6 +3736,7 @@ async function readableSurface(
     const value = await load();
     return { name, endpoint, status: "readable", count: countResolver?.(value) ?? null, httpStatus: null };
   } catch (error) {
+    rethrowIfAborted(error);
     // Only a request the run actually issued may be named, so the label travels on the error; a failure raised before
     // any request (for example an unresolved enterprise ID) leaves the endpoint and status null.
     return {
@@ -3770,8 +3779,8 @@ export async function checkBoxAccess(
 ): Promise<BoxAccessCheckResult> {
   const config = client.getResolvedConfig();
   const currentUserSurface = await readableSurface("current_user", "/users/me", () => client.getCurrentUser(), () => 1);
-  const currentUser = currentUserSurface.status === "readable" ? await client.getCurrentUser().catch(() => ({})) : {};
-  const enterpriseId = await client.resolveEnterpriseId().catch(() => undefined);
+  const currentUser = currentUserSurface.status === "readable" ? await client.getCurrentUser().catch(fallbackUnlessAborted({})) : {};
+  const enterpriseId = await client.resolveEnterpriseId().catch(fallbackUnlessAborted(undefined));
 
   const surfaces: BoxAccessSurface[] = [currentUserSurface];
   if (enterpriseId) {

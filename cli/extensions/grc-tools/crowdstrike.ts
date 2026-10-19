@@ -21,7 +21,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { CROWDSTRIKE_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -940,6 +940,7 @@ async function collectDataset<T>(load: () => Promise<T>, fallback: T, label: str
   try {
     return { data: scrubDataStrings(await load()), label, endpoint };
   } catch (error) {
+    rethrowIfAborted(error);
     const http = error instanceof CrowdstrikeHttpError ? error : undefined;
     return {
       data: fallback,
@@ -1361,6 +1362,7 @@ export class CrowdstrikeApiClient {
     try {
       return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
+      rethrowIfAborted(error);
       if (error instanceof Error && error.name === "AbortError") {
         throw new Error(`CrowdStrike request timed out after ${this.config.timeoutMs}ms: ${new URL(url).pathname}`);
       }
@@ -1831,6 +1833,7 @@ export async function checkCrowdstrikeAccess(client: AccessProbeClient): Promise
         count: totalOrResourceCount(payload),
       });
     } catch (error) {
+      rethrowIfAborted(error);
       const http = error instanceof CrowdstrikeHttpError ? error : undefined;
       const forbidden = http !== undefined && (http.status === 401 || http.status === 403);
       surfaces.push({

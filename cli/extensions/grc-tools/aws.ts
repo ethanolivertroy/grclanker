@@ -93,7 +93,7 @@ import {
 import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { ToolCallAbortedError, unlessAborted } from "./abort.js";
+import { ToolCallAbortedError, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   AWS_CONTROL_CATALOG,
@@ -1640,6 +1640,7 @@ export async function attemptAwsRead<T>(
   try {
     return { value: await loader() };
   } catch (error) {
+    rethrowIfAborted(error);
     const denied = isAwsAccessDenied(error);
     const message = readFailureLine(label, error);
     errors.push(message);
@@ -2695,6 +2696,7 @@ async function surface(
     const value = await loader();
     return { name, service, command, region, status: "readable", ...observe(value) };
   } catch (error) {
+    rethrowIfAborted(error);
     // A probe that never completed has no count and no truncation state; it names what the service answered instead.
     return {
       name,

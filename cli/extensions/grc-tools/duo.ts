@@ -18,7 +18,7 @@ import {
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
 import { DUO_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -2023,6 +2023,7 @@ export class DuoAuditorClient {
         response = await this.fetchImpl(url, { method, headers, body: body || undefined });
         text = await response.text();
       } catch (error) {
+        rethrowIfAborted(error);
         throw new DuoApiError(`Duo API request failed for ${path} (network error: ${describeThrown(error)})`, path);
       }
       let parsed: JsonRecord | null = null;
@@ -2377,6 +2378,7 @@ async function collectArrayDataset<T extends JsonRecord>(
     if (status === null) return { data, total: undefined, complete: false };
     return { data, total: status.totalObjects, complete: status.complete };
   } catch (error) {
+    rethrowIfAborted(error);
     return { data: [], ...describeFailedRead(error) };
   }
 }
@@ -2388,6 +2390,7 @@ async function collectObjectDataset<T>(
   try {
     return { data: scrubSnapshotValue(await loader()) as T };
   } catch (error) {
+    rethrowIfAborted(error);
     return { data: fallback, ...describeFailedRead(error) };
   }
 }
@@ -5170,6 +5173,7 @@ export async function runDuoAccessCheck(
         detail: "Readable",
       });
     } catch (error) {
+      rethrowIfAborted(error);
       const message = describeThrown(error);
       // The probe status comes from the HTTP status the request observed, never from a hard-coded code.
       const observed = error instanceof DuoApiError ? error.status : undefined;

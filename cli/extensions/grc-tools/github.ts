@@ -17,7 +17,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { STATUS_CODES } from "node:http";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { ToolCallAbortedError, abortableFetch, abortableSleep, unlessAborted } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { NextLinkError, parseNextLinkHeader, resolveSameOriginUrl, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
@@ -1395,6 +1395,7 @@ async function collectDataset<T>(
   try {
     return { data: await fn() };
   } catch (error) {
+    rethrowIfAborted(error);
     return { data: fallback, error: summarizeError(error) };
   }
 }
@@ -2881,6 +2882,7 @@ export async function runGitHubAccessCheck(
         probes.push({ key: probe.key, path: probe.path(config.organization), status: "error", detail: `unexpected response (${result.response.status})` });
       }
     } catch (error) {
+      rethrowIfAborted(error);
       const status = error instanceof GitHubHttpError && error.status === 401
         ? "unauthorized"
         : (error instanceof GitHubHttpError && (error.status === 403 || error.status === 404) ? "forbidden" : "error");
@@ -3520,6 +3522,7 @@ export async function collectGitHubRepoProtectionData(
       try {
         return [key, { rules: await client.listBranchRules(owner, name, defaultBranch) }] as const;
       } catch (error) {
+        rethrowIfAborted(error);
         return [key, { rules: null, error: summarizeError(error) }] as const;
       }
     });
@@ -3544,6 +3547,7 @@ export async function collectGitHubRepoProtectionData(
       try {
         return [key, { protection: await client.getBranchProtection(owner, name, defaultBranch) }] as const;
       } catch (error) {
+        rethrowIfAborted(error);
         return [key, { protection: null, error: summarizeError(error) }] as const;
       }
     });
@@ -3607,6 +3611,7 @@ async function collectPerRepo(
     try {
       return [key, { items: await fetchItems(owner, name) }] as const;
     } catch (error) {
+      rethrowIfAborted(error);
       return [key, { items: null, error: summarizeError(error) }] as const;
     }
   });

@@ -17,7 +17,7 @@ import {
 import { readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch } from "./abort.js";
+import { abortableFetch, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -1304,6 +1304,7 @@ export class CloudflareApiClient implements CloudflareReader {
         });
         rawText = await response.text();
       } catch (error) {
+        rethrowIfAborted(error);
         // Transport failures carry no HTTP status; the message names the path and the timeout budget, never a body.
         const reason = controller.signal.aborted
           ? `timed out after ${this.config.timeoutMs} ms`
@@ -1493,6 +1494,7 @@ export class CloudflareApiClient implements CloudflareReader {
         const setting = await this.getObject(this.zonePath(zoneId, `/settings/${settingId}`), false);
         return { id: settingId, value: setting?.value };
       } catch (error) {
+        rethrowIfAborted(error);
         return { id: settingId, error: errorMessage(error), status: errorStatus(error) ?? null };
       }
     }));
@@ -1595,6 +1597,7 @@ async function attempt<T>(load: () => Promise<T>): Promise<ReadOutcome<T>> {
   try {
     return { ok: true, value: await load() };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ok: false, error: errorMessage(error), status: errorStatus(error), endpoint: errorEndpoint(error) };
   }
 }
@@ -1867,6 +1870,7 @@ async function readableSurface(
       : value === null ? 0 : 1;
     return { name, scope, endpoint, status: "readable", count };
   } catch (error) {
+    rethrowIfAborted(error);
     return { name, scope, endpoint: errorEndpoint(error) ?? endpoint, status: "not_readable", count: null, http_status: errorStatus(error) ?? null, error: errorMessage(error) };
   }
 }
