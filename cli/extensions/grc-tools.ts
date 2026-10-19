@@ -21,6 +21,7 @@ import { shutdownComputeSessions } from "../pi/compute-shutdown.js";
 import { executeComputeAwareGrep } from "../pi/search-tools.js";
 import { readGrclankerSettings } from "../pi/settings.js";
 import { initialPromptInputResult } from "../pi/prompt-envelope.js";
+import { runToolCall, type ToolCallState } from "./grc-tools/abort.js";
 import { registerAnsibleTools } from "./grc-tools/ansible.js";
 import { registerAwsTools } from "./grc-tools/aws.js";
 import { registerAzureTools } from "./grc-tools/azure.js";
@@ -116,21 +117,24 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
  * collector that tolerates per-dataset failures can still finish after an
  * abort with every dataset failed. So a call aborted before it starts never
  * runs, and a call whose signal aborts while it runs rejects with the abort
- * reason instead of returning that result.
+ * reason instead of returning that result. The exception is a call that
+ * committed its output before it returned: the output exists either way, so
+ * the call reports where it is.
  */
 function rejectAbortedCalls(tool: ToolDefinition): ToolDefinition {
   return {
     ...tool,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       signal?.throwIfAborted();
+      const call: ToolCallState = { committed: false };
       let result: Awaited<ReturnType<ToolDefinition["execute"]>>;
       try {
-        result = await tool.execute(toolCallId, params, signal, onUpdate, ctx);
+        result = await runToolCall(call, () => tool.execute(toolCallId, params, signal, onUpdate, ctx));
       } catch (error) {
         signal?.throwIfAborted();
         throw error;
       }
-      signal?.throwIfAborted();
+      if (!call.committed) signal?.throwIfAborted();
       return result;
     },
   };

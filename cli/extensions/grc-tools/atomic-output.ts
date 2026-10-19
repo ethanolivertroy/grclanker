@@ -3,6 +3,7 @@ import { linkSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync, rmd
 import { chmod, link, lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { markOutputCommitted } from "./abort.js";
 
 /**
  * Where a bundle lands: the directory that receives it and the names to try in order. The first
@@ -25,7 +26,7 @@ export interface BundleTarget {
 export interface AtomicBundleOptions extends BundleTarget {
   /** Commit the `<name>.zip` the writer produced next to the directory. */
   zip?: boolean;
-  /** Aborting discards the staged bundle, so nothing is committed. */
+  /** Aborting before the bundle starts moving into place discards it, so nothing is committed. */
   signal?: AbortSignal;
 }
 
@@ -405,7 +406,10 @@ async function stageAndCommit(
       const archived = zip && pathEntryExists(staged.zipPath);
       if (!archived) await rm(staged.zipPath, { force: true });
       const committed = await commitStaged(root, stagingRoot, current, () => takenOnDisk(current), archived, signal);
-      if (committed) return committed;
+      if (committed) {
+        markOutputCommitted();
+        return committed;
+      }
 
       await rm(staged.dir, { recursive: true, force: true });
       await rm(staged.zipPath, { force: true });

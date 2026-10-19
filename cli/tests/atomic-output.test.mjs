@@ -18,6 +18,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
+import { runToolCall } from "../dist/extensions/grc-tools/abort.js";
 import {
   numberedNames,
   writeBundleAtomically,
@@ -224,6 +225,39 @@ test("writeBundleAtomically stages nothing when the signal is already aborted", 
 
   assert.equal(wrote, false);
   assert.deepEqual(readdirSync(root), []);
+});
+
+test("an abort that arrives once the bundle starts moving into place lets the commit finish, and the write resolves", async () => {
+  const root = createTempBase("grclanker-atomic-late-abort-");
+  const controller = new AbortController();
+
+  const result = await beforeMove(join(root, "bundle"), () => controller.abort(), () =>
+    writeBundleAtomically({ root, names: ["bundle"], zip: true, signal: controller.signal }, (staged) => writeSampleBundle(staged)));
+
+  assert.equal(controller.signal.aborted, true);
+  assert.deepEqual(result, { outputDir: join(root, "bundle"), zipPath: join(root, "bundle.zip") });
+  assert.equal(readFileSync(result.zipPath, "utf8"), "zip-bytes");
+  assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle.zip"]);
+});
+
+test("a write marks the tool call it runs in as committed once its bundle is in place, and a write that commits nothing does not", async () => {
+  const root = createTempBase("grclanker-atomic-call-");
+  const call = { committed: false };
+
+  await runToolCall(call, () => writeBundleAtomically({ root, names: ["bundle"] }, async (staged) => {
+    await writeSampleBundle(staged, { zip: false });
+    assert.equal(call.committed, false, "a bundle still in staging is not committed");
+  }));
+  assert.equal(call.committed, true);
+
+  const failed = { committed: false };
+  await assert.rejects(
+    runToolCall(failed, () => writeBundleAtomically({ root, names: ["other"] }, async () => {
+      throw new Error("collector failed");
+    })),
+    /collector failed/,
+  );
+  assert.equal(failed.committed, false);
 });
 
 test("a write that commits nothing removes the directories it created on the way to its root, and keeps the ones that were there", async () => {

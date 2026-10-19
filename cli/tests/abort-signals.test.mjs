@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import childProcess from "node:child_process";
 import { setMaxListeners } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { syncBuiltinESMExports } from "node:module";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { collectRegisteredGrcTools, getRegisteredGrcTool } from "../dist/agent-sdk/lib/registry.js";
@@ -79,6 +79,8 @@ const VANTA_AUDIT = {
   auditStartDate: "2026-01-01",
   auditEndDate: "2026-12-31",
 };
+
+const fsPromises = createRequire(import.meta.url)("node:fs/promises");
 
 const CHILD_PROCESS_FUNCTIONS = ["exec", "execFile", "execFileSync", "execSync", "fork", "spawn", "spawnSync"];
 const KEEP_ENV = /^(PATH|TMPDIR|TMP|TEMP|LANG|LC_[A-Z_]+|TZ|NODE_[A-Z_]+)$/;
@@ -317,6 +319,20 @@ function vantaResponder(call) {
   if (path.endsWith("/oauth/token")) return Response.json({ access_token: "vanta-abort-token", expires_in: 3600 });
   if (path.endsWith("/audits")) return Response.json({ results: { data: [VANTA_AUDIT], pageInfo: { hasNextPage: false } } });
   return undefined;
+}
+
+/** Runs `effect` as a staged bundle named `name` starts moving to its final path, until the returned undo runs. */
+function onCommitMove(name, effect) {
+  const original = fsPromises.rename;
+  fsPromises.rename = async (from, to) => {
+    if (basename(to) === name && basename(dirname(from)).startsWith(".grclanker-staging-")) effect();
+    return original(from, to);
+  };
+  syncBuiltinESMExports();
+  return () => {
+    fsPromises.rename = original;
+    syncBuiltinESMExports();
+  };
 }
 
 /** A stand-in CLI that writes its process id to `<name>.pid` and then never finishes. */
@@ -677,6 +693,30 @@ test("aborting vanta_export_audit while it lists evidence writes nothing, not ev
   assert.equal(outcome.status, "rejected", `the export ${outcome.status} instead of rejecting`);
   assert.equal(outcome.error, reason);
   assert.equal(existsSync(exportsDir), false, `the export created its output directory: ${listTree(box.cwd).join(", ")}`);
+});
+
+test("an export aborted as its bundle starts moving into place resolves with the whole bundle, since the abort came too late to stop it", async (t) => {
+  const box = sandbox(t, () => Response.json(PAGERDUTY_FIXTURE));
+  const outputRoot = join(box.cwd, "exports");
+  const bundleName = "pagerduty-us-audit-bundle";
+  const controller = new AbortController();
+  t.after(onCommitMove(bundleName, () => controller.abort(new Error("operator stopped the export as it finished"))));
+
+  const outcome = await settleWithin(
+    getRegisteredGrcTool("pagerduty_export_audit_bundle").execute(
+      "call-late-abort",
+      { api_token: FAKE_SECRET, region: "us", output_dir: outputRoot },
+      controller.signal,
+    ),
+    10_000,
+  );
+  assert.equal(controller.signal.aborted, true, "the abort arrived while the bundle moved into place");
+  assert.equal(outcome.status, "resolved", `the export ${outcome.status === "rejected" ? `rejected with ${describeError(outcome.error)}` : "never settled"}`);
+  const { output_dir: outputDir, zip_path: zipPath } = outcome.value.details;
+  assert.equal(outputDir, join(realpathSync(outputRoot), bundleName));
+  assert.ok(existsSync(join(outputDir, "QUICK_REFERENCE.md")), "the bundle is complete");
+  assert.ok(existsSync(zipPath), "and so is its archive");
+  assert.deepEqual(readdirSync(outputRoot).sort(), [bundleName, `${bundleName}.zip`]);
 });
 
 test("every registered tool refuses a call whose signal already aborted: it rejects with the reason and sends, runs, and writes nothing", async (t) => {

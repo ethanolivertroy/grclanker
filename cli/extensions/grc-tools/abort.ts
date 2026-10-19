@@ -4,7 +4,31 @@
  * retry wait with these helpers: aborting the call cancels the request in
  * flight, ends the wait before a retry, and fails every later request at once.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { setTimeout as delay } from "node:timers/promises";
+
+/** One tool call in flight, and whether it has published its output yet. */
+export interface ToolCallState {
+  committed: boolean;
+}
+
+// Per call rather than per signal: the calls of one turn can share a signal.
+const runningCall = new AsyncLocalStorage<ToolCallState>();
+
+/** Runs `run` as the tool call `call`, so output it commits is recorded on `call`. */
+export function runToolCall<T>(call: ToolCallState, run: () => Promise<T>): Promise<T> {
+  return runningCall.run(call, run);
+}
+
+/**
+ * Records that the running tool call published its output. An abort that lands
+ * afterwards can no longer undo the output, so the call reports it instead of
+ * rejecting.
+ */
+export function markOutputCommitted(): void {
+  const call = runningCall.getStore();
+  if (call) call.committed = true;
+}
 
 /**
  * The tool call's abort signal fired. Its name is not "AbortError", so a client
