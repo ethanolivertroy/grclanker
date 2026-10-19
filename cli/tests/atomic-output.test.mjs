@@ -311,6 +311,34 @@ test("an archive another writer creates just before this one moves into place is
   assert.deepEqual(readdirSync(root).sort(), ["bundle-2", "bundle-2.zip", "bundle.zip"], "no directory is left without its archive");
 });
 
+test("a rename refused with EPERM or EACCES is a name collision only when the name exists, as Windows reports one", async () => {
+  for (const code of ["EPERM", "EACCES"]) {
+    const root = createTempBase("grclanker-atomic-windows-collision-");
+    let runs = 0;
+    const write = () => writeBundleAtomically({ root, names: numberedNames("bundle", 3), zip: true }, async (staged) => {
+      runs += 1;
+      await writeSampleBundle(staged);
+    });
+
+    const result = await beforeMove(join(root, "bundle"), () => {
+      mkdirSync(join(root, "bundle"));
+      throw errorWithCode(code);
+    }, write, { methods: ["rename"] });
+
+    assert.equal(runs, 2, `${code} onto an existing directory moves on to the next name`);
+    assert.equal(result.outputDir, join(root, "bundle-2"));
+    assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle-2", "bundle-2.zip"]);
+
+    runs = 0;
+    await assert.rejects(
+      beforeMove(join(root, "bundle-3"), () => { throw errorWithCode(code); }, write, { methods: ["rename"] }),
+      { code },
+    );
+    assert.equal(runs, 1, `${code} with nothing at the destination is an error, not a collision`);
+    assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle-2", "bundle-2.zip"], "the failed write leaves nothing behind");
+  }
+});
+
 test("on a filesystem without hard links, the archive moves into place with a rename", async () => {
   const root = createTempBase("grclanker-atomic-no-hard-links-");
 

@@ -213,6 +213,8 @@ async function renameUnlessTaken(from: string, to: string): Promise<boolean> {
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "EEXIST" || code === "ENOTEMPTY") return false;
+    // Windows refuses a rename onto an existing directory with EPERM or EACCES instead.
+    if ((code === "EPERM" || code === "EACCES") && pathEntryExists(to)) return false;
     throw error;
   }
 }
