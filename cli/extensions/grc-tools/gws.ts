@@ -31,7 +31,7 @@ import {
 import { readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep, ToolCallAbortedError, unlessAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { GWS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1028,6 +1028,7 @@ async function collectDataset(collector: () => Promise<GwsCollection>): Promise<
       seen: collection.items.length,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return { data: [], error: summarizeError(error), errorKind: classifyError(error), seen: 0 };
   }
 }
@@ -2273,6 +2274,7 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
         detail: httpStatusLabel(response.status),
       };
     } catch (error) {
+      rethrowIfAborted(error);
       return {
         key: basename(pathname) || pathname,
         path: pathname,
@@ -2595,6 +2597,7 @@ async function collectTokenInventory(
         kind: undefined,
       };
     } catch (error) {
+      rethrowIfAborted(error);
       return {
         records: [],
         failure: { userId, primaryEmail, error: summarizeError(error) },

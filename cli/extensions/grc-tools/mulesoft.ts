@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep, ToolCallAbortedError, unlessAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -1529,6 +1529,7 @@ export class MulesoftApiClient {
           pathLabel,
         );
       } catch (error) {
+        rethrowIfAborted(error);
         if (error instanceof MulesoftApiError) throw error;
         if (attempt < this.maxRetries) {
           await this.sleepImpl(this.retryDelayMs(undefined, attempt));
@@ -2021,6 +2022,7 @@ async function collect<T>(label: string, fallback: T, load: () => Promise<T>, er
   try {
     return { label, value: scrubDataStrings(await load()) };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     errors.push(`${label}: ${message}`);
     return {
@@ -3438,6 +3440,7 @@ export async function assessMulesoftRuntimeInfrastructure(
         const certificate = scrubDataStrings(await client.probeCertificate(host, target.servername));
         certificateProbes.push({ loadBalancer, sslEndpoint: target.label, servername: target.servername, certificate });
       } catch (error) {
+        rethrowIfAborted(error);
         const message = errorMessage(error);
         errors.push(`certificate_probe (${host}${target.servername === host ? "" : `, ${target.servername}`}): ${message}`);
         certificateProbes.push({ loadBalancer, sslEndpoint: target.label, servername: target.servername, error: message });
@@ -4195,6 +4198,7 @@ async function probeSurface(definition: SurfaceDefinition): Promise<MulesoftAcce
       count: definition.count?.(value),
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name: definition.name,
       endpoint: definition.endpoint,

@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { createCredentialScrubber, isCredentialDataKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1618,6 +1618,7 @@ export class ElasticApiClient {
         }
         return payload;
       } catch (error) {
+        rethrowIfAborted(error);
         if (error instanceof ElasticRequestError) throw error;
         const aborted = error instanceof Error && error.name === "AbortError";
         if (!aborted && attempt < this.config.maxRetries && isNetworkError(error)) {
@@ -2046,6 +2047,7 @@ export async function collectElasticSnapshot(
         ...(paged ? { page: { seen: paged.seen, total: paged.total, truncated: paged.truncated, pages: paged.pages } } : {}),
       };
     } catch (error) {
+      rethrowIfAborted(error);
       snapshot[name] = {
         name,
         target: spec.target,
@@ -4351,6 +4353,7 @@ export async function checkElasticAccess(client: ElasticPartialReader): Promise<
   try {
     privileges = privilegeProbeAvailable ? await client.hasPrivileges?.() : undefined;
   } catch (error) {
+    rethrowIfAborted(error);
     privilegeError = redactSecrets(errorMessage(error), config);
   }
   const missing = privileges ? missingPrivilegeSummary(privileges) : undefined;

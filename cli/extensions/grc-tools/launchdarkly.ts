@@ -16,7 +16,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { DEFAULT_DATA_SCRUB_DEPTH, REDACTED, createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1554,6 +1554,7 @@ export class LaunchdarklyApiClient {
         });
         rawText = await response.text();
       } catch (error) {
+        rethrowIfAborted(error);
         const timedOut = error instanceof Error && error.name === "AbortError";
         if (attempt < this.maxRetries) {
           await this.sleep(Math.min(500 * 2 ** attempt, MAX_RATE_LIMIT_WAIT_MS));
@@ -1895,6 +1896,7 @@ async function readableSurface(
       count: countResolver?.(value) ?? null,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name,
       endpoint: observedEndpoint(error) ?? request,
@@ -2087,6 +2089,7 @@ async function collectRecord(
   try {
     return { payload: await load(), endpoint: request };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     errors.push(`${label}: ${message}`);
     return { payload: {}, error: message, httpStatus: observedStatus(error), endpoint: observedEndpoint(error) ?? request };
@@ -2107,6 +2110,7 @@ async function collectList(
   try {
     return toCollection(await load());
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     errors.push(`${label}: ${message}`);
     return { items: [], truncated: false, seen: 0, error: message, httpStatus: observedStatus(error), endpoint: observedEndpoint(error) };
@@ -4760,6 +4764,7 @@ async function runAssessment(
   try {
     return await load();
   } catch (error) {
+    rethrowIfAborted(error);
     errors.push(`${category}: ${errorMessage(error)}`);
     return { title, category, summary: { failed: true }, findings: [], errors: [errorMessage(error)], snapshots: {} };
   }

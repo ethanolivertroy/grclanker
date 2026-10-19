@@ -18,7 +18,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, resolveWithCommands, type CommandLookup } from "./abort.js";
+import { abortableFetch, resolveWithCommands, rethrowIfAborted, type CommandLookup } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -879,6 +879,7 @@ async function postTokenRequest(tokenUri: string, form: URLSearchParams, fetchIm
       body: form.toString(),
     });
   } catch (error) {
+    rethrowIfAborted(error);
     throw new GcpApiError(`Token exchange failed before a response arrived: ${describeError(error)} (POST ${tokenUri})`, tokenUri, undefined, secrets);
   }
   const text = await response.text().catch(() => "");
@@ -1130,6 +1131,7 @@ async function surface(
     const value = await load();
     return { name, service, status: "readable", count: countResolver?.(value) };
   } catch (error) {
+    rethrowIfAborted(error);
     return { name, service, status: "not_readable", error: describeError(error) };
   }
 }
@@ -1201,6 +1203,7 @@ export class GcpAuditorClient {
         body: init.body === undefined ? undefined : JSON.stringify(init.body),
       });
     } catch (error) {
+      rethrowIfAborted(error);
       throw new GcpApiError(`${method} ${endpoint} failed before a response arrived: ${describeError(error)}`, endpoint, undefined, this.getKnownSecrets());
     }
     const secrets = this.getKnownSecrets();
@@ -1558,6 +1561,7 @@ async function attempt<T>(load: () => Promise<T>, fallback: T): Promise<Collecte
     const truncated = Boolean(list && Array.isArray(list.items) && list.truncated === true);
     return { data, truncated };
   } catch (error) {
+    rethrowIfAborted(error);
     return { data: fallback, error: describeError(error), truncated: false };
   }
 }
@@ -1603,6 +1607,7 @@ async function scanProjects<T>(
       }
       scan.rows.push({ projectId, data });
     } catch (error) {
+      rethrowIfAborted(error);
       const message = describeError(error);
       if (isApiDisabledError(message)) scan.apiDisabled.push(projectId);
       else scan.denied.push({ projectId, error: message });
@@ -2418,6 +2423,7 @@ export async function assessGcpIdentity(
           else if (ageDays > staleDays) staleKeys.push({ ...record, ageDays: Number(ageDays.toFixed(1)) });
         }
       } catch (error) {
+        rethrowIfAborted(error);
         keyErrors.push({ projectId: row.projectId, error: `${email}: ${describeError(error)}` });
       }
     }

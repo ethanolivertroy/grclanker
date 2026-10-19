@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { KNOWBE4_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1295,6 +1295,7 @@ export class Knowbe4ApiClient {
         headers.set("authorization", `Bearer ${token}`);
         response = await this.fetchImpl(url, { ...init, headers, signal: controller.signal });
       } catch (error) {
+        rethrowIfAborted(error);
         if (controller.signal.aborted) {
           throw new Knowbe4ApiError(this.redact(`KnowBe4 request timed out after ${this.config.timeoutMs}ms: ${target}`), null, endpoint);
         }
@@ -1616,6 +1617,7 @@ async function readableSurface(
     const value = await load();
     return { name, endpoint, status: "readable", collected: true, http_status: null, count: countResolver?.(value) ?? null };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name,
       endpoint,
@@ -1731,6 +1733,7 @@ async function collectSurface<T>(
   try {
     return collected(await load());
   } catch (error) {
+    rethrowIfAborted(error);
     return recordFailure(label, fallback, errors, error);
   }
 }
@@ -1778,6 +1781,7 @@ async function collectListing(
       ...(listing.endpoint ? { endpoint: listing.endpoint } : {}),
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ...recordFailure<JsonRecord[]>(label, [], errors, error), limit };
   }
 }
@@ -2109,6 +2113,7 @@ export async function collectKnowbe4Snapshot(
           ...(listing.truncated ? { recipients_truncated: true } : {}),
         });
       } catch (error) {
+        rethrowIfAborted(error);
         const message = errorMessage(error);
         recipientErrors.push(`security_test_recipients[${id}]: ${message}`);
         const endpoint = observedEndpoint(error) ?? recipientsEndpoint(id);
