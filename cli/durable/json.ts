@@ -16,11 +16,40 @@ import type { JsonObject } from "@earendil-works/pi-durable";
 
 export const CIRCULAR_PLACEHOLDER = "[Circular]";
 
-function hasToJson(value: object): value is { toJSON: () => unknown } {
+/** `JSON.stringify` looks for `toJSON` on objects, functions, and bigints. */
+function hasToJson(value: unknown): value is { toJSON: () => unknown } {
+  const kind = typeof value;
+  if (value === null || (kind !== "object" && kind !== "function" && kind !== "bigint")) return false;
   return typeof (value as { toJSON?: unknown }).toJSON === "function";
 }
 
-function convert(value: unknown, ancestors: Set<object>): JsonValue | undefined {
+/** What `JSON.stringify` serializes in place of `value`: its `toJSON()` result, with boxed primitives unwrapped. */
+function serializationInput(value: unknown): unknown {
+  const replaced = hasToJson(value) ? value.toJSON() : value;
+  if (replaced instanceof Number) return Number(replaced);
+  if (replaced instanceof String) return String(replaced);
+  if (replaced instanceof Boolean || replaced instanceof BigInt) return replaced.valueOf();
+  return replaced;
+}
+
+function isReference(value: unknown): value is object {
+  return (typeof value === "object" && value !== null) || typeof value === "function";
+}
+
+function convert(input: unknown, ancestors: Set<object>): JsonValue | undefined {
+  if (isReference(input) && ancestors.has(input)) return CIRCULAR_PLACEHOLDER;
+  const value = serializationInput(input);
+  if (value === input || !isReference(input)) return convertValue(value, ancestors);
+  // The original stays on the path while its replacement converts, so a `toJSON()` that wraps its own object ends as a cycle.
+  ancestors.add(input);
+  try {
+    return convertValue(value, ancestors);
+  } finally {
+    ancestors.delete(input);
+  }
+}
+
+function convertValue(value: unknown, ancestors: Set<object>): JsonValue | undefined {
   const kind = typeof value;
   switch (kind) {
     case "string":
@@ -47,15 +76,6 @@ function convert(value: unknown, ancestors: Set<object>): JsonValue | undefined 
 
   if (value === null || typeof value !== "object") return null;
   if (ancestors.has(value)) return CIRCULAR_PLACEHOLDER;
-
-  if (hasToJson(value)) {
-    ancestors.add(value);
-    try {
-      return convert(value.toJSON(), ancestors);
-    } finally {
-      ancestors.delete(value);
-    }
-  }
 
   ancestors.add(value);
   try {
