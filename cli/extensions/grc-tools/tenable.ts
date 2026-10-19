@@ -20,7 +20,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
-import { ToolCallAbortedError, abortableFetch, abortableSleep } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -2355,6 +2355,7 @@ export class TenableApiClient extends TenableHttpClient {
         if (typeof document.payload.status !== "string") throw this.nonDocument(document, { kind: "member", key: "status", type: "member" });
         status = document.payload;
       } catch (error) {
+        rethrowIfAborted(error);
         return notRun("STATUS_UNREADABLE", errorMessage(error), errorEndpoint(error) ?? statusEndpoint, errorStatus(error) ?? null);
       }
       const state = asString(status.status)?.toUpperCase();
@@ -2392,6 +2393,7 @@ export class TenableApiClient extends TenableHttpClient {
         unevaluableRecords += chunkRecords.length - documented.length;
         fetchedChunks += 1;
       } catch (error) {
+        rethrowIfAborted(error);
         downloadErrors.push(errorMessage(error));
         failedEndpoint = failedEndpoint ?? errorEndpoint(error) ?? `GET ${chunkPath}`;
         failedStatus = failedStatus ?? errorStatus(error);
@@ -2600,6 +2602,7 @@ async function collectList(endpoint: string, load: () => Promise<JsonRecord[]>):
     const items = await load();
     return okDataset(endpoint, items, items.length, items.length);
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset<JsonRecord[]>(endpoint, [], error);
   }
 }
@@ -2612,6 +2615,7 @@ async function collectPaginated(endpoint: string, load: () => Promise<TenablePag
     const total = page.total ?? (page.truncated ? null : page.items.length);
     return okDataset(endpoint, page.items, page.items.length, total, page.truncated, page.reason);
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset<JsonRecord[]>(endpoint, [], error);
   }
 }
@@ -2621,6 +2625,7 @@ async function collectObject(endpoint: string, load: () => Promise<JsonRecord>):
     const value = await load();
     return okDataset(endpoint, value, 1, 1);
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset<JsonRecord>(endpoint, {}, error);
   }
 }
@@ -2647,6 +2652,7 @@ async function collectExport(endpoint: string, load: () => Promise<TenableExport
     }
     return dataset;
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset<TenableExportResult>(endpoint, EMPTY_EXPORT, error);
   }
 }
@@ -3173,6 +3179,7 @@ async function collectPolicyDetails(clients: TenableClients, scans: TenableDatas
       const payload = await client.getPolicyDetails(policyId);
       return { policyId, scanNames, endpoint, status: "ok", httpStatus: null, details: projectPolicyDetails(payload) };
     } catch (error) {
+      rethrowIfAborted(error);
       return {
         policyId,
         scanNames,
@@ -4900,6 +4907,7 @@ async function probeSurface(
     const value = await load();
     return { surface: { name, endpoint, requiredRole, status: "readable", count: count?.(value) ?? null, httpStatus: null }, value };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       surface: {
         name,

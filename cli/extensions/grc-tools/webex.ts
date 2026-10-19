@@ -16,7 +16,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   ConfigFileError,
@@ -1006,6 +1006,7 @@ async function collectPage(load: () => Promise<WebexPage>): Promise<SurfaceResul
     const page = await load();
     return { ok: true, data: page.items, truncated: page.truncated };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ok: false, error: errorMessage(error), status: errorStatus(error) };
   }
 }
@@ -1014,6 +1015,7 @@ async function collectObject(load: () => Promise<JsonRecord>): Promise<SurfaceRe
   try {
     return { ok: true, data: await load(), truncated: false };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ok: false, error: errorMessage(error), status: errorStatus(error) };
   }
 }

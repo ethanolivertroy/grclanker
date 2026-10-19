@@ -19,7 +19,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, VERACODE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1597,6 +1597,7 @@ export class VeracodeApiClient {
           url.pathname,
         );
       } catch (error) {
+        rethrowIfAborted(error);
         if (error instanceof VeracodeApiError) throw error;
         const message = scrubErrorText(error instanceof Error ? error.message : String(error), configuredSecretsOf(this.config));
         if (attempt < this.config.retries) {
@@ -1786,6 +1787,7 @@ async function surface<T>(load: () => Promise<T>): Promise<Surface<T>> {
   try {
     return { status: "ok", value: await load() };
   } catch (error) {
+    rethrowIfAborted(error);
     const statusCode = asNumber(asObject(error)?.statusCode);
     return {
       status: "error",

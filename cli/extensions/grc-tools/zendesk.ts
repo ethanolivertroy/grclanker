@@ -20,7 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1860,6 +1860,7 @@ export class ZendeskApiClient {
         signal: controller.signal,
       });
     } catch (error) {
+      rethrowIfAborted(error);
       const message = error instanceof Error ? error.message : String(error);
       throw new ZendeskApiError(this.redact(`Zendesk request failed for ${url}: ${message}`), 0, endpointLabel(url));
     } finally {
@@ -2271,6 +2272,7 @@ async function snapshot<T>(method: ZendeskReadMethod, load: () => Promise<T>): P
   try {
     return { status: "ok", data: redactCredentialProperties(await load()) as T, endpoint };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     if (error instanceof ZendeskApiError) {
       const observed = error.endpoint ?? endpoint;
