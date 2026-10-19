@@ -76,8 +76,8 @@ export function SpecCatalogSection({ specs }: { specs: SpecMeta[] }) {
                       <td className="py-2.5 text-right align-top">
                         <SpecUrlCopyButton
                           url={`${RAW_BASE}/${spec.slug}.spec.md`}
-                          label="COPY"
-                          specName={spec.name}
+                          label="Copy"
+                          detail={`raw URL for ${spec.name}`}
                           className="copy-btn spec-copy-btn"
                         />
                       </td>

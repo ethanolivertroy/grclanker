@@ -14,7 +14,7 @@ interface PageProps {
 const pillClass =
   'inline-flex items-center rounded-full border px-2.5 py-1 text-[0.6875rem] font-mono uppercase tracking-[0.12em]';
 const neutralPillClass = `${pillClass} border-surface0 bg-crust/70 text-subtext0`;
-const externalLinkClass = 'text-blue hover:text-lavender';
+const externalLinkClass = 'text-blue underline! underline-offset-2 hover:text-lavender';
 
 async function getSpecOrNotFound(props: PageProps) {
   const { slug } = await props.params;
@@ -85,8 +85,8 @@ export default async function SpecPage(props: PageProps) {
           <div className="flex flex-wrap items-center gap-2 lg:max-w-[18rem] lg:justify-end">
             <SpecUrlCopyButton
               url={rawUrl}
-              label="COPY URL"
-              specName={meta.name}
+              label="Copy URL"
+              detail={`of the raw ${meta.name} spec`}
               className="copy-btn spec-action-btn spec-action-btn-primary"
             />
             <a href={rawUrl} download className="spec-action-btn">

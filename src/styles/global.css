@@ -2185,6 +2185,7 @@ details[open] > .agent-group-toggle::before {
   font-size: var(--text-nano);
   font-weight: 700;
   letter-spacing: 0.14em;
+  text-transform: uppercase;
 }
 
 .spec-copy-btn:hover {

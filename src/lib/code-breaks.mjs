@@ -1,16 +1,21 @@
-// Line-break control for inline code, link text, and numbers in running text.
-// Browsers fill each line greedily, so any break point inside an identifier
-// gets used whenever the identifier reaches a line end; each context gets only
-// the break points it needs.
+// Line-break control for inline code, link text, long paths and lists in table
+// text, and numbers in running text. Browsers fill each line greedily, so any
+// break point inside an identifier gets used whenever the identifier reaches a
+// line end; each context gets only the break points it needs.
 //
 // Inline code with no letters or digits, such as `;` or `: `, also gets
 // data-symbol, which keeps it in a box: the code face and color alone cannot
 // show where punctuation or a space starts and ends.
 
-// After a slash, or after a dot that does not start a file extension.
-const PATH_BREAK = String.raw`(?<=[^\s./_][/])(?=[^\s./_])|(?<=[^\s./_][.])(?=[^\s./_])(?![A-Za-z0-9]{1,4}$)`;
+// After a slash, or after a pipe or comma between items, as in `(admin|root)`,
+// `id,name`, or `22,445,1433`, but not after a comma that groups the digits
+// of a number such as 10,000 or one inside a regex quantifier such as {0,63}.
+const LIST_BREAK = String.raw`(?<=[^\s./_][/])(?=[^\s./_])|(?<=[^\s|]\|)(?=[^\s|])|(?<=[^\s\d,],)(?<!\{,)(?=[^\s,])|(?<=\d,)(?<!\{\d+,)(?=[^\s,])(?!\d{3}(?!\d))`;
+// Also after a dot that does not start a file extension.
+const PATH_BREAK = String.raw`${LIST_BREAK}|(?<=[^\s./_][.])(?=[^\s./_])(?![A-Za-z0-9]{1,4}$)`;
 // Also after an underscore and between camelCase words.
 const WORD_BREAK = String.raw`${PATH_BREAK}|(?<=[^\s./_]_)(?=[^\s./_])|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])`;
+const LIST_BREAKS = new RegExp(LIST_BREAK);
 const PATH_BREAKS = new RegExp(PATH_BREAK);
 const WORD_BREAKS = new RegExp(WORD_BREAK);
 
@@ -20,11 +25,14 @@ const WORD_BREAKS = new RegExp(WORD_BREAK);
 // LONG_LENGTH stay whole unless `breakHyphens` is set; longer ones may still
 // wrap at their hyphens, so they cannot overflow a phone screen. Running text
 // keeps identifiers whole; table columns are narrower, dense ones narrower still.
+// Plain text in a table also wraps at list breaks from `textLength`: a column
+// never narrows past its longest unbreakable run, so a long path or pattern
+// would push the whole table past the edge of the page.
 const LONG_LENGTH = 24;
 const PROSE = { shortLength: 16, wordLength: Infinity, breakHyphens: false };
-const TABLE = { shortLength: 16, wordLength: LONG_LENGTH, breakHyphens: false };
+const TABLE = { shortLength: 16, wordLength: LONG_LENGTH, textLength: LONG_LENGTH, breakHyphens: false };
 const DENSE_COLUMNS = 4;
-const DENSE_TABLE = { shortLength: 12, wordLength: 12, breakHyphens: true };
+const DENSE_TABLE = { shortLength: 12, wordLength: 12, textLength: 12, breakHyphens: true };
 
 // Numbers joined by hyphens, such as 2027-01-01, 800-53, SHA-256, or 1-300.
 // Words such as 30-day still break at their hyphen, as they do in print.
@@ -77,6 +85,14 @@ function keepNumbersWhole(value) {
   });
 }
 
+function breakPlainText(value, mode) {
+  if (!mode.textLength) return keepNumbersWhole(value);
+  return value.split(new RegExp(String.raw`(\S{${mode.textLength},})`)).flatMap((part, index) => {
+    const pieces = index % 2 ? part.split(LIST_BREAKS) : [part];
+    return pieces.flatMap((piece, at) => (at ? [wbr(), ...keepNumbersWhole(piece)] : keepNumbersWhole(piece)));
+  });
+}
+
 function visit(node, mode) {
   if (node.type !== 'element' || node.tagName === 'pre' || 'dataNowrap' in node.properties) return;
   if (node.tagName === 'table') mode = columnCount(node) >= DENSE_COLUMNS ? DENSE_TABLE : TABLE;
@@ -95,7 +111,7 @@ function visit(node, mode) {
     );
   } else {
     node.children = node.children.flatMap((child) =>
-      child.type === 'text' ? keepNumbersWhole(child.value) : [child],
+      child.type === 'text' ? breakPlainText(child.value, mode) : [child],
     );
   }
   for (const child of node.children) visit(child, mode);

@@ -3,15 +3,16 @@
 import { useCopy } from '../lib/use-copy';
 import { CheckIcon, CopyIcon } from './icons';
 
+/** The button's name is its visible label and then `detail`, so saying the label still finds it by voice. */
 export function SpecUrlCopyButton({
   url,
   label,
-  specName,
+  detail,
   className,
 }: {
   url: string;
   label: string;
-  specName: string;
+  detail: string;
   className: string;
 }) {
   const { copied, copy } = useCopy('Raw spec URL copied to clipboard');
@@ -19,10 +20,10 @@ export function SpecUrlCopyButton({
     <button
       type="button"
       className={copied ? `${className} copied` : className}
-      aria-label={`Copy raw URL for ${specName}`}
+      aria-label={`${label} ${detail}`}
       onClick={() => copy(url)}
     >
-      {copied ? 'COPIED' : label}
+      {copied ? 'Copied' : label}
     </button>
   );
 }
