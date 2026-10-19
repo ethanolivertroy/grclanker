@@ -3019,3 +3019,25 @@ kbd {
     margin-left: 11.25rem;
   }
 }
+
+/* Chrome can carry a grid that would fit over to the next sheet, leaving this
+   one nearly blank. Below 768px these grids are one column, so on paper they
+   are blocks spaced as the grid gaps were. */
+@media print and (max-width: 767px) {
+  .hero-briefing-grid,
+  .hero-summary-list,
+  .hero-fact-list,
+  .workflow-grid {
+    display: flow-root;
+  }
+
+  .hero-briefing-side {
+    margin-top: 1.5rem;
+  }
+
+  .hero-summary-item + .hero-summary-item,
+  .hero-fact-row + .hero-fact-row,
+  .workflow-row + .workflow-row {
+    margin-top: 1rem;
+  }
+}
