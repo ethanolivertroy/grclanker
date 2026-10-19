@@ -47,7 +47,9 @@ export type AssessmentState = {
 export const ASSESSMENT_DOC_KIND = "grclanker.assessment";
 
 export function emptyAssessmentState(): AssessmentState {
-  return { calls: {}, findings: {}, artifacts: {} };
+  // Call ids come from the model, so an id of `__proto__` must land as an entry, not on the prototype. Chord accepts and
+  // keeps null prototypes, and its drafts write own properties even into documents reloaded as ordinary objects.
+  return { calls: Object.create(null), findings: Object.create(null), artifacts: Object.create(null) };
 }
 
 export const Assessment = defineDoc<AssessmentState>({
