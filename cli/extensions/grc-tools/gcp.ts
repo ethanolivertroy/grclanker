@@ -4159,10 +4159,12 @@ export async function exportGcpAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = assessments.flatMap((assessment) => assessment.errors.map((error) => `[${assessment.category}] ${error}`));
   const targetName = safeDirName(`${config.organizationId ?? config.projectId ?? "gcp-scope"}-audit`);
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(targetName, 9),
     zip: true,
     signal: options.signal,

@@ -976,13 +976,14 @@ async function writeFileBundle(
   files: BundleTemplateFile[],
   signal?: AbortSignal,
 ): Promise<{ outputDir: string; files: string[] }> {
-  signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
-  const canonicalOutputRoot = realpathSync(outputRoot);
   const { outputDir } = await writeBundleAtomically({
-    root: canonicalOutputRoot,
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(bundleName, 100),
-    exhaustedMessage: `Unable to allocate bundle directory under ${canonicalOutputRoot}`,
+    exhaustedMessage: (root) => `Unable to allocate bundle directory under ${root}`,
     signal,
   }, async (staged) => {
     for (const file of files) {

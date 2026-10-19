@@ -4516,11 +4516,13 @@ export async function exportKnowbe4AuditBundle(
   // Credential-shaped values and token-bearing URLs never leave the process regardless of the PII setting.
   const redact = (value: unknown): unknown => redactCredentialValues(config.redactPii ? redactKnowbe4Pii(value) : value);
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const accountName = asString(snapshot.account.data.name) ?? `knowbe4-${config.region}`;
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(accountName)}-knowbe4-audit-bundle`, 6),
     zip: true,
     signal: options.signal,

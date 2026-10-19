@@ -3564,11 +3564,13 @@ export async function exportSplunkAuditBundle(
     }
   }
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(new URL(config.url).host)}-splunk-audit-${stamp}`, 50),
     zip: true,
     signal: options.signal,

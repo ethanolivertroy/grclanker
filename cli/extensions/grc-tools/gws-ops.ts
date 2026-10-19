@@ -1286,10 +1286,12 @@ export async function collectGwsOperatorEvidenceBundle(
   const completion = getBundleCompletion(results);
 
   const outputRoot = args.output_dir?.trim() || DEFAULT_OUTPUT_DIR;
-  args.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(safeDirName("gws-operator-evidence"), 6),
     zip: true,
     signal: args.signal,

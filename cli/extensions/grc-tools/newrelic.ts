@@ -4949,11 +4949,13 @@ export async function exportNewrelicAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
   const accountIds = asArray(accessControl.summary.accounts_in_scope).map((id) => asNumber(id)).filter((id): id is number => id !== undefined);
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const label = accountIds.length > 0 ? accountIds.join("-") : config.region.toLowerCase();
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(safeDirName(`newrelic-${label}-audit-bundle`), 6),
     zip: true,
     signal: options.signal,

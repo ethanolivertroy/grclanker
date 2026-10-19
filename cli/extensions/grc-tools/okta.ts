@@ -5988,10 +5988,12 @@ export async function exportOktaAuditBundle(
   ];
   const allFindings = assessments.flatMap((assessment) => assessment.findings);
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(safeDirName(`${new URL(config.orgUrl).hostname}-audit-bundle`), 10),
     zip: true,
     signal: options.signal,

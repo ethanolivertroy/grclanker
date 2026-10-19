@@ -71,6 +71,15 @@ const PAGERDUTY_FIXTURE = {
 // Read for on-call coverage, which the export collects after access control and incident response.
 const PAGERDUTY_HANGING_PATHS = new Set(["/schedules", "/oncalls"]);
 
+const VANTA_AUDIT = {
+  id: "audit-abort",
+  customerDisplayName: null,
+  customerOrganizationName: "Example Customer",
+  framework: "soc2",
+  auditStartDate: "2026-01-01",
+  auditEndDate: "2026-12-31",
+};
+
 const CHILD_PROCESS_FUNCTIONS = ["exec", "execFile", "execFileSync", "execSync", "fork", "spawn", "spawnSync"];
 const KEEP_ENV = /^(PATH|TMPDIR|TMP|TEMP|LANG|LC_[A-Z_]+|TZ|NODE_[A-Z_]+)$/;
 
@@ -300,6 +309,14 @@ function abortProblems(run, requests) {
 function pagerdutyResponder(call) {
   const path = new URL(call.url).pathname;
   return PAGERDUTY_HANGING_PATHS.has(path) ? undefined : Response.json(PAGERDUTY_FIXTURE);
+}
+
+/** Answers the token and audit list requests, so the export gets as far as listing evidence, which never answers. */
+function vantaResponder(call) {
+  const path = new URL(call.url).pathname;
+  if (path.endsWith("/oauth/token")) return Response.json({ access_token: "vanta-abort-token", expires_in: 3600 });
+  if (path.endsWith("/audits")) return Response.json({ results: { data: [VANTA_AUDIT], pageInfo: { hasNextPage: false } } });
+  return undefined;
 }
 
 /** A stand-in CLI that writes its process id to `<name>.pid` and then never finishes. */
@@ -640,6 +657,26 @@ test("aborting pagerduty_export_audit_bundle mid-collection writes nothing, not 
 
   assert.deepEqual(listTree(box.root).filter((path) => /\.zip$|\.grclanker-staging-|audit-bundle/.test(path)), []);
   assert.equal(existsSync(outputRoot), false, `the export created its output directory: ${listTree(box.cwd).join(", ")}`);
+});
+
+test("aborting vanta_export_audit while it lists evidence writes nothing, not even its output directory", async (t) => {
+  const box = sandbox(t, vantaResponder);
+  const exportsDir = join(box.cwd, "exports");
+  const isEvidence = (request) => new URL(request.url).pathname.includes("/evidence");
+  const controller = new AbortController();
+  const call = getRegisteredGrcTool("vanta_export_audit").execute(
+    "call-vanta-export",
+    { audit_id: VANTA_AUDIT.id, client_id: "vanta-abort-client", client_secret: FAKE_SECRET, output_dir: join(exportsDir, "vanta") },
+    controller.signal,
+  );
+  assert.ok(await waitUntil(() => box.requests.some(isEvidence), 5000), "the export started listing evidence");
+
+  const reason = new Error("operator stopped the Vanta export");
+  controller.abort(reason);
+  const outcome = await settleWithin(call, SETTLE_MS);
+  assert.equal(outcome.status, "rejected", `the export ${outcome.status} instead of rejecting`);
+  assert.equal(outcome.error, reason);
+  assert.equal(existsSync(exportsDir), false, `the export created its output directory: ${listTree(box.cwd).join(", ")}`);
 });
 
 test("every registered tool refuses a call whose signal already aborted: it rejects with the reason and sends, runs, and writes nothing", async (t) => {

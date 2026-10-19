@@ -3652,10 +3652,12 @@ export async function exportAzureAuditBundle(
   const { findings, errors } = mergeAssessments("Azure audit bundle", assessments);
   const generatedAt = new Date().toISOString();
   const targetName = safeDirName(`${config.tenantId}-${config.subscriptionId}-audit`);
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(targetName, 50),
     zip: true,
     signal: options.signal,

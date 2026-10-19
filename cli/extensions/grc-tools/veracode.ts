@@ -3823,10 +3823,12 @@ export async function exportVeracodeAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings).sort((left, right) => left.id.localeCompare(right.id));
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(new URL(config.baseUrl).host)}-audit-bundle`, 50),
     zip: true,
     signal: options.signal,

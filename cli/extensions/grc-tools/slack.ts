@@ -2883,10 +2883,12 @@ export async function exportSlackAuditBundle(
   const errors = areas.flatMap((area) => area.result.errors.map((item) => `[${area.slug}] ${item}`));
   const generatedAt = client.getNow().toISOString();
   const targetName = safeDirName(`${config.orgId ?? "slack"}-audit`);
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(targetName, 9),
     zip: true,
     signal: options.signal,

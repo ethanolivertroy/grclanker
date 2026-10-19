@@ -3649,10 +3649,12 @@ export async function exportOciAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
   if (compartments.error) errors.push(redactSensitiveText(compartments.error));
   const targetName = safeDirName(`${config.tenancyOcid}-${config.region}-audit`);
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(targetName, 9),
     zip: true,
     signal: options.signal,

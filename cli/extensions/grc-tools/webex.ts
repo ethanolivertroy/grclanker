@@ -2231,10 +2231,12 @@ export async function exportWebexAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors.map((item) => `${assessment.category}: ${item}`)))];
   const secrets = client.knownSecrets?.() ?? webexCredentialValues(config);
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(config.orgId ?? access.orgId ?? "webex-org")}-audit-bundle`, 9),
     zip: true,
     signal: options.signal,

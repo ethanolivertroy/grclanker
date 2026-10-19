@@ -4377,10 +4377,12 @@ export async function exportZendeskAuditBundle(
   // Every file passes through the configured-secret scrub (guard 2) on the way
   // out: JSON files value by value, text files as a whole.
   const secrets = configuredZendeskSecrets(config);
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(config.subdomain)}-zendesk-audit-bundle`, 50),
     zip: true,
     signal: options.signal,

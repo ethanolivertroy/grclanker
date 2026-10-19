@@ -4373,11 +4373,13 @@ export async function exportCrowdstrikeAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = assessments.flatMap((assessment) => assessment.errors.map((error) => `[${assessment.category}] ${error}`));
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const bundleName = safeDirName(`${config.cloud ?? new URL(config.baseUrl).hostname}${config.memberCid ? `-${config.memberCid}` : ""}-audit-bundle`);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(bundleName, 9),
     zip: true,
     signal: options.signal,

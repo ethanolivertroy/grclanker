@@ -3506,10 +3506,12 @@ export async function exportSalesforceAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
   const orgLabel = asString(platformData.organization.data?.Name) ?? asString(platformData.organization.data?.Id) ?? (platformData.instanceUrl ? new URL(platformData.instanceUrl).hostname : "salesforce-org");
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(orgLabel)}-audit-bundle`, 50),
     zip: true,
     signal: options.signal,

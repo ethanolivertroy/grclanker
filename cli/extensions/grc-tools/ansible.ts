@@ -4169,10 +4169,12 @@ export async function exportAnsibleAuditBundle(
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors))];
 
   const targetName = safeDirName(`${new URL(config.baseUrl).host}-ansible-aap-audit`);
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(targetName, 10),
     zip: true,
     signal: options.signal,

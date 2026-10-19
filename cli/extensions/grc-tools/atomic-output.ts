@@ -1,8 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
-import { linkSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { linkSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync } from "node:fs";
 import { chmod, link, lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 /**
  * Where a bundle lands: the directory that receives it and the names to try in order. The first
@@ -10,11 +10,16 @@ import { dirname, join } from "node:path";
  */
 export interface BundleTarget {
   root: string;
+  /**
+   * Creates `root` with the caller's own checks, in place of a plain recursive mkdir, and returns the
+   * path the bundle lands under, such as the root's real path.
+   */
+  createRoot?: (root: string) => string;
   names: Iterable<string>;
   /** Runs on each candidate name before it is considered; throwing refuses the export instead of moving on. */
   checkName?: (name: string) => void;
-  /** Thrown when every name is taken. */
-  exhaustedMessage?: string;
+  /** Thrown when every name is taken; a function gets the path the bundle would have landed under. */
+  exhaustedMessage?: string | ((root: string) => string);
 }
 
 export interface AtomicBundleOptions extends BundleTarget {
@@ -58,6 +63,11 @@ const activeStaging = new Set<string>();
 const pendingCommits = new Map<string, { root: string; record: CommitRecord }>();
 /** Final paths claimed by writes still in flight in this process, so concurrent writes pick different names. */
 const claimedTargets = new Set<string>();
+/**
+ * Directories that writes in flight in this process created on the way to their roots, with how many of
+ * those writes still need each. The last of them to finish removes the directory if nothing landed in it.
+ */
+const createdDirectories = new Map<string, number>();
 let exitCleanupRegistered = false;
 
 /** `base`, then `base-2` through `base-<count>`: the rerun naming the audit exporters share. */
@@ -80,8 +90,7 @@ function stagingName(): string {
   return `${STAGING_PREFIX}${HOST_TOKEN}-${process.pid}-${randomBytes(6).toString("hex")}`;
 }
 
-function trackStaging(path: string): void {
-  activeStaging.add(path);
+function registerExitCleanup(): void {
   if (exitCleanupRegistered) return;
   exitCleanupRegistered = true;
   process.once("exit", () => {
@@ -94,7 +103,51 @@ function trackStaging(path: string): void {
         // The next write under the same root sweeps whatever is left.
       }
     }
+    // Deepest first, so removing a directory can leave its parent empty.
+    for (const dir of [...createdDirectories.keys()].sort((a, b) => b.length - a.length)) removeIfEmpty(dir);
   });
+}
+
+function trackStaging(path: string): void {
+  activeStaging.add(path);
+  registerExitCleanup();
+}
+
+function removeIfEmpty(dir: string): boolean {
+  try {
+    rmdirSync(dir);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
+/**
+ * Claims, deepest first, the directories on the way to `root` that do not exist yet or that another
+ * write in flight created. Claiming before the root is created is what tells the directories a write
+ * creates from the ones that were already there, which are never removed.
+ */
+function claimNewDirectories(root: string): string[] {
+  registerExitCleanup();
+  const claimed: string[] = [];
+  for (let dir = resolve(root); createdDirectories.has(dir) || !pathEntryExists(dir); dir = dirname(dir)) {
+    claimed.push(dir);
+    createdDirectories.set(dir, (createdDirectories.get(dir) ?? 0) + 1);
+    if (dirname(dir) === dir) break;
+  }
+  return claimed;
+}
+
+/** Drops a write's claims, removing each directory that no other write in flight claims while it is empty. */
+function releaseNewDirectories(claimed: readonly string[]): void {
+  let removing = true;
+  for (const dir of claimed) {
+    const remaining = (createdDirectories.get(dir) ?? 1) - 1;
+    if (remaining > 0) createdDirectories.set(dir, remaining);
+    else createdDirectories.delete(dir);
+    // A directory that stays keeps every directory above it from being empty.
+    removing &&= remaining === 0 && removeIfEmpty(dir);
+  }
 }
 
 async function releaseStaging(path: string): Promise<void> {
@@ -286,14 +339,28 @@ async function commitStaged(
  * staged directory under the next free name, so files that record the bundle's location stay
  * accurate; keep the writer's state local to each run. The staging directory is removed on every
  * exit path; one left by a process that died is removed by the next write under the same root.
+ * Directories created on the way to the root are removed again, while empty, when nothing commits.
  */
 export async function writeBundleAtomically(
   options: AtomicBundleOptions,
   write: (staged: StagedBundle) => Promise<void>,
 ): Promise<CommittedBundle> {
-  const { root, zip = false, signal, checkName } = options;
-  signal?.throwIfAborted();
+  options.signal?.throwIfAborted();
+  const created = claimNewDirectories(options.root);
+  try {
+    const root = options.createRoot ? options.createRoot(options.root) : options.root;
+    return await stageAndCommit(root, options, write);
+  } finally {
+    releaseNewDirectories(created);
+  }
+}
 
+async function stageAndCommit(
+  root: string,
+  options: AtomicBundleOptions,
+  write: (staged: StagedBundle) => Promise<void>,
+): Promise<CommittedBundle> {
+  const { zip = false, signal, checkName, exhaustedMessage } = options;
   const candidates = options.names[Symbol.iterator]();
   const takenOnDisk = (name: string) =>
     pathEntryExists(join(root, name)) || (zip && pathEntryExists(join(root, `${name}.zip`)));
@@ -305,7 +372,11 @@ export async function writeBundleAtomically(
     }
     return undefined;
   };
-  const exhausted = () => new Error(options.exhaustedMessage ?? `Unable to allocate output directory under ${root}`);
+  const exhausted = () => new Error(
+    typeof exhaustedMessage === "function"
+      ? exhaustedMessage(root)
+      : exhaustedMessage ?? `Unable to allocate output directory under ${root}`,
+  );
 
   await mkdir(root, { recursive: true, mode: 0o700 });
   await sweepAbandonedStaging(root);
@@ -317,7 +388,8 @@ export async function writeBundleAtomically(
   const stagingRoot = join(root, stagingName());
   trackStaging(stagingRoot);
   try {
-    await mkdir(stagingRoot, { mode: 0o700 });
+    // Recursive: a failed write in another process removes a root it created, even while this one starts.
+    await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
     for (;;) {
       const current = name;
       const staged: StagedBundle = {

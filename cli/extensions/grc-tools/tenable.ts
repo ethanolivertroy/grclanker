@@ -5205,10 +5205,12 @@ export async function exportTenableAuditBundle(
   const errors = assessments.flatMap((assessment) => assessment.errors);
 
   const hostLabel = config.vm ? new URL(config.vm.baseUrl).hostname : new URL(config.securityCenter?.baseUrl ?? DEFAULT_CLOUD_URL).hostname;
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(hostLabel)}-audit-bundle`, 50),
     zip: true,
     signal: options.signal,

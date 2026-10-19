@@ -4138,10 +4138,12 @@ export async function exportBoxAuditBundle(
   const truncated = [...new Set([...assessments.flatMap((assessment) => assessment.truncated), ...datasetTruncations("groups", groups)])];
   const enterpriseId = access.enterpriseId ?? identityData.enterpriseId;
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(enterpriseId ?? "box-enterprise")}-audit-bundle`, 6),
     zip: true,
     checkName: (name) => resolveSecureOutputPath(outputRoot, name),

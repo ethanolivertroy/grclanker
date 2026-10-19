@@ -3555,17 +3555,18 @@ export async function exportPagerdutyAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = assessments.flatMap((assessment) => assessment.errors);
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
-  const root = realpathSync(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root,
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(`pagerduty-${config.region}`)}-audit-bundle`, 10),
     zip: true,
     signal: options.signal,
     checkName: (name) => {
-      resolveSecureOutputPath(root, name);
-      resolveSecureOutputPath(root, `${name}.zip`);
+      resolveSecureOutputPath(outputRoot, name);
+      resolveSecureOutputPath(outputRoot, `${name}.zip`);
     },
   }, async (staged) => {
     // A denied, errored, or uncollected dataset is written as a not-collected marker, never as an empty list.

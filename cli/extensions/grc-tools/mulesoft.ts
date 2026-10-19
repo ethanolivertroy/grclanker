@@ -4590,10 +4590,12 @@ export async function exportMulesoftAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = assessments.flatMap((assessment) => assessment.errors.map((error) => `[${assessment.category}] ${error}`));
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(config.organizationId)}-audit-bundle`, MAX_AUDIT_DIR_SUFFIX),
     zip: true,
     signal: options.signal,

@@ -4222,10 +4222,12 @@ export async function exportQualysAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = uniqueStrings(assessments.flatMap((assessment) => assessment.errors));
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(safeDirName(`qualys-${config.platform}-audit-bundle`), MAX_BUNDLE_SUFFIX),
     zip: true,
     signal: options.signal,

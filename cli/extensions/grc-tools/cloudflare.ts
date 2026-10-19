@@ -3470,10 +3470,12 @@ export async function exportCloudflareAuditBundle(
     attemptList(() => client.listZones(options.zoneLimit)),
   ]);
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(config.accountId ?? "cloudflare-account")}-audit-bundle`, 50),
     zip: true,
     signal: options.signal,

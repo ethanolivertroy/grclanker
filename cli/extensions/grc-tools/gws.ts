@@ -4171,10 +4171,12 @@ export async function exportGwsAuditBundle(
   const knownSecrets = knownGwsSecretValues(config);
 
   const safeName = safeDirName(`${getDisplayOrganization(config)}-gws-audit`);
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(safeName, 9),
     zip: true,
     signal: options.signal,

@@ -5481,11 +5481,13 @@ export async function exportPaloaltoAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set([...(prismaSnapshot?.errors ?? []), ...deviceSnapshots.flatMap((item) => item.errors)])];
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const label = safeDirName(config.prisma ? new URL(config.prisma.apiUrl).hostname : config.panos[0]?.host ?? "paloalto");
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${label}-audit-bundle`, 6),
     zip: true,
     signal: options.signal,

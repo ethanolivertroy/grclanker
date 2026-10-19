@@ -5019,10 +5019,12 @@ export async function exportAwsAuditBundle(
   const counts = countByStatus(findings);
   const accountId = access.accountId ?? config.accountId ?? "aws-account";
   const targetName = safeDirName(`${accountId}-${config.region}-audit`);
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(targetName, 6),
     zip: true,
     signal: options.signal,

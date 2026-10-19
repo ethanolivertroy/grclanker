@@ -5313,10 +5313,12 @@ export async function exportGitHubAuditBundle(
   ];
   const allFindings = assessments.flatMap((assessment) => assessment.findings);
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(safeDirName(`${config.organization}-audit-bundle`), 6),
     zip: true,
     signal: options.signal,

@@ -910,7 +910,6 @@ export async function exportVantaAuditPackage(
   const errors: string[] = [];
 
   options.signal?.throwIfAborted();
-  ensurePrivateDir(baseOutputDir);
 
   const evidence = await client.listEvidence(audit.id);
   const controlMap = collectControlMap(evidence);
@@ -934,6 +933,10 @@ export async function exportVantaAuditPackage(
   let totalSizeBytes = 0;
   const { outputDir, zipPath } = await writeBundleAtomically({
     root: baseOutputDir,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return root;
+    },
     names: auditOutputNames(audit),
     zip: true,
     signal: options.signal,

@@ -3291,10 +3291,12 @@ export async function exportSumologicAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors.map((error) => `${assessment.area}: ${error}`)))];
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(config.deployment ?? new URL(config.baseUrl).hostname)}-sumologic-audit-bundle`, 50),
     zip: true,
     signal: options.signal,

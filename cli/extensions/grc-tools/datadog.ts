@@ -4563,11 +4563,13 @@ export async function exportDatadogAuditBundle(
     ...dataSnapshot.errors,
   ])];
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const bundleName = `${safeDirName(config.site)}-audit-bundle`;
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(bundleName, 6),
     zip: true,
     signal: options.signal,

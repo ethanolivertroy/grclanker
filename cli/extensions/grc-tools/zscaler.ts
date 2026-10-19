@@ -3757,10 +3757,12 @@ export async function exportZscalerAuditBundle(clients: ZscalerClients, options:
     ...assessments.flatMap((assessment) => assessment.truncated.map((note) => `${assessment.area} partial: ${note}`)),
   ];
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(root);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(root),
+    root,
+    createRoot: (dir) => {
+      ensurePrivateDir(dir);
+      return realpathSync(dir);
+    },
     names: numberedNames(`zscaler-audit-${tenantLabel}-${generatedAt.slice(0, 10)}`, 9),
     zip: true,
     signal: options.signal,

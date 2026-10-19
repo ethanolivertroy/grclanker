@@ -4667,11 +4667,13 @@ export async function exportElasticAuditBundle(
   const truncated = listSnapshotTruncations(snapshot);
   const notCollected = listSnapshotSkips(snapshot);
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const clusterLabel = safeDirName(new URL(config.elasticsearchUrl).hostname);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${clusterLabel}-audit-bundle`, 9),
     zip: true,
     signal: options.signal,

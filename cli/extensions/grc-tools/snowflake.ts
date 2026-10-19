@@ -3749,10 +3749,12 @@ export async function exportSnowflakeAuditBundle(
   const failedStatements = statements.filter((statement) => statement.status !== "ok");
   const notRequestedStatements = statements.filter((statement) => statement.status === "not_requested");
 
-  options.signal?.throwIfAborted();
-  ensurePrivateDir(outputRoot);
   const { outputDir, zipPath } = await writeBundleAtomically({
-    root: realpathSync(outputRoot),
+    root: outputRoot,
+    createRoot: (root) => {
+      ensurePrivateDir(root);
+      return realpathSync(root);
+    },
     names: numberedNames(`${safeDirName(access.account || config.account)}-audit-bundle`, 50),
     zip: true,
     signal: options.signal,
