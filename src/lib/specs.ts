@@ -47,6 +47,36 @@ export const categoryLabels: Record<string, string> = {
   'community-specs': 'Community Specs',
 };
 
+/**
+ * Category names that generated specs carry from the CLI registry, mapped to the catalog group each belongs to.
+ * The catalog leaves out a spec whose category is neither a group key nor listed here.
+ */
+export const categoryAliases: Record<string, string> = {
+  'application-security': 'vulnerability-application-security',
+  cloud: 'cloud-infrastructure',
+  'cloud-and-network-security': 'security-network-infrastructure',
+  collaboration: 'saas-collaboration',
+  'collaboration-and-content': 'saas-collaboration',
+  'crm-and-business-applications': 'saas-collaboration',
+  'customer-support': 'saas-collaboration',
+  'edge-security': 'security-network-infrastructure',
+  'endpoint-security': 'security-network-infrastructure',
+  'identity-and-access': 'identity-access-management',
+  'identity-and-collaboration': 'identity-access-management',
+  'it-service-management': 'saas-collaboration',
+  'security-awareness': 'vulnerability-application-security',
+  'zero-trust-and-secure-web-gateway': 'security-network-infrastructure',
+};
+
+/** The catalog group key for a spec's frontmatter category. */
+export function getCategoryKey(category: string) {
+  return categoryAliases[category] ?? category;
+}
+
+export function getCategoryLabel(category: string) {
+  return categoryLabels[getCategoryKey(category)] ?? category;
+}
+
 export const RAW_BASE = 'https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs';
 
 /** Specs whose guide is not `integrations/<slug without -sec-inspector>`. */
@@ -86,9 +116,7 @@ export function groupSpecsByCategory(specs: SpecMeta[] = loadSpecs()): Record<st
   });
 
   specs.forEach((spec) => {
-    if (categories[spec.category]) {
-      categories[spec.category].specs.push(spec);
-    }
+    categories[getCategoryKey(spec.category)]?.specs.push(spec);
   });
 
   return categories;

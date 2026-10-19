@@ -8,7 +8,7 @@ import { SpecViewState, SpecViews } from '../../../components/spec-views';
 import { pageMetadata } from '../../../lib/metadata';
 import { githubUrl } from '../../../lib/site';
 import { source } from '../../../lib/source';
-import { RAW_BASE, categoryLabels, getSpec, getSpecGuideSlug, loadSpecs } from '../../../lib/specs';
+import { RAW_BASE, getCategoryLabel, getSpec, getSpecGuideSlug, loadSpecs } from '../../../lib/specs';
 
 interface PageProps {
   params: Promise<{ slug: string }>;
@@ -61,7 +61,7 @@ export default async function SpecPage(props: PageProps) {
               <div className="mt-3 flex flex-wrap gap-2">
                 <span className={`${pillClass} border-blue/20 bg-blue/[0.06] text-blue`}>{meta.vendor}</span>
                 <span className={`${pillClass} border-teal/20 bg-teal/[0.06] text-teal`}>
-                  {categoryLabels[meta.category] || meta.category}
+                  {getCategoryLabel(meta.category)}
                 </span>
                 <span className={neutralPillClass}>{meta.language}</span>
                 <span className={neutralPillClass}>v{meta.version}</span>
