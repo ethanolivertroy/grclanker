@@ -9,7 +9,6 @@
  */
 import { execFileSync } from "node:child_process";
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -17,9 +16,8 @@ import {
 } from "node:fs";
 import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, resolveWithCommands, type CommandLookup } from "./abort.js";
+import { abortableFetch, resolveWithCommands, rethrowIfAborted, type CommandLookup } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -52,6 +50,7 @@ import {
   AZURE_STALE_GUEST_DAYS as STALE_GUEST_DAYS,
 } from "./azure.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type JsonRecord = Record<string, unknown>;
 type FetchImpl = typeof fetch;
@@ -1307,6 +1306,7 @@ async function attempt<T>(load: () => Promise<T>): Promise<Attempt<T>> {
   try {
     return { ok: true, value: await load() };
   } catch (error) {
+    rethrowIfAborted(error);
     const status = error instanceof AzureApiError ? error.status : undefined;
     return { ok: false, error: describeThrown(error), status, url: observedRequestUrl(error) };
   }
@@ -1664,20 +1664,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-}
-
 async function countFilesRecursively(pathname: string): Promise<number> {
   const entries = await readdir(pathname, { withFileTypes: true });
   let count = 0;
@@ -1873,6 +1859,7 @@ async function surface(
       ...(summary.truncated && summary.truncation ? { truncation: summary.truncation } : {}),
     };
   } catch (error) {
+    rethrowIfAborted(error);
     // A probe that never completed has no count or paging outcome; both stay null and the
     // status and URL are the ones the request observed.
     return {
@@ -2088,6 +2075,7 @@ export class AzureAuditorClient {
     try {
       return await this.fetchImpl(url, init);
     } catch (error) {
+      rethrowIfAborted(error);
       if (error instanceof AzureApiError) throw error;
       // A parser error raised inside the transport keeps its fixed note; anything else produced no response.
       throw new AzureApiError(`${prefix}${isParseError(error) ? PARSE_ERROR_NOTE : describeNoResponse(error)}`, url);
@@ -3703,7 +3691,7 @@ export async function exportAzureAuditBundle(
       await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
   const fileCount = await countFilesRecursively(outputDir);
   return {

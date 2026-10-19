@@ -5,18 +5,16 @@
  * alerting, and data governance posture, mapped to compliance frameworks.
  */
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   ConfigFileError,
@@ -31,6 +29,7 @@ import {
   type PaginationStop,
 } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -585,21 +584,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
-
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
 }
 
 async function countFilesRecursively(rootDir: string): Promise<number> {
@@ -1629,6 +1613,7 @@ export class NewrelicApiClient {
       try {
         response = await this.fetchImpl(url, { ...init, signal: controller.signal });
       } catch (error) {
+        rethrowIfAborted(error);
         const aborted = controller.signal.aborted;
         const message = error instanceof Error ? error.message : String(error);
         throw this.failure(
@@ -2255,6 +2240,7 @@ async function collectRecord(source: string, shape: RecordShape, load: () => Pro
   try {
     return { data: projectRecord(await load(), shape), source };
   } catch (error) {
+    rethrowIfAborted(error);
     return { data: {}, source, error: `${source}: ${errorMessage(error)}` };
   }
 }
@@ -2273,6 +2259,7 @@ async function collectList(source: string, shape: RecordShape, load: () => Promi
       basis: page.basis,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     if (error instanceof NotCollectedError) return { data: [], source, notCollected: `${source} ${error.message}` };
     return { data: [], source, error: `${source}: ${errorMessage(error)}` };
   }
@@ -2611,6 +2598,7 @@ async function readableSurface(
     const value = await load();
     return { name, endpoint, required, status: "readable", count: countResolver?.(value) };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name,
       endpoint,
@@ -2647,8 +2635,8 @@ export async function checkNewrelicAccess(
   >,
 ): Promise<NewrelicAccessCheckResult> {
   const config = client.getResolvedConfig();
-  const currentUser = await client.getCurrentUser().catch(() => ({} as JsonRecord));
-  const accountIds = await client.resolveAccountIds().catch(() => config.accountIds);
+  const currentUser = await client.getCurrentUser().catch(fallbackUnlessAborted({} as JsonRecord));
+  const accountIds = await client.resolveAccountIds().catch(fallbackUnlessAborted(config.accountIds));
   const primaryAccount = accountIds[0];
 
   const surfaces: NewrelicAccessSurface[] = [
@@ -2789,6 +2777,7 @@ async function collectScoped(
       if (page.failures) failures.push(...page.failures.map((failure) => `${scope.label}: ${failure}`));
       totalCount = totalCount === undefined || page.totalCount === undefined ? undefined : totalCount + page.totalCount;
     } catch (error) {
+      rethrowIfAborted(error);
       failures.push(`${scope.label}: ${errorMessage(error)}`);
       totalCount = undefined;
     }
@@ -2842,6 +2831,7 @@ async function resolveAccountScope(client: Pick<NewrelicClientSurface, "getResol
   try {
     return { accountIds: await client.resolveAccountIds(), source: "actor.accounts" };
   } catch (error) {
+    rethrowIfAborted(error);
     if (error instanceof NewrelicNoAccountsError) return { accountIds: [], source: "actor.accounts" };
     return { accountIds: [], source: "actor.accounts", error: errorMessage(error) };
   }
@@ -4249,6 +4239,7 @@ async function scanSyntheticScripts(
         secretIndicators: scanScriptForSecrets(text),
       });
     } catch (error) {
+      rethrowIfAborted(error);
       failures.push(`${label}: ${errorMessage(error)}`);
     }
   }
@@ -5006,7 +4997,7 @@ export async function exportNewrelicAuditBundle(
       await write("_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

@@ -23,11 +23,11 @@ import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { ToolCallAbortedError, abortableFetch, unlessAborted } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
-import { errorResult, formatTable, textResult } from "./shared.js";
+import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 const VANTA_TOKEN_URL = "https://api.vanta.com/oauth/token";
 const VANTA_BASE_URL = "https://api.vanta.com/v1";
@@ -749,28 +749,6 @@ function reserveUniquePath(path: string, usedPaths: Set<string>): string {
   return candidate;
 }
 
-async function runWithConcurrency<T>(
-  items: T[],
-  limit: number,
-  worker: (item: T, index: number) => Promise<void>,
-): Promise<void> {
-  if (items.length === 0) return;
-
-  const size = Math.max(1, Math.min(limit, items.length));
-  let cursor = 0;
-
-  await Promise.all(
-    Array.from({ length: size }, async () => {
-      for (;;) {
-        const index = cursor;
-        cursor += 1;
-        if (index >= items.length) return;
-        await worker(items[index]!, index);
-      }
-    }),
-  );
-}
-
 async function followDownloadRedirects(
   rawUrl: string,
   fetchImpl: FetchImpl,
@@ -830,7 +808,7 @@ async function downloadFile(
   const resolvedPath = resolveSecureOutputPath(baseDir, destPath);
   const output = createWriteStream(resolvedPath, { mode: 0o600 });
   try {
-    await pipeline(Readable.fromWeb(response.body as NodeReadableStream), output, { signal });
+    await unlessAborted(pipeline(Readable.fromWeb(response.body as NodeReadableStream), output, { signal }), signal);
   } finally {
     await chmod(resolvedPath, 0o600);
   }
@@ -870,30 +848,14 @@ async function collectRegularFiles(rootDir: string): Promise<string[]> {
   return files.sort();
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string, baseDir: string): Promise<void> {
+async function zipAuditPackage(sourceDir: string, zipPath: string, baseDir: string, signal?: AbortSignal): Promise<void> {
+  const zipRoot = basename(sourceDir);
   const files = await collectRegularFiles(sourceDir);
-  const resolvedZipPath = resolveSecureOutputPath(baseDir, zipPath);
-
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(resolvedZipPath, { mode: 0o600, flags: "wx" });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-
-    const zipRoot = basename(sourceDir);
-    for (const filePath of files) {
-      archive.file(filePath, {
-        name: join(zipRoot, relative(sourceDir, filePath)),
-      });
-    }
-
-    void archive.finalize();
-  });
-
-  await chmod(resolvedZipPath, 0o600);
+  await createZipArchive(
+    files.map((filePath) => ({ path: filePath, name: join(zipRoot, relative(sourceDir, filePath)) })),
+    resolveSecureOutputPath(baseDir, zipPath),
+    signal,
+  );
 }
 
 export async function exportVantaAuditPackage(
@@ -921,6 +883,7 @@ export async function exportVantaAuditPackage(
       const urls = await client.listEvidenceUrls(audit.id, item.id);
       uniqueEvidenceUrls.set(item.id, urls.filter((entry) => entry.isDownloadable));
     } catch (error) {
+      rethrowIfAborted(error);
       uniqueEvidenceUrls.set(item.id, []);
       errors.push(
         `Failed to list evidence URLs for ${item.name} (${item.id}): ${error instanceof Error ? error.message : String(error)}`,
@@ -980,12 +943,13 @@ export async function exportVantaAuditPackage(
       }
     }
 
-    await runWithConcurrency(downloads, options.downloadConcurrency ?? 5, async (task) => {
+    await mapWithConcurrency(downloads, options.downloadConcurrency ?? 5, async (task) => {
       try {
         const size = await downloadFile(task.url.url, task.filePath, staged.dir, fetchImpl, options.signal);
         totalFilesExported += 1;
         totalSizeBytes += size;
       } catch (error) {
+        rethrowIfAborted(error);
         errors.push(
           `Failed to download ${task.fileName} for ${task.evidence.name} (${task.controlName}): ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -1086,8 +1050,9 @@ export async function exportVantaAuditPackage(
     }
 
     try {
-      await createZipArchive(staged.dir, staged.zipPath, baseOutputDir);
+      await zipAuditPackage(staged.dir, staged.zipPath, baseOutputDir, options.signal);
     } catch (error) {
+      rethrowIfAborted(error);
       // A half-written archive must not be committed next to the bundle.
       await rm(staged.zipPath, { force: true });
       errors.push(`Failed to create zip archive: ${error instanceof Error ? error.message : String(error)}`);

@@ -6,22 +6,21 @@
  * against the 20 controls in specs/datadog-sec-inspector.spec.md.
  */
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
@@ -902,21 +901,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
-}
-
 async function countFilesRecursively(rootDir: string): Promise<number> {
   let total = 0;
   const entries = await readdir(rootDir, { withFileTypes: true });
@@ -1270,6 +1254,7 @@ export class DatadogApiClient {
         signal: controller.signal,
       });
     } catch (error) {
+      rethrowIfAborted(error);
       if (controller.signal.aborted) {
         throw new Error(this.redact(`Datadog request timed out after ${this.config.timeoutMs}ms: ${method} ${new URL(url).pathname}`));
       }
@@ -1754,6 +1739,7 @@ async function loadSurface<T>(label: string, load: () => Promise<T>, errors: str
   try {
     return { value: redactCredentialValues(await load()) as T };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     errors.push(`${label}: ${message}`);
     const httpStatus = observedStatus(error);
@@ -2161,6 +2147,7 @@ export async function collectDatadogIdentityData(
       const permissions = await client.listRolePermissions(roleId);
       rolePermissions[roleId] = permissions.map(permissionName).filter((name): name is string => Boolean(name));
     } catch (error) {
+      rethrowIfAborted(error);
       const message = errorMessage(error);
       rolePermissionErrors[roleId] = { role: roleName(role), error: message, endpoint, http_status: observedStatus(error) ?? null };
       errors.push(`role_permissions(${roleName(role)}): ${message}`);
@@ -4076,6 +4063,7 @@ async function probeSurface(
     const value = await load();
     return { name, endpoint, permission, status: "readable", collected: true, http_status: null, count: countResolver?.(value) ?? null };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name,
       endpoint,
@@ -4645,7 +4633,7 @@ export async function exportDatadogAuditBundle(
       await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

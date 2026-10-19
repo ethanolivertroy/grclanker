@@ -8,6 +8,7 @@
  * Enables vulnerability prioritization with exploit intelligence.
  */
 import { Type } from "@sinclair/typebox";
+import { rethrowIfAborted } from "./abort.js";
 import { cachedFetch, errorResult, formatTable, textResult, throttledFetch } from "./shared.js";
 
 const KEV_URL =
@@ -254,6 +255,7 @@ async function fetchEpss(cveIds: string[], signal?: AbortSignal): Promise<Map<st
         scores.set(entry.cve, entry);
       }
     } catch (error) {
+      rethrowIfAborted(error);
       if (signal?.aborted) throw error;
       // EPSS enrichment is best-effort. Keep the base KEV response working.
     }

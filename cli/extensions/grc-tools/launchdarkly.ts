@@ -6,22 +6,21 @@
  * hygiene, and monitoring integrations. It never mutates the account.
  */
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { DEFAULT_DATA_SCRUB_DEPTH, REDACTED, createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -1028,21 +1027,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
-}
-
 async function countFilesRecursively(rootDir: string): Promise<number> {
   let total = 0;
   const entries = await readdir(rootDir, { withFileTypes: true });
@@ -1570,6 +1554,7 @@ export class LaunchdarklyApiClient {
         });
         rawText = await response.text();
       } catch (error) {
+        rethrowIfAborted(error);
         const timedOut = error instanceof Error && error.name === "AbortError";
         if (attempt < this.maxRetries) {
           await this.sleep(Math.min(500 * 2 ** attempt, MAX_RATE_LIMIT_WAIT_MS));
@@ -1911,6 +1896,7 @@ async function readableSurface(
       count: countResolver?.(value) ?? null,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name,
       endpoint: observedEndpoint(error) ?? request,
@@ -2103,6 +2089,7 @@ async function collectRecord(
   try {
     return { payload: await load(), endpoint: request };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     errors.push(`${label}: ${message}`);
     return { payload: {}, error: message, httpStatus: observedStatus(error), endpoint: observedEndpoint(error) ?? request };
@@ -2123,6 +2110,7 @@ async function collectList(
   try {
     return toCollection(await load());
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     errors.push(`${label}: ${message}`);
     return { items: [], truncated: false, seen: 0, error: message, httpStatus: observedStatus(error), endpoint: observedEndpoint(error) };
@@ -4776,6 +4764,7 @@ async function runAssessment(
   try {
     return await load();
   } catch (error) {
+    rethrowIfAborted(error);
     errors.push(`${category}: ${errorMessage(error)}`);
     return { title, category, summary: { failed: true }, findings: [], errors: [errorMessage(error)], snapshots: {} };
   }
@@ -4860,7 +4849,7 @@ export async function exportLaunchdarklyAuditBundle(
       await writeSecureTextFile(staged.dir, "_errors.log", `${uniqueErrors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

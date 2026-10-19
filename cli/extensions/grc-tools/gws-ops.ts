@@ -15,14 +15,14 @@
  * by parse_service_and_version in crates/google-workspace-cli/src/main.rs.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { createWriteStream, existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { projectActivitySnapshot, projectAlertSnapshot, redactKnownValues, redactSecrets, scrubText } from "./gws.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type JsonRecord = Record<string, unknown>;
 type GwsCliErrorKind = "missing" | "auth" | "api" | "validation" | "discovery" | "internal";
@@ -915,20 +915,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-}
-
 async function countFilesRecursively(pathname: string): Promise<number> {
   const entries = await readdir(pathname, { withFileTypes: true });
   let count = 0;
@@ -1322,7 +1308,7 @@ export async function collectGwsOperatorEvidenceBundle(
       }));
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, args.signal);
   });
   const fileCount = await countFilesRecursively(outputDir);
 

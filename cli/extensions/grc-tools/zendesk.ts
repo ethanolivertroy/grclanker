@@ -8,26 +8,25 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { ZENDESK_SPEC } from "./zendesk.spec.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -1861,6 +1860,7 @@ export class ZendeskApiClient {
         signal: controller.signal,
       });
     } catch (error) {
+      rethrowIfAborted(error);
       const message = error instanceof Error ? error.message : String(error);
       throw new ZendeskApiError(this.redact(`Zendesk request failed for ${url}: ${message}`), 0, endpointLabel(url));
     } finally {
@@ -2272,6 +2272,7 @@ async function snapshot<T>(method: ZendeskReadMethod, load: () => Promise<T>): P
   try {
     return { status: "ok", data: redactCredentialProperties(await load()) as T, endpoint };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     if (error instanceof ZendeskApiError) {
       const observed = error.endpoint ?? endpoint;
@@ -4200,20 +4201,6 @@ async function writeSecureJsonFile(rootDir: string, relativePathname: string, va
   await writeSecureTextFile(rootDir, relativePathname, serializeJson(sealValue(plain, secrets)));
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
-}
-
 async function countFilesRecursively(rootDir: string): Promise<number> {
   let total = 0;
   for (const entry of await readdir(rootDir, { withFileTypes: true })) {
@@ -4417,7 +4404,7 @@ export async function exportZendeskAuditBundle(
       await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`, secrets);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
   return {
     outputDir,

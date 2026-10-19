@@ -8,24 +8,23 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZOOM_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readJsonConfig } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { ZOOM_SPEC } from "./zoom.spec.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -671,21 +670,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
-}
-
 async function countFilesRecursively(rootDir: string): Promise<number> {
   let total = 0;
   const entries = await readdir(rootDir, { withFileTypes: true });
@@ -1227,6 +1211,7 @@ async function captureSurface<T>(
     const data = await load();
     return { name, endpoint, docUrl, status: "ok", data };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name,
       endpoint,
@@ -3243,7 +3228,7 @@ export async function exportZoomAuditBundle(
       await write("_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

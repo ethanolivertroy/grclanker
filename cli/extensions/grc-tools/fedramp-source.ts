@@ -3,7 +3,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { ensureGrclankerHome, getGrclankerHome, getGrclankerStateDir } from "../../config/paths.js";
-import { abortableFetch } from "./abort.js";
+import { abortableFetch, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
 import { writeFileAtomically } from "./atomic-output.js";
 import { persistentCachesEnabled } from "./shared.js";
 
@@ -495,6 +495,7 @@ async function fetchJson<T>(url: string, auth?: GitHubAuth, signal?: AbortSignal
   try {
     response = await abortableFetch(fetch, signal)(url, { headers: githubHeaders(token) });
   } catch (error) {
+    rethrowIfAborted(error);
     if (signal?.aborted) throw error;
     throw failure(errorText(error));
   }
@@ -574,6 +575,7 @@ async function fetchSupportingSourceMetadata(
 }
 
 function unavailableSupportingSource(error: unknown): FedrampSupportingSourceStatus {
+  rethrowIfAborted(error);
   return {
     org: FEDRAMP_MARKDOWN_SOURCE.org,
     repo: FEDRAMP_MARKDOWN_SOURCE.repo,
@@ -619,7 +621,7 @@ async function fetchPrimarySourceCatalog(signal?: AbortSignal): Promise<{
   const emptyFileMetadata: GitHubContentFileResponse = {};
   const [rawCatalog, metadata] = await Promise.all([
     fetchJson<Record<string, unknown>>(FEDRAMP_RULES_SOURCE.rawUrl, undefined, signal),
-    fetchPrimarySourceMetadata(undefined, signal).catch(() => ({
+    fetchPrimarySourceMetadata(undefined, signal).catch(fallbackUnlessAborted({
       repo: emptyRepoMetadata,
       file: emptyFileMetadata,
     })),
@@ -1128,6 +1130,7 @@ export async function loadFedrampCatalog(options?: {
     };
     return value;
   } catch (error) {
+    rethrowIfAborted(error);
     if (options?.signal?.aborted) throw error;
     if (cached) {
       const staleValue: FedrampLoadedCatalog = {
@@ -1221,6 +1224,7 @@ export async function inspectFedrampOfficialSources(options?: {
     };
     return value;
   } catch (error) {
+    rethrowIfAborted(error);
     if (options?.signal?.aborted) throw error;
     if (cached) {
       const value: FedrampSourceStatus = {

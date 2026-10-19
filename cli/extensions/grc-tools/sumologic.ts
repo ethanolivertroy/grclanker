@@ -5,23 +5,22 @@
  * governance, and content sharing controls, mapped to compliance frameworks.
  */
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -471,20 +470,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
-
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
 }
 
 async function countFilesRecursively(rootDir: string): Promise<number> {
@@ -1658,6 +1643,7 @@ export class SumologicApiClient implements SumologicReader {
           signal: controller.signal,
         });
       } catch (error) {
+        rethrowIfAborted(error);
         clearTimeout(timeout);
         if (attempt < this.maxRetries) {
           await this.sleepImpl(Math.min(250 * 2 ** attempt, 8_000));
@@ -1705,6 +1691,7 @@ export class SumologicApiClient implements SumologicReader {
         count: result.count ?? (Array.isArray(result.data) ? result.data.length : 1),
       };
     } catch (error) {
+      rethrowIfAborted(error);
       // Every dataset error is recorded here and nowhere else, so this is the
       // one place the redaction pass has to run for findings and the bundle.
       return {
@@ -3331,7 +3318,7 @@ export async function exportSumologicAuditBundle(
       await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

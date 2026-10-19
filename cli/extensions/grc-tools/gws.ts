@@ -22,7 +22,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createPrivateKey, sign as signData } from "node:crypto";
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -31,15 +30,15 @@ import {
 } from "node:fs";
 import { readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep, ToolCallAbortedError, unlessAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { GWS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { REDACTED, systemErrorCode } from "./hardening/index.js";
 import { GWS_SPEC } from "./gws.spec.js";
-import { errorResult, formatTable, textResult } from "./shared.js";
+import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type JsonRecord = Record<string, unknown>;
 type GwsAuthMode = "service_account" | "access_token";
@@ -1029,30 +1028,9 @@ async function collectDataset(collector: () => Promise<GwsCollection>): Promise<
       seen: collection.items.length,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return { data: [], error: summarizeError(error), errorKind: classifyError(error), seen: 0 };
   }
-}
-
-async function mapWithConcurrency<T, R>(
-  values: T[],
-  limit: number,
-  worker: (value: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(values.length);
-  let index = 0;
-
-  async function runWorker(): Promise<void> {
-    while (true) {
-      const current = index;
-      index += 1;
-      if (current >= values.length) return;
-      results[current] = await worker(values[current], current);
-    }
-  }
-
-  const workers = Array.from({ length: Math.max(1, Math.min(limit, values.length)) }, () => runWorker());
-  await Promise.all(workers);
-  return results;
 }
 
 function isSuperAdminRole(role: JsonRecord | undefined): boolean {
@@ -2032,20 +2010,6 @@ async function writeBundleFile(rootDir: string, relativePathname: string, conten
   await writeSecureTextFile(rootDir, relativePathname, scrubBundleText(content, knownSecrets));
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-}
-
 async function countFilesRecursively(pathname: string): Promise<number> {
   const entries = await readdir(pathname, { withFileTypes: true });
   let count = 0;
@@ -2310,6 +2274,7 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
         detail: httpStatusLabel(response.status),
       };
     } catch (error) {
+      rethrowIfAborted(error);
       return {
         key: basename(pathname) || pathname,
         path: pathname,
@@ -2632,6 +2597,7 @@ async function collectTokenInventory(
         kind: undefined,
       };
     } catch (error) {
+      rethrowIfAborted(error);
       return {
         records: [],
         failure: { userId, primaryEmail, error: summarizeError(error) },
@@ -4219,7 +4185,7 @@ export async function exportGwsAuditBundle(
       await writeBundleFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`, knownSecrets);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
   const fileCount = await countFilesRecursively(outputDir);
 

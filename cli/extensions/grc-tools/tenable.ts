@@ -7,28 +7,27 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
-import { ToolCallAbortedError, abortableFetch, abortableSleep } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
-import { errorResult, formatTable, textResult } from "./shared.js";
+import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
 import type { FrameworkKey } from "./spec-model.js";
 import { TENABLE_SPEC } from "./tenable.spec.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
@@ -1738,20 +1737,6 @@ async function writeSecureJsonFile(rootDir: string, relativePathname: string, va
   await writeSecureTextFile(rootDir, relativePathname, serializeJson(sealValue(plain, secrets)));
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
-}
-
 async function countFilesRecursively(rootDir: string): Promise<number> {
   let total = 0;
   for (const entry of await readdir(rootDir, { withFileTypes: true })) {
@@ -2370,6 +2355,7 @@ export class TenableApiClient extends TenableHttpClient {
         if (typeof document.payload.status !== "string") throw this.nonDocument(document, { kind: "member", key: "status", type: "member" });
         status = document.payload;
       } catch (error) {
+        rethrowIfAborted(error);
         return notRun("STATUS_UNREADABLE", errorMessage(error), errorEndpoint(error) ?? statusEndpoint, errorStatus(error) ?? null);
       }
       const state = asString(status.status)?.toUpperCase();
@@ -2407,6 +2393,7 @@ export class TenableApiClient extends TenableHttpClient {
         unevaluableRecords += chunkRecords.length - documented.length;
         fetchedChunks += 1;
       } catch (error) {
+        rethrowIfAborted(error);
         downloadErrors.push(errorMessage(error));
         failedEndpoint = failedEndpoint ?? errorEndpoint(error) ?? `GET ${chunkPath}`;
         failedStatus = failedStatus ?? errorStatus(error);
@@ -2615,6 +2602,7 @@ async function collectList(endpoint: string, load: () => Promise<JsonRecord[]>):
     const items = await load();
     return okDataset(endpoint, items, items.length, items.length);
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset<JsonRecord[]>(endpoint, [], error);
   }
 }
@@ -2627,6 +2615,7 @@ async function collectPaginated(endpoint: string, load: () => Promise<TenablePag
     const total = page.total ?? (page.truncated ? null : page.items.length);
     return okDataset(endpoint, page.items, page.items.length, total, page.truncated, page.reason);
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset<JsonRecord[]>(endpoint, [], error);
   }
 }
@@ -2636,6 +2625,7 @@ async function collectObject(endpoint: string, load: () => Promise<JsonRecord>):
     const value = await load();
     return okDataset(endpoint, value, 1, 1);
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset<JsonRecord>(endpoint, {}, error);
   }
 }
@@ -2662,6 +2652,7 @@ async function collectExport(endpoint: string, load: () => Promise<TenableExport
     }
     return dataset;
   } catch (error) {
+    rethrowIfAborted(error);
     return failedDataset<TenableExportResult>(endpoint, EMPTY_EXPORT, error);
   }
 }
@@ -3151,20 +3142,6 @@ async function vmExport(clients: TenableClients, endpoint: string, load: (client
   return collectExport(endpoint, () => load(clients.vm as TenableApiClient));
 }
 
-async function mapWithConcurrency<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      results[index] = await worker(items[index]);
-    }
-  });
-  await Promise.all(runners);
-  return results;
-}
-
 /**
  * One GET /policies/{policy_id} per policy referenced by a visible scan. The
  * dataset is ok while at least one detail was read (per-policy failures stay on
@@ -3202,6 +3179,7 @@ async function collectPolicyDetails(clients: TenableClients, scans: TenableDatas
       const payload = await client.getPolicyDetails(policyId);
       return { policyId, scanNames, endpoint, status: "ok", httpStatus: null, details: projectPolicyDetails(payload) };
     } catch (error) {
+      rethrowIfAborted(error);
       return {
         policyId,
         scanNames,
@@ -4929,6 +4907,7 @@ async function probeSurface(
     const value = await load();
     return { surface: { name, endpoint, requiredRole, status: "readable", count: count?.(value) ?? null, httpStatus: null }, value };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       surface: {
         name,
@@ -5280,7 +5259,7 @@ export async function exportTenableAuditBundle(
       await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`, secrets);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

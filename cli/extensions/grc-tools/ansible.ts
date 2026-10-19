@@ -5,7 +5,6 @@
  * ansible-sec-inspector spec with read-only AAP controller REST API checks.
  */
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -15,11 +14,11 @@ import { readdir, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch } from "./abort.js";
+import { abortableFetch, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 const DEFAULT_LOOKBACK_DAYS = 90;
 const DEFAULT_PAGE_SIZE = 100;
@@ -611,20 +610,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
-
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
 }
 
 async function countFilesRecursively(pathname: string): Promise<number> {
@@ -1972,6 +1957,7 @@ export class AnsibleAapClient {
       method: "GET",
       headers: { accept: "text/html,application/json" },
     }).catch((error: unknown) => {
+      rethrowIfAborted(error);
       throw new AnsibleApiError(`AAP login bootstrap failed (network error: ${errorMessage(error)}).`, undefined, loginPath);
     });
     if (!initial.ok) {
@@ -1996,6 +1982,7 @@ export class AnsibleAapClient {
       },
       body,
     }).catch((error: unknown) => {
+      rethrowIfAborted(error);
       throw new AnsibleApiError(`AAP session login failed (network error: ${errorMessage(error)}).`, undefined, loginPath);
     });
 
@@ -2036,6 +2023,7 @@ export class AnsibleAapClient {
     const url = this.resolveUrl(pathOrUrl);
     const endpoint = requestPath(url);
     const response = await this.fetchWithTimeout(url, { method: "GET", headers }).catch((error: unknown) => {
+      rethrowIfAborted(error);
       throw new AnsibleApiError(`AAP request failed: ${pathOrUrl} (network error: ${errorMessage(error)})`, undefined, endpoint);
     });
     const contentType = response.headers.get("content-type");
@@ -2204,6 +2192,7 @@ async function collect(
       },
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return { data: uncollected(), ...failedSnapshot(label, path, error) };
   }
 }
@@ -2215,6 +2204,7 @@ async function fetchObject(client: AnsibleClientSurface, label: string, path: st
   try {
     return { data: asObject(await client.get(path)) };
   } catch (error) {
+    rethrowIfAborted(error);
     return { data: undefined, ...failedSnapshot(label, path, error) };
   }
 }
@@ -2446,6 +2436,7 @@ async function readableSurface(client: AnsibleAapClient, name: string, endpoint:
       count: await client.count(endpoint),
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name,
       endpoint: errorEndpoint(error) ?? endpoint,
@@ -2460,7 +2451,7 @@ async function readableSurface(client: AnsibleAapClient, name: string, endpoint:
 export async function checkAnsibleAccess(client: AnsibleAapClient): Promise<AnsibleAccessCheckResult> {
   const me = await client.get("/api/v2/me/");
   const currentUser = currentUserFromMe(me);
-  const ping = await client.get<unknown>("/api/v2/ping/").catch(() => undefined);
+  const ping = await client.get<unknown>("/api/v2/ping/").catch(fallbackUnlessAborted(undefined));
 
   const surfaces = await Promise.all([
     readableSurface(client, "organizations", "/api/v2/organizations/"),
@@ -4238,7 +4229,7 @@ export async function exportAnsibleAuditBundle(
       await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

@@ -8,18 +8,16 @@
  * src/content/docs/docs/integrations/zscaler.md for the citation table.
  */
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -44,6 +42,7 @@ import {
   ZSCALER_MAX_SECURITY_ALLOWLIST_URLS as MAX_SECURITY_ALLOWLIST_URLS,
   ZSCALER_SPEC,
 } from "./zscaler.spec.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -436,21 +435,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
-
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
 }
 
 async function countFilesRecursively(rootDir: string): Promise<number> {
@@ -897,6 +881,7 @@ export class ZiaApiClient implements ZiaReadClient {
       try {
         response = await this.fetchImpl(url, { ...init, signal: controller.signal });
       } catch (error) {
+        rethrowIfAborted(error);
         clearTimeout(timeout);
         if (attempt < this.maxRetries && (error instanceof Error && error.name === "AbortError")) {
           continue;
@@ -1129,6 +1114,7 @@ async function collect<T>(product: ZscalerProduct, loader: () => Promise<T>, fal
   try {
     return { data: await loader() };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       data: fallback,
       error: errorMessage(error),
@@ -1670,6 +1656,7 @@ async function readableSurface(
         : undefined;
     return { product, name, endpoint, status: "readable", count };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       product,
       name,
@@ -1874,6 +1861,7 @@ export class ZpaApiClient implements ZpaReadClient {
       try {
         response = await this.fetchImpl(url, { ...init, signal: controller.signal });
       } catch (error) {
+        rethrowIfAborted(error);
         clearTimeout(timeout);
         if (attempt < this.maxRetries && (error instanceof Error && error.name === "AbortError")) {
           continue;
@@ -2111,6 +2099,7 @@ async function collectSubLocations(client: ZiaReadClient, locations: CollectedDa
     try {
       items.push(...(await client.listSubLocations(parentId)));
     } catch (error) {
+      rethrowIfAborted(error);
       errors.push(`${parentId}: ${errorMessage(error)}`);
     }
   }
@@ -2128,6 +2117,7 @@ async function collectCloudAppRules(client: ZiaReadClient): Promise<CollectedDat
   try {
     ruleTypes = await client.listCloudAppRuleTypes();
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       data: [],
       error: errorMessage(error),
@@ -2142,6 +2132,7 @@ async function collectCloudAppRules(client: ZiaReadClient): Promise<CollectedDat
         items.push({ ...rule, ruleType });
       }
     } catch (error) {
+      rethrowIfAborted(error);
       errors.push(`${ruleType}: ${errorMessage(error)}`);
     }
   }
@@ -2900,6 +2891,7 @@ async function collectScimGroups(client: ZpaReadClient, idps: CollectedDataset<J
       items.push(...page.items.map((group) => ({ ...group, idpId })));
       truncated = truncated || page.truncated;
     } catch (error) {
+      rethrowIfAborted(error);
       errors.push(`${idpId}: ${errorMessage(error)}`);
     }
   }
@@ -3794,7 +3786,7 @@ export async function exportZscalerAuditBundle(clients: ZscalerClients, options:
       await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
   return {
     outputDir,

@@ -91,6 +91,36 @@ export async function throttledFetch<T>(
   return (await res.json()) as T;
 }
 
+/**
+ * Runs `worker` over `items`, at most `limit` at a time, and returns the results
+ * in input order. Once a worker fails no further item starts, and the call
+ * rejects with that failure after the items already running settle, so an
+ * aborted call neither starts the rest of the list nor leaves work running.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  let failure: { error: unknown } | undefined;
+  const run = async (): Promise<void> => {
+    while (!failure && next < items.length) {
+      const index = next;
+      next += 1;
+      try {
+        results[index] = await worker(items[index], index);
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, run));
+  if (failure) throw failure.error;
+  return results;
+}
+
 /** Format a table for terminal output */
 export function formatTable(
   headers: string[],

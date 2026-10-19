@@ -7,18 +7,16 @@
  * developer.webex.com page named in WEBEX_DOCS.
  */
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   ConfigFileError,
@@ -52,6 +50,7 @@ import type {
   WebexFrameworkMap,
   WebexSurfaceName,
 } from "./webex.spec.js";
+import { createZipArchive } from "./zip-archive.js";
 
 export {
   WEBEX_CONTROL_FRAMEWORKS,
@@ -453,21 +452,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
-
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
 }
 
 async function countFilesRecursively(rootDir: string): Promise<number> {
@@ -1022,6 +1006,7 @@ async function collectPage(load: () => Promise<WebexPage>): Promise<SurfaceResul
     const page = await load();
     return { ok: true, data: page.items, truncated: page.truncated };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ok: false, error: errorMessage(error), status: errorStatus(error) };
   }
 }
@@ -1030,6 +1015,7 @@ async function collectObject(load: () => Promise<JsonRecord>): Promise<SurfaceRe
   try {
     return { ok: true, data: await load(), truncated: false };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ok: false, error: errorMessage(error), status: errorStatus(error) };
   }
 }
@@ -2278,7 +2264,7 @@ export async function exportWebexAuditBundle(
       await writeText("_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

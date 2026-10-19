@@ -9,23 +9,22 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createSign } from "node:crypto";
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SALESFORCE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SALESFORCE_SPEC } from "./salesforce.spec.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -508,20 +507,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
-
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
 }
 
 async function countFilesRecursively(rootDir: string): Promise<number> {
@@ -1270,6 +1255,7 @@ export class SalesforceApiClient {
     try {
       return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
+      rethrowIfAborted(error);
       if (error instanceof Error && error.name === "AbortError") {
         throw new SalesforceApiError(`Salesforce request to ${endpoint} timed out after ${this.config.timeoutMs} ms`, { endpoint });
       }
@@ -1288,6 +1274,7 @@ export class SalesforceApiClient {
       try {
         response = await this.rawFetch(url, init);
       } catch (error) {
+        rethrowIfAborted(error);
         failure = error instanceof SalesforceApiError ? error : new SalesforceApiError(String(error));
       }
       const retryable = failure !== undefined || (response !== undefined && (response.status === 429 || response.status >= 500));
@@ -1555,7 +1542,7 @@ export class SalesforceApiClient {
     if (cached) return cached;
     const pending = this.describeSObject(objectName)
       .then((describe) => new Set(asRecords(describe.fields).map((field) => asString(field.name) ?? "").filter(Boolean)))
-      .catch(() => undefined);
+      .catch(fallbackUnlessAborted(undefined));
     this.describeCache.set(objectName, pending);
     return pending;
   }
@@ -1781,6 +1768,7 @@ async function collectRecords(name: string, load: () => Promise<SalesforceQueryR
       omittedFields: result.omittedFields,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     // The in-memory fallback keeps an empty array for the evaluators; every exported or summarized
     // view of a failed dataset goes through datasetCoreData or whenOk and renders a marker or null.
     return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0, ...failureFields(error) };
@@ -1792,6 +1780,7 @@ async function collectRecord(name: string, load: () => Promise<JsonRecord | unde
     const data = scrubDataStrings(await load());
     return { name, status: "ok", data, truncated: false, seen: data ? 1 : 0, total: data ? 1 : 0 };
   } catch (error) {
+    rethrowIfAborted(error);
     return { name, status: classifyError(error), data: undefined, error: errorMessage(error), truncated: false, seen: 0, ...failureFields(error) };
   }
 }
@@ -2122,6 +2111,7 @@ export async function collectProfileMetadata(client: ReadClient, profiles: Sales
       total: targets.length,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return { name, status: classifyError(error), data: [], error: errorMessage(error), truncated: false, seen: 0, total: targets.length, ...failureFields(error) };
   }
 }
@@ -2180,7 +2170,8 @@ export async function collectSalesforcePlatformData(client: ReadClient, options:
   let instanceUrl = client.getResolvedConfig().instanceUrl;
   try {
     instanceUrl = (await client.getSession()).instanceUrl;
-  } catch {
+  } catch (error) {
+    rethrowIfAborted(error);
     instanceUrl = client.getResolvedConfig().instanceUrl;
   }
   return { organization, healthCheck, healthCheckRisks, securitySettings, myDomainSettings, profiles, profileMetadata, instanceUrl };
@@ -3267,6 +3258,7 @@ async function probeSurface(
     const value = await load();
     return { name, endpoint, status: "readable", count: count?.(value), permissionHint };
   } catch (error) {
+    rethrowIfAborted(error);
     return { name, endpoint, status: "not_readable", error: errorMessage(error), permissionHint };
   }
 }
@@ -3284,6 +3276,7 @@ export async function checkSalesforceAccess(client: ReadClient): Promise<Salesfo
   try {
     instanceUrl = (await client.getSession()).instanceUrl;
   } catch (error) {
+    rethrowIfAborted(error);
     sessionError = errorMessage(error);
   }
 
@@ -3582,7 +3575,7 @@ export async function exportSalesforceAuditBundle(
       await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

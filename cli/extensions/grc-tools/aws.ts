@@ -85,7 +85,6 @@ import {
 import { ListInstancesCommand, SSOAdminClient } from "@aws-sdk/client-sso-admin";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -93,9 +92,8 @@ import {
 } from "node:fs";
 import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { ToolCallAbortedError, unlessAborted } from "./abort.js";
+import { ToolCallAbortedError, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   AWS_CONTROL_CATALOG,
@@ -115,7 +113,8 @@ import type {
   AwsOutputMemberKind,
 } from "./aws.spec.js";
 import { checkContract, defineGrcTool, evaluateVerdictCriteria, toolContract } from "./spec-model.js";
-import { errorResult, formatTable, textResult } from "./shared.js";
+import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 export {
   AWS_CONTROL_CATALOG,
@@ -1641,6 +1640,7 @@ export async function attemptAwsRead<T>(
   try {
     return { value: await loader() };
   } catch (error) {
+    rethrowIfAborted(error);
     const denied = isAwsAccessDenied(error);
     const message = readFailureLine(label, error);
     errors.push(message);
@@ -1715,24 +1715,6 @@ export function maskAccessKeyId(accessKeyId: string): string {
  */
 export function labelIdentifier(id: string): string {
   return redactErrorText(id) === id ? id : maskAccessKeyId(id);
-}
-
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  limit: number,
-  worker: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  const runners = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      results[index] = await worker(items[index], index);
-    }
-  });
-  await Promise.all(runners);
-  return results;
 }
 
 function parseRegionList(value: unknown): string[] | undefined {
@@ -1882,20 +1864,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
-
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
 }
 
 async function countFilesRecursively(pathname: string): Promise<number> {
@@ -2728,6 +2696,7 @@ async function surface(
     const value = await loader();
     return { name, service, command, region, status: "readable", ...observe(value) };
   } catch (error) {
+    rethrowIfAborted(error);
     // A probe that never completed has no count and no truncation state; it names what the service answered instead.
     return {
       name,
@@ -5080,7 +5049,7 @@ export async function exportAwsAuditBundle(
       await writeSecureTextFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
   const fileCount = await countFilesRecursively(outputDir);
 

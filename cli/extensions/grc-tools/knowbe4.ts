@@ -9,20 +9,18 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { KNOWBE4_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -39,6 +37,7 @@ import {
   USER_FREE_FORM_FIELDS,
 } from "./knowbe4.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
@@ -796,21 +795,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
-}
-
 async function countFilesRecursively(rootDir: string): Promise<number> {
   let total = 0;
   const entries = await readdir(rootDir, { withFileTypes: true });
@@ -1311,6 +1295,7 @@ export class Knowbe4ApiClient {
         headers.set("authorization", `Bearer ${token}`);
         response = await this.fetchImpl(url, { ...init, headers, signal: controller.signal });
       } catch (error) {
+        rethrowIfAborted(error);
         if (controller.signal.aborted) {
           throw new Knowbe4ApiError(this.redact(`KnowBe4 request timed out after ${this.config.timeoutMs}ms: ${target}`), null, endpoint);
         }
@@ -1632,6 +1617,7 @@ async function readableSurface(
     const value = await load();
     return { name, endpoint, status: "readable", collected: true, http_status: null, count: countResolver?.(value) ?? null };
   } catch (error) {
+    rethrowIfAborted(error);
     return {
       name,
       endpoint,
@@ -1747,6 +1733,7 @@ async function collectSurface<T>(
   try {
     return collected(await load());
   } catch (error) {
+    rethrowIfAborted(error);
     return recordFailure(label, fallback, errors, error);
   }
 }
@@ -1794,6 +1781,7 @@ async function collectListing(
       ...(listing.endpoint ? { endpoint: listing.endpoint } : {}),
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ...recordFailure<JsonRecord[]>(label, [], errors, error), limit };
   }
 }
@@ -2125,6 +2113,7 @@ export async function collectKnowbe4Snapshot(
           ...(listing.truncated ? { recipients_truncated: true } : {}),
         });
       } catch (error) {
+        rethrowIfAborted(error);
         const message = errorMessage(error);
         recipientErrors.push(`security_test_recipients[${id}]: ${message}`);
         const endpoint = observedEndpoint(error) ?? recipientsEndpoint(id);
@@ -4581,7 +4570,7 @@ export async function exportKnowbe4AuditBundle(
       await writeSecureTextFile(staged.dir, "_errors.log", `${snapshot.errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

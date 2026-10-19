@@ -8,19 +8,17 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
   realpathSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { QUALYS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -28,6 +26,7 @@ import { NextLinkError, readConfigText, resolveSameOriginUrl } from "./hardening
 import { QUALYS_RAW_DATA_ALLOWLISTS, QUALYS_SPEC, type FieldAllowlist, type FieldRule } from "./qualys.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import type { FrameworkKey } from "./spec-model.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
@@ -1134,6 +1133,7 @@ export class QualysApiClient {
         }
         return { status: response.status, text, headers: response.headers };
       } catch (error) {
+        rethrowIfAborted(error);
         if (attempt < this.config.maxRetries && error instanceof Error && error.name !== "AbortError") {
           attempt += 1;
           await this.sleepImpl(Math.min(1000 * 2 ** attempt, DEFAULT_MAX_RATE_LIMIT_WAIT_MS));
@@ -1705,6 +1705,7 @@ async function collect(
     }
     return { name, endpoint, data: list.items, moduleUnavailable: false, truncated: Boolean(truncationReason), truncationReason, cap };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     errors.push(`${name}: ${message}`);
     return { name, endpoint, data: [], error: message, moduleUnavailable: isModuleUnavailableError(message), truncated: false, cap };
@@ -3938,6 +3939,7 @@ async function probeSurface(
       ...(list.truncated ? { truncation: list.truncationReason } : {}),
     };
   } catch (error) {
+    rethrowIfAborted(error);
     const message = errorMessage(error);
     return {
       name,
@@ -4182,20 +4184,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-  await chmod(zipPath, 0o600);
-}
-
 async function countFilesRecursively(rootDir: string): Promise<number> {
   let total = 0;
   for (const entry of await readdir(rootDir, { withFileTypes: true })) {
@@ -4270,7 +4258,7 @@ export async function exportQualysAuditBundle(
       await write("_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   return {

@@ -8,7 +8,6 @@
  */
 import { createPrivateKey, sign as signData, type KeyObject } from "node:crypto";
 import {
-  createWriteStream,
   lstatSync,
   mkdirSync,
   readFileSync,
@@ -17,12 +16,12 @@ import {
 import { readdir, writeFile } from "node:fs/promises";
 import { STATUS_CODES } from "node:http";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { ToolCallAbortedError, abortableFetch, abortableSleep, unlessAborted } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { NextLinkError, parseNextLinkHeader, resolveSameOriginUrl, systemErrorCode } from "./hardening/index.js";
-import { errorResult, formatTable, textResult } from "./shared.js";
+import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
+import { createZipArchive } from "./zip-archive.js";
 
 type JsonRecord = Record<string, unknown>;
 type GitHubAuthMode = "pat" | "app";
@@ -1396,6 +1395,7 @@ async function collectDataset<T>(
   try {
     return { data: await fn() };
   } catch (error) {
+    rethrowIfAborted(error);
     return { data: fallback, error: summarizeError(error) };
   }
 }
@@ -2703,42 +2703,6 @@ async function writeBundleText(rootDir: string, relativePathname: string, conten
   await writeSecureTextFile(rootDir, relativePathname, scrubErrorText(content));
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-}
-
-async function mapWithConcurrency<T, R>(
-  values: T[],
-  limit: number,
-  worker: (value: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(values.length);
-  let index = 0;
-
-  async function runWorker(): Promise<void> {
-    while (true) {
-      const current = index;
-      index += 1;
-      if (current >= values.length) return;
-      results[current] = await worker(values[current], current);
-    }
-  }
-
-  const workers = Array.from({ length: Math.max(1, Math.min(limit, values.length)) }, () => runWorker());
-  await Promise.all(workers);
-  return results;
-}
-
 function isArchivedRepo(repo: JsonRecord): boolean {
   return asBoolean(repo.archived) === true || asBoolean(repo.disabled) === true;
 }
@@ -2918,6 +2882,7 @@ export async function runGitHubAccessCheck(
         probes.push({ key: probe.key, path: probe.path(config.organization), status: "error", detail: `unexpected response (${result.response.status})` });
       }
     } catch (error) {
+      rethrowIfAborted(error);
       const status = error instanceof GitHubHttpError && error.status === 401
         ? "unauthorized"
         : (error instanceof GitHubHttpError && (error.status === 403 || error.status === 404) ? "forbidden" : "error");
@@ -3557,6 +3522,7 @@ export async function collectGitHubRepoProtectionData(
       try {
         return [key, { rules: await client.listBranchRules(owner, name, defaultBranch) }] as const;
       } catch (error) {
+        rethrowIfAborted(error);
         return [key, { rules: null, error: summarizeError(error) }] as const;
       }
     });
@@ -3581,6 +3547,7 @@ export async function collectGitHubRepoProtectionData(
       try {
         return [key, { protection: await client.getBranchProtection(owner, name, defaultBranch) }] as const;
       } catch (error) {
+        rethrowIfAborted(error);
         return [key, { protection: null, error: summarizeError(error) }] as const;
       }
     });
@@ -3644,6 +3611,7 @@ async function collectPerRepo(
     try {
       return [key, { items: await fetchItems(owner, name) }] as const;
     } catch (error) {
+      rethrowIfAborted(error);
       return [key, { items: null, error: summarizeError(error) }] as const;
     }
   });
@@ -5362,7 +5330,7 @@ export async function exportGitHubAuditBundle(
       await writeBundleText(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
 
   const files = await readdir(outputDir, { recursive: true });

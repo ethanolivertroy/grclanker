@@ -8,7 +8,6 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
-  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -17,16 +16,16 @@ import {
 import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SLACK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SLACK_SPEC } from "./slack.spec.js";
+import { createZipArchive } from "./zip-archive.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_USER_LIMIT = 1000;
@@ -704,19 +703,6 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
   await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
 }
 
-async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = new ZipArchive({ zlib: { level: 9 } });
-    output.on("close", () => resolvePromise());
-    output.on("error", rejectPromise);
-    archive.on("error", rejectPromise);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    void archive.finalize();
-  });
-}
-
 async function countFilesRecursively(pathname: string): Promise<number> {
   const entries = await readdir(pathname, { withFileTypes: true });
   let count = 0;
@@ -1229,6 +1215,7 @@ async function readWeb(client: SlackApiClient, method: string, query: JsonRecord
   try {
     return { ok: true, value: await client.web(method, query), complete: true };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ok: false, error: surfaceError(error), code: errorCode(error) };
   }
 }
@@ -1237,6 +1224,7 @@ async function readAnalyticsProbe(client: SlackApiClient): Promise<ReadResult<{ 
   try {
     return { ok: true, value: await client.probeAnalyticsExport(), complete: true };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ok: false, error: surfaceError(error), code: errorCode(error) };
   }
 }
@@ -1271,6 +1259,7 @@ async function collectEmoji(client: SlackApiClient): Promise<ReadResult<SlackEmo
       else if (cursor && pages >= MAX_PAGES_PER_LIST) truncation = "page_cap";
     } while (cursor && !truncation);
   } catch (error) {
+    rethrowIfAborted(error);
     return { ok: false, error: surfaceError(error), code: errorCode(error) };
   }
   return { ok: true, value: entries, complete: truncation === undefined && !cursor, truncation };
@@ -1287,6 +1276,7 @@ async function readWebList(
     const page = await client.collectWeb(method, itemKeys, query, options);
     return { ok: true, value: page.items, complete: page.complete, total: page.total, truncation: page.truncation };
   } catch (error) {
+    rethrowIfAborted(error);
     return { ok: false, error: surfaceError(error), code: errorCode(error) };
   }
 }
@@ -1356,6 +1346,7 @@ async function webSurface(
       count: itemKeys.length > 0 ? itemKeys.reduce((sum, key) => sum + asObjectArray(result[key]).length, 0) : 1,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return { name, api: "web", endpoint: method, status: "not_readable", error: surfaceError(error) };
   }
 }
@@ -1371,6 +1362,7 @@ async function scimSurface(client: SlackApiClient, name: string, path: string): 
       count: path === "/ServiceProviderConfig" ? 1 : asNumber(result.totalResults) ?? asObjectArray(result.Resources).length,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     const status = errorCode(error) === "not_configured" ? "not_configured" : "not_readable";
     return { name, api: "scim", endpoint: path, status, error: surfaceError(error) };
   }
@@ -1387,6 +1379,7 @@ async function auditSurface(client: SlackApiClient, name: string, path: string):
       count: asObjectArray(result.entries).length + asObjectArray(result.schemas).length,
     };
   } catch (error) {
+    rethrowIfAborted(error);
     return { name, api: "audit", endpoint: path, status: "not_readable", error: surfaceError(error) };
   }
 }
@@ -1502,12 +1495,18 @@ export async function assessSlackIdentity(
     ? { ok: false, error: "SCIM checks were skipped by request.", code: "skipped" }
     : await client.scim("/ServiceProviderConfig")
       .then((value): ReadResult<JsonRecord> => ({ ok: true, value, complete: true }))
-      .catch((error): ReadResult<JsonRecord> => ({ ok: false, error: surfaceError(error), code: errorCode(error) }));
+      .catch((error): ReadResult<JsonRecord> => {
+        rethrowIfAborted(error);
+        return { ok: false, error: surfaceError(error), code: errorCode(error) };
+      });
   const scimUsers: ReadResult<JsonRecord[]> = options.skipScim || !scimConfig.ok
     ? { ok: false, error: scimConfig.error ?? "SCIM unavailable", code: scimConfig.code }
     : await client.collectScim("/Users", {}, { limit: userLimit })
       .then((page): ReadResult<JsonRecord[]> => ({ ok: true, value: page.items, complete: page.complete, total: page.total, truncation: page.truncation }))
-      .catch((error): ReadResult<JsonRecord[]> => ({ ok: false, error: surfaceError(error), code: errorCode(error) }));
+      .catch((error): ReadResult<JsonRecord[]> => {
+        rethrowIfAborted(error);
+        return { ok: false, error: surfaceError(error), code: errorCode(error) };
+      });
   if (!options.skipScim && !scimConfig.ok) errors.push(`SCIM /ServiceProviderConfig: ${scimConfig.error}`);
   if (!options.skipScim && scimConfig.ok && !scimUsers.ok) errors.push(`SCIM /Users: ${scimUsers.error}`);
   const scimUsersStatus = options.skipScim
@@ -2579,10 +2578,16 @@ export async function assessSlackMonitoring(
       value: asObjectArray(value.entries),
       complete: !asString(asObject(value.response_metadata)?.next_cursor),
     }))
-    .catch((error): ReadResult<JsonRecord[]> => ({ ok: false, error: surfaceError(error), code: errorCode(error) }));
+    .catch((error): ReadResult<JsonRecord[]> => {
+      rethrowIfAborted(error);
+      return { ok: false, error: surfaceError(error), code: errorCode(error) };
+    });
   const schemasResult = await client.audit("/schemas")
     .then((value): ReadResult<JsonRecord[]> => ({ ok: true, value: asObjectArray(value.schemas), complete: true }))
-    .catch((error): ReadResult<JsonRecord[]> => ({ ok: false, error: surfaceError(error), code: errorCode(error) }));
+    .catch((error): ReadResult<JsonRecord[]> => {
+      rethrowIfAborted(error);
+      return { ok: false, error: surfaceError(error), code: errorCode(error) };
+    });
   if (!logsResult.ok) errors.push(`Audit Logs /logs: ${logsResult.error}`);
   if (!schemasResult.ok) errors.push(`Audit Logs /schemas: ${schemasResult.error}`);
 
@@ -2934,7 +2939,7 @@ export async function exportSlackAuditBundle(
       await writeBundleFile(staged.dir, "_errors.log", `${errors.join("\n")}\n`);
     }
 
-    await createZipArchive(staged.dir, staged.zipPath);
+    await createZipArchive(staged.dir, staged.zipPath, options.signal);
   });
   const fileCount = await countFilesRecursively(outputDir);
 

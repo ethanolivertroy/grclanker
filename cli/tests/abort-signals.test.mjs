@@ -31,6 +31,9 @@ const SHARED_MS = 50;
 // The sweep fails when fewer tools than this reach the mocked fetch, so a resolver change that stops a family before
 // its first request cannot quietly shrink it.
 const NETWORK_COVERAGE_FLOOR = 216;
+// The read sweep fails when fewer tools than this send a request past their first, so a fixture or resolver change
+// that ends a family's collection at its first read cannot quietly shrink what the sweep interrupts mid-collection.
+const LATER_READ_COVERAGE_FLOOR = 196;
 
 // Families whose requests never pass through global fetch, so a hanging fetch cannot show whether they stop.
 const NOT_FETCH = [
@@ -274,8 +277,8 @@ function familyRounds(tools) {
 }
 
 /** Call `tool` with fake arguments, recording whether it reached the mocked fetch and how it settled. */
-function startRun(tool, outputDir, signal = new AbortController().signal) {
-  const run = { tool, outputDir, reached: false, settled: false };
+function startRun(tool, outputDir, signal = new AbortController().signal, fields = {}) {
+  const run = { tool, outputDir, reached: false, settled: false, ...fields };
   run.promise = currentRun.run(run, () => tool.execute(`abort-test-${tool.name}`, fakeArgs(tool, outputDir), signal));
   run.promise.then(
     (value) => Object.assign(run, { settled: true, value }),
@@ -906,4 +909,83 @@ test("every tool that requests through fetch stops when aborted mid-request: it 
     (family) => !reached.some((pair) => familyOf(pair.tool) === family),
   );
   assert.deepEqual(silent, [], "every swept family has a tool that reaches the mocked fetch");
+});
+
+/**
+ * Answers a call's requests with an empty object until its `nth`, which fails with the tool call's abort error, as do
+ * the requests sent alongside it. Any request sent after that is recorded as late and fails the same way. A request
+ * whose signal has already aborted is never sent, as with fetch.
+ */
+function interruptAt(nth) {
+  const aborted = () => new ToolCallAbortedError(AbortSignal.abort(new Error(`the sweep interrupted read ${nth}`)));
+  return (call) => {
+    if (call.signal?.aborted) return Promise.reject(call.signal.reason);
+    const run = call.run;
+    run.sent += 1;
+    if (run.interrupted) {
+      run.late.push(new URL(call.url).pathname);
+      return Promise.reject(aborted());
+    }
+    if (run.sent < nth) return Response.json({});
+    if (run.sent === nth) {
+      setImmediate(() => {
+        run.interrupted = true;
+        for (const reject of run.held.splice(0)) reject(aborted());
+      });
+    }
+    return new Promise((_, reject) => run.held.push(reject));
+  };
+}
+
+/**
+ * A collector that records a failed read and moves on must rethrow the tool call's abort, so the abort ends the call
+ * at the read it interrupted. Each tool's first, second, and third requests are interrupted in turn, the later cuts
+ * landing past any token or session request, while the call's own signal stays live: only the error can stop it. Once
+ * the call settles its signal aborts, as it would have from the start in production, so a read running beside the
+ * interrupted one that has not yet sent its request stops there.
+ */
+test("every tool that requests through fetch ends its collection at the read an abort interrupts: it sends no further request, settles at once with the abort, and writes nothing", async (t) => {
+  const box = sandbox(t, (call) => call.run?.respond(call));
+  const swept = collectRegisteredGrcTools().filter((tool) => !NOT_FETCH.some(([prefix]) => tool.name.startsWith(prefix)));
+  const runs = [];
+
+  for (const nth of [1, 2, 3]) {
+    for (const round of familyRounds(swept)) {
+      clearGrcSharedCachesForTests();
+      const started = round.map((tool) => {
+        const controller = new AbortController();
+        const run = startRun(tool, join(box.root, "out", tool.name, `read-${nth}`), controller.signal, { nth, respond: interruptAt(nth), sent: 0, held: [], late: [] });
+        const abort = () => controller.abort(new Error(`the sweep stopped a call of ${tool.name} once it settled`));
+        run.promise.then(abort, abort);
+        return run;
+      });
+      await waitUntil(() => started.every((run) => run.settled || run.interrupted), REACH_MS);
+      await waitUntil(() => started.every((run) => run.settled || !run.interrupted), SETTLE_MS);
+      runs.push(...started);
+    }
+  }
+
+  const abortMessage = new ToolCallAbortedError(AbortSignal.abort()).message;
+  const interrupted = runs.filter((run) => run.interrupted);
+  const problems = interrupted.flatMap((run) => {
+    const found = [];
+    if (run.late.length > 0) found.push(`sent ${run.late.length} more requests (${[...new Set(run.late)].slice(0, 3).join(", ")})`);
+    if (!run.settled) found.push(`still running ${SETTLE_MS} ms after the read failed`);
+    else if (run.rejected ? !(run.error instanceof ToolCallAbortedError) : !String(run.value?.content?.[0]?.text).includes(abortMessage)) {
+      found.push(`settled without the abort: ${describeOutcome(run)}`);
+    }
+    const written = listTree(run.outputDir).filter((path) => !path.endsWith("/"));
+    if (written.length > 0) found.push(`wrote ${written.join(", ")}`);
+    return found.map((problem) => `${run.tool.name} (read ${run.nth} interrupted): ${problem}`);
+  });
+  if (runs.some((run) => !run.settled)) box.open = false;
+
+  const pastFirst = swept.filter((tool) => interrupted.some((run) => run.tool === tool && run.nth > 1));
+  t.diagnostic(`${swept.length} tools swept, ${interrupted.length} of ${runs.length} calls interrupted mid-collection, ${pastFirst.length} tools past their first read`);
+  for (const tool of swept.filter((tool) => !pastFirst.includes(tool))) t.diagnostic(`settled after its first read: ${tool.name}`);
+  assert.equal(problems.length, 0, `${problems.length} problems after interrupting a read:\n${problems.join("\n")}`);
+  assert.ok(
+    pastFirst.length >= LATER_READ_COVERAGE_FLOOR,
+    `only ${pastFirst.length} of ${swept.length} tools sent a request past their first; the floor is ${LATER_READ_COVERAGE_FLOOR}`,
+  );
 });
