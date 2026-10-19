@@ -4,9 +4,10 @@ Copyright 2026 Ethan Troy
 This product includes software developed by Ethan Troy (https://github.com/ethanolivertroy).
 
 The durable terminal app (cli/durable/tui/) is adapted from Pi's coding agent
-(packages/coding-agent/ at Pi v1.3.0, https://github.com/earendil-works/pi):
-its experimental durable app in src/experimental/durable/ and parts of its
-interactive mode. Used under the MIT License:
+(packages/coding-agent/ in https://github.com/earendil-works/pi): its
+experimental durable app in src/experimental/durable/ as of commit e6b9a6af5,
+the last version before Pi removed it, and parts of its interactive mode at
+v1.3.0. Used under the MIT License:
 
 MIT License
 

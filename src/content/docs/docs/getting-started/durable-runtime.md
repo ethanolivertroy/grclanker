@@ -57,7 +57,7 @@ grclanker durable tui --session fips-review --model ollama/gemma4
 
 Without `--session`, it starts a new session. With `--session`, it shows the session's conversation and continues any work an interrupted command left in it, with the same replay policy as [`resume`](#crash-and-resume). A session can move between the terminal app, `run`, and `resume`, one process at a time: while the app is open, it holds the [session lock](#sessions-and-the-lock).
 
-The app is adapted from the experimental durable coding agent in [Pi](https://github.com/earendil-works/pi) v1.3.0 (MIT License, see `NOTICE`). It uses the theme set in `~/.grclanker/agent/settings.json`, the grclanker theme by default. Below the transcript, which shows each tool call and its result, the screen has:
+The app is adapted from the experimental durable coding agent in [Pi](https://github.com/earendil-works/pi) (MIT License, see `NOTICE`). It uses the theme set in `~/.grclanker/agent/settings.json`, the grclanker theme by default. Below the transcript, which shows each tool call and its result, the screen has:
 
 - A task panel listing Pi Durable's live tasks
 - Messages queued for the end of the turn

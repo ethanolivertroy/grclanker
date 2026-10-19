@@ -5,7 +5,8 @@
  * holds whatever an earlier process left.
  *
  * Adapted from Pi's experimental durable coding agent
- * (`packages/coding-agent/src/experimental/durable/tui.ts`, Pi v1.3.0).
+ * (`packages/coding-agent/src/experimental/durable/tui.ts` at Pi commit
+ * e6b9a6af5, its last version before Pi removed it ahead of v1.3.0).
  * Copyright (c) 2025 Mario Zechner. MIT License; see NOTICE. grclanker adds its
  * banner, the session id, and the assessment summary, and has no subagents.
  */

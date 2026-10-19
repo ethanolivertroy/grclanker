@@ -5,7 +5,8 @@
  * the session opens, with the same replay policy as `grclanker durable resume`.
  *
  * Adapted from Pi's experimental durable coding agent
- * (`packages/coding-agent/src/experimental/durable/runtime.ts`, Pi v1.3.0).
+ * (`packages/coding-agent/src/experimental/durable/runtime.ts` at Pi commit
+ * e6b9a6af5, its last version before Pi removed it ahead of v1.3.0).
  * Copyright (c) 2025 Mario Zechner. MIT License; see NOTICE. grclanker opens
  * its own session directories, installs its domain tools in place of Pi's
  * coding tools, has no subagents, and adds the assessment document and
