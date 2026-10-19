@@ -3020,6 +3020,19 @@ kbd {
     display: block;
     margin-left: 11.25rem;
   }
+
+  /* Chrome moves a row to the next sheet whole when only its bottom padding
+     runs past this one, so on paper the space under a cell's text is a margin
+     as tall as the padding, which the end of a sheet can cut. */
+  .docs-prose table:not([data-layout='stacked']) td {
+    padding-bottom: 0;
+  }
+
+  .docs-prose table:not([data-layout='stacked']) td::after {
+    content: '';
+    display: block;
+    margin-top: 0.8rem;
+  }
 }
 
 /* Chrome can carry a grid that would fit over to the next sheet, leaving this
