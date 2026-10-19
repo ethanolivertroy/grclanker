@@ -72,7 +72,7 @@ The app is adapted from the experimental durable coding agent in [Pi](https://gi
 | Esc | Abort the running turn |
 | Ctrl+O | Expand or collapse tool output and compaction summaries |
 | Shift+Tab | Cycle the thinking level, on a model that supports thinking |
-| Ctrl+L or `/model` | Switch to another model whose provider has credentials |
+| Ctrl+L or `/model` | Switch to another model whose provider has credentials. In the list, Esc or Ctrl+C closes it without switching |
 | `/compact [instructions]` | Summarize older context now |
 | `/tasks` | Hide or show the task panel |
 | Ctrl+C, or Ctrl+D on an empty editor | Exit |

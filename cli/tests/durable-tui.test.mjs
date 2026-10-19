@@ -300,7 +300,7 @@ test("an app closed mid tool round keeps it: on reopen the read-only tool reruns
   await reopened.exit("\x03");
 });
 
-test("terminal app commands: /model opens the model list, Esc closes it, and an unsupported thinking change is a notice", async (t) => {
+test("terminal app commands: /model opens the model list, Esc or Ctrl+C closes it without exiting, and an unsupported thinking change is a notice", async (t) => {
   const home = scratchDir(t);
   const session = resolveDurableSession("tui-commands", home);
   const model = scriptedModel();
@@ -312,7 +312,12 @@ test("terminal app commands: /model opens the model list, Esc closes it, and an 
   assert.match(listed, /faux-1/);
   app.terminal.type("\x1b");
   await app.terminal.waitFor((screen) => !screen.includes("Select model:"), "the editor to return");
+  app.terminal.type("\x0c");
+  await app.terminal.waitFor((screen) => screen.includes("Select model:"), "the model list from Ctrl+L");
+  app.terminal.type("\x03");
+  await app.terminal.waitFor((screen) => !screen.includes("Select model:"), "the editor to return after Ctrl+C");
 
+  // The notice also shows that Ctrl+C in the list left the app running.
   app.terminal.type("\x1b[Z");
   await app.terminal.waitFor((screen) => screen.includes("Current model does not support thinking"), "the notice");
   assert.deepEqual(model.calls, [], "no command reached the model");
