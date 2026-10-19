@@ -227,18 +227,23 @@ test("writeBundleAtomically stages nothing when the signal is already aborted", 
   assert.deepEqual(readdirSync(root), []);
 });
 
-test("an abort that arrives once the bundle starts moving into place lets the commit finish, and the write resolves", async () => {
-  const root = createTempBase("grclanker-atomic-late-abort-");
-  const controller = new AbortController();
+for (const [entry, target] of [["directory", "bundle"], ["archive", "bundle.zip"]]) {
+  test(`an abort that arrives once the bundle ${entry} starts moving into place lets the commit finish, and the write resolves and marks its tool call committed`, async () => {
+    const root = createTempBase("grclanker-atomic-late-abort-");
+    const controller = new AbortController();
+    const call = { committed: false };
 
-  const result = await beforeMove(join(root, "bundle"), () => controller.abort(), () =>
-    writeBundleAtomically({ root, names: ["bundle"], zip: true, signal: controller.signal }, (staged) => writeSampleBundle(staged)));
+    const result = await beforeMove(join(root, target), () => controller.abort(), () =>
+      runToolCall(call, () =>
+        writeBundleAtomically({ root, names: ["bundle"], zip: true, signal: controller.signal }, (staged) => writeSampleBundle(staged))));
 
-  assert.equal(controller.signal.aborted, true);
-  assert.deepEqual(result, { outputDir: join(root, "bundle"), zipPath: join(root, "bundle.zip") });
-  assert.equal(readFileSync(result.zipPath, "utf8"), "zip-bytes");
-  assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle.zip"]);
-});
+    assert.equal(controller.signal.aborted, true);
+    assert.deepEqual(result, { outputDir: join(root, "bundle"), zipPath: join(root, "bundle.zip") });
+    assert.equal(call.committed, true, "the call counts as committed, so it reports the bundle instead of the abort");
+    assert.equal(readFileSync(result.zipPath, "utf8"), "zip-bytes");
+    assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle.zip"]);
+  });
+}
 
 test("a write marks the tool call it runs in as committed once its bundle is in place, and a write that commits nothing does not", async () => {
   const root = createTempBase("grclanker-atomic-call-");

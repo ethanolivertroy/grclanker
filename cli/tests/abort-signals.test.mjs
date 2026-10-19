@@ -323,16 +323,21 @@ function vantaResponder(call) {
   return undefined;
 }
 
-/** Runs `effect` as a staged bundle named `name` starts moving to its final path, until the returned undo runs. */
+/**
+ * Runs `effect` as the staged entry named `name`, a bundle directory or its archive, starts moving to its final path
+ * by a rename or a link, until the returned undo runs.
+ */
 function onCommitMove(name, effect) {
-  const original = fsPromises.rename;
-  fsPromises.rename = async (from, to) => {
-    if (basename(to) === name && basename(dirname(from)).startsWith(".grclanker-staging-")) effect();
-    return original(from, to);
-  };
+  const originals = { rename: fsPromises.rename, link: fsPromises.link };
+  for (const [method, original] of Object.entries(originals)) {
+    fsPromises[method] = async (from, to) => {
+      if (basename(to) === name && basename(dirname(from)).startsWith(".grclanker-staging-")) effect();
+      return original(from, to);
+    };
+  }
   syncBuiltinESMExports();
   return () => {
-    fsPromises.rename = original;
+    Object.assign(fsPromises, originals);
     syncBuiltinESMExports();
   };
 }
@@ -760,29 +765,31 @@ test("aborting vanta_export_audit while it lists evidence writes nothing, not ev
   assert.equal(existsSync(exportsDir), false, `the export created its output directory: ${listTree(box.cwd).join(", ")}`);
 });
 
-test("an export aborted as its bundle starts moving into place resolves with the whole bundle, since the abort came too late to stop it", async (t) => {
-  const box = sandbox(t, () => Response.json(PAGERDUTY_FIXTURE));
-  const outputRoot = join(box.cwd, "exports");
-  const bundleName = "pagerduty-us-audit-bundle";
-  const controller = new AbortController();
-  t.after(onCommitMove(bundleName, () => controller.abort(new Error("operator stopped the export as it finished"))));
+for (const [entry, suffix] of [["directory", ""], ["archive", ".zip"]]) {
+  test(`an export aborted as its bundle ${entry} starts moving into place resolves with the whole bundle, since the abort came too late to stop it`, async (t) => {
+    const box = sandbox(t, () => Response.json(PAGERDUTY_FIXTURE));
+    const outputRoot = join(box.cwd, "exports");
+    const bundleName = "pagerduty-us-audit-bundle";
+    const controller = new AbortController();
+    t.after(onCommitMove(`${bundleName}${suffix}`, () => controller.abort(new Error("operator stopped the export as it finished"))));
 
-  const outcome = await settleWithin(
-    getRegisteredGrcTool("pagerduty_export_audit_bundle").execute(
-      "call-late-abort",
-      { api_token: FAKE_SECRET, region: "us", output_dir: outputRoot },
-      controller.signal,
-    ),
-    10_000,
-  );
-  assert.equal(controller.signal.aborted, true, "the abort arrived while the bundle moved into place");
-  assert.equal(outcome.status, "resolved", `the export ${outcome.status === "rejected" ? `rejected with ${describeError(outcome.error)}` : "never settled"}`);
-  const { output_dir: outputDir, zip_path: zipPath } = outcome.value.details;
-  assert.equal(outputDir, join(realpathSync(outputRoot), bundleName));
-  assert.ok(existsSync(join(outputDir, "QUICK_REFERENCE.md")), "the bundle is complete");
-  assert.ok(existsSync(zipPath), "and so is its archive");
-  assert.deepEqual(readdirSync(outputRoot).sort(), [bundleName, `${bundleName}.zip`]);
-});
+    const outcome = await settleWithin(
+      getRegisteredGrcTool("pagerduty_export_audit_bundle").execute(
+        "call-late-abort",
+        { api_token: FAKE_SECRET, region: "us", output_dir: outputRoot },
+        controller.signal,
+      ),
+      10_000,
+    );
+    assert.equal(controller.signal.aborted, true, `the abort arrived as the bundle ${entry} moved into place`);
+    assert.equal(outcome.status, "resolved", `the export ${outcome.status === "rejected" ? `rejected with ${describeError(outcome.error)}` : "never settled"}`);
+    const { output_dir: outputDir, zip_path: zipPath } = outcome.value.details;
+    assert.equal(outputDir, join(realpathSync(outputRoot), bundleName));
+    assert.ok(existsSync(join(outputDir, "QUICK_REFERENCE.md")), "the bundle is complete");
+    assert.ok(existsSync(zipPath), "and so is its archive");
+    assert.deepEqual(readdirSync(outputRoot).sort(), [bundleName, `${bundleName}.zip`]);
+  });
+}
 
 test("every registered tool refuses a call whose signal already aborted: it rejects with the reason and sends, runs, and writes nothing", async (t) => {
   const box = sandbox(t);
