@@ -81,6 +81,18 @@ const VANTA_AUDIT = {
   auditStartDate: "2026-01-01",
   auditEndDate: "2026-12-31",
 };
+const VANTA_EVIDENCE = {
+  id: "audit-evidence-abort",
+  evidenceId: "evidence-abort",
+  name: "Quarterly access review",
+  status: "Ready for audit",
+  description: null,
+  evidenceType: "Document",
+  testStatus: null,
+  relatedControls: [{ name: "CC6.1" }],
+  creationDate: "2026-02-01T00:00:00.000Z",
+  statusUpdatedDate: "2026-02-02T00:00:00.000Z",
+};
 
 const fsPromises = createRequire(import.meta.url)("node:fs/promises");
 
@@ -315,12 +327,20 @@ function pagerdutyResponder(call) {
   return PAGERDUTY_HANGING_PATHS.has(path) ? undefined : Response.json(PAGERDUTY_FIXTURE);
 }
 
-/** Answers the token and audit list requests, so the export gets as far as listing evidence, which never answers. */
-function vantaResponder(call) {
-  const path = new URL(call.url).pathname;
-  if (path.endsWith("/oauth/token")) return Response.json({ access_token: "vanta-abort-token", expires_in: 3600 });
-  if (path.endsWith("/audits")) return Response.json({ results: { data: [VANTA_AUDIT], pageInfo: { hasNextPage: false } } });
-  return undefined;
+/**
+ * Answers the token and audit list requests, and with `evidence` the audit's evidence list too, so the export gets as
+ * far as listing evidence, or listing an evidence item's files, which never answers.
+ */
+function vantaResponder({ evidence = false } = {}) {
+  return (call) => {
+    const path = new URL(call.url).pathname;
+    if (path.endsWith("/oauth/token")) return Response.json({ access_token: "vanta-abort-token", expires_in: 3600 });
+    if (path.endsWith("/audits")) return Response.json({ results: { data: [VANTA_AUDIT], pageInfo: { hasNextPage: false } } });
+    if (evidence && path.endsWith("/evidence")) {
+      return Response.json({ results: { data: [VANTA_EVIDENCE], pageInfo: { hasNextPage: false } } });
+    }
+    return undefined;
+  };
 }
 
 /**
@@ -745,25 +765,32 @@ test("aborting pagerduty_export_audit_bundle mid-collection writes nothing, not 
   assert.equal(existsSync(outputRoot), false, `the export created its output directory: ${listTree(box.cwd).join(", ")}`);
 });
 
-test("aborting vanta_export_audit while it lists evidence writes nothing, not even its output directory", async (t) => {
-  const box = sandbox(t, vantaResponder);
-  const exportsDir = join(box.cwd, "exports");
-  const isEvidence = (request) => new URL(request.url).pathname.includes("/evidence");
-  const controller = new AbortController();
-  const call = getRegisteredGrcTool("vanta_export_audit").execute(
-    "call-vanta-export",
-    { audit_id: VANTA_AUDIT.id, client_id: "vanta-abort-client", client_secret: FAKE_SECRET, output_dir: join(exportsDir, "vanta") },
-    controller.signal,
-  );
-  assert.ok(await waitUntil(() => box.requests.some(isEvidence), 5000), "the export started listing evidence");
+// The export catches a failed file listing and carries on, so in that case the bundle writer is what stops on the abort.
+for (const [step, evidence, hangs] of [
+  ["lists evidence", false, (path) => path.endsWith("/evidence")],
+  ["lists an evidence item's files", true, (path) => path.endsWith("/urls")],
+]) {
+  test(`aborting vanta_export_audit while it ${step} writes nothing, not even its output directory`, async (t) => {
+    const box = sandbox(t, vantaResponder({ evidence }));
+    const exportsDir = join(box.cwd, "exports");
+    const isHanging = (request) => hangs(new URL(request.url).pathname);
+    const controller = new AbortController();
+    const call = getRegisteredGrcTool("vanta_export_audit").execute(
+      "call-vanta-export",
+      { audit_id: VANTA_AUDIT.id, client_id: "vanta-abort-client", client_secret: FAKE_SECRET, output_dir: join(exportsDir, "vanta") },
+      controller.signal,
+    );
+    assert.ok(await waitUntil(() => box.requests.some(isHanging), 5000), `the export is waiting while it ${step}`);
 
-  const reason = new Error("operator stopped the Vanta export");
-  controller.abort(reason);
-  const outcome = await settleWithin(call, SETTLE_MS);
-  assert.equal(outcome.status, "rejected", `the export ${outcome.status} instead of rejecting`);
-  assert.equal(outcome.error, reason);
-  assert.equal(existsSync(exportsDir), false, `the export created its output directory: ${listTree(box.cwd).join(", ")}`);
-});
+    const reason = new Error("operator stopped the Vanta export");
+    controller.abort(reason);
+    const outcome = await settleWithin(call, SETTLE_MS);
+    assert.equal(outcome.status, "rejected", `the export ${outcome.status} instead of rejecting`);
+    assert.equal(outcome.error, reason);
+    assert.ok(box.requests.filter(isHanging).every((request) => request.signal.aborted), "the request in flight saw the abort");
+    assert.equal(existsSync(exportsDir), false, `the export created its output directory: ${listTree(box.cwd).join(", ")}`);
+  });
+}
 
 for (const [entry, suffix] of [["directory", ""], ["archive", ".zip"]]) {
   test(`an export aborted as its bundle ${entry} starts moving into place resolves with the whole bundle, since the abort came too late to stop it`, async (t) => {
