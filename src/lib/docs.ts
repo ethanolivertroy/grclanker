@@ -35,6 +35,7 @@ export const docsSections: Array<{ title: string; items: DocsSectionEntry[] }> =
       { label: 'Compute Backends', slug: 'getting-started/compute-backends' },
       { label: 'Cursor Agent SDK', slug: 'getting-started/agent-sdk' },
       { label: 'Flue Runtime', slug: 'getting-started/flue-runtime' },
+      { label: 'Durable Runtime', slug: 'getting-started/durable-runtime' },
     ],
   },
   {
