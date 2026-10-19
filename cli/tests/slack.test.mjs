@@ -47,6 +47,7 @@ import {
   resolveSlackConfiguration,
   vendorErrorCode,
 } from "../dist/extensions/grc-tools/slack.js";
+import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const EMPTY_ENV = { SLACK_CONFIG_FILE: "" };
@@ -2280,4 +2281,10 @@ test("byte differential fixtures: Slack assessments and export artifacts", { ski
   const exportRoot = prepareByteDifferentialExportRoot("slack");
   const exported = await exportSlackAuditBundle(makeClient(compliantFixture), config, exportRoot);
   writeByteDifferentialFixture("slack", "export", snapshotExportBundle(exported));
+});
+
+test("exportSlackAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-slack-write-failure-");
+  const config = resolveSlackConfiguration({ token: "xoxp-test", scim_token: "scim-test", org_id: "E1" }, EMPTY_ENV);
+  await assertNoPartialBundleOnWriteFailure(base, () => exportSlackAuditBundle(makeClient(compliantFixture), config, base));
 });

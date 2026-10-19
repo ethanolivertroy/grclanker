@@ -20,6 +20,7 @@ import {
   escapeCsvCell,
   sanitizeFilename,
 } from "../dist/extensions/grc-tools/vanta.js";
+import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
 import { readZipEntries } from "./helpers/bundle-contents.mjs";
 
 function createTempBase(prefix) {
@@ -816,4 +817,26 @@ test("secure output helpers reject symlink escapes and filename helpers stay saf
   );
   assert.equal(sanitizeFilename("../../Quarterly*Report?.pdf"), "Quarterly_Report_.pdf");
   assert.equal(escapeCsvCell("=SUM(A1:A2)"), "'=SUM(A1:A2)");
+});
+
+test("exportVantaAuditPackage leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-vanta-write-failure-");
+  const audit = {
+    id: "audit-write-failure-123456",
+    customerDisplayName: "Write Failure Test",
+    customerOrganizationName: "Write Failure Test LLC",
+    framework: "SOC 2",
+    auditStartDate: "2026-01-01T00:00:00.000Z",
+    auditEndDate: "2026-12-31T00:00:00.000Z",
+  };
+  const client = {
+    async listEvidence() {
+      return [];
+    },
+    async listEvidenceUrls() {
+      return [];
+    },
+  };
+  // Without evidence the package writes only _audit_info.json and _index.csv, so the second write is the one that fails.
+  await assertNoPartialBundleOnWriteFailure(base, () => exportVantaAuditPackage(client, audit, base), { failAt: 2 });
 });

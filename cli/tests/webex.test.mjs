@@ -37,6 +37,7 @@ import {
 } from "../dist/extensions/grc-tools/webex.js";
 import { checkContract, evaluateVerdictCriteria } from "../dist/extensions/grc-tools/spec-model.js";
 import { WEBEX_SPEC } from "../dist/extensions/grc-tools/webex.spec.js";
+import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(TEST_DIR, "..", "..");
@@ -2352,4 +2353,9 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
 
   const safe = resolveSecureOutputPath(base, join("reports", "safe.txt"));
   assert.match(safe, /reports\/safe\.txt$/);
+});
+
+test("exportWebexAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-webex-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportWebexAuditBundle(compliantClient(), sampleConfig(), base));
 });

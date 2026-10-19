@@ -24,6 +24,7 @@ import {
   reviewGwsTokenActivity,
   traceGwsAdminActivity,
 } from "../dist/extensions/grc-tools/gws-ops.js";
+import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1107,4 +1108,10 @@ test("collectGwsOperatorEvidenceBundle rejects symlinked output roots", async ()
 
   assert.equal(existsSync(realOutside), false);
   assert.equal(existsSync(safeRoot), false);
+});
+
+test("collectGwsOperatorEvidenceBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-gws-ops-write-failure-");
+  const gwsBin = createFakeBinary(base);
+  await assertNoPartialBundleOnWriteFailure(base, () => collectGwsOperatorEvidenceBundle({ gwsBin, output_dir: base, max_results: 10, lookback_days: 7 }, createRunner()));
 });

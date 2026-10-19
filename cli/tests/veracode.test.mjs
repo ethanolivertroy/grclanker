@@ -45,6 +45,7 @@ import {
   recordFetchRequests,
   sweepCheckCompleteness,
 } from "./helpers/spec-conformance.mjs";
+import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
 
 const observedDecisionFacts = observeRuntimeDecisionFacts(VERACODE_SPEC);
 const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
@@ -3635,4 +3636,9 @@ portableContractTest("every threshold edge and ordered rule in the spec is reach
   const boundaries = certifyRuntimeBoundaryCoverage(VERACODE_SPEC, observedDecisionFacts.factsByCheck);
   const rules = certifyRuntimeRuleDecisiveness(VERACODE_SPEC, observedDecisionFacts.factsByCheck);
   assert.deepEqual([...boundaries.gaps, ...rules.gaps], []);
+});
+
+test("exportVeracodeAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-veracode-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportVeracodeAuditBundle(mockClient(healthyFixture()), sampleConfig(), base, { now: NOW }));
 });

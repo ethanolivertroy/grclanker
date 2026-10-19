@@ -47,6 +47,7 @@ import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
+import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
 
 const DAY_MS = 86_400_000;
 // The configured API key: its base64 form and the secret half of its decoded id:api_key form are both alphanumeric and
@@ -3912,4 +3913,11 @@ test("cookie attribute class: a later cookie whose name holds a dot or another t
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactSecrets(text, sampleConfig()), "elastic redactSecrets");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactSensitiveValues({ note: text }).note, "elastic redactSensitiveValues");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactSensitiveValues([{ message: text }])[0].message, "elastic redactSensitiveValues, error list");
+});
+
+test("exportElasticAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-elastic-write-failure-");
+  const config = sampleConfig();
+  const client = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(healthyFixtures())) });
+  await assertNoPartialBundleOnWriteFailure(base, () => exportElasticAuditBundle(client, config, base));
 });

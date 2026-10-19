@@ -49,6 +49,7 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
+import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_LOGIN = new Date(Date.now() - 2 * DAY_MS).toISOString();
@@ -2819,4 +2820,9 @@ test("byte differential fixtures: GWS assessments and export artifacts", { skip:
   const exportRoot = prepareByteDifferentialExportRoot("gws");
   const exported = await exportGwsAuditBundle(createFakeCollector(), config, exportRoot);
   writeByteDifferentialFixture("gws", "export", snapshotExportBundle(exported));
+});
+
+test("exportGwsAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-gws-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportGwsAuditBundle(createFakeCollector(), createSampleConfig(), base));
 });

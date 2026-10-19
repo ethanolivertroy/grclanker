@@ -40,6 +40,7 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
+import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 
@@ -3459,4 +3460,11 @@ test("byte differential fixtures: Zscaler assessments and export artifacts", { s
   const exportRoot = prepareByteDifferentialExportRoot("zscaler");
   const exported = await exportZscalerAuditBundle(clients, { outputDir: exportRoot });
   writeByteDifferentialFixture("zscaler", "export", snapshotExportBundle(exported));
+});
+
+test("exportZscalerAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-zscaler-write-failure-");
+  const config = { zia: ziaConfig(), zpa: undefined, oneApiDetected: false, zdxDetected: false, timeoutMs: 30000, maxRetries: 0, sourceChain: [] };
+  const zia = new ZiaApiClient(ziaConfig(), { fetchImpl: ziaFetchMock(), maxRetries: 0 });
+  await assertNoPartialBundleOnWriteFailure(base, () => exportZscalerAuditBundle({ config, zia }, { outputDir: base }));
 });

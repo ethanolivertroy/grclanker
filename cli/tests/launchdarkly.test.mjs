@@ -43,6 +43,7 @@ import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
+import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
 
 const NOW = Date.parse("2026-09-21T00:00:00Z");
 const RECENT = "2026-09-15T00:00:00Z";
@@ -3997,4 +3998,9 @@ test("cookie attribute class: a later cookie whose name holds a dot or another t
   assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "launchdarkly scrubErrorText");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "launchdarkly redactCredentialValues");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "launchdarkly redactCredentialValues, error list");
+});
+
+test("exportLaunchdarklyAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-ld-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportLaunchdarklyAuditBundle(healthyClient(), sampleConfig(), base, { now: NOW }));
 });

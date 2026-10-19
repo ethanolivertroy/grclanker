@@ -48,6 +48,7 @@ import { BARE_TOKEN_CONTROL, CONFIGURED_SECRET_CANARIES, VENDOR_TOKEN_CANARIES, 
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
+import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 // An explicit config path must exist (a missing explicit file is a read error), so isolation from
@@ -3574,4 +3575,9 @@ test("PagerdutyApiClient refuses a 200 listing that omits the documented collect
   const users = await empty.listUsers(5);
   assert.deepEqual(users.items, []);
   assert.equal(users.complete, true);
+});
+
+test("exportPagerdutyAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-pagerduty-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportPagerdutyAuditBundle(healthyClient(), sampleConfig(), base, { maxAdmins: 3 }));
 });

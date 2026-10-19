@@ -94,6 +94,7 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
+import { assertNoPartialBundleOnWriteFailure } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-04-16T00:00:00.000Z");
 const ASSESSORS = [
@@ -2503,4 +2504,9 @@ test("byte differential fixtures: Azure assessments and export artifacts", { ski
   const exportRoot = prepareByteDifferentialExportRoot("azure");
   const exported = await exportAzureAuditBundle(compliantClient(), sampleConfig(), exportRoot, { max_assignments: 25 });
   writeByteDifferentialFixture("azure", "export", snapshotExportBundle(exported));
+});
+
+test("exportAzureAuditBundle leaves nothing under the output root when a write fails partway", async () => {
+  const base = createTempBase("grclanker-azure-write-failure-");
+  await assertNoPartialBundleOnWriteFailure(base, () => exportAzureAuditBundle(compliantClient(), sampleConfig(), base, { max_assignments: 25 }));
 });
