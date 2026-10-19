@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { SpecUrlCopyButton } from '../../../components/spec-copy';
 import { SpecContentsBar } from '../../../components/spec-contents-bar';
@@ -6,7 +7,8 @@ import { SpecDocument, specSections } from '../../../components/spec-document';
 import { SpecViewState, SpecViews } from '../../../components/spec-views';
 import { pageMetadata } from '../../../lib/metadata';
 import { githubUrl } from '../../../lib/site';
-import { RAW_BASE, categoryLabels, getSpec, loadSpecs } from '../../../lib/specs';
+import { source } from '../../../lib/source';
+import { RAW_BASE, categoryLabels, getSpec, getSpecGuideSlug, loadSpecs } from '../../../lib/specs';
 
 interface PageProps {
   params: Promise<{ slug: string }>;
@@ -15,7 +17,7 @@ interface PageProps {
 const pillClass =
   'inline-flex items-center rounded-full border px-2.5 py-1 text-[0.6875rem] font-mono uppercase tracking-[0.12em]';
 const neutralPillClass = `${pillClass} border-surface0 bg-crust/70 text-subtext0`;
-const externalLinkClass = 'text-blue underline! underline-offset-2 hover:text-lavender';
+const textLinkClass = 'text-blue underline! underline-offset-2 hover:text-lavender';
 
 async function getSpecOrNotFound(props: PageProps) {
   const { slug } = await props.params;
@@ -41,6 +43,7 @@ export default async function SpecPage(props: PageProps) {
   const { meta, content } = await getSpecOrNotFound(props);
   const rawUrl = `${RAW_BASE}/${meta.slug}.spec.md`;
   const toc = await specSections(content);
+  const guide = source.getPage(getSpecGuideSlug(meta.slug).split('/'));
 
   return (
     <SpecViewState key={meta.slug}>
@@ -68,7 +71,7 @@ export default async function SpecPage(props: PageProps) {
                 <p className="mt-3 text-xs text-subtext0">
                   Community spec contributed by{' '}
                   {meta.contributor_url ? (
-                    <a href={meta.contributor_url} target="_blank" rel="noopener" className={externalLinkClass}>
+                    <a href={meta.contributor_url} target="_blank" rel="noopener" className={textLinkClass}>
                       @{meta.contributor}
                     </a>
                   ) : (
@@ -78,11 +81,21 @@ export default async function SpecPage(props: PageProps) {
                     <>
                       {' '}
                       via{' '}
-                      <a href={meta.source_pr} target="_blank" rel="noopener" className={externalLinkClass}>
+                      <a href={meta.source_pr} target="_blank" rel="noopener" className={textLinkClass}>
                         PR #{meta.source_pr.split('/').pop()}
                       </a>
                     </>
                   )}
+                </p>
+              )}
+              {guide && (
+                <p className="mt-3 text-sm text-subtext0">
+                  Set up and run it with the{' '}
+                  {/* Prefetching would download the guide on every visit to the spec. */}
+                  <Link href={guide.url} prefetch={false} className={textLinkClass}>
+                    {guide.data.title} guide
+                  </Link>
+                  .
                 </p>
               )}
             </div>
