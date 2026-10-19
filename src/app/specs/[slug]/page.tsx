@@ -1,7 +1,8 @@
 import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
-import { MonacoViewer } from '../../../components/monaco-viewer';
 import { SpecUrlCopyButton } from '../../../components/spec-copy';
+import { SpecDocument } from '../../../components/spec-document';
+import { SpecViews } from '../../../components/spec-views';
 import { pageMetadata } from '../../../lib/metadata';
 import { githubUrl } from '../../../lib/site';
 import { RAW_BASE, categoryLabels, getSpec, loadSpecs } from '../../../lib/specs';
@@ -106,11 +107,9 @@ export default async function SpecPage(props: PageProps) {
         </div>
       </div>
 
-      <div className="viewscreen rounded-lg scanlines relative min-w-0 overflow-hidden">
-        <div className="relative z-10">
-          <MonacoViewer key={meta.slug} content={content.trim()} />
-        </div>
-      </div>
+      <SpecViews key={meta.slug} sourceUrl={`/specs/${meta.slug}/source.md`}>
+        <SpecDocument content={content} />
+      </SpecViews>
     </div>
   );
 }
