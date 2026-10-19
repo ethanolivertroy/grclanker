@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import childProcess from "node:child_process";
 import { setMaxListeners } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { collectRegisteredGrcTools, getRegisteredGrcTool } from "../dist/agent-sdk/lib/registry.js";
@@ -302,6 +302,28 @@ function pagerdutyResponder(call) {
   return PAGERDUTY_HANGING_PATHS.has(path) ? undefined : Response.json(PAGERDUTY_FIXTURE);
 }
 
+/** A stand-in CLI that writes its process id to `<name>.pid` and then never finishes. */
+function hangingCli(dir, name) {
+  const executable = join(dir, name);
+  const pidFile = join(dir, `${name}.pid`);
+  writeFileSync(executable, `#!/bin/sh\necho $$ > "${pidFile}"\nexec sleep 30\n`, { mode: 0o755 });
+  return { executable, pidFile };
+}
+
+function readPid(pidFile) {
+  const text = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim() : "";
+  return text ? Number(text) : undefined;
+}
+
+function isRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
 test("abortableFetch without a signal is the fetch it was given", () => {
   const fetchImpl = async () => new Response("ok");
   assert.equal(abortableFetch(fetchImpl, undefined), fetchImpl);
@@ -501,6 +523,76 @@ test("the raw TLS transports close their connection when the request aborts", as
     assert.equal(outcome.status, "rejected", `${name} ${outcome.status} instead of rejecting`);
     assert.ok(await waitUntil(() => closed.has(connection), SETTLE_MS), `${name} kept its connection open after the abort`);
   }
+});
+
+// The sweeps also refuse child processes, so the families that run an external CLI are checked against stand-ins.
+test("aborting a gws or trestle call kills the command it is running", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "grclanker-abort-cli-"));
+  const savedTrestle = process.env.GRCLANKER_TRESTLE_BIN;
+  const pids = [];
+  t.after(() => {
+    for (const pid of pids) if (isRunning(pid)) process.kill(pid, "SIGKILL");
+    if (savedTrestle === undefined) delete process.env.GRCLANKER_TRESTLE_BIN;
+    else process.env.GRCLANKER_TRESTLE_BIN = savedTrestle;
+    rmSync(root, { recursive: true, force: true });
+  });
+  const gws = hangingCli(root, "gws");
+  const trestle = hangingCli(root, "trestle");
+  process.env.GRCLANKER_TRESTLE_BIN = trestle.executable;
+  const calls = [
+    ["gws_ops_check_cli", gws, { gws_bin: gws.executable }],
+    ["oscal_check_trestle", trestle, { workspace_dir: root }],
+  ];
+
+  for (const [name, cli, args] of calls) {
+    const tool = getRegisteredGrcTool(name);
+    const controller = new AbortController();
+    const reason = new Error(`stopped ${name}`);
+    const call = tool.execute(`abort-${name}`, tool.prepareArguments?.(args) ?? args, controller.signal);
+    assert.ok(await waitUntil(() => readPid(cli.pidFile) !== undefined, 5000), `${name} started its command`);
+    const pid = readPid(cli.pidFile);
+    pids.push(pid);
+    controller.abort(reason);
+    const settling = settleWithin(call, SETTLE_MS);
+    assert.ok(await waitUntil(() => !isRunning(pid), SETTLE_MS), `${name} left its command running after the abort`);
+    const outcome = await settling;
+    assert.equal(outcome.status, "rejected", `${name} ${outcome.status} instead of rejecting`);
+    assert.equal(outcome.error, reason);
+  }
+});
+
+// The oci runner blocks the event loop until its command exits, so the abort lands between commands.
+test("aborting an oci call starts no further oci command", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "grclanker-abort-oci-"));
+  const savedPath = process.env.PATH;
+  t.after(() => {
+    process.env.PATH = savedPath;
+    rmSync(root, { recursive: true, force: true });
+  });
+  const bin = join(root, "bin");
+  const log = join(root, "oci.log");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "oci"), `#!/bin/sh\necho "$*" >> "${log}"\necho '{"data": []}'\n`, { mode: 0o755 });
+  process.env.PATH = `${bin}${delimiter}${savedPath}`;
+  const commands = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).length : 0);
+  const tool = getRegisteredGrcTool("oci_check_access");
+  const args = { tenancy_ocid: "ocid1.tenancy.oc1..example", region: "us-ashburn-1", config_file: join(root, "config") };
+
+  await tool.execute("oci-full", args, new AbortController().signal);
+  const full = commands();
+  rmSync(log);
+
+  const controller = new AbortController();
+  const reason = new Error("operator stopped the call");
+  const call = tool.execute("oci-abort", args, controller.signal);
+  assert.ok(await waitUntil(() => commands() > 0, 5000), "the check ran its first command");
+  const ran = commands();
+  controller.abort(reason);
+  const outcome = await settleWithin(call, SETTLE_MS);
+  assert.equal(outcome.status, "rejected", `the call ${outcome.status} instead of rejecting`);
+  assert.equal(outcome.error, reason);
+  assert.equal(commands(), ran, "no oci command started after the abort");
+  assert.ok(ran < full, `the abort stopped the check partway (${ran} of the ${full} commands a full check runs)`);
 });
 
 test("aborting pagerduty_check_access mid-request cancels the request and rejects at once with the abort reason", async (t) => {
