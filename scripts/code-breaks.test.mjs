@@ -68,11 +68,28 @@ test('dense tables wrap long identifiers at word boundaries and hyphens', () => 
 test('long patterns and lists wrap between their items, but numbers stay whole', () => {
   const pattern = el('code', [text('(^|[._-])(admin|administrator|root)')]);
   const fields = el('code', [text('fields=id,name,statusMessage')]);
+  const factors = el('code', [text('factors=id,2fa,3ds,u2f')]);
+  const ports = el('code', [text('21,22,23,445,1433,5900,27017')]);
   const count = el('code', [text('limit=10,000,000')]);
-  run(el('p', [pattern, text(' '), fields, text(' '), count]));
+  run(el('p', [pattern, text(' '), fields, text(' '), factors, text(' '), ports, text(' '), count]));
   assert.equal(render(pattern, '^'), '(^|^[[._-])(admin|]^administrator|^root)');
   assert.equal(render(fields, '^'), 'fields=id,^name,^statusMessage');
+  assert.equal(render(factors, '^'), 'factors=id,^2fa,^3ds,^u2f');
+  // 23,445 could be a number, so it stays whole.
+  assert.equal(render(ports, '^'), '21,^22,^23,445,^1433,^5900,^27017');
   assert.equal(render(count, '^'), 'limit=10,000,000');
+});
+
+test('regex quantifiers stay whole', () => {
+  const name = el('code', [text('^[A-Za-z][A-Za-z0-9._:-]{0,63}$')]);
+  const id = el('code', [text('32hex(/32hex){0,2}')]);
+  const error = el('code', [text('^E[A-Z0-9_]{1,30}$')]);
+  const open = el('code', [text('x{,3}y{3,}id,name')]);
+  run(el('p', [name, text(' '), id, text(' '), error, text(' '), open]));
+  assert.equal(render(name), '^[A-Za-z][A-Za-z0-9._:-]{0,63}$');
+  assert.equal(render(id), '32hex(/|32hex){0,2}');
+  assert.equal(render(error), '[^E[A-Z0-9_]{1,30}$]');
+  assert.equal(render(open), 'x{,3}y{3,}id,|name');
 });
 
 test('plain text in tables wraps long paths and lists, and running text does not', () => {
@@ -90,6 +107,10 @@ test('plain text in tables wraps long paths and lists, and running text does not
   const dense = el('span', [text('Scopes: read/write/admin and v3.0/api')]);
   run(table(5, dense));
   assert.equal(render(dense), 'Scopes: read/|write/|admin and v3.0/api');
+
+  const ports = el('span', [text('Defaults to 21,22,23,445,1433.')]);
+  run(table(4, ports));
+  assert.equal(render(ports), 'Defaults to 21,|22,|23,445,|1433.');
 });
 
 test('link text wraps after slashes', () => {

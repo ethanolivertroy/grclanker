@@ -7,9 +7,10 @@
 // data-symbol, which keeps it in a box: the code face and color alone cannot
 // show where punctuation or a space starts and ends.
 
-// After a slash, or after a pipe or comma between items, as in `(admin|root)`
-// or `id,name`, but not inside a number such as 10,000.
-const LIST_BREAK = String.raw`(?<=[^\s./_][/])(?=[^\s./_])|(?<=[^\s|]\|)(?=[^\s|])|(?<=[^\s,],)(?=[^\s\d,])`;
+// After a slash, or after a pipe or comma between items, as in `(admin|root)`,
+// `id,name`, or `22,445,1433`, but not after a comma that groups the digits
+// of a number such as 10,000 or one inside a regex quantifier such as {0,63}.
+const LIST_BREAK = String.raw`(?<=[^\s./_][/])(?=[^\s./_])|(?<=[^\s|]\|)(?=[^\s|])|(?<=[^\s\d,],)(?<!\{,)(?=[^\s,])|(?<=\d,)(?<!\{\d+,)(?=[^\s,])(?!\d{3}(?!\d))`;
 // Also after a dot that does not start a file extension.
 const PATH_BREAK = String.raw`${LIST_BREAK}|(?<=[^\s./_][.])(?=[^\s./_])(?![A-Za-z0-9]{1,4}$)`;
 // Also after an underscore and between camelCase words.
