@@ -461,7 +461,8 @@ test("the assessment summary stays short: counts, open findings only, and export
       "Findings: 3 (fail 1, manual 1, Passed 1).",
       "- aws:IAM-1: fail high Root access keys exist",
       "- aws:IAM-3: manual",
-      "Export from aws_export_bundle: /tmp/aws",
+      "Exports: 1 (aws_export_bundle 1).",
+      "- aws_export_bundle: /tmp/aws",
     ].join("\n"),
   );
 
@@ -477,6 +478,33 @@ test("the assessment summary stays short: counts, open findings only, and export
   const lines = renderAssessmentSummary(many).split("\n");
   assert.equal(lines.length, 2 + 25 + 1);
   assert.equal(lines.at(-1), "- ... 5 more not shown");
+});
+
+test("the assessment summary caps exports like findings: a count per tool and the ten most recent paths", () => {
+  const toolFor = (index) => (index % 3 === 0 ? "okta_export_audit_bundle" : "aws_export_bundle");
+  const exportsOf = (count) => {
+    const state = emptyAssessmentState();
+    for (let index = 0; index < count; index += 1) {
+      recordToolOutcome(state, {
+        callId: `c${index}`,
+        tool: toolFor(index),
+        replay: "unsafe",
+        isError: false,
+        recordedAt: "t",
+        details: { zip_path: `/tmp/export-${index}.zip` },
+      });
+    }
+    return renderAssessmentSummary(state).split("\n");
+  };
+
+  assert.deepEqual(exportsOf(30), [
+    "Recorded tool calls: 30 (completed 30).",
+    "Exports: 30 (aws_export_bundle 20, okta_export_audit_bundle 10).",
+    ...Array.from({ length: 10 }, (_, offset) => `- ${toolFor(20 + offset)}: /tmp/export-${20 + offset}.zip`),
+    "- ... 20 earlier exports not shown",
+  ]);
+  assert.equal(exportsOf(300).length, exportsOf(30).length, "a longer session adds no lines");
+  assert.equal(exportsOf(10).at(-1), `- ${toolFor(9)}: /tmp/export-9.zip`, "ten exports are all listed");
 });
 
 test("the tool adapter keeps the registry tool's name, schema, and argument repair, and adds the replay policy", () => {

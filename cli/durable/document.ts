@@ -116,6 +116,7 @@ export function recordToolOutcome(state: AssessmentState, outcome: ToolOutcome):
 }
 
 const MAX_LISTED_FINDINGS = 25;
+const MAX_LISTED_EXPORTS = 10;
 const PASSING_STATUSES = new Set(["pass", "passed", "satisfied", "compliant", "ok"]);
 
 function countBy<T>(items: readonly T[], key: (item: T) => string): string {
@@ -152,8 +153,15 @@ export function renderAssessmentSummary(state: Readonly<AssessmentState> | undef
     }
   }
 
-  for (const artifact of Object.values(state.artifacts)) {
-    lines.push(`Export from ${artifact.tool}: ${artifact.zipPath ?? artifact.outputDir}`);
+  const artifacts = Object.values(state.artifacts);
+  if (artifacts.length > 0) {
+    lines.push(`Exports: ${artifacts.length} (${countBy(artifacts, (artifact) => artifact.tool)}).`);
+    for (const artifact of artifacts.slice(-MAX_LISTED_EXPORTS)) {
+      lines.push(`- ${artifact.tool}: ${artifact.zipPath ?? artifact.outputDir}`);
+    }
+    if (artifacts.length > MAX_LISTED_EXPORTS) {
+      lines.push(`- ... ${artifacts.length - MAX_LISTED_EXPORTS} earlier exports not shown`);
+    }
   }
 
   return lines.join("\n");
