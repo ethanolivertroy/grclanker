@@ -18,13 +18,14 @@ import {
   realpathSync,
   chmodSync,
 } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { chmod, readdir, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 const VANTA_TOKEN_URL = "https://api.vanta.com/oauth/token";
@@ -307,32 +308,11 @@ function buildAuditDirectoryName(audit: VantaAudit): string {
   );
 }
 
-function pathEntryExists(path: string): boolean {
-  return lstatSync(path, { throwIfNoEntry: false }) !== undefined;
-}
-
-function allocateAuditOutputDir(baseDir: string, audit: VantaAudit): string {
+function* auditOutputNames(audit: VantaAudit): Generator<string> {
   const directoryName = buildAuditDirectoryName(audit);
-
-  for (let index = 0; ; index += 1) {
-    const suffix = index === 0 ? "" : `_${index}`;
-    const outputDir = join(baseDir, `${directoryName}${suffix}`);
-    const zipPath = `${outputDir}.zip`;
-
-    if (pathEntryExists(zipPath)) {
-      continue;
-    }
-
-    try {
-      mkdirSync(outputDir, { mode: 0o700 });
-      chmodSync(outputDir, 0o700);
-      return outputDir;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        continue;
-      }
-      throw error;
-    }
+  yield directoryName;
+  for (let index = 1; ; index += 1) {
+    yield `${directoryName}_${index}`;
   }
 }
 
@@ -922,8 +902,6 @@ export async function exportVantaAuditPackage(
 
   ensurePrivateDir(baseOutputDir);
 
-  const outputDir = allocateAuditOutputDir(baseOutputDir, audit);
-
   const evidence = await client.listEvidence(audit.id);
   const controlMap = collectControlMap(evidence);
   const uniqueEvidenceUrls = new Map<string, VantaEvidenceUrl[]>();
@@ -941,151 +919,158 @@ export async function exportVantaAuditPackage(
     }
   }
 
-  const controlDirByName = new Map<string, string>();
-  for (const controlName of controlMap.keys()) {
-    const preferred = join(outputDir, sanitizeFilename(controlName));
-    const controlDir = reserveUniquePath(preferred, usedControlPaths);
-    ensurePrivateDir(controlDir);
-    controlDirByName.set(controlName, controlDir);
-  }
-
-  const downloads: DownloadTask[] = [];
-  for (const [controlName, evidenceList] of controlMap.entries()) {
-    const controlDir = controlDirByName.get(controlName)!;
-    for (const item of evidenceList) {
-      const urls = uniqueEvidenceUrls.get(item.id) ?? [];
-      const files: string[] = [];
-      for (const file of urls) {
-        const preferredName = sanitizeFilename(file.filename) || `file_${file.id.slice(0, 8)}`;
-        const reservedPath = reserveUniquePath(join(controlDir, preferredName), usedFilePaths);
-        const fileName = basename(reservedPath);
-        files.push(fileName);
-        downloads.push({
-          url: file,
-          evidence: item,
-          controlName,
-          controlDir,
-          filePath: reservedPath,
-          fileName,
-        });
-      }
-      evidenceFilesByControlKey.set(`${controlName}\0${item.id}`, files);
-    }
-  }
-
   let totalFilesExported = 0;
   let totalSizeBytes = 0;
-  await runWithConcurrency(downloads, options.downloadConcurrency ?? 5, async (task) => {
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: baseOutputDir,
+    names: auditOutputNames(audit),
+    zip: true,
+  }, async (staged) => {
+    const controlDirByName = new Map<string, string>();
+    for (const controlName of controlMap.keys()) {
+      const preferred = join(staged.dir, sanitizeFilename(controlName));
+      const controlDir = reserveUniquePath(preferred, usedControlPaths);
+      ensurePrivateDir(controlDir);
+      controlDirByName.set(controlName, controlDir);
+    }
+
+    const downloads: DownloadTask[] = [];
+    for (const [controlName, evidenceList] of controlMap.entries()) {
+      const controlDir = controlDirByName.get(controlName)!;
+      for (const item of evidenceList) {
+        const urls = uniqueEvidenceUrls.get(item.id) ?? [];
+        const files: string[] = [];
+        for (const file of urls) {
+          const preferredName = sanitizeFilename(file.filename) || `file_${file.id.slice(0, 8)}`;
+          const reservedPath = reserveUniquePath(join(controlDir, preferredName), usedFilePaths);
+          const fileName = basename(reservedPath);
+          files.push(fileName);
+          downloads.push({
+            url: file,
+            evidence: item,
+            controlName,
+            controlDir,
+            filePath: reservedPath,
+            fileName,
+          });
+        }
+        evidenceFilesByControlKey.set(`${controlName}\0${item.id}`, files);
+      }
+    }
+
+    await runWithConcurrency(downloads, options.downloadConcurrency ?? 5, async (task) => {
+      try {
+        const size = await downloadFile(task.url.url, task.filePath, staged.dir, fetchImpl);
+        totalFilesExported += 1;
+        totalSizeBytes += size;
+      } catch (error) {
+        errors.push(
+          `Failed to download ${task.fileName} for ${task.evidence.name} (${task.controlName}): ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+
+    const uniqueEvidence = Array.from(new Map(evidence.map((item) => [item.id, item])).values());
+    const indexRows = uniqueEvidence.map((item) => [
+      escapeCsvCell(item.id),
+      escapeCsvCell(item.evidenceId),
+      escapeCsvCell(item.name),
+      escapeCsvCell(item.evidenceType),
+      escapeCsvCell(item.status),
+      escapeCsvCell(item.testStatus ?? ""),
+      escapeCsvCell(item.relatedControls.map((control) => control.name).join("; ")),
+      String((uniqueEvidenceUrls.get(item.id) ?? []).length),
+      escapeCsvCell(formatDate(item.creationDate)),
+      escapeCsvCell(formatDate(item.statusUpdatedDate)),
+    ]);
+
+    const indexTable = formatTable(
+      [
+        "audit_evidence_id",
+        "evidence_id",
+        "name",
+        "type",
+        "status",
+        "test_status",
+        "controls",
+        "file_count",
+        "created",
+        "updated",
+      ],
+      indexRows,
+    );
+
+    for (const [controlName, evidenceList] of controlMap.entries()) {
+      const controlDir = controlDirByName.get(controlName)!;
+      const metadata = {
+        control_name: controlName,
+        evidence_items: evidenceList.map((item) => ({
+          id: item.id,
+          evidence_id: item.evidenceId,
+          name: item.name,
+          type: item.evidenceType,
+          status: item.status,
+          description: item.description ?? "",
+          test_status: item.testStatus ?? "",
+          files: evidenceFilesByControlKey.get(`${controlName}\0${item.id}`) ?? [],
+          creation_date: item.creationDate,
+          status_updated_date: item.statusUpdatedDate,
+        })),
+      };
+
+      await writeSecureFile(controlDir, join(controlDir, "metadata.json"), JSON.stringify(metadata, null, 2) + "\n");
+    }
+
+    await writeSecureFile(
+      staged.dir,
+      join(staged.dir, "_audit_info.json"),
+      JSON.stringify({
+        id: audit.id,
+        customer_name: getAuditCustomerName(audit),
+        organization_name: audit.customerOrganizationName,
+        framework: audit.framework,
+        audit_start_date: audit.auditStartDate,
+        audit_end_date: audit.auditEndDate,
+        export_date: new Date().toISOString(),
+        total_evidence_items: evidence.length,
+        total_files_exported: totalFilesExported,
+        total_control_folders: controlMap.size,
+      }, null, 2) + "\n",
+    );
+
+    const csvContent = [
+      [
+        "audit_evidence_id",
+        "evidence_id",
+        "name",
+        "type",
+        "status",
+        "test_status",
+        "controls",
+        "file_count",
+        "created",
+        "updated",
+      ],
+      ...indexRows,
+    ]
+      .map((row) => row.map((cell) => `"${cell.replaceAll("\"", "\"\"")}"`).join(","))
+      .join("\n") + "\n";
+
+    await writeSecureFile(staged.dir, join(staged.dir, "_index.csv"), csvContent);
+
+    if (errors.length > 0) {
+      await writeSecureFile(staged.dir, join(staged.dir, "_errors.log"), `${errors.join("\n")}\n`);
+    }
+
     try {
-      const size = await downloadFile(task.url.url, task.filePath, outputDir, fetchImpl);
-      totalFilesExported += 1;
-      totalSizeBytes += size;
+      await createZipArchive(staged.dir, staged.zipPath, baseOutputDir);
     } catch (error) {
-      errors.push(
-        `Failed to download ${task.fileName} for ${task.evidence.name} (${task.controlName}): ${error instanceof Error ? error.message : String(error)}`,
-      );
+      // A half-written archive must not be committed next to the bundle.
+      await rm(staged.zipPath, { force: true });
+      errors.push(`Failed to create zip archive: ${error instanceof Error ? error.message : String(error)}`);
+      await writeSecureFile(staged.dir, join(staged.dir, "_errors.log"), `${errors.join("\n")}\n`);
     }
   });
-
-  const uniqueEvidence = Array.from(new Map(evidence.map((item) => [item.id, item])).values());
-  const indexRows = uniqueEvidence.map((item) => [
-    escapeCsvCell(item.id),
-    escapeCsvCell(item.evidenceId),
-    escapeCsvCell(item.name),
-    escapeCsvCell(item.evidenceType),
-    escapeCsvCell(item.status),
-    escapeCsvCell(item.testStatus ?? ""),
-    escapeCsvCell(item.relatedControls.map((control) => control.name).join("; ")),
-    String((uniqueEvidenceUrls.get(item.id) ?? []).length),
-    escapeCsvCell(formatDate(item.creationDate)),
-    escapeCsvCell(formatDate(item.statusUpdatedDate)),
-  ]);
-
-  const indexTable = formatTable(
-    [
-      "audit_evidence_id",
-      "evidence_id",
-      "name",
-      "type",
-      "status",
-      "test_status",
-      "controls",
-      "file_count",
-      "created",
-      "updated",
-    ],
-    indexRows,
-  );
-
-  for (const [controlName, evidenceList] of controlMap.entries()) {
-    const controlDir = controlDirByName.get(controlName)!;
-    const metadata = {
-      control_name: controlName,
-      evidence_items: evidenceList.map((item) => ({
-        id: item.id,
-        evidence_id: item.evidenceId,
-        name: item.name,
-        type: item.evidenceType,
-        status: item.status,
-        description: item.description ?? "",
-        test_status: item.testStatus ?? "",
-        files: evidenceFilesByControlKey.get(`${controlName}\0${item.id}`) ?? [],
-        creation_date: item.creationDate,
-        status_updated_date: item.statusUpdatedDate,
-      })),
-    };
-
-    await writeSecureFile(controlDir, join(controlDir, "metadata.json"), JSON.stringify(metadata, null, 2) + "\n");
-  }
-
-  await writeSecureFile(
-    outputDir,
-    join(outputDir, "_audit_info.json"),
-    JSON.stringify({
-      id: audit.id,
-      customer_name: getAuditCustomerName(audit),
-      organization_name: audit.customerOrganizationName,
-      framework: audit.framework,
-      audit_start_date: audit.auditStartDate,
-      audit_end_date: audit.auditEndDate,
-      export_date: new Date().toISOString(),
-      total_evidence_items: evidence.length,
-      total_files_exported: totalFilesExported,
-      total_control_folders: controlMap.size,
-    }, null, 2) + "\n",
-  );
-
-  const csvContent = [
-    [
-      "audit_evidence_id",
-      "evidence_id",
-      "name",
-      "type",
-      "status",
-      "test_status",
-      "controls",
-      "file_count",
-      "created",
-      "updated",
-    ],
-    ...indexRows,
-  ]
-    .map((row) => row.map((cell) => `"${cell.replaceAll("\"", "\"\"")}"`).join(","))
-    .join("\n") + "\n";
-
-  await writeSecureFile(outputDir, join(outputDir, "_index.csv"), csvContent);
-
-  if (errors.length > 0) {
-    await writeSecureFile(outputDir, join(outputDir, "_errors.log"), `${errors.join("\n")}\n`);
-  }
-
-  const zipPath = `${outputDir}.zip`;
-  try {
-    await createZipArchive(outputDir, zipPath, baseOutputDir);
-  } catch (error) {
-    errors.push(`Failed to create zip archive: ${error instanceof Error ? error.message : String(error)}`);
-    await writeSecureFile(outputDir, join(outputDir, "_errors.log"), `${errors.join("\n")}\n`);
-  }
 
   return {
     outputDir,

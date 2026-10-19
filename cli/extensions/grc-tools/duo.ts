@@ -17,9 +17,10 @@ import {
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { writeBundleAtomically } from "./atomic-output.js";
 import { DUO_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { DUO_SPEC } from "./duo.spec.js";
@@ -5358,19 +5359,12 @@ function sanitizeSegment(value: string): string {
     .slice(0, 80) || "item";
 }
 
-function ensureUniqueRelativePath(root: string, preferredName: string): string {
+function uniqueNameCandidates(preferredName: string): string[] {
   const extIndex = preferredName.lastIndexOf(".");
   const hasExt = extIndex > 0;
   const base = hasExt ? preferredName.slice(0, extIndex) : preferredName;
   const ext = hasExt ? preferredName.slice(extIndex) : "";
-  for (let counter = 0; counter < 500; counter += 1) {
-    const suffix = counter === 0 ? "" : `_${counter}`;
-    const candidate = resolveSecureOutputPath(root, `${base}${suffix}${ext}`);
-    if (!existsSync(candidate)) {
-      return relative(root, candidate);
-    }
-  }
-  throw new Error(`Unable to allocate unique output path for ${preferredName}`);
+  return Array.from({ length: 500 }, (_, counter) => `${base}${counter === 0 ? "" : `_${counter}`}${ext}`);
 }
 
 /** Every JSON file the bundle writes goes through the snapshot walk first (rule 9 at every depth, with the cap). */
@@ -5480,65 +5474,70 @@ export async function exportDuoAuditBundle(
   ]);
 
   const timestamp = new Date().toISOString().replace(/[:]/g, "-");
-  const folderRelative = ensureUniqueRelativePath(outputRoot, sanitizeSegment(`${config.apiHost}_${timestamp}`));
-  const outputDir = resolveSecureOutputPath(outputRoot, folderRelative);
-  mkdirSync(outputDir, { recursive: true, mode: 0o700 });
-  await chmod(outputDir, 0o700);
+  const folderName = sanitizeSegment(`${config.apiHost}_${timestamp}`);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: resolve(outputRoot),
+    names: uniqueNameCandidates(folderName),
+    zip: true,
+    checkName: (name) => {
+      resolveSecureOutputPath(outputRoot, name);
+      resolveSecureOutputPath(outputRoot, `${name}.zip`);
+    },
+    exhaustedMessage: `Unable to allocate unique output path for ${folderName}`,
+  }, async (staged) => {
+    await writeText(staged.dir, "QUICK_REFERENCE.md", buildQuickReference());
+    await writeJson(staged.dir, "config.json", {
+      api_host: config.apiHost,
+      lookback_days: config.lookbackDays,
+      source_chain: config.sourceChain,
+    });
 
-  await writeText(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
-  await writeJson(outputDir, "config.json", {
-    api_host: config.apiHost,
-    lookback_days: config.lookbackDays,
-    source_chain: config.sourceChain,
+    // An unread dataset is written as null, never as its empty fallback; collection_status.json names the error.
+    const coreData: Array<[string, unknown]> = [
+      ["core_data/settings.json", readData(authentication.settings)],
+      ["core_data/policies.json", readData(authentication.policies)],
+      ["core_data/global_policy.json", readData(authentication.globalPolicy)],
+      ["core_data/users.json", readData(authentication.users)],
+      ["core_data/bypass_codes.json", readData(authentication.bypassCodes)],
+      ["core_data/webauthn_credentials.json", readData(authentication.webauthnCredentials)],
+      ["core_data/admin_allowed_auth_methods.json", readData(authentication.allowedAdminAuthMethods)],
+      ["core_data/authentication_logs.json", readData(authentication.authenticationLogs)],
+      ["core_data/offline_enrollment_logs.json", readData(authentication.offlineEnrollmentLogs)],
+      ["core_data/admins.json", readData(adminAccess.admins)],
+      ["core_data/activity_logs.json", readData(adminAccess.activityLogs)],
+      ["core_data/integrations.json", readData(integrations.integrations)],
+      ["core_data/info_summary.json", readData(monitoring.infoSummary)],
+      ["core_data/telephony_logs.json", readData(monitoring.telephonyLogs)],
+      ["core_data/trust_monitor_events.json", readData(monitoring.trustMonitorEvents)],
+      ["core_data/authentication_attempts.json", readData(monitoring.authenticationAttempts)],
+    ];
+    for (const [path, value] of coreData) {
+      await writeJson(staged.dir, path, value);
+    }
+    await writeJson(staged.dir, "core_data/collection_status.json", {
+      authentication: projectCollectionStatus({ ...authentication }),
+      admin_access: projectCollectionStatus({ ...adminAccess }),
+      integrations: projectCollectionStatus({ ...integrations }),
+      monitoring: projectCollectionStatus({ ...monitoring }),
+    });
+
+    for (const assessment of assessments) {
+      await writeJson(staged.dir, `analysis/${assessment.category}.json`, assessment);
+    }
+    await writeJson(staged.dir, "analysis/findings.json", findings);
+
+    await writeText(staged.dir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+    await writeText(staged.dir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+    for (const report of FRAMEWORK_REPORTS) {
+      await writeText(staged.dir, report.path, buildFrameworkReport(report.title, findings, report.key));
+    }
+
+    if (errors.length > 0) {
+      await writeText(staged.dir, "_errors.log", errors.join("\n"));
+    }
+
+    await zipDirectory(staged.dir, staged.zipPath);
   });
-
-  // An unread dataset is written as null, never as its empty fallback; collection_status.json names the error.
-  const coreData: Array<[string, unknown]> = [
-    ["core_data/settings.json", readData(authentication.settings)],
-    ["core_data/policies.json", readData(authentication.policies)],
-    ["core_data/global_policy.json", readData(authentication.globalPolicy)],
-    ["core_data/users.json", readData(authentication.users)],
-    ["core_data/bypass_codes.json", readData(authentication.bypassCodes)],
-    ["core_data/webauthn_credentials.json", readData(authentication.webauthnCredentials)],
-    ["core_data/admin_allowed_auth_methods.json", readData(authentication.allowedAdminAuthMethods)],
-    ["core_data/authentication_logs.json", readData(authentication.authenticationLogs)],
-    ["core_data/offline_enrollment_logs.json", readData(authentication.offlineEnrollmentLogs)],
-    ["core_data/admins.json", readData(adminAccess.admins)],
-    ["core_data/activity_logs.json", readData(adminAccess.activityLogs)],
-    ["core_data/integrations.json", readData(integrations.integrations)],
-    ["core_data/info_summary.json", readData(monitoring.infoSummary)],
-    ["core_data/telephony_logs.json", readData(monitoring.telephonyLogs)],
-    ["core_data/trust_monitor_events.json", readData(monitoring.trustMonitorEvents)],
-    ["core_data/authentication_attempts.json", readData(monitoring.authenticationAttempts)],
-  ];
-  for (const [path, value] of coreData) {
-    await writeJson(outputDir, path, value);
-  }
-  await writeJson(outputDir, "core_data/collection_status.json", {
-    authentication: projectCollectionStatus({ ...authentication }),
-    admin_access: projectCollectionStatus({ ...adminAccess }),
-    integrations: projectCollectionStatus({ ...integrations }),
-    monitoring: projectCollectionStatus({ ...monitoring }),
-  });
-
-  for (const assessment of assessments) {
-    await writeJson(outputDir, `analysis/${assessment.category}.json`, assessment);
-  }
-  await writeJson(outputDir, "analysis/findings.json", findings);
-
-  await writeText(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeText(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
-  for (const report of FRAMEWORK_REPORTS) {
-    await writeText(outputDir, report.path, buildFrameworkReport(report.title, findings, report.key));
-  }
-
-  if (errors.length > 0) {
-    await writeText(outputDir, "_errors.log", errors.join("\n"));
-  }
-
-  const zipRelative = ensureUniqueRelativePath(outputRoot, `${basename(outputDir)}.zip`);
-  const zipPath = resolveSecureOutputPath(outputRoot, zipRelative);
-  await zipDirectory(outputDir, zipPath);
 
   return {
     outputDir,

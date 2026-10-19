@@ -16,10 +16,11 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createWriteStream, existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { projectActivitySnapshot, projectAlertSnapshot, redactKnownValues, redactSecrets, scrubText } from "./gws.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -901,20 +902,6 @@ function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
   return resolvedTarget;
 }
 
-async function nextAvailableAuditDir(root: string, preferredName: string): Promise<string> {
-  ensurePrivateDir(root);
-  const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
-  for (const suffix of suffixes) {
-    const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
-      mkdirSync(candidate, { recursive: true, mode: 0o700 });
-      await chmod(candidate, 0o700);
-      return candidate;
-    }
-  }
-  throw new Error(`Unable to allocate output directory under ${root}`);
-}
-
 async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
   ensurePrivateDir(dirname(destination));
@@ -1292,35 +1279,40 @@ export async function collectGwsOperatorEvidenceBundle(
   const completion = getBundleCompletion(results);
 
   const outputRoot = args.output_dir?.trim() || DEFAULT_OUTPUT_DIR;
-  const outputDir = await nextAvailableAuditDir(outputRoot, safeDirName("gws-operator-evidence"));
+  ensurePrivateDir(outputRoot);
+  const { outputDir, zipPath } = await writeBundleAtomically({
+    root: realpathSync(outputRoot),
+    names: numberedNames(safeDirName("gws-operator-evidence"), 6),
+    zip: true,
+    checkName: (name) => resolveSecureOutputPath(outputRoot, name),
+  }, async (staged) => {
+    await writeSecureTextFile(staged.dir, "README.md", buildBundleReadme());
+    await writeSecureTextFile(staged.dir, "summary.md", buildBundleSummary(results, completion));
+    await writeSecureTextFile(
+      staged.dir,
+      "commands.json",
+      serializeJson(results.map((result) => ({ category: result.category, ...result.command }))),
+    );
 
-  await writeSecureTextFile(outputDir, "README.md", buildBundleReadme());
-  await writeSecureTextFile(outputDir, "summary.md", buildBundleSummary(results, completion));
-  await writeSecureTextFile(
-    outputDir,
-    "commands.json",
-    serializeJson(results.map((result) => ({ category: result.category, ...result.command }))),
-  );
+    for (const result of results) {
+      await writeSecureTextFile(staged.dir, `analysis/${result.category}.json`, serializeJson({
+        title: result.title,
+        mode: result.mode,
+        status: result.status,
+        count: result.count,
+        complete: result.complete,
+        nextPageToken: result.nextPageToken ?? null,
+        notes: result.notes,
+        records: result.records,
+      }));
+      await writeSecureTextFile(staged.dir, `raw/${result.category}.json`, serializeJson({
+        command: result.command,
+        raw: result.raw ?? null,
+      }));
+    }
 
-  for (const result of results) {
-    await writeSecureTextFile(outputDir, `analysis/${result.category}.json`, serializeJson({
-      title: result.title,
-      mode: result.mode,
-      status: result.status,
-      count: result.count,
-      complete: result.complete,
-      nextPageToken: result.nextPageToken ?? null,
-      notes: result.notes,
-      records: result.records,
-    }));
-    await writeSecureTextFile(outputDir, `raw/${result.category}.json`, serializeJson({
-      command: result.command,
-      raw: result.raw ?? null,
-    }));
-  }
-
-  const zipPath = `${outputDir}.zip`;
-  await createZipArchive(outputDir, zipPath);
+    await createZipArchive(staged.dir, staged.zipPath);
+  });
   const fileCount = await countFilesRecursively(outputDir);
 
   return {
