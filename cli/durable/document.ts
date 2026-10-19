@@ -155,7 +155,11 @@ export function renderAssessmentSummary(state: Readonly<AssessmentState> | undef
     }
   }
 
-  const artifacts = Object.values(state.artifacts);
+  // Key order is not recording order: integer-like call ids enumerate first, and a rerun keeps its key's place.
+  const recordedAt = (callId: string) => state.calls[callId].recordedAt;
+  const artifacts = Object.entries(state.artifacts)
+    .sort(([left], [right]) => recordedAt(left).localeCompare(recordedAt(right)))
+    .map(([, artifact]) => artifact);
   if (artifacts.length > 0) {
     lines.push(`Exports: ${artifacts.length} (${countBy(artifacts, (artifact) => artifact.tool)}).`);
     for (const artifact of artifacts.slice(-MAX_LISTED_EXPORTS)) {

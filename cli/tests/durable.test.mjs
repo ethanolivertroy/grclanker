@@ -508,6 +508,31 @@ test("the assessment summary caps exports like findings: a count per tool and th
   assert.equal(exportsOf(10).at(-1), `- ${toolFor(9)}: /tmp/export-9.zip`, "ten exports are all listed");
 });
 
+test("the exports listed are the ten most recently recorded, even when integer-like call ids and reruns reorder the keys", () => {
+  const state = emptyAssessmentState();
+  const record = (callId, minute) =>
+    recordToolOutcome(state, {
+      callId,
+      tool: "aws_export_bundle",
+      replay: "unsafe",
+      isError: false,
+      recordedAt: new Date(Date.UTC(2026, 9, 19, 0, minute)).toISOString(),
+      details: { zip_path: `/tmp/${callId}-at-${minute}.zip` },
+    });
+  for (let minute = 0; minute < 12; minute += 1) record(`call-${minute}`, minute);
+  record("7", 12);
+  record("call-0", 13);
+  assert.deepEqual(Object.keys(state.artifacts).slice(0, 3), ["7", "call-0", "call-1"], "the two newest enumerate first");
+  assert.deepEqual(renderAssessmentSummary(state).split("\n"), [
+    "Recorded tool calls: 13 (completed 13).",
+    "Exports: 13 (aws_export_bundle 13).",
+    ...Array.from({ length: 8 }, (_, offset) => `- aws_export_bundle: /tmp/call-${4 + offset}-at-${4 + offset}.zip`),
+    "- aws_export_bundle: /tmp/7-at-12.zip",
+    "- aws_export_bundle: /tmp/call-0-at-13.zip",
+    "- ... 3 earlier exports not shown",
+  ]);
+});
+
 test("a model-chosen call id such as __proto__ is recorded as its own entry, and the state stays strict JSON", () => {
   const state = emptyAssessmentState();
   for (const callId of ["__proto__", "c2"]) {
