@@ -34,7 +34,9 @@ export function SpecCatalogSection({ specs }: { specs: SpecMeta[] }) {
               />
               <div className="spec-category-overlay">
                 <h3 className="spec-category-title">{group.label}</h3>
-                <span className="spec-category-count">{group.specs.length} specs</span>
+                <span className="spec-category-count">
+                  {group.specs.length} {group.specs.length === 1 ? 'spec' : 'specs'}
+                </span>
               </div>
             </div>
             <div className="overflow-x-auto">
