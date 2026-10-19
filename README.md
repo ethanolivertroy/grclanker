@@ -266,10 +266,6 @@ npm run build:bundle -- --all
 
 Bugs and feature requests use the [issue templates](.github/ISSUE_TEMPLATE/). Repository layout, commands, and how to add an integration are in [AGENTS.md](AGENTS.md). The short contributor path is [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Security
-
-Read [SECURITY.md](SECURITY.md) before you report a vulnerability. Do not open a public issue for one.
-
 ## License
 
 grclanker is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.

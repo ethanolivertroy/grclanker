@@ -33,5 +33,3 @@ Live smoke scripts, such as `npm --prefix cli run test:gws-ops:live`, skip when 
 Use the pull request template. Say what a user can do after the change, and paste the validation commands you ran. Maintainer pull requests link the Linear issue (`Resolves ABC-123`). An outside contributor links the GitHub issue.
 
 Do not commit tenant credentials, generated evidence bundles, or local workspace artifacts. `.gitignore` already covers common secrets such as `.env*`, `.okta.yaml`, `credentials.json`, `client_secret.json`, `*service-account*.json`, `export/`, and `oscal-workspace/`.
-
-Security reports do not belong in a pull request or a public issue. Use [SECURITY.md](SECURITY.md).

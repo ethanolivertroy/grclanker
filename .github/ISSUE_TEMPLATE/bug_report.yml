@@ -8,8 +8,6 @@ body:
     attributes:
       value: |
         Do not paste API keys, tokens, passwords, or tenant data. Redact them before you file.
-
-        A security vulnerability does not belong here. Read https://github.com/ethanolivertroy/grclanker/blob/main/SECURITY.md and do not open a public issue for it.
   - type: textarea
     id: what-happened
     attributes:

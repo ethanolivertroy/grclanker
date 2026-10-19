@@ -9,7 +9,7 @@ body:
       value: |
         The docs cover install, setup, workflows, and the tool catalog: https://grclanker.com/docs/
 
-        Do not paste API keys, tokens, passwords, or tenant data. A security vulnerability does not belong here. Read https://github.com/ethanolivertroy/grclanker/blob/main/SECURITY.md.
+        Do not paste API keys, tokens, passwords, or tenant data.
   - type: textarea
     id: question
     attributes:
