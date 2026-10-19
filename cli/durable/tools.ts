@@ -82,9 +82,10 @@ export function toolFailureResult(
 }
 
 /**
- * Run the native tool. Registry tools take no abort signal, so a cancelled
- * invocation (an abort, or the Harness closing) stops waiting at once and
- * leaves the call to the Harness: closing keeps it pending for resume.
+ * Run the native tool with the invocation's abort signal. A cancelled
+ * invocation (an abort, or the Harness closing) cancels the tool's in-flight
+ * requests, stops waiting at once, and leaves the call to the Harness: closing
+ * keeps it pending for resume.
  */
 async function runNativeTool(
   tool: DurableBridgeableTool,
@@ -94,7 +95,7 @@ async function runNativeTool(
 ): Promise<ToolExecutionResult> {
   context.abortSignal?.throwIfAborted();
   try {
-    const running = tool.execute(callId, args);
+    const running = tool.execute(callId, args, context.abortSignal);
     running.catch(() => undefined);
     return toDurableToolResult(tool, args, await awaitWithContext(running, context));
   } catch (error) {

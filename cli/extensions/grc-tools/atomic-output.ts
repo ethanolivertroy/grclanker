@@ -247,6 +247,7 @@ async function commitStaged(
   name: string,
   taken: () => boolean,
   archived: boolean,
+  signal: AbortSignal | undefined,
 ): Promise<CommittedBundle | undefined> {
   const stagedDir = join(stagingRoot, name);
   const outputDir = join(root, name);
@@ -259,6 +260,8 @@ async function commitStaged(
   await writeFile(recordPath, JSON.stringify(record), { mode: 0o600 });
   pendingCommits.set(stagingRoot, { root, record });
   try {
+    // The last point an abort can stop the commit: once the directory moves, the archive follows it.
+    signal?.throwIfAborted();
     if (await renameUnlessTaken(stagedDir, outputDir)) {
       if (!archived) return { outputDir, zipPath };
       try {
@@ -329,7 +332,7 @@ export async function writeBundleAtomically(
 
       const archived = zip && pathEntryExists(staged.zipPath);
       if (!archived) await rm(staged.zipPath, { force: true });
-      const committed = await commitStaged(root, stagingRoot, current, () => takenOnDisk(current), archived);
+      const committed = await commitStaged(root, stagingRoot, current, () => takenOnDisk(current), archived, signal);
       if (committed) return committed;
 
       await rm(staged.dir, { recursive: true, force: true });
@@ -350,14 +353,16 @@ export async function writeBundleAtomically(
 export async function writeFileAtomically(
   path: string,
   data: string | Uint8Array,
-  options: { encoding?: BufferEncoding; mode?: number } = {},
+  options: { encoding?: BufferEncoding; mode?: number; signal?: AbortSignal } = {},
 ): Promise<void> {
+  options.signal?.throwIfAborted();
   const dir = dirname(path);
   await sweepAbandonedStaging(dir);
   const temporary = join(dir, stagingName());
   trackStaging(temporary);
   try {
     await writeFile(temporary, data, { encoding: options.encoding, mode: options.mode, flag: "wx" });
+    options.signal?.throwIfAborted();
     await rename(temporary, path);
   } finally {
     await releaseStaging(temporary);

@@ -30,6 +30,8 @@ export interface ExecuteGrcToolOptions {
   toolCallId?: string;
   /** Keep dry-run catalog mirrors out of the persistent state directory. */
   dryRun?: boolean;
+  /** Cancels the tool's in-flight API requests; the call then returns an error envelope. */
+  signal?: AbortSignal;
 }
 
 function describeError(error: unknown): string {
@@ -87,7 +89,7 @@ export async function executeGrcTool(
     return safeErrorEnvelope(tool, input, describeError(error));
   }
 
-  const run = () => tool.execute(toolCallId, args);
+  const run = () => tool.execute(toolCallId, args, options.signal);
   try {
     const result = options.dryRun === true ? await runWithoutPersistentCaches(run) : await run();
     return sanitizeErrorResult(tool, input, toSdkToolResult(result));

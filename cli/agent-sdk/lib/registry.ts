@@ -15,9 +15,9 @@ export interface GrcToolResult {
 /**
  * The slice of a Pi `ToolDefinition` the Agent SDK adapter consumes.
  *
- * grclanker domain tools only read the tool call id and their arguments. The
- * Pi `signal`, `onUpdate`, and extension `ctx` parameters are unused, so the
- * adapter exposes a two-argument `execute`.
+ * grclanker domain tools read the tool call id, their arguments, and the abort
+ * signal, which cancels their in-flight API requests and makes the call reject.
+ * The Pi `onUpdate` and extension `ctx` parameters are unused.
  */
 export interface RegisteredGrcTool {
   name: string;
@@ -26,7 +26,7 @@ export interface RegisteredGrcTool {
   /** TypeBox parameter schema (a JSON Schema object at runtime). */
   parameters: Record<string, unknown>;
   prepareArguments?: (args: unknown) => unknown;
-  execute: (toolCallId: string, args: unknown) => Promise<GrcToolResult>;
+  execute: (toolCallId: string, args: unknown, signal?: AbortSignal) => Promise<GrcToolResult>;
 }
 
 let registry: Map<string, RegisteredGrcTool> | undefined;
@@ -43,8 +43,8 @@ function toRegisteredGrcTool(tool: ToolDefinition): RegisteredGrcTool {
     description: tool.description,
     parameters: tool.parameters as Record<string, unknown>,
     prepareArguments: tool.prepareArguments,
-    execute: async (toolCallId, args) =>
-      (await tool.execute(toolCallId, args, undefined, undefined, extensionContext)) as GrcToolResult,
+    execute: async (toolCallId, args, signal) =>
+      (await tool.execute(toolCallId, args, signal, undefined, extensionContext)) as GrcToolResult,
   };
 }
 
