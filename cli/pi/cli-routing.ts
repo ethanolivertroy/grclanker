@@ -97,7 +97,7 @@ export function routeCliInvocation(
     return withPromptOptions({ kind: "command", command }, compute, joinPrompt(rest));
   }
 
-  if (["env", "flue", "tools", "help", "version"].includes(command)) {
+  if (["env", "flue", "durable", "tools", "help", "version"].includes(command)) {
     return { kind: "unknown-command", command };
   }
 

@@ -82,6 +82,14 @@ async function main() {
     return;
   }
 
+  if (command === "durable") {
+    // Loaded lazily, like Flue, so the interactive CLI never pays for the Pi Durable runtime.
+    const { runDurableCommand } = await import("./durable/cli.js");
+    const exitCode = await runDurableCommand(args.slice(1));
+    if (exitCode !== 0) process.exit(exitCode);
+    return;
+  }
+
   if (command === "tools") {
     const tools = getRegisteredToolSummaries();
     const toolArgs = args.slice(1);

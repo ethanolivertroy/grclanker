@@ -11,6 +11,10 @@ Usage:
   grclanker env exec -- <cmd>   Run a shell command on the selected backend
   grclanker tools               List bundled GRC and compute tools
   grclanker flue run -m <text>  Run the same GRC agent under the Flue Framework runtime
+  grclanker durable run -m <text>
+                                Experimental: run the GRC agent under Pi Durable, resumable after a crash
+  grclanker durable resume --session <id>
+                                Experimental: finish the work an interrupted durable run left
   grclanker "<prompt>"          Send a literal free-form prompt to the GRC agent
   grclanker investigate         Trace crypto status, KEVs, and exploitability
   grclanker investigate <subject> [--compute <kind>]
