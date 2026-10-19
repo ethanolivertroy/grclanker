@@ -84,7 +84,7 @@ test('tables more than three viewport heights above or below the viewport leave 
   ]);
   assert.deepEqual(labels(), [null, null, 'lazy', null, 'lazy']);
   assert.deepEqual(observer.targets, [tables[2].parentElement, tables[4].parentElement]);
-  assert.equal(observer.options.rootMargin, '300% 0px');
+  assert.equal(observer.options.rootMargin, `${3 * VIEWPORT}px 0px`);
 });
 
 test('a screen wider than a phone keeps every label', () => {

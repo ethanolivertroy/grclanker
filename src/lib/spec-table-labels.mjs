@@ -28,7 +28,8 @@ export function leaveOutFarLabels() {
     observer.disconnect();
     removeEventListener('scroll', restore);
   };
-  const observer = new IntersectionObserver(restore, { rootMargin: '300% 0px' });
+  // The spec resolves a percentage root margin against the viewport's width.
+  const observer = new IntersectionObserver(restore, { rootMargin: `${3 * innerHeight}px 0px` });
   for (const table of far) {
     table.setAttribute('data-labels', 'lazy');
     observer.observe(table.parentElement);
