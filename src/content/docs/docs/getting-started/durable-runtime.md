@@ -1,6 +1,6 @@
 ---
 title: Durable Runtime
-description: "Experimental: run the grclanker agent under Pi Durable, so a run that crashes or is stopped can be resumed."
+description: "Experimental: run the grclanker agent under Pi Durable, from the command line or a terminal app, so a run that crashes or is stopped can be resumed."
 ---
 
 **Experimental.** `grclanker durable` is new. Its commands, output, and session format may change between releases, and every run prints `grclanker durable (experimental)` to stderr.
@@ -44,6 +44,44 @@ grclanker durable run --session fips-review --message "Summarize the findings" -
 ```
 
 A session id is up to 64 letters, digits, dots, dashes, or underscores, starting with a letter or digit.
+
+## Terminal app
+
+`grclanker durable tui` opens a session in a terminal app instead of sending one message from the command line:
+
+```bash
+grclanker durable tui
+grclanker durable tui --session fips-review
+grclanker durable tui --session fips-review --model ollama/gemma4
+```
+
+Without `--session`, it starts a new session. With `--session`, it shows the session's conversation and continues any work an interrupted command left in it, with the same replay policy as [`resume`](#crash-and-resume). A session can move between the terminal app, `run`, and `resume`, one process at a time: while the app is open, it holds the [session lock](#sessions-and-the-lock).
+
+The app is adapted from the experimental durable coding agent in [Pi](https://github.com/earendil-works/pi) v1.3.0 (MIT License, see `NOTICE`). It uses the theme set in `~/.grclanker/agent/settings.json`, the grclanker theme by default. Below the transcript, which shows each tool call and its result, the screen has:
+
+- A task panel listing Pi Durable's live tasks
+- Messages queued for the end of the turn
+- The last four notices: a tool round resumed from an earlier process, an interrupted tool (and, for a tool that can write, that it was not rerun), a request that settled without an answer, a failed task, and compaction results
+- The editor, with a status line while the model answers or a tool runs
+- A footer with token use and cost, how full the model's context window is, the tool calls, findings, and exports in the [assessment document](#assessment-document), the session id, the model, and the thinking level
+
+| Key or command | Action |
+| --- | --- |
+| Enter | Send the message. While a turn runs, the message steers it |
+| Alt+Enter (Ctrl+Q on Windows and WSL) | Queue the message as a follow-up for when the turn ends |
+| Esc | Abort the running turn |
+| Ctrl+O | Expand or collapse tool output and compaction summaries |
+| Shift+Tab | Cycle the thinking level, on a model that supports thinking |
+| Ctrl+L or `/model` | Switch to another model whose provider has credentials |
+| `/compact [instructions]` | Summarize older context now |
+| `/tasks` | Hide or show the task panel |
+| Ctrl+C, or Ctrl+D on an empty editor | Exit |
+
+The keys are Pi's defaults. Override them in `~/.grclanker/agent/keybindings.json`, keyed by Pi's action names such as `app.model.select`.
+
+Exiting closes the session, prints the command that opens it again, and exits `0`. A turn still running when you exit is not cancelled: it continues the next time the session is opened, in the terminal app or with `resume`. Tool calls that were running are cut off and handled like those of a crashed process: read-only tools run again, and tools that can write are reported and not rerun.
+
+The terminal app takes only `--session` and `--model`, and needs an interactive terminal. From a script or a pipe, it exits `1` and points to `grclanker durable run`. A usage, configuration, or lock error also exits `1` before the app opens.
 
 ## Crash and resume
 
@@ -151,7 +189,8 @@ Tools that accept `output_dir`, `workspace_dir`, or `zip_path` resolve relative 
 ## Limitations
 
 - The runtime is experimental. Commands, output, and the session format may change, and a session written by one release may not open in a later one.
-- Only the domain tools are available. There are no compute backends (no shell or file tools), workflow prompts, skills, or subagent personas, and there is no interactive terminal UI for durable sessions.
+- Only the domain tools are available. There are no compute backends (no shell or file tools), workflow prompts, skills, or subagent personas.
+- The terminal app has only the keys and commands listed under [Terminal app](#terminal-app). The interactive CLI's commands, such as `/login` and `/settings`, are not in it.
 - An interrupted writer may have written part of its output before the process stopped. It is reported, not rerun. Check its output directory before you ask for the export again.
 - The session database keeps the whole conversation: your messages, the tool arguments the model sent, and tool results. Tool error text is redacted before it is stored, but a credential you paste into a message, or that the model passes as a tool argument, is stored as is. Treat `~/.grclanker/durable/sessions/` like a credential store and keep it out of shared locations and CI caches.
 - Every model request offers all 241 tool declarations, a large share of a 128k-token context window. Pi Durable compacts the conversation as it nears the model's window (the `compacting the conversation` progress line), so long sessions on small-window models compact often.
@@ -170,6 +209,14 @@ npm --prefix cli run test:cli
 - The interrupted export is reported and not rerun, and no bundle is written.
 - The model is not asked the request twice.
 - A settled request id returns the stored answer without new model calls or API requests.
+
+`cli/tests/durable-tui.test.mjs` drives the terminal app on an in-memory screen, and the real `grclanker durable tui` in a pseudo-terminal. It checks that:
+
+- A turn shows the message, tool calls, results, answer, and footer counts, and reopening the session shows them again without new model calls or tool runs.
+- An app closed partway through a tool round leaves the round in the session. Reopened, it reruns the read-only tool, reports the writer without rerunning it, and shows both notices in full on a narrow screen.
+- `/model`, Esc, and a thinking change on a model without thinking never reach the model.
+- `grclanker durable tui`, killed with `SIGKILL` partway through the PagerDuty tool round above, holds the session lock while it runs. Opened again, it keeps the finished assessment, reruns the interrupted one, and does not rerun the export.
+- `grclanker durable tui`, closed with Ctrl+C partway through that tool round, exits at once instead of waiting for the stalled tools, and `resume` finishes the round without rerunning the export.
 
 `cli/tests/durable.test.mjs` covers:
 
