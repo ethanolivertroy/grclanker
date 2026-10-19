@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, type KeyboardEvent, type ReactNode } from 'react';
+import { createContext, use, useState, type Dispatch, type KeyboardEvent, type ReactNode, type SetStateAction } from 'react';
 import { MonacoViewer } from './monaco-viewer';
 
 const views = [
@@ -11,6 +11,25 @@ const views = [
 type View = (typeof views)[number]['id'];
 
 type Source = { status: 'idle' | 'loading' | 'failed' } | { status: 'ready'; content: string };
+
+const ViewContext = createContext<[View, Dispatch<SetStateAction<View>>] | null>(null);
+
+/** Holds which view of a spec is open, for its tabs and its contents bar. */
+export function SpecViewState({ children }: { children: ReactNode }) {
+  const state = useState<View>('document');
+  return <ViewContext value={state}>{children}</ViewContext>;
+}
+
+function useView() {
+  const state = use(ViewContext);
+  if (!state) throw new Error('Spec views need a SpecViewState around them.');
+  return state;
+}
+
+/** Whether a spec page shows its rendered document rather than its markdown. */
+export function useDocumentView() {
+  return useView()[0] === 'document';
+}
 
 function keyTarget(key: string, current: number) {
   const last = views.length - 1;
@@ -67,7 +86,7 @@ function SourceView({ source, retry }: { source: Source; retry: () => void }) {
  * time a reader opens that view.
  */
 export function SpecViews({ sourceUrl, children }: { sourceUrl: string; children: ReactNode }) {
-  const [view, setView] = useState<View>('document');
+  const [view, setView] = useView();
   const [source, setSource] = useState<Source>({ status: 'idle' });
 
   async function loadSource() {

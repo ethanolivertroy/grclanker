@@ -3,6 +3,7 @@
 import type { TOCItemType } from 'fumadocs-core/toc';
 import { useEffect, useId, useRef, useState, type FocusEvent, type MouseEvent, type RefObject } from 'react';
 import { ChevronDownIcon } from './icons';
+import { useDocumentView } from './spec-views';
 
 // A jump to a section leaves its heading 1rem under the bar (the scroll margin
 // on `.docs-prose [id]`), so the reading line sits a little lower than that.
@@ -16,8 +17,8 @@ const RING_LENGTH = 2 * Math.PI * RING_RADIUS;
  * under the bar, or -1 above the first. The last sections of a spec can be
  * too short to scroll up to the line, so at the bottom of the page the one a
  * link jumped to, or else the last one on screen, is current. Follows the
- * page only while the bar shows: not from 1024px, where the rail beside the
- * document marks the section, nor while the markdown source is open.
+ * page only while the bar shows, so not from 1024px, where the rail beside
+ * the document marks the section.
  */
 function useCurrentSection(items: TOCItemType[], barRef: RefObject<HTMLElement | null>) {
   const [current, setCurrent] = useState(-1);
@@ -107,9 +108,14 @@ function ProgressRing({ value }: { value: number }) {
 /**
  * Below 1024px, a bar under the site header names the section in view and
  * opens the list of sections, so a reader deep in a spec that runs hundreds
- * of screens can change sections without going back to the top.
+ * of screens can change sections without going back to the top. Shown with
+ * the document, not the markdown source.
  */
 export function SpecContentsBar({ items }: { items: TOCItemType[] }) {
+  return useDocumentView() ? <ContentsBar items={items} /> : null;
+}
+
+function ContentsBar({ items }: { items: TOCItemType[] }) {
   const barRef = useRef<HTMLElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);

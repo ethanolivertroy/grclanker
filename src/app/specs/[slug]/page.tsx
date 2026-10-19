@@ -3,7 +3,7 @@ import { notFound } from 'next/navigation';
 import { SpecUrlCopyButton } from '../../../components/spec-copy';
 import { SpecContentsBar } from '../../../components/spec-contents-bar';
 import { SpecDocument, specSections } from '../../../components/spec-document';
-import { SpecViews } from '../../../components/spec-views';
+import { SpecViewState, SpecViews } from '../../../components/spec-views';
 import { pageMetadata } from '../../../lib/metadata';
 import { githubUrl } from '../../../lib/site';
 import { RAW_BASE, categoryLabels, getSpec, loadSpecs } from '../../../lib/specs';
@@ -43,7 +43,7 @@ export default async function SpecPage(props: PageProps) {
   const toc = await specSections(content);
 
   return (
-    <>
+    <SpecViewState key={meta.slug}>
       {toc.length > 0 && <SpecContentsBar items={toc} />}
 
       <div className="max-w-content mx-auto px-4 py-6 sm:px-6 sm:py-8">
@@ -112,10 +112,10 @@ export default async function SpecPage(props: PageProps) {
           </div>
         </div>
 
-        <SpecViews key={meta.slug} sourceUrl={`/specs/${meta.slug}/source.md`}>
+        <SpecViews sourceUrl={`/specs/${meta.slug}/source.md`}>
           <SpecDocument content={content} toc={toc} />
         </SpecViews>
       </div>
-    </>
+    </SpecViewState>
   );
 }

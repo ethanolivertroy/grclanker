@@ -131,9 +131,9 @@ html {
   }
 }
 
-/* Below 1024px spec pages pin their contents bar under it while the document view is open. */
+/* Below 1024px a spec's document view pins its contents bar under it. */
 @media (max-width: 1023.98px) {
-  html:has(.spec-contents-bar):has(#spec-panel-document:not([hidden])) {
+  html:has(.spec-contents-bar) {
     scroll-padding-top: calc(var(--fd-banner-height) + 2.5rem);
   }
 }
@@ -2295,10 +2295,6 @@ details[open] > .agent-group-toggle::before {
   z-index: 40;
   border-bottom: 1px solid var(--color-fd-border);
   background-color: var(--color-fd-background);
-}
-
-html:has(#spec-panel-document[hidden]) .spec-contents-bar {
-  display: none;
 }
 
 .spec-contents-trigger {
