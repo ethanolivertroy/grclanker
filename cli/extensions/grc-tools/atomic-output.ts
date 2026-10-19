@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
-import { lstatSync, readdirSync, rmSync } from "node:fs";
-import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { lstatSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { chmod, lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -40,11 +40,22 @@ export interface StagedBundle {
   target: CommittedBundle;
 }
 
+/** Names the bundle directory a commit is moving, so recovery never moves another writer's directory. */
+interface CommitRecord {
+  name: string;
+  dev: string;
+  ino: string;
+}
+
 const STAGING_PREFIX = ".grclanker-staging-";
 const STAGING_ENTRY = /^\.grclanker-staging-([0-9a-f]{8})-([1-9]\d*)-[0-9a-f]+$/;
+// Bundle names may not start with the staging prefix, so the record never collides with a staged bundle.
+const COMMIT_RECORD = `${STAGING_PREFIX}commit.json`;
 const HOST_TOKEN = createHash("sha256").update(hostname()).digest("hex").slice(0, 8);
 
 const activeStaging = new Set<string>();
+/** Commits in flight in this process, by staging directory, for the exit handler to finish. */
+const pendingCommits = new Map<string, { root: string; record: CommitRecord }>();
 /** Final paths claimed by writes still in flight in this process, so concurrent writes pick different names. */
 const claimedTargets = new Set<string>();
 let exitCleanupRegistered = false;
@@ -74,7 +85,15 @@ function trackStaging(path: string): void {
   if (exitCleanupRegistered) return;
   exitCleanupRegistered = true;
   process.once("exit", () => {
-    for (const staged of activeStaging) rmSync(staged, { recursive: true, force: true });
+    for (const staged of activeStaging) {
+      try {
+        const pending = pendingCommits.get(staged);
+        if (pending) finishCommit(pending.root, staged, pending.record);
+        rmSync(staged, { recursive: true, force: true });
+      } catch {
+        // The next write under the same root sweeps whatever is left.
+      }
+    }
   });
 }
 
@@ -92,7 +111,61 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-/** Removes staging entries a process on this host left behind when it died mid-write. */
+function identityOf(path: string): { dev: string; ino: string } | undefined {
+  const entry = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+  return entry && { dev: String(entry.dev), ino: String(entry.ino) };
+}
+
+function tryRenameSync(from: string, to: string): void {
+  try {
+    renameSync(from, to);
+  } catch {
+    // finishCommit re-reads the paths after every rename, so a failed one only changes which branch it takes.
+  }
+}
+
+/**
+ * Finishes a commit its process left partway: from the exit handler, or after a crash from the next
+ * write under the same root. The directory and its archive both end up at their final paths, or
+ * neither does. A rename the interrupted commit still has in flight is harmless, because whichever
+ * of the two renames runs second finds its source gone.
+ */
+function finishCommit(root: string, stagingRoot: string, record: CommitRecord): void {
+  const stagedDir = join(stagingRoot, record.name);
+  const stagedZip = `${stagedDir}.zip`;
+  const outputDir = join(root, record.name);
+  const zipPath = `${outputDir}.zip`;
+  const published = () => {
+    const identity = identityOf(outputDir);
+    return identity !== undefined && identity.dev === record.dev && identity.ino === record.ino;
+  };
+
+  if (!published()) {
+    const zipTaken = pathEntryExists(stagedZip) && pathEntryExists(zipPath);
+    if (!pathEntryExists(outputDir) && !zipTaken) tryRenameSync(stagedDir, outputDir);
+    if (!published()) return;
+  }
+  if (pathEntryExists(stagedZip) && !pathEntryExists(zipPath)) tryRenameSync(stagedZip, zipPath);
+  if (pathEntryExists(stagedZip)) tryRenameSync(outputDir, stagedDir);
+}
+
+function readCommitRecord(stagingRoot: string): CommitRecord | undefined {
+  try {
+    const path = join(stagingRoot, COMMIT_RECORD);
+    if (!lstatSync(path).isFile()) return undefined;
+    const record = JSON.parse(readFileSync(path, "utf8")) as Partial<CommitRecord>;
+    if (typeof record.name !== "string" || typeof record.dev !== "string" || typeof record.ino !== "string") return undefined;
+    assertBundleName(record.name);
+    return { name: record.name, dev: record.dev, ino: record.ino };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Removes staging entries a process on this host left behind when it died mid-write, first
+ * finishing any commit it had started.
+ */
 async function sweepAbandonedStaging(dir: string): Promise<void> {
   let names: string[];
   try {
@@ -105,9 +178,16 @@ async function sweepAbandonedStaging(dir: string): Promise<void> {
     if (!match || match[1] !== HOST_TOKEN) continue;
     const pid = Number(match[2]);
     if (pid === process.pid || processIsAlive(pid)) continue;
-    const entry = lstatSync(join(dir, name), { throwIfNoEntry: false });
+    const path = join(dir, name);
+    const entry = lstatSync(path, { throwIfNoEntry: false });
     if (!entry || (!entry.isDirectory() && !entry.isFile())) continue;
-    await rm(join(dir, name), { recursive: true, force: true });
+    try {
+      const record = entry.isDirectory() ? readCommitRecord(path) : undefined;
+      if (record) finishCommit(dir, path, record);
+      await rm(path, { recursive: true, force: true });
+    } catch {
+      // A dead writer's leftovers never fail a new write; a later sweep tries again.
+    }
   }
 }
 
@@ -123,8 +203,10 @@ async function renameUnlessTaken(from: string, to: string): Promise<boolean> {
 }
 
 /**
- * Moves a finished bundle from staging to its final paths, the directory and then its archive.
- * Returns undefined, with the bundle back in staging, when another process took the name first.
+ * Moves a finished bundle from staging to its final paths, the directory and then its archive. A
+ * record written first lets the exit handler or a later write finish the commit if this process
+ * stops between the two renames. Returns undefined, with the bundle back in staging, when another
+ * process took the name first.
  */
 async function commitStaged(
   root: string,
@@ -136,19 +218,32 @@ async function commitStaged(
   const stagedDir = join(stagingRoot, name);
   const outputDir = join(root, name);
   const zipPath = `${outputDir}.zip`;
-  if (taken() || !(await renameUnlessTaken(stagedDir, outputDir))) return undefined;
-  if (!archived) return { outputDir, zipPath };
-  if (!pathEntryExists(zipPath)) {
-    try {
-      await rename(`${stagedDir}.zip`, zipPath);
-    } catch (error) {
+  if (taken()) return undefined;
+
+  const identity = await lstat(stagedDir, { bigint: true });
+  const record: CommitRecord = { name, dev: String(identity.dev), ino: String(identity.ino) };
+  const recordPath = join(stagingRoot, COMMIT_RECORD);
+  await writeFile(recordPath, JSON.stringify(record), { mode: 0o600 });
+  pendingCommits.set(stagingRoot, { root, record });
+  try {
+    if (await renameUnlessTaken(stagedDir, outputDir)) {
+      if (!archived) return { outputDir, zipPath };
+      if (!pathEntryExists(zipPath)) {
+        try {
+          await rename(`${stagedDir}.zip`, zipPath);
+        } catch (error) {
+          await rename(outputDir, stagedDir);
+          throw error;
+        }
+        return { outputDir, zipPath };
+      }
       await rename(outputDir, stagedDir);
-      throw error;
     }
-    return { outputDir, zipPath };
+    await rm(recordPath, { force: true });
+    return undefined;
+  } finally {
+    pendingCommits.delete(stagingRoot);
   }
-  await rename(outputDir, stagedDir);
-  return undefined;
 }
 
 /**

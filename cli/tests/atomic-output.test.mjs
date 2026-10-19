@@ -68,6 +68,33 @@ async function deadPid() {
   return child.pid;
 }
 
+/**
+ * Source for a process that writes a zipped `bundle` under `root` and stops at the commit's rename
+ * onto `stopAt`, before that rename happens: it prints `ready` and then hangs, or exits.
+ */
+function commitThatStops(root, stopAt, how) {
+  return `
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    import { writeFile } from "node:fs/promises";
+    import { join } from "node:path";
+    const fsPromises = createRequire(${JSON.stringify(MODULE_URL)})("node:fs/promises");
+    const rename = fsPromises.rename;
+    fsPromises.rename = (from, to) => {
+      if (to === ${JSON.stringify(stopAt)}) {
+        process.stdout.write("ready");
+        ${how === "exit" ? "process.exit(0);" : "return new Promise(() => setInterval(() => {}, 1000));"}
+      }
+      return rename(from, to);
+    };
+    syncBuiltinESMExports();
+    const { writeBundleAtomically } = await import(${JSON.stringify(MODULE_URL)});
+    await writeBundleAtomically({ root: ${JSON.stringify(root)}, names: ["bundle"], zip: true }, async (staged) => {
+      await writeFile(join(staged.dir, "README.md"), "# bundle\\n");
+      await writeFile(staged.zipPath, "zip-bytes");
+    });
+  `;
+}
+
 /** Runs `effect` right after this process renames something onto `target`, while `run` executes. */
 async function afterRename(target, effect, run) {
   const original = fsPromises.rename;
@@ -348,6 +375,54 @@ test("a process killed mid-write leaves nothing at the final path, and the next 
 
   assert.equal(result.outputDir, join(root, "bundle"), "the rerun commits under the name the killed run would have used");
   assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle.zip"]);
+});
+
+test("a commit whose process was killed partway is finished by the next write under the same root", async () => {
+  for (const stopAt of ["bundle", "bundle.zip"]) {
+    const root = createTempBase("grclanker-atomic-commit-kill-");
+    const { child, ready, exited } = spawnModule(commitThatStops(root, join(root, stopAt), "hang"));
+    await ready;
+    child.kill("SIGKILL");
+    await exited;
+    assert.equal(existsSync(join(root, "bundle")), stopAt === "bundle.zip", `killed before the rename onto ${stopAt}`);
+    assert.equal(existsSync(join(root, "bundle.zip")), false);
+    assert.equal(stagingEntries(root).length, 1);
+
+    const next = await writeBundleAtomically({ root, names: numberedNames("bundle", 6), zip: true }, (staged) => writeSampleBundle(staged));
+
+    assert.equal(readFileSync(join(root, "bundle", "README.md"), "utf8"), "# bundle\n");
+    assert.equal(readFileSync(join(root, "bundle.zip"), "utf8"), "zip-bytes", "the interrupted bundle lands with its archive");
+    assert.equal(next.outputDir, join(root, "bundle-2"));
+    assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle-2", "bundle-2.zip", "bundle.zip"]);
+  }
+});
+
+test("a process that exits partway through a commit finishes it on the way out", async () => {
+  for (const stopAt of ["bundle", "bundle.zip"]) {
+    const root = createTempBase("grclanker-atomic-commit-exit-");
+    const { ready, exited } = spawnModule(commitThatStops(root, join(root, stopAt), "exit"));
+    ready.catch(() => {});
+
+    assert.equal(await exited, 0);
+    assert.deepEqual(readdirSync(root).sort(), ["bundle", "bundle.zip"], `exited before the rename onto ${stopAt}`);
+    assert.equal(readFileSync(join(root, "bundle", "README.md"), "utf8"), "# bundle\n");
+    assert.equal(readFileSync(join(root, "bundle.zip"), "utf8"), "zip-bytes");
+  }
+});
+
+test("finishing an interrupted commit withdraws its directory when the archive's name was taken in the meantime", async () => {
+  const root = createTempBase("grclanker-atomic-commit-taken-");
+  const { child, ready, exited } = spawnModule(commitThatStops(root, join(root, "bundle.zip"), "hang"));
+  await ready;
+  child.kill("SIGKILL");
+  await exited;
+  writeFileSync(join(root, "bundle.zip"), "another writer's archive");
+
+  const next = await writeBundleAtomically({ root, names: numberedNames("bundle", 6), zip: true }, (staged) => writeSampleBundle(staged));
+
+  assert.equal(readFileSync(join(root, "bundle.zip"), "utf8"), "another writer's archive");
+  assert.equal(next.outputDir, join(root, "bundle-2"));
+  assert.deepEqual(readdirSync(root).sort(), ["bundle-2", "bundle-2.zip", "bundle.zip"], "no directory is left without its archive");
 });
 
 test("the sweep keeps staging entries that belong to a live process or another host", async () => {
