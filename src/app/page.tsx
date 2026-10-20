@@ -59,7 +59,7 @@ function releaseFacts(integrationSpecCount: number) {
     {
       label: '241 domain tools',
       detail:
-        'Native checks, assessments, and evidence exports cover 35 vendor integrations, plus CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools. The v0.1.2 release bundle carries all of them.',
+        'Native checks, assessments, and evidence exports cover 35 vendor integrations, plus CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools. The v0.1.3 release bundle carries all of them.',
     },
     {
       label: 'Three runtime paths',
@@ -81,40 +81,40 @@ function releaseFacts(integrationSpecCount: number) {
 
 const whatsNewCards = [
   {
-    label: 'October 2026 FedRAMP rules',
+    label: 'Experimental durable mode',
     color: 'text-sapphire',
     detail:
-      'The FedRAMP docs are regenerated from Consolidated Rules 2026.10.13.01. FRC-CSX-MOT is gone, leaving 245 requirements.',
+      'grclanker durable runs the agent under Pi Durable 1.3.0, so a crashed or stopped run resumes instead of starting over. It is opt-in: the CLI, Agent SDK, and Flue paths do not use it.',
   },
   {
-    label: 'Fuller FedRAMP lookups',
+    label: 'Atomic exports, clean stops',
     color: 'text-yellow',
     detail:
-      'fedramp_get_requirement shows notification forms, mapped Rev5 controls, and the full update history. fedramp_search_frmr matches control IDs such as ra-5.',
+      'Exports build in a hidden staging directory and move into place when done. Stopping a run cancels its API requests and child processes, and a stopped export writes nothing.',
   },
   {
-    label: 'Trust-center headers',
+    label: 'Fewer passes on partial evidence',
     color: 'text-peach',
     detail:
-      'The ADS bundle and site scaffolds list the FRC-CSO-JSN hosting requirements: a JSON content type, nosniff, and CORS.',
+      'Cloudflare, Zscaler, Vanta, CrowdStrike, Snowflake, Zoom, and other checks now warn or fail instead of passing when the evidence they read is incomplete.',
   },
   {
-    label: 'sandbox-runtime 0.0.78',
+    label: 'Pi 1.3.0 and Node.js 24',
     color: 'text-green',
     detail:
-      'Backend grep and find keep working with the placeholder files it mounts, and env exec and env smoke-test exit when done.',
+      'The CLI moves to Pi 1.3.0 and the release bundles to Node.js 24.22.0 LTS, with Flue 2.3.0 and sandbox-runtime 0.0.79.',
   },
   {
-    label: 'Agent SDK on BDK 0.2.26',
+    label: 'Redaction and config hardening',
     color: 'text-mauve',
     detail:
-      'The Cursor Agent SDK project moves up from 0.2.21 and still serves all 241 tools: 199 read-only and 42 approval-gated writers.',
+      'Flue scrubs tool-input credentials from errors and replies, a broken sandbox.json fails closed, and installers stop when a checksum cannot be verified.',
   },
   {
-    label: 'New docs site',
+    label: 'Readable spec pages',
     color: 'text-blue',
     detail:
-      'grclanker.com runs on Next.js with Fumadocs at the same URLs. Search covers docs, specs, and pages, and wide tables stack into cards on phones.',
+      'Spec pages render as documents with headings, tables, and a contents list. Search finds body text and IDs such as SRG-APP-000148, and corrects one-letter typos.',
   },
 ];
 
@@ -161,7 +161,7 @@ export default function HomePage() {
               </div>
 
               <p className="hero-support-copy">
-                The curl installer ships the v0.1.2 release bundle with all 241 domain tools and its own Node.js runtime.
+                The curl installer ships the v0.1.3 release bundle with all 241 domain tools and its own Node.js runtime.
                 To run unreleased changes,{' '}
                 <Link href="/docs/getting-started/installation/#install-from-source">build from source</Link> (Node 22.19
                 or newer).
@@ -182,7 +182,7 @@ export default function HomePage() {
               src="/hero/grclanker-terminal.webp"
               width={1750}
               height={1316}
-              alt="grclanker CLI start screen from the v0.1.2 release bundle: 248 tools and 2 agents, the investigate, audit, assess, and validate workflows, and 241 domain tools ready"
+              alt="grclanker CLI start screen from the v0.1.3 release bundle: 248 tools and 2 agents, the investigate, audit, assess, and validate workflows, and 241 domain tools ready"
               className="hero-preview-image"
               loading="eager"
             />
@@ -198,9 +198,9 @@ export default function HomePage() {
             <div className="hero-briefing-top">
               <div>
                 <h2 className="font-semibold text-sm tracking-widest uppercase text-blue">What You Ask → What It Does</h2>
-                <p className="text-subtext0 text-sm mt-1 italic">Shipped in v0.1.2, not a roadmap.</p>
+                <p className="text-subtext0 text-sm mt-1 italic">Shipped in v0.1.3, not a roadmap.</p>
               </div>
-              <div className="hero-briefing-version">v0.1.2 // released</div>
+              <div className="hero-briefing-version">v0.1.3 // released</div>
             </div>
 
             <div className="hero-briefing-grid">
@@ -236,11 +236,11 @@ export default function HomePage() {
             <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
               <div>
                 <h2 id="whats-new-heading" className="font-semibold text-sm tracking-widest uppercase text-blue">
-                  What's New in v0.1.2
+                  What's New in v0.1.3
                 </h2>
                 <p className="text-subtext0 text-sm mt-1 italic">
-                  Updates the FedRAMP tools to the October 2026 Consolidated Rules and moves the sandbox-runtime backend to
-                  0.0.78. The tool surface is unchanged, and the changelog has upgrade notes.
+                  Adds an experimental, opt-in durable mode and moves to Pi 1.3.0 and Node.js 24.22.0. The tool surface is
+                  unchanged, and the changelog has upgrade notes, including a downgrade caveat for durable sessions.
                 </p>
               </div>
               <Link href="/docs/changelog/" className="spec-action-btn spec-action-btn-primary self-start md:self-auto">

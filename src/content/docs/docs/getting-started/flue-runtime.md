@@ -45,7 +45,7 @@ grclanker flue run --message "Is BoringCrypto FIPS validated?"
 
 `grclanker flue --help` prints the options and environment variables.
 
-The runner ships in the `v0.1.2` release bundle. The older `v0.0.1` bundle predates the Flue adapter and answers `Unknown command: flue`.
+The runner ships in the `v0.1.3` release bundle. The older `v0.0.1` bundle predates the Flue adapter and answers `Unknown command: flue`.
 
 From a source checkout, with Node.js 22.19 or newer:
 

@@ -125,7 +125,7 @@ grclanker env smoke-test
 
 If you need the backend-specific details, use the dedicated [Compute Backends](/docs/getting-started/compute-backends/) guide.
 
-The older `v0.0.1` release bundle predates the Modal and RunPod backends and `setup --compute`. Its wizard offers only `host`, `sandbox-runtime`, `docker`, and `parallels-vm`. Rerun the installer to get `v0.1.2` and the full list.
+The older `v0.0.1` release bundle predates the Modal and RunPod backends and `setup --compute`. Its wizard offers only `host`, `sandbox-runtime`, `docker`, and `parallels-vm`. Rerun the installer to get `v0.1.3` and the full list.
 
 ## Skill visibility
 

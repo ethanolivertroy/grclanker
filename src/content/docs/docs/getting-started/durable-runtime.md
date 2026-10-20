@@ -7,7 +7,7 @@ description: "Experimental: run the grclanker agent under Pi Durable, from the c
 
 `grclanker durable` runs the GRC agent under [Pi Durable](https://www.npmjs.com/package/@earendil-works/pi-durable), Pi's durable conversation runtime. Pi Durable writes the conversation and each tool round to a SQLite database as the run goes. If the process crashes, is killed, or is stopped with Ctrl-C, a later command picks the session up where it stopped instead of starting over.
 
-The command is on `main` and is not in a release bundle yet. `v0.1.2` and older do not have it.
+The command ships in the `v0.1.3` release bundle. `v0.1.2` and older do not have it.
 
 ## What the runtime maps
 
@@ -25,6 +25,14 @@ The runtime lives in `cli/durable/` and is additive. The interactive CLI, the Cu
 
 ## Run it
 
+With the [release bundle](/docs/getting-started/installation/) installed:
+
+```bash
+grclanker durable run --message "Is BoringCrypto FIPS validated?"
+```
+
+`grclanker durable --help` prints the options.
+
 From a [source checkout](/docs/getting-started/installation#install-from-source), with Node.js 22.19 or newer:
 
 ```bash
@@ -33,7 +41,7 @@ npm --prefix cli run build
 node cli/bin/grclanker.js durable run --message "Is BoringCrypto FIPS validated?"
 ```
 
-With a source checkout linked through `npm link`, the same command is `grclanker durable run`. `grclanker durable --help` prints the options.
+With a source checkout linked through `npm link`, the same command is `grclanker durable run`.
 
 `run` without `--session` starts a new session with an id such as `20261019-143012-a1b2c3` and prints it to stderr. Name a session to continue its conversation, or ask for a JSON report:
 
@@ -188,7 +196,7 @@ Tools that accept `output_dir`, `workspace_dir`, or `zip_path` resolve relative 
 
 ## Limitations
 
-- The runtime is experimental. Commands, output, and the session format may change, and a session written by one release may not open in a later one.
+- The runtime is experimental. Commands, output, and the session format may change, and a session written by one release may not open in a later one. Going back is riskier: the next pi-durable release migrates a session to a new schema when it opens it, and `v0.1.3` cannot open a migrated session. If you might downgrade, copy `~/.grclanker/durable/sessions/` before a newer grclanker opens your sessions.
 - Only the domain tools are available. There are no compute backends (no shell or file tools), workflow prompts, skills, or subagent personas.
 - The terminal app has only the keys and commands listed under [Terminal app](#terminal-app). The interactive CLI's commands, such as `/login` and `/settings`, are not in it.
 - An interrupted writer may have written part of its output before the process stopped. It is reported, not rerun. Check its output directory before you ask for the export again.

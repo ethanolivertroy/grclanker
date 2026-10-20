@@ -7,7 +7,7 @@ grclanker separates model choice from execution environment on purpose.
 
 Use `env doctor` and `env smoke-test` to verify the selected backend can actually execute the tool surface you expect.
 
-This page describes the `v0.1.2` release and `main`. The design behind it, including the backend matrix and the reasons for each backend, is in the [grclanker Compute Backends spec](/specs/grclanker-compute-backends/).
+This page describes the `v0.1.3` release and `main`. The design behind it, including the backend matrix and the reasons for each backend, is in the [grclanker Compute Backends spec](/specs/grclanker-compute-backends/).
 
 The older `v0.0.1` bundle ships only `host`, `sandbox-runtime`, `docker`, and `parallels-vm`, plus `env doctor`, `env smoke-test`, and `env exec`. `env list`, `setup --compute`, per-run `--compute`, compute profiles, and the Modal and RunPod backends arrived in `v0.1.0`.
 
