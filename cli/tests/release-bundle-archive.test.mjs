@@ -7,12 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  copyApp,
   createArchive,
   findPythonCommand,
   normalizeStagedTree,
   resolveSourceDateEpoch,
 } from "../scripts/build-native-bundle.mjs";
 
+const CLI_DIR = join(import.meta.dirname, "..");
 const EPOCH = 1_700_000_000;
 const gnuTar = /GNU tar/.test(spawnSync("tar", ["--version"], { encoding: "utf8" }).stdout ?? "");
 
@@ -136,6 +138,28 @@ test("zip bundles are byte-identical regardless of staging mtimes and modes", (t
   const { hashes, modes } = buildVariants("zip", { epoch: EPOCH, pythonCommand });
   assert.equal(new Set(hashes).size, 1, `expected one hash, got ${hashes.join(", ")}`);
   assert.deepEqual(formatModes(modes), formatModes(EXPECTED_MODES));
+});
+
+test("bundles ship the Apache-2.0 LICENSE and NOTICE in app/", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "grclanker-archive-license-"));
+  const bundle = join(workspace, "bundle");
+  const archive = join(workspace, "bundle.tar.gz");
+  const commands = [];
+  try {
+    copyApp(join(bundle, "app"), { npmPlatform: "linux", npmArch: "x64", npmLibc: "glibc" }, (command) => {
+      commands.push(command);
+    });
+    assert.deepEqual(commands, ["npm", "node"]);
+    createArchive(bundle, archive, "tar.gz", { epoch: EPOCH });
+    const entries = spawnSync("tar", ["-tzf", archive], { encoding: "utf8" }).stdout.split("\n");
+    for (const name of ["LICENSE", "NOTICE"]) {
+      assert.ok(entries.includes(`./app/${name}`), `bundle archive is missing app/${name}`);
+      const packed = spawnSync("tar", ["-xOzf", archive, `./app/${name}`], { encoding: "utf8" }).stdout;
+      assert.equal(packed, readFileSync(join(CLI_DIR, name), "utf8"));
+    }
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
 });
 
 test("normalizeStagedTree rejects special files", { skip: process.platform === "win32" && "requires mkfifo" }, () => {

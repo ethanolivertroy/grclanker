@@ -295,7 +295,7 @@ function ensureNodeArchive(target, pythonCommand) {
   return extractedRoot;
 }
 
-function copyApp(stageAppDir, target) {
+export function copyApp(stageAppDir, target, runCommand = run) {
   const entries = [
     ".grclanker",
     "bin",
@@ -304,6 +304,8 @@ function copyApp(stageAppDir, target) {
     "prompts",
     "scripts",
     "skills",
+    "LICENSE",
+    "NOTICE",
     "package.json",
     "package-lock.json",
   ];
@@ -331,8 +333,8 @@ function copyApp(stageAppDir, target) {
     npmEnv.npm_config_libc = target.npmLibc;
   }
 
-  run("npm", npmArgs, { cwd: stageAppDir, env: npmEnv });
-  run("node", [join(companionDir, "scripts", "patch-embedded-pi.mjs"), "--root", stageAppDir], {
+  runCommand("npm", npmArgs, { cwd: stageAppDir, env: npmEnv });
+  runCommand("node", [join(companionDir, "scripts", "patch-embedded-pi.mjs"), "--root", stageAppDir], {
     cwd: stageAppDir,
   });
 }
