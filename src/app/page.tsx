@@ -9,7 +9,7 @@ import { loadSpecs } from '../lib/specs';
 export const metadata = pageMetadata({
   title: 'grclanker: Put a Clanker on Your Compliance',
   description:
-    '241 domain tools across 35 vendor integrations and CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL, with Pi, Cursor Agent SDK, and Flue runtime paths.',
+    '241 domain tools across 35 vendor integrations and CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL, with Pi, Cursor Agent SDK, Flue, and experimental durable runtime paths.',
   path: '/',
 });
 
@@ -62,9 +62,9 @@ function releaseFacts(integrationSpecCount: number) {
         'Native checks, assessments, and evidence exports cover 35 vendor integrations, plus CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools. The v0.1.3 release bundle carries all of them.',
     },
     {
-      label: 'Three runtime paths',
+      label: 'Four runtime paths',
       detail:
-        'Use the Pi terminal CLI, run the same agent from source with the Cursor Agent SDK, or use the bundled Flue runner and official Flue CLI.',
+        'Use the Pi terminal CLI, run the same agent from source with the Cursor Agent SDK, use the bundled Flue runner and official Flue CLI, or opt in to the experimental durable runtime, which can resume a crashed or stopped run.',
     },
     {
       label: 'Hardened evidence',
@@ -81,10 +81,10 @@ function releaseFacts(integrationSpecCount: number) {
 
 const whatsNewCards = [
   {
-    label: 'Experimental durable mode',
+    label: 'Experimental durable runtime',
     color: 'text-sapphire',
     detail:
-      'grclanker durable runs the agent under Pi Durable 1.3.0, so a crashed or stopped run resumes instead of starting over. It is opt-in: the CLI, Agent SDK, and Flue paths do not use it.',
+      'grclanker durable, a fourth runtime path, runs the agent under Pi Durable 1.3.0, so a crashed or stopped run resumes instead of starting over. It is opt-in: the Pi CLI, Agent SDK, and Flue paths do not use it.',
   },
   {
     label: 'Atomic exports, clean stops',
@@ -144,7 +144,8 @@ export default function HomePage() {
                 Put a clanker on it.
               </h1>
               <p className="mx-auto mt-5 max-w-2xl text-base md:text-lg text-subtext1 leading-relaxed italic hero-copy-lede">
-                241 domain tools. 35 vendor integrations. Pi, Cursor Agent SDK, and Flue runtime paths.
+                241 domain tools. 35 vendor integrations. Pi, Cursor Agent SDK, Flue, and experimental durable runtime
+                paths.
               </p>
             </div>
 
@@ -239,8 +240,8 @@ export default function HomePage() {
                   What's New in v0.1.3
                 </h2>
                 <p className="text-subtext0 text-sm mt-1 italic">
-                  Adds an experimental, opt-in durable mode and moves to Pi 1.3.0 and Node.js 24.22.0. The tool surface is
-                  unchanged, and the changelog has upgrade notes, including a downgrade caveat for durable sessions.
+                  Adds an experimental, opt-in durable runtime and moves to Pi 1.3.0 and Node.js 24.22.0. The tool surface
+                  is unchanged, and the changelog has upgrade notes, including a downgrade caveat for durable sessions.
                 </p>
               </div>
               <Link href="/docs/changelog/" className="spec-action-btn spec-action-btn-primary self-start md:self-auto">

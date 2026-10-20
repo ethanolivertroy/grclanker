@@ -6,7 +6,7 @@ import { githubUrl } from '../../lib/site';
 export const metadata = pageMetadata({
   title: 'About: grclanker',
   description:
-    'What grclanker ships today: an open source compliance agent with 241 domain tools, 35 vendor integrations, and Pi, Cursor Agent SDK, and Flue runtime paths.',
+    'What grclanker ships today: an open source compliance agent with 241 domain tools, 35 vendor integrations, and Pi, Cursor Agent SDK, Flue, and experimental durable runtime paths.',
   path: '/about/',
 });
 
@@ -67,7 +67,8 @@ export default function AboutPage() {
                 <p>
                   The same prompts, personas, and domain tools run in the Pi terminal CLI, the Cursor Agent SDK project, and
                   the Flue Framework adapter. The Pi path supports local-first models or an explicitly configured hosted
-                  provider.
+                  provider. The experimental, opt-in durable runtime runs the agent with only the domain tools, and it can
+                  resume a run that crashed or was stopped.
                 </p>
 
                 <p>

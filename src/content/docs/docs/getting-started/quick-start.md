@@ -90,4 +90,4 @@ Read specs/aws-sec-inspector.spec.md, inspect the shipped AWS tools, and propose
 
 grclanker ships 35 integrations, and most have a spec under `specs/`. Use a spec to inspect coverage, plan a change, or seed an independent implementation.
 
-The Pi terminal CLI is the default path. A source checkout can also run the same domain tools through the [Cursor Agent SDK](/docs/getting-started/agent-sdk/) or [Flue](/docs/getting-started/flue-runtime/).
+The Pi terminal CLI is the default path. A source checkout can also run the same domain tools through the [Cursor Agent SDK](/docs/getting-started/agent-sdk/), [Flue](/docs/getting-started/flue-runtime/), or the experimental [Durable Runtime](/docs/getting-started/durable-runtime/).
