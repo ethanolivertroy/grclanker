@@ -22,6 +22,13 @@ test('homepage workflow states match the shipped prompts', () => {
   assert.doesNotMatch(home, /partial, absent/);
 });
 
+test('runtime path lists count the durable runtime', () => {
+  const lists = [...`${home}\n${about}`.matchAll(/Pi, Cursor Agent SDK,[^.']*?runtime\s+paths/g)].map((match) => match[0]);
+  assert.equal(lists.length, 3);
+  for (const list of lists) assert.match(list, /experimental durable runtime/);
+  assert.match(home, /label: 'Four runtime paths'/);
+});
+
 test('the install command stays in the button name', () => {
   assert.match(install, /aria-label=\{`Copy install command: \$\{command\}`\}/);
 });
