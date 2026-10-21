@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import childProcess from "node:child_process";
 import { setMaxListeners } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -96,7 +96,14 @@ const VANTA_EVIDENCE = {
   creationDate: "2026-02-01T00:00:00.000Z",
   statusUpdatedDate: "2026-02-02T00:00:00.000Z",
 };
+const VANTA_FILE = {
+  id: "url-abort",
+  url: "https://downloads.example.test/access-review.pdf",
+  filename: "access-review.pdf",
+  isDownloadable: true,
+};
 
+const fsModule = createRequire(import.meta.url)("node:fs");
 const fsPromises = createRequire(import.meta.url)("node:fs/promises");
 
 const CHILD_PROCESS_FUNCTIONS = ["exec", "execFile", "execFileSync", "execSync", "fork", "spawn", "spawnSync"];
@@ -332,15 +339,22 @@ function pagerdutyResponder(call) {
 
 /**
  * Answers the token and audit list requests, and with `evidence` the audit's evidence list too, so the export gets as
- * far as listing evidence, or listing an evidence item's files, which never answers.
+ * far as listing evidence, or listing an evidence item's files, which never answers. With `download` the item's files
+ * are listed as VANTA_FILE, whose download sends a first chunk and then stays open.
  */
-function vantaResponder({ evidence = false } = {}) {
+function vantaResponder({ evidence = false, download = false } = {}) {
   return (call) => {
     const path = new URL(call.url).pathname;
     if (path.endsWith("/oauth/token")) return Response.json({ access_token: "vanta-abort-token", expires_in: 3600 });
     if (path.endsWith("/audits")) return Response.json({ results: { data: [VANTA_AUDIT], pageInfo: { hasNextPage: false } } });
     if (evidence && path.endsWith("/evidence")) {
       return Response.json({ results: { data: [VANTA_EVIDENCE], pageInfo: { hasNextPage: false } } });
+    }
+    if (download && path.endsWith("/urls")) {
+      return Response.json({ results: { data: [VANTA_FILE], pageInfo: { hasNextPage: false } } });
+    }
+    if (download && call.url === VANTA_FILE.url) {
+      return new Response(new ReadableStream({ start: (body) => body.enqueue(new TextEncoder().encode("%PDF-1.7\n")) }));
     }
     return undefined;
   };
@@ -363,6 +377,40 @@ function onCommitMove(name, effect) {
     Object.assign(fsPromises, originals);
     syncBuiltinESMExports();
   };
+}
+
+/**
+ * Holds the close of the first file a stream opens under the name `name` until `release` runs, so a test can see what a
+ * call does while that file is still open. File streams open and close their files through these node:fs functions.
+ */
+function holdFileClose(name) {
+  const originals = { open: fsModule.open, close: fsModule.close };
+  let release;
+  const released = new Promise((resolve) => {
+    release = resolve;
+  });
+  const file = { path: undefined, fd: undefined, closing: false, release };
+  fsModule.open = (path, ...rest) => {
+    const callback = rest.pop();
+    return originals.open(path, ...rest, (error, fd) => {
+      if (!error && file.fd === undefined && basename(String(path)) === name) {
+        file.path = String(path);
+        file.fd = fd;
+      }
+      callback(error, fd);
+    });
+  };
+  fsModule.close = (fd, callback) => {
+    if (fd !== file.fd || file.closing) return originals.close(fd, callback);
+    file.closing = true;
+    released.then(() => originals.close(fd, callback));
+  };
+  file.restore = () => {
+    release();
+    Object.assign(fsModule, originals);
+    syncBuiltinESMExports();
+  };
+  return file;
 }
 
 /** A stand-in CLI that writes its process id to `<name>.pid` and then never finishes. */
@@ -794,6 +842,36 @@ for (const [step, evidence, hangs] of [
     assert.equal(existsSync(exportsDir), false, `the export created its output directory: ${listTree(box.cwd).join(", ")}`);
   });
 }
+
+test("aborting vanta_export_audit mid-download rejects only once the evidence file is closed, then removes its staging directory", async (t) => {
+  const box = sandbox(t, vantaResponder({ evidence: true, download: true }));
+  const download = holdFileClose(VANTA_FILE.filename);
+  t.after(download.restore);
+  const exportsDir = join(box.cwd, "exports");
+  const controller = new AbortController();
+  const call = getRegisteredGrcTool("vanta_export_audit").execute(
+    "call-vanta-download",
+    { audit_id: VANTA_AUDIT.id, client_id: "vanta-abort-client", client_secret: FAKE_SECRET, output_dir: join(exportsDir, "vanta") },
+    controller.signal,
+  );
+  assert.ok(
+    await waitUntil(() => download.path !== undefined && statSync(download.path).size > 0, 5000),
+    "the export is partway through downloading the evidence file",
+  );
+
+  const reason = new Error("operator stopped the Vanta export");
+  controller.abort(reason);
+  assert.ok(await waitUntil(() => download.closing, SETTLE_MS), "the abort stopped the download");
+  const early = await settleWithin(call, SETTLE_MS);
+  assert.equal(early.status, "pending", `the export ${early.status} while the evidence file was still open`);
+  assert.ok(existsSync(download.path), "the staging directory stays until the evidence file is closed");
+
+  download.release();
+  const outcome = await settleWithin(call, SETTLE_MS);
+  assert.equal(outcome.status, "rejected", `the export ${outcome.status} instead of rejecting`);
+  assert.equal(outcome.error, reason);
+  assert.equal(existsSync(exportsDir), false, `the export left ${listTree(box.cwd).join(", ")}`);
+});
 
 for (const [entry, suffix] of [["directory", ""], ["archive", ".zip"]]) {
   test(`an export aborted as its bundle ${entry} starts moving into place resolves with the whole bundle, since the abort came too late to stop it`, async (t) => {
