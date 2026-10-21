@@ -808,7 +808,12 @@ async function downloadFile(
   const resolvedPath = resolveSecureOutputPath(baseDir, destPath);
   const output = createWriteStream(resolvedPath, { mode: 0o600 });
   try {
-    await unlessAborted(pipeline(Readable.fromWeb(response.body as NodeReadableStream), output, { signal }), signal);
+    // Awaited, not raced with unlessAborted: the pipeline stops on the signal and settles only once the file is closed,
+    // and the export removes its staging directory as soon as this call rejects.
+    await pipeline(Readable.fromWeb(response.body as NodeReadableStream), output, { signal });
+  } catch (error) {
+    if (signal?.aborted) throw new ToolCallAbortedError(signal);
+    throw error;
   } finally {
     await chmod(resolvedPath, 0o600);
   }

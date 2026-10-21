@@ -64,7 +64,10 @@ export function fallbackUnlessAborted<T>(fallback: T): (error: unknown) => T {
 
 /**
  * Settle as `promise` does, or reject with ToolCallAbortedError as soon as
- * `signal` aborts, whether or not the work behind `promise` stops.
+ * `signal` aborts, whether or not the work behind `promise` stops. Work that
+ * stops on `signal` by itself while it holds a file open, such as a stream
+ * pipeline given the signal, is awaited instead, so the file is closed before
+ * the call rejects.
  */
 export function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (!signal) return promise;
