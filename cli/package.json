@@ -140,6 +140,7 @@
   "overrides": {
     "@modelcontextprotocol/client": "2.3.1",
     "@modelcontextprotocol/sdk": "1.32.1",
+    "@modelcontextprotocol/server": "2.3.1",
     "@opentelemetry/core": "^2.8.0",
     "basic-ftp": "6.0.1",
     "js-yaml": "4.3.2",
