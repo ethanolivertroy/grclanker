@@ -3069,3 +3069,215 @@ writeFailureTest("exportServicenowAuditBundle leaves nothing under the output ro
   const { fetchImpl } = fixtureFetch(healthyFixture());
   await assertNoPartialBundleOnWriteFailure(base, () => exportServicenowAuditBundle(createClient(fetchImpl), sampleConfig(), base));
 });
+
+const SNOW_INSTANCE_CHECK = "check that SERVICENOW_URL (or SERVICENOW_INSTANCE_URL) or SERVICENOW_INSTANCE (or the instance_url or instance arguments) names the right instance";
+const SNOW_LIMITED_NEXT_STEP = "Grant the audit account admin (read) or a scoped read role over the listed tables; forbidden or ACL-filtered tables render as manual findings.";
+/** The configured secrets of the rejected-credential runs; every refusal body echoes them. */
+const SNOW_REJECTED_SECRETS = [SNOW_CANARY.password, SNOW_CANARY.clientSecret, SNOW_CANARY.accessToken, REFRESH_TOKEN_CANARY.argument];
+const SNOW_REJECTED_MODES = [
+  {
+    label: "basic",
+    kind: "username and password",
+    config: { password: SNOW_CANARY.password },
+    exchanges: false,
+    step: (evidence) => `ServiceNow rejected the username and password (${evidence}). Set SERVICENOW_USERNAME and SERVICENOW_PASSWORD (or the username and password arguments, or the same keys in SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml), and ${SNOW_INSTANCE_CHECK}, then rerun servicenow_check_access.`,
+  },
+  {
+    label: "pre-issued access token",
+    kind: "access token",
+    config: { authMode: "oauth", username: undefined, password: undefined, accessToken: SNOW_CANARY.accessToken },
+    exchanges: false,
+    step: (evidence) => `ServiceNow rejected the access token (${evidence}). Set SERVICENOW_ACCESS_TOKEN (or SERVICENOW_TOKEN, or the access_token argument, or the same key in SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml) to a current token, and ${SNOW_INSTANCE_CHECK}, then rerun servicenow_check_access.`,
+  },
+  {
+    label: "refresh_token grant",
+    kind: "OAuth refresh token",
+    config: { authMode: "oauth", username: undefined, password: undefined, clientId: "audit-client", clientSecret: SNOW_CANARY.clientSecret, refreshToken: REFRESH_TOKEN_CANARY.argument },
+    exchanges: true,
+    step: (evidence) => `ServiceNow rejected the OAuth refresh token (${evidence}). Check SERVICENOW_REFRESH_TOKEN, SERVICENOW_CLIENT_ID, and SERVICENOW_CLIENT_SECRET (or the refresh_token, client_id, and client_secret arguments, or the same keys in SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml), and ${SNOW_INSTANCE_CHECK}, then rerun servicenow_check_access.`,
+  },
+  {
+    label: "password grant",
+    kind: "OAuth password grant credentials",
+    config: { authMode: "oauth", password: SNOW_CANARY.password, clientId: "audit-client", clientSecret: SNOW_CANARY.clientSecret },
+    exchanges: true,
+    step: (evidence) => `ServiceNow rejected the OAuth password grant credentials (${evidence}). Check SERVICENOW_CLIENT_ID, SERVICENOW_CLIENT_SECRET, SERVICENOW_USERNAME, and SERVICENOW_PASSWORD (or the client_id, client_secret, username, and password arguments, or the same keys in SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml), and ${SNOW_INSTANCE_CHECK}, then rerun servicenow_check_access.`,
+  },
+  {
+    label: "client_credentials grant",
+    kind: "OAuth client credentials",
+    config: { authMode: "oauth", username: undefined, password: undefined, clientId: "audit-client", clientSecret: SNOW_CANARY.clientSecret },
+    exchanges: true,
+    step: (evidence) => `ServiceNow rejected the OAuth client credentials (${evidence}). Check SERVICENOW_CLIENT_ID and SERVICENOW_CLIENT_SECRET (or the client_id and client_secret arguments, or the same keys in SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml), ${SNOW_INSTANCE_CHECK}, and confirm the instance allows the client_credentials grant for this client (glide.oauth.inbound.client.credential.grant_type.enabled set to true, and an OAuth Application User on its Application Registry record), then rerun servicenow_check_access.`,
+  },
+];
+
+function snowUnauthorized() {
+  return jsonResponse({ error: { message: "User Not Authenticated", detail: `Required to provide Auth information; presented ${SNOW_REJECTED_SECRETS.join(" ")}` }, status: "failure" }, { status: 401 });
+}
+
+/** The Table and Aggregate APIs refuse with 401; the token endpoint answers `token()`, by default the documented 401 access_denied. */
+function snowRejectingFetch(token) {
+  const requests = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(String(input));
+    requests.push(url.pathname);
+    if (url.pathname !== "/oauth_token.do") return snowUnauthorized();
+    return token?.() ?? jsonResponse({ error_description: `access_denied; presented ${SNOW_REJECTED_SECRETS.join(" ")}`, error: "server_error" }, { status: 401 });
+  };
+  return { fetchImpl, requests };
+}
+
+const snowIssuedToken = () => jsonResponse({ access_token: "issued-bearer-value", expires_in: 1799, token_type: "Bearer" });
+const snowRefusedToken = (code) => () => jsonResponse({ error: code, error_description: `Refused; presented ${SNOW_REJECTED_SECRETS.join(" ")}` }, { status: 400 });
+
+async function snowAccessCheck(configOverrides, fetchImpl) {
+  return checkServicenowAccess(new ServicenowApiClient(sampleConfig(configOverrides), { fetchImpl, sleep: async () => {}, now: () => FIXED_NOW }));
+}
+
+function assertSnowRejected(result, mode, evidence, httpStatus, label) {
+  assert.equal(result.status, "failed", label);
+  assert.equal(result.surfaces.length, 27, label);
+  for (const surface of result.surfaces) {
+    assert.equal(surface.status, "unauthorized", `${label}: ${surface.table}`);
+    assert.equal(surface.http_status, httpStatus, `${label}: ${surface.table}`);
+  }
+  assert.equal(result.recommendedNextStep, mode.step(evidence), label);
+  assert.deepEqual(result.notes.slice(1), [
+    "0/27 audit tables are readable; 0/9 core tables are readable.",
+    `Permissions were not checked because ServiceNow rejected the ${mode.kind}; the denied probes do not mean permissions are missing.`,
+  ], `${label}: no Degraded note lists the tables`);
+  assertFragmentsAbsent(assert, JSON.stringify(result), SNOW_REJECTED_SECRETS, label);
+}
+
+test("checkServicenowAccess reports failed and names the credential settings when every probe returns 401, for basic auth, a pre-issued token, and each OAuth grant", async () => {
+  for (const mode of SNOW_REJECTED_MODES) {
+    const { fetchImpl, requests } = snowRejectingFetch();
+    const result = await snowAccessCheck(mode.config, fetchImpl);
+    assertSnowRejected(result, mode, mode.exchanges ? "the token request returned 401" : "every probe returned 401", 401, mode.label);
+    if (mode.exchanges) {
+      assert.ok(requests.every((path) => path === "/oauth_token.do"), `${mode.label}: no Table API request is sent without a bearer token`);
+    } else {
+      assert.ok(!requests.includes("/oauth_token.do"), `${mode.label}: no token exchange is attempted`);
+    }
+  }
+});
+
+test("checkServicenowAccess also reports failed when ServiceNow issues a token and refuses it on every probe, or refuses the token request with an OAuth credential error", async () => {
+  for (const mode of SNOW_REJECTED_MODES.filter((item) => item.exchanges)) {
+    assertSnowRejected(await snowAccessCheck(mode.config, snowRejectingFetch(snowIssuedToken).fetchImpl), mode, "every probe returned 401", 401, `${mode.label}, token issued`);
+    for (const code of ["invalid_client", "invalid_grant", "unauthorized_client"]) {
+      const result = await snowAccessCheck(mode.config, snowRejectingFetch(snowRefusedToken(code)).fetchImpl);
+      assertSnowRejected(result, mode, `the token request returned ${code}`, 400, `${mode.label}, ${code}`);
+    }
+  }
+});
+
+test("checkServicenowAccess keeps the limited result and role advice when any probe reads, when every table is denied with 403, or when the token request fails without a credential error", async () => {
+  const assertLimited = (result, label) => {
+    assert.equal(result.status, "limited", label);
+    assert.equal(result.recommendedNextStep, SNOW_LIMITED_NEXT_STEP, label);
+    assert.ok(result.notes.some((note) => note.startsWith("Degraded: ")), `${label}: the Degraded note lists the unreadable tables`);
+    assert.ok(!result.notes.some((note) => note.startsWith("Permissions were not checked")), label);
+    assert.ok(!result.surfaces.some((surface) => surface.status === "unauthorized"), `${label}: no surface is relabeled`);
+  };
+  const healthy = fixtureFetch(healthyFixture(), { oauthToken: "issued-bearer-value" }).fetchImpl;
+  const partly = (keep) => async (input, init) => (keep(new URL(String(input))) ? healthy(input, init) : snowUnauthorized());
+  const clientCredentials = SNOW_REJECTED_MODES.find((mode) => mode.label === "client_credentials grant").config;
+
+  const identityOnly = await snowAccessCheck({}, partly((url) => (url.searchParams.get("sysparm_query") ?? "").includes("getUserID")));
+  assertLimited(identityOnly, "identity lookup readable");
+  assert.equal(identityOnly.identity, "audit.reader");
+  assert.ok(identityOnly.surfaces.every((surface) => surface.status === "forbidden" && surface.http_status === 401));
+
+  assertLimited(await snowAccessCheck({}, partly((url) => url.pathname.startsWith("/api/now/stats/"))), "aggregate counts readable");
+  assertLimited(await snowAccessCheck(clientCredentials, partly((url) => url.pathname === "/oauth_token.do" || url.pathname.endsWith("/sys_properties"))), "one table readable over OAuth");
+
+  const denied = await snowAccessCheck({}, fixtureFetch(healthyFixture(), { forbidAll: true }).fetchImpl);
+  assertLimited(denied, "every table 403");
+  assert.ok(denied.surfaces.every((surface) => surface.status === "forbidden" && surface.http_status === 403));
+
+  const unsupported = await snowAccessCheck(clientCredentials, snowRejectingFetch(snowRefusedToken("unsupported_grant_type")).fetchImpl);
+  assertLimited(unsupported, "token request 400 unsupported_grant_type");
+  assert.ok(unsupported.surfaces.every((surface) => surface.status === "not_readable" && surface.http_status === 400));
+});
+
+test("servicenow_check_access renders the failed result with the credential settings and without the role advice", async () => {
+  const registered = [];
+  registerServicenowTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "servicenow_check_access");
+  const scratch = createTempBase("servicenow-rejected-tool-");
+  const configPath = join(scratch, "servicenow.yaml");
+  writeFileSync(configPath, "servicenow:\n  page_size: 100\n");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = snowRejectingFetch().fetchImpl;
+  let result;
+  try {
+    result = await checkAccess.execute("call-rejected-basic", checkAccess.prepareArguments({
+      instance: "dev12345",
+      auth_method: "basic",
+      username: "audit.reader",
+      password: SNOW_CANARY.password,
+      config_file: configPath,
+    }));
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(scratch, { recursive: true, force: true });
+  }
+  const text = result.content[0].text;
+  assert.equal(result.details.status, "failed");
+  assert.match(text, /^ServiceNow access check: failed$/m);
+  assert.ok(text.includes(`Next: ${SNOW_REJECTED_MODES[0].step("every probe returned 401")}`), text);
+  assert.ok(text.includes("Permissions were not checked because ServiceNow rejected the username and password; the denied probes do not mean permissions are missing."), text);
+  assert.doesNotMatch(text, /scoped read role|Degraded:/);
+  assertFragmentsAbsent(assert, `${text}\n${JSON.stringify(result.details)}`, SNOW_REJECTED_SECRETS, "rendered access check");
+});
+
+test("servicenow_check_access names SERVICENOW_TOKEN and SERVICENOW_INSTANCE_URL in the failed next step when the rejected token and the instance come from those aliases", async () => {
+  const registered = [];
+  registerServicenowTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "servicenow_check_access");
+  const scratch = createTempBase("servicenow-rejected-alias-");
+  const configPath = join(scratch, "servicenow.yaml");
+  writeFileSync(configPath, "servicenow:\n  page_size: 100\n");
+  const savedEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("SERVICENOW_")));
+  const clearEnv = () => {
+    for (const key of Object.keys(process.env)) if (key.startsWith("SERVICENOW_")) delete process.env[key];
+  };
+  const rejecting = snowRejectingFetch();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = rejecting.fetchImpl;
+  let result;
+  try {
+    clearEnv();
+    Object.assign(process.env, { SERVICENOW_TOKEN: SNOW_CANARY.accessToken, SERVICENOW_INSTANCE_URL: "https://dev12345.service-now.com" });
+    result = await checkAccess.execute("call-rejected-alias", checkAccess.prepareArguments({ config_file: configPath }));
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearEnv();
+    Object.assign(process.env, savedEnv);
+    rmSync(scratch, { recursive: true, force: true });
+  }
+  const text = result.content[0].text;
+  assert.equal(result.details.status, "failed");
+  assert.equal(result.details.authMode, "oauth");
+  assert.ok(!rejecting.requests.includes("/oauth_token.do"), "the pre-issued token is sent as is");
+  assert.ok(text.endsWith(`Next: ${SNOW_REJECTED_MODES[1].step("every probe returned 401")}`), text);
+  assert.ok(text.includes("Permissions were not checked because ServiceNow rejected the access token; the denied probes do not mean permissions are missing."), text);
+  assertFragmentsAbsent(assert, `${text}\n${JSON.stringify(result.details)}`, SNOW_REJECTED_SECRETS, "rendered access check");
+});
+
+test("round 7 note 1, rejected credentials: every failed access check next step and note comes back from redactSecrets unchanged", async () => {
+  const texts = new Set();
+  for (const mode of SNOW_REJECTED_MODES) {
+    const tokens = mode.exchanges ? [undefined, snowIssuedToken, ...["invalid_client", "invalid_grant", "unauthorized_client"].map(snowRefusedToken)] : [undefined];
+    for (const token of tokens) {
+      const result = await snowAccessCheck(mode.config, snowRejectingFetch(token).fetchImpl);
+      assert.equal(result.status, "failed", mode.label);
+      texts.add(result.recommendedNextStep);
+      for (const note of result.notes.slice(1)) texts.add(note);
+    }
+  }
+  const checked = assertFixedTextsSurvive((text) => redactSecrets(text, []), texts, "ServiceNow rejected-credential texts");
+  assert.equal(checked, 23, "every mode, grant, and evidence renders its own next step, plus one permissions note per credential kind and the shared count note");
+});

@@ -282,7 +282,7 @@ export function countCoreData(count: CountResult): CountResult | NotCollectedMar
 export interface ServicenowAccessSurface {
   name: string;
   table: string;
-  status: "readable" | "forbidden" | "acl_filtered" | "not_readable";
+  status: "readable" | "forbidden" | "acl_filtered" | "not_readable" | "unauthorized";
   /** Rows the probe returned; absent when the Table API read was not answered with rows. */
   visible?: number;
   /** Aggregate count, or the X-Total-Count header when the aggregate failed; absent when neither request answered. */
@@ -293,7 +293,7 @@ export interface ServicenowAccessSurface {
 }
 
 export interface ServicenowAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   instanceUrl: string;
   authMode: ServicenowAuthMode;
   identity?: string;
@@ -1068,6 +1068,15 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+const REJECTED_TOKEN_ERRORS = new Set(["invalid_client", "invalid_grant", "unauthorized_client"]);
+const TOKEN_REQUEST_FAILURE = /^ServiceNow OAuth token request failed \((\d{3})\b[^)]*\) for \/oauth_token\.do(?:: (invalid_client|invalid_grant|unauthorized_client)\b)?/;
+
+/** ServiceNow refused the credential itself: a 401 from any request, or a token request refused with an OAuth credential error. */
+function isRejectedCredentials(result: { statusCode?: number; error?: string }): boolean {
+  if (result.statusCode === 401) return true;
+  return result.statusCode === 400 && TOKEN_REQUEST_FAILURE.exec(result.error ?? "")?.[2] !== undefined;
+}
+
 /**
  * Judges a server-supplied URL before it is requested. requestJson attaches the Authorization header
  * to whatever it fetches, so a URL is requested only when it resolves to the configured instance
@@ -1309,7 +1318,11 @@ export class ServicenowApiClient implements ServicenowReadClient {
     const parsed = parseJsonBody(rawText);
     const payload: JsonRecord = parsed ?? {};
     if (!response.ok) {
-      const detail = servicenowErrorDetail(payload) ?? asString(payload.error) ?? (rawText.length > 0 ? describeOpaqueBody(response, rawText, parsed !== undefined) : undefined);
+      const oauthError = asString(payload.error);
+      // A credential refusal keeps its OAuth error code ahead of the description, so the access check can tell it from other 400s.
+      const detail = response.status === 400 && oauthError !== undefined && REJECTED_TOKEN_ERRORS.has(oauthError)
+        ? [oauthError, servicenowErrorDetail(payload)].filter(Boolean).join(": ")
+        : servicenowErrorDetail(payload) ?? oauthError ?? (rawText.length > 0 ? describeOpaqueBody(response, rawText, parsed !== undefined) : undefined);
       // detail passes through the client's redact too: it knows the configured credentials, including
       // ones shorter than the remembered-secret minimum that the constructor's pass cannot see.
       throw new ServicenowApiError(
@@ -3800,14 +3813,18 @@ const ACCESS_SURFACES: Array<{ name: string; table: string }> = [
 
 const CORE_ACCESS_SURFACES = new Set(["users", "user_roles", "roles", "system_properties", "acls", "acl_roles", "audit", "update_sets", "dictionary"]);
 
+type ServicenowRequestOutcome = Pick<TableSnapshot, "statusCode" | "error">;
+
 async function probeSurface(
   client: Pick<ServicenowReadClient, "queryTable" | "countRecords">,
   surface: { name: string; table: string },
+  rejections: Map<string, ServicenowRequestOutcome[]>,
 ): Promise<ServicenowAccessSurface> {
   const [snapshot, count] = await Promise.all([
     readTable(client, surface.table, { fields: ["sys_id"], limit: 1, pageSize: 1 }),
     client.countRecords(surface.table),
   ]);
+  if (isRejectedCredentials(snapshot) && isRejectedCredentials(count)) rejections.set(surface.name, [snapshot, count]);
   const total = count.count ?? snapshot.total;
   if (snapshot.error) {
     return {
@@ -3838,11 +3855,16 @@ export async function checkServicenowAccess(
   const config = client.getResolvedConfig();
   const whoami = await readTable(client, "sys_user", { query: "sys_id=javascript:gs.getUserID()", fields: ["user_name", "name"], limit: 1, pageSize: 1 });
   const identity = whoami.rows[0] ? rowString(whoami.rows[0], "user_name") ?? rowString(whoami.rows[0], "name") : undefined;
-  const surfaces = await Promise.all(ACCESS_SURFACES.map((surface) => probeSurface(client, surface)));
+  const rejections = new Map<string, ServicenowRequestOutcome[]>();
+  const probed = await Promise.all(ACCESS_SURFACES.map((surface) => probeSurface(client, surface, rejections)));
+  const rejected = isRejectedCredentials(whoami) && probed.every((surface) => rejections.has(surface.name));
+  // A rejected credential is refused on every table whatever the account's roles, so its denials name no missing role.
+  const surfaces = rejected ? probed.map((surface): ServicenowAccessSurface => ({ ...surface, status: "unauthorized" })) : probed;
   const readable = surfaces.filter((surface) => surface.status === "readable");
   const coreReadable = readable.filter((surface) => CORE_ACCESS_SURFACES.has(surface.name)).length;
-  const status = coreReadable === CORE_ACCESS_SURFACES.size ? "healthy" : "limited";
+  const status: ServicenowAccessCheckResult["status"] = rejected ? "failed" : coreReadable === CORE_ACCESS_SURFACES.size ? "healthy" : "limited";
   const degraded = surfaces.filter((surface) => surface.status !== "readable");
+  const credential = rejectedCredential(config, [whoami, ...probed.flatMap((surface) => rejections.get(surface.name) ?? [])]);
 
   return {
     status,
@@ -3853,12 +3875,81 @@ export async function checkServicenowAccess(
     notes: [
       `Instance ${config.instanceUrl} via ${config.authMode} auth${identity ? ` as ${identity}` : whoami.error ? ` (identity lookup failed: ${whoami.error})` : ""}.`,
       `${readable.length}/${surfaces.length} audit tables are readable; ${coreReadable}/${CORE_ACCESS_SURFACES.size} core tables are readable.`,
-      ...(degraded.length > 0 ? [`Degraded: ${degraded.map((surface) => `${surface.table} (${surface.status})`).join(", ")}.`] : []),
+      ...(rejected
+        ? [`Permissions were not checked because ServiceNow rejected the ${credential.kind}; the denied probes do not mean permissions are missing.`]
+        : degraded.length > 0 ? [`Degraded: ${degraded.map((surface) => `${surface.table} (${surface.status})`).join(", ")}.`] : []),
     ],
-    recommendedNextStep: status === "healthy"
-      ? "Run servicenow_assess_identity_access, servicenow_assess_platform_hardening, servicenow_assess_access_control, servicenow_assess_operations_governance, or servicenow_export_audit_bundle."
-      : "Grant the audit account admin (read) or a scoped read role over the listed tables; forbidden or ACL-filtered tables render as manual findings.",
+    recommendedNextStep: accessCheckNextStep(status, credential),
   };
+}
+
+interface ServicenowRejectedCredential {
+  kind: string;
+  step: string;
+}
+
+/** Names the credential the configuration presents and the settings that supply it, for the failed access check. */
+function rejectedCredential(config: ServicenowResolvedConfig, outcomes: ServicenowRequestOutcome[]): ServicenowRejectedCredential {
+  const tokenFailure = outcomes.map((outcome) => TOKEN_REQUEST_FAILURE.exec(outcome.error ?? "")).find((match) => match !== null);
+  const evidence = tokenFailure ? `the token request returned ${tokenFailure[1] === "400" ? tokenFailure[2] : tokenFailure[1]}` : "every probe returned 401";
+  const configFile = "or the same keys in SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml";
+  const instance = "check that SERVICENOW_URL (or SERVICENOW_INSTANCE_URL) or SERVICENOW_INSTANCE (or the instance_url or instance arguments) names the right instance";
+  switch (config.authMode) {
+    case "basic":
+      return {
+        kind: "username and password",
+        step: `ServiceNow rejected the username and password (${evidence}). Set SERVICENOW_USERNAME and SERVICENOW_PASSWORD (or the username and password arguments, ${configFile}), and ${instance}, then rerun servicenow_check_access.`,
+      };
+    case "oauth":
+      // The client sends a pre-issued access token as given and never exchanges it; otherwise the first exchange
+      // uses the refresh_token grant when a refresh token is set, then the password grant, then client_credentials.
+      if (config.accessToken) {
+        return {
+          kind: "access token",
+          step: `ServiceNow rejected the access token (${evidence}). Set SERVICENOW_ACCESS_TOKEN (or SERVICENOW_TOKEN, or the access_token argument, or the same key in SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml) to a current token, and ${instance}, then rerun servicenow_check_access.`,
+        };
+      }
+      if (config.refreshToken) {
+        return {
+          kind: "OAuth refresh token",
+          step: `ServiceNow rejected the OAuth refresh token (${evidence}). Check SERVICENOW_REFRESH_TOKEN, SERVICENOW_CLIENT_ID, and SERVICENOW_CLIENT_SECRET (or the refresh_token, client_id, and client_secret arguments, ${configFile}), and ${instance}, then rerun servicenow_check_access.`,
+        };
+      }
+      if (config.username && config.password) {
+        return {
+          kind: "OAuth password grant credentials",
+          step: `ServiceNow rejected the OAuth password grant credentials (${evidence}). Check SERVICENOW_CLIENT_ID, SERVICENOW_CLIENT_SECRET, SERVICENOW_USERNAME, and SERVICENOW_PASSWORD (or the client_id, client_secret, username, and password arguments, ${configFile}), and ${instance}, then rerun servicenow_check_access.`,
+        };
+      }
+      return {
+        kind: "OAuth client credentials",
+        step: `ServiceNow rejected the OAuth client credentials (${evidence}). Check SERVICENOW_CLIENT_ID and SERVICENOW_CLIENT_SECRET (or the client_id and client_secret arguments, ${configFile}), ${instance}, and confirm the instance allows the client_credentials grant for this client (glide.oauth.inbound.client.credential.grant_type.enabled set to true, and an OAuth Application User on its Application Registry record), then rerun servicenow_check_access.`,
+      };
+    case "mtls":
+      return {
+        kind: "mutual TLS configuration",
+        step: "ServiceNow mutual TLS is not supported by this runtime; set SERVICENOW_AUTH_METHOD (or the auth_method argument) to basic or oauth, then rerun servicenow_check_access.",
+      };
+    default: {
+      const exhaustive: never = config.authMode;
+      throw new Error(`Unhandled ServiceNow auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: ServicenowAccessCheckResult["status"], credential: ServicenowRejectedCredential): string {
+  switch (status) {
+    case "healthy":
+      return "Run servicenow_assess_identity_access, servicenow_assess_platform_hardening, servicenow_assess_access_control, servicenow_assess_operations_governance, or servicenow_export_audit_bundle.";
+    case "limited":
+      return "Grant the audit account admin (read) or a scoped read role over the listed tables; forbidden or ACL-filtered tables render as manual findings.";
+    case "failed":
+      return credential.step;
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled ServiceNow access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function severityRank(severity: ServicenowSeverity): number {
