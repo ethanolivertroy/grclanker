@@ -79,7 +79,7 @@ All tools accept the shared authentication arguments `api_key`, `account_id`, `r
 
 ### `newrelic_check_access`
 
-Probes each read surface the assessments depend on and reports `healthy` or `limited`, or `failed` when every NerdGraph and REST API v2 request it sends returns `401` because New Relic rejected the API key. A `failed` next step names `NEW_RELIC_API_KEY` and `NEW_RELIC_REGION` instead of the role recommendation.
+Probes each read surface the assessments depend on and reports `healthy` or `limited`, or `failed` when New Relic rejects the API key on every NerdGraph and REST API v2 request it sends. NerdGraph rejects a key with `401` or with an error whose `extensions.error_code` is `BAD_API_KEY`, which can arrive with HTTP 200; REST API v2 rejects one with `401`. A `failed` next step says which of those the probes returned and names `NEW_RELIC_API_KEY` and `NEW_RELIC_REGION` instead of the role recommendation.
 
 Required surfaces:
 

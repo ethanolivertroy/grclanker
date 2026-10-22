@@ -1460,13 +1460,17 @@ test("rejected-key planted value self-check: the key body is alphanumeric and no
 
 /**
  * Answers every NerdGraph POST and REST API v2 GET with `status` and documented error fields echoing the configured
- * key, except the NerdGraph queries `readable` returns data for.
+ * key, except the NerdGraph queries `readable` returns data for. With `nerdgraph`, NerdGraph instead answers
+ * `{ data: null, errors: [...] }` on `nerdgraph.status`, its one error carrying `nerdgraph.extensions`.
  */
-function refusingNewrelicFetch({ status = 401, readable = () => undefined } = {}) {
+function refusingNewrelicFetch({ status = 401, readable = () => undefined, nerdgraph } = {}) {
   return async (_input, init = {}) => {
     if ((init.method ?? "GET").toUpperCase() === "POST") {
       const data = readable(JSON.parse(init.body).query);
       if (data) return jsonResponse({ data });
+      if (nerdgraph) {
+        return jsonResponse({ data: null, errors: [{ message: `Invalid API key ${REJECTED_KEY}`, extensions: nerdgraph.extensions }] }, { status: nerdgraph.status });
+      }
     }
     return jsonResponse({ errors: [{ message: `Invalid API key ${REJECTED_KEY}` }], error: { title: `Invalid API key ${REJECTED_KEY}` } }, { status });
   };
@@ -1521,6 +1525,33 @@ test("newrelic_check_access reports failed in the configured region and leaves o
   assertRejectedKeyOutput(run, "EU without an account ID");
 });
 
+test("newrelic_check_access reports failed when NerdGraph answers BAD_API_KEY, on HTTP 200 with an errors array or on an error status, and REST API v2 returns 401", async () => {
+  const badApiKeyStep = "New Relic rejected the API key (every probe returned 401 or BAD_API_KEY). Set NEW_RELIC_API_KEY (or the api_key argument or config.yaml key) to a valid User API key, and NEW_RELIC_REGION (or the region argument) if the account is not in the US region, then rerun newrelic_check_access.";
+  const only401Step = "New Relic rejected the API key (every probe returned 401). Set NEW_RELIC_API_KEY (or the api_key argument or config.yaml key) to a valid User API key, and NEW_RELIC_REGION (or the region argument) if the account is not in the US region, then rerun newrelic_check_access.";
+  for (const [nerdgraphStatus, message, nerdgraphError] of [
+    [200, badApiKeyStep, /^NerdGraph returned errors: Invalid API key /],
+    [403, badApiKeyStep, /^NerdGraph request failed \(403\b.*: Invalid API key /],
+    [401, only401Step, /^NerdGraph request failed \(401\b.*: Invalid API key /],
+  ]) {
+    const label = `BAD_API_KEY on HTTP ${nerdgraphStatus}`;
+    const run = await runNewrelicCheckAccessTool(
+      { account_id: "1234567" },
+      refusingNewrelicFetch({ nerdgraph: { status: nerdgraphStatus, extensions: { error_code: "BAD_API_KEY" } } }),
+    );
+    const restSurface = run.details.surfaces.find((surface) => surface.name === "rest_v2_users");
+    const nerdgraphSurfaces = run.details.surfaces.filter((surface) => surface !== restSurface);
+
+    assert.equal(run.details.status, "failed", label);
+    assert.equal(run.details.recommendedNextStep, message, label);
+    assert.ok(run.text.startsWith("New Relic access check: failed\n") && run.text.endsWith(`\nNext: ${message}`), label);
+    assert.equal(nerdgraphSurfaces.length, 11, label);
+    assert.ok(nerdgraphSurfaces.every((surface) => surface.status === "not_readable" && nerdgraphError.test(surface.error)), label);
+    assert.match(restSurface.error, /\(401\b/, label);
+    assertFragmentsAbsent(assert, `${run.text}\n${JSON.stringify(run.details)}`, [REJECTED_KEY_BODY], `${label}: rendered output and serialized result`);
+    assertRejectedKeyOutput(run, label);
+  }
+});
+
 test("newrelic_check_access keeps the limited status and the role advice when actor.user is readable and the rest return 401, or when every probe returns 403", async () => {
   const currentUser = (query) => (query === "{ actor { user { id email name } } }" ? { actor: { user: { id: "u-1", email: "auditor@example.com", name: "Auditor" } } } : undefined);
   const partial = await runNewrelicCheckAccessTool({ account_id: "1234567" }, refusingNewrelicFetch({ readable: currentUser }));
@@ -1532,6 +1563,21 @@ test("newrelic_check_access keeps the limited status and the role advice when ac
     assert.equal(run.details.status, "limited", label);
     assert.equal(run.details.recommendedNextStep, "Use a User API key from a user with Organization manager and Authentication domain manager roles plus access to every account in scope.", label);
     assert.ok(run.details.notes.includes(`Authenticated as ${principal}.`), label);
+    assert.ok(run.details.notes.some((note) => note.startsWith("The role catalog (customerAdministration.roles) is only served to organizations with the multi-tenancy entitlement")), label);
+    assert.doesNotMatch(run.text, /rejected the API key|were not checked/, label);
+  }
+});
+
+test("newrelic_check_access keeps the limited status and the role advice when NerdGraph answers HTTP 200 with an error that is not exactly extensions.error_code BAD_API_KEY and REST API v2 returns 401", async () => {
+  for (const extensions of [{ error_code: "FORBIDDEN" }, { error_code: "bad_api_key" }, { errorClass: "BAD_API_KEY" }]) {
+    const label = JSON.stringify(extensions);
+    const run = await runNewrelicCheckAccessTool({ account_id: "1234567" }, refusingNewrelicFetch({ nerdgraph: { status: 200, extensions } }));
+    const nerdgraphSurfaces = run.details.surfaces.filter((surface) => surface.name !== "rest_v2_users");
+
+    assert.ok(nerdgraphSurfaces.every((surface) => surface.status === "not_readable" && surface.error.startsWith("NerdGraph returned errors: Invalid API key ")), label);
+    assert.equal(run.details.status, "limited", label);
+    assert.equal(run.details.recommendedNextStep, "Use a User API key from a user with Organization manager and Authentication domain manager roles plus access to every account in scope.", label);
+    assert.ok(run.details.notes.includes("Authenticated as unknown user."), label);
     assert.ok(run.details.notes.some((note) => note.startsWith("The role catalog (customerAdministration.roles) is only served to organizations with the multi-tenancy entitlement")), label);
     assert.doesNotMatch(run.text, /rejected the API key|were not checked/, label);
   }
