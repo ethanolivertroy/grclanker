@@ -961,6 +961,109 @@ test("checkZendeskAccess reports limited access and names admin-only surfaces fo
   assert.match(result.recommendedNextStep, /admin API token or OAuth token/);
 });
 
+// Credentials Zendesk refuses outright: every probe answers 401 with a body that echoes them
+// in each encoded form, as a misbehaving proxy might, beside the generic carriers.
+const REJECTED_API_TOKEN = "Tq4Lw9Xc2Nb7Vd5Hk8Rz";
+const REJECTED_OAUTH_TOKEN = "Mf6Yp3Jd8Gs1Kx5Wn2Bv";
+const LIMITED_PERMISSION_STEP = "Use an admin API token or OAuth token with read scope so the admin-only surfaces become readable, then rerun zendesk_check_access.";
+// How a missing role, permission, or scope reads in this module's access check output.
+const PERMISSION_CLAIM = /requires an? (?:agent|admin|Enterprise admin) credential|lacks permission|\bforbidden\b|not an admin|admin API token|read scope|Missing permissions/;
+
+const REJECTED_CREDENTIAL_CASES = [
+  {
+    label: "email and API token",
+    config: sampleConfig({ apiToken: REJECTED_API_TOKEN }),
+    args: { subdomain: "acme", email: "auditor@example.com", api_token: REJECTED_API_TOKEN },
+    secrets: [REJECTED_API_TOKEN, Buffer.from(`auditor@example.com/token:${REJECTED_API_TOKEN}`).toString("base64")],
+    usingNote: "Using Zendesk subdomain acme with API token basic auth.",
+    rolesNote: "Roles were not checked because Zendesk rejected the email and API token; the rejected probes do not mean a role is missing.",
+    step: "Zendesk rejected the email and API token (every probe returned 401). Set ZENDESK_EMAIL and ZENDESK_API_TOKEN (or the email and api_token arguments or config file entries) to a Zendesk sign-in email address and an active API token, with ZENDESK_SUBDOMAIN naming the account that issued the token, then rerun zendesk_check_access.",
+  },
+  {
+    label: "OAuth token",
+    config: sampleConfig({ authMode: "oauth", email: undefined, apiToken: undefined, oauthToken: REJECTED_OAUTH_TOKEN }),
+    args: { subdomain: "acme", oauth_token: REJECTED_OAUTH_TOKEN },
+    secrets: [REJECTED_OAUTH_TOKEN],
+    usingNote: "Using Zendesk subdomain acme with an OAuth bearer token.",
+    rolesNote: "Roles and scopes were not checked because Zendesk rejected the OAuth token; the rejected probes do not mean a role or scope is missing.",
+    step: "Zendesk rejected the OAuth token (every probe returned 401). Set ZENDESK_OAUTH_TOKEN (or the oauth_token argument or config file entry) to a valid, unrevoked OAuth access token, with ZENDESK_SUBDOMAIN naming the account that issued it, then rerun zendesk_check_access.",
+  },
+];
+
+function rejectedCredentialResponse(secrets) {
+  return jsonResponse(
+    { error: "Couldn't authenticate you", description: `credentials ${secrets.flatMap(secretForms).join(" ")} rejected; Bearer ${CANARY_BEARER} _zendesk_session=${CANARY_SESSION} api_key=${CANARY_API_KEY} at ${CANARY_URL}` },
+    { status: 401, statusText: "Unauthorized" },
+  );
+}
+
+function rejectedCredentialCanaries(secrets) {
+  return [...secrets.flatMap(secretForms), CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN];
+}
+
+test("checkZendeskAccess reports failed with a plain credential step and no role or scope claim when every probe returns 401", async () => {
+  for (const { label, config, secrets, usingNote, rolesNote, step } of REJECTED_CREDENTIAL_CASES) {
+    const result = await checkZendeskAccess(new ZendeskApiClient(config, { fetchImpl: async () => rejectedCredentialResponse(secrets) }));
+    assert.equal(result.status, "failed", label);
+    assert.equal(result.surfaces.length, 20, label);
+    assert.ok(result.surfaces.every((surface) => surface.status === "unauthorized" && surface.httpStatus === 401 && surface.count === null), label);
+    assert.ok(result.surfaces.every((surface) => /\b401\b/.test(surface.error ?? "")), `${label}: each surface keeps the 401 it observed`);
+    assert.deepEqual(result.missingPermissions, [], label);
+    assert.equal(result.currentUserRole, undefined, label);
+    assert.deepEqual(result.notes, [usingNote, "0/20 Zendesk audit surfaces are readable; every probe returned 401.", rolesNote], label);
+    assert.equal(result.recommendedNextStep, step, label);
+    const text = JSON.stringify(result);
+    assert.doesNotMatch(text, PERMISSION_CLAIM, label);
+    assertNoCanary(text, label, rejectedCredentialCanaries(secrets));
+  }
+});
+
+test("zendesk_check_access tool returns the failed status and the plain credential step without leaking the rejected credentials", async () => {
+  const tools = new Map();
+  registerZendeskTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const check = tools.get("zendesk_check_access");
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const { label, args, secrets, step } of REJECTED_CREDENTIAL_CASES) {
+      globalThis.fetch = async () => rejectedCredentialResponse(secrets);
+      const output = await check.execute("call-rejected", check.prepareArguments(args));
+      assert.notEqual(output.isError, true, label);
+      assert.equal(output.details.status, "failed", label);
+      assert.equal(output.details.recommendedNextStep, step, label);
+      assert.deepEqual(output.details.missingPermissions, [], label);
+      const text = output.content[0].text;
+      assert.match(text, /^Zendesk access check: failed\n/, label);
+      assert.ok(text.endsWith(`\nNext: ${step}`), label);
+      const serialized = JSON.stringify(output);
+      assert.doesNotMatch(serialized, PERMISSION_CLAIM, label);
+      assertNoCanary(serialized, label, rejectedCredentialCanaries(secrets));
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("checkZendeskAccess keeps the limited status and its role wording when a probe reads or a refusal is a 403", async () => {
+  const forbiddenResponse = () => jsonResponse({ error: "Forbidden", description: "You do not have access to this page." }, { status: 403, statusText: "Forbidden" });
+  const rejected = () => rejectedCredentialResponse([REJECTED_API_TOKEN]);
+  const runs = [
+    { label: "one readable probe among 401s", readable: 1, respond: (path) => (path.endsWith("/users/me") ? jsonResponse({ user: { id: 7, email: "auditor@example.com", role: "admin" } }) : rejected()) },
+    { label: "every probe refused with 403", readable: 0, respond: forbiddenResponse },
+    { label: "401s with one 403", readable: 0, respond: (path) => (path.endsWith("/users/me") ? forbiddenResponse() : rejected()) },
+  ];
+  for (const { label, readable, respond } of runs) {
+    const fetchImpl = async (url) => respond(new URL(url).pathname);
+    const result = await checkZendeskAccess(new ZendeskApiClient(sampleConfig({ apiToken: REJECTED_API_TOKEN }), { fetchImpl }));
+    assert.equal(result.status, "limited", label);
+    assert.ok(result.surfaces.every((surface) => surface.status === (surface.httpStatus === null ? "readable" : "forbidden")), label);
+    assert.equal(result.missingPermissions.length, 20 - readable, label);
+    assert.ok(result.missingPermissions.every((item) => /requires an? (?:agent|admin|Enterprise admin) credential \(\/api\/v2\//.test(item)), label);
+    assert.ok(result.notes.includes(`${readable}/20 Zendesk audit surfaces are readable.`), label);
+    assert.ok(!result.notes.some((note) => /were not checked/.test(note)), label);
+    assert.equal(result.recommendedNextStep, LIMITED_PERMISSION_STEP, label);
+  }
+});
+
 test("assessZendeskAuthentication passes controls 1-5 and 21 from documented security settings on a compliant tenant", async () => {
   const result = await assessZendeskAuthentication(healthyClient(), { now: () => NOW });
   assert.equal(result.findings.length, 6);
@@ -3432,7 +3535,7 @@ function assertNoCanary(text, label, canaries = CANARIES) {
 // rules run on their own (hyphenated words with one digit group), the plain lowercase word
 // that only the Bearer scheme gives away, and the Slack path (the documented T/B/secret
 // shape, the whole path being the secret).
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_NEXT_LINK, CANARY_APOSTROPHE, CANARY_USERINFO, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_NEXT_LINK, CANARY_APOSTROPHE, CANARY_USERINFO, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN, REJECTED_API_TOKEN, REJECTED_OAUTH_TOKEN];
 const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_APOSTROPHE, CANARY_PLAIN, FIXTURE_API_TOKEN, FAKE_ZENDESK_SECRETS.slackWebhookPath]);
 
 // Every HTTP surface ZendeskApiClient reads, keyed by path (the three /audit_logs reads are

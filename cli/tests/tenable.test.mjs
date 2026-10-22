@@ -2580,6 +2580,132 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
   }
 });
 
+const TENABLE_REJECTED_VM_STEP = "Tenable rejected the API keys (every probe returned 401). Set TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY (or the access_key and secret_key arguments or config file entries) to a valid key pair, with TENABLE_URL pointing at the platform that issued it, then rerun tenable_check_access.";
+const TENABLE_REJECTED_SC_STEP = "Tenable Security Center rejected the API keys (every probe returned 401). Set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or the sc_access_key and sc_secret_key arguments or config file entries) to a valid key pair, with TENABLE_SC_URL (or TENABLE_URL) pointing at the Security Center that issued it, then rerun tenable_check_access.";
+const TENABLE_REJECTED_BOTH_STEP = "Tenable rejected both API key pairs (every probe returned 401). Set TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY for the platform at TENABLE_URL and TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY for the Security Center at TENABLE_SC_URL (or the matching access_key, secret_key, sc_access_key, and sc_secret_key arguments or config file entries), then rerun tenable_check_access.";
+const TENABLE_ROLE_GAP_STEP = "Generate API keys for an Administrator [64] user (Settings > My Account > API Keys) so every surface is readable, or accept manual verdicts for refused surfaces.";
+// The wording that blames a role. A rejected key pair says nothing about roles, so none of it may appear.
+const TENABLE_ROLE_CLAIMS = /requires role|refused the API key|below Administrator|Generate API keys|Caller role|forbidden/;
+// Random-looking Security Center keys: the SC fixture keys hold the words "access" and
+// "secret", which the rejected-key messages legitimately carry.
+const REJECTED_SC_KEYS = { sc_access_key: "Wd3qLx8RkT5vNcGy", sc_secret_key: "Pz6hJm2YgB9sFeUo" };
+const REJECTED_KEY_CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, ...ECHOED_FORMS, ...Object.values(REJECTED_SC_KEYS).flatMap(secretForms)];
+
+// A 401 whose documented fields echo the run's configured keys in every encoded form beside
+// a bearer token, a session pair, and an API key pair.
+function unauthorizedCanaryResponse(configuredKeys) {
+  return new Response(JSON.stringify({
+    statusCode: 401,
+    error: `Unauthorized; Bearer ${CANARY_BEARER} refused; session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}`,
+    message: `Invalid Credentials ${configuredKeys.flatMap(secretForms).join(" ")}`,
+  }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } });
+}
+
+// Clients over every Vulnerability Management and Security Center route, answering each
+// request with the status statusFor picks: 401 and 403 as refusals, anything else as routed.
+// A 401 echoes the key pair its own platform was sent, as a real server would.
+function statusClients(config, statusFor) {
+  const fallback = routerFetch({ ...healthyRoutes(), ...healthyScRoutes() });
+  const sentKeys = (url) => (config.vm && new URL(url).origin === new URL(config.vm.baseUrl).origin
+    ? [config.vm.accessKey, config.vm.secretKey]
+    : [config.securityCenter.accessKey, config.securityCenter.secretKey]);
+  return createTenableClients(config, {
+    fetchImpl: async (url, init) => {
+      const status = statusFor(`${(init?.method ?? "GET").toUpperCase()} ${new URL(url).pathname}`);
+      if (status === 401) return unauthorizedCanaryResponse(sentKeys(url));
+      if (status === 403) return jsonResponse({ statusCode: 403, error: "Forbidden", message: "Forbidden" }, 403);
+      return fallback(url, init);
+    },
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+}
+
+test("checkTenableAccess reports failed and names the key pair settings, never a role, when every configured surface returns 401", async () => {
+  const scOnly = resolveTenableConfiguration({ url: "https://sc.example.internal", ...REJECTED_SC_KEYS, config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV);
+  const cases = [
+    { label: "Vulnerability Management", config: vmConfig(), step: TENABLE_REJECTED_VM_STEP, probed: 19 },
+    { label: "Security Center", config: scOnly, step: TENABLE_REJECTED_SC_STEP, probed: 4 },
+    { label: "both platforms", config: vmConfig({ sc_url: "https://sc.example.internal", ...REJECTED_SC_KEYS }), step: TENABLE_REJECTED_BOTH_STEP, probed: 23 },
+  ];
+  for (const { label, config, step, probed } of cases) {
+    const result = await checkTenableAccess(statusClients(config, () => 401));
+    assert.equal(result.status, "failed", label);
+    assert.equal(result.recommendedNextStep, step, label);
+    const configured = result.surfaces.filter((surface) => surface.status !== "not_configured");
+    assert.equal(configured.length, probed, label);
+    for (const surface of configured) {
+      assert.equal(surface.status, "unauthorized", `${label}: ${surface.name}`);
+      assert.equal(surface.httpStatus, 401, `${label}: ${surface.name}`);
+    }
+    assert.deepEqual(result.notes.slice(1), [
+      `0/${probed} configured audit surfaces are readable; every one returned HTTP 401.`,
+      "Roles were not checked because Tenable rejected the API keys; the rejected probes do not mean a role is missing.",
+    ], label);
+    for (const text of [...result.notes, result.recommendedNextStep]) assert.doesNotMatch(text, TENABLE_ROLE_CLAIMS, `${label}: ${text}`);
+    // Fixed text and setting names only, so the module's own scrub leaves the step whole.
+    assert.equal(redactErrorText(result.recommendedNextStep), result.recommendedNextStep, label);
+    for (const canary of REJECTED_KEY_CANARIES) assertNoWindow(JSON.stringify(result), canary, `${label} access check`);
+  }
+});
+
+test("tenable_check_access renders failed with the key pair settings and leaks no planted value when every probe returns 401", async () => {
+  const tools = new Map();
+  registerTenableTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const tool = tools.get("tenable_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => unauthorizedCanaryResponse([FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]);
+  let result;
+  try {
+    result = await tool.execute("call-rejected-keys", tool.prepareArguments({ access_key: FIXTURE_ACCESS_KEY, secret_key: FIXTURE_SECRET_KEY, config_file: EMPTY_CONFIG_FILE }));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const text = result.content[0].text;
+  assert.notEqual(result.isError, true, text);
+  assert.equal(result.details.status, "failed");
+  assert.match(text, /^Tenable access check: failed$/m);
+  assert.ok(text.includes(`\nNext: ${TENABLE_REJECTED_VM_STEP}`), text);
+  assert.ok(text.includes("Roles were not checked because Tenable rejected the API keys; the rejected probes do not mean a role is missing."), text);
+  assert.doesNotMatch(text, TENABLE_ROLE_CLAIMS);
+  assert.doesNotMatch(JSON.stringify(result.details), TENABLE_ROLE_CLAIMS);
+  for (const canary of REJECTED_KEY_CANARIES) assertNoWindow(`${text}\n${JSON.stringify(result.details)}`, canary, "rendered access check");
+});
+
+test("checkTenableAccess keeps the limited status and role wording when a surface reads or a refusal is not a 401", async () => {
+  const configuredSurfaces = (result) => result.surfaces.filter((surface) => surface.status !== "not_configured");
+
+  // One readable surface proves the keys authenticated, so the other 401s stay role refusals.
+  const partly = await checkTenableAccess(statusClients(vmConfig(), (key) => (key === "GET /server/properties" ? 200 : 401)));
+  assert.equal(partly.status, "limited");
+  assert.equal(partly.recommendedNextStep, TENABLE_ROLE_GAP_STEP);
+  assert.ok(configuredSurfaces(partly).every((surface) => (surface.name === "server_properties" ? surface.status === "readable" : surface.status === "forbidden" && surface.httpStatus === 401)));
+  assert.ok(partly.notes.includes("1/19 configured audit surfaces are readable; 18 refused the API key (HTTP 401) and 0 failed for other reasons."), JSON.stringify(partly.notes));
+  assert.ok(partly.notes.some((note) => note.startsWith("audit_log requires role Administrator; GET /audit-log/v1/events refused the API key with HTTP 401: ")), JSON.stringify(partly.notes));
+  assert.ok(partly.notes.some((note) => note.startsWith("Caller role could not be determined because GET /users refused the API key with HTTP 401: ")), JSON.stringify(partly.notes));
+
+  // Security Center reads while Vulnerability Management returns 401: one platform accepted its keys.
+  const vmRejected = await checkTenableAccess(statusClients(vmConfig({ sc_url: "https://sc.example.internal", ...REJECTED_SC_KEYS }), (key) => (key.startsWith("GET /rest/") ? 200 : 401)));
+  assert.equal(vmRejected.status, "limited");
+  assert.equal(vmRejected.recommendedNextStep, TENABLE_ROLE_GAP_STEP);
+  assert.ok(configuredSurfaces(vmRejected).every((surface) => (surface.name.startsWith("sc_") ? surface.status === "readable" : surface.status === "forbidden")));
+
+  // Every surface refused with 403: the keys authenticated, so the role analysis stands.
+  const forbidden = await checkTenableAccess(statusClients(vmConfig(), () => 403));
+  assert.equal(forbidden.status, "limited");
+  assert.equal(forbidden.recommendedNextStep, TENABLE_ROLE_GAP_STEP);
+  assert.ok(configuredSurfaces(forbidden).every((surface) => surface.status === "forbidden" && surface.httpStatus === 403));
+  assert.ok(forbidden.notes.includes("0/19 configured audit surfaces are readable; 19 refused the API key (HTTP 403) and 0 failed for other reasons."), JSON.stringify(forbidden.notes));
+  assert.ok(forbidden.notes.some((note) => note.startsWith("roles requires role Administrator; ")), JSON.stringify(forbidden.notes));
+
+  // A 403 beside the 401s means not every probe was rejected.
+  const mixed = await checkTenableAccess(statusClients(vmConfig(), (key) => (key === "GET /audit-log/v1/events" ? 403 : 401)));
+  assert.equal(mixed.status, "limited");
+  assert.equal(mixed.recommendedNextStep, TENABLE_ROLE_GAP_STEP);
+  assert.ok(mixed.notes.includes("0/19 configured audit surfaces are readable; 19 refused the API key (HTTP 401, 403) and 0 failed for other reasons."), JSON.stringify(mixed.notes));
+});
+
 test("rule 9: a user-and-secret prefix on a configured Vulnerability Management or Security Center URL leaves with no request and reaches no platform label, metadata.json, executive summary, assessment, or bundle file; configured URLs are written as scheme and host only", async () => {
   const configured = {
     url: `https://vm-operator:${CANARY_USERINFO}@cloud.tenable.com/`,
@@ -2813,7 +2939,7 @@ test("exportTenableAuditBundle never writes policy credentials, scanner linking 
 // shape are the name-shaped values that prove the configured-secret pass and the carrier
 // rules run on their own (hyphenated words with one digit group) and the plain lowercase
 // word that only the Bearer scheme gives away.
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_ESCAPED_HEADER, CANARY_APOSTROPHE, CANARY_USERINFO, ...Object.values(FAKE_TENABLE_SECRETS), FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY];
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_ESCAPED_HEADER, CANARY_APOSTROPHE, CANARY_USERINFO, ...Object.values(FAKE_TENABLE_SECRETS), FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY, ...Object.values(REJECTED_SC_KEYS)];
 const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_ESCAPED_HEADER, CANARY_APOSTROPHE, CANARY_PLAIN, FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]);
 
 test("fixture self-check: planted credentials are alphanumeric and random-looking, share no 6-character window with each other, and no 6-character window of any occurs in the fixtures' legitimate text", async () => {

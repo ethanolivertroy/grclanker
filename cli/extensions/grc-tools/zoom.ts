@@ -198,6 +198,11 @@ export interface ZoomResolvedConfig {
 
 export type ZoomSurfaceStatus = "ok" | "denied" | "error" | "skipped";
 
+/** How a failed request rejected the credentials themselves, as opposed to a scope or a role. */
+type ZoomCredentialRejection =
+  | { source: "api" }
+  | { source: "token_request"; status: number; code?: string };
+
 export interface ZoomSurface<T = unknown> {
   name: string;
   endpoint: string;
@@ -206,6 +211,7 @@ export interface ZoomSurface<T = unknown> {
   data?: T;
   error?: string;
   httpStatus?: number;
+  rejection?: ZoomCredentialRejection;
 }
 
 export interface ZoomListResult<T = JsonRecord> {
@@ -224,7 +230,8 @@ export interface ZoomAccessSurface {
 }
 
 export interface ZoomAccessCheckResult {
-  status: "healthy" | "limited";
+  // failed when every attempted probe was refused for the credentials themselves (a 401 or a refused token request).
+  status: "healthy" | "limited" | "failed";
   accountId: string;
   surfaces: ZoomAccessSurface[];
   notes: string[];
@@ -723,13 +730,33 @@ function zoomErrorSummary(payload: unknown): string | undefined {
 export class ZoomApiError extends Error {
   readonly status: number;
   readonly retryAfterMs?: number;
+  readonly rejection?: ZoomCredentialRejection;
 
-  constructor(message: string, status: number, retryAfterMs?: number) {
+  constructor(message: string, status: number, retryAfterMs?: number, rejection?: ZoomCredentialRejection) {
     super(scrubErrorText(message));
     this.name = "ZoomApiError";
     this.status = status;
     this.retryAfterMs = retryAfterMs;
+    this.rejection = rejection;
   }
+}
+
+/**
+ * OAuth error codes with which the token endpoint refuses the client or the grant itself (RFC 6749 section 5.2),
+ * matched across the documented error fields (message, error, reason, errors[]).
+ */
+const REJECTED_GRANT_CODE = /\b(invalid_client|invalid_grant|unauthorized_client)\b/;
+
+/** A refused token request: HTTP 401, or HTTP 400 with one of the rejected grant codes. */
+function tokenRequestRejection(status: number, body: ParsedJsonBody): ZoomCredentialRejection | undefined {
+  const code = REJECTED_GRANT_CODE.exec((body.parsed ? zoomErrorSummary(body.payload) : undefined) ?? "")?.[1];
+  return status === 401 || (status === 400 && code) ? { source: "token_request", status, ...(code ? { code } : {}) } : undefined;
+}
+
+/** A refused token request or a 401 from the API rejects the credentials; a 403 and every other failure do not. */
+function credentialRejection(error: unknown): ZoomCredentialRejection | undefined {
+  if (!(error instanceof ZoomApiError)) return undefined;
+  return error.rejection ?? (error.status === 401 ? { source: "api" } : undefined);
 }
 
 function isDeniedError(error: unknown): boolean {
@@ -938,7 +965,7 @@ export class ZoomApiClient {
   private async fetchJson(
     url: string,
     init: RequestInit = {},
-    options: { skipAuth?: boolean } = {},
+    options: { skipAuth?: boolean; tokenRequest?: boolean } = {},
   ): Promise<JsonRecord> {
     for (let attempt = 0; ; attempt += 1) {
       const controller = new AbortController();
@@ -962,6 +989,7 @@ export class ZoomApiClient {
             this.describeFailure(url, init.method ?? "GET", response, rawText, body),
             response.status,
             response.status === 429 ? this.parseRetryAfter(response) : undefined,
+            options.tokenRequest ? tokenRequestRejection(response.status, body) : undefined,
           );
         }
         return body.payload;
@@ -1022,7 +1050,7 @@ export class ZoomApiClient {
         "content-type": "application/x-www-form-urlencoded",
       },
       body: body.toString(),
-    }, { skipAuth: true });
+    }, { skipAuth: true, tokenRequest: true });
 
     const accessToken = asString(payload.access_token);
     if (!accessToken) {
@@ -1212,6 +1240,7 @@ async function captureSurface<T>(
     return { name, endpoint, docUrl, status: "ok", data };
   } catch (error) {
     rethrowIfAborted(error);
+    const rejection = credentialRejection(error);
     return {
       name,
       endpoint,
@@ -1219,6 +1248,7 @@ async function captureSurface<T>(
       status: isDeniedError(error) ? "denied" : "error",
       error: errorMessage(error),
       httpStatus: error instanceof ZoomApiError ? error.status : undefined,
+      ...(rejection ? { rejection } : {}),
     };
   }
 }
@@ -1266,6 +1296,12 @@ function surfaceCause(surface: ZoomSurface): string {
       return exhaustive;
     }
   }
+}
+
+/** The cause of a probe refused for the credentials themselves; it names no scope or role, since none was checked. */
+function rejectedSurfaceCause(surface: ZoomSurface): string {
+  const detail = surfaceDetail(surface);
+  return `${surface.endpoint} was not read because Zoom rejected the credentials (${surface.httpStatus})${detail ? `: ${detail}` : ""}`;
 }
 
 function surfaceErrors(surfaces: ZoomSurface[]): string[] {
@@ -2843,28 +2879,49 @@ export async function checkZoomAccess(client: ZoomClientLike, options: ZoomAcces
     ? [`Authenticated as ${asString(currentUser.email) ?? asString(currentUser.first_name) ?? asString(currentUser.id) ?? "current Zoom admin context"}.`]
     : ["Could not read /users/me; Zoom credentials may be invalid or missing required authorization."];
 
-  const toAccessSurface = (surface: ZoomSurface, count?: number): ZoomAccessSurface => ({
+  const keyCount = (surface: ZoomSurface) => Object.keys(asObject(surface.data) ?? {}).length;
+  const listCount = (surface: ZoomSurface<ZoomListResult<unknown>>) => surface.data?.items.length;
+  const probes: Array<{ surface: ZoomSurface; count?: number }> = [
+    { surface: snapshot.currentUser, count: 1 },
+    ...snapshot.settings.settingsSurfaces.map((surface) => ({ surface, count: keyCount(surface) })),
+    ...snapshot.settings.lockSurfaces.map((surface) => ({ surface, count: keyCount(surface) })),
+    { surface: snapshot.users, count: listCount(snapshot.users) },
+    { surface: snapshot.roles, count: listCount(snapshot.roles) },
+    { surface: snapshot.groups, count: listCount(snapshot.groups) },
+    { surface: snapshot.operationLogs, count: listCount(snapshot.operationLogs) },
+    { surface: snapshot.imGroups, count: listCount(snapshot.imGroups) },
+    { surface: snapshot.managedDomains, count: listCount(snapshot.managedDomains) },
+    { surface: snapshot.trustedDomains, count: listCount(snapshot.trustedDomains) },
+    { surface: snapshot.phoneSettings, count: keyCount(snapshot.phoneSettings) },
+  ];
+  // Every attempted probe rejected the credentials themselves, so nothing was learned about scopes or roles.
+  const attempted = probes.map(({ surface }) => surface).filter((surface) => surface.status !== "skipped");
+  const rejections = attempted.flatMap((surface) => (surface.rejection ? [surface.rejection] : []));
+  const credentialsRejected = attempted.length > 0 && rejections.length === attempted.length;
+  const mode: ZoomCredentialMode = config.token ? "token" : "oauth";
+
+  const surfaces: ZoomAccessSurface[] = probes.map(({ surface, count }) => ({
     name: surface.name,
     endpoint: surface.endpoint,
     status: surface.status === "ok" ? "readable" : surface.status === "skipped" ? "not_configured" : "not_readable",
     count: surface.status === "ok" ? count : undefined,
-    error: surface.status === "ok" ? undefined : surfaceCause(surface),
-  });
-  const listCount = (surface: ZoomSurface<ZoomListResult<unknown>>) => surface.data?.items.length;
+    error: surface.status === "ok" ? undefined : credentialsRejected && surface.rejection ? rejectedSurfaceCause(surface) : surfaceCause(surface),
+  }));
 
-  const surfaces: ZoomAccessSurface[] = [
-    toAccessSurface(snapshot.currentUser, 1),
-    ...snapshot.settings.settingsSurfaces.map((surface) => toAccessSurface(surface, Object.keys(asObject(surface.data) ?? {}).length)),
-    ...snapshot.settings.lockSurfaces.map((surface) => toAccessSurface(surface, Object.keys(asObject(surface.data) ?? {}).length)),
-    toAccessSurface(snapshot.users, listCount(snapshot.users)),
-    toAccessSurface(snapshot.roles, listCount(snapshot.roles)),
-    toAccessSurface(snapshot.groups, listCount(snapshot.groups)),
-    toAccessSurface(snapshot.operationLogs, listCount(snapshot.operationLogs)),
-    toAccessSurface(snapshot.imGroups, listCount(snapshot.imGroups)),
-    toAccessSurface(snapshot.managedDomains, listCount(snapshot.managedDomains)),
-    toAccessSurface(snapshot.trustedDomains, listCount(snapshot.trustedDomains)),
-    toAccessSurface(snapshot.phoneSettings, Object.keys(asObject(snapshot.phoneSettings.data) ?? {}).length),
-  ];
+  if (credentialsRejected) {
+    return {
+      status: "failed",
+      accountId: config.accountId,
+      surfaces,
+      notes: [
+        `Using Zoom account ${config.accountId}.`,
+        `0/${surfaces.length} Zoom audit surfaces are readable; ${rejectionEvidence(rejections)}.`,
+        `Scopes and roles were not checked because Zoom rejected the ${credentialKind(mode)}; the rejected probes do not mean a scope or role is missing.`,
+        ...(config.configFile ? [`Configuration file: ${config.configFile}`] : []),
+      ],
+      recommendedNextStep: accessCheckNextStep("failed", mode, rejections),
+    };
+  }
 
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
   const coreSurfaces = ["account_settings", "account_settings:security", "account_settings:meeting_security", "users", "roles", "groups"];
@@ -2881,11 +2938,61 @@ export async function checkZoomAccess(client: ZoomClientLike, options: ZoomAcces
       `${readableCount}/${surfaces.length} Zoom audit surfaces are readable.`,
       ...(config.configFile ? [`Configuration file: ${config.configFile}`] : []),
     ],
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run zoom_assess_identity, zoom_assess_collaboration_governance, zoom_assess_meeting_security, or zoom_export_audit_bundle."
-        : "Grant the Server-to-Server OAuth app account:read:admin, user:read:admin, role:read:admin, group:read:admin, report:read:admin, imgroup:read:admin, and phone:read:admin (or their granular equivalents) and rerun.",
+    recommendedNextStep: accessCheckNextStep(status, mode, rejections),
   };
+}
+
+/** A pre-issued token is used whenever one is configured; the Server-to-Server OAuth credentials only when it is not. */
+type ZoomCredentialMode = "token" | "oauth";
+
+function credentialKind(mode: ZoomCredentialMode): string {
+  switch (mode) {
+    case "token":
+      return "access token";
+    case "oauth":
+      return "OAuth app credentials";
+    default: {
+      const exhaustive: never = mode;
+      throw new Error(`Unhandled Zoom credential mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** A refused token request stops every probe before the API, so its status and OAuth code are the evidence. */
+function rejectionEvidence(rejections: ZoomCredentialRejection[]): string {
+  const tokenRequest = rejections.find((rejection): rejection is Extract<ZoomCredentialRejection, { source: "token_request" }> => rejection.source === "token_request");
+  return tokenRequest
+    ? `the token request returned ${tokenRequest.status}${tokenRequest.code ? ` ${tokenRequest.code}` : ""}`
+    : "every probe returned 401";
+}
+
+// The long-token scrub reads a capitalized "Server-to-Server" as a 16-character token, so the product name stays lowercase here.
+function rejectedCredentialsStep(mode: ZoomCredentialMode, evidence: string): string {
+  switch (mode) {
+    case "token":
+      return `Zoom rejected the ${credentialKind(mode)} (${evidence}). Set ZOOM_TOKEN or ZOOM_ACCESS_TOKEN (or the token argument or config file entry) to an unexpired OAuth access token, or remove the token and set ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET so the tool requests its own token, then rerun zoom_check_access.`;
+    case "oauth":
+      return `Zoom rejected the ${credentialKind(mode)} (${evidence}). Set ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, and ZOOM_CLIENT_SECRET (or the account_id, client_id, and client_secret arguments or config file entries) to the account ID, client ID, and client secret of an activated server-to-server OAuth app, then rerun zoom_check_access.`;
+    default: {
+      const exhaustive: never = mode;
+      throw new Error(`Unhandled Zoom credential mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: ZoomAccessCheckResult["status"], mode: ZoomCredentialMode, rejections: ZoomCredentialRejection[]): string {
+  switch (status) {
+    case "healthy":
+      return "Run zoom_assess_identity, zoom_assess_collaboration_governance, zoom_assess_meeting_security, or zoom_export_audit_bundle.";
+    case "limited":
+      return "Grant the Server-to-Server OAuth app account:read:admin, user:read:admin, role:read:admin, group:read:admin, report:read:admin, imgroup:read:admin, and phone:read:admin (or their granular equivalents) and rerun.";
+    case "failed":
+      return rejectedCredentialsStep(mode, rejectionEvidence(rejections));
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Zoom access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 export async function assessZoomIdentity(
@@ -3269,7 +3376,7 @@ async function checkZoomAccessFromSnapshot(snapshot: ZoomSnapshot, config: ZoomR
 
 function unwrap<T>(surface: ZoomSurface<T>): T {
   if (surface.status === "ok" && surface.data !== undefined) return surface.data;
-  throw new ZoomApiError(surface.error ?? surfaceCause(surface), surface.httpStatus ?? (surface.status === "denied" ? 403 : 500));
+  throw new ZoomApiError(surface.error ?? surfaceCause(surface), surface.httpStatus ?? (surface.status === "denied" ? 403 : 500), undefined, surface.rejection);
 }
 
 function normalizeCheckAccessArgs(args: unknown): CheckAccessArgs {

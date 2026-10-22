@@ -110,14 +110,14 @@ export interface TenableAccessSurface {
   name: string;
   endpoint: string | null;
   requiredRole: string;
-  status: "readable" | "forbidden" | "not_readable" | "not_configured";
+  status: "readable" | "unauthorized" | "forbidden" | "not_readable" | "not_configured";
   count: number | null;
   httpStatus: number | null;
   error?: string;
 }
 
 export interface TenableAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   platform: string;
   callerIsAdministrator: boolean | null;
   surfaces: TenableAccessSurface[];
@@ -4966,12 +4966,28 @@ export async function checkTenableAccess(clients: TenableClients): Promise<Tenab
   const surfaces = probes.map((probe) => probe.surface);
 
   const configured = surfaces.filter((surface) => surface.status !== "not_configured");
+  const platform = [vm ? `Tenable Vulnerability Management ${displayOrigin(vm.getConfig().baseUrl)}${vm.getConfig().fedramp ? " (FedRAMP)" : ""}` : undefined, sc ? `Tenable Security Center ${displayOrigin(sc.getConfig().baseUrl)}` : undefined].filter(Boolean).join(" + ");
+  // A 401 on every configured surface means the key pair itself was rejected, which says
+  // nothing about roles; any other mix keeps the role analysis below unchanged.
+  if (configured.length > 0 && configured.every((surface) => surface.httpStatus === 401)) {
+    return {
+      status: "failed",
+      platform,
+      callerIsAdministrator,
+      surfaces: surfaces.map((surface) => (surface.status === "not_configured" ? surface : { ...surface, status: "unauthorized" })),
+      notes: [
+        `Platform: ${platform}.`,
+        `0/${configured.length} configured audit surfaces are readable; every one returned HTTP 401.`,
+        "Roles were not checked because Tenable rejected the API keys; the rejected probes do not mean a role is missing.",
+      ],
+      recommendedNextStep: accessCheckNextStep("failed", vm && sc ? "vm_and_security_center" : vm ? "vm" : "security_center", false),
+    };
+  }
   const readable = configured.filter((surface) => surface.status === "readable");
   const forbidden = configured.filter((surface) => surface.status === "forbidden");
   const failed = configured.filter((surface) => surface.status === "not_readable");
   const observedRefusals = [...new Set(forbidden.map((surface) => surface.httpStatus).filter((code): code is number => code !== null))].sort();
   const status = configured.length > 0 && readable.length === configured.length && callerIsAdministrator !== false ? "healthy" : "limited";
-  const platform = [vm ? `Tenable Vulnerability Management ${displayOrigin(vm.getConfig().baseUrl)}${vm.getConfig().fedramp ? " (FedRAMP)" : ""}` : undefined, sc ? `Tenable Security Center ${displayOrigin(sc.getConfig().baseUrl)}` : undefined].filter(Boolean).join(" + ");
   const roleNote = usersProbe.surface.status === "not_configured"
     ? "Caller role could not be determined because no Tenable Vulnerability Management tenant is configured."
     : usersProbe.surface.status !== "readable"
@@ -4997,12 +5013,43 @@ export async function checkTenableAccess(clients: TenableClients): Promise<Tenab
       ...forbidden.map((surface) => `${surface.name} requires role ${surface.requiredRole}; ${describeSurfaceFailure(surface)}`),
       ...failed.map((surface) => `${surface.name} could not be read: ${describeSurfaceFailure(surface)}`),
     ],
-    recommendedNextStep: status === "healthy"
-      ? "Run tenable_assess_scan_program, tenable_assess_sensor_coverage, tenable_assess_access_control, tenable_assess_vulnerability_management, or tenable_export_audit_bundle."
-      : forbidden.length > 0 || callerIsAdministrator === false
-        ? "Generate API keys for an Administrator [64] user (Settings > My Account > API Keys) so every surface is readable, or accept manual verdicts for refused surfaces."
-        : "Investigate the failed surfaces (the base URL, a proxy or portal answering in place of the API, or a transport fault) before relying on the assessments; findings that read them are demoted to warn or manual.",
+    recommendedNextStep: accessCheckNextStep(status, vm && sc ? "vm_and_security_center" : vm ? "vm" : "security_center", forbidden.length > 0 || callerIsAdministrator === false),
   };
+}
+
+type TenableKeyPairs = "vm" | "security_center" | "vm_and_security_center";
+
+/** A wrong platform URL is rejected with 401 just like a wrong key, so each step names the URL setting too. */
+function rejectedKeysStep(keyPairs: TenableKeyPairs): string {
+  switch (keyPairs) {
+    case "vm":
+      return "Tenable rejected the API keys (every probe returned 401). Set TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY (or the access_key and secret_key arguments or config file entries) to a valid key pair, with TENABLE_URL pointing at the platform that issued it, then rerun tenable_check_access.";
+    case "security_center":
+      return "Tenable Security Center rejected the API keys (every probe returned 401). Set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or the sc_access_key and sc_secret_key arguments or config file entries) to a valid key pair, with TENABLE_SC_URL (or TENABLE_URL) pointing at the Security Center that issued it, then rerun tenable_check_access.";
+    case "vm_and_security_center":
+      return "Tenable rejected both API key pairs (every probe returned 401). Set TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY for the platform at TENABLE_URL and TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY for the Security Center at TENABLE_SC_URL (or the matching access_key, secret_key, sc_access_key, and sc_secret_key arguments or config file entries), then rerun tenable_check_access.";
+    default: {
+      const exhaustive: never = keyPairs;
+      throw new Error(`Unhandled Tenable key pairs ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: TenableAccessCheckResult["status"], keyPairs: TenableKeyPairs, roleGap: boolean): string {
+  switch (status) {
+    case "healthy":
+      return "Run tenable_assess_scan_program, tenable_assess_sensor_coverage, tenable_assess_access_control, tenable_assess_vulnerability_management, or tenable_export_audit_bundle.";
+    case "limited":
+      return roleGap
+        ? "Generate API keys for an Administrator [64] user (Settings > My Account > API Keys) so every surface is readable, or accept manual verdicts for refused surfaces."
+        : "Investigate the failed surfaces (the base URL, a proxy or portal answering in place of the API, or a transport fault) before relying on the assessments; findings that read them are demoted to warn or manual.";
+    case "failed":
+      return rejectedKeysStep(keyPairs);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Tenable access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 /** A count is only ever a number for a readable surface; anything else renders as what it is. */
@@ -5013,6 +5060,7 @@ function renderSurfaceCount(surface: TenableAccessSurface): string {
       return "unknown";
     case "not_configured":
       return "n/a";
+    case "unauthorized":
     case "forbidden":
     case "not_readable":
       return "unread";

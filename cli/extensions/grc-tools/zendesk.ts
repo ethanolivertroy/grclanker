@@ -99,7 +99,7 @@ export interface ZendeskAccessSurface {
   name: string;
   endpoint: string;
   requiredRole: "agent" | "admin" | "admin-enterprise";
-  status: "readable" | "forbidden" | "not_found" | "error";
+  status: "readable" | "unauthorized" | "forbidden" | "not_found" | "error";
   // Items seen by a readable probe; null when the probe did not read anything, so a
   // refused surface is never mistaken for an empty one.
   count: number | null;
@@ -116,8 +116,9 @@ export interface ZendeskAccessSurface {
 
 export interface ZendeskAccessCheckResult {
   // healthy only when every surface was read: a refused, failed, or 2xx-without-document
-  // surface makes the check limited, since it produced no data to assess.
-  status: "healthy" | "limited";
+  // surface makes the check limited, since it produced no data to assess. failed when
+  // every probe returned 401, so Zendesk rejected the credentials themselves.
+  status: "healthy" | "limited" | "failed";
   subdomain: string;
   authMode: ZendeskAuthMode;
   currentUserRole?: string;
@@ -2641,6 +2642,24 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
       error: snap.error,
     });
   }
+  const usingNote = `Using Zendesk subdomain ${config.subdomain} with ${config.authMode === "oauth" ? "an OAuth bearer token" : "API token basic auth"}.`;
+  // A 401 on every probe means Zendesk rejected the credentials themselves, which says
+  // nothing about roles or scopes; any other mix keeps the analysis below unchanged.
+  if (surfaces.every((surface) => surface.httpStatus === 401)) {
+    return {
+      status: "failed",
+      subdomain: config.subdomain,
+      authMode: config.authMode,
+      surfaces: surfaces.map((surface) => ({ ...surface, status: "unauthorized" })),
+      missingPermissions: [],
+      notes: [
+        usingNote,
+        `0/${surfaces.length} Zendesk audit surfaces are readable; every probe returned 401.`,
+        rolesNotCheckedNote(config.authMode),
+      ],
+      recommendedNextStep: accessCheckNextStep("failed", config.authMode, false),
+    };
+  }
   const truncatedProbes = surfaces.filter((surface) => surface.truncated === true).map((surface) => surface.name);
 
   const coreReadable = ["current_user", "account_settings", "team_members"].every((name) =>
@@ -2661,7 +2680,7 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
     surfaces,
     missingPermissions,
     notes: [
-      `Using Zendesk subdomain ${config.subdomain} with ${config.authMode === "oauth" ? "an OAuth bearer token" : "API token basic auth"}.`,
+      usingNote,
       `Authenticated as ${currentUser.status === "ok" ? `${userLabel(currentUser.data ?? {})} (role: ${currentUserRole ?? "unknown"})` : "an unknown principal (current user lookup failed)"}.`,
       `${readableCount}/${surfaces.length} Zendesk audit surfaces are readable.`,
       ...(unavailable.length > 0 ? [`Unavailable on this account or plan: ${unavailable.join(", ")}.`] : []),
@@ -2674,12 +2693,52 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
         .map((surface) => `The ${surface.name} probe stopped paging early because ${surface.truncationReason}.`),
       ...(currentUserRole && currentUserRole !== "admin" ? ["The credential is not an admin, so admin-only surfaces (security settings, deletion schedules, OAuth clients and tokens, audit logs, owned apps, brands, suspended tickets) will render as manual findings."] : []),
     ],
-    recommendedNextStep: status === "healthy"
-      ? "Run zendesk_assess_authentication, zendesk_assess_access_control, zendesk_assess_data_protection, zendesk_assess_integrations, or zendesk_export_audit_bundle."
-      : missingPermissions.length > 0
-        ? "Use an admin API token or OAuth token with read scope so the admin-only surfaces become readable, then rerun zendesk_check_access."
-        : "Check the network path to the Zendesk API (a proxy or sign-in page answering in place of it, or an outage) for the surfaces that were not read, then rerun zendesk_check_access.",
+    recommendedNextStep: accessCheckNextStep(status, config.authMode, missingPermissions.length > 0),
   };
+}
+
+function rolesNotCheckedNote(authMode: ZendeskAuthMode): string {
+  switch (authMode) {
+    case "api_token":
+      return "Roles were not checked because Zendesk rejected the email and API token; the rejected probes do not mean a role is missing.";
+    case "oauth":
+      return "Roles and scopes were not checked because Zendesk rejected the OAuth token; the rejected probes do not mean a role or scope is missing.";
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled Zendesk auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** A token from another Zendesk account is rejected with 401 just like a wrong one, so each step names the subdomain setting too. */
+function rejectedCredentialsStep(authMode: ZendeskAuthMode): string {
+  switch (authMode) {
+    case "api_token":
+      return "Zendesk rejected the email and API token (every probe returned 401). Set ZENDESK_EMAIL and ZENDESK_API_TOKEN (or the email and api_token arguments or config file entries) to a Zendesk sign-in email address and an active API token, with ZENDESK_SUBDOMAIN naming the account that issued the token, then rerun zendesk_check_access.";
+    case "oauth":
+      return "Zendesk rejected the OAuth token (every probe returned 401). Set ZENDESK_OAUTH_TOKEN (or the oauth_token argument or config file entry) to a valid, unrevoked OAuth access token, with ZENDESK_SUBDOMAIN naming the account that issued it, then rerun zendesk_check_access.";
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled Zendesk auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: ZendeskAccessCheckResult["status"], authMode: ZendeskAuthMode, permissionGap: boolean): string {
+  switch (status) {
+    case "healthy":
+      return "Run zendesk_assess_authentication, zendesk_assess_access_control, zendesk_assess_data_protection, zendesk_assess_integrations, or zendesk_export_audit_bundle.";
+    case "limited":
+      return permissionGap
+        ? "Use an admin API token or OAuth token with read scope so the admin-only surfaces become readable, then rerun zendesk_check_access."
+        : "Check the network path to the Zendesk API (a proxy or sign-in page answering in place of it, or an outage) for the surfaces that were not read, then rerun zendesk_check_access.";
+    case "failed":
+      return rejectedCredentialsStep(authMode);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Zendesk access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function resolveOptions(options: ZendeskAssessmentOptions): Required<Omit<ZendeskAssessmentOptions, "now">> & { now: () => Date } {

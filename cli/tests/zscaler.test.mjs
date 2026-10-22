@@ -41,6 +41,7 @@ import {
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { assertCanaryFixture, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 
@@ -3467,4 +3468,355 @@ writeFailureTest("exportZscalerAuditBundle leaves nothing under the output root 
   const config = { zia: ziaConfig(), zpa: undefined, oneApiDetected: false, zdxDetected: false, timeoutMs: 30000, maxRetries: 0, sourceChain: [] };
   const zia = new ZiaApiClient(ziaConfig(), { fetchImpl: ziaFetchMock(), maxRetries: 0 });
   await assertNoPartialBundleOnWriteFailure(base, () => exportZscalerAuditBundle({ config, zia }, { outputDir: base }));
+});
+
+// Credentials Zscaler refuses outright. Every refusal body echoes the credentials the request carried beside a bearer
+// token, a session cookie, an API key pair, and a tokenized URL, as a misbehaving proxy might.
+const REJECTED_ZIA_API_KEY = "ZZf7RrrD3QR2asz3FdTX42GgUWCH9Y";
+const REJECTED_ZIA_PASSWORD = "mJvJNC3sK3DQbx4UmXDJ";
+const REJECTED_ZPA_CLIENT_ID = "g385vhMXLKPs4fRN7WGgnM7p";
+const REJECTED_ZPA_CLIENT_SECRET = "vFxusTzB5MyDB8FjAsVoMv2S";
+const REJECTED_ISSUED_SESSION = "3FjJo5mTn92Nr68tgzbW";
+const REJECTED_ISSUED_TOKEN = "XYG2V5oHQQwtDH7qHNNbRJX8h8KUFKEn";
+const REJECTED_BEARER = "WoHYD8hbRwj5BrWMzDXK";
+const REJECTED_SESSION = "UarMfdWr6X8JPEeBritF";
+const REJECTED_API_KEY = "tRgQoGDBUmwtqpEEjPX6";
+const REJECTED_URL_TOKEN = "WjaAYFLBkX8RGeyB3dtv";
+const REJECTED_CANARIES = [
+  REJECTED_ZIA_API_KEY,
+  REJECTED_ZIA_PASSWORD,
+  REJECTED_ZPA_CLIENT_ID,
+  REJECTED_ZPA_CLIENT_SECRET,
+  REJECTED_ISSUED_SESSION,
+  REJECTED_ISSUED_TOKEN,
+  REJECTED_BEARER,
+  REJECTED_SESSION,
+  REJECTED_API_KEY,
+  REJECTED_URL_TOKEN,
+];
+const REJECTION_ECHO = `Bearer ${REJECTED_BEARER}; JSESSIONID=${REJECTED_SESSION}; api_key=${REJECTED_API_KEY}; https://zsapi.example.net/login?token=${REJECTED_URL_TOKEN}`;
+
+const ZIA_LOGIN = "ZIA POST /api/v1/authenticatedSession";
+const ZPA_SIGN_IN = "ZPA POST /signin";
+const ZSCALER_ROLE_STEP = "Grant the ZIA admin a read-capable role for every surface above and the ZPA API client a read role, then rerun zscaler_check_access. Unreadable surfaces produce manual findings, never passes.";
+const ZSCALER_HEALTHY_STEP = "Run zscaler_assess_zia_access_control, zscaler_assess_zia_policy, zscaler_assess_zpa, or zscaler_export_audit_bundle.";
+const ZIA_CREDENTIAL_SETTINGS = "Set ZIA_API_KEY, ZIA_USERNAME, and ZIA_PASSWORD (or the zia_api_key, zia_username, and zia_password arguments or config file entries) to the tenant's API key and an admin's login name and password, with ZIA_CLOUD naming the tenant's cloud";
+const ZPA_CREDENTIAL_SETTINGS = "Set ZPA_CLIENT_ID, ZPA_CLIENT_SECRET, and ZPA_CUSTOMER_ID (or the zpa_client_id, zpa_client_secret, and zpa_customer_id arguments or config file entries) to the client ID and client secret of a ZPA API key and the customer ID it belongs to, with ZPA_CLOUD naming the key's cloud";
+const ZIA_CONFIGURED_NOTE = "ZIA cloud zscalerthree at https://zsapi.zscalerthree.net/api/v1 (API key plus session login as auditor@example.com).";
+const ZIA_NOT_CONFIGURED_NOTE = "ZIA is not configured (ZIA_CLOUD, ZIA_API_KEY, ZIA_USERNAME, ZIA_PASSWORD); ZIA controls will render as manual.";
+const ZPA_CONFIGURED_NOTE = `ZPA cloud PRODUCTION at https://config.private.zscaler.com (client credentials for customer ${ZPA_CUSTOMER}).`;
+const ZPA_NOT_CONFIGURED_NOTE = "ZPA is not configured (ZPA_CLIENT_ID, ZPA_CLIENT_SECRET, ZPA_CUSTOMER_ID, ZPA_CLOUD); ZPA controls will render as manual.";
+// The wording this module uses for a missing role. A rejected credential says nothing about one.
+const ZSCALER_ROLE_CLAIMS = /Grant the ZIA admin|read-capable role|a read role/;
+
+const ziaRejectedStep = (evidence) => `Zscaler rejected the ZIA API key and admin login (${evidence}). ${ZIA_CREDENTIAL_SETTINGS}, then rerun zscaler_check_access.`;
+const zpaRejectedStep = (evidence) => `Zscaler rejected the ZPA API key (${evidence}). ${ZPA_CREDENTIAL_SETTINGS}, then rerun zscaler_check_access.`;
+const bothRejectedStep = (ziaEvidence, zpaEvidence) =>
+  `Zscaler rejected the ZIA API key and admin login (${ziaEvidence}) and the ZPA API key (${zpaEvidence}). ${ZIA_CREDENTIAL_SETTINGS}. ${ZPA_CREDENTIAL_SETTINGS}, then rerun zscaler_check_access.`;
+const zscalerRolesNote = (credentials) => `Roles were not checked because Zscaler rejected ${credentials}; the rejected probes do not mean a role is missing.`;
+
+/** A refused ZIA login whose message echoes the API key and password the request carried. */
+function ziaLoginRefused(status = 401, code = "AUTHENTICATION_FAILED") {
+  return jsonResponse({ code, message: `${code}: apiKey ${REJECTED_ZIA_API_KEY} password=${REJECTED_ZIA_PASSWORD}; ${REJECTION_ECHO}` }, { status });
+}
+
+/** A refused ZPA sign-in whose reason echoes the client ID and secret the request carried; `fields` adds error fields. */
+function zpaSignInRefused(status = 401, fields = {}) {
+  return jsonResponse({ reason: `client_id ${REJECTED_ZPA_CLIENT_ID} client_secret=${REJECTED_ZPA_CLIENT_SECRET}; ${REJECTION_ECHO}`, ...fields }, { status });
+}
+
+/** A 401 from the API behind an accepted login or sign-in, echoing the session or token it was sent. */
+function apiRejection(issued) {
+  return jsonResponse({ code: "UNAUTHORIZED", message: `credential ${issued} not accepted; ${REJECTION_ECHO}` }, { status: 401 });
+}
+
+/** A 401 rendered as an HTML page by a gateway, carrying every planted value. */
+function htmlRejection() {
+  return new Response(`<html><body>401 ${REJECTION_ECHO} ${REJECTED_ZIA_API_KEY} ${REJECTED_ZPA_CLIENT_SECRET}</body></html>`, { status: 401, headers: { "content-type": "text/html" } });
+}
+
+function ziaLoginAccepted() {
+  return jsonResponse({ authType: "ADMIN_LOGIN" }, { headers: { "set-cookie": `JSESSIONID=${REJECTED_ISSUED_SESSION}; Path=/; Secure; HttpOnly` } });
+}
+
+function zpaSignInAccepted() {
+  return jsonResponse({ token_type: "Bearer", access_token: REJECTED_ISSUED_TOKEN, expires_in: "3600" });
+}
+
+/** ZIA answering the session login with `login` and every API request with `api`. */
+function ziaRejectingFetch({ login = () => ziaLoginRefused(), api = () => apiRejection(REJECTED_ISSUED_SESSION) } = {}) {
+  return async (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/v1/authenticatedSession") return init.method === "POST" ? login() : jsonResponse({});
+    return api(url);
+  };
+}
+
+/** ZPA answering the sign-in with `signIn` and every API request with `api`. */
+function zpaRejectingFetch({ signIn = () => zpaSignInRefused(), api = () => apiRejection(REJECTED_ISSUED_TOKEN) } = {}) {
+  return async (input) => {
+    const url = new URL(String(input));
+    return url.pathname === "/signin" ? signIn() : api(url);
+  };
+}
+
+/** The real clients, configured with the rejected credentials, over fetch stubs that record "<PRODUCT> <METHOD> <path>". */
+function zscalerClientsOver({ zia, zpa }) {
+  const requests = [];
+  const recording = (product, fetchImpl) => async (input, init = {}) => {
+    requests.push(`${product} ${init.method ?? "GET"} ${new URL(String(input)).pathname}`);
+    return fetchImpl(input, init);
+  };
+  const config = {
+    zia: zia ? { ...ziaConfig(), apiKey: REJECTED_ZIA_API_KEY, password: REJECTED_ZIA_PASSWORD } : undefined,
+    zpa: zpa ? { ...zpaConfig(), clientId: REJECTED_ZPA_CLIENT_ID, clientSecret: REJECTED_ZPA_CLIENT_SECRET } : undefined,
+    oneApiDetected: false,
+    zdxDetected: false,
+    timeoutMs: 30000,
+    maxRetries: 0,
+    sourceChain: [],
+  };
+  return {
+    clients: {
+      config,
+      zia: zia ? new ZiaApiClient(config.zia, { fetchImpl: recording("ZIA", zia), maxRetries: 0, now: () => NOW }) : undefined,
+      zpa: zpa ? new ZpaApiClient(config.zpa, { fetchImpl: recording("ZPA", zpa), maxRetries: 0, now: () => NOW }) : undefined,
+    },
+    requests,
+  };
+}
+
+/** The text as the module's error scrub leaves it: every ZIA probe throws it and the access check records the result. */
+async function scrubbedByZscalerModule(text) {
+  const fail = async () => {
+    throw new Error(text);
+  };
+  const zia = new Proxy({ getResolvedConfig: () => ziaConfig(), getNow: () => NOW }, { get: (target, name) => target[name] ?? fail });
+  const result = await checkZscalerAccess({ config: { oneApiDetected: false, zdxDetected: false }, zia });
+  return result.surfaces[0].error;
+}
+
+test("rejected-credential fixtures: the refusal bodies carry every planted value and no window of one occurs in a legitimate value", async () => {
+  const ziaBody = await ziaLoginRefused().text();
+  for (const canary of [REJECTED_ZIA_API_KEY, REJECTED_ZIA_PASSWORD, REJECTED_BEARER, REJECTED_SESSION, REJECTED_API_KEY, REJECTED_URL_TOKEN]) {
+    assert.ok(ziaBody.includes(canary), `positive control: the ZIA login refusal carries ${canary}`);
+  }
+  const zpaBody = await zpaSignInRefused().text();
+  for (const canary of [REJECTED_ZPA_CLIENT_ID, REJECTED_ZPA_CLIENT_SECRET, REJECTED_BEARER, REJECTED_SESSION, REJECTED_API_KEY, REJECTED_URL_TOKEN]) {
+    assert.ok(zpaBody.includes(canary), `positive control: the ZPA sign-in refusal carries ${canary}`);
+  }
+  for (const issued of [REJECTED_ISSUED_SESSION, REJECTED_ISSUED_TOKEN]) {
+    assert.ok((await apiRejection(issued).text()).includes(issued), `positive control: the API refusal carries ${issued}`);
+  }
+
+  const healthy = await checkZscalerAccess(zscalerClientsOver({
+    zia: ziaTenantFetch(ziaCompliantTenant()).fetchImpl,
+    zpa: zpaTenantFetch(zpaCompliantTenant()).fetchImpl,
+  }).clients);
+  assert.equal(healthy.status, "healthy", "baseline: valid credentials over the same clients read every surface");
+  assertCanaryFixture(assert, REJECTED_CANARIES, [
+    ["ZIA config", JSON.stringify(ziaConfig())],
+    ["ZPA config", JSON.stringify(zpaConfig())],
+    ["baseline access check", JSON.stringify(healthy)],
+    ["expected wording", [ZSCALER_ROLE_STEP, ZIA_CREDENTIAL_SETTINGS, ZPA_CREDENTIAL_SETTINGS, zscalerRolesNote("")].join("\n")],
+  ], "Zscaler rejected-credential canaries");
+});
+
+test("checkZscalerAccess reports failed and names the ZIA credential settings, never a role, when Zscaler refuses the ZIA login or session", async () => {
+  const cases = [
+    { label: "401 AUTHENTICATION_FAILED", login: () => ziaLoginRefused(401, "AUTHENTICATION_FAILED"), evidence: "POST /authenticatedSession returned 401 AUTHENTICATION_FAILED" },
+    { label: "401 INVALID_USERNAME_OR_PASSWORD", login: () => ziaLoginRefused(401, "INVALID_USERNAME_OR_PASSWORD"), evidence: "POST /authenticatedSession returned 401 INVALID_USERNAME_OR_PASSWORD" },
+    { label: "400 INVALID_API_KEY", login: () => ziaLoginRefused(400, "INVALID_API_KEY"), evidence: "POST /authenticatedSession returned 400 INVALID_API_KEY" },
+    { label: "401 with an undocumented code", login: () => ziaLoginRefused(401, "SOMETHING_ELSE"), evidence: "POST /authenticatedSession returned 401" },
+    { label: "401 HTML page", login: htmlRejection, evidence: "POST /authenticatedSession returned 401" },
+    { label: "accepted login, every API request 401", login: ziaLoginAccepted, evidence: "every ZIA probe returned 401" },
+  ];
+  for (const { label, login, evidence } of cases) {
+    const { clients, requests } = zscalerClientsOver({ zia: ziaRejectingFetch({ login }) });
+    const result = await checkZscalerAccess(clients);
+    assert.equal(result.status, "failed", label);
+    assert.equal(result.recommendedNextStep, ziaRejectedStep(evidence), label);
+    assert.deepEqual(result.notes, [
+      ZIA_CONFIGURED_NOTE,
+      ZPA_NOT_CONFIGURED_NOTE,
+      `0/10 Zscaler audit surfaces are readable; ${evidence}.`,
+      zscalerRolesNote("the ZIA API key and admin login"),
+    ], label);
+    assert.deepEqual(result.products, { zia: "configured", zpa: "not_configured" }, label);
+    assert.equal(result.surfaces.length, 10, label);
+    assert.ok(result.surfaces.every((surface) => surface.status === "not_readable"), label);
+    if (login === ziaLoginAccepted) {
+      assert.ok(requests.filter((request) => request !== ZIA_LOGIN).length === 10, `${label}: each surface was requested: ${requests.join(", ")}`);
+    } else {
+      assert.ok(requests.length > 0 && requests.every((request) => request === ZIA_LOGIN), `${label}: no API request goes out without a session: ${requests.join(", ")}`);
+    }
+    assert.doesNotMatch(JSON.stringify(result), ZSCALER_ROLE_CLAIMS, label);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(result), REJECTED_CANARIES, `${label} access check result`);
+  }
+});
+
+test("checkZscalerAccess reports failed and names the ZPA credential settings, never a role, when Zscaler refuses the ZPA sign-in or token", async () => {
+  const cases = [
+    { label: "401", signIn: () => zpaSignInRefused(401), evidence: "POST /signin returned 401" },
+    { label: "401 invalid_client", signIn: () => zpaSignInRefused(401, { error: "invalid_client" }), evidence: "POST /signin returned 401 invalid_client" },
+    { label: "400 invalid_client", signIn: () => zpaSignInRefused(400, { error: "invalid_client" }), evidence: "POST /signin returned 400 invalid_client" },
+    { label: "400 invalid_grant", signIn: () => zpaSignInRefused(400, { message: "invalid_grant" }), evidence: "POST /signin returned 400 invalid_grant" },
+    { label: "400 unauthorized_client", signIn: () => zpaSignInRefused(400, { error: "unauthorized_client" }), evidence: "POST /signin returned 400 unauthorized_client" },
+    { label: "401 HTML page", signIn: htmlRejection, evidence: "POST /signin returned 401" },
+    { label: "accepted sign-in, every API request 401", signIn: zpaSignInAccepted, evidence: "every ZPA probe returned 401" },
+  ];
+  for (const { label, signIn, evidence } of cases) {
+    const { clients, requests } = zscalerClientsOver({ zpa: zpaRejectingFetch({ signIn }) });
+    const result = await checkZscalerAccess(clients);
+    assert.equal(result.status, "failed", label);
+    assert.equal(result.recommendedNextStep, zpaRejectedStep(evidence), label);
+    assert.deepEqual(result.notes, [
+      ZIA_NOT_CONFIGURED_NOTE,
+      ZPA_CONFIGURED_NOTE,
+      `0/7 Zscaler audit surfaces are readable; ${evidence}.`,
+      zscalerRolesNote("the ZPA API key"),
+    ], label);
+    assert.deepEqual(result.products, { zia: "not_configured", zpa: "configured" }, label);
+    assert.equal(result.surfaces.length, 7, label);
+    if (signIn !== zpaSignInAccepted) {
+      assert.ok(requests.length > 0 && requests.every((request) => request === ZPA_SIGN_IN), `${label}: no API request goes out without a token: ${requests.join(", ")}`);
+    }
+    assert.doesNotMatch(JSON.stringify(result), ZSCALER_ROLE_CLAIMS, label);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(result), REJECTED_CANARIES, `${label} access check result`);
+  }
+});
+
+test("checkZscalerAccess names both credential sets when Zscaler refuses ZIA and ZPA, and its wording survives the module's error scrub", async () => {
+  const { clients } = zscalerClientsOver({ zia: ziaRejectingFetch(), zpa: zpaRejectingFetch({ signIn: zpaSignInAccepted }) });
+  const result = await checkZscalerAccess(clients);
+  const ziaEvidence = "POST /authenticatedSession returned 401 AUTHENTICATION_FAILED";
+  const zpaEvidence = "every ZPA probe returned 401";
+  assert.equal(result.status, "failed");
+  assert.equal(result.recommendedNextStep, bothRejectedStep(ziaEvidence, zpaEvidence));
+  assert.deepEqual(result.notes, [
+    ZIA_CONFIGURED_NOTE,
+    ZPA_CONFIGURED_NOTE,
+    `0/17 Zscaler audit surfaces are readable; ${ziaEvidence} and ${zpaEvidence}.`,
+    zscalerRolesNote("the ZIA API key and admin login and the ZPA API key"),
+  ]);
+  assert.doesNotMatch(JSON.stringify(result), ZSCALER_ROLE_CLAIMS);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(result), REJECTED_CANARIES, "ZIA and ZPA access check result");
+
+  // Positive control: the route applies the scrub, so a token-shaped run would not come back whole.
+  assert.equal(await scrubbedByZscalerModule(`Bearer ${REJECTED_BEARER}`), "Bearer [REDACTED]");
+  const wording = [
+    result.recommendedNextStep,
+    ...result.notes,
+    ziaRejectedStep("POST /authenticatedSession returned 400 INVALID_API_KEY"),
+    ziaRejectedStep("POST /authenticatedSession returned 401 INVALID_USERNAME_OR_PASSWORD"),
+    zpaRejectedStep("POST /signin returned 400 unauthorized_client"),
+  ];
+  for (const text of wording) {
+    assert.equal(await scrubbedByZscalerModule(text), text, "the scrub leaves the wording whole");
+  }
+});
+
+test("zscaler_check_access renders failed with the credential settings through the registered tool and leaks no planted value", async () => {
+  const check = registeredZscalerTool("zscaler_check_access");
+  const configFile = join(createTempBase("grclanker-zscaler-rejected-"), "zscaler.yaml");
+  writeFileSync(configFile, "{}\n");
+  const ziaArgs = { zia_cloud: "zscalerthree", zia_api_key: REJECTED_ZIA_API_KEY, zia_username: "auditor@example.com", zia_password: REJECTED_ZIA_PASSWORD };
+  const zpaArgs = { zpa_client_id: REJECTED_ZPA_CLIENT_ID, zpa_client_secret: REJECTED_ZPA_CLIENT_SECRET, zpa_customer_id: ZPA_CUSTOMER };
+  const ziaEvidence = "POST /authenticatedSession returned 401 AUTHENTICATION_FAILED";
+  const zpaEvidence = "POST /signin returned 401";
+  const runs = [
+    { label: "ZIA", args: ziaArgs, step: ziaRejectedStep(ziaEvidence), credentials: "the ZIA API key and admin login" },
+    { label: "ZPA", args: zpaArgs, step: zpaRejectedStep(zpaEvidence), credentials: "the ZPA API key" },
+    { label: "ZIA and ZPA", args: { ...ziaArgs, ...zpaArgs }, step: bothRejectedStep(ziaEvidence, zpaEvidence), credentials: "the ZIA API key and admin login and the ZPA API key" },
+  ];
+  const ziaRefusing = ziaRejectingFetch();
+  const zpaRefusing = zpaRejectingFetch();
+  const environment = Object.fromEntries([
+    "ZSCALER_CONFIG_FILE", "ZIA_CLOUD", "ZIA_BASE_URL", "ZIA_API_KEY", "ZIA_USERNAME", "ZIA_PASSWORD",
+    "ZPA_CLOUD", "ZPA_BASE_URL", "ZPA_CLIENT_ID", "ZPA_CLIENT_SECRET", "ZPA_CUSTOMER_ID",
+    "ZSCALER_CLIENT_ID", "ZSCALER_CLIENT_SECRET", "ZDX_CLIENT_ID", "ZDX_CLIENT_SECRET",
+  ].map((name) => [name, undefined]));
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const { hostname } = new URL(String(input));
+    if (hostname === "zsapi.zscalerthree.net") return ziaRefusing(input, init);
+    if (hostname === "config.private.zscaler.com") return zpaRefusing(input, init);
+    throw new Error(`unexpected request to ${hostname}`);
+  };
+  try {
+    for (const { label, args, step, credentials } of runs) {
+      const { text, serialized } = await withProcessEnv(environment, () => check({ ...args, config_file: configFile, max_retries: 0 }));
+      const { details } = JSON.parse(serialized);
+      assert.equal(details.status, "failed", label);
+      assert.equal(details.recommendedNextStep, step, label);
+      assert.ok(details.notes.includes(zscalerRolesNote(credentials)), `${label}: ${JSON.stringify(details.notes)}`);
+      assert.match(text, /^Zscaler access check: failed\n/, label);
+      assert.ok(text.endsWith(`\nNext: ${step}`), `${label}: ${text}`);
+      assert.doesNotMatch(serialized, ZSCALER_ROLE_CLAIMS, label);
+      assertCanaryWindowsAbsent(assert, [["text", text], ["serialized", serialized]], REJECTED_CANARIES, `${label} zscaler_check_access`);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("exportZscalerAuditBundle records the failed access check and leaks no planted value when Zscaler refuses every credential", async () => {
+  const { clients } = zscalerClientsOver({ zia: ziaRejectingFetch(), zpa: zpaRejectingFetch() });
+  const exported = await exportZscalerAuditBundle(clients, { outputDir: createTempBase("grclanker-zscaler-rejected-export-") });
+  const accessText = readFileSync(join(exported.outputDir, "core_data/access_check.json"), "utf8");
+  const access = JSON.parse(accessText);
+  assert.equal(access.status, "failed");
+  assert.equal(access.recommendedNextStep, bothRejectedStep("POST /authenticatedSession returned 401 AUTHENTICATION_FAILED", "POST /signin returned 401"));
+  assert.ok(access.notes.includes(zscalerRolesNote("the ZIA API key and admin login and the ZPA API key")), JSON.stringify(access.notes));
+  assert.doesNotMatch(accessText, ZSCALER_ROLE_CLAIMS);
+  assert.equal(JSON.parse(readFileSync(join(exported.outputDir, "analysis/summary.json"), "utf8")).access_status, "failed");
+  assert.match(readFileSync(join(exported.outputDir, "compliance/executive_summary.md"), "utf8"), /^Access check: failed \(ZIA configured, ZPA configured\)$/m);
+  const files = walkFiles(exported.outputDir).map((file) => [relative(exported.outputDir, file), readFileSync(file, "utf8")]);
+  const entries = zipEntries(exported.zipPath).map((entry) => [`zip ${entry.name}`, entry.content]);
+  assertCanaryWindowsAbsent(assert, [...files, ...entries], REJECTED_CANARIES, "rejected-credential bundle");
+});
+
+test("checkZscalerAccess keeps the limited status and role wording when a probe reads or a refusal is not a credential rejection", async () => {
+  const ziaReadable = ziaTenantFetch(ziaCompliantTenant()).fetchImpl;
+  const zpaReadable = zpaTenantFetch(zpaCompliantTenant()).fetchImpl;
+  const forbiddenResponse = () => jsonResponse({ code: "NOT_AUTHORIZED", message: "forbidden" }, { status: 403 });
+  const runs = [
+    { label: "ZIA login refused while every ZPA probe reads", zia: ziaRejectingFetch(), zpa: zpaReadable, readable: 7, total: 17 },
+    { label: "ZPA sign-in refused while every ZIA probe reads", zia: ziaReadable, zpa: zpaRejectingFetch(), readable: 10, total: 17 },
+    {
+      label: "one ZIA probe reads among 401s",
+      zia: ziaRejectingFetch({ login: ziaLoginAccepted, api: (url) => (url.pathname === "/api/v1/adminRoles/lite" ? jsonResponse([{ id: 1 }]) : apiRejection(REJECTED_ISSUED_SESSION)) }),
+      readable: 1,
+      total: 10,
+    },
+    { label: "every ZIA probe refused with 403", zia: ziaRejectingFetch({ login: ziaLoginAccepted, api: forbiddenResponse }), readable: 0, total: 10 },
+    {
+      label: "ZIA probes refused with 401 except one 403",
+      zia: ziaRejectingFetch({ login: ziaLoginAccepted, api: (url) => (url.pathname === "/api/v1/authSettings" ? forbiddenResponse() : apiRejection(REJECTED_ISSUED_SESSION)) }),
+      readable: 0,
+      total: 10,
+    },
+    { label: "ZIA login refused with 403", zia: ziaRejectingFetch({ login: forbiddenResponse }), readable: 0, total: 10 },
+    { label: "ZIA login failing with 500", zia: ziaRejectingFetch({ login: () => jsonResponse({ message: "internal error" }, { status: 500 }) }), readable: 0, total: 10 },
+    { label: "ZPA sign-in refused with 400 and no grant code", zpa: zpaRejectingFetch({ signIn: () => jsonResponse({ reason: "bad request" }, { status: 400 }) }), readable: 0, total: 7 },
+    { label: "ZPA sign-in refused with 403", zpa: zpaRejectingFetch({ signIn: forbiddenResponse }), readable: 0, total: 7 },
+    { label: "every ZPA probe refused with 403", zpa: zpaRejectingFetch({ signIn: zpaSignInAccepted, api: forbiddenResponse }), readable: 0, total: 7 },
+  ];
+  for (const { label, zia, zpa, readable, total } of runs) {
+    const result = await checkZscalerAccess(zscalerClientsOver({ zia, zpa }).clients);
+    assert.equal(result.status, "limited", label);
+    assert.equal(result.recommendedNextStep, ZSCALER_ROLE_STEP, label);
+    assert.equal(result.notes.at(-1), `${readable}/${total} Zscaler audit surfaces are readable.`, label);
+    assert.ok(!result.notes.some((note) => note.startsWith("Roles were not checked")), label);
+  }
+
+  const healthy = await checkZscalerAccess(zscalerClientsOver({ zia: ziaReadable, zpa: zpaReadable }).clients);
+  assert.equal(healthy.status, "healthy");
+  assert.equal(healthy.recommendedNextStep, ZSCALER_HEALTHY_STEP);
+  assert.equal(healthy.notes.at(-1), "17/17 Zscaler audit surfaces are readable.");
+
+  const unconfigured = await checkZscalerAccess({ config: { oneApiDetected: false, zdxDetected: false, timeoutMs: 30000, maxRetries: 0, sourceChain: [] } });
+  assert.equal(unconfigured.status, "unavailable");
+  assert.equal(unconfigured.recommendedNextStep, ZSCALER_ROLE_STEP);
+  assert.deepEqual(unconfigured.notes, [ZIA_NOT_CONFIGURED_NOTE, ZPA_NOT_CONFIGURED_NOTE, "0/0 Zscaler audit surfaces are readable."]);
 });

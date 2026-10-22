@@ -545,6 +545,122 @@ test("checkVeracodeAccess reports healthy access and names missing roles when de
   assert.ok(degraded.notes.some((note) => /sca_workspaces/.test(note)));
 });
 
+const VERACODE_REJECTED_STEP = "Veracode rejected the API credentials (every probe returned 401). Set VERACODE_API_KEY_ID and VERACODE_API_KEY_SECRET (or the api_key_id and api_key_secret arguments, or veracode_api_key_id and veracode_api_key_secret in ~/.veracode/credentials) to a valid API ID and secret, with VERACODE_REGION or VERACODE_API_BASE_URL pointing at the region that issued them, then rerun veracode_check_access.";
+const VERACODE_REJECTED_ROLES_NOTE = "Roles were not checked because Veracode rejected the API credentials; the rejected probes do not mean a role is missing.";
+const VERACODE_ROLE_GAP_STEP = (roles) => `Grant the API service account the missing roles (${roles}) and confirm the region matches the account.`;
+// The wording that blames a role or a license. Rejected credentials say nothing about either, so none of it may appear.
+const VERACODE_ROLE_CLAIMS = /Grant the API service account|missing roles|license-gated|unlicensed|lacks/;
+// Random hex for the rejected API ID and secret (the resolver requires a hex secret) and random
+// alphanumerics for the carriers a 401 body may echo beside them.
+const REJECTED_API_ID = "394fd17dac74b98e304edf1e805b3bbe";
+const REJECTED_API_SECRET = "f22bfe158eb39e4fdf4468aa987de27a9fd9908a71339e49fed978d71a455cae7f2f9c4699b9f73f364ed7b0d8532cfe3e51114bbb753c299d201d54702a2651";
+const REJECTED_BEARER = "aqtb7acAa9cExSyoSezA";
+const REJECTED_SESSION = "TBStFsmgbaTUmARANn";
+const REJECTED_API_KEY = "rYhKYxi7tSNzdArwD3";
+const rejectedSecretForms = (value) => [value, Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")];
+const REJECTED_CANARIES = [...[REJECTED_API_ID, REJECTED_API_SECRET].flatMap(rejectedSecretForms), REJECTED_BEARER, REJECTED_SESSION, REJECTED_API_KEY];
+
+// A 401 whose message echoes the configured API ID and secret in their raw and base64 forms
+// beside a bearer token, a session pair, and an API key pair, with more of them in fields the
+// client never keeps.
+function rejectedCredentialsResponse() {
+  const echoed = [REJECTED_API_ID, REJECTED_API_SECRET].flatMap(rejectedSecretForms).join(" ");
+  return new Response(JSON.stringify({
+    http_code: 401,
+    http_status: "Unauthorized",
+    message: `Invalid API credentials ${echoed}; Bearer ${REJECTED_BEARER} refused; session=${REJECTED_SESSION}, api_key=${REJECTED_API_KEY}`,
+    detail: { id: REJECTED_API_ID, key: REJECTED_API_SECRET },
+  }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } });
+}
+
+// A real client over the healthy route table that answers each path with the status statusFor
+// picks: 401 as a credential rejection, 403 as a role refusal, anything else as routed.
+function statusVeracodeClient(statusFor, config = sampleConfig({ retries: 0 })) {
+  const { fetchImpl: serve } = recordingVeracodeFetch();
+  return new VeracodeApiClient(config, {
+    fetchImpl: async (input, init) => {
+      const status = statusFor(new URL(String(input)).pathname);
+      if (status === 401) return rejectedCredentialsResponse();
+      if (status === 403) return jsonResponse({ http_code: 403, http_status: "Forbidden", message: "Access denied" }, { status: 403 });
+      return serve(input, init);
+    },
+    sleep: async () => {},
+  });
+}
+
+test("checkVeracodeAccess reports failed and names the credential settings, never a role, when every probe returns 401", async () => {
+  assertFixtureFreeOfCanaryWindows(
+    `${VERACODE_REJECTED_STEP} ${VERACODE_REJECTED_ROLES_NOTE} ${JSON.stringify(sampleConfig())} ${rejectedCredentialsResponse().statusText} Invalid API credentials Bearer refused session api_key`,
+    REJECTED_CANARIES,
+    "rejected credentials fixture",
+  );
+  const result = await checkVeracodeAccess(statusVeracodeClient(() => 401, sampleConfig({ apiKeyId: REJECTED_API_ID, apiKeySecret: REJECTED_API_SECRET, retries: 0 })));
+  assert.equal(result.status, "failed");
+  assert.equal(result.recommendedNextStep, VERACODE_REJECTED_STEP);
+  assert.deepEqual(result.missingRoles, []);
+  assert.equal(result.principal, undefined);
+  assert.equal(result.surfaces.length, 9);
+  for (const surface of result.surfaces) {
+    assert.equal(surface.status, "not_readable", surface.name);
+    assert.equal(surface.statusCode, 401, surface.name);
+    assert.equal(surface.count, null, surface.name);
+  }
+  assert.deepEqual(result.notes.slice(1), ["0/9 audit surfaces are readable; every one returned HTTP 401.", VERACODE_REJECTED_ROLES_NOTE]);
+  for (const text of [...result.notes, result.recommendedNextStep]) assert.doesNotMatch(text, VERACODE_ROLE_CLAIMS, text);
+  // Fixed text and setting names only, so the module's own scrub leaves the step whole.
+  assert.equal(scrubErrorText(result.recommendedNextStep), result.recommendedNextStep);
+  assert.equal(scrubErrorText(result.recommendedNextStep, [REJECTED_API_ID, REJECTED_API_SECRET]), result.recommendedNextStep);
+  for (const canary of REJECTED_CANARIES) assertNoWindowOf(JSON.stringify(result), canary, "access check result");
+});
+
+test("veracode_check_access renders failed with the credential settings and leaks no planted value when every probe returns 401", async () => {
+  const tools = new Map();
+  registerVeracodeTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const tool = tools.get("veracode_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => rejectedCredentialsResponse();
+  let result;
+  try {
+    result = await tool.execute("call-rejected-credentials", tool.prepareArguments({ api_key_id: REJECTED_API_ID, api_key_secret: REJECTED_API_SECRET }));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const text = result.content[0].text;
+  assert.notEqual(result.isError, true, text);
+  assert.equal(result.details.status, "failed");
+  assert.match(text, /^Veracode access check: failed$/m);
+  assert.ok(text.includes(`\nNext: ${VERACODE_REJECTED_STEP}`), text);
+  assert.ok(text.includes(VERACODE_REJECTED_ROLES_NOTE), text);
+  assert.doesNotMatch(text, VERACODE_ROLE_CLAIMS);
+  assert.doesNotMatch(JSON.stringify(result.details), VERACODE_ROLE_CLAIMS);
+  for (const canary of REJECTED_CANARIES) assertNoWindowOf(`${text}\n${JSON.stringify(result.details)}`, canary, "rendered access check");
+});
+
+test("checkVeracodeAccess keeps the limited status and role wording when a probe reads or a refusal is not a 401", async () => {
+  // The self read succeeds, so the credentials authenticated and the other 401s stay role refusals.
+  const partly = await checkVeracodeAccess(statusVeracodeClient((path) => (path === "/api/authn/v2/users/self" ? 200 : 401)));
+  assert.equal(partly.status, "limited");
+  assert.equal(partly.principal, "svc-api");
+  assert.deepEqual(partly.missingRoles, ["Security Insights or Reviewer", "Administrator", "any API user"]);
+  assert.equal(partly.recommendedNextStep, VERACODE_ROLE_GAP_STEP("Security Insights or Reviewer, Administrator, any API user"));
+  assert.ok(partly.notes.includes("1/7 core audit surfaces are readable."), JSON.stringify(partly.notes));
+  assert.ok(partly.notes.includes("Optional license-gated surfaces not readable: sca_workspaces, dynamic_analyses (their controls will render as manual)."), JSON.stringify(partly.notes));
+
+  // Every probe refused with 403: the credentials authenticated, so the role analysis stands.
+  const refused = await checkVeracodeAccess(statusVeracodeClient(() => 403));
+  assert.equal(refused.status, "limited");
+  assert.ok(refused.surfaces.every((surface) => surface.statusCode === 403), JSON.stringify(refused.surfaces));
+  assert.deepEqual(refused.missingRoles, ["any API user", "Security Insights or Reviewer", "Administrator"]);
+  assert.equal(refused.recommendedNextStep, VERACODE_ROLE_GAP_STEP("any API user, Security Insights or Reviewer, Administrator"));
+  assert.ok(refused.notes.includes("0/7 core audit surfaces are readable."), JSON.stringify(refused.notes));
+
+  // A 403 beside the 401s means not every probe was rejected.
+  const mixed = await checkVeracodeAccess(statusVeracodeClient((path) => (path === "/was/configservice/v1/analyses" ? 403 : 401)));
+  assert.equal(mixed.status, "limited");
+  assert.deepEqual(mixed.missingRoles, ["any API user", "Security Insights or Reviewer", "Administrator"]);
+  assert.equal(mixed.recommendedNextStep, VERACODE_ROLE_GAP_STEP("any API user, Security Insights or Reviewer, Administrator"));
+});
+
 test("assessments pass on the healthy fixture and register every control exactly once", async () => {
   const findings = await runAllAssessments(mockClient());
   assert.equal(findings.length, VERACODE_CONTROLS.length);
@@ -2420,6 +2536,9 @@ const VERACODE_FIXED_TEXTS = [
   "Optional license-gated surfaces not readable: sca_workspaces, dynamic_analyses (their controls will render as manual).",
   "Run veracode_assess_scan_coverage, veracode_assess_policy_compliance, veracode_assess_findings_hygiene, veracode_assess_sca_posture, veracode_assess_access_controls, or veracode_export_audit_bundle.",
   "Grant the API service account the missing roles (Security Insights or Reviewer, Administrator) and confirm the region matches the account.",
+  "0/9 audit surfaces are readable; every one returned HTTP 401.",
+  "Roles were not checked because Veracode rejected the API credentials; the rejected probes do not mean a role is missing.",
+  "Veracode rejected the API credentials (every probe returned 401). Set VERACODE_API_KEY_ID and VERACODE_API_KEY_SECRET (or the api_key_id and api_key_secret arguments, or veracode_api_key_id and veracode_api_key_secret in ~/.veracode/credentials) to a valid API ID and secret, with VERACODE_REGION or VERACODE_API_BASE_URL pointing at the region that issued them, then rerun veracode_check_access.",
   "first page only, total unknown",
 ];
 

@@ -115,7 +115,7 @@ export interface ZscalerAccessSurface {
 }
 
 export interface ZscalerAccessCheckResult {
-  status: "healthy" | "limited" | "unavailable";
+  status: "healthy" | "limited" | "failed" | "unavailable";
   products: Record<ZscalerProduct, "configured" | "not_configured">;
   surfaces: ZscalerAccessSurface[];
   notes: string[];
@@ -664,16 +664,60 @@ export function resolveZscalerConfiguration(
   };
 }
 
+/**
+ * How a request's credentials were refused: by the ZIA session login or the ZPA sign-in itself, with the status and
+ * the code it answered, or by a 401 from the API afterward.
+ */
+type ZscalerCredentialRejection =
+  | { source: "api" }
+  | { source: "sign_in"; status: number; code?: string };
+
 export class ZscalerApiError extends Error {
   readonly status: number;
   readonly product: ZscalerProduct;
+  readonly rejection?: ZscalerCredentialRejection;
 
-  constructor(product: ZscalerProduct, status: number, message: string) {
+  constructor(product: ZscalerProduct, status: number, message: string, rejection?: ZscalerCredentialRejection) {
     super(message);
     this.name = "ZscalerApiError";
     this.status = status;
     this.product = product;
+    this.rejection = rejection;
   }
+}
+
+/**
+ * The codes the ZIA session login answers for a wrong username, password, or cloud (AUTHENTICATION_FAILED), a
+ * malformed username (INVALID_USERNAME_OR_PASSWORD), and a wrong API key or timestamp (INVALID_API_KEY).
+ */
+const ZIA_LOGIN_REJECTION_CODES = new Set(["AUTHENTICATION_FAILED", "INVALID_USERNAME_OR_PASSWORD", "INVALID_API_KEY"]);
+
+/** A refused ZIA login: HTTP 401, or a client error carrying one of the login rejection codes. */
+function ziaLoginRejection(status: number, payload: unknown): ZscalerCredentialRejection | undefined {
+  const code = asString(asObject(payload)?.code);
+  const knownCode = code !== undefined && ZIA_LOGIN_REJECTION_CODES.has(code) ? code : undefined;
+  if (status === 401 || (status >= 400 && status < 500 && knownCode)) {
+    return { source: "sign_in", status, ...(knownCode ? { code: knownCode } : {}) };
+  }
+  return undefined;
+}
+
+/** OAuth error codes with which a token endpoint refuses the client or the grant itself (RFC 6749 section 5.2). */
+const REJECTED_GRANT_CODE = /\b(invalid_client|invalid_grant|unauthorized_client)\b/;
+
+/** A refused ZPA sign-in: HTTP 401, or HTTP 400 with one of the rejected grant codes in a documented error field. */
+function zpaSignInRejection(status: number, payload: unknown): ZscalerCredentialRejection | undefined {
+  const code = REJECTED_GRANT_CODE.exec(payloadErrorSummary(payload) ?? "")?.[1];
+  if (status === 401 || (status === 400 && code)) {
+    return { source: "sign_in", status, ...(code ? { code } : {}) };
+  }
+  return undefined;
+}
+
+/** A refused login or sign-in, or a 401 from the API, rejects the credentials; a 403 and every other failure do not. */
+function credentialRejection(error: unknown): ZscalerCredentialRejection | undefined {
+  if (!(error instanceof ZscalerApiError)) return undefined;
+  return error.rejection ?? (error.status === 401 ? { source: "api" } : undefined);
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -911,8 +955,14 @@ export class ZiaApiClient implements ZiaReadClient {
     });
     const rawText = await response.text();
     if (!response.ok) {
-      const detail = errorDetail(parseJsonText(rawText), rawText);
-      throw new ZscalerApiError("zia", response.status, this.redact(`ZIA login failed (${response.status})${detail ? `: ${detail}` : ""}`));
+      const payload = parseJsonText(rawText);
+      const detail = errorDetail(payload, rawText);
+      throw new ZscalerApiError(
+        "zia",
+        response.status,
+        this.redact(`ZIA login failed (${response.status})${detail ? `: ${detail}` : ""}`),
+        ziaLoginRejection(response.status, payload),
+      );
     }
     const sessionId = extractSessionCookie(response);
     if (!sessionId) {
@@ -1641,12 +1691,17 @@ function severityRank(severity: ZscalerSeverity): number {
   }
 }
 
+interface ZscalerAccessProbe {
+  surface: ZscalerAccessSurface;
+  rejection?: ZscalerCredentialRejection;
+}
+
 async function readableSurface(
   product: ZscalerProduct,
   name: string,
   endpoint: string,
   load: () => Promise<unknown>,
-): Promise<ZscalerAccessSurface> {
+): Promise<ZscalerAccessProbe> {
   try {
     const value = await load();
     const count = Array.isArray(value)
@@ -1654,16 +1709,19 @@ async function readableSurface(
       : asObject(value) && Array.isArray(asObject(value)?.items)
         ? asArray(asObject(value)?.items).length
         : undefined;
-    return { product, name, endpoint, status: "readable", count };
+    return { surface: { product, name, endpoint, status: "readable", count } };
   } catch (error) {
     rethrowIfAborted(error);
     return {
-      product,
-      name,
-      endpoint,
-      status: "not_readable",
-      statusCode: error instanceof ZscalerApiError ? error.status : undefined,
-      error: errorMessage(error),
+      surface: {
+        product,
+        name,
+        endpoint,
+        status: "not_readable",
+        statusCode: error instanceof ZscalerApiError ? error.status : undefined,
+        error: errorMessage(error),
+      },
+      rejection: credentialRejection(error),
     };
   }
 }
@@ -1675,12 +1733,12 @@ export interface ZscalerClients {
 }
 
 export async function checkZscalerAccess(clients: ZscalerClients): Promise<ZscalerAccessCheckResult> {
-  const surfaces: ZscalerAccessSurface[] = [];
+  const probes: ZscalerAccessProbe[] = [];
   const notes: string[] = [];
   if (clients.zia) {
     const zia = clients.zia;
     notes.push(`ZIA cloud ${zia.getResolvedConfig().cloud} at ${zia.getResolvedConfig().baseUrl} (API key plus session login as ${zia.getResolvedConfig().username}).`);
-    surfaces.push(
+    probes.push(
       await readableSurface("zia", "admin_users", "/adminUsers", () => zia.listAdminUsers()),
       await readableSurface("zia", "admin_roles", "/adminRoles/lite", () => zia.listAdminRoles()),
       await readableSurface("zia", "auth_settings", "/authSettings", () => zia.getAuthSettings()),
@@ -1699,7 +1757,7 @@ export async function checkZscalerAccess(clients: ZscalerClients): Promise<Zscal
   if (clients.zpa) {
     const zpa = clients.zpa;
     notes.push(`ZPA cloud ${zpa.getResolvedConfig().cloud} at ${zpa.getResolvedConfig().baseUrl} (client credentials for customer ${zpa.getResolvedConfig().customerId}).`);
-    surfaces.push(
+    probes.push(
       await readableSurface("zpa", "application_segments", "/mgmtconfig/v1/admin/customers/{customerId}/application", () => zpa.listApplicationSegments()),
       await readableSurface("zpa", "segment_groups", "/mgmtconfig/v1/admin/customers/{customerId}/segmentGroup", () => zpa.listSegmentGroups()),
       await readableSurface("zpa", "access_policy_rules", "/mgmtconfig/v1/admin/customers/{customerId}/policySet/rules/policyType/ACCESS_POLICY", () => zpa.listPolicyRules("ACCESS_POLICY")),
@@ -1718,6 +1776,22 @@ export async function checkZscalerAccess(clients: ZscalerClients): Promise<Zscal
     notes.push("ZDX credentials were detected; ZDX enrichment is not implemented in this release and no control depends on it.");
   }
 
+  const surfaces = probes.map((probe) => probe.surface);
+  const products: ZscalerAccessCheckResult["products"] = {
+    zia: clients.zia ? "configured" : "not_configured",
+    zpa: clients.zpa ? "configured" : "not_configured",
+  };
+
+  // Every probe rejected the credentials themselves, so nothing was learned about roles.
+  if (probes.length > 0 && probes.every((probe) => probe.rejection)) {
+    const rejected = rejectedProducts(probes);
+    notes.push(
+      `0/${surfaces.length} Zscaler audit surfaces are readable; ${rejected.map(({ evidence }) => evidence).join(" and ")}.`,
+      `Roles were not checked because Zscaler rejected ${rejectedCredentials(rejected)}; the rejected probes do not mean a role is missing.`,
+    );
+    return { status: "failed", products, surfaces, notes, recommendedNextStep: accessCheckNextStep("failed", rejected) };
+  }
+
   const readable = surfaces.filter((surface) => surface.status === "readable").length;
   const status: ZscalerAccessCheckResult["status"] = surfaces.length === 0
     ? "unavailable"
@@ -1726,18 +1800,92 @@ export async function checkZscalerAccess(clients: ZscalerClients): Promise<Zscal
       : "limited";
   notes.push(`${readable}/${surfaces.length} Zscaler audit surfaces are readable.`);
 
-  return {
-    status,
-    products: {
-      zia: clients.zia ? "configured" : "not_configured",
-      zpa: clients.zpa ? "configured" : "not_configured",
-    },
-    surfaces,
-    notes,
-    recommendedNextStep: status === "healthy"
-      ? "Run zscaler_assess_zia_access_control, zscaler_assess_zia_policy, zscaler_assess_zpa, or zscaler_export_audit_bundle."
-      : "Grant the ZIA admin a read-capable role for every surface above and the ZPA API client a read role, then rerun zscaler_check_access. Unreadable surfaces produce manual findings, never passes.",
-  };
+  return { status, products, surfaces, notes, recommendedNextStep: accessCheckNextStep(status, []) };
+}
+
+interface ZscalerRejectedProduct {
+  product: ZscalerProduct;
+  evidence: string;
+}
+
+/** The products whose probes were rejected, each with the evidence its rejections carry. */
+function rejectedProducts(probes: ZscalerAccessProbe[]): ZscalerRejectedProduct[] {
+  return (["zia", "zpa"] as const).flatMap((product) => {
+    const rejections = probes.flatMap((probe) => (probe.surface.product === product && probe.rejection ? [probe.rejection] : []));
+    return rejections.length > 0 ? [{ product, evidence: rejectionEvidence(product, rejections) }] : [];
+  });
+}
+
+/** A refused login or sign-in stops every probe of its product before the API, so its status and code are the evidence. */
+function rejectionEvidence(product: ZscalerProduct, rejections: ZscalerCredentialRejection[]): string {
+  const signIn = rejections.find((rejection): rejection is Extract<ZscalerCredentialRejection, { source: "sign_in" }> => rejection.source === "sign_in");
+  return signIn
+    ? `POST ${signInPath(product)} returned ${signIn.status}${signIn.code ? ` ${signIn.code}` : ""}`
+    : `every ${product.toUpperCase()} probe returned 401`;
+}
+
+function signInPath(product: ZscalerProduct): string {
+  switch (product) {
+    case "zia":
+      return "/authenticatedSession";
+    case "zpa":
+      return "/signin";
+    default: {
+      const exhaustive: never = product;
+      throw new Error(`Unhandled Zscaler product ${String(exhaustive)}`);
+    }
+  }
+}
+
+function credentialKind(product: ZscalerProduct): string {
+  switch (product) {
+    case "zia":
+      return "ZIA API key and admin login";
+    case "zpa":
+      return "ZPA API key";
+    default: {
+      const exhaustive: never = product;
+      throw new Error(`Unhandled Zscaler product ${String(exhaustive)}`);
+    }
+  }
+}
+
+function credentialSettings(product: ZscalerProduct): string {
+  switch (product) {
+    case "zia":
+      return "Set ZIA_API_KEY, ZIA_USERNAME, and ZIA_PASSWORD (or the zia_api_key, zia_username, and zia_password arguments or config file entries) to the tenant's API key and an admin's login name and password, with ZIA_CLOUD naming the tenant's cloud";
+    case "zpa":
+      return "Set ZPA_CLIENT_ID, ZPA_CLIENT_SECRET, and ZPA_CUSTOMER_ID (or the zpa_client_id, zpa_client_secret, and zpa_customer_id arguments or config file entries) to the client ID and client secret of a ZPA API key and the customer ID it belongs to, with ZPA_CLOUD naming the key's cloud";
+    default: {
+      const exhaustive: never = product;
+      throw new Error(`Unhandled Zscaler product ${String(exhaustive)}`);
+    }
+  }
+}
+
+function rejectedCredentials(rejected: ZscalerRejectedProduct[]): string {
+  return rejected.map(({ product }) => `the ${credentialKind(product)}`).join(" and ");
+}
+
+function rejectedCredentialsStep(rejected: ZscalerRejectedProduct[]): string {
+  const refused = rejected.map(({ product, evidence }) => `the ${credentialKind(product)} (${evidence})`).join(" and ");
+  return `Zscaler rejected ${refused}. ${rejected.map(({ product }) => credentialSettings(product)).join(". ")}, then rerun zscaler_check_access.`;
+}
+
+function accessCheckNextStep(status: ZscalerAccessCheckResult["status"], rejected: ZscalerRejectedProduct[]): string {
+  switch (status) {
+    case "healthy":
+      return "Run zscaler_assess_zia_access_control, zscaler_assess_zia_policy, zscaler_assess_zpa, or zscaler_export_audit_bundle.";
+    case "limited":
+    case "unavailable":
+      return "Grant the ZIA admin a read-capable role for every surface above and the ZPA API client a read role, then rerun zscaler_check_access. Unreadable surfaces produce manual findings, never passes.";
+    case "failed":
+      return rejectedCredentialsStep(rejected);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Zscaler access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function formatAccessCheckText(result: ZscalerAccessCheckResult): string {
@@ -1888,7 +2036,12 @@ export class ZpaApiClient implements ZpaReadClient {
     const payload = asObject(parseJsonText(rawText)) ?? {};
     if (!response.ok) {
       const detail = errorDetail(payload, rawText);
-      throw new ZscalerApiError("zpa", response.status, this.redact(`ZPA signin failed (${response.status})${detail ? `: ${detail}` : ""}`));
+      throw new ZscalerApiError(
+        "zpa",
+        response.status,
+        this.redact(`ZPA signin failed (${response.status})${detail ? `: ${detail}` : ""}`),
+        zpaSignInRejection(response.status, payload),
+      );
     }
     const token = asString(payload.access_token);
     if (!token) {
