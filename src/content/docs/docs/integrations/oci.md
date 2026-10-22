@@ -82,7 +82,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose | Key arguments |
 |------|---------|---------------|
-| `oci_check_access` | Probes ten read surfaces (compartments, users, authentication policy, audit configuration, audit events, Cloud Guard configuration, security lists, vaults, Object Storage, compute) | `profile`, `region`, `tenancy_ocid`, `compartment_ocid` |
+| `oci_check_access` | Probes ten read surfaces (compartments, users, authentication policy, audit configuration, audit events, Cloud Guard configuration, security lists, vaults, Object Storage, compute). Reports `healthy` when at least seven are readable, compartments among them, and `failed` when every CLI command fails with `ServiceError` status `401` (`NotAuthenticated`) because OCI rejected the profile's API signing key; the `failed` next step names the profile entries and variables to fix. Otherwise reports `limited` | `profile`, `region`, `tenancy_ocid`, `compartment_ocid` |
 | `oci_assess_identity` | Findings OCI-IAM-01..06 | `stale_days` (90), `max_keys` (200), `max_policies` (500), `max_compartments` (25) |
 | `oci_assess_logging_detection` | Findings OCI-LOG-01..06 | `lookback_days` (7), `max_compartments` |
 | `oci_assess_tenancy_guardrails` | Findings OCI-GRD-01..06 | `max_compartments`, `max_buckets` (100), `max_keys` (200, ENABLED vault keys fetched with `kms management key get`) |

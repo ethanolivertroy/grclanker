@@ -62,7 +62,7 @@ timeout = 30
 
 Create a connected app that acts on its own behalf (client credentials). Grant it read-only scopes in the organization and in each environment you want inspected.
 
-`mulesoft_check_access` probes every surface and names the connected-app scope for any `401` or `403`.
+`mulesoft_check_access` probes every surface and names the connected-app scope for any `401` or `403`. When Anypoint Platform rejects the credentials themselves, it names no scope: it reports `failed` and names the credential variables to fix.
 
 Scope IDs come from the Anypoint OpenID discovery document. When MuleSoft publicly documents a scope display name, both the display name and API ID are shown.
 
@@ -101,7 +101,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 | --- | --- |
-| `mulesoft_check_access` | Probes 20 read surfaces (Access Management, API Manager, Exchange, CloudHub, Runtime Manager, audit log, MQ, Secrets Manager), reports `healthy` or `limited`, and lists missing permissions. |
+| `mulesoft_check_access` | Probes 20 read surfaces (Access Management, API Manager, Exchange, CloudHub, Runtime Manager, audit log, MQ, Secrets Manager), reports `healthy` or `limited`, and lists missing permissions. Reports `failed` with no missing permissions when Anypoint Platform rejects the credentials: every probe it sends returns `401`, or the token request or login is refused with `401` or the OAuth error `invalid_client`, `invalid_grant`, or `unauthorized_client`. The `failed` next step names the credential variables to fix. |
 | `mulesoft_assess_identity_access` | Controls 1-6, 18, 19, 25: identity providers, MFA exemptions, admin count, role group least privilege and environment scoping, environment isolation, connected app scopes and staleness, business groups. |
 | `mulesoft_assess_api_gateway` | Controls 7-9, 20: authentication and rate limiting policies on API instances (production first), client credential rotation evidence, Exchange asset governance. |
 | `mulesoft_assess_runtime_infrastructure` | Controls 10-16, 21-23: runtime versions, worker sizing, persistent queue encryption, VPC firewall rules and open ingress, DLB TLS versions and certificate expiry, MQ, Secrets Manager, hybrid servers. |

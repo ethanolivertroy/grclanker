@@ -325,7 +325,7 @@ export interface MulesoftAccessSurface {
 }
 
 export interface MulesoftAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   organizationId: string;
   controlPlane: MulesoftControlPlane;
   baseUrl: string;
@@ -401,6 +401,28 @@ export class MulesoftApiError extends Error {
     this.name = "MulesoftApiError";
     this.status = status;
     this.endpoint = endpoint;
+  }
+}
+
+type MulesoftCredentialExchange = "token request" | "login request";
+
+/** The RFC 6749 section 5.2 token errors that mean the server refused the credentials themselves. */
+const REJECTED_CREDENTIAL_OAUTH_ERRORS = ["invalid_client", "invalid_grant", "unauthorized_client"] as const;
+type RejectedCredentialOauthError = typeof REJECTED_CREDENTIAL_OAUTH_ERRORS[number];
+
+/**
+ * The connected-app token request or the username-and-password login failed. Only an OAuth error code
+ * from the fixed rejection list is kept, so nothing else from the response body rides on the error.
+ */
+class MulesoftCredentialExchangeError extends MulesoftApiError {
+  readonly exchange: MulesoftCredentialExchange;
+  readonly oauthError?: RejectedCredentialOauthError;
+
+  constructor(status: number, message: string, endpoint: string, exchange: MulesoftCredentialExchange, payload: unknown) {
+    super(status, message, endpoint);
+    this.exchange = exchange;
+    const code = asString(asObject(payload)?.error);
+    this.oauthError = REJECTED_CREDENTIAL_OAUTH_ERRORS.find((item) => item === code);
   }
 }
 
@@ -1316,7 +1338,8 @@ interface RequestOptions {
   query?: JsonRecord;
   body?: unknown;
   headers?: Record<string, string>;
-  skipAuth?: boolean;
+  /** The token request or the login: it carries no bearer, and its failure is a MulesoftCredentialExchangeError. */
+  exchange?: MulesoftCredentialExchange;
 }
 
 interface ListOptions {
@@ -1489,7 +1512,7 @@ export class MulesoftApiClient {
     const method = init.method ?? "GET";
     const url = this.buildUrl(path, init.query ?? {});
     const pathLabel = new URL(url).pathname;
-    const bearer = init.skipAuth ? undefined : await this.getAccessToken();
+    const bearer = init.exchange ? undefined : await this.getAccessToken();
 
     for (let attempt = 0; ; attempt += 1) {
       const controller = new AbortController();
@@ -1520,14 +1543,14 @@ export class MulesoftApiClient {
         } catch {
           payload = undefined;
         }
-        throw new MulesoftApiError(
-          response.status,
-          this.redact(
-            `Anypoint request failed (${response.status} ${response.statusText}) for ${method} ${pathLabel}`
-            + anypointErrorDetail(payload, response, rawText),
-          ),
-          pathLabel,
+        const message = this.redact(
+          `Anypoint request failed (${response.status} ${response.statusText}) for ${method} ${pathLabel}`
+          + anypointErrorDetail(payload, response, rawText),
         );
+        if (init.exchange) {
+          throw new MulesoftCredentialExchangeError(response.status, message, pathLabel, init.exchange, payload);
+        }
+        throw new MulesoftApiError(response.status, message, pathLabel);
       } catch (error) {
         rethrowIfAborted(error);
         if (error instanceof MulesoftApiError) throw error;
@@ -1561,7 +1584,7 @@ export class MulesoftApiClient {
             client_id: this.config.clientId,
             client_secret: this.config.clientSecret,
           },
-          skipAuth: true,
+          exchange: "token request",
         });
         break;
       }
@@ -1572,7 +1595,7 @@ export class MulesoftApiClient {
             username: this.config.username,
             password: this.config.password,
           },
-          skipAuth: true,
+          exchange: "login request",
         });
         break;
       }
@@ -4187,6 +4210,22 @@ function countItems(value: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * Probes Anypoint refused the credentials on, keyed by surface so the surface records keep their shape.
+ * `exchangeAnswer` is set when the token request or the login was the request refused.
+ */
+const REJECTED_PROBES = new WeakMap<MulesoftAccessSurface, { exchangeAnswer?: string }>();
+const EVERY_PROBE_REJECTED = "every probe returned 401";
+
+function credentialRejection(error: unknown): { exchangeAnswer?: string } | undefined {
+  if (error instanceof MulesoftCredentialExchangeError) {
+    if (error.status !== 400 && error.status !== 401) return undefined;
+    if (error.oauthError) return { exchangeAnswer: `the ${error.exchange} returned ${error.oauthError}` };
+    return error.status === 401 ? { exchangeAnswer: `the ${error.exchange} returned 401` } : undefined;
+  }
+  return error instanceof MulesoftApiError && error.status === 401 ? {} : undefined;
+}
+
 async function probeSurface(definition: SurfaceDefinition): Promise<MulesoftAccessSurface> {
   try {
     const value = await definition.load();
@@ -4199,7 +4238,7 @@ async function probeSurface(definition: SurfaceDefinition): Promise<MulesoftAcce
     };
   } catch (error) {
     rethrowIfAborted(error);
-    return {
+    const surface: MulesoftAccessSurface = {
       name: definition.name,
       endpoint: definition.endpoint,
       permission: definition.permission,
@@ -4207,7 +4246,18 @@ async function probeSurface(definition: SurfaceDefinition): Promise<MulesoftAcce
       httpStatus: error instanceof MulesoftApiError ? error.status : undefined,
       error: errorMessage(error),
     };
+    const rejection = credentialRejection(error);
+    if (rejection) REJECTED_PROBES.set(surface, rejection);
+    return surface;
   }
+}
+
+/** The evidence that Anypoint refused the credentials on every attempted probe, or undefined when any probe got another answer. */
+function rejectedCredentialsEvidence(surfaces: MulesoftAccessSurface[]): string | undefined {
+  const attempted = surfaces.filter((surface) => surface.status !== "skipped");
+  const rejections = attempted.map((surface) => REJECTED_PROBES.get(surface));
+  if (attempted.length === 0 || rejections.some((rejection) => rejection === undefined)) return undefined;
+  return rejections.find((rejection) => rejection?.exchangeAnswer)?.exchangeAnswer ?? EVERY_PROBE_REJECTED;
 }
 
 function skippedSurface(name: string, endpoint: string, permission: string, reason: string): MulesoftAccessSurface {
@@ -4280,8 +4330,12 @@ export async function checkMulesoftAccess(client: AccessClient): Promise<Mulesof
   const readable = surfaces.filter((surface) => surface.status === "readable");
   const coreSurfaces = new Set(["current_user", "organization", "members", "role_groups", "environments"]);
   const coreReadable = surfaces.filter((surface) => coreSurfaces.has(surface.name) && surface.status === "readable").length;
-  const status = coreReadable === coreSurfaces.size && readable.length >= Math.ceil(surfaces.length * 0.75) ? "healthy" : "limited";
-  const missingPermissions = [...new Set(
+  const rejectionEvidence = rejectedCredentialsEvidence(surfaces);
+  const status: MulesoftAccessCheckResult["status"] = rejectionEvidence
+    ? "failed"
+    : (coreReadable === coreSurfaces.size && readable.length >= Math.ceil(surfaces.length * 0.75) ? "healthy" : "limited");
+  // A refused credential is denied on every probe whatever its scopes, so those denials name no missing scope.
+  const missingPermissions = rejectionEvidence ? [] : [...new Set(
     surfaces
       .filter((surface) => surface.status === "not_readable" && (surface.httpStatus === 401 || surface.httpStatus === 403))
       .map((surface) => surface.permission),
@@ -4289,7 +4343,9 @@ export async function checkMulesoftAccess(client: AccessClient): Promise<Mulesof
 
   const notes = [
     `Using Anypoint organization ${config.organizationId} on the ${config.controlPlane.toUpperCase()} control plane (${config.baseUrl}).`,
-    `Authenticated via ${config.authMode.replace("_", " ")} as ${asString(getNestedValue(currentUser, ["user", "username"])) ?? asString(getNestedValue(currentUser, ["client", "name"])) ?? asString(getNestedValue(currentUser, ["user", "email"])) ?? "the current principal"}.`,
+    rejectionEvidence
+      ? `Permissions were not checked because Anypoint Platform rejected the ${credentialKind(config.authMode)}; the denied probes do not mean permissions are missing.`
+      : `Authenticated via ${config.authMode.replace("_", " ")} as ${asString(getNestedValue(currentUser, ["user", "username"])) ?? asString(getNestedValue(currentUser, ["client", "name"])) ?? asString(getNestedValue(currentUser, ["user", "email"])) ?? "the current principal"}.`,
     environmentName
       ? `Environment-scoped probes used ${environmentName}${config.environmentFilter.length > 0 ? " (from the configured environment filter)" : ""}.`
       : "No environment was readable, so environment-scoped surfaces were skipped.",
@@ -4306,13 +4362,77 @@ export async function checkMulesoftAccess(client: AccessClient): Promise<Mulesof
     surfaces,
     missingPermissions,
     notes,
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run mulesoft_assess_identity_access, mulesoft_assess_api_gateway, mulesoft_assess_runtime_infrastructure, mulesoft_assess_audit_monitoring, or mulesoft_export_audit_bundle."
-        : missingPermissions.length > 0
-          ? `Add these documented connected-app scopes or permissions, then retry: ${missingPermissions.join("; ")}.`
-          : "Confirm the organization ID, control plane, and credentials, then retry.",
+    recommendedNextStep: accessCheckNextStep(status, config.authMode, missingPermissions, rejectionEvidence ?? EVERY_PROBE_REJECTED),
   };
+}
+
+function credentialKind(authMode: MulesoftAuthMode): string {
+  switch (authMode) {
+    case "token":
+      return "bearer token";
+    case "connected_app":
+      return "connected app credentials";
+    case "credentials":
+      return "username and password";
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled MuleSoft auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function rejectedCredentialsStep(authMode: MulesoftAuthMode, evidence: string): string {
+  const controlPlane = "plus ANYPOINT_CONTROL_PLANE or ANYPOINT_BASE_URL (or the control_plane or base_url arguments) if the organization is on another control plane, then rerun mulesoft_check_access.";
+  const rejected = `Anypoint Platform rejected the ${credentialKind(authMode)} (${evidence}).`;
+  switch (authMode) {
+    case "token":
+      return `${rejected} Set ANYPOINT_TOKEN (or its alias ANYPOINT_ACCESS_TOKEN, or the token argument or config.toml key) to a current token, ${controlPlane}`;
+    case "connected_app":
+      return `${rejected} Set ANYPOINT_CLIENT_ID and ANYPOINT_CLIENT_SECRET (or the client_id and client_secret arguments or config.toml keys) for a connected app that acts on its own behalf, ${controlPlane}`;
+    case "credentials":
+      return `${rejected} Set ANYPOINT_USERNAME and ANYPOINT_PASSWORD (or the username and password arguments or config.toml keys), ${controlPlane}`;
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled MuleSoft auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(
+  status: MulesoftAccessCheckResult["status"],
+  authMode: MulesoftAuthMode,
+  missingPermissions: string[],
+  rejectionEvidence: string,
+): string {
+  switch (status) {
+    case "healthy":
+      return "Run mulesoft_assess_identity_access, mulesoft_assess_api_gateway, mulesoft_assess_runtime_infrastructure, mulesoft_assess_audit_monitoring, or mulesoft_export_audit_bundle.";
+    case "limited":
+      return missingPermissions.length > 0
+        ? `Add these documented connected-app scopes or permissions, then retry: ${missingPermissions.join("; ")}.`
+        : "Confirm the organization ID, control plane, and credentials, then retry.";
+    case "failed":
+      return rejectedCredentialsStep(authMode, rejectionEvidence);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled MuleSoft access status ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** A refused credential leaves permissions unchecked, so a failed check prints no missing-permissions line. */
+function missingPermissionsLines(result: MulesoftAccessCheckResult): string[] {
+  switch (result.status) {
+    case "healthy":
+    case "limited":
+      return [result.missingPermissions.length > 0 ? `Missing permissions: ${result.missingPermissions.join("; ")}` : "Missing permissions: none detected"];
+    case "failed":
+      return [];
+    default: {
+      const exhaustive: never = result.status;
+      throw new Error(`Unhandled MuleSoft access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function formatAccessCheckText(result: MulesoftAccessCheckResult): string {
@@ -4330,7 +4450,7 @@ function formatAccessCheckText(result: MulesoftAccessCheckResult): string {
     "",
     formatTable(["Surface", "Status", "Count", "Note"], rows),
     "",
-    result.missingPermissions.length > 0 ? `Missing permissions: ${result.missingPermissions.join("; ")}` : "Missing permissions: none detected",
+    ...missingPermissionsLines(result),
     `Next: ${result.recommendedNextStep}`,
   ].join("\n");
 }

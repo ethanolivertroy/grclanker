@@ -740,6 +740,154 @@ test("checkPagerdutyAccess reports limited access, missing permissions, and part
   assert.ok(limitedScope.notes.some((note) => /partial visibility/.test(note)));
 });
 
+/** Credentials the rejected-credential runs configure; the refusing fixture echoes them back (see the planted-values self-check). */
+const REJECTED_CREDENTIALS = {
+  apiToken: "eKpIdYp0YChA3DsjtF",
+  accessToken: "xOs0GQt9uTMFX1m1WH",
+  clientSecret: "qMkDly0KEM1Znd6x8C",
+};
+const PAGERDUTY_STATUS_TEXT = { 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden" };
+
+/**
+ * Answers every REST request with `status` and PagerDuty's documented error fields echoing `echoed`, except the paths
+ * `readable` serves; `tokenRequest` answers the Scoped OAuth token request, which otherwise issues a token.
+ */
+function refusingPagerdutyFetch({ echoed, status = 401, readable = {}, tokenRequest } = {}) {
+  return async (input) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.hostname === "identity.pagerduty.com") {
+      return tokenRequest
+        ? jsonResponse(tokenRequest.body, { status: tokenRequest.status, statusText: PAGERDUTY_STATUS_TEXT[tokenRequest.status] })
+        : jsonResponse({ access_token: "issued-access-token", token_type: "bearer", expires_in: 3600 });
+    }
+    if (readable[url.pathname]) return jsonResponse(readable[url.pathname]);
+    return jsonResponse({ error: { message: `Invalid credential ${echoed}`, code: 2006 } }, { status, statusText: PAGERDUTY_STATUS_TEXT[status] });
+  };
+}
+
+/** Runs the registered check against `fetchImpl`; no window of any planted credential may reach the text or the details. */
+async function runPagerdutyCheckAccessTool(args, fetchImpl) {
+  const registered = [];
+  registerPagerdutyTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "pagerduty_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchImpl;
+  try {
+    const output = await checkAccess.execute("call-rejected", checkAccess.prepareArguments({ config_file: EMPTY_CONFIG_FILE, ...args }));
+    assert.notEqual(output.isError, true, output.content[0].text);
+    const run = { text: output.content.map((part) => part.text ?? "").join("\n"), details: output.details };
+    assertFragmentsAbsent(assert, `${run.text}\n${JSON.stringify(run.details)}`, Object.values(REJECTED_CREDENTIALS), "pagerduty_check_access text and details");
+    return run;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+/** A refused credential: the unchecked-permissions note and no missing-permission, scope, or key-type claim. */
+function assertRejectedCredentialOutput({ text, details }, credentialKind) {
+  const note = `Permissions were not checked because PagerDuty rejected the ${credentialKind}; the denied probes do not mean permissions are missing.`;
+  assert.ok(details.notes.includes(note) && text.includes(`\n${note}\n`), `${credentialKind}: the unchecked-permissions note`);
+  assert.deepEqual(details.missingPermissions, [], `${credentialKind}: no missing permissions are listed`);
+  assert.equal(details.surfaces.length, 14, `${credentialKind}: every probe is reported`);
+  assert.ok(details.surfaces.every((surface) => surface.status === "not_readable"), `${credentialKind}: no surface is readable`);
+  assert.doesNotMatch(text, /Missing read access|Credential scope|\.read\b|API Access Keys/, `${credentialKind}: no permission, scope, or key-type advice`);
+}
+
+test("pagerduty_check_access reports failed with a plain message when every probe rejects the REST API key or OAuth access token with 401", async () => {
+  const apiKey = await runPagerdutyCheckAccessTool({ api_token: REJECTED_CREDENTIALS.apiToken }, refusingPagerdutyFetch({ echoed: REJECTED_CREDENTIALS.apiToken }));
+  const apiKeyMessage = "PagerDuty rejected the REST API key (every probe returned 401). Set PAGERDUTY_API_TOKEN (or one of its aliases PAGERDUTY_API_KEY, PAGERDUTY_TOKEN, and PD_API_KEY, or the api_token argument or pagerduty.json key) to an active REST API key, and set PAGERDUTY_REGION or PAGERDUTY_BASE_URL (or their aliases PAGERDUTY_SERVICE_REGION and PAGERDUTY_API_BASE_URL, or the region or base_url arguments) if the account is not in the US service region, then rerun pagerduty_check_access.";
+  assert.equal(apiKey.details.status, "failed");
+  assert.equal(apiKey.details.authMode, "api_token");
+  assert.equal(apiKey.details.recommendedNextStep, apiKeyMessage);
+  assert.ok(apiKey.text.startsWith("PagerDuty access check: failed\n"));
+  assert.ok(apiKey.text.endsWith(`\nNext: ${apiKeyMessage}`));
+  assert.ok(apiKey.details.surfaces.every((surface) => surface.http_status === 401 && /\(401 Unauthorized\)/.test(surface.error)));
+  assertRejectedCredentialOutput(apiKey, "REST API key");
+
+  const bearer = await runPagerdutyCheckAccessTool(
+    { access_token: REJECTED_CREDENTIALS.accessToken, region: "eu" },
+    refusingPagerdutyFetch({ echoed: REJECTED_CREDENTIALS.accessToken }),
+  );
+  assert.equal(bearer.details.status, "failed");
+  assert.equal(bearer.details.authMode, "oauth_bearer");
+  assert.equal(bearer.details.region, "eu");
+  assert.equal(
+    bearer.details.recommendedNextStep,
+    "PagerDuty rejected the OAuth access token (every probe returned 401). Set PAGERDUTY_ACCESS_TOKEN (or its alias PAGERDUTY_OAUTH_TOKEN, or the access_token argument or pagerduty.json key) to a current OAuth access token, and set PAGERDUTY_REGION or PAGERDUTY_BASE_URL (or their aliases PAGERDUTY_SERVICE_REGION and PAGERDUTY_API_BASE_URL, or the region or base_url arguments) if the account is not in the EU service region, then rerun pagerduty_check_access.",
+  );
+  assertRejectedCredentialOutput(bearer, "OAuth access token");
+
+  const fromAliases = await checkPagerdutyAccess(new PagerdutyApiClient(
+    resolvePagerdutyConfiguration({}, { ...EMPTY_ENV, PD_API_KEY: REJECTED_CREDENTIALS.apiToken, PAGERDUTY_SERVICE_REGION: "eu" }),
+    { fetchImpl: refusingPagerdutyFetch({ echoed: REJECTED_CREDENTIALS.apiToken }) },
+  ));
+  assert.equal(fromAliases.status, "failed", "a key set only in PD_API_KEY");
+  assert.equal(fromAliases.authMode, "api_token");
+  assert.equal(fromAliases.region, "eu");
+  assert.equal(
+    fromAliases.recommendedNextStep,
+    "PagerDuty rejected the REST API key (every probe returned 401). Set PAGERDUTY_API_TOKEN (or one of its aliases PAGERDUTY_API_KEY, PAGERDUTY_TOKEN, and PD_API_KEY, or the api_token argument or pagerduty.json key) to an active REST API key, and set PAGERDUTY_REGION or PAGERDUTY_BASE_URL (or their aliases PAGERDUTY_SERVICE_REGION and PAGERDUTY_API_BASE_URL, or the region or base_url arguments) if the account is not in the EU service region, then rerun pagerduty_check_access.",
+  );
+  assertFragmentsAbsent(assert, JSON.stringify(fromAliases), Object.values(REJECTED_CREDENTIALS), "the PD_API_KEY check");
+});
+
+test("pagerduty_check_access reports failed when the Scoped OAuth token request is refused, naming the OAuth error or the 401", async () => {
+  const cases = [
+    [401, { error: "invalid_client", error_description: `Invalid client secret ${REJECTED_CREDENTIALS.clientSecret}` }, "the token request returned invalid_client"],
+    [400, { error: "unauthorized_client" }, "the token request returned unauthorized_client"],
+    [400, { error: "invalid_grant", error_description: "grant refused" }, "the token request returned invalid_grant"],
+    [401, { message: `Unauthorized client secret ${REJECTED_CREDENTIALS.clientSecret}` }, "the token request returned 401"],
+  ];
+  for (const [status, body, evidence] of cases) {
+    const run = await runPagerdutyCheckAccessTool(
+      { client_id: "client-1", client_secret: REJECTED_CREDENTIALS.clientSecret, subdomain: "acme" },
+      refusingPagerdutyFetch({ echoed: REJECTED_CREDENTIALS.clientSecret, tokenRequest: { status, body } }),
+    );
+    const message = `PagerDuty rejected the Scoped OAuth app credentials (${evidence}). Set PAGERDUTY_CLIENT_ID, PAGERDUTY_CLIENT_SECRET, and PAGERDUTY_SUBDOMAIN (or the alias PAGERDUTY_ACCOUNT_SUBDOMAIN for the subdomain, or the client_id, client_secret, and subdomain arguments or pagerduty.json keys) for an active Scoped OAuth app, and set PAGERDUTY_REGION or PAGERDUTY_BASE_URL (or their aliases PAGERDUTY_SERVICE_REGION and PAGERDUTY_API_BASE_URL, or the region or base_url arguments) if the account is not in the US service region, then rerun pagerduty_check_access.`;
+    assert.equal(run.details.status, "failed", evidence);
+    assert.equal(run.details.authMode, "oauth_client_credentials", evidence);
+    assert.equal(run.details.recommendedNextStep, message, evidence);
+    assert.ok(run.text.endsWith(`\nNext: ${message}`), evidence);
+    assert.ok(run.details.surfaces.every((surface) => surface.error.startsWith(`PagerDuty OAuth token request failed (${status})`)), evidence);
+    assertRejectedCredentialOutput(run, "Scoped OAuth app credentials");
+  }
+});
+
+test("pagerduty_check_access keeps the limited status and missing-permission wording when one probe is readable and the rest return 401, when every probe returns 403, or when the token request is refused for another reason", async () => {
+  const limitedStep = "Use a read-only account-level REST API key created by an account admin (Integrations > API Access Keys), or a Scoped OAuth app token that includes the listed *.read scopes.";
+  const clientCredentials = { client_id: "client-1", client_secret: REJECTED_CREDENTIALS.clientSecret, subdomain: "acme" };
+  const runs = [
+    ["/abilities readable, the rest 401", await runPagerdutyCheckAccessTool(
+      { api_token: REJECTED_CREDENTIALS.apiToken },
+      refusingPagerdutyFetch({ echoed: REJECTED_CREDENTIALS.apiToken, readable: { "/abilities": { abilities: ["sso", "teams"] } } }),
+    ), 13],
+    ["every probe 403", await runPagerdutyCheckAccessTool(
+      { api_token: REJECTED_CREDENTIALS.apiToken },
+      refusingPagerdutyFetch({ echoed: REJECTED_CREDENTIALS.apiToken, status: 403 }),
+    ), 14],
+    ["token request 403", await runPagerdutyCheckAccessTool(
+      clientCredentials,
+      refusingPagerdutyFetch({ echoed: REJECTED_CREDENTIALS.clientSecret, tokenRequest: { status: 403, body: { error: "access_denied" } } }),
+    ), 14],
+    ["token request 400 invalid_scope", await runPagerdutyCheckAccessTool(
+      clientCredentials,
+      refusingPagerdutyFetch({ echoed: REJECTED_CREDENTIALS.clientSecret, tokenRequest: { status: 400, body: { error: "invalid_scope" } } }),
+    ), 14],
+  ];
+  for (const [label, run, deniedCount] of runs) {
+    const denied = run.details.surfaces.filter((surface) => surface.status === "not_readable");
+    assert.equal(run.details.status, "limited", label);
+    assert.equal(run.details.recommendedNextStep, limitedStep, label);
+    assert.equal(denied.length, deniedCount, label);
+    assert.deepEqual(run.details.missingPermissions.map((item) => item.split(": ")[0]), denied.map((surface) => surface.endpoint), label);
+    const missing = `Missing read access: ${run.details.missingPermissions.join("; ")}.`;
+    assert.ok(run.details.notes.includes(missing) && run.text.includes(`\n${missing}\n`), `${label}: the missing-permission note`);
+    assert.ok(run.details.notes.some((note) => note.startsWith("Credential scope")), `${label}: the credential scope note`);
+    assert.doesNotMatch(run.text, /rejected the|were not checked/, label);
+  }
+  assert.equal(runs[0][1].details.surfaces.find((surface) => surface.name === "abilities").status, "readable");
+});
+
 test("assessPagerdutyAccessControl passes on a well governed tenant", () => {
   const result = assessPagerdutyAccessControl({
     scope: accountScope(),
@@ -3129,6 +3277,7 @@ test("planted values self-check: every canary and planted secret is alphanumeric
     ...Object.fromEntries(Object.entries(PD_CANARY).map(([name, value]) => [`PD_CANARY.${name}`, value])),
     ...Object.fromEntries(Object.entries(FAKE_PAGERDUTY_SECRETS).map(([name, value]) => [`FAKE_PAGERDUTY_SECRETS.${name}`, value])),
     ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    ...Object.fromEntries(Object.entries(REJECTED_CREDENTIALS).map(([name, value]) => [`REJECTED_CREDENTIALS.${name}`, value])),
     ...ESCAPE_CANARY_PLANTED_VALUES,
     SAMPLE_API_TOKEN,
   }, [

@@ -254,7 +254,7 @@ export interface PagerdutyAccessSurface {
 }
 
 export interface PagerdutyAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   region: PagerdutyRegion;
   authMode: PagerdutyAuthMode;
   surfaces: PagerdutyAccessSurface[];
@@ -1334,6 +1334,24 @@ export class PagerdutyRequestError extends Error {
   }
 }
 
+/** The RFC 6749 section 5.2 token errors that mean the server refused the client credentials themselves. */
+const REJECTED_CREDENTIAL_OAUTH_ERRORS = ["invalid_client", "invalid_grant", "unauthorized_client"] as const;
+type RejectedCredentialOauthError = typeof REJECTED_CREDENTIAL_OAUTH_ERRORS[number];
+
+/**
+ * The Scoped OAuth token request failed. Only an OAuth error code from the fixed rejection list is kept,
+ * so nothing else from the response body rides on the error.
+ */
+class PagerdutyTokenRequestError extends PagerdutyRequestError {
+  readonly oauthError?: RejectedCredentialOauthError;
+
+  constructor(status: number, message: string, path: string, payload: JsonRecord) {
+    super(status, message, path);
+    const code = asString(payload.error);
+    this.oauthError = REJECTED_CREDENTIAL_OAUTH_ERRORS.find((item) => item === code);
+  }
+}
+
 export class PagerdutyApiClient {
   private readonly config: PagerdutyResolvedConfig;
   private readonly fetchImpl: FetchImpl;
@@ -1424,10 +1442,11 @@ export class PagerdutyApiClient {
       if (!response.ok) {
         // RFC 6749 error and error_description are the documented fields; anything else is described by shape.
         const detail = asString(payload.error_description) ?? asString(payload.error) ?? describeOpaqueBody(response, rawText, parsed !== undefined) ?? "empty response body";
-        throw new PagerdutyRequestError(
+        throw new PagerdutyTokenRequestError(
           response.status,
           this.redact(`PagerDuty OAuth token request failed (${response.status}) for ${requestPath(this.config.identityTokenUrl)}: ${detail}`),
           requestPath(this.config.identityTokenUrl),
+          payload,
         );
       }
       const token = asString(payload.access_token);
@@ -1846,6 +1865,29 @@ function countByStatus(findings: PagerdutyFinding[]): Record<PagerdutyFindingSta
   return counts;
 }
 
+/**
+ * Probes PagerDuty refused the credential on, keyed by surface so the surface records keep their shape.
+ * `tokenAnswer` is set when the Scoped OAuth token request was the request refused.
+ */
+const REJECTED_PROBES = new WeakMap<PagerdutyAccessSurface, { tokenAnswer?: string }>();
+const EVERY_PROBE_REJECTED = "every probe returned 401";
+
+function credentialRejection(error: unknown): { tokenAnswer?: string } | undefined {
+  if (error instanceof PagerdutyTokenRequestError) {
+    if (error.status !== 400 && error.status !== 401) return undefined;
+    if (error.oauthError) return { tokenAnswer: `the token request returned ${error.oauthError}` };
+    return error.status === 401 ? { tokenAnswer: "the token request returned 401" } : undefined;
+  }
+  return error instanceof PagerdutyRequestError && error.status === 401 ? {} : undefined;
+}
+
+/** The evidence that PagerDuty refused the credential on every probe, or undefined when any probe got another answer. */
+function rejectedCredentialsEvidence(surfaces: PagerdutyAccessSurface[]): string | undefined {
+  const rejections = surfaces.map((surface) => REJECTED_PROBES.get(surface));
+  if (surfaces.length === 0 || rejections.some((rejection) => rejection === undefined)) return undefined;
+  return rejections.find((rejection) => rejection?.tokenAnswer)?.tokenAnswer ?? EVERY_PROBE_REJECTED;
+}
+
 export async function checkPagerdutyAccess(client: PagerdutyClientSurface): Promise<PagerdutyAccessCheckResult> {
   const config = client.getResolvedConfig();
   const now = client.getNow();
@@ -1867,7 +1909,7 @@ export async function checkPagerdutyAccess(client: PagerdutyClientSurface): Prom
   ];
 
   const surfaces: PagerdutyAccessSurface[] = [];
-  const missingPermissions: string[] = [];
+  const deniedPermissions: string[] = [];
   for (const [name, endpoint, load, permission] of probes) {
     try {
       const value = await load();
@@ -1881,16 +1923,22 @@ export async function checkPagerdutyAccess(client: PagerdutyClientSurface): Prom
       rethrowIfAborted(error);
       const message = errorMessage(error);
       const httpStatus = error instanceof PagerdutyRequestError ? error.status : requestStatus(message);
-      surfaces.push({
+      const surface: PagerdutyAccessSurface = {
         name,
         endpoint,
         status: "not_readable",
         error: message,
         ...(httpStatus !== undefined ? { http_status: httpStatus } : {}),
-      });
-      missingPermissions.push(`${endpoint}: ${permission}`);
+      };
+      surfaces.push(surface);
+      const rejection = credentialRejection(error);
+      if (rejection) REJECTED_PROBES.set(surface, rejection);
+      deniedPermissions.push(`${endpoint}: ${permission}`);
     }
   }
+  const rejectionEvidence = rejectedCredentialsEvidence(surfaces);
+  // A refused credential is denied on every probe whatever its scopes, so those denials name no missing permission.
+  const missingPermissions = rejectionEvidence ? [] : deniedPermissions;
 
   const scope = await capture<PagerdutyCredentialScope>(
     { kind: "unknown", fullVisibility: false },
@@ -1903,9 +1951,9 @@ export async function checkPagerdutyAccess(client: PagerdutyClientSurface): Prom
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
   const coreSurfaces = ["abilities", "users", "teams", "services", "escalation_policies", "schedules"];
   const coreReadable = surfaces.filter((surface) => coreSurfaces.includes(surface.name) && surface.status === "readable").length;
-  const status = coreReadable === coreSurfaces.length && readableCount >= surfaces.length - 2 && !scope.error && scope.data.fullVisibility
-    ? "healthy"
-    : "limited";
+  const status: PagerdutyAccessCheckResult["status"] = rejectionEvidence
+    ? "failed"
+    : (coreReadable === coreSurfaces.length && readableCount >= surfaces.length - 2 && !scope.error && scope.data.fullVisibility ? "healthy" : "limited");
 
   return {
     status,
@@ -1915,15 +1963,66 @@ export async function checkPagerdutyAccess(client: PagerdutyClientSurface): Prom
     missingPermissions,
     notes: [
       `Using PagerDuty ${config.region.toUpperCase()} service region at ${config.baseUrl} with ${config.authMode} authentication.`,
-      scopeNote,
+      rejectionEvidence
+        ? `Permissions were not checked because PagerDuty rejected the ${credentialKind(config.authMode)}; the denied probes do not mean permissions are missing.`
+        : scopeNote,
       `${readableCount}/${surfaces.length} PagerDuty audit surfaces are readable.`,
       ...(missingPermissions.length > 0 ? [`Missing read access: ${missingPermissions.join("; ")}.`] : []),
     ],
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run pagerduty_assess_access_control, pagerduty_assess_incident_response, pagerduty_assess_oncall_coverage, pagerduty_assess_audit_logging, pagerduty_assess_integration_security, or pagerduty_export_audit_bundle."
-        : "Use a read-only account-level REST API key created by an account admin (Integrations > API Access Keys), or a Scoped OAuth app token that includes the listed *.read scopes.",
+    recommendedNextStep: accessCheckNextStep(status, config, rejectionEvidence ?? EVERY_PROBE_REJECTED),
   };
+}
+
+function credentialKind(authMode: PagerdutyAuthMode): string {
+  switch (authMode) {
+    case "api_token":
+      return "REST API key";
+    case "oauth_bearer":
+      return "OAuth access token";
+    case "oauth_client_credentials":
+      return "Scoped OAuth app credentials";
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled PagerDuty auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function rejectedCredentialsStep(config: PagerdutyResolvedConfig, evidence: string): string {
+  const authMode = config.authMode;
+  const region = `and set PAGERDUTY_REGION or PAGERDUTY_BASE_URL (or their aliases PAGERDUTY_SERVICE_REGION and PAGERDUTY_API_BASE_URL, or the region or base_url arguments) if the account is not in the ${config.region.toUpperCase()} service region, then rerun pagerduty_check_access.`;
+  const rejected = `PagerDuty rejected the ${credentialKind(authMode)} (${evidence}).`;
+  switch (authMode) {
+    case "api_token":
+      return `${rejected} Set PAGERDUTY_API_TOKEN (or one of its aliases PAGERDUTY_API_KEY, PAGERDUTY_TOKEN, and PD_API_KEY, or the api_token argument or pagerduty.json key) to an active REST API key, ${region}`;
+    case "oauth_bearer":
+      return `${rejected} Set PAGERDUTY_ACCESS_TOKEN (or its alias PAGERDUTY_OAUTH_TOKEN, or the access_token argument or pagerduty.json key) to a current OAuth access token, ${region}`;
+    case "oauth_client_credentials":
+      return `${rejected} Set PAGERDUTY_CLIENT_ID, PAGERDUTY_CLIENT_SECRET, and PAGERDUTY_SUBDOMAIN (or the alias PAGERDUTY_ACCOUNT_SUBDOMAIN for the subdomain, or the client_id, client_secret, and subdomain arguments or pagerduty.json keys) for an active Scoped OAuth app, ${region}`;
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled PagerDuty auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(
+  status: PagerdutyAccessCheckResult["status"],
+  config: PagerdutyResolvedConfig,
+  rejectionEvidence: string,
+): string {
+  switch (status) {
+    case "healthy":
+      return "Run pagerduty_assess_access_control, pagerduty_assess_incident_response, pagerduty_assess_oncall_coverage, pagerduty_assess_audit_logging, pagerduty_assess_integration_security, or pagerduty_export_audit_bundle.";
+    case "limited":
+      return "Use a read-only account-level REST API key created by an account admin (Integrations > API Access Keys), or a Scoped OAuth app token that includes the listed *.read scopes.";
+    case "failed":
+      return rejectedCredentialsStep(config, rejectionEvidence);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled PagerDuty access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 export interface PagerdutyAccessControlData {
