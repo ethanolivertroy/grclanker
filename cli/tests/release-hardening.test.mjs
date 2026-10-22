@@ -383,10 +383,62 @@ function writeTruncatedArchive(archivePath) {
   }
 }
 
-test("a failed extraction puts the previous install back", () => {
+// The listing prints one safe entry and then fails, while extraction still runs the real tar.
+function stubFailingTarListing(stage) {
+  const realTar = spawnSync("sh", ["-c", "command -v tar"], { encoding: "utf8" }).stdout.trim();
+  const log = resolve(stage.root, "tar.log");
+  writeExecutable(resolve(stage.stubBin, "tar"), `#!/bin/sh
+printf '%s\\n' "$*" >> '${log}'
+case "$1" in
+  -t*) printf 'grclanker\\n'; exit 2 ;;
+esac
+exec '${realTar}' "$@"
+`);
+  return log;
+}
+
+test("a failed archive listing stops the install even when extraction would work", () => {
+  const name = "grclanker-1.0.0-linux-x64.tar.gz";
+  const stage = stageCheckout([name], { packageVersion: "1.0.0" });
+  const tarLog = stubFailingTarListing(stage);
+  const installDir = resolve(stage.root, "install");
+  mkdirSync(installDir);
+  writeFileSync(resolve(installDir, "grclanker"), "previous\n");
+  try {
+    const { result } = runStagedInstall(stage);
+    assert.notEqual(result.status, 0, result.stdout);
+    assert.match(result.stderr, /Could not list the entries in grclanker-1\.0\.0-linux-x64\.tar\.gz, so nothing was installed/);
+    assert.equal(readFileSync(resolve(installDir, "grclanker"), "utf8"), "previous\n");
+    assert.deepEqual(readdirSync(stage.root).filter((entry) => entry.startsWith("install.")), []);
+    assert.doesNotMatch(readFileSync(tarLog, "utf8"), /^-x/m);
+  } finally {
+    rmSync(stage.root, { recursive: true, force: true });
+  }
+});
+
+test("a truncated archive is refused before the previous install moves", () => {
   const name = "grclanker-1.0.0-linux-x64.tar.gz";
   const stage = stageCheckout([name], { packageVersion: "1.0.0" });
   writeTruncatedArchive(stage.archives[name]);
+  const installDir = resolve(stage.root, "install");
+  mkdirSync(installDir);
+  writeFileSync(resolve(installDir, "grclanker"), "previous\n");
+  try {
+    const { result } = runStagedInstall(stage);
+    assert.notEqual(result.status, 0, result.stdout);
+    assert.match(result.stderr, /Could not list the entries in grclanker-1\.0\.0-linux-x64\.tar\.gz, so nothing was installed/);
+    assert.equal(readFileSync(resolve(installDir, "grclanker"), "utf8"), "previous\n");
+    assert.deepEqual(readdirSync(stage.root).filter((entry) => entry.startsWith("install.")), []);
+  } finally {
+    rmSync(stage.root, { recursive: true, force: true });
+  }
+});
+
+test("a failed extraction puts the previous install back", () => {
+  const name = "grclanker-1.0.0-linux-x64.tar.gz";
+  const stage = stageCheckout([name], { packageVersion: "1.0.0" });
+  // tar lists a 300-character name, but filesystems cap names at 255 bytes, so extraction fails partway.
+  writeArchive(stage.archives[name], { grclanker: "new\n", ["x".repeat(300)]: "too long\n" });
   const installDir = resolve(stage.root, "install");
   mkdirSync(installDir);
   writeFileSync(resolve(installDir, "grclanker"), "previous\n");
