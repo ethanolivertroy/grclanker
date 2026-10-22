@@ -1607,9 +1607,9 @@ function rejectionEvidence(rejections: CredentialRejection[]): string {
 function rejectedCredentialsStep(mode: WebexCredentialMode, evidence: string): string {
   switch (mode) {
     case "token":
-      return `Webex rejected the access token (${evidence}). Set ${WEBEX_ENV.token} (or the token argument or config file entry) to a valid, unexpired access token, then rerun webex_check_access.`;
+      return `Webex rejected the access token (${evidence}). Set ${WEBEX_ENV.token} (or the token argument, or token in ~/.config/webex-sec-inspector/config.json) to a valid, unexpired access token, then rerun webex_check_access.`;
     case "refresh":
-      return `Webex rejected the OAuth refresh credentials (${evidence}). Set ${WEBEX_ENV.clientId}, ${WEBEX_ENV.clientSecret}, and ${WEBEX_ENV.refreshToken} (or the client_id, client_secret, and refresh_token arguments or config file entries) to the client ID and secret of the integration or Service App and a current refresh token, then rerun webex_check_access.`;
+      return `Webex rejected the OAuth refresh credentials (${evidence}). Set ${WEBEX_ENV.clientId}, ${WEBEX_ENV.clientSecret}, and ${WEBEX_ENV.refreshToken} (or the client_id, client_secret, and refresh_token arguments, or the same keys in ~/.config/webex-sec-inspector/config.json) to the client ID and secret of the integration or Service App and a current refresh token, then rerun webex_check_access.`;
     default: {
       const exhaustive: never = mode;
       throw new Error(`Unhandled Webex credential mode ${String(exhaustive)}`);

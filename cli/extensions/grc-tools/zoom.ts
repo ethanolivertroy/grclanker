@@ -2970,9 +2970,9 @@ function rejectionEvidence(rejections: ZoomCredentialRejection[]): string {
 function rejectedCredentialsStep(mode: ZoomCredentialMode, evidence: string): string {
   switch (mode) {
     case "token":
-      return `Zoom rejected the ${credentialKind(mode)} (${evidence}). Set ZOOM_TOKEN or ZOOM_ACCESS_TOKEN (or the token argument or config file entry) to an unexpired OAuth access token, or remove the token and set ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET so the tool requests its own token, then rerun zoom_check_access.`;
+      return `Zoom rejected the ${credentialKind(mode)} (${evidence}). Set ZOOM_TOKEN (or ZOOM_ACCESS_TOKEN, or the token argument, or token in .zoom.json) to an unexpired OAuth access token, or remove the token and set ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET so the tool requests its own token, with ZOOM_BASE_URL (or ZOOM_API_BASE_URL) set to https://api.zoomgov.com/v2 for a Zoom for Government account, then rerun zoom_check_access.`;
     case "oauth":
-      return `Zoom rejected the ${credentialKind(mode)} (${evidence}). Set ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, and ZOOM_CLIENT_SECRET (or the account_id, client_id, and client_secret arguments or config file entries) to the account ID, client ID, and client secret of an activated server-to-server OAuth app, then rerun zoom_check_access.`;
+      return `Zoom rejected the ${credentialKind(mode)} (${evidence}). Set ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, and ZOOM_CLIENT_SECRET (or the account_id, client_id, and client_secret arguments, or the same keys in .zoom.json) to the account ID, client ID, and client secret of an activated server-to-server OAuth app, with ZOOM_BASE_URL (or ZOOM_API_BASE_URL) set to https://api.zoomgov.com/v2 for a Zoom for Government account, then rerun zoom_check_access.`;
     default: {
       const exhaustive: never = mode;
       throw new Error(`Unhandled Zoom credential mode ${String(exhaustive)}`);

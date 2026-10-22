@@ -1853,9 +1853,9 @@ function credentialKind(product: ZscalerProduct): string {
 function credentialSettings(product: ZscalerProduct): string {
   switch (product) {
     case "zia":
-      return "Set ZIA_API_KEY, ZIA_USERNAME, and ZIA_PASSWORD (or the zia_api_key, zia_username, and zia_password arguments or config file entries) to the tenant's API key and an admin's login name and password, with ZIA_CLOUD naming the tenant's cloud";
+      return "Set ZIA_API_KEY, ZIA_USERNAME, and ZIA_PASSWORD (or the zia_api_key, zia_username, and zia_password arguments, or apiKey, username, and password under zia.client in ~/.zscaler/zscaler.yaml) to the tenant's API key and an admin's login name and password, with ZIA_CLOUD naming the tenant's cloud (or ZIA_BASE_URL pointing at its API)";
     case "zpa":
-      return "Set ZPA_CLIENT_ID, ZPA_CLIENT_SECRET, and ZPA_CUSTOMER_ID (or the zpa_client_id, zpa_client_secret, and zpa_customer_id arguments or config file entries) to the client ID and client secret of a ZPA API key and the customer ID it belongs to, with ZPA_CLOUD naming the key's cloud";
+      return "Set ZPA_CLIENT_ID, ZPA_CLIENT_SECRET, and ZPA_CUSTOMER_ID (or the zpa_client_id, zpa_client_secret, and zpa_customer_id arguments, or clientId, clientSecret, and customerId under zpa.client in ~/.zscaler/zscaler.yaml) to the client ID and client secret of a ZPA API key and the customer ID it belongs to, with ZPA_CLOUD naming the key's cloud (or ZPA_BASE_URL pointing at its API)";
     default: {
       const exhaustive: never = product;
       throw new Error(`Unhandled Zscaler product ${String(exhaustive)}`);

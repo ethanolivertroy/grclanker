@@ -5023,11 +5023,11 @@ type TenableKeyPairs = "vm" | "security_center" | "vm_and_security_center";
 function rejectedKeysStep(keyPairs: TenableKeyPairs): string {
   switch (keyPairs) {
     case "vm":
-      return "Tenable rejected the API keys (every probe returned 401). Set TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY (or the access_key and secret_key arguments or config file entries) to a valid key pair, with TENABLE_URL pointing at the platform that issued it, then rerun tenable_check_access.";
+      return "Tenable rejected the API keys (every probe returned 401). Set TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY (or the access_key and secret_key arguments, or the same keys in ~/.tenable/config.yaml) to a valid key pair, with TENABLE_URL (or TENABLE_BASE_URL, or the url argument) pointing at the platform that issued it, then rerun tenable_check_access.";
     case "security_center":
-      return "Tenable Security Center rejected the API keys (every probe returned 401). Set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or the sc_access_key and sc_secret_key arguments or config file entries) to a valid key pair, with TENABLE_SC_URL (or TENABLE_URL) pointing at the Security Center that issued it, then rerun tenable_check_access.";
+      return "Tenable Security Center rejected the API keys (every probe returned 401). Set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or the sc_access_key and sc_secret_key arguments, or the same keys in ~/.tenable/config.yaml, or TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY when TENABLE_URL or TENABLE_BASE_URL points at Security Center) to a valid key pair, with TENABLE_SC_URL (or the sc_url argument, or TENABLE_URL or TENABLE_BASE_URL) pointing at the Security Center that issued it, then rerun tenable_check_access.";
     case "vm_and_security_center":
-      return "Tenable rejected both API key pairs (every probe returned 401). Set TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY for the platform at TENABLE_URL and TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY for the Security Center at TENABLE_SC_URL (or the matching access_key, secret_key, sc_access_key, and sc_secret_key arguments or config file entries), then rerun tenable_check_access.";
+      return "Tenable rejected both API key pairs (every probe returned 401). Set TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY for the platform at TENABLE_URL (or TENABLE_BASE_URL) and TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY for the Security Center at TENABLE_SC_URL (or the access_key, secret_key, sc_access_key, and sc_secret_key arguments, or the same keys in ~/.tenable/config.yaml), then rerun tenable_check_access.";
     default: {
       const exhaustive: never = keyPairs;
       throw new Error(`Unhandled Tenable key pairs ${String(exhaustive)}`);

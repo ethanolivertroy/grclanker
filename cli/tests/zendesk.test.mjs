@@ -977,7 +977,7 @@ const REJECTED_CREDENTIAL_CASES = [
     secrets: [REJECTED_API_TOKEN, Buffer.from(`auditor@example.com/token:${REJECTED_API_TOKEN}`).toString("base64")],
     usingNote: "Using Zendesk subdomain acme with API token basic auth.",
     rolesNote: "Roles were not checked because Zendesk rejected the email and API token; the rejected probes do not mean a role is missing.",
-    step: "Zendesk rejected the email and API token (every probe returned 401). Set ZENDESK_EMAIL and ZENDESK_API_TOKEN (or the email and api_token arguments or config file entries) to a Zendesk sign-in email address and an active API token, with ZENDESK_SUBDOMAIN naming the account that issued the token, then rerun zendesk_check_access.",
+    step: "Zendesk rejected the email and API token (every probe returned 401). Set ZENDESK_EMAIL and ZENDESK_API_TOKEN (or the email and api_token arguments, or the same keys in ~/.zendesk/config.json) to a Zendesk sign-in email address and an active API token, with ZENDESK_SUBDOMAIN (or the subdomain argument) naming the account that issued the token, then rerun zendesk_check_access.",
   },
   {
     label: "OAuth token",
@@ -986,7 +986,7 @@ const REJECTED_CREDENTIAL_CASES = [
     secrets: [REJECTED_OAUTH_TOKEN],
     usingNote: "Using Zendesk subdomain acme with an OAuth bearer token.",
     rolesNote: "Roles and scopes were not checked because Zendesk rejected the OAuth token; the rejected probes do not mean a role or scope is missing.",
-    step: "Zendesk rejected the OAuth token (every probe returned 401). Set ZENDESK_OAUTH_TOKEN (or the oauth_token argument or config file entry) to a valid, unrevoked OAuth access token, with ZENDESK_SUBDOMAIN naming the account that issued it, then rerun zendesk_check_access.",
+    step: "Zendesk rejected the OAuth token (every probe returned 401). Set ZENDESK_OAUTH_TOKEN (or ZENDESK_ACCESS_TOKEN, or the oauth_token argument, or oauth_token in ~/.zendesk/config.json) to a valid, unrevoked OAuth access token, with ZENDESK_SUBDOMAIN (or the subdomain argument) naming the account that issued it, then rerun zendesk_check_access.",
   },
 ];
 

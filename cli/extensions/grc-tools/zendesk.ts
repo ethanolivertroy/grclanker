@@ -2714,9 +2714,9 @@ function rolesNotCheckedNote(authMode: ZendeskAuthMode): string {
 function rejectedCredentialsStep(authMode: ZendeskAuthMode): string {
   switch (authMode) {
     case "api_token":
-      return "Zendesk rejected the email and API token (every probe returned 401). Set ZENDESK_EMAIL and ZENDESK_API_TOKEN (or the email and api_token arguments or config file entries) to a Zendesk sign-in email address and an active API token, with ZENDESK_SUBDOMAIN naming the account that issued the token, then rerun zendesk_check_access.";
+      return "Zendesk rejected the email and API token (every probe returned 401). Set ZENDESK_EMAIL and ZENDESK_API_TOKEN (or the email and api_token arguments, or the same keys in ~/.zendesk/config.json) to a Zendesk sign-in email address and an active API token, with ZENDESK_SUBDOMAIN (or the subdomain argument) naming the account that issued the token, then rerun zendesk_check_access.";
     case "oauth":
-      return "Zendesk rejected the OAuth token (every probe returned 401). Set ZENDESK_OAUTH_TOKEN (or the oauth_token argument or config file entry) to a valid, unrevoked OAuth access token, with ZENDESK_SUBDOMAIN naming the account that issued it, then rerun zendesk_check_access.";
+      return "Zendesk rejected the OAuth token (every probe returned 401). Set ZENDESK_OAUTH_TOKEN (or ZENDESK_ACCESS_TOKEN, or the oauth_token argument, or oauth_token in ~/.zendesk/config.json) to a valid, unrevoked OAuth access token, with ZENDESK_SUBDOMAIN (or the subdomain argument) naming the account that issued it, then rerun zendesk_check_access.";
     default: {
       const exhaustive: never = authMode;
       throw new Error(`Unhandled Zendesk auth mode ${String(exhaustive)}`);
