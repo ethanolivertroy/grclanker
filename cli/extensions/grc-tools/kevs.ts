@@ -132,6 +132,15 @@ function lookbackDays(value: number | undefined): number {
   return Math.trunc(value);
 }
 
+/**
+ * Short descriptions cite related CVEs, and the catalog lists the newest entries first, so an
+ * entry that only mentions the queried CVE ID can come before that CVE's own entry.
+ */
+function exactCveFirst(matches: KevVulnerability[], normalizedQuery: string): KevVulnerability[] {
+  const isExact = (vulnerability: KevVulnerability) => vulnerability.cveID.toLowerCase() === normalizedQuery;
+  return [...matches.filter(isExact), ...matches.filter((vulnerability) => !isExact(vulnerability))];
+}
+
 function normalizeSearchArgs(args: unknown): SearchArgs {
   if (typeof args === "string" || typeof args === "number") {
     return { query: String(args) };
@@ -311,15 +320,19 @@ export function registerKevsTools(pi: any): void {
         const requestedLimit = Math.trunc(args.limit ?? DEFAULT_SEARCH_LIMIT);
         const limit = requestedLimit < 1 ? DEFAULT_SEARCH_LIMIT : Math.min(requestedLimit, MAX_SEARCH_LIMIT);
 
-        const allMatches = catalog.vulnerabilities.filter(
-          (vulnerability) =>
-            vulnerability.cveID.toLowerCase().includes(normalizedQuery) ||
-            vulnerability.vendorProject.toLowerCase().includes(normalizedQuery) ||
-            vulnerability.product.toLowerCase().includes(normalizedQuery) ||
-            vulnerability.vulnerabilityName.toLowerCase().includes(normalizedQuery) ||
-            vulnerability.shortDescription.toLowerCase().includes(normalizedQuery),
+        const allMatches = exactCveFirst(
+          catalog.vulnerabilities.filter(
+            (vulnerability) =>
+              vulnerability.cveID.toLowerCase().includes(normalizedQuery) ||
+              vulnerability.vendorProject.toLowerCase().includes(normalizedQuery) ||
+              vulnerability.product.toLowerCase().includes(normalizedQuery) ||
+              vulnerability.vulnerabilityName.toLowerCase().includes(normalizedQuery) ||
+              vulnerability.shortDescription.toLowerCase().includes(normalizedQuery),
+          ),
+          normalizedQuery,
         );
         const matches = allMatches.slice(0, limit);
+        const truncated = matches.length < allMatches.length;
         const capped = requestedLimit > MAX_SEARCH_LIMIT && allMatches.length > MAX_SEARCH_LIMIT;
 
         if (matches.length === 0) {
@@ -336,8 +349,11 @@ export function registerKevsTools(pi: any): void {
           ? `Showing ${matches.length} of ${allMatches.length} KEV entries matching "${args.query}" ` +
             `(catalog size: ${catalog.count}). Results are capped at ${MAX_SEARCH_LIMIT}; ` +
             `narrow the query to a CVE ID, vendor, or product to see the rest.`
-          : `Found ${matches.length} KEV entr${matches.length === 1 ? "y" : "ies"} matching "${args.query}" ` +
-            `(catalog size: ${catalog.count}):`;
+          : truncated
+            ? `Showing ${matches.length} of ${allMatches.length} KEV entries matching "${args.query}" ` +
+              `(catalog size: ${catalog.count}):`
+            : `Found ${matches.length} KEV entr${matches.length === 1 ? "y" : "ies"} matching "${args.query}" ` +
+              `(catalog size: ${catalog.count}):`;
         return textResult(
           `${heading}\n\n` +
             matches
@@ -346,7 +362,8 @@ export function registerKevsTools(pi: any): void {
           {
             query: args.query,
             count: matches.length,
-            ...(capped ? { total_matches: allMatches.length, capped: true } : {}),
+            ...(truncated ? { total_matches: allMatches.length } : {}),
+            ...(capped ? { capped: true } : {}),
             ...(Object.keys(scoreDates).length > 0 ? { epss_score_dates: scoreDates } : {}),
           },
         );

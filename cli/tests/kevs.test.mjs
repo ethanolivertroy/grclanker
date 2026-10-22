@@ -44,8 +44,11 @@ function scoreDates(count) {
 }
 
 async function runSearch(args, matchCount) {
-  const vulnerabilities = Array.from({ length: matchCount }, (_, index) => kevEntry(index + 1));
-  const catalog = { title: "KEV", catalogVersion: "1", dateReleased: "2024-05-01", count: matchCount, vulnerabilities };
+  return searchCatalog(args, Array.from({ length: matchCount }, (_, index) => kevEntry(index + 1)));
+}
+
+async function searchCatalog(args, vulnerabilities) {
+  const catalog = { title: "KEV", catalogVersion: "1", dateReleased: "2024-05-01", count: vulnerabilities.length, vulnerabilities };
   const tools = new Map();
   registerKevsTools({ registerTool: (tool) => tools.set(tool.name, tool) });
   const tool = tools.get("kevs_search");
@@ -89,15 +92,25 @@ test("kevs_search caps an oversized limit at 50 results and says how many matche
   assert.deepEqual(epssRequests.flat().length, 50, "EPSS is only requested for shown entries");
 });
 
-test("kevs_search output is unchanged when the cap does not remove results", async () => {
+test("kevs_search heading counts every match when the limit leaves some out", async () => {
   const byDefault = await runSearch({ query: "acme" }, 120);
-  assert.ok(byDefault.text.startsWith('Found 10 KEV entries matching "acme" (catalog size: 120):\n\n'));
+  assert.ok(byDefault.text.startsWith('Showing 10 of 120 KEV entries matching "acme" (catalog size: 120):\n\n'));
   assert.equal(byDefault.text.split("\n\n").length, 11);
-  assert.deepEqual(byDefault.result.details, { query: "acme", count: 10, epss_score_dates: scoreDates(10) });
+  assert.deepEqual(byDefault.result.details, { query: "acme", count: 10, total_matches: 120, epss_score_dates: scoreDates(10) });
 
   const atBound = await runSearch({ query: "acme", limit: 50 }, 120);
-  assert.ok(atBound.text.startsWith('Found 50 KEV entries matching "acme" (catalog size: 120):\n\n'));
-  assert.deepEqual(atBound.result.details, { query: "acme", count: 50, epss_score_dates: scoreDates(50) });
+  assert.ok(atBound.text.startsWith('Showing 50 of 120 KEV entries matching "acme" (catalog size: 120):\n\n'));
+  assert.deepEqual(atBound.result.details, { query: "acme", count: 50, total_matches: 120, epss_score_dates: scoreDates(50) });
+
+  const oneLeftOut = await runSearch({ query: "acme" }, 11);
+  assert.ok(oneLeftOut.text.startsWith('Showing 10 of 11 KEV entries matching "acme" (catalog size: 11):\n\n'));
+  assert.deepEqual(oneLeftOut.result.details, { query: "acme", count: 10, total_matches: 11, epss_score_dates: scoreDates(10) });
+});
+
+test("kevs_search heading says Found only when every match is shown", async () => {
+  const exactlyTheLimit = await runSearch({ query: "acme" }, 10);
+  assert.ok(exactlyTheLimit.text.startsWith('Found 10 KEV entries matching "acme" (catalog size: 10):\n\n'));
+  assert.deepEqual(exactlyTheLimit.result.details, { query: "acme", count: 10, epss_score_dates: scoreDates(10) });
 
   const fewMatches = await runSearch({ query: "acme", limit: 10000 }, 3);
   assert.ok(fewMatches.text.startsWith('Found 3 KEV entries matching "acme" (catalog size: 3):\n\n'));
@@ -109,24 +122,97 @@ test("kevs_search treats zero, negative, and sub-1 limits as the default of 10",
   for (const limit of [0, -1, -10000, 0.5, "0", "-1"]) {
     const { result, text } = await runSearch({ query: "acme", limit }, 120);
     const label = `limit ${JSON.stringify(limit)}`;
-    assert.ok(text.startsWith('Found 10 KEV entries matching "acme" (catalog size: 120):\n\n'), label);
+    assert.ok(text.startsWith('Showing 10 of 120 KEV entries matching "acme" (catalog size: 120):\n\n'), label);
     assert.equal(text.split("\n\n").length, 11, label);
     assert.equal(text.split("\n\n").at(-1), expectedBlock(10), label);
-    assert.deepEqual(result.details, { query: "acme", count: 10, epss_score_dates: scoreDates(10) }, label);
+    assert.deepEqual(result.details, { query: "acme", count: 10, total_matches: 120, epss_score_dates: scoreDates(10) }, label);
   }
 });
 
 test("kevs_search honors the smallest positive limit and truncates fractional limits", async () => {
   const one = await runSearch({ query: "acme", limit: 1 }, 120);
-  assert.equal(one.text, `Found 1 KEV entry matching "acme" (catalog size: 120):\n\n${expectedBlock(1)}`);
+  assert.equal(one.text, `Showing 1 of 120 KEV entries matching "acme" (catalog size: 120):\n\n${expectedBlock(1)}`);
 
   const fractionalAtBound = await runSearch({ query: "acme", limit: 50.9 }, 120);
-  assert.ok(fractionalAtBound.text.startsWith('Found 50 KEV entries matching "acme" (catalog size: 120):\n\n'));
-  assert.deepEqual(fractionalAtBound.result.details, { query: "acme", count: 50, epss_score_dates: scoreDates(50) });
+  assert.ok(fractionalAtBound.text.startsWith('Showing 50 of 120 KEV entries matching "acme" (catalog size: 120):\n\n'));
+  assert.deepEqual(fractionalAtBound.result.details, { query: "acme", count: 50, total_matches: 120, epss_score_dates: scoreDates(50) });
 
   const justOver = await runSearch({ query: "acme", limit: 51 }, 120);
-  assert.ok(justOver.text.startsWith("Showing 50 of 120 KEV entries"));
+  assert.ok(justOver.text.startsWith('Showing 50 of 120 KEV entries matching "acme" (catalog size: 120). Results are capped at 50;'));
   assert.deepEqual(justOver.result.details, { query: "acme", count: 50, total_matches: 120, capped: true, epss_score_dates: scoreDates(50) });
+});
+
+const LOG4J_ENTRIES = [
+  {
+    cveID: "CVE-2021-45046",
+    vendorProject: "Apache",
+    product: "Log4j2",
+    vulnerabilityName: "Apache Log4j2 Deserialization of Untrusted Data Vulnerability",
+    dateAdded: "2023-05-01",
+    shortDescription: "Apache Log4j2 contains a deserialization of untrusted data vulnerability due to the incomplete fix of CVE-2021-44228.",
+    requiredAction: "Apply updates per vendor instructions.",
+    dueDate: "2023-05-22",
+    knownRansomwareCampaignUse: "Known",
+    notes: "https://nvd.nist.gov/vuln/detail/CVE-2021-45046",
+  },
+  {
+    cveID: "CVE-2021-44228",
+    vendorProject: "Apache",
+    product: "Log4j2",
+    vulnerabilityName: "Apache Log4j2 Remote Code Execution Vulnerability",
+    dateAdded: "2021-12-10",
+    shortDescription: "Apache Log4j2 contains a vulnerability where JNDI features do not protect against attacker-controlled JNDI-related endpoints, allowing for remote code execution.",
+    requiredAction: "Apply updates per vendor instructions.",
+    dueDate: "2021-12-24",
+    knownRansomwareCampaignUse: "Known",
+    notes: "https://nvd.nist.gov/vuln/detail/CVE-2021-44228",
+  },
+];
+
+function shownCves(text) {
+  return text.split("\n\n").slice(1).map((block) => block.split(" - ")[0]);
+}
+
+test("kevs_search lists an exact CVE ID match before entries that only cite that ID", async () => {
+  const newestFirst = [kevEntry(1), ...LOG4J_ENTRIES];
+
+  const one = await searchCatalog({ query: "CVE-2021-44228", limit: 1 }, newestFirst);
+  assert.equal(one.text.split("\n\n")[0], 'Showing 1 of 2 KEV entries matching "CVE-2021-44228" (catalog size: 3):');
+  assert.deepEqual(shownCves(one.text), ["CVE-2021-44228"]);
+  assert.ok(!one.text.includes("CVE-2021-45046"), "the entry that cites the CVE does not take the only slot");
+  assert.deepEqual(one.epssRequests, [["CVE-2021-44228"]]);
+  assert.deepEqual(one.result.details, {
+    query: "CVE-2021-44228",
+    count: 1,
+    total_matches: 2,
+    epss_score_dates: { "CVE-2021-44228": EPSS_DATE },
+  });
+
+  const all = await searchCatalog({ query: "CVE-2021-44228" }, newestFirst);
+  assert.equal(all.text.split("\n\n")[0], 'Found 2 KEV entries matching "CVE-2021-44228" (catalog size: 3):');
+  assert.deepEqual(shownCves(all.text), ["CVE-2021-44228", "CVE-2021-45046"]);
+  assert.equal(all.result.details.total_matches, undefined);
+
+  const lowercase = await searchCatalog({ query: "cve-2021-44228", limit: 1 }, newestFirst);
+  assert.deepEqual(shownCves(lowercase.text), ["CVE-2021-44228"]);
+
+  const keyword = await searchCatalog({ query: "log4j2" }, newestFirst);
+  assert.deepEqual(shownCves(keyword.text), ["CVE-2021-45046", "CVE-2021-44228"], "a query that is not a CVE ID keeps catalog order");
+});
+
+test("kevs_search lists an exact CVE ID match before longer CVE IDs that contain it", async () => {
+  const newestFirst = [
+    { ...kevEntry(1), cveID: "CVE-2022-22948" },
+    { ...kevEntry(2), cveID: "CVE-2022-2294" },
+    { ...kevEntry(3), cveID: "CVE-2022-22947" },
+  ];
+
+  const one = await searchCatalog({ query: "CVE-2022-2294", limit: 1 }, newestFirst);
+  assert.equal(one.text.split("\n\n")[0], 'Showing 1 of 3 KEV entries matching "CVE-2022-2294" (catalog size: 3):');
+  assert.deepEqual(shownCves(one.text), ["CVE-2022-2294"]);
+
+  const all = await searchCatalog({ query: "CVE-2022-2294" }, newestFirst);
+  assert.deepEqual(shownCves(all.text), ["CVE-2022-2294", "CVE-2022-22948", "CVE-2022-22947"]);
 });
 
 test("kevs_search advertises both limit bounds in its schema", async () => {
