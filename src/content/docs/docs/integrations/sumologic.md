@@ -101,7 +101,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 |---|---|
-| `sumologic_check_access` | Probe 18 read surfaces (including `/v1/serviceAllowlist/addresses`) and report unreadable ones with the likely missing role capability. |
+| `sumologic_check_access` | Probe 18 read surfaces (including `/v1/serviceAllowlist/addresses`) and report unreadable ones with the likely missing role capability. Reports `failed` when every probe returns 401 because Sumo Logic rejected the access ID and access key: the surfaces are marked `unauthorized`, no capability is named as missing, and the next step names the variables to fix. |
 | `sumologic_assess_identity` | Controls 1 to 5: SAML SSO, SAML allowlist, password strength, password expiration, MFA. |
 | `sumologic_assess_access_control` | Controls 6, 7, 8, 13, 14: RBAC, key rotation, inactive keys, service allowlist, session timeout. |
 | `sumologic_assess_data_governance` | Controls 9, 10, 12, 16, 17: audit index, data forwarding, collectors, ingest budgets, retention. |

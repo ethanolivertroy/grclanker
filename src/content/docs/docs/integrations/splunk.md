@@ -109,7 +109,7 @@ All tools accept the shared connection arguments (`url`, `token`, `username`, `p
 
 | Tool | Controls | Extra arguments |
 |------|----------|-----------------|
-| `splunk_check_access` | n/a | none. Probes 15 audit surfaces, reports the authenticated user, capabilities, missing capabilities, and whether ACS is configured. Status is `healthy` when the core surfaces are readable and `limited` otherwise. |
+| `splunk_check_access` | n/a | none. Probes 15 audit surfaces, reports the authenticated user, capabilities, missing capabilities, and whether ACS is configured. Status is `healthy` when the core surfaces are readable, `failed` when Splunk rejected the credentials (every probe or the session login request returned 401, and so did the ACS request when ACS is configured), and `limited` otherwise. A failed check marks the attempted surfaces `unauthorized`, lists no missing capabilities, and names the variables to fix in the next step. |
 | `splunk_assess_authentication` | 1-6 | `max_token_age_days` (default 90), `max_session_minutes` (default 60) |
 | `splunk_assess_access_control` | 7-12 | `max_admins` (default 3) |
 | `splunk_assess_data_protection` | 13-16 | none |

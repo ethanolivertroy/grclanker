@@ -104,7 +104,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 |---|---|
-| `salesforce_check_access` | Probes the OAuth session, Organization, limits, Health Check and its per-setting risks, SecuritySettings, users, profiles, Profile metadata (`listMetadata`), permission sets, `TwoFactorMethodsInfo`, login history, audit trail, connected apps, `OauthToken`, event log files, and the caller's `UserPermissionAccess` flags; lists likely missing permissions, including any caller flag that is false |
+| `salesforce_check_access` | Probes the OAuth session, Organization, limits, Health Check and its per-setting risks, SecuritySettings, users, profiles, Profile metadata (`listMetadata`), permission sets, `TwoFactorMethodsInfo`, login history, audit trail, connected apps, `OauthToken`, event log files, and the caller's `UserPermissionAccess` flags; lists likely missing permissions, including any caller flag that is false. Reports `failed` when Salesforce rejected the credentials: every probe returns 401 or `INVALID_SESSION_ID`, or the token request returns 401 or 400 with `invalid_client`, `invalid_client_id`, `invalid_grant`, or `unauthorized_client`. A failed check marks the surfaces `unauthorized`, lists no missing permissions, and names the variables to fix in the next step |
 | `salesforce_assess_platform_security` | Controls 1, 2, 3, 5, 18, 19, 20 |
 | `salesforce_assess_identity_access` | Controls 4, 6, 7, 9, 10, 13 |
 | `salesforce_assess_data_protection` | Controls 8, 12, 16, 17 |

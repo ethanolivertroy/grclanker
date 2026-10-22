@@ -26,7 +26,7 @@ This spec ships as native TypeScript tools in grclanker (`cli/extensions/grc-too
 
 | Tool | Controls |
 |------|----------|
-| `splunk_check_access` | Probes 15 REST and ACS surfaces, reports the authenticated user, capabilities, missing capabilities, and whether ACS is configured |
+| `splunk_check_access` | Probes 15 REST and ACS surfaces, reports the authenticated user, capabilities, missing capabilities, and whether ACS is configured; reports `failed` with no missing capabilities when every attempted probe returns 401 because Splunk rejected the credentials |
 | `splunk_assess_authentication` | 1-6 |
 | `splunk_assess_access_control` | 7-12 |
 | `splunk_assess_data_protection` | 13-16 |

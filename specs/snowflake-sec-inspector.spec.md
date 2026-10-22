@@ -22,7 +22,7 @@ Snowflake exposes its configuration through SQL queries against the `ACCOUNT_USA
 
 The spec shipped as native grclanker tools in `cli/extensions/grc-tools/snowflake.ts`, executing read-only `SHOW` and `SELECT` statements through the Snowflake SQL REST API (`POST /api/v2/statements?async=true` with `GET /api/v2/statements/{handle}` polling and partition fetching) using key-pair JWT, OAuth, or programmatic access token bearer auth:
 
-- `snowflake_check_access`: probes every `SHOW` command and `ACCOUNT_USAGE` view the assessments need and reports denied surfaces and partial visibility
+- `snowflake_check_access`: probes every `SHOW` command and `ACCOUNT_USAGE` view the assessments need and reports denied surfaces and partial visibility, or `failed` with no missing privilege named when every statement returns 401 because Snowflake rejected the credential
 - `snowflake_assess_network_and_authentication`: controls 1-6 and 25
 - `snowflake_assess_access_control`: controls 7-10 and 16
 - `snowflake_assess_monitoring_and_lifecycle`: controls 11-13 and 24
