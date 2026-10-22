@@ -33,6 +33,9 @@ try {
   for (const surface of access.surfaces.filter((entry) => entry.status !== "readable")) {
     log(`- ${surface.name}: ${surface.status}${surface.error ? ` (${surface.error.replace(/\s+/g, " ").slice(0, 120)})` : ""}`);
   }
+  if (access.status === "failed") {
+    throw new Error(`Live Snowflake smoke test stopped: ${access.recommendedNextStep}`);
+  }
 
   const assessment = await assessSnowflakeNetworkAndAuthentication(client);
   log("");

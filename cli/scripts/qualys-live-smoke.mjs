@@ -41,6 +41,9 @@ try {
   if (access.unavailableModules.length > 0) {
     log(`Unavailable modules: ${access.unavailableModules.join(", ")}`);
   }
+  if (access.status === "failed") {
+    throw new Error(`Live Qualys smoke test stopped: ${access.recommendedNextStep}`);
+  }
 
   if (access.status === "limited") {
     throw new Error(
