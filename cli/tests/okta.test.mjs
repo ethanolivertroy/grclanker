@@ -1979,6 +1979,87 @@ test("rule 9: OktaAuditorClient error strings drop the request cursor, raw bodie
   assert.ok(!JSON.stringify(access).includes("<html>"), "access check payload never echoes a raw body");
 });
 
+test("runOktaAccessCheck reports failed and names the credential settings when every probe returns 401", async () => {
+  const token = "00Wq7rTnZx3Kp9LmVb2HsYd6JcFg4NeUa8QiRo1Bt5";
+  const unauthorized = (body = { errorCode: "E0000011", errorSummary: "Invalid token provided" }) =>
+    new Response(JSON.stringify(body), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } });
+  const config = { orgUrl: "https://tenant.example.okta.com", authMode: "SSWS", token, scopes: [], sourceChain: ["tests"] };
+  const rejectedNextStep = "Okta rejected the API token (every probe returned 401). Set OKTA_CLIENT_TOKEN, configure token in .okta.yaml, or pass api_token with a valid token, then rerun okta_check_access.";
+
+  const rejected = await runOktaAccessCheck(new OktaAuditorClient(config, { fetchImpl: async () => unauthorized() }), config);
+  assert.equal(rejected.status, "failed");
+  assert.equal(rejected.probes.length, 5);
+  for (const probe of rejected.probes) {
+    assert.equal(probe.status, "unauthorized", probe.key);
+  }
+  assert.equal(rejected.recommendedNextStep, rejectedNextStep);
+  assertNoWindowOf(JSON.stringify(rejected), token, "rejected access check");
+
+  // A token that reads even one surface was accepted, so the other 401s stay a scope problem.
+  const partlyReadable = await runOktaAccessCheck(
+    new OktaAuditorClient(config, {
+      fetchImpl: async (input) => (new URL(String(input)).pathname === "/api/v1/users"
+        ? new Response("[]", { status: 200, headers: { "content-type": "application/json" } })
+        : unauthorized()),
+    }),
+    config,
+  );
+  assert.equal(partlyReadable.status, "limited");
+  assert.match(partlyReadable.recommendedNextStep, /missing read scopes/);
+
+  const registered = [];
+  registerOktaTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "okta_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => unauthorized();
+  let result;
+  try {
+    result = await checkAccess.execute(
+      "call-rejected-ssws",
+      checkAccess.prepareArguments({ org_url: config.orgUrl, auth_mode: "SSWS", api_token: token }),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const text = result.content[0].text;
+  assert.equal(result.details.status, "failed");
+  assert.match(text, /^Status: failed$/m);
+  assert.ok(text.includes(rejectedNextStep), text);
+  assert.doesNotMatch(text, /missing read scopes/);
+  assertNoWindowOf(`${text}\n${JSON.stringify(result.details)}`, token, "rendered access check");
+
+  clearOktaTokenCacheForTests();
+  const oauthConfig = {
+    orgUrl: "https://tenant.example.okta.com",
+    authMode: "PrivateKey",
+    clientId: "client-id",
+    clientAssertion: "signed-jwt",
+    scopes: ["okta.users.read"],
+    sourceChain: ["tests"],
+  };
+  const requestedPaths = new Set();
+  try {
+    const oauth = await runOktaAccessCheck(
+      new OktaAuditorClient(oauthConfig, {
+        fetchImpl: async (input) => {
+          requestedPaths.add(new URL(String(input)).pathname);
+          return unauthorized({ error: "invalid_client", error_description: "The client_assertion signature is invalid." });
+        },
+      }),
+      oauthConfig,
+    );
+    assert.deepEqual([...requestedPaths], ["/oauth2/v1/token"], "no API request is sent without an access token");
+    assert.equal(oauth.status, "failed");
+    assert.equal(
+      oauth.recommendedNextStep,
+      "Okta rejected the OAuth client credentials (every probe returned 401). Check OKTA_CLIENT_CLIENTID and OKTA_CLIENT_PRIVATEKEY (or OKTA_CLIENT_CLIENTASSERTION), plus OKTA_CLIENT_PRIVATEKEYID when the app has more than one key, then rerun okta_check_access.",
+    );
+    assert.ok(!JSON.stringify(oauth).includes("signed-jwt"), "the client assertion is never echoed");
+  } finally {
+    clearOktaTokenCacheForTests();
+  }
+});
+
 function pagedFetch({ pageSize = 200, totalPages = Infinity, nextFor, onRequest } = {}) {
   return async (input) => {
     const url = new URL(input.toString());

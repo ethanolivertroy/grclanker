@@ -1843,6 +1843,82 @@ test("runGitHubAccessCheck reports healthy and limited surfaces", async () => {
   assert.equal(limited.status, "limited");
 });
 
+test("runGitHubAccessCheck reports failed and names the token settings when every probe returns 401", async () => {
+  const token = "ghp_REJECTEDTOKENCANARY000000000000000000";
+  const config = createSampleConfig({ apiToken: token });
+  const badCredentials = () => new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401, headers: { "content-type": "application/json" } });
+  const rejectedNextStep = "GitHub rejected the token (every probe returned 401). Set GITHUB_TOKEN / GH_TOKEN or pass api_token with a valid token, then rerun github_check_access.";
+
+  const rejected = await runGitHubAccessCheck(new GitHubAuditorClient(config, async () => badCredentials()), config);
+  assert.equal(rejected.status, "failed");
+  assert.equal(rejected.probes.length, 8);
+  for (const probe of rejected.probes) {
+    assert.equal(probe.status, "unauthorized", probe.key);
+  }
+  assert.equal(rejected.recommendedNextStep, rejectedNextStep);
+  assert.ok(!JSON.stringify(rejected).includes(token), "the rejected token is never echoed");
+
+  // A token that reads even one surface was accepted, so the other 401s stay a permissions problem.
+  const partlyReadable = await runGitHubAccessCheck(
+    new GitHubAuditorClient(config, async (input) => (new URL(String(input)).pathname === "/orgs/example-org"
+      ? new Response(JSON.stringify({ login: "example-org" }), { status: 200, headers: { "content-type": "application/json" } })
+      : badCredentials())),
+    config,
+  );
+  assert.equal(partlyReadable.status, "limited");
+  assert.match(partlyReadable.recommendedNextStep, /^Fix the missing GitHub permissions first/);
+
+  const checkAccess = captureGitHubTools().get("github_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => badCredentials();
+  let result;
+  try {
+    result = await checkAccess.execute("call-rejected-pat", { organization: "example-org", auth_mode: "pat", api_token: token });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const text = result.content[0].text;
+  assert.equal(result.details.status, "failed");
+  assert.match(text, /^Status: failed$/m);
+  assert.ok(text.includes(`Next step: ${rejectedNextStep}`), text);
+  assert.doesNotMatch(text, /missing GitHub permissions/);
+  assert.ok(!`${text}\n${JSON.stringify(result.details)}`.includes(token), "the rendered result never echoes the token");
+});
+
+test("runGitHubAccessCheck reports failed and names the App settings when the installation token exchange returns 401", async () => {
+  clearGitHubTokenCacheForTests();
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const config = createSampleConfig({
+    authMode: "app",
+    apiToken: undefined,
+    appId: "12345",
+    appPrivateKey: pem,
+    installationId: "98765",
+  });
+  const requestedPaths = new Set();
+  const fetchImpl = async (input) => {
+    requestedPaths.add(new URL(String(input)).pathname);
+    return new Response(JSON.stringify({ message: "A JSON web token could not be decoded" }), { status: 401, headers: { "content-type": "application/json" } });
+  };
+
+  try {
+    const result = await runGitHubAccessCheck(new GitHubAuditorClient(config, fetchImpl), config);
+    assert.deepEqual([...requestedPaths], ["/app/installations/98765/access_tokens"], "no org endpoint is called without an installation token");
+    assert.equal(result.status, "failed");
+    for (const probe of result.probes) {
+      assert.equal(probe.status, "unauthorized", probe.key);
+    }
+    assert.equal(
+      result.recommendedNextStep,
+      "GitHub rejected the App credentials (every probe returned 401). Check GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, and GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH (or the matching arguments), then rerun github_check_access.",
+    );
+    assert.ok(!JSON.stringify(result).includes("PRIVATE KEY"), "the private key is never echoed");
+  } finally {
+    clearGitHubTokenCacheForTests();
+  }
+});
+
 test("exportGitHubAuditBundle writes evidence and respects secure output roots", async () => {
   const outputRoot = createTempBase("grclanker-github-export-");
   const config = createSampleConfig();

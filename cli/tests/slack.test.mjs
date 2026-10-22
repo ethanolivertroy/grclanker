@@ -371,6 +371,41 @@ test("checkSlackAccess reports readable surfaces using documented response keys"
   assert.equal(limited.surfaces.find((surface) => surface.name === "scim_users")?.status, "not_configured");
 });
 
+test("checkSlackAccess says Slack rejected the token and names its variable when auth.test refuses it", async () => {
+  const userToken = "xoxp-1111111111-2222222222-rejectedcanary";
+  for (const code of ["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired"]) {
+    await assert.rejects(checkSlackAccess(makeClient(() => ({ ok: false, error: code }), { token: userToken })), (error) => {
+      assert.equal(error.message, `Slack rejected the user token (${code}). Set SLACK_USER_TOKEN (or the token argument) to a valid org-level user token.`);
+      assert.equal(error.code, code);
+      return true;
+    });
+  }
+  await assert.rejects(checkSlackAccess(makeClient(() => ({ ok: false, error: "invalid_auth" }), { bot_token: "xoxb-1111111111-2222222222-rejectedcanary" })), (error) => {
+    assert.equal(error.message, "Slack rejected the bot token (invalid_auth). Set SLACK_BOT_TOKEN (or the bot_token argument) to a valid bot token.");
+    return true;
+  });
+  // A failure that is not a token rejection keeps its original wording.
+  await assert.rejects(checkSlackAccess(makeClient(() => ({ ok: false, error: "internal_error" }), { token: userToken })), (error) => {
+    assert.equal(error.message, "Slack Web API auth.test failed: internal_error");
+    return true;
+  });
+
+  const tools = new Map();
+  registerSlackTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const checkAccess = tools.get("slack_check_access");
+  const previous = process.env.SLACK_CONFIG_FILE;
+  process.env.SLACK_CONFIG_FILE = "";
+  try {
+    const rejected = await withStubbedFetch(() => ({ ok: false, error: "invalid_auth" }), () => checkAccess.execute("call-rejected", checkAccess.prepareArguments({ token: userToken })));
+    assert.equal(rejected.isError, true);
+    assert.equal(rejected.content[0].text, "Check Slack audit access failed: Slack rejected the user token (invalid_auth). Set SLACK_USER_TOKEN (or the token argument) to a valid org-level user token.");
+    assert.ok(!JSON.stringify(rejected).includes(userToken), "the rejected token is never echoed");
+  } finally {
+    if (previous === undefined) delete process.env.SLACK_CONFIG_FILE;
+    else process.env.SLACK_CONFIG_FILE = previous;
+  }
+});
+
 test("fixture (a): every method denied yields manual findings and never pass", async () => {
   const client = makeClient((request) => request.pathname === "/api/auth.test" ? { ok: true, team_id: "T1" } : deniedFixture());
   const results = await runAll(client);

@@ -4127,7 +4127,15 @@ export async function checkDatadogAccess(client: AccessCheckReader): Promise<Dat
   const dataSurfaces = surfaces.filter((surface) => !validationSurfaces.has(surface.name));
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
   const dataSurfacesReadable = dataSurfaces.filter((surface) => surface.status === "readable").length;
-  const missingPermissions = [...new Set(
+  // A rejected key is denied on every probe whatever its permissions, so those denials name no missing permission.
+  const rejectedKey = dataSurfacesReadable > 0
+    ? null
+    : validate.status === "forbidden"
+      ? "API key"
+      : validateKeys.status === "forbidden"
+        ? "application key"
+        : null;
+  const missingPermissions = rejectedKey ? [] : [...new Set(
     dataSurfaces
       .filter((surface) => surface.status === "forbidden")
       .map((surface) => surface.permission),
@@ -4157,11 +4165,13 @@ export async function checkDatadogAccess(client: AccessCheckReader): Promise<Dat
         ? `The API key and application key pair validated successfully (GET ${validateKeys.endpoint}).`
         : `The API key and application key pair did not validate (GET ${validateKeys.endpoint}): ${validateKeys.error ?? "unknown error"}.`,
       `${readableCount}/${surfaces.length} Datadog audit surfaces are readable.`,
-      missingPermissions.length > 0
-        ? `Missing application key permissions: ${missingPermissions.join(", ")}.`
-        : permissionStateUnknown.length > 0
-          ? "No permission denials were observed among the probes that were answered."
-          : "No permission denials were observed.",
+      rejectedKey
+        ? `Permissions were not checked because Datadog rejected the ${rejectedKey}; the denied probes do not mean permissions are missing.`
+        : missingPermissions.length > 0
+          ? `Missing application key permissions: ${missingPermissions.join(", ")}.`
+          : permissionStateUnknown.length > 0
+            ? "No permission denials were observed among the probes that were answered."
+            : "No permission denials were observed.",
       ...(permissionStateUnknown.length > 0
         ? [`Permission state unknown for ${permissionStateUnknown.join(", ")}: the probe failed without a permission denial, so the permission was neither confirmed nor found missing.`]
         : []),
