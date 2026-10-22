@@ -3880,7 +3880,7 @@ function rejectedCredentialsStep(config: BoxResolvedConfig, tokenRefusal: BoxApi
       const refreshHint = config.refreshToken && config.clientId && config.clientSecret
         ? ""
         : ", or set BOX_REFRESH_TOKEN, BOX_CLIENT_ID, and BOX_CLIENT_SECRET (or refresh_token, client_id, and client_secret) so the CLI can refresh it";
-      return `Box rejected the OAuth 2.0 access token (${evidence}). Set BOX_ACCESS_TOKEN (or the access_token argument, or access_token in ~/.box-sec-inspector/config.yaml) to a current token${refreshHint}, then rerun box_check_access.`;
+      return `Box rejected the OAuth 2.0 access token (${evidence}). Set BOX_ACCESS_TOKEN (or BOX_TOKEN or BOX_DEVELOPER_TOKEN, or the access_token argument, or access_token in ~/.box-sec-inspector/config.yaml) to a current token${refreshHint}, then rerun box_check_access.`;
     }
     default: {
       const exhaustive: never = config.authMode;

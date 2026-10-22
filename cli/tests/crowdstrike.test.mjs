@@ -3530,7 +3530,7 @@ const CS_REJECTED_CLIENT_SECRET = "tim5vbAnh6jDp9nUwL0oR6abazdD2LBK";
 const CS_REJECTED_ISSUED_TOKEN = "yj6lxeMEtMhX3rD7BWcbQUKB9s9Odwk0";
 const CS_LIMITED_NEXT_STEP = "Grant the missing read scopes to the Falcon API client (Support and resources > API clients and keys) and rerun crowdstrike_check_access.";
 const CS_PERMISSION_CLAIM = /\b(?:permissions?|scopes?|roles?|privileges?|licen[cs]es?|licensing|modules?)\b/i;
-const CS_CREDENTIALS_NEXT_STEP_TAIL = "Set CS_CLIENT_ID and CS_CLIENT_SECRET (or the client_id and client_secret arguments, or the same keys in ~/.crowdstrike/config.json) to a valid API client ID and secret, and CS_CLOUD or CS_BASE_URL (or cloud or base_url) to the cloud where that client was created, then rerun crowdstrike_check_access.";
+const CS_CREDENTIALS_NEXT_STEP_TAIL = "Set CS_CLIENT_ID and CS_CLIENT_SECRET (or FALCON_CLIENT_ID and FALCON_CLIENT_SECRET, or the client_id and client_secret arguments, or the same keys in ~/.crowdstrike/config.json) to a valid API client ID and secret, and CS_CLOUD or CS_BASE_URL (or FALCON_CLOUD or FALCON_BASE_URL, or cloud or base_url) to the cloud where that client was created, then rerun crowdstrike_check_access.";
 
 /** A Falcon fetch double: the token endpoint answers with `token()`, every probe with `probe(path)`. */
 function csAccessFetch(token, probe) {
@@ -3570,7 +3570,7 @@ test("checkCrowdstrikeAccess reports failed and names the credential and cloud s
       fetchImpl: csAccessFetch(csTokenIssued, csErrors(401, `access denied, invalid bearer token ${CS_REJECTED_ISSUED_TOKEN}`)),
       httpStatus: 401,
       kind: "OAuth2 access token",
-      nextStep: "CrowdStrike rejected the OAuth2 access token issued for the API client (every probe returned 401). Set CS_CLOUD or CS_BASE_URL (or the cloud or base_url arguments, or the same keys in ~/.crowdstrike/config.json) to the cloud where the API client was created, then rerun crowdstrike_check_access.",
+      nextStep: "CrowdStrike rejected the OAuth2 access token issued for the API client (every probe returned 401). Set CS_CLOUD or CS_BASE_URL (or FALCON_CLOUD or FALCON_BASE_URL, or the cloud or base_url arguments, or the same keys in ~/.crowdstrike/config.json) to the cloud where the API client was created, then rerun crowdstrike_check_access.",
     },
   ];
   for (const entry of cases) {

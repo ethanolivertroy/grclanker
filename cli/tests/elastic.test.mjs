@@ -3949,7 +3949,7 @@ test("checkElasticAccess reports failed and names the credential and cluster set
       echo: API_KEY_SECRET,
       canaries: [API_KEY_SECRET, API_KEY],
       kind: "API key",
-      nextStep: "Elastic rejected the API key (every probe returned 401). Set ELASTIC_API_KEY (or the api_key argument, or api_key in ~/.elastic-sec-inspector/config.yaml) to a valid key and ELASTIC_URL (or elasticsearch_url) to the cluster that issued it, then rerun elastic_check_access.",
+      nextStep: "Elastic rejected the API key (every probe returned 401). Set ELASTIC_API_KEY (or the api_key argument, or api_key in ~/.elastic-sec-inspector/config.yaml) to a valid key and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster that issued it, then rerun elastic_check_access.",
     },
     {
       label: "api_key with an Elastic Cloud API key",
@@ -3957,7 +3957,7 @@ test("checkElasticAccess reports failed and names the credential and cluster set
       echo: ES_REJECTED_CLOUD_API_KEY,
       canaries: [API_KEY_SECRET, API_KEY, ES_REJECTED_CLOUD_API_KEY],
       kind: "API key",
-      nextStep: "Elastic rejected the API key and the Elastic Cloud API key (every probe returned 401). Set ELASTIC_API_KEY (or the api_key argument, or api_key in ~/.elastic-sec-inspector/config.yaml) to a valid key and ELASTIC_URL (or elasticsearch_url) to the cluster that issued it, and ELASTIC_CLOUD_API_KEY (or cloud_api_key) to a valid Elastic Cloud API key, then rerun elastic_check_access.",
+      nextStep: "Elastic rejected the API key and the Elastic Cloud API key (every probe returned 401). Set ELASTIC_API_KEY (or the api_key argument, or api_key in ~/.elastic-sec-inspector/config.yaml) to a valid key and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster that issued it, and ELASTIC_CLOUD_API_KEY (or cloud_api_key) to a valid Elastic Cloud API key, then rerun elastic_check_access.",
     },
     {
       label: "basic",
@@ -3965,7 +3965,7 @@ test("checkElasticAccess reports failed and names the credential and cluster set
       echo: ES_REJECTED_PASSWORD,
       canaries: [ES_REJECTED_PASSWORD],
       kind: "username and password",
-      nextStep: "Elastic rejected the username and password (every probe returned 401). Set ELASTIC_USERNAME and ELASTIC_PASSWORD (or the username and password arguments, or the same keys in ~/.elastic-sec-inspector/config.yaml) to valid credentials and ELASTIC_URL (or elasticsearch_url) to the cluster they are for, then rerun elastic_check_access.",
+      nextStep: "Elastic rejected the username and password (every probe returned 401). Set ELASTIC_USERNAME and ELASTIC_PASSWORD (or the username and password arguments, or the same keys in ~/.elastic-sec-inspector/config.yaml) to valid credentials and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster they are for, then rerun elastic_check_access.",
     },
     {
       label: "bearer",
@@ -3973,7 +3973,7 @@ test("checkElasticAccess reports failed and names the credential and cluster set
       echo: ES_REJECTED_BEARER_TOKEN,
       canaries: [ES_REJECTED_BEARER_TOKEN],
       kind: "access token",
-      nextStep: "Elastic rejected the access token (every probe returned 401). Set ELASTIC_BEARER_TOKEN (or the bearer_token argument, or bearer_token in ~/.elastic-sec-inspector/config.yaml) to a valid token and ELASTIC_URL (or elasticsearch_url) to the cluster that issued it, then rerun elastic_check_access.",
+      nextStep: "Elastic rejected the access token (every probe returned 401). Set ELASTIC_BEARER_TOKEN (or the bearer_token argument, or bearer_token in ~/.elastic-sec-inspector/config.yaml) to a valid token and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster that issued it, then rerun elastic_check_access.",
     },
   ];
   for (const mode of modes) {

@@ -1910,11 +1910,11 @@ function accessCheckNextStep(status: CrowdstrikeAccessCheckResult["status"], tok
     case "failed": {
       if (tokenRefusalStatus === undefined) {
         // Any commercial cloud's token endpoint issues a token for the client, but only the client's own cloud accepts it.
-        return "CrowdStrike rejected the OAuth2 access token issued for the API client (every probe returned 401). Set CS_CLOUD or CS_BASE_URL (or the cloud or base_url arguments, or the same keys in ~/.crowdstrike/config.json) to the cloud where the API client was created, then rerun crowdstrike_check_access.";
+        return "CrowdStrike rejected the OAuth2 access token issued for the API client (every probe returned 401). Set CS_CLOUD or CS_BASE_URL (or FALCON_CLOUD or FALCON_BASE_URL, or the cloud or base_url arguments, or the same keys in ~/.crowdstrike/config.json) to the cloud where the API client was created, then rerun crowdstrike_check_access.";
       }
       // The scrubber reads "token - Not" as a credential carrier, so the evidence quotes the refusal only up to the dash.
       const evidence = tokenRefusalStatus === 401 ? "401" : `${tokenRefusalStatus}: Failed to issue access token`;
-      return `CrowdStrike rejected the API client credentials (the token request returned ${evidence}). Set CS_CLIENT_ID and CS_CLIENT_SECRET (or the client_id and client_secret arguments, or the same keys in ~/.crowdstrike/config.json) to a valid API client ID and secret, and CS_CLOUD or CS_BASE_URL (or cloud or base_url) to the cloud where that client was created, then rerun crowdstrike_check_access.`;
+      return `CrowdStrike rejected the API client credentials (the token request returned ${evidence}). Set CS_CLIENT_ID and CS_CLIENT_SECRET (or FALCON_CLIENT_ID and FALCON_CLIENT_SECRET, or the client_id and client_secret arguments, or the same keys in ~/.crowdstrike/config.json) to a valid API client ID and secret, and CS_CLOUD or CS_BASE_URL (or FALCON_CLOUD or FALCON_BASE_URL, or cloud or base_url) to the cloud where that client was created, then rerun crowdstrike_check_access.`;
     }
     default: {
       const exhaustive: never = status;

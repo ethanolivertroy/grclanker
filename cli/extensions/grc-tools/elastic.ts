@@ -4428,11 +4428,11 @@ function rejectedCredentialsStep(authMode: ElasticResolvedConfig["authMode"], cl
   // API keys, native users, and tokens belong to one cluster, so another cluster's URL draws the same 401s.
   switch (authMode) {
     case "api_key":
-      return `${rejected} Set ELASTIC_API_KEY (or the api_key argument, or api_key in ~/.elastic-sec-inspector/config.yaml) to a valid key and ELASTIC_URL (or elasticsearch_url) to the cluster that issued it${cloudSetting}, then rerun elastic_check_access.`;
+      return `${rejected} Set ELASTIC_API_KEY (or the api_key argument, or api_key in ~/.elastic-sec-inspector/config.yaml) to a valid key and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster that issued it${cloudSetting}, then rerun elastic_check_access.`;
     case "basic":
-      return `${rejected} Set ELASTIC_USERNAME and ELASTIC_PASSWORD (or the username and password arguments, or the same keys in ~/.elastic-sec-inspector/config.yaml) to valid credentials and ELASTIC_URL (or elasticsearch_url) to the cluster they are for${cloudSetting}, then rerun elastic_check_access.`;
+      return `${rejected} Set ELASTIC_USERNAME and ELASTIC_PASSWORD (or the username and password arguments, or the same keys in ~/.elastic-sec-inspector/config.yaml) to valid credentials and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster they are for${cloudSetting}, then rerun elastic_check_access.`;
     case "bearer":
-      return `${rejected} Set ELASTIC_BEARER_TOKEN (or the bearer_token argument, or bearer_token in ~/.elastic-sec-inspector/config.yaml) to a valid token and ELASTIC_URL (or elasticsearch_url) to the cluster that issued it${cloudSetting}, then rerun elastic_check_access.`;
+      return `${rejected} Set ELASTIC_BEARER_TOKEN (or the bearer_token argument, or bearer_token in ~/.elastic-sec-inspector/config.yaml) to a valid token and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster that issued it${cloudSetting}, then rerun elastic_check_access.`;
     default: {
       const exhaustive: never = authMode;
       throw new Error(`Unhandled Elastic auth mode ${String(exhaustive)}`);

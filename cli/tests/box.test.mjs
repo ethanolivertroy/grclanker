@@ -3668,7 +3668,7 @@ test("checkBoxAccess reports failed and names the credential settings for each a
       routes: boxEveryApiRoute(boxUnauthorized(BOX_REJECTED_ACCESS_TOKEN)),
       httpStatus: 401,
       canaries: [BOX_REJECTED_ACCESS_TOKEN],
-      nextStep: "Box rejected the OAuth 2.0 access token (every probe returned 401). Set BOX_ACCESS_TOKEN (or the access_token argument, or access_token in ~/.box-sec-inspector/config.yaml) to a current token, or set BOX_REFRESH_TOKEN, BOX_CLIENT_ID, and BOX_CLIENT_SECRET (or refresh_token, client_id, and client_secret) so the CLI can refresh it, then rerun box_check_access.",
+      nextStep: "Box rejected the OAuth 2.0 access token (every probe returned 401). Set BOX_ACCESS_TOKEN (or BOX_TOKEN or BOX_DEVELOPER_TOKEN, or the access_token argument, or access_token in ~/.box-sec-inspector/config.yaml) to a current token, or set BOX_REFRESH_TOKEN, BOX_CLIENT_ID, and BOX_CLIENT_SECRET (or refresh_token, client_id, and client_secret) so the CLI can refresh it, then rerun box_check_access.",
     },
   ];
   for (const entry of cases) {

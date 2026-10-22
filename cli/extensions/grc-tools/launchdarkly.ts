@@ -2064,7 +2064,7 @@ function accessCheckNextStep(status: LaunchdarklyAccessCheckResult["status"]): s
     case "limited":
       return "Use an access token with the Reader base role (Admin or Owner for showAll token listing and audit log depth), or a custom role with reader base permissions plus viewProject on the audited projects, then rerun the access check.";
     case "failed":
-      return "LaunchDarkly rejected the access token (every probe returned 401). Set LAUNCHDARKLY_API_TOKEN (or the token argument, or token in ~/.config/launchdarkly-sec-inspector/config.toml) to a valid token, and LAUNCHDARKLY_BASE_URL (or base_url) when the token comes from the federal or EU instance, then rerun launchdarkly_check_access.";
+      return "LaunchDarkly rejected the access token (every probe returned 401). Set LAUNCHDARKLY_API_TOKEN (or LD_ACCESS_TOKEN, or the token argument, or token in ~/.config/launchdarkly-sec-inspector/config.toml) to a valid token, and LAUNCHDARKLY_BASE_URL (or LD_BASE_URI, or base_url) when the token comes from the federal or EU instance, then rerun launchdarkly_check_access.";
     default: {
       const exhaustive: never = status;
       throw new Error(`Unhandled LaunchDarkly access status ${String(exhaustive)}`);

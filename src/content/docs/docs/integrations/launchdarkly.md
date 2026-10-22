@@ -80,7 +80,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 | --- | --- |
-| `launchdarkly_check_access` | Probe caller identity plus 11 read surfaces (members, teams, custom roles, projects, environments, flags, access tokens, audit log, webhooks, Relay Proxy configs, integration subscriptions). Reports `healthy` only when every core surface is readable; webhooks, Relay Proxy configs, and integration subscriptions are optional. Reports `failed` when every probe returns 401 because LaunchDarkly rejected the access token; the next step names `LAUNCHDARKLY_API_TOKEN`, and `LAUNCHDARKLY_BASE_URL` for a federal or EU token. |
+| `launchdarkly_check_access` | Probe caller identity plus 11 read surfaces (members, teams, custom roles, projects, environments, flags, access tokens, audit log, webhooks, Relay Proxy configs, integration subscriptions). Reports `healthy` only when every core surface is readable; webhooks, Relay Proxy configs, and integration subscriptions are optional. Reports `failed` when every probe returns 401 because LaunchDarkly rejected the access token; the next step names `LAUNCHDARKLY_API_TOKEN` (or `LD_ACCESS_TOKEN`), and `LAUNCHDARKLY_BASE_URL` (or `LD_BASE_URI`) for a federal or EU token. |
 | `launchdarkly_assess_identity` | Controls 1, 2, 3, 6, 7, 24. Arguments: `member_limit`, `team_limit`, `max_owners`, `max_admins`, `allowed_domains`. |
 | `launchdarkly_assess_access_control` | Controls 4, 5, 8, 9, 10, 11. Arguments: `role_limit`, `token_limit`, `stale_token_days`. |
 | `launchdarkly_assess_environment_governance` | Controls 16, 17, 19, 22, 23. Arguments: `project_limit`, `environment_limit`, `project_keys`, `production_pattern`, `test_project_pattern`, `sdk_key_max_age_days`. |
