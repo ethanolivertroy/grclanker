@@ -1725,6 +1725,17 @@ test("grclanker flue command parses arguments and formats outcomes", async () =>
   assert.deepEqual(formatFlueRunOutcome({ id: "c", agent: "grclanker", outcome: "failed", error: "nope" }, false), {
     err: "grclanker flue run failed: nope",
   });
+  assert.deepEqual(
+    formatFlueRunOutcome({ id: "c", agent: "grclanker", outcome: "failed", error: "Provider is not configured: anthropic" }, false),
+    {
+      err: "grclanker flue run failed: Provider is not configured: anthropic\n"
+        + "Set ANTHROPIC_API_KEY, or set GRCLANKER_FLUE_MODEL to a provider/model you have a key for.",
+    },
+  );
+  assert.match(
+    formatFlueRunOutcome({ id: "c", agent: "grclanker", outcome: "failed", error: "Provider is not configured: groq" }, false).err,
+    /\nSet the API key for groq, or set GRCLANKER_FLUE_MODEL/,
+  );
   assert.match(formatFlueRunOutcome({ id: "c", agent: "grclanker", outcome: "aborted" }, true).out, /"outcome":"aborted"/);
   assert.match(formatFlueHelp(), /grclanker flue run --message/);
   assert.match(formatFlueHelp(), /GRCLANKER_FLUE_MODEL/);

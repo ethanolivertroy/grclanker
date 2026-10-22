@@ -105,6 +105,14 @@ const HOSTED_MODEL_OPTIONS = {
   ],
   google: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
 } as const;
+const HOSTED_API_KEY_ENV = {
+  openai: "OPENAI_API_KEY",
+  anthropic: "ANTHROPIC_API_KEY",
+  google: "GEMINI_API_KEY",
+} as const satisfies Record<keyof typeof HOSTED_DEFAULTS, string>;
+const LOCAL_CONTEXT_HINT =
+  "grclanker sends about 100k tokens of tool definitions with each request. Start Ollama with OLLAMA_CONTEXT_LENGTH=128000, or raise the context length in the Ollama app, so they fit.";
+const CONFIGURATION_DOCS_URL = "https://grclanker.com/docs/getting-started/configuration/";
 const COMMON_DOCKER_IMAGES = [
   "ubuntu:24.04",
   "debian:bookworm-slim",
@@ -731,7 +739,7 @@ async function fetchReachableModelIds(baseUrl: string, modelId: string): Promise
         `Could not reach a local OpenAI-compatible endpoint at ${baseUrl}.`,
         "",
         "Expected local-first path:",
-        "  ollama serve",
+        "  OLLAMA_CONTEXT_LENGTH=128000 ollama serve",
         `  ollama pull ${modelId}`,
         "  grclanker setup",
         "",
@@ -856,12 +864,20 @@ export async function ensureCliConfigured(): Promise<void> {
   if (isConfigured(settings)) return;
 
   if (!input.isTTY || !output.isTTY) {
-    throw new Error(
-      "grclanker is not configured yet. Run `grclanker setup` in an interactive terminal first.",
+    throw new GrclankerUserError(
+      [
+        "grclanker is not configured yet, and first-run setup needs an interactive terminal.",
+        "Run `grclanker setup` in a terminal once; later runs reuse the saved choice.",
+        nonInteractiveSetupHint(),
+      ].join("\n"),
     );
   }
 
   await runSetupWizard();
+}
+
+function nonInteractiveSetupHint(): string {
+  return `Without a terminal, add the model settings to ${getGrclankerSettingsPath()} yourself: ${CONFIGURATION_DOCS_URL}`;
 }
 
 export async function runSetupWizard(force = true): Promise<void> {
@@ -872,6 +888,15 @@ export async function runSetupWizard(force = true): Promise<void> {
 
   if (!force && isConfigured(settings)) {
     return;
+  }
+
+  if (!input.isTTY || !output.isTTY) {
+    throw new GrclankerUserError(
+      [
+        "`grclanker setup` is interactive and needs a terminal, so no model was configured.",
+        nonInteractiveSetupHint(),
+      ].join("\n"),
+    );
   }
 
   try {
@@ -920,6 +945,7 @@ export async function runSetupWizard(force = true): Promise<void> {
             console.log("Skipped advanced compute setup. Re-run setup later if you want Docker or Parallels.");
           }
           console.log("grclanker will stay on that local model until you rerun setup.");
+          console.log(LOCAL_CONTEXT_HINT);
           outro("Saved local-first setup.");
           return;
         }
@@ -961,6 +987,7 @@ export async function runSetupWizard(force = true): Promise<void> {
               console.log("Skipped advanced compute setup. Re-run setup later if you want Docker or Parallels.");
             }
             console.log("grclanker will stay on that local model until you rerun setup.");
+            console.log(LOCAL_CONTEXT_HINT);
             outro("Saved local-first setup.");
             return;
           }
@@ -997,7 +1024,9 @@ export async function runSetupWizard(force = true): Promise<void> {
     if (!shouldConfigureCompute) {
       console.log("Skipped advanced compute setup. Re-run setup later if you want Docker or Parallels.");
     }
-    console.log("grclanker will use the configured provider/model when credentials are available.");
+    console.log(
+      `grclanker reads the API key from ${HOSTED_API_KEY_ENV[provider]}, or from a key saved with /login inside grclanker.`,
+    );
     outro("Saved hosted setup.");
   } catch (error) {
     if (error instanceof SetupCancelledError) {

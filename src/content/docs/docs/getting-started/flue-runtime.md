@@ -38,10 +38,18 @@ Pi tool results map onto Flue's result envelope: text content becomes the tool o
 
 No separate Flue install is needed, because the runner uses Flue's documented `start()` and `init()` APIs from `@flue/runtime`, which is a dependency of the CLI package.
 
+The runner uses the model saved by `grclanker setup`:
+
+- After a local-first setup, it needs no API key, only the running Ollama endpoint with its [context length](/docs/getting-started/setup#context-length) raised.
+- After a hosted setup, it needs that provider's key: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`.
+- With no setup at all, it uses `anthropic/claude-sonnet-4-6`, so it needs `ANTHROPIC_API_KEY`.
+
 ```bash
 export ANTHROPIC_API_KEY=...
 grclanker flue run --message "Is BoringCrypto FIPS validated?"
 ```
+
+A missing key ends the run with `grclanker flue run failed: Provider is not configured: <provider>`, after Flue's own error report. Set that provider's key, or set `GRCLANKER_FLUE_MODEL` to a provider and model you have a key for (see [Configuration](#configuration)).
 
 `grclanker flue --help` prints the options and environment variables.
 

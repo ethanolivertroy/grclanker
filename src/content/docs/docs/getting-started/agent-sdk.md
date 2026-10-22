@@ -50,7 +50,9 @@ npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-4
 
 The `kevs_search` call above needs network access to the CISA KEV feed and prints a JSON envelope with `"ok": true` and the matching Log4j entries.
 
-Because `@cursor/bdk` is pinned (see [Limitations](#limitations)), every `bdk` command prints an "outdated" warning once a newer release is published. That warning is expected.
+Because `@cursor/bdk` is pinned (see [Limitations](#limitations)), every `bdk` command prints an "outdated" warning once a newer release is published. That warning is expected. Skip the `bdk update` it suggests, because the pin is deliberate.
+
+Every `bdk` command also prints `[bdk] GitHub auth: unavailable` unless a GitHub App or token is set. That line is about BDK's own GitHub integration, which this project does not use, so the tools still run. The `github_*` domain tools read their own credentials, as listed on the [GitHub](/docs/integrations/github/) page.
 
 Model turns need a Cursor credential. Sign in once with `npx bdk login` inside `cli/`, or export `CURSOR_API_KEY`, then serve the agent with the playground:
 

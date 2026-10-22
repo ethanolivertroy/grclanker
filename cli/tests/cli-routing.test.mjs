@@ -156,6 +156,33 @@ test("reserved roots, option-like commands, and workflow typos retain the Unknow
   );
 });
 
+test("the resume command Pi prints on exit routes its session flags to the bare prompt path", () => {
+  assert.deepEqual(routeCliInvocation(["--session", "0198c3a2"], workflows), {
+    kind: "prompt",
+    sessionArgs: ["--session", "0198c3a2"],
+  });
+  assert.deepEqual(
+    routeCliInvocation(
+      ["--session-dir", "/tmp/sessions", "--session", "abc", "--compute", "docker", "follow", "up"],
+      workflows,
+    ),
+    {
+      kind: "prompt",
+      sessionArgs: ["--session-dir", "/tmp/sessions", "--session", "abc"],
+      compute: "docker",
+      prompt: "follow up",
+    },
+  );
+  assert.deepEqual(routeCliInvocation(["--session"], workflows), { kind: "unknown-option", command: "--session" });
+  assert.deepEqual(
+    routeCliInvocation(["--session", "abc", "--bogus"], workflows),
+    { kind: "unknown-option", command: "--bogus" },
+  );
+
+  const parsed = parseArgs(["--session", "abc", ...buildCliLaunchArgs(cliRoot, "/tmp/grclanker-home/agent", {})]);
+  assert.equal(parsed.session, "abc");
+});
+
 test("workflow commands without a subject remain valid", () => {
   const invocation = routeCliInvocation(["investigate"], workflows);
   assert.deepEqual(invocation, { kind: "command", command: "investigate" });
@@ -239,4 +266,6 @@ test("help documents prompt, workflow, compute, and delimiter invocation forms",
     assert.match(CLI_HELP, new RegExp(`${workflow} <subject> \\[--compute <kind>\\]`));
   }
   assert.match(CLI_HELP, /Treat all following text literally/);
+  assert.match(CLI_HELP, /--version, -v/);
+  assert.match(CLI_HELP, /--session <id>/);
 });

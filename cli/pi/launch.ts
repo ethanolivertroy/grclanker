@@ -87,6 +87,7 @@ export async function launchCli(
   workflow?: string,
   compute?: ComputeBackendKind,
   prompt?: string,
+  sessionArgs: string[] = [],
 ): Promise<void> {
   const workingDir = process.cwd();
   const { agentDir, settingsPath } = prepareCliRuntime(appRoot);
@@ -100,7 +101,7 @@ export async function launchCli(
     : prompt
       ? { kind: "prompt" as const, content: prompt }
       : undefined;
-  const args = buildCliLaunchArgs(appRoot, agentDir, settings, initialPrompt);
+  const args = [...sessionArgs, ...buildCliLaunchArgs(appRoot, agentDir, settings, initialPrompt)];
 
   process.env.GRCLANKER_CODING_AGENT_DIR = agentDir;
   process.env.GRCLANKER_COMPUTE_BACKEND = resolveComputeBackend(settings);

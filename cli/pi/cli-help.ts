@@ -36,6 +36,8 @@ Recommended next step after install:
 
 Options:
   --help, -h                    Show this help
+  --version, -v                 Print the grclanker version
+  --session <id>                Reopen a saved session (grclanker prints this command when you exit)
   --compute <kind>              Use <kind> for this investigate/audit/assess/validate or "<prompt>" run only
                                 (bare interactive mode uses the backend saved by setup --compute)
   --                            Treat all following text literally (including --compute)

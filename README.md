@@ -49,11 +49,13 @@ grclanker tools
 
 The release installer links `grclanker` into `~/.local/bin`. A source checkout does the same with the `npm link` step above. The commands below use that name.
 
-Install [Ollama](https://ollama.com/download) yourself. The grclanker installer does not install it. If Ollama is not already serving, start it and leave that terminal running:
+Install [Ollama](https://ollama.com/download) yourself. The grclanker installer does not install it. If Ollama is not already serving, start it with a larger context window and leave that terminal running:
 
 ```bash
-ollama serve
+OLLAMA_CONTEXT_LENGTH=128000 ollama serve
 ```
+
+grclanker sends about 100k tokens of tool definitions with every request. Unless your GPU has 48 GiB or more, Ollama's default context window (4k or 32k tokens) is too small to hold them. If the Ollama app is already serving, raise its context length setting instead. `ollama ps` shows the context each loaded model got.
 
 In a second terminal:
 
@@ -62,18 +64,18 @@ ollama pull gemma4
 grclanker setup
 ```
 
-Choose Local-first. Setup uses `http://localhost:11434/v1`. If that endpoint is down, or the model you name is not installed, setup stops. It does not switch you to a hosted model. The wizard can also save an explicit hosted provider and model. See [Setup](https://grclanker.com/docs/getting-started/setup/).
+Choose Local-first. Setup uses `http://localhost:11434/v1`. If that endpoint is down, setup stops and prints the commands to start it. If the model you name is not installed, setup offers an installed local model or asks you to pull one. It never switches you to a hosted model. The wizard can also save an explicit hosted provider and model. grclanker then reads the key from `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`, or from a key saved with `/login` in a session. See [Setup](https://grclanker.com/docs/getting-started/setup/).
 
 Then:
 
 ```bash
-grclanker
 grclanker tools
+grclanker
 grclanker "Is CVE-2021-44228 in the CISA KEV catalog, and what is its EPSS score?"
 grclanker investigate "CVE-2021-44228"
 ```
 
-`grclanker` with no arguments opens an interactive session. A quoted argument is a prompt. `investigate`, `audit`, `assess`, and `validate` open a session that starts on that workflow, and each one takes a subject. The `v0.0.1` bundle rejects the quoted form and drops workflow subjects.
+`grclanker tools` lists every bundled tool without opening a session. `grclanker` with no arguments opens an interactive session. Leave it with `/quit` or Ctrl+D before you run the next command, and use `/resume` inside a session to reopen an earlier one. The `grclanker --session <id>` command printed on exit works from a source checkout of `main`. The `v0.1.3` bundle rejects it as an unknown command. A quoted argument is a prompt. `investigate`, `audit`, `assess`, and `validate` open a session that starts on that workflow, and each one takes a subject. The `v0.0.1` bundle rejects the quoted form and drops workflow subjects.
 
 Inside a session the same four workflows are slash commands. Guides: [Investigate](https://grclanker.com/docs/workflows/investigate/), [Audit](https://grclanker.com/docs/workflows/audit/), [Assess](https://grclanker.com/docs/workflows/assess/), [Validate](https://grclanker.com/docs/workflows/validate/).
 
@@ -180,7 +182,7 @@ npm --prefix cli run agent-sdk:info
 npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-44228"}'
 ```
 
-`validate`, `info`, and `call` need no Cursor credential. Model turns (`agent-sdk:dev`, `agent-sdk:run`) need one: run `npx bdk login` inside `cli/`, or export `CURSOR_API_KEY`. See [Cursor Agent SDK](https://grclanker.com/docs/getting-started/agent-sdk/).
+`validate`, `info`, and `call` need no Cursor credential. Model turns (`agent-sdk:dev`, `agent-sdk:run`) need one: run `npx bdk login` inside `cli/`, or export `CURSOR_API_KEY`. Every `bdk` command starts with an "outdated" warning for the pinned version and a `[bdk] GitHub auth: unavailable` line. Both are expected, and neither stops the tools. See [Cursor Agent SDK](https://grclanker.com/docs/getting-started/agent-sdk/).
 
 ## Flue
 
@@ -200,7 +202,7 @@ npx flue run flue/agent.ts --message "Is CVE-2021-44228 in the CISA KEV catalog?
 
 `@flue/cli` is a devDependency so it shares this repo's `@flue/runtime`. A separately downloaded `npx @flue/cli` loads a second runtime and fails.
 
-`GRCLANKER_FLUE_MODEL` sets the `provider/model` specifier. Without it, Flue reuses the `grclanker setup` choice, or `anthropic/claude-sonnet-4-6` when setup has not chosen one. Hosted provider API keys come from the environment. `GRCLANKER_FLUE_SANDBOX=none` turns off Flue's local file and shell sandbox. Pi compute backends do not apply here.
+`GRCLANKER_FLUE_MODEL` sets the `provider/model` specifier. Without it, Flue reuses the `grclanker setup` choice, or `anthropic/claude-sonnet-4-6` when setup has not chosen one. Hosted provider API keys come from the environment. A missing key ends the run with `Provider is not configured: <provider>`. `GRCLANKER_FLUE_SANDBOX=none` turns off Flue's local file and shell sandbox. Pi compute backends do not apply here.
 
 `grclanker flue run` stores conversations in `~/.grclanker/flue/conversations.db`, including tool arguments and credentials. `GRCLANKER_HOME` moves that directory. Pass `--db <path>` to use another file, or `--db :memory:` in CI so the run keeps nothing.
 

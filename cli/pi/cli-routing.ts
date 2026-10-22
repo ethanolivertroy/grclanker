@@ -12,6 +12,7 @@ export type CliInvocation =
     kind: "prompt";
     compute?: ComputeBackendKind;
     prompt?: string;
+    sessionArgs?: string[];
   }
   | {
     kind: "unknown-option";
@@ -79,6 +80,31 @@ function isOneEditAway(left: string, right: string): boolean {
   return true;
 }
 
+// Pi prints `grclanker [--session-dir <dir>] --session <id>` on exit, so both pass through to it.
+const SESSION_FLAGS = ["--session", "--session-dir"];
+
+function routeSessionInvocation(args: string[]): CliInvocation {
+  const sessionArgs: string[] = [];
+  let index = 0;
+  while (SESSION_FLAGS.includes(args[index]!) && index + 1 < args.length) {
+    sessionArgs.push(args[index]!, args[index + 1]!);
+    index += 2;
+  }
+
+  const next = args[index];
+  const nextIsOption = next !== undefined &&
+    next.startsWith("-") &&
+    next !== "--" &&
+    next !== "--compute" &&
+    !next.startsWith("--compute=");
+  if (sessionArgs.length === 0 || nextIsOption) {
+    return { kind: "unknown-option", command: next ?? args[0]! };
+  }
+
+  const { compute, rest } = extractComputeFlag(args.slice(index));
+  return withPromptOptions({ kind: "prompt", sessionArgs }, compute, joinPrompt(rest));
+}
+
 export function routeCliInvocation(
   args: string[],
   commands: readonly string[],
@@ -106,6 +132,10 @@ export function routeCliInvocation(
     commands.some((known) => known !== "setup" && isOneEditAway(command, known))
   ) {
     return { kind: "unknown-command", command };
+  }
+
+  if (SESSION_FLAGS.includes(command)) {
+    return routeSessionInvocation(args);
   }
 
   if (command !== "--" && command.startsWith("-")) {

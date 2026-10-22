@@ -24,8 +24,10 @@ For the local path, install Ollama from [ollama.com/download](https://ollama.com
 If the Ollama app or background service is already running, skip this command. Otherwise start the server in its own terminal and leave it running:
 
 ```bash
-ollama serve
+OLLAMA_CONTEXT_LENGTH=128000 ollama serve
 ```
+
+grclanker sends about 100k tokens of tool definitions with every request. Unless your GPU has 48 GiB or more, Ollama's default context window (4k or 32k tokens) is too small to hold them, so the variable above raises it. If the app or service is already running, raise its context length setting instead. [Context length](/docs/getting-started/setup#context-length) on the Setup page has the details.
 
 Then, in a second terminal:
 
@@ -37,6 +39,14 @@ grclanker setup
 Choose `Local-first` when prompted. Setup defaults to the Ollama endpoint at `http://localhost:11434/v1`.
 
 ## 3. Start the companion
+
+List the full tool surface first. This prints the catalog and exits without opening a session:
+
+```bash
+grclanker tools
+```
+
+Then open a session:
 
 ```bash
 grclanker
@@ -60,11 +70,7 @@ grclanker "Is CVE-2024-3400 in the CISA KEV catalog?"
 
 The older `v0.0.1` bundle does not take either form. There, name the vendor, product, CVE, or framework in the session once it opens.
 
-List the full tool surface first:
-
-```bash
-grclanker tools
-```
+Leave a session with `/quit` or Ctrl+D. To reopen an earlier conversation, start `grclanker` and run `/resume`. On exit, grclanker also prints a `grclanker --session <id>` command. The `v0.1.3` bundle rejects that command as unknown, and a source checkout of `main` accepts it.
 
 ## 4. Ask one useful first question
 

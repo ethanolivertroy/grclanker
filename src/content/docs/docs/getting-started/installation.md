@@ -67,6 +67,12 @@ That setup step is where you choose the local-first or hosted model path.
 
 grclanker keeps its settings and runtime state under `~/.grclanker/agent`, separate from the install directory, so reinstalling does not reset your setup.
 
+### First interactive session
+
+The first interactive session looks for `fd` and `rg` (ripgrep), which the `find` and `grep` tools use on the `host` compute backend. If either is not on your `PATH`, grclanker downloads it from that project's GitHub releases into `~/.grclanker/agent/bin`.
+
+On a machine without internet access, install both first, or set `PI_OFFLINE=1` to skip the download and the other startup network calls. Without them, `find` and `grep` fail with a message that the binary is not available.
+
 ## Pinned versions and install locations
 
 Pin a release explicitly:
@@ -140,11 +146,13 @@ Install and model setup are separate on purpose.
 
 If you want grclanker to stay local-first instead of using a hosted provider, install Ollama first from [ollama.com/download](https://ollama.com/download). The grclanker installer does not install it.
 
-Ollama must be serving before setup. If the Ollama app or background service is already running, skip this step. Otherwise start the server in its own terminal and leave it running:
+Ollama must be serving before setup, with a context window large enough for grclanker's tool definitions. If the Ollama app or background service is already running, raise its context length setting instead of running this command. Otherwise start the server in its own terminal and leave it running:
 
 ```bash
-ollama serve
+OLLAMA_CONTEXT_LENGTH=128000 ollama serve
 ```
+
+[Context length](/docs/getting-started/setup#context-length) on the Setup page explains the number.
 
 Then, in a second terminal:
 
@@ -206,6 +214,8 @@ If the help output appears and setup starts, the install is healthy. `grclanker 
 - If `grclanker tools` or `grclanker flue run` prints `Unknown command`, you are still running the `v0.0.1` bundle. Rerun the [one-line installer](#one-line-installer) to upgrade.
 - If local-first setup fails, check that Ollama is serving on `http://localhost:11434/v1`.
 - If `gemma4` is missing, run `ollama pull gemma4` and rerun `grclanker setup`.
+- If local-first answers come back without any tool calls, run `ollama ps` while the model is loaded. The `CONTEXT` column should show at least `128000`. If it is lower, raise it as described in [Context length](/docs/getting-started/setup#context-length).
+- If `grclanker` reports that it is not configured yet and asks for an interactive terminal, it was started without one, for example from a script or CI job. Run `grclanker setup` once in a terminal, or write the settings by hand as described in [Configuration](/docs/getting-started/configuration/).
 - If you do not want local-first, rerun `grclanker setup` and choose `Hosted`.
 
 On Windows, expect rough edges. The recommended path for now is macOS or Linux.
