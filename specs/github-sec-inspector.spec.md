@@ -637,7 +637,7 @@ github-sec-inspector audit
 
 | Tool | Purpose |
 |------|---------|
-| `github_check_access` | Probes the org-level read surfaces (org profile, members, repositories, audit log, org roles, rulesets, Actions permissions, code security configurations) and reports healthy or limited before any assessment runs |
+| `github_check_access` | Probes the org-level read surfaces (org profile, members, repositories, audit log, org roles, rulesets, Actions permissions, code security configurations) and reports healthy, limited, or failed (every probe returned 401, so the credentials were rejected) before any assessment runs |
 | `github_assess_org_access` | Controls 1 to 8 and 19: 2FA requirement plus `members?filter=2fa_disabled`, SAML SSO and identity linkage (GraphQL `samlIdentityProvider`, `externalIdentities`), EMU detection (GraphQL `enterprise.ownerInfo`), IP allow list (GraphQL `ipAllowListEnabledSetting`, `ipAllowListForInstalledAppsEnabledSetting`, `ipAllowListEntries`), base permission, public repository creation, private fork policy, outside collaborators, privileged access, audit log visibility, audit log streaming (manual) |
 | `github_assess_repo_protection` | Controls 10 to 14: effective rules for each default branch (`/repos/{owner}/{repo}/rules/branches/{branch}`) merged with legacy branch protection, org and repo rulesets, approving review detail, status check detail, signed commits, force push and deletion, web commit signoff |
 | `github_assess_actions_security` | Controls 21 and 22: allowed actions, workflow token defaults, workflow PR approval, Actions enablement scope, self-hosted runner and runner group exposure |

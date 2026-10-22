@@ -133,7 +133,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 | --- | --- |
-| `okta_check_access` | Resolves configuration, authenticates, and probes five read surfaces. Each probe reports `status` (`ok`, `forbidden`, `unauthorized`, or `error`), the error text, and `httpStatus`: the status code the failed request actually returned, `null` when the probe was readable or the failure carried no status. Reports `healthy` (three or more readable) or `limited` with a recommended next step. |
+| `okta_check_access` | Resolves configuration, authenticates, and probes five read surfaces. Each probe reports `status` (`ok`, `forbidden`, `unauthorized`, or `error`), the error text, and `httpStatus`: the status code the failed request actually returned, `null` when the probe was readable or the failure carried no status. Reports `healthy` (three or more readable), `failed` when every probe returns 401 because Okta rejected the credentials, or `limited`, with a recommended next step. A `failed` next step names the credential variables to fix. |
 | `okta_assess_authentication` | OKTA-AUTH-001 through OKTA-AUTH-009. |
 | `okta_assess_admin_access` | OKTA-ADMIN-001 through OKTA-ADMIN-006, including the paginated user population and per-admin factor enrollment. |
 | `okta_assess_integrations` | OKTA-INTEG-001 through OKTA-INTEG-006. |

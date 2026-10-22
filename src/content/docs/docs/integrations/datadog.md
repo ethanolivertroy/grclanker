@@ -123,7 +123,7 @@ Returns one of these statuses:
 - `limited` when the pair does not validate or any surface returns 401, 403, or an error.
 - `failed` when the API key is invalid or nothing beyond validation is readable.
 
-Lists the missing permissions by name and treats 401 responses like 403.
+Lists the missing permissions by name and treats 401 responses like 403. When Datadog rejects the API key or the key pair and no data surface is readable, it lists no missing permissions, because the denials come from the rejected key.
 
 ### `datadog_assess_identity`
 
