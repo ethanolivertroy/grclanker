@@ -1,0 +1,178 @@
+name: windows-bundle
+
+# Release bundles are cross-built on Linux, so this is the only place the
+# win32-x64 bundle and install.ps1 actually run on Windows before a release.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-bundle.yml"
+      - "cli/bin/**"
+      - "cli/index.ts"
+      - "cli/package-lock.json"
+      - "cli/package.json"
+      - "cli/pi/branding.ts"
+      - "cli/scripts/build-native-bundle.mjs"
+      - "cli/scripts/patch-embedded-pi.mjs"
+      - "public/install.ps1"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/windows-bundle.yml"
+      - "cli/bin/**"
+      - "cli/index.ts"
+      - "cli/package-lock.json"
+      - "cli/package.json"
+      - "cli/pi/branding.ts"
+      - "cli/scripts/build-native-bundle.mjs"
+      - "cli/scripts/patch-embedded-pi.mjs"
+      - "public/install.ps1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: build win32-x64 bundle
+    # Same image and Node version as the release-bundles build job.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      tools-summary: ${{ steps.reference.outputs.tools-summary }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.0"
+          cache: npm
+          cache-dependency-path: cli/package-lock.json
+
+      - name: Install CLI dependencies
+        working-directory: cli
+        run: npm ci
+
+      - name: Build win32-x64 bundle
+        working-directory: cli
+        run: npm run build:bundle -- --target win32-x64
+
+      - name: Record the tool catalog summary on Linux
+        id: reference
+        working-directory: cli
+        run: |
+          node bin/grclanker.js tools > "$RUNNER_TEMP/tools.txt"
+          summary="$(grep -E '^[0-9]+ domain tools \+ [0-9]+ compute backend tools' "$RUNNER_TEMP/tools.txt" | head -n 1)"
+          if [ -z "$summary" ]; then
+            echo "::error::grclanker tools printed no catalog summary line"
+            cat "$RUNNER_TEMP/tools.txt"
+            exit 1
+          fi
+          echo "$summary"
+          echo "tools-summary=$summary" >> "$GITHUB_OUTPUT"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: win32-x64-bundle
+          path: |
+            cli/release/*-win32-x64.zip
+            cli/release/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  smoke:
+    name: smoke (${{ matrix.installer }})
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # powershell is Windows PowerShell 5.1, pwsh is PowerShell 7.
+        installer: [powershell, pwsh]
+
+    steps:
+      - name: Checkout installer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            cli/package.json
+            public/install.ps1
+          sparse-checkout-cone-mode: false
+
+      - name: Download bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: win32-x64-bundle
+          path: cli/release
+
+      - name: Install with install.ps1 from the local bundle
+        env:
+          INSTALLER: ${{ matrix.installer }}
+        run: |
+          $bundles = @(Get-ChildItem -LiteralPath cli\release -Filter "grclanker-*-win32-x64.zip")
+          if ($bundles.Count -ne 1) { throw "Expected one win32-x64 bundle in cli\release, found $($bundles.Count)" }
+          $bundle = $bundles[0].Name
+
+          $installArgs = switch ($env:INSTALLER) {
+            # Mirrors the documented command: powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
+            "powershell" { "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Get-Content -Raw -LiteralPath public\install.ps1 | Invoke-Expression" }
+            "pwsh" { "-NoProfile", "-File", "public\install.ps1" }
+            default { throw "Unknown installer: $env:INSTALLER" }
+          }
+          $output = & $env:INSTALLER @installArgs
+          $exitCode = $LASTEXITCODE
+          $output | Write-Host
+          if ($exitCode -ne 0) { throw "install.ps1 exited with $exitCode under $env:INSTALLER" }
+
+          # A missing local bundle would fall back to downloading the published release.
+          $log = $output -join "`n"
+          if ($log -notmatch [regex]::Escape("Using local release artifact $bundle")) { throw "install.ps1 did not install $bundle from cli\release" }
+          if ($log -notmatch "Integrity verified") { throw "install.ps1 did not verify $bundle against SHA256SUMS.txt" }
+
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $HOME ".local\bin")
+
+      - name: Run grclanker --help and grclanker tools
+        env:
+          EXPECTED_TOOLS_SUMMARY: ${{ needs.build.outputs.tools-summary }}
+        run: |
+          $installDir = Join-Path $HOME ".local\share\grclanker"
+          $launcher = Join-Path $HOME ".local\bin\grclanker.cmd"
+          $resolved = (Get-Command grclanker -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          if ($resolved -ne $launcher) { throw "grclanker resolved to $resolved, not the installed launcher $launcher" }
+
+          Write-Host "Bundled Node: $(& (Join-Path $installDir 'node\node.exe') --version)"
+
+          $help = grclanker --help
+          $exitCode = $LASTEXITCODE
+          $help | Write-Host
+          if ($exitCode -ne 0) { throw "grclanker --help exited with $exitCode" }
+          if ($help -notcontains "Usage:") { throw "grclanker --help printed no usage" }
+
+          $tools = grclanker tools
+          $exitCode = $LASTEXITCODE
+          $tools | Write-Host
+          if ($exitCode -ne 0) { throw "grclanker tools exited with $exitCode" }
+          $summary = @($tools | Where-Object { $_ -match '^\d+ domain tools \+ \d+ compute backend tools' })[0]
+          if (-not $env:EXPECTED_TOOLS_SUMMARY) { throw "The build job recorded no tool catalog summary" }
+          if ($summary -ne $env:EXPECTED_TOOLS_SUMMARY) {
+            throw "grclanker tools on Windows printed '$summary', but the Linux build printed '$env:EXPECTED_TOOLS_SUMMARY'"
+          }
+
+          # The launcher inside the bundle is what a manual unzip runs.
+          $bundleHelp = & (Join-Path $installDir "grclanker.cmd") --help
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) { throw "The bundle's own grclanker.cmd --help exited with $exitCode" }
+          if ($bundleHelp -notcontains "Usage:") { throw "The bundle's own grclanker.cmd --help printed no usage" }
