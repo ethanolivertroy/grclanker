@@ -3,6 +3,7 @@ import { HeroImage } from '../components/hero-image';
 import { HeroBrandRail, HeroImageBreak } from '../components/hero-images';
 import { HeroInstall } from '../components/hero-install';
 import { pageMetadata } from '../lib/metadata';
+import { imageSrcSet } from '../lib/responsive-images.mjs';
 import { githubUrl } from '../lib/site';
 import { loadSpecs } from '../lib/specs';
 
@@ -128,9 +129,14 @@ export default function HomePage() {
         <div className="hero-backdrop absolute inset-0 w-full h-full">
           <HeroImage
             src="/hero/command-center.webp"
+            sources={[
+              { media: '(max-width: 479px)', srcSet: '/hero/command-center-crop-880.webp' },
+              { media: '(max-width: 767px)', srcSet: '/hero/command-center-crop-1500.webp' },
+            ]}
             alt="Clanker command center"
             className="w-full h-full object-cover object-center"
             loading="eager"
+            fetchPriority="high"
           />
         </div>
         <div className="absolute inset-0 bg-gradient-to-b from-base/65 via-base/84 to-base pointer-events-none" />
@@ -179,13 +185,18 @@ export default function HomePage() {
       <section className="hero-preview-section">
         <div className="max-w-content mx-auto px-6">
           <div className="hero-preview-shell">
+            {/* The shell is at most 54rem wide, inside a 1px border. Low priority
+                leaves the bandwidth to the hero picture, the largest paint. */}
             <HeroImage
               src="/hero/grclanker-terminal.webp"
+              srcSet={imageSrcSet('/hero/grclanker-terminal.webp')}
+              sizes="(min-width: 912px) 862px, calc(100vw - 50px)"
               width={1750}
               height={1316}
               alt="grclanker CLI start screen from the v0.1.3 release bundle: 248 tools and 2 agents, the investigate, audit, assess, and validate workflows, and 241 domain tools ready"
               className="hero-preview-image"
               loading="eager"
+              fetchPriority="low"
             />
           </div>
         </div>

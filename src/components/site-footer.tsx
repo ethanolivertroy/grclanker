@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { imageSrcSet } from '../lib/responsive-images.mjs';
 import { footerImages, githubUrl, normalizePathname } from '../lib/site';
 
 function footerImageFor(pathname: string) {
@@ -11,11 +12,19 @@ function footerImageFor(pathname: string) {
 
 export function SiteFooter() {
   const pathname = usePathname();
+  const image = footerImageFor(pathname);
 
   return (
     <footer className="border-t border-surface0/60 bg-mantle/80">
       <div className="footer-image-strip" aria-hidden="true">
-        <img src={footerImageFor(pathname)} alt="" className="footer-image-strip-media" loading="lazy" />
+        <img
+          src={image}
+          srcSet={imageSrcSet(image, 1600)}
+          sizes="100vw"
+          alt=""
+          className="footer-image-strip-media"
+          loading="lazy"
+        />
         <div className="footer-image-strip-overlay" />
       </div>
       <div className="site-footer-shell max-w-content mx-auto px-6 py-4 text-xs text-subtext0">
@@ -38,7 +47,7 @@ export function SiteFooter() {
         </div>
         <span className="site-footer-status">
           <span className="led led-live" />
-          <span className="italic">SYS NOMINAL</span>
+          <span className="site-footer-status-label">SYS NOMINAL</span>
         </span>
       </div>
     </footer>

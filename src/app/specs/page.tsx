@@ -3,6 +3,7 @@ import { HeroImage } from '../../components/hero-image';
 import { SpecCatalogSection } from '../../components/spec-catalog-section';
 import { SpecCommandHero } from '../../components/spec-copy';
 import { pageMetadata } from '../../lib/metadata';
+import { IMAGE_BREAK_SIZES, imageSrcSet } from '../../lib/responsive-images.mjs';
 import { RAW_BASE, loadSpecs } from '../../lib/specs';
 
 export const metadata = pageMetadata({
@@ -22,9 +23,13 @@ export default function SpecsPage() {
         <div className="hero-backdrop absolute inset-0 w-full h-full">
           <HeroImage
             src="/hero/holographic.webp"
+            srcSet={imageSrcSet('/hero/holographic.webp')}
+            sizes="100vw"
+            sources={[{ media: '(max-width: 479px)', srcSet: '/hero/holographic-crop-880.webp' }]}
             alt="Spec catalog cockpit display"
             className="w-full h-full object-cover object-center"
             loading="eager"
+            fetchPriority="high"
           />
         </div>
         <div className="absolute inset-0 bg-gradient-to-b from-base/55 via-base/78 to-base pointer-events-none" />
@@ -50,7 +55,14 @@ export default function SpecsPage() {
         <SpecCatalogSection specs={specs} />
 
         <section className="page-image-break mb-8" aria-label="Specs ambient frame">
-          <img src="/footer/closeup.webp" alt="" className="page-image-break-image" loading="lazy" />
+          <img
+            src="/footer/closeup.webp"
+            srcSet={imageSrcSet('/footer/closeup.webp', 1600)}
+            sizes={IMAGE_BREAK_SIZES}
+            alt=""
+            className="page-image-break-image"
+            loading="lazy"
+          />
           <div className="page-image-break-overlay">
             <span className="page-image-break-pill">Raw markdown in // agent output out</span>
           </div>

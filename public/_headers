@@ -1,0 +1,10 @@
+# Next.js puts a content hash in every file name under /_next/static.
+/_next/static/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# Fonts and images keep their names when they change, so they expire sooner.
+/fonts/*
+  Cache-Control: public, max-age=2592000
+
+/*.webp
+  Cache-Control: public, max-age=86400, stale-while-revalidate=604800

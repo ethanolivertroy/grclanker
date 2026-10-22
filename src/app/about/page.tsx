@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { HeroImage } from '../../components/hero-image';
 import { pageMetadata } from '../../lib/metadata';
+import { IMAGE_BREAK_SIZES, imageSrcSet } from '../../lib/responsive-images.mjs';
 import { githubUrl } from '../../lib/site';
 
 export const metadata = pageMetadata({
@@ -17,9 +18,12 @@ export default function AboutPage() {
         <div className="hero-backdrop absolute inset-0 w-full h-full">
           <HeroImage
             src="/about-clanker.webp"
+            srcSet={imageSrcSet('/about-clanker.webp')}
+            sizes="100vw"
             alt="A clanker robot working at a compliance workstation"
             className="w-full h-full object-cover object-center"
             loading="eager"
+            fetchPriority="high"
           />
         </div>
         <div className="absolute inset-0 bg-gradient-to-b from-base/30 via-base/60 to-base pointer-events-none" />
@@ -131,7 +135,14 @@ export default function AboutPage() {
         </div>
 
         <section className="page-image-break mt-8" aria-label="About ambient frame">
-          <img src="/footer/standby.webp" alt="" className="page-image-break-image" loading="lazy" />
+          <img
+            src="/footer/standby.webp"
+            srcSet={imageSrcSet('/footer/standby.webp', 1600)}
+            sizes={IMAGE_BREAK_SIZES}
+            alt=""
+            className="page-image-break-image"
+            loading="lazy"
+          />
           <div className="page-image-break-overlay">
             <span className="page-image-break-pill">Open source // local-first // experimental by design</span>
           </div>
