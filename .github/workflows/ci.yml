@@ -14,7 +14,47 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  verify:
+  cli-tests:
+    name: cli-tests (${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: cli/package-lock.json
+
+      - name: Install CLI dependencies
+        working-directory: cli
+        run: npm ci
+
+      - name: Build CLI TypeScript
+        working-directory: cli
+        run: npm run build
+
+      # The test:cli command, split into disjoint file shards. npm appends
+      # arguments after the file pattern, where node --test ignores them, so
+      # the shard flag cannot be passed through npm run test:cli.
+      - name: Test CLI
+        working-directory: cli
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARD_TOTAL: ${{ strategy.job-total }}
+        run: node --test --test-shard="$SHARD/$SHARD_TOTAL" "tests/*.test.mjs"
+
+  checks:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -44,10 +84,6 @@ jobs:
         working-directory: cli
         run: npm run build
 
-      - name: Test CLI
-        working-directory: cli
-        run: npm run test:cli
-
       - name: Validate Agent SDK registry
         working-directory: cli
         run: npm run test:agent-sdk:validate
@@ -65,3 +101,19 @@ jobs:
 
       - name: Build site
         run: npm run build
+
+  verify:
+    needs: [cli-tests, checks]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Require every CI job to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = success ] || exit 1
+          done

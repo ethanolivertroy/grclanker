@@ -10,6 +10,29 @@ function readWorkflow(name) {
   return parseYaml(readFileSync(resolve(REPO_ROOT, ".github", "workflows", name), "utf8"));
 }
 
+test("CI test shards run the test:cli command over every test file", () => {
+  const { scripts } = JSON.parse(readFileSync(resolve(REPO_ROOT, "cli", "package.json"), "utf8"));
+  const testCli = /^npm run build && node --test (\S.*)$/.exec(scripts["test:cli"]);
+  assert.ok(testCli, "test:cli changed shape; update the cli-tests shards in ci.yml to match it");
+
+  const job = readWorkflow("ci.yml").jobs["cli-tests"];
+  assert.deepEqual(Object.keys(job.strategy.matrix), ["shard"]);
+  const shards = job.strategy.matrix.shard;
+  assert.deepEqual(shards, shards.map((_, index) => index + 1), "shards must be numbered 1 through N");
+
+  const runs = job.steps.map((step) => step.run);
+  const testStep = job.steps.find((step) => step.run?.startsWith("node --test"));
+  assert.equal(testStep.run, `node --test --test-shard="$SHARD/$SHARD_TOTAL" ${testCli[1]}`);
+  assert.deepEqual(testStep.env, { SHARD: "${{ matrix.shard }}", SHARD_TOTAL: "${{ strategy.job-total }}" });
+  assert.ok(runs.indexOf("npm run build") >= 0 && runs.indexOf("npm run build") < runs.indexOf(testStep.run));
+});
+
+test("the verify job waits on every other CI job", () => {
+  const { jobs } = readWorkflow("ci.yml");
+  const others = Object.keys(jobs).filter((name) => name !== "verify");
+  assert.deepEqual([...jobs.verify.needs].sort(), others.sort());
+});
+
 test("the Windows bundle smoke runs when the bundle, installer, or CLI entry changes", () => {
   const triggers = readWorkflow("windows-bundle.yml").on;
   const paths = triggers.pull_request.paths;
