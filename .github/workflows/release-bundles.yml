@@ -1,15 +1,45 @@
 name: release-bundles
 
+# Bundles are cross-built on Linux, so each one is installed with the real
+# installer and run on a runner of its own OS and architecture before a tag can
+# publish it. Pull requests, pushes to main, and manual runs stop at the release gate.
 on:
   push:
     tags:
       - "v*"
+    branches:
+      - main
+    # GitHub skips path filters for tag pushes, so every v* tag still runs.
+    paths:
+      - ".github/workflows/release-bundles.yml"
+      - "cli/bin/**"
+      - "cli/index.ts"
+      - "cli/package-lock.json"
+      - "cli/package.json"
+      - "cli/pi/branding.ts"
+      - "cli/scripts/build-native-bundle.mjs"
+      - "cli/scripts/patch-embedded-pi.mjs"
+      - "public/install"
+      - "public/install.ps1"
+  pull_request:
+    paths:
+      - ".github/workflows/release-bundles.yml"
+      - "cli/bin/**"
+      - "cli/index.ts"
+      - "cli/package-lock.json"
+      - "cli/package.json"
+      - "cli/pi/branding.ts"
+      - "cli/scripts/build-native-bundle.mjs"
+      - "cli/scripts/patch-embedded-pi.mjs"
+      - "public/install"
+      - "public/install.ps1"
+  workflow_dispatch:
 
 permissions: {}
 
 concurrency:
   group: release-bundles-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -17,6 +47,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    outputs:
+      tools-summary: ${{ steps.reference.outputs.tools-summary }}
 
     steps:
       - name: Checkout
@@ -30,6 +62,7 @@ jobs:
           node-version: "24.22.0"
 
       - name: Verify tag matches CLI version
+        if: github.ref_type == 'tag'
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           VERSION="$(node -p "require('./cli/package.json').version")"
@@ -58,8 +91,263 @@ jobs:
           compression-level: 0
           retention-days: 3
 
-  publish:
+      - name: Record the tool catalog summary on Linux
+        id: reference
+        working-directory: cli
+        run: |
+          node bin/grclanker.js tools > "$RUNNER_TEMP/tools.txt"
+          summary="$(grep -m 1 -E '^[0-9]+ domain tools \+ [0-9]+ compute backend tools' "$RUNNER_TEMP/tools.txt" || true)"
+          if [ -z "$summary" ]; then
+            echo "::error::grclanker tools printed no catalog summary line"
+            cat "$RUNNER_TEMP/tools.txt"
+            exit 1
+          fi
+          echo "$summary"
+          echo "tools-summary=$summary" >> "$GITHUB_OUTPUT"
+
+  smoke-unix:
+    name: smoke (${{ matrix.target }})
     needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-15
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: linux-x64
+            runner: ubuntu-24.04
+    defaults:
+      run:
+        # Explicit bash adds pipefail, so `grclanker tools | tee` keeps the exit code.
+        shell: bash
+
+    steps:
+      - name: Checkout installer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            cli/package.json
+            public/install
+          sparse-checkout-cone-mode: false
+
+      - name: Download release bundles
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-bundles
+          path: cli/release
+
+      - name: Install with public/install from the local bundle
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          bundles=(cli/release/grclanker-*-"$TARGET".tar.gz)
+          if [ "${#bundles[@]}" -ne 1 ] || [ ! -f "${bundles[0]}" ]; then
+            echo "::error::Expected one $TARGET bundle in cli/release"
+            ls -l cli/release
+            exit 1
+          fi
+          bundle="$(basename "${bundles[0]}")"
+
+          # Mirrors the documented command, which also feeds the script to bash on stdin:
+          # curl -fsSL https://grclanker.com/install | bash
+          bash < public/install 2>&1 | tee "$RUNNER_TEMP/install.log"
+
+          # A missing local bundle would fall back to downloading the published release.
+          if ! grep -qF "Using local artifact $bundle" "$RUNNER_TEMP/install.log"; then
+            echo "::error::public/install did not install $bundle from cli/release"
+            exit 1
+          fi
+          if ! grep -qF "Integrity verified" "$RUNNER_TEMP/install.log"; then
+            echo "::error::public/install did not verify $bundle against SHA256SUMS.txt"
+            exit 1
+          fi
+
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run grclanker --help and grclanker tools
+        env:
+          TARGET: ${{ matrix.target }}
+          EXPECTED_TOOLS_SUMMARY: ${{ needs.build.outputs.tools-summary }}
+        run: |
+          install_dir="$HOME/.local/share/grclanker"
+          launcher="$HOME/.local/bin/grclanker"
+          resolved="$(command -v grclanker || true)"
+          if [ "$resolved" != "$launcher" ]; then
+            echo "::error::grclanker resolved to '$resolved', not the installed launcher $launcher"
+            exit 1
+          fi
+
+          # Rosetta would run another architecture's Node without complaint.
+          node_target="$("$install_dir/node/bin/node" -p 'process.platform + "-" + process.arch')"
+          echo "Bundled Node: $("$install_dir/node/bin/node" --version) ($node_target)"
+          if [ "$node_target" != "$TARGET" ]; then
+            echo "::error::The $TARGET bundle carries a $node_target Node runtime"
+            exit 1
+          fi
+
+          grclanker --help | tee "$RUNNER_TEMP/help.txt"
+          if ! grep -qx "Usage:" "$RUNNER_TEMP/help.txt"; then
+            echo "::error::grclanker --help printed no usage"
+            exit 1
+          fi
+
+          grclanker tools | tee "$RUNNER_TEMP/tools.txt"
+          summary="$(grep -m 1 -E '^[0-9]+ domain tools \+ [0-9]+ compute backend tools' "$RUNNER_TEMP/tools.txt" || true)"
+          if [ -z "$EXPECTED_TOOLS_SUMMARY" ]; then
+            echo "::error::The build job recorded no tool catalog summary"
+            exit 1
+          fi
+          if [ "$summary" != "$EXPECTED_TOOLS_SUMMARY" ]; then
+            echo "::error::grclanker tools on $TARGET printed '$summary', but the Linux build printed '$EXPECTED_TOOLS_SUMMARY'"
+            exit 1
+          fi
+
+          # The launcher inside the bundle is what a manual extract runs.
+          "$install_dir/grclanker" --help > "$RUNNER_TEMP/bundle-help.txt"
+          if ! grep -qx "Usage:" "$RUNNER_TEMP/bundle-help.txt"; then
+            echo "::error::The bundle's own grclanker launcher printed no usage"
+            exit 1
+          fi
+
+  smoke-windows:
+    name: smoke (${{ matrix.target }}, ${{ matrix.installer }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [win32-arm64, win32-x64]
+        # powershell is Windows PowerShell 5.1, pwsh is PowerShell 7.
+        installer: [powershell, pwsh]
+        include:
+          - target: win32-arm64
+            runner: windows-11-arm
+          - target: win32-x64
+            runner: windows-2025
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout installer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            cli/package.json
+            public/install.ps1
+          sparse-checkout-cone-mode: false
+
+      - name: Download release bundles
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-bundles
+          path: cli/release
+
+      - name: Install with install.ps1 from the local bundle
+        env:
+          INSTALLER: ${{ matrix.installer }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $bundles = @(Get-ChildItem -LiteralPath cli\release -Filter "grclanker-*-$env:TARGET.zip")
+          if ($bundles.Count -ne 1) { throw "Expected one $env:TARGET bundle in cli\release, found $($bundles.Count)" }
+          $bundle = $bundles[0].Name
+
+          $installArgs = switch ($env:INSTALLER) {
+            # Mirrors the documented command: powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
+            "powershell" { "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Get-Content -Raw -LiteralPath public\install.ps1 | Invoke-Expression" }
+            "pwsh" { "-NoProfile", "-File", "public\install.ps1" }
+            default { throw "Unknown installer: $env:INSTALLER" }
+          }
+          $output = & $env:INSTALLER @installArgs
+          $exitCode = $LASTEXITCODE
+          $output | Write-Host
+          if ($exitCode -ne 0) { throw "install.ps1 exited with $exitCode under $env:INSTALLER" }
+
+          # A missing local bundle would fall back to downloading the published release.
+          $log = $output -join "`n"
+          if ($log -notmatch [regex]::Escape("Using local release artifact $bundle")) { throw "install.ps1 did not install $bundle from cli\release" }
+          if ($log -notmatch "Integrity verified") { throw "install.ps1 did not verify $bundle against SHA256SUMS.txt" }
+
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $HOME ".local\bin")
+
+      - name: Run grclanker --help and grclanker tools
+        env:
+          TARGET: ${{ matrix.target }}
+          EXPECTED_TOOLS_SUMMARY: ${{ needs.build.outputs.tools-summary }}
+        run: |
+          $installDir = Join-Path $HOME ".local\share\grclanker"
+          $launcher = Join-Path $HOME ".local\bin\grclanker.cmd"
+          $resolved = (Get-Command grclanker -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          if ($resolved -ne $launcher) { throw "grclanker resolved to $resolved, not the installed launcher $launcher" }
+
+          # Windows on Arm would run an x64 Node under emulation without complaint.
+          $node = Join-Path $installDir "node\node.exe"
+          $nodeTarget = & $node -p "process.platform + '-' + process.arch"
+          Write-Host "Bundled Node: $(& $node --version) ($nodeTarget)"
+          if ($nodeTarget -ne $env:TARGET) { throw "The $env:TARGET bundle carries a $nodeTarget Node runtime" }
+
+          $help = grclanker --help
+          $exitCode = $LASTEXITCODE
+          $help | Write-Host
+          if ($exitCode -ne 0) { throw "grclanker --help exited with $exitCode" }
+          if ($help -notcontains "Usage:") { throw "grclanker --help printed no usage" }
+
+          $tools = grclanker tools
+          $exitCode = $LASTEXITCODE
+          $tools | Write-Host
+          if ($exitCode -ne 0) { throw "grclanker tools exited with $exitCode" }
+          $summary = @($tools | Where-Object { $_ -match '^\d+ domain tools \+ \d+ compute backend tools' })[0]
+          if (-not $env:EXPECTED_TOOLS_SUMMARY) { throw "The build job recorded no tool catalog summary" }
+          if ($summary -ne $env:EXPECTED_TOOLS_SUMMARY) {
+            throw "grclanker tools on $env:TARGET printed '$summary', but the Linux build printed '$env:EXPECTED_TOOLS_SUMMARY'"
+          }
+
+          # The launcher inside the bundle is what a manual unzip runs.
+          $bundleHelp = & (Join-Path $installDir "grclanker.cmd") --help
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) { throw "The bundle's own grclanker.cmd --help exited with $exitCode" }
+          if ($bundleHelp -notcontains "Usage:") { throw "The bundle's own grclanker.cmd --help printed no usage" }
+
+  release-gate:
+    name: release gate
+    needs: [build, smoke-unix, smoke-windows]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+
+    steps:
+      - name: Require every bundle to build and pass its smoke check
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"
+          if jq -e 'any(.[]; .result != "success")' <<< "$NEEDS" > /dev/null; then
+            echo "::error::Refusing to publish: every bundle has to build and pass its smoke check on its own OS and architecture"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "Every bundle passed its smoke check. Publishing $GITHUB_REF_NAME."
+          else
+            echo "Every bundle passed its smoke check. This $GITHUB_EVENT_NAME run on $GITHUB_REF_NAME publishes nothing; only a v* tag push publishes."
+          fi
+
+  publish:
+    needs: [build, smoke-unix, smoke-windows, release-gate]
+    if: success() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
