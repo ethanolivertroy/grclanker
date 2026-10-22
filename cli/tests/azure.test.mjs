@@ -2164,7 +2164,7 @@ test("request matching: a token-endpoint denial is attributed to POST /<tenant>/
     assert.match(
       access.recommendedNextStep,
       status === 401
-        ? /^Microsoft Entra ID rejected the client credentials \(the token request returned 401\)\. Check AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET/
+        ? /^Microsoft Entra ID rejected the client credentials, so no token was issued\. Check AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET/
         : /^Fix the app registration's client credentials/,
       `${label}: the next step is the credential`,
     );
@@ -2215,11 +2215,24 @@ function everyAzureRoute(respond) {
   return Object.fromEntries(Object.keys(healthyAzureRoutes()).map((key) => [key, respond]));
 }
 
-test("access check: when every probe is refused with 401 the check fails and names the settings the refused requests carried; a readable probe or a 403 keeps the limited wording, and no refused credential reaches the result", async () => {
+/** A token-endpoint 400 with the OAuth error and AADSTS code Entra sends; the description echoes the client secret the way some gateways repeat the request. */
+function badRequestTokenResponse(error, description) {
+  return () => new Response(JSON.stringify({ error, error_description: `${description} Secret ${AZURE_REJECTED_CLIENT_SECRET}.` }), {
+    status: 400,
+    statusText: "Bad Request",
+    headers: { "content-type": "application/json" },
+  });
+}
+
+const AZURE_CLIENT_CREDENTIALS_REJECTED = "Microsoft Entra ID rejected the client credentials, so no token was issued. Check AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments); a wrong tenant ID or client ID, or a wrong or expired client secret, is refused this way. Then re-run azure_check_access.";
+const AZURE_TOKEN_REQUEST_FAILED = "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check.";
+
+test("access check: when every probe is refused for its credentials (a 401, or a token request refused as invalid_client, unauthorized_client, or AADSTS90002) the check fails and names the settings the refused requests carried; a readable probe, a 403, or another token-request error keeps the limited wording, and no refused credential reaches the result", async () => {
   const tenant = { AZURE_TENANT_ID: "tenant-123", AZURE_SUBSCRIPTION_ID: "sub-123" };
   const clientCredentials = { AZURE_CLIENT_ID: "client-123", AZURE_CLIENT_SECRET: AZURE_REJECTED_CLIENT_SECRET };
   const tokens = { graph_token: AZURE_REJECTED_GRAPH_TOKEN, management_token: AZURE_REJECTED_MANAGEMENT_TOKEN };
   const refusedTokenRequest = refusedTokenResponse(401, "Unauthorized");
+  const unregisteredClient = badRequestTokenResponse("unauthorized_client", "AADSTS700016: Application with identifier 'client-123' was not found in the directory 'tenant-123'.");
   const armForbidden = Object.fromEntries(Object.keys(healthyAzureRoutes()).filter((key) => key.startsWith(AZURE_SUB)).map((key) => [key, forbiddenAzureResponse]));
   const cases = [
     {
@@ -2228,7 +2241,39 @@ test("access check: when every probe is refused with 401 the check fails and nam
       env: { ...tenant, ...clientCredentials },
       routes: { ...everyAzureRoute(unauthorizedAzureRoute()), [AZURE_TOKEN_PATH]: refusedTokenRequest },
       status: "failed",
-      next: "Microsoft Entra ID rejected the client credentials (the token request returned 401). Check AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments), then re-run azure_check_access.",
+      next: AZURE_CLIENT_CREDENTIALS_REJECTED,
+    },
+    {
+      label: "client ID not registered in the tenant (400 unauthorized_client, AADSTS700016)",
+      input: {},
+      env: { ...tenant, ...clientCredentials },
+      routes: { ...everyAzureRoute(unauthorizedAzureRoute()), [AZURE_TOKEN_PATH]: unregisteredClient },
+      status: "failed",
+      next: AZURE_CLIENT_CREDENTIALS_REJECTED,
+    },
+    {
+      label: "tenant not found (400 invalid_request, AADSTS90002)",
+      input: {},
+      env: { ...tenant, ...clientCredentials },
+      routes: { ...everyAzureRoute(unauthorizedAzureRoute()), [AZURE_TOKEN_PATH]: badRequestTokenResponse("invalid_request", "AADSTS90002: Tenant 'tenant-123' not found.") },
+      status: "failed",
+      next: AZURE_CLIENT_CREDENTIALS_REJECTED,
+    },
+    {
+      label: "a 400 invalid_request that is not a credential refusal (AADSTS900144, a missing parameter)",
+      input: {},
+      env: { ...tenant, ...clientCredentials },
+      routes: { ...everyAzureRoute(unauthorizedAzureRoute()), [AZURE_TOKEN_PATH]: badRequestTokenResponse("invalid_request", "AADSTS900144: The request body must contain the following parameter: 'grant_type'.") },
+      status: "limited",
+      next: AZURE_TOKEN_REQUEST_FAILED,
+    },
+    {
+      label: "the token request answered 403 with invalid_client",
+      input: {},
+      env: { ...tenant, ...clientCredentials },
+      routes: { ...everyAzureRoute(unauthorizedAzureRoute()), [AZURE_TOKEN_PATH]: refusedTokenResponse(403, "Forbidden") },
+      status: "limited",
+      next: AZURE_TOKEN_REQUEST_FAILED,
     },
     {
       label: "supplied access tokens refused by Graph and ARM",
@@ -2244,7 +2289,15 @@ test("access check: when every probe is refused with 401 the check fails and nam
       env: { ...tenant, ...clientCredentials },
       routes: { ...everyAzureRoute(unauthorizedAzureRoute()), [AZURE_TOKEN_PATH]: refusedTokenRequest },
       status: "failed",
-      next: "Azure rejected both the supplied access token and the client credentials (every probe returned 401). Check AZURE_GRAPH_TOKEN, AZURE_MANAGEMENT_TOKEN, or AZURE_ACCESS_TOKEN (or the graph_token and management_token arguments), and AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments), then re-run azure_check_access.",
+      next: "Azure rejected both the supplied access token and the client credentials (every probe was refused). Check AZURE_GRAPH_TOKEN, AZURE_MANAGEMENT_TOKEN, or AZURE_ACCESS_TOKEN (or the graph_token and management_token arguments), and AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments), then re-run azure_check_access.",
+    },
+    {
+      label: "a supplied Graph token refused and the client ID not registered in the tenant",
+      input: { graph_token: AZURE_REJECTED_GRAPH_TOKEN },
+      env: { ...tenant, ...clientCredentials },
+      routes: { ...everyAzureRoute(unauthorizedAzureRoute()), [AZURE_TOKEN_PATH]: unregisteredClient },
+      status: "failed",
+      next: "Azure rejected both the supplied access token and the client credentials (every probe was refused). Check AZURE_GRAPH_TOKEN, AZURE_MANAGEMENT_TOKEN, or AZURE_ACCESS_TOKEN (or the graph_token and management_token arguments), and AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments), then re-run azure_check_access.",
     },
     {
       label: "Graph refuses the token while ARM answers 403",

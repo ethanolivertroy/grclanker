@@ -2439,14 +2439,23 @@ export async function checkAzureAccess(
   };
 }
 
-/** A probe refused for its credentials: Graph or ARM returned 401 to the access token, or the token endpoint returned 401 to the client credentials. A 403 stays a permission gap. */
+/**
+ * Token-request refusals Microsoft documents as wrong client credentials, whatever their status: invalid_client (the
+ * credentials aren't valid), unauthorized_client (the app isn't registered in the tenant, as with AADSTS700016), and
+ * AADSTS90002 (the tenant wasn't found). https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes
+ */
+const REFUSED_CLIENT_CREDENTIALS = /^Token request failed: \d{3}\b[^:]*: (?:invalid_client|unauthorized_client|invalid_request: AADSTS90002)\b/;
+
+/** A probe refused for its credentials: Graph or ARM returned 401 to the access token, or the token endpoint returned 401 or a documented credential refusal to the client credentials. A 403 stays a permission gap. */
 function isRejectedProbe(item: AzureAccessSurface): boolean {
-  return item.status === "not_readable" && item.http_status === 401;
+  if (item.status !== "not_readable" || item.http_status === 403) return false;
+  if (item.http_status === 401) return true;
+  return isTokenRequestFailure({ url: item.request_url ?? undefined }) && REFUSED_CLIENT_CREDENTIALS.test(item.error ?? "");
 }
 
-const CLIENT_CREDENTIALS_REJECTED = "Microsoft Entra ID rejected the client credentials (the token request returned 401). Check AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments), then re-run azure_check_access.";
+const CLIENT_CREDENTIALS_REJECTED = "Microsoft Entra ID rejected the client credentials, so no token was issued. Check AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments); a wrong tenant ID or client ID, or a wrong or expired client secret, is refused this way. Then re-run azure_check_access.";
 const ACCESS_TOKENS_REJECTED = "Microsoft Graph and Azure Resource Manager rejected the access tokens (every probe returned 401). Set AZURE_GRAPH_TOKEN and AZURE_MANAGEMENT_TOKEN or its alias AZURE_ACCESS_TOKEN (or the graph_token and management_token arguments) to valid tokens, or run az login again when the tokens come from the Azure CLI, then re-run azure_check_access.";
-const TOKEN_AND_CLIENT_CREDENTIALS_REJECTED = "Azure rejected both the supplied access token and the client credentials (every probe returned 401). Check AZURE_GRAPH_TOKEN, AZURE_MANAGEMENT_TOKEN, or AZURE_ACCESS_TOKEN (or the graph_token and management_token arguments), and AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments), then re-run azure_check_access.";
+const TOKEN_AND_CLIENT_CREDENTIALS_REJECTED = "Azure rejected both the supplied access token and the client credentials (every probe was refused). Check AZURE_GRAPH_TOKEN, AZURE_MANAGEMENT_TOKEN, or AZURE_ACCESS_TOKEN (or the graph_token and management_token arguments), and AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments), then re-run azure_check_access.";
 
 /** Names the settings behind the refused requests: the token request carries the client credentials, a Graph or ARM request carries an access token. */
 function rejectedCredentialsStep(surfaces: AzureAccessSurface[]): string {
