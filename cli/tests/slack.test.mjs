@@ -280,6 +280,10 @@ test("resolveSlackConfiguration reads arguments, environment, bot tokens, and co
   assert.equal(botOnly.token, undefined);
   assert.equal(botOnly.botToken, "xoxb-only");
 
+  const alias = resolveSlackConfiguration({}, { SLACK_TOKEN: "xoxp-alias", SLACK_CONFIG_FILE: "" });
+  assert.equal(alias.token, "xoxp-alias");
+  assert.ok(alias.sourceChain.includes("environment-token"));
+
   const base = createTempBase("grclanker-slack-config-");
   const configPath = join(base, "slack.json");
   writeFileSync(configPath, JSON.stringify({ user_token: "xoxp-file", scim_token: "scim-file", org_id: "E9" }));
@@ -288,7 +292,9 @@ test("resolveSlackConfiguration reads arguments, environment, bot tokens, and co
   assert.equal(fromFile.orgId, "E9");
   assert.ok(fromFile.sourceChain.includes("config-file-token"));
 
-  assert.throws(() => resolveSlackConfiguration({}, EMPTY_ENV), /SLACK_USER_TOKEN/);
+  assert.throws(() => resolveSlackConfiguration({}, EMPTY_ENV), {
+    message: "SLACK_USER_TOKEN or its alias SLACK_TOKEN (or SLACK_BOT_TOKEN for bot-capable methods), a token argument, or a config file entry is required.",
+  });
   assert.throws(() => resolveSlackConfiguration({}, { SLACK_CONFIG_FILE: join(base, "missing.json") }), /does not exist/);
 });
 
@@ -375,7 +381,7 @@ test("checkSlackAccess says Slack rejected the token and names its variable when
   const userToken = "xoxp-1111111111-2222222222-rejectedcanary";
   for (const code of ["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired"]) {
     await assert.rejects(checkSlackAccess(makeClient(() => ({ ok: false, error: code }), { token: userToken })), (error) => {
-      assert.equal(error.message, `Slack rejected the user token (${code}). Set SLACK_USER_TOKEN (or the token argument) to a valid org-level user token.`);
+      assert.equal(error.message, `Slack rejected the user token (${code}). Set SLACK_USER_TOKEN (or its alias SLACK_TOKEN, or the token argument) to a valid org-level user token.`);
       assert.equal(error.code, code);
       return true;
     });
@@ -398,7 +404,7 @@ test("checkSlackAccess says Slack rejected the token and names its variable when
   try {
     const rejected = await withStubbedFetch(() => ({ ok: false, error: "invalid_auth" }), () => checkAccess.execute("call-rejected", checkAccess.prepareArguments({ token: userToken })));
     assert.equal(rejected.isError, true);
-    assert.equal(rejected.content[0].text, "Check Slack audit access failed: Slack rejected the user token (invalid_auth). Set SLACK_USER_TOKEN (or the token argument) to a valid org-level user token.");
+    assert.equal(rejected.content[0].text, "Check Slack audit access failed: Slack rejected the user token (invalid_auth). Set SLACK_USER_TOKEN (or its alias SLACK_TOKEN, or the token argument) to a valid org-level user token.");
     assert.ok(!JSON.stringify(rejected).includes(userToken), "the rejected token is never echoed");
   } finally {
     if (previous === undefined) delete process.env.SLACK_CONFIG_FILE;
