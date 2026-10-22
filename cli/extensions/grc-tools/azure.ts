@@ -254,7 +254,7 @@ export interface AzureAccessSurface {
 }
 
 export interface AzureAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   tenantId: string;
   subscriptionId: string;
   surfaces: AzureAccessSurface[];
@@ -2411,7 +2411,9 @@ export async function checkAzureAccess(
   ]);
 
   const readableCount = surfaces.filter((item) => item.status === "readable").length;
-  const status = readableCount >= 6 ? "healthy" : "limited";
+  const status: AzureAccessCheckResult["status"] = surfaces.every(isRejectedProbe)
+    ? "failed"
+    : (readableCount >= 6 ? "healthy" : "limited");
   // A probe that failed at the token request never reached its resource; the note names the request that was made.
   const tokenFailures = surfaces.filter((item) => item.status === "not_readable" && isTokenRequestFailure({ url: item.request_url ?? undefined }));
   const tokenFailure = tokenFailures[0]
@@ -2433,15 +2435,47 @@ export async function checkAzureAccess(
     subscriptionId: config.subscriptionId,
     surfaces,
     notes,
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run azure_assess_identity, azure_assess_monitoring, azure_assess_subscription_guardrails, azure_assess_data_protection, azure_assess_network_and_policy, or azure_export_audit_bundle."
-        : tokenFailure
-          ? isNoResponseFailure(tokenFailure)
-            ? `${tokenFailureRemedy(tokenFailure)}, then re-run the access check.`
-            : "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check."
-          : "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
+    recommendedNextStep: accessCheckNextStep(status, surfaces, tokenFailure),
   };
+}
+
+/** A probe refused for its credentials: Graph or ARM returned 401 to the access token, or the token endpoint returned 401 to the client credentials. A 403 stays a permission gap. */
+function isRejectedProbe(item: AzureAccessSurface): boolean {
+  return item.status === "not_readable" && item.http_status === 401;
+}
+
+const CLIENT_CREDENTIALS_REJECTED = "Microsoft Entra ID rejected the client credentials (the token request returned 401). Check AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments), then re-run azure_check_access.";
+const ACCESS_TOKENS_REJECTED = "Microsoft Graph and Azure Resource Manager rejected the access tokens (every probe returned 401). Set AZURE_GRAPH_TOKEN and AZURE_MANAGEMENT_TOKEN or its alias AZURE_ACCESS_TOKEN (or the graph_token and management_token arguments) to valid tokens, or run az login again when the tokens come from the Azure CLI, then re-run azure_check_access.";
+const TOKEN_AND_CLIENT_CREDENTIALS_REJECTED = "Azure rejected both the supplied access token and the client credentials (every probe returned 401). Check AZURE_GRAPH_TOKEN, AZURE_MANAGEMENT_TOKEN, or AZURE_ACCESS_TOKEN (or the graph_token and management_token arguments), and AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments), then re-run azure_check_access.";
+
+/** Names the settings behind the refused requests: the token request carries the client credentials, a Graph or ARM request carries an access token. */
+function rejectedCredentialsStep(surfaces: AzureAccessSurface[]): string {
+  const atTokenRequest = surfaces.filter((item) => isTokenRequestFailure({ url: item.request_url ?? undefined })).length;
+  if (atTokenRequest === surfaces.length) return CLIENT_CREDENTIALS_REJECTED;
+  if (atTokenRequest === 0) return ACCESS_TOKENS_REJECTED;
+  return TOKEN_AND_CLIENT_CREDENTIALS_REJECTED;
+}
+
+function accessCheckNextStep(
+  status: AzureAccessCheckResult["status"],
+  surfaces: AzureAccessSurface[],
+  tokenFailure: { error: string; status?: number; url?: string } | undefined,
+): string {
+  switch (status) {
+    case "healthy":
+      return "Run azure_assess_identity, azure_assess_monitoring, azure_assess_subscription_guardrails, azure_assess_data_protection, azure_assess_network_and_policy, or azure_export_audit_bundle.";
+    case "limited":
+      if (!tokenFailure) return "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.";
+      return isNoResponseFailure(tokenFailure)
+        ? `${tokenFailureRemedy(tokenFailure)}, then re-run the access check.`
+        : "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check.";
+    case "failed":
+      return rejectedCredentialsStep(surfaces);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Azure access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function enabledPolicies(policies: JsonRecord[]): JsonRecord[] {
@@ -4037,5 +4071,8 @@ export function azureFixedTexts(): readonly string[] {
     "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check.",
     `${tokenFailureRemedy(tokenNoResponse)}, then re-run the access check.`,
     "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
+    CLIENT_CREDENTIALS_REJECTED,
+    ACCESS_TOKENS_REJECTED,
+    TOKEN_AND_CLIENT_CREDENTIALS_REJECTED,
   ]);
 }

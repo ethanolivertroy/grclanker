@@ -79,7 +79,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Findings |
 |------|----------|
-| `azure_check_access` | Probes eight Graph and ARM surfaces and reports which are readable; a probe that stopped at its page cap or at a refused next link carries `truncated: true` (with the refusal as `truncation`) and its count is a floor |
+| `azure_check_access` | Probes eight Graph and ARM surfaces and reports which are readable; a probe that stopped at its page cap or at a refused next link carries `truncated: true` (with the refusal as `truncation`) and its count is a floor. When every probe is refused with 401, the status is `failed` and the next step says the credentials were rejected, naming `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` for a refused token request, or `AZURE_GRAPH_TOKEN` and `AZURE_MANAGEMENT_TOKEN` (alias `AZURE_ACCESS_TOKEN`) for refused tokens. A 403 or any readable probe keeps the status `limited` |
 | `azure_assess_identity` | AZURE-ID-01 to AZURE-ID-13 |
 | `azure_assess_monitoring` | AZURE-MON-01 to AZURE-MON-07 |
 | `azure_assess_subscription_guardrails` | AZURE-SUB-01 to AZURE-SUB-05 (`max_assignments`, default 500) |
