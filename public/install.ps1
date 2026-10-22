@@ -291,6 +291,13 @@ function Assert-ZipEntriesSafe([string]$ArchivePath) {
   }
 }
 
+# Expand-Archive runs PowerShell code for every entry, which takes minutes for a
+# full bundle under Windows PowerShell 5.1.
+function Expand-Bundle([string]$ArchivePath, [string]$DestinationPath) {
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::ExtractToDirectory($ArchivePath, $DestinationPath)
+}
+
 function Assert-HttpUrl([string]$Url, [string]$Label) {
   if ($Url -notmatch "^https?://") {
     throw "$Label must be an http or https URL. Got: $Url"
@@ -453,8 +460,9 @@ try {
     Remove-Item -Recurse -Force $InstallDir
   }
 
-  New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-  Expand-Archive -Path $ArchivePath -DestinationPath $InstallDir -Force
+  # .NET resolves a relative path against the process directory, not the PowerShell location.
+  $InstallRoot = (New-Item -ItemType Directory -Force -Path $InstallDir).FullName
+  Expand-Bundle -ArchivePath $ArchivePath -DestinationPath $InstallRoot
   Write-Ok "Installed bundle into $InstallDir"
 
   New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
