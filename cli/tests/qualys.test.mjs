@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { inflateRawSync } from "node:zlib";
 
-import { assertNoCanaryWindows } from "./helpers/error-canaries.mjs";
+import { assertCanaryFixture, assertNoCanaryWindows } from "./helpers/error-canaries.mjs";
 import {
   QPS_DOCUMENTED_RESPONSE_CODES,
   QUALYS_DOCUMENTED_ERROR_CODES,
@@ -2061,6 +2061,211 @@ test("checkQualysAccess reports healthy, degraded with a missing module or parti
     listHosts: async () => truncated([documentedHost()], "item cap 100 reached with more records available"),
   }));
   assert.match(truncatedProbe.surfaces.find((surface) => surface.name === "hosts").truncation, /item cap 100/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Rejected credentials: when every probe answers 401 the check fails and names the settings to fix
+// ---------------------------------------------------------------------------------------------
+
+const REJECTED_PASSWORD = "Rq7vWm2KxT9pLc4N";
+const REJECTED_TOKEN = "Zt5HbY8nQe3JfV6sGd1A";
+const REJECTED_GATEWAY_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4N3BrIn0.Wk9dTq2MhR6vXb3LsN8c";
+const REJECTED_BASIC_CREDENTIAL = Buffer.from(`acme_api:${REJECTED_PASSWORD}`).toString("base64").replace(/=+$/, "");
+const REJECTED_CANARIES = [REJECTED_PASSWORD, REJECTED_TOKEN, REJECTED_GATEWAY_JWT, REJECTED_BASIC_CREDENTIAL];
+const MANAGER_NEXT_STEP = "Grant the API user Manager or Unit Manager role with API access and confirm the VM/VMDR module subscription before running assessments.";
+const ALL_MODULES_NOTE = "Modules or roles not available to this account: VM, VMDR, PC, Administration, Asset Management, Cloud Agent, WAS. Controls depending on them are reported as manual.";
+const REJECTED_MODES = {
+  basic: {
+    config: { password: REJECTED_PASSWORD },
+    kind: "username and password",
+    nextStep: "Qualys rejected the username and password (every probe returned 401). Set QUALYS_USERNAME (or QUALYS_USER) and QUALYS_PASSWORD (or the username and password arguments, or the same keys in QUALYS_CONFIG_FILE or ~/.qcrc), with QUALYS_PLATFORM (or QUALYS_API_SERVER) or QUALYS_BASE_URL (or QUALYS_API_URL, or the platform or base_url arguments) naming the platform that hosts the account, then rerun qualys_check_access.",
+  },
+  bearer: {
+    config: { authMode: "bearer", token: REJECTED_TOKEN, username: undefined, password: undefined },
+    kind: "bearer token",
+    nextStep: "Qualys rejected the bearer token (every probe returned 401). Set QUALYS_TOKEN (or QUALYS_ACCESS_TOKEN, or the token argument, or the same key in QUALYS_CONFIG_FILE or ~/.qcrc) to a current token, with QUALYS_PLATFORM (or QUALYS_API_SERVER) or QUALYS_BASE_URL (or QUALYS_API_URL, or the platform or base_url arguments) naming the platform that issued it, then rerun qualys_check_access.",
+  },
+  "oauth token request": {
+    config: { authMode: "oauth", password: REJECTED_PASSWORD },
+    kind: "username and password",
+    nextStep: "Qualys rejected the username and password (the token request returned 401). Set QUALYS_USERNAME (or QUALYS_USER) and QUALYS_PASSWORD (or the username and password arguments, or the same keys in QUALYS_CONFIG_FILE or ~/.qcrc), with QUALYS_PLATFORM (or QUALYS_API_SERVER) or QUALYS_GATEWAY_URL (or the platform or gateway_url arguments) naming the platform that hosts the account, then rerun qualys_check_access.",
+  },
+  "oauth gateway token": {
+    config: { authMode: "oauth", password: REJECTED_PASSWORD },
+    issueToken: true,
+    kind: "gateway token",
+    nextStep: "Qualys rejected the gateway token (every probe returned 401). Set QUALYS_PLATFORM (or QUALYS_API_SERVER), or QUALYS_BASE_URL (or QUALYS_API_URL) and QUALYS_GATEWAY_URL (or the platform, base_url, and gateway_url arguments), to the platform that hosts the account, then rerun qualys_check_access.",
+  },
+};
+
+function rejectedNote(kind) {
+  return `Permissions were not checked because Qualys rejected the ${kind}; the denied probes do not mean permissions are missing.`;
+}
+
+function rejectedNotes(mode) {
+  const { authMode = "basic" } = REJECTED_MODES[mode].config;
+  return [
+    `Using Qualys platform US1 at https://qualysapi.qualys.com with ${authMode} authentication.`,
+    "0/15 Qualys audit surfaces are readable.",
+    rejectedNote(REJECTED_MODES[mode].kind),
+  ];
+}
+
+/**
+ * A deployment that refuses the credential everywhere: the XML API with SIMPLE_RETURN code 2000 (Bad Login/Password),
+ * QPS with responseCode UNAUTHORIZED, and the gateway /auth endpoint, each answering 401 and echoing the Authorization
+ * header and body it received, so a leaked credential shows up in the output. `issueToken` makes /auth issue a JWT that
+ * the API then refuses; URLs containing a key of `answers` reply with that response instead.
+ */
+function rejectingQualys({ issueToken = false, answers = {} } = {}) {
+  const requests = [];
+  const handler = async (url, init) => {
+    const path = new URL(url).pathname;
+    requests.push(path);
+    const echo = `Authorization ${new Headers(init.headers ?? {}).get("authorization") ?? ""} body ${String(init.body ?? "")}`;
+    if (path === "/auth") {
+      if (answers["/auth"]) return answers["/auth"](url, init);
+      return issueToken
+        ? new Response(REJECTED_GATEWAY_JWT, { status: 201, headers: { "content-type": "text/plain" } })
+        : new Response(`Bad credentials. ${echo}`, { status: 401, headers: { "content-type": "text/plain" } });
+    }
+    const answer = Object.entries(answers).find(([fragment]) => url.includes(fragment));
+    if (answer) return answer[1](url, init);
+    if (path.startsWith("/qps/rest/")) {
+      return jsonResponse({ ServiceResponse: { responseCode: "UNAUTHORIZED", responseErrorDetails: { errorMessage: `Bad credentials. ${echo}` } } }, { status: 401 });
+    }
+    return xmlResponse(`<?xml version="1.0" encoding="UTF-8"?><SIMPLE_RETURN><RESPONSE><CODE>2000</CODE><TEXT>Bad Login/Password. ${escapeXml(echo)}</TEXT></RESPONSE></SIMPLE_RETURN>`, { status: 401 });
+  };
+  return { handler, requests };
+}
+
+function rejectedQualysClient(mode, answers = {}) {
+  const deployment = rejectingQualys({ issueToken: REJECTED_MODES[mode].issueToken, answers });
+  return { client: routedClient(deployment.handler, REJECTED_MODES[mode].config), requests: deployment.requests };
+}
+
+test("checkQualysAccess reports failed and names the credential settings when every probe returns 401, with no module or role claimed missing", async () => {
+  const fixedTexts = Object.keys(REJECTED_MODES).flatMap((mode) => [REJECTED_MODES[mode].nextStep, ...rejectedNotes(mode)]);
+  assertCanaryFixture(assert, REJECTED_CANARIES, [...fixedTexts, MANAGER_NEXT_STEP, ALL_MODULES_NOTE], "rejected credential fixture");
+  const echoed = await (await rejectingQualys().handler("https://qualysapi.qualys.com/api/2.0/fo/asset/host/", { headers: { authorization: `Basic ${REJECTED_BASIC_CREDENTIAL}==` } })).text();
+  assert.ok(echoed.includes(REJECTED_BASIC_CREDENTIAL), "positive control: the rejecting deployment echoes the credential it received");
+
+  for (const mode of Object.keys(REJECTED_MODES)) {
+    const { client, requests } = rejectedQualysClient(mode);
+    const result = await checkQualysAccess(client);
+    assert.equal(result.status, "failed", mode);
+    assert.equal(result.surfaces.length, 15, mode);
+    for (const surface of result.surfaces) assert.equal(surface.status, "unauthorized", `${mode}: ${surface.name}`);
+    assert.deepEqual(result.unavailableModules, [], `${mode}: no module is claimed unavailable`);
+    assert.deepEqual(result.viewScope, { verified: false, partial: false, roles: null, scopeTags: null, source: "unverified", note: `API user role not verified because Qualys rejected the ${REJECTED_MODES[mode].kind}.` }, mode);
+    assert.deepEqual(result.notes, rejectedNotes(mode), mode);
+    assert.equal(result.recommendedNextStep, REJECTED_MODES[mode].nextStep, mode);
+    assertNoCanaryWindows(assert, result, REJECTED_CANARIES, `${mode} access check`);
+    // A rejected token request is not retried: one /auth call per probe, or a single one when the gateway issued a token.
+    const tokenRequests = requests.filter((path) => path === "/auth").length;
+    assert.equal(tokenRequests, mode === "oauth token request" ? 15 : mode === "oauth gateway token" ? 1 : 0, `${mode}: ${requests.join(", ")}`);
+  }
+});
+
+test("checkQualysAccess keeps the limited result and the module and role advice when a probe reads, every probe is denied with 403, or a probe fails with something other than 401", async () => {
+  const plain = (status) => () => new Response("unavailable", { status, headers: { "content-type": "text/plain" } });
+  const notWas = "Modules or roles not available to this account: VM, VMDR, PC, Administration, Asset Management, Cloud Agent. Controls depending on them are reported as manual.";
+  const cases = [
+    { name: "hosts readable, the rest 401", answers: { "/asset/host/?": () => xmlResponse(EMPTY_LIST_XML) }, readable: 1 },
+    { name: "every probe 403", router: forbiddenRouter },
+    { name: "every probe 401 but hosts 503", answers: { "/asset/host/?": plain(503) } },
+    { name: "every probe 401 but detections 404", answers: { "/vm/detection/": plain(404) }, modulesNote: "Modules or roles not available to this account: VM, PC, Administration, Asset Management, Cloud Agent, WAS. Controls depending on them are reported as manual." },
+    { name: "every probe 401 but the activity log 422", answers: { "/activity_log/": plain(422) } },
+    { name: "every probe 401 but WAS 429", answers: { "/was/webapp": plain(429) }, modulesNote: notWas },
+    { name: "every probe 401 but tags unreachable", answers: { "/am/tag": () => { throw new TypeError("fetch failed"); } }, modulesNote: "Modules or roles not available to this account: VM, VMDR, PC, Administration, Cloud Agent, Asset Management, WAS. Controls depending on them are reported as manual." },
+    { name: "every probe 404", router: plain(404), modulesNote: "All probed modules responded." },
+    { name: "the gateway token request denied with 403", mode: "oauth token request", answers: { "/auth": plain(403) } },
+  ];
+  for (const { name, mode = "basic", router, answers = {}, readable = 0, modulesNote = ALL_MODULES_NOTE } of cases) {
+    const client = router ? routedClient(router, REJECTED_MODES[mode].config) : rejectedQualysClient(mode, answers).client;
+    const result = await checkQualysAccess(client);
+    assert.equal(result.status, "limited", name);
+    assert.equal(result.recommendedNextStep, MANAGER_NEXT_STEP, name);
+    assert.ok(result.surfaces.every((surface) => surface.status !== "unauthorized"), `${name}: no surface is relabeled`);
+    assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, readable, name);
+    assert.deepEqual(result.notes, [
+      `Using Qualys platform US1 at https://qualysapi.qualys.com with ${REJECTED_MODES[mode].config.authMode ?? "basic"} authentication.`,
+      `${readable}/15 Qualys audit surfaces are readable.`,
+      modulesNote,
+      result.viewScope.note,
+    ], name);
+    assert.doesNotMatch(result.viewScope.note, /rejected/, name);
+  }
+});
+
+test("qualys_check_access renders the failed result for credentials from the arguments, the environment, or the config file, with no credential in the output", async () => {
+  const dir = createTempBase("qualys-rejected-tool-");
+  const missing = join(dir, "missing.qcrc");
+  const oauthFile = join(dir, "oauth.qcrc");
+  writeFileSync(oauthFile, `[info]\nusername = acme_api\npassword = ${REJECTED_PASSWORD}\nuse_oauth = true\n`);
+  const checkAccess = registeredQualysTools().get("qualys_check_access");
+  const sources = [
+    { name: "basic from the arguments", mode: "basic", args: { username: "acme_api", password: REJECTED_PASSWORD, config_file: missing }, env: {} },
+    { name: "bearer from the environment", mode: "bearer", args: { config_file: missing }, env: { QUALYS_TOKEN: REJECTED_TOKEN } },
+    { name: "bearer from the QUALYS_ACCESS_TOKEN and QUALYS_API_SERVER aliases", mode: "bearer", args: { config_file: missing }, env: { QUALYS_ACCESS_TOKEN: REJECTED_TOKEN, QUALYS_API_SERVER: "US1" } },
+    { name: "basic from the QUALYS_USER and QUALYS_API_URL aliases", mode: "basic", args: { config_file: missing }, env: { QUALYS_USER: "acme_api", QUALYS_PASSWORD: REJECTED_PASSWORD, QUALYS_API_URL: "https://qualysapi.qualys.com" } },
+    { name: "OAuth from the config file", mode: "oauth token request", args: { config_file: oauthFile }, env: {} },
+    { name: "OAuth from the arguments with a gateway token", mode: "oauth gateway token", args: { username: "acme_api", password: REJECTED_PASSWORD, use_oauth: true, config_file: missing }, env: {} },
+  ];
+  const envKeys = Object.keys(process.env).filter((key) => key.startsWith("QUALYS_"));
+  const savedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const source of sources) {
+      for (const key of Object.keys(process.env)) if (key.startsWith("QUALYS_")) delete process.env[key];
+      Object.assign(process.env, source.env);
+      const deployment = rejectingQualys({ issueToken: REJECTED_MODES[source.mode].issueToken });
+      globalThis.fetch = async (input, init) => deployment.handler(String(input), init ?? {});
+      const result = await checkAccess.execute("call", checkAccess.prepareArguments(source.args));
+      const text = result.content[0].text;
+      assert.equal(result.isError, undefined, source.name);
+      assert.equal(result.details.status, "failed", source.name);
+      assert.match(text, /^Qualys access check: failed$/m, source.name);
+      for (const note of rejectedNotes(source.mode)) assert.ok(text.includes(note), `${source.name}: ${note}`);
+      assert.ok(text.endsWith(`Next: ${REJECTED_MODES[source.mode].nextStep}`), `${source.name}: ${text}`);
+      assert.ok(!text.includes("Manager or Unit Manager") && !text.includes("Modules or roles not available"), `${source.name}: ${text}`);
+      assert.equal(text.split("\n").filter((line) => /│\s*unauthorized\s*│/.test(line)).length, 15, `${source.name}: ${text}`);
+      assertNoCanaryWindows(assert, text, REJECTED_CANARIES, `${source.name} text`);
+      assertNoCanaryWindows(assert, result.details, REJECTED_CANARIES, `${source.name} details`);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const key of Object.keys(process.env)) if (key.startsWith("QUALYS_")) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+  }
+});
+
+test("exportQualysAuditBundle writes the failed access check when every probe returns 401, with the next step intact and no credential in any file", async () => {
+  const outputRoot = createTempBase("qualys-rejected-export-");
+  const config = sampleConfig(REJECTED_MODES.basic.config);
+  const exported = await exportQualysAuditBundle(rejectedQualysClient("basic").client, config, outputRoot);
+  const access = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "access.json"), "utf8"));
+  assert.equal(access.status, "failed");
+  assert.equal(access.recommendedNextStep, REJECTED_MODES.basic.nextStep);
+  assert.deepEqual(access.notes, rejectedNotes("basic"));
+  assert.deepEqual(access.unavailableModules, []);
+  for (const file of walkFiles(exported.outputDir)) assertNoCanaryWindows(assert, file.content, REJECTED_CANARIES, `bundle file ${file.name}`);
+  for (const member of readZipMembers(exported.zipPath)) assertNoCanaryWindows(assert, member.content, REJECTED_CANARIES, `zip member ${member.name}`);
+});
+
+test("rejected credentials: the failed Qualys access check next steps and notes come back from the error and data scrubs unchanged", async () => {
+  for (const mode of Object.keys(REJECTED_MODES)) {
+    const config = sampleConfig(REJECTED_MODES[mode].config);
+    const result = await checkQualysAccess(rejectedQualysClient(mode).client);
+    assert.equal(result.status, "failed", mode);
+    const secrets = credentialValues(config);
+    assert.ok(secrets.length > 0, `${mode}: the configured credential is an exact secret`);
+    for (const text of [result.recommendedNextStep, ...result.notes, result.viewScope.note]) {
+      assert.equal(scrubErrorText(text), text, `${mode}: the error scrub changed ${text}`);
+      assert.equal(scrubErrorText(text, secrets), text, `${mode}: the error scrub with the configured secrets changed ${text}`);
+      assert.equal(scrubErrorText(text, secrets, { longTokens: false }), text, `${mode}: the bundle data scrub changed ${text}`);
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------------------------

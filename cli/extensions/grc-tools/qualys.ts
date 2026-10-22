@@ -104,14 +104,14 @@ export interface QualysAccessSurface {
   name: string;
   module: string;
   endpoint: string;
-  status: "readable" | "not_readable" | "module_unavailable";
+  status: "readable" | "not_readable" | "module_unavailable" | "unauthorized";
   count?: number;
   truncation?: string;
   error?: string;
 }
 
 export interface QualysAccessCheckResult {
-  status: "healthy" | "degraded" | "limited";
+  status: "healthy" | "degraded" | "limited" | "failed";
   platform: string;
   baseUrl: string;
   authMode: QualysAuthMode;
@@ -855,6 +855,10 @@ export class QualysApiError extends Error {
   }
 }
 
+function isRejectedCredentials(error: unknown): error is QualysApiError {
+  return error instanceof QualysApiError && error.status === 401;
+}
+
 // Every thrown value that becomes a surface error string or a tool result goes through here, so a plain Error raised
 // outside the client (configuration resolution, a data-client stub, a parser) gets the same treatment as a
 // QualysApiError. The six tool handlers render their catch through this function and nothing else.
@@ -1134,6 +1138,8 @@ export class QualysApiClient {
         return { status: response.status, text, headers: response.headers };
       } catch (error) {
         rethrowIfAborted(error);
+        // A gateway token request rejected with 401 cannot succeed on retry, and rewrapping it would drop the status.
+        if (isRejectedCredentials(error)) throw error;
         if (attempt < this.config.maxRetries && error instanceof Error && error.name !== "AbortError") {
           attempt += 1;
           await this.sleepImpl(Math.min(1000 * 2 ** attempt, DEFAULT_MAX_RATE_LIMIT_WAIT_MS));
@@ -3954,34 +3960,51 @@ async function probeSurface(
 export async function checkQualysAccess(client: QualysDataClient & Partial<Pick<QualysApiClient, "lastRateLimit">>): Promise<QualysAccessCheckResult> {
   const config = client.getResolvedConfig();
   const scopeErrors: string[] = [];
-  const users = await collect("users", () => client.searchUsers(), scopeErrors, DEFAULT_LIST_LIMIT);
-  const userList = await collect("user_list", () => client.listUsers(), scopeErrors, DEFAULT_LIST_LIMIT);
-  const activity = await collect("activity_log", () => client.listActivityLog(7), scopeErrors, DEFAULT_LIST_LIMIT);
-  const viewScope = resolveViewScope(config, users, activity, userList);
-  const surfaces: QualysAccessSurface[] = [
-    await probeSurface("scheduled_scans", "VM", surfaceEndpoint("scheduled_scans"), () => client.listScheduledScans()),
-    await probeSurface("hosts", "VM", surfaceEndpoint("hosts"), () => client.listHosts(100)),
-    await probeSurface("asset_groups", "VM", surfaceEndpoint("asset_groups"), () => client.listAssetGroups()),
-    await probeSurface("option_profiles", "VM", surfaceEndpoint("option_profiles"), () => client.listOptionProfiles()),
-    await probeSurface("appliances", "VM", surfaceEndpoint("appliances"), () => client.listAppliances()),
-    await probeSurface("auth_records", "VM", surfaceEndpoint("auth_records"), () => client.listAuthRecordSummary()),
-    await probeSurface("detections", "VMDR", surfaceEndpoint("detections"), () => client.listDetections(100)),
-    await probeSurface("compliance_policies", "PC", surfaceEndpoint("compliance_policies"), () => client.listCompliancePolicies()),
+  const rejections = new Map<string, QualysApiError>();
+  const watch = <T>(name: string, load: () => Promise<T>) => async (): Promise<T> => {
+    try {
+      return await load();
+    } catch (error) {
+      if (isRejectedCredentials(error)) rejections.set(name, error);
+      throw error;
+    }
+  };
+  const users = await collect("users", watch("users", () => client.searchUsers()), scopeErrors, DEFAULT_LIST_LIMIT);
+  const userList = await collect("user_list", watch("user_list", () => client.listUsers()), scopeErrors, DEFAULT_LIST_LIMIT);
+  const activity = await collect("activity_log", watch("activity_log", () => client.listActivityLog(7)), scopeErrors, DEFAULT_LIST_LIMIT);
+  const probed: QualysAccessSurface[] = [
+    await probeSurface("scheduled_scans", "VM", surfaceEndpoint("scheduled_scans"), watch("scheduled_scans", () => client.listScheduledScans())),
+    await probeSurface("hosts", "VM", surfaceEndpoint("hosts"), watch("hosts", () => client.listHosts(100))),
+    await probeSurface("asset_groups", "VM", surfaceEndpoint("asset_groups"), watch("asset_groups", () => client.listAssetGroups())),
+    await probeSurface("option_profiles", "VM", surfaceEndpoint("option_profiles"), watch("option_profiles", () => client.listOptionProfiles())),
+    await probeSurface("appliances", "VM", surfaceEndpoint("appliances"), watch("appliances", () => client.listAppliances())),
+    await probeSurface("auth_records", "VM", surfaceEndpoint("auth_records"), watch("auth_records", () => client.listAuthRecordSummary())),
+    await probeSurface("detections", "VMDR", surfaceEndpoint("detections"), watch("detections", () => client.listDetections(100))),
+    await probeSurface("compliance_policies", "PC", surfaceEndpoint("compliance_policies"), watch("compliance_policies", () => client.listCompliancePolicies())),
     await probeSurface("activity_log", "Administration", surfaceEndpoint("activity_log"), () => (activity.error ? Promise.reject(new Error(activity.error)) : Promise.resolve(activity.data))),
     await probeSurface("users", "Administration", surfaceEndpoint("users"), () => (users.error ? Promise.reject(new Error(users.error)) : Promise.resolve(users.data))),
     await probeSurface("user_list", "Administration", surfaceEndpoint("user_list"), () => (userList.error ? Promise.reject(new Error(userList.error)) : Promise.resolve(userList.data))),
-    await probeSurface("tags", "Asset Management", surfaceEndpoint("tags"), () => client.searchTags(100)),
-    await probeSurface("cloud_agents", "Cloud Agent", surfaceEndpoint("cloud_agents"), () => client.searchCloudAgents(100)),
-    await probeSurface("connectors", "Asset Management", surfaceEndpoint("connectors"), () => client.searchConnectors()),
-    await probeSurface("was_webapps", "WAS", surfaceEndpoint("was_webapps"), () => client.searchWebApps()),
+    await probeSurface("tags", "Asset Management", surfaceEndpoint("tags"), watch("tags", () => client.searchTags(100))),
+    await probeSurface("cloud_agents", "Cloud Agent", surfaceEndpoint("cloud_agents"), watch("cloud_agents", () => client.searchCloudAgents(100))),
+    await probeSurface("connectors", "Asset Management", surfaceEndpoint("connectors"), watch("connectors", () => client.searchConnectors())),
+    await probeSurface("was_webapps", "WAS", surfaceEndpoint("was_webapps"), watch("was_webapps", () => client.searchWebApps())),
   ];
+  const rejected = probed.every((surface) => rejections.has(surface.name));
+  // A rejected credential is refused on every surface whatever its role or modules, so its 401s name no module gap.
+  const surfaces = rejected ? probed.map((surface): QualysAccessSurface => ({ ...surface, status: "unauthorized" })) : probed;
+  const credential = rejectedCredential(config.authMode, [...rejections.values()].every((error) => error.endpoint === "/auth"));
+  const viewScope = rejected
+    ? unverifiedScope(`API user role not verified because Qualys rejected the ${credential.kind}.`)
+    : resolveViewScope(config, users, activity, userList);
 
   const coreModules = new Set(["VM", "VMDR"]);
   const coreSurfaces = surfaces.filter((surface) => coreModules.has(surface.module));
   const coreReadable = coreSurfaces.filter((surface) => surface.status === "readable").length;
   const unavailableModules = uniqueStrings(surfaces.filter((surface) => surface.status === "module_unavailable").map((surface) => surface.module));
   const anyFailures = surfaces.some((surface) => surface.status !== "readable");
-  const status: QualysAccessCheckResult["status"] = coreReadable < coreSurfaces.length ? "limited" : anyFailures || viewScope.partial ? "degraded" : "healthy";
+  const status: QualysAccessCheckResult["status"] = rejected
+    ? "failed"
+    : coreReadable < coreSurfaces.length ? "limited" : anyFailures || viewScope.partial ? "degraded" : "healthy";
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
 
   return {
@@ -3996,16 +4019,68 @@ export async function checkQualysAccess(client: QualysDataClient & Partial<Pick<
     notes: [
       `Using Qualys platform ${config.platform} at ${config.baseUrl} with ${config.authMode} authentication.`,
       `${readableCount}/${surfaces.length} Qualys audit surfaces are readable.`,
-      unavailableModules.length > 0
-        ? `Modules or roles not available to this account: ${unavailableModules.join(", ")}. Controls depending on them are reported as manual.`
-        : "All probed modules responded.",
-      viewScope.note,
+      ...(rejected
+        ? [`Permissions were not checked because Qualys rejected the ${credential.kind}; the denied probes do not mean permissions are missing.`]
+        : [
+          unavailableModules.length > 0
+            ? `Modules or roles not available to this account: ${unavailableModules.join(", ")}. Controls depending on them are reported as manual.`
+            : "All probed modules responded.",
+          viewScope.note,
+        ]),
     ],
-    recommendedNextStep:
-      status === "limited"
-        ? "Grant the API user Manager or Unit Manager role with API access and confirm the VM/VMDR module subscription before running assessments."
-        : "Run qualys_assess_scan_coverage, qualys_assess_asset_inventory, qualys_assess_vulnerability_management, qualys_assess_administration, or qualys_export_audit_bundle.",
+    recommendedNextStep: accessCheckNextStep(status, credential),
   };
+}
+
+interface QualysRejectedCredential {
+  kind: string;
+  step: string;
+}
+
+/** `tokenRequest` is true when every rejection came from the gateway /auth request rather than the API server. */
+function rejectedCredential(authMode: QualysAuthMode, tokenRequest: boolean): QualysRejectedCredential {
+  switch (authMode) {
+    case "basic":
+      return {
+        kind: "username and password",
+        step: "Qualys rejected the username and password (every probe returned 401). Set QUALYS_USERNAME (or QUALYS_USER) and QUALYS_PASSWORD (or the username and password arguments, or the same keys in QUALYS_CONFIG_FILE or ~/.qcrc), with QUALYS_PLATFORM (or QUALYS_API_SERVER) or QUALYS_BASE_URL (or QUALYS_API_URL, or the platform or base_url arguments) naming the platform that hosts the account, then rerun qualys_check_access.",
+      };
+    case "bearer":
+      return {
+        kind: "bearer token",
+        step: "Qualys rejected the bearer token (every probe returned 401). Set QUALYS_TOKEN (or QUALYS_ACCESS_TOKEN, or the token argument, or the same key in QUALYS_CONFIG_FILE or ~/.qcrc) to a current token, with QUALYS_PLATFORM (or QUALYS_API_SERVER) or QUALYS_BASE_URL (or QUALYS_API_URL, or the platform or base_url arguments) naming the platform that issued it, then rerun qualys_check_access.",
+      };
+    case "oauth":
+      return tokenRequest
+        ? {
+          kind: "username and password",
+          step: "Qualys rejected the username and password (the token request returned 401). Set QUALYS_USERNAME (or QUALYS_USER) and QUALYS_PASSWORD (or the username and password arguments, or the same keys in QUALYS_CONFIG_FILE or ~/.qcrc), with QUALYS_PLATFORM (or QUALYS_API_SERVER) or QUALYS_GATEWAY_URL (or the platform or gateway_url arguments) naming the platform that hosts the account, then rerun qualys_check_access.",
+        }
+        : {
+          kind: "gateway token",
+          step: "Qualys rejected the gateway token (every probe returned 401). Set QUALYS_PLATFORM (or QUALYS_API_SERVER), or QUALYS_BASE_URL (or QUALYS_API_URL) and QUALYS_GATEWAY_URL (or the platform, base_url, and gateway_url arguments), to the platform that hosts the account, then rerun qualys_check_access.",
+        };
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled Qualys auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: QualysAccessCheckResult["status"], credential: QualysRejectedCredential): string {
+  switch (status) {
+    case "healthy":
+    case "degraded":
+      return "Run qualys_assess_scan_coverage, qualys_assess_asset_inventory, qualys_assess_vulnerability_management, qualys_assess_administration, or qualys_export_audit_bundle.";
+    case "limited":
+      return "Grant the API user Manager or Unit Manager role with API access and confirm the VM/VMDR module subscription before running assessments.";
+    case "failed":
+      return credential.step;
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Qualys access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function formatAccessCheckText(result: QualysAccessCheckResult): string {
