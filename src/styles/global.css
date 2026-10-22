@@ -936,6 +936,10 @@ details[open] > .agent-group-toggle::before {
 
 .hero-support-copy a {
   color: var(--ui-accent-soft);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
 }
 
 .hero-support-copy a:hover {
@@ -1027,6 +1031,18 @@ details[open] > .agent-group-toggle::before {
       color-mix(in srgb, var(--ui-bg) 42%, transparent) 45%,
       color-mix(in srgb, var(--ui-bg) 88%, transparent) 100%
     );
+}
+
+/* A card title can wrap to three lines, reaching up into the brightest part
+   of a rail picture, so this overlay darkens sooner to keep the title at 4.5:1
+   against every picture. */
+.hero-brand-overlay {
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--ui-bg) 6%, transparent) 0%,
+    color-mix(in srgb, var(--ui-bg) 70%, transparent) 40%,
+    color-mix(in srgb, var(--ui-bg) 92%, transparent) 100%
+  );
 }
 
 .hero-brand-eyebrow,
