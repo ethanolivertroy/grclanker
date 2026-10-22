@@ -456,14 +456,51 @@ try {
   # Reject a hostile archive before replacing anything already installed.
   Assert-ZipEntriesSafe -ArchivePath $ArchivePath
 
-  if (Test-Path $InstallDir) {
-    Remove-Item -Recurse -Force $InstallDir
+  # Move the previous install aside so a failed extraction can put it back.
+  $PreviousInstall = $null
+  if (Test-Path -LiteralPath $InstallDir) {
+    $InstallPath = (Resolve-Path -LiteralPath $InstallDir).ProviderPath.TrimEnd([char[]]"\/")
+    # A short suffix keeps the deepest bundle paths under the 260-character Windows limit.
+    # A leftover with the same name would make Move-Item move the install inside it, so pick an unused name.
+    do {
+      $PreviousInstall = "$InstallPath.old-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8)
+    } while (Test-Path -LiteralPath $PreviousInstall)
+    Move-Item -LiteralPath $InstallPath -Destination $PreviousInstall
   }
 
-  # .NET resolves a relative path against the process directory, not the PowerShell location.
-  $InstallRoot = (New-Item -ItemType Directory -Force -Path $InstallDir).FullName
-  Expand-Bundle -ArchivePath $ArchivePath -DestinationPath $InstallRoot
+  $Extracted = $false
+  try {
+    # .NET resolves a relative path against the process directory, not the PowerShell location.
+    $InstallRoot = (New-Item -ItemType Directory -Force -Path $InstallDir).FullName
+    Expand-Bundle -ArchivePath $ArchivePath -DestinationPath $InstallRoot
+    $Extracted = $true
+  } finally {
+    if ($PreviousInstall -and -not $Extracted) {
+      try {
+        if (Test-Path -LiteralPath $InstallPath) {
+          Remove-Item -Recurse -Force -LiteralPath $InstallPath
+        }
+        Move-Item -LiteralPath $PreviousInstall -Destination $InstallPath
+        Write-Warn "Extraction failed, so the previous install was restored."
+      } catch {
+        Write-Warn "Could not restore the previous install from ${PreviousInstall}: $($_.Exception.Message)"
+      }
+    }
+  }
   Write-Ok "Installed bundle into $InstallDir"
+
+  # The new install is complete, so this run's aside can go, along with any an
+  # interrupted earlier run left behind. Windows names ignore case, but the
+  # installer only generates lowercase suffixes.
+  $InstallRoot = $InstallRoot.TrimEnd([char[]]"\/")
+  $AsideName = "^(?i:" + [regex]::Escape((Split-Path -Leaf $InstallRoot)) + ")\.old-[0-9a-f]{8}$"
+  foreach ($Aside in @(Get-ChildItem -LiteralPath (Split-Path -Parent $InstallRoot) -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -cmatch $AsideName })) {
+    try {
+      Remove-Item -Recurse -Force -LiteralPath $Aside.FullName
+    } catch {
+      Write-Warn "Could not remove the previous install at $($Aside.FullName): $($_.Exception.Message)"
+    }
+  }
 
   New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
   $LauncherShim = @(

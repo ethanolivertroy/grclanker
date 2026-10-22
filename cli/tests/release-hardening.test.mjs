@@ -2,16 +2,18 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import http from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -362,6 +364,64 @@ test("a local SHA256SUMS.txt with the matching digest verifies the archive", () 
     const { result } = runStagedInstall(stage);
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     assert.match(result.stdout, /Integrity verified/);
+  } finally {
+    rmSync(stage.root, { recursive: true, force: true });
+  }
+});
+
+function writeTruncatedArchive(archivePath) {
+  const payload = mkdtempSync(join(tmpdir(), "grclanker-release-payload-"));
+  try {
+    writeExecutable(resolve(payload, "grclanker"), "#!/usr/bin/env bash\nprintf 'new\\n'\n");
+    // Random bytes do not compress, so cutting the archive in half cuts into file data.
+    writeFileSync(resolve(payload, "payload.bin"), randomBytes(256 * 1024));
+    const packed = spawnSync("tar", ["-czf", archivePath, "-C", payload, "."], { encoding: "utf8" });
+    assert.equal(packed.status, 0, packed.stderr);
+    truncateSync(archivePath, Math.floor(statSync(archivePath).size / 2));
+  } finally {
+    rmSync(payload, { recursive: true, force: true });
+  }
+}
+
+test("a failed extraction puts the previous install back", () => {
+  const name = "grclanker-1.0.0-linux-x64.tar.gz";
+  const stage = stageCheckout([name], { packageVersion: "1.0.0" });
+  writeTruncatedArchive(stage.archives[name]);
+  const installDir = resolve(stage.root, "install");
+  mkdirSync(installDir);
+  writeFileSync(resolve(installDir, "grclanker"), "previous\n");
+  mkdirSync(resolve(stage.root, "install.old-0badc0de"));
+  try {
+    const { result } = runStagedInstall(stage);
+    assert.notEqual(result.status, 0, result.stdout);
+    assert.match(result.stderr, /Could not extract grclanker-1\.0\.0-linux-x64\.tar\.gz, so the previous install was restored/);
+    assert.equal(readFileSync(resolve(installDir, "grclanker"), "utf8"), "previous\n");
+    // A failed run keeps an earlier aside, which may be the only complete copy.
+    assert.deepEqual(readdirSync(stage.root).filter((entry) => entry.startsWith("install.")), ["install.old-0badc0de"]);
+  } finally {
+    rmSync(stage.root, { recursive: true, force: true });
+  }
+});
+
+test("a successful install removes asides an interrupted earlier run left behind", () => {
+  const stage = stageCheckout(["grclanker-1.0.0-linux-x64.tar.gz"], { packageVersion: "1.0.0" });
+  const installDir = resolve(stage.root, "install");
+  mkdirSync(installDir);
+  writeFileSync(resolve(installDir, "stale.txt"), "from the previous install\n");
+  mkdirSync(resolve(stage.root, "install.old-0badc0de", "app"), { recursive: true });
+  writeFileSync(resolve(stage.root, "install.old-0badc0de", "app", "left.js"), "left behind\n");
+  mkdirSync(resolve(stage.root, "install.old-ABCDEF12"));
+  mkdirSync(resolve(stage.root, "install.old-backup12"));
+  try {
+    const { result } = runStagedInstall(stage);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.equal(existsSync(resolve(installDir, "grclanker")), true);
+    assert.equal(existsSync(resolve(installDir, "stale.txt")), false);
+    // Only names the installer generates are removed.
+    assert.deepEqual(readdirSync(stage.root).filter((entry) => entry.startsWith("install.")).sort(), [
+      "install.old-ABCDEF12",
+      "install.old-backup12",
+    ]);
   } finally {
     rmSync(stage.root, { recursive: true, force: true });
   }
@@ -811,9 +871,59 @@ test("PowerShell verifies the bundle, then replaces the install with its full la
       }
     }
     assert.equal(existsSync(resolve(installDir, "app", "stale.js")), false);
+    assert.deepEqual(readdirSync(stage.root).filter((name) => name.startsWith("install.")), []);
     const launcher = readFileSync(resolve(stage.root, "bin", "grclanker.cmd"), "utf8");
     assert.ok(launcher.includes(`set "GRCLANKER_INSTALL_DIR=${installDir}"`), launcher);
     assert.ok(launcher.includes(String.raw`"%GRCLANKER_INSTALL_DIR%\node\node.exe" "%GRCLANKER_INSTALL_DIR%\app\bin\grclanker.js" %*`), launcher);
+  } finally {
+    rmSync(stage.root, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell puts the previous install back when extraction fails", { skip: !hasPwsh }, () => {
+  // The file named app passes the entry check, then blocks the app/ directory the next entry needs.
+  const stage = stagePwshCheckout(["grclanker-1.0.0-win32-x64.zip"], {
+    packageVersion: "1.0.0",
+    entries: { app: "not a directory\n", "app/bin/grclanker.js": "console.log('new');\n" },
+  });
+  const installDir = resolve(stage.root, "install");
+  const previousLauncher = resolve(installDir, "app", "bin", "grclanker.js");
+  mkdirSync(resolve(installDir, "app", "bin"), { recursive: true });
+  writeFileSync(previousLauncher, "console.log('previous');\n");
+  mkdirSync(resolve(stage.root, "install.old-0badc0de"));
+  try {
+    const result = runPwshInstall(stage.root);
+    assert.notEqual(result.status, 0, result.stdout);
+    assert.doesNotMatch(result.stdout, /Installed bundle into/);
+    assert.match(result.stdout, /Extraction failed, so the previous install was restored/);
+    assert.equal(readFileSync(previousLauncher, "utf8"), "console.log('previous');\n");
+    // A failed run keeps an earlier aside, which may be the only complete copy.
+    assert.deepEqual(readdirSync(stage.root).filter((name) => name.startsWith("install.")), ["install.old-0badc0de"]);
+    assert.equal(existsSync(resolve(stage.root, "bin", "grclanker.cmd")), false);
+  } finally {
+    rmSync(stage.root, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell removes asides an interrupted earlier run left behind", { skip: !hasPwsh }, () => {
+  const stage = stagePwshCheckout(["grclanker-1.0.0-win32-x64.zip"], { packageVersion: "1.0.0" });
+  const installDir = resolve(stage.root, "install");
+  mkdirSync(installDir);
+  writeFileSync(resolve(installDir, "stale.txt"), "from the previous install\n");
+  mkdirSync(resolve(stage.root, "install.old-0badc0de", "app"), { recursive: true });
+  writeFileSync(resolve(stage.root, "install.old-0badc0de", "app", "left.js"), "left behind\n");
+  mkdirSync(resolve(stage.root, "install.old-ABCDEF12"));
+  mkdirSync(resolve(stage.root, "install.old-backup12"));
+  try {
+    const result = runPwshInstall(stage.root);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.equal(readFileSync(resolve(installDir, "ok.txt"), "utf8"), "ok\n");
+    assert.equal(existsSync(resolve(installDir, "stale.txt")), false);
+    // Only names the installer generates are removed.
+    assert.deepEqual(readdirSync(stage.root).filter((name) => name.startsWith("install.")).sort(), [
+      "install.old-ABCDEF12",
+      "install.old-backup12",
+    ]);
   } finally {
     rmSync(stage.root, { recursive: true, force: true });
   }
@@ -890,8 +1000,8 @@ test("the PowerShell installer fails closed and checks zip entries before expand
   const verify = contents.indexOf("$verified = Verify-Checksum -ArchivePath $ArchivePath");
   const check = contents.indexOf("Assert-ZipEntriesSafe -ArchivePath $ArchivePath");
   const expand = contents.indexOf("Expand-Bundle -ArchivePath $ArchivePath");
-  const replaceInstall = contents.indexOf("Remove-Item -Recurse -Force $InstallDir");
-  assert.ok(verify > 0 && check > verify && replaceInstall > check && expand > replaceInstall);
+  const setAside = contents.indexOf("Move-Item -LiteralPath $InstallPath -Destination $PreviousInstall");
+  assert.ok(verify > 0 && check > verify && setAside > check && expand > setAside);
   assert.match(contents, /Refusing to extract unsafe archive entry/);
   assert.match(contents, /\^\[A-Za-z\]:/);
   assert.match(contents, /Could not fetch SHA256SUMS\.txt/);
