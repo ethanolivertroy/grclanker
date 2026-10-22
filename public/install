@@ -427,10 +427,16 @@ fallback_instructions() {
 extract_archive() {
   local archive_path="$1"
   local install_dir="$2"
-  local archive_name entry="" aside_prefix previous_dir="" leftover
+  local archive_name entries="" entry="" aside_prefix previous_dir="" leftover
 
   if [ -z "$install_dir" ]; then
     fail "Refusing to extract: install directory is empty"
+  fi
+
+  archive_name="$(basename "$archive_path")"
+  # A listing that stops early would skip the check below for every entry it missed.
+  if ! entries="$(tar -tzf "$archive_path")"; then
+    fail "Could not list the entries in ${archive_name}, so nothing was installed"
   fi
 
   while IFS= read -r entry; do
@@ -442,7 +448,7 @@ extract_archive() {
       fail "Refusing to extract unsafe archive entry: $entry"
     fi
   done <<EOF
-$(tar -tzf "$archive_path")
+$entries
 EOF
 
   # Move the previous install aside so a failed extraction can put it back.
@@ -457,7 +463,6 @@ EOF
   fi
 
   if ! { mkdir -p "$install_dir" && tar -xzf "$archive_path" -C "$install_dir"; }; then
-    archive_name="$(basename "$archive_path")"
     if [ -z "$previous_dir" ]; then
       fail "Could not extract ${archive_name}"
     fi
