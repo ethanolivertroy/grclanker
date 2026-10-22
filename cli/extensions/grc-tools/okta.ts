@@ -1064,7 +1064,7 @@ export interface OktaAccessCheckResult {
   organization: string;
   authMode: OktaAuthMode;
   sourceChain: string[];
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   probes: OktaAccessProbe[];
   recommendedNextStep: string;
   notes: string[];
@@ -5610,7 +5610,9 @@ export async function runOktaAccessCheck(
   }
 
   const okay = probes.filter((probe) => probe.status === "ok").length;
-  const status = okay >= 3 ? "healthy" : "limited";
+  const status: OktaAccessCheckResult["status"] = probes.every((probe) => probe.status === "unauthorized")
+    ? "failed"
+    : (okay >= 3 ? "healthy" : "limited");
 
   return {
     organization: new URL(config.orgUrl).hostname,
@@ -5618,12 +5620,37 @@ export async function runOktaAccessCheck(
     sourceChain: config.sourceChain,
     status,
     probes,
-    recommendedNextStep:
-      status === "healthy"
-        ? "Start with okta_assess_authentication, then run the admin, integration, or monitoring assessments as needed."
-        : "Use the probe details to fill missing read scopes or switch to a broader read-only Okta audit principal before running the deeper assessments.",
+    recommendedNextStep: accessCheckNextStep(status, config.authMode),
     notes: buildConfigNotes(config),
   };
+}
+
+function rejectedCredentialsStep(authMode: OktaAuthMode): string {
+  switch (authMode) {
+    case "SSWS":
+      return "Okta rejected the API token (every probe returned 401). Set OKTA_CLIENT_TOKEN, configure token in .okta.yaml, or pass api_token with a valid token, then rerun okta_check_access.";
+    case "PrivateKey":
+      return "Okta rejected the OAuth client credentials (every probe returned 401). Check OKTA_CLIENT_CLIENTID and OKTA_CLIENT_PRIVATEKEY (or OKTA_CLIENT_CLIENTASSERTION), plus OKTA_CLIENT_PRIVATEKEYID when the app has more than one key, then rerun okta_check_access.";
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled Okta auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: OktaAccessCheckResult["status"], authMode: OktaAuthMode): string {
+  switch (status) {
+    case "healthy":
+      return "Start with okta_assess_authentication, then run the admin, integration, or monitoring assessments as needed.";
+    case "limited":
+      return "Use the probe details to fill missing read scopes or switch to a broader read-only Okta audit principal before running the deeper assessments.";
+    case "failed":
+      return rejectedCredentialsStep(authMode);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Okta access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 /** Every JSON document in the bundle passes through the rule 9 scrubber once more, so a value that bypassed collection-time redaction still never lands on disk. */

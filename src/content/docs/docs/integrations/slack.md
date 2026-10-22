@@ -54,7 +54,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | What it does |
 |------|--------------|
-| `slack_check_access` | Calls `auth.test` and probes 15 surfaces (workspaces, users, admin users, approved and restricted apps, barriers, channels, emoji, team preferences, Audit Logs, SCIM). |
+| `slack_check_access` | Calls `auth.test` and probes 15 surfaces (workspaces, users, admin users, approved and restricted apps, barriers, channels, emoji, team preferences, Audit Logs, SCIM). When `auth.test` rejects the token (`invalid_auth`, `not_authed`, `account_inactive`, `token_revoked`, or `token_expired`), the check fails with a message that names `SLACK_USER_TOKEN`, or `SLACK_BOT_TOKEN` when only a bot token is configured. |
 | `slack_assess_identity` | MFA enrollment (`has_2fa`), guest inventory, SCIM provisioning coverage, lifecycle alignment, deactivated user visibility. |
 | `slack_assess_admin_access` | Admin inventory, SSO coverage (`has_sso`), session duration, idle timeout, discoverability, mobile session controls, email domain restrictions, custom emoji governance, analytics access. |
 | `slack_assess_integrations` | Approved and restricted app inventories, internal and sensitive-scope apps, information barriers, DLP and Discovery evidence, file upload restrictions (`team.preferences.list`), token rotation. |

@@ -173,7 +173,7 @@ export interface GitHubAccessProbe {
 export interface GitHubAccessCheckResult {
   organization: string;
   authMode: GitHubAuthMode;
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   sourceChain: string[];
   probes: GitHubAccessProbe[];
   notes: string[];
@@ -1414,6 +1414,21 @@ export class GitHubHttpError extends Error {
   }
 }
 
+/** The installation token exchange failed; the status lets the access check tell rejected App credentials (401) from other failures. */
+class GitHubAppTokenError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "GitHubAppTokenError";
+    this.status = status;
+  }
+}
+
+function isRejectedCredentials(error: unknown): boolean {
+  return (error instanceof GitHubHttpError || error instanceof GitHubAppTokenError) && error.status === 401;
+}
+
 /**
  * Reads the GitHub App private key file named by GITHUB_APP_PRIVATE_KEY_PATH or app_private_key_path.
  * The read error is never interpolated: a Node fs message carries library wording and whatever a
@@ -1660,7 +1675,8 @@ export class GitHubAuditorClient {
         const detail = response.ok
           ? "the response did not include a token"
           : describeErrorBody(response.status, payload, text, headerValue(response, "content-type"));
-        throw new Error(
+        throw new GitHubAppTokenError(
+          response.status,
           `GitHub App installation token request failed (${response.status}): ${detail}`,
         );
       }
@@ -2883,7 +2899,7 @@ export async function runGitHubAccessCheck(
       }
     } catch (error) {
       rethrowIfAborted(error);
-      const status = error instanceof GitHubHttpError && error.status === 401
+      const status = isRejectedCredentials(error)
         ? "unauthorized"
         : (error instanceof GitHubHttpError && (error.status === 403 || error.status === 404) ? "forbidden" : "error");
       probes.push({
@@ -2896,6 +2912,9 @@ export async function runGitHubAccessCheck(
   }
 
   const okCount = probes.filter((probe) => probe.status === "ok").length;
+  const status: GitHubAccessCheckResult["status"] = probes.every((probe) => probe.status === "unauthorized")
+    ? "failed"
+    : (okCount >= 4 ? "healthy" : "limited");
   const notes = [
     config.authMode === "app"
       ? "GitHub App installation auth is enabled. Some org-admin endpoints may still require broader org or user-token access depending on how the app is installed."
@@ -2906,14 +2925,40 @@ export async function runGitHubAccessCheck(
   return {
     organization: config.organization,
     authMode: config.authMode,
-    status: okCount >= 4 ? "healthy" : "limited",
+    status,
     sourceChain: config.sourceChain,
     probes,
     notes,
-    recommendedNextStep: okCount >= 4
-      ? "Run the focused GitHub assessment that matches the question, or export a full audit bundle if you need evidence artifacts."
-      : "Fix the missing GitHub permissions first, then rerun github_check_access before trusting any compliance conclusion.",
+    recommendedNextStep: accessCheckNextStep(status, config.authMode),
   };
+}
+
+function rejectedCredentialsStep(authMode: GitHubAuthMode): string {
+  switch (authMode) {
+    case "pat":
+      return "GitHub rejected the token (every probe returned 401). Set GITHUB_TOKEN / GH_TOKEN or pass api_token with a valid token, then rerun github_check_access.";
+    case "app":
+      return "GitHub rejected the App credentials (every probe returned 401). Check GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, and GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH (or the matching arguments), then rerun github_check_access.";
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled GitHub auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: GitHubAccessCheckResult["status"], authMode: GitHubAuthMode): string {
+  switch (status) {
+    case "healthy":
+      return "Run the focused GitHub assessment that matches the question, or export a full audit bundle if you need evidence artifacts.";
+    case "limited":
+      return "Fix the missing GitHub permissions first, then rerun github_check_access before trusting any compliance conclusion.";
+    case "failed":
+      return rejectedCredentialsStep(authMode);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled GitHub access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 export async function collectGitHubOrgAccessData(

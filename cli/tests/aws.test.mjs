@@ -2718,7 +2718,8 @@ test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrie
     configuredSecret: ENCODED_FORM_SECRET,
     mustKeep: [
       `iam:GetAccessKeyLastUsed ${MASKED_ACCESS_KEY_ID}: AccessDenied (AccessDeniedException (HTTP 403): User is not authorized to perform this operation (AccessDeniedException))`,
-      "credentials could not be resolved by fromIni (profile audit) (CredentialsProviderError ENOENT). The provider's message is not recorded because it can quote the shared config or credentials file; check the profile in ~/.aws/credentials and ~/.aws/config.",
+      "credentials could not be resolved by fromIni (profile audit) (CredentialsProviderError ENOENT). The provider's message is not recorded because it can quote the shared config or credentials file; check the profile in ~/.aws/credentials and ~/.aws/config, and if it is an SSO profile run aws sso login --profile audit.",
+      "credentials could not be resolved by fromNodeProviderChain (default credential chain) (CredentialsProviderError). The provider's message is not recorded because it can quote the shared config or credentials file; set AWS_PROFILE to a profile in ~/.aws/credentials or ~/.aws/config (for an SSO profile, run aws sso login first), or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.",
       "SyntaxError (HTTP 502): non-JSON body (text/html, 5120 bytes)",
       "SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body",
       "arn:aws:cloudtrail:us-east-1:123456789012:trail/management-events-2026",
@@ -2824,7 +2825,8 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
     new AwsApiError({ name: "SyntaxError", $metadata: { httpStatusCode: 502 }, $bodyNote: "non-JSON body (text/html, 5120 bytes)" }),
     new AwsApiError(new SyntaxError("Unexpected token '<', \"<html>\" is not valid JSON")),
     new AwsApiError({ name: "TimeoutError", message: "Request did not complete within 10000 ms" }),
-    new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "ENOENT" }),
+    new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "ENOENT" }, "audit"),
+    new AwsCredentialProviderError("fromNodeProviderChain (default credential chain)", { name: "CredentialsProviderError" }),
   ];
   for (const error of thrown) {
     assert.equal(redactErrorText(error.message), error.message, `the thrown rendering survives the scrub: ${error.message}`);
@@ -3374,6 +3376,61 @@ for (const shape of SHARED_CONFIG_CASES) {
     });
   });
 }
+
+test("config loader errors: a named profile that resolves no credentials points at aws sso login for that profile", async () => {
+  await withSharedAwsFiles({ credentials: "" }, async (files) => {
+    await assert.rejects(() => realAwsClient(realAwsConfig({ profile: "audit" })).getCallerIdentity(), (error) => {
+      assertProviderErrorShape(error, files, "missing profile");
+      assert.ok(
+        error.message.endsWith(`; check the profile in ${files.credentialsFile} and ${files.configFile}, and if it is an SSO profile run aws sso login --profile audit.`),
+        error.message,
+      );
+      assert.doesNotMatch(error.message, /AWS_PROFILE/, "a profile was named, so the message does not ask for one");
+      return true;
+    });
+  });
+});
+
+test("config loader errors: with no credentials anywhere, aws_check_access names AWS_PROFILE, aws sso login, and the static key variables", async () => {
+  const dir = createNameShapedFixtureDir();
+  const credentialsFile = join(dir, "credentials");
+  const configFile = join(dir, "config");
+  writeFileSync(credentialsFile, "");
+  writeFileSync(configFile, "");
+  const set = { AWS_SHARED_CREDENTIALS_FILE: credentialsFile, AWS_CONFIG_FILE: configFile, AWS_EC2_METADATA_DISABLED: "true" };
+  const cleared = [
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+  ];
+  const previous = Object.fromEntries([...Object.keys(set), ...cleared].map((key) => [key, process.env[key]]));
+  for (const key of cleared) delete process.env[key];
+  Object.assign(process.env, set);
+  try {
+    const registered = [];
+    registerAwsTools({ registerTool: (tool) => registered.push(tool) });
+    const checkAccess = registered.find((tool) => tool.name === "aws_check_access");
+    const result = await checkAccess.execute("call-no-credentials", { region: "us-east-1" });
+    const text = result.content[0].text;
+    assert.equal(result.isError, true);
+    assert.match(text, /^AWS access check failed: AwsCredentialProviderError: credentials could not be resolved by fromNodeProviderChain \(default credential chain\) \([A-Za-z]+(?:Error|Exception)\)\. /);
+    assert.ok(
+      text.endsWith(`; set AWS_PROFILE to a profile in ${credentialsFile} or ${configFile} (for an SSO profile, run aws sso login first), or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.`),
+      text,
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
 
 
 test("config loader errors: a SyntaxError the SDK raises without attaching the body is recorded by name only, never by the parser's message that quotes the text", async () => {

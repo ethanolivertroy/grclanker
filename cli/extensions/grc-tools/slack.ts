@@ -1384,8 +1384,37 @@ async function auditSurface(client: SlackApiClient, name: string, path: string):
   }
 }
 
+/** auth.test codes that mean Slack refused the token itself, not a scope or a workspace setting. */
+const SLACK_REJECTED_TOKEN_CODES: ReadonlySet<string> = new Set(["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired"]);
+
+function rejectedTokenMessage(kind: TokenKind, code: string): string {
+  switch (kind) {
+    case "user":
+      return `Slack rejected the user token (${code}). Set SLACK_USER_TOKEN (or the token argument) to a valid org-level user token.`;
+    case "bot":
+      return `Slack rejected the bot token (${code}). Set SLACK_BOT_TOKEN (or the bot_token argument) to a valid bot token.`;
+    default: {
+      const exhaustive: never = kind;
+      throw new Error(`Unhandled Slack token kind ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** auth.test runs with the user token when one is configured, otherwise the bot token, so a rejection names that token. */
+async function authenticate(client: SlackApiClient): Promise<JsonRecord> {
+  try {
+    return await client.web("auth.test");
+  } catch (error) {
+    if (error instanceof SlackApiError && error.code !== undefined && SLACK_REJECTED_TOKEN_CODES.has(error.code)) {
+      const kind: TokenKind = client.getTokenKinds().includes("user") ? "user" : "bot";
+      throw new SlackApiError(rejectedTokenMessage(kind, error.code), error.method, error.code, error.httpStatus);
+    }
+    throw error;
+  }
+}
+
 export async function checkSlackAccess(client: SlackApiClient): Promise<SlackAccessCheckResult> {
-  const auth = await client.web("auth.test");
+  const auth = await authenticate(client);
   const orgQuery = client.getOrgQuery();
   const surfaces = await Promise.all([
     webSurface(client, "auth", "auth.test"),

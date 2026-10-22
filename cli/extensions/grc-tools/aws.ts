@@ -1577,19 +1577,23 @@ function sdkErrorIdentity(cause: unknown): string {
  * Raised in place of any error the credential provider chain throws (rule 9, config loader class). The SDK
  * parses the shared config and credentials files, SSO token caches, and credential_process output while it
  * resolves credentials, and a provider's message can quote that text. This error carries only the provider
- * name, the SDK error name (plus a filesystem code), and the paths of the files an operator should check,
- * never the provider's message.
+ * name, the SDK error name (plus a filesystem code), the paths of the files an operator should check, and the
+ * settings that supply credentials, never the provider's message.
  */
 export class AwsCredentialProviderError extends Error {
   readonly provider: string;
   readonly code: string;
 
-  constructor(provider: string, cause: unknown) {
+  /** `profile` is the named profile the provider read; without one the default chain ran, so AWS_PROFILE was unset. */
+  constructor(provider: string, cause: unknown, profile?: string) {
     const identity = sdkErrorIdentity(cause);
     const credentialsFile = process.env.AWS_SHARED_CREDENTIALS_FILE || "~/.aws/credentials";
     const configFile = process.env.AWS_CONFIG_FILE || "~/.aws/config";
+    const remedy = profile
+      ? `check the profile in ${credentialsFile} and ${configFile}, and if it is an SSO profile run aws sso login --profile ${profile}.`
+      : `set AWS_PROFILE to a profile in ${credentialsFile} or ${configFile} (for an SSO profile, run aws sso login first), or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.`;
     super(
-      `credentials could not be resolved by ${provider} (${identity}). The provider's message is not recorded because it can quote the shared config or credentials file; check the profile in ${credentialsFile} and ${configFile}.`,
+      `credentials could not be resolved by ${provider} (${identity}). The provider's message is not recorded because it can quote the shared config or credentials file; ${remedy}`,
     );
     this.name = "AwsCredentialProviderError";
     this.provider = provider;
@@ -1602,13 +1606,13 @@ export class AwsCredentialProviderError extends Error {
  * registers the resolved secret access key and session token as configured secrets so an error string that
  * echoes either (whatever its shape, in any encoded form) is scrubbed.
  */
-function guardCredentialProvider(provider: string, resolve: AwsCredentialProvider): AwsCredentialProvider {
+function guardCredentialProvider(provider: string, resolve: AwsCredentialProvider, profile?: string): AwsCredentialProvider {
   return async (options) => {
     let credentials;
     try {
       credentials = await resolve(options);
     } catch (error) {
-      throw new AwsCredentialProviderError(provider, error);
+      throw new AwsCredentialProviderError(provider, error, profile);
     }
     registerConfiguredSecrets(credentials.secretAccessKey, credentials.sessionToken);
     return credentials;
@@ -1622,7 +1626,7 @@ function guardCredentialProvider(provider: string, resolve: AwsCredentialProvide
  */
 function credentialProviderFor(config: AwsResolvedConfig): AwsCredentialProvider {
   return config.profile
-    ? guardCredentialProvider(`fromIni (profile ${config.profile})`, fromIni({ profile: config.profile }))
+    ? guardCredentialProvider(`fromIni (profile ${config.profile})`, fromIni({ profile: config.profile }), config.profile)
     : guardCredentialProvider("fromNodeProviderChain (default credential chain)", fromNodeProviderChain({ clientConfig: { region: config.region } }));
 }
 
@@ -5466,8 +5470,8 @@ export function awsFixedTexts(): readonly string[] {
     textInBoolean.message,
     notPolicy.message,
     refusedByDeserializer.message,
-    new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "ENOENT" }).message,
-    new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "EISDIR" }).message,
+    new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "ENOENT" }, "audit").message,
+    new AwsCredentialProviderError("fromIni (profile audit)", { name: "CredentialsProviderError", code: "EISDIR" }, "audit").message,
     new AwsCredentialProviderError("fromNodeProviderChain (default credential chain)", new Error("Could not load credentials from any providers")).message,
     readFailureLine("iam:ListUsers", deniedError),
     readFailureLine(`iam:GetAccessKeyLastUsed ${maskedKey}`, notFoundError),

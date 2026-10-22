@@ -981,6 +981,60 @@ test("checkDatadogAccess reports an invalid key pair, 401 denials, and the org c
   assert.equal(nothingReadable.surfaces.filter((surface) => surface.status === "forbidden").length, 20);
 });
 
+test("checkDatadogAccess blames the rejected key, not missing permissions, when validation fails and nothing is readable", async () => {
+  const rejectedApiKeyNote = "Permissions were not checked because Datadog rejected the API key; the denied probes do not mean permissions are missing.";
+  const keyNextStep = "Verify DD_API_KEY and DD_APP_KEY belong to the same organization and that DD_SITE matches the org region.";
+  const apiKey = "Zq4Wn8Ty2Lp6Vx3Hc9Rb7Mk5Jd1Fg0Ss";
+  const appKey = "Xa7Pe2Qr9Ub4Nw6Ky3Ht8Lc1Vm5Gd0Jz";
+  const deniedEverywhere = async () => jsonResponse({ errors: ["Forbidden"] }, { status: 403, statusText: "Forbidden" });
+
+  const keyRejected = await checkDatadogAccess(new DatadogApiClient(sampleConfig({ apiKey, appKey, maxRetries: 0 }), { fetchImpl: deniedEverywhere }));
+  assert.equal(keyRejected.status, "failed");
+  assert.equal(keyRejected.apiKeyValid, false);
+  assert.equal(keyRejected.surfaces.filter((surface) => surface.status === "forbidden").length, 22);
+  assert.deepEqual(keyRejected.missingPermissions, []);
+  assert.ok(keyRejected.notes.includes(rejectedApiKeyNote), JSON.stringify(keyRejected.notes));
+  assert.ok(!keyRejected.notes.some((note) => note.startsWith("Missing application key permissions")), JSON.stringify(keyRejected.notes));
+  assert.equal(keyRejected.recommendedNextStep, keyNextStep);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(keyRejected), [apiKey, appKey], "rejected key access check");
+
+  const appKeyRejected = await checkDatadogAccess(healthyClient({
+    ...Object.fromEntries(READ_METHODS.map((method) => [method, async () => { throw forbidden(`/${method}`); }])),
+    async validateKeyPair() {
+      throw forbidden("/api/v2/validate_keys");
+    },
+  }));
+  assert.equal(appKeyRejected.status, "failed");
+  assert.equal(appKeyRejected.apiKeyValid, true);
+  assert.equal(appKeyRejected.keyPairValid, false);
+  assert.deepEqual(appKeyRejected.missingPermissions, []);
+  assert.ok(appKeyRejected.notes.includes("Permissions were not checked because Datadog rejected the application key; the denied probes do not mean permissions are missing."), JSON.stringify(appKeyRejected.notes));
+
+  // A pair that validates but reads nothing is a real permissions gap, so every missing permission stays listed.
+  const noPermissions = await checkDatadogAccess(forbiddenClient());
+  assert.equal(noPermissions.keyPairValid, true);
+  assert.equal(noPermissions.missingPermissions.length, 17);
+  assert.ok(noPermissions.notes.some((note) => note.startsWith("Missing application key permissions: ")), JSON.stringify(noPermissions.notes));
+
+  const registered = [];
+  registerDatadogTools({ registerTool: (tool) => registered.push(tool) });
+  const checkTool = registered.find((tool) => tool.name === "datadog_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = deniedEverywhere;
+  let result;
+  try {
+    result = await checkTool.execute("call-rejected-key", checkTool.prepareArguments({ api_key: apiKey, app_key: appKey, site: "datadoghq.com" }));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const text = result.content[0].text;
+  assert.match(text, /^Datadog access check: failed$/m);
+  assert.ok(text.includes(rejectedApiKeyNote), text);
+  assert.doesNotMatch(text, /Missing application key permissions/);
+  assert.ok(text.includes(`Next: ${keyNextStep}`), text);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(result), [apiKey, appKey], "rendered rejected key access check");
+});
+
 test("assessDatadogIdentity passes on a hardened tenant and marks session timeout as manual", async () => {
   const result = await assessDatadogIdentity(healthyClient(), { now: NOW });
   assert.equal(result.findings.length, 6);

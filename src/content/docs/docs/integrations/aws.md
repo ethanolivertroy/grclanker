@@ -622,7 +622,7 @@ Credential provider errors name the provider and the SDK error only.
 
 The SDK parses the shared `config` and `credentials` files, SSO token caches, and `credential_process` output while it resolves credentials. A provider's message can quote that text.
 
-The client wraps its provider (`fromIni` for a named profile, `fromNodeProviderChain` otherwise) so every failure surfaces as `AwsCredentialProviderError`. Its message is `credentials could not be resolved by fromIni (profile <name>) (<SDK error name>)`, followed by the paths of the shared credentials and config files to check (`AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE`, or their `~/.aws` defaults).
+The client wraps its provider (`fromIni` for a named profile, `fromNodeProviderChain` otherwise) so every failure surfaces as `AwsCredentialProviderError`. Its message is `credentials could not be resolved by fromIni (profile <name>) (<SDK error name>)`, followed by the paths of the shared credentials and config files to check (`AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE`, or their `~/.aws` defaults) and the next step. For a named profile, the next step is to check that profile and, for an SSO profile, run `aws sso login --profile <name>`. When no profile is set and the default chain finds nothing, it says to set `AWS_PROFILE` to a profile in one of those files (running `aws sso login` first for an SSO profile), or to set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
 
 The SDK error name is validated against `^[A-Za-z]+(Error|Exception)$`, and a filesystem code against `^E[A-Z]+$`. So no free text from the provider rides along.
 
