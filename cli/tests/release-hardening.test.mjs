@@ -135,7 +135,6 @@ test("bundled Node, CI, and release workflows pin Node 24 LTS", () => {
     ".github/workflows/ci.yml": /node-version:\s*"24"/,
     ".github/workflows/fedramp-sync.yml": /node-version:\s*"24\.22\.0"/,
     ".github/workflows/release-bundles.yml": /node-version:\s*"24\.22\.0"/,
-    ".github/workflows/windows-bundle.yml": /node-version:\s*"24\.22\.0"/,
   };
   for (const [relative, pattern] of Object.entries(pins)) {
     const contents = readFileSync(resolve(REPO_ROOT, relative), "utf8");

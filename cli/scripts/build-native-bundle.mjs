@@ -103,7 +103,7 @@ export function findPythonCommand() {
   throw new Error("Could not find python3, python, or py for zip archive handling");
 }
 
-function getTargetDefinitions(version) {
+export function getTargetDefinitions(version) {
   return {
     "darwin-arm64": {
       id: "darwin-arm64",
