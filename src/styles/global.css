@@ -193,9 +193,10 @@ body {
   box-shadow: 0 0 4px color-mix(in srgb, var(--color-green) 50%, transparent);
   animation: led-breathe 3s ease-in-out infinite;
 }
+/* Animate opacity only: it runs on the compositor, while box-shadow repaints every frame. */
 @keyframes led-breathe {
-  0%, 100% { opacity: 1; box-shadow: 0 0 4px color-mix(in srgb, var(--color-green) 50%, transparent); }
-  50% { opacity: 0.55; box-shadow: 0 0 2px color-mix(in srgb, var(--color-green) 25%, transparent); }
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
 }
 @media (prefers-reduced-motion: reduce) {
   .led-live { animation: none; }
@@ -998,6 +999,9 @@ details[open] > .agent-group-toggle::before {
   display: block;
   width: 100%;
   height: 100%;
+  /* The pictures' shape, so a frame keeps its height while its picture loads
+     and when the rail shuffles in a picture of another shape. */
+  aspect-ratio: 3168 / 1344;
   object-fit: cover;
 }
 
@@ -2113,6 +2117,13 @@ details[open] > .agent-group-toggle::before {
   align-items: center;
   gap: 0.4rem;
   width: fit-content;
+}
+
+/* Slanted instead of italic, which would download the oblique font on every
+   page for these two words. */
+.site-footer-status-label {
+  display: inline-block;
+  transform: skewX(-10deg);
 }
 
 @media (min-width: 40rem) {

@@ -6,6 +6,7 @@ import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { useSearchContext } from 'fumadocs-ui/contexts/search';
 import { githubUrl, isActivePath, primaryLinks } from '../lib/site';
 import { GitHubIcon, RobotLogo, SearchIcon } from './icons';
+import { preloadSiteSearchDialog } from './site-search';
 
 export function SiteHeader() {
   const pathname = usePathname();
@@ -46,6 +47,8 @@ export function SiteHeader() {
             <button
               type="button"
               onClick={() => setOpenSearch(true)}
+              onPointerEnter={preloadSiteSearchDialog}
+              onFocus={preloadSiteSearchDialog}
               className="nav-action-btn nav-search-btn"
               aria-label="Search site (press / or Cmd+K)"
             >
@@ -71,7 +74,14 @@ export function SiteHeader() {
             </a>
           </div>
           <div className="site-nav-mobile-actions flex md:hidden items-center gap-2">
-            <button type="button" onClick={() => setOpenSearch(true)} className="nav-icon-btn" aria-label="Search site">
+            <button
+              type="button"
+              onClick={() => setOpenSearch(true)}
+              onPointerEnter={preloadSiteSearchDialog}
+              onFocus={preloadSiteSearchDialog}
+              className="nav-icon-btn"
+              aria-label="Search site"
+            >
               <SearchIcon size={18} />
             </button>
             <a href={githubUrl} target="_blank" rel="noopener" className="nav-icon-btn" aria-label="GitHub repository">
