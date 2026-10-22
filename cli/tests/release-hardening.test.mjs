@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -674,8 +675,8 @@ function runPwshInstallAsync(root, env) {
   });
 }
 
-function runPwshInstall(root, env) {
-  return spawnSync(pwshBin, ["-NoProfile", "-File", resolve(root, "public", "install.ps1")], {
+function runPwshInstall(root, env, pwshArgs = ["-File", resolve(root, "public", "install.ps1")]) {
+  return spawnSync(pwshBin, ["-NoProfile", ...pwshArgs], {
     cwd: root,
     encoding: "utf8",
     // An open empty stdin pipe makes pwsh block, and a progress bar deadlocks a full stdout pipe.
@@ -695,7 +696,7 @@ function runPwshInstall(root, env) {
   });
 }
 
-function stagePwshCheckout(names, { packageVersion = "9.9.9", sums = null } = {}) {
+function stagePwshCheckout(names, { packageVersion = "9.9.9", sums = null, entries = { "ok.txt": "ok\n" } } = {}) {
   const root = mkdtempSync(join(tmpdir(), "grclanker-release-ps-"));
   const releaseDir = resolve(root, "cli", "release");
   mkdirSync(releaseDir, { recursive: true });
@@ -703,7 +704,7 @@ function stagePwshCheckout(names, { packageVersion = "9.9.9", sums = null } = {}
   writeFileSync(resolve(root, "cli", "package.json"), JSON.stringify({ version: packageVersion }));
   copyFileSync(resolve(REPO_ROOT, "public", "install.ps1"), resolve(root, "public", "install.ps1"));
   for (const name of names) {
-    writeZip(resolve(releaseDir, name), { "ok.txt": "ok\n" });
+    writeZip(resolve(releaseDir, name), entries);
   }
   if (sums !== null) {
     writeFileSync(resolve(releaseDir, "SHA256SUMS.txt"), sums);
@@ -782,6 +783,60 @@ test("PowerShell refuses zip entries that escape the install directory", { skip:
   }
 });
 
+test("PowerShell verifies the bundle, then replaces the install with its full layout", { skip: !hasPwsh }, () => {
+  const name = "grclanker-1.0.0-win32-x64.zip";
+  const entries = {
+    "app/bin/grclanker.js": "console.log('grclanker');\n",
+    "app/node_modules/pkg/lib/index.js": "module.exports = 'na\u00efve \u2603';\n",
+    "app/empty/": "",
+    "node/node.exe": "MZ\n",
+  };
+  const stage = stagePwshCheckout([name], { packageVersion: "1.0.0", entries });
+  const archive = readFileSync(resolve(stage.releaseDir, name));
+  writeFileSync(resolve(stage.releaseDir, "SHA256SUMS.txt"), `${sha256(archive)}  ${name}\n`);
+  const installDir = resolve(stage.root, "install");
+  mkdirSync(resolve(installDir, "app"), { recursive: true });
+  writeFileSync(resolve(installDir, "app", "stale.js"), "from the previous install\n");
+  try {
+    const result = runPwshInstall(stage.root);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const verified = result.stdout.indexOf("Integrity verified");
+    const installed = result.stdout.indexOf(`Installed bundle into ${installDir}`);
+    assert.ok(verified > 0 && installed > verified, result.stdout);
+
+    for (const [entry, body] of Object.entries(entries)) {
+      if (entry.endsWith("/")) {
+        assert.ok(statSync(resolve(installDir, entry)).isDirectory(), entry);
+      } else {
+        assert.equal(readFileSync(resolve(installDir, entry), "utf8"), body, entry);
+      }
+    }
+    assert.equal(existsSync(resolve(installDir, "app", "stale.js")), false);
+    const launcher = readFileSync(resolve(stage.root, "bin", "grclanker.cmd"), "utf8");
+    assert.ok(launcher.includes(`set "GRCLANKER_INSTALL_DIR=${installDir}"`), launcher);
+    assert.ok(launcher.includes(String.raw`"%GRCLANKER_INSTALL_DIR%\node\node.exe" "%GRCLANKER_INSTALL_DIR%\app\bin\grclanker.js" %*`), launcher);
+  } finally {
+    rmSync(stage.root, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell resolves a relative install directory from its location, not the process directory", { skip: !hasPwsh }, () => {
+  const stage = stagePwshCheckout(["grclanker-1.0.0-win32-x64.zip"], { packageVersion: "1.0.0" });
+  const elsewhere = resolve(stage.root, "elsewhere");
+  mkdirSync(elsewhere);
+  try {
+    const result = runPwshInstall(stage.root, { GRCLANKER_INSTALL_DIR: "relative-install" }, [
+      "-Command",
+      `Set-Location -LiteralPath '${elsewhere}'; & '${resolve(stage.root, "public", "install.ps1")}'`,
+    ]);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.equal(readFileSync(resolve(elsewhere, "relative-install", "ok.txt"), "utf8"), "ok\n");
+    assert.equal(existsSync(resolve(stage.root, "relative-install")), false);
+  } finally {
+    rmSync(stage.root, { recursive: true, force: true });
+  }
+});
+
 test("PowerShell refuses a release base URL whose checksum file is missing", { skip: !hasPwsh }, async () => {
   const root = mkdtempSync(join(tmpdir(), "grclanker-release-ps-base-"));
   mkdirSync(resolve(root, "public"), { recursive: true });
@@ -833,10 +888,11 @@ test("PowerShell rejects a non-http release base URL instead of hanging", { skip
 
 test("the PowerShell installer fails closed and checks zip entries before expanding", () => {
   const contents = readFileSync(resolve(REPO_ROOT, "public", "install.ps1"), "utf8");
+  const verify = contents.indexOf("$verified = Verify-Checksum -ArchivePath $ArchivePath");
   const check = contents.indexOf("Assert-ZipEntriesSafe -ArchivePath $ArchivePath");
-  const expand = contents.indexOf("Expand-Archive -Path $ArchivePath");
+  const expand = contents.indexOf("Expand-Bundle -ArchivePath $ArchivePath");
   const replaceInstall = contents.indexOf("Remove-Item -Recurse -Force $InstallDir");
-  assert.ok(check > 0 && replaceInstall > check && expand > replaceInstall);
+  assert.ok(verify > 0 && check > verify && replaceInstall > check && expand > replaceInstall);
   assert.match(contents, /Refusing to extract unsafe archive entry/);
   assert.match(contents, /\^\[A-Za-z\]:/);
   assert.match(contents, /Could not fetch SHA256SUMS\.txt/);
@@ -846,4 +902,13 @@ test("the PowerShell installer fails closed and checks zip entries before expand
   assert.match(contents, /function Assert-HttpUrl/);
   assert.match(contents, /\$ProgressPreference = "SilentlyContinue"/);
   assert.doesNotMatch(contents, /Sort-Object/);
+});
+
+test("the PowerShell installer extracts in one ZipFile call, not per entry with Expand-Archive", () => {
+  const code = readFileSync(resolve(REPO_ROOT, "public", "install.ps1"), "utf8")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n");
+  assert.match(code, /\[System\.IO\.Compression\.ZipFile\]::ExtractToDirectory\(\$ArchivePath, \$DestinationPath\)/);
+  assert.doesNotMatch(code, /Expand-Archive/);
 });
