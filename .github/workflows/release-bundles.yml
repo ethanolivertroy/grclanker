@@ -256,14 +256,6 @@ jobs:
           name: release-bundles
           path: cli/release
 
-      # Temporary gate proof, reverted before merge: one corrupted Windows bundle has to block the release.
-      - name: "Gate proof: corrupt the win32-x64 bundle for Windows PowerShell 5.1"
-        if: matrix.target == 'win32-x64' && matrix.installer == 'powershell'
-        run: |
-          $bundle = Get-Item -Path cli\release\grclanker-*-win32-x64.zip
-          [IO.File]::AppendAllText($bundle.FullName, "tampered")
-          Get-FileHash -Algorithm SHA256 -LiteralPath $bundle.FullName | Format-List
-
       - name: Install with install.ps1 from the local bundle
         env:
           INSTALLER: ${{ matrix.installer }}
@@ -352,18 +344,6 @@ jobs:
           else
             echo "Every bundle passed its smoke check. This $GITHUB_EVENT_NAME run on $GITHUB_REF_NAME publishes nothing; only a v* tag push publishes."
           fi
-
-  # Temporary gate proof, reverted before merge: wired like publish, minus the tag check.
-  publish-canary:
-    needs: [build, smoke-unix, smoke-windows, release-gate]
-    if: success()
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions: {}
-
-    steps:
-      - name: Stand in for publish
-        run: echo "The release gate let this run through, so a tag push would publish now."
 
   publish:
     needs: [build, smoke-unix, smoke-windows, release-gate]
