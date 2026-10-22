@@ -263,7 +263,7 @@ Each finding's `mappings` array follows the spec compliance table and feeds the 
 npm --prefix cli run test:qualys:live
 ```
 
-The script skips with exit code 0 when no credentials are present. With `QUALYS_USERNAME`, `QUALYS_PASSWORD`, and `QUALYS_PLATFORM` (or `QUALYS_TOKEN`, or a `~/.qcrc` file), it runs `qualys_check_access` followed by the scan coverage assessment against the real subscription.
+The script skips with exit code 0 when no credentials are present. With `QUALYS_USERNAME`, `QUALYS_PASSWORD`, and `QUALYS_PLATFORM` (or `QUALYS_TOKEN`, or a `~/.qcrc` file), it runs `qualys_check_access` followed by the scan coverage assessment against the real subscription. If the access check reports `failed`, the script stops with exit code 1 before the assessment and prints the check's next step.
 
 ## Limitations and manual controls
 

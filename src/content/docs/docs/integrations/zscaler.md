@@ -138,7 +138,7 @@ The bundle writes one report per framework under `compliance/`.
 npm --prefix cli run test:zscaler:live
 ```
 
-The script skips with exit code 0 when no ZIA or ZPA credentials are present. Otherwise it runs `zscaler_check_access` and one assessment against the real tenant.
+The script skips with exit code 0 when no ZIA or ZPA credentials are present. Otherwise it runs `zscaler_check_access` and one assessment against the real tenant. If the access check reports `failed`, the script stops with exit code 1 before the assessment and prints the check's next step.
 
 ## Limitations and manual controls
 

@@ -66,6 +66,9 @@ try {
   for (const surface of access.surfaces) {
     log(`- ${surface.name}: ${surface.status}${surface.error ? ` (${surface.error.split("\n")[0].slice(0, 120)})` : ""}`);
   }
+  if (access.status === "failed") {
+    throw new Error(`Live OCI smoke test stopped: ${access.recommendedNextStep}`);
+  }
 
   summarize(await assessOciIdentity(client));
   summarize(await assessOciLoggingDetection(client));

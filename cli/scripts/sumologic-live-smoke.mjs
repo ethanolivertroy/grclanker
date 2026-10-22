@@ -33,6 +33,9 @@ try {
   if (access.missingCapabilities.length > 0) {
     log(`Missing capabilities: ${access.missingCapabilities.join(", ")}`);
   }
+  if (access.status === "failed") {
+    throw new Error(`Live Sumo Logic smoke test stopped: ${access.recommendedNextStep}`);
+  }
 
   const identity = await assessSumologicIdentity(client);
   log(`Identity findings: ${identity.findings.length}`);

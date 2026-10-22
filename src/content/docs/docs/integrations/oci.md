@@ -152,7 +152,7 @@ Bundle contents:
 npm --prefix cli run test:oci:live
 ```
 
-The smoke test skips with exit 0 when no `~/.oci/config`, `OCI_CONFIG_FILE`, or `OCI_TENANCY_OCID` is present, or when the `oci` binary is missing. Otherwise it runs the access check and every assess tool against the configured profile.
+The smoke test skips with exit 0 when no `~/.oci/config`, `OCI_CONFIG_FILE`, or `OCI_TENANCY_OCID` is present, or when the `oci` binary is missing. Otherwise it runs the access check and every assess tool against the configured profile. If the access check reports `failed`, the smoke test stops with exit 1 before the assess tools and prints the check's next step.
 
 ## Limitations and manual controls
 

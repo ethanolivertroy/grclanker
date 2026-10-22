@@ -240,7 +240,7 @@ The audit bundle renders `compliance/fedramp.md`, `cmmc.md`, `soc-2.md`, `cis.md
 npm --prefix cli run test:snowflake:live
 ```
 
-The script exits 0 with a skip message when no credentials resolve. With credentials, it runs `snowflake_check_access` and the network and authentication assessment, then prints the finding statuses.
+The script exits 0 with a skip message when no credentials resolve. With credentials, it runs `snowflake_check_access` and the network and authentication assessment, then prints the finding statuses. If the access check reports `failed`, the script stops with exit 1 before the assessment and prints the check's next step.
 
 ## Limitations and manual controls
 

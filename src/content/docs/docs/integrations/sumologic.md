@@ -179,7 +179,7 @@ The export bundle writes one report per framework under `compliance/` plus `unif
 npm --prefix cli run test:sumologic:live
 ```
 
-The script skips with exit code 0 when `SUMOLOGIC_ACCESS_ID` or `SUMOLOGIC_ACCESS_KEY` is absent. Otherwise it runs the access check and the identity assessment against the configured deployment.
+The script skips with exit code 0 when `SUMOLOGIC_ACCESS_ID` or `SUMOLOGIC_ACCESS_KEY` is absent. Otherwise it runs the access check and the identity assessment against the configured deployment. If the access check reports `failed`, the script stops with exit code 1 before the assessment and prints the check's next step.
 
 ## Limitations and manual controls
 
