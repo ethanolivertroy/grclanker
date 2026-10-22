@@ -1919,6 +1919,63 @@ test("runGitHubAccessCheck reports failed and names the App settings when the in
   }
 });
 
+test("runGitHubAccessCheck says the installation ID is wrong or the App is not installed when the installation token exchange returns 404", async () => {
+  clearGitHubTokenCacheForTests();
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const pemBodyLine = pem.split("\n")[1];
+  const config = createSampleConfig({
+    authMode: "app",
+    apiToken: undefined,
+    appId: "12345",
+    appPrivateKey: pem,
+    installationId: "98765",
+  });
+  const missingInstallationNextStep = "GitHub could not find the App installation (the installation token request returned 404), so the installation ID is wrong or the App is not installed on example-org. Check GITHUB_APP_INSTALLATION_ID (or the installation_id argument), and install the App on example-org if it is not installed, then rerun github_check_access.";
+  const requestedPaths = new Set();
+  const notFound = async (input) => {
+    requestedPaths.add(new URL(String(input)).pathname);
+    return new Response(JSON.stringify({ message: "Not Found", documentation_url: "https://docs.github.com/rest/apps/apps#create-an-installation-access-token-for-an-app" }), { status: 404, headers: { "content-type": "application/json" } });
+  };
+  const leaksKey = (text) => text.includes("PRIVATE KEY") || text.includes(pemBodyLine);
+
+  try {
+    const result = await runGitHubAccessCheck(new GitHubAuditorClient(config, notFound), config);
+    assert.deepEqual([...requestedPaths], ["/app/installations/98765/access_tokens"], "no org endpoint is called without an installation token");
+    assert.equal(result.status, "failed");
+    for (const probe of result.probes) {
+      assert.equal(probe.status, "installation_not_found", probe.key);
+    }
+    assert.equal(result.recommendedNextStep, missingInstallationNextStep);
+    assert.ok(!leaksKey(JSON.stringify(result)), "the private key is never echoed");
+
+    clearGitHubTokenCacheForTests();
+    const checkAccess = captureGitHubTools().get("github_check_access");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = notFound;
+    let rendered;
+    try {
+      rendered = await checkAccess.execute("call-missing-installation", {
+        organization: "example-org",
+        auth_mode: "app",
+        app_id: "12345",
+        app_private_key: pem,
+        installation_id: "98765",
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    const text = rendered.content[0].text;
+    assert.equal(rendered.details.status, "failed");
+    assert.match(text, /^Status: failed$/m);
+    assert.ok(text.includes(`Next step: ${missingInstallationNextStep}`), text);
+    assert.doesNotMatch(text, /missing GitHub permissions/);
+    assert.ok(!leaksKey(`${text}\n${JSON.stringify(rendered.details)}`), "the rendered result never echoes the private key");
+  } finally {
+    clearGitHubTokenCacheForTests();
+  }
+});
+
 test("exportGitHubAuditBundle writes evidence and respects secure output roots", async () => {
   const outputRoot = createTempBase("grclanker-github-export-");
   const config = createSampleConfig();

@@ -75,7 +75,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | What it does |
 |---|---|
-| `duo_check_access` | Probes settings, users, policies, admins, authentication logs, and integrations and reports which surfaces the audit principal can read. |
+| `duo_check_access` | Probes settings, users, policies, admins, authentication logs, and integrations and reports which surfaces the audit principal can read. When every probe is refused with 401, the status is `failed` and the next step says Duo rejected the Admin API credentials, naming `DUO_IKEY`, `DUO_SKEY`, and `DUO_API_HOST`. A 403 or any readable probe keeps the status `limited`. |
 | `duo_assess_authentication` | Global MFA enforcement mode, phishing-resistant factors, deprecated factors, new user policy, remembered devices, trusted endpoints, bypass codes, enrollment completeness, inactive users, WebAuthn adoption, offline access evidence. |
 | `duo_assess_admin_access` | Owner concentration, administrator MFA methods, help desk bypass governance, stale and never-logged-in administrators, user lockout policy. Administrator activity logs are collected as evidence (`core_data/activity_logs.json`) rather than graded. |
 | `duo_assess_integrations` | Explicit policy attachment, Universal Prompt adoption, self-service portal governance, Admin API least privilege, critical application coverage, device health depth. |

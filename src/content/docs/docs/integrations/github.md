@@ -51,7 +51,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | What it does |
 |------|--------------|
-| `github_check_access` | Probes the org profile, repositories, audit log, organization roles, rulesets, Actions permissions, code security configurations, and the default code security configurations, and reports `healthy` when at least four of those eight probes are readable, `failed` when every probe returns 401 because GitHub rejected the credentials (the next step names the variables to fix), otherwise `limited` |
+| `github_check_access` | Probes the org profile, repositories, audit log, organization roles, rulesets, Actions permissions, code security configurations, and the default code security configurations, and reports `healthy` when at least four of those eight probes are readable, `failed` when every probe returns 401 because GitHub rejected the credentials (the next step names the variables to fix) or, in App mode, when the installation token request returns 404 because the installation ID is wrong or the App is not installed, otherwise `limited` |
 | `github_assess_org_access` | Identity and access findings GITHUB-ORG-001 to GITHUB-ORG-011 |
 | `github_assess_repo_protection` | Repository protection findings GITHUB-REPO-001 to GITHUB-REPO-007 |
 | `github_assess_actions_security` | Actions findings GITHUB-ACT-001 to GITHUB-ACT-005 |

@@ -578,6 +578,52 @@ test("GoogleWorkspaceAuditorClient refreshes service-account tokens and handles 
   assert.ok(access.notes.some((note) => /GWS-ID-005 will render Manual/.test(note)));
 });
 
+test("access check: when every probe is refused for its credentials the check fails and names the GWS settings that carried them; a readable probe, a 403, or a delegation gap keeps the limited wording, and no credential reaches the result", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const runToken = "ya29.PLANTEDgws-run-token-0123456789abcdef";
+  const leak = /PLANTED|PRIVATE KEY/;
+  const tokenArgs = { auth_mode: "access_token", access_token: runToken, domain: "example.com" };
+  const serviceAccountArgs = {
+    auth_mode: "service_account",
+    credentials_json: JSON.stringify({
+      type: "service_account",
+      client_email: "svc@example-project.iam.gserviceaccount.com",
+      private_key: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+      token_uri: "https://oauth2.googleapis.com/token",
+    }),
+    admin_email: "admin@example.com",
+    domain: "example.com",
+  };
+  const unauthenticated = () => jsonResponse({ error: { code: 401, message: `Invalid Credentials for ${runToken}`, status: "UNAUTHENTICATED" } }, 401);
+  const forbidden = () => jsonResponse({ error: { code: 403, message: "Not Authorized to access this resource/api", status: "PERMISSION_DENIED" } }, 403);
+  const refusedExchange = (status, error) => [
+    (url) => url.origin === "https://oauth2.googleapis.com" && url.pathname === "/token",
+    () => jsonResponse({ error, error_description: `assertion PLANTEDgws-assertion-0123 for ${runToken} refused` }, status),
+  ];
+  const failedToken = "Google rejected the access token (every probe returned 401). Set GWS_ACCESS_TOKEN (or the access_token argument) to a valid token, then re-run gws_check_access.";
+  const failedServiceAccount = "Google rejected the service account credentials (every probe returned 401 or its token exchange was refused with invalid_grant, invalid_client, deleted_client, or disabled_client). Check the key named by GWS_CREDENTIALS_FILE, GWS_SERVICE_ACCOUNT_FILE, or GOOGLE_APPLICATION_CREDENTIALS, or held in GWS_CREDENTIALS_JSON or GWS_SERVICE_ACCOUNT_JSON (or the credentials_file or credentials_json argument), and check that GWS_ADMIN_EMAIL (or admin_email) names an existing user; a deleted, disabled, or expired key or an unknown admin email is refused this way. Then re-run gws_check_access.";
+  const limited = "Fix the missing Google scopes or delegated-admin setup, then re-run gws_check_access before trusting posture findings.";
+  const cases = [
+    { label: "access token refused by every API", args: tokenArgs, overrides: [[() => true, unauthenticated]], status: "failed", next: failedToken },
+    { label: "service account key refused with invalid_grant", args: serviceAccountArgs, overrides: [refusedExchange(400, "invalid_grant")], status: "failed", next: failedServiceAccount },
+    { label: "service account key refused with disabled_client", args: serviceAccountArgs, overrides: [refusedExchange(401, "disabled_client")], status: "failed", next: failedServiceAccount },
+    { label: "domain-wide delegation does not cover the scopes", args: serviceAccountArgs, overrides: [refusedExchange(401, "unauthorized_client")], status: "limited", next: limited },
+    { label: "every API answers 403", args: tokenArgs, overrides: [[() => true, forbidden]], status: "limited", next: limited },
+    { label: "Directory users readable", args: tokenArgs, overrides: [[(url) => url.pathname !== "/admin/directory/v1/users", unauthenticated]], status: "limited", next: limited },
+  ];
+  const { run } = registeredTools();
+  for (const { label, args, overrides, status, next } of cases) {
+    clearGwsTokenCacheForTests();
+    const access = await withRoutedFetch(routeEndpoints(overrides), () => run("gws_check_access", args));
+    assert.equal(access.details.status, status, `${label}: ${access.text}`);
+    assert.match(access.text, new RegExp(`^Status: ${status}$`, "m"), label);
+    assert.ok(access.text.includes(`Next step: ${next}`), `${label}: ${access.text}`);
+    assert.doesNotMatch(access.text, leak, label);
+    assert.doesNotMatch(access.json, leak, label);
+  }
+  clearGwsTokenCacheForTests();
+});
+
 test("Directory, Reports, and Policy requests encode the documented query parameters exactly", async () => {
   const config = createSampleConfig({ lookbackDays: 7 });
   const seen = [];

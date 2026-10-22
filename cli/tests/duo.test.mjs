@@ -2648,6 +2648,33 @@ const SNAPSHOT_FIELDS_BY_DATASET = {
   telephonyLogs: ["telephony_logs"],
 };
 
+/** A Duo 401 envelope whose detail echoes the configured credentials, the way some proxies repeat the request. */
+function unauthorizedDuoResponse() {
+  return new Response(
+    JSON.stringify({ stat: "FAIL", code: 40103, message: "Invalid signature in request credentials", message_detail: `ikey=${DUO_IKEY_CANARY} skey=${DUO_SKEY_CANARY} ${DUO_SKEY_CANARY}` }),
+    { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } },
+  );
+}
+
+test("access check: when every probe is refused with 401 the check fails and names DUO_IKEY, DUO_SKEY, and DUO_API_HOST; a 403 or a readable probe keeps the limited wording, and no configured credential reaches the result", async () => {
+  const config = createSampleConfig();
+  const refused = Object.fromEntries([...DUO_ACCESS_PROBE_PATHS].map((path) => [path, unauthorizedDuoResponse]));
+  const [firstProbe] = DUO_ACCESS_PROBE_PATHS;
+  const limitedNext = "Use the probe details to add the missing Duo Admin API read permissions before relying on the deeper assessments.";
+  const cases = [
+    ["every probe refused with 401", refused, "failed", "Duo rejected the Admin API credentials (every probe returned 401). Check DUO_IKEY and DUO_SKEY (or the ikey and skey arguments), and that DUO_API_HOST (or api_host) is the API hostname of the same Admin API application, then re-run duo_check_access."],
+    ["one probe answers 403", { ...refused, [firstProbe]: forbiddenResponse }, "limited", limitedNext],
+    ["one probe readable", { ...refused, [firstProbe]: healthyDuoRoutes()[firstProbe] }, "limited", limitedNext],
+  ];
+  for (const [label, overrides, status, next] of cases) {
+    const client = new DuoAuditorClient(config, { fetchImpl: routedFetch({ ...healthyDuoRoutes(), ...overrides }) });
+    const access = await runDuoAccessCheck(client, config);
+    assert.equal(access.status, status, `${label}: ${JSON.stringify(access.probes.map((probe) => [probe.key, probe.status]))}`);
+    assert.equal(access.recommendedNextStep, next, label);
+    assertNoCanaryWindows(assert, access, DUO_PLANTED_CANARIES, `${label} check_access`);
+  }
+});
+
 test("rule 1 corollary: denying one secondary read at a time never passes a dependent finding silently and never moves unrelated findings", () => {
   const config = createSampleConfig();
   for (const denial of SECONDARY_DENIALS) {

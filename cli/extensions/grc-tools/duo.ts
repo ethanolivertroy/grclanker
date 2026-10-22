@@ -119,7 +119,7 @@ export interface DuoAccessProbe {
 
 export interface DuoAccessCheckResult {
   organization: string;
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   sourceChain: string[];
   probes: DuoAccessProbe[];
   notes: string[];
@@ -5187,7 +5187,10 @@ export async function runDuoAccessCheck(
   }
 
   const readableCount = probes.filter((probe) => probe.status === "ok").length;
-  const status = readableCount === probes.length ? "healthy" : "limited";
+  // Duo answers 401 when the signed Authorization or Date header is refused; a 403 is a missing API permission.
+  const status: DuoAccessCheckResult["status"] = probes.every((probe) => probe.status === "unauthorized")
+    ? "failed"
+    : (readableCount === probes.length ? "healthy" : "limited");
 
   return {
     organization: getOrganizationName(config),
@@ -5199,11 +5202,25 @@ export async function runDuoAccessCheck(
       "Duo Admin API collection is read-only in this grclanker slice.",
       "Direct integration inventory uses the current Admin API v3 signing path when available.",
     ],
-    recommendedNextStep:
-      status === "healthy"
-        ? "The audit principal can read the core Duo surfaces. Run the focused Duo assessment that matches your question, or export the full audit bundle."
-        : "Use the probe details to add the missing Duo Admin API read permissions before relying on the deeper assessments.",
+    recommendedNextStep: accessCheckNextStep(status),
   };
+}
+
+const DUO_CREDENTIALS_REJECTED = "Duo rejected the Admin API credentials (every probe returned 401). Check DUO_IKEY and DUO_SKEY (or the ikey and skey arguments), and that DUO_API_HOST (or api_host) is the API hostname of the same Admin API application, then re-run duo_check_access.";
+
+function accessCheckNextStep(status: DuoAccessCheckResult["status"]): string {
+  switch (status) {
+    case "healthy":
+      return "The audit principal can read the core Duo surfaces. Run the focused Duo assessment that matches your question, or export the full audit bundle.";
+    case "limited":
+      return "Use the probe details to add the missing Duo Admin API read permissions before relying on the deeper assessments.";
+    case "failed":
+      return DUO_CREDENTIALS_REJECTED;
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Duo access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function frameworkSummary(findings: DuoFinding[], key: FrameworkKey): DuoFinding[] {
@@ -5828,5 +5845,6 @@ export function duoFixedTexts(): readonly string[] {
     "Trusted endpoint posture could not be read because the global policy was unavailable.",
     "Device health requirements could not be read because the global policy was unavailable.",
     "Remaining telephony credits could not be read, so telephony capacity cannot be confirmed (unknown credits never support Pass).",
+    DUO_CREDENTIALS_REJECTED,
   ]);
 }

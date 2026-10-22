@@ -448,7 +448,7 @@ export function resolveSlackConfiguration(
     sourceChain,
   );
   if (!token && !botToken) {
-    throw new Error("SLACK_USER_TOKEN (or SLACK_BOT_TOKEN for bot-capable methods), a token argument, or a config file entry is required.");
+    throw new Error("SLACK_USER_TOKEN or its alias SLACK_TOKEN (or SLACK_BOT_TOKEN for bot-capable methods), a token argument, or a config file entry is required.");
   }
   const scimToken = pickSource(
     "scim",
@@ -1390,7 +1390,7 @@ const SLACK_REJECTED_TOKEN_CODES: ReadonlySet<string> = new Set(["invalid_auth",
 function rejectedTokenMessage(kind: TokenKind, code: string): string {
   switch (kind) {
     case "user":
-      return `Slack rejected the user token (${code}). Set SLACK_USER_TOKEN (or the token argument) to a valid org-level user token.`;
+      return `Slack rejected the user token (${code}). Set SLACK_USER_TOKEN (or its alias SLACK_TOKEN, or the token argument) to a valid org-level user token.`;
     case "bot":
       return `Slack rejected the bot token (${code}). Set SLACK_BOT_TOKEN (or the bot_token argument) to a valid bot token.`;
     default: {

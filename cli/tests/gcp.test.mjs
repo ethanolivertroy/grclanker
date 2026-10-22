@@ -2658,6 +2658,39 @@ test("token exchange failures never echo the token endpoint's body and the excha
   assertNoCanary(JSON.stringify(result), "org guardrails after a failed token exchange");
 });
 
+test("access check: when every probe is refused for its credentials the check fails and names the GCP settings that carried them; a readable probe or a 403 keeps the limited wording, and no credential reaches the result", async () => {
+  const credentials = { type: "authorized_user", clientId: "client-id", clientSecret: ERROR_CANARIES.clientSecret, refreshToken: ERROR_CANARIES.refreshToken, tokenUri: "https://oauth2.googleapis.com/token" };
+  const unauthenticated = () => new Response(JSON.stringify({ error: { code: 401, message: `Request had invalid authentication credentials: ${ERROR_CANARIES.longToken}`, status: "UNAUTHENTICATED" } }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } });
+  const refusedExchange = (status, statusText, error) => async (url) => {
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ error, error_description: `refresh token ${ERROR_CANARIES.refreshToken} for client ${ERROR_CANARIES.clientSecret} refused` }), { status, statusText, headers: { "content-type": "application/json" } });
+    }
+    throw new Error("the API must not be called without a token");
+  };
+  const onScc = (respond) => async (url, init) => (new URL(url).hostname === "securitycenter.googleapis.com" ? respond(url, init) : unauthenticated());
+  const tokenConfig = sampleConfig({ accessToken: ERROR_CANARIES.longToken });
+  const tokenRejected = "Google Cloud rejected the access token (every probe returned 401). Set GCP_ACCESS_TOKEN (or GOOGLE_OAUTH_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN, or the access_token argument) to a valid token, or run gcloud auth login again when the token comes from gcloud auth print-access-token, then re-run gcp_check_access.";
+  const fileRejected = "Google rejected the credentials file (every probe returned 401 or its token exchange was refused). Check the file named by GCP_CREDENTIALS_FILE or GOOGLE_APPLICATION_CREDENTIALS (or the credentials_file argument, or the application default credentials file); a deleted or disabled service account key or a revoked refresh token is refused this way. Then re-run gcp_check_access.";
+  const limited = /^Grant roles\/cloudasset\.viewer, roles\/iam\.securityReviewer/;
+  const cases = [
+    { label: "access token refused by every API", fetchImpl: async () => unauthenticated(), config: tokenConfig, status: "failed", next: tokenRejected },
+    { label: "credentials file refused with invalid_grant and no sample project", fetchImpl: refusedExchange(400, "Bad Request", "invalid_grant"), config: sampleConfig({ accessToken: undefined, credentials, projectId: undefined }), status: "failed", next: fileRejected, skipped: 5 },
+    { label: "credentials file refused with 401 invalid_client", fetchImpl: refusedExchange(401, "Unauthorized", "invalid_client"), config: sampleConfig({ accessToken: undefined, credentials }), status: "failed", next: fileRejected },
+    { label: "credentials file refused with 400 disabled_client", fetchImpl: refusedExchange(400, "Bad Request", "disabled_client"), config: sampleConfig({ accessToken: undefined, credentials }), status: "failed", next: fileRejected },
+    { label: "token exchange refused with 400 invalid_scope", fetchImpl: refusedExchange(400, "Bad Request", "invalid_scope"), config: sampleConfig({ accessToken: undefined, credentials }), status: "limited", next: limited },
+    { label: "Security Command Center answers 403", fetchImpl: onScc(() => forbidden()), config: tokenConfig, status: "limited", next: limited },
+    { label: "Security Command Center readable", fetchImpl: onScc((url, init) => jsonResponse(routeCompliant(url, init))), config: tokenConfig, status: "limited", next: limited },
+  ];
+  for (const { label, fetchImpl, config, status, next, skipped = 0 } of cases) {
+    const access = await checkGcpAccess(createClient(fetchImpl, config));
+    assert.equal(access.status, status, `${label}: ${JSON.stringify(access.surfaces.map((item) => [item.name, item.error]))}`);
+    if (typeof next === "string") assert.equal(access.recommendedNextStep, next, label);
+    else assert.match(access.recommendedNextStep, next, label);
+    assert.equal(access.surfaces.filter((item) => item.error === "No project available for the sample query.").length, skipped, `${label}: project-scoped probes skipped for want of a sample project`);
+    assertNoCanary(JSON.stringify(access), label);
+  }
+});
+
 const ERROR_BODY_SHAPES = {
   "502 text/html with bearer, session cookie, and API key canaries": {
     status: 502,

@@ -161,7 +161,7 @@ export interface GitHubGraphqlResult<T = JsonRecord> {
   errors: GitHubGraphqlError[];
 }
 
-type GitHubEndpointStatus = "ok" | "forbidden" | "unauthorized" | "error";
+type GitHubEndpointStatus = "ok" | "forbidden" | "unauthorized" | "installation_not_found" | "error";
 
 export interface GitHubAccessProbe {
   key: string;
@@ -1414,7 +1414,7 @@ export class GitHubHttpError extends Error {
   }
 }
 
-/** The installation token exchange failed; the status lets the access check tell rejected App credentials (401) from other failures. */
+/** The installation token exchange failed; the status lets the access check tell rejected App credentials (401) and a missing installation (404) from other failures. */
 class GitHubAppTokenError extends Error {
   status: number;
 
@@ -1427,6 +1427,10 @@ class GitHubAppTokenError extends Error {
 
 function isRejectedCredentials(error: unknown): boolean {
   return (error instanceof GitHubHttpError || error instanceof GitHubAppTokenError) && error.status === 401;
+}
+
+function isMissingInstallation(error: unknown): boolean {
+  return error instanceof GitHubAppTokenError && error.status === 404;
 }
 
 /**
@@ -2899,9 +2903,11 @@ export async function runGitHubAccessCheck(
       }
     } catch (error) {
       rethrowIfAborted(error);
-      const status = isRejectedCredentials(error)
+      const status: GitHubEndpointStatus = isRejectedCredentials(error)
         ? "unauthorized"
-        : (error instanceof GitHubHttpError && (error.status === 403 || error.status === 404) ? "forbidden" : "error");
+        : isMissingInstallation(error)
+          ? "installation_not_found"
+          : (error instanceof GitHubHttpError && (error.status === 403 || error.status === 404) ? "forbidden" : "error");
       probes.push({
         key: probe.key,
         path: probe.path(config.organization),
@@ -2912,7 +2918,8 @@ export async function runGitHubAccessCheck(
   }
 
   const okCount = probes.filter((probe) => probe.status === "ok").length;
-  const status: GitHubAccessCheckResult["status"] = probes.every((probe) => probe.status === "unauthorized")
+  const failure = accessCheckFailure(probes);
+  const status: GitHubAccessCheckResult["status"] = failure
     ? "failed"
     : (okCount >= 4 ? "healthy" : "limited");
   const notes = [
@@ -2929,8 +2936,16 @@ export async function runGitHubAccessCheck(
     sourceChain: config.sourceChain,
     probes,
     notes,
-    recommendedNextStep: accessCheckNextStep(status, config.authMode),
+    recommendedNextStep: accessCheckNextStep(status, config, failure),
   };
+}
+
+type GitHubAccessFailure = "credentials_rejected" | "installation_not_found";
+
+function accessCheckFailure(probes: GitHubAccessProbe[]): GitHubAccessFailure | undefined {
+  if (probes.every((probe) => probe.status === "unauthorized")) return "credentials_rejected";
+  if (probes.every((probe) => probe.status === "installation_not_found")) return "installation_not_found";
+  return undefined;
 }
 
 function rejectedCredentialsStep(authMode: GitHubAuthMode): string {
@@ -2946,14 +2961,24 @@ function rejectedCredentialsStep(authMode: GitHubAuthMode): string {
   }
 }
 
-function accessCheckNextStep(status: GitHubAccessCheckResult["status"], authMode: GitHubAuthMode): string {
+function missingInstallationStep(organization: string): string {
+  return `GitHub could not find the App installation (the installation token request returned 404), so the installation ID is wrong or the App is not installed on ${organization}. Check GITHUB_APP_INSTALLATION_ID (or the installation_id argument), and install the App on ${organization} if it is not installed, then rerun github_check_access.`;
+}
+
+function accessCheckNextStep(
+  status: GitHubAccessCheckResult["status"],
+  config: GitHubResolvedConfig,
+  failure: GitHubAccessFailure | undefined,
+): string {
   switch (status) {
     case "healthy":
       return "Run the focused GitHub assessment that matches the question, or export a full audit bundle if you need evidence artifacts.";
     case "limited":
       return "Fix the missing GitHub permissions first, then rerun github_check_access before trusting any compliance conclusion.";
     case "failed":
-      return rejectedCredentialsStep(authMode);
+      return failure === "installation_not_found"
+        ? missingInstallationStep(config.organization)
+        : rejectedCredentialsStep(config.authMode);
     default: {
       const exhaustive: never = status;
       throw new Error(`Unhandled GitHub access status ${String(exhaustive)}`);
