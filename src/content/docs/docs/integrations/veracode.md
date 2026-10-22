@@ -62,7 +62,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 | --- | --- |
-| `veracode_check_access` | Probes every read surface with a one-page request and reports the role each surface requires (Security Insights, Reviewer, Administrator, Workspace roles). A readable list reports the vendor `total_elements` when the page carried it, otherwise the items on that page with the note `first page only, total unknown` when the walk did not finish; a surface that could not be read reports `count: null`, the HTTP status the request observed, the path that failed, and the scrubbed error |
+| `veracode_check_access` | Probes every read surface with a one-page request and reports the role each surface requires (Security Insights, Reviewer, Administrator, Workspace roles). A readable list reports the vendor `total_elements` when the page carried it, otherwise the items on that page with the note `first page only, total unknown` when the walk did not finish; a surface that could not be read reports `count: null`, the HTTP status the request observed, the path that failed, and the scrubbed error. Reports `failed` when every probe returns 401 because Veracode rejected the API credentials: `missingRoles` is empty, and the next step names the API ID, secret, and region settings to fix. Otherwise it reports `healthy` or `limited` |
 | `veracode_assess_scan_coverage` | Controls 1, 4, 10, 11, 13, 14, 19 |
 | `veracode_assess_policy_compliance` | Controls 2, 15, 20 |
 | `veracode_assess_findings_hygiene` | Controls 3, 12, 16, 17 |

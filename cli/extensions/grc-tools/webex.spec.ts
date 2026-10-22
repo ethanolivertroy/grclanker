@@ -722,7 +722,7 @@ const WEBEX_EXPORT = {
   recordSchemas: {
     WebexFinding: ["id:string", "control:number[]", "title:string", "severity:critical|high|medium|low|info", "status:pass|warn|fail|manual", "summary:string", "evidence?:object", "mappings:string[]", "frameworks:{fedramp,cmmc,soc2,cis,pci_dss,disa_stig,irap,ismap}:string[]"],
     WebexAssessment: ["title:string", "category:string", "summary:object", "findings:WebexFinding[]", "errors:string[]", "rawData:surface-name -> projected value or unreadable marker"],
-    WebexAccessCheckResult: ["status:healthy|limited", "orgId?:string", "tokenType:person|bot|appuser|unknown", "adminCapable:boolean", "surfaces:WebexAccessSurface[]", "notes:string[]", "recommendedNextStep:string"],
+    WebexAccessCheckResult: ["status:healthy|limited|failed", "orgId?:string", "tokenType:person|bot|appuser|unknown", "adminCapable:boolean", "surfaces:WebexAccessSurface[]", "notes:string[]", "recommendedNextStep:string"],
     WebexAccessSurface: ["name:string", "endpoint:string", "doc:string", "status:readable|not_readable|not_configured|manual", "count?:number", "truncated?:boolean", "error?:string"],
     UnreadableSurface: ["error:scrubbed string", "status:number|null"],
     IdentitySummary: ["org_id", "token_type", "people_seen", "people_truncated", "admin_users", "compliance_officers", "bots", "guests", "inventory_status", "pass", "warn", "fail", "manual"],
