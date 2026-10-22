@@ -1930,6 +1930,208 @@ test("checkSnowflakeAccess reports limited access when ACCOUNT_USAGE views are d
   assert.match(result.recommendedNextStep, /IMPORTED PRIVILEGES/);
 });
 
+/** Planted credential for the rejected-credential access checks: random alphanumerics with no 6-character window in any fixed text or fixture value. */
+const REJECTED_TOKEN = "Qm7vKx2RtN9wLp4ZsB8c";
+const LIMITED_NEXT_STEP = "Grant the audit role IMPORTED PRIVILEGES on the SNOWFLAKE database plus MANAGE GRANTS (or use SECURITYADMIN/ACCOUNTADMIN) and a small warehouse, then re-run snowflake_check_access.";
+const REJECTED_401 = () => new SnowflakeStatementError("Snowflake SQL API request failed (401 Unauthorized): Invalid OAuth access token. [code 390303]", { statusCode: 401 });
+
+/** One entry per token type: the client config, the tool arguments, the 401 body Snowflake returns, and the next step the failed check must give. */
+const REJECTED_MODES = [
+  {
+    name: "key-pair JWT",
+    overrides: {},
+    args: { private_key: TEST_PRIVATE_KEY_PEM },
+    body: { code: "390144", message: "JWT token is invalid." },
+    canaries: [TEST_PRIVATE_KEY_PEM.split("\n")[1]],
+    nextStep: "Snowflake rejected the key-pair JWT (every probe returned 401). Set SNOWFLAKE_PRIVATE_KEY_PATH (or SNOWFLAKE_PRIVATE_KEY_FILE) or SNOWFLAKE_PRIVATE_KEY (or SNOWFLAKE_PRIVATE_KEY_RAW, or the private_key_path or private_key arguments, or the connections.toml entry) to the private key whose public key is set on the user, with SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER (or the account and user arguments) naming that account and user, then rerun snowflake_check_access.",
+  },
+  {
+    name: "OAuth token",
+    overrides: { tokenType: "OAUTH", privateKeyPem: undefined, token: REJECTED_TOKEN },
+    args: { token: REJECTED_TOKEN },
+    body: { code: "390303", message: "Invalid OAuth access token." },
+    canaries: [REJECTED_TOKEN],
+    nextStep: "Snowflake rejected the OAuth token (every probe returned 401). Set SNOWFLAKE_TOKEN (or SNOWFLAKE_OAUTH_TOKEN or SNOWFLAKE_ACCESS_TOKEN, or the token argument, or the connections.toml entry) to a current OAuth access token for the account in SNOWFLAKE_ACCOUNT (or the account argument), or set SNOWFLAKE_TOKEN_TYPE (or SNOWFLAKE_AUTHENTICATOR, or the token_type argument) to PROGRAMMATIC_ACCESS_TOKEN when the token is a programmatic access token, then rerun snowflake_check_access.",
+  },
+  {
+    name: "programmatic access token",
+    overrides: { tokenType: "PROGRAMMATIC_ACCESS_TOKEN", privateKeyPem: undefined, token: REJECTED_TOKEN },
+    args: { token: REJECTED_TOKEN, token_type: "PROGRAMMATIC_ACCESS_TOKEN" },
+    body: { code: "394400", message: "Programmatic access token is invalid." },
+    canaries: [REJECTED_TOKEN],
+    nextStep: "Snowflake rejected the programmatic access token (every probe returned 401). Set SNOWFLAKE_TOKEN (or SNOWFLAKE_OAUTH_TOKEN or SNOWFLAKE_ACCESS_TOKEN, or the token argument, or the connections.toml entry) to a current programmatic access token for the account in SNOWFLAKE_ACCOUNT (or the account argument), then rerun snowflake_check_access.",
+  },
+];
+
+/** A SQL API that rejects every request with 401 and echoes back the Authorization header it received, so a leak of the credential shows up in the output. */
+function rejectingFetch(body, received) {
+  return async (_url, init = {}) => {
+    const authorization = headerValue(init.headers, "authorization") ?? "";
+    received.add(authorization.replace(/^Bearer /, ""));
+    return jsonResponse({ ...body, message: `${body.message} Request carried Authorization: ${authorization}` }, { status: 401, statusText: "Unauthorized" });
+  };
+}
+
+function assertNoCredentialInText(text, mode, received, label) {
+  for (const canary of mode.canaries) assertNoWindowOf(text, canary, label);
+  assert.ok(received.size > 0, `${label}: the SQL API saw the credential`);
+  for (const credential of received) {
+    for (const window of windowsOf(credential, { min: 12, max: 12 })) assert.ok(!text.includes(window), `${label} carries a window (${window}) of the bearer credential`);
+  }
+}
+
+function assertRejectedAccess(result, mode, received, label) {
+  assert.equal(result.status, "failed", label);
+  assert.equal(result.authentication, "unconfirmed", label);
+  assert.ok(result.surfaces.length >= 20, label);
+  assert.deepEqual(result.surfaces.filter((surface) => surface.status !== "unauthorized"), [], `${label}: every rejected surface reads unauthorized`);
+  assert.equal(result.recommendedNextStep, mode.nextStep, label);
+  assert.equal(result.authenticationNote, `Authentication failed: Snowflake rejected the ${mode.name}, so the configured user auditor and role AUDIT_ROLE are reported as configured, not as observed.`, label);
+  assert.ok(result.notes.includes(result.authenticationNote), label);
+  assert.ok(result.notes.includes(`Permissions were not checked because Snowflake rejected the ${mode.name}; the denied probes do not mean permissions are missing.`), label);
+  assert.ok(!result.notes.some((note) => note.includes("MANAGE GRANTS")), `${label}: no privilege is claimed missing`);
+  assert.ok(!result.recommendedNextStep.includes("IMPORTED PRIVILEGES"), label);
+  assertNoCredentialInText(JSON.stringify(result), mode, received, label);
+}
+
+test("checkSnowflakeAccess reports failed and names the credential settings when every statement returns 401, for a key-pair JWT, an OAuth token, and a programmatic access token", async () => {
+  for (const mode of REJECTED_MODES) {
+    const received = new Set();
+    const client = new SnowflakeSqlClient(sampleConfig({ maxRetries: 0, ...mode.overrides }), { fetchImpl: rejectingFetch(mode.body, received) });
+    const result = await checkSnowflakeAccess(client);
+    assertRejectedAccess(result, mode, received, mode.name);
+    assert.deepEqual(result.notes, [
+      `Using Snowflake account myorg-myaccount via https://myorg-myaccount.snowflakecomputing.com (${sampleConfig(mode.overrides).tokenType}).`,
+      result.authenticationNote,
+      `0/${result.surfaces.length} Snowflake audit surfaces are readable; 0 ACCOUNT_USAGE views responded.`,
+      `Permissions were not checked because Snowflake rejected the ${mode.name}; the denied probes do not mean permissions are missing.`,
+      "Credential sources: tests.",
+    ], mode.name);
+  }
+});
+
+test("checkSnowflakeAccess keeps the limited result and the MANAGE GRANTS advice when a statement reads, when every statement is denied with 403, or when one statement fails with something other than 401", async () => {
+  const cases = [
+    { name: "session readable, the rest 401", resolver: (statement) => {
+      if (isSession(normalizeStatement(statement))) return healthyFixture(statement, { role: "AUDIT_ROLE" });
+      throw REJECTED_401();
+    } },
+    { name: "every statement 403", resolver: () => { throw DENIED_403(); } },
+    { name: "every statement 401 but SHOW SHARES 422", resolver: (statement) => {
+      if (normalizeStatement(statement) === "SHOW SHARES") throw new SnowflakeStatementError("Snowflake SQL API request failed (422 Unprocessable Entity): SQL compilation error.", { statusCode: 422 });
+      throw REJECTED_401();
+    } },
+    { name: "every statement 401 but SHOW SHARES times out", resolver: (statement) => {
+      if (normalizeStatement(statement) === "SHOW SHARES") throw new SnowflakeStatementError("Snowflake statement timed out after 1s.", { kind: "timeout" });
+      throw REJECTED_401();
+    } },
+  ];
+  for (const { name, resolver } of cases) {
+    const result = await checkSnowflakeAccess(createMockClient(resolver, { role: "AUDIT_ROLE" }));
+    assert.equal(result.status, "limited", name);
+    assert.equal(result.recommendedNextStep, LIMITED_NEXT_STEP, name);
+    assert.ok(!result.surfaces.some((surface) => surface.status === "unauthorized"), `${name}: no surface is relabeled`);
+    assert.ok(result.notes.includes("The active role AUDIT_ROLE lacks MANAGE GRANTS, so SHOW commands may list only objects granted to that role."), name);
+    assert.ok(!result.notes.some((note) => note.startsWith("Permissions were not checked")), name);
+    assert.ok(!result.notes.some((note) => note.startsWith("Authentication failed")), name);
+  }
+});
+
+test("snowflake_check_access renders the failed result with the credential settings and no MANAGE GRANTS advice, for every token type", async () => {
+  const base = createTempBase("grclanker-snowflake-rejected-tool-");
+  const registered = [];
+  registerSnowflakeTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "snowflake_check_access");
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const mode of REJECTED_MODES) {
+      const received = new Set();
+      globalThis.fetch = rejectingFetch(mode.body, received);
+      const result = await withSnowflakeHome(base, () => checkAccess.execute("call", checkAccess.prepareArguments({
+        account: "myorg-myaccount", user: "auditor", role: "AUDIT_ROLE", warehouse: "AUDIT_WH", max_retries: 0, ...mode.args,
+      })));
+      const text = result.content[0].text;
+      assert.equal(result.details.status, "failed", mode.name);
+      assert.match(text, /^Snowflake access check: failed$/m, mode.name);
+      assert.ok(text.includes(`Next: ${mode.nextStep}`), `${mode.name}: ${text}`);
+      assert.ok(text.includes(`Permissions were not checked because Snowflake rejected the ${mode.name}; the denied probes do not mean permissions are missing.`), mode.name);
+      for (const surface of result.details.surfaces) assert.match(text, new RegExp(`${surface.name}\\s+│ unauthorized │`), `${mode.name}: ${surface.name}`);
+      assert.ok(!text.includes("MANAGE GRANTS") && !text.includes("IMPORTED PRIVILEGES"), mode.name);
+      assertNoCredentialInText(`${text}\n${JSON.stringify(result.details)}`, mode, received, mode.name);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("snowflake_check_access names the token aliases in the failed next step when the rejected token and its type come from SNOWFLAKE_ACCESS_TOKEN and SNOWFLAKE_AUTHENTICATOR", async () => {
+  const base = createTempBase("grclanker-snowflake-rejected-alias-");
+  const registered = [];
+  registerSnowflakeTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "snowflake_check_access");
+  const mode = REJECTED_MODES.find((item) => item.name === "programmatic access token");
+  const savedEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("SNOWFLAKE_")));
+  const clearEnv = () => {
+    for (const key of Object.keys(process.env)) if (key.startsWith("SNOWFLAKE_")) delete process.env[key];
+  };
+  const received = new Set();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = rejectingFetch(mode.body, received);
+  let result;
+  try {
+    clearEnv();
+    Object.assign(process.env, {
+      SNOWFLAKE_ACCOUNT: "myorg-myaccount",
+      SNOWFLAKE_USER: "auditor",
+      SNOWFLAKE_ROLE: "AUDIT_ROLE",
+      SNOWFLAKE_WAREHOUSE: "AUDIT_WH",
+      SNOWFLAKE_ACCESS_TOKEN: REJECTED_TOKEN,
+      SNOWFLAKE_AUTHENTICATOR: "PROGRAMMATIC_ACCESS_TOKEN",
+    });
+    result = await withSnowflakeHome(base, () => checkAccess.execute("call", checkAccess.prepareArguments({ max_retries: 0 })));
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearEnv();
+    Object.assign(process.env, savedEnv);
+  }
+  const text = result.content[0].text;
+  assert.equal(result.details.status, "failed");
+  assert.ok(text.endsWith(`Next: ${mode.nextStep}`), text);
+  assert.ok(text.includes(`Permissions were not checked because Snowflake rejected the ${mode.name}; the denied probes do not mean permissions are missing.`), text);
+  assertNoCredentialInText(`${text}\n${JSON.stringify(result.details)}`, mode, received, "credentials from the aliases");
+});
+
+test("exportSnowflakeAuditBundle records the failed access check without the partial visibility claim when every statement returns 401", async () => {
+  const base = createTempBase("grclanker-snowflake-rejected-export-");
+  const mode = REJECTED_MODES[1];
+  const received = new Set();
+  const config = sampleConfig({ maxRetries: 0, ...mode.overrides });
+  const client = new SnowflakeSqlClient(config, { fetchImpl: rejectingFetch(mode.body, received) });
+  const exported = await exportSnowflakeAuditBundle(client, config, base);
+  const files = readBundleFiles(exported.outputDir);
+  const summary = files.get(join("compliance", "executive_summary.md"));
+  assert.match(summary, /^Access check: failed$/m);
+  assert.ok(summary.includes(`Authentication: Authentication failed: Snowflake rejected the ${mode.name}, so the configured user auditor and role AUDIT_ROLE are reported as configured, not as observed.`));
+  assert.ok(!summary.includes("partial visibility") && !summary.includes("lacks MANAGE GRANTS"), summary);
+  assert.equal(JSON.parse(files.get(join("core_data", "access_check.json"))).status, "failed");
+  assertNoCredentialInText([...files.values()].join("\n"), mode, received, "bundle");
+});
+
+test("GWS note 1, rejected credentials: every failed Snowflake access check next step and note comes back from redactSecrets unchanged", async () => {
+  const texts = new Set();
+  for (const mode of REJECTED_MODES) {
+    const client = new SnowflakeSqlClient(sampleConfig({ maxRetries: 0, ...mode.overrides }), { fetchImpl: rejectingFetch(mode.body, new Set()) });
+    const result = await checkSnowflakeAccess(client);
+    assert.equal(result.status, "failed", mode.name);
+    for (const text of [result.recommendedNextStep, ...result.notes]) texts.add(text);
+  }
+  assert.equal(texts.size, 14);
+  for (const text of texts) {
+    assert.equal(redactSecrets(text), text, `redactSecrets changed: ${text}`);
+    assert.equal(redactSecrets(text, [REJECTED_TOKEN, TEST_PRIVATE_KEY_PEM]), text, `redactSecrets with the configured secrets changed: ${text}`);
+  }
+});
+
 test("assessSnowflakeNetworkAndAuthentication passes on a hardened fixture with every control evaluated", async () => {
   const result = await assessSnowflakeNetworkAndAuthentication(createMockClient((statement) => healthyFixture(statement)));
   assert.equal(result.area, "network-and-authentication");

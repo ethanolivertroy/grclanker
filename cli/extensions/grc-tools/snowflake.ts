@@ -183,7 +183,7 @@ export interface SnowflakeAccessSurface {
   name: string;
   /** The statement that was executed; null when it was never sent. */
   statement: string | null;
-  status: "readable" | "denied" | "error" | "timeout" | "not_requested";
+  status: "readable" | "denied" | "error" | "timeout" | "not_requested" | "unauthorized";
   /** Rows seen on a readable surface; null when the statement did not complete. */
   rowCount: number | null;
   error?: string;
@@ -198,7 +198,7 @@ export interface SnowflakeAccessSurface {
 export type SnowflakeAuthenticationStatus = "confirmed" | "unconfirmed" | "not_authenticated";
 
 export interface SnowflakeAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   account: string;
   /** The session user, the configured user when unconfirmed, null when not authenticated. */
   user: string | null;
@@ -1782,6 +1782,10 @@ export class SnowflakeStatementError extends Error {
   }
 }
 
+function isRejectedCredentials(error: unknown): error is SnowflakeStatementError {
+  return error instanceof SnowflakeStatementError && error.statusCode === 401;
+}
+
 /** A URL resolved onto the configured account origin, or the fixed reason it was refused before any request. */
 type OriginResolution = { url: string; refusal?: undefined } | { url?: undefined; refusal: string };
 
@@ -2660,7 +2664,19 @@ function parameterValue(outcome: SnowflakeStatementOutcome, key: string): { valu
 
 export async function checkSnowflakeAccess(client: SnowflakeQueryClient): Promise<SnowflakeAccessCheckResult> {
   const config = client.getResolvedConfig();
-  const session = await collectSessionContext(client);
+  const rejections = new Set<string>();
+  const watch = (name: string): SnowflakeQueryClient => ({
+    getResolvedConfig: () => client.getResolvedConfig(),
+    async execute(statement, options) {
+      try {
+        return await client.execute(statement, options);
+      } catch (error) {
+        if (isRejectedCredentials(error)) rejections.add(name);
+        throw error;
+      }
+    },
+  });
+  const session = await collectSessionContext(watch("session_context"));
   const probes: Array<[string, string]> = [
     ["show_network_policies", SNOWFLAKE_STATEMENTS.showNetworkPolicies],
     ["show_parameters", SNOWFLAKE_STATEMENTS.accountNetworkPolicyParameter],
@@ -2684,22 +2700,30 @@ export async function checkSnowflakeAccess(client: SnowflakeQueryClient): Promis
     ["account_usage_tag_references", `SELECT COUNT(*) AS REFERENCE_COUNT FROM ${accountUsageView("TAG_REFERENCES")}`],
   ];
 
-  const surfaces: SnowflakeAccessSurface[] = [toSurface("session_context", session.outcome)];
+  const probed: SnowflakeAccessSurface[] = [toSurface("session_context", session.outcome)];
   for (const [name, statement] of probes) {
-    surfaces.push(toSurface(name, await collectStatement(client, name, statement)));
+    probed.push(toSurface(name, await collectStatement(watch(name), name, statement)));
   }
+  const rejected = probed.every((surface) => rejections.has(surface.name));
+  // A rejected credential is refused on every statement whatever its role holds, so its 401s name no missing privilege.
+  const surfaces = rejected ? probed.map((surface): SnowflakeAccessSurface => ({ ...surface, status: "unauthorized" })) : probed;
+  const credential = rejectedCredential(config.tokenType);
 
   const role = effectiveRole(config, session);
   const readable = surfaces.filter((surface) => surface.status === "readable").length;
   const accountUsageReadable = surfaces.filter((surface) => surface.name.startsWith("account_usage_") && surface.status === "readable").length;
-  const status = session.outcome.status === "ok" && accountUsageReadable >= 10 && readable >= surfaces.length - 3 ? "healthy" : "limited";
-  const authentication = describeAuthentication(config, session, role);
+  const status: SnowflakeAccessCheckResult["status"] = rejected
+    ? "failed"
+    : session.outcome.status === "ok" && accountUsageReadable >= 10 && readable >= surfaces.length - 3 ? "healthy" : "limited";
+  const authentication = describeAuthentication(config, session, role, rejected ? credential : undefined);
   const notes = [
     `Using Snowflake account ${session.account ?? config.account} via ${config.baseUrl} (${config.tokenType}).`,
     authentication.note,
     `${readable}/${surfaces.length} Snowflake audit surfaces are readable; ${accountUsageReadable} ACCOUNT_USAGE views responded.`,
   ];
-  if (authentication.status !== "not_authenticated" && !hasFullVisibility(role)) {
+  if (rejected) {
+    notes.push(`Permissions were not checked because Snowflake rejected the ${credential.kind}; the denied probes do not mean permissions are missing.`);
+  } else if (authentication.status !== "not_authenticated" && !hasFullVisibility(role)) {
     notes.push(partialVisibilityNote(role, "SHOW commands"));
   }
   if (config.sourceChain.length > 0) {
@@ -2716,11 +2740,52 @@ export async function checkSnowflakeAccess(client: SnowflakeQueryClient): Promis
     fullVisibility: hasFullVisibility(role),
     surfaces,
     notes,
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run snowflake_assess_network_and_authentication, snowflake_assess_access_control, snowflake_assess_monitoring_and_lifecycle, snowflake_assess_data_protection, or snowflake_export_audit_bundle."
-        : "Grant the audit role IMPORTED PRIVILEGES on the SNOWFLAKE database plus MANAGE GRANTS (or use SECURITYADMIN/ACCOUNTADMIN) and a small warehouse, then re-run snowflake_check_access.",
+    recommendedNextStep: accessCheckNextStep(status, credential),
   };
+}
+
+interface SnowflakeRejectedCredential {
+  kind: string;
+  step: string;
+}
+
+function rejectedCredential(tokenType: SnowflakeTokenType): SnowflakeRejectedCredential {
+  switch (tokenType) {
+    case "KEYPAIR_JWT":
+      return {
+        kind: "key-pair JWT",
+        step: "Snowflake rejected the key-pair JWT (every probe returned 401). Set SNOWFLAKE_PRIVATE_KEY_PATH (or SNOWFLAKE_PRIVATE_KEY_FILE) or SNOWFLAKE_PRIVATE_KEY (or SNOWFLAKE_PRIVATE_KEY_RAW, or the private_key_path or private_key arguments, or the connections.toml entry) to the private key whose public key is set on the user, with SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER (or the account and user arguments) naming that account and user, then rerun snowflake_check_access.",
+      };
+    case "OAUTH":
+      return {
+        kind: "OAuth token",
+        step: "Snowflake rejected the OAuth token (every probe returned 401). Set SNOWFLAKE_TOKEN (or SNOWFLAKE_OAUTH_TOKEN or SNOWFLAKE_ACCESS_TOKEN, or the token argument, or the connections.toml entry) to a current OAuth access token for the account in SNOWFLAKE_ACCOUNT (or the account argument), or set SNOWFLAKE_TOKEN_TYPE (or SNOWFLAKE_AUTHENTICATOR, or the token_type argument) to PROGRAMMATIC_ACCESS_TOKEN when the token is a programmatic access token, then rerun snowflake_check_access.",
+      };
+    case "PROGRAMMATIC_ACCESS_TOKEN":
+      return {
+        kind: "programmatic access token",
+        step: "Snowflake rejected the programmatic access token (every probe returned 401). Set SNOWFLAKE_TOKEN (or SNOWFLAKE_OAUTH_TOKEN or SNOWFLAKE_ACCESS_TOKEN, or the token argument, or the connections.toml entry) to a current programmatic access token for the account in SNOWFLAKE_ACCOUNT (or the account argument), then rerun snowflake_check_access.",
+      };
+    default: {
+      const exhaustive: never = tokenType;
+      throw new Error(`Unhandled Snowflake token type ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: SnowflakeAccessCheckResult["status"], credential: SnowflakeRejectedCredential): string {
+  switch (status) {
+    case "healthy":
+      return "Run snowflake_assess_network_and_authentication, snowflake_assess_access_control, snowflake_assess_monitoring_and_lifecycle, snowflake_assess_data_protection, or snowflake_export_audit_bundle.";
+    case "limited":
+      return "Grant the audit role IMPORTED PRIVILEGES on the SNOWFLAKE database plus MANAGE GRANTS (or use SECURITYADMIN/ACCOUNTADMIN) and a small warehouse, then re-run snowflake_check_access.";
+    case "failed":
+      return credential.step;
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Snowflake access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 /**
@@ -2733,6 +2798,7 @@ function describeAuthentication(
   config: SnowflakeResolvedConfig,
   session: SessionContext,
   role: string | undefined,
+  rejected?: SnowflakeRejectedCredential,
 ): { status: SnowflakeAuthenticationStatus; user: string | null; note: string } {
   switch (session.outcome.status) {
     case "ok": {
@@ -2753,7 +2819,9 @@ function describeAuthentication(
       return {
         status: "unconfirmed",
         user: config.user,
-        note: `Authentication not confirmed: the session context statement ${session.outcome.status === "denied" ? "was denied" : session.outcome.status === "timeout" ? "timed out" : "failed"}, so the configured user ${config.user} and role ${role ?? "(default role)"} are reported as configured, not as observed.`,
+        note: rejected
+          ? `Authentication failed: Snowflake rejected the ${rejected.kind}, so the configured user ${config.user} and role ${role ?? "(default role)"} are reported as configured, not as observed.`
+          : `Authentication not confirmed: the session context statement ${session.outcome.status === "denied" ? "was denied" : session.outcome.status === "timeout" ? "timed out" : "failed"}, so the configured user ${config.user} and role ${role ?? "(default role)"} are reported as configured, not as observed.`,
       };
   }
 }
@@ -3650,7 +3718,7 @@ function buildExecutiveSummary(config: SnowflakeResolvedConfig, access: Snowflak
       ? `Authenticated as: ${access.user} (role ${access.role ?? "default"}, ${config.tokenType})`
       : `Authentication: ${access.authenticationNote}`,
     `Generated: ${new Date().toISOString()}`,
-    `Access check: ${access.status}${access.fullVisibility || access.authentication === "not_authenticated" ? "" : " (partial visibility: role lacks MANAGE GRANTS)"}`,
+    `Access check: ${access.status}${access.fullVisibility || access.authentication === "not_authenticated" || access.status === "failed" ? "" : " (partial visibility: role lacks MANAGE GRANTS)"}`,
     "",
     "## Result Counts",
     "",
