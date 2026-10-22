@@ -251,7 +251,7 @@ export interface SumologicReader {
 export interface SumologicAccessSurface {
   name: string;
   endpoint: string;
-  status: "readable" | "not_readable";
+  status: "readable" | "not_readable" | "unauthorized";
   /** Items seen on a readable surface; null when the probe did not succeed. */
   count: number | null;
   /** Whether pagination finished on a readable surface; null when the probe did not succeed. */
@@ -263,7 +263,7 @@ export interface SumologicAccessSurface {
 }
 
 export interface SumologicAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   baseUrl: string;
   surfaces: SumologicAccessSurface[];
   missingCapabilities: string[];
@@ -2311,23 +2311,43 @@ export async function checkSumologicAccess(client: SumologicReader): Promise<Sum
   }
 
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
-  const missingCapabilities = [...new Set(surfaces.filter((surface) => surface.status === "not_readable").map((surface) => surface.capabilityHint))];
-  const status = readableCount === surfaces.length ? "healthy" : "limited";
+  // A rejected access key is refused on every endpoint whatever its role, so its denials name no missing capability.
+  const rejected = surfaces.every((surface) => surface.httpStatus === 401);
+  const missingCapabilities = rejected
+    ? []
+    : [...new Set(surfaces.filter((surface) => surface.status === "not_readable").map((surface) => surface.capabilityHint))];
+  const status: SumologicAccessCheckResult["status"] = rejected ? "failed" : readableCount === surfaces.length ? "healthy" : "limited";
 
   return {
     status,
     baseUrl: config.baseUrl,
-    surfaces,
+    surfaces: rejected ? surfaces.map((surface): SumologicAccessSurface => ({ ...surface, status: "unauthorized" })) : surfaces,
     missingCapabilities,
     notes: [
       `Using Sumo Logic API ${config.baseUrl}${config.deployment ? ` (deployment ${config.deployment})` : ""}.`,
       `Access ID ${config.accessId.slice(0, 4)}... resolved from ${config.sourceChain.join(", ")}.`,
       `${readableCount}/${surfaces.length} Sumo Logic audit surfaces are readable.`,
+      ...(rejected
+        ? ["Permissions were not checked because Sumo Logic rejected the access ID and access key; the denied probes do not mean permissions are missing."]
+        : []),
     ],
-    recommendedNextStep: status === "healthy"
-      ? "Run sumologic_assess_identity, sumologic_assess_access_control, sumologic_assess_data_governance, sumologic_assess_content_sharing, or sumologic_export_audit_bundle."
-      : `Grant the access key owner a role with: ${missingCapabilities.join(", ")}. Unreadable surfaces render as manual findings, never as passes.`,
+    recommendedNextStep: accessCheckNextStep(status, missingCapabilities),
   };
+}
+
+function accessCheckNextStep(status: SumologicAccessCheckResult["status"], missingCapabilities: string[]): string {
+  switch (status) {
+    case "healthy":
+      return "Run sumologic_assess_identity, sumologic_assess_access_control, sumologic_assess_data_governance, sumologic_assess_content_sharing, or sumologic_export_audit_bundle.";
+    case "limited":
+      return `Grant the access key owner a role with: ${missingCapabilities.join(", ")}. Unreadable surfaces render as manual findings, never as passes.`;
+    case "failed":
+      return "Sumo Logic rejected the access ID and access key (every probe returned 401). Set SUMOLOGIC_ACCESS_ID and SUMOLOGIC_ACCESS_KEY (or the access_id and access_key arguments, or the same keys in SUMOLOGIC_CONFIG_FILE or ~/.sumologic-sec-inspector/config.yaml) to an active access key, with SUMOLOGIC_ENDPOINT (or SUMOLOGIC_DEPLOYMENT, or the endpoint or deployment arguments) naming the deployment that issued it, then rerun sumologic_check_access.";
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Sumo Logic access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 export async function assessSumologicIdentity(
@@ -3144,7 +3164,7 @@ function formatAccessCheckText(result: SumologicAccessCheckResult): string {
     surface.name,
     surface.status,
     surface.count === undefined ? "-" : String(surface.count),
-    surface.status === "readable" ? surface.capabilityHint : `needs ${surface.capabilityHint}`,
+    surface.status === "not_readable" ? `needs ${surface.capabilityHint}` : surface.capabilityHint,
   ]);
   return [
     `Sumo Logic access check: ${result.status}`,

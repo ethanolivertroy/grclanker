@@ -970,8 +970,8 @@ test("a 401 response is reported as rejected credentials, is not retried, and ne
   assert.deepEqual(requests, ["/api/v1/accessKeys"]);
 
   const access = await checkSumologicAccess(client);
-  assert.equal(access.status, "limited");
-  assert.equal(access.surfaces.filter((surface) => surface.status === "readable").length, 0);
+  assert.equal(access.status, "failed");
+  assert.equal(access.surfaces.filter((surface) => surface.status === "unauthorized").length, 18);
 
   const unauthorized = async () => failedCollection("Sumo Logic request failed (401 unauthorized)", 401);
   const reader = { ...forbiddenReader() };
@@ -986,6 +986,174 @@ test("a 401 response is reported as rejected credentials, is not retried, and ne
   assert.match(byId(results[0], "SUMO-01").summary, /credentials were rejected \(401\)/);
   assert.equal(byId(results[0], "SUMO-01").evidence.http_status, 401);
   assert.match(byId(results[1], "SUMO-07").summary, /credentials were rejected \(401\)/);
+});
+
+/** Planted credentials for the rejected-credential access checks: random alphanumerics with no 6-character window in any fixed text or fixture value. */
+const REJECTED_ACCESS_ID = "suJ5qXw8RmT3";
+const REJECTED_ACCESS_KEY = "Hb6NzP2vKc9WqL4tYf7D";
+const REJECTED_BASIC_CREDENTIAL = Buffer.from(`${REJECTED_ACCESS_ID}:${REJECTED_ACCESS_KEY}`).toString("base64");
+const REJECTED_CANARIES = [REJECTED_ACCESS_ID, REJECTED_ACCESS_KEY, REJECTED_BASIC_CREDENTIAL];
+const REJECTED_NEXT_STEP = "Sumo Logic rejected the access ID and access key (every probe returned 401). Set SUMOLOGIC_ACCESS_ID and SUMOLOGIC_ACCESS_KEY (or the access_id and access_key arguments, or the same keys in SUMOLOGIC_CONFIG_FILE or ~/.sumologic-sec-inspector/config.yaml) to an active access key, with SUMOLOGIC_ENDPOINT (or SUMOLOGIC_DEPLOYMENT, or the endpoint or deployment arguments) naming the deployment that issued it, then rerun sumologic_check_access.";
+const REJECTED_NOTE = "Permissions were not checked because Sumo Logic rejected the access ID and access key; the denied probes do not mean permissions are missing.";
+const REJECTED_NOTES = [
+  "Using Sumo Logic API https://api.us2.sumologic.com/api (deployment us2).",
+  "Access ID suJ5... resolved from tests.",
+  "0/18 Sumo Logic audit surfaces are readable.",
+  REJECTED_NOTE,
+];
+const ALL_DENIED_NEXT_STEP = "Grant the access key owner a role with: viewAccountOverview, manageUsersAndRoles, manageAccessKeys (falls back to createAccessKeys for personal keys), manageSaml, managePasswordPolicy, ipAllowlisting, manageOrgSettings, viewPartitions, viewScheduledViews, manageBudgets, viewConnections, viewCollectors, viewMonitorsV2, manageContent. Unreadable surfaces render as manual findings, never as passes.";
+const ACCOUNT_READABLE_NEXT_STEP = "Grant the access key owner a role with: manageUsersAndRoles, manageAccessKeys (falls back to createAccessKeys for personal keys), manageSaml, managePasswordPolicy, ipAllowlisting, manageOrgSettings, viewPartitions, viewScheduledViews, manageBudgets, viewConnections, viewCollectors, viewMonitorsV2, manageContent. Unreadable surfaces render as manual findings, never as passes.";
+
+/**
+ * A deployment that answers every request with `status` (401 unless given) and echoes back the Authorization header it
+ * received, so a leak of the access key shows up in the output. Paths named in `answers` reply with that response instead.
+ */
+function rejectingFetch({ status = 401, answers = {} } = {}) {
+  return async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (answers[url.pathname]) return answers[url.pathname]();
+    const echo = `received Authorization: ${headerValue(init.headers, "authorization") ?? ""}`;
+    return status === 401
+      ? jsonResponse({ errors: [{ code: "unauthorized", message: `Full authentication is required to access this resource; ${echo}` }] }, { status })
+      : jsonResponse({ errors: [{ code: "forbidden", message: `The access key lacks the capability; ${echo}` }] }, { status });
+  };
+}
+
+function rejectedClient(fetchOptions) {
+  return new SumologicApiClient(sampleConfig({ accessId: REJECTED_ACCESS_ID, accessKey: REJECTED_ACCESS_KEY }), {
+    fetchImpl: rejectingFetch(fetchOptions),
+    sleepImpl: async () => {},
+    maxRetries: 0,
+  });
+}
+
+/** The cells of each access check table row, keyed by surface name. */
+function accessTableRows(text) {
+  const rows = text.split("\n").filter((line) => line.includes("│")).map((line) => line.split("│").map((cell) => cell.trim()));
+  return new Map(rows.map(([name, ...cells]) => [name, cells]));
+}
+
+test("checkSumologicAccess reports failed and names the access key settings when every probe returns 401, with no capability claimed missing", async () => {
+  assertFixtureFreeOfCanaryWindows([REJECTED_NEXT_STEP, ...REJECTED_NOTES, ALL_DENIED_NEXT_STEP].join("\n"), REJECTED_CANARIES, "rejected credential fixed texts");
+  const echoed = await (await rejectingFetch()("https://api.us2.sumologic.com/api/v1/users", { headers: { authorization: `Basic ${REJECTED_BASIC_CREDENTIAL}` } })).text();
+  assert.ok(echoed.includes(REJECTED_BASIC_CREDENTIAL), "positive control: the rejecting deployment echoes the credential it received");
+
+  const result = await checkSumologicAccess(rejectedClient());
+  assert.equal(result.status, "failed");
+  assert.equal(result.surfaces.length, 18);
+  for (const surface of result.surfaces) {
+    assert.equal(surface.status, "unauthorized", surface.name);
+    assert.equal(surface.httpStatus, 401, surface.name);
+  }
+  assert.deepEqual(result.missingCapabilities, [], "no capability is claimed missing");
+  assert.equal(result.recommendedNextStep, REJECTED_NEXT_STEP);
+  assert.deepEqual(result.notes, REJECTED_NOTES);
+  assertSecretsAbsent(assert, new Map([["check_access", JSON.stringify(result)]]), leakWindows(REJECTED_CANARIES), "rejected access check");
+
+  const unauthorized = async () => failedCollection("Sumo Logic request failed (401 unauthorized)", 401);
+  const reader = { ...forbiddenReader() };
+  for (const key of Object.keys(reader)) if (key !== "getResolvedConfig") reader[key] = unauthorized;
+  const fromReader = await checkSumologicAccess(reader);
+  assert.equal(fromReader.status, "failed");
+  assert.deepEqual(fromReader.missingCapabilities, []);
+  assert.equal(fromReader.recommendedNextStep, REJECTED_NEXT_STEP);
+});
+
+test("checkSumologicAccess keeps the limited result and the capability advice when a probe reads, when every probe is denied with 403, or when one probe fails with something other than 401", async () => {
+  const failing = (status) => () => jsonResponse({ errors: [{ code: "error", message: "request failed" }] }, { status });
+  const cases = [
+    { name: "every probe 403", fetch: { status: 403 } },
+    { name: "account status readable, the rest 401", fetch: { answers: { "/api/v1/account/status": () => jsonResponse(healthyData().accountStatus) } }, readable: 1, nextStep: ACCOUNT_READABLE_NEXT_STEP },
+    { name: "every probe 401 but users 403", fetch: { answers: { "/api/v1/users": failing(403) } } },
+    { name: "every probe 401 but partitions 404", fetch: { answers: { "/api/v1/partitions": failing(404) } } },
+    { name: "every probe 401 but roles 422", fetch: { answers: { "/api/v1/roles": failing(422) } } },
+    { name: "every probe 401 but collectors 429", fetch: { answers: { "/api/v1/collectors": failing(429) } } },
+    { name: "every probe 401 but connections 502", fetch: { answers: { "/api/v1/connections": failing(502) } } },
+    { name: "every probe 401 but monitors unreachable", fetch: { answers: { "/api/v1/monitors/search": () => { throw new TypeError("fetch failed"); } } } },
+  ];
+  for (const { name, fetch, readable = 0, nextStep = ALL_DENIED_NEXT_STEP } of cases) {
+    const result = await checkSumologicAccess(rejectedClient(fetch));
+    assert.equal(result.status, "limited", name);
+    assert.equal(result.recommendedNextStep, nextStep, name);
+    assert.equal(result.missingCapabilities.length, readable === 0 ? 14 : 13, name);
+    assert.deepEqual(result.notes, [...REJECTED_NOTES.slice(0, 2), `${readable}/18 Sumo Logic audit surfaces are readable.`], name);
+    assert.ok(result.surfaces.every((surface) => surface.status !== "unauthorized"), `${name}: no surface is relabeled`);
+  }
+});
+
+test("sumologic_check_access renders the failed result for an access key from the arguments, the environment, or the config file, with plain capability hints and no credential", async () => {
+  const dir = createTempBase("grclanker-sumo-rejected-tool-");
+  const configFile = join(dir, "config.yaml");
+  writeFileSync(configFile, `access_id: ${REJECTED_ACCESS_ID}\naccess_key: ${REJECTED_ACCESS_KEY}\nendpoint: us2\n`);
+  const absent = join(dir, "absent.yaml");
+  const registered = [];
+  registerSumologicTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "sumologic_check_access");
+  const sources = [
+    { name: "arguments", args: { access_id: REJECTED_ACCESS_ID, access_key: REJECTED_ACCESS_KEY, endpoint: "us2", config_file: absent }, env: {} },
+    { name: "environment", args: { config_file: absent }, env: { SUMOLOGIC_ACCESS_ID: REJECTED_ACCESS_ID, SUMOLOGIC_ACCESS_KEY: REJECTED_ACCESS_KEY, SUMOLOGIC_DEPLOYMENT: "us2" } },
+    { name: "config file", args: { config_file: configFile }, env: {} },
+  ];
+  const envKeys = ["SUMOLOGIC_ACCESS_ID", "SUMOLOGIC_ACCESS_KEY", "SUMOLOGIC_ENDPOINT", "SUMOLOGIC_DEPLOYMENT", "SUMOLOGIC_CONFIG_FILE"];
+  const savedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const source of sources) {
+      for (const key of envKeys) delete process.env[key];
+      Object.assign(process.env, source.env);
+      globalThis.fetch = rejectingFetch();
+      const result = await checkAccess.execute("call", checkAccess.prepareArguments(source.args));
+      const text = result.content[0].text;
+      assert.equal(result.details.status, "failed", source.name);
+      assert.match(text, /^Sumo Logic access check: failed$/m, source.name);
+      assert.ok(text.includes(`Next: ${REJECTED_NEXT_STEP}`), `${source.name}: ${text}`);
+      assert.ok(text.includes(REJECTED_NOTE), source.name);
+      assert.ok(!text.includes("needs ") && !text.includes("Grant the access key owner"), `${source.name}: ${text}`);
+      const rows = accessTableRows(text);
+      for (const surface of result.details.surfaces) assert.deepEqual(rows.get(surface.name), ["unauthorized", "null", surface.capabilityHint], `${source.name}: ${surface.name}`);
+      assertSecretsAbsent(assert, new Map([["text", text], ["details", JSON.stringify(result.details)]]), leakWindows(REJECTED_CANARIES), source.name);
+    }
+
+    for (const key of envKeys) delete process.env[key];
+    globalThis.fetch = rejectingFetch({ status: 403 });
+    const denied = await checkAccess.execute("call", checkAccess.prepareArguments(sources[0].args));
+    assert.equal(denied.details.status, "limited");
+    assert.ok(denied.content[0].text.includes(`Next: ${ALL_DENIED_NEXT_STEP}`));
+    const deniedRows = accessTableRows(denied.content[0].text);
+    for (const surface of denied.details.surfaces) assert.deepEqual(deniedRows.get(surface.name), ["not_readable", "null", `needs ${surface.capabilityHint}`], surface.name);
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const key of envKeys) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+  }
+});
+
+test("exportSumologicAuditBundle writes the failed access check when every probe returns 401, with the next step intact and no credential in any file", async () => {
+  const base = createTempBase("grclanker-sumo-rejected-export-");
+  const config = sampleConfig({ accessId: REJECTED_ACCESS_ID, accessKey: REJECTED_ACCESS_KEY });
+  const exported = await exportSumologicAuditBundle(rejectedClient(), config, base, { now: NOW });
+  const files = readBundleFiles(exported.outputDir);
+  const access = JSON.parse(files.get(join("core_data", "access_check.json")));
+  assert.equal(access.status, "failed");
+  assert.equal(access.recommendedNextStep, REJECTED_NEXT_STEP);
+  assert.deepEqual(access.missingCapabilities, []);
+  assert.deepEqual(access.notes, REJECTED_NOTES);
+  const secrets = leakWindows(REJECTED_CANARIES);
+  assertSecretsAbsent(assert, files, secrets, "rejected bundle");
+  assertSecretsAbsent(assert, readZipEntries(exported.zipPath), secrets, "rejected zip");
+});
+
+test("GWS note 1, rejected credentials: the failed Sumo Logic access check next step and notes come back from scrubErrorText, scrubDataText, and redactSnapshot unchanged", async () => {
+  const result = await checkSumologicAccess(rejectedClient());
+  assert.equal(result.status, "failed");
+  for (const text of [result.recommendedNextStep, ...result.notes]) {
+    assert.equal(scrubErrorText(text), text, `scrubErrorText changed: ${text}`);
+    assert.equal(scrubErrorText(text, [REJECTED_ACCESS_KEY, REJECTED_ACCESS_ID]), text, `scrubErrorText with the configured credentials changed: ${text}`);
+    assert.equal(scrubDataText(text), text, `scrubDataText changed: ${text}`);
+    assert.equal(redactSnapshot(text), text, `redactSnapshot changed: ${text}`);
+  }
 });
 
 test("undated items are never counted as fresh or active", async () => {
@@ -2510,6 +2678,8 @@ const SUMOLOGIC_FIXED_TEXTS = [
   "17/24 Sumo Logic audit surfaces are readable.",
   "Run sumologic_assess_identity, sumologic_assess_access_control, sumologic_assess_data_governance, sumologic_assess_content_sharing, or sumologic_export_audit_bundle.",
   "Grant the access key owner a role with: manageUsersAndRoles, manageSaml, manageAccessKeys (falls back to createAccessKeys for personal keys). Unreadable surfaces render as manual findings, never as passes.",
+  REJECTED_NEXT_STEP,
+  REJECTED_NOTE,
   "needs manageUsersAndRoles",
   "- `_errors.log`: present only when some API surfaces could not be collected",
   "- MANUAL: unreadable endpoint, not applicable, or outside API scope; the summary names the evidence to collect",
