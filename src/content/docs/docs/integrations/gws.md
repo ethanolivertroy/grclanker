@@ -90,7 +90,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 | --- | --- |
-| `gws_check_access` | Probes each surface, reports `healthy` or `limited`, and says whether GWS-ID-005 can be evaluated automatically |
+| `gws_check_access` | Probes each surface, reports `healthy`, `limited`, or `failed`, and says whether GWS-ID-005 can be evaluated automatically. The status is `failed` when every probe is refused for its credentials: a 401, or a service-account token exchange refused with `invalid_grant`, `invalid_client`, `deleted_client`, or `disabled_client`. The next step then names the access token, key, and admin email settings. A 403, a token exchange refused because domain-wide delegation does not cover the scopes (`unauthorized_client`, `access_denied`), or any readable probe keeps the status `limited`. |
 | `gws_assess_identity` | GWS-ID-001 to GWS-ID-005 |
 | `gws_assess_admin_access` | GWS-ADMIN-001 to GWS-ADMIN-005 |
 | `gws_assess_integrations` | GWS-INTEG-001 to GWS-INTEG-004 |

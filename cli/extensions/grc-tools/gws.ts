@@ -284,7 +284,7 @@ export interface GwsAccessProbe {
 export interface GwsAccessCheckResult {
   organization: string;
   authMode: GwsAuthMode;
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   sourceChain: string[];
   probes: GwsAccessProbe[];
   notes: string[];
@@ -483,6 +483,31 @@ export class GwsApiError extends Error {
     this.status = status;
     this.url = url;
   }
+}
+
+/** The service-account token exchange failed; the RFC 6749 error code lets the access check tell refused credentials from a delegation gap. */
+class GwsTokenExchangeError extends Error {
+  tokenErrorCode: string | undefined;
+
+  constructor(message: string, tokenErrorCode: string | undefined) {
+    super(scrubErrorText(message));
+    this.name = "GwsTokenExchangeError";
+    this.tokenErrorCode = tokenErrorCode;
+  }
+}
+
+/**
+ * Token errors that refuse the service account credentials themselves: a key that is deleted, disabled, expired, or not
+ * the account's, a deleted client, or an admin email that is not a user
+ * (https://developers.google.com/identity/protocols/oauth2/service-account#error-codes). unauthorized_client,
+ * access_denied, and admin_policy_enforced mean domain-wide delegation does not cover the scopes, which is a permission gap.
+ */
+const REJECTED_CREDENTIAL_TOKEN_ERRORS = new Set(["invalid_grant", "invalid_client", "deleted_client", "disabled_client"]);
+
+function isRejectedTokenExchange(error: unknown): boolean {
+  return error instanceof GwsTokenExchangeError
+    && error.tokenErrorCode !== undefined
+    && REJECTED_CREDENTIAL_TOKEN_ERRORS.has(error.tokenErrorCode);
 }
 
 const GWS_ACCESS_PROBES = [
@@ -2199,11 +2224,13 @@ export async function resolveGwsConfiguration(
   };
 }
 
+type JsonBody = { payload: JsonRecord; failure?: undefined } | { payload?: undefined; failure: string };
+
 /**
  * Reads a response body as text and parses the JSON itself, so a body that is not JSON yields a fixed description (the
  * content type and byte count) instead of the parser's message, which quotes the first characters of the body.
  */
-async function readJsonBody(response: Response): Promise<{ payload: JsonRecord; failure?: undefined } | { payload?: undefined; failure: string }> {
+async function readJsonBody(response: Response): Promise<JsonBody> {
   const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || "untyped";
   let text: string;
   try {
@@ -2216,6 +2243,14 @@ async function readJsonBody(response: Response): Promise<{ payload: JsonRecord; 
   } catch {
     return { failure: `non-JSON ${contentType} body (${Buffer.byteLength(text, "utf8")} bytes) withheld` };
   }
+}
+
+/** Renders the HTTP status plus documented identifiers only; the body's free-text message is never kept (see describeErrorReasons). */
+function describeFailedResponse(status: number, body: JsonBody): string {
+  const base = httpStatusLabel(status);
+  if (body.failure !== undefined) return base;
+  const reasons = describeErrorReasons(body.payload);
+  return reasons.length > 0 ? `${base} (${reasons.join(", ")})` : base;
 }
 
 export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
@@ -2278,7 +2313,7 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
       return {
         key: basename(pathname) || pathname,
         path: pathname,
-        status: "error",
+        status: isRejectedTokenExchange(error) ? "unauthorized" : "error",
         detail: summarizeError(error),
       };
     }
@@ -2442,13 +2477,8 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
     throw new GwsApiError(response.status, await this.readError(response), url);
   }
 
-  /** Renders the HTTP status plus documented identifiers only; the body's free-text message is never kept (see describeErrorReasons). */
   private async readError(response: Response): Promise<string> {
-    const base = httpStatusLabel(response.status);
-    const body = await readJsonBody(response);
-    if (body.failure !== undefined) return base;
-    const reasons = describeErrorReasons(body.payload);
-    return reasons.length > 0 ? `${base} (${reasons.join(", ")})` : base;
+    return describeFailedResponse(response.status, await readJsonBody(response));
   }
 
   private clearToken(scopes: string[]): void {
@@ -2503,7 +2533,11 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
     });
 
     if (!response.ok) {
-      throw new Error(`Failed to obtain Google access token: ${await this.readError(response)}`);
+      const failure = await readJsonBody(response);
+      throw new GwsTokenExchangeError(
+        `Failed to obtain Google access token: ${describeFailedResponse(response.status, failure)}`,
+        failure.failure === undefined ? errorIdentifier(failure.payload.error) : undefined,
+      );
     }
 
     const body = await readJsonBody(response);
@@ -2545,9 +2579,9 @@ export async function runGwsAccessCheck(
   );
 
   const okKeys = new Set(probes.filter((probe) => probe.status === "ok").map((probe) => probe.key));
-  const status = okKeys.has("users") && okKeys.has("roles") && okKeys.has("role_assignments") && okKeys.has("reports_login")
-    ? "healthy"
-    : "limited";
+  const status: GwsAccessCheckResult["status"] = probes.every((probe) => probe.status === "unauthorized")
+    ? "failed"
+    : (okKeys.has("users") && okKeys.has("roles") && okKeys.has("role_assignments") && okKeys.has("reports_login") ? "healthy" : "limited");
 
   const notes = [
     config.authMode === "service_account"
@@ -2566,10 +2600,36 @@ export async function runGwsAccessCheck(
     sourceChain: config.sourceChain,
     probes,
     notes,
-    recommendedNextStep: status === "healthy"
-      ? "Run the focused GWS assessment that matches the question, or export the audit bundle for a full evidence package."
-      : "Fix the missing Google scopes or delegated-admin setup, then re-run gws_check_access before trusting posture findings.",
+    recommendedNextStep: accessCheckNextStep(status, config.authMode),
   };
+}
+
+function rejectedCredentialsStep(authMode: GwsAuthMode): string {
+  switch (authMode) {
+    case "access_token":
+      return "Google rejected the access token (every probe returned 401). Set GWS_ACCESS_TOKEN (or the access_token argument) to a valid token, then re-run gws_check_access.";
+    case "service_account":
+      return "Google rejected the service account credentials (every probe returned 401 or its token exchange was refused with invalid_grant, invalid_client, deleted_client, or disabled_client). Check the key named by GWS_CREDENTIALS_FILE, GWS_SERVICE_ACCOUNT_FILE, or GOOGLE_APPLICATION_CREDENTIALS, or held in GWS_CREDENTIALS_JSON or GWS_SERVICE_ACCOUNT_JSON (or the credentials_file or credentials_json argument), and check that GWS_ADMIN_EMAIL (or admin_email) names an existing user; a deleted, disabled, or expired key or an unknown admin email is refused this way. Then re-run gws_check_access.";
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled Google Workspace auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: GwsAccessCheckResult["status"], authMode: GwsAuthMode): string {
+  switch (status) {
+    case "healthy":
+      return "Run the focused GWS assessment that matches the question, or export the audit bundle for a full evidence package.";
+    case "limited":
+      return "Fix the missing Google scopes or delegated-admin setup, then re-run gws_check_access before trusting posture findings.";
+    case "failed":
+      return rejectedCredentialsStep(authMode);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Google Workspace access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 async function collectTokenInventory(
