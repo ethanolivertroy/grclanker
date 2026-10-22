@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
@@ -11,6 +12,7 @@ import { copyJson, isJsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { CURRENT_SQLITE_SCHEMA_VERSION } from "@earendil-works/pi-durable/storage/sqlite";
 
 import { classifyGrcToolEffect, hasWriteVerb, WRITE_VERBS } from "../dist/agent-sdk/lib/effects.js";
 import { readGrclankerSystemPrompt } from "../dist/agent-sdk/lib/instructions.js";
@@ -202,6 +204,16 @@ function hangingFetch(t, onRequest = () => {}) {
     globalThis.fetch = saved;
   });
   return requests;
+}
+
+/** Run SQL on a session database outside Pi Durable, as another release or tool would. */
+function editDatabase(path, ...statements) {
+  const database = new DatabaseSync(path);
+  try {
+    for (const statement of statements) database.exec(statement);
+  } finally {
+    database.close();
+  }
 }
 
 /** Fake PagerDuty arguments, with an empty config file so the operator's own config stays out of the test. */
@@ -1304,6 +1316,60 @@ test("grclanker durable run and resume print the answer or a JSON report, with p
   assert.equal(await runDurableCommand(["resume", "--session", session.id, "--model", "faux/faux-1"], idle.writer, deps), 0);
   assert.deepEqual(idle.io.out, []);
   assert.equal(idle.io.err.at(-1), `Nothing to resume: every request in session ${session.id} has settled.`);
+});
+
+test("a session from a newer Pi Durable schema is refused with a message before Pi Durable opens it, and left as it was", async (t) => {
+  const home = useGrclankerHome(t);
+  const model = scriptedModel(() => fauxAssistantMessage("done"));
+  const deps = { loadModels: model.loadModels, tools: () => [] };
+  const session = resolveDurableSession("from-newer", home);
+  const run = ["run", "--session", session.id, "--model", "faux/faux-1", "-m", "hi"];
+  assert.equal(await runDurableCommand(run, captureIo().writer, deps), 0);
+
+  const newer = CURRENT_SQLITE_SCHEMA_VERSION + 1;
+  editDatabase(session.database, `UPDATE durable_schema SET version = ${newer} WHERE singleton = 1`);
+  const refusal = `Session "from-newer" was written by a newer grclanker: its database is at schema version ${newer}, and this grclanker reads up to version ${CURRENT_SQLITE_SCHEMA_VERSION}. Open it with the newer grclanker, or start a new session. The session was not changed.`;
+  const commands = [run, [...run, "--json"], ["resume", "--session", session.id, "--model", "faux/faux-1"]];
+  const written = readFileSync(session.database);
+  for (const argv of commands) {
+    const { io, writer } = captureIo();
+    assert.equal(await runDurableCommand(argv, writer, deps), 1, argv.join(" "));
+    assert.deepEqual(io.out, [], argv.join(" "));
+    assert.equal(io.err.at(-1), refusal, argv.join(" "));
+    assert.ok(readFileSync(session.database).equals(written), `${argv.join(" ")} left the database as it was`);
+  }
+  assert.equal(model.views.length, 1, "no refused command reached the model");
+
+  // Opening for writing would switch the file back to WAL mode before Pi Durable reads its version.
+  editDatabase(session.database, "PRAGMA journal_mode = DELETE");
+  const unopened = readFileSync(session.database);
+  const { io, writer } = captureIo();
+  assert.equal(await runDurableCommand(run, writer, deps), 1);
+  assert.equal(io.err.at(-1), refusal);
+  assert.ok(readFileSync(session.database).equals(unopened), "the database was not opened for writing");
+});
+
+test("a session file that is not a database is refused with a message, and left as it was", async (t) => {
+  const home = useGrclankerHome(t);
+  const model = scriptedModel(() => fauxAssistantMessage("done"));
+  const deps = { loadModels: model.loadModels, tools: () => [] };
+  const session = resolveDurableSession("not-a-database", home);
+  mkdirSync(session.dir, { recursive: true });
+  const contents = Buffer.from("not a database\n".repeat(300));
+  writeFileSync(session.database, contents);
+
+  const refusal = `Session "not-a-database" cannot be opened: ${session.database} is not a SQLite database. Move it aside to start the session over, or use another --session.`;
+  for (const argv of [
+    ["run", "--session", session.id, "--model", "faux/faux-1", "-m", "hi"],
+    ["resume", "--session", session.id, "--model", "faux/faux-1"],
+  ]) {
+    const { io, writer } = captureIo();
+    assert.equal(await runDurableCommand(argv, writer, deps), 1, argv.join(" "));
+    assert.deepEqual(io.out, [], argv.join(" "));
+    assert.equal(io.err.at(-1), refusal, argv.join(" "));
+    assert.ok(readFileSync(session.database).equals(contents), `${argv.join(" ")} left the file as it was`);
+  }
+  assert.equal(model.views.length, 0);
 });
 
 test("durable is a reserved command root, so a mistyped durable command is never sent to the model as a prompt", () => {

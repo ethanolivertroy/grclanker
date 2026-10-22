@@ -4,11 +4,13 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@sinclair/typebox";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { CURRENT_SQLITE_SCHEMA_VERSION } from "@earendil-works/pi-durable/storage/sqlite";
 import {
   buildDurableRequest,
   DURABLE_EXPERIMENTAL_BANNER,
@@ -18,6 +20,7 @@ import {
 } from "../dist/durable/cli.js";
 import { emptyAssessmentState } from "../dist/durable/document.js";
 import { DurableUsageError } from "../dist/durable/errors.js";
+import { acquireSessionLock } from "../dist/durable/lock.js";
 import { DURABLE_MODEL_ENV } from "../dist/durable/models.js";
 import { durableSessionsDir, resolveDurableSession } from "../dist/durable/session.js";
 import { toDurableTool } from "../dist/durable/tools.js";
@@ -331,6 +334,28 @@ test("terminal app commands: /model opens the model list, Esc or Ctrl+C closes i
   await app.terminal.waitFor((screen) => screen.includes("Current model does not support thinking"), "the notice");
   assert.deepEqual(model.calls, [], "no command reached the model");
   await app.exit("\x03");
+});
+
+test("the terminal app refuses a session from a newer Pi Durable schema before it opens, and releases the session lock", async (t) => {
+  const home = scratchDir(t);
+  const session = resolveDurableSession("tui-newer", home);
+  const model = scriptedModel();
+  const deps = { loadModels: model.loadModels, tools: fakeTools(home, { read: 0, write: 0 }) };
+  await (await openDurableTui({ session, model: MODEL }, deps)).close();
+
+  const newer = CURRENT_SQLITE_SCHEMA_VERSION + 1;
+  const database = new DatabaseSync(session.database);
+  database.exec(`UPDATE durable_schema SET version = ${newer} WHERE singleton = 1`);
+  database.close();
+  const written = readFileSync(session.database);
+
+  await assert.rejects(openDurableTui({ session, model: MODEL }, deps), {
+    name: "DurableSessionVersionError",
+    message: `Session "tui-newer" was written by a newer grclanker: its database is at schema version ${newer}, and this grclanker reads up to version ${CURRENT_SQLITE_SCHEMA_VERSION}. Open it with the newer grclanker, or start a new session. The session was not changed.`,
+  });
+  assert.ok(readFileSync(session.database).equals(written), "the database was left as it was");
+  acquireSessionLock(session.lock).release();
+  assert.deepEqual(model.calls, []);
 });
 
 // The real `grclanker durable tui` in a pseudo-terminal, crashed with SIGKILL partway through a parallel tool

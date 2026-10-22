@@ -27,13 +27,13 @@ import {
   type Submission,
   type ToolRegistration,
 } from "@earendil-works/pi-durable";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { Assessment, emptyAssessmentState, type AssessmentState } from "./document.js";
 import { acquireSessionLock } from "./lock.js";
 import { assertModelAvailable, formatModelRef } from "./models.js";
 import { createGrclankerDurableExtension } from "./prompts.js";
 import { durableReplayPolicy, type DurableReplayPolicy } from "./replay.js";
 import type { DurableSessionPaths } from "./session.js";
+import { openDurableSessionStorage } from "./storage.js";
 
 export const INTERRUPTED_DIAGNOSTIC = "interrupted";
 
@@ -339,7 +339,7 @@ export async function runDurable(request: DurableRunRequest, deps: DurableRunDep
     const registry = createRegistry();
     registry.install(createGrclankerDurableExtension(deps.tools?.()));
     const harness = await Harness.open(
-      await openNodeSqliteStorage(request.session.database),
+      await openDurableSessionStorage(request.session),
       {
         models,
         registry,

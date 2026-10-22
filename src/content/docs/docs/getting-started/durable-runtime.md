@@ -89,7 +89,7 @@ The keys are Pi's defaults. Override them in `~/.grclanker/agent/keybindings.jso
 
 Exiting closes the session, prints the command that opens it again, and exits `0`. A turn still running when you exit is not cancelled: it continues the next time the session is opened, in the terminal app or with `resume`. Tool calls that were running are cancelled as the session closes, so they stop calling APIs, and an unfinished export writes nothing. The next open handles them like those of a crashed process: read-only tools run again, and tools that can write are reported and not rerun.
 
-The terminal app takes only `--session` and `--model`, and needs an interactive terminal. From a script or a pipe, it exits `1` and points to `grclanker durable run`. A usage, configuration, or lock error also exits `1` before the app opens.
+The terminal app takes only `--session` and `--model`, and needs an interactive terminal. From a script or a pipe, it exits `1` and points to `grclanker durable run`. A usage, configuration, or lock error, or a [session it cannot read](#sessions-and-the-lock), also exits `1` before the app opens.
 
 ## Crash and resume
 
@@ -130,6 +130,8 @@ One process can use a session at a time. A second `grclanker durable` command on
 
 The lock is an exclusive SQLite lock that the operating system drops when the process exits for any reason, `SIGKILL` included, so a crash never leaves a stale lock behind.
 
+Before Pi Durable opens a session's database, grclanker reads its schema version over a read-only connection. A session written by a newer grclanker, at a schema version this release cannot read, is refused: the command exits `1` with `Session "<id>" was written by a newer grclanker`, the two versions, and `The session was not changed.` A `session.sqlite` that is not a SQLite database is refused the same way. Neither file is changed.
+
 Delete a session directory to discard the session.
 
 ## Output and exit codes
@@ -155,7 +157,7 @@ The answer goes to stdout. With `--json`, stdout carries one JSON report instead
 | Exit code | Meaning |
 | --- | --- |
 | `0` | Answered, or nothing to resume |
-| `1` | The request settled without an answer, or a usage, configuration, or lock error |
+| `1` | The request settled without an answer; a usage, configuration, or lock error; or a session this release cannot read |
 | `130` | Stopped by Ctrl-C or `SIGTERM`. The session can be resumed |
 
 ### Redaction
@@ -196,7 +198,7 @@ Tools that accept `output_dir`, `workspace_dir`, or `zip_path` resolve relative 
 
 ## Limitations
 
-- The runtime is experimental. Commands, output, and the session format may change, and a session written by one release may not open in a later one. Going back is riskier: the next pi-durable release migrates a session to a new schema when it opens it, and `v0.1.3` cannot open a migrated session. If you might downgrade, copy `~/.grclanker/durable/sessions/` before a newer grclanker opens your sessions.
+- The runtime is experimental. Commands, output, and the session format may change, and a session written by one release may not open in a later one. Going back is riskier: the next pi-durable release migrates a session to a new schema when it opens it, and an older grclanker cannot open a migrated session. It refuses the session as described under [Sessions and the lock](#sessions-and-the-lock), while `v0.1.3` prints Pi Durable's `schema version 2 is newer than supported version 1` error with a stack trace. Neither changes the file. If you might downgrade, copy `~/.grclanker/durable/sessions/` before a newer grclanker opens your sessions.
 - Only the domain tools are available. There are no compute backends (no shell or file tools), workflow prompts, skills, or subagent personas.
 - The terminal app has only the keys and commands listed under [Terminal app](#terminal-app). The interactive CLI's commands, such as `/login` and `/settings`, are not in it.
 - An interrupted writer may have written part of its output before the process stopped. It is reported, not rerun. Check its output directory before you ask for the export again.
@@ -226,6 +228,7 @@ npm --prefix cli run test:cli
 - `/model`, Esc, and a thinking change on a model without thinking never reach the model.
 - `grclanker durable tui`, killed with `SIGKILL` partway through the PagerDuty tool round above, holds the session lock while it runs. Opened again, it keeps the finished assessment, reruns the interrupted one, and does not rerun the export.
 - `grclanker durable tui`, closed with Ctrl+C partway through that tool round, exits on its own at once: closing the session aborts the stalled API requests, and the export writes nothing, not even its output directory. `resume` then finishes the round without rerunning the export.
+- A session from a newer schema is refused before the app opens, the file is not changed, and the session lock is free again.
 
 `cli/tests/durable.test.mjs` covers:
 
@@ -237,6 +240,7 @@ npm --prefix cli run test:cli
 - Model selection
 - The command surface
 - In-process runs that continue, replay, stop, and resume a session
+- Sessions it cannot read: a newer schema version and a file that is not a database are refused with a message before Pi Durable opens them for writing, and neither file changes
 
 `cli/tests/abort-signals.test.mjs` checks that every registry tool honors its abort signal. A call whose signal has already aborted sends, runs, and writes nothing. Each tool that requests through fetch, aborted mid-request, rejects within a second and writes nothing, while a concurrent call with the same credentials keeps running.
 

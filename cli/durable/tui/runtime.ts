@@ -30,7 +30,6 @@ import {
   type Submission,
   type TaskGraph,
 } from "@earendil-works/pi-durable";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { Assessment, ASSESSMENT_DOC_KIND, emptyAssessmentState, type AssessmentState } from "../document.js";
 import { acquireSessionLock } from "../lock.js";
 import { assertModelAvailable } from "../models.js";
@@ -38,6 +37,7 @@ import { createGrclankerDurableExtension } from "../prompts.js";
 import { durableReplayPolicy } from "../replay.js";
 import { INTERRUPTED_DIAGNOSTIC, type DurableRunDeps } from "../run.js";
 import type { DurableSessionPaths } from "../session.js";
+import { openDurableSessionStorage } from "../storage.js";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -150,7 +150,7 @@ export async function openDurableTui(request: DurableTuiRequest, deps: DurableTu
     const pendingReports: unknown[] = [];
     let report: (error: unknown) => void = (error) => pendingReports.push(error);
     harness = await Harness.open(
-      await openNodeSqliteStorage(request.session.database),
+      await openDurableSessionStorage(request.session),
       {
         models,
         registry,
