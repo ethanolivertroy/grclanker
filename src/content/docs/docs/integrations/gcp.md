@@ -103,7 +103,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose | Notable arguments |
 |------|---------|-------------------|
-| `gcp_check_access` | Probe the core surfaces and report which are readable | `organization_id`, `project_id`, `access_token`, `credentials_file` |
+| `gcp_check_access` | Probe the core surfaces and report which are readable. When every probe is refused for its credentials (a 401, or a token exchange refused with 401, `invalid_grant`, `invalid_client`, `deleted_client`, or `disabled_client`), the status is `failed` and the next step names the access token or credentials file settings to fix. A 403 or any readable probe keeps the status `limited`. | `organization_id`, `project_id`, `access_token`, `credentials_file` |
 | `gcp_assess_identity` | Controls 1, 2, 13, 14 | `stale_days` (90), `max_keys` (200), `project_limit` |
 | `gcp_assess_logging_detection` | Control 5 plus Security Command Center visibility | `max_findings` (200), `project_limit` |
 | `gcp_assess_org_guardrails` | Controls 6, 8, 11, 12, 23 | `max_assets` (2000), `project_limit` |

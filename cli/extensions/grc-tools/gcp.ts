@@ -251,7 +251,7 @@ export interface GcpAccessSurface {
 }
 
 export interface GcpAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   organizationId?: string;
   projectId?: string;
   surfaces: GcpAccessSurface[];
@@ -2036,7 +2036,7 @@ export async function checkGcpAccess(
   const projects = inventory.data.projects;
   const targetProject = parseProjectId(projects[0] ?? {}) ?? config.projectId;
   const requireProject = (): string => {
-    if (!targetProject) throw new Error("No project available for the sample query.");
+    if (!targetProject) throw new Error(NO_SAMPLE_PROJECT);
     return targetProject;
   };
   const surfaces = await Promise.all([
@@ -2056,7 +2056,9 @@ export async function checkGcpAccess(
   ]);
 
   const readableCount = surfaces.filter((item) => item.status === "readable").length;
-  const status = readableCount >= 7 ? "healthy" : "limited";
+  const status: GcpAccessCheckResult["status"] = everyProbeRejected(surfaces)
+    ? "failed"
+    : (readableCount >= 7 ? "healthy" : "limited");
   const notes = [
     `Authenticated against ${describeSourceChain(config)}.`,
     `${readableCount}/${surfaces.length} GCP audit surfaces are readable.`,
@@ -2069,11 +2071,43 @@ export async function checkGcpAccess(
     projectId: targetProject ?? config.projectId,
     surfaces,
     notes,
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run gcp_assess_identity, gcp_assess_logging_detection, gcp_assess_org_guardrails, gcp_assess_data_protection, gcp_assess_network_security, or gcp_export_audit_bundle."
-        : "Grant roles/cloudasset.viewer, roles/iam.securityReviewer, roles/logging.viewer, roles/orgpolicy.policyViewer, roles/compute.viewer, and roles/securitycenter.findingsViewer to the audit principal and enable the corresponding APIs. roles/iam.securityReviewer already includes storage.buckets.list for project bucket inventory. If the principal does not have roles/iam.securityReviewer, grant a custom role containing only storage.buckets.list at the organization or each audited project.",
+    recommendedNextStep: accessCheckNextStep(status, config),
   };
+}
+
+const NO_SAMPLE_PROJECT = "No project available for the sample query.";
+
+/**
+ * A probe refused for its credentials: the API answered 401, or the token exchange answered 401 or refused the
+ * credentials file with invalid_grant, invalid_client, deleted_client, or disabled_client
+ * (https://developers.google.com/identity/protocols/oauth2/service-account#error-codes). A 403 stays a permission gap.
+ */
+function isRejectedCredentialError(message: string): boolean {
+  return /^401\b/.test(message) || /(?:^|: )Token exchange failed: (?:401\b|\d{3}\b[^:]*: (?:invalid_grant|invalid_client|deleted_client|disabled_client)\b)/.test(message);
+}
+
+/** A project-scoped probe skipped for want of a sample project counts with the refused ones, since the project inventory it needed was refused too. */
+function everyProbeRejected(surfaces: GcpAccessSurface[]): boolean {
+  const attempted = surfaces.filter((item) => item.error !== NO_SAMPLE_PROJECT);
+  return attempted.length > 0 && attempted.every((item) => item.status === "not_readable" && isRejectedCredentialError(item.error ?? ""));
+}
+
+const ACCESS_TOKEN_REJECTED = "Google Cloud rejected the access token (every probe returned 401). Set GCP_ACCESS_TOKEN (or GOOGLE_OAUTH_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN, or the access_token argument) to a valid token, or run gcloud auth login again when the token comes from gcloud auth print-access-token, then re-run gcp_check_access.";
+const CREDENTIALS_FILE_REJECTED = "Google rejected the credentials file (every probe returned 401 or its token exchange was refused). Check the file named by GCP_CREDENTIALS_FILE or GOOGLE_APPLICATION_CREDENTIALS (or the credentials_file argument, or the application default credentials file); a deleted or disabled service account key or a revoked refresh token is refused this way. Then re-run gcp_check_access.";
+
+function accessCheckNextStep(status: GcpAccessCheckResult["status"], config: GcpResolvedConfig): string {
+  switch (status) {
+    case "healthy":
+      return "Run gcp_assess_identity, gcp_assess_logging_detection, gcp_assess_org_guardrails, gcp_assess_data_protection, gcp_assess_network_security, or gcp_export_audit_bundle.";
+    case "limited":
+      return "Grant roles/cloudasset.viewer, roles/iam.securityReviewer, roles/logging.viewer, roles/orgpolicy.policyViewer, roles/compute.viewer, and roles/securitycenter.findingsViewer to the audit principal and enable the corresponding APIs. roles/iam.securityReviewer already includes storage.buckets.list for project bucket inventory. If the principal does not have roles/iam.securityReviewer, grant a custom role containing only storage.buckets.list at the organization or each audited project.";
+    case "failed":
+      return config.accessToken ? ACCESS_TOKEN_REJECTED : CREDENTIALS_FILE_REJECTED;
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled GCP access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 /*
