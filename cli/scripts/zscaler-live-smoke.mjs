@@ -41,6 +41,7 @@ try {
   for (const surface of access.surfaces) {
     log(`- ${surface.product} ${surface.name}: ${surface.status}${surface.count === undefined ? "" : ` (${surface.count})`}${surface.error ? ` ${surface.error}` : ""}`);
   }
+  if (access.status === "failed") throw new Error(`Live Zscaler smoke test stopped: ${access.recommendedNextStep}`);
   if (access.status === "unavailable") {
     throw new Error("No Zscaler surfaces were readable.");
   }

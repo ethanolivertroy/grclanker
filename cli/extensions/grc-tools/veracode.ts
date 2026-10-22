@@ -171,7 +171,7 @@ export interface VeracodeAccessSurface {
 }
 
 export interface VeracodeAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   region: string;
   baseUrl: string;
   principal?: string;
@@ -3527,6 +3527,23 @@ export async function checkVeracodeAccess(client: ClientLike): Promise<VeracodeA
       ? { name: probe.name, endpoint: probe.endpoint, status: "readable", count: result.value.count, ...(result.value.countNote ? { countNote: result.value.countNote } : {}), requiredRole: probe.requiredRole }
       : { name: probe.name, endpoint: result.endpoint ?? probe.endpoint, status: "not_readable", count: null, statusCode: result.statusCode ?? null, error: result.error, requiredRole: probe.requiredRole });
   }
+  // A 401 on every probe, the self read that any API user may make included, means the API
+  // credentials themselves were rejected, which says nothing about roles or licenses.
+  if (surfaces.every((item) => item.statusCode === 401)) {
+    return {
+      status: "failed",
+      region: config.region,
+      baseUrl: config.baseUrl,
+      surfaces,
+      missingRoles: [],
+      notes: [
+        `Using Veracode API base ${config.baseUrl} (region ${config.region}, credentials from ${config.sourceChain.join(" -> ")}).`,
+        `0/${surfaces.length} audit surfaces are readable; every one returned HTTP 401.`,
+        "Roles were not checked because Veracode rejected the API credentials; the rejected probes do not mean a role is missing.",
+      ],
+      recommendedNextStep: accessCheckNextStep("failed", []),
+    };
+  }
   const self = await surface(() => client.getSelf());
   const principal = self.status === "ok" ? userLabel(self.value) : undefined;
   const roles = self.status === "ok" ? userRoleNames(self.value) : [];
@@ -3549,10 +3566,24 @@ export async function checkVeracodeAccess(client: ClientLike): Promise<VeracodeA
       ...probeNotes,
       ...(optionalUnavailable.length > 0 ? [`Optional license-gated surfaces not readable: ${optionalUnavailable.join(", ")} (their controls will render as manual).`] : []),
     ],
-    recommendedNextStep: status === "healthy"
-      ? "Run veracode_assess_scan_coverage, veracode_assess_policy_compliance, veracode_assess_findings_hygiene, veracode_assess_sca_posture, veracode_assess_access_controls, or veracode_export_audit_bundle."
-      : `Grant the API service account the missing roles (${missingRoles.join(", ") || "Security Insights, Reviewer, Administrator"}) and confirm the region matches the account.`,
+    recommendedNextStep: accessCheckNextStep(status, missingRoles),
   };
+}
+
+/** Credentials issued in one region are rejected with 401 by the others, so the failed step names the region settings too. */
+function accessCheckNextStep(status: VeracodeAccessCheckResult["status"], missingRoles: string[]): string {
+  switch (status) {
+    case "healthy":
+      return "Run veracode_assess_scan_coverage, veracode_assess_policy_compliance, veracode_assess_findings_hygiene, veracode_assess_sca_posture, veracode_assess_access_controls, or veracode_export_audit_bundle.";
+    case "limited":
+      return `Grant the API service account the missing roles (${missingRoles.join(", ") || "Security Insights, Reviewer, Administrator"}) and confirm the region matches the account.`;
+    case "failed":
+      return "Veracode rejected the API credentials (every probe returned 401). Set VERACODE_API_KEY_ID and VERACODE_API_KEY_SECRET (or the api_key_id and api_key_secret arguments, or veracode_api_key_id and veracode_api_key_secret in ~/.veracode/credentials) to a valid API ID and secret, with VERACODE_REGION or VERACODE_API_BASE_URL pointing at the region that issued them, then rerun veracode_check_access.";
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Veracode access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function formatAccessCheckText(result: VeracodeAccessCheckResult): string {

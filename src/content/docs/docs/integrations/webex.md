@@ -85,7 +85,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 |------|---------|
-| `webex_check_access` | Probes every surface, reports token type, org selection, readable counts, truncation, and the missing scopes. |
+| `webex_check_access` | Probes every surface, reports token type, org selection, readable counts, truncation, and the missing scopes. Reports `failed` when Webex rejected the credentials on every probe (each returned 401, or the refresh grant returned 401, or 400 with `invalid_client`, `invalid_grant`, or `unauthorized_client`): no scope is named as missing, and the next step names the token or refresh credential settings to fix. Otherwise it reports `healthy` or `limited`. |
 | `webex_assess_identity` | WEBEX-ID-01 to WEBEX-ID-07. |
 | `webex_assess_collaboration_governance` | WEBEX-COLLAB-01 to WEBEX-COLLAB-08. |
 | `webex_assess_meeting_hybrid_security` | WEBEX-MTG-01 to WEBEX-MTG-07. |

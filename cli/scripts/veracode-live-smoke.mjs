@@ -29,6 +29,7 @@ try {
   for (const item of access.surfaces) {
     log(`  ${item.name}: ${item.status}${item.count === undefined ? "" : ` (${item.count})`}${item.error ? ` ${item.error}` : ""}`);
   }
+  if (access.status === "failed") throw new Error(`Live Veracode smoke test stopped: ${access.recommendedNextStep}`);
 
   const assessment = await assessVeracodePolicyCompliance(client, {});
   log("");

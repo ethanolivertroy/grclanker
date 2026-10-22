@@ -35,6 +35,7 @@ import {
 } from "../dist/extensions/grc-tools/zoom.js";
 import { ZOOM_SPEC } from "../dist/extensions/grc-tools/zoom.spec.js";
 import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
+import { assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 import {
   byteDifferentialEnabled,
   prepareByteDifferentialExportRoot,
@@ -1013,6 +1014,254 @@ test("checkZoomAccess reports readable Zoom audit surfaces per documented option
   assert.ok(denied.notes.includes("Could not read /users/me; Zoom credentials may be invalid or missing required authorization."));
   assert.equal(denied.notes.some((note) => note.startsWith("Authenticated as ")), false);
   assert.match(denied.recommendedNextStep, /account:read:admin/);
+});
+
+const ZOOM_SCOPE_STEP = "Grant the Server-to-Server OAuth app account:read:admin, user:read:admin, role:read:admin, group:read:admin, report:read:admin, imgroup:read:admin, and phone:read:admin (or their granular equivalents) and rerun.";
+const ZOOM_REJECTED_TOKEN_STEP = "Zoom rejected the access token (every probe returned 401). Set ZOOM_TOKEN (or ZOOM_ACCESS_TOKEN, or the token argument, or token in .zoom.json) to an unexpired OAuth access token, or remove the token and set ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET so the tool requests its own token, with ZOOM_BASE_URL (or ZOOM_API_BASE_URL) set to https://api.zoomgov.com/v2 for a Zoom for Government account, then rerun zoom_check_access.";
+const zoomRejectedOauthStep = (evidence) => `Zoom rejected the OAuth app credentials (${evidence}). Set ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, and ZOOM_CLIENT_SECRET (or the account_id, client_id, and client_secret arguments, or the same keys in .zoom.json) to the account ID, client ID, and client secret of an activated server-to-server OAuth app, with ZOOM_BASE_URL (or ZOOM_API_BASE_URL) set to https://api.zoomgov.com/v2 for a Zoom for Government account, then rerun zoom_check_access.`;
+const zoomRejectedNote = (credential) => `Scopes and roles were not checked because Zoom rejected the ${credential}; the rejected probes do not mean a scope or role is missing.`;
+// The wording that blames a scope, a role, or an authorization gap. A rejected credential says nothing about any of them.
+const ZOOM_SCOPE_CLAIMS = /Grant the Server-to-Server OAuth app|account:read:admin|check the app scopes|admin role\)|missing required authorization|does not contain scopes/;
+// Every probe the access check sends: /users/me, four settings and four lock settings option views, and seven inventories.
+const ZOOM_PROBE_COUNT = 15;
+
+// Planted credentials: random alphanumerics whose base64 forms carry no "/", so each form is one run for the long-token rule.
+const REJECTED_TOKEN = "d99EDS6GfCHkttxt";
+const REJECTED_CLIENT_ID = "RghqQS3P6K2twZZJ";
+const REJECTED_CLIENT_SECRET = "AwSi5QTDzJ7AinSR";
+const REJECTED_GRANTED_TOKEN = "Kp4xWm8RtV2nLq6ZcY9bHs3JdF7gNe5A";
+const REJECTED_BEARER = "n9YYKBvFF7x6gvwc";
+const REJECTED_SESSION = "5LtCfG2JznmfzzJM";
+const REJECTED_API_KEY = "Lisz3yY5MNw5Nd4g";
+const REJECTED_URL_TOKEN = "G2WNDRjEzwMMLbys";
+const REJECTED_BASIC = Buffer.from(`${REJECTED_CLIENT_ID}:${REJECTED_CLIENT_SECRET}`).toString("base64");
+const rejectedForms = (value) => [value, Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")];
+const REJECTED_CANARIES = [
+  ...[REJECTED_TOKEN, REJECTED_CLIENT_ID, REJECTED_CLIENT_SECRET, REJECTED_GRANTED_TOKEN].flatMap(rejectedForms),
+  REJECTED_BASIC,
+  REJECTED_BEARER,
+  REJECTED_SESSION,
+  REJECTED_API_KEY,
+  REJECTED_URL_TOKEN,
+];
+const REJECTION_EXTRAS = `Bearer ${REJECTED_BEARER} refused; session_id=${REJECTED_SESSION}, api_key=${REJECTED_API_KEY}; sign in at https://zoom.us/oauth/authorize?access_token=${REJECTED_URL_TOKEN}`;
+
+/** A 401 whose documented message fields echo the credentials the request carried beside a bearer token, a session pair, an API key pair, and a tokenised URL. */
+function rejectedApiResponse(sent) {
+  return jsonResponse({
+    code: 124,
+    message: `Invalid access token. ${sent.flatMap(rejectedForms).join(" ")}`,
+    errors: [{ message: REJECTION_EXTRAS }],
+  }, { status: 401, statusText: "Unauthorized" });
+}
+
+/** A failed token request whose reason echoes the client credentials and the Basic value the request carried. */
+function tokenResponse(status, fields = {}) {
+  return jsonResponse({
+    reason: `Invalid client_id or client_secret. ${[REJECTED_CLIENT_ID, REJECTED_CLIENT_SECRET].flatMap(rejectedForms).join(" ")} Basic ${REJECTED_BASIC} ${REJECTION_EXTRAS}`,
+    ...fields,
+  }, { status, statusText: status === 401 ? "Unauthorized" : status === 400 ? "Bad Request" : status === 403 ? "Forbidden" : "Internal Server Error" });
+}
+
+const rejectedTokenConfig = () => sampleConfig({ token: REJECTED_TOKEN });
+const rejectedOauthConfig = () => sampleConfig({ token: undefined, clientId: REJECTED_CLIENT_ID, clientSecret: REJECTED_CLIENT_SECRET });
+
+/** The real client, with each API request answered by respond and each token request by grant. */
+function rejectingClient(config, { respond = () => rejectedApiResponse([REJECTED_TOKEN]), grant = () => tokenResponse(400, { error: "invalid_client" }) } = {}) {
+  const requests = [];
+  const client = new ZoomApiClient(config, {
+    fetchImpl: async (input, init = {}) => {
+      const url = new URL(String(input));
+      requests.push(`${init.method ?? "GET"} ${url.pathname}`);
+      return url.pathname === "/oauth/token" ? grant() : respond(url);
+    },
+    sleep: async () => {},
+  });
+  return { client, requests };
+}
+
+test("rejected-credential fixtures: every planted value reaches the raw bodies and every base64 form is a single run", async () => {
+  const apiBody = await rejectedApiResponse([REJECTED_TOKEN, REJECTED_GRANTED_TOKEN]).text();
+  for (const canary of [...rejectedForms(REJECTED_TOKEN), ...rejectedForms(REJECTED_GRANTED_TOKEN), REJECTED_BEARER, REJECTED_SESSION, REJECTED_API_KEY, REJECTED_URL_TOKEN]) {
+    assert.ok(apiBody.includes(canary), `positive control: the 401 body carries ${canary}`);
+  }
+  const grantBody = await tokenResponse(401).text();
+  for (const canary of [...rejectedForms(REJECTED_CLIENT_ID), ...rejectedForms(REJECTED_CLIENT_SECRET), REJECTED_BASIC]) {
+    assert.ok(grantBody.includes(canary), `positive control: the token response carries ${canary}`);
+  }
+  for (const canary of REJECTED_CANARIES) assert.doesNotMatch(canary, /\//, `${canary} splits into short runs`);
+});
+
+test("checkZoomAccess reports failed and names ZOOM_TOKEN, never a scope or role, when every probe returns 401", async () => {
+  const { client, requests } = rejectingClient(rejectedTokenConfig());
+  const result = await checkZoomAccess(client, { now: NOW });
+  assert.equal(result.status, "failed");
+  assert.equal(result.recommendedNextStep, ZOOM_REJECTED_TOKEN_STEP);
+  assert.deepEqual(result.notes, [
+    "Using Zoom account acct-123.",
+    `0/${ZOOM_PROBE_COUNT} Zoom audit surfaces are readable; every probe returned 401.`,
+    zoomRejectedNote("access token"),
+  ]);
+  assert.equal(result.surfaces.length, ZOOM_PROBE_COUNT);
+  for (const surface of result.surfaces) {
+    assert.equal(surface.status, "not_readable", surface.name);
+    assert.ok(surface.error.startsWith(`${surface.endpoint} was not read because Zoom rejected the credentials (401): Invalid access token.`), `${surface.name}: ${surface.error}`);
+  }
+  assert.equal(requests.length, ZOOM_PROBE_COUNT);
+  assert.ok(requests.every((request) => request.startsWith("GET /v2/")), `a static token never reaches the token endpoint: ${requests.join(", ")}`);
+  assert.doesNotMatch(JSON.stringify(result), ZOOM_SCOPE_CLAIMS);
+  // Fixed text and setting names only, so the module's own scrub leaves the step and the notes whole.
+  for (const text of [result.recommendedNextStep, ...result.notes]) assert.equal(scrubErrorText(text), text);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(result), REJECTED_CANARIES, "access check result");
+});
+
+test("checkZoomAccess reports failed and names the OAuth app settings when the token request or every probe rejects them", async () => {
+  const unreachable = () => { throw new Error("no API request may be sent without an access token"); };
+  const cases = [
+    { label: "400 invalid_client", grant: () => tokenResponse(400, { error: "invalid_client" }), evidence: "the token request returned 400 invalid_client" },
+    { label: "401 invalid_client", grant: () => tokenResponse(401, { error: "invalid_client" }), evidence: "the token request returned 401 invalid_client" },
+    { label: "400 invalid_grant", grant: () => tokenResponse(400, { error: "invalid_grant" }), evidence: "the token request returned 400 invalid_grant" },
+    { label: "400 unauthorized_client in errors[]", grant: () => tokenResponse(400, { errors: [{ message: "unauthorized_client" }] }), evidence: "the token request returned 400 unauthorized_client" },
+    { label: "401 without a code", grant: () => tokenResponse(401), evidence: "the token request returned 401" },
+    {
+      label: "401 HTML page",
+      grant: () => new Response(`<html><body>${REJECTION_EXTRAS} Basic ${REJECTED_BASIC} ${REJECTED_CLIENT_SECRET}</body></html>`, { status: 401, statusText: "Unauthorized", headers: { "content-type": "text/html" } }),
+      evidence: "the token request returned 401",
+    },
+  ];
+  for (const { label, grant, evidence } of cases) {
+    const { client, requests } = rejectingClient(rejectedOauthConfig(), { grant, respond: unreachable });
+    const result = await checkZoomAccess(client, { now: NOW });
+    assert.equal(result.status, "failed", label);
+    assert.equal(result.recommendedNextStep, zoomRejectedOauthStep(evidence), label);
+    assert.deepEqual(result.notes, [
+      "Using Zoom account acct-123.",
+      `0/${ZOOM_PROBE_COUNT} Zoom audit surfaces are readable; ${evidence}.`,
+      zoomRejectedNote("OAuth app credentials"),
+    ], label);
+    assert.ok(result.surfaces.every((surface) => surface.status === "not_readable" && surface.error.includes("rejected the credentials") && surface.error.includes("POST /oauth/token")), `${label}: ${JSON.stringify(result.surfaces)}`);
+    assert.ok(requests.length > 0 && requests.every((request) => request === "POST /oauth/token"), `${label}: every probe stopped at the token request: ${requests.join(", ")}`);
+    assert.doesNotMatch(JSON.stringify(result), ZOOM_SCOPE_CLAIMS, label);
+    for (const text of [result.recommendedNextStep, ...result.notes]) assert.equal(scrubErrorText(text), text, label);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(result), REJECTED_CANARIES, `${label} access check result`);
+  }
+
+  // The token request succeeds, then the API refuses the issued token on every probe.
+  const { client, requests } = rejectingClient(rejectedOauthConfig(), {
+    grant: () => jsonResponse({ access_token: REJECTED_GRANTED_TOKEN, token_type: "bearer", expires_in: 3600 }),
+    respond: () => rejectedApiResponse([REJECTED_GRANTED_TOKEN]),
+  });
+  const result = await checkZoomAccess(client, { now: NOW });
+  assert.equal(result.status, "failed");
+  assert.equal(result.recommendedNextStep, zoomRejectedOauthStep("every probe returned 401"));
+  assert.ok(result.notes.includes(`0/${ZOOM_PROBE_COUNT} Zoom audit surfaces are readable; every probe returned 401.`), JSON.stringify(result.notes));
+  assert.ok(requests.includes("POST /oauth/token") && requests.filter((request) => request.startsWith("GET /v2/")).length === ZOOM_PROBE_COUNT, requests.join(", "));
+  assert.doesNotMatch(JSON.stringify(result), ZOOM_SCOPE_CLAIMS);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(result), REJECTED_CANARIES, "issued token access check result");
+});
+
+/** Runs fn with the Zoom credential environment cleared and fetch answered by respond, then restores both. */
+async function withRejectingFetch(respond, fn) {
+  const names = ["ZOOM_ACCOUNT_ID", "ZOOM_TOKEN", "ZOOM_ACCESS_TOKEN", "ZOOM_CLIENT_ID", "ZOOM_CLIENT_SECRET", "ZOOM_CONFIG_FILE"];
+  const saved = names.map((name) => [name, process.env[name]]);
+  const originalFetch = globalThis.fetch;
+  for (const name of names) delete process.env[name];
+  globalThis.fetch = respond;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+test("zoom_check_access renders failed with the credential settings and leaks no planted value", async () => {
+  const check = zoomTool("zoom_check_access");
+  // A config file holding only the account keeps a home or project .zoom.json from supplying credentials.
+  const configFile = join(createTempBase("grclanker-zoom-rejected-"), "zoom.json");
+  writeFileSync(configFile, JSON.stringify({ account_id: "acct-123" }));
+  const runs = [
+    {
+      label: "static token",
+      args: { token: REJECTED_TOKEN },
+      respond: async () => rejectedApiResponse([REJECTED_TOKEN]),
+      step: ZOOM_REJECTED_TOKEN_STEP,
+      note: zoomRejectedNote("access token"),
+    },
+    {
+      label: "Server-to-Server OAuth",
+      args: { client_id: REJECTED_CLIENT_ID, client_secret: REJECTED_CLIENT_SECRET },
+      respond: async () => tokenResponse(400, { error: "invalid_client" }),
+      step: zoomRejectedOauthStep("the token request returned 400 invalid_client"),
+      note: zoomRejectedNote("OAuth app credentials"),
+    },
+  ];
+  for (const { label, args, respond, step, note } of runs) {
+    const result = await withRejectingFetch(respond, () => runZoomTool(check, { ...args, config_file: configFile }));
+    const text = result.content[0].text;
+    assert.notEqual(result.isError, true, `${label}: ${text}`);
+    assert.equal(result.details.status, "failed", label);
+    assert.equal(result.details.recommendedNextStep, step, label);
+    assert.match(text, /^Zoom access check: failed\n/, label);
+    assert.ok(text.includes(`\n${note}\n`), `${label}: ${text}`);
+    assert.ok(text.endsWith(`\nNext: ${step}`), `${label}: ${text}`);
+    assert.doesNotMatch(text, ZOOM_SCOPE_CLAIMS, label);
+    assert.doesNotMatch(JSON.stringify(result.details), ZOOM_SCOPE_CLAIMS, label);
+    assertCanaryWindowsAbsent(assert, `${text}\n${JSON.stringify(result)}`, REJECTED_CANARIES, `${label} rendered access check`);
+  }
+});
+
+test("exportZoomAuditBundle records the failed access check from the collected snapshot and leaks no planted value", async () => {
+  const config = rejectedTokenConfig();
+  const { client } = rejectingClient(config);
+  const exported = await exportZoomAuditBundle(client, config, createTempBase("grclanker-zoom-rejected-export-"), { now: NOW });
+  const access = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "access.json"), "utf8"));
+  assert.equal(access.status, "failed");
+  assert.equal(access.recommendedNextStep, ZOOM_REJECTED_TOKEN_STEP);
+  assert.ok(access.notes.includes(zoomRejectedNote("access token")), JSON.stringify(access.notes));
+  const summary = readFileSync(join(exported.outputDir, "summary.md"), "utf8");
+  assert.match(summary, /^Zoom access check: failed$/m);
+  assert.ok(summary.includes(`Next: ${ZOOM_REJECTED_TOKEN_STEP}`), summary);
+  const files = walkFiles(exported.outputDir).map((file) => [file, readFileSync(file, "utf8")]);
+  const entries = readZipEntries(readFileSync(exported.zipPath)).map((entry) => [`zip ${entry.name}`, entry.content]);
+  assertCanaryWindowsAbsent(assert, [...files, ...entries], REJECTED_CANARIES, "rejected-credential bundle");
+});
+
+test("checkZoomAccess keeps the limited status and scope wording when a probe reads or a failure is not a credential rejection", async () => {
+  // GET /users/me reads, so the token authenticated and the other 401s stay scope gaps.
+  const meReads = rejectingClient(rejectedTokenConfig(), {
+    respond: (url) => (url.pathname === "/v2/users/me" ? jsonResponse({ id: "user-1", email: "auditor@example.com" }) : rejectedApiResponse([REJECTED_TOKEN])),
+  });
+  const partly = await checkZoomAccess(meReads.client, { now: NOW });
+  assert.equal(partly.status, "limited");
+  assert.equal(partly.recommendedNextStep, ZOOM_SCOPE_STEP);
+  assert.deepEqual(partly.notes, ["Using Zoom account acct-123.", "Authenticated as auditor@example.com.", `1/${ZOOM_PROBE_COUNT} Zoom audit surfaces are readable.`]);
+  assert.ok(partly.surfaces.filter((surface) => surface.status === "not_readable").every((surface) => /was denied \(401; check the app scopes and admin role\)/.test(surface.error)), JSON.stringify(partly.surfaces));
+
+  const forbidden = () => jsonResponse({ code: 124, message: "Invalid access token, does not contain scopes:[account:read:admin]" }, { status: 403, statusText: "Forbidden" });
+  const deniedNote = "Could not read /users/me; Zoom credentials may be invalid or missing required authorization.";
+  const runs = [
+    // Every probe refused with 403: the token authenticated, so the scope analysis stands.
+    { label: "every probe refused with 403", config: rejectedTokenConfig(), respond: forbidden },
+    // A 403 beside the 401s means not every probe was rejected.
+    { label: "401s with one 403", config: rejectedTokenConfig(), respond: (url) => (url.pathname === "/v2/roles" ? forbidden() : rejectedApiResponse([REJECTED_TOKEN])) },
+    // The token endpoint rejects the credentials only with a 401 or an RFC 6749 rejection code; other failures keep the old wording.
+    { label: "token request 400 invalid_request", config: rejectedOauthConfig(), grant: () => tokenResponse(400, { error: "invalid_request" }) },
+    { label: "token request 400 invalid_scope", config: rejectedOauthConfig(), grant: () => tokenResponse(400, { error: "invalid_scope" }) },
+    { label: "token request 403", config: rejectedOauthConfig(), grant: () => tokenResponse(403) },
+    { label: "token request 500", config: rejectedOauthConfig(), grant: () => tokenResponse(500, { error: "server_error" }) },
+  ];
+  for (const { label, config, respond, grant } of runs) {
+    const { client } = rejectingClient(config, { ...(respond ? { respond } : {}), ...(grant ? { grant } : {}) });
+    const result = await checkZoomAccess(client, { now: NOW });
+    assert.equal(result.status, "limited", label);
+    assert.equal(result.recommendedNextStep, ZOOM_SCOPE_STEP, label);
+    assert.deepEqual(result.notes, ["Using Zoom account acct-123.", deniedNote, `0/${ZOOM_PROBE_COUNT} Zoom audit surfaces are readable.`], label);
+    assert.ok(!result.surfaces.some((surface) => /rejected the credentials/.test(surface.error ?? "")), `${label}: ${JSON.stringify(result.surfaces)}`);
+  }
 });
 
 test("exportZoomAuditBundle writes the shared layout, one report per framework, and never overwrites a prior bundle", async () => {

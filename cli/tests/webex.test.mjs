@@ -1046,6 +1046,220 @@ test("checkWebexAccess renders admin surfaces manual for a bot token", async () 
   assert.match(result.recommendedNextStep, /meeting:admin_config_read/);
 });
 
+const WEBEX_SCOPE_STEP = "Provide an admin, integration, or Service App token with spark-admin:people_read, spark-admin:roles_read, spark-admin:licenses_read, spark-admin:organizations_read, spark-admin:devices_read, spark-admin:hybrid_clusters_read, spark-compliance:events_read, spark-compliance:recordings_read, audit:events_read, meeting:admin_config_read, and guest-issuer:read.";
+const WEBEX_REJECTED_TOKEN_STEP = "Webex rejected the access token (every probe returned 401). Set WEBEX_TOKEN (or the token argument, or token in ~/.config/webex-sec-inspector/config.json) to a valid, unexpired access token, then rerun webex_check_access.";
+const webexRejectedRefreshStep = (evidence) => `Webex rejected the OAuth refresh credentials (${evidence}). Set WEBEX_CLIENT_ID, WEBEX_CLIENT_SECRET, and WEBEX_REFRESH_TOKEN (or the client_id, client_secret, and refresh_token arguments, or the same keys in ~/.config/webex-sec-inspector/config.json) to the client ID and secret of the integration or Service App and a current refresh token, then rerun webex_check_access.`;
+const webexRejectedNote = (credential) => `Scopes and roles were not checked because Webex rejected the ${credential}; the rejected probes do not mean a scope or role is missing.`;
+// The wording that blames a scope, a role, or the token type. A rejected credential says nothing about any of them.
+const WEBEX_SCOPE_CLAIMS = /Provide an admin|spark-admin:|spark-compliance:|audit:events_read|meeting:admin_config_read|guest-issuer:read|lacks the scope|Bot tokens/;
+// Every probe the access check sends when the organization ID is configured and the token type is unknown.
+const WEBEX_PROBE_COUNT = 20;
+
+// Planted credentials: random alphanumerics, so no 8-character window of one occurs in fixed text or in another canary.
+const REJECTED_TOKEN = "Qm7vTz2KpX9wLr4N";
+const REJECTED_CLIENT_SECRET = "Hc5dYs8JfB3nUe6G";
+const REJECTED_REFRESH_TOKEN = "Vk2gRa9WqM4tZp7C";
+const REJECTED_BEARER = "Lx8sNh3DyF6jQw1E";
+const REJECTED_SESSION = "Tb4uKe7ZmP2vGc9R";
+const REJECTED_API_KEY = "Jn6wXq1HsA8fYd3M";
+const REJECTED_URL_TOKEN = "Pr9cVt5BkE2hNz7L";
+const rejectedForms = (value) => [value, Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")];
+const REJECTED_CANARIES = [
+  ...[REJECTED_TOKEN, REJECTED_CLIENT_SECRET, REJECTED_REFRESH_TOKEN].flatMap(rejectedForms),
+  REJECTED_BEARER,
+  REJECTED_SESSION,
+  REJECTED_API_KEY,
+  REJECTED_URL_TOKEN,
+];
+const REJECTION_EXTRAS = `Bearer ${REJECTED_BEARER} refused; session=${REJECTED_SESSION}, api_key=${REJECTED_API_KEY}; sign in at https://idbroker.webex.com/idb/oauth2/v1/authorize?token=${REJECTED_URL_TOKEN}`;
+
+function assertNoWindowOf(text, secret, label) {
+  for (let start = 0; start + 8 <= secret.length; start += 1) {
+    const window = secret.slice(start, start + 8);
+    assert.ok(!text.includes(window), `${label} carries ${JSON.stringify(window)} of a planted value`);
+  }
+}
+
+/** A 401 whose documented message fields echo the credentials the request carried beside a bearer token, a session pair, an API key pair, and a tokenised URL. */
+function rejectedApiResponse(sent) {
+  return jsonResponse({
+    message: `The request requires a valid access token set in the Authorization request header. ${sent.flatMap(rejectedForms).join(" ")}`,
+    errors: [{ description: REJECTION_EXTRAS }],
+    trackingId: "ROUTER_REJECTED",
+  }, { status: 401, statusText: "Unauthorized" });
+}
+
+/** A failed refresh grant whose description echoes the client secret and refresh token the request carried. */
+function grantResponse(status, fields = {}) {
+  return jsonResponse({
+    error_description: `${[REJECTED_CLIENT_SECRET, REJECTED_REFRESH_TOKEN].flatMap(rejectedForms).join(" ")} ${REJECTION_EXTRAS}`,
+    ...fields,
+  }, { status, statusText: status === 401 ? "Unauthorized" : status === 400 ? "Bad Request" : "Internal Server Error" });
+}
+
+const rejectedTokenConfig = () => sampleConfig({ token: REJECTED_TOKEN });
+const rejectedRefreshConfig = () => sampleConfig({
+  token: undefined,
+  refresh: { clientId: "cid-rejected", clientSecret: REJECTED_CLIENT_SECRET, refreshToken: REJECTED_REFRESH_TOKEN },
+});
+
+/** The real client, with each API request answered by respond and each token request by grant. */
+function rejectingClient(config, { respond = () => rejectedApiResponse([REJECTED_TOKEN]), grant = () => grantResponse(400, { error: "invalid_grant" }) } = {}) {
+  const requests = [];
+  const client = new WebexApiClient(config, {
+    fetchImpl: async (input, init = {}) => {
+      const url = new URL(String(input));
+      requests.push(`${init.method ?? "GET"} ${url.pathname}`);
+      return url.pathname.endsWith("/access_token") ? grant() : respond(url);
+    },
+  });
+  return { client, requests };
+}
+
+test("checkWebexAccess reports failed and names WEBEX_TOKEN, never a scope or role, when every probe returns 401", async () => {
+  const rawBody = await rejectedApiResponse([REJECTED_TOKEN]).text();
+  for (const canary of [...rejectedForms(REJECTED_TOKEN), REJECTED_BEARER, REJECTED_SESSION, REJECTED_API_KEY, REJECTED_URL_TOKEN]) {
+    assert.ok(rawBody.includes(canary), `positive control: the 401 body carries ${canary}`);
+  }
+  const { client, requests } = rejectingClient(rejectedTokenConfig());
+  const result = await checkWebexAccess(client);
+  assert.equal(result.status, "failed");
+  assert.equal(result.recommendedNextStep, WEBEX_REJECTED_TOKEN_STEP);
+  assert.deepEqual(result.notes, [
+    `0/${WEBEX_PROBE_COUNT} probed Webex audit surfaces are readable; every probe returned 401.`,
+    webexRejectedNote("access token"),
+  ]);
+  assert.equal(result.tokenType, "unknown");
+  assert.equal(result.adminCapable, false);
+  assert.equal(result.surfaces.length, WEBEX_PROBE_COUNT);
+  for (const surface of result.surfaces) {
+    assert.equal(surface.status, "not_readable", surface.name);
+    assert.match(surface.error, /\(401 Unauthorized\)/, surface.name);
+  }
+  assert.equal(requests.length, WEBEX_PROBE_COUNT);
+  assert.ok(requests.every((request) => request.startsWith("GET ")), `a static token never reaches the token endpoint: ${requests.join(", ")}`);
+  for (const text of [...result.notes, result.recommendedNextStep]) assert.doesNotMatch(text, WEBEX_SCOPE_CLAIMS, text);
+  // Fixed text and setting names only, so the module's own scrub leaves the step whole.
+  assert.equal(scrubErrorText(result.recommendedNextStep), result.recommendedNextStep);
+  for (const canary of REJECTED_CANARIES) assertNoWindowOf(JSON.stringify(result), canary, "access check result");
+});
+
+test("checkWebexAccess reports failed and names the refresh credential settings when the token request rejects them", async () => {
+  const cases = [
+    { label: "400 invalid_grant", grant: () => grantResponse(400, { error: "invalid_grant" }), evidence: "the token request returned 400 invalid_grant" },
+    {
+      label: "400 invalid_client carried in the gateway message",
+      grant: () => jsonResponse({
+        message: "invalid_client",
+        errors: [{ description: `${rejectedForms(REJECTED_CLIENT_SECRET).join(" ")} ${REJECTION_EXTRAS}` }],
+        trackingId: "ROUTER_GRANT",
+      }, { status: 400, statusText: "Bad Request" }),
+      evidence: "the token request returned 400 invalid_client",
+    },
+    { label: "401 unauthorized_client", grant: () => grantResponse(401, { error: "unauthorized_client" }), evidence: "the token request returned 401 unauthorized_client" },
+    { label: "401 without a code", grant: () => grantResponse(401), evidence: "the token request returned 401" },
+  ];
+  for (const { label, grant, evidence } of cases) {
+    const { client, requests } = rejectingClient(rejectedRefreshConfig(), {
+      grant,
+      respond: () => { throw new Error("no API request may be sent without an access token"); },
+    });
+    const result = await checkWebexAccess(client);
+    assert.equal(result.status, "failed", label);
+    assert.equal(result.recommendedNextStep, webexRejectedRefreshStep(evidence), label);
+    assert.deepEqual(result.notes, [
+      `0/${WEBEX_PROBE_COUNT} probed Webex audit surfaces are readable; ${evidence}.`,
+      webexRejectedNote("OAuth refresh credentials"),
+    ], label);
+    assert.equal(requests.length, WEBEX_PROBE_COUNT, label);
+    assert.ok(requests.every((request) => request === "POST /v1/access_token"), `${label}: every probe stopped at the token request: ${requests.join(", ")}`);
+    for (const text of [...result.notes, result.recommendedNextStep]) assert.doesNotMatch(text, WEBEX_SCOPE_CLAIMS, `${label}: ${text}`);
+    assert.equal(scrubErrorText(result.recommendedNextStep), result.recommendedNextStep, label);
+    for (const canary of REJECTED_CANARIES) assertNoWindowOf(JSON.stringify(result), canary, `${label} access check result`);
+  }
+});
+
+test("webex_check_access renders failed with the credential settings and leaks no planted value", async () => {
+  const configFile = join(createTempBase("grclanker-webex-rejected-"), "config.json");
+  writeFileSync(configFile, JSON.stringify({ org_id: "org-123" }));
+  const runs = [
+    {
+      label: "static token",
+      args: { token: REJECTED_TOKEN },
+      respond: async () => rejectedApiResponse([REJECTED_TOKEN]),
+      step: WEBEX_REJECTED_TOKEN_STEP,
+      note: webexRejectedNote("access token"),
+    },
+    {
+      label: "refresh grant",
+      args: { client_id: "cid-rejected", client_secret: REJECTED_CLIENT_SECRET, refresh_token: REJECTED_REFRESH_TOKEN },
+      respond: async () => grantResponse(400, { error: "invalid_grant" }),
+      step: webexRejectedRefreshStep("the token request returned 400 invalid_grant"),
+      note: webexRejectedNote("OAuth refresh credentials"),
+    },
+  ];
+  for (const { label, args, respond, step, note } of runs) {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = respond;
+    let result;
+    try {
+      result = await checkAccessThroughTool({ ...args, config_file: configFile });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    const text = result.content[0].text;
+    assert.notEqual(result.isError, true, `${label}: ${text}`);
+    assert.equal(result.details.status, "failed", label);
+    assert.match(text, /^Webex access check: failed$/m, label);
+    assert.ok(text.includes(`\nNext: ${step}`), `${label}: ${text}`);
+    assert.ok(text.includes(note), `${label}: ${text}`);
+    assert.doesNotMatch(text, WEBEX_SCOPE_CLAIMS, label);
+    assert.doesNotMatch(JSON.stringify(result.details), WEBEX_SCOPE_CLAIMS, label);
+    for (const canary of REJECTED_CANARIES) assertNoWindowOf(`${text}\n${JSON.stringify(result.details)}`, canary, `${label} rendered access check`);
+  }
+});
+
+test("checkWebexAccess keeps the limited status and scope wording when a probe reads or a failure is not a credential rejection", async () => {
+  // GET /people/me reads, so the token authenticated and the other 401s stay scope gaps.
+  const meReads = rejectingClient(rejectedTokenConfig(), {
+    respond: (url) => (url.pathname === "/v1/people/me" ? jsonResponse({ id: "me-1", displayName: "Auditor", type: "person" }) : rejectedApiResponse([REJECTED_TOKEN])),
+  });
+  const partly = await checkWebexAccess(meReads.client);
+  assert.equal(partly.status, "limited");
+  assert.equal(partly.recommendedNextStep, WEBEX_SCOPE_STEP);
+  assert.equal(partly.notes[0], "Authenticated as Auditor (token type: person).");
+  assert.ok(partly.notes.includes(`1/${WEBEX_PROBE_COUNT} Webex audit surfaces are readable.`), JSON.stringify(partly.notes));
+
+  // Every probe refused with 403: the token authenticated, so the scope analysis stands.
+  const refused = await checkWebexAccess(forbiddenClient());
+  assert.equal(refused.status, "limited");
+  assert.equal(refused.recommendedNextStep, WEBEX_SCOPE_STEP);
+  assert.ok(refused.surfaces.every((surface) => surface.status === "not_readable"), JSON.stringify(refused.surfaces));
+  assert.ok(refused.notes.includes(`0/${WEBEX_PROBE_COUNT} Webex audit surfaces are readable.`), JSON.stringify(refused.notes));
+
+  // A 403 beside the 401s means not every probe was rejected.
+  const mixed = rejectingClient(rejectedTokenConfig(), {
+    respond: (url) => (url.pathname === "/v1/roles" ? jsonResponse({ message: "Forbidden" }, { status: 403, statusText: "Forbidden" }) : rejectedApiResponse([REJECTED_TOKEN])),
+  });
+  const mixedResult = await checkWebexAccess(mixed.client);
+  assert.equal(mixedResult.status, "limited");
+  assert.equal(mixedResult.recommendedNextStep, WEBEX_SCOPE_STEP);
+
+  // The token endpoint rejects the credentials only with a 401 or an RFC 6749 rejection code; other failures keep the old wording.
+  const otherGrantFailures = [
+    ["400 invalid_scope", () => grantResponse(400, { error: "invalid_scope" })],
+    ["400 invalid_request", () => grantResponse(400, { error: "invalid_request" })],
+    ["500", () => grantResponse(500, { error: "server_error" })],
+  ];
+  for (const [label, grant] of otherGrantFailures) {
+    const { client } = rejectingClient(rejectedRefreshConfig(), { grant });
+    const result = await checkWebexAccess(client);
+    assert.equal(result.status, "limited", label);
+    assert.equal(result.recommendedNextStep, WEBEX_SCOPE_STEP, label);
+    assert.ok(result.notes.includes(`0/${WEBEX_PROBE_COUNT} Webex audit surfaces are readable.`), `${label}: ${JSON.stringify(result.notes)}`);
+  }
+});
+
 test("fixture (a): every endpoint 403 yields manual verdicts naming the cause, never pass", async () => {
   const findings = findingsOf(await allAssessments(forbiddenClient()));
   assert.equal(findings.length, FINDING_COUNT);

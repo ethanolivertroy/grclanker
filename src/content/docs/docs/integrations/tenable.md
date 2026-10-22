@@ -101,7 +101,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 |------|---------|
-| `tenable_check_access` | Probes every read surface the assessments depend on (scans, templates, export job lists, scanners, agents, networks, exclusions, credentials, users, groups, roles, permissions, audit log, tags, target groups, and Security Center current user, scans, scanners, users), reports whether the key holds the Administrator role, and names the role each refused surface needs. |
+| `tenable_check_access` | Probes every read surface the assessments depend on (scans, templates, export job lists, scanners, agents, networks, exclusions, credentials, users, groups, roles, permissions, audit log, tags, target groups, and Security Center current user, scans, scanners, users), reports whether the key holds the Administrator role, and names the role each refused surface needs. Reports `failed` when every configured surface returns 401 because Tenable rejected the API keys: the surfaces are marked `unauthorized`, no role is named, and the next step names the key and URL settings to fix. Otherwise it reports `healthy` or `limited`. |
 | `tenable_assess_scan_program` | Spec controls 1, 2, 4, 13, 17, 20 plus the Security Center schedule equivalent. |
 | `tenable_assess_sensor_coverage` | Spec controls 3, 5, 6, 7, 8, 9, 16 plus the Security Center scanner equivalent. |
 | `tenable_assess_access_control` | Spec controls 10, 11, 12, 18 plus the Security Center user equivalent. |

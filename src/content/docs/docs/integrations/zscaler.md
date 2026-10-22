@@ -75,7 +75,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 | --- | --- |
-| `zscaler_check_access` | Probes ten ZIA and seven ZPA read surfaces and reports healthy, limited, or unavailable plus which products are configured |
+| `zscaler_check_access` | Probes ten ZIA and seven ZPA read surfaces and reports healthy, limited, failed, or unavailable plus which products are configured. `failed` means Zscaler rejected the credentials on every probe. A probe counts as rejected when the ZIA login returned 401, or a client error with `AUTHENTICATION_FAILED`, `INVALID_USERNAME_OR_PASSWORD`, or `INVALID_API_KEY`; when the ZPA sign-in returned 401, or 400 with `invalid_client`, `invalid_grant`, or `unauthorized_client`; or when the API returned 401. No role is named, and the next step names the ZIA or ZPA settings to fix |
 | `zscaler_assess_zia_access_control` | Controls 6, 7, 14 (admin MFA evidence, RBAC, audit log export) |
 | `zscaler_assess_zia_policy` | Controls 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 25 |
 | `zscaler_assess_zpa` | Controls 8, 9, 10, 11, 12, 13, 15, 21, 22, 23, 24 |

@@ -85,7 +85,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 |------|---------|
-| `zendesk_check_access` | Probes 20 read surfaces (current user, account settings, security settings, team members, custom roles, groups, group memberships, audit logs, OAuth clients and tokens, app installations, owned apps, brands, webhooks, targets, triggers, automations, sharing agreements, deletion schedules, suspended tickets) and reports which admin-only or Enterprise-only surfaces the credential cannot read. |
+| `zendesk_check_access` | Probes 20 read surfaces (current user, account settings, security settings, team members, custom roles, groups, group memberships, audit logs, OAuth clients and tokens, app installations, owned apps, brands, webhooks, targets, triggers, automations, sharing agreements, deletion schedules, suspended tickets) and reports which admin-only or Enterprise-only surfaces the credential cannot read. Reports `failed` when every probe returns 401 because Zendesk rejected the credentials: the surfaces are marked `unauthorized`, `missingPermissions` is empty, and the next step names the credential and subdomain settings to fix. Otherwise it reports `healthy` or `limited`. |
 | `zendesk_assess_authentication` | Controls 1-5 and 21. |
 | `zendesk_assess_access_control` | Controls 6-8, 13, and 14. |
 | `zendesk_assess_data_protection` | Controls 9-12 and 18-20. |

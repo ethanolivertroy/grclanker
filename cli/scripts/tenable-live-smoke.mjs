@@ -36,6 +36,7 @@ try {
   for (const surface of access.surfaces) {
     log(`- ${surface.name}: ${surface.status}${surface.count !== undefined ? ` (${surface.count})` : ""}${surface.error ? ` ${surface.error}` : ""}`);
   }
+  if (access.status === "failed") throw new Error(`Live Tenable smoke test stopped: ${access.recommendedNextStep}`);
 
   const assessment = assessTenableScanProgram(await collectTenableScanProgramData(clients));
   log("");

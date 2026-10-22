@@ -721,7 +721,7 @@ Conditional paths:
 
 #### WebexAccessCheckResult
 
-- `status:healthy|limited`
+- `status:healthy|limited|failed`
 - `orgId?:string`
 - `tokenType:person|bot|appuser|unknown`
 - `adminCapable:boolean`

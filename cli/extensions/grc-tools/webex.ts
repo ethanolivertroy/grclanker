@@ -114,7 +114,7 @@ export interface WebexAccessSurface {
 }
 
 export interface WebexAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   orgId?: string;
   tokenType: WebexTokenType;
   adminCapable: boolean;
@@ -170,9 +170,30 @@ export class WebexApiError extends Error {
   }
 }
 
+/** How a failed request rejected the credentials themselves, as opposed to a scope or a role. */
+type CredentialRejection =
+  | { source: "api" }
+  | { source: "token_request"; status: number; code?: string };
+
+/**
+ * OAuth error codes with which the token endpoint refuses the client or the refresh token itself (RFC 6749 section 5.2),
+ * matched across every documented error field because the API gateway can carry the code in message or errors[].description.
+ */
+const REJECTED_GRANT_CODE = /\b(invalid_client|invalid_grant|unauthorized_client)\b/;
+
+/** A failed refresh grant; `rejection` is set only when the token endpoint refused the client or the refresh token. */
+export class WebexTokenRefreshError extends WebexApiError {
+  readonly rejection?: CredentialRejection;
+
+  constructor(message: string, status: number, rejection?: CredentialRejection) {
+    super(message, status, WEBEX_ENDPOINTS.tokenRefresh);
+    this.rejection = rejection;
+  }
+}
+
 type SurfaceResult<T> =
   | { ok: true; data: T; truncated: boolean }
-  | { ok: false; error: string; status?: number };
+  | { ok: false; error: string; status?: number; rejection?: CredentialRejection };
 
 type CheckAccessArgs = {
   token?: string;
@@ -725,7 +746,11 @@ export class WebexApiClient {
     const payload = parseJsonObject(rawText);
     if (!response.ok) {
       const detail = describeErrorBody(payload, rawText, response.headers.get("content-type"));
-      throw new WebexApiError(`Webex token refresh failed (${response.status})${detail ? `: ${detail}` : ""}`, response.status, WEBEX_ENDPOINTS.tokenRefresh);
+      const code = REJECTED_GRANT_CODE.exec(webexErrorSummary(payload) ?? "")?.[1];
+      const rejection: CredentialRejection | undefined = response.status === 401 || (response.status === 400 && code)
+        ? { source: "token_request", status: response.status, ...(code ? { code } : {}) }
+        : undefined;
+      throw new WebexTokenRefreshError(`Webex token refresh failed (${response.status})${detail ? `: ${detail}` : ""}`, response.status, rejection);
     }
     if (payload === undefined) {
       throw new WebexApiError(
@@ -1001,13 +1026,24 @@ function errorMessage(error: unknown): string {
   return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
+/** A refused refresh grant or a 401 from the API rejects the credentials; a 403 and every other failure do not. */
+function credentialRejection(error: unknown): CredentialRejection | undefined {
+  if (error instanceof WebexTokenRefreshError) return error.rejection;
+  return errorStatus(error) === 401 ? { source: "api" } : undefined;
+}
+
+function failedSurface(error: unknown): { ok: false; error: string; status?: number; rejection?: CredentialRejection } {
+  const rejection = credentialRejection(error);
+  return { ok: false, error: errorMessage(error), status: errorStatus(error), ...(rejection ? { rejection } : {}) };
+}
+
 async function collectPage(load: () => Promise<WebexPage>): Promise<SurfaceResult<JsonRecord[]>> {
   try {
     const page = await load();
     return { ok: true, data: page.items, truncated: page.truncated };
   } catch (error) {
     rethrowIfAborted(error);
-    return { ok: false, error: errorMessage(error), status: errorStatus(error) };
+    return failedSurface(error);
   }
 }
 
@@ -1016,7 +1052,7 @@ async function collectObject(load: () => Promise<JsonRecord>): Promise<SurfaceRe
     return { ok: true, data: await load(), truncated: false };
   } catch (error) {
     rethrowIfAborted(error);
-    return { ok: false, error: errorMessage(error), status: errorStatus(error) };
+    return failedSurface(error);
   }
 }
 
@@ -1417,15 +1453,18 @@ export async function checkWebexAccess(client: WebexClientLike): Promise<WebexAc
   const orgs = await collectPage(() => client.listOrganizations());
   const { orgId, note } = deriveOrgContext(config, orgs);
   const tokenType = detectTokenType(me.ok ? me.data : undefined);
+  const attempts: Array<SurfaceResult<unknown>> = [me, orgs];
 
   const pageSurface = async (name: string, endpoint: string, doc: string, load: () => Promise<WebexPage>): Promise<WebexAccessSurface> => {
     const result = await collectPage(load);
+    attempts.push(result);
     return result.ok
       ? { name, endpoint, doc, status: "readable", count: result.data.length, truncated: result.truncated }
       : { name, endpoint, doc, status: "not_readable", error: result.error };
   };
   const objectSurface = async (name: string, endpoint: string, doc: string, load: () => Promise<JsonRecord>): Promise<WebexAccessSurface> => {
     const result = await collectObject(load);
+    attempts.push(result);
     return result.ok
       ? { name, endpoint, doc, status: "readable", count: 1 }
       : { name, endpoint, doc, status: "not_readable", error: result.error };
@@ -1482,6 +1521,7 @@ export async function checkWebexAccess(client: WebexClientLike): Promise<WebexAc
   }
   surfaces.push(await objectSurface("meeting_preferences", "/meetingPreferences", WEBEX_DOCS.meetingPreferences, () => client.getMeetingPreferences()));
   const sites = await collectPage(() => client.listMeetingSites());
+  attempts.push(sites);
   surfaces.push(sites.ok
     ? { name: "meeting_sites", endpoint: "/meetingPreferences/sites", doc: WEBEX_DOCS.meetingSites, status: "readable", count: sites.data.length, truncated: sites.truncated }
     : { name: "meeting_sites", endpoint: "/meetingPreferences/sites", doc: WEBEX_DOCS.meetingSites, status: "not_readable", error: sites.error });
@@ -1496,6 +1536,24 @@ export async function checkWebexAccess(client: WebexClientLike): Promise<WebexAc
     } else {
       surfaces.push(await objectSurface(name, endpoint, doc, load));
     }
+  }
+
+  // Every probe rejected the credentials themselves, so nothing was learned about scopes or roles.
+  const rejections = attempts.flatMap((result) => (!result.ok && result.rejection ? [result.rejection] : []));
+  const mode: WebexCredentialMode = config.token ? "token" : "refresh";
+  if (rejections.length === attempts.length) {
+    return {
+      status: "failed",
+      orgId,
+      tokenType,
+      adminCapable: false,
+      surfaces,
+      notes: [
+        `0/${attempts.length} probed Webex audit surfaces are readable; ${rejectionEvidence(rejections)}.`,
+        `Scopes and roles were not checked because Webex rejected the ${credentialKind(mode)}; the rejected probes do not mean a scope or role is missing.`,
+      ],
+      recommendedNextStep: accessCheckNextStep("failed", mode, rejections),
+    };
   }
 
   const readable = surfaces.filter((item) => item.status === "readable");
@@ -1518,11 +1576,60 @@ export async function checkWebexAccess(client: WebexClientLike): Promise<WebexAc
       ...(tokenType === "bot" ? ["Bot tokens cannot read admin surfaces; admin-only controls will render as manual."] : []),
       ...(config.refresh ? ["Access token obtained through the refresh_token grant; tokens are redacted from all output."] : []),
     ],
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run webex_assess_identity, webex_assess_collaboration_governance, webex_assess_meeting_hybrid_security, or webex_export_audit_bundle."
-        : `Provide an admin, integration, or Service App token with ${WEBEX_SCOPES.peopleRead}, ${WEBEX_SCOPES.rolesRead}, ${WEBEX_SCOPES.licensesRead}, ${WEBEX_SCOPES.organizationsRead}, ${WEBEX_SCOPES.devicesRead}, ${WEBEX_SCOPES.hybridRead}, ${WEBEX_SCOPES.eventsRead}, ${WEBEX_SCOPES.adminRecordingsRead}, ${WEBEX_SCOPES.adminAuditRead}, ${WEBEX_SCOPES.meetingAdminConfigRead}, and ${WEBEX_SCOPES.guestIssuerRead}.`,
+    recommendedNextStep: accessCheckNextStep(status, mode, rejections),
   };
+}
+
+/** A static token is used whenever one is configured; the refresh trio only when it is not. */
+type WebexCredentialMode = "token" | "refresh";
+
+function credentialKind(mode: WebexCredentialMode): string {
+  switch (mode) {
+    case "token":
+      return "access token";
+    case "refresh":
+      return "OAuth refresh credentials";
+    default: {
+      const exhaustive: never = mode;
+      throw new Error(`Unhandled Webex credential mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** A refused refresh grant stops every probe at the token request, so its status and OAuth code are the evidence. */
+function rejectionEvidence(rejections: CredentialRejection[]): string {
+  const tokenRequest = rejections.find((rejection): rejection is Extract<CredentialRejection, { source: "token_request" }> => rejection.source === "token_request");
+  return tokenRequest
+    ? `the token request returned ${tokenRequest.status}${tokenRequest.code ? ` ${tokenRequest.code}` : ""}`
+    : "every probe returned 401";
+}
+
+function rejectedCredentialsStep(mode: WebexCredentialMode, evidence: string): string {
+  switch (mode) {
+    case "token":
+      return `Webex rejected the access token (${evidence}). Set ${WEBEX_ENV.token} (or the token argument, or token in ~/.config/webex-sec-inspector/config.json) to a valid, unexpired access token, then rerun webex_check_access.`;
+    case "refresh":
+      return `Webex rejected the OAuth refresh credentials (${evidence}). Set ${WEBEX_ENV.clientId}, ${WEBEX_ENV.clientSecret}, and ${WEBEX_ENV.refreshToken} (or the client_id, client_secret, and refresh_token arguments, or the same keys in ~/.config/webex-sec-inspector/config.json) to the client ID and secret of the integration or Service App and a current refresh token, then rerun webex_check_access.`;
+    default: {
+      const exhaustive: never = mode;
+      throw new Error(`Unhandled Webex credential mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: WebexAccessCheckResult["status"], mode: WebexCredentialMode, rejections: CredentialRejection[]): string {
+  switch (status) {
+    case "healthy":
+      return "Run webex_assess_identity, webex_assess_collaboration_governance, webex_assess_meeting_hybrid_security, or webex_export_audit_bundle.";
+    case "limited":
+      return `Provide an admin, integration, or Service App token with ${WEBEX_SCOPES.peopleRead}, ${WEBEX_SCOPES.rolesRead}, ${WEBEX_SCOPES.licensesRead}, ${WEBEX_SCOPES.organizationsRead}, ${WEBEX_SCOPES.devicesRead}, ${WEBEX_SCOPES.hybridRead}, ${WEBEX_SCOPES.eventsRead}, ${WEBEX_SCOPES.adminRecordingsRead}, ${WEBEX_SCOPES.adminAuditRead}, ${WEBEX_SCOPES.meetingAdminConfigRead}, and ${WEBEX_SCOPES.guestIssuerRead}.`;
+    case "failed":
+      return rejectedCredentialsStep(mode, rejectionEvidence(rejections));
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Webex access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 export async function assessWebexIdentity(
