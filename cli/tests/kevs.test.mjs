@@ -328,7 +328,7 @@ function cutoffDay(days) {
   return cutoff.toISOString().split("T")[0];
 }
 
-async function runCatalogTool(name, args, vulnerabilities) {
+async function runCatalogToolResult(name, args, vulnerabilities) {
   const catalog = {
     title: "KEV",
     catalogVersion: "1",
@@ -341,10 +341,12 @@ async function runCatalogTool(name, args, vulnerabilities) {
   const tool = tools.get(name);
   clearGrcSharedCachesForTests();
   const originalFetch = globalThis.fetch;
+  const epssRequests = [];
   globalThis.fetch = async (url) => {
     const href = String(url);
     if (href === KEV_URL) return new Response(JSON.stringify(catalog));
     const cves = new URL(href).searchParams.get("cve")?.split(",") ?? [];
+    epssRequests.push(cves);
     return new Response(JSON.stringify({
       status: "OK",
       total: cves.length,
@@ -353,11 +355,15 @@ async function runCatalogTool(name, args, vulnerabilities) {
   };
   try {
     const result = await tool.execute("call-1", tool.prepareArguments(args));
-    return result.content[0].text;
+    return { result, text: result.content[0].text, epssRequests };
   } finally {
     globalThis.fetch = originalFetch;
     clearGrcSharedCachesForTests();
   }
+}
+
+async function runCatalogTool(name, args, vulnerabilities) {
+  return (await runCatalogToolResult(name, args, vulnerabilities)).text;
 }
 
 test("kevs_recent and kevs_check_ransomware treat a non-positive limit as the default instead of an empty or tail-trimmed result", async () => {
@@ -368,7 +374,7 @@ test("kevs_recent and kevs_check_ransomware treat a non-positive limit as the de
   for (const limit of [0, -1, 0.5, "0", "-1"]) {
     const recentText = await runCatalogTool("kevs_recent", { days: 30, limit }, recent);
     const label = `recent limit ${JSON.stringify(limit)}`;
-    assert.ok(recentText.startsWith("10 KEV entries added in the last 30 days:"), label);
+    assert.ok(recentText.startsWith("Showing 10 of 12 KEV entries added in the last 30 days:"), label);
     assert.equal(recentText.includes("CVE-2024-0010"), true, label);
     assert.equal(recentText.includes("CVE-2024-0011"), false, `${label} still honors the default cap`);
     assert.doesNotMatch(recentText, /No new KEV entries/, label);
@@ -389,6 +395,33 @@ test("kevs_recent treats a negative lookback as the default of 30 days", async (
     assert.ok(text.startsWith("1 KEV entry added in the last 30 days:"), label);
     assert.equal(text.includes("CVE-2024-0001"), true, label);
     assert.doesNotMatch(text, /No new KEV entries/, label);
+  }
+});
+
+test("kevs_recent heading counts every entry added in the window when the limit leaves some out", async () => {
+  const entries = [
+    datedKev(1, cutoffDay(2)),
+    datedKev(2, cutoffDay(0)),
+    datedKev(3, cutoffDay(40)),
+    datedKev(4, cutoffDay(1)),
+  ];
+
+  const cut = await runCatalogToolResult("kevs_recent", { days: 30, limit: 2 }, entries);
+  assert.ok(cut.text.startsWith("Showing 2 of 3 KEV entries added in the last 30 days:\n\n"), cut.text);
+  assert.deepEqual(cut.result.details, { days: 30, count: 2, total_matches: 3 });
+  assert.deepEqual(cut.epssRequests, [["CVE-2024-0002", "CVE-2024-0004"]], "only the newest rows shown are scored");
+  assert.equal(cut.text.includes("CVE-2024-0001"), false, "the oldest entry in the window is the one left out");
+
+  const one = await runCatalogToolResult("kevs_recent", { days: 30, limit: 1 }, entries);
+  assert.ok(one.text.startsWith("Showing 1 of 3 KEV entries added in the last 30 days:\n\n"), one.text);
+  assert.deepEqual(one.result.details, { days: 30, count: 1, total_matches: 3 });
+
+  for (const limit of [3, 10]) {
+    const all = await runCatalogToolResult("kevs_recent", { days: 30, limit }, entries);
+    const label = `limit ${limit}`;
+    assert.ok(all.text.startsWith("3 KEV entries added in the last 30 days:\n\n"), label);
+    assert.equal(all.text.includes("CVE-2024-0003"), false, `${label} leaves out the entry older than the window`);
+    assert.deepEqual(all.result.details, { days: 30, count: 3 }, `${label} omits total_matches when every entry is shown`);
   }
 });
 

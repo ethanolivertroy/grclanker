@@ -469,10 +469,11 @@ export function registerKevsTools(pi: any): void {
         cutoff.setDate(cutoff.getDate() - days);
         const cutoffString = cutoff.toISOString().split("T")[0];
 
-        const recent = catalog.vulnerabilities
+        const added = catalog.vulnerabilities
           .filter((vulnerability) => vulnerability.dateAdded >= cutoffString)
-          .sort((left, right) => right.dateAdded.localeCompare(left.dateAdded))
-          .slice(0, limit);
+          .sort((left, right) => right.dateAdded.localeCompare(left.dateAdded));
+        const recent = added.slice(0, limit);
+        const truncated = recent.length < added.length;
 
         if (recent.length === 0) {
           return textResult(`No new KEV entries in the last ${days} days.`, {
@@ -482,14 +483,18 @@ export function registerKevsTools(pi: any): void {
         }
 
         const epssScores = await fetchEpss(recent.map((vulnerability) => vulnerability.cveID), signal);
+        const heading = truncated
+          ? `Showing ${recent.length} of ${added.length} KEV entries added in the last ${days} days:`
+          : `${recent.length} KEV entr${recent.length === 1 ? "y" : "ies"} added in the last ${days} days:`;
         return textResult(
-          `${recent.length} KEV entr${recent.length === 1 ? "y" : "ies"} added in the last ${days} days:\n\n` +
+          `${heading}\n\n` +
             recent
               .map((vulnerability) => formatKev(vulnerability, epssScores.get(vulnerability.cveID)))
               .join("\n\n"),
           {
             days,
             count: recent.length,
+            ...(truncated ? { total_matches: added.length } : {}),
           },
         );
       } catch (error) {
