@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { runComputeDoctor } from "./pi/doctor.js";
 import { runComputeExec, runComputeList, runComputeSmokeTest } from "./pi/env.js";
@@ -44,13 +44,23 @@ function printHelp() {
   console.log(CLI_HELP);
 }
 
+function readCliVersion(): string {
+  const packageJson = JSON.parse(readFileSync(resolve(appRoot, "package.json"), "utf8")) as { version?: string };
+  return packageJson.version ?? "unknown";
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const command = args[0];
   const subcommand = args[1];
 
-  if (command === "--help" || command === "-h") {
+  if (command === "--help" || command === "-h" || command === "help") {
     printHelp();
+    return;
+  }
+
+  if (command === "--version" || command === "-v" || command === "version") {
+    console.log(readCliVersion());
     return;
   }
 
@@ -123,7 +133,7 @@ async function main() {
     return;
   }
 
-  await launchCli(appRoot, undefined, invocation.compute, invocation.prompt);
+  await launchCli(appRoot, undefined, invocation.compute, invocation.prompt, invocation.sessionArgs);
 }
 
 main().catch((error) => {

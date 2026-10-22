@@ -105,14 +105,31 @@ export function parseFlueRunArgs(argv: string[]): ParsedFlueRunArgs {
   return { request: { message, id, db }, json };
 }
 
+const PROVIDER_API_KEY_ENV: Record<string, string> = {
+  anthropic: "ANTHROPIC_API_KEY",
+  openai: "OPENAI_API_KEY",
+  google: "GEMINI_API_KEY",
+};
+
+function missingProviderKeyHint(error: string | undefined): string | undefined {
+  const provider = error?.match(/^Provider is not configured: (\S+)$/)?.[1];
+  if (!provider) return undefined;
+  const keyEnv = PROVIDER_API_KEY_ENV[provider];
+  const setKey = keyEnv ? `Set ${keyEnv}` : `Set the API key for ${provider}`;
+  return `${setKey}, or set GRCLANKER_FLUE_MODEL to a provider/model you have a key for.`;
+}
+
 export function formatFlueRunOutcome(outcome: FlueRunOutcome, json: boolean): { out?: string; err?: string } {
   if (json) return { out: JSON.stringify(outcome) };
 
   switch (outcome.outcome) {
     case "completed":
       return { out: outcome.message ?? "" };
-    case "failed":
-      return { err: `grclanker flue run failed: ${outcome.error ?? "unknown error"}` };
+    case "failed": {
+      const failure = `grclanker flue run failed: ${outcome.error ?? "unknown error"}`;
+      const hint = missingProviderKeyHint(outcome.error);
+      return { err: hint ? `${failure}\n${hint}` : failure };
+    }
     case "aborted":
       return { err: `grclanker flue run was aborted: ${outcome.error ?? "no reason recorded"}` };
     default: {

@@ -11,6 +11,8 @@ grclanker setup
 
 On first launch, grclanker runs setup automatically if no model configuration exists yet. Automatic setup needs an interactive terminal. Without one, grclanker exits and asks you to run `grclanker setup` first.
 
+`grclanker setup` needs a terminal too. To configure a machine without one, write the fields listed under [What the wizard saves](#what-the-wizard-saves) into `~/.grclanker/agent/settings.json` yourself. Local-first also needs the `models.json` provider entry. [Configuration](/docs/getting-started/configuration/) shows both files.
+
 Setup covers three separate decisions:
 
 - model/provider selection
@@ -31,20 +33,32 @@ The recommended first local configuration is:
 - Default endpoint: `http://localhost:11434/v1`
 - Default model example: `gemma4`
 
-Before setup, make sure the local endpoint is actually running:
+Before setup, make sure the local endpoint is actually running with a large enough [context window](#context-length). Start the server in its own terminal and leave it running:
 
 ```bash
-ollama serve
-ollama pull gemma4
+OLLAMA_CONTEXT_LENGTH=128000 ollama serve
 ```
 
-Then run:
+Then, in a second terminal:
 
 ```bash
+ollama pull gemma4
 grclanker setup
 ```
 
 Choose `Local-first` when prompted, then confirm or change the local endpoint.
+
+### Context length
+
+grclanker sends every tool definition with every request, about 100k tokens for the 241 domain tools and 7 compute tools. Ollama picks a default context window from your GPU memory: 4k tokens under 24 GiB, 32k from 24 to 48 GiB, and 256k at 48 GiB or more. Below 48 GiB, the default is too small to hold the tool definitions.
+
+Give Ollama a larger window in one of these ways:
+
+- Start the server with `OLLAMA_CONTEXT_LENGTH=128000 ollama serve`.
+- In the Ollama app, raise the context length slider in its settings.
+- If the Linux installer set Ollama up as a systemd service, add `Environment="OLLAMA_CONTEXT_LENGTH=128000"` to the service with `systemctl edit ollama.service`, then restart it. Ollama's FAQ has the [steps](https://docs.ollama.com/faq#setting-environment-variables-on-linux).
+
+A larger window needs more memory. While a model is loaded, `ollama ps` shows the window it got in the `CONTEXT` column. Ollama's [context length guide](https://docs.ollama.com/context-length) covers the details.
 
 ### What the wizard saves
 
