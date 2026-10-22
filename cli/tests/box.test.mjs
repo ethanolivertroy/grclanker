@@ -3565,3 +3565,170 @@ writeFailureTest("exportBoxAuditBundle leaves nothing under the output root when
   const base = createTempBase("grclanker-box-write-failure-");
   await assertNoPartialBundleOnWriteFailure(base, () => exportBoxAuditBundle(createStubClient(hardenedFixture()), sampleConfig(), base));
 });
+
+const BOX_REJECTED_CLIENT_SECRET = "9YDCyOfc0DLyjBjYEQ8QaGkXwhznHGpa";
+const BOX_REJECTED_ACCESS_TOKEN = "FRfCXXrGKHPSQoEQI2tXYKc8UFBiAPd2";
+const BOX_REJECTED_REFRESH_TOKEN = "2Rb9uJGUcX6cRuGlBCA0phBAkJktqCDZ";
+const BOX_LIMITED_NEXT_STEP = "Grant the Box app Manage users, Manage groups, Manage enterprise properties, and (with Governance or Shield licensing) Manage retention policies, Manage legal holds, and Shield read access, then re-authorize it in the Admin Console.";
+const BOX_PERMISSION_CLAIM = /\b(?:permissions?|scopes?|roles?|privileges?|licen[cs]es?|licensing|modules?)\b/i;
+
+/** Every Box API route answers with the same response; the token endpoint keeps whatever the case sets. */
+function boxEveryApiRoute(respond) {
+  return Object.fromEntries(BOX_ROUTE_TEMPLATES.filter(([route]) => route !== "POST /oauth2/token").map(([route]) => [route, respond]));
+}
+
+/** Box's documented 401 for an API request; the message echoes a planted secret so every result below also proves the echo is scrubbed. */
+function boxUnauthorized(echo = "") {
+  return () => jsonResponse(
+    { type: "error", status: 401, code: "unauthorized", message: `Unauthorized ${echo}`.trim(), request_id: "req-unauthorized" },
+    { status: 401, statusText: "Unauthorized" },
+  );
+}
+
+/** The token endpoint's RFC 6749 error object, its description echoing a planted secret. */
+function boxTokenError(status, error, description) {
+  return () => jsonResponse({ error, error_description: description }, { status, statusText: status === 401 ? "Unauthorized" : "Bad Request" });
+}
+
+/** A JWT app config file whose client secret is a planted canary. */
+function writeRejectedJwtConfig(directory) {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pathname = join(directory, "box-jwt-config.json");
+  writeFileSync(pathname, JSON.stringify({
+    boxAppSettings: {
+      clientID: "jwt-client-id",
+      clientSecret: BOX_REJECTED_CLIENT_SECRET,
+      appAuth: { publicKeyID: "kid-1234", privateKey: privateKey.export({ type: "pkcs8", format: "pem" }), passphrase: "" },
+    },
+    enterpriseID: "987654",
+  }));
+  return pathname;
+}
+
+test("checkBoxAccess reports failed and names the credential settings for each auth mode when Box refuses the token request or every probe returns 401", async () => {
+  const base = createTempBase("grclanker-box-rejected-");
+  const jwtConfigPath = writeRejectedJwtConfig(base);
+  const jwtConfig = (args) => resolveBoxConfiguration(args, { BOX_JWT_CONFIG_PATH: jwtConfigPath }, { homeDir: base, cwd: base });
+  const cases = [
+    {
+      label: "ccg enterprise, token request refused with invalid_client",
+      config: sampleConfig({ clientSecret: BOX_REJECTED_CLIENT_SECRET }),
+      routes: { "POST /oauth2/token": boxTokenError(400, "invalid_client", `The client credentials are invalid ${BOX_REJECTED_CLIENT_SECRET}`) },
+      httpStatus: 400,
+      canaries: [BOX_REJECTED_CLIENT_SECRET],
+      nextStep: "Box rejected the Client Credentials Grant credentials (the token request returned 400 invalid_client). Set BOX_CLIENT_ID, BOX_CLIENT_SECRET, and BOX_ENTERPRISE_ID (or the client_id, client_secret, and enterprise_id arguments, or the same keys in ~/.box-sec-inspector/config.yaml) to the client ID and secret of an app a Box admin has authorized and the ID of its enterprise, then rerun box_check_access.",
+    },
+    {
+      label: "ccg user, token request refused with 401",
+      config: sampleConfig({ clientSecret: BOX_REJECTED_CLIENT_SECRET, subjectType: "user", subjectId: "42" }),
+      routes: { "POST /oauth2/token": boxUnauthorized(BOX_REJECTED_CLIENT_SECRET) },
+      httpStatus: 401,
+      canaries: [BOX_REJECTED_CLIENT_SECRET],
+      nextStep: "Box rejected the Client Credentials Grant credentials (the token request returned 401). Set BOX_CLIENT_ID, BOX_CLIENT_SECRET, and BOX_SUBJECT_ID (or the client_id, client_secret, and subject_id arguments, or the same keys in ~/.box-sec-inspector/config.yaml) to the client ID and secret of an app a Box admin has authorized and the ID of the user to authenticate as, then rerun box_check_access.",
+    },
+    {
+      label: "ccg enterprise, token issued but every probe returns 401",
+      config: sampleConfig({ clientSecret: BOX_REJECTED_CLIENT_SECRET }),
+      routes: boxEveryApiRoute(boxUnauthorized(BOX_REJECTED_CLIENT_SECRET)),
+      httpStatus: 401,
+      canaries: [BOX_REJECTED_CLIENT_SECRET],
+      nextStep: "Box rejected the Client Credentials Grant credentials (every probe returned 401). Set BOX_CLIENT_ID, BOX_CLIENT_SECRET, and BOX_ENTERPRISE_ID (or the client_id, client_secret, and enterprise_id arguments, or the same keys in ~/.box-sec-inspector/config.yaml) to the client ID and secret of an app a Box admin has authorized and the ID of its enterprise, then rerun box_check_access.",
+    },
+    {
+      label: "jwt enterprise, token request refused with unauthorized_client",
+      config: jwtConfig({}),
+      routes: { "POST /oauth2/token": boxTokenError(400, "unauthorized_client", `This app is not authorized by the enterprise admin ${BOX_REJECTED_CLIENT_SECRET}`) },
+      httpStatus: 400,
+      canaries: [BOX_REJECTED_CLIENT_SECRET],
+      nextStep: "Box rejected the JWT app credentials (the token request returned 400 unauthorized_client). Set BOX_JWT_CONFIG_PATH (or the jwt_config_path argument, or jwt_config_path in ~/.box-sec-inspector/config.yaml) to the current config file of an app a Box admin has authorized, and BOX_ENTERPRISE_ID (or enterprise_id) to that app's enterprise ID or leave it unset, then rerun box_check_access.",
+    },
+    {
+      label: "jwt user, token request refused with invalid_grant",
+      config: jwtConfig({ subject_type: "user", subject_id: "42" }),
+      routes: { "POST /oauth2/token": boxTokenError(400, "invalid_grant", `Grant credentials are invalid ${BOX_REJECTED_CLIENT_SECRET}`) },
+      httpStatus: 400,
+      canaries: [BOX_REJECTED_CLIENT_SECRET],
+      nextStep: "Box rejected the JWT app credentials (the token request returned 400 invalid_grant). Set BOX_JWT_CONFIG_PATH and BOX_SUBJECT_ID (or the jwt_config_path and subject_id arguments, or the same keys in ~/.box-sec-inspector/config.yaml) to the current config file of an app a Box admin has authorized and the ID of the user to authenticate as, then rerun box_check_access.",
+    },
+    {
+      label: "oauth, access token expired and the refresh refused with invalid_grant",
+      config: sampleConfig({ authMode: "oauth", accessToken: BOX_REJECTED_ACCESS_TOKEN, refreshToken: BOX_REJECTED_REFRESH_TOKEN, clientSecret: BOX_REJECTED_CLIENT_SECRET }),
+      routes: {
+        ...boxEveryApiRoute(boxUnauthorized(BOX_REJECTED_ACCESS_TOKEN)),
+        "POST /oauth2/token": boxTokenError(400, "invalid_grant", `Invalid refresh token ${BOX_REJECTED_REFRESH_TOKEN}`),
+      },
+      httpStatus: 400,
+      canaries: [BOX_REJECTED_ACCESS_TOKEN, BOX_REJECTED_REFRESH_TOKEN, BOX_REJECTED_CLIENT_SECRET],
+      nextStep: "Box rejected the OAuth 2.0 refresh token or client credentials (the token request returned 400 invalid_grant). Set BOX_REFRESH_TOKEN, BOX_CLIENT_ID, and BOX_CLIENT_SECRET (or the refresh_token, client_id, and client_secret arguments, or the same keys in ~/.box-sec-inspector/config.yaml) to a current refresh token and the client ID and secret of the app that issued it, then rerun box_check_access.",
+    },
+    {
+      // Without an enterprise ID the device pins probe asks /users/me for it, and that 401 is the probe's failure.
+      label: "oauth, access token without a refresh token or enterprise ID, every probe returns 401",
+      config: sampleConfig({ authMode: "oauth", accessToken: BOX_REJECTED_ACCESS_TOKEN, clientId: undefined, clientSecret: undefined, enterpriseId: undefined }),
+      routes: boxEveryApiRoute(boxUnauthorized(BOX_REJECTED_ACCESS_TOKEN)),
+      httpStatus: 401,
+      canaries: [BOX_REJECTED_ACCESS_TOKEN],
+      nextStep: "Box rejected the OAuth 2.0 access token (every probe returned 401). Set BOX_ACCESS_TOKEN (or the access_token argument, or access_token in ~/.box-sec-inspector/config.yaml) to a current token, or set BOX_REFRESH_TOKEN, BOX_CLIENT_ID, and BOX_CLIENT_SECRET (or refresh_token, client_id, and client_secret) so the CLI can refresh it, then rerun box_check_access.",
+    },
+  ];
+  for (const entry of cases) {
+    const { fetchImpl } = httpBox(hardenedFixture(), { routes: entry.routes });
+    const client = new BoxApiClient(entry.config, { fetchImpl, now: () => NOW, sleep: async () => {} });
+    const result = await checkBoxAccess(client);
+    assert.equal(result.status, "failed", entry.label);
+    assert.equal(result.recommendedNextStep, entry.nextStep, entry.label);
+    const attempted = result.surfaces.filter((surface) => surface.status !== "not_configured");
+    assert.ok(attempted.length > 0 && attempted.every((surface) => surface.status === "not_readable" && surface.httpStatus === entry.httpStatus), `${entry.label}: ${JSON.stringify(result.surfaces)}`);
+    assert.equal(result.notes[0], `Authentication with ${entry.config.authMode.toUpperCase()} failed.`, entry.label);
+    const claims = [...result.notes, result.recommendedNextStep, ...result.surfaces.map((surface) => surface.status)].join("\n");
+    assert.doesNotMatch(claims, BOX_PERMISSION_CLAIM, entry.label);
+    for (const text of [...result.notes, result.recommendedNextStep]) assert.equal(scrubErrorText(text), text, `${entry.label}: survives the error scrubber`);
+    const serialized = JSON.stringify(result);
+    assertCanaryWindowsAbsent(assert, serialized, entry.canaries, `${entry.label} rejected access check`);
+    assert.ok(!serialized.includes("PRIVATE KEY"), `${entry.label}: the JWT private key stays out of the result`);
+  }
+
+  const checkTool = registeredBoxTools().get("box_check_access");
+  const { fetchImpl } = httpBox(hardenedFixture(), { routes: cases[0].routes });
+  const originalFetch = globalThis.fetch;
+  let tool;
+  try {
+    globalThis.fetch = fetchImpl;
+    tool = await withBoxEnvironment({}, () => checkTool.execute("call-rejected-ccg", checkTool.prepareArguments({
+      client_id: "client-id",
+      client_secret: BOX_REJECTED_CLIENT_SECRET,
+      enterprise_id: "123456",
+      max_retries: 0,
+    })));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const text = tool.content[0].text;
+  assert.equal(tool.details.status, "failed", text);
+  assert.match(text, /^Box access check: failed$/m);
+  assert.ok(text.includes(`Next: ${cases[0].nextStep}`), text);
+  assertCanaryWindowsAbsent(assert, [["text", text], ["details", JSON.stringify(tool.details)]], [BOX_REJECTED_CLIENT_SECRET], "rendered rejected access check");
+});
+
+test("checkBoxAccess keeps the limited result when a probe reads, a probe is denied with 403, an API request or the token request fails for another reason, or every probe is a 403 or a server error", async () => {
+  const fixture = hardenedFixture();
+  const serverError = () => jsonResponse({ type: "error", status: 500, code: "internal_server_error", message: "Internal Server Error" }, { status: 500, statusText: "Internal Server Error" });
+  const badRequest = () => jsonResponse({ type: "error", status: 400, code: "bad_request", message: "Bad Request" }, { status: 400, statusText: "Bad Request" });
+  const cases = {
+    // Credentials that read even one surface were accepted, so the other 401s keep the permission wording.
+    partlyReadable: { ...boxEveryApiRoute(boxUnauthorized()), "GET /2.0/users/me": boxRoutes(fixture)["GET /2.0/users/me"] },
+    oneForbidden: { ...boxEveryApiRoute(boxUnauthorized()), "GET /2.0/retention_policies": boxDenyRoute() },
+    allForbidden: boxEveryApiRoute(boxDenyRoute()),
+    allServerErrors: boxEveryApiRoute(serverError),
+    // A 400 only refuses the credentials when the token request sends it with an RFC 6749 credential code.
+    apiBadRequest: boxEveryApiRoute(badRequest),
+    tokenInvalidRequest: { "POST /oauth2/token": boxTokenError(400, "invalid_request", "Invalid grant_type parameter or parameter missing") },
+  };
+  for (const [label, routes] of Object.entries(cases)) {
+    const { client } = httpBox(fixture, { routes, config: { maxRetries: 0 } });
+    const result = await checkBoxAccess(client);
+    assert.equal(result.status, "limited", label);
+    assert.equal(result.recommendedNextStep, BOX_LIMITED_NEXT_STEP, label);
+    assert.match(result.notes[0], /^Authenticated with CCG as /, label);
+  }
+});

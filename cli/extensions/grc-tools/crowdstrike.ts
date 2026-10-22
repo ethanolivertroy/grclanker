@@ -388,7 +388,7 @@ export interface CrowdstrikeAccessSurface {
 }
 
 export interface CrowdstrikeAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   baseUrl: string;
   memberCid?: string;
   surfaces: CrowdstrikeAccessSurface[];
@@ -513,13 +513,27 @@ interface PartialInventory {
 export class CrowdstrikeHttpError extends Error {
   readonly status: number;
   readonly path: string;
+  /** True when the token endpoint refused the API client credentials themselves (see tokenRequestRefused). */
+  readonly credentialsRefused: boolean;
 
-  constructor(message: string, status: number, path: string) {
+  constructor(message: string, status: number, path: string, credentialsRefused = false) {
     super(scrubSecretText(message));
     this.name = "CrowdstrikeHttpError";
     this.status = status;
     this.path = path;
+    this.credentialsRefused = credentialsRefused;
   }
+}
+
+/**
+ * The token endpoint's answer to an unknown client ID or a wrong secret. Falcon sends it with 403, so the status
+ * alone cannot tell it from the 403 "access denied, authorization failed" an IP allowlist returns for valid credentials.
+ */
+const TOKEN_REFUSAL_MESSAGE = "Failed to issue access token - Not Authorized";
+
+function tokenRequestRefused(status: number, payload: JsonRecord | undefined): boolean {
+  if (status === 401) return true;
+  return asRecordArray(payload?.errors).some((item) => asString(item.message)?.toLowerCase() === TOKEN_REFUSAL_MESSAGE.toLowerCase());
 }
 
 function asObject(value: unknown): JsonRecord | undefined {
@@ -1396,6 +1410,7 @@ export class CrowdstrikeApiClient {
         this.redact(`CrowdStrike OAuth2 token request failed (${response.status})${errorDetail(response, rawText, payload)}`),
         response.status,
         "/oauth2/token",
+        tokenRequestRefused(response.status, payload),
       );
     }
 
@@ -1822,6 +1837,8 @@ const HEALTHY_SURFACE_FLOOR = 15;
 export async function checkCrowdstrikeAccess(client: AccessProbeClient): Promise<CrowdstrikeAccessCheckResult> {
   const config = client.getResolvedConfig();
   const surfaces: CrowdstrikeAccessSurface[] = [];
+  let rejectedCount = 0;
+  let tokenRefusalStatus: number | undefined;
   for (const probe of ACCESS_PROBES) {
     try {
       const payload = await probe.load(client);
@@ -1836,6 +1853,8 @@ export async function checkCrowdstrikeAccess(client: AccessProbeClient): Promise
       rethrowIfAborted(error);
       const http = error instanceof CrowdstrikeHttpError ? error : undefined;
       const forbidden = http !== undefined && (http.status === 401 || http.status === 403);
+      if (http?.credentialsRefused) tokenRefusalStatus = http.status;
+      if (http?.credentialsRefused || http?.status === 401) rejectedCount += 1;
       surfaces.push({
         name: probe.name,
         endpoint: probe.endpoint,
@@ -1847,9 +1866,17 @@ export async function checkCrowdstrikeAccess(client: AccessProbeClient): Promise
     }
   }
 
+  // A refused token request or a 401 on every probe means Falcon refused the API client or its token, so the denials say nothing about its scopes.
+  const credentialsRejected = surfaces.length > 0 && rejectedCount === surfaces.length;
+  const tokenRefused = tokenRefusalStatus !== undefined;
+  if (credentialsRejected) {
+    for (const surface of surfaces) surface.status = "not_readable";
+  }
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
   const missingScopes = [...new Set(surfaces.filter((surface) => surface.status === "forbidden").map((surface) => surface.scope))];
-  const status = readableCount >= HEALTHY_SURFACE_FLOOR ? "healthy" : "limited";
+  const status: CrowdstrikeAccessCheckResult["status"] = credentialsRejected
+    ? "failed"
+    : (readableCount >= HEALTHY_SURFACE_FLOOR ? "healthy" : "limited");
 
   return {
     status,
@@ -1860,19 +1887,40 @@ export async function checkCrowdstrikeAccess(client: AccessProbeClient): Promise
     notes: [
       `Using Falcon API ${config.baseUrl}${config.cloud ? ` (${config.cloud})` : ""}${config.memberCid ? ` for member CID ${config.memberCid}` : ""}.`,
       `${readableCount}/${surfaces.length} CrowdStrike audit surfaces are readable.`,
-      missingScopes.length > 0
-        ? `Missing API client scopes: ${missingScopes.join("; ")}.`
-        : "No 401 or 403 responses were observed, so the API client scopes cover the probed read surfaces.",
+      credentialsRejected
+        ? `API client scopes were not checked because CrowdStrike rejected the ${tokenRefused ? "API client credentials" : "OAuth2 access token"}; the denied probes do not mean scopes are missing.`
+        : missingScopes.length > 0
+          ? `Missing API client scopes: ${missingScopes.join("; ")}.`
+          : "No 401 or 403 responses were observed, so the API client scopes cover the probed read surfaces.",
       config.memberCid
         ? `Scope: results cover member CID ${config.memberCid} only; other Flight Control children need separate runs.`
         : "Scope: results cover the CID that issued the API client; Flight Control child tenants need CS_MEMBER_CID runs.",
       "All probes are read-only; the tools never modify the Falcon tenant.",
     ],
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run crowdstrike_assess_prevention_policies, crowdstrike_assess_response_readiness, crowdstrike_assess_device_firewall, crowdstrike_assess_sensor_coverage, crowdstrike_assess_access_governance, or crowdstrike_export_audit_bundle."
-        : "Grant the missing read scopes to the Falcon API client (Support and resources > API clients and keys) and rerun crowdstrike_check_access.",
+    recommendedNextStep: accessCheckNextStep(status, tokenRefusalStatus),
   };
+}
+
+function accessCheckNextStep(status: CrowdstrikeAccessCheckResult["status"], tokenRefusalStatus: number | undefined): string {
+  switch (status) {
+    case "healthy":
+      return "Run crowdstrike_assess_prevention_policies, crowdstrike_assess_response_readiness, crowdstrike_assess_device_firewall, crowdstrike_assess_sensor_coverage, crowdstrike_assess_access_governance, or crowdstrike_export_audit_bundle.";
+    case "limited":
+      return "Grant the missing read scopes to the Falcon API client (Support and resources > API clients and keys) and rerun crowdstrike_check_access.";
+    case "failed": {
+      if (tokenRefusalStatus === undefined) {
+        // Any commercial cloud's token endpoint issues a token for the client, but only the client's own cloud accepts it.
+        return "CrowdStrike rejected the OAuth2 access token issued for the API client (every probe returned 401). Set CS_CLOUD or CS_BASE_URL (or the cloud or base_url arguments, or the same keys in ~/.crowdstrike/config.json) to the cloud where the API client was created, then rerun crowdstrike_check_access.";
+      }
+      // The scrubber reads "token - Not" as a credential carrier, so the evidence quotes the refusal only up to the dash.
+      const evidence = tokenRefusalStatus === 401 ? "401" : `${tokenRefusalStatus}: Failed to issue access token`;
+      return `CrowdStrike rejected the API client credentials (the token request returned ${evidence}). Set CS_CLIENT_ID and CS_CLIENT_SECRET (or the client_id and client_secret arguments, or the same keys in ~/.crowdstrike/config.json) to a valid API client ID and secret, and CS_CLOUD or CS_BASE_URL (or cloud or base_url) to the cloud where that client was created, then rerun crowdstrike_check_access.`;
+    }
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled CrowdStrike access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 interface FlatSetting {

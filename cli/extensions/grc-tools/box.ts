@@ -219,7 +219,7 @@ export interface BoxAccessSurface {
 }
 
 export interface BoxAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   enterpriseId?: string;
   authMode: BoxAuthMode;
   surfaces: BoxAccessSurface[];
@@ -3731,12 +3731,14 @@ async function readableSurface(
   endpoint: string,
   load: () => Promise<unknown>,
   countResolver?: (value: unknown) => number | undefined,
+  onFailure?: (error: unknown) => void,
 ): Promise<BoxAccessSurface> {
   try {
     const value = await load();
     return { name, endpoint, status: "readable", count: countResolver?.(value) ?? null, httpStatus: null };
   } catch (error) {
     rethrowIfAborted(error);
+    onFailure?.(error);
     // Only a request the run actually issued may be named, so the label travels on the error; a failure raised before
     // any request (for example an unresolved enterprise ID) leaves the endpoint and status null.
     return {
@@ -3778,14 +3780,17 @@ export async function checkBoxAccess(
   >,
 ): Promise<BoxAccessCheckResult> {
   const config = client.getResolvedConfig();
-  const currentUserSurface = await readableSurface("current_user", "/users/me", () => client.getCurrentUser(), () => 1);
+  const failures = new Map<string, unknown>();
+  const probe = (name: string, endpoint: string, load: () => Promise<unknown>, countResolver?: (value: unknown) => number | undefined) =>
+    readableSurface(name, endpoint, load, countResolver, (error) => failures.set(name, error));
+  const currentUserSurface = await probe("current_user", "/users/me", () => client.getCurrentUser(), () => 1);
   const currentUser = currentUserSurface.status === "readable" ? await client.getCurrentUser().catch(fallbackUnlessAborted({})) : {};
   const enterpriseId = await client.resolveEnterpriseId().catch(fallbackUnlessAborted(undefined));
 
   const surfaces: BoxAccessSurface[] = [currentUserSurface];
   if (enterpriseId) {
     surfaces.push(
-      await readableSurface("enterprise_configuration", `/enterprise_configurations/${enterpriseId}`, () => client.getEnterpriseConfiguration(), (value) => Object.keys(asObject(value) ?? {}).length),
+      await probe("enterprise_configuration", `/enterprise_configurations/${enterpriseId}`, () => client.getEnterpriseConfiguration(), (value) => Object.keys(asObject(value) ?? {}).length),
     );
   } else {
     surfaces.push({
@@ -3798,24 +3803,31 @@ export async function checkBoxAccess(
     });
   }
   surfaces.push(
-    await readableSurface("users", "/users", () => client.listUsers(100), pageLength),
-    await readableSurface("groups", "/groups", () => client.listGroups(100), pageLength),
-    await readableSurface("enterprise_events", "/events?stream_type=admin_logs", () => client.listEnterpriseEvents({ limit: 50 }), pageLength),
-    await readableSurface("device_pinners", `/enterprises/${enterpriseId ?? "{enterprise_id}"}/device_pinners`, () => client.listDevicePinners(100), pageLength),
-    await readableSurface("retention_policies", "/retention_policies", () => client.listRetentionPolicies(100), pageLength),
-    await readableSurface("legal_hold_policies", "/legal_hold_policies", () => client.listLegalHoldPolicies(100), pageLength),
-    await readableSurface("shield_information_barriers", "/shield_information_barriers", () => client.listShieldInformationBarriers(100), pageLength),
-    await readableSurface("shield_lists", "/shield_lists", () => client.listShieldLists(), pageLength),
-    await readableSurface("collaboration_allowlist_entries", "/collaboration_whitelist_entries", () => client.listCollaborationAllowlistEntries(100), pageLength),
-    await readableSurface("collaboration_allowlist_exempt_targets", "/collaboration_whitelist_exempt_targets", () => client.listCollaborationAllowlistExemptTargets(100), pageLength),
-    await readableSurface("metadata_templates", "/metadata_templates/enterprise", () => client.listEnterpriseMetadataTemplates(100), pageLength),
-    await readableSurface("classification_template", `/metadata_templates/enterprise/${CLASSIFICATION_TEMPLATE_KEY}/schema`, () => client.getClassificationTemplate(), () => 1),
-    await readableSurface("terms_of_services", "/terms_of_services", () => client.listTermsOfServices(), pageLength),
+    await probe("users", "/users", () => client.listUsers(100), pageLength),
+    await probe("groups", "/groups", () => client.listGroups(100), pageLength),
+    await probe("enterprise_events", "/events?stream_type=admin_logs", () => client.listEnterpriseEvents({ limit: 50 }), pageLength),
+    await probe("device_pinners", `/enterprises/${enterpriseId ?? "{enterprise_id}"}/device_pinners`, () => client.listDevicePinners(100), pageLength),
+    await probe("retention_policies", "/retention_policies", () => client.listRetentionPolicies(100), pageLength),
+    await probe("legal_hold_policies", "/legal_hold_policies", () => client.listLegalHoldPolicies(100), pageLength),
+    await probe("shield_information_barriers", "/shield_information_barriers", () => client.listShieldInformationBarriers(100), pageLength),
+    await probe("shield_lists", "/shield_lists", () => client.listShieldLists(), pageLength),
+    await probe("collaboration_allowlist_entries", "/collaboration_whitelist_entries", () => client.listCollaborationAllowlistEntries(100), pageLength),
+    await probe("collaboration_allowlist_exempt_targets", "/collaboration_whitelist_exempt_targets", () => client.listCollaborationAllowlistExemptTargets(100), pageLength),
+    await probe("metadata_templates", "/metadata_templates/enterprise", () => client.listEnterpriseMetadataTemplates(100), pageLength),
+    await probe("classification_template", `/metadata_templates/enterprise/${CLASSIFICATION_TEMPLATE_KEY}/schema`, () => client.getClassificationTemplate(), () => 1),
+    await probe("terms_of_services", "/terms_of_services", () => client.listTermsOfServices(), pageLength),
   );
 
   const readable = new Set(surfaces.filter((surface) => surface.status === "readable").map((surface) => surface.name));
   const coreReadable = ["current_user", "enterprise_configuration", "users", "enterprise_events"].every((name) => readable.has(name));
-  const status = coreReadable && readable.size >= 9 ? "healthy" : "limited";
+  const tokenRequest = describeBoxRequest("POST", config.tokenUrl);
+  const refusals = surfaces
+    .filter((surface) => surface.status !== "not_configured")
+    .map((surface) => credentialRefusal(failures.get(surface.name), tokenRequest));
+  const credentialsRejected = refusals.length > 0 && refusals.every((refusal) => refusal !== undefined);
+  const status: BoxAccessCheckResult["status"] = credentialsRejected
+    ? "failed"
+    : (coreReadable && readable.size >= 9 ? "healthy" : "limited");
   const identity = asString(asObject(currentUser)?.login) ?? asString(asObject(currentUser)?.name) ?? asString(asObject(currentUser)?.id) ?? "current Box principal";
 
   return {
@@ -3824,15 +3836,72 @@ export async function checkBoxAccess(
     authMode: config.authMode,
     surfaces,
     notes: [
-      `Authenticated with ${config.authMode.toUpperCase()} as ${identity}${asString(asObject(currentUser)?.role) ? ` (role ${asString(asObject(currentUser)?.role)})` : ""}.`,
+      status === "failed"
+        ? `Authentication with ${config.authMode.toUpperCase()} failed.`
+        : `Authenticated with ${config.authMode.toUpperCase()} as ${identity}${asString(asObject(currentUser)?.role) ? ` (role ${asString(asObject(currentUser)?.role)})` : ""}.`,
       enterpriseId ? `Using Box enterprise ${enterpriseId}.` : "Box enterprise ID could not be resolved.",
       `${readable.size}/${surfaces.length} Box audit surfaces are readable.`,
     ],
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run box_assess_identity_access, box_assess_sharing_collaboration, box_assess_data_governance, box_assess_shield_monitoring, or box_export_audit_bundle."
-        : "Grant the Box app Manage users, Manage groups, Manage enterprise properties, and (with Governance or Shield licensing) Manage retention policies, Manage legal holds, and Shield read access, then re-authorize it in the Admin Console.",
+    recommendedNextStep: accessCheckNextStep(status, config, refusals.find((refusal) => refusal?.request === tokenRequest)),
   };
+}
+
+// The RFC 6749 section 5.2 codes a token endpoint sends with 400 when it refuses the client or the grant.
+const OAUTH_CREDENTIAL_ERRORS = new Set(["invalid_client", "invalid_grant", "unauthorized_client"]);
+
+/**
+ * The failure when it is Box refusing the credentials: a 401 from any request, or a 400 from the token exchange with
+ * an RFC 6749 credential code. Box documents those codes for a wrong secret, key, subject, or refresh token, and also
+ * for an app no Box admin has authorized.
+ */
+function credentialRefusal(error: unknown, tokenRequest: string): BoxApiError | undefined {
+  if (!(error instanceof BoxApiError)) return undefined;
+  if (error.status === 401) return error;
+  return error.status === 400 && error.request === tokenRequest && OAUTH_CREDENTIAL_ERRORS.has(error.code ?? "") ? error : undefined;
+}
+
+function rejectedCredentialsStep(config: BoxResolvedConfig, tokenRefusal: BoxApiError | undefined): string {
+  const code = tokenRefusal?.code !== undefined && OAUTH_CREDENTIAL_ERRORS.has(tokenRefusal.code) ? ` ${tokenRefusal.code}` : "";
+  const evidence = tokenRefusal ? `the token request returned ${tokenRefusal.status}${code}` : "every probe returned 401";
+  const userSubject = config.subjectType === "user";
+  switch (config.authMode) {
+    case "jwt":
+      return userSubject
+        ? `Box rejected the JWT app credentials (${evidence}). Set BOX_JWT_CONFIG_PATH and BOX_SUBJECT_ID (or the jwt_config_path and subject_id arguments, or the same keys in ~/.box-sec-inspector/config.yaml) to the current config file of an app a Box admin has authorized and the ID of the user to authenticate as, then rerun box_check_access.`
+        : `Box rejected the JWT app credentials (${evidence}). Set BOX_JWT_CONFIG_PATH (or the jwt_config_path argument, or jwt_config_path in ~/.box-sec-inspector/config.yaml) to the current config file of an app a Box admin has authorized, and BOX_ENTERPRISE_ID (or enterprise_id) to that app's enterprise ID or leave it unset, then rerun box_check_access.`;
+    case "ccg":
+      return userSubject
+        ? `Box rejected the Client Credentials Grant credentials (${evidence}). Set BOX_CLIENT_ID, BOX_CLIENT_SECRET, and BOX_SUBJECT_ID (or the client_id, client_secret, and subject_id arguments, or the same keys in ~/.box-sec-inspector/config.yaml) to the client ID and secret of an app a Box admin has authorized and the ID of the user to authenticate as, then rerun box_check_access.`
+        : `Box rejected the Client Credentials Grant credentials (${evidence}). Set BOX_CLIENT_ID, BOX_CLIENT_SECRET, and BOX_ENTERPRISE_ID (or the client_id, client_secret, and enterprise_id arguments, or the same keys in ~/.box-sec-inspector/config.yaml) to the client ID and secret of an app a Box admin has authorized and the ID of its enterprise, then rerun box_check_access.`;
+    case "oauth": {
+      if (tokenRefusal) {
+        return `Box rejected the OAuth 2.0 refresh token or client credentials (${evidence}). Set BOX_REFRESH_TOKEN, BOX_CLIENT_ID, and BOX_CLIENT_SECRET (or the refresh_token, client_id, and client_secret arguments, or the same keys in ~/.box-sec-inspector/config.yaml) to a current refresh token and the client ID and secret of the app that issued it, then rerun box_check_access.`;
+      }
+      const refreshHint = config.refreshToken && config.clientId && config.clientSecret
+        ? ""
+        : ", or set BOX_REFRESH_TOKEN, BOX_CLIENT_ID, and BOX_CLIENT_SECRET (or refresh_token, client_id, and client_secret) so the CLI can refresh it";
+      return `Box rejected the OAuth 2.0 access token (${evidence}). Set BOX_ACCESS_TOKEN (or the access_token argument, or access_token in ~/.box-sec-inspector/config.yaml) to a current token${refreshHint}, then rerun box_check_access.`;
+    }
+    default: {
+      const exhaustive: never = config.authMode;
+      throw new Error(`Unhandled Box auth mode: ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: BoxAccessCheckResult["status"], config: BoxResolvedConfig, tokenRefusal: BoxApiError | undefined): string {
+  switch (status) {
+    case "healthy":
+      return "Run box_assess_identity_access, box_assess_sharing_collaboration, box_assess_data_governance, box_assess_shield_monitoring, or box_export_audit_bundle.";
+    case "limited":
+      return "Grant the Box app Manage users, Manage groups, Manage enterprise properties, and (with Governance or Shield licensing) Manage retention policies, Manage legal holds, and Shield read access, then re-authorize it in the Admin Console.";
+    case "failed":
+      return rejectedCredentialsStep(config, tokenRefusal);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Box access status: ${String(exhaustive)}`);
+    }
+  }
 }
 
 function statusLabel(status: BoxFindingStatus): string {
