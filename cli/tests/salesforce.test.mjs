@@ -641,6 +641,273 @@ test("checkSalesforceAccess reports healthy when core surfaces are readable and 
   assert.match(degraded.recommendedNextStep, /re-run salesforce_check_access/);
 });
 
+// ---------------------------------------------------------------------------------------------
+// Rejected credentials: when every probe is refused the check fails and names the settings to fix
+// ---------------------------------------------------------------------------------------------
+
+/** Planted credentials for the rejected-credential tests: alphanumeric and random-looking (see the planted-values self-check). */
+const REJECTED_SF = {
+  password: "bhBtuCjDApgfdpuNPT",
+  securityToken: "A9pwcgJ8ecng9MCE3Z",
+  consumerSecret: "42hVWhA6RMgXyWeTy7",
+  refreshToken: "qsTChD9iKSnC5Dn4PS",
+  accessToken: "VChk753jUysbeZcQWG",
+};
+const REJECTED_SF_VALUES = Object.values(REJECTED_SF);
+const SF_INSTANCE = "https://acme.my.salesforce.com";
+const SF_LIMITED_NEXT_STEP = "Grant the auditing user View Setup and Configuration, View Health Check, API Enabled, View All Users, Customize Application, Manage MFA in API, and Modify Metadata Through Metadata API Functions, then re-run salesforce_check_access.";
+const SF_LOGIN_HOST_CLAUSE = "and set SF_LOGIN_URL or SF_SANDBOX (or the login_url or sandbox arguments) when the user signs in through a sandbox or My Domain login host";
+const SF_REJECTED_MODES = {
+  "access-token": {
+    config: { accessToken: REJECTED_SF.accessToken },
+    kind: "access token",
+    nextStep: (evidence) => `Salesforce rejected the access token (${evidence}). Set SF_ACCESS_TOKEN and SF_INSTANCE_URL (or the access_token and instance_url arguments, or the same keys in SF_CREDENTIALS_FILE) to a current session for the org, then rerun salesforce_check_access.`,
+  },
+  "jwt-bearer": {
+    config: { authMode: "jwt-bearer", accessToken: undefined, consumerKey: "3MVG9consumer", username: "svc@acme.example", privateKey: TEST_PRIVATE_KEY },
+    kind: "JWT bearer credentials",
+    nextStep: (evidence) => `Salesforce rejected the JWT bearer credentials (${evidence}). Check SF_CONSUMER_KEY (or SF_CLIENT_ID), SF_USERNAME, and SF_PRIVATE_KEY_FILE or SF_PRIVATE_KEY (or the consumer_key, username, private_key_file, and private_key arguments, or the same keys in SF_CREDENTIALS_FILE), ${SF_LOGIN_HOST_CLAUSE}, then rerun salesforce_check_access.`,
+  },
+  password: {
+    config: { authMode: "password", accessToken: undefined, username: "auditor@acme.example", password: REJECTED_SF.password, securityToken: REJECTED_SF.securityToken, consumerKey: "3MVG9consumer", consumerSecret: REJECTED_SF.consumerSecret },
+    kind: "username-password credentials",
+    nextStep: (evidence) => `Salesforce rejected the username-password credentials (${evidence}). Check SF_CONSUMER_KEY (or SF_CLIENT_ID), SF_CONSUMER_SECRET (or SF_CLIENT_SECRET), SF_USERNAME, SF_PASSWORD, and SF_SECURITY_TOKEN (or the consumer_key, consumer_secret, username, password, and security_token arguments, or the same keys in SF_CREDENTIALS_FILE), ${SF_LOGIN_HOST_CLAUSE}, then rerun salesforce_check_access.`,
+  },
+  "refresh-token": {
+    config: { authMode: "refresh-token", accessToken: undefined, refreshToken: REJECTED_SF.refreshToken, consumerKey: "3MVG9consumer", consumerSecret: REJECTED_SF.consumerSecret },
+    kind: "refresh token",
+    nextStep: (evidence) => `Salesforce rejected the refresh token (${evidence}). Check SF_REFRESH_TOKEN and SF_CONSUMER_KEY (or SF_CLIENT_ID), plus SF_CONSUMER_SECRET (or SF_CLIENT_SECRET) when the connected app requires it (or the refresh_token, consumer_key, and consumer_secret arguments, or the same keys in SF_CREDENTIALS_FILE), ${SF_LOGIN_HOST_CLAUSE}, then rerun salesforce_check_access.`,
+  },
+};
+const SF_REJECTED_CASES = [
+  { name: "access token refused by the REST and Metadata APIs", mode: "access-token", evidence: "every probe returned 401 or INVALID_SESSION_ID" },
+  { name: "access token refused with 401 by every API", mode: "access-token", soapStatus: 401, evidence: "every probe returned 401" },
+  { name: "JWT assertion refused with invalid_grant", mode: "jwt-bearer", token: { status: 400, error: "invalid_grant", description: "user hasn't approved this consumer" }, evidence: "the token request returned invalid_grant" },
+  { name: "password refused with invalid_grant", mode: "password", token: { status: 400, error: "invalid_grant", description: "authentication failure" }, evidence: "the token request returned invalid_grant" },
+  { name: "consumer key refused with invalid_client_id", mode: "password", token: { status: 400, error: "invalid_client_id", description: "client identifier invalid" }, evidence: "the token request returned invalid_client_id" },
+  { name: "consumer secret refused with invalid_client", mode: "password", token: { status: 400, error: "invalid_client", description: "invalid client credentials" }, evidence: "the token request returned invalid_client" },
+  { name: "token request refused with a bare 401", mode: "password", token: { status: 401, description: "unauthorized" }, evidence: "the token request returned 401" },
+  { name: "refresh token refused with invalid_grant", mode: "refresh-token", token: { status: 400, error: "invalid_grant", description: "expired access/refresh token" }, evidence: "the token request returned invalid_grant" },
+  { name: "refresh grant refused with unauthorized_client", mode: "refresh-token", token: { status: 400, error: "unauthorized_client", description: "the client is not authorized for this grant type" }, evidence: "the token request returned unauthorized_client" },
+];
+
+function sfRejectedNotes(mode) {
+  return [
+    `Auth mode ${mode} against https://login.salesforce.com, instance ${SF_INSTANCE}, API v64.0.`,
+    "Organization record was not readable.",
+    "0/17 Salesforce audit surfaces are readable.",
+    `Permissions were not checked because Salesforce rejected the ${SF_REJECTED_MODES[mode].kind}; the denied probes do not mean permissions are missing.`,
+  ];
+}
+
+/** The request a probe makes, named like SF_CANARY_SURFACES: `oauth2/token`, `limits`, `describe:<object>`, `query:<object>`, or `soap:<operation>`. */
+function salesforceRequestSurface(url, body) {
+  if (url.pathname === "/services/oauth2/token") return "oauth2/token";
+  if (url.pathname.endsWith("/limits")) return "limits";
+  if (url.pathname.startsWith("/services/Soap/m/")) {
+    return body.includes("<met:listMetadata>") ? "soap:listMetadata" : `soap:readMetadata:${body.match(/<met:type>(\w+)<\/met:type>/)?.[1]}`;
+  }
+  const described = url.pathname.match(/\/sobjects\/(\w+)\/describe$/);
+  if (described) return `describe:${described[1]}`;
+  return `query:${(url.searchParams.get("q") ?? "").match(/\bFROM\s+(\w+)/i)?.[1]}`;
+}
+
+function soapFaultResponse(code, faultString, status) {
+  return xmlResponse(`<?xml version="1.0" encoding="UTF-8"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:sf="http://soap.sforce.com/2006/04/metadata"><soapenv:Body><soapenv:Fault><faultcode>sf:${code}</faultcode><faultstring>${faultString}</faultstring></soapenv:Fault></soapenv:Body></soapenv:Envelope>`, status);
+}
+
+/**
+ * An org that refuses the credential everywhere: the token endpoint answers `token` (a status, an OAuth error code, and
+ * a description), the REST API answers 401 INVALID_SESSION_ID, and the Metadata API answers the INVALID_SESSION_ID
+ * SOAP fault with HTTP 500 (or `soapStatus`), as Salesforce documents. Each echoes the Authorization header and body it
+ * received, so a leaked credential shows up in the output. A request whose surface is a key of `answers` gets that
+ * response instead. `assertions` collects the JWT assertions the token endpoint received.
+ */
+function rejectingSalesforce({ token = { status: 400, error: "invalid_grant", description: "authentication failure" }, soapStatus = 500, answers = {} } = {}) {
+  const requests = [];
+  const assertions = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const body = String(init.body ?? "");
+    const surface = salesforceRequestSurface(url, body);
+    requests.push(surface);
+    if (answers[surface]) return answers[surface](url, init);
+    const echo = `Authorization ${new Headers(init.headers ?? {}).get("authorization") ?? ""} body ${body}`;
+    if (surface === "oauth2/token") {
+      const assertion = new URLSearchParams(body).get("assertion");
+      if (assertion) assertions.push(assertion);
+      return jsonResponse({ ...(token.error ? { error: token.error } : {}), error_description: `${token.description}. ${echo}` }, { status: token.status });
+    }
+    if (surface.startsWith("soap:")) {
+      const escaped = echo.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      return soapFaultResponse("INVALID_SESSION_ID", `INVALID_SESSION_ID: Invalid Session ID found in SessionHeader: Illegal Session. ${escaped}`, soapStatus);
+    }
+    return jsonResponse([{ message: `Session expired or invalid. ${echo}`, errorCode: "INVALID_SESSION_ID" }], { status: 401 });
+  };
+  return { fetchImpl, requests, assertions };
+}
+
+function rejectedSalesforceClient({ mode, token, soapStatus, answers }) {
+  const org = rejectingSalesforce({ token, soapStatus, answers });
+  const client = new SalesforceApiClient(sampleConfig(SF_REJECTED_MODES[mode].config), { fetchImpl: org.fetchImpl, sleep: async () => {}, now: () => NOW });
+  return { client, ...org };
+}
+
+/** A signed JWT assertion is a credential the org received, though not a planted one: none of its 16-character windows may appear. */
+function assertAssertionsAbsent(text, assertions, label) {
+  for (const assertion of new Set(assertions)) {
+    for (let index = 0; index + 16 <= assertion.length; index += 1) {
+      assert.ok(!text.includes(assertion.slice(index, index + 16)), `${label}: a window of the JWT assertion appears`);
+    }
+  }
+}
+
+test("checkSalesforceAccess reports failed and names the credential settings when every probe is refused, with no permission claimed missing", async () => {
+  const fixedTexts = [
+    ...SF_REJECTED_CASES.flatMap((item) => [SF_REJECTED_MODES[item.mode].nextStep(item.evidence), ...sfRejectedNotes(item.mode)]),
+    SF_LIMITED_NEXT_STEP,
+  ];
+  assertPlantedValuesWellFormed(assert, Object.fromEntries(Object.entries(REJECTED_SF).map(([name, value]) => [`REJECTED_SF.${name}`, value])), fixedTexts);
+  const echoed = await (await rejectingSalesforce().fetchImpl(`https://login.salesforce.com/services/oauth2/token`, { method: "POST", body: `password=${REJECTED_SF.password}` })).text();
+  assert.ok(echoed.includes(REJECTED_SF.password), "positive control: the rejecting org echoes the credential it received");
+
+  for (const item of SF_REJECTED_CASES) {
+    const { client, requests, assertions } = rejectedSalesforceClient(item);
+    const result = await checkSalesforceAccess(client);
+    assert.equal(result.status, "failed", item.name);
+    assert.equal(result.surfaces.length, 17, item.name);
+    for (const surface of result.surfaces) assert.equal(surface.status, "unauthorized", `${item.name}: ${surface.name}`);
+    assert.deepEqual(result.missingPermissions, [], item.name);
+    assert.deepEqual(result.notes, sfRejectedNotes(item.mode), item.name);
+    assert.equal(result.recommendedNextStep, SF_REJECTED_MODES[item.mode].nextStep(item.evidence), item.name);
+    const text = JSON.stringify(result);
+    assertFragmentsAbsent(assert, text, REJECTED_SF_VALUES, `${item.name} access check`);
+    assertAssertionsAbsent(text, assertions, item.name);
+    // A refused token request leaves no session, so no API request is made with the credential; an access token is used as given.
+    if (item.mode === "access-token") assert.ok(!requests.includes("oauth2/token"), `${item.name}: ${requests.join(", ")}`);
+    else assert.ok(requests.every((surface) => surface === "oauth2/token"), `${item.name}: ${requests.join(", ")}`);
+    if (item.mode === "jwt-bearer") assert.ok(assertions.length > 0, `${item.name}: the org received the JWT assertion`);
+  }
+});
+
+test("checkSalesforceAccess keeps the limited result and the permission advice when a probe reads, every probe is denied with 403, or a probe fails with something other than a credential rejection", async () => {
+  const plain = (status) => () => new Response("unavailable", { status, headers: { "content-type": "text/plain" } });
+  const cases = [
+    { name: "limits readable, the rest refused", answers: { limits: () => jsonResponse({ DailyApiRequests: { Max: 100000, Remaining: 99000 } }) }, readable: 2 },
+    { name: "every probe 403", client: forbiddenClient() },
+    { name: "every probe refused but the health check 500", answers: { "query:SecurityHealthCheck": plain(500) } },
+    { name: "every probe refused but users 404", answers: { "query:User": plain(404) } },
+    { name: "every probe refused but the setup audit trail 422", answers: { "query:SetupAuditTrail": plain(422) } },
+    { name: "every probe refused but login history 429", answers: { "query:LoginHistory": plain(429) } },
+    { name: "every probe refused but event log files unreachable", answers: { "query:EventLogFile": () => { throw new TypeError("fetch failed"); } } },
+    { name: "every probe refused but the SecuritySettings read faults with INSUFFICIENT_ACCESS", answers: { "soap:readMetadata:SecuritySettings": () => soapFaultResponse("INSUFFICIENT_ACCESS", "INSUFFICIENT_ACCESS: no metadata access", 500) } },
+    { name: "the token request refused with inactive_user", mode: "password", token: { status: 400, error: "inactive_user", description: "user is inactive" }, readable: 0 },
+    { name: "the token request answered 503", mode: "password", token: { status: 503, description: "service unavailable" }, readable: 0 },
+    { name: "a session issued, then every API probe refused", mode: "password", answers: { "oauth2/token": () => jsonResponse({ access_token: REJECTED_SF.accessToken, instance_url: SF_INSTANCE }) } },
+  ];
+  for (const { name, mode = "access-token", client, token, answers, readable = 1 } of cases) {
+    const result = await checkSalesforceAccess(client ?? rejectedSalesforceClient({ mode, token, answers }).client);
+    assert.equal(result.status, "limited", name);
+    assert.equal(result.recommendedNextStep, SF_LIMITED_NEXT_STEP, name);
+    assert.ok(result.surfaces.every((surface) => surface.status !== "unauthorized"), `${name}: no surface is relabeled`);
+    assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, readable, name);
+    const hints = [...new Set(result.surfaces.filter((surface) => surface.status === "not_readable").map((surface) => surface.permissionHint))];
+    assert.ok(hints.length > 0, name);
+    assert.deepEqual(result.missingPermissions, hints, name);
+    assert.deepEqual(result.notes.slice(0, 3), [
+      `Auth mode ${mode} against https://login.salesforce.com, instance ${SF_INSTANCE}, API v64.0.`,
+      "Organization record was not readable.",
+      `${readable}/17 Salesforce audit surfaces are readable.`,
+    ], name);
+    assert.match(result.notes[3], /^Caller permissions could not be read from UserPermissionAccess \(.+\); OauthToken visibility \(Customize Application\) and user visibility \(View All Users\) are unknown\.$/, name);
+    assert.equal(result.notes[4], `Likely missing permissions: ${hints.join("; ")}.`, name);
+    assert.equal(result.notes.length, 5, name);
+  }
+});
+
+test("salesforce_check_access renders the failed result for credentials from the arguments, the environment, or the credentials file, with no credential in the output", async () => {
+  const dir = createTempBase("grclanker-sf-rejected-tool-");
+  const keyPath = join(dir, "server.key");
+  writeFileSync(keyPath, TEST_PRIVATE_KEY);
+  const credentialsPath = join(dir, "salesforce-credentials.json");
+  writeFileSync(credentialsPath, JSON.stringify({ grant_type: "authorization_code", refresh_token: REJECTED_SF.refreshToken, consumer_key: "3MVG9consumer", consumer_secret: REJECTED_SF.consumerSecret, instance_url: SF_INSTANCE }));
+  const registered = [];
+  registerSalesforceTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "salesforce_check_access");
+  const sources = [
+    { name: "access token from the arguments", mode: "access-token", evidence: "every probe returned 401 or INVALID_SESSION_ID", args: { access_token: REJECTED_SF.accessToken, instance_url: SF_INSTANCE }, env: {} },
+    {
+      name: "username-password from the environment, with the consumer key and secret under their SF_CLIENT_* aliases",
+      mode: "password",
+      evidence: "the token request returned invalid_grant",
+      args: {},
+      env: { SF_USERNAME: "auditor@acme.example", SF_PASSWORD: REJECTED_SF.password, SF_SECURITY_TOKEN: REJECTED_SF.securityToken, SF_CLIENT_ID: "3MVG9consumer", SF_CLIENT_SECRET: REJECTED_SF.consumerSecret, SF_INSTANCE_URL: SF_INSTANCE },
+    },
+    { name: "refresh token from the credentials file", mode: "refresh-token", evidence: "the token request returned invalid_grant", args: { credentials_file: credentialsPath }, env: {} },
+    { name: "JWT bearer from the arguments with a private key file", mode: "jwt-bearer", evidence: "the token request returned invalid_grant", args: { consumer_key: "3MVG9consumer", username: "svc@acme.example", private_key_file: keyPath, instance_url: SF_INSTANCE }, env: {} },
+  ];
+  const savedEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("SF_")));
+  const clearEnv = () => {
+    for (const key of Object.keys(process.env)) if (key.startsWith("SF_")) delete process.env[key];
+  };
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const source of sources) {
+      clearEnv();
+      // The Metadata API's INVALID_SESSION_ID fault is an HTTP 500, which the client retries with real sleeps.
+      Object.assign(process.env, { SF_MAX_RETRIES: "0" }, source.env);
+      const org = rejectingSalesforce();
+      globalThis.fetch = org.fetchImpl;
+      const result = await checkAccess.execute("call", checkAccess.prepareArguments(source.args));
+      const text = result.content[0].text;
+      assert.equal(result.isError, undefined, source.name);
+      assert.equal(result.details.status, "failed", source.name);
+      assert.match(text, /^Salesforce access check: failed$/m, source.name);
+      for (const note of sfRejectedNotes(source.mode)) assert.ok(text.includes(note), `${source.name}: ${note}`);
+      assert.ok(text.endsWith(`Next: ${SF_REJECTED_MODES[source.mode].nextStep(source.evidence)}`), `${source.name}: ${text}`);
+      assert.ok(!text.includes("Likely missing permissions") && !text.includes("Grant the auditing user"), `${source.name}: ${text}`);
+      assert.equal(text.split("\n").filter((line) => /│ unauthorized\s*│/.test(line)).length, 17, `${source.name}: ${text}`);
+      const output = `${text}\n${JSON.stringify(result.details)}`;
+      assertFragmentsAbsent(assert, output, REJECTED_SF_VALUES, `${source.name} output`);
+      assertAssertionsAbsent(output, org.assertions, source.name);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearEnv();
+    Object.assign(process.env, savedEnv);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("exportSalesforceAuditBundle writes the failed access check when every probe is refused, with the next step intact and no credential in any file", async () => {
+  const base = createTempBase("grclanker-sf-rejected-export-");
+  try {
+    const { client } = rejectedSalesforceClient({ mode: "access-token" });
+    const exported = await exportSalesforceAuditBundle(client, client.getResolvedConfig(), base, { now: NOW });
+    const files = readBundleFiles(exported.outputDir);
+    const access = JSON.parse(files.get(join("core_data", "access_check.json")));
+    assert.equal(access.status, "failed");
+    assert.equal(access.recommendedNextStep, SF_REJECTED_MODES["access-token"].nextStep("every probe returned 401 or INVALID_SESSION_ID"));
+    assert.deepEqual(access.notes, sfRejectedNotes("access-token"));
+    assert.deepEqual(access.missingPermissions, []);
+    assertSecretFragmentsAbsent(assert, files, REJECTED_SF_VALUES, "bundle directory");
+    assertSecretFragmentsAbsent(assert, readZipEntries(exported.zipPath), REJECTED_SF_VALUES, "zip archive");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("rejected credentials: the failed Salesforce access check next steps and notes come back from SalesforceApiError's pass unchanged", async () => {
+  const texts = new Set();
+  for (const item of SF_REJECTED_CASES) {
+    const result = await checkSalesforceAccess(rejectedSalesforceClient(item).client);
+    assert.equal(result.status, "failed", item.name);
+    for (const text of [result.recommendedNextStep, ...result.notes]) texts.add(text);
+  }
+  // The clients above remembered the planted credentials, so the pass runs with them as exact secrets.
+  assertFixedTextsSurvive((text) => new SalesforceApiError(text).message, texts, "rejected Salesforce credentials");
+});
+
 test("assessSalesforcePlatformSecurity passes a hardened org and reads every flag it depends on", async () => {
   const result = await assessSalesforcePlatformSecurity(createFullMockClient());
   assert.deepEqual(result.findings.map((item) => item.control), [1, 2, 3, 5, 18, 19, 20]);
@@ -2213,6 +2480,7 @@ test("planted values self-check: every canary and planted secret is alphanumeric
     ...Object.fromEntries(Object.entries(SF_CANARY).map(([name, value]) => [`SF_CANARY.${name}`, value])),
     ...Object.fromEntries(Object.entries(FAKE_SALESFORCE_SECRETS).map(([name, value]) => [`FAKE_SALESFORCE_SECRETS.${name}`, value])),
     ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
+    ...Object.fromEntries(Object.entries(REJECTED_SF).map(([name, value]) => [`REJECTED_SF.${name}`, value])),
     ...ESCAPE_CANARY_PLANTED_VALUES,
     SAMPLE_ACCESS_TOKEN,
   }, [

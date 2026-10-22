@@ -85,7 +85,7 @@ export interface SplunkAssessmentResult {
 export interface SplunkAccessSurface {
   name: string;
   endpoint: string;
-  status: "readable" | "not_readable" | "not_configured";
+  status: "readable" | "not_readable" | "not_configured" | "unauthorized";
   /** Entries seen on a readable surface; null when the probe did not succeed or was not configured. */
   count: number | null;
   /** The total splunkd reported for a readable list; null when it was omitted or the probe did not succeed. */
@@ -106,7 +106,7 @@ export interface SplunkNotCollectedMarker {
 }
 
 export interface SplunkAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   url: string;
   deployment: SplunkDeploymentInfo;
   authenticatedAs?: string;
@@ -3378,12 +3378,18 @@ export async function checkSplunkAccess(client: SplunkInspectorClient): Promise<
       : { name: "acs_ip_allowlist", endpoint: "acs:/access/search-api/ipallowlists", status: "not_configured", count: null, total: null, truncated: null, httpStatus: null },
   ];
 
+  const attempted = surfaces.filter((surface) => surface.status !== "not_configured");
+  // A rejected credential is refused on every endpoint whatever its capabilities, so its denials name no missing capability.
+  const rejected = attempted.every((surface) => surface.httpStatus === 401);
+  const credential = rejectedCredential(config, attempted);
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
   const coreReadable = surfaces.filter((surface) => ["server_info", "users", "roles", "conf_authentication", "conf_server", "indexes"].includes(surface.name)).every((surface) => surface.status === "readable");
-  const missingCapabilities = capabilities
-    ? REQUIRED_CAPABILITIES.filter((item) => !capabilities.includes(item.capability) && !capabilities.includes("admin_all_objects")).map((item) => `${item.capability} (${item.purpose})`)
-    : REQUIRED_CAPABILITIES.map((item) => `${item.capability} (${item.purpose}; capability list unreadable)`);
-  const status = coreReadable && readableCount >= 11 ? "healthy" : "limited";
+  const missingCapabilities = rejected
+    ? []
+    : capabilities
+      ? REQUIRED_CAPABILITIES.filter((item) => !capabilities.includes(item.capability) && !capabilities.includes("admin_all_objects")).map((item) => `${item.capability} (${item.purpose})`)
+      : REQUIRED_CAPABILITIES.map((item) => `${item.capability} (${item.purpose}; capability list unreadable)`);
+  const status: SplunkAccessCheckResult["status"] = rejected ? "failed" : coreReadable && readableCount >= 11 ? "healthy" : "limited";
 
   return {
     status,
@@ -3393,16 +3399,84 @@ export async function checkSplunkAccess(client: SplunkInspectorClient): Promise<
     capabilities,
     missingCapabilities,
     acsConfigured: client.hasAcs(),
-    surfaces,
+    surfaces: rejected
+      ? surfaces.map((surface): SplunkAccessSurface => (surface.status === "not_configured" ? surface : { ...surface, status: "unauthorized" }))
+      : surfaces,
     notes: [
       `Splunk ${deployment.info.isCloud ? "Cloud Platform" : "Enterprise"}${deployment.info.version ? ` ${deployment.info.version}` : ""} at ${config.url} (${config.token ? "bearer token" : "session key"} auth, TLS verification ${config.verifyTls ? "on" : "OFF"}).`,
-      `Authenticated as ${authenticatedAs ?? "unknown (current-context unreadable)"} with ${capabilities ? `${capabilities.length} capabilities` : "an unread capability list"}.`,
+      rejected
+        ? `Authentication failed: Splunk rejected the ${credential.kind}, so no user or capability list was read.`
+        : `Authenticated as ${authenticatedAs ?? "unknown (current-context unreadable)"} with ${capabilities ? `${capabilities.length} capabilities` : "an unread capability list"}.`,
       `${readableCount}/${surfaces.length} audit surfaces are readable; ACS ${client.hasAcs() ? "configured" : "not configured"}.`,
+      ...(rejected
+        ? [`Permissions were not checked because Splunk rejected the ${credential.kind}; the denied probes do not mean permissions are missing.`]
+        : []),
     ],
-    recommendedNextStep: status === "healthy"
-      ? "Run splunk_assess_authentication, splunk_assess_access_control, splunk_assess_data_protection, splunk_assess_audit_monitoring, splunk_assess_platform_hardening, or splunk_export_audit_bundle."
-      : `Grant the audit role the missing capabilities (${missingCapabilities.slice(0, 4).join("; ") || "see surfaces"}) or use an admin-scoped token; unreadable surfaces will render as manual findings.`,
+    recommendedNextStep: accessCheckNextStep(status, credential, missingCapabilities),
   };
+}
+
+interface SplunkRejectedCredential {
+  kind: string;
+  step: string;
+}
+
+type SplunkAuthMode = "token" | "session";
+
+/**
+ * Names the credentials the configuration presents and the settings that
+ * supply them, for the failed access check. A separate ACS token is named
+ * beside the splunkd credential because its rejection is part of the failure.
+ */
+function rejectedCredential(config: SplunkResolvedConfig, attempted: SplunkAccessSurface[]): SplunkRejectedCredential {
+  const mode: SplunkAuthMode = config.token ? "token" : "session";
+  const separateAcs = Boolean(config.stack && config.acsToken && config.acsToken !== config.token);
+  switch (mode) {
+    case "token":
+      return separateAcs
+        ? {
+          kind: "authentication token and the ACS token",
+          step: "Splunk rejected the authentication token and the ACS token (every probe returned 401). Set SPLUNK_TOKEN and SPLUNK_ACS_TOKEN (or the token and acs_token arguments, or the same keys in SPLUNK_CONFIG_FILE or ~/.config/grclanker/splunk.json) to enabled, unexpired tokens, with SPLUNK_URL and SPLUNK_STACK (or the url and stack arguments) naming the splunkd and the stack that issued them, then rerun splunk_check_access.",
+        }
+        : {
+          kind: "authentication token",
+          step: "Splunk rejected the authentication token (every probe returned 401). Set SPLUNK_TOKEN (or the token argument, or the same key in SPLUNK_CONFIG_FILE or ~/.config/grclanker/splunk.json) to an enabled, unexpired token, with SPLUNK_URL (or the url argument) naming the splunkd that issued it, then rerun splunk_check_access.",
+        };
+    case "session": {
+      const loginRejected = attempted.filter((surface) => !surface.endpoint.startsWith("acs:")).every((surface) => surface.endpoint === "/services/auth/login");
+      if (separateAcs) {
+        const evidence = loginRejected ? "the login request and the ACS request returned 401" : "every probe returned 401";
+        return {
+          kind: "username and password and the ACS token",
+          step: `Splunk rejected the username and password and the ACS token (${evidence}). Set SPLUNK_USERNAME, SPLUNK_PASSWORD, and SPLUNK_ACS_TOKEN (or the username, password, and acs_token arguments, or the same keys in SPLUNK_CONFIG_FILE or ~/.config/grclanker/splunk.json), with SPLUNK_URL and SPLUNK_STACK (or the url and stack arguments) naming the splunkd that holds the account and the stack that issued the ACS token, then rerun splunk_check_access.`,
+        };
+      }
+      const evidence = loginRejected ? "the login request returned 401" : "every probe returned 401";
+      return {
+        kind: "username and password",
+        step: `Splunk rejected the username and password (${evidence}). Set SPLUNK_USERNAME and SPLUNK_PASSWORD (or the username and password arguments, or the same keys in SPLUNK_CONFIG_FILE or ~/.config/grclanker/splunk.json), with SPLUNK_URL (or the url argument) naming the splunkd that holds the account, then rerun splunk_check_access.`,
+      };
+    }
+    default: {
+      const exhaustive: never = mode;
+      throw new Error(`Unhandled Splunk auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: SplunkAccessCheckResult["status"], credential: SplunkRejectedCredential, missingCapabilities: string[]): string {
+  switch (status) {
+    case "healthy":
+      return "Run splunk_assess_authentication, splunk_assess_access_control, splunk_assess_data_protection, splunk_assess_audit_monitoring, splunk_assess_platform_hardening, or splunk_export_audit_bundle.";
+    case "limited":
+      return `Grant the audit role the missing capabilities (${missingCapabilities.slice(0, 4).join("; ") || "see surfaces"}) or use an admin-scoped token; unreadable surfaces will render as manual findings.`;
+    case "failed":
+      return credential.step;
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Splunk access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function formatAccessCheckText(result: SplunkAccessCheckResult): string {
@@ -3419,7 +3493,9 @@ function formatAccessCheckText(result: SplunkAccessCheckResult): string {
     "",
     formatTable(["Surface", "Status", "Count", "Note"], rows),
     "",
-    result.missingCapabilities.length > 0 ? `Missing capabilities: ${result.missingCapabilities.join("; ")}` : "All expected capabilities are present.",
+    ...(result.status === "failed"
+      ? []
+      : [result.missingCapabilities.length > 0 ? `Missing capabilities: ${result.missingCapabilities.join("; ")}` : "All expected capabilities are present."]),
     `Next: ${result.recommendedNextStep}`,
   ].join("\n");
 }

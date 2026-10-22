@@ -158,14 +158,14 @@ export function datasetCoreData<T>(dataset: SalesforceDataset<T>): SalesforceDat
 export interface SalesforceAccessSurface {
   name: string;
   endpoint: string;
-  status: "readable" | "not_readable";
+  status: "readable" | "not_readable" | "unauthorized";
   count?: number;
   error?: string;
   permissionHint?: string;
 }
 
 export interface SalesforceAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   authMode: SalesforceAuthMode;
   instanceUrl?: string;
   organization?: JsonRecord;
@@ -885,6 +885,18 @@ function isForbiddenError(error: unknown): boolean {
 function isUnavailableError(error: unknown): boolean {
   if (!(error instanceof SalesforceApiError)) return false;
   return /INVALID_TYPE|INVALID_FIELD|NOT_FOUND|INVALID_TYPE_FOR_OPERATION|sObject type .* is not supported|No such column|UNKNOWN_EXCEPTION/i.test(`${error.errorCode ?? ""} ${error.message}`);
+}
+
+const REJECTED_TOKEN_ERRORS = new Set(["invalid_client", "invalid_client_id", "invalid_grant", "unauthorized_client"]);
+
+/**
+ * Salesforce refused the credential itself: a 401, the documented INVALID_SESSION_ID (which the Metadata API
+ * returns as a SOAP fault with HTTP 500), or a token request refused with a documented credential error.
+ */
+function isRejectedCredentials(error: unknown): error is SalesforceApiError {
+  if (!(error instanceof SalesforceApiError)) return false;
+  if (error.status === 401 || error.errorCode === "INVALID_SESSION_ID") return true;
+  return error.endpoint === "/services/oauth2/token" && error.status === 400 && REJECTED_TOKEN_ERRORS.has(error.errorCode ?? "");
 }
 
 /**
@@ -3271,18 +3283,29 @@ function queryCount(value: unknown): number | undefined {
 export async function checkSalesforceAccess(client: ReadClient): Promise<SalesforceAccessCheckResult> {
   const config = client.getResolvedConfig();
   const version = config.apiVersion;
+  const rejections = new Map<string, SalesforceApiError>();
+  const watch = <T>(name: string, load: () => Promise<T>) => async (): Promise<T> => {
+    try {
+      return await load();
+    } catch (error) {
+      if (isRejectedCredentials(error)) rejections.set(name, error);
+      throw error;
+    }
+  };
+  const probe = (name: string, endpoint: string, permissionHint: string, load: () => Promise<unknown>, count?: (value: unknown) => number | undefined) =>
+    probeSurface(name, endpoint, permissionHint, watch(name, load), count);
   let instanceUrl = config.instanceUrl;
   let sessionError: string | undefined;
   try {
-    instanceUrl = (await client.getSession()).instanceUrl;
+    instanceUrl = (await watch("oauth_session", () => client.getSession())()).instanceUrl;
   } catch (error) {
     rethrowIfAborted(error);
     sessionError = errorMessage(error);
   }
 
-  const organization = await collectRecord("Organization", () => client.getOrganization());
-  const callerPermissions = await collectRecord("UserPermissionAccess", () => client.getCallerPermissions());
-  const surfaces: SalesforceAccessSurface[] = [
+  const organization = await collectRecord("Organization", watch("organization", () => client.getOrganization()));
+  const callerPermissions = await collectRecord("UserPermissionAccess", watch("caller_permissions", () => client.getCallerPermissions()));
+  const probed: SalesforceAccessSurface[] = [
     {
       name: "oauth_session",
       endpoint: `${config.loginUrl}/services/oauth2/token`,
@@ -3291,33 +3314,41 @@ export async function checkSalesforceAccess(client: ReadClient): Promise<Salesfo
       permissionHint: "API Enabled plus a valid connected app grant",
     },
     { name: "organization", endpoint: `/services/data/v${version}/query (Organization)`, status: organization.status === "ok" ? "readable" : "not_readable", count: organization.status === "ok" ? organization.seen : undefined, error: organization.error, permissionHint: "API Enabled" },
-    await probeSurface("limits", `/services/data/v${version}/limits`, "API Enabled", () => client.getLimits(), () => 1),
-    await probeSurface("health_check", `/services/data/v${version}/tooling/query (SecurityHealthCheck)`, "View Setup and Configuration, View Health Check", () => client.getHealthCheck(), (value) => (value ? 1 : 0)),
-    await probeSurface("health_check_risks", `/services/data/v${version}/tooling/query (SecurityHealthCheckRisks)`, "View Setup and Configuration", () => client.listHealthCheckRisks(50), queryCount),
-    await probeSurface("security_settings", `/services/Soap/m/${version} readMetadata(SecuritySettings)`, "Modify Metadata Through Metadata API Functions or Modify All Data", () => client.readSecuritySettings(), (value) => (value ? 1 : 0)),
-    await probeSurface("users", `/services/data/v${version}/query (User)`, "View All Users (Manage Users read)", () => client.listUsers(50), queryCount),
-    await probeSurface("profiles", `/services/data/v${version}/query (Profile)`, "View Setup and Configuration", () => client.listProfiles(50), queryCount),
-    await probeSurface("permission_sets", `/services/data/v${version}/query (PermissionSet)`, "View Setup and Configuration", () => client.listPermissionSets(50), queryCount),
-    await probeSurface("profile_metadata", `/services/Soap/m/${version} listMetadata(Profile) + readMetadata(Profile)`, "Modify Metadata Through Metadata API Functions or Modify All Data", () => client.listProfileMetadata(), (value) => asRecords(value).length),
-    await probeSurface("two_factor_methods", `/services/data/v${version}/query (TwoFactorMethodsInfo)`, "Manage MFA in API", () => client.listTwoFactorMethods(50), queryCount),
-    await probeSurface("login_history", `/services/data/v${version}/query (LoginHistory)`, "Manage Users or View All Users", () => client.listLoginHistory(7, 50), queryCount),
-    await probeSurface("setup_audit_trail", `/services/data/v${version}/query (SetupAuditTrail)`, "View Setup and Configuration", () => client.listSetupAuditTrail(30, 50), queryCount),
-    await probeSurface("connected_applications", `/services/data/v${version}/query (ConnectedApplication)`, "View Setup and Configuration", () => client.listConnectedApplications(50), queryCount),
-    await probeSurface("oauth_tokens", `/services/data/v${version}/query (OauthToken)`, "Customize Application (without it only the caller's own tokens are returned)", () => client.listOauthTokens(50), queryCount),
-    await probeSurface("event_log_files", `/services/data/v${version}/query (EventLogFile)`, "View Event Log Files (Event Monitoring license)", () => client.listEventLogFiles(1, 10), queryCount),
+    await probe("limits", `/services/data/v${version}/limits`, "API Enabled", () => client.getLimits(), () => 1),
+    await probe("health_check", `/services/data/v${version}/tooling/query (SecurityHealthCheck)`, "View Setup and Configuration, View Health Check", () => client.getHealthCheck(), (value) => (value ? 1 : 0)),
+    await probe("health_check_risks", `/services/data/v${version}/tooling/query (SecurityHealthCheckRisks)`, "View Setup and Configuration", () => client.listHealthCheckRisks(50), queryCount),
+    await probe("security_settings", `/services/Soap/m/${version} readMetadata(SecuritySettings)`, "Modify Metadata Through Metadata API Functions or Modify All Data", () => client.readSecuritySettings(), (value) => (value ? 1 : 0)),
+    await probe("users", `/services/data/v${version}/query (User)`, "View All Users (Manage Users read)", () => client.listUsers(50), queryCount),
+    await probe("profiles", `/services/data/v${version}/query (Profile)`, "View Setup and Configuration", () => client.listProfiles(50), queryCount),
+    await probe("permission_sets", `/services/data/v${version}/query (PermissionSet)`, "View Setup and Configuration", () => client.listPermissionSets(50), queryCount),
+    await probe("profile_metadata", `/services/Soap/m/${version} listMetadata(Profile) + readMetadata(Profile)`, "Modify Metadata Through Metadata API Functions or Modify All Data", () => client.listProfileMetadata(), (value) => asRecords(value).length),
+    await probe("two_factor_methods", `/services/data/v${version}/query (TwoFactorMethodsInfo)`, "Manage MFA in API", () => client.listTwoFactorMethods(50), queryCount),
+    await probe("login_history", `/services/data/v${version}/query (LoginHistory)`, "Manage Users or View All Users", () => client.listLoginHistory(7, 50), queryCount),
+    await probe("setup_audit_trail", `/services/data/v${version}/query (SetupAuditTrail)`, "View Setup and Configuration", () => client.listSetupAuditTrail(30, 50), queryCount),
+    await probe("connected_applications", `/services/data/v${version}/query (ConnectedApplication)`, "View Setup and Configuration", () => client.listConnectedApplications(50), queryCount),
+    await probe("oauth_tokens", `/services/data/v${version}/query (OauthToken)`, "Customize Application (without it only the caller's own tokens are returned)", () => client.listOauthTokens(50), queryCount),
+    await probe("event_log_files", `/services/data/v${version}/query (EventLogFile)`, "View Event Log Files (Event Monitoring license)", () => client.listEventLogFiles(1, 10), queryCount),
     { name: "caller_permissions", endpoint: `/services/data/v${version}/query (UserPermissionAccess)`, status: callerPermissions.status === "ok" && callerPermissions.data ? "readable" : "not_readable", count: callerPermissions.status === "ok" && callerPermissions.data ? callerPermissions.seen : undefined, error: callerPermissions.error, permissionHint: "API Enabled" },
   ];
+  // An access token is used as given, so its oauth_session row records no request and proves nothing either way.
+  const attempted = probed.filter((surface) => surface.name !== "oauth_session" || config.authMode !== "access-token");
+  const rejected = attempted.every((surface) => rejections.has(surface.name));
+  // A rejected credential is refused on every surface whatever the user's permissions, so its denials name no missing permission.
+  const surfaces = rejected ? probed.map((surface): SalesforceAccessSurface => ({ ...surface, status: "unauthorized" })) : probed;
+  const credential = rejectedCredential(config.authMode, [...rejections.values()]);
 
   const deniedCallerPermissions = CALLER_PERMISSION_FIELDS
     .filter(([field]) => callerPermission(callerPermissions, field) === false)
     .map(([, label]) => label);
-  const missingPermissions = [...new Set([
+  const missingPermissions = rejected ? [] : [...new Set([
     ...surfaces.filter((surface) => surface.status === "not_readable").map((surface) => surface.permissionHint ?? "").filter(Boolean),
     ...deniedCallerPermissions,
   ])];
   const coreNames = new Set(["oauth_session", "organization", "health_check", "security_settings", "users", "profiles", "permission_sets", "setup_audit_trail", "login_history"]);
   const coreReadable = surfaces.filter((surface) => coreNames.has(surface.name) && surface.status === "readable").length;
-  const status: SalesforceAccessCheckResult["status"] = coreReadable === coreNames.size && deniedCallerPermissions.length === 0 ? "healthy" : "limited";
+  const status: SalesforceAccessCheckResult["status"] = rejected
+    ? "failed"
+    : coreReadable === coreNames.size && deniedCallerPermissions.length === 0 ? "healthy" : "limited";
   const org = organization.data;
   const callerNote = callerPermissions.status === "ok" && callerPermissions.data
     ? `Caller permissions (UserPermissionAccess): ${CALLER_PERMISSION_FIELDS.map(([field, label]) => `${label}=${String(callerPermission(callerPermissions, field) ?? "unknown")}`).join(", ")}.`
@@ -3334,13 +3365,67 @@ export async function checkSalesforceAccess(client: ReadClient): Promise<Salesfo
       `Auth mode ${config.authMode} against ${config.loginUrl}${instanceUrl ? `, instance ${instanceUrl}` : ""}, API v${version}.`,
       org ? `Org ${asString(org.Name) ?? asString(org.Id)} (${asString(org.OrganizationType) ?? "unknown edition"}, sandbox=${String(asBoolean(org.IsSandbox) ?? "unknown")}).` : "Organization record was not readable.",
       `${surfaces.filter((surface) => surface.status === "readable").length}/${surfaces.length} Salesforce audit surfaces are readable.`,
-      callerNote,
-      ...(missingPermissions.length > 0 ? [`Likely missing permissions: ${missingPermissions.join("; ")}.`] : []),
+      ...(rejected
+        ? [`Permissions were not checked because Salesforce rejected the ${credential.kind}; the denied probes do not mean permissions are missing.`]
+        : [callerNote, ...(missingPermissions.length > 0 ? [`Likely missing permissions: ${missingPermissions.join("; ")}.`] : [])]),
     ],
-    recommendedNextStep: status === "healthy"
-      ? "Run salesforce_assess_platform_security, salesforce_assess_identity_access, salesforce_assess_data_protection, salesforce_assess_monitoring_integrations, or salesforce_export_audit_bundle."
-      : "Grant the auditing user View Setup and Configuration, View Health Check, API Enabled, View All Users, Customize Application, Manage MFA in API, and Modify Metadata Through Metadata API Functions, then re-run salesforce_check_access.",
+    recommendedNextStep: accessCheckNextStep(status, credential),
   };
+}
+
+interface SalesforceRejectedCredential {
+  kind: string;
+  step: string;
+}
+
+/** The evidence names the token request when the exchange was refused, and the probes' answers otherwise. */
+function rejectedCredential(authMode: SalesforceAuthMode, rejections: SalesforceApiError[]): SalesforceRejectedCredential {
+  const tokenRejection = rejections.find((error) => error.endpoint === "/services/oauth2/token");
+  const evidence = tokenRejection
+    ? `the token request returned ${tokenRejection.status === 401 ? "401" : tokenRejection.errorCode}`
+    : rejections.every((error) => error.status === 401) ? "every probe returned 401" : "every probe returned 401 or INVALID_SESSION_ID";
+  const loginHost = "and set SF_LOGIN_URL or SF_SANDBOX (or the login_url or sandbox arguments) when the user signs in through a sandbox or My Domain login host";
+  switch (authMode) {
+    case "access-token":
+      return {
+        kind: "access token",
+        step: `Salesforce rejected the access token (${evidence}). Set SF_ACCESS_TOKEN and SF_INSTANCE_URL (or the access_token and instance_url arguments, or the same keys in SF_CREDENTIALS_FILE) to a current session for the org, then rerun salesforce_check_access.`,
+      };
+    case "jwt-bearer":
+      return {
+        kind: "JWT bearer credentials",
+        step: `Salesforce rejected the JWT bearer credentials (${evidence}). Check SF_CONSUMER_KEY (or SF_CLIENT_ID), SF_USERNAME, and SF_PRIVATE_KEY_FILE or SF_PRIVATE_KEY (or the consumer_key, username, private_key_file, and private_key arguments, or the same keys in SF_CREDENTIALS_FILE), ${loginHost}, then rerun salesforce_check_access.`,
+      };
+    case "password":
+      return {
+        kind: "username-password credentials",
+        step: `Salesforce rejected the username-password credentials (${evidence}). Check SF_CONSUMER_KEY (or SF_CLIENT_ID), SF_CONSUMER_SECRET (or SF_CLIENT_SECRET), SF_USERNAME, SF_PASSWORD, and SF_SECURITY_TOKEN (or the consumer_key, consumer_secret, username, password, and security_token arguments, or the same keys in SF_CREDENTIALS_FILE), ${loginHost}, then rerun salesforce_check_access.`,
+      };
+    case "refresh-token":
+      return {
+        kind: "refresh token",
+        step: `Salesforce rejected the refresh token (${evidence}). Check SF_REFRESH_TOKEN and SF_CONSUMER_KEY (or SF_CLIENT_ID), plus SF_CONSUMER_SECRET (or SF_CLIENT_SECRET) when the connected app requires it (or the refresh_token, consumer_key, and consumer_secret arguments, or the same keys in SF_CREDENTIALS_FILE), ${loginHost}, then rerun salesforce_check_access.`,
+      };
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled Salesforce auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: SalesforceAccessCheckResult["status"], credential: SalesforceRejectedCredential): string {
+  switch (status) {
+    case "healthy":
+      return "Run salesforce_assess_platform_security, salesforce_assess_identity_access, salesforce_assess_data_protection, salesforce_assess_monitoring_integrations, or salesforce_export_audit_bundle.";
+    case "limited":
+      return "Grant the auditing user View Setup and Configuration, View Health Check, API Enabled, View All Users, Customize Application, Manage MFA in API, and Modify Metadata Through Metadata API Functions, then re-run salesforce_check_access.";
+    case "failed":
+      return credential.step;
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Salesforce access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function formatAccessCheckText(result: SalesforceAccessCheckResult): string {

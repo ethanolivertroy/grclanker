@@ -127,7 +127,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 | --- | --- |
-| `servicenow_check_access` | Probes 27 audit tables with a one-row Table API read plus an Aggregate API count and reports each as `readable`, `forbidden`, `acl_filtered`, or `not_readable`. An aggregate count above zero with no rows returned is reported as ACL-filtered. |
+| `servicenow_check_access` | Probes 27 audit tables with a one-row Table API read plus an Aggregate API count and reports each as `readable`, `forbidden`, `acl_filtered`, or `not_readable`. An aggregate count above zero with no rows returned is reported as ACL-filtered. Reports `failed` when ServiceNow rejected the credentials: every probe returns 401, or the OAuth token request returns 401 or 400 with `invalid_client`, `invalid_grant`, or `unauthorized_client`. A failed check marks the tables `unauthorized`, names no missing role, and names the variables to fix in the next step. |
 | `servicenow_assess_identity_access` | Controls 3, 4, 6, 7, 8, 14. Options: `inactive_days` (90), `min_password_length` (12), `cert_expiry_warn_days` (30), `max_admins` (10), `record_limit` (10000). |
 | `servicenow_assess_platform_hardening` | Controls 1, 5, 12, 13, 16, 17, 18. Options: `max_session_timeout_minutes` (60), `record_limit`. |
 | `servicenow_assess_access_control` | Controls 2 and 11. Option: `record_limit`. |

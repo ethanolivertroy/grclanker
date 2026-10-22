@@ -119,7 +119,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 |------|---------|
-| `snowflake_check_access` | Probes the session context, every `SHOW` command, and every `ACCOUNT_USAGE` view the assessments use; reports readable, denied, errored, timed-out, and not-requested surfaces, whether the run authenticated (`confirmed`, `unconfirmed`, or `not_authenticated`), whether the role has full visibility, and the credential source chain |
+| `snowflake_check_access` | Probes the session context, every `SHOW` command, and every `ACCOUNT_USAGE` view the assessments use; reports readable, denied, errored, timed-out, and not-requested surfaces, whether the run authenticated (`confirmed`, `unconfirmed`, or `not_authenticated`), whether the role has full visibility, and the credential source chain. Reports `failed` when every statement returns 401 because Snowflake rejected the key-pair JWT, OAuth token, or programmatic access token: the surfaces are marked `unauthorized`, authentication is `unconfirmed`, no missing privilege is named, and the next step names the variables to fix |
 | `snowflake_assess_network_and_authentication` | Controls 1-6 and 25 |
 | `snowflake_assess_access_control` | Controls 7-10 and 16 |
 | `snowflake_assess_monitoring_and_lifecycle` | Controls 11-13 and 24 |

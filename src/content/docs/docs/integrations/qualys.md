@@ -118,13 +118,14 @@ Assessment tools add these arguments, with defaults in parentheses:
 
 ### `qualys_check_access`
 
-Probes 15 read surfaces across VM, VMDR, PC, Administration, Asset Management, Cloud Agent, and WAS. Each surface is reported as `readable`, `not_readable`, or `module_unavailable`.
+Probes 15 read surfaces across VM, VMDR, PC, Administration, Asset Management, Cloud Agent, and WAS. Each surface is reported as `readable`, `not_readable`, or `module_unavailable`, or as `unauthorized` when the check fails.
 
 Overall status:
 
 - `healthy`: Everything readable.
 - `degraded`: Core VM/VMDR readable, some optional modules missing.
 - `limited`: Core VM/VMDR surfaces not readable.
+- `failed`: Every probe returned 401, or in OAuth mode the gateway `/auth` token request did, because Qualys rejected the credentials. No module is reported unavailable, the view scope is reported as not verified, and the next step names the variables to fix.
 
 The response lists unavailable modules, the API user's view scope, and the last observed rate limit headers.
 

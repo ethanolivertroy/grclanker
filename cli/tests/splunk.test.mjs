@@ -493,6 +493,169 @@ test("checkSplunkAccess reports degraded access and missing capabilities on 403"
   assert.match(result.recommendedNextStep, /missing capabilities/);
 });
 
+/** Planted credentials for the rejected-credential access checks: random alphanumerics with no 6-character window in any fixed text or fixture value. */
+const REJECTED_PASSWORD = "Vq8LmT3wXk6RzN2pHd5J";
+const REJECTED_SESSION_KEY = "Kc4WnB9tYq2MxF7sLr3G";
+const UNREAD_CAPABILITIES_NEXT_STEP = "Grant the audit role the missing capabilities (edit_user (list users (/services/authentication/users); capability list unreadable); list_tokens_all (list every authentication token (/services/authorization/tokens); capability list unreadable); rest_properties_get (read configuration files (/services/configs/conf-*); capability list unreadable); list_settings (read server settings; capability list unreadable)) or use an admin-scoped token; unreadable surfaces will render as manual findings.";
+const TOKEN_REJECTED_NEXT_STEP = "Splunk rejected the authentication token (every probe returned 401). Set SPLUNK_TOKEN (or the token argument, or the same key in SPLUNK_CONFIG_FILE or ~/.config/grclanker/splunk.json) to an enabled, unexpired token, with SPLUNK_URL (or the url argument) naming the splunkd that issued it, then rerun splunk_check_access.";
+const SESSION_CONFIG = { token: undefined, username: "auditor", password: REJECTED_PASSWORD };
+
+/** One entry per credential setup: the client config, how the SQL API answers the login, and what the failed check must say. */
+const REJECTED_MODES = [
+  { name: "bearer token", overrides: {}, args: { token: SAMPLE_TOKEN }, acs: false, kind: "authentication token", canaries: [SAMPLE_TOKEN], nextStep: TOKEN_REJECTED_NEXT_STEP },
+  { name: "bearer token shared with ACS", overrides: { stack: "acme-stack", acsToken: SAMPLE_TOKEN }, acs: true, kind: "authentication token", canaries: [SAMPLE_TOKEN], nextStep: TOKEN_REJECTED_NEXT_STEP },
+  {
+    name: "bearer token and a separate ACS token",
+    overrides: { stack: "acme-stack", acsToken: SAMPLE_ACS_TOKEN },
+    acs: true,
+    kind: "authentication token and the ACS token",
+    canaries: [SAMPLE_TOKEN, SAMPLE_ACS_TOKEN],
+    nextStep: "Splunk rejected the authentication token and the ACS token (every probe returned 401). Set SPLUNK_TOKEN and SPLUNK_ACS_TOKEN (or the token and acs_token arguments, or the same keys in SPLUNK_CONFIG_FILE or ~/.config/grclanker/splunk.json) to enabled, unexpired tokens, with SPLUNK_URL and SPLUNK_STACK (or the url and stack arguments) naming the splunkd and the stack that issued them, then rerun splunk_check_access.",
+  },
+  {
+    name: "username and password",
+    overrides: SESSION_CONFIG,
+    args: { username: "auditor", password: REJECTED_PASSWORD },
+    acs: false,
+    kind: "username and password",
+    canaries: [REJECTED_PASSWORD],
+    nextStep: "Splunk rejected the username and password (the login request returned 401). Set SPLUNK_USERNAME and SPLUNK_PASSWORD (or the username and password arguments, or the same keys in SPLUNK_CONFIG_FILE or ~/.config/grclanker/splunk.json), with SPLUNK_URL (or the url argument) naming the splunkd that holds the account, then rerun splunk_check_access.",
+  },
+  {
+    name: "username and password whose session key every probe refuses",
+    overrides: SESSION_CONFIG,
+    loginAccepted: true,
+    acs: false,
+    kind: "username and password",
+    canaries: [REJECTED_PASSWORD, REJECTED_SESSION_KEY],
+    nextStep: "Splunk rejected the username and password (every probe returned 401). Set SPLUNK_USERNAME and SPLUNK_PASSWORD (or the username and password arguments, or the same keys in SPLUNK_CONFIG_FILE or ~/.config/grclanker/splunk.json), with SPLUNK_URL (or the url argument) naming the splunkd that holds the account, then rerun splunk_check_access.",
+  },
+  {
+    name: "username and password and a separate ACS token",
+    overrides: { ...SESSION_CONFIG, stack: "acme-stack", acsToken: SAMPLE_ACS_TOKEN },
+    acs: true,
+    kind: "username and password and the ACS token",
+    canaries: [REJECTED_PASSWORD, SAMPLE_ACS_TOKEN],
+    nextStep: "Splunk rejected the username and password and the ACS token (the login request and the ACS request returned 401). Set SPLUNK_USERNAME, SPLUNK_PASSWORD, and SPLUNK_ACS_TOKEN (or the username, password, and acs_token arguments, or the same keys in SPLUNK_CONFIG_FILE or ~/.config/grclanker/splunk.json), with SPLUNK_URL and SPLUNK_STACK (or the url and stack arguments) naming the splunkd that holds the account and the stack that issued the ACS token, then rerun splunk_check_access.",
+  },
+];
+
+/**
+ * A deployment that answers every request with 401 and echoes back the Authorization header and form body it received,
+ * so a leak of any credential shows up in the output. Routes named in `answers` reply with that status instead.
+ */
+function rejectingFetch({ loginAccepted = false, answers = {} } = {}) {
+  return async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const echo = `Request carried Authorization: ${new Headers(init.headers ?? {}).get("authorization") ?? ""} and body ${String(init.body ?? "")}`;
+    const route = url.hostname === "admin.splunk.com" ? "acs" : url.pathname;
+    if (answers[route]) return answers[route](url);
+    if (route === "/services/auth/login") {
+      return loginAccepted ? jsonResponse({ sessionKey: REJECTED_SESSION_KEY }) : jsonResponse({ messages: [{ type: "WARN", text: `Login failed. ${echo}` }] }, 401);
+    }
+    if (route === "acs") return jsonResponse({ code: "401-unauthorized", message: `unauthorized. ${echo}` }, 401);
+    return jsonResponse({ messages: [{ type: "WARN", text: `call not properly authenticated. ${echo}` }] }, 401);
+  };
+}
+
+function rejectedNotes(mode) {
+  return [
+    `Splunk Enterprise at https://splunk.example.com:8089 (${mode.overrides.username ? "session key" : "bearer token"} auth, TLS verification on).`,
+    `Authentication failed: Splunk rejected the ${mode.kind}, so no user or capability list was read.`,
+    `0/15 audit surfaces are readable; ACS ${mode.acs ? "configured" : "not configured"}.`,
+    `Permissions were not checked because Splunk rejected the ${mode.kind}; the denied probes do not mean permissions are missing.`,
+  ];
+}
+
+test("checkSplunkAccess reports failed and names the credential settings when every probe returns 401, for a bearer token, a username and password, and either with a separate ACS token", async () => {
+  for (const mode of REJECTED_MODES) {
+    const api = new SplunkApiClient(sampleConfig(mode.overrides), { fetchImpl: rejectingFetch(mode), retryDelayMs: 0 });
+    const result = await checkSplunkAccess(api);
+    assert.equal(result.status, "failed", mode.name);
+    assert.deepEqual(result.surfaces.filter((surface) => surface.status !== "unauthorized").map((surface) => surface.name), mode.acs ? [] : ["acs_ip_allowlist"], mode.name);
+    assert.deepEqual(result.missingCapabilities, [], `${mode.name}: no capability is claimed missing`);
+    assert.equal(result.recommendedNextStep, mode.nextStep, mode.name);
+    assert.deepEqual(result.notes, rejectedNotes(mode), mode.name);
+    const text = JSON.stringify(result);
+    for (const canary of mode.canaries) assertNoWindowOf(text, canary, mode.name);
+  }
+});
+
+test("checkSplunkAccess keeps the limited result and the missing capabilities advice when a probe reads, when every probe is denied with 403, when ACS answers a rejected splunkd credential, or when one probe fails with something other than 401", async () => {
+  const separateAcs = { stack: "acme-stack", acsToken: SAMPLE_ACS_TOKEN };
+  const cases = [
+    { name: "every probe 403", api: client(HARDENED, { status: 403 }).client },
+    { name: "server info readable, the rest 401", fetch: { answers: { "/services/server/info": () => jsonResponse(entryList(HARDENED["/services/server/info"])) } } },
+    { name: "splunkd 401, ACS readable", overrides: separateAcs, fetch: { answers: { acs: () => jsonResponse({ subnets: ["10.0.0.0/8"] }) } } },
+    { name: "splunkd 401, ACS 403", overrides: separateAcs, fetch: { answers: { acs: () => jsonResponse({ code: "403-forbidden", message: "forbidden" }, 403) } } },
+    { name: "every probe 401 but kv collections 404", fetch: { answers: { "/servicesNS/-/-/storage/collections/config": () => jsonResponse({ messages: [{ type: "ERROR", text: "Not Found" }] }, 404) } } },
+    { name: "every probe 401 but apps 500", fetch: { answers: { "/services/apps/local": () => jsonResponse({ messages: [{ type: "ERROR", text: "Internal Server Error" }] }, 500) } } },
+    { name: "login 401 but ACS readable", overrides: { ...SESSION_CONFIG, ...separateAcs }, fetch: { answers: { acs: () => jsonResponse({ subnets: ["10.0.0.0/8"] }) } } },
+  ];
+  for (const { name, api, overrides = {}, fetch = {} } of cases) {
+    const result = await checkSplunkAccess(api ?? new SplunkApiClient(sampleConfig(overrides), { fetchImpl: rejectingFetch(fetch), retryDelayMs: 0 }));
+    assert.equal(result.status, "limited", name);
+    assert.equal(result.recommendedNextStep, UNREAD_CAPABILITIES_NEXT_STEP, name);
+    assert.equal(result.missingCapabilities.length, 7, name);
+    assert.equal(result.notes[1], "Authenticated as unknown (current-context unreadable) with an unread capability list.", name);
+    assert.equal(result.notes.length, 3, name);
+    assert.ok(!result.surfaces.some((surface) => surface.status === "unauthorized"), `${name}: no surface is relabeled`);
+  }
+});
+
+test("splunk_check_access renders the failed result without a missing capabilities line, for a bearer token and a username and password", async () => {
+  const dir = createTempBase("grclanker-splunk-rejected-tool-");
+  const registered = [];
+  registerSplunkTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "splunk_check_access");
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const mode of REJECTED_MODES.filter((item) => item.args)) {
+      globalThis.fetch = rejectingFetch(mode);
+      const result = await checkAccess.execute("call", checkAccess.prepareArguments({ url: "https://splunk.example.com:8089", config_file: join(dir, "absent.json"), ...mode.args }));
+      const text = result.content[0].text;
+      assert.equal(result.details.status, "failed", mode.name);
+      assert.match(text, /^Splunk access check: failed$/m, mode.name);
+      assert.ok(text.includes(`Next: ${mode.nextStep}`), `${mode.name}: ${text}`);
+      for (const note of rejectedNotes(mode)) assert.ok(text.includes(note), `${mode.name}: ${note}`);
+      assert.ok(!text.includes("Missing capabilities") && !text.includes("All expected capabilities are present."), mode.name);
+      for (const surface of result.details.surfaces.filter((item) => item.status !== "not_configured")) assert.match(text, new RegExp(`${surface.name}\\s+│ unauthorized`), `${mode.name}: ${surface.name}`);
+      for (const canary of mode.canaries) assertNoWindowOf(`${text}\n${JSON.stringify(result.details)}`, canary, mode.name);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("exportSplunkAuditBundle writes the failed access check when every probe returns 401, with the next step intact and no credential in any file", async () => {
+  const base = createTempBase("grclanker-splunk-rejected-export-");
+  const config = sampleConfig({ stack: "acme-stack", acsToken: SAMPLE_ACS_TOKEN });
+  const exported = await exportSplunkAuditBundle(new SplunkApiClient(config, { fetchImpl: rejectingFetch(), retryDelayMs: 0 }), config, base);
+  const files = readBundleFiles(exported.outputDir);
+  const access = JSON.parse(files.get(join("core_data", "access_check.json")));
+  assert.equal(access.status, "failed");
+  assert.equal(access.recommendedNextStep, REJECTED_MODES[2].nextStep);
+  assert.deepEqual(access.missingCapabilities, []);
+  assertSecretsAbsent(assert, files, leakWindows([SAMPLE_TOKEN, SAMPLE_ACS_TOKEN]), "rejected bundle");
+});
+
+test("GWS note 1, rejected credentials: every failed Splunk access check next step and note comes back from scrubErrorText, scrubDataText, and redactSnapshot unchanged", async () => {
+  const texts = new Set();
+  for (const mode of REJECTED_MODES) {
+    const result = await checkSplunkAccess(new SplunkApiClient(sampleConfig(mode.overrides), { fetchImpl: rejectingFetch(mode), retryDelayMs: 0 }));
+    assert.equal(result.status, "failed", mode.name);
+    for (const text of [result.recommendedNextStep, ...result.notes]) texts.add(text);
+  }
+  assert.equal(texts.size, 17);
+  const configured = [SAMPLE_TOKEN, SAMPLE_ACS_TOKEN, REJECTED_PASSWORD, REJECTED_SESSION_KEY];
+  for (const text of texts) {
+    assert.equal(scrubErrorText(text), text, `scrubErrorText changed: ${text}`);
+    assert.equal(scrubErrorText(text, configured), text, `scrubErrorText with the configured secrets changed: ${text}`);
+    assert.equal(scrubDataText(text), text, `scrubDataText changed: ${text}`);
+    assert.equal(redactSnapshot(text), text, `redactSnapshot changed: ${text}`);
+  }
+});
+
 test("hardened fixture passes the API-verifiable controls and keeps scoped-out controls manual", async () => {
   const { client: api } = client(HARDENED);
   const [auth, access, data, audit, platform] = await runAllAssessments(api);

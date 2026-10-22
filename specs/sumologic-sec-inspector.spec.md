@@ -22,7 +22,7 @@ Written in Go with a hybrid CLI/TUI architecture, it supports both automated pip
 
 The shipped implementation lives in `cli/extensions/grc-tools/sumologic.ts` as native grclanker tools (TypeScript, read-only Management API access with basic auth):
 
-- `sumologic_check_access`: probes 18 read surfaces and reports missing role capabilities
+- `sumologic_check_access`: probes 18 read surfaces and reports missing role capabilities, or `failed` with no capabilities named when every probe returns 401 because Sumo Logic rejected the access ID and access key
 - `sumologic_assess_identity`: controls 1 to 5
 - `sumologic_assess_access_control`: controls 6, 7, 8, 13, 14
 - `sumologic_assess_data_governance`: controls 9, 10, 12, 16, 17
