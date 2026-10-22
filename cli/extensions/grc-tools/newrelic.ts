@@ -183,7 +183,7 @@ export interface NewrelicAccessSurface {
 }
 
 export interface NewrelicAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   region: NewrelicRegion;
   accountIds: number[];
   surfaces: NewrelicAccessSurface[];
@@ -285,7 +285,10 @@ export interface Collected<T> {
   basis?: string;
 }
 
-/** Thrown by a scoped collector when it had no scopes to query; `collectList` records it as a not-collected inventory. */
+/**
+ * Thrown by a scoped collector or access probe when it had no scopes to query, so no request was sent; `collectList`
+ * records it as a not-collected inventory.
+ */
 class NotCollectedError extends Error {
   constructor(message: string) {
     super(message);
@@ -298,6 +301,22 @@ export class NewrelicNoAccountsError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "NewrelicNoAccountsError";
+  }
+}
+
+/**
+ * A NerdGraph or REST API v2 failure that `checkNewrelicAccess` reads to recognize a rejected key: the HTTP error
+ * status, when the response had one, and whether a NerdGraph error carried `extensions.error_code` BAD_API_KEY.
+ */
+class NewrelicApiError extends Error {
+  readonly status: number | undefined;
+  readonly badApiKey: boolean;
+
+  constructor(status: number | undefined, message: string, badApiKey: boolean) {
+    super(message);
+    this.name = "NewrelicApiError";
+    this.status = status;
+    this.badApiKey = badApiKey;
   }
 }
 
@@ -919,6 +938,11 @@ function nerdgraphErrorSummary(errors: unknown): string {
       return `${message}${classNote}${path ? ` (at ${path})` : ""}`;
     })
     .join("; ");
+}
+
+/** A GraphQL error whose `extensions.error_code` is BAD_API_KEY, which NerdGraph returns for an invalid or missing API key on any HTTP status. */
+function isBadApiKeyError(error: unknown): boolean {
+  return asObject(asObject(error)?.extensions)?.error_code === "BAD_API_KEY";
 }
 
 /** A response body parsed as a JSON object; undefined when it is empty, not JSON, or not an object. */
@@ -1599,10 +1623,12 @@ export class NewrelicApiClient {
   /**
    * The single point where a failed exchange becomes an error: status and endpoint (or the transport failure), then
    * either the documented error fields or a description of the body that was not echoed. Every message passes
-   * through scrub, so nothing the network or the API returned reaches a caller unscrubbed.
+   * through scrub, so nothing the network or the API returned reaches a caller unscrubbed. An HTTP error status, and
+   * whether a NerdGraph error carried the BAD_API_KEY error code, are kept on the error.
    */
-  private failure(summary: string, detail: string | undefined): Error {
-    return new Error(this.scrub(detail ? `${summary}: ${detail}` : summary));
+  private failure(summary: string, detail: string | undefined, httpStatus?: number, badApiKey = false): Error {
+    const message = this.scrub(detail ? `${summary}: ${detail}` : summary);
+    return httpStatus === undefined && !badApiKey ? new Error(message) : new NewrelicApiError(httpStatus, message, badApiKey);
   }
 
   private async requestWithRetry(url: string, init: RequestInit): Promise<Response> {
@@ -1647,16 +1673,17 @@ export class NewrelicApiClient {
     const parsed = parseJsonObject(rawText);
     const payload: JsonRecord = parsed ?? {};
     const errors = asArray(payload.errors);
+    const badApiKey = errors.some(isBadApiKeyError);
     if (!response.ok) {
       // Never the body itself: the documented errors[] fields when present, otherwise the body's type and length.
       const detail = errors.length > 0
         ? nerdgraphErrorSummary(errors)
         : describeOpaqueBody(response, rawText, parsed ? "JSON error body without an errors array" : "non-JSON error body");
-      throw this.failure(`NerdGraph request failed (${httpStatusLabel(response)}) at POST ${new URL(this.config.nerdgraphUrl).pathname}`, detail);
+      throw this.failure(`NerdGraph request failed (${httpStatusLabel(response)}) at POST ${new URL(this.config.nerdgraphUrl).pathname}`, detail, response.status, badApiKey);
     }
     const data = asObject(payload.data);
     if (errors.length > 0) {
-      throw this.failure("NerdGraph returned errors", nerdgraphErrorSummary(errors));
+      throw this.failure("NerdGraph returned errors", nerdgraphErrorSummary(errors), undefined, badApiKey);
     }
     if (!data) {
       throw new Error("NerdGraph response did not include data.");
@@ -1722,7 +1749,7 @@ export class NewrelicApiClient {
       // Only the documented error.title is echoed (scrubbed); any other body is described by type and length.
       const title = parsed ? asString(asObject(parsed.error)?.title) : undefined;
       const detail = title ?? describeOpaqueBody(response, rawText, parsed ? "JSON error body without a documented error.title" : "non-JSON error body");
-      throw this.failure(`REST API v2 request failed for GET ${new URL(url).pathname} (${httpStatusLabel(response)})`, detail);
+      throw this.failure(`REST API v2 request failed for GET ${new URL(url).pathname} (${httpStatusLabel(response)})`, detail, response.status);
     }
     return { payload: parsed ?? {}, nextLink: parseNextLinkHeader(response.headers.get("link")) };
   }
@@ -2587,6 +2614,27 @@ function finding(controlNumber: number, result: Verdict, evidence?: JsonRecord):
   };
 }
 
+/**
+ * The answers that reject the API key, in the order the failed next step names them: HTTP 401 from NerdGraph or
+ * REST API v2, and a NerdGraph error whose `extensions.error_code` is BAD_API_KEY on any other status. REST API v2
+ * answers 403 when API access is not enabled for the account, which is not a rejected key.
+ */
+const KEY_REJECTIONS = ["401", "BAD_API_KEY"] as const;
+type NewrelicKeyRejection = typeof KEY_REJECTIONS[number];
+
+/**
+ * Probes New Relic answered by rejecting the API key, with that answer, and probes that sent no request because no
+ * account ID was available; keyed by surface so the records keep their shape.
+ */
+const REJECTED_PROBES = new WeakMap<NewrelicAccessSurface, NewrelicKeyRejection>();
+const UNSENT_PROBES = new WeakSet<NewrelicAccessSurface>();
+
+function keyRejection(error: unknown): NewrelicKeyRejection | undefined {
+  if (!(error instanceof NewrelicApiError)) return undefined;
+  if (error.status === 401) return "401";
+  return error.badApiKey ? "BAD_API_KEY" : undefined;
+}
+
 async function readableSurface(
   name: string,
   endpoint: string,
@@ -2599,14 +2647,25 @@ async function readableSurface(
     return { name, endpoint, required, status: "readable", count: countResolver?.(value) };
   } catch (error) {
     rethrowIfAborted(error);
-    return {
+    const surface: NewrelicAccessSurface = {
       name,
       endpoint,
       required,
       status: "not_readable",
       error: errorMessage(error),
     };
+    const rejection = keyRejection(error);
+    if (rejection) REJECTED_PROBES.set(surface, rejection);
+    if (error instanceof NotCollectedError) UNSENT_PROBES.add(surface);
+    return surface;
   }
+}
+
+/** What the probes that sent a request answered, in KEY_REJECTIONS order, when every one rejected the key; empty otherwise. */
+function keyRejectionAnswers(surfaces: NewrelicAccessSurface[]): NewrelicKeyRejection[] {
+  const answers = surfaces.filter((surface) => !UNSENT_PROBES.has(surface)).map((surface) => REJECTED_PROBES.get(surface));
+  if (answers.length === 0 || answers.includes(undefined)) return [];
+  return KEY_REJECTIONS.filter((answer) => answers.includes(answer));
 }
 
 function arrayCount(value: unknown): number | undefined {
@@ -2667,7 +2726,7 @@ export async function checkNewrelicAccess(
       "NerdGraph actor.account.nrql (NrAuditEvent)",
       true,
       async () => {
-        if (primaryAccount === undefined) throw new Error("No account ID available for NRQL.");
+        if (primaryAccount === undefined) throw new NotCollectedError("No account ID available for NRQL.");
         return client.runNrql(primaryAccount, "SELECT count(*) FROM NrAuditEvent SINCE 1 day ago");
       },
       arrayCount,
@@ -2678,7 +2737,7 @@ export async function checkNewrelicAccess(
       "NerdGraph actor.account.alerts.policiesSearch",
       false,
       async () => {
-        if (primaryAccount === undefined) throw new Error("No account ID available for alerts.");
+        if (primaryAccount === undefined) throw new NotCollectedError("No account ID available for alerts.");
         return client.listAlertPolicies(primaryAccount, 50);
       },
       arrayCount,
@@ -2688,7 +2747,7 @@ export async function checkNewrelicAccess(
       "NerdGraph actor.account.dataManagement.eventRetentionRules",
       false,
       async () => {
-        if (primaryAccount === undefined) throw new Error("No account ID available for data management.");
+        if (primaryAccount === undefined) throw new NotCollectedError("No account ID available for data management.");
         return client.listEventRetentionRules(primaryAccount);
       },
       arrayCount,
@@ -2698,7 +2757,7 @@ export async function checkNewrelicAccess(
       "NerdGraph actor.account.logConfigurations.obfuscationRules",
       false,
       async () => {
-        if (primaryAccount === undefined) throw new Error("No account ID available for log configurations.");
+        if (primaryAccount === undefined) throw new NotCollectedError("No account ID available for log configurations.");
         return client.listObfuscationRules(primaryAccount);
       },
       arrayCount,
@@ -2709,7 +2768,11 @@ export async function checkNewrelicAccess(
   const requiredSurfaces = surfaces.filter((surface) => surface.required);
   const readableRequired = requiredSurfaces.filter((surface) => surface.status === "readable").length;
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
-  const status = readableRequired === requiredSurfaces.length ? "healthy" : "limited";
+  const rejectionAnswers = keyRejectionAnswers(surfaces);
+  const keyRejected = rejectionAnswers.length > 0;
+  const status: NewrelicAccessCheckResult["status"] = keyRejected
+    ? "failed"
+    : readableRequired === requiredSurfaces.length ? "healthy" : "limited";
 
   return {
     status,
@@ -2718,17 +2781,37 @@ export async function checkNewrelicAccess(
     surfaces,
     notes: [
       `Using New Relic ${config.region} region endpoint ${config.nerdgraphUrl}.`,
-      `Authenticated as ${asString(currentUser.email) ?? asString(currentUser.name) ?? asString(currentUser.id) ?? "unknown user"}.`,
+      keyRejected
+        ? "Permissions were not checked because New Relic rejected the API key; the denied probes do not mean permissions are missing."
+        : `Authenticated as ${asString(currentUser.email) ?? asString(currentUser.name) ?? asString(currentUser.id) ?? "unknown user"}.`,
       `Accounts in scope: ${accountIds.length > 0 ? accountIds.join(", ") : "none resolved"}.`,
       `${readableRequired}/${requiredSurfaces.length} required surfaces and ${readableCount}/${surfaces.length} total surfaces are readable.`,
-      "The role catalog (customerAdministration.roles) is only served to organizations with the multi-tenancy entitlement; when it is not readable, control 20 renders manual and custom roles are reported from group grants only.",
+      ...(keyRejected
+        ? []
+        : ["The role catalog (customerAdministration.roles) is only served to organizations with the multi-tenancy entitlement; when it is not readable, control 20 renders manual and custom roles are reported from group grants only."]),
       "REST API v2 /v2/users.json only lists original user model users and is informational.",
     ],
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run newrelic_assess_identity, newrelic_assess_access_control, newrelic_assess_alerting, newrelic_assess_data_governance, or newrelic_export_audit_bundle."
-        : "Use a User API key from a user with Organization manager and Authentication domain manager roles plus access to every account in scope.",
+    recommendedNextStep: accessCheckNextStep(status, config.region, rejectionAnswers),
   };
+}
+
+function accessCheckNextStep(
+  status: NewrelicAccessCheckResult["status"],
+  region: NewrelicRegion,
+  rejectionAnswers: NewrelicKeyRejection[],
+): string {
+  switch (status) {
+    case "healthy":
+      return "Run newrelic_assess_identity, newrelic_assess_access_control, newrelic_assess_alerting, newrelic_assess_data_governance, or newrelic_export_audit_bundle.";
+    case "limited":
+      return "Use a User API key from a user with Organization manager and Authentication domain manager roles plus access to every account in scope.";
+    case "failed":
+      return `New Relic rejected the API key (every probe returned ${rejectionAnswers.join(" or ")}). Set NEW_RELIC_API_KEY (or the api_key argument or config.yaml key) to a valid User API key, and NEW_RELIC_REGION (or the region argument) if the account is not in the ${region} region, then rerun newrelic_check_access.`;
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled New Relic access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 export interface NewrelicIdentityData {

@@ -35,6 +35,7 @@ import {
   projectCompartmentSnapshot,
   redactSensitiveText,
   redactSensitiveValues,
+  registerOciTools,
   resolveOciConfiguration,
   resolveSecureOutputPath,
   ruleReachesSensitivePort,
@@ -50,6 +51,7 @@ import {
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const TENANCY = "ocid1.tenancy.oc1..aaaaexample";
@@ -2150,7 +2152,8 @@ const SILENT_SUCCESS_ROWS = [
 /**
  * Puts a fake `oci` first on PATH so the default execFileSync runner (no
  * injected exec) spawns it; OCI_FAKE_STDOUT selects the stdout shape and the
- * process always exits 0. Restores PATH and removes the directory afterwards.
+ * process exits 0, except `stderr`, which prints OCI_FAKE_STDERR and exits 1.
+ * Restores PATH and removes the directory afterwards.
  */
 function installFakeOci() {
   const dir = mkdtempSync(join(tmpdir(), "grclanker-oci-fake-cli-"));
@@ -2161,6 +2164,7 @@ function installFakeOci() {
     "  whitespace) printf '  \\n\\t \\n'; exit 0 ;;",
     "  foreign) printf '%s' '{\"items\": [], \"opc-request-id\": \"6B5074A48E0B435699E3CF5EC923D475\"}'; exit 0 ;;",
     '  html) printf \'%s\' "$OCI_FAKE_HTML"; exit 0 ;;',
+    '  stderr) printf \'%s\' "$OCI_FAKE_STDERR" >&2; exit 1 ;;',
     "esac",
     'echo "unexpected OCI_FAKE_STDOUT=$OCI_FAKE_STDOUT" >&2',
     "exit 3",
@@ -2175,6 +2179,7 @@ function installFakeOci() {
       process.env.PATH = previousPath;
       delete process.env.OCI_FAKE_HTML;
       delete process.env.OCI_FAKE_STDOUT;
+      delete process.env.OCI_FAKE_STDERR;
       rmSync(dir, { recursive: true, force: true });
     },
   };
@@ -2230,6 +2235,122 @@ test("silent success: empty, whitespace-only, and foreign-JSON stdout on exit 0 
   } finally {
     fake.restore();
   }
+});
+
+/** Values the rejected-key runs plant: the request signature a 401 ServiceError echoes and the profile's pass_phrase (see the self-check). */
+const REJECTED_KEY_PLANTED = {
+  signature: "FjTTPaRGBg1xFrEfGc",
+  passPhrase: "RrtEHf5cBJAz0XSpvT",
+};
+
+/** The ServiceError block the CLI prints when OCI rejects the request signature (401 NotAuthenticated), here echoing the signing header. */
+function notAuthenticatedBlock() {
+  return `ServiceError:\n${JSON.stringify({
+    client_version: "Oracle-PythonSDK/2.124.1, Oracle-PythonCLI/3.37.13",
+    code: "NotAuthenticated",
+    logging_tips: "Please run the OCI CLI command using --debug flag to find more debug information.",
+    message: `The required information to complete authentication was not provided or was incorrect. Authorization: Signature version="1",keyId="${TENANCY}/ocid1.user.oc1..aaaaexampleuser/aa:bb",algorithm="rsa-sha256",headers="(request-target) date host",signature="${REJECTED_KEY_PLANTED.signature}"`,
+    "opc-request-id": OPC_REQUEST_ID,
+    operation_name: "list_compartments",
+    request_endpoint: `GET https://identity.us-ashburn-1.oci.oraclecloud.com/20160918/compartments?compartmentId=${TENANCY}`,
+    status: 401,
+    target_service: "identity",
+    timestamp: "2026-09-21T22:47:00.000000+00:00",
+    troubleshooting_tips: "See [https://docs.oracle.com/iaas/Content/API/References/apierrors.htm] for more information about resolving this error.",
+  }, null, 4)}\n`;
+}
+
+function rejectedKeyStep(profile) {
+  return `OCI rejected the API signing key of profile ${profile} (every probe returned 401). Check the profile's user, fingerprint, key_file, and tenancy entries against the user's uploaded API keys, or set OCI_CLI_PROFILE and OCI_CONFIG_FILE (or the profile and config_file arguments) to a working profile, plus OCI_REGION (or the region argument) if the tenancy is not subscribed to the configured region, then rerun oci_check_access.`;
+}
+
+/** A client on the real command runner whose every `oci` command fails with `stderr`, except the commands `readable` answers. */
+function scriptedCliClient(stderr, readable = () => undefined) {
+  const runner = createOciCommandRunner((_file, args) => {
+    const stdout = readable(args);
+    if (stdout !== undefined) return stdout;
+    throw execFileSyncFailure(args, stderr);
+  });
+  return new OciAuditorClient(sampleConfig(), runner, { now: () => NOW });
+}
+
+test("rejected-key planted values self-check: alphanumeric, distinct in every 6-character window, and absent from the sample configuration and a healthy access check", async () => {
+  assertPlantedValuesWellFormed(assert, REJECTED_KEY_PLANTED, [
+    ["sample configuration", JSON.stringify(sampleConfig())],
+    ["healthy access check", JSON.stringify(await checkOciAccess(compliantClient()))],
+  ]);
+});
+
+test("checkOciAccess reports failed with a plain message when every CLI command fails with ServiceError 401 NotAuthenticated", async () => {
+  const result = await checkOciAccess(scriptedCliClient(notAuthenticatedBlock()));
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.recommendedNextStep, rejectedKeyStep("prod-audit"));
+  assert.equal(result.surfaces.length, 10);
+  assert.ok(result.surfaces.every((surface) => surface.status === "not_readable" && / with ServiceError status=401 code=NotAuthenticated /.test(surface.error)));
+  assert.deepEqual(result.notes, [
+    "Permissions were not checked because OCI rejected the API signing key of profile prod-audit; the denied probes do not mean permissions are missing.",
+    "Using OCI config /tmp/oci/config profile prod-audit.",
+    "0/10 OCI audit surfaces are readable.",
+    "Unreadable surfaces render their controls as manual, never pass.",
+  ]);
+  assertFragmentsAbsent(assert, JSON.stringify(result), Object.values(REJECTED_KEY_PLANTED), "rejected-key access check");
+});
+
+test("oci_check_access renders the failed status and the next step when the real CLI exits 1 with ServiceError 401 on every command", { skip: POSIX_ONLY }, async () => {
+  const configDir = createTempBase("grclanker-oci-rejected-config-");
+  const configFile = join(configDir, "config");
+  writeFileSync(configFile, [
+    "[ci-audit]",
+    "user=ocid1.user.oc1..aaaaexampleuser",
+    "fingerprint=aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99",
+    `key_file=${join(configDir, "oci_api_key.pem")}`,
+    `pass_phrase=${REJECTED_KEY_PLANTED.passPhrase}`,
+    `tenancy=${TENANCY}`,
+    "region=eu-frankfurt-1",
+    "",
+  ].join("\n"));
+  const registered = [];
+  registerOciTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "oci_check_access");
+  const fake = installFakeOci();
+  try {
+    process.env.OCI_FAKE_STDOUT = "stderr";
+    process.env.OCI_FAKE_STDERR = notAuthenticatedBlock();
+    const output = await checkAccess.execute("call-rejected", checkAccess.prepareArguments({ config_file: configFile, profile: "ci-audit" }));
+    const text = output.content.map((part) => part.text ?? "").join("\n");
+    const message = rejectedKeyStep("ci-audit");
+
+    assert.notEqual(output.isError, true, text);
+    assert.equal(output.details.status, "failed");
+    assert.equal(output.details.recommendedNextStep, message);
+    assert.ok(text.startsWith("OCI access check: failed\n\nPermissions were not checked because OCI rejected the API signing key of profile ci-audit; the denied probes do not mean permissions are missing.\n"));
+    assert.ok(text.endsWith(`\nNext: ${message}`));
+    assert.doesNotMatch(text, /Authenticated via|iam compartment list is not readable|inspect permissions/);
+    assertFragmentsAbsent(assert, `${text}\n${JSON.stringify(output.details)}`, Object.values(REJECTED_KEY_PLANTED), "oci_check_access text and details");
+  } finally {
+    fake.restore();
+    rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("checkOciAccess keeps the limited status and the inspect-permissions advice when one probe is readable and the rest return 401, when every probe returns 404, or when the CLI prints no ServiceError block", async () => {
+  const compartments = (args) => (args.includes("compartment") && args.includes("list") ? JSON.stringify({ data: [ROOT, PROD] }) : undefined);
+  const notFound = `ServiceError:\n${JSON.stringify({ code: "NotAuthorizedOrNotFound", message: "Authorization failed or requested resource not found.", status: 404 })}\n`;
+  const runs = [
+    ["compartments readable, the rest 401", await checkOciAccess(scriptedCliClient(notAuthenticatedBlock(), compartments)), 9],
+    ["every probe 404", await checkOciAccess(scriptedCliClient(notFound)), 10],
+    ["no ServiceError block", await checkOciAccess(scriptedCliClient(GATEWAY_PAGE)), 10],
+  ];
+  for (const [label, result, deniedCount] of runs) {
+    assert.equal(result.status, "limited", label);
+    assert.equal(result.recommendedNextStep, "Install and configure the OCI CLI profile or supply explicit tenancy/profile arguments with read-only inspect permissions.", label);
+    assert.equal(result.surfaces.filter((surface) => surface.status === "not_readable").length, deniedCount, label);
+    assert.ok(result.notes.includes("Authenticated via OCI profile prod-audit in us-ashburn-1."), label);
+    assert.doesNotMatch(JSON.stringify(result), /rejected the API signing key|were not checked/, label);
+    assertFragmentsAbsent(assert, JSON.stringify(result), Object.values(REJECTED_KEY_PLANTED), label);
+  }
+  assert.ok(runs[1][1].notes.includes("iam compartment list is not readable, so every compartment-scoped control renders manual and the check is limited."));
 });
 
 test("byte differential fixtures: OCI assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {

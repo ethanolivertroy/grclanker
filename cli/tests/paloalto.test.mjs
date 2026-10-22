@@ -1160,6 +1160,201 @@ test("checkPaloaltoAccess reports degraded access and single-product configurati
   assert.ok(single.notes.some((note) => /Prisma Cloud not configured/.test(note)));
 });
 
+// Planted credentials of the rejected-credential runs. The refusing servers echo them back, so
+// every run proves that no window of any reaches the access check, the tool text, or the details.
+const REJECTED_CREDENTIALS = {
+  prismaAccessKeyId: "3jHMY6i01tsSMCDPcr",
+  prismaSecretKey: "Ywq2FPogPzVzE0Buuf",
+  panosApiKey: "HaYQlBX4Z3yN7uznDZ",
+  panosPassword: "xVEG6RkKSCFp29n7mb",
+};
+// PAN-OS's documented answer to a refused API key or keygen login, in the device's own attribute spacing and quoting.
+const PANOS_INVALID_CREDENTIAL = "<response status = 'error' code = '403'><result><msg>Invalid Credential</msg></result></response>";
+const ROLE_GRANT_STEP = "Grant the Prisma Cloud access key a read-only System Admin or Account Group Read Only role and the PAN-OS admin a read-only (auditadmin or custom XML API read) role, then re-run paloalto_check_access.";
+const PRISMA_REJECTED_SETTINGS = "PRISMA_ACCESS_KEY_ID and PRISMA_SECRET_KEY (or the prisma_access_key_id and prisma_secret_key arguments or paloalto.json keys) to an active access key, plus PRISMA_API_URL (or the prisma_api_url argument) if the tenant's API URL is not https://api2.prismacloud.io";
+const PANOS_API_KEY_SETTINGS = "PANOS_API_KEY (or the panos_api_key argument or paloalto.json key) to a current API key";
+const COMPUTE_REJECTED_NOTE = "Prisma Cloud Compute not reachable: Compute console discovery via CSPM /meta_info uses the rejected Prisma Cloud access key. Controls 7-11, 24, and 25 fall back to manual findings.";
+const COMPUTE_DISCOVERY_FAILED_NOTE = /^Prisma Cloud Compute not reachable: Compute console discovery via CSPM \/meta_info failed \(.+\); set PRISMA_COMPUTE_URL to the Compute console path\. Controls 7-11, 24, and 25 fall back to manual findings\.$/;
+const PRISMA_NOT_CONFIGURED_NOTE = "Prisma Cloud not configured (PRISMA_ACCESS_KEY_ID and PRISMA_SECRET_KEY missing); controls 1-11, 24, and 25 fall back to manual findings.";
+
+/** Prisma Cloud with the planted access key and fw1 with the planted API key or admin login; false leaves a product out. */
+function rejectedCredentialConfig({ prisma = true, panos = "api_key" } = {}) {
+  return resolvePaloaltoConfiguration({}, {
+    ...(prisma ? { PRISMA_API_URL: "https://api2.prismacloud.io", PRISMA_ACCESS_KEY_ID: REJECTED_CREDENTIALS.prismaAccessKeyId, PRISMA_SECRET_KEY: REJECTED_CREDENTIALS.prismaSecretKey } : {}),
+    ...(panos === "api_key" ? { PANOS_HOST: "fw1.example.com", PANOS_API_KEY: REJECTED_CREDENTIALS.panosApiKey } : {}),
+    ...(panos === "admin_login" ? { PANOS_HOST: "fw1.example.com", PANOS_USERNAME: "audit-admin", PANOS_PASSWORD: REJECTED_CREDENTIALS.panosPassword } : {}),
+  });
+}
+
+/**
+ * The servers of the rejected-credential runs. prisma "refuse" answers /login with Prisma Cloud's
+ * documented 401 (x-redlock-status invalid_credentials) and a message echoing both halves of the
+ * access key, "deny" accepts the login and forbids every read, and "accept" is the healthy tenant.
+ * panos is how fw1 answers every request, keygen included: "invalid_credential" (PAN-OS's Invalid
+ * Credential response with panosHttpStatus), "unauthorized" (a bare 401 page echoing the key),
+ * "forbidden" (403 Insufficient privileges), "keygen_refused" (a 403 whose message is not Invalid
+ * Credential and echoes the password), or "readable" (the healthy device).
+ */
+function refusingPaloaltoFetch({ prisma = "refuse", panos = "invalid_credential", panosHttpStatus = 403 } = {}) {
+  const prismaServer = mockedFetch({ denyAll: prisma === "deny" });
+  const panosServer = mockedFetch();
+  return async (input, init = {}) => {
+    const url = new URL(input);
+    if (url.hostname !== "fw1.example.com") {
+      if (prisma === "refuse" && url.pathname === "/login") {
+        return jsonResponse(
+          { message: `Invalid credentials for access key ${REJECTED_CREDENTIALS.prismaAccessKeyId} and secret key ${REJECTED_CREDENTIALS.prismaSecretKey}` },
+          { status: 401, headers: { "x-redlock-status": JSON.stringify([{ i18nKey: "invalid_credentials", severity: "error", subject: null }]) } },
+        );
+      }
+      return prismaServer(input, init);
+    }
+    switch (panos) {
+      case "invalid_credential":
+        return xmlResponse(PANOS_INVALID_CREDENTIAL, panosHttpStatus);
+      case "unauthorized":
+        return new Response(`Unauthorized: X-PAN-KEY ${REJECTED_CREDENTIALS.panosApiKey} is not a valid key`, { status: 401, statusText: "Unauthorized", headers: { "content-type": "text/plain" } });
+      case "forbidden":
+        return xmlResponse(PANOS_FORBIDDEN, 403);
+      case "keygen_refused":
+        return xmlResponse(`<response status="error" code="403"><result><msg>Login refused for audit-admin with password ${REJECTED_CREDENTIALS.panosPassword}</msg></result></response>`, 403);
+      case "readable":
+        return panosServer(input, init);
+      default:
+        throw new Error(`unknown PAN-OS answer ${panos}`);
+    }
+  };
+}
+
+function assertNoRejectedCredential(text, label) {
+  for (const value of Object.values(REJECTED_CREDENTIALS)) assertNoWindow(text, value, label);
+}
+
+/** One access check against the refusing servers; no window of a planted credential may reach the result. */
+async function rejectedCredentialCheck(config, fetchImpl, label) {
+  const result = await checkPaloaltoAccess(createPaloaltoClients(config, fetchImpl));
+  assertNoRejectedCredential(JSON.stringify(result), label);
+  return result;
+}
+
+test("checkPaloaltoAccess reports failed with a plain message when Prisma Cloud refuses the access key at login with 401", async () => {
+  const result = await rejectedCredentialCheck(rejectedCredentialConfig({ panos: false }), refusingPaloaltoFetch(), "Prisma Cloud login refused");
+  assert.equal(result.status, "failed");
+  assert.deepEqual(result.products, ["prisma-cloud"]);
+  assert.equal(result.surfaces.length, 8);
+  for (const surface of result.surfaces) {
+    assert.deepEqual([surface.status, surface.endpoint, surface.httpStatus], ["not_readable", "POST /login", 401], surface.name);
+    assert.ok(surface.error.includes(REDACTION_MARKER), `the echoed access key reached ${surface.name} only redacted: ${surface.error}`);
+  }
+  assert.deepEqual(result.notes, [
+    "Prisma Cloud API: https://api2.prismacloud.io",
+    COMPUTE_REJECTED_NOTE,
+    "PAN-OS not configured (PANOS_HOST missing); controls 12-18, 22, and 23 fall back to manual findings.",
+    "Permissions were not checked because Prisma Cloud rejected the access key; the denied probes do not mean permissions are missing.",
+    "0/8 Palo Alto audit surfaces are readable.",
+  ]);
+  assert.equal(result.recommendedNextStep, `Prisma Cloud rejected the access key (the login request returned 401). Set ${PRISMA_REJECTED_SETTINGS}, then rerun paloalto_check_access.`);
+});
+
+test("checkPaloaltoAccess reports failed when PAN-OS answers every probe with Invalid Credential for the API key, over HTTP 403 or HTTP 200", async () => {
+  for (const panosHttpStatus of [403, 200]) {
+    const label = `Invalid Credential over HTTP ${panosHttpStatus}`;
+    const result = await rejectedCredentialCheck(rejectedCredentialConfig({ prisma: false }), refusingPaloaltoFetch({ panosHttpStatus }), label);
+    assert.equal(result.status, "failed", label);
+    assert.equal(result.surfaces.length, 7, label);
+    for (const surface of result.surfaces) {
+      assert.deepEqual([surface.status, surface.httpStatus], ["not_readable", panosHttpStatus], `${label}: ${surface.name}`);
+      assert.match(surface.error, /failed \(code 403, status \d+\): Invalid Credential$/, `${label}: ${surface.name}`);
+    }
+    assert.deepEqual(result.notes, [
+      PRISMA_NOT_CONFIGURED_NOTE,
+      "fw1.example.com: firewall",
+      "Permissions were not checked because PAN-OS rejected the API key; the denied probes do not mean permissions are missing.",
+      "0/7 Palo Alto audit surfaces are readable.",
+    ], label);
+    assert.equal(result.recommendedNextStep, `PAN-OS rejected the API key (every probe returned Invalid Credential). Set ${PANOS_API_KEY_SETTINGS}, then rerun paloalto_check_access.`, label);
+  }
+});
+
+test("checkPaloaltoAccess reports failed when keygen answers Invalid Credential for the admin username and password", async () => {
+  const result = await rejectedCredentialCheck(rejectedCredentialConfig({ prisma: false, panos: "admin_login" }), refusingPaloaltoFetch(), "keygen refused");
+  assert.equal(result.status, "failed");
+  assert.equal(result.surfaces.length, 7);
+  for (const surface of result.surfaces) {
+    assert.deepEqual([surface.status, surface.endpoint, surface.httpStatus], ["not_readable", "POST /api/?type=keygen", 403], surface.name);
+  }
+  assert.deepEqual(result.notes, [
+    PRISMA_NOT_CONFIGURED_NOTE,
+    "fw1.example.com: firewall",
+    "Permissions were not checked because PAN-OS rejected the admin username and password; the denied probes do not mean permissions are missing.",
+    "0/7 Palo Alto audit surfaces are readable.",
+  ]);
+  assert.equal(result.recommendedNextStep, "PAN-OS rejected the admin username and password (the keygen request returned Invalid Credential). Set PANOS_USERNAME and PANOS_PASSWORD (or the panos_username and panos_password arguments or paloalto.json keys) to the admin account's current credentials, then rerun paloalto_check_access.");
+});
+
+test("paloalto_check_access renders the failed status and one next step naming both refused credentials when Prisma Cloud refuses the login and PAN-OS answers every probe with 401", async () => {
+  const configFile = join(createTempBase("grclanker-paloalto-rejected-"), "paloalto.json");
+  writeFileSync(configFile, "{}");
+  const tools = new Map();
+  registerPaloaltoTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const check = tools.get("paloalto_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = refusingPaloaltoFetch({ panos: "unauthorized" });
+  let output;
+  try {
+    output = await check.execute("call-rejected", check.prepareArguments({
+      config_file: configFile,
+      prisma_api_url: "https://api2.prismacloud.io",
+      prisma_access_key_id: REJECTED_CREDENTIALS.prismaAccessKeyId,
+      prisma_secret_key: REJECTED_CREDENTIALS.prismaSecretKey,
+      panos_hosts: "fw1.example.com",
+      panos_api_key: REJECTED_CREDENTIALS.panosApiKey,
+    }));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const text = output.content.map((part) => part.text ?? "").join("\n");
+  assertNoRejectedCredential(`${text}\n${JSON.stringify(output.details)}`, "paloalto_check_access text and details");
+  assert.notEqual(output.isError, true, text);
+  const nextStep = `Prisma Cloud rejected the access key (the login request returned 401), and PAN-OS rejected the API key (every probe returned 401). Set ${PRISMA_REJECTED_SETTINGS}; and set ${PANOS_API_KEY_SETTINGS}, then rerun paloalto_check_access.`;
+  assert.equal(output.details.status, "failed");
+  assert.equal(output.details.recommendedNextStep, nextStep);
+  assert.ok(text.startsWith("Palo Alto access check: failed\n"), text);
+  assert.ok(text.endsWith(`\nNext: ${nextStep}`), text);
+  assert.deepEqual(output.details.notes, [
+    "Prisma Cloud API: https://api2.prismacloud.io",
+    COMPUTE_REJECTED_NOTE,
+    "fw1.example.com: firewall",
+    "Permissions were not checked because Prisma Cloud rejected the access key and PAN-OS rejected the API key; the denied probes do not mean permissions are missing.",
+    "0/15 Palo Alto audit surfaces are readable.",
+  ]);
+  assert.ok(output.details.surfaces.every((surface) => surface.status === "not_readable" && surface.httpStatus === 401), JSON.stringify(output.details.surfaces));
+  assert.doesNotMatch(text, /Grant the|auditadmin|Read Only role|PRISMA_COMPUTE_URL/);
+});
+
+test("checkPaloaltoAccess keeps the degraded status and the role-grant step when one product reads while the other refuses its credential, when every probe is forbidden, or when keygen is refused with another message", async () => {
+  // echoed: the refusals carry a planted credential in a field the client keeps, so it must arrive redacted.
+  const cases = [
+    { label: "Prisma Cloud refuses the login while PAN-OS reads", config: rejectedCredentialConfig(), fetchImpl: refusingPaloaltoFetch({ panos: "readable" }), notReadable: ["prisma-cloud", 8], readable: "7/15", computeUnreachable: true, echoed: true },
+    { label: "PAN-OS answers every probe with 401 while Prisma Cloud reads", config: rejectedCredentialConfig(), fetchImpl: refusingPaloaltoFetch({ prisma: "accept", panos: "unauthorized" }), notReadable: ["pan-os", 7], readable: "17/24", computeUnreachable: false, echoed: false },
+    { label: "every probe is forbidden", config: rejectedCredentialConfig(), fetchImpl: refusingPaloaltoFetch({ prisma: "deny", panos: "forbidden" }), notReadable: [undefined, 15], readable: "0/15", computeUnreachable: true, echoed: false },
+    { label: "keygen is refused with another message", config: rejectedCredentialConfig({ prisma: false, panos: "admin_login" }), fetchImpl: refusingPaloaltoFetch({ panos: "keygen_refused" }), notReadable: ["pan-os", 7], readable: "0/7", computeUnreachable: false, echoed: true },
+  ];
+  for (const entry of cases) {
+    const result = await rejectedCredentialCheck(entry.config, entry.fetchImpl, entry.label);
+    assert.equal(result.status, "degraded", entry.label);
+    assert.equal(result.recommendedNextStep, ROLE_GRANT_STEP, entry.label);
+    const [product, count] = entry.notReadable;
+    const notReadable = result.surfaces.filter((surface) => surface.status === "not_readable");
+    assert.equal(notReadable.length, count, entry.label);
+    if (product) assert.ok(notReadable.every((surface) => surface.product === product), `${entry.label}: ${JSON.stringify(notReadable)}`);
+    if (entry.echoed) assert.ok(notReadable.every((surface) => surface.error.includes(REDACTION_MARKER)), `${entry.label}: ${JSON.stringify(notReadable)}`);
+    assert.equal(result.notes.at(-1), `${entry.readable} Palo Alto audit surfaces are readable.`, entry.label);
+    assert.ok(!result.notes.some((note) => note.startsWith("Permissions were not checked") || note === COMPUTE_REJECTED_NOTE), `${entry.label}: ${result.notes.join(" | ")}`);
+    assert.equal(result.notes.some((note) => COMPUTE_DISCOVERY_FAILED_NOTE.test(note)), entry.computeUnreachable, `${entry.label}: ${result.notes.join(" | ")}`);
+  }
+});
+
 test("assessPrismaCloudPosture passes on a healthy tenant and fails on a weak one", () => {
   const good = assessPrismaCloudPosture(prismaSnapshot());
   assert.equal(good.length, 6);
@@ -1515,7 +1710,7 @@ function assertNoCanary(text, label, canaries = CANARIES) {
 // rules run on their own (hyphenated words with one digit group), the Slack path (the
 // documented T/B/secret shape, the whole path being the secret), and the PAN-OS password
 // (every character class an encoding changes).
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_APOSTROPHE, CANARY_USERINFO, ...Object.values(FAKE_PANOS_SECRETS), ...Object.values(FAKE_PRISMA_SECRETS), FIXTURE_SECRET_KEY, FIXTURE_PANOS_PASSWORD];
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_APOSTROPHE, CANARY_USERINFO, ...Object.values(FAKE_PANOS_SECRETS), ...Object.values(FAKE_PRISMA_SECRETS), ...Object.values(REJECTED_CREDENTIALS), FIXTURE_SECRET_KEY, FIXTURE_PANOS_PASSWORD];
 const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_APOSTROPHE, FIXTURE_SECRET_KEY, FAKE_PRISMA_SECRETS.slackWebhookPath, FIXTURE_PANOS_PASSWORD]);
 
 // A proxy or load balancer error page: HTML with header lines and a URL carrying a token.

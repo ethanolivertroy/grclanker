@@ -268,7 +268,7 @@ export interface OciAccessSurface {
 }
 
 export interface OciAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   tenancyOcid: string;
   compartmentOcid: string;
   surfaces: OciAccessSurface[];
@@ -1515,6 +1515,12 @@ function compartmentScope(compartments: OciCollected<JsonRecord>, maxCompartment
   return summaryEntry(outcome, { compartments_inspected: inspected, compartments_total: active.length });
 }
 
+/**
+ * Probes whose CLI command failed with a ServiceError of status 401 (NotAuthenticated), which OCI returns when it
+ * rejects the request signature; keyed by surface so the records keep their shape.
+ */
+const REJECTED_PROBES = new WeakSet<OciAccessSurface>();
+
 async function surface(
   name: string,
   service: string,
@@ -1531,12 +1537,14 @@ async function surface(
     };
   } catch (error) {
     rethrowIfAborted(error);
-    return {
+    const unreadable: OciAccessSurface = {
       name,
       service,
       status: "not_readable",
       error: errorMessage(error),
     };
+    if (error instanceof OciCommandError && error.serviceError?.status === 401) REJECTED_PROBES.add(unreadable);
+    return unreadable;
   }
 }
 
@@ -1963,13 +1971,18 @@ export async function checkOciAccess(client: OciAccessClient): Promise<OciAccess
 
   const readableCount = surfaces.filter((item) => item.status === "readable").length;
   const compartmentsReadable = surfaces.some((item) => item.name === "compartments" && item.status === "readable");
-  const status = readableCount >= 7 && compartmentsReadable ? "healthy" : "limited";
+  const keyRejected = surfaces.every((item) => REJECTED_PROBES.has(item));
+  const status: OciAccessCheckResult["status"] = keyRejected
+    ? "failed"
+    : readableCount >= 7 && compartmentsReadable ? "healthy" : "limited";
   const notes = [
-    `Authenticated via ${describeSourceChain(config)}.`,
+    keyRejected
+      ? `Permissions were not checked because OCI rejected the API signing key of profile ${config.profile}; the denied probes do not mean permissions are missing.`
+      : `Authenticated via ${describeSourceChain(config)}.`,
     `Using OCI config ${config.configFile} profile ${config.profile}.`,
     `${readableCount}/${surfaces.length} OCI audit surfaces are readable.`,
     "Unreadable surfaces render their controls as manual, never pass.",
-    ...(compartmentsReadable ? [] : ["iam compartment list is not readable, so every compartment-scoped control renders manual and the check is limited."]),
+    ...(compartmentsReadable || keyRejected ? [] : ["iam compartment list is not readable, so every compartment-scoped control renders manual and the check is limited."]),
   ];
 
   return {
@@ -1978,11 +1991,23 @@ export async function checkOciAccess(client: OciAccessClient): Promise<OciAccess
     compartmentOcid: config.compartmentOcid,
     surfaces,
     notes,
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run oci_assess_identity, oci_assess_logging_detection, oci_assess_tenancy_guardrails, oci_assess_compute_and_storage, or oci_export_audit_bundle."
-        : "Install and configure the OCI CLI profile or supply explicit tenancy/profile arguments with read-only inspect permissions.",
+    recommendedNextStep: accessCheckNextStep(status, config),
   };
+}
+
+function accessCheckNextStep(status: OciAccessCheckResult["status"], config: OciResolvedConfig): string {
+  switch (status) {
+    case "healthy":
+      return "Run oci_assess_identity, oci_assess_logging_detection, oci_assess_tenancy_guardrails, oci_assess_compute_and_storage, or oci_export_audit_bundle.";
+    case "limited":
+      return "Install and configure the OCI CLI profile or supply explicit tenancy/profile arguments with read-only inspect permissions.";
+    case "failed":
+      return `OCI rejected the API signing key of profile ${config.profile} (every probe returned 401). Check the profile's user, fingerprint, key_file, and tenancy entries against the user's uploaded API keys, or set OCI_CLI_PROFILE and OCI_CONFIG_FILE (or the profile and config_file arguments) to a working profile, plus OCI_REGION (or the region argument) if the tenancy is not subscribed to the configured region, then rerun oci_check_access.`;
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled OCI access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function computeCompartmentDepth(compartments: JsonRecord[]): number {

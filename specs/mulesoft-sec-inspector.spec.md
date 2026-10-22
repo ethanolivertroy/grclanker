@@ -24,7 +24,7 @@ The shipped implementation is the native TypeScript module `cli/extensions/grc-t
 
 | Tool | Covers |
 |------|--------|
-| `mulesoft_check_access` | Probes every read surface used below and names the missing permission for each 401 or 403 |
+| `mulesoft_check_access` | Probes every read surface used below and names the missing permission for each 401 or 403, or reports failed without naming permissions when Anypoint rejects the credentials (every probe sent returns 401, or the token request or login is refused) |
 | `mulesoft_assess_identity_access` | Controls 1-6, 18, 19, 25 |
 | `mulesoft_assess_api_gateway` | Controls 7-9, 20 |
 | `mulesoft_assess_runtime_infrastructure` | Controls 10-16, 21-23 |

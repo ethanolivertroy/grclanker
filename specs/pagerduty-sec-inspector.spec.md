@@ -233,7 +233,7 @@ The Go layout above is the original standalone design. The shipped implementatio
 
 | Tool | Controls |
 |------|----------|
-| `pagerduty_check_access` | Probes 14 read surfaces (abilities, users, teams, services, escalation policies, schedules, on-calls, audit records, extensions, webhook subscriptions, business services, priorities, incident workflows, change events) and reports missing permissions |
+| `pagerduty_check_access` | Probes 14 read surfaces (abilities, users, teams, services, escalation policies, schedules, on-calls, audit records, extensions, webhook subscriptions, business services, priorities, incident workflows, change events) and reports missing permissions, or reports failed without them when PagerDuty rejects the credential (every probe returns 401, or the Scoped OAuth token request is refused) |
 | `pagerduty_assess_access_control` | 1, 2, 3, 4, 24 |
 | `pagerduty_assess_incident_response` | 5, 6, 7, 10, 19, 20, 22, 23 |
 | `pagerduty_assess_oncall_coverage` | 8, 9, 17, 18 |

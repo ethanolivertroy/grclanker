@@ -41,6 +41,7 @@ import {
 } from "../dist/extensions/grc-tools/newrelic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 
 const TEST_KEY = "NRAK-TESTKEY1234567890ABCDEF";
 const NOW = Date.UTC(2026, 8, 21, 12, 0, 0);
@@ -1443,6 +1444,143 @@ test("checkNewrelicAccess reports limited access when required surfaces fail", a
   assert.match(userManagement.error, /Not authorized/);
   assert.equal(result.surfaces.find((surface) => surface.name === "rest_v2_users").required, false);
   assert.match(result.recommendedNextStep, /Organization manager/);
+});
+
+/** The key the rejected-key runs configure; the refusing fixture echoes it back in the documented error fields. */
+const REJECTED_KEY_BODY = "T2G7XLKQBKVK6YWZIVMEDFCN43L";
+const REJECTED_KEY = `NRAK-${REJECTED_KEY_BODY}`;
+
+test("rejected-key planted value self-check: the key body is alphanumeric and none of its 6-character windows occurs in the tool schemas or the sample configuration", () => {
+  const schemas = [...registeredNewrelicTools().values()].map(({ name, label, description, parameters }) => ({ name, label, description, parameters }));
+  assertPlantedValuesWellFormed(assert, { REJECTED_KEY_BODY }, [
+    ["tool schemas", JSON.stringify(schemas)],
+    ["sample configuration", JSON.stringify(sampleConfig())],
+  ]);
+});
+
+/**
+ * Answers every NerdGraph POST and REST API v2 GET with `status` and documented error fields echoing the configured
+ * key, except the NerdGraph queries `readable` returns data for. With `nerdgraph`, NerdGraph instead answers
+ * `{ data: null, errors: [...] }` on `nerdgraph.status`, its one error carrying `nerdgraph.extensions`.
+ */
+function refusingNewrelicFetch({ status = 401, readable = () => undefined, nerdgraph } = {}) {
+  return async (_input, init = {}) => {
+    if ((init.method ?? "GET").toUpperCase() === "POST") {
+      const data = readable(JSON.parse(init.body).query);
+      if (data) return jsonResponse({ data });
+      if (nerdgraph) {
+        return jsonResponse({ data: null, errors: [{ message: `Invalid API key ${REJECTED_KEY}`, extensions: nerdgraph.extensions }] }, { status: nerdgraph.status });
+      }
+    }
+    return jsonResponse({ errors: [{ message: `Invalid API key ${REJECTED_KEY}` }], error: { title: `Invalid API key ${REJECTED_KEY}` } }, { status });
+  };
+}
+
+/** Runs the registered check against `fetchImpl`; no window of the configured key may reach the text or the details. */
+async function runNewrelicCheckAccessTool(args, fetchImpl) {
+  const checkAccess = registeredNewrelicTools().get("newrelic_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchImpl;
+  try {
+    const output = await checkAccess.execute("call-rejected", checkAccess.prepareArguments({ api_key: REJECTED_KEY, ...args }));
+    assert.notEqual(output.isError, true, output.content[0].text);
+    const run = { text: output.content.map((part) => part.text ?? "").join("\n"), details: output.details };
+    assertFragmentsAbsent(assert, `${run.text}\n${JSON.stringify(run.details)}`, [REJECTED_KEY_BODY], "newrelic_check_access text and details");
+    return run;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+/** A rejected key: the unchecked-permissions note and no role, entitlement, or identity claim. */
+function assertRejectedKeyOutput({ text, details }, label) {
+  const note = "Permissions were not checked because New Relic rejected the API key; the denied probes do not mean permissions are missing.";
+  assert.ok(details.notes.includes(note) && text.includes(`\n${note}\n`), `${label}: the unchecked-permissions note`);
+  assert.doesNotMatch(text, /Organization manager|Authentication domain manager|multi-tenancy entitlement|Authenticated as/, `${label}: no role, entitlement, or identity claim`);
+}
+
+test("newrelic_check_access reports failed with a plain message when every NerdGraph and REST API v2 probe returns 401", async () => {
+  const run = await runNewrelicCheckAccessTool({ account_id: "1234567" }, refusingNewrelicFetch());
+  const message = "New Relic rejected the API key (every probe returned 401). Set NEW_RELIC_API_KEY (or the api_key argument or config.yaml key) to a valid User API key, and NEW_RELIC_REGION (or the region argument) if the account is not in the US region, then rerun newrelic_check_access.";
+
+  assert.equal(run.details.status, "failed");
+  assert.equal(run.details.recommendedNextStep, message);
+  assert.ok(run.text.startsWith("New Relic access check: failed\n"));
+  assert.ok(run.text.endsWith(`\nNext: ${message}`));
+  assert.equal(run.details.surfaces.length, 12);
+  assert.ok(run.details.surfaces.every((surface) => surface.status === "not_readable" && /\(401\b/.test(surface.error)));
+  assertRejectedKeyOutput(run, "401 everywhere");
+});
+
+test("newrelic_check_access reports failed in the configured region and leaves out the account-scoped probes it never sent when no account ID is known", async () => {
+  const run = await runNewrelicCheckAccessTool({ region: "EU" }, refusingNewrelicFetch());
+
+  assert.equal(run.details.status, "failed");
+  assert.deepEqual(run.details.accountIds, []);
+  assert.deepEqual(
+    run.details.surfaces.filter((surface) => surface.error?.startsWith("No account ID available")).map((surface) => surface.name),
+    ["nrql", "alerts", "data_management", "log_configurations"],
+  );
+  assert.equal(run.details.recommendedNextStep, "New Relic rejected the API key (every probe returned 401). Set NEW_RELIC_API_KEY (or the api_key argument or config.yaml key) to a valid User API key, and NEW_RELIC_REGION (or the region argument) if the account is not in the EU region, then rerun newrelic_check_access.");
+  assertRejectedKeyOutput(run, "EU without an account ID");
+});
+
+test("newrelic_check_access reports failed when NerdGraph answers BAD_API_KEY, on HTTP 200 with an errors array or on an error status, and REST API v2 returns 401", async () => {
+  const badApiKeyStep = "New Relic rejected the API key (every probe returned 401 or BAD_API_KEY). Set NEW_RELIC_API_KEY (or the api_key argument or config.yaml key) to a valid User API key, and NEW_RELIC_REGION (or the region argument) if the account is not in the US region, then rerun newrelic_check_access.";
+  const only401Step = "New Relic rejected the API key (every probe returned 401). Set NEW_RELIC_API_KEY (or the api_key argument or config.yaml key) to a valid User API key, and NEW_RELIC_REGION (or the region argument) if the account is not in the US region, then rerun newrelic_check_access.";
+  for (const [nerdgraphStatus, message, nerdgraphError] of [
+    [200, badApiKeyStep, /^NerdGraph returned errors: Invalid API key /],
+    [403, badApiKeyStep, /^NerdGraph request failed \(403\b.*: Invalid API key /],
+    [401, only401Step, /^NerdGraph request failed \(401\b.*: Invalid API key /],
+  ]) {
+    const label = `BAD_API_KEY on HTTP ${nerdgraphStatus}`;
+    const run = await runNewrelicCheckAccessTool(
+      { account_id: "1234567" },
+      refusingNewrelicFetch({ nerdgraph: { status: nerdgraphStatus, extensions: { error_code: "BAD_API_KEY" } } }),
+    );
+    const restSurface = run.details.surfaces.find((surface) => surface.name === "rest_v2_users");
+    const nerdgraphSurfaces = run.details.surfaces.filter((surface) => surface !== restSurface);
+
+    assert.equal(run.details.status, "failed", label);
+    assert.equal(run.details.recommendedNextStep, message, label);
+    assert.ok(run.text.startsWith("New Relic access check: failed\n") && run.text.endsWith(`\nNext: ${message}`), label);
+    assert.equal(nerdgraphSurfaces.length, 11, label);
+    assert.ok(nerdgraphSurfaces.every((surface) => surface.status === "not_readable" && nerdgraphError.test(surface.error)), label);
+    assert.match(restSurface.error, /\(401\b/, label);
+    assertFragmentsAbsent(assert, `${run.text}\n${JSON.stringify(run.details)}`, [REJECTED_KEY_BODY], `${label}: rendered output and serialized result`);
+    assertRejectedKeyOutput(run, label);
+  }
+});
+
+test("newrelic_check_access keeps the limited status and the role advice when actor.user is readable and the rest return 401, or when every probe returns 403", async () => {
+  const currentUser = (query) => (query === "{ actor { user { id email name } } }" ? { actor: { user: { id: "u-1", email: "auditor@example.com", name: "Auditor" } } } : undefined);
+  const partial = await runNewrelicCheckAccessTool({ account_id: "1234567" }, refusingNewrelicFetch({ readable: currentUser }));
+  const forbidden = await runNewrelicCheckAccessTool({ account_id: "1234567" }, refusingNewrelicFetch({ status: 403 }));
+
+  assert.equal(partial.details.surfaces.find((surface) => surface.name === "actor_user").status, "readable");
+  assert.ok(forbidden.details.surfaces.every((surface) => surface.status === "not_readable" && /\(403\b/.test(surface.error)));
+  for (const [label, run, principal] of [["one readable probe", partial, "auditor@example.com"], ["every probe 403", forbidden, "unknown user"]]) {
+    assert.equal(run.details.status, "limited", label);
+    assert.equal(run.details.recommendedNextStep, "Use a User API key from a user with Organization manager and Authentication domain manager roles plus access to every account in scope.", label);
+    assert.ok(run.details.notes.includes(`Authenticated as ${principal}.`), label);
+    assert.ok(run.details.notes.some((note) => note.startsWith("The role catalog (customerAdministration.roles) is only served to organizations with the multi-tenancy entitlement")), label);
+    assert.doesNotMatch(run.text, /rejected the API key|were not checked/, label);
+  }
+});
+
+test("newrelic_check_access keeps the limited status and the role advice when NerdGraph answers HTTP 200 with an error that is not exactly extensions.error_code BAD_API_KEY and REST API v2 returns 401", async () => {
+  for (const extensions of [{ error_code: "FORBIDDEN" }, { error_code: "bad_api_key" }, { errorClass: "BAD_API_KEY" }]) {
+    const label = JSON.stringify(extensions);
+    const run = await runNewrelicCheckAccessTool({ account_id: "1234567" }, refusingNewrelicFetch({ nerdgraph: { status: 200, extensions } }));
+    const nerdgraphSurfaces = run.details.surfaces.filter((surface) => surface.name !== "rest_v2_users");
+
+    assert.ok(nerdgraphSurfaces.every((surface) => surface.status === "not_readable" && surface.error.startsWith("NerdGraph returned errors: Invalid API key ")), label);
+    assert.equal(run.details.status, "limited", label);
+    assert.equal(run.details.recommendedNextStep, "Use a User API key from a user with Organization manager and Authentication domain manager roles plus access to every account in scope.", label);
+    assert.ok(run.details.notes.includes("Authenticated as unknown user."), label);
+    assert.ok(run.details.notes.some((note) => note.startsWith("The role catalog (customerAdministration.roles) is only served to organizations with the multi-tenancy entitlement")), label);
+    assert.doesNotMatch(run.text, /rejected the API key|were not checked/, label);
+  }
 });
 
 test("assessNewrelicIdentity passes a SCIM-provisioned SSO domain with active, minimal admins", async () => {

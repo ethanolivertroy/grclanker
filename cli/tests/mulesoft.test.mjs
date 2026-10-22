@@ -906,6 +906,159 @@ test("checkMulesoftAccess reports limited access and missing permissions when su
   assert.ok(result.notes.some((note) => note.includes("No environment was readable")));
 });
 
+/** Credentials the rejected-credential runs configure; the refusing fixture echoes them back (see the planted-values self-check). */
+const REJECTED_CREDENTIALS = {
+  token: "gViCkAqektIKEQhnpq",
+  clientSecret: "IkZ9DeNrEDPd73pFKE",
+  password: "60T5Nfr8u4p1EVkD9H",
+};
+
+const STATUS_TEXT = { 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden" };
+
+/**
+ * Answers every Anypoint request with `status` and a body echoing `echoed`, except the paths in `readable`;
+ * `exchange` answers the token request and the login instead.
+ */
+function refusingAnypointFetch({ echoed, status = 401, readable = {}, exchange } = {}) {
+  return async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (exchange && (url.pathname === "/accounts/api/v2/oauth2/token" || url.pathname === "/accounts/login")) {
+      return jsonResponse(exchange.body, { status: exchange.status, statusText: STATUS_TEXT[exchange.status] });
+    }
+    if (readable[url.pathname]) return jsonResponse(readable[url.pathname]);
+    return jsonResponse({ message: `Invalid credential ${echoed}` }, { status, statusText: STATUS_TEXT[status] });
+  };
+}
+
+/** Runs the registered check against `fetchImpl`; no window of any planted credential may reach the text or the details. */
+async function runMulesoftCheckAccessTool(args, fetchImpl) {
+  const registered = [];
+  registerMulesoftTools({ registerTool: (tool) => registered.push(tool) });
+  const tool = registered.find((item) => item.name === "mulesoft_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchImpl;
+  try {
+    const output = await tool.execute("call-rejected", tool.prepareArguments({ organization_id: ORG_ID, control_plane: "us", ...args }));
+    assert.notEqual(output.isError, true, output.content[0].text);
+    const run = { text: output.content.map((part) => part.text ?? "").join("\n"), details: output.details };
+    assertFragmentsAbsent(assert, `${run.text}\n${JSON.stringify(run.details)}`, Object.values(REJECTED_CREDENTIALS), "mulesoft_check_access text and details");
+    return run;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+/** A refused credential: the unchecked-permissions note and no permission or scope claim. */
+function assertRejectedCredentialOutput({ text, details }, credentialKind) {
+  const note = `Permissions were not checked because Anypoint Platform rejected the ${credentialKind}; the denied probes do not mean permissions are missing.`;
+  assert.ok(details.notes.includes(note) && text.includes(`\n${note}\n`), `${credentialKind}: the unchecked-permissions note`);
+  assert.deepEqual(details.missingPermissions, [], `${credentialKind}: no missing permissions are listed`);
+  assert.doesNotMatch(text, /Missing permissions|Add these documented|connected-app scope/, `${credentialKind}: no permission or scope advice`);
+  for (const surface of details.surfaces) assert.ok(!text.includes(surface.permission), `${credentialKind}: the ${surface.name} permission is not named`);
+}
+
+test("mulesoft_check_access reports failed with a plain message when every attempted probe rejects the bearer token with 401", async () => {
+  const run = await runMulesoftCheckAccessTool({ token: REJECTED_CREDENTIALS.token }, refusingAnypointFetch({ echoed: REJECTED_CREDENTIALS.token }));
+  const message = "Anypoint Platform rejected the bearer token (every probe returned 401). Set ANYPOINT_TOKEN (or its alias ANYPOINT_ACCESS_TOKEN, or the token argument or config.toml key) to a current token, plus ANYPOINT_CONTROL_PLANE or ANYPOINT_BASE_URL (or the control_plane or base_url arguments) if the organization is on another control plane, then rerun mulesoft_check_access.";
+
+  assert.equal(run.details.status, "failed");
+  assert.equal(run.details.authMode, "token");
+  assert.equal(run.details.recommendedNextStep, message);
+  assert.ok(run.text.startsWith("MuleSoft access check: failed\n"));
+  assert.ok(run.text.endsWith(`\nNext: ${message}`));
+  assert.ok(run.details.surfaces.some((surface) => surface.status === "skipped"), "the environment-scoped probes were never attempted");
+  assert.ok(run.details.surfaces.filter((surface) => surface.status !== "skipped").every((surface) => surface.httpStatus === 401));
+  assertRejectedCredentialOutput(run, "bearer token");
+
+  const fromAlias = await checkMulesoftAccess(new MulesoftApiClient(
+    resolveMulesoftConfiguration(
+      { organization_id: ORG_ID, control_plane: "us" },
+      { ANYPOINT_ACCESS_TOKEN: REJECTED_CREDENTIALS.token },
+      { homeDir: createTempBase("grclanker-mulesoft-alias-home-") },
+    ),
+    { fetchImpl: refusingAnypointFetch({ echoed: REJECTED_CREDENTIALS.token }) },
+  ));
+  assert.equal(fromAlias.status, "failed", "a token set only in ANYPOINT_ACCESS_TOKEN");
+  assert.equal(fromAlias.authMode, "token");
+  assert.equal(fromAlias.recommendedNextStep, message, "a token set only in ANYPOINT_ACCESS_TOKEN");
+  assertFragmentsAbsent(assert, JSON.stringify(fromAlias), Object.values(REJECTED_CREDENTIALS), "the ANYPOINT_ACCESS_TOKEN check");
+});
+
+test("mulesoft_check_access reports failed when the connected app token request is refused, naming the OAuth error or the 401", async () => {
+  const cases = [
+    [401, { error: "invalid_client", error_description: `Invalid client secret ${REJECTED_CREDENTIALS.clientSecret}` }, "the token request returned invalid_client"],
+    [400, { error: "unauthorized_client" }, "the token request returned unauthorized_client"],
+    [400, { error: "invalid_grant", error_description: "grant refused" }, "the token request returned invalid_grant"],
+    [401, { message: `Unauthorized client secret ${REJECTED_CREDENTIALS.clientSecret}` }, "the token request returned 401"],
+  ];
+  for (const [status, body, evidence] of cases) {
+    const run = await runMulesoftCheckAccessTool(
+      { client_id: "client-1", client_secret: REJECTED_CREDENTIALS.clientSecret },
+      refusingAnypointFetch({ echoed: REJECTED_CREDENTIALS.clientSecret, exchange: { status, body } }),
+    );
+    const message = `Anypoint Platform rejected the connected app credentials (${evidence}). Set ANYPOINT_CLIENT_ID and ANYPOINT_CLIENT_SECRET (or the client_id and client_secret arguments or config.toml keys) for a connected app that acts on its own behalf, plus ANYPOINT_CONTROL_PLANE or ANYPOINT_BASE_URL (or the control_plane or base_url arguments) if the organization is on another control plane, then rerun mulesoft_check_access.`;
+    assert.equal(run.details.status, "failed", evidence);
+    assert.equal(run.details.authMode, "connected_app");
+    assert.equal(run.details.recommendedNextStep, message);
+    assert.ok(run.text.endsWith(`\nNext: ${message}`), evidence);
+    assertRejectedCredentialOutput(run, "connected app credentials");
+  }
+});
+
+test("mulesoft_check_access reports failed when the username and password login is refused with 401", async () => {
+  const run = await runMulesoftCheckAccessTool(
+    { username: "auditor", password: REJECTED_CREDENTIALS.password },
+    refusingAnypointFetch({ echoed: REJECTED_CREDENTIALS.password, exchange: { status: 401, body: { message: `Invalid password ${REJECTED_CREDENTIALS.password}` } } }),
+  );
+  const message = "Anypoint Platform rejected the username and password (the login request returned 401). Set ANYPOINT_USERNAME and ANYPOINT_PASSWORD (or the username and password arguments or config.toml keys), plus ANYPOINT_CONTROL_PLANE or ANYPOINT_BASE_URL (or the control_plane or base_url arguments) if the organization is on another control plane, then rerun mulesoft_check_access.";
+
+  assert.equal(run.details.status, "failed");
+  assert.equal(run.details.authMode, "credentials");
+  assert.equal(run.details.recommendedNextStep, message);
+  assert.ok(run.text.endsWith(`\nNext: ${message}`));
+  assertRejectedCredentialOutput(run, "username and password");
+});
+
+/** The missing-permission wording: every 401 or 403 surface's permission, listed once in probe order. */
+function assertMissingPermissionsWording({ text, details }, label) {
+  const expected = [...new Set(details.surfaces.filter((surface) => surface.httpStatus === 401 || surface.httpStatus === 403).map((surface) => surface.permission))];
+  assert.ok(expected.length > 0, `${label}: some surface was denied`);
+  assert.deepEqual(details.missingPermissions, expected, label);
+  assert.equal(details.recommendedNextStep, `Add these documented connected-app scopes or permissions, then retry: ${expected.join("; ")}.`, label);
+  assert.ok(text.includes(`\nMissing permissions: ${expected.join("; ")}\n`), `${label}: the missing-permissions line`);
+  assert.doesNotMatch(text, /rejected the|were not checked/, `${label}: no rejected-credential wording`);
+}
+
+test("mulesoft_check_access keeps the limited status and missing-permission wording when one probe is readable and the rest return 401, or when every probe returns 403", async () => {
+  const partial = await runMulesoftCheckAccessTool(
+    { token: REJECTED_CREDENTIALS.token },
+    refusingAnypointFetch({ echoed: REJECTED_CREDENTIALS.token, readable: { "/accounts/api/me": { user: { id: "u1", username: "alice" } } } }),
+  );
+  assert.equal(partial.details.status, "limited");
+  assert.ok(partial.details.notes.includes("Authenticated via token as alice."));
+  assertMissingPermissionsWording(partial, "one readable probe");
+
+  const forbidden = await runMulesoftCheckAccessTool({ token: REJECTED_CREDENTIALS.token }, refusingAnypointFetch({ echoed: REJECTED_CREDENTIALS.token, status: 403 }));
+  assert.equal(forbidden.details.status, "limited");
+  assert.ok(forbidden.details.surfaces.filter((surface) => surface.status !== "skipped").every((surface) => surface.httpStatus === 403));
+  assert.ok(forbidden.details.notes.includes("Authenticated via token as the current principal."));
+  assertMissingPermissionsWording(forbidden, "every probe 403");
+
+  const exchangeForbidden = await runMulesoftCheckAccessTool(
+    { client_id: "client-1", client_secret: REJECTED_CREDENTIALS.clientSecret },
+    refusingAnypointFetch({ echoed: REJECTED_CREDENTIALS.clientSecret, exchange: { status: 403, body: { error: "access_denied" } } }),
+  );
+  assert.equal(exchangeForbidden.details.status, "limited");
+  assertMissingPermissionsWording(exchangeForbidden, "token request 403");
+
+  const exchangeMalformed = await runMulesoftCheckAccessTool(
+    { client_id: "client-1", client_secret: REJECTED_CREDENTIALS.clientSecret },
+    refusingAnypointFetch({ echoed: REJECTED_CREDENTIALS.clientSecret, exchange: { status: 400, body: { error: "invalid_request" } } }),
+  );
+  assert.equal(exchangeMalformed.details.status, "limited");
+  assert.equal(exchangeMalformed.details.recommendedNextStep, "Confirm the organization ID, control plane, and credentials, then retry.");
+});
+
 test("assessMulesoftIdentityAccess passes a federated, least-privilege organization", async () => {
   const result = await assessMulesoftIdentityAccess(healthyIdentityClient());
 
@@ -3744,6 +3897,7 @@ test("planted values self-check: every canary and planted secret is alphanumeric
     ...Object.fromEntries(Object.entries(PLANTED).map(([name, value]) => [`PLANTED.${name}`, value])),
     ...Object.fromEntries(Object.entries(CONFIG_CANARIES).map(([name, value]) => [`CONFIG_CANARIES.${name}`, value])),
     ...Object.fromEntries(Object.entries(TOML_CANARIES).map(([name, value]) => [`TOML_CANARIES.${name}`, value])),
+    ...Object.fromEntries(Object.entries(REJECTED_CREDENTIALS).map(([name, value]) => [`REJECTED_CREDENTIALS.${name}`, value])),
     ...ESCAPE_CANARY_PLANTED_VALUES,
     SAMPLE_TOKEN,
   }, [
