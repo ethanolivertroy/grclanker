@@ -3921,3 +3921,118 @@ writeFailureTest("exportElasticAuditBundle leaves nothing under the output root 
   const client = new ElasticApiClient(config, { fetchImpl: createRouter(healthyRoutes(healthyFixtures())) });
   await assertNoPartialBundleOnWriteFailure(base, () => exportElasticAuditBundle(client, config, base));
 });
+
+const ES_REJECTED_PASSWORD = "rdKSFgIpiANQwp35ByPpvw8qekstCJF7";
+const ES_REJECTED_BEARER_TOKEN = "ljFjVRKYSGC7xJ2OdZj9oQde4JtJbMTM";
+const ES_REJECTED_CLOUD_API_KEY = "uhDpm8hGwVfWzqfG8myJcwTk91FrfjyC";
+const ES_LIMITED_NEXT_STEP = "Grant the auditing principal the monitor, read_security (or manage_security), manage_api_key, read_pipeline, monitor_snapshot, read_ilm, read_slm, and monitor_watcher cluster privileges, and set KIBANA_URL for Kibana checks.";
+const ES_PERMISSION_CLAIM = /\b(?:permissions?|scopes?|roles?|privileges?|licen[cs]es?|licensing|modules?)\b/i;
+
+/** Every route answers with the same response; the routes are the ones a healthy run serves. */
+function esEveryRoute(respond) {
+  return Object.fromEntries(Object.keys(healthyRoutes(healthyFixtures())).map((route) => [route, respond]));
+}
+
+/** Elasticsearch's documented 401 body; the reason echoes a planted secret so every result below also proves the echo is scrubbed. */
+function esUnauthorized(echo) {
+  return () => jsonResponse({
+    error: { type: "security_exception", reason: `unable to authenticate with provided credentials ${echo} and anonymous access is not allowed for this request` },
+    status: 401,
+  }, { status: 401, statusText: "Unauthorized" });
+}
+
+test("checkElasticAccess reports failed and names the credential and cluster settings for each auth mode when every request returns 401", async () => {
+  const modes = [
+    {
+      label: "api_key",
+      config: {},
+      echo: API_KEY_SECRET,
+      canaries: [API_KEY_SECRET, API_KEY],
+      kind: "API key",
+      nextStep: "Elastic rejected the API key (every probe returned 401). Set ELASTIC_API_KEY (or the api_key argument, or api_key in ~/.elastic-sec-inspector/config.yaml) to a valid key and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster that issued it, then rerun elastic_check_access.",
+    },
+    {
+      label: "api_key with an Elastic Cloud API key",
+      config: { cloudApiKey: ES_REJECTED_CLOUD_API_KEY },
+      echo: ES_REJECTED_CLOUD_API_KEY,
+      canaries: [API_KEY_SECRET, API_KEY, ES_REJECTED_CLOUD_API_KEY],
+      kind: "API key",
+      nextStep: "Elastic rejected the API key and the Elastic Cloud API key (every probe returned 401). Set ELASTIC_API_KEY (or the api_key argument, or api_key in ~/.elastic-sec-inspector/config.yaml) to a valid key and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster that issued it, and ELASTIC_CLOUD_API_KEY (or cloud_api_key) to a valid Elastic Cloud API key, then rerun elastic_check_access.",
+    },
+    {
+      label: "basic",
+      config: { authMode: "basic", apiKey: undefined, username: "grc-auditor", password: ES_REJECTED_PASSWORD },
+      echo: ES_REJECTED_PASSWORD,
+      canaries: [ES_REJECTED_PASSWORD],
+      kind: "username and password",
+      nextStep: "Elastic rejected the username and password (every probe returned 401). Set ELASTIC_USERNAME and ELASTIC_PASSWORD (or the username and password arguments, or the same keys in ~/.elastic-sec-inspector/config.yaml) to valid credentials and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster they are for, then rerun elastic_check_access.",
+    },
+    {
+      label: "bearer",
+      config: { authMode: "bearer", apiKey: undefined, bearerToken: ES_REJECTED_BEARER_TOKEN },
+      echo: ES_REJECTED_BEARER_TOKEN,
+      canaries: [ES_REJECTED_BEARER_TOKEN],
+      kind: "access token",
+      nextStep: "Elastic rejected the access token (every probe returned 401). Set ELASTIC_BEARER_TOKEN (or the bearer_token argument, or bearer_token in ~/.elastic-sec-inspector/config.yaml) to a valid token and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster that issued it, then rerun elastic_check_access.",
+    },
+  ];
+  for (const mode of modes) {
+    const client = new ElasticApiClient(sampleConfig(mode.config), { fetchImpl: createRouter(esEveryRoute(esUnauthorized(mode.echo))), sleepImpl: async () => {} });
+    const result = await checkElasticAccess(client);
+    assert.equal(result.status, "failed", mode.label);
+    assert.equal(result.recommendedNextStep, mode.nextStep, mode.label);
+    const attempted = result.surfaces.filter((surface) => surface.status !== "not_configured");
+    assert.ok(attempted.length > 0 && attempted.every((surface) => surface.http_status === 401), `${mode.label}: ${JSON.stringify(result.surfaces)}`);
+    assert.equal(result.privilegeProbe, "not_readable", mode.label);
+    assert.equal(result.missingClusterPrivileges, null, mode.label);
+    const disclaimer = `Privileges were not checked because Elastic rejected the ${mode.kind}; the denied probes do not mean privileges are missing.`;
+    assert.ok(result.notes.includes(disclaimer), `${mode.label}: ${result.notes.join(" | ")}`);
+    const claims = [...result.notes.filter((note) => note !== disclaimer), result.recommendedNextStep, ...result.surfaces.map((surface) => surface.status)].join("\n");
+    assert.doesNotMatch(claims, ES_PERMISSION_CLAIM, mode.label);
+    for (const text of [disclaimer, result.recommendedNextStep]) assert.equal(scrubErrorText(text), text, `${mode.label}: survives the error scrubber`);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(result), mode.canaries, `${mode.label} rejected access check`);
+  }
+
+  const registered = [];
+  registerElasticTools({ registerTool: (tool) => registered.push(tool) });
+  const checkTool = registered.find((tool) => tool.name === "elastic_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = createRouter(esEveryRoute(esUnauthorized(ES_REJECTED_PASSWORD)));
+  let tool;
+  try {
+    tool = await checkTool.execute("call-rejected-basic", checkTool.prepareArguments({
+      elasticsearch_url: "https://es.example.com:9200",
+      username: "grc-auditor",
+      password: ES_REJECTED_PASSWORD,
+      max_retries: 0,
+    }));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const text = tool.content[0].text;
+  assert.equal(tool.details.status, "failed", text);
+  assert.match(text, /^Elastic access check: failed$/m);
+  assert.ok(text.includes(`Next: ${modes[2].nextStep}`), text);
+  assertCanaryWindowsAbsent(assert, [["text", text], ["details", JSON.stringify(tool.details)]], [ES_REJECTED_PASSWORD], "rendered rejected access check");
+});
+
+test("checkElasticAccess keeps the limited result when a request reads, a request is denied with 403, or every request is a 403 or a server error", async () => {
+  const fixtures = healthyFixtures();
+  const forbiddenRoute = () => jsonResponse({ error: { type: "security_exception", reason: "action [cluster:monitor/main] is unauthorized for user [grc-auditor]" }, status: 403 }, { status: 403, statusText: "Forbidden" });
+  const serverError = () => jsonResponse({ error: { type: "internal_server_error", reason: "boom" }, status: 500 }, { status: 500, statusText: "Internal Server Error" });
+  const cases = {
+    // Credentials that read even one surface were accepted, so the other 401s keep the privilege wording.
+    partlyReadable: { ...esEveryRoute(esUnauthorized("")), "GET /_security/_authenticate": fixtures.authenticate },
+    privilegesReadable: { ...esEveryRoute(esUnauthorized("")), "POST /_security/user/_has_privileges": fixtures.hasPrivileges },
+    oneForbidden: { ...esEveryRoute(esUnauthorized("")), "GET /_license": forbiddenRoute },
+    allForbidden: esEveryRoute(forbiddenRoute),
+    allServerErrors: esEveryRoute(serverError),
+  };
+  for (const [label, routes] of Object.entries(cases)) {
+    const client = new ElasticApiClient(sampleConfig({ maxRetries: 0 }), { fetchImpl: createRouter(routes), sleepImpl: async () => {} });
+    const result = await checkElasticAccess(client);
+    assert.equal(result.status, "limited", label);
+    assert.equal(result.recommendedNextStep, ES_LIMITED_NEXT_STEP, label);
+    assert.ok(result.notes.every((note) => !/rejected|were not checked/.test(note)), `${label}: ${result.notes.join(" | ")}`);
+  }
+});

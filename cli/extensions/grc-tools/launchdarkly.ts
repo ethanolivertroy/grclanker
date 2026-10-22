@@ -118,7 +118,7 @@ export interface LaunchdarklyCallerIdentity {
 }
 
 export interface LaunchdarklyAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   baseUrl: string;
   callerIdentity: LaunchdarklyCallerIdentity;
   surfaces: LaunchdarklyAccessSurface[];
@@ -2032,7 +2032,9 @@ export async function checkLaunchdarklyAccess(client: AccessCheckClient): Promis
   const coreReadable = surfaces
     .filter((surface) => CORE_ACCESS_SURFACES.has(surface.name))
     .every((surface) => surface.status === "readable");
-  const status = coreReadable ? "healthy" : "limited";
+  const status: LaunchdarklyAccessCheckResult["status"] = tokenRejected(surfaces)
+    ? "failed"
+    : (coreReadable ? "healthy" : "limited");
 
   return {
     status,
@@ -2045,11 +2047,29 @@ export async function checkLaunchdarklyAccess(client: AccessCheckClient): Promis
       `Config precedence resolved from: ${config.sourceChain.join(" -> ")}.`,
       `${readableCount}/${surfaces.length} LaunchDarkly audit surfaces are readable (webhooks, Relay Proxy configs, and integration subscriptions are optional).`,
     ],
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run launchdarkly_assess_identity, launchdarkly_assess_access_control, launchdarkly_assess_environment_governance, launchdarkly_assess_flag_hygiene, launchdarkly_assess_monitoring_integrations, or launchdarkly_export_audit_bundle."
-        : "Use an access token with the Reader base role (Admin or Owner for showAll token listing and audit log depth), or a custom role with reader base permissions plus viewProject on the audited projects, then rerun the access check.",
+    recommendedNextStep: accessCheckNextStep(status),
   };
+}
+
+/** A 401 on every probe that sent a request means LaunchDarkly refused the token itself, so no role or permission was checked. */
+function tokenRejected(surfaces: LaunchdarklyAccessSurface[]): boolean {
+  const attempted = surfaces.filter((surface) => surface.status !== "not_configured");
+  return attempted.length > 0 && attempted.every((surface) => surface.http_status === 401);
+}
+
+function accessCheckNextStep(status: LaunchdarklyAccessCheckResult["status"]): string {
+  switch (status) {
+    case "healthy":
+      return "Run launchdarkly_assess_identity, launchdarkly_assess_access_control, launchdarkly_assess_environment_governance, launchdarkly_assess_flag_hygiene, launchdarkly_assess_monitoring_integrations, or launchdarkly_export_audit_bundle.";
+    case "limited":
+      return "Use an access token with the Reader base role (Admin or Owner for showAll token listing and audit log depth), or a custom role with reader base permissions plus viewProject on the audited projects, then rerun the access check.";
+    case "failed":
+      return "LaunchDarkly rejected the access token (every probe returned 401). Set LAUNCHDARKLY_API_TOKEN (or LD_ACCESS_TOKEN, or the token argument, or token in ~/.config/launchdarkly-sec-inspector/config.toml) to a valid token, and LAUNCHDARKLY_BASE_URL (or LD_BASE_URI, or base_url) when the token comes from the federal or EU instance, then rerun launchdarkly_check_access.";
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled LaunchDarkly access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function buildFinding(

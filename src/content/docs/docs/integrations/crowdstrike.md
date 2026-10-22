@@ -77,7 +77,7 @@ Required API client scopes (all Read):
 - Real time response audit
 - Assets (Falcon Discover), Zero Trust Assessment, Identity Protection Policy Rules: optional. When the module is not licensed, the related controls become `manual` findings.
 
-`crowdstrike_check_access` probes each of these surfaces and lists the scopes that returned 403.
+`crowdstrike_check_access` probes each of these surfaces and lists the scopes that returned 403. When Falcon refuses the API client credentials (the token request returns 401, or 403 with `Failed to issue access token - Not Authorized`) or every probe returns 401, the check reports `failed` and lists no missing scopes, because no scope was checked.
 
 ## Run it
 
@@ -95,7 +95,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 |---|---|
-| `crowdstrike_check_access` | Probe 19 read surfaces, report readable counts, and list missing API client scopes |
+| `crowdstrike_check_access` | Probe 19 read surfaces, report readable counts, and list missing API client scopes, or report `failed` when Falcon rejected the API client credentials or its token on every probe (the next step names the client credential or cloud settings to fix) |
 | `crowdstrike_assess_prevention_policies` | CS-01 to CS-05 from prevention policy settings |
 | `crowdstrike_assess_response_readiness` | CS-06, CS-07, CS-22, CS-23 from response policies, RTR audit sessions, alerts, and contained hosts |
 | `crowdstrike_assess_device_firewall` | CS-08 to CS-11 from device control and firewall policies, containers, rule groups, and rules |

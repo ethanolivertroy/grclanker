@@ -24,6 +24,7 @@ import {
   labelIdentifier,
   redactCarrierText,
   redactErrorText,
+  registerCloudflareTools,
   resolveCloudflareConfiguration,
   resolveSecureOutputPath,
   scrubSnapshotValue,
@@ -1259,10 +1260,15 @@ const FAKE_CLOUDFLARE_SECRETS = {
 };
 const FAKE_CLOUDFLARE_CANARIES = Object.values(FAKE_CLOUDFLARE_SECRETS).map((value) => value.split("@")[0]);
 
-/** Other planted credentials: the header echoed by a proxy page, a configured token, and the canary run's token. */
+/**
+ * Other planted credentials: the header echoed by a proxy page, a configured token, the canary run's token, and
+ * the API token and Global API Key the rejected-credential access checks send.
+ */
 const CLOUDFLARE_HEADER_ECHO_CANARY = "aJagv77Dvu2evcFMM4NP";
 const CLOUDFLARE_CONFIGURED_TOKEN_CANARY = "dcgqmL3afrWE64EJTmzpzEjb";
 const CLOUDFLARE_RUN_TOKEN_CANARY = "BhK5xQdrtGjV39mFJaKvKeRV";
+const CLOUDFLARE_REJECTED_API_TOKEN = "UozGqxKrt74WafWJLzJBwYhkrFDkZ5g6";
+const CLOUDFLARE_REJECTED_GLOBAL_KEY = "aoZts2YcLqkMb5E4RGaHa7tAChVAor8h";
 
 /** Every planted canary a Cloudflare output is swept for, window by window. */
 const CLOUDFLARE_PLANTED_CANARIES = Object.freeze([
@@ -1273,6 +1279,8 @@ const CLOUDFLARE_PLANTED_CANARIES = Object.freeze([
   CLOUDFLARE_HEADER_ECHO_CANARY,
   CLOUDFLARE_CONFIGURED_TOKEN_CANARY,
   CLOUDFLARE_RUN_TOKEN_CANARY,
+  CLOUDFLARE_REJECTED_API_TOKEN,
+  CLOUDFLARE_REJECTED_GLOBAL_KEY,
 ]);
 
 test("verdict rule 9: exportCloudflareAuditBundle never writes token values, contact emails, or unprojected account settings into the bundle or its zip", async () => {
@@ -2346,4 +2354,158 @@ test("review conditions do not pass: missing MFA, non-Read token scopes, unused 
 writeFailureTest("exportCloudflareAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-cloudflare-write-failure-");
   await assertNoPartialBundleOnWriteFailure(base, () => exportCloudflareAuditBundle(fixtureClient("compliant"), sampleConfig(), base));
+});
+
+const CLOUDFLARE_LIMITED_NEXT_STEP = "Provide a read-only API token and, when multiple accounts exist, set account_id to unlock account-scoped Cloudflare checks.";
+const CLOUDFLARE_PERMISSION_CLAIM = /\b(?:permissions?|scopes?|roles?|privileges?)\b/i;
+const CLOUDFLARE_INVALID_API_TOKEN = { code: 1000, message: "Invalid API Token" };
+const CLOUDFLARE_INVALID_ACCESS_TOKEN = { code: 9109, message: "Invalid access token" };
+const CLOUDFLARE_UNKNOWN_GLOBAL_KEY = { code: 9103, message: "Unknown X-Auth-Key or X-Auth-Email" };
+
+/** Cloudflare's 6003 Invalid request headers, its error_chain naming the malformed header. */
+function cloudflareMalformedHeader(code, message) {
+  return { code: 6003, message: "Invalid request headers", error_chain: [{ code, message }] };
+}
+
+/**
+ * A Cloudflare error response. With `echo`, a second error repeats a planted credential, so each result below also
+ * proves the echo is scrubbed; the echo cannot ride in the first error because 9103 and 9109 count only with their exact message.
+ */
+function cloudflareError(status, statusText, error, echo) {
+  const errors = echo ? [error, { code: error.code, message: `The request carried ${echo}` }] : [error];
+  return () => new Response(JSON.stringify({ success: false, errors, messages: [], result: null }), { status, statusText, headers: CLOUDFLARE_JSON_HEADERS });
+}
+
+/** Every route the healthy table serves, answered with the same response. */
+function cloudflareEveryRoute(respond) {
+  return Object.fromEntries(Object.keys(healthyCloudflareRoutes()).map((path) => [path, respond]));
+}
+
+function cloudflareGlobalKeyConfig(overrides = {}) {
+  return sampleConfig({ authMethod: "global_key", apiToken: undefined, apiKey: CLOUDFLARE_REJECTED_GLOBAL_KEY, email: "auditor@example.com", ...overrides });
+}
+
+function registeredCloudflareTools() {
+  const registered = [];
+  registerCloudflareTools({ registerTool: (tool) => registered.push(tool) });
+  return new Map(registered.map((tool) => [tool.name, tool]));
+}
+
+test("checkCloudflareAccess reports failed and names the credential settings when every probe is a 401 or a Cloudflare invalid-credential error, for an API token and a Global API Key", async () => {
+  const token = CLOUDFLARE_REJECTED_API_TOKEN;
+  const key = CLOUDFLARE_REJECTED_GLOBAL_KEY;
+  const malformedAuthorization = cloudflareMalformedHeader(6111, "Invalid format for Authorization header");
+  const cases = [
+    {
+      label: "api token, verify returns 401 and every other probe returns 9109 Invalid access token",
+      config: sampleConfig({ apiToken: token }),
+      routes: { ...cloudflareEveryRoute(cloudflareError(403, "Forbidden", CLOUDFLARE_INVALID_ACCESS_TOKEN, token)), "/user/tokens/verify": cloudflareError(401, "Unauthorized", CLOUDFLARE_INVALID_API_TOKEN, token) },
+      canary: token,
+      nextStep: "Cloudflare rejected the API token (every probe returned 401 or error 9109 (Invalid access token)). Set CLOUDFLARE_API_TOKEN (or the api_token argument) to a valid token, then rerun cloudflare_check_access.",
+    },
+    {
+      label: "api token, every probe returns 400 6003 naming a malformed Authorization header",
+      config: sampleConfig({ apiToken: token }),
+      routes: cloudflareEveryRoute(cloudflareError(400, "Bad Request", malformedAuthorization, token)),
+      canary: token,
+      nextStep: "Cloudflare rejected the API token (every probe returned error 6111 (Invalid format for Authorization header)). Set CLOUDFLARE_API_TOKEN (or the api_token argument) to a valid token, then rerun cloudflare_check_access.",
+    },
+    {
+      // Each distinct rejection is listed once, in probe order: verify, accounts, zones, then the account probes.
+      label: "api token, verify returns 401, the account and zone lists return 9109, and the account probes return 6111",
+      config: sampleConfig({ apiToken: token }),
+      routes: {
+        ...cloudflareEveryRoute(cloudflareError(400, "Bad Request", malformedAuthorization, token)),
+        "/user/tokens/verify": cloudflareError(401, "Unauthorized", CLOUDFLARE_INVALID_API_TOKEN, token),
+        "/accounts": cloudflareError(403, "Forbidden", CLOUDFLARE_INVALID_ACCESS_TOKEN, token),
+        "/zones": cloudflareError(403, "Forbidden", CLOUDFLARE_INVALID_ACCESS_TOKEN, token),
+      },
+      canary: token,
+      nextStep: "Cloudflare rejected the API token (every probe returned 401, error 9109 (Invalid access token), or error 6111 (Invalid format for Authorization header)). Set CLOUDFLARE_API_TOKEN (or the api_token argument) to a valid token, then rerun cloudflare_check_access.",
+    },
+    {
+      // Without account_id only verify, accounts, and zones are sent; the account probes stay not_configured.
+      label: "global key without account_id, every probe returns 9103",
+      config: cloudflareGlobalKeyConfig({ accountId: undefined }),
+      routes: cloudflareEveryRoute(cloudflareError(403, "Forbidden", CLOUDFLARE_UNKNOWN_GLOBAL_KEY, key)),
+      canary: key,
+      nextStep: "Cloudflare rejected the Global API Key (every probe returned error 9103 (Unknown X-Auth-Key or X-Auth-Email)). Set CLOUDFLARE_API_KEY and CLOUDFLARE_EMAIL (or the api_key and email arguments) to a valid Global API Key and the email of the user who owns it, then rerun cloudflare_check_access.",
+    },
+    {
+      label: "global key, every probe returns 400 6003 naming a malformed X-Auth-Key header",
+      config: cloudflareGlobalKeyConfig(),
+      routes: cloudflareEveryRoute(cloudflareError(400, "Bad Request", cloudflareMalformedHeader(6103, "Invalid format for X-Auth-Key header"), key)),
+      canary: key,
+      nextStep: "Cloudflare rejected the Global API Key (every probe returned error 6103 (Invalid format for X-Auth-Key header)). Set CLOUDFLARE_API_KEY and CLOUDFLARE_EMAIL (or the api_key and email arguments) to a valid Global API Key and the email of the user who owns it, then rerun cloudflare_check_access.",
+    },
+  ];
+  for (const entry of cases) {
+    const result = await checkCloudflareAccess(new CloudflareApiClient(entry.config, { fetchImpl: cloudflareRoutedFetch(entry.routes) }));
+    assert.equal(result.status, "failed", entry.label);
+    assert.equal(result.authMethod, entry.config.authMethod, entry.label);
+    assert.equal(result.recommendedNextStep, entry.nextStep, entry.label);
+    const sent = result.surfaces.filter((surface) => surface.status === "readable" || surface.status === "not_readable");
+    assert.equal(sent.length, entry.config.accountId ? 6 : 3, `${entry.label}: ${JSON.stringify(result.surfaces)}`);
+    assert.ok(sent.every((surface) => surface.status === "not_readable" && [400, 401, 403].includes(surface.http_status)), `${entry.label}: ${JSON.stringify(sent)}`);
+    assert.equal(result.notes[0], `Authentication with ${entry.config.authMethod === "token" ? "an API token" : "a Global API Key"} failed.`, entry.label);
+    const claims = [...result.notes, result.recommendedNextStep, ...result.surfaces.map((surface) => surface.status)].join("\n");
+    assert.doesNotMatch(claims, CLOUDFLARE_PERMISSION_CLAIM, entry.label);
+    for (const text of [result.notes[0], result.recommendedNextStep]) assert.equal(redactErrorText(text), text, `${entry.label}: survives the error scrubber`);
+    assertNoCanaryWindows(assert, result, [entry.canary], `${entry.label} rejected access check`);
+  }
+
+  const checkTool = registeredCloudflareTools().get("cloudflare_check_access");
+  const originalFetch = globalThis.fetch;
+  let tool;
+  try {
+    globalThis.fetch = cloudflareRoutedFetch(cases[0].routes);
+    tool = await checkTool.execute("call-rejected-token", checkTool.prepareArguments({ api_token: token, account_id: ACCOUNT }));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const text = tool.content[0].text;
+  assert.equal(tool.details.status, "failed", text);
+  assert.match(text, /^Cloudflare access check: failed$/m);
+  assert.ok(text.includes(`Next: ${cases[0].nextStep}`), text);
+  assertNoCanaryWindows(assert, text, [token], "rendered rejected access check text");
+  assertNoCanaryWindows(assert, tool.details, [token], "rendered rejected access check details");
+});
+
+test("checkCloudflareAccess keeps the limited result when a probe reads, 9109 answers an IP filter or an unreachable resource, every probe is denied with 10000 or fails with a 502, one probe is denied, or a Global API Key's verify probe is refused beside readable probes", async () => {
+  const healthy = healthyCloudflareRoutes();
+  const cases = [
+    {
+      // Credentials that read even one surface were accepted, so the other rejections keep the limited wording.
+      label: "verify reads and every other probe returns 9109 Invalid access token",
+      routes: { ...cloudflareEveryRoute(cloudflareError(403, "Forbidden", CLOUDFLARE_INVALID_ACCESS_TOKEN)), "/user/tokens/verify": healthy["/user/tokens/verify"] },
+    },
+    {
+      // 9109 also answers a valid token sent from outside its IP filter and a valid token that cannot reach a resource.
+      label: "every probe returns 9109 for an IP filter",
+      routes: cloudflareEveryRoute(cloudflareError(403, "Forbidden", { code: 9109, message: "Cannot use the access token from location: 198.51.100.7" })),
+    },
+    {
+      label: "every probe returns 9109 for an unreachable resource",
+      routes: cloudflareEveryRoute(cloudflareError(403, "Forbidden", { code: 9109, message: "Unauthorized to access requested resource" })),
+    },
+    { label: "every probe returns 10000 Authentication error", routes: cloudflareEveryRoute(cloudflareForbidden) },
+    { label: "every probe returns a 502 HTML page", routes: cloudflareEveryRoute(cloudflareCanaryHtml) },
+    {
+      label: "every probe returns 401 except one 10000 denial",
+      routes: { ...cloudflareEveryRoute(cloudflareError(401, "Unauthorized", CLOUDFLARE_INVALID_API_TOKEN)), [`/accounts/${ACCOUNT}/members`]: cloudflareForbidden },
+    },
+    {
+      // Global API Key requests carry no bearer token for /user/tokens/verify to verify, so a refusal there sits beside readable probes.
+      label: "global key whose verify probe is refused while every other probe reads",
+      config: cloudflareGlobalKeyConfig(),
+      routes: { ...healthy, "/user/tokens/verify": cloudflareError(400, "Bad Request", cloudflareMalformedHeader(6111, "Invalid format for Authorization header")) },
+    },
+  ];
+  for (const entry of cases) {
+    const config = entry.config ?? sampleConfig();
+    const result = await checkCloudflareAccess(new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(entry.routes) }));
+    assert.equal(result.status, "limited", entry.label);
+    assert.equal(result.recommendedNextStep, CLOUDFLARE_LIMITED_NEXT_STEP, entry.label);
+    assert.equal(result.notes[0], `Authenticated with ${config.authMethod === "token" ? "an API token" : "a Global API Key"}.`, entry.label);
+  }
 });

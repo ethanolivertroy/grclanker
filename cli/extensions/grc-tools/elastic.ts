@@ -204,7 +204,7 @@ export interface ElasticAccessSurface {
 }
 
 export interface ElasticAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   elasticsearchUrl: string;
   kibanaUrl?: string;
   cloudConfigured: boolean;
@@ -4349,12 +4349,14 @@ export async function checkElasticAccess(client: ElasticPartialReader): Promise<
 
   let privileges: JsonRecord | undefined;
   let privilegeError: string | undefined;
+  let privilegeStatus: number | null = null;
   const privilegeProbeAvailable = typeof client.hasPrivileges === "function";
   try {
     privileges = privilegeProbeAvailable ? await client.hasPrivileges?.() : undefined;
   } catch (error) {
     rethrowIfAborted(error);
     privilegeError = redactSecrets(errorMessage(error), config);
+    privilegeStatus = error instanceof ElasticRequestError ? error.status : null;
   }
   const missing = privileges ? missingPrivilegeSummary(privileges) : undefined;
 
@@ -4362,7 +4364,14 @@ export async function checkElasticAccess(client: ElasticPartialReader): Promise<
   const coreReadable = CORE_ACCESS_SURFACES.every((name) => snapshot[name]?.error === undefined && snapshot[name]?.skipped === undefined);
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
   const configuredCount = surfaces.filter((surface) => surface.status !== "not_configured").length;
-  const status: ElasticAccessCheckResult["status"] = coreReadable && missing !== undefined && missing.cluster.length === 0 ? "healthy" : "limited";
+  const attempted = surfaces.filter((surface) => surface.status !== "not_configured");
+  // A 401 on every request, the privilege probe included, means Elastic refused the credentials themselves, so no privilege was checked.
+  const credentialsRejected = attempted.length > 0
+    && attempted.every((surface) => surface.http_status === 401)
+    && (!privilegeProbeAvailable || privilegeStatus === 401);
+  const status: ElasticAccessCheckResult["status"] = credentialsRejected
+    ? "failed"
+    : (coreReadable && missing !== undefined && missing.cluster.length === 0 ? "healthy" : "limited");
   const notes = [
     `Using Elasticsearch ${config.elasticsearchUrl} with ${config.authMode} authentication.`,
     config.kibanaUrl ? `Kibana ${config.kibanaUrl}${config.kibanaSpaceId ? ` (space ${config.kibanaSpaceId})` : ""} is configured.` : "Kibana is not configured (set KIBANA_URL to enable Kibana checks).",
@@ -4371,8 +4380,12 @@ export async function checkElasticAccess(client: ElasticPartialReader): Promise<
       ? `Authenticated as ${asString(authenticated.username) ?? "unknown"} via ${asString(getNestedValue(authenticated, ["authentication_realm", "type"])) ?? "unknown"} realm with roles ${asStringList(authenticated.roles).join(", ") || "(none)"}.`
       : `Authentication probe failed: ${datasetProblem(snapshot, "authenticate")}.`,
     `${readableCount}/${configuredCount} configured audit surfaces are readable.`,
-    ...(privilegeError ? [`Privilege probe failed, so missing privileges are unknown: ${privilegeError}`] : []),
-    ...(!privilegeProbeAvailable ? ["Privilege probe not available on this client, so missing privileges are unknown."] : []),
+    ...(credentialsRejected
+      ? [`Privileges were not checked because Elastic rejected the ${credentialKind(config.authMode)}; the denied probes do not mean privileges are missing.`]
+      : [
+        ...(privilegeError ? [`Privilege probe failed, so missing privileges are unknown: ${privilegeError}`] : []),
+        ...(!privilegeProbeAvailable ? ["Privilege probe not available on this client, so missing privileges are unknown."] : []),
+      ]),
     ...(missing && missing.cluster.length > 0 ? [`Missing cluster privileges: ${missing.cluster.join(", ")}.`] : []),
     ...(missing && missing.index.length > 0 ? [`Missing index privileges: ${missing.index.join(", ")}.`] : []),
   ];
@@ -4389,10 +4402,57 @@ export async function checkElasticAccess(client: ElasticPartialReader): Promise<
     missingIndexPrivileges: missing?.index ?? null,
     privilegeProbe: missing ? "readable" : privilegeError ? "not_readable" : "not_available",
     notes,
-    recommendedNextStep: status === "healthy"
-      ? "Run elastic_assess_identity, elastic_assess_access_control, elastic_assess_transport_security, elastic_assess_cluster_hardening, elastic_assess_kibana, or elastic_export_audit_bundle."
-      : "Grant the auditing principal the monitor, read_security (or manage_security), manage_api_key, read_pipeline, monitor_snapshot, read_ilm, read_slm, and monitor_watcher cluster privileges, and set KIBANA_URL for Kibana checks.",
+    recommendedNextStep: accessCheckNextStep(status, config.authMode, Boolean(config.cloudApiKey)),
   };
+}
+
+function credentialKind(authMode: ElasticResolvedConfig["authMode"]): string {
+  switch (authMode) {
+    case "api_key":
+      return "API key";
+    case "basic":
+      return "username and password";
+    case "bearer":
+      // The scrubber reads "bearer <word>" as an Authorization value, so the kind avoids the word "bearer".
+      return "access token";
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled Elastic auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function rejectedCredentialsStep(authMode: ElasticResolvedConfig["authMode"], cloudKeyRejected: boolean): string {
+  const rejected = `Elastic rejected the ${credentialKind(authMode)}${cloudKeyRejected ? " and the Elastic Cloud API key" : ""} (every probe returned 401).`;
+  const cloudSetting = cloudKeyRejected ? ", and ELASTIC_CLOUD_API_KEY (or cloud_api_key) to a valid Elastic Cloud API key" : "";
+  // API keys, native users, and tokens belong to one cluster, so another cluster's URL draws the same 401s.
+  switch (authMode) {
+    case "api_key":
+      return `${rejected} Set ELASTIC_API_KEY (or the api_key argument, or api_key in ~/.elastic-sec-inspector/config.yaml) to a valid key and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster that issued it${cloudSetting}, then rerun elastic_check_access.`;
+    case "basic":
+      return `${rejected} Set ELASTIC_USERNAME and ELASTIC_PASSWORD (or the username and password arguments, or the same keys in ~/.elastic-sec-inspector/config.yaml) to valid credentials and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster they are for${cloudSetting}, then rerun elastic_check_access.`;
+    case "bearer":
+      return `${rejected} Set ELASTIC_BEARER_TOKEN (or the bearer_token argument, or bearer_token in ~/.elastic-sec-inspector/config.yaml) to a valid token and ELASTIC_URL (or ELASTICSEARCH_URL, or elasticsearch_url) to the cluster that issued it${cloudSetting}, then rerun elastic_check_access.`;
+    default: {
+      const exhaustive: never = authMode;
+      throw new Error(`Unhandled Elastic auth mode ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: ElasticAccessCheckResult["status"], authMode: ElasticResolvedConfig["authMode"], cloudConfigured: boolean): string {
+  switch (status) {
+    case "healthy":
+      return "Run elastic_assess_identity, elastic_assess_access_control, elastic_assess_transport_security, elastic_assess_cluster_hardening, elastic_assess_kibana, or elastic_export_audit_bundle.";
+    case "limited":
+      return "Grant the auditing principal the monitor, read_security (or manage_security), manage_api_key, read_pipeline, monitor_snapshot, read_ilm, read_slm, and monitor_watcher cluster privileges, and set KIBANA_URL for Kibana checks.";
+    case "failed":
+      return rejectedCredentialsStep(authMode, cloudConfigured);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Elastic access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function formatAccessCheckText(result: ElasticAccessCheckResult): string {

@@ -3521,3 +3521,82 @@ writeFailureTest("exportKnowbe4AuditBundle leaves nothing under the output root 
   const client = mockClient(healthyFixture(), { phisher: true });
   await assertNoPartialBundleOnWriteFailure(base, () => exportKnowbe4AuditBundle(client, client.getResolvedConfig(), base, { now: NOW }));
 });
+
+const KB_REJECTED_NEXT_STEP = "KnowBe4 rejected the Reporting API token (every probe returned 401). Set KNOWBE4_API_TOKEN (or the api_token argument, or api_token in ~/.knowbe4-inspector/config.yaml) to a valid token, and KNOWBE4_REGION (or region) to the region that hosts the account, then rerun knowbe4_check_access.";
+const KB_REJECTED_BOTH_NEXT_STEP = "KnowBe4 rejected the Reporting API token and the PhishER API token (every probe returned 401). Set KNOWBE4_API_TOKEN and KNOWBE4_PHISHER_API_TOKEN (or the api_token and phisher_api_token arguments, or the same keys in ~/.knowbe4-inspector/config.yaml) to valid tokens, and KNOWBE4_REGION (or region) to the region that hosts the account, then rerun knowbe4_check_access.";
+const KB_REJECTED_BASE_URL_NEXT_STEP = "KnowBe4 rejected the Reporting API token (every probe returned 401). Set KNOWBE4_API_TOKEN (or the api_token argument, or api_token in ~/.knowbe4-inspector/config.yaml) to a valid token, and KNOWBE4_BASE_URL (or base_url) to the Reporting API host of the region that hosts the account, then rerun knowbe4_check_access.";
+const KB_LIMITED_NEXT_STEP = "Regenerate the Reporting API key in the KnowBe4 console (Account Settings, API section) and confirm the region matches where the account is hosted.";
+const KB_PERMISSION_CLAIM = /\b(?:permissions?|scopes?|roles?|privileges?|licen[cs]es?|licensing|modules?)\b/i;
+
+function kbEveryRoute(respond) {
+  return Object.fromEntries(Object.keys(kbRoutes(healthyFixture())).map((route) => [route, respond]));
+}
+
+/** A 401 whose message echoes the token it refused, so every result below also proves the echo is scrubbed. */
+function kbUnauthorized(token) {
+  return () => jsonResponse({ message: `Invalid token ${token}` }, { status: 401, statusText: "Unauthorized" });
+}
+
+test("checkKnowbe4Access reports failed and names the token and host settings when every probe returns 401", async () => {
+  const bothRejected = { ...kbEveryRoute(kbUnauthorized(KB_TEST_TOKEN)), [KB_PHISHER_ROUTE]: kbUnauthorized(KB_PHISHER_TOKEN) };
+  const both = await checkKnowbe4Access(httpKnowbe4(healthyFixture(), { routes: bothRejected }).client);
+  assert.equal(both.status, "failed");
+  assert.equal(both.recommendedNextStep, KB_REJECTED_BOTH_NEXT_STEP);
+  assert.equal(both.surfaces.length, 10);
+  assert.ok(both.surfaces.every((surface) => surface.http_status === 401), JSON.stringify(both.surfaces));
+
+  // Without PhishER credentials no PhishER request is sent, so only the Reporting API token is named.
+  const reportingOnly = await checkKnowbe4Access(httpKnowbe4(healthyFixture(), { phisher: false, routes: kbEveryRoute(kbUnauthorized(KB_TEST_TOKEN)) }).client);
+  assert.equal(reportingOnly.status, "failed");
+  assert.equal(reportingOnly.recommendedNextStep, KB_REJECTED_NEXT_STEP);
+  assert.equal(reportingOnly.surfaces.find((surface) => surface.name === "phisher_messages")?.status, "not_configured");
+
+  // An explicit base URL replaces the region's host, so the next step names the base URL instead of the region.
+  const explicitConfig = resolveKnowbe4Configuration({ api_token: KB_TEST_TOKEN, base_url: "https://eu.api.knowbe4.com" }, {}, createTempBase("grclanker-knowbe4-rejected-home-"));
+  const explicitBaseUrl = await checkKnowbe4Access(kbClient(explicitConfig, kbRouter(kbEveryRoute(kbUnauthorized(KB_TEST_TOKEN)))));
+  assert.equal(explicitBaseUrl.status, "failed");
+  assert.equal(explicitBaseUrl.recommendedNextStep, KB_REJECTED_BASE_URL_NEXT_STEP);
+
+  for (const [label, result] of Object.entries({ both, reportingOnly, explicitBaseUrl })) {
+    assert.doesNotMatch([...result.notes, result.recommendedNextStep, ...result.surfaces.map((surface) => surface.status)].join("\n"), KB_PERMISSION_CLAIM, label);
+    assert.equal(scrubErrorText(result.recommendedNextStep), result.recommendedNextStep, `${label}: the next step survives the error scrubber`);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(result), [KB_TEST_TOKEN, KB_PHISHER_TOKEN], `${label} rejected access check`);
+  }
+
+  const registered = [];
+  registerKnowbe4Tools({ registerTool: (tool) => registered.push(tool) });
+  const checkTool = registered.find((tool) => tool.name === "knowbe4_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = kbRouter(bothRejected);
+  let tool;
+  try {
+    tool = await checkTool.execute("call-rejected-tokens", checkTool.prepareArguments({ api_token: KB_TEST_TOKEN, phisher_api_token: KB_PHISHER_TOKEN, region: "us" }));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const text = tool.content[0].text;
+  assert.equal(tool.details.status, "failed");
+  assert.match(text, /^KnowBe4 access check: failed$/m);
+  assert.ok(text.includes(`Next: ${KB_REJECTED_BOTH_NEXT_STEP}`), text);
+  assertCanaryWindowsAbsent(assert, [["text", text], ["details", JSON.stringify(tool.details)]], [KB_TEST_TOKEN, KB_PHISHER_TOKEN], "rendered rejected access check");
+});
+
+test("checkKnowbe4Access keeps the limited result when a probe reads, a probe is denied with 403, or every probe is a 403 or a server error", async () => {
+  const forbiddenRoute = () => jsonResponse({ message: "Forbidden" }, { status: 403, statusText: "Forbidden" });
+  const serverError = () => jsonResponse({ message: "Internal Server Error" }, { status: 500, statusText: "Internal Server Error" });
+  const fixture = healthyFixture();
+  const cases = {
+    // A token that reads even one surface was accepted, so the other 401s keep the regenerate-the-key wording.
+    partlyReadable: { ...kbEveryRoute(kbUnauthorized(KB_TEST_TOKEN)), "GET /v1/account": () => jsonResponse(fixture.account) },
+    phisherReadable: { ...kbEveryRoute(kbUnauthorized(KB_TEST_TOKEN)), [KB_PHISHER_ROUTE]: kbRoutes(fixture)[KB_PHISHER_ROUTE] },
+    oneForbidden: { ...kbEveryRoute(kbUnauthorized(KB_TEST_TOKEN)), "GET /v1/groups": forbiddenRoute },
+    allForbidden: kbEveryRoute(forbiddenRoute),
+    allServerErrors: kbEveryRoute(serverError),
+  };
+  for (const [label, routes] of Object.entries(cases)) {
+    const result = await checkKnowbe4Access(httpKnowbe4(fixture, { routes }).client);
+    assert.equal(result.status, "limited", label);
+    assert.equal(result.recommendedNextStep, KB_LIMITED_NEXT_STEP, label);
+    assert.ok(result.notes.every((note) => !/rejected|were not checked/.test(note)), `${label}: ${result.notes.join(" | ")}`);
+  }
+});

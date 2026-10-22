@@ -137,7 +137,7 @@ export interface CloudflareAccessSurface {
 }
 
 export interface CloudflareAccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   authMethod: CloudflareResolvedConfig["authMethod"];
   accountId?: string;
   surfaces: CloudflareAccessSurface[];
@@ -472,6 +472,45 @@ function cloudflareErrorSummary(payload: unknown): string | undefined {
     .map((record) => asString(record.message))
     .filter((item): item is string => Boolean(item));
   return errors.length > 0 ? errors.join("; ") : undefined;
+}
+
+/**
+ * Cloudflare's invalid-credential errors, matched on code and message together because a code alone is reused:
+ * 9109 also answers a valid token sent from an address its IP filter excludes ("Cannot use the access token from
+ * location") and a valid token that cannot reach a resource ("Unauthorized to access requested resource").
+ * 10000 Authentication error is a permission denial and is never one of these.
+ */
+const CLOUDFLARE_CREDENTIAL_ERRORS: ReadonlyArray<{ code: number; message: string }> = [
+  { code: 1000, message: "Invalid API Token" },
+  { code: 9103, message: "Unknown X-Auth-Key or X-Auth-Email" },
+  { code: 9109, message: "Invalid access token" },
+];
+
+/** The error_chain entries under 6003 Invalid request headers that say a credential header is malformed. */
+const CLOUDFLARE_MALFORMED_CREDENTIAL_HEADERS: ReadonlyMap<number, string> = new Map([
+  [6102, "Invalid format for X-Auth-Email header"],
+  [6103, "Invalid format for X-Auth-Key header"],
+  [6111, "Invalid format for Authorization header"],
+]);
+
+/**
+ * The invalid-credential error a Cloudflare error payload carries, as `error 9109 (Invalid access token)`, or
+ * undefined. The text comes from the tables above, never from the response, so a next step can quote it.
+ */
+function cloudflareCredentialRejection(payload: unknown): string | undefined {
+  for (const record of asRecordArray(asObject(payload)?.errors)) {
+    const code = asNumber(record.code);
+    const message = asString(record.message)?.trim().toLowerCase();
+    const known = CLOUDFLARE_CREDENTIAL_ERRORS.find((entry) => entry.code === code && entry.message.toLowerCase() === message);
+    if (known) return `error ${known.code} (${known.message})`;
+    if (code !== 6003) continue;
+    for (const link of asRecordArray(record.error_chain)) {
+      const linkCode = asNumber(link.code);
+      const header = linkCode === undefined ? undefined : CLOUDFLARE_MALFORMED_CREDENTIAL_HEADERS.get(linkCode);
+      if (header) return `error ${linkCode} (${header})`;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -1209,12 +1248,15 @@ export class CloudflareApiError extends Error {
   /** HTTP status the request observed; undefined for transport failures (timeouts, connection errors). */
   readonly status: number | undefined;
   readonly path: string;
+  /** Cloudflare's invalid-credential error for this request (see cloudflareCredentialRejection); undefined for every other failure. */
+  readonly credentialRejection: string | undefined;
 
-  constructor(message: string, status: number | undefined, path: string) {
+  constructor(message: string, status: number | undefined, path: string, credentialRejection?: string) {
     super(redactErrorText(message));
     this.name = "CloudflareApiError";
     this.status = status;
     this.path = path;
+    this.credentialRejection = credentialRejection;
   }
 }
 
@@ -1226,6 +1268,12 @@ function errorStatus(error: unknown): number | undefined {
 /** Path of the request that failed, taken from the observed request rather than a caller's constant. */
 function errorEndpoint(error: unknown): string | undefined {
   return error instanceof CloudflareApiError ? error.path : undefined;
+}
+
+/** How a failed request reads in the rejected-credential evidence: `401`, Cloudflare's invalid-credential error, or undefined for any other failure. */
+function errorRejection(error: unknown): string | undefined {
+  if (errorStatus(error) === 401) return "401";
+  return error instanceof CloudflareApiError ? error.credentialRejection : undefined;
 }
 
 /**
@@ -1334,6 +1382,7 @@ export class CloudflareApiClient implements CloudflareReader {
           `Cloudflare request failed for ${displayPath(path)} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
           response.status,
           path,
+          cloudflareCredentialRejection(payload),
         );
       }
 
@@ -1347,7 +1396,7 @@ export class CloudflareApiClient implements CloudflareReader {
       }
 
       if (payload.success === false) {
-        throw new CloudflareApiError(cloudflareErrorSummary(payload) ?? `Cloudflare API reported failure for ${displayPath(path)}.`, response.status, path);
+        throw new CloudflareApiError(cloudflareErrorSummary(payload) ?? `Cloudflare API reported failure for ${displayPath(path)}.`, response.status, path, cloudflareCredentialRejection(payload));
       }
 
       return payload;
@@ -1587,7 +1636,7 @@ export class CloudflareApiClient implements CloudflareReader {
 }
 
 /** A failed read: the scrubbed error plus the HTTP status and path the failing request observed, when it was one. */
-type ReadFailure = { ok: false; error: string; status?: number; endpoint?: string };
+type ReadFailure = { ok: false; error: string; status?: number; endpoint?: string; rejection?: string };
 
 type ReadOutcome<T> =
   | { ok: true; value: T }
@@ -1598,7 +1647,8 @@ async function attempt<T>(load: () => Promise<T>): Promise<ReadOutcome<T>> {
     return { ok: true, value: await load() };
   } catch (error) {
     rethrowIfAborted(error);
-    return { ok: false, error: errorMessage(error), status: errorStatus(error), endpoint: errorEndpoint(error) };
+    const rejection = errorRejection(error);
+    return { ok: false, error: errorMessage(error), status: errorStatus(error), endpoint: errorEndpoint(error), ...(rejection ? { rejection } : {}) };
   }
 }
 
@@ -1862,6 +1912,7 @@ async function readableSurface(
   scope: CloudflareAccessSurface["scope"],
   endpoint: string,
   load: () => Promise<unknown>,
+  rejections: Map<CloudflareAccessSurface, string>,
 ): Promise<CloudflareAccessSurface> {
   try {
     const value = await load();
@@ -1871,7 +1922,10 @@ async function readableSurface(
     return { name, scope, endpoint, status: "readable", count };
   } catch (error) {
     rethrowIfAborted(error);
-    return { name, scope, endpoint: errorEndpoint(error) ?? endpoint, status: "not_readable", count: null, http_status: errorStatus(error) ?? null, error: errorMessage(error) };
+    const surface: CloudflareAccessSurface = { name, scope, endpoint: errorEndpoint(error) ?? endpoint, status: "not_readable", count: null, http_status: errorStatus(error) ?? null, error: errorMessage(error) };
+    const rejection = errorRejection(error);
+    if (rejection) rejections.set(surface, rejection);
+    return surface;
   }
 }
 
@@ -2275,8 +2329,13 @@ export async function checkCloudflareAccess(
   const { accountId, note } = deriveAccountContext(config, accounts);
   const firstZoneId = asString(zoneItems[0]?.id);
 
-  const failedSurface = (name: string, scope: CloudflareAccessSurface["scope"], endpoint: string, outcome: { error: string; status?: number; endpoint?: string }): CloudflareAccessSurface =>
-    ({ name, scope, endpoint: outcome.endpoint ?? endpoint, status: "not_readable", count: null, http_status: outcome.status ?? null, error: outcome.error });
+  // Each sent probe Cloudflare answered with a credential rejection, mapped to how it reads in the evidence.
+  const rejections = new Map<CloudflareAccessSurface, string>();
+  const failedSurface = (name: string, scope: CloudflareAccessSurface["scope"], endpoint: string, outcome: ReadFailure): CloudflareAccessSurface => {
+    const surface: CloudflareAccessSurface = { name, scope, endpoint: outcome.endpoint ?? endpoint, status: "not_readable", count: null, http_status: outcome.status ?? null, error: outcome.error };
+    if (outcome.rejection) rejections.set(surface, outcome.rejection);
+    return surface;
+  };
   const surfaces: CloudflareAccessSurface[] = [
     verify.ok
       ? { name: "token_verify", scope: "user", endpoint: "/user/tokens/verify", status: "readable", count: verify.value ? 1 : 0 }
@@ -2306,11 +2365,11 @@ export async function checkCloudflareAccess(
             ? `${settingErrors} of ${settings.value.length} zone settings could not be read: ${settings.value.filter((item) => asString(item.error)).map((item) => `${asString(item.id)}: ${asString(item.error)}`).join("; ")}`
             : settings.error,
         },
-      await readableSurface("dnssec", "zone", `/zones/${firstZoneId}/dnssec`, () => client.getDnssec(firstZoneId)),
+      await readableSurface("dnssec", "zone", `/zones/${firstZoneId}/dnssec`, () => client.getDnssec(firstZoneId), rejections),
     );
     if (client.listZoneRulesets) {
       const listZoneRulesets = client.listZoneRulesets.bind(client);
-      surfaces.push(await readableSurface("rulesets", "zone", `/zones/${firstZoneId}/rulesets`, () => listZoneRulesets(firstZoneId)));
+      surfaces.push(await readableSurface("rulesets", "zone", `/zones/${firstZoneId}/rulesets`, () => listZoneRulesets(firstZoneId), rejections));
     }
   } else if (!zones.ok) {
     // The zone list itself failed, so nothing zone-scoped was sent: the rows name the parent read and its
@@ -2331,9 +2390,9 @@ export async function checkCloudflareAccess(
 
   if (accountId) {
     surfaces.push(
-      await readableSurface("members", "account", `/accounts/${accountId}/members`, () => client.listMembers(accountId)),
-      await readableSurface("zero_trust_apps", "account", `/accounts/${accountId}/access/apps`, () => client.listAccessApplications(accountId)),
-      await readableSurface("audit_logs", "account", `/accounts/${accountId}/audit_logs`, () => client.listAuditLogs(accountId)),
+      await readableSurface("members", "account", `/accounts/${accountId}/members`, () => client.listMembers(accountId), rejections),
+      await readableSurface("zero_trust_apps", "account", `/accounts/${accountId}/access/apps`, () => client.listAccessApplications(accountId), rejections),
+      await readableSurface("audit_logs", "account", `/accounts/${accountId}/audit_logs`, () => client.listAuditLogs(accountId), rejections),
     );
   } else {
     surfaces.push(
@@ -2346,9 +2405,15 @@ export async function checkCloudflareAccess(
   const readableCount = surfaces.filter((surfaceItem) => surfaceItem.status === "readable").length;
   const notAttempted = surfaces.filter((surfaceItem) => surfaceItem.status === "not_attempted");
   const failedCount = surfaces.filter((surfaceItem) => surfaceItem.status === "not_readable").length;
+  // Only probes that were sent count; a not_attempted row carries its parent's status without a request of its own.
+  const sent = surfaces.filter((surfaceItem) => surfaceItem.status === "readable" || surfaceItem.status === "not_readable");
+  const credentialsRejected = sent.length > 0 && sent.every((surfaceItem) => rejections.has(surfaceItem));
   // A probe that failed or was never sent keeps the check at limited: not_configured rows (no account id,
   // readable-but-empty zone list) are the only non-readable rows a healthy check may carry.
-  const status = readableCount >= 5 && failedCount === 0 && notAttempted.length === 0 ? "healthy" : "limited";
+  const status: CloudflareAccessCheckResult["status"] = credentialsRejected
+    ? "failed"
+    : (readableCount >= 5 && failedCount === 0 && notAttempted.length === 0 ? "healthy" : "limited");
+  const credential = config.authMethod === "token" ? "an API token" : "a Global API Key";
 
   return {
     status,
@@ -2356,18 +2421,52 @@ export async function checkCloudflareAccess(
     accountId,
     surfaces,
     notes: [
-      `Authenticated with ${config.authMethod === "token" ? "an API token" : "a Global API Key"}.`,
+      status === "failed" ? `Authentication with ${credential} failed.` : `Authenticated with ${credential}.`,
       note,
       `${readableCount}/${surfaces.length} Cloudflare audit surfaces are readable.`,
       ...(!zones.ok && notAttempted.length > 0
         ? [`${notAttempted.length} zone-scoped surfaces were not attempted because ${displayPath(zones.endpoint ?? "/zones")} could not be read (${zones.status ?? "no HTTP status"}).`]
         : []),
     ],
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run cloudflare_assess_identity, cloudflare_assess_zone_security, cloudflare_assess_traffic_controls, or cloudflare_export_audit_bundle."
-        : "Provide a read-only API token and, when multiple accounts exist, set account_id to unlock account-scoped Cloudflare checks.",
+    recommendedNextStep: accessCheckNextStep(status, config.authMethod, sent.map((surfaceItem) => rejections.get(surfaceItem) ?? "")),
   };
+}
+
+/** `every probe returned 401 or error 9109 (Invalid access token)`: each distinct rejection, in probe order. */
+function rejectionEvidence(rejections: readonly string[]): string {
+  const distinct = [...new Set(rejections)];
+  const last = distinct.pop();
+  if (distinct.length === 0) return `every probe returned ${last}`;
+  return `every probe returned ${distinct.join(", ")}${distinct.length > 1 ? "," : ""} or ${last}`;
+}
+
+function rejectedCredentialsStep(authMethod: CloudflareResolvedConfig["authMethod"], rejections: readonly string[]): string {
+  const evidence = rejectionEvidence(rejections);
+  switch (authMethod) {
+    case "token":
+      return `Cloudflare rejected the API token (${evidence}). Set CLOUDFLARE_API_TOKEN (or the api_token argument) to a valid token, then rerun cloudflare_check_access.`;
+    case "global_key":
+      return `Cloudflare rejected the Global API Key (${evidence}). Set CLOUDFLARE_API_KEY and CLOUDFLARE_EMAIL (or the api_key and email arguments) to a valid Global API Key and the email of the user who owns it, then rerun cloudflare_check_access.`;
+    default: {
+      const exhaustive: never = authMethod;
+      throw new Error(`Unhandled Cloudflare auth method ${String(exhaustive)}`);
+    }
+  }
+}
+
+function accessCheckNextStep(status: CloudflareAccessCheckResult["status"], authMethod: CloudflareResolvedConfig["authMethod"], rejections: readonly string[]): string {
+  switch (status) {
+    case "healthy":
+      return "Run cloudflare_assess_identity, cloudflare_assess_zone_security, cloudflare_assess_traffic_controls, or cloudflare_export_audit_bundle.";
+    case "limited":
+      return "Provide a read-only API token and, when multiple accounts exist, set account_id to unlock account-scoped Cloudflare checks.";
+    case "failed":
+      return rejectedCredentialsStep(authMethod, rejections);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled Cloudflare access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 export async function assessCloudflareIdentity(
@@ -3760,6 +3859,11 @@ export function cloudflareFixedTexts(): readonly string[] {
   const policiesDenied = `Cloudflare request failed for ${policiesPath} (403 Forbidden): ${denied}`;
   const subscriptionDenied = `Cloudflare request failed for /zones/zone-1/subscription (403 Forbidden): ${denied}`;
   const notAttemptedZoneSurface = notAttemptedSurface("zone_dnssec", "zone", "/zones/{zone_id}/dnssec", { endpoint: "/zones", status: 403, error: zonesDenied });
+  const everyRejection = [
+    "401",
+    ...CLOUDFLARE_CREDENTIAL_ERRORS.map((entry) => cloudflareCredentialRejection({ errors: [entry] }) ?? ""),
+    ...[...CLOUDFLARE_MALFORMED_CREDENTIAL_HEADERS.keys()].map((code) => cloudflareCredentialRejection({ errors: [{ code: 6003, message: "Invalid request headers", error_chain: [{ code }] }] }) ?? ""),
+  ];
   return Object.freeze([
     PARSE_ERROR_NOTE,
     describeNonJsonBody("text/html; charset=utf-8", html) ?? "",
@@ -3778,6 +3882,11 @@ export function cloudflareFixedTexts(): readonly string[] {
     "3 zone-scoped surfaces were not attempted because /zones could not be read (no HTTP status).",
     "5/7 Cloudflare audit surfaces are readable.",
     "Provide a read-only API token and, when multiple accounts exist, set account_id to unlock account-scoped Cloudflare checks.",
+    "Authentication with an API token failed.",
+    "Authentication with a Global API Key failed.",
+    rejectedCredentialsStep("token", ["401"]),
+    rejectedCredentialsStep("token", everyRejection),
+    rejectedCredentialsStep("global_key", everyRejection),
     manualReason("/user/tokens/verify", "any valid API token (verify needs no extra permission)", "the token status and permission groups from the dashboard", `Cloudflare request failed for /user/tokens/verify (403 Forbidden): ${denied}`),
     manualReason(policiesPath, "Access: Apps and Policies: Read", "the reusable Access policy list and each policy's decision", policiesDenied),
     `2 Access applications carry 3 inline policies, none with bypass, but the reusable policy list could not be checked. ${manualReason(policiesPath, "Access: Apps and Policies: Read", "the reusable Access policy list and each policy's decision", policiesDenied)}`,

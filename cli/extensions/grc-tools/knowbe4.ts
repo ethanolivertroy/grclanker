@@ -202,7 +202,7 @@ export interface Knowbe4AccessSurface {
 }
 
 export interface Knowbe4AccessCheckResult {
-  status: "healthy" | "limited";
+  status: "healthy" | "limited" | "failed";
   region: Knowbe4Region;
   baseUrl: string;
   accountName?: string;
@@ -1677,7 +1677,9 @@ export async function checkKnowbe4Access(client: Knowbe4AccessClient): Promise<K
   const readableCore = surfaces
     .slice(0, CORE_ACCESS_SURFACES)
     .filter((surface) => surface.status === "readable").length;
-  const status = readableCore >= HEALTHY_SURFACE_THRESHOLD ? "healthy" : "limited";
+  const status: Knowbe4AccessCheckResult["status"] = tokensRejected(surfaces)
+    ? "failed"
+    : (readableCore >= HEALTHY_SURFACE_THRESHOLD ? "healthy" : "limited");
   const accountName = asString(account.name);
   const subscriptionLevel = asString(account.subscription_level);
 
@@ -1699,11 +1701,40 @@ export async function checkKnowbe4Access(client: Knowbe4AccessClient): Promise<K
         : "PhishER GraphQL credentials are not configured; report-rate enrichment will be skipped.",
       `Configuration sources: ${config.sourceChain.join(", ") || "defaults"}.`,
     ],
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run knowbe4_assess_phishing_program, knowbe4_assess_training_program, knowbe4_assess_user_risk, knowbe4_assess_account_governance, or knowbe4_export_audit_bundle."
-        : "Regenerate the Reporting API key in the KnowBe4 console (Account Settings, API section) and confirm the region matches where the account is hosted.",
+    recommendedNextStep: accessCheckNextStep(
+      status,
+      client.hasPhisherCredentials(),
+      config.sourceChain.some((source) => source.endsWith("-base-url")),
+    ),
   };
+}
+
+/** A 401 on every probe that sent a request means KnowBe4 refused the token itself, so nothing about the account was checked. */
+function tokensRejected(surfaces: Knowbe4AccessSurface[]): boolean {
+  const attempted = surfaces.filter((surface) => surface.status !== "not_configured");
+  return attempted.length > 0 && attempted.every((surface) => surface.http_status === 401);
+}
+
+function accessCheckNextStep(status: Knowbe4AccessCheckResult["status"], phisherConfigured: boolean, explicitBaseUrl: boolean): string {
+  switch (status) {
+    case "healthy":
+      return "Run knowbe4_assess_phishing_program, knowbe4_assess_training_program, knowbe4_assess_user_risk, knowbe4_assess_account_governance, or knowbe4_export_audit_bundle.";
+    case "limited":
+      return "Regenerate the Reporting API key in the KnowBe4 console (Account Settings, API section) and confirm the region matches where the account is hosted.";
+    case "failed": {
+      // A token used against another region's host is refused with the same 401, so the setting that picked the host is named with the token.
+      const host = explicitBaseUrl
+        ? "KNOWBE4_BASE_URL (or base_url) to the Reporting API host of the region that hosts the account"
+        : "KNOWBE4_REGION (or region) to the region that hosts the account";
+      return phisherConfigured
+        ? `KnowBe4 rejected the Reporting API token and the PhishER API token (every probe returned 401). Set KNOWBE4_API_TOKEN and KNOWBE4_PHISHER_API_TOKEN (or the api_token and phisher_api_token arguments, or the same keys in ~/.knowbe4-inspector/config.yaml) to valid tokens, and ${host}, then rerun knowbe4_check_access.`
+        : `KnowBe4 rejected the Reporting API token (every probe returned 401). Set KNOWBE4_API_TOKEN (or the api_token argument, or api_token in ~/.knowbe4-inspector/config.yaml) to a valid token, and ${host}, then rerun knowbe4_check_access.`;
+    }
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled KnowBe4 access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function collected<T>(data: T, error?: string): Knowbe4Collected<T> {

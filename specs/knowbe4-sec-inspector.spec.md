@@ -41,6 +41,7 @@ PhishER is a separate product with its own API key. Without the key the tool doe
 - Users stop at user_limit (5000), training enrollments at enrollment_limit (20000), PhishER messages at phisher_message_limit (1000), and every other list, including each sampled test's recipient list, at 20000 records.
 - Training campaigns are read 10 per page, other Reporting API lists 500 per page, and PhishER messages 200 per page.
 - A refused or failed read never counts as an empty list. A check whose decision needs that read is manual, and a check that uses it only as supporting evidence cannot pass.
+- When every probe returns 401, the access check reports failed: KnowBe4 refused the token itself, and a token sent to another region's host draws the same 401, so the next step names the token setting and the region or base URL setting that picked the host.
 - The account record is cut to its listed fields, and user records lose their comment, custom field, and custom date values before they reach evidence, decision facts, or the bundle. With redact_pii, the export also hashes email and reporter values and masks names, phone numbers, IP addresses, and message subjects.
 - The phish-prone baseline is the first three tests that ran, used only once at least four have run, and the trend needs at least four tests in twice the lookback window. Neither count can be configured.
 

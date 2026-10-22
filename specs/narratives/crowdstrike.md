@@ -19,6 +19,7 @@ Most lists come from offset walks and ID lookups that stop at a cap, and a few c
 - The tool only reads. Besides the OAuth2 token request, its only POST requests are the user lookup and the alert search, which change nothing.
 - Policy lists stop at 5000 policies; hosts stop at host_limit (5000), alerts at alert_limit (2000), users and API clients at user_limit (500), each exclusion type at exclusion_limit (500), and each user's role grants at 500.
 - A refused or failed read never counts as an empty list. The checks that need it are manual and name the read, and a read that depends on a failed one is recorded as not collected.
+- When the token request refuses the API client credentials (a 401, or a 403 whose error reads Failed to issue access token - Not Authorized) or every probe returns 401, the access check reports failed instead of listing missing scopes. Its next step names the client ID, secret, and cloud settings after a refused token request, and the cloud setting alone when Falcon issued a token that every probe refused, since only the client's own cloud accepts its tokens.
 - Exclusion regexes, paths, names, descriptions, and comments pass through the data redaction pass and the exclusion text pass before they reach evidence, summaries, decision facts, or the bundle.
 - The 90-day periods for stale admin logins and unused API clients are fixed and cannot be configured.
 

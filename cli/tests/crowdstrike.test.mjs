@@ -3525,3 +3525,114 @@ writeFailureTest("exportCrowdstrikeAuditBundle leaves nothing under the output r
   const base = createTempBase("grclanker-cs-write-failure-");
   await assertNoPartialBundleOnWriteFailure(base, () => exportCrowdstrikeAuditBundle(createFakeClient(), sampleConfig(), base));
 });
+
+const CS_REJECTED_CLIENT_SECRET = "tim5vbAnh6jDp9nUwL0oR6abazdD2LBK";
+const CS_REJECTED_ISSUED_TOKEN = "yj6lxeMEtMhX3rD7BWcbQUKB9s9Odwk0";
+const CS_LIMITED_NEXT_STEP = "Grant the missing read scopes to the Falcon API client (Support and resources > API clients and keys) and rerun crowdstrike_check_access.";
+const CS_PERMISSION_CLAIM = /\b(?:permissions?|scopes?|roles?|privileges?|licen[cs]es?|licensing|modules?)\b/i;
+const CS_CREDENTIALS_NEXT_STEP_TAIL = "Set CS_CLIENT_ID and CS_CLIENT_SECRET (or FALCON_CLIENT_ID and FALCON_CLIENT_SECRET, or the client_id and client_secret arguments, or the same keys in ~/.crowdstrike/config.json) to a valid API client ID and secret, and CS_CLOUD or CS_BASE_URL (or FALCON_CLOUD or FALCON_BASE_URL, or cloud or base_url) to the cloud where that client was created, then rerun crowdstrike_check_access.";
+
+/** A Falcon fetch double: the token endpoint answers with `token()`, every probe with `probe(path)`. */
+function csAccessFetch(token, probe) {
+  return async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    return url.pathname === "/oauth2/token" ? token() : probe(url.pathname);
+  };
+}
+
+/** The Falcon error envelope; a case can add a message echoing a planted secret, so every result below also proves the echo is scrubbed. */
+function csErrors(status, ...messages) {
+  return () => jsonResponse({ meta: { query_time: 0.002, trace_id: "trace-rejected" }, resources: [], errors: messages.map((message) => ({ code: status, message })) }, { status });
+}
+
+function csTokenIssued() {
+  return jsonResponse({ access_token: CS_REJECTED_ISSUED_TOKEN, expires_in: 1799, token_type: "bearer" }, { status: 201 });
+}
+
+test("checkCrowdstrikeAccess reports failed and names the credential and cloud settings when Falcon refuses the API client or every probe returns 401", async () => {
+  const cases = [
+    {
+      label: "token request refused with 403 Failed to issue access token",
+      fetchImpl: csAccessFetch(csErrors(403, "Failed to issue access token - Not Authorized", `client ${CS_REJECTED_CLIENT_SECRET}`), csErrors(500, "unreachable")),
+      httpStatus: 403,
+      kind: "API client credentials",
+      nextStep: `CrowdStrike rejected the API client credentials (the token request returned 403: Failed to issue access token). ${CS_CREDENTIALS_NEXT_STEP_TAIL}`,
+    },
+    {
+      label: "token request refused with 401",
+      fetchImpl: csAccessFetch(csErrors(401, `access denied, invalid client ${CS_REJECTED_CLIENT_SECRET}`), csErrors(500, "unreachable")),
+      httpStatus: 401,
+      kind: "API client credentials",
+      nextStep: `CrowdStrike rejected the API client credentials (the token request returned 401). ${CS_CREDENTIALS_NEXT_STEP_TAIL}`,
+    },
+    {
+      label: "token issued but every probe returns 401",
+      fetchImpl: csAccessFetch(csTokenIssued, csErrors(401, `access denied, invalid bearer token ${CS_REJECTED_ISSUED_TOKEN}`)),
+      httpStatus: 401,
+      kind: "OAuth2 access token",
+      nextStep: "CrowdStrike rejected the OAuth2 access token issued for the API client (every probe returned 401). Set CS_CLOUD or CS_BASE_URL (or FALCON_CLOUD or FALCON_BASE_URL, or the cloud or base_url arguments, or the same keys in ~/.crowdstrike/config.json) to the cloud where the API client was created, then rerun crowdstrike_check_access.",
+    },
+  ];
+  for (const entry of cases) {
+    const client = new CrowdstrikeApiClient(sampleConfig({ clientSecret: CS_REJECTED_CLIENT_SECRET }), { fetchImpl: entry.fetchImpl, sleep: async () => {}, retryLimit: 0 });
+    const result = await checkCrowdstrikeAccess(client);
+    assert.equal(result.status, "failed", entry.label);
+    assert.equal(result.recommendedNextStep, entry.nextStep, entry.label);
+    assert.ok(result.surfaces.length === 19 && result.surfaces.every((surface) => surface.status === "not_readable" && surface.http_status === entry.httpStatus), `${entry.label}: ${JSON.stringify(result.surfaces)}`);
+    assert.deepEqual(result.missingScopes, [], entry.label);
+    const disclaimer = `API client scopes were not checked because CrowdStrike rejected the ${entry.kind}; the denied probes do not mean scopes are missing.`;
+    assert.ok(result.notes.includes(disclaimer), `${entry.label}: ${result.notes.join(" | ")}`);
+    // The "Scope:" note names the CID the results cover, not API client scopes.
+    const claims = [
+      ...result.notes.filter((note) => note !== disclaimer && !note.startsWith("Scope: results cover")),
+      result.recommendedNextStep,
+      ...result.surfaces.map((surface) => surface.status),
+    ].join("\n");
+    assert.doesNotMatch(claims, CS_PERMISSION_CLAIM, entry.label);
+    for (const text of [disclaimer, result.recommendedNextStep]) {
+      assert.equal(new CrowdstrikeHttpError(text, 502, "/x").message, text, `${entry.label}: survives the error scrubber`);
+    }
+    assertFragmentsAbsent(assert, JSON.stringify(result), [CS_REJECTED_CLIENT_SECRET, CS_REJECTED_ISSUED_TOKEN], `${entry.label} rejected access check`);
+  }
+
+  const registered = [];
+  registerCrowdstrikeTools({ registerTool: (tool) => registered.push(tool) });
+  const checkTool = registered.find((tool) => tool.name === "crowdstrike_check_access");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = cases[0].fetchImpl;
+  let tool;
+  try {
+    tool = await checkTool.execute("call-rejected-client", checkTool.prepareArguments({ client_id: "client-id", client_secret: CS_REJECTED_CLIENT_SECRET, cloud: "us-1" }));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const text = tool.content[0].text;
+  assert.equal(tool.details.status, "failed", text);
+  assert.match(text, /^CrowdStrike access check: failed$/m);
+  assert.ok(text.includes(`Next: ${cases[0].nextStep}`), text);
+  assertSecretFragmentsAbsent(assert, [["text", text], ["details", JSON.stringify(tool.details)]], [CS_REJECTED_CLIENT_SECRET], "rendered rejected access check");
+});
+
+test("checkCrowdstrikeAccess keeps the limited result when a probe reads, a probe is denied with 403, an IP allowlist denies the token request, or every probe is a 403 or a server error", async () => {
+  const readable = () => jsonResponse({ meta: { pagination: { offset: 0, limit: 1, total: 4 } }, resources: ["x"], errors: [] });
+  const unauthorized = csErrors(401, "access denied, invalid bearer token");
+  const denied = csErrors(403, "access denied, authorization failed");
+  const missingScopes = /^Missing API client scopes: /;
+  const cases = {
+    // A token that reads even one surface was accepted, so the other 401s keep the missing-scope wording.
+    partlyReadable: { fetchImpl: csAccessFetch(csTokenIssued, (path) => (path === "/policy/combined/prevention/v1" ? readable() : unauthorized())), scopeNote: missingScopes },
+    oneForbidden: { fetchImpl: csAccessFetch(csTokenIssued, (path) => (path === "/policy/combined/prevention/v1" ? denied() : unauthorized())), scopeNote: missingScopes },
+    allForbidden: { fetchImpl: csAccessFetch(csTokenIssued, denied), scopeNote: missingScopes },
+    // An IP allowlist answers the token request for valid credentials with a bare 403, so it is not a refusal.
+    ipAllowlist: { fetchImpl: csAccessFetch(denied, readable), scopeNote: missingScopes },
+    allServerErrors: { fetchImpl: csAccessFetch(csTokenIssued, csErrors(500, "internal server error")), scopeNote: /^No 401 or 403 responses were observed/ },
+  };
+  for (const [label, entry] of Object.entries(cases)) {
+    const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl: entry.fetchImpl, sleep: async () => {}, retryLimit: 0 });
+    const result = await checkCrowdstrikeAccess(client);
+    assert.equal(result.status, "limited", label);
+    assert.equal(result.recommendedNextStep, CS_LIMITED_NEXT_STEP, label);
+    assert.ok(result.notes.some((note) => entry.scopeNote.test(note)), `${label}: ${result.notes.join(" | ")}`);
+    assert.ok(result.notes.every((note) => !/rejected|were not checked/.test(note)), `${label}: ${result.notes.join(" | ")}`);
+  }
+});

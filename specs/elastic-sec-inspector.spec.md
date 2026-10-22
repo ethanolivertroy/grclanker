@@ -26,7 +26,7 @@ The shipped implementation is native TypeScript inside grclanker (`cli/extension
 
 | Tool | Spec controls |
 |------|---------------|
-| `elastic_check_access` | Probes every read surface across Elasticsearch, Kibana, and Elastic Cloud and reports missing cluster and index privileges |
+| `elastic_check_access` | Probes every read surface across Elasticsearch, Kibana, and Elastic Cloud, reports missing cluster and index privileges, and reports healthy, limited, or failed (every configured probe and the privilege probe returned 401, so the credentials were rejected) |
 | `elastic_assess_identity` | 1, 9, 10, 13, 14 |
 | `elastic_assess_access_control` | 6, 7, 8 |
 | `elastic_assess_transport_security` | 2, 3, 4, 5 |

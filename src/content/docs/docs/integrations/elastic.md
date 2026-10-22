@@ -97,7 +97,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 |------|---------|
-| `elastic_check_access` | Probe every read surface (29 endpoints across Elasticsearch, Kibana, and Elastic Cloud), report readable, not readable, and not configured surfaces, and list missing cluster and index privileges |
+| `elastic_check_access` | Probe every read surface (29 endpoints across Elasticsearch, Kibana, and Elastic Cloud), report readable, not readable, and not configured surfaces, and list missing cluster and index privileges, or report `failed` when every configured probe, the privilege probe included, returned 401 because Elastic rejected the credentials (the next step names the credential and cluster URL settings to fix) |
 | `elastic_assess_identity` | Controls 1, 9, 10, 13, 14: realms, API key hygiene and scope, SSO mapping, anonymous access |
 | `elastic_assess_access_control` | Controls 6, 7, 8: roles and users, field-level security, document-level security |
 | `elastic_assess_transport_security` | Controls 2, 3, 4, 5: transport TLS, HTTP TLS, minimum TLS version, certificate expiration |

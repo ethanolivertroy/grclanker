@@ -4004,3 +4004,57 @@ writeFailureTest("exportLaunchdarklyAuditBundle leaves nothing under the output 
   const base = createTempBase("grclanker-ld-write-failure-");
   await assertNoPartialBundleOnWriteFailure(base, () => exportLaunchdarklyAuditBundle(healthyClient(), sampleConfig(), base, { now: NOW }));
 });
+
+const LD_REJECTED_NEXT_STEP = "LaunchDarkly rejected the access token (every probe returned 401). Set LAUNCHDARKLY_API_TOKEN (or LD_ACCESS_TOKEN, or the token argument, or token in ~/.config/launchdarkly-sec-inspector/config.toml) to a valid token, and LAUNCHDARKLY_BASE_URL (or LD_BASE_URI, or base_url) when the token comes from the federal or EU instance, then rerun launchdarkly_check_access.";
+const LD_LIMITED_NEXT_STEP = "Use an access token with the Reader base role (Admin or Owner for showAll token listing and audit log depth), or a custom role with reader base permissions plus viewProject on the audited projects, then rerun the access check.";
+const LD_PERMISSION_CLAIM = /\b(?:permissions?|scopes?|roles?|privileges?|licen[cs]es?|licensing|modules?)\b/i;
+
+/** Every route answers with the same response, as LaunchDarkly does for a token it does not recognize. */
+function ldEveryRoute(respond) {
+  return Object.fromEntries(LD_ROUTE_TEMPLATES.map(([template]) => [template, respond]));
+}
+
+function ldUnauthorized(message = "Invalid access token") {
+  return () => jsonResponse({ code: "unauthorized", message }, { status: 401, statusText: "Unauthorized" });
+}
+
+test("checkLaunchdarklyAccess reports failed and names the token settings when every probe returns 401", async () => {
+  // The 401 message echoes the configured token, so the rendered result also proves the echo is scrubbed.
+  const { client, fetchImpl } = httpLaunchdarkly(ldFixture(), { routes: ldEveryRoute(ldUnauthorized(`Invalid access token ${TEST_TOKEN}`)) });
+
+  const rejected = await checkLaunchdarklyAccess(client);
+  assert.equal(rejected.status, "failed");
+  assert.equal(rejected.recommendedNextStep, LD_REJECTED_NEXT_STEP);
+  const attempted = rejected.surfaces.filter((surface) => surface.status !== "not_configured");
+  assert.equal(attempted.length, 10);
+  assert.ok(attempted.every((surface) => surface.http_status === 401), JSON.stringify(rejected.surfaces));
+  assert.doesNotMatch([...rejected.notes, rejected.recommendedNextStep, ...rejected.surfaces.map((surface) => surface.status)].join("\n"), LD_PERMISSION_CLAIM);
+  assert.equal(scrubErrorText(rejected.recommendedNextStep), rejected.recommendedNextStep, "the next step survives the error scrubber");
+  assertCanaryWindowsAbsent(assert, JSON.stringify(rejected), [TEST_TOKEN], "rejected access check");
+
+  const tool = await runLaunchdarklyTool("launchdarkly_check_access", fetchImpl, { token: TEST_TOKEN });
+  const text = tool.content[0].text;
+  assert.equal(tool.details.status, "failed");
+  assert.match(text, /^LaunchDarkly access check: failed$/m);
+  assert.ok(text.includes(`Next: ${LD_REJECTED_NEXT_STEP}`), text);
+  assertCanaryWindowsAbsent(assert, [["text", text], ["details", JSON.stringify(tool.details)]], [TEST_TOKEN], "rendered rejected access check");
+});
+
+test("checkLaunchdarklyAccess keeps the limited result when a probe reads, a probe is denied with 403, or every probe is a 403 or a server error", async () => {
+  const fixture = ldFixture();
+  const forbidden = () => jsonResponse({ code: "forbidden", message: "Access to the requested resource was denied" }, { status: 403, statusText: "Forbidden" });
+  const serverError = () => jsonResponse({ code: "internal_server_error", message: "Internal error" }, { status: 500, statusText: "Internal Server Error" });
+  const cases = {
+    // A token that reads even one surface was accepted, so the other 401s keep the role wording.
+    partlyReadable: { ...ldEveryRoute(ldUnauthorized()), "GET /api/v2/caller-identity": () => jsonResponse(fixture.identity) },
+    oneForbidden: { ...ldEveryRoute(ldUnauthorized()), "GET /api/v2/members": forbidden },
+    allForbidden: ldEveryRoute(forbidden),
+    allServerErrors: ldEveryRoute(serverError),
+  };
+  for (const [label, routes] of Object.entries(cases)) {
+    const result = await checkLaunchdarklyAccess(httpLaunchdarkly(fixture, { routes }).client);
+    assert.equal(result.status, "limited", label);
+    assert.equal(result.recommendedNextStep, LD_LIMITED_NEXT_STEP, label);
+    assert.ok(result.notes.every((note) => !/rejected|were not checked/.test(note)), `${label}: ${result.notes.join(" | ")}`);
+  }
+});
