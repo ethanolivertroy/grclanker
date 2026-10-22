@@ -54,6 +54,7 @@ try {
   if (access.missingPermissions.length > 0) {
     log(`Missing permissions: ${access.missingPermissions.join("; ")}`);
   }
+  if (access.status === "failed") throw new Error(`Live MuleSoft smoke test stopped: ${access.recommendedNextStep}`);
 
   const coreSurfaces = new Set(["current_user", "organization", "members", "role_groups", "environments"]);
   const unreadableCore = access.surfaces.filter((surface) => coreSurfaces.has(surface.name) && surface.status !== "readable");
