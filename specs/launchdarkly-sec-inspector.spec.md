@@ -214,7 +214,7 @@ The shipped implementation lives in the grclanker CLI as a native TypeScript too
 
 | Tool | Spec controls |
 |------|---------------|
-| `launchdarkly_check_access` | Probes caller identity and every required read surface before an assessment |
+| `launchdarkly_check_access` | Probes caller identity and every required read surface before an assessment and reports healthy, limited, or failed (every probe returned 401, so the access token was rejected) |
 | `launchdarkly_assess_identity` | 1, 2, 3, 6, 7, 24 |
 | `launchdarkly_assess_access_control` | 4, 5, 8, 9, 10, 11 |
 | `launchdarkly_assess_environment_governance` | 16, 17, 19, 22, 23 |

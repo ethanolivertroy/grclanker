@@ -130,7 +130,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose |
 | --- | --- |
-| `box_check_access` | Resolves credentials, exchanges a token, and probes 15 read surfaces (current user, enterprise configuration, users, groups, enterprise events, device pins, retention, legal holds, Shield barriers and lists, allowlist entries and exemptions, metadata and classification templates, terms of service). Reports `healthy` or `limited` with the next step. |
+| `box_check_access` | Resolves credentials, exchanges a token, and probes 15 read surfaces (current user, enterprise configuration, users, groups, enterprise events, device pins, retention, legal holds, Shield barriers and lists, allowlist entries and exemptions, metadata and classification templates, terms of service). Reports `healthy` or `limited` with the next step, or `failed` when Box refused the credentials themselves on every probe: a 401, or a 400 `invalid_client`, `invalid_grant`, or `unauthorized_client` from the token exchange (Box also sends these for an app no admin has authorized). A `failed` next step names the credential settings to fix for the auth method in use. |
 | `box_assess_identity_access` | Controls 1, 2, 3, 17, 18, 21, 22, 23, 24. Options: `user_limit`, `event_limit`, `lookback_days`, `max_admins`, `min_password_length`, `max_session_hours`. |
 | `box_assess_sharing_collaboration` | Controls 4, 5, 6, 7, 8, 9, 19, 20. Options: `event_limit`, `lookback_days`, `stale_allowlist_days`, `list_limit`. |
 | `box_assess_data_governance` | Controls 10, 11, 12, 13. Option: `list_limit`. |
