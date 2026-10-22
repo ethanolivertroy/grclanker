@@ -55,6 +55,9 @@ try {
   for (const surface of access.surfaces) {
     log(`- ${surface.name}: ${surface.status}${surface.count === undefined ? "" : ` (${surface.count})`}`);
   }
+  if (access.status === "failed") {
+    throw new Error(`Live Webex smoke test stopped: ${access.recommendedNextStep}`);
+  }
 
   logAssessment(await assessWebexIdentity(client));
   logAssessment(await assessWebexCollaborationGovernance(client));

@@ -180,7 +180,7 @@ Every finding carries the FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, a
 npm --prefix cli run test:tenable:live
 ```
 
-The script prints a skip message and exits 0 without credentials. With credentials, it runs `tenable_check_access` and the scan program assessment against the configured tenant.
+The script prints a skip message and exits 0 without credentials. With credentials, it runs `tenable_check_access` and the scan program assessment against the configured tenant. If the access check reports `failed`, the script stops with exit 1 before the assessment and prints the check's next step.
 
 ## Limitations and manual controls
 

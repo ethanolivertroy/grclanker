@@ -37,6 +37,9 @@ try {
   for (const surface of access.surfaces) {
     log(`- ${surface.product} ${surface.target} ${surface.name}: ${surface.status}${surface.error ? ` (${surface.error})` : ""}`);
   }
+  if (access.status === "failed") {
+    throw new Error(`Live Palo Alto smoke test stopped: ${access.recommendedNextStep}`);
+  }
   if (access.status === "unconfigured") {
     throw new Error("Live Palo Alto smoke test stopped because no audit surface was configured.");
   }

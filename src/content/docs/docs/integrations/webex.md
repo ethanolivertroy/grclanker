@@ -156,7 +156,7 @@ The bundle writes one report per framework under `compliance/`.
 npm --prefix cli run test:webex:live
 ```
 
-The script skips with exit code 0 when no `WEBEX_TOKEN`, refresh credential trio, or config file is present. Otherwise it runs `webex_check_access` and all three assess tools.
+The script skips with exit code 0 when no `WEBEX_TOKEN`, refresh credential trio, or config file is present. Otherwise it runs `webex_check_access` and all three assess tools. If the access check reports `failed`, the script stops with exit code 1 before the assess tools and prints the check's next step.
 
 ## Limitations and manual controls
 

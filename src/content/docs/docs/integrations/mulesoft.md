@@ -214,7 +214,7 @@ The bundle writes one report per framework under `compliance/`, and a unified ma
 ANYPOINT_ORG_ID=... ANYPOINT_CLIENT_ID=... ANYPOINT_CLIENT_SECRET=... npm --prefix cli run test:mulesoft:live
 ```
 
-The script exits 0 with a skip message when no credentials are present. With credentials, it runs `mulesoft_check_access` and the identity and access assessment against the real organization.
+The script exits 0 with a skip message when no credentials are present. With credentials, it runs `mulesoft_check_access` and the identity and access assessment against the real organization. If the access check reports `failed`, the script stops with exit 1 before the assessment and prints the check's next step.
 
 ## Limitations and manual controls
 
