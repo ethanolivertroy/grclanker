@@ -1893,12 +1893,14 @@ export class GitHubAuditorClient {
     pathname: string,
     options: RequestOptions = {},
   ): Promise<ResponseEnvelope<T>> {
+    let refreshed = false;
     let forceRefresh = false;
     let rateLimits = 0;
     const method = options.method ?? (options.body ? "POST" : "GET");
 
     for (let attempt = 1; ; attempt += 1) {
       const token = await this.getAccessToken(forceRefresh);
+      forceRefresh = false;
       const outcome = await this.sendOnce(this.buildUrl(pathname), {
         method,
         headers: {
@@ -1930,7 +1932,8 @@ export class GitHubAuditorClient {
         return { response, payload, rawText };
       }
 
-      if (response.status === 401 && this.config.authMode === "app" && !forceRefresh && attempt < MAX_ATTEMPTS) {
+      if (response.status === 401 && this.config.authMode === "app" && !refreshed && attempt < MAX_ATTEMPTS) {
+        refreshed = true;
         forceRefresh = true;
         continue;
       }

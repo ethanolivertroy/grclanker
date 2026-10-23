@@ -1223,6 +1223,54 @@ test("GitHubAuditorClient retries the installation token exchange and names it w
   clearGitHubTokenCacheForTests();
 });
 
+test("GitHubAuditorClient refreshes the installation token once after a 401 and reuses it on later retries", async () => {
+  clearGitHubTokenCacheForTests();
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const config = createSampleConfig({
+    authMode: "app",
+    apiToken: undefined,
+    appId: "12345",
+    appPrivateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    installationId: "98765",
+  });
+  const orgSteps = [
+    () => jsonResponse({ message: "Bad credentials" }, {}, 401),
+    unavailable(),
+    connectionReset,
+    () => jsonResponse({ login: "example-org" }),
+  ];
+  let tokenCalls = 0;
+  let orgCalls = 0;
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations/98765/access_tokens") {
+      tokenCalls += 1;
+      requests.push(`POST access_tokens -> ghs_token_${tokenCalls}`);
+      return jsonResponse({ token: `ghs_token_${tokenCalls}`, expires_at: "2035-01-01T00:00:00Z" }, {}, 201);
+    }
+    orgCalls += 1;
+    requests.push(`${init.method ?? "GET"} ${url.pathname} with ${init.headers.Authorization}`);
+    return orgSteps[orgCalls - 1](url, init);
+  };
+  const { waits, sleep } = recordingSleep();
+  const client = new GitHubAuditorClient(config, fetchImpl, { sleep, now: () => RETRY_NOW });
+
+  const { payload } = await client.requestJson("/orgs/example-org");
+
+  assert.deepEqual(payload, { login: "example-org" });
+  assert.deepEqual(requests, [
+    "POST access_tokens -> ghs_token_1",
+    "GET /orgs/example-org with Bearer ghs_token_1",
+    "POST access_tokens -> ghs_token_2",
+    "GET /orgs/example-org with Bearer ghs_token_2",
+    "GET /orgs/example-org with Bearer ghs_token_2",
+    "GET /orgs/example-org with Bearer ghs_token_2",
+  ], "the retries after the one refresh reuse the refreshed token instead of minting another");
+  assert.deepEqual(waits, [1000, 2000]);
+  clearGitHubTokenCacheForTests();
+});
+
 test("GitHubAuditorClient ends a retry wait when the tool call is aborted", async () => {
   const controller = new AbortController();
   const { fetchImpl, requests } = sequenceFetch([unavailable()]);
