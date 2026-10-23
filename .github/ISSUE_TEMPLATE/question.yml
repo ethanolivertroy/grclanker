@@ -21,7 +21,7 @@ body:
     id: version
     attributes:
       label: Version
-      description: The release bundle (for example v0.1.3) or the git commit if you built from source.
-      placeholder: v0.1.3
+      description: The release bundle (for example v0.1.4) or the git commit if you built from source.
+      placeholder: v0.1.4
     validations:
       required: false
