@@ -44,8 +44,77 @@ else
   RAW_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REF}/skills/grclanker/SKILL.md"
 fi
 
+fail() { printf "%s\n" "$*" >&2; exit 1; }
+
+# No published checksum covers SKILL.md, and the default ref is a moving branch,
+# so check that the download is the grclanker skill before replacing anything.
+is_grclanker_skill() {
+  local line first=1 named=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    if [ "$first" = 1 ]; then
+      [ "$line" = "---" ] || return 1
+      first=0
+    elif [ "$line" = "---" ]; then
+      [ "$named" = 1 ]
+      return
+    elif [ "$line" = "name: grclanker" ]; then
+      named=1
+    fi
+  done < "$1"
+  return 1
+}
+
+SKILL_PATH="${TARGET_DIR}/SKILL.md"
+DOWNLOAD=""
+CREATED_DIR=""
+
+cleanup() {
+  if [ -n "$DOWNLOAD" ]; then
+    rm -f "$DOWNLOAD"
+  fi
+  # A failed first install should not leave an empty skill directory behind.
+  if [ -n "$CREATED_DIR" ]; then
+    rmdir "$TARGET_DIR" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+# mv would move the download inside a directory instead of replacing it.
+if [ -d "$SKILL_PATH" ]; then
+  fail "${SKILL_PATH} is a directory, so nothing was changed"
+fi
+
+if [ ! -e "$TARGET_DIR" ] && [ ! -L "$TARGET_DIR" ]; then
+  CREATED_DIR=1
+fi
 mkdir -p "$TARGET_DIR"
-curl -fsSL "$RAW_URL" -o "${TARGET_DIR}/SKILL.md"
+
+# Download beside the installed skill so replacing it is a single rename.
+while :; do
+  printf -v candidate "%s/.SKILL.md.%04x%04x" "$TARGET_DIR" "$RANDOM" "$RANDOM"
+  [ -e "$candidate" ] || [ -L "$candidate" ] || break
+done
+DOWNLOAD="$candidate"
+
+if ! curl -fsSL "$RAW_URL" -o "$DOWNLOAD"; then
+  fail "Could not download ${RAW_URL}, so nothing was changed"
+fi
+if ! is_grclanker_skill "$DOWNLOAD"; then
+  fail "${RAW_URL} did not return a grclanker SKILL.md, so nothing was changed"
+fi
+mv -f "$DOWNLOAD" "$SKILL_PATH"
+DOWNLOAD=""
+CREATED_DIR=""
+
+# Remove downloads that an interrupted earlier run left behind.
+for leftover in "$TARGET_DIR"/.SKILL.md.????????; do
+  case "${leftover##*/.SKILL.md.}" in
+    *[!0123456789abcdef]*) continue ;;
+  esac
+  [ -f "$leftover" ] || continue
+  rm -f "$leftover" || printf "Could not remove %s\n" "$leftover" >&2
+done
 
 printf "\nInstalled grclanker skill into %s\n" "$TARGET_DIR"
 printf "Use it when you need CMVP, KEV, EPSS, or framework-mapped GRC analysis.\n\n"
