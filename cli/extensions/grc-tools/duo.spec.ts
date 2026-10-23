@@ -58,7 +58,7 @@ const DUO_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchCom
   "DUO-AUTH-006": { complete: completeFrom(["bypass-codes"], "true only when the bypass-code inventory is readable and its authoritative total is exhausted; Settings readability is a separate fact and does not contribute.") },
   "DUO-AUTH-008": { complete: completeFrom(["users"], "true only when the user inventory is readable and its authoritative total is exhausted.") },
   "DUO-AUTH-009": { complete: completeFrom(["users"], "true only when the user inventory is readable and its authoritative total is exhausted.") },
-  "DUO-AUTH-010": { complete: completeFrom(["users"], "true only when the user inventory is readable and its authoritative total is exhausted; WebAuthn credential evidence contributes enrollment counts but never changes this completeness fact.") },
+  "DUO-AUTH-010": { complete: completeFrom(["users"], "true only when the user inventory is readable and its authoritative total is exhausted; WebAuthn credential evidence never changes this completeness fact, and a failed or truncated credential inventory is carried by webauthn_user_count instead.") },
   "DUO-ADMIN-001": { complete: completeFrom(["admins"], "true only when the administrator inventory is readable and its authoritative total is exhausted.") },
   "DUO-ADMIN-004": { complete: completeFrom(["admins"], "true only when the administrator inventory is readable and its authoritative total is exhausted.") },
   "DUO-INTEGRATIONS-001": { complete: completeFrom(["integrations"], "true only when the integration inventory is readable and its authoritative total is exhausted.") },
@@ -128,7 +128,7 @@ const decisions = {
     "return pass for user_auth_behavior=enforce, fail for bypass, warn for another readable value such as deny, and manual when the authentication policy or value is absent.",
     "for users with known enrollment state, return pass when all active users are enrolled and none has bypass status, warn when at least 90 percent are enrolled with no bypass users, and fail otherwise.",
     "for a non-empty active-or-bypass population, return pass when every last-login date is present and no login is older than 90 days, warn when dates are missing or at most 10 percent are stale, and fail when more than 10 percent are stale.",
-    "for enrolled users, return pass when at least 75 percent have WebAuthn and none has deprecated U2F, warn when any user has WebAuthn but that bar is not met, and fail when none has WebAuthn.",
+    "for enrolled users, return pass when at least 75 percent have WebAuthn, none has deprecated U2F, and the WebAuthn credential inventory was read in full; warn when any user has WebAuthn but that bar is not met, including when the credential inventory failed or stopped paging early; and fail when none has WebAuthn.",
     "always return manual because the Admin API exposes offline-enrollment events but not the offline-access policy limits.",
   ],
   ADMIN: [
@@ -255,6 +255,12 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
     return [name, definition];
   }),
 );
+const inputWith = (
+  overrides: Readonly<Record<string, string>>,
+  ...names: string[]
+): Readonly<Record<string, string>> => Object.fromEntries(
+  names.map((name) => [name, overrides[name] ?? input(name)[name]]),
+);
 const unreadable = ne("readable", true);
 const incomplete = ne("complete", true);
 
@@ -370,13 +376,16 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
     }),
   },
   "DUO-AUTH-010": {
-    inputs: input("readable", "complete", "enrolled_user_count", "webauthn_user_count", "deprecated_u2f_user_count"),
+    inputs: inputWith({
+      webauthn_user_count: "Non-negative cardinality of enrolled users whose Duo user record lists at least one WebAuthn credential, or null when that cardinality is positive but the WebAuthn credential inventory failed, was denied, was not collected, or stopped paging early, so adoption could not be confirmed against it; zero stays zero because no user record lists a credential.",
+    }, "readable", "complete", "enrolled_user_count", "webauthn_user_count", "deprecated_u2f_user_count"),
     constants: { pass_minimum_percent: 75 },
     rules: ordered({
       manual: any(unreadable, eq("enrolled_user_count", 0)),
       fail: eq("webauthn_user_count", 0),
       warn: any(
         incomplete,
+        notDefined("webauthn_user_count"),
         ratio("lt", "webauthn_user_count", "enrolled_user_count", 75, { scale: 100, roundDigits: 1 }),
         gt("deprecated_u2f_user_count", 0),
       ),
@@ -690,15 +699,15 @@ export const DUO_SPEC = buildBatchIntegrationSpec({
     },
   ],
   rateLimit: {
-    documentedLimit: "Duo applies integration- and endpoint-specific limits",
-    retryHeaders: ["Retry-After", "X-RateLimit-Remaining"],
+    documentedLimit: "Duo applies integration- and endpoint-specific limits; the log endpoints default to two requests per minute per account",
+    retryHeaders: ["Retry-After"],
     retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Honor bounded Retry-After, otherwise use bounded exponential retry and surface exhaustion.",
+    backoffPolicy: "Retry 429 and 500/502/503/504 answers, attempts that pass the 30-second per-request timeout, and transport failures up to four times (five attempts), signing each attempt with a fresh Date. Each wait honors Retry-After (delta-seconds or HTTP-date) on any retried status, else exponential backoff from 1 second with jitter, capped at 30 seconds; a Retry-After above 30 seconds ends the read without waiting. Exhaustion names the path, the last status or failure, and the attempt count, and leaves the dataset unreadable evidence; a tool-call abort is never retried.",
   },
   runtimeBehavior: DUO_RUNTIME_BEHAVIOR,
   knownGaps: [
     "Auth API and Accounts API authentication modes, richer Trust Monitor analysis, and trend reporting are not shipped.",
-    "DUO-AUTH-010 derives its verdict completeness from the user inventory only. WebAuthn credential source errors, denials, or truncation do not make that fact incomplete, so a readable user inventory can retain Pass despite incomplete WebAuthn source evidence; changing that behavior requires a separate runtime fix.",
+    "DUO-AUTH-010 derives its `complete` fact from the user inventory only, and WebAuthn credential source errors, denials, or truncation still do not make that fact incomplete. They record the WebAuthn user count as unknown instead whenever a user record lists a credential, so a readable user inventory yields Partial rather than Pass, while a zero count keeps its Fail.",
   ],
   sensitiveFields: ["skey", "integration_key", "authorization", "cookie", "bypass_code"],
   credentialFormats: ["Duo integration keys", "Duo secret keys", "HMAC Authorization signatures"],
