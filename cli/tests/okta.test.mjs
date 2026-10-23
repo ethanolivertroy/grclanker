@@ -46,6 +46,7 @@ import {
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { assertValidOscal } from "./helpers/oscal-schema.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -893,6 +894,7 @@ test("exportOktaAuditBundle writes the expected package and secure paths stay ro
     readFileSync(join(result.outputDir, "compliance", "fedramp", "oscal_assessment_results.json"), "utf8"),
   );
   assert.equal(oscal["assessment-results"].metadata["oscal-version"], "1.1.2");
+  assertValidOscal(oscal, "sample bundle compliance/fedramp/oscal_assessment_results.json");
   const oscalResult = oscal["assessment-results"].results[0];
   const oscalFindings = oscalResult.findings;
   assert.ok(oscalFindings.some((finding) => finding.target["target-id"] === "ia-2.11_obj"));
@@ -929,6 +931,7 @@ test("OSCAL export marks manual findings not-satisfied with a manual reason", ()
     ],
     "2026-09-21T00:00:00.000Z",
   );
+  assertValidOscal(oscal, "manual finding");
   const findings = oscal["assessment-results"].results[0].findings;
   assert.equal(findings.length, 2);
   assert.equal(findings[0].target.status.state, "not-satisfied");
@@ -969,6 +972,7 @@ test("OSCAL export uses relevant-evidence and reviewed-controls per the 1.1.2 as
     "2026-09-21T00:00:00.000Z",
   );
 
+  assertValidOscal(oscal, "findings with and without evidence");
   const document = oscal["assessment-results"];
   for (const key of ["uuid", "metadata", "import-ap", "results"]) {
     assert.ok(key in document, `assessment-results.${key}`);
@@ -1008,6 +1012,72 @@ test("OSCAL export uses relevant-evidence and reviewed-controls per the 1.1.2 as
   const serialized = JSON.stringify(oscal);
   assert.equal(serialized.includes("relevant_evidence"), false);
   assert.equal(serialized.includes("reviewed_controls"), false);
+});
+
+test("OSCAL export omits the observation and finding lists when they would be empty, since the 1.1.2 schema requires at least one item", () => {
+  const config = createSampleConfig();
+  const noFindings = buildOscalAssessmentResults(config, [], "2026-09-21T00:00:00.000Z");
+  assertValidOscal(noFindings, "no findings");
+  const [emptyResult] = noFindings["assessment-results"].results;
+  assert.equal("observations" in emptyResult, false);
+  assert.equal("findings" in emptyResult, false);
+  assert.deepEqual(emptyResult["reviewed-controls"]["control-selections"], [
+    { description: "No findings mapped to NIST SP 800-53 controls in this result." },
+  ]);
+
+  const unmapped = buildOscalAssessmentResults(
+    config,
+    [
+      {
+        id: "OKTA-MON-009",
+        title: "Administrator security notification emails",
+        category: "monitoring",
+        status: "Manual",
+        severity: "low",
+        summary: "Not exposed by API.",
+        evidence: [],
+        recommendation: "Capture screenshots.",
+        manualNote: "Collect manually.",
+        frameworks: { fedramp: [], disa_stig: [], irap: [], ismap: [], soc2: ["CC7.2"], pci_dss: [], general: [] },
+      },
+    ],
+    "2026-09-21T00:00:00.000Z",
+  );
+  assertValidOscal(unmapped, "a finding with no FedRAMP mapping");
+  const [unmappedResult] = unmapped["assessment-results"].results;
+  assert.equal(unmappedResult.observations.length, 1);
+  assert.equal("findings" in unmappedResult, false);
+});
+
+test("OSCAL assessment results in the bundle validate against the NIST OSCAL 1.1.2 schema for every fixture org", async () => {
+  const oauthConfig = createSampleConfig({ authMode: "PrivateKey", token: undefined, clientId: "service-app" });
+  const fixtures = [
+    ["compliant", createSampleClient(), createSampleConfig()],
+    ["all-403", createAll403Client(), createSampleConfig()],
+    ["all-empty (SSWS)", createAllEmptyClient(), createSampleConfig()],
+    ["all-empty (OAuth)", createAllEmptyClient(), oauthConfig],
+    ["partial inventory", createPartialInventoryClient(), createSampleConfig()],
+    ["secret-bearing", createSecretFixtureClient(), createSampleConfig()],
+  ];
+  const outputRoot = createTempBase("grclanker-okta-oscal-schema-");
+  const statuses = new Set();
+  for (const [label, client, config] of fixtures) {
+    const result = await exportOktaAuditBundle(client, config, outputRoot);
+    const oscal = JSON.parse(
+      readFileSync(join(result.outputDir, "compliance", "fedramp", "oscal_assessment_results.json"), "utf8"),
+    );
+    assertValidOscal(oscal, `${label} bundle`);
+    const [oscalResult] = oscal["assessment-results"].results;
+    assert.equal(oscalResult.observations.length, OKTA_CHECK_IDS.length, `${label}: one observation per check`);
+    for (const finding of oscalResult.findings) {
+      statuses.add([finding.target.status.state, finding.target.status.reason].filter(Boolean).join(":"));
+    }
+  }
+  assert.deepEqual(
+    [...statuses].sort(),
+    ["not-satisfied:fail", "not-satisfied:info", "not-satisfied:manual", "not-satisfied:partial", "satisfied"],
+    "the fixture orgs exercise every status the export maps",
+  );
 });
 
 test("OKTA-ADMIN-006 reads thirdPartyAdmin and passes only for a compliant org", () => {

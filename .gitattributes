@@ -1,0 +1,2 @@
+# The vendored NIST OSCAL schemas are pinned by SHA-256, so checkouts keep their bytes as released. Diffs collapse them.
+cli/tests/fixtures/oscal/**/*_schema.json -text linguist-generated

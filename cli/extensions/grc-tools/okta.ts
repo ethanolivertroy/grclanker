@@ -5929,8 +5929,9 @@ export function buildOscalAssessmentResults(
                 : { description: "No findings mapped to NIST SP 800-53 controls in this result." },
             ],
           },
-          observations,
-          findings: oscalFindings,
+          // OSCAL result sets observations and findings to minItems=1, so omit each when empty.
+          ...(observations.length > 0 ? { observations } : {}),
+          ...(oscalFindings.length > 0 ? { findings: oscalFindings } : {}),
         },
       ],
     },
