@@ -51,7 +51,7 @@ import {
   statementDeniesInsecureTransport,
   unrestrictedSecurityGroupRules,
 } from "../dist/extensions/grc-tools/aws.js";
-import { AWS_IAM_ACTIONS, AWS_SPEC } from "../dist/extensions/grc-tools/aws.spec.js";
+import { AWS_IAM_ACTIONS, AWS_SDK_RETRY, AWS_SPEC } from "../dist/extensions/grc-tools/aws.spec.js";
 import { checkContract, evaluateVerdictCriteria } from "../dist/extensions/grc-tools/spec-model.js";
 import {
   AWS_CANARIES,
@@ -477,6 +477,73 @@ test("checkAwsAccess probes EC2, S3, KMS, RDS, Audit Manager, and Account surfac
     { status: buckets?.status, command: buckets?.command },
     { status: "not_readable", command: "s3:ListAllMyBuckets" },
     "a denied S3 ListBuckets probe names the IAM action to grant, which S3 calls s3:ListAllMyBuckets",
+  );
+});
+
+test("checkAwsAccess reports a probe whose retries ran out on throttling, a 503, a timeout, or a network failure as unanswered: a note says the check is incomplete and the next step says to wait or restore the network, never to grant access for it", async () => {
+  const dnsFailure = () => Object.assign(new Error("getaddrinfo ENOTFOUND access-analyzer.us-east-1.amazonaws.com"), {
+    code: "ENOTFOUND",
+    $metadata: { attempts: 3, totalRetryDelay: 900 },
+  });
+  const unanswered = await checkAwsAccess(compliantBundleClient({
+    async listIamUsers() {
+      throw sdkThrottled();
+    },
+    async describeTrails() {
+      throw sdkServiceUnavailable();
+    },
+    async listDetectors() {
+      throw sdkTimeout();
+    },
+    async listAnalyzers() {
+      throw dnsFailure();
+    },
+  }));
+  assert.equal(unanswered.status, "limited");
+  for (const name of ["iam_users", "cloudtrail", "guardduty", "access_analyzer"]) {
+    const surface = unanswered.surfaces.find((item) => item.name === name);
+    assert.equal(surface?.status, "not_readable", name);
+    assert.equal(surface.count, null, name);
+    assert.match(surface.error, / after 3 attempts/, `${name} records the attempt count beside its last error: ${surface.error}`);
+  }
+  assert.ok(unanswered.notes.includes("11/15 AWS audit surfaces are readable."), unanswered.notes.join(" | "));
+  assert.ok(
+    unanswered.notes.includes("This check is incomplete: the probes for iam_users, cloudtrail, guardduty, access_analyzer ran out of retries without an answer (each surface records its last error), so whether those surfaces are readable is unknown."),
+    unanswered.notes.join(" | "),
+  );
+  assert.equal(
+    unanswered.recommendedNextStep,
+    "Wait for AWS to stop throttling or failing the requests and restore network access to the AWS endpoints (DNS, TLS, proxy), then re-run aws_check_access; unreadable surfaces render manual findings, never pass.",
+    "no unreadable surface was refused, so the next step names no grant",
+  );
+
+  const mixed = await checkAwsAccess(compliantBundleClient({
+    async listIamUsers() {
+      throw sdkThrottled();
+    },
+    async listKmsKeys() {
+      throw accessDenied();
+    },
+  }));
+  assert.ok(
+    mixed.notes.includes("This check is incomplete: the probes for iam_users ran out of retries without an answer (each surface records its last error), so whether that surface is readable is unknown."),
+    mixed.notes.join(" | "),
+  );
+  assert.equal(
+    mixed.recommendedNextStep,
+    "For the probes that ran out of retries, wait for AWS to stop throttling or failing the requests, then re-run aws_check_access. Grant read-only access for the audit principal to the remaining surfaces marked not_readable (kms); unreadable surfaces render manual findings, never pass.",
+    "the grant names only the refused service, never the throttled one",
+  );
+
+  const denied = await checkAwsAccess(compliantBundleClient({
+    async listKmsKeys() {
+      throw accessDenied();
+    },
+  }));
+  assert.ok(!denied.notes.some((note) => note.startsWith("This check is incomplete")), `a denial is an answer, so the check is not incomplete: ${denied.notes.join(" | ")}`);
+  assert.equal(
+    denied.recommendedNextStep,
+    "Grant read-only access for the audit principal to the surfaces marked not_readable (kms); unreadable surfaces render manual findings, never pass.",
   );
 });
 
@@ -3804,9 +3871,10 @@ const STS_IDENTITY_RESPONSE = Object.freeze({
 /**
  * Runs `run` with the real AWS SDK sending every request to a local server that answers with respond(request), or
  * never answers when respond returns null. The SDK reaches it through AWS_ENDPOINT_URL with static environment
- * credentials and a single attempt per request; `localhost` and its subdomains resolve to the server for the run
- * (S3 Control prefixes the account id to the endpoint host). Every request is logged as
- * { service, action, label, status }, and `run` also gets the server side of every connection.
+ * credentials; the environment asks for more attempts than AWS_SDK_RETRY pins, so a retried request shows the
+ * client's own limit winning. `localhost` and its subdomains resolve to the server for the run (S3 Control
+ * prefixes the account id to the endpoint host). Every request is logged as { service, action, label, status },
+ * and `run` also gets the server side of every connection.
  */
 async function withLocalAwsEndpoint(respond, run) {
   const requests = [];
@@ -3838,7 +3906,7 @@ async function withLocalAwsEndpoint(respond, run) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const env = {
     AWS_ENDPOINT_URL: `http://localhost:${server.address().port}`,
-    AWS_MAX_ATTEMPTS: "1",
+    AWS_MAX_ATTEMPTS: String(AWS_SDK_RETRY.maxAttempts + 2),
     AWS_RETRY_MODE: "standard",
     AWS_ACCESS_KEY_ID: "AKIALOCALENDPOINT001",
     AWS_SECRET_ACCESS_KEY: "local-endpoint-fixture-secret-access-key-2026",
@@ -4462,26 +4530,57 @@ test("rule 9: a server-controlled error code (<Code>Bearer …</Code>, a __type 
   );
 });
 
-test("rule 9: a 502 HTML page through the real SDK parser path is recorded on every protocol as the non-JSON body note with the observed status, measured from the response rather than quoted from the SDK error", async () => {
+test("rule 9: a 502 HTML page through the real SDK parser path is retried up to the pinned attempt limit and recorded on every protocol as the non-JSON body note with the observed status and the attempt count, measured from the response rather than quoted from the SDK error", async () => {
   const page = { status: 502, contentType: "text/html; charset=utf-8", body: canaryHtmlBody() };
+  const attempts = AWS_SDK_RETRY.maxAttempts;
   await withLocalAwsEndpoint(() => page, async ({ requests }) => {
     const client = realAwsClient();
     for (const [name, , call] of LOCAL_AWS_METHODS) {
+      const sentBefore = requests.length;
       await assert.rejects(() => call(client), (error) => {
         const record = thrownErrorRecord(error);
         assert.ok(error instanceof AwsApiError, `${name}: ${record}`);
         assert.equal(error.httpStatus, 502, name);
-        assert.match(error.message, new RegExp(`^(?:Unknown|SyntaxError) \\(HTTP 502\\): non-JSON body \\(text/html, ${Buffer.byteLength(page.body)} bytes\\)$`), `${name}: ${error.message}`);
+        assert.match(error.message, new RegExp(`^(?:Unknown|SyntaxError) \\(HTTP 502\\) after ${attempts} attempts: non-JSON body \\(text/html, ${Buffer.byteLength(page.body)} bytes\\)$`), `${name}: ${error.message}`);
         assertNoCanaryWindows(assert, record, AWS_PLANTED_CANARIES, `${name} thrown error`);
         assert.doesNotMatch(record, PARSER_WORDING, name);
         return true;
       });
+      assert.equal(requests.length - sentBefore, attempts, `${name}: the SDK sent the request ${attempts} times, not the ${process.env.AWS_MAX_ATTEMPTS} AWS_MAX_ATTEMPTS asks for`);
     }
-    assert.ok(requests.length >= LOCAL_AWS_METHODS.length && requests.every((request) => request.status === 502));
+    assert.ok(requests.every((request) => request.status === 502));
     const text = await runAwsTool("aws_check_access", { region: "us-east-1", account_id: FIXTURE_ACCOUNT });
-    assert.match(text, /AWS access check failed: Unknown \(HTTP 502\): non-JSON body \(text\/html, \d+ bytes\)/);
+    assert.match(text, new RegExp(`AWS access check failed: Unknown \\(HTTP 502\\) after ${attempts} attempts: non-JSON body \\(text/html, \\d+ bytes\\)`));
     assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, "aws_check_access payload");
   });
+});
+
+test("aws_check_access through the real SDK: a probe answered 503 on every attempt is retried up to the pinned limit, then reported as unanswered with the attempt count, and the next step says to wait rather than grant", async () => {
+  const attempts = AWS_SDK_RETRY.maxAttempts;
+  const unavailable = {
+    status: 503,
+    contentType: "text/xml",
+    body: '<ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><Error><Type>Receiver</Type><Code>ServiceUnavailable</Code><Message>Service is unavailable</Message></Error><RequestId>req-1</RequestId></ErrorResponse>',
+  };
+  await withLocalAwsEndpoint(
+    (request) => (request.label === "iam:ListUsers" ? unavailable : documentedLocalResponse(request)),
+    async ({ requests }) => {
+      const access = await checkAwsAccess(realAwsClient());
+      assert.equal(requests.filter((request) => request.label === "iam:ListUsers").length, attempts, `the probe was sent ${attempts} times, not the ${process.env.AWS_MAX_ATTEMPTS} AWS_MAX_ATTEMPTS asks for`);
+      const users = access.surfaces.find((surface) => surface.name === "iam_users");
+      assert.deepEqual(
+        { status: users.status, count: users.count, error_code: users.error_code, http_status: users.http_status },
+        { status: "not_readable", count: null, error_code: "ServiceUnavailable", http_status: 503 },
+      );
+      assert.equal(users.error, `ServiceUnavailable (HTTP 503) after ${attempts} attempts: Service is unavailable`);
+      assert.equal(access.surfaces.filter((surface) => surface.status === "readable").length, access.surfaces.length - 1, "every other probe was answered");
+      assert.ok(
+        access.notes.includes("This check is incomplete: the probes for iam_users ran out of retries without an answer (each surface records its last error), so whether that surface is readable is unknown."),
+        access.notes.join(" | "),
+      );
+      assert.equal(access.recommendedNextStep, "Wait for AWS to stop throttling or failing the requests, then re-run aws_check_access; unreadable surfaces render manual findings, never pass.");
+    },
+  );
 });
 
 writeFailureTest("exportAwsAuditBundle leaves nothing under the output root when a write fails partway", async () => {

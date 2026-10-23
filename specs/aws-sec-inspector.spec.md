@@ -492,7 +492,7 @@ Malformed configuration: Credential-provider errors are replaced with a fixed pr
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| AWS service APIs | Not published | None | 429, 500, 502, 503, 504 | Use the service client's bounded retry behavior. If retries are exhausted, mark the surface unreadable and demote dependent findings. |
+| AWS service APIs | Not published | `Retry-After`, `x-amz-retry-after` | 429, 500, 502, 503, 504 | The AWS SDK retries in standard mode, at most 3 attempts per request: 429, 500, 502, 503, and 504 responses, throttling error codes, and transport failures, with jittered exponential backoff. It waits for Retry-After or x-amz-retry-after only up to 5 s past its own backoff delay. Each attempt allows 10 s to connect and 30 s for the service to start answering; an attempt past either limit fails with TimeoutError and is retried. A read whose attempts run out is unreadable, its error names the code, the status, and the attempt count, and the findings that depend on it are demoted; a list that fails on a later page keeps none of its earlier pages. |
 
 ## Checks
 

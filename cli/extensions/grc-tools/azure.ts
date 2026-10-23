@@ -49,6 +49,18 @@ import {
   AZURE_SPEC,
   AZURE_STALE_GUEST_DAYS as STALE_GUEST_DAYS,
 } from "./azure.spec.js";
+import {
+  attemptsNote,
+  CLOUD_MAX_RETRIES,
+  CLOUD_REQUEST_TIMEOUT_MS,
+  CLOUD_RETRYABLE_STATUSES,
+  cloudRetryPolicy,
+  exchangeWithRetries,
+  retryStopNote,
+  timeoutReason,
+  unansweredProbesNote,
+  type CloudRetryPolicy,
+} from "./cloud-retry.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
 
@@ -1190,26 +1202,36 @@ function describeThrown(error: unknown): string {
 
 const ERROR_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 const TRANSPORT_CODE_PATTERN = /^E[A-Z_]{2,31}$/;
-/** Detail for a rejection before any HTTP response: "no response (<name>: <scrubbed message> (<cause code>))". */
-const NO_RESPONSE_PREFIX = "no response (";
+/** Detail for a rejection before any HTTP response: "no response after 4 attempts (<name>: <scrubbed message> (<cause code>))". */
+const NO_RESPONSE_DETAIL = /^no response(?: after \d+ attempts)? \(/;
+
+/** The attempt count comes before the reason, so a length cap on the recorded detail shortens the reason, never the count. */
+function noResponseDetail(reason: string, attempts: number): string {
+  return `no response${attemptsNote(attempts)} (${reason})`;
+}
 
 /**
  * Describes a fetch rejection that produced no response (DNS, TLS, connection, timeout): the error's name when
  * it is not the plain Error, its scrubbed message, and the cause's network code (ENOTFOUND, ECONNREFUSED) when
  * it is one. Only the shape of the failure is kept; nothing is copied from a body because there was none.
  */
-function describeNoResponse(error: unknown): string {
+function describeNoResponse(error: unknown, attempts: number): string {
   const message = describeThrown(error);
   const name = error instanceof Error && ERROR_NAME_PATTERN.test(error.name) && error.name !== "Error" ? `${error.name}: ` : "";
   const cause = error instanceof Error ? error.cause : undefined;
   const code = cause instanceof Error || (typeof cause === "object" && cause !== null) ? (cause as { code?: unknown }).code : undefined;
   const codeText = typeof code === "string" && TRANSPORT_CODE_PATTERN.test(code) && !message.includes(code) ? ` (${code})` : "";
-  return `${NO_RESPONSE_PREFIX}${name}${message}${codeText})`;
+  return noResponseDetail(`${name}${message}${codeText}`, attempts);
 }
 
 /** True when the recorded failure detail says the request produced no response at all. */
 function isNoResponseFailure(result: { error: string; status?: number }): boolean {
-  return result.status === undefined && describeTokenFailure(result).startsWith(NO_RESPONSE_PREFIX);
+  return result.status === undefined && NO_RESPONSE_DETAIL.test(describeTokenFailure(result));
+}
+
+/** True when the read ended on a status the client retries (429, 5xx): throttling or a service fault, never a permission gap. */
+function isRetryableStatusFailure(result: { status?: number }): boolean {
+  return result.status !== undefined && CLOUD_RETRYABLE_STATUSES.includes(result.status);
 }
 
 export class AzureApiError extends Error {
@@ -1403,7 +1425,7 @@ function azureDecisionFacts(id: string, evidence?: JsonRecord): Readonly<Record<
       return { readable, complete, inventory_count: inventoryCount, effective_setting_count: asNumber(item.effective_settings) ?? null };
     case "AZURE-MON-06": {
       const workspaces = asRecords(item.workspaces);
-      return { readable, complete: true, inventory_count: workspaces.length, destination_workspace_count: workspaces.length, linked_workspace_count: workspaces.length, workspace_retention_at_least_minimum_count: workspaces.filter((workspace) => (asNumber(workspace.retentionInDays) ?? 0) >= MIN_RETENTION_DAYS).length };
+      return { readable, complete: true, diagnostic_settings_truncation_present: item.diagnostic_settings_truncated ?? null, inventory_count: workspaces.length, destination_workspace_count: workspaces.length, linked_workspace_count: workspaces.length, workspace_retention_at_least_minimum_count: workspaces.filter((workspace) => (asNumber(workspace.retentionInDays) ?? 0) >= MIN_RETENTION_DAYS).length };
     }
     case "AZURE-SUB-01":
       return { readable, complete, inventory_count: inventoryCount, matching_assignment_count: evidenceCount(item, "owner_assignments"), warn_maximum: 2 };
@@ -1470,9 +1492,12 @@ function resourceApiFor(endpoint: string): string {
   return /\bMicrosoft\./.test(endpoint) ? "Azure Resource Manager" : "Microsoft Graph";
 }
 
-/** The failure detail without the "Token request failed:" prefix getToken adds, so it is not repeated after the request label. */
+/**
+ * The failure detail without the "Token request failed:" prefix getToken adds, so it is not repeated after the
+ * request label. The prefix comes off before describeFailure's length cap, which bounds only the text shown.
+ */
 function describeTokenFailure(result: { error: string; status?: number }): string {
-  return describeFailure(result).replace(/^Token request failed: /, "");
+  return describeFailure({ ...result, error: result.error.replace(/^Token request failed: /, "") });
 }
 
 /**
@@ -1491,11 +1516,14 @@ function requestHost(result: { url?: string }): string {
   return match ? redactErrorText(match[1]) : "the endpoint";
 }
 
-/** The remedy for a failed token request: credentials when the endpoint answered, the network path when it did not. */
+/**
+ * The remedy for a failed token request: the network path when no response arrived, waiting out the throttling or
+ * service fault when every attempt ended on a retryable status, and the client credentials otherwise.
+ */
 function tokenFailureRemedy(result: { error: string; status?: number; url?: string }): string {
-  return isNoResponseFailure(result)
-    ? `Restore network access to ${requestHost(result)} (DNS, TLS, proxy) so the token request receives a response`
-    : "Fix the app registration's client credentials (tenant id, client id, client secret) so a token is issued";
+  if (isNoResponseFailure(result)) return `Restore network access to ${requestHost(result)} (DNS, TLS, proxy) so the token request receives a response`;
+  if (isRetryableStatusFailure(result)) return `Wait for ${requestHost(result)} to stop throttling or failing the token request`;
+  return "Fix the app registration's client credentials (tenant id, client id, client secret) so a token is issued";
 }
 
 /** Sentence and marker for a finding whose resource request never happened because the token request failed. */
@@ -1571,6 +1599,18 @@ function manualForError(
       severity,
       "manual",
       `${requestOutcomeClause(endpoint, result)}. Restore network access to ${requestHost(result)} (DNS, TLS, proxy) and re-run; the read needs ${requirement}. Or collect ${evidenceToCollect} manually.`,
+      evidence,
+    );
+  }
+  if (isRetryableStatusFailure(result)) {
+    // Throttling or a service fault says nothing about permissions, so no grant is recommended.
+    return finding(
+      id,
+      control,
+      title,
+      severity,
+      "manual",
+      `${endpoint} returned ${describeFailure(result).replace(/\.$/, "")}, so this read is incomplete. Wait for ${resourceApiFor(endpoint)} to stop throttling or failing the request, then re-run; the read needs ${requirement}. Or collect ${evidenceToCollect} manually.`,
       evidence,
     );
   }
@@ -1901,6 +1941,33 @@ function truncatedProbeNotes(surfaces: AzureAccessSurface[]): string[] {
 }
 
 /**
+ * Probes whose Graph or ARM request ran out of retries without an answer about access: every attempt ended on a
+ * status the client retries (throttling or a service fault) or received no response. Whether those surfaces are
+ * readable is unknown, which is not a permission gap. A failed token request has its own note.
+ */
+function unansweredProbes(surfaces: AzureAccessSurface[]): AzureAccessSurface[] {
+  return surfaces.filter((item) => {
+    if (item.status !== "not_readable" || isTokenRequestFailure({ url: item.request_url ?? undefined })) return false;
+    const result = { error: item.error ?? "", status: item.http_status ?? undefined };
+    return isRetryableStatusFailure(result) || isNoResponseFailure(result);
+  });
+}
+
+/** Waiting out the throttling or service fault of each API that kept failing, and restoring the network path to each host that never answered. */
+function unansweredProbeRemedy(probes: AzureAccessSurface[]): string {
+  const failing = new Set<string>();
+  const unreachable = new Set<string>();
+  for (const item of probes) {
+    if (item.http_status != null) failing.add(item.service === "arm" ? "Azure Resource Manager" : "Microsoft Graph");
+    else unreachable.add(requestHost({ url: item.request_url ?? undefined }));
+  }
+  return [
+    ...(failing.size > 0 ? [`wait for ${[...failing].join(" and ")} to stop throttling or failing the requests`] : []),
+    ...(unreachable.size > 0 ? [`restore network access to ${[...unreachable].join(" and ")} (DNS, TLS, proxy)`] : []),
+  ].join(" and ");
+}
+
+/**
  * Reduces an error response body to its documented error envelope so bundle logs never
  * echo raw payloads: Graph and ARM return `{ error: { code, message } }`, the token
  * endpoint returns `{ error, error_description }`. Non-JSON bodies are dropped entirely.
@@ -1989,15 +2056,18 @@ function projectPage(page: AzurePage, project: (record: JsonRecord) => JsonRecor
 export class AzureAuditorClient {
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
+  private readonly retry: CloudRetryPolicy;
   private readonly cloud: AzureCloudEndpoints;
   private readonly tokenCache = new Map<string, { token: string; expiresAt: number }>();
+  private readonly tokenRequests = new Map<string, Promise<string>>();
 
   constructor(
     private readonly config: AzureResolvedConfig,
-    options: { fetchImpl?: FetchImpl; now?: () => Date; signal?: AbortSignal } = {},
+    options: { fetchImpl?: FetchImpl; now?: () => Date; signal?: AbortSignal; sleepImpl?: (ms: number) => Promise<void>; requestTimeoutMs?: number } = {},
   ) {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
+    this.retry = cloudRetryPolicy({ signal: options.signal, sleepImpl: options.sleepImpl, now: this.now, requestTimeoutMs: options.requestTimeoutMs });
     this.cloud = config.cloud ?? AZURE_CLOUDS["login.microsoftonline.com"];
     registerConfiguredSecrets(config.graphToken, config.managementToken, config.clientCredentials?.clientSecret);
   }
@@ -2014,10 +2084,7 @@ export class AzureAuditorClient {
     return this.cloud;
   }
 
-  /**
-   * OAuth 2.0 client credentials grant.
-   * https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow
-   */
+  /** The bearer token for `resource`: the configured token, an unexpired cached one, or a new one from requestToken. */
   async getToken(resource: "graph" | "management"): Promise<string> {
     const explicit = resource === "graph" ? this.config.graphToken : this.config.managementToken;
     if (explicit) return explicit;
@@ -2025,7 +2092,21 @@ export class AzureAuditorClient {
     if (!credentials) throw new Error(`No ${resource} token or client credentials are available.`);
     const cached = this.tokenCache.get(resource);
     if (cached && cached.expiresAt > this.now().getTime() + 60_000) return cached.token;
+    // Reads in flight at once share one token request and its retries, so a throttled token endpoint sees one
+    // retry sequence per resource rather than one per read; a failed request is dropped, so a later read asks again.
+    let pending = this.tokenRequests.get(resource);
+    if (!pending) {
+      pending = this.requestToken(resource, credentials).finally(() => this.tokenRequests.delete(resource));
+      this.tokenRequests.set(resource, pending);
+    }
+    return pending;
+  }
 
+  /**
+   * OAuth 2.0 client credentials grant.
+   * https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow
+   */
+  private async requestToken(resource: "graph" | "management", credentials: NonNullable<AzureResolvedConfig["clientCredentials"]>): Promise<string> {
     const scopeBase = resource === "graph" ? this.cloud.graphBaseUrl : this.cloud.managementBaseUrl;
     const url = `${this.cloud.authorityHost}/${this.config.tenantId}/oauth2/v2.0/token`;
     const body = new URLSearchParams({
@@ -2037,15 +2118,14 @@ export class AzureAuditorClient {
     // A rejection before any response (DNS, TLS, connection, timeout) is still the token request failing: it is
     // wrapped with the token URL so the findings name this request and state that no resource request was made,
     // instead of blaming the Graph or ARM endpoint that was never called.
-    const response = await this.send(url, {
+    const { response, text, note } = await this.send(url, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
     }, "Token request failed: ");
-    const text = await response.text().catch(() => "");
     if (!response.ok) {
       const detail = describeErrorBody(text, response.headers.get("content-type"));
-      throw new AzureApiError(`Token request failed: ${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`, url, response.status);
+      throw new AzureApiError(`Token request failed: ${response.status} ${response.statusText}${note}${detail ? `: ${detail}` : ""}`, url, response.status);
     }
     const payload = this.parseJsonBody(text, response, url, "Token request");
     const token = asString(payload.access_token);
@@ -2067,19 +2147,21 @@ export class AzureAuditorClient {
   }
 
   /**
-   * One fetch with its pre-response rejection wrapped: the observed URL and the shape of the failure travel in an
-   * AzureApiError with no status, so `request_url` names the request that was actually made and `http_status`
-   * stays null. Nothing is read from a body because none arrived.
+   * One request with the bounded retries of cloud-retry.ts. A response comes back with its body and the note on how
+   * the retries ended, for the caller's status line. A rejection before any response is wrapped instead: the
+   * observed URL and the shape of the failure travel in an AzureApiError with no status, so `request_url` names the
+   * request that was actually made and `http_status` stays null. Nothing is read from a body because none arrived.
    */
-  private async send(url: string, init: RequestInit, prefix = ""): Promise<Response> {
-    try {
-      return await this.fetchImpl(url, init);
-    } catch (error) {
-      rethrowIfAborted(error);
-      if (error instanceof AzureApiError) throw error;
-      // A parser error raised inside the transport keeps its fixed note; anything else produced no response.
-      throw new AzureApiError(`${prefix}${isParseError(error) ? PARSE_ERROR_NOTE : describeNoResponse(error)}`, url);
-    }
+  private async send(url: string, init: RequestInit, prefix = ""): Promise<{ response: Response; text: string; note: string }> {
+    const result = await exchangeWithRetries(this.fetchImpl, url, init, this.retry);
+    if (result.kind === "response") return { response: result.response, text: result.text, note: retryStopNote(result) };
+    const { error, timedOut, attempts } = result;
+    if (error instanceof AzureApiError) throw error;
+    // A parser error raised inside the transport keeps its fixed note; anything else produced no response.
+    const detail = isParseError(error)
+      ? `${PARSE_ERROR_NOTE}${attemptsNote(attempts)}`
+      : timedOut ? noResponseDetail(timeoutReason(this.retry.requestTimeoutMs), attempts) : describeNoResponse(error, attempts);
+    throw new AzureApiError(`${prefix}${detail}`, url);
   }
 
   private async requestJson(url: string, resource: "graph" | "management", init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<JsonRecord> {
@@ -2089,7 +2171,7 @@ export class AzureAuditorClient {
     const base = resourceBase(this.cloud, resource);
     if (nextLinkRefusal(url, base)) throw new AzureApiError(REQUEST_REFUSED_NOTE, base);
     const token = await this.getToken(resource);
-    const response = await this.send(url, {
+    const { response, text, note } = await this.send(url, {
       method: init.method ?? "GET",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -2099,11 +2181,9 @@ export class AzureAuditorClient {
       ...(init.body ? { body: init.body } : {}),
     });
     if (!response.ok) {
-      const text = await response.text().catch(() => "");
       const detail = describeErrorBody(text, response.headers.get("content-type"));
-      throw new AzureApiError(`${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`, url, response.status);
+      throw new AzureApiError(`${response.status} ${response.statusText}${note}${detail ? `: ${detail}` : ""}`, url, response.status);
     }
-    const text = await response.text();
     return this.parseJsonBody(text, response, url, "Request");
   }
 
@@ -2426,6 +2506,7 @@ export async function checkAzureAccess(
     `Authenticated against ${describeSourceChain(config)}.`,
     `${readableCount}/${surfaces.length} Azure audit surfaces are readable.`,
     ...(tokenNote ? [tokenNote] : []),
+    ...unansweredProbesNote(unansweredProbes(surfaces).map((item) => item.name)),
     ...truncatedProbeNotes(surfaces),
   ];
 
@@ -2453,6 +2534,7 @@ function isRejectedProbe(item: AzureAccessSurface): boolean {
   return isTokenRequestFailure({ url: item.request_url ?? undefined }) && REFUSED_CLIENT_CREDENTIALS.test(item.error ?? "");
 }
 
+const GRANT_READ_ACCESS_STEP = "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.";
 const CLIENT_CREDENTIALS_REJECTED = "Microsoft Entra ID rejected the client credentials, so no token was issued. Check AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments); a wrong tenant ID or client ID, or a wrong or expired client secret, is refused this way. Then re-run azure_check_access.";
 const ACCESS_TOKENS_REJECTED = "Microsoft Graph and Azure Resource Manager rejected the access tokens (every probe returned 401). Set AZURE_GRAPH_TOKEN and AZURE_MANAGEMENT_TOKEN or its alias AZURE_ACCESS_TOKEN (or the graph_token and management_token arguments) to valid tokens, or run az login again when the tokens come from the Azure CLI, then re-run azure_check_access.";
 const TOKEN_AND_CLIENT_CREDENTIALS_REJECTED = "Azure rejected both the supplied access token and the client credentials (every probe was refused). Check AZURE_GRAPH_TOKEN, AZURE_MANAGEMENT_TOKEN, or AZURE_ACCESS_TOKEN (or the graph_token and management_token arguments), and AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET (or the tenant_id, client_id, and client_secret arguments), then re-run azure_check_access.";
@@ -2473,11 +2555,20 @@ function accessCheckNextStep(
   switch (status) {
     case "healthy":
       return "Run azure_assess_identity, azure_assess_monitoring, azure_assess_subscription_guardrails, azure_assess_data_protection, azure_assess_network_and_policy, or azure_export_audit_bundle.";
-    case "limited":
-      if (!tokenFailure) return "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.";
-      return isNoResponseFailure(tokenFailure)
-        ? `${tokenFailureRemedy(tokenFailure)}, then re-run the access check.`
-        : "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check.";
+    case "limited": {
+      if (tokenFailure) {
+        return isNoResponseFailure(tokenFailure) || isRetryableStatusFailure(tokenFailure)
+          ? `${tokenFailureRemedy(tokenFailure)}, then re-run the access check.`
+          : "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check.";
+      }
+      const unanswered = unansweredProbes(surfaces);
+      if (unanswered.length === 0) return GRANT_READ_ACCESS_STEP;
+      const remedy = unansweredProbeRemedy(unanswered);
+      const denied = surfaces.some((item) => item.status === "not_readable" && !unanswered.includes(item));
+      return denied
+        ? `${GRANT_READ_ACCESS_STEP} For the probes that ran out of retries, ${remedy}, then re-run the access check.`
+        : `${remedy.charAt(0).toUpperCase()}${remedy.slice(1)}, then re-run the access check.`;
+    }
     case "failed":
       return rejectedCredentialsStep(surfaces);
     default: {
@@ -2924,15 +3015,15 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
     const compliant = retention.filter((item) => item.retentionInDays !== null && item.retentionInDays >= MIN_RETENTION_DAYS);
     const status: AzureFindingStatus = workspaceIds.size === 0
       ? "fail"
-      : linked.length === 0 ? "manual" : compliant.length === retention.length ? capForPartial("pass", workspaces.value) : "fail";
+      : linked.length === 0 ? "manual" : compliant.length === retention.length ? capForPartial("pass", diagnosticSettings.value, workspaces.value) : "fail";
     findings.push(finding("AZURE-MON-06", 19, "Activity log retention depth", "high", status,
       workspaceIds.size === 0
         ? "No enabled diagnostic setting sends the Activity Log to a Log Analytics workspace, so 90-day retention cannot be demonstrated."
         : linked.length === 0
           ? "The diagnostic settings reference workspaces outside this subscription; collect their retentionInDays manually."
-          : `${compliant.length}/${retention.length} linked Log Analytics workspaces retain data for ${MIN_RETENTION_DAYS}+ days.${partialNote(workspaces.value, "workspaces")}`,
-      { workspaces: retention, minimum_days: MIN_RETENTION_DAYS },
-      { readable: true, complete: !workspaces.value.truncated, inventory_count: retention.length, destination_workspace_count: workspaceIds.size, linked_workspace_count: linked.length, workspace_retention_at_least_minimum_count: compliant.length }));
+          : `${compliant.length}/${retention.length} linked Log Analytics workspaces retain data for ${MIN_RETENTION_DAYS}+ days.${partialNote(diagnosticSettings.value, "diagnostic settings")}${partialNote(workspaces.value, "workspaces")}`,
+      { workspaces: retention, minimum_days: MIN_RETENTION_DAYS, diagnostic_settings_truncated: diagnosticSettings.value.truncated },
+      { readable: true, complete: !workspaces.value.truncated, diagnostic_settings_truncation_present: diagnosticSettings.value.truncated, inventory_count: retention.length, destination_workspace_count: workspaceIds.size, linked_workspace_count: linked.length, workspace_retention_at_least_minimum_count: compliant.length }));
   }
 
   findings.push(finding("AZURE-MON-07", 19, "Entra ID audit log export", "medium", "manual",
@@ -3994,11 +4085,28 @@ export function azureFixedTexts(): readonly string[] {
   const mailboxMissing = { error: `404 Not Found: ${describeErrorBody(JSON.stringify({ error: { code: "ErrorItemNotFound", message: "The specified object was not found in the store." } }), "application/json")}`, status: 404 };
   const tokenDenied = { error: "Token request failed: 403 Forbidden", status: 403, url: tokenUrl };
   const tokenInvalid = { error: `Token request failed: 401 Unauthorized: ${describeErrorBody(invalidClientBody, "application/json")}`, status: 401, url: tokenUrl };
-  // Rejections before any response, rendered the way send() wraps them: the token request and a Graph request.
+  // Rejections before any response, rendered the way send() wraps them once the retries run out: the token
+  // request, a Graph request rejected by a lower layer's timeout, and one whose every attempt ran past the
+  // per-request timeout.
+  const attempts = CLOUD_MAX_RETRIES + 1;
   const dnsFailure = Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("getaddrinfo ENOTFOUND login.microsoftonline.com"), { code: "ENOTFOUND" }) });
   const timeout = Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
-  const tokenNoResponse = { error: `Token request failed: ${describeNoResponse(dnsFailure)}`, url: tokenUrl };
-  const graphNoResponse = { error: describeNoResponse(timeout), url: "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies" };
+  const tokenNoResponse = { error: `Token request failed: ${describeNoResponse(dnsFailure, attempts)}`, url: tokenUrl };
+  const graphNoResponse = { error: describeNoResponse(timeout, attempts), url: "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies" };
+  const graphTimedOut = { error: noResponseDetail(timeoutReason(CLOUD_REQUEST_TIMEOUT_MS), attempts), url: "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies" };
+  // Retryable statuses, rendered the way getToken and requestJson render them: still failing after every attempt,
+  // and refused at once because Retry-After asked for more than the wait limit.
+  const throttledBody = JSON.stringify({ error: { code: "TooManyRequests", message: "Too many requests. Retry after some time." } });
+  const tokenUnavailable = { error: `Token request failed: 503 Service Unavailable${retryStopNote({ attempts })}`, status: 503, url: tokenUrl };
+  const graphThrottled = { error: `429 Too Many Requests${retryStopNote({ attempts })}: ${describeErrorBody(throttledBody, "application/json")}`, status: 429, url: "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies" };
+  const armRefusedWait = { error: `503 Service Unavailable${retryStopNote({ attempts: 1, refusedRetryAfterMs: 120_000 })}: ${describeErrorBody(html, "text/html")}`, status: 503, url: "https://management.azure.com/subscriptions/sub-123/providers/Microsoft.Security/pricings" };
+  const probeFailure = (name: string, service: string, result: { error: string; status?: number; url: string }): AzureAccessSurface => (
+    { name, service, status: "not_readable", count: null, truncated: null, http_status: result.status ?? null, request_url: result.url, error: result.error }
+  );
+  const throttledProbe = probeFailure("conditional_access", "graph", graphThrottled);
+  const unreachableProbe = probeFailure("secure_scores", "graph", { ...graphNoResponse, url: "https://graph.microsoft.com/v1.0/security/secureScores" });
+  const armThrottledProbe = probeFailure("defender_pricings", "arm", armRefusedWait);
+  const deniedProbe = probeFailure("directory_roles", "graph", { error: "403 Forbidden", status: 403, url: "https://graph.microsoft.com/v1.0/directoryRoles" });
   const conditionalAccess = "GET /v1.0/identity/conditionalAccess/policies";
   const pricings = "GET /subscriptions/sub-123/providers/Microsoft.Security/pricings";
   const errors: string[] = [];
@@ -4008,8 +4116,12 @@ export function azureFixedTexts(): readonly string[] {
     manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, tokenInvalid, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
     manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, tokenNoResponse, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
     manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, graphNoResponse, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
+    manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, graphTimedOut, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
+    manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, graphThrottled, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
+    manualForError("AZURE-ID-01", 1, "Conditional Access MFA baseline", "high", conditionalAccess, "Policy.Read.All", evidence, tokenUnavailable, AZURE_ENDPOINT_DOCS.conditionalAccess, errors),
     manualForError("AZURE-MON-05", 10, "Defender for Cloud plans", "high", pricings, "Security Reader", "the Defender for Cloud plan list", tokenDenied, AZURE_ENDPOINT_DOCS.defenderPricings, errors),
     manualForError("AZURE-MON-05", 10, "Defender for Cloud plans", "high", pricings, "Security Reader", "the Defender for Cloud plan list", tokenNoResponse, AZURE_ENDPOINT_DOCS.defenderPricings, errors),
+    manualForError("AZURE-MON-05", 10, "Defender for Cloud plans", "high", pricings, "Security Reader", "the Defender for Cloud plan list", armRefusedWait, AZURE_ENDPOINT_DOCS.defenderPricings, errors),
     manualForError("AZURE-DP-06", 20, "Inbox forwarding rules", "high", MESSAGE_RULES_ENDPOINT, MAILBOX_RULES_PERMISSION, "the inbox rule export for every mailbox", mailboxDenied, AZURE_ENDPOINT_DOCS.messageRules, errors),
   ];
   const surfaceNames = ["organization", "conditional_access", "directory_roles", "secure_scores", "defender_pricings", "role_assignments", "diagnostic_settings", "security_contacts"];
@@ -4072,14 +4184,27 @@ export function azureFixedTexts(): readonly string[] {
     "6/8 Azure audit surfaces are readable.",
     `${tokenRequestLabel(tokenDenied)} returned ${describeTokenFailure(tokenDenied)}; no resource request was made for ${surfaceNames.join(", ")}.`,
     `${requestOutcomeClause(tokenRequestLabel(tokenNoResponse), tokenNoResponse)}; no resource request was made for ${surfaceNames.join(", ")}.`,
+    `${requestOutcomeClause(tokenRequestLabel(tokenUnavailable), tokenUnavailable)}; no resource request was made for ${surfaceNames.join(", ")}.`,
     tokenNoResponse.error,
     graphNoResponse.error,
+    graphTimedOut.error,
+    tokenUnavailable.error,
+    graphThrottled.error,
+    armRefusedWait.error,
     failedReadNote(tokenNoResponse, SECURITY_DEFAULTS_ENDPOINT),
+    failedReadNote(tokenUnavailable, SECURITY_DEFAULTS_ENDPOINT),
     `Security defaults could not be read (${requestOutcomeClause(SECURITY_DEFAULTS_ENDPOINT, graphNoResponse)}).`,
+    `Security defaults could not be read (${requestOutcomeClause(SECURITY_DEFAULTS_ENDPOINT, graphThrottled)}).`,
     "Probe counts for role_assignments stopped at the probe page cap and are lower bounds, not inventory sizes.",
     "Fix the app registration's client credentials (tenant id, client id, client secret) so the token request succeeds, then re-run the access check.",
     `${tokenFailureRemedy(tokenNoResponse)}, then re-run the access check.`,
-    "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.",
+    `${tokenFailureRemedy(tokenUnavailable)}, then re-run the access check.`,
+    GRANT_READ_ACCESS_STEP,
+    ...unansweredProbesNote(unansweredProbes([throttledProbe, unreachableProbe, armThrottledProbe]).map((item) => item.name)),
+    ...unansweredProbesNote(unansweredProbes([throttledProbe]).map((item) => item.name)),
+    accessCheckNextStep("limited", [throttledProbe, armThrottledProbe], undefined),
+    accessCheckNextStep("limited", [unreachableProbe], undefined),
+    accessCheckNextStep("limited", [deniedProbe, throttledProbe, unreachableProbe], undefined),
     CLIENT_CREDENTIALS_REJECTED,
     ACCESS_TOKENS_REJECTED,
     TOKEN_AND_CLIENT_CREDENTIALS_REJECTED,

@@ -134,7 +134,9 @@ Calls `sts:GetCallerIdentity`, then probes 15 read surfaces with a minimal reque
 - Audit Manager assessments
 - The account security contact
 
-Returns `healthy` only when every surface is readable, and `limited` otherwise, naming the services to grant. A missing security contact is readable evidence (count 0), not a denial.
+Returns `healthy` only when every surface is readable, and `limited` otherwise, naming the services to grant for every unreadable surface except a probe that ran out of retries. A missing security contact is readable evidence (count 0), not a denial.
+
+A probe whose retries ran out on throttling, a service fault, a timeout, or a network failure is `not_readable`, but it is not treated as a refusal, because AWS never answered whether the principal may read that surface. A note says the check is incomplete and names the probe. The next step says to wait for AWS or restore network access, and names services to grant only for the other unreadable surfaces (see [Retries and timeouts](#retries-and-timeouts)).
 
 Every probe records in `command` the IAM action its request needs (`iam:ListUsers`; the S3 bucket probe calls `ListBuckets` and records `s3:ListAllMyBuckets`) and the `region` it was sent to. Other probe fields:
 
@@ -143,7 +145,7 @@ Every probe records in `command` the IAM action its request needs (`iam:ListUser
 - **Failed probe:** `{ status: "not_readable", count: null, truncated: null, command, region, error_code, http_status, error }`, where:
   - `error_code` is the validated SDK error name (`AccessDeniedException`, `ThrottlingException`, `TimeoutError`, `IncompleteResponse` for a 2xx whose body was not a service response, `UnknownError` when the served code is not code-shaped).
   - `http_status` is the observed status, or `null` when no response arrived.
-  - `error` is the scrubbed message.
+  - `error` is the scrubbed message. When the SDK retried the request, the attempt count follows the status (`ThrottlingException (HTTP 400) after 3 attempts: Rate exceeded`).
 
 A 200 HTML or empty answer on any probe, including the identity read, is `not_readable`. It is never a healthy surface with a zero count.
 
@@ -414,6 +416,21 @@ Per-bucket, per-key, per-policy, per-trail, per-detector, per-SCP, and per-analy
 
 Each of these secondary reads is attempted individually and recorded on failure, so one denied item never hides behind its siblings.
 
+#### Retries and timeouts
+
+Every SDK client the tools build, including the clients the credential providers create, runs the SDK's standard retry mode with at most 3 attempts per request. The tools set these values on each client, so `AWS_MAX_ATTEMPTS` and `AWS_RETRY_MODE` from the environment or the shared config file do not change them.
+
+- Throttling (HTTP 429 or a throttling error code such as `ThrottlingException`), HTTP 500, 502, 503, and 504, timeouts, and network failures are retried with the SDK's jittered exponential backoff. Any other error, a denial included, is final at once.
+- The SDK waits for a `Retry-After` or `x-amz-retry-after` header only up to 5 seconds past its own backoff delay.
+- Each attempt has 10 seconds to connect and 30 seconds for the service to start answering. An attempt past either limit fails with `TimeoutError` and is retried.
+
+When the attempts run out, the read is unreadable, never empty or partial:
+
+- Its error names the code, the status, and the attempt count, for example `ThrottlingException (HTTP 400) after 3 attempts: Rate exceeded`.
+- The findings that depend on it render `manual` or cap at `warn` (see [Unreadable datasets](#unreadable-datasets)).
+- A list that fails on a later page keeps none of its earlier pages, so it never passes as a complete or truncated inventory.
+- In `aws_check_access`, the probe is `not_readable` and a note says the check is incomplete: `This check is incomplete: the probes for iam_users ran out of retries without an answer (each surface records its last error), so whether that surface is readable is unknown.` The next step says to wait for AWS to stop throttling or failing the requests, or to restore network access to the AWS endpoints, and names services to grant only for the other unreadable surfaces.
+
 #### Denied and errored reads
 
 `AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, `AuthorizationError`, and HTTP 403 responses are classified as denied.
@@ -483,7 +500,7 @@ The pass replaces:
 
 So an SDK message that echoes request context keeps its error code, HTTP status, and host, but not the values.
 
-A response the SDK could not parse as the service protocol (for example a proxy's 502 HTML page, which the SDK attaches as `$responseBodyText`) is never quoted. The recorded text is `<code> (HTTP <status>): non-JSON body (text/html, <n> bytes)`.
+A response the SDK could not parse as the service protocol (for example a proxy's 502 HTML page, which the SDK attaches as `$responseBodyText`) is never quoted. The recorded text is `<code> (HTTP <status>): non-JSON body (text/html, <n> bytes)`, with the attempt count after the status when the SDK retried the request (`Unknown (HTTP 502) after 3 attempts: non-JSON body (text/html, 512 bytes)`).
 
 A `SyntaxError` that arrives without an attached body is recorded by name only (`SyntaxError: response could not be parsed as the service protocol; the parser's message is not recorded because it quotes the body`), because V8's parse message quotes a snippet of the text it rejected, and the whole text when it is 21 characters or shorter.
 
@@ -554,7 +571,7 @@ Tests run every fixed-text integration message through the scrub and verify that
 The client throws fixed text, not the SDK's error. Every SDK client the auditor holds is guarded so a failed `send()` surfaces as `AwsApiError`:
 
 - **Message:** `describeError`'s text (for example `SyntaxError (HTTP 200): non-JSON body (text/plain, 18 bytes)` for a 200 answer whose body is a short non-JSON page).
-- **Structured fields:** Only `code`, `httpStatus`, and a numbers-only `$metadata`.
+- **Structured fields:** Only `code`, `httpStatus`, and a numbers-only `$metadata` (`httpStatusCode` and the SDK's `attempts`).
 - **Not retained:** The SDK's `$response`, `$responseBodyText`, and cause.
 
 A caller that logs the thrown error therefore cannot re-emit a body or request context, and a scrub at the tool boundary is not what protects it.

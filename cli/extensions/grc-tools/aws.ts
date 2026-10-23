@@ -95,6 +95,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { ToolCallAbortedError, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
+import { attemptsNote, unansweredProbesNote } from "./cloud-retry.js";
 import {
   AWS_CONTROL_CATALOG,
   AWS_DEFAULTS,
@@ -103,6 +104,7 @@ import {
   AWS_IAM_ACTIONS,
   AWS_REQUIRED_OUTPUT_MEMBERS,
   AWS_REQUIRED_PUBLIC_ACCESS_FLAGS,
+  AWS_SDK_RETRY,
   AWS_SPEC,
   AWS_VERDICT_VALUES,
 } from "./aws.spec.js";
@@ -407,6 +409,12 @@ function errorHttpStatus(error: unknown): number | undefined {
   return asNumber(metadata?.httpStatusCode);
 }
 
+/** The attempts the SDK's retry middleware made before it gave up, which it records on the error it throws. */
+function errorAttempts(error: unknown): number | undefined {
+  const attempts = asNumber(asObject(asObject(error)?.$metadata)?.attempts);
+  return attempts !== undefined && Number.isSafeInteger(attempts) && attempts > 0 ? attempts : undefined;
+}
+
 export function isAwsAccessDenied(error: unknown): boolean {
   const code = errorCode(error);
   if (/AccessDenied|Unauthorized|Forbidden|AuthorizationError|NotAuthorized|AuthFailure|InvalidClientTokenId|ExpiredToken/i.test(code)) {
@@ -418,6 +426,43 @@ export function isAwsAccessDenied(error: unknown): boolean {
 function isErrorCode(error: unknown, ...codes: string[]): boolean {
   const code = errorCode(error);
   return codes.some((candidate) => candidate === code);
+}
+
+/**
+ * Error codes the SDK's standard retry mode retries, mirrored from @smithy/core's THROTTLING_ERROR_CODES and
+ * TRANSIENT_ERROR_CODES because that package is not a direct dependency. Query protocols send throttling with HTTP 400.
+ */
+const AWS_RETRIED_ERROR_CODES: ReadonlySet<string> = new Set([
+  "BandwidthLimitExceeded",
+  "EC2ThrottledException",
+  "LimitExceededException",
+  "PriorRequestNotComplete",
+  "ProvisionedThroughputExceededException",
+  "RequestLimitExceeded",
+  "RequestThrottled",
+  "RequestThrottledException",
+  "SlowDown",
+  "ThrottledException",
+  "Throttling",
+  "ThrottlingException",
+  "TooManyRequestsException",
+  "TransactionInProgressException",
+  "TimeoutError",
+  "RequestTimeout",
+  "RequestTimeoutException",
+]);
+const AWS_RETRIED_STATUSES: readonly number[] = [429, 500, 502, 503, 504];
+
+/**
+ * A failure the SDK's retries ended on without an answer about access: throttling, a service fault, a timeout, or a
+ * network failure. Whether the surface it probed is readable is unknown, which is not a permission gap.
+ */
+function isUnansweredFailure(error: unknown): boolean {
+  if (error instanceof AwsCredentialProviderError) return false;
+  const status = errorHttpStatus(error);
+  if (AWS_RETRIED_ERROR_CODES.has(errorCode(error)) || (status !== undefined && AWS_RETRIED_STATUSES.includes(status))) return true;
+  // A network failure such as DNS or a refused connection has no status and no retryable code, but the SDK retried it.
+  return status === undefined && (errorAttempts(error) ?? 1) > 1;
 }
 
 const REDACTED_ERROR_VALUE = "[REDACTED]";
@@ -1157,7 +1202,8 @@ const PARSE_ERROR_NOTE = "response could not be parsed as the service protocol; 
 
 /**
  * Describes a thrown SDK error as "<code> (HTTP <status>): <message>" with every part scrubbed; the code
- * and status are kept so a failure names what the service answered without repeating request context.
+ * and status are kept so a failure names what the service answered without repeating request context. A
+ * request the SDK retried until its attempts ran out says so after the status ("... after 3 attempts: ...").
  */
 function describeError(error: unknown): string {
   // An AwsApiError was built by this function when the client threw it; its message is already the record.
@@ -1165,14 +1211,16 @@ function describeError(error: unknown): string {
   const object = asObject(error);
   const code = errorCode(error);
   const status = errorHttpStatus(error);
+  const retried = attemptsNote(errorAttempts(error) ?? 1);
   // An object without a message contributes nothing (never its "[object Object]" rendering); a primitive is its text.
   const rawMessage = asString(object?.$bodyNote)
     ?? nonJsonBodyNote(object)
     ?? (isParseError(error) ? PARSE_ERROR_NOTE : error instanceof Error ? error.message : asString(object?.message) ?? (object ? "" : String(error)));
   const message = code && rawMessage.startsWith(`${code}:`) ? rawMessage.slice(code.length + 1).trim() : rawMessage;
-  const prefix = code
+  const answered = code
     ? (status !== undefined ? `${code} (HTTP ${status})` : code)
     : (status !== undefined ? `HTTP ${status}` : "");
+  const prefix = `${answered}${retried}`.trim();
   return redactErrorText(prefix && message ? `${prefix}: ${message}` : prefix || message);
 }
 
@@ -1195,16 +1243,23 @@ export class AwsApiError extends Error {
   readonly code: string;
   /** HTTP status the request observed; undefined for transport failures (timeouts, connection errors). */
   readonly httpStatus: number | undefined;
-  /** Kept in the SDK's shape so callers that read $metadata.httpStatusCode keep working; it holds numbers only. */
-  readonly $metadata: { httpStatusCode?: number };
+  /** Kept in the SDK's shape so callers that read $metadata.httpStatusCode or attempts keep working; it holds numbers only. */
+  readonly $metadata: { httpStatusCode?: number; attempts?: number };
 
   constructor(cause: unknown) {
     super(describeError(cause));
     this.name = "AwsApiError";
     this.code = errorCode(cause);
     this.httpStatus = errorHttpStatus(cause);
-    this.$metadata = this.httpStatus === undefined ? {} : { httpStatusCode: this.httpStatus };
+    this.$metadata = sdkMetadata(this.httpStatus, errorAttempts(cause));
   }
+}
+
+function sdkMetadata(httpStatusCode: number | undefined, attempts: number | undefined): { httpStatusCode?: number; attempts?: number } {
+  return {
+    ...(httpStatusCode === undefined ? {} : { httpStatusCode }),
+    ...(attempts === undefined ? {} : { attempts }),
+  };
 }
 
 /** Errors the client throws as-is: already fixed text, and their types are part of the client's contract. */
@@ -1320,7 +1375,7 @@ function withObservedBody(error: unknown, observed: ObservedResponse, command: u
   if (typeof object?.$responseBodyText === "string") return error;
   const htmlBody = observed.contentType !== undefined && /^text\/html$/i.test(observed.contentType);
   const status = errorHttpStatus(error) ?? observed.statusCode;
-  const metadata = status === undefined ? {} : { httpStatusCode: status };
+  const metadata = sdkMetadata(status, errorAttempts(error));
   if (isParseError(error) || htmlBody) {
     return {
       name: isParseError(error) ? "SyntaxError" : errorCode(error) || UNKNOWN_ERROR_CODE,
@@ -1620,14 +1675,32 @@ function guardCredentialProvider(provider: string, resolve: AwsCredentialProvide
 }
 
 /**
+ * Retry and timeout settings for every SDK client, the STS and SSO clients the credential providers build
+ * included. Standard mode retries throttling, 500, 502, 503, 504, and transport failures; throwOnRequestTimeout
+ * makes an attempt past its timeout fail, and so be retried, where the handler would otherwise only log a
+ * warning and keep waiting.
+ */
+function sdkRetrySettings() {
+  return {
+    maxAttempts: AWS_SDK_RETRY.maxAttempts,
+    retryMode: AWS_SDK_RETRY.retryMode,
+    requestHandler: {
+      requestTimeout: AWS_SDK_RETRY.requestTimeoutMs,
+      connectionTimeout: AWS_SDK_RETRY.connectionTimeoutMs,
+      throwOnRequestTimeout: true,
+    },
+  };
+}
+
+/**
  * The credential provider for the resolved configuration: the named profile through fromIni, otherwise the
  * same default chain the SDK would use (environment, shared files, SSO, process, container, and instance
  * metadata providers), both guarded so provider errors never reach an error string verbatim.
  */
 function credentialProviderFor(config: AwsResolvedConfig): AwsCredentialProvider {
   return config.profile
-    ? guardCredentialProvider(`fromIni (profile ${config.profile})`, fromIni({ profile: config.profile }), config.profile)
-    : guardCredentialProvider("fromNodeProviderChain (default credential chain)", fromNodeProviderChain({ clientConfig: { region: config.region } }));
+    ? guardCredentialProvider(`fromIni (profile ${config.profile})`, fromIni({ profile: config.profile, clientConfig: sdkRetrySettings() }), config.profile)
+    : guardCredentialProvider("fromNodeProviderChain (default credential chain)", fromNodeProviderChain({ clientConfig: { region: config.region, ...sdkRetrySettings() } }));
 }
 
 /** The recorded line for a failed read: the command label, whether it was a denial, and the scrubbed error text. */
@@ -2018,7 +2091,7 @@ export class AwsAuditorClient {
     // is signed; the guarded chain registers whatever it resolves at the first signed request as well.
     registerConfiguredSecrets(process.env.AWS_SECRET_ACCESS_KEY, process.env.AWS_SESSION_TOKEN);
     const credentials = credentialProviderFor(config);
-    const clientConfig = { region: config.region, credentials };
+    const clientConfig = { region: config.region, credentials, ...sdkRetrySettings() };
     this.credentials = credentials;
     this.signal = options.signal;
     // Every SDK client is guarded so the error a read throws is fixed text (AwsApiError), never the SDK's message.
@@ -2129,7 +2202,7 @@ export class AwsAuditorClient {
   private ec2For(region: string): EC2Client {
     let client = this.ec2Clients.get(region);
     if (!client) {
-      client = guardSdkClient(new EC2Client({ region, credentials: this.credentials }), this.signal);
+      client = guardSdkClient(new EC2Client({ region, credentials: this.credentials, ...sdkRetrySettings() }), this.signal);
       this.ec2Clients.set(region, client);
     }
     return client;
@@ -2139,7 +2212,7 @@ export class AwsAuditorClient {
     if (region === this.config.region) return this.cloudTrail;
     let client = this.cloudTrailClients.get(region);
     if (!client) {
-      client = guardSdkClient(new CloudTrailClient({ region, credentials: this.credentials }), this.signal);
+      client = guardSdkClient(new CloudTrailClient({ region, credentials: this.credentials, ...sdkRetrySettings() }), this.signal);
       this.cloudTrailClients.set(region, client);
     }
     return client;
@@ -2148,7 +2221,7 @@ export class AwsAuditorClient {
   private rdsFor(region: string): RDSClient {
     let client = this.rdsClients.get(region);
     if (!client) {
-      client = guardSdkClient(new RDSClient({ region, credentials: this.credentials }), this.signal);
+      client = guardSdkClient(new RDSClient({ region, credentials: this.credentials, ...sdkRetrySettings() }), this.signal);
       this.rdsClients.set(region, client);
     }
     return client;
@@ -2157,7 +2230,7 @@ export class AwsAuditorClient {
   private kmsFor(region: string): KMSClient {
     let client = this.kmsClients.get(region);
     if (!client) {
-      client = guardSdkClient(new KMSClient({ region, credentials: this.credentials }), this.signal);
+      client = guardSdkClient(new KMSClient({ region, credentials: this.credentials, ...sdkRetrySettings() }), this.signal);
       this.kmsClients.set(region, client);
     }
     return client;
@@ -2688,33 +2761,43 @@ interface ProbeObservation {
   truncated: boolean | null;
 }
 
-async function surface(
+/** A probe's surface record, and whether its failure left the surface's readability unknown rather than refused. */
+interface AccessProbe {
+  surface: AwsAccessSurface;
+  unanswered: boolean;
+}
+
+async function probe(
   name: string,
   service: string,
   command: string,
   region: string,
   loader: () => Promise<unknown>,
   observe: (value: unknown) => ProbeObservation,
-): Promise<AwsAccessSurface> {
+): Promise<AccessProbe> {
   try {
     const value = await loader();
-    return { name, service, command, region, status: "readable", ...observe(value) };
+    return { surface: { name, service, command, region, status: "readable", ...observe(value) }, unanswered: false };
   } catch (error) {
     rethrowIfAborted(error);
-    // A probe that never completed has no count and no truncation state; it names what the service answered instead.
-    return {
-      name,
-      service,
-      command,
-      region,
-      status: "not_readable",
-      count: null,
-      truncated: null,
-      error: describeError(error),
-      error_code: errorCode(error) || null,
-      http_status: errorHttpStatus(error) ?? null,
-    };
+    return { surface: failedSurface(name, service, command, region, error), unanswered: isUnansweredFailure(error) };
   }
+}
+
+/** A probe that never completed has no count and no truncation state; it names what the service answered instead. */
+function failedSurface(name: string, service: string, command: string, region: string, error: unknown): AwsAccessSurface {
+  return {
+    name,
+    service,
+    command,
+    region,
+    status: "not_readable",
+    count: null,
+    truncated: null,
+    error: describeError(error),
+    error_code: errorCode(error) || null,
+    http_status: errorHttpStatus(error) ?? null,
+  };
 }
 
 export type AwsAccessCheckClient = Pick<
@@ -2746,45 +2829,48 @@ export async function checkAwsAccess(client: AwsAccessCheckClient): Promise<AwsA
   const caller = await client.getCallerIdentity();
   const config = client.getResolvedConfig();
   const region = config.region;
-  const optionalProbes: Array<Promise<AwsAccessSurface>> = [];
+  const optionalProbes: Array<Promise<AccessProbe>> = [];
   if (client.describeRegions) {
-    optionalProbes.push(surface("ec2_regions", "ec2", AWS_IAM_ACTIONS["ec2-describe-regions"], region, () => client.describeRegions!(), arrayObservation));
+    optionalProbes.push(probe("ec2_regions", "ec2", AWS_IAM_ACTIONS["ec2-describe-regions"], region, () => client.describeRegions!(), arrayObservation));
   }
   if (client.listBuckets) {
-    optionalProbes.push(surface("s3_buckets", "s3", AWS_IAM_ACTIONS["s3-list-buckets"], region, () => client.listBuckets!(1), pagedObservation));
+    optionalProbes.push(probe("s3_buckets", "s3", AWS_IAM_ACTIONS["s3-list-buckets"], region, () => client.listBuckets!(1), pagedObservation));
   }
   if (client.listKmsKeys) {
-    optionalProbes.push(surface("kms_keys", "kms", AWS_IAM_ACTIONS["kms-list-keys"], region, () => client.listKmsKeys!(region, 1), pagedObservation));
+    optionalProbes.push(probe("kms_keys", "kms", AWS_IAM_ACTIONS["kms-list-keys"], region, () => client.listKmsKeys!(region, 1), pagedObservation));
   }
   if (client.describeDbInstances) {
-    optionalProbes.push(surface("rds_instances", "rds", AWS_IAM_ACTIONS["rds-describe-db-instances"], region, () => client.describeDbInstances!(region, 1), pagedObservation));
+    optionalProbes.push(probe("rds_instances", "rds", AWS_IAM_ACTIONS["rds-describe-db-instances"], region, () => client.describeDbInstances!(region, 1), pagedObservation));
   }
   if (client.listActiveAuditManagerAssessments) {
-    optionalProbes.push(surface("audit_manager", "auditmanager", AWS_IAM_ACTIONS["auditmanager-list-assessments"], region, () => client.listActiveAuditManagerAssessments!(1), pagedObservation));
+    optionalProbes.push(probe("audit_manager", "auditmanager", AWS_IAM_ACTIONS["auditmanager-list-assessments"], region, () => client.listActiveAuditManagerAssessments!(1), pagedObservation));
   }
   if (client.getSecurityAlternateContact) {
-    optionalProbes.push(surface("account_contacts", "account", AWS_IAM_ACTIONS["account-get-alternate-contact"], region, () => client.getSecurityAlternateContact!(), presenceObservation));
+    optionalProbes.push(probe("account_contacts", "account", AWS_IAM_ACTIONS["account-get-alternate-contact"], region, () => client.getSecurityAlternateContact!(), presenceObservation));
   }
-  const surfaces = await Promise.all([
-    surface("iam_summary", "iam", AWS_IAM_ACTIONS["iam-get-account-summary"], region, () => client.getAccountSummary(), () => ({ count: 1, truncated: null })),
-    surface("iam_users", "iam", AWS_IAM_ACTIONS["iam-list-users"], region, () => client.listIamUsers(1), pagedObservation),
-    surface("cloudtrail", "cloudtrail", AWS_IAM_ACTIONS["cloudtrail-describe-trails"], region, () => client.describeTrails(), arrayObservation),
-    surface("security_hub", "securityhub", AWS_IAM_ACTIONS["securityhub-get-enabled-standards"], region, () => client.getEnabledSecurityHubStandards(), pagedObservation),
-    surface("config", "config", AWS_IAM_ACTIONS["config-describe-configuration-recorders"], region, () => client.describeConfigurationRecorders(), arrayObservation),
-    surface("guardduty", "guardduty", AWS_IAM_ACTIONS["guardduty-list-detectors"], region, () => client.listDetectors(), pagedObservation),
-    surface("access_analyzer", "access-analyzer", AWS_IAM_ACTIONS["access-analyzer-list-analyzers"], region, () => client.listAnalyzers(), pagedObservation),
-    surface("organizations", "organizations", AWS_IAM_ACTIONS["organizations-describe-organization"], region, () => client.describeOrganization(), presenceObservation),
-    surface("identity_center", "sso-admin", AWS_IAM_ACTIONS["sso-admin-list-instances"], region, () => client.listIdentityCenterInstances(), pagedObservation),
+  const probes = await Promise.all([
+    probe("iam_summary", "iam", AWS_IAM_ACTIONS["iam-get-account-summary"], region, () => client.getAccountSummary(), () => ({ count: 1, truncated: null })),
+    probe("iam_users", "iam", AWS_IAM_ACTIONS["iam-list-users"], region, () => client.listIamUsers(1), pagedObservation),
+    probe("cloudtrail", "cloudtrail", AWS_IAM_ACTIONS["cloudtrail-describe-trails"], region, () => client.describeTrails(), arrayObservation),
+    probe("security_hub", "securityhub", AWS_IAM_ACTIONS["securityhub-get-enabled-standards"], region, () => client.getEnabledSecurityHubStandards(), pagedObservation),
+    probe("config", "config", AWS_IAM_ACTIONS["config-describe-configuration-recorders"], region, () => client.describeConfigurationRecorders(), arrayObservation),
+    probe("guardduty", "guardduty", AWS_IAM_ACTIONS["guardduty-list-detectors"], region, () => client.listDetectors(), pagedObservation),
+    probe("access_analyzer", "access-analyzer", AWS_IAM_ACTIONS["access-analyzer-list-analyzers"], region, () => client.listAnalyzers(), pagedObservation),
+    probe("organizations", "organizations", AWS_IAM_ACTIONS["organizations-describe-organization"], region, () => client.describeOrganization(), presenceObservation),
+    probe("identity_center", "sso-admin", AWS_IAM_ACTIONS["sso-admin-list-instances"], region, () => client.listIdentityCenterInstances(), pagedObservation),
     ...optionalProbes,
   ]);
+  const surfaces = probes.map((item) => item.surface);
+  const unanswered = probes.filter((item) => item.unanswered).map((item) => item.surface);
 
   const readableCount = surfaces.filter((item) => item.status === "readable").length;
-  const status = readableCount === surfaces.length ? "healthy" : "limited";
+  const status: AwsAccessCheckResult["status"] = readableCount === surfaces.length ? "healthy" : "limited";
   const accountId = asString(caller.Account);
   const notes = [
     `Authenticated via ${describeSourceChain(config)}.`,
     accountId ? `Current AWS account: ${accountId}` : "Current AWS account could not be determined.",
     `${readableCount}/${surfaces.length} AWS audit surfaces are readable.`,
+    ...unansweredProbesNote(unanswered.map((item) => item.name)),
   ];
 
   if (config.accountId && config.accountId !== accountId) {
@@ -2797,11 +2883,39 @@ export async function checkAwsAccess(client: AwsAccessCheckClient): Promise<AwsA
     arn: asString(caller.Arn),
     surfaces,
     notes,
-    recommendedNextStep:
-      status === "healthy"
-        ? "Run aws_assess_identity, aws_assess_logging_detection, aws_assess_org_guardrails, aws_assess_data_protection, aws_assess_network_security, or aws_export_audit_bundle."
-        : `Grant read-only access for the audit principal to the surfaces marked not_readable (${surfaces.filter((item) => item.status === "not_readable").map((item) => item.service).join(", ") || "none"}); unreadable surfaces render manual findings, never pass.`,
+    recommendedNextStep: accessCheckNextStep(status, surfaces, unanswered),
   };
+}
+
+/** Waiting out throttling or a service fault, and restoring the network path when a probe never got a response. */
+function unansweredProbeRemedy(probes: AwsAccessSurface[]): string {
+  const unreachable = probes.filter((item) => item.http_status == null).length;
+  return [
+    ...(unreachable < probes.length ? ["wait for AWS to stop throttling or failing the requests"] : []),
+    ...(unreachable > 0 ? ["restore network access to the AWS endpoints (DNS, TLS, proxy)"] : []),
+  ].join(" and ");
+}
+
+/** `unanswered` are the probes whose retries ran out without an answer about access; a grant would not make them readable. */
+function accessCheckNextStep(status: AwsAccessCheckResult["status"], surfaces: AwsAccessSurface[], unanswered: AwsAccessSurface[]): string {
+  switch (status) {
+    case "healthy":
+      return "Run aws_assess_identity, aws_assess_logging_detection, aws_assess_org_guardrails, aws_assess_data_protection, aws_assess_network_security, or aws_export_audit_bundle.";
+    case "limited": {
+      const refused = surfaces.filter((item) => item.status === "not_readable" && !unanswered.includes(item));
+      const services = [...new Set(refused.map((item) => item.service))].join(", ");
+      const grant = `Grant read-only access for the audit principal to the ${unanswered.length > 0 ? "remaining " : ""}surfaces marked not_readable (${services}); unreadable surfaces render manual findings, never pass.`;
+      if (unanswered.length === 0) return grant;
+      const remedy = unansweredProbeRemedy(unanswered);
+      return refused.length > 0
+        ? `For the probes that ran out of retries, ${remedy}, then re-run aws_check_access. ${grant}`
+        : `${remedy.charAt(0).toUpperCase()}${remedy.slice(1)}, then re-run aws_check_access; unreadable surfaces render manual findings, never pass.`;
+    }
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled AWS access status ${String(exhaustive)}`);
+    }
+  }
 }
 
 function isServiceWildcardAction(value: unknown): boolean {
@@ -5427,6 +5541,20 @@ export function awsFixedTexts(): readonly string[] {
   const noBucketPolicy = { name: "NoSuchBucketPolicy", message: "The bucket policy does not exist", $metadata: { httpStatusCode: 404 } };
   const htmlPage = { name: "SyntaxError", $metadata: { httpStatusCode: 502 }, $bodyNote: `non-JSON body (text/html, ${Buffer.byteLength(html, "utf8")} bytes)` };
   const timeout = { name: "TimeoutError", message: "Request did not complete within 10000 ms" };
+  const attempts = AWS_SDK_RETRY.maxAttempts;
+  const throttled = new AwsApiError({ name: "ThrottlingException", message: "Rate exceeded", $metadata: { httpStatusCode: 400, attempts } });
+  const unavailable = new AwsApiError({ name: "ServiceUnavailableException", message: "Service Unavailable", $metadata: { httpStatusCode: 503, attempts } });
+  const requestTimedOut = new AwsApiError({
+    name: "TimeoutError",
+    message: `@smithy/node-http-handler - [ERROR] a request has exceeded the configured ${AWS_SDK_RETRY.requestTimeoutMs} ms requestTimeout.`,
+    $metadata: { attempts },
+  });
+  const connectTimedOut = new AwsApiError({
+    name: "TimeoutError",
+    message: `@smithy/node-http-handler - the request socket did not establish a connection with the server within the configured timeout of ${AWS_SDK_RETRY.connectionTimeoutMs} ms.`,
+    $metadata: { attempts },
+  });
+  const retriedPage = new AwsApiError({ name: "SyntaxError", $metadata: { httpStatusCode: 502, attempts }, $bodyNote: `non-JSON body (text/html, ${Buffer.byteLength(html, "utf8")} bytes)` });
   const deniedError = new AwsApiError(denied);
   const notFoundError = new AwsApiError(noSuchEntity);
   const emptyBody = incompleteResponseError("ListUsers", { statusCode: 200, bodyBytes: 0 });
@@ -5443,6 +5571,11 @@ export function awsFixedTexts(): readonly string[] {
     { statusCode: 200, contentType: "application/x-amz-json-1.1", bodyBytes: 33 },
     { constructor: { name: "GetTrailStatusCommand" } },
   ));
+  const usersRefused = failedSurface("iam_users", "iam", "iam:ListUsers", "us-east-1", deniedError);
+  const summaryRefused = failedSurface("iam_summary", "iam", "iam:GetAccountSummary", "us-east-1", deniedError);
+  const regionsRefused = failedSurface("ec2_regions", "ec2", "ec2:DescribeRegions", "us-east-1", deniedError);
+  const usersThrottled = failedSurface("iam_users", "iam", "iam:ListUsers", "us-east-1", throttled);
+  const trailsTimedOut = failedSurface("cloudtrail", "cloudtrail", "cloudtrail:DescribeTrails", "us-east-1", requestTimedOut);
   return Object.freeze([
     PARSE_ERROR_NOTE,
     nonJsonBodyNote({ $responseBodyText: html, $response: { headers: { "content-type": "text/html; charset=utf-8" } } }) ?? "",
@@ -5457,6 +5590,11 @@ export function awsFixedTexts(): readonly string[] {
     new AwsApiError(htmlPage).message,
     new AwsApiError(new SyntaxError("Unexpected token '<', \"<html>\" is not valid JSON")).message,
     new AwsApiError(timeout).message,
+    throttled.message,
+    unavailable.message,
+    requestTimedOut.message,
+    connectTimedOut.message,
+    retriedPage.message,
     new AwsApiError({ $metadata: { httpStatusCode: 403 } }).message,
     new AwsApiError({ name: "not a code", message: "rejected", $metadata: { httpStatusCode: 403 } }).message,
     UNKNOWN_ERROR_CODE,
@@ -5480,6 +5618,9 @@ export function awsFixedTexts(): readonly string[] {
     readFailureLine("s3:GetBucketPolicy cloudtrail-logs-123456789012-us-east-1", new AwsApiError(noBucketPolicy)),
     readFailureLine("organizations:ListAccounts", new AwsApiError(htmlPage)),
     readFailureLine("sts:GetCallerIdentity", new AwsApiError(timeout)),
+    readFailureLine("iam:ListUsers", throttled),
+    readFailureLine("ec2:DescribeVpcs us-east-1", unavailable),
+    readFailureLine("sts:GetCallerIdentity", requestTimedOut),
     readFailureLine("iam:GetAccountSummary", unobserved),
     readFailureLine(`guardduty:GetDetector ${labelIdentifier("12abc34d567e8fa901bc2d34e56789f0")}`, deniedError),
     readFailureLine(`guardduty:GetDetector ${labelIdentifier("detector-1")}`, deniedError),
@@ -5497,6 +5638,11 @@ export function awsFixedTexts(): readonly string[] {
     "Current AWS account could not be determined.",
     "14/15 AWS audit surfaces are readable.",
     "Requested account hint 123456789012 does not match caller account 210987654321.",
-    "Grant read-only access for the audit principal to the surfaces marked not_readable (iam, ec2); unreadable surfaces render manual findings, never pass.",
+    ...unansweredProbesNote([usersThrottled.name]),
+    ...unansweredProbesNote([usersThrottled.name, trailsTimedOut.name]),
+    accessCheckNextStep("limited", [summaryRefused, usersRefused, regionsRefused], []),
+    accessCheckNextStep("limited", [usersThrottled], [usersThrottled]),
+    accessCheckNextStep("limited", [trailsTimedOut], [trailsTimedOut]),
+    accessCheckNextStep("limited", [usersThrottled, trailsTimedOut, regionsRefused], [usersThrottled, trailsTimedOut]),
   ]);
 }

@@ -53,6 +53,27 @@ export const AWS_DEFAULTS = {
   sensitivePorts: [21, 22, 23, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200, 27017],
 } as const;
 
+/**
+ * Retry and timeout settings given to every SDK client the integration builds; the SDK runs the retries. Set on
+ * the client, they take precedence over AWS_MAX_ATTEMPTS and AWS_RETRY_MODE from the environment or shared config.
+ */
+export const AWS_SDK_RETRY = {
+  maxAttempts: 3,
+  retryMode: "standard",
+  requestTimeoutMs: 30_000,
+  connectionTimeoutMs: 10_000,
+} as const;
+
+/** How standard mode treats a Retry-After hint: it waits no longer than this past its own backoff delay. */
+const SDK_RETRY_AFTER_ALLOWANCE_SECONDS = 5;
+
+export const AWS_RETRY_POLICY_TEXT = [
+  `The AWS SDK retries in ${AWS_SDK_RETRY.retryMode} mode, at most ${AWS_SDK_RETRY.maxAttempts} attempts per request: 429, 500, 502, 503, and 504 responses, throttling error codes, and transport failures, with jittered exponential backoff.`,
+  `It waits for Retry-After or x-amz-retry-after only up to ${SDK_RETRY_AFTER_ALLOWANCE_SECONDS} s past its own backoff delay.`,
+  `Each attempt allows ${AWS_SDK_RETRY.connectionTimeoutMs / 1000} s to connect and ${AWS_SDK_RETRY.requestTimeoutMs / 1000} s for the service to start answering; an attempt past either limit fails with TimeoutError and is retried.`,
+  "A read whose attempts run out is unreadable, its error names the code, the status, and the attempt count, and the findings that depend on it are demoted; a list that fails on a later page keeps none of its earlier pages.",
+].join(" ");
+
 export const AWS_VERDICT_VALUES = {
   minimumPasswordLength: 14,
   passwordComplexityFields: ["RequireSymbols", "RequireNumbers", "RequireUppercaseCharacters", "RequireLowercaseCharacters"],
@@ -1100,9 +1121,9 @@ export const AWS_SPEC: IntegrationSpecContract = {
   rateLimits: [{
     scope: "AWS service APIs",
     documentedLimit: null,
-    retryHeaders: [],
+    retryHeaders: ["Retry-After", "x-amz-retry-after"],
     retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Use the service client's bounded retry behavior. If retries are exhausted, mark the surface unreadable and demote dependent findings.",
+    backoffPolicy: AWS_RETRY_POLICY_TEXT,
   }],
   controls: AWS_CONTROLS,
   checks: AWS_CHECKS,

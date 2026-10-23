@@ -30,6 +30,17 @@ import {
   readResolverEnvironment,
 } from "./auth-resolver-contracts.js";
 import {
+  attemptsNote,
+  CLOUD_RETRYABLE_STATUSES,
+  cloudRetryPolicy,
+  exchangeWithRetries,
+  retryStopNote,
+  timeoutReason,
+  unansweredProbesNote,
+  type CloudExchange,
+  type CloudRetryPolicy,
+} from "./cloud-retry.js";
+import {
   GCP_ADMIN_PORTS as ADMIN_PORTS,
   GCP_DEFAULT_SERVICE_ACCOUNT_KEY_MAX_AGE_DAYS as DEFAULT_STALE_DAYS,
   GCP_FLOW_LOG_UNSUPPORTED_PURPOSES,
@@ -869,24 +880,29 @@ export function createGcpServiceAccountAssertion(
   return `${header}.${claims}.${base64Url(signature)}`;
 }
 
-/** Every failure of the token endpoint is a GcpApiError built from the documented OAuth error fields or the body's content type and length. */
-async function postTokenRequest(tokenUri: string, form: URLSearchParams, fetchImpl: FetchImpl, secrets: string[]): Promise<string> {
-  let response: Response;
-  try {
-    response = await fetchImpl(tokenUri, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: form.toString(),
-    });
-  } catch (error) {
-    rethrowIfAborted(error);
-    throw new GcpApiError(`Token exchange failed before a response arrived: ${describeError(error)} (POST ${tokenUri})`, tokenUri, undefined, secrets);
+/** Why an exchange produced no response: the attempt timeout, or the scrubbed transport error. */
+function describeNoResponse(failure: Extract<CloudExchange, { kind: "failure" }>, retry: CloudRetryPolicy): string {
+  return failure.timedOut ? timeoutReason(retry.requestTimeoutMs) : describeError(failure.error);
+}
+
+/**
+ * Every failure of the token endpoint is a GcpApiError built from the documented OAuth error fields or the body's
+ * content type and length, after the bounded retries of cloud-retry.ts.
+ */
+async function postTokenRequest(tokenUri: string, form: URLSearchParams, fetchImpl: FetchImpl, secrets: string[], retry: CloudRetryPolicy): Promise<string> {
+  const exchange = await exchangeWithRetries(fetchImpl, tokenUri, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: form.toString(),
+  }, retry);
+  if (exchange.kind === "failure") {
+    throw new GcpApiError(`Token exchange failed before a response arrived${attemptsNote(exchange.attempts)}: ${describeNoResponse(exchange, retry)} (POST ${tokenUri})`, tokenUri, undefined, secrets);
   }
-  const text = await response.text().catch(() => "");
+  const { response, text } = exchange;
   const contentType = response.headers.get("content-type");
   if (!response.ok) {
     const body = describeOAuthErrorBody(text, contentType, secrets);
-    throw new GcpApiError(`Token exchange failed: ${httpStatusLine(response)}${body ? `: ${body}` : ""} (POST ${tokenUri})`, tokenUri, response.status, secrets);
+    throw new GcpApiError(`Token exchange failed: ${httpStatusLine(response)}${retryStopNote(exchange)}${body ? `: ${body}` : ""} (POST ${tokenUri})`, tokenUri, response.status, secrets);
   }
   const payload = parseJsonObject(text);
   if (!payload) {
@@ -906,6 +922,7 @@ export async function exchangeGcpCredentials(
   credentials: GcpFileCredentials,
   fetchImpl: FetchImpl = fetch,
   now: Date = new Date(),
+  retry: CloudRetryPolicy = cloudRetryPolicy(),
 ): Promise<string> {
   const secrets = credentialValues({ credentials });
   switch (credentials.type) {
@@ -914,7 +931,7 @@ export async function exchangeGcpCredentials(
         grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
         assertion: createGcpServiceAccountAssertion(credentials, now),
       });
-      return postTokenRequest(credentials.tokenUri, form, fetchImpl, secrets);
+      return postTokenRequest(credentials.tokenUri, form, fetchImpl, secrets, retry);
     }
     case "authorized_user": {
       const form = new URLSearchParams({
@@ -923,7 +940,7 @@ export async function exchangeGcpCredentials(
         client_secret: credentials.clientSecret,
         refresh_token: credentials.refreshToken,
       });
-      return postTokenRequest(credentials.tokenUri, form, fetchImpl, secrets);
+      return postTokenRequest(credentials.tokenUri, form, fetchImpl, secrets, retry);
     }
     default: {
       const exhaustive: never = credentials;
@@ -1148,15 +1165,17 @@ function buildQuery(params: Record<string, string | number | undefined>): string
 export class GcpAuditorClient {
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
+  private readonly retry: CloudRetryPolicy;
   private tokenPromise?: Promise<string>;
   private exchangedToken?: string;
 
   constructor(
     private readonly config: GcpResolvedConfig,
-    options: { fetchImpl?: FetchImpl; now?: () => Date; signal?: AbortSignal } = {},
+    options: { fetchImpl?: FetchImpl; now?: () => Date; signal?: AbortSignal; sleepImpl?: (ms: number) => Promise<void>; requestTimeoutMs?: number } = {},
   ) {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
+    this.retry = cloudRetryPolicy({ signal: options.signal, sleepImpl: options.sleepImpl, now: this.now, requestTimeoutMs: options.requestTimeoutMs });
   }
 
   getResolvedConfig(): GcpResolvedConfig {
@@ -1175,7 +1194,7 @@ export class GcpAuditorClient {
   async getAccessToken(): Promise<string> {
     if (this.config.accessToken) return this.config.accessToken;
     if (!this.config.credentials) throw new Error("No GCP access token or credentials file was resolved.");
-    this.tokenPromise ??= exchangeGcpCredentials(this.config.credentials, this.fetchImpl, this.now()).then((token) => {
+    this.tokenPromise ??= exchangeGcpCredentials(this.config.credentials, this.fetchImpl, this.now(), this.retry).then((token) => {
       this.exchangedToken = token;
       return token;
     });
@@ -1183,35 +1202,39 @@ export class GcpAuditorClient {
   }
 
   /**
-   * The single point where a request failure becomes an error string. The message carries the HTTP status,
-   * method, and endpoint (the URL without its query); the body contributes only what describeGoogleErrorBody
-   * admits, and the GcpApiError constructor scrubs the whole message with the known secrets.
+   * The single point where a request failure becomes an error string. The message carries the HTTP status, how
+   * the bounded retries of cloud-retry.ts ended, the method, and the endpoint (the URL without its query); the body
+   * contributes only what describeGoogleErrorBody admits, and the GcpApiError constructor scrubs the whole message
+   * with the known secrets. The token exchange runs its own retries, so a failed exchange is not repeated here.
    */
   private async requestJson(url: string, init: { method?: string; body?: unknown } = {}): Promise<JsonRecord> {
     const method = init.method ?? "GET";
     const endpoint = url.split("?")[0];
-    let response: Response;
+    let token: string;
     try {
-      const token = await this.getAccessToken();
-      response = await this.fetchImpl(url, {
-        method,
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/json",
-          ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
-        },
-        body: init.body === undefined ? undefined : JSON.stringify(init.body),
-      });
+      token = await this.getAccessToken();
     } catch (error) {
       rethrowIfAborted(error);
       throw new GcpApiError(`${method} ${endpoint} failed before a response arrived: ${describeError(error)}`, endpoint, undefined, this.getKnownSecrets());
     }
+    const exchange = await exchangeWithRetries(this.fetchImpl, url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
+      },
+      body: init.body === undefined ? undefined : JSON.stringify(init.body),
+    }, this.retry);
     const secrets = this.getKnownSecrets();
-    const text = await response.text().catch(() => "");
+    if (exchange.kind === "failure") {
+      throw new GcpApiError(`${method} ${endpoint} failed before a response arrived${attemptsNote(exchange.attempts)}: ${describeNoResponse(exchange, this.retry)}`, endpoint, undefined, secrets);
+    }
+    const { response, text } = exchange;
     const contentType = response.headers.get("content-type");
     if (!response.ok) {
       const body = describeGoogleErrorBody(text, contentType, response.status, secrets);
-      throw new GcpApiError(`${httpStatusLine(response)}${body ? `: ${body}` : ""} (${method} ${endpoint})`, endpoint, response.status, secrets);
+      throw new GcpApiError(`${httpStatusLine(response)}${retryStopNote(exchange)}${body ? `: ${body}` : ""} (${method} ${endpoint})`, endpoint, response.status, secrets);
     }
     // Every surface this client reads answers with a JSON object: the proto3 JSON mapping encodes a response message
     // whose fields all hold defaults, and google.protobuf.Empty itself, as `{}` (protobuf.dev/programming-guides/json,
@@ -1633,13 +1656,22 @@ export interface UnreadableInventory {
   error: string;
 }
 
+const STATUS_ERROR = /^(?:[^\s():]+: )?(\d{3} [A-Za-z][A-Za-z '-]*?(?: after \d+ attempts)?(?: \(the server asked to retry after [^)]+\))?)(?=$|:| \()/;
+const NO_RESPONSE_ERROR = /^[A-Z]+ \S+ failed before a response arrived((?: after \d+ attempts)?): /;
+
 /**
- * HTTP status text ("403 Forbidden") from the request error itself, optionally behind a
- * single identifier prefix such as the service account email; a status quoted inside
- * nested text belongs to another call and is never harvested. Non-HTTP errors keep their start.
+ * HTTP status text ("403 Forbidden", "503 Service Unavailable after 4 attempts") from the request error itself,
+ * optionally behind a single identifier prefix such as the service account email; a status quoted inside nested
+ * text belongs to another call and is never harvested. A request that got no response keeps its reason (a timeout
+ * or a transport failure) and attempt count instead of the endpoint the caller already names. Other errors keep
+ * their start.
  */
 function shortError(error: string): string {
-  return error.match(/^(?:[^\s():]+: )?(\d{3} [A-Za-z][A-Za-z ]*)/)?.[1]?.trim() ?? truncateAtWord(error, 80);
+  const status = error.match(STATUS_ERROR)?.[1];
+  if (status) return status;
+  const noResponse = error.match(NO_RESPONSE_ERROR);
+  if (noResponse) return `no response${noResponse[1]}: ${truncateAtWord(error.slice(noResponse[0].length), 120)}`;
+  return truncateAtWord(error, 80);
 }
 
 /**
@@ -1785,7 +1817,10 @@ interface VerdictInput {
   unreadable?: UnreadableInventory[];
   /** The count rendered as evidence.seen; defaults to total. Null when total sums a list that was never received. */
   seen?: number | null;
+  /** Projects whose read of the primary inventory failed for any reason other than a disabled API. */
   deniedProjects?: number;
+  /** False when at least one of those reads ended on something other than a 401 or 403 (throttling, a service fault, no response). */
+  deniedByPermission?: boolean;
   /** Projects the per-project scan could attempt; undefined for findings computed from organization-scoped reads only. */
   scannedProjects?: number;
   apiDisabledProjects?: number;
@@ -1881,10 +1916,12 @@ function verdict(input: VerdictInput): GcpFinding {
   }
   if (input.total === 0 && (allDenied || allDisabled)) {
     const dataset = input.inventory?.dataset ?? "the inventory";
+    const read = `the read of ${dataset}${input.inventory ? ` (${input.inventory.endpoint})` : ""}`;
+    const failure = input.deniedByPermission === false ? `${read} failed in every sampled project` : `every sampled project denied ${read}`;
     return {
       ...unseen,
       status: evaluatedStatus,
-      summary: `Manual: ${allDenied ? `every sampled project denied the read of ${dataset}${input.inventory ? ` (${input.inventory.endpoint})` : ""}` : `the API serving ${dataset} is not enabled in any sampled project`}.${partial} Collect manually: ${input.manualEvidence}`,
+      summary: `Manual: ${allDenied ? failure : `the API serving ${dataset} is not enabled in any sampled project`}.${partial} Collect manually: ${input.manualEvidence}`,
     };
   }
   if (input.total === 0) {
@@ -1976,6 +2013,7 @@ function scanVerdictBase(context: ProjectContext, primary: ProjectScan<unknown>,
     inventory: primary.inventory,
     inventoryError: context.unreadable[0],
     deniedProjects: primary.denied.length,
+    deniedByPermission: primary.denied.every((entry) => isPermissionError(entry.error)),
     scannedProjects: context.projectIds.length,
     apiDisabledProjects: primary.apiDisabled.length,
     truncated: anyTruncated([projectsTruncated(context), ...scans.map(scanTruncation)]),
@@ -2063,6 +2101,7 @@ export async function checkGcpAccess(
     `Authenticated against ${describeSourceChain(config)}.`,
     `${readableCount}/${surfaces.length} GCP audit surfaces are readable.`,
     targetProject ? `Primary sampled project: ${targetProject}.` : "No project was available for sample queries.",
+    ...unansweredProbesNote(unansweredProbes(surfaces).map((item) => item.name)),
   ];
 
   return {
@@ -2071,11 +2110,34 @@ export async function checkGcpAccess(
     projectId: targetProject ?? config.projectId,
     surfaces,
     notes,
-    recommendedNextStep: accessCheckNextStep(status, config),
+    recommendedNextStep: accessCheckNextStep(status, config, surfaces),
   };
 }
 
 const NO_SAMPLE_PROJECT = "No project available for the sample query.";
+
+/** A request, to a Google API or to the token endpoint ahead of it, that got no response on any attempt. */
+const NO_RESPONSE_AFTER_RETRIES = /^[A-Z]+ \S+ failed before a response arrived(?:: Token exchange failed before a response arrived)? after \d+ attempts: /;
+/** A status the client retries that was still the answer when the retries ran out, from a Google API or the token endpoint ahead of it. */
+const RETRYABLE_STATUS_ERROR = new RegExp(`(?:^|^[A-Z]+ \\S+ failed before a response arrived: Token exchange failed: )(?:${CLOUD_RETRYABLE_STATUSES.join("|")}) `);
+
+/**
+ * Probes whose retries ran out without an answer about access: every attempt ended on a status the client retries
+ * (throttling or a service fault) or received no response. Whether those surfaces are readable is unknown, which is
+ * not a permission gap.
+ */
+function unansweredProbes(surfaces: GcpAccessSurface[]): GcpAccessSurface[] {
+  return surfaces.filter((item) => item.status === "not_readable" && (NO_RESPONSE_AFTER_RETRIES.test(item.error ?? "") || RETRYABLE_STATUS_ERROR.test(item.error ?? "")));
+}
+
+/** Waiting out throttling or a service fault, and restoring the network path when a request never got a response. */
+function unansweredProbeRemedy(probes: GcpAccessSurface[]): string {
+  const unreachable = probes.filter((item) => NO_RESPONSE_AFTER_RETRIES.test(item.error ?? "")).length;
+  return [
+    ...(unreachable < probes.length ? ["wait for Google Cloud to stop throttling or failing the requests"] : []),
+    ...(unreachable > 0 ? ["restore network access to the Google Cloud APIs (DNS, TLS, proxy)"] : []),
+  ].join(" and ");
+}
 
 /**
  * A probe refused for its credentials: the API answered 401, or the token exchange answered 401 or refused the
@@ -2095,12 +2157,21 @@ function everyProbeRejected(surfaces: GcpAccessSurface[]): boolean {
 const ACCESS_TOKEN_REJECTED = "Google Cloud rejected the access token (every probe returned 401). Set GCP_ACCESS_TOKEN (or GOOGLE_OAUTH_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN, or the access_token argument) to a valid token, or run gcloud auth login again when the token comes from gcloud auth print-access-token, then re-run gcp_check_access.";
 const CREDENTIALS_FILE_REJECTED = "Google rejected the credentials file (every probe returned 401 or its token exchange was refused). Check the file named by GCP_CREDENTIALS_FILE or GOOGLE_APPLICATION_CREDENTIALS (or the credentials_file argument, or the application default credentials file); a deleted or disabled service account key or a revoked refresh token is refused this way. Then re-run gcp_check_access.";
 
-function accessCheckNextStep(status: GcpAccessCheckResult["status"], config: GcpResolvedConfig): string {
+const GRANT_READ_ACCESS_STEP = "Grant roles/cloudasset.viewer, roles/iam.securityReviewer, roles/logging.viewer, roles/orgpolicy.policyViewer, roles/compute.viewer, and roles/securitycenter.findingsViewer to the audit principal and enable the corresponding APIs. roles/iam.securityReviewer already includes storage.buckets.list for project bucket inventory. If the principal does not have roles/iam.securityReviewer, grant a custom role containing only storage.buckets.list at the organization or each audited project.";
+
+function accessCheckNextStep(status: GcpAccessCheckResult["status"], config: GcpResolvedConfig, surfaces: GcpAccessSurface[]): string {
   switch (status) {
     case "healthy":
       return "Run gcp_assess_identity, gcp_assess_logging_detection, gcp_assess_org_guardrails, gcp_assess_data_protection, gcp_assess_network_security, or gcp_export_audit_bundle.";
-    case "limited":
-      return "Grant roles/cloudasset.viewer, roles/iam.securityReviewer, roles/logging.viewer, roles/orgpolicy.policyViewer, roles/compute.viewer, and roles/securitycenter.findingsViewer to the audit principal and enable the corresponding APIs. roles/iam.securityReviewer already includes storage.buckets.list for project bucket inventory. If the principal does not have roles/iam.securityReviewer, grant a custom role containing only storage.buckets.list at the organization or each audited project.";
+    case "limited": {
+      const unanswered = unansweredProbes(surfaces);
+      if (unanswered.length === 0) return GRANT_READ_ACCESS_STEP;
+      const remedy = unansweredProbeRemedy(unanswered);
+      const denied = surfaces.some((item) => item.status === "not_readable" && item.error !== NO_SAMPLE_PROJECT && !unanswered.includes(item));
+      return denied
+        ? `${GRANT_READ_ACCESS_STEP} For the probes that ran out of retries, ${remedy}, then re-run gcp_check_access.`
+        : `${remedy.charAt(0).toUpperCase()}${remedy.slice(1)}, then re-run gcp_check_access.`;
+    }
     case "failed":
       return config.accessToken ? ACCESS_TOKEN_REJECTED : CREDENTIALS_FILE_REJECTED;
     default: {

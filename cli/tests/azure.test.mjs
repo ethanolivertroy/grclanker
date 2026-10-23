@@ -97,6 +97,8 @@ import {
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-04-16T00:00:00.000Z");
+/** Retry waits resolve at once, so a test that serves retryable failures does not spend the real backoff. */
+const NO_SLEEP = async () => {};
 const ASSESSORS = [
   ["identity", (client) => assessAzureIdentity(client)],
   ["monitoring", (client) => assessAzureMonitoring(client)],
@@ -309,7 +311,7 @@ test("resolveAzureCloud accepts both documented China authority hosts", async ()
     { AZURE_TENANT_ID: "tenant-cn", AZURE_SUBSCRIPTION_ID: "sub-cn", AZURE_CLIENT_ID: "client-cn", AZURE_CLIENT_SECRET: "secret-cn", AZURE_AUTHORITY_HOST: "login.partner.microsoftonline.cn" },
     () => undefined,
   );
-  await new AzureAuditorClient(config, { fetchImpl, now: () => NOW }).listSubscribedSkus();
+  await new AzureAuditorClient(config, { fetchImpl, now: () => NOW, sleepImpl: NO_SLEEP }).listSubscribedSkus();
   assert.equal(requests[0].url, "https://login.partner.microsoftonline.cn/tenant-cn/oauth2/v2.0/token");
   assert.equal(new URLSearchParams(requests[0].init.body).get("scope"), "https://microsoftgraph.chinacloudapi.cn/.default");
   assert.equal(requests[1].url, "https://microsoftgraph.chinacloudapi.cn/v1.0/subscribedSkus");
@@ -333,7 +335,7 @@ test("AzureAuditorClient acquires tokens via the documented client credentials g
     { AZURE_TENANT_ID: "tenant-1", AZURE_SUBSCRIPTION_ID: "sub-1", AZURE_CLIENT_ID: "client-1", AZURE_CLIENT_SECRET: "secret-1", AZURE_AUTHORITY_HOST: "login.microsoftonline.us" },
     () => undefined,
   );
-  const client = new AzureAuditorClient(config, { fetchImpl, now: () => NOW });
+  const client = new AzureAuditorClient(config, { fetchImpl, now: () => NOW, sleepImpl: NO_SLEEP });
   await client.getOrganization();
   await client.getSubscription();
 
@@ -354,7 +356,7 @@ test("AzureAuditorClient acquires tokens via the documented client credentials g
 });
 
 // Prototype members that do not issue a Graph or ARM request; every other client method must appear in the URL assertions below.
-const NON_REQUEST_CLIENT_MEMBERS = new Set(["constructor", "getToken", "parseJsonBody", "send", "getResolvedConfig", "getNow", "getCloud", "requestJson", "collectPages", "collectGraph", "collectArm", "graph", "arm"]);
+const NON_REQUEST_CLIENT_MEMBERS = new Set(["constructor", "getToken", "requestToken", "parseJsonBody", "send", "getResolvedConfig", "getNow", "getCloud", "requestJson", "collectPages", "collectGraph", "collectArm", "graph", "arm"]);
 
 test("AzureAuditorClient sends the documented request URL and API version for every request method", async () => {
   const requests = [];
@@ -362,7 +364,7 @@ test("AzureAuditorClient sends the documented request URL and API version for ev
     requests.push({ url, init });
     return new Response(JSON.stringify({ value: [] }), { status: 200 });
   };
-  const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW });
+  const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW, sleepImpl: NO_SLEEP });
   const sub = "https://management.azure.com/subscriptions/sub-123";
   const graph = "https://graph.microsoft.com/v1.0";
   const graphBeta = "https://graph.microsoft.com/beta";
@@ -440,7 +442,7 @@ test("pagination follows @odata.nextLink and nextLink to completion and records 
     if (url.includes("graph")) return new Response(JSON.stringify({ "@odata.count": 2, value: [{ id: "a" }], "@odata.nextLink": "https://graph.microsoft.com/v1.0/subscribedSkus?page=2" }), { status: 200 });
     return new Response(JSON.stringify({ value: [{ id: "arm-a" }], nextLink: "https://management.azure.com/next?page=2" }), { status: 200 });
   };
-  const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW });
+  const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW, sleepImpl: NO_SLEEP });
   const graphPage = await client.listSubscribedSkus();
   assert.deepEqual(graphPage.items.map((item) => item.id), ["a", "b"]);
   assert.equal(graphPage.truncated, false);
@@ -472,7 +474,7 @@ test("rule 10: a next link that repeats or arrives with an empty page exits as t
       // The server keeps handing back the same page URL; without a guard this walk never ends.
       return new Response(JSON.stringify({ value: [{ id: `sku-${graphCalls.length}` }], "@odata.nextLink": "https://graph.microsoft.com/v1.0/subscribedSkus?$skiptoken=same" }), { status: 200 });
     },
-    now: () => NOW,
+    now: () => NOW, sleepImpl: NO_SLEEP,
   });
   const repeated = await repeating.listSubscribedSkus();
   assert.equal(graphCalls.length, 2, "the first page follows the link once, the repeat stops the walk");
@@ -488,7 +490,7 @@ test("rule 10: a next link that repeats or arrives with an empty page exits as t
       // Each later page is empty but still advertises a fresh next link.
       return new Response(JSON.stringify({ value: [], nextLink: `https://management.azure.com/next?page=${armCalls.length + 1}` }), { status: 200 });
     },
-    now: () => NOW,
+    now: () => NOW, sleepImpl: NO_SLEEP,
   });
   const empty = await emptyPages.listKeyVaults();
   assert.equal(armCalls.length, 2);
@@ -610,7 +612,7 @@ test("rule 9: a next link that leaves the configured origin is refused before an
     for (const [variant, [link, reason]] of Object.entries(variants.refused)) {
       const label = `${walk} (${variant})`;
       const calls = [];
-      const client = new AzureAuditorClient(sampleConfig(), { fetchImpl: plantedNextLinkFetch(new URL(firstPage).pathname, linkField, link, calls), now: () => NOW });
+      const client = new AzureAuditorClient(sampleConfig(), { fetchImpl: plantedNextLinkFetch(new URL(firstPage).pathname, linkField, link, calls), now: () => NOW, sleepImpl: NO_SLEEP });
       const page = await list(client);
       assert.equal(calls.length, 1, `${label}: only the first page is requested; the planted link never reaches the transport`);
       assert.equal(new URL(calls[0].url).pathname, new URL(firstPage).pathname, `${label}: the one request is the first page`);
@@ -624,7 +626,7 @@ test("rule 9: a next link that leaves the configured origin is refused before an
     for (const [variant, link] of Object.entries(variants.followed)) {
       const label = `${walk} (${variant})`;
       const calls = [];
-      const client = new AzureAuditorClient(sampleConfig(), { fetchImpl: plantedNextLinkFetch(new URL(firstPage).pathname, linkField, link, calls), now: () => NOW });
+      const client = new AzureAuditorClient(sampleConfig(), { fetchImpl: plantedNextLinkFetch(new URL(firstPage).pathname, linkField, link, calls), now: () => NOW, sleepImpl: NO_SLEEP });
       const page = await list(client);
       assert.equal(calls.length, 2, `${label}: the same-origin control page is followed`);
       assert.equal(new URL(calls[1].url).origin, new URL(firstPage).origin, `${label}: the control request stays on the configured origin`);
@@ -639,7 +641,7 @@ test("rule 9: a next link that leaves the configured origin is refused before an
   // The rule also sits in front of the transport itself, so a URL that reaches the request path from anywhere else
   // is refused with fixed text naming the configured base, not the target, and no request (token included) is made.
   let transportCalls = 0;
-  const guarded = new AzureAuditorClient(sampleConfig(), { fetchImpl: async () => { transportCalls += 1; return new Response("{}", { status: 200 }); }, now: () => NOW });
+  const guarded = new AzureAuditorClient(sampleConfig(), { fetchImpl: async () => { transportCalls += 1; return new Response("{}", { status: 200 }); }, now: () => NOW, sleepImpl: NO_SLEEP });
   for (const [resource, base] of [["graph", "https://graph.microsoft.com"], ["management", "https://management.azure.com"]]) {
     const foreign = `https://${FOREIGN_NEXT_HOST}/${NEXT_LINK_PATH_CANARY}?$skiptoken=${NEXT_LINK_QUERY_CANARY}`;
     const error = await guarded.requestJson(foreign, resource).then(() => undefined, (thrown) => thrown);
@@ -673,7 +675,7 @@ test("rule 9: a refused next link on a probed surface leaves the access check, t
     }
     return routed(url, init);
   };
-  const client = new AzureAuditorClient(config, { fetchImpl, now: () => NOW });
+  const client = new AzureAuditorClient(config, { fetchImpl, now: () => NOW, sleepImpl: NO_SLEEP });
   const { access, assessments, exported } = await runEveryAzureTool(client, config, createTempBase("grclanker-azure-next-link-"));
 
   assert.deepEqual(foreignRequests, [], "no request leaves the configured origins, credentialed or not");
@@ -757,7 +759,7 @@ test("rule 9: API error bodies are reduced to the documented error envelope befo
     }
     return new Response(JSON.stringify({ error: { code: "Authorization_RequestDenied", message: "Insufficient privileges to complete the operation.", innerError: { echo: leakedMarker } } }), { status: 403, statusText: "Forbidden" });
   };
-  const tokenClient = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW });
+  const tokenClient = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW, sleepImpl: NO_SLEEP });
   await assert.rejects(tokenClient.listSubscribedSkus(), (error) => {
     assert.equal(error.name, "AzureApiError");
     assert.equal(error.status, 403);
@@ -770,7 +772,7 @@ test("rule 9: API error bodies are reduced to the documented error envelope befo
     { AZURE_TENANT_ID: "tenant-1", AZURE_SUBSCRIPTION_ID: "sub-1", AZURE_CLIENT_ID: "client-1", AZURE_CLIENT_SECRET: AZURE_TOKEN_TEST_SECRET_CANARY },
     () => undefined,
   );
-  await assert.rejects(new AzureAuditorClient(credentialConfig, { fetchImpl, now: () => NOW }).getOrganization(), (error) => {
+  await assert.rejects(new AzureAuditorClient(credentialConfig, { fetchImpl, now: () => NOW, sleepImpl: NO_SLEEP }).getOrganization(), (error) => {
     assert.equal(error.message, "Token request failed: 401 Unauthorized: invalid_client: AADSTS7000215: Invalid client secret provided.");
     assertNoCanaryWindows(assert, error.message, [leakedMarker, AZURE_TOKEN_TEST_SECRET_CANARY], "token endpoint error");
     return true;
@@ -783,7 +785,7 @@ test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrie
     { AZURE_TENANT_ID: "tenant-123", AZURE_SUBSCRIPTION_ID: "sub-123", AZURE_CLIENT_ID: "client-123", AZURE_CLIENT_SECRET: ENCODED_FORM_SECRET },
     () => undefined,
   );
-  new AzureAuditorClient(config, { fetchImpl: async () => new Response("{}"), now: () => NOW });
+  new AzureAuditorClient(config, { fetchImpl: async () => new Response("{}"), now: () => NOW, sleepImpl: NO_SLEEP });
   assertScrubBoundary(assert, redactErrorText, {
     configuredSecret: ENCODED_FORM_SECRET,
     mustKeep: [
@@ -935,11 +937,11 @@ test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-
   const expectedTail = "\\nCookie: [REDACTED]\\u000aX-Auth-Key: [REDACTED]";
   const config = sampleConfig();
   const probed = new Set();
-  await checkAzureAccess(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), probed), now: () => NOW }));
+  await checkAzureAccess(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), probed), now: () => NOW, sleepImpl: NO_SLEEP }));
   const surface = [...probed].find((path) => path !== AZURE_TOKEN_PATH);
   assert.ok(surface, "the access check probes a resource surface");
   const respond = () => new Response(JSON.stringify({ error: { code: "AuthorizationFailed", message } }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
-  const access = await checkAzureAccess(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: respond }), now: () => NOW }));
+  const access = await checkAzureAccess(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: respond }), now: () => NOW, sleepImpl: NO_SLEEP }));
   const failed = access.surfaces.filter((entry) => entry.status === "not_readable");
   assert.ok(failed.length > 0, "the access check records the failing surface");
   assert.ok(failed.some((entry) => entry.error.includes(expectedTail)), `both carriers are removed whole after their escapes: ${JSON.stringify(failed.map((entry) => entry.error))}`);
@@ -953,7 +955,7 @@ test("rule 9 depth control (reviewer D round 5 depth control): every string a sn
   assertDepthControl(assert, (tree) => scrubSnapshotValue({ value: [tree] }).value[0], { label: "azure.scrubSnapshotValue under a Graph page", rootDepth: 3 });
   // The string half on its own: carriers go, identifiers stay (a tenant or role template UUID among them), the configured tokens go in every form.
   const config = sampleConfig({ graphToken: "GraphTok3nQz8Nv3Tm5Rk2Wy7Lp4", managementToken: "ArmTok3nHx9Pl2Vt7Rb4Kn6Mc1" });
-  new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes()), now: () => NOW });
+  new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes()), now: () => NOW, sleepImpl: NO_SLEEP });
   assertCarrierTextScrub(assert, redactCarrierText, { label: "azure.redactCarrierText", configuredSecret: config.graphToken });
   assert.equal(redactCarrierText(`note: ${config.managementToken}`), "note: [REDACTED]", "the ARM token is a configured secret too");
 
@@ -962,7 +964,7 @@ test("rule 9 depth control (reviewer D round 5 depth control): every string a sn
   // so no bundle file, zip entry, or tool payload carries a trace of it.
   const planted = { count: 0 };
   const run = await runEveryAzureTool(
-    new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(withPlantedRoutes(healthyAzureRoutes(), { planted, skip: [AZURE_TOKEN_PATH] })), now: () => NOW }),
+    new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(withPlantedRoutes(healthyAzureRoutes(), { planted, skip: [AZURE_TOKEN_PATH] })), now: () => NOW, sleepImpl: NO_SLEEP }),
     config,
     createTempBase("grclanker-azure-depth-"),
   );
@@ -1050,7 +1052,7 @@ test("rule 9: service principal and application credential records keep only sch
   assert.deepEqual(projectCredentialCarrier({ id: "sp-2" }), { id: "sp-2", passwordCredentials: [], keyCredentials: [] });
 
   const fetchImpl = async () => new Response(JSON.stringify({ value: [{ id: "sp-1", displayName: "App", appId: "app-1", passwordCredentials: [rawCredential], keyCredentials: [rawKey] }] }), { status: 200 });
-  const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW });
+  const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW, sleepImpl: NO_SLEEP });
   for (const page of [await client.listServicePrincipals(), await client.listApplications()]) {
     const serialized = JSON.stringify(page);
     assertNoCanaryWindows(assert, serialized, Object.values(AZURE_RAW_CREDENTIAL_CANARIES), "collected credential carrier");
@@ -1106,7 +1108,7 @@ test("rule 10: checkAzureAccess keeps the truncated flag on a capped probe so it
   assert.equal(result.surfaces.find((surface) => surface.name === "security_contacts").truncated, undefined);
 });
 
-test("rule 10: AZURE-MON-04 and AZURE-MON-05 cap at warn on a truncated pricing or diagnostic settings page", async () => {
+test("rule 10: AZURE-MON-04, AZURE-MON-05, and AZURE-MON-06 cap at warn on a truncated pricing or diagnostic settings page", async () => {
   const baseline = statusesById(await assessAzureMonitoring(compliantClient()));
   assert.equal(baseline["AZURE-MON-04"], "pass");
   assert.equal(baseline["AZURE-MON-05"], "pass");
@@ -1125,9 +1127,12 @@ test("rule 10: AZURE-MON-04 and AZURE-MON-05 cap at warn on a truncated pricing 
   assert.equal(diagnostics.status, "warn");
   assert.match(diagnostics.summary, /Inventory of diagnostic settings is partial \(1 seen of 3 total\); verdict capped at warn\./);
   assert.deepEqual({ seen: diagnostics.evidence.seen, total: diagnostics.evidence.total, truncated: diagnostics.evidence.truncated }, { seen: 1, total: 3, truncated: true });
+  // A diagnostic setting past the last page read may send the Activity Log to a workspace this run never checked.
   const retention = result.findings.find((item) => item.id === "AZURE-MON-06");
-  assert.equal(retention.status, "pass", "parent-parity limitation: diagnostic-settings truncation does not cap AZURE-MON-06");
-  assert.equal(retention.summary, "1/1 linked Log Analytics workspaces retain data for 90+ days.");
+  assert.equal(baseline["AZURE-MON-06"], "pass");
+  assert.equal(retention.status, "warn");
+  assert.equal(retention.summary, "1/1 linked Log Analytics workspaces retain data for 90+ days. Inventory of diagnostic settings is partial (1 seen of 3 total); verdict capped at warn.");
+  assert.equal(retention.evidence.diagnostic_settings_truncated, true);
   // A non-compliant page is still fail or warn on its own merits, never masked by the cap.
   const mixed = clientWith({ ...compliantClient(), async listDefenderPricings() { return { items: [{ properties: { pricingTier: "Standard" } }, { properties: { pricingTier: "Free" } }], truncated: true, seen: 2 }; } });
   assert.equal((await assessAzureMonitoring(mixed)).findings.find((item) => item.id === "AZURE-MON-04").status, "warn");
@@ -1779,7 +1784,7 @@ test("rule 9: the exported bundle and its zip never contain tokens, the client s
     { AZURE_TENANT_ID: "tenant-123", AZURE_SUBSCRIPTION_ID: "sub-123", AZURE_CLIENT_ID: "client-123", AZURE_CLIENT_SECRET: FAKE_AZURE_SECRETS.clientSecret },
     () => undefined,
   );
-  const client = new AzureAuditorClient(config, { fetchImpl: secretBearingFetch(), now: () => NOW });
+  const client = new AzureAuditorClient(config, { fetchImpl: secretBearingFetch(), now: () => NOW, sleepImpl: NO_SLEEP });
   const base = createTempBase("grclanker-azure-secrets-");
   const result = await exportAzureAuditBundle(client, config, base);
 
@@ -1907,7 +1912,7 @@ test("fixture self-check: every planted canary is alphanumeric and random-lookin
   const legitimate = new Map();
   for (const [key, route] of Object.entries(healthyAzureRoutes())) legitimate.set(`route ${key}`, await route().text());
   const config = sampleConfig();
-  const run = await runEveryAzureTool(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes()), now: () => NOW }), config, createTempBase("grclanker-azure-self-check-"));
+  const run = await runEveryAzureTool(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes()), now: () => NOW, sleepImpl: NO_SLEEP }), config, createTempBase("grclanker-azure-self-check-"));
   legitimate.set("check_access", run.access);
   for (const assessment of run.assessments) legitimate.set(assessment.title, assessment);
   for (const [name, text] of readBundleFiles(run.exported.outputDir)) legitimate.set(`bundle ${name}`, text);
@@ -1922,15 +1927,15 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
 
   // The healthy run proves the route table is the surface list: every route is requested and nothing else is.
   const healthySeen = new Set();
-  const healthy = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), healthySeen), now: () => NOW });
+  const healthy = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), healthySeen), now: () => NOW, sleepImpl: NO_SLEEP });
   const healthyRun = await runEveryAzureTool(healthy, config, outputRoot);
   assert.equal(healthyRun.exported.errorCount, 0, "the healthy fixture records no errors");
   const surfaces = Object.keys(healthyAzureRoutes());
   assert.deepEqual([...healthySeen].sort(), [...surfaces].sort(), "every documented surface is exercised by the access check, the collectors, or the export");
   const accessSurfaces = new Set();
-  await checkAzureAccess(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), accessSurfaces), now: () => NOW }));
+  await checkAzureAccess(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), accessSurfaces), now: () => NOW, sleepImpl: NO_SLEEP }));
   const collectorSurfaces = new Set();
-  const collectorClient = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), collectorSurfaces), now: () => NOW });
+  const collectorClient = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(healthyAzureRoutes(), collectorSurfaces), now: () => NOW, sleepImpl: NO_SLEEP });
   for (const [, assess] of ASSESSORS) await assess(collectorClient);
   assert.equal(accessSurfaces.size, 9, "the access check probes eight surfaces plus the token endpoint");
   assert.ok(collectorSurfaces.size >= surfaces.length - 1, "every surface but the organization probe is read by a collector");
@@ -1941,7 +1946,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       ["json", () => canaryJsonResponse(surface), REDACTED_CANARY_URL],
     ]) {
       const label = `${surface} (${variant})`;
-      const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: response }), now: () => NOW });
+      const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: response }), now: () => NOW, sleepImpl: NO_SLEEP });
       const { access, assessments, exported } = await runEveryAzureTool(client, config, createTempBase("grclanker-azure-canary-"));
 
       assertNoCanaryWindows(assert, access, AZURE_PLANTED_CANARIES, `${label} check_access`);
@@ -1978,7 +1983,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       assertNoCanaryWindowsInFiles(assert, readZipEntries(exported.zipPath), AZURE_PLANTED_CANARIES, `${label} zip`);
       if (recorded.length > 0) {
         assert.ok(exported.errorCount > 0, `${label}: the export logs the failed read`);
-        if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes\)/);
+        if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway after 4 attempts: non-JSON body \(text\/html, \d+ bytes\)/);
       }
     }
   }
@@ -2006,7 +2011,7 @@ test("denied-list markers: a denied surface keeps count and truncated null in ac
   const surfaces = Object.keys(healthyAzureRoutes()).filter((surface) => surface !== AZURE_TOKEN_PATH);
 
   for (const surface of surfaces) {
-    const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: forbiddenAzureResponse }), now: () => NOW });
+    const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: forbiddenAzureResponse }), now: () => NOW, sleepImpl: NO_SLEEP });
     const { access, assessments, exported } = await runEveryAzureTool(client, config, outputRoot);
     const files = readBundleFiles(exported.outputDir);
     const accessFile = JSON.parse(files.get("core_data/access.json"));
@@ -2092,7 +2097,7 @@ test("request matching: every endpoint, request URL, and HTTP status named in an
     [`${AZURE_SUB}/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_eastus/flowLogs`]: () =>
       new Response(JSON.stringify({ error: { code: "AuthorizationFailed", message: "denied" } }), { status: 403, statusText: "Forbidden" }),
   };
-  const client = new AzureAuditorClient(config, { fetchImpl: recordingAzureFetch(routes, log), now: () => NOW });
+  const client = new AzureAuditorClient(config, { fetchImpl: recordingAzureFetch(routes, log), now: () => NOW, sleepImpl: NO_SLEEP });
   const { access, assessments, exported } = await runEveryAzureTool(client, config, outputRoot);
 
   const outputs = [JSON.stringify(access), ...assessments.map((assessment) => JSON.stringify(assessment)), ...readBundleFiles(exported.outputDir).values()];
@@ -2134,7 +2139,7 @@ test("request matching: a token-endpoint denial is attributed to POST /<tenant>/
     const outputRoot = createTempBase("grclanker-azure-token-denied-");
     const log = [];
     const routes = { ...healthyAzureRoutes(), [AZURE_TOKEN_PATH]: refusedTokenResponse(status, statusText) };
-    const client = new AzureAuditorClient(config, { fetchImpl: recordingAzureFetch(routes, log), now: () => NOW });
+    const client = new AzureAuditorClient(config, { fetchImpl: recordingAzureFetch(routes, log), now: () => NOW, sleepImpl: NO_SLEEP });
     const { access, assessments, exported } = await runEveryAzureTool(client, config, outputRoot);
     const label = `token ${status}`;
 
@@ -2318,7 +2323,7 @@ test("access check: when every probe is refused for its credentials (a 401, or a
   ];
   for (const { label, input, env, routes, status, next } of cases) {
     const config = resolveAzureConfiguration(input, env, () => undefined);
-    const access = await checkAzureAccess(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(routes), now: () => NOW }));
+    const access = await checkAzureAccess(new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(routes), now: () => NOW, sleepImpl: NO_SLEEP }));
     assert.equal(access.status, status, `${label}: ${JSON.stringify(access.surfaces.map((probe) => [probe.name, probe.http_status]))}`);
     assert.equal(access.recommendedNextStep, next, label);
     assertNoCanaryWindows(assert, JSON.stringify(access), AZURE_REJECTED_CANARIES, `${label} access result`);
@@ -2343,7 +2348,7 @@ test("request matching (Codex P2): a token request rejected before any response 
       log.push({ method: init?.method ?? "GET", url: String(url).split("?")[0], status: null });
       throw reject();
     };
-    const client = new AzureAuditorClient(config, { fetchImpl, now: () => NOW });
+    const client = new AzureAuditorClient(config, { fetchImpl, now: () => NOW, sleepImpl: NO_SLEEP });
     const { access, assessments, exported } = await runEveryAzureTool(client, config, outputRoot);
 
     // The only request the run made is the token request, and it produced no response.
@@ -2367,11 +2372,11 @@ test("request matching (Codex P2): a token request rejected before any response 
     for (const probe of access.surfaces) {
       assert.equal(probe.status, "not_readable", `${label}: probe ${probe.name} is not readable`);
       assert.deepEqual({ count: probe.count, truncated: probe.truncated, http_status: probe.http_status, request_url: probe.request_url }, { count: null, truncated: null, http_status: null, request_url: AZURE_TOKEN_URL }, `${label}: probe ${probe.name} records the token request without a status`);
-      assert.match(probe.error, new RegExp(`^Token request failed: no response \\(${detail.source.slice(1, -1)}\\)$`), `${label}: probe ${probe.name} records the shape of the transport failure: ${probe.error}`);
+      assert.match(probe.error, new RegExp(`^Token request failed: no response after 4 attempts \\(${detail.source.slice(1, -1)}\\)$`), `${label}: probe ${probe.name} records the retries and the shape of the transport failure: ${probe.error}`);
     }
-    const note = access.notes.find((item) => item.startsWith(`POST ${AZURE_TOKEN_PATH} received no response (`));
-    assert.ok(note, `${label}: the access check note names the token request and says no response arrived: ${JSON.stringify(access.notes)}`);
-    assert.match(note, /\); no resource request was made for organization, conditional_access, directory_roles, secure_scores, defender_pricings, role_assignments, diagnostic_settings, security_contacts\.$/, `${label}: the note lists every probe that never reached its resource`);
+    const note = access.notes.find((item) => item.startsWith(`POST ${AZURE_TOKEN_PATH} received no response after 4 attempts (`));
+    assert.ok(note, `${label}: the access check note names the token request and says no response arrived after every attempt: ${JSON.stringify(access.notes)}`);
+    assert.match(note, new RegExp(`\\(${detail.source.slice(1, -1)}\\); no resource request was made for organization, conditional_access, directory_roles, secure_scores, defender_pricings, role_assignments, diagnostic_settings, security_contacts\\.$`), `${label}: the note keeps the whole transport detail and lists every probe that never reached its resource`);
     assert.equal(access.recommendedNextStep, "Restore network access to login.microsoftonline.com (DNS, TLS, proxy) so the token request receives a response, then re-run the access check.", `${label}: the next step is the network path`);
 
     // Findings: every finding that recorded the failure names the token request, carries no status, and carries the not-attempted marker.
@@ -2383,13 +2388,13 @@ test("request matching (Codex P2): a token request rejected before any response 
       assert.equal(item.evidence.endpoint, `POST ${AZURE_TOKEN_PATH}`, `${label}: ${item.id} names the token request as the failed request`);
       assert.equal(item.evidence.http_status, null, `${label}: ${item.id} records no status`);
       assert.match(item.evidence.resource_request, /^not attempted: the token request failed, so no (Microsoft Graph|Azure Resource Manager) request was made$/, `${label}: ${item.id} carries the not-attempted marker`);
-      assert.match(item.summary, new RegExp(`^POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")} received no response \\(${detail.source.slice(1, -1)}\\), so no (Microsoft Graph|Azure Resource Manager) request was made for this finding\\. Restore network access to login\\.microsoftonline\\.com \\(DNS, TLS, proxy\\) so the token request receives a response; the read then needs `), `${label}: ${item.id} summary names the token request and the network remedy: ${item.summary}`);
+      assert.match(item.summary, new RegExp(`^POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")} received no response after 4 attempts \\(${detail.source.slice(1, -1)}\\), so no (Microsoft Graph|Azure Resource Manager) request was made for this finding\\. Restore network access to login\\.microsoftonline\\.com \\(DNS, TLS, proxy\\) so the token request receives a response; the read then needs `), `${label}: ${item.id} summary names the token request and the network remedy: ${item.summary}`);
       assert.doesNotMatch(item.summary, /^GET |Grant |returned/, `${label}: ${item.id} neither attributes the failure to its resource endpoint nor says the token endpoint returned anything`);
       assert.equal(typeof item.evidence.required_access, "string", `${label}: ${item.id} still records the permission the read will need`);
     }
     for (const assessment of assessments) {
       for (const error of assessment.errors) {
-        assert.match(error, new RegExp(`^AZURE-[A-Z]+-\\d+ POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")} received no response \\(${detail.source.slice(1, -1)}\\); no (Microsoft Graph|Azure Resource Manager) request was made$`), `${label}: the errors array names the token request: ${error}`);
+        assert.match(error, new RegExp(`^AZURE-[A-Z]+-\\d+ POST ${AZURE_TOKEN_PATH.replace(/[.]/g, "\\.")} received no response after 4 attempts \\(${detail.source.slice(1, -1)}\\); no (Microsoft Graph|Azure Resource Manager) request was made$`), `${label}: the errors array names the token request: ${error}`);
       }
     }
     assert.ok(exported.errorCount >= 30, `${label}: the export logs every failed read`);
@@ -2401,18 +2406,191 @@ test("request matching (Codex P2): a Graph request rejected before any response 
   const config = canaryConfig();
   const [, reject, detail] = AZURE_TRANSPORT_REJECTIONS[0];
   const routes = { ...healthyAzureRoutes(), "/v1.0/identity/conditionalAccess/policies": async () => { throw reject(); } };
-  const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(routes), now: () => NOW });
+  const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch(routes), now: () => NOW, sleepImpl: NO_SLEEP });
   const identity = await assessAzureIdentity(client);
   const finding = identity.findings.find((item) => item.id === "AZURE-ID-01");
   assert.equal(finding.status, "manual");
-  assert.match(finding.summary, new RegExp(`^GET /v1\\.0/identity/conditionalAccess/policies received no response \\(${detail.source.slice(1, -1)}\\)\\. Restore network access to graph\\.microsoft\\.com \\(DNS, TLS, proxy\\) and re-run; the read needs Policy\\.Read\\.All\\. Or collect `), finding.summary);
+  assert.match(finding.summary, new RegExp(`^GET /v1\\.0/identity/conditionalAccess/policies received no response after 4 attempts \\(${detail.source.slice(1, -1)}\\)\\. Restore network access to graph\\.microsoft\\.com \\(DNS, TLS, proxy\\) and re-run; the read needs Policy\\.Read\\.All\\. Or collect `), finding.summary);
   assert.doesNotMatch(finding.summary, /Grant |returned/);
   assert.deepEqual(
     { endpoint: finding.evidence.endpoint, http_status: finding.evidence.http_status, request_url: finding.evidence.request_url, resource_request: finding.evidence.resource_request },
     { endpoint: "GET /v1.0/identity/conditionalAccess/policies", http_status: null, request_url: "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies", resource_request: undefined },
   );
-  assert.match(finding.evidence.error, new RegExp(`^no response \\(${detail.source.slice(1, -1)}\\)$`));
-  assert.ok(identity.errors.some((error) => error === `AZURE-ID-01 GET /v1.0/identity/conditionalAccess/policies: no response (${detail.source.slice(1, -1).replace(/\\/g, "")})`), JSON.stringify(identity.errors));
+  assert.match(finding.evidence.error, new RegExp(`^no response after 4 attempts \\(${detail.source.slice(1, -1)}\\)$`));
+  assert.ok(identity.errors.some((error) => error === `AZURE-ID-01 GET /v1.0/identity/conditionalAccess/policies: no response after 4 attempts (${detail.source.slice(1, -1).replace(/\\/g, "")})`), JSON.stringify(identity.errors));
+});
+
+const CA_PATH = "/v1.0/identity/conditionalAccess/policies";
+const PRICINGS_PATH = `${AZURE_SUB}/providers/Microsoft.Security/pricings`;
+const THROTTLED_BODY = JSON.stringify({ error: { code: "TooManyRequests", message: "Too many requests." } });
+
+/** A route that gives `answers` in order and then repeats the last one, counting the requests it served. */
+function answerSequence(...answers) {
+  let calls = 0;
+  const route = () => answers[Math.min(calls++, answers.length - 1)]();
+  Object.defineProperty(route, "calls", { get: () => calls });
+  return route;
+}
+
+/** A client over `fetchImpl` whose retry waits are recorded instead of slept. */
+function recordingClient(fetchImpl, options = {}, config = sampleConfig()) {
+  const waits = [];
+  const client = new AzureAuditorClient(config, { fetchImpl, now: () => NOW, sleepImpl: async (ms) => { waits.push(ms); }, ...options });
+  return { client, waits };
+}
+
+const RETRYABLE_STATUS_TEXT = { 429: "Too Many Requests", 500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout" };
+const throttled = (status = 429, headers = {}) => () => new Response(THROTTLED_BODY, { status, statusText: RETRYABLE_STATUS_TEXT[status], headers: { "content-type": "application/json", ...headers } });
+const listOf = (value) => () => new Response(JSON.stringify({ value }), { status: 200 });
+
+test("bounded retries: a read answered 429, 500, 502, 503, or 504 is retried after 1 s and then 2 s and returns the answer that finally succeeds, while a 400, 401, 403, or 404 is answered once with no wait", async () => {
+  for (const status of [429, 500, 502, 503, 504]) {
+    const route = answerSequence(throttled(status), throttled(status), listOf([CA_MFA]));
+    const { client, waits } = recordingClient(azureRoutedFetch({ [CA_PATH]: route }));
+    const page = await client.listConditionalAccessPolicies();
+    assert.deepEqual({ ids: page.items.map((item) => item.id), truncated: page.truncated }, { ids: ["ca-mfa"], truncated: false }, `${status}`);
+    assert.equal(route.calls, 3, `${status}: two failed attempts and the one that succeeded`);
+    assert.deepEqual(waits, [1000, 2000], `${status}: the backoff doubles from 1 s`);
+  }
+  for (const status of [400, 401, 403, 404]) {
+    const route = answerSequence(() => new Response(JSON.stringify({ error: { code: "Denied", message: "Not allowed." } }), { status, headers: { "content-type": "application/json" } }));
+    const { client, waits } = recordingClient(azureRoutedFetch({ [CA_PATH]: route }));
+    await assert.rejects(() => client.listConditionalAccessPolicies(), (error) => error instanceof AzureApiError && error.status === status && !error.message.includes("attempts"), `${status}`);
+    assert.deepEqual({ calls: route.calls, waits }, { calls: 1, waits: [] }, `${status} is not retried`);
+  }
+});
+
+test("bounded retries: a read still throttled after four attempts fails closed: every finding that needed it is manual, says the read is incomplete and why, recommends waiting rather than a grant, and nothing renders the missing policies", async () => {
+  const route = answerSequence(throttled(429));
+  const { client, waits } = recordingClient(azureRoutedFetch({ ...healthyAzureRoutes(), [CA_PATH]: route }));
+  const identity = await assessAzureIdentity(client);
+  assert.equal(route.calls, 4, "one request and three retries");
+  assert.deepEqual(waits, [1000, 2000, 4000]);
+
+  const dependent = identity.findings.filter((item) => item.evidence?.request_url === `https://graph.microsoft.com${CA_PATH}`);
+  assert.deepEqual(dependent.map((item) => item.id).sort(), ["AZURE-ID-01", "AZURE-ID-02", "AZURE-ID-09", "AZURE-ID-10"]);
+  for (const item of dependent) {
+    assert.equal(item.status, "manual", item.id);
+    assert.equal(item.evidence.http_status, 429, item.id);
+    assert.equal(item.evidence.error, "429 Too Many Requests after 4 attempts: TooManyRequests: Too many requests.", item.id);
+    assert.match(item.summary, /^GET \/v1\.0\/identity\/conditionalAccess\/policies returned 429 Too Many Requests after 4 attempts: TooManyRequests: Too many requests, so this read is incomplete\. Wait for Microsoft Graph to stop throttling or failing the request, then re-run; the read needs /, `${item.id}: ${item.summary}`);
+    assert.doesNotMatch(item.summary, /Grant /, `${item.id}: throttling is not a permission gap`);
+  }
+  assert.ok(identity.errors.includes(`AZURE-ID-01 GET ${CA_PATH}: 429 Too Many Requests after 4 attempts: TooManyRequests: Too many requests.`), JSON.stringify(identity.errors));
+});
+
+test("bounded retries: Retry-After in delta-seconds or as an HTTP date sets the wait, and one above 30 s ends the read at once with the requested wait named in the finding", async () => {
+  const seconds = answerSequence(throttled(429, { "retry-after": "7" }), listOf([]));
+  const bySeconds = recordingClient(azureRoutedFetch({ [CA_PATH]: seconds }));
+  await bySeconds.client.listConditionalAccessPolicies();
+  assert.deepEqual({ calls: seconds.calls, waits: bySeconds.waits }, { calls: 2, waits: [7000] });
+
+  const dated = answerSequence(throttled(503, { "retry-after": new Date(NOW.getTime() + 12_000).toUTCString() }), listOf([]));
+  const byDate = recordingClient(azureRoutedFetch({ [CA_PATH]: dated }));
+  await byDate.client.listConditionalAccessPolicies();
+  assert.deepEqual({ calls: dated.calls, waits: byDate.waits }, { calls: 2, waits: [12000] }, "the HTTP date is measured from the client's clock");
+
+  const refused = answerSequence(() => new Response("<html>busy</html>", { status: 503, statusText: "Service Unavailable", headers: { "content-type": "text/html", "retry-after": "120" } }));
+  const tooLong = recordingClient(azureRoutedFetch({ ...healthyAzureRoutes(), [PRICINGS_PATH]: refused }));
+  const monitoring = await assessAzureMonitoring(tooLong.client);
+  assert.deepEqual({ calls: refused.calls, waits: tooLong.waits }, { calls: 1, waits: [] }, "a wait above the limit is neither slept nor retried");
+  const finding = monitoring.findings.find((item) => item.id === "AZURE-MON-04");
+  assert.equal(finding.status, "manual");
+  assert.equal(finding.evidence.error, "503 Service Unavailable (the server asked to retry after 120 s, more than the 30 s limit): non-JSON body (text/html, 17 bytes)");
+  assert.match(finding.summary, /^GET Microsoft\.Security\/pricings returned 503 Service Unavailable \(the server asked to retry after 120 s, more than the 30 s limit\): non-JSON body \(text\/html, 17 bytes\), so this read is incomplete\. Wait for Azure Resource Manager to stop throttling or failing the request, then re-run; /, finding.summary);
+});
+
+test("bounded retries: an attempt with no answer within the per-request timeout is abandoned and retried, and after four attempts the finding records no response with the timeout and the network remedy", async () => {
+  let hung = 0;
+  const healthy = azureRoutedFetch(healthyAzureRoutes());
+  const fetchImpl = (url, init) => {
+    if (new URL(url).pathname !== CA_PATH) return healthy(url, init);
+    hung += 1;
+    return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+  };
+  const { client, waits } = recordingClient(fetchImpl, { requestTimeoutMs: 20 });
+  const identity = await assessAzureIdentity(client);
+  assert.deepEqual({ hung, waits }, { hung: 4, waits: [1000, 2000, 4000] });
+  const finding = identity.findings.find((item) => item.id === "AZURE-ID-01");
+  assert.equal(finding.status, "manual");
+  assert.deepEqual({ http_status: finding.evidence.http_status, error: finding.evidence.error }, { http_status: null, error: "no response after 4 attempts (TimeoutError: the request did not complete within 20 ms)" });
+  assert.match(finding.summary, /^GET \/v1\.0\/identity\/conditionalAccess\/policies received no response after 4 attempts \(TimeoutError: the request did not complete within 20 ms\)\. Restore network access to graph\.microsoft\.com \(DNS, TLS, proxy\) and re-run; /, finding.summary);
+});
+
+test("bounded retries: a later page that still fails after four attempts fails the whole read, so the pages before it are never reported as the inventory", async () => {
+  const firstPage = { value: [CA_MFA], "@odata.nextLink": `https://graph.microsoft.com${CA_PATH}?$skiptoken=page2` };
+  let laterPage = 0;
+  const healthy = azureRoutedFetch(healthyAzureRoutes());
+  const fetchImpl = async (url, init) => {
+    if (new URL(url).pathname !== CA_PATH) return healthy(url, init);
+    if (!String(url).includes("$skiptoken")) return new Response(JSON.stringify(firstPage), { status: 200 });
+    laterPage += 1;
+    return new Response("", { status: 503, statusText: "Service Unavailable" });
+  };
+  const { client, waits } = recordingClient(fetchImpl);
+  await assert.rejects(() => client.listConditionalAccessPolicies(), (error) => error instanceof AzureApiError && error.status === 503 && error.message === "503 Service Unavailable after 4 attempts");
+  assert.deepEqual({ laterPage, waits }, { laterPage: 4, waits: [1000, 2000, 4000] });
+
+  const identity = await assessAzureIdentity(client);
+  const finding = identity.findings.find((item) => item.id === "AZURE-ID-01");
+  assert.equal(finding.status, "manual");
+  assert.match(finding.summary, /^GET \/v1\.0\/identity\/conditionalAccess\/policies returned 503 Service Unavailable after 4 attempts, so this read is incomplete\. /, finding.summary);
+  assert.ok(!JSON.stringify(identity).includes(CA_MFA.displayName), "no policy from the page that did arrive is rendered");
+});
+
+test("bounded retries: reads that start together share one token request and its retries per resource, and a token request that failed is not kept, so the next call asks again", async () => {
+  const config = resolveAzureConfiguration({}, { AZURE_TENANT_ID: "tenant-123", AZURE_SUBSCRIPTION_ID: "sub-123", AZURE_CLIENT_ID: "client-123", AZURE_CLIENT_SECRET: "secret-value-123" }, () => undefined);
+  const scopes = [];
+  let tokenAnswer = () => new Response("", { status: 503, statusText: "Service Unavailable" });
+  const routes = { ...healthyAzureRoutes(), [AZURE_TOKEN_PATH]: () => tokenAnswer() };
+  const route = azureRoutedFetch(routes);
+  const fetchImpl = async (url, init) => {
+    if (new URL(url).pathname === AZURE_TOKEN_PATH) scopes.push(new URLSearchParams(init.body).get("scope"));
+    return route(url, init);
+  };
+  const { client } = recordingClient(fetchImpl, {}, config);
+
+  const unavailable = await checkAzureAccess(client);
+  assert.deepEqual([...scopes].sort(), [...Array(4).fill("https://graph.microsoft.com/.default"), ...Array(4).fill("https://management.azure.com/.default")], "eight probes, one four-attempt token request per resource");
+  assert.equal(unavailable.status, "limited");
+  for (const probe of unavailable.surfaces) assert.equal(probe.error, "Token request failed: 503 Service Unavailable after 4 attempts", probe.name);
+  assert.equal(unavailable.recommendedNextStep, "Wait for login.microsoftonline.com to stop throttling or failing the token request, then re-run the access check.");
+
+  scopes.length = 0;
+  tokenAnswer = healthyAzureRoutes()[AZURE_TOKEN_PATH];
+  const recovered = await checkAzureAccess(client);
+  assert.equal(recovered.status, "healthy");
+  assert.deepEqual([...scopes].sort(), ["https://graph.microsoft.com/.default", "https://management.azure.com/.default"], "the failure was not kept, and the eight probes shared one new token per resource");
+});
+
+test("bounded retries: an access probe that ran out of retries is reported as unknown rather than denied, and the next step waits or restores the network instead of granting access when nothing was denied", async () => {
+  const graphForbidden = () => new Response(JSON.stringify({ error: { code: "Authorization_RequestDenied", message: "Insufficient privileges." } }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
+  const accessWith = async (overrides) => {
+    const routes = { ...healthyAzureRoutes(), ...overrides };
+    return checkAzureAccess(recordingClient(azureRoutedFetch(routes)).client);
+  };
+
+  const one = await accessWith({ [CA_PATH]: throttled(429) });
+  assert.equal(one.status, "healthy", "seven of eight probes are readable");
+  assert.ok(one.notes.includes("This check is incomplete: the probes for conditional_access ran out of retries without an answer (each surface records its last error), so whether that surface is readable is unknown."), JSON.stringify(one.notes));
+
+  const surfaceRoutes = {
+    "/v1.0/organization": throttled(429), [CA_PATH]: throttled(429), "/v1.0/directoryRoles": throttled(503), "/v1.0/security/secureScores": throttled(503),
+    [PRICINGS_PATH]: throttled(429), [`${AZURE_SUB}/providers/Microsoft.Authorization/roleAssignments`]: throttled(503),
+    [`${AZURE_SUB}/providers/Microsoft.Insights/diagnosticSettings`]: throttled(429), [`${AZURE_SUB}/providers/Microsoft.Security/securityContacts`]: throttled(503),
+  };
+  const all = await accessWith(surfaceRoutes);
+  assert.equal(all.status, "limited");
+  assert.ok(all.notes.some((note) => note.startsWith("This check is incomplete: the probes for organization, conditional_access, directory_roles, secure_scores, defender_pricings, role_assignments, diagnostic_settings, security_contacts ran out of retries") && note.endsWith("so whether those surfaces are readable is unknown.")), JSON.stringify(all.notes));
+  assert.equal(all.recommendedNextStep, "Wait for Microsoft Graph and Azure Resource Manager to stop throttling or failing the requests, then re-run the access check.");
+
+  const mixed = await accessWith({ ...surfaceRoutes, "/v1.0/directoryRoles": graphForbidden });
+  assert.equal(mixed.recommendedNextStep, "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal. For the probes that ran out of retries, wait for Microsoft Graph and Azure Resource Manager to stop throttling or failing the requests, then re-run the access check.");
+  assert.ok(!mixed.notes.some((note) => note.includes("directory_roles")), "the denied probe is not reported as unanswered");
+
+  const denied = await accessWith(Object.fromEntries(Object.keys(surfaceRoutes).map((path) => [path, graphForbidden])));
+  assert.equal(denied.recommendedNextStep, "Grant Microsoft Graph read permissions and Azure Reader/Security Reader roles for the audit principal.");
+  assert.ok(!denied.notes.some((note) => note.startsWith("This check is incomplete")), "a denial is an answer about access");
 });
 
 test("verdict safety 8: re-running the export never overwrites a prior bundle and logs errors on partial failure", async () => {
@@ -2452,7 +2630,7 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
     throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
   };
   const note = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
-  const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW });
+  const client = new AzureAuditorClient(sampleConfig(), { fetchImpl, now: () => NOW, sleepImpl: NO_SLEEP });
 
   const access = await checkAzureAccess(client);
   const unreadable = access.surfaces.filter((surface) => surface.status === "not_readable");
@@ -2477,7 +2655,7 @@ test("config loader errors: a 200 answer whose body is short non-JSON text is re
   const config = sampleConfig();
   const surface = "/v1.0/directoryRoles";
   const seen = new Set();
-  const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: () => shortBodyResponse() }, seen), now: () => NOW });
+  const client = new AzureAuditorClient(config, { fetchImpl: azureRoutedFetch({ ...healthyAzureRoutes(), [surface]: () => shortBodyResponse() }, seen), now: () => NOW, sleepImpl: NO_SLEEP });
 
   // The thrown client error is fixed text: a scrub at the tool boundary would not protect a caller that logs it.
   await assert.rejects(() => client.listDirectoryRoles(), (error) => {

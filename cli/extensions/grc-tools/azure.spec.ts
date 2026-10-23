@@ -21,6 +21,7 @@ import {
   type Batch2CheckRow,
 } from "./batch2-spec-helpers.js";
 import { AZURE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
+import { CLOUD_RETRY_POLICY_TEXT, CLOUD_RETRYABLE_STATUSES } from "./cloud-retry.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const DOCS = "https://learn.microsoft.com/en-us/graph/api/overview";
@@ -218,7 +219,7 @@ function azureCompletenessSemantics(id: string, title: string): string {
     case "AZURE-MON-03":
       return "true after a readable sign-in response; sign-in pagination truncation leaves this primitive true.";
     case "AZURE-MON-06":
-      return "true when the Log Analytics workspace inventory is untruncated; diagnostic-settings truncation leaves this primitive true.";
+      return "true when the Log Analytics workspace inventory is untruncated; diagnostic-settings truncation leaves this primitive true and is carried by diagnostic_settings_truncation_present, which caps an otherwise passing finding at warn.";
     case "AZURE-SUB-04":
       return "true only after a readable Network Watcher response whose pagination reached the final page; truncation makes this primitive false and caps an otherwise passing finding at warn.";
     case "AZURE-DP-06":
@@ -236,7 +237,8 @@ interface AzureDecision {
 
 const AZURE_INPUT_DEFINITIONS: Readonly<Record<string, string>> = {
   readable: "Boolean collector state. True only when every Azure response and raw field required by this finding was returned and parseable; false, null, or missing means manual.",
-  complete: "Boolean collector state. True only when every required Microsoft Graph or Azure Resource Manager list exhausted continuation links; false is a lower bound and cannot support pass except for the documented AZURE-MON-06 limitation.",
+  complete: "Boolean collector state. True only when every required Microsoft Graph or Azure Resource Manager list exhausted continuation links; false is a lower bound and cannot support pass.",
+  diagnostic_settings_truncation_present: "Boolean collector state. False only when the subscription diagnostic-settings list reached its final page; true means settings beyond the last page read were never seen, and null or missing cannot support pass.",
   inventory_count: "Non-negative integer count over the complete primary source inventory before any 25-record evidence display slice; zero retains the check-specific empty-inventory semantics.",
   policy_readable: "Boolean. True only when the Conditional Access policy list was returned and parseable.",
   policy_count: "Non-negative integer count of all Conditional Access policies before evidence display slicing.",
@@ -464,10 +466,10 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     warn: incomplete,
     pass: gt("effective_setting_count", 0),
   }),
-  "AZURE-MON-06": countDecision(["destination_workspace_count", "linked_workspace_count", "workspace_retention_at_least_minimum_count"], {
+  "AZURE-MON-06": countDecision(["diagnostic_settings_truncation_present", "destination_workspace_count", "linked_workspace_count", "workspace_retention_at_least_minimum_count"], {
     manual: any(unreadable, all(gt("destination_workspace_count", 0), eq("linked_workspace_count", 0))),
     fail: any(eq("destination_workspace_count", 0), { op: "not", condition: comparePaths("eq", "workspace_retention_at_least_minimum_count", "linked_workspace_count") }),
-    warn: incomplete,
+    warn: any(incomplete, ne("diagnostic_settings_truncation_present", false)),
     pass: comparePaths("eq", "workspace_retention_at_least_minimum_count", "linked_workspace_count"),
   }, { minimum_retention_days: AZURE_MIN_RETENTION_DAYS }),
   "AZURE-SUB-01": countDecision(["matching_assignment_count", "warn_maximum"], {
@@ -640,13 +642,12 @@ export const AZURE_SPEC = buildBatchIntegrationSpec({
   }],
   rateLimit: {
     documentedLimit: "Service and endpoint specific",
-    retryHeaders: ["Retry-After", "x-ms-ratelimit-remaining-*"],
-    retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Honor bounded Retry-After and use bounded exponential retry; exhausted reads remain unreadable.",
+    retryHeaders: ["Retry-After"],
+    retryableStatuses: CLOUD_RETRYABLE_STATUSES,
+    backoffPolicy: CLOUD_RETRY_POLICY_TEXT,
   },
   runtimeBehavior: AZURE_RUNTIME_BEHAVIOR,
   knownGaps: [
-    "AZURE-MON-06 currently caps pass only when the Log Analytics workspace inventory is truncated. Diagnostic-settings truncation leaves complete true and can pass; a collector follow-up must make both dependencies completeness-gating.",
     "Certificate authentication, managed identity, several mailbox and device surfaces, alternate reporters, and standalone binaries are not shipped.",
   ],
   sensitiveFields: ["client_secret", "graph_token", "management_token", "access_token", "authorization", "cookie"],
