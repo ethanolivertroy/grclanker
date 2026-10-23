@@ -13,6 +13,7 @@ Most lists arrive through WARNING/URL continuations or QPS searches that stop at
 - The tool only reads. QPS searches are POST requests that change nothing, and the OAuth mode's token request to the platform gateway is the only other POST.
 - Lists stop at 5000 records and 25 pages unless the list states another cap; hosts and detections stop at host_limit and detection_limit.
 - A refused or failed read never counts as an empty list: the checks that need it are manual and name the read, and when Qualys answers that a module is unavailable the finding says the module may be unlicensed or the role not permitted.
+- A throttled or failed read is retried before it counts as failed: HTTP 409, 429, and 5xx answers, timeouts, and network errors get up to QUALYS_MAX_RETRIES more attempts, each waiting as long as X-RateLimit-ToWait-Sec or Retry-After asks, up to 30 seconds. A read that still fails names its endpoint, the status or the timeout, and the number of attempts.
 - The knowledge base is looked up only for the QIDs of open detections, 200 QIDs per request and at most 2000 QIDs.
 - The WAS scan history search runs only for web applications the lookback scan search did not resolve, and is recorded as not collected when no web application needed it or when an earlier WAS read failed.
 - Agent activation keys are read only to tell whether one is present and are never exported.
