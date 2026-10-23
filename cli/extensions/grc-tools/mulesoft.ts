@@ -391,12 +391,13 @@ export type MulesoftListResult = JsonRecord[] | MulesoftPage;
  * Anypoint's documented message, error_description, error, or errors[0].message, or the opaque-body
  * note); it is scrubbed in the constructor so no throw site can hand an unredacted body to a catch
  * block. `endpoint` is the request path, recorded so a not-collected marker can name the request.
+ * `status` is undefined when no response was observed (a timeout or a lost connection).
  */
 export class MulesoftApiError extends Error {
-  readonly status: number;
+  readonly status: number | undefined;
   readonly endpoint?: string;
 
-  constructor(status: number, message: string, endpoint?: string) {
+  constructor(status: number | undefined, message: string, endpoint?: string) {
     super(scrubErrorText(message));
     this.name = "MulesoftApiError";
     this.status = status;
@@ -1391,6 +1392,21 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+/** Retry-After in milliseconds: delta-seconds, or an HTTP-date measured against `now`; a past date is 0. */
+function retryAfterMs(value: string | null, now: number): number | undefined {
+  if (value === null) return undefined;
+  const seconds = asNumber(value);
+  if (seconds !== undefined) return Math.max(seconds * 1000, 0);
+  if (!/^(mon|tue|wed|thu|fri|sat|sun)/i.test(value.trim())) return undefined;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(date - now, 0) : undefined;
+}
+
+/** " after N attempts" once a request was retried, so a failure says how hard it was tried. */
+function attemptsNote(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
 function certificateName(value: unknown): string | undefined {
   const object = asObject(value);
   return asString(object?.CN) ?? asString(object?.O);
@@ -1440,6 +1456,7 @@ export class MulesoftApiClient {
   private readonly config: MulesoftResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleepImpl: SleepImpl;
+  private readonly now: () => number;
   private readonly maxRetries: number;
   private readonly retryBaseDelayMs: number;
   private readonly certificateProbe: MulesoftCertificateProbe;
@@ -1453,6 +1470,8 @@ export class MulesoftApiClient {
     options: {
       fetchImpl?: FetchImpl;
       sleepImpl?: SleepImpl;
+      /** Clock in epoch milliseconds for HTTP-date Retry-After values. */
+      now?: () => number;
       maxRetries?: number;
       retryBaseDelayMs?: number;
       certificateProbe?: MulesoftCertificateProbe;
@@ -1462,6 +1481,7 @@ export class MulesoftApiClient {
     this.config = config;
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
+    this.now = options.now ?? (() => Date.now());
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     this.retryBaseDelayMs = clampNumber(options.retryBaseDelayMs, DEFAULT_RETRY_BASE_DELAY_MS, 0, MAX_RETRY_DELAY_MS);
     this.certificateProbe = options.certificateProbe
@@ -1500,14 +1520,16 @@ export class MulesoftApiClient {
     return url.toString();
   }
 
-  private retryDelayMs(response: Response | undefined, attempt: number): number {
-    const retryAfter = asNumber(response?.headers.get("retry-after"));
-    if (retryAfter !== undefined && retryAfter > 0) {
-      return Math.min(retryAfter * 1000, MAX_RETRY_DELAY_MS);
-    }
+  private backoffMs(attempt: number): number {
     return Math.min(this.retryBaseDelayMs * 2 ** attempt, MAX_RETRY_DELAY_MS);
   }
 
+  /**
+   * A 429, a 5xx, a timeout, or a lost connection is retried up to maxRetries times, waiting what Retry-After
+   * asked for or else an exponential backoff. A server that asks for more than MAX_RETRY_DELAY_MS is not
+   * retried early; the request fails closed at once with the wait it asked for. A 2xx whose body is not JSON
+   * is a definite answer and is not retried.
+   */
   private async requestJson(path: string, init: RequestOptions = {}): Promise<unknown> {
     const method = init.method ?? "GET";
     const url = this.buildUrl(path, init.query ?? {});
@@ -1517,54 +1539,72 @@ export class MulesoftApiClient {
     for (let attempt = 0; ; attempt += 1) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
+      let response: Response;
+      let rawText: string;
       try {
         const headers = new Headers(init.headers ?? {});
         if (!headers.has("accept")) headers.set("accept", "application/json");
         if (init.body !== undefined && !headers.has("content-type")) headers.set("content-type", "application/json");
         if (bearer) headers.set("authorization", `Bearer ${bearer}`);
 
-        const response = await this.fetchImpl(url, {
+        response = await this.fetchImpl(url, {
           method,
           headers,
           body: init.body === undefined ? undefined : JSON.stringify(init.body),
           signal: controller.signal,
         });
-        const rawText = await response.text();
-        if (response.ok) return parseJsonText(rawText);
-
-        if (isRetryableStatus(response.status) && attempt < this.maxRetries) {
-          await this.sleepImpl(this.retryDelayMs(response, attempt));
-          continue;
-        }
-
-        let payload: unknown;
-        try {
-          payload = parseJsonText(rawText);
-        } catch {
-          payload = undefined;
-        }
-        const message = this.redact(
-          `Anypoint request failed (${response.status} ${response.statusText}) for ${method} ${pathLabel}`
-          + anypointErrorDetail(payload, response, rawText),
-        );
-        if (init.exchange) {
-          throw new MulesoftCredentialExchangeError(response.status, message, pathLabel, init.exchange, payload);
-        }
-        throw new MulesoftApiError(response.status, message, pathLabel);
+        rawText = await response.text();
       } catch (error) {
         rethrowIfAborted(error);
-        if (error instanceof MulesoftApiError) throw error;
+        if (this.signal?.aborted) throw new ToolCallAbortedError(this.signal);
         if (attempt < this.maxRetries) {
-          await this.sleepImpl(this.retryDelayMs(undefined, attempt));
+          await this.sleepImpl(this.backoffMs(attempt));
           continue;
         }
-        if (error instanceof Error && error.name === "AbortError") {
-          throw new Error(`Anypoint request to ${method} ${pathLabel} timed out after ${this.config.timeoutMs} ms`);
-        }
-        throw new Error(this.redact(`Anypoint request failed for ${method} ${pathLabel}: ${errorMessage(error)}`));
+        const detail = controller.signal.aborted ? `timed out after ${this.config.timeoutMs} ms` : errorMessage(error);
+        throw new MulesoftApiError(undefined, this.redact(`Anypoint request failed${attemptsNote(attempt + 1)} for ${method} ${pathLabel}: ${detail}`), pathLabel);
       } finally {
         clearTimeout(timer);
       }
+
+      if (response.ok) {
+        try {
+          return parseJsonText(rawText);
+        } catch {
+          throw new MulesoftApiError(
+            response.status,
+            `Anypoint response for ${method} ${pathLabel} (${response.status} ${response.statusText}) was not valid JSON: ${describeOpaqueBody(response, rawText, "non-JSON body")}`,
+            pathLabel,
+          );
+        }
+      }
+
+      let refusedWait: string | undefined;
+      if (isRetryableStatus(response.status)) {
+        const askedMs = retryAfterMs(response.headers.get("retry-after"), this.now());
+        if (askedMs !== undefined && askedMs > MAX_RETRY_DELAY_MS) {
+          refusedWait = `the server asked to retry after ${Math.ceil(askedMs / 1000)} s, more than the ${MAX_RETRY_DELAY_MS / 1000} s limit`;
+        } else if (attempt < this.maxRetries) {
+          await this.sleepImpl(askedMs ?? this.backoffMs(attempt));
+          continue;
+        }
+      }
+
+      let payload: unknown;
+      try {
+        payload = parseJsonText(rawText);
+      } catch {
+        payload = undefined;
+      }
+      const statusLine = `${response.status} ${response.statusText}${refusedWait ? `; ${refusedWait}` : ""}`;
+      const message = this.redact(
+        `Anypoint request failed${attemptsNote(attempt + 1)} (${statusLine}) for ${method} ${pathLabel}`
+        + anypointErrorDetail(payload, response, rawText),
+      );
+      if (init.exchange) {
+        throw new MulesoftCredentialExchangeError(response.status, message, pathLabel, init.exchange, payload);
+      }
+      throw new MulesoftApiError(response.status, message, pathLabel);
     }
   }
 
