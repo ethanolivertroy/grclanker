@@ -1,0 +1,13 @@
+{
+  "oscalVersion": "1.1.2",
+  "release": "https://github.com/usnistgov/OSCAL/releases/tag/v1.1.2",
+  "commit": "4f02dac6f698efda387cc5f55bc99581eaf494b6",
+  "schemas": [
+    {
+      "model": "assessment-results",
+      "file": "oscal_assessment-results_schema.json",
+      "url": "https://github.com/usnistgov/OSCAL/releases/download/v1.1.2/oscal_assessment-results_schema.json",
+      "sha256": "d033da70154cf6625ae46a746199e88e58f2928b1387dfac051d381b92f41b0d"
+    }
+  ]
+}

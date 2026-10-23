@@ -237,7 +237,7 @@ The bundle renders them as:
 - One markdown report per framework.
 - `compliance/fedramp/oscal_assessment_results.json`, an OSCAL 1.1.2 assessment-results document.
 
-The OSCAL document's findings target NIST objective ids, for example `ia-2.11_obj`. A Pass becomes `satisfied`. Any other status becomes `not-satisfied`, with a `reason` of `partial`, `fail`, `manual`, or `info`.
+The OSCAL document's findings target NIST objective ids, for example `ia-2.11_obj`. A Pass becomes `satisfied`. Any other status becomes `not-satisfied`, with a `reason` of `partial`, `fail`, `manual`, or `info`. The document validates against the NIST OSCAL 1.1.2 assessment-results JSON schema.
 
 ## Live smoke
 
@@ -522,3 +522,4 @@ Each assessment's `snapshotSummary` renders `null` for every counter derived fro
 - [Policies API](https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Policy/)
 - [OAuth 2.0 for Okta API service apps](https://developer.okta.com/docs/guides/implement-oauth-for-okta-serviceapp/main/)
 - [OSCAL assessment results model](https://pages.nist.gov/OSCAL/concepts/layer/assessment/assessment-results/)
+- [OSCAL 1.1.2 release, with the JSON schemas](https://github.com/usnistgov/OSCAL/releases/tag/v1.1.2)
