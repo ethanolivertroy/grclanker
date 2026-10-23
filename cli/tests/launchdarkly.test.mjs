@@ -762,6 +762,31 @@ test("LaunchdarklyApiClient stops at once when the tool call is aborted during a
   assert.equal(sent, 1, "an aborted request is not retried as a timeout");
 });
 
+test("LaunchdarklyApiClient reports an abort that lands while the last attempt's body is read as the abort, not as a timeout", async () => {
+  const controller = new AbortController();
+  let sent = 0;
+  const client = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init) => {
+      sent += 1;
+      if (sent < 4) return jsonResponse({}, { status: 503, statusText: "Service Unavailable" });
+      return new Response(new ReadableStream({
+        start(stream) {
+          stream.enqueue(new TextEncoder().encode('{"accountId":'));
+          init.signal.addEventListener("abort", () => stream.error(Object.assign(new Error("This operation was aborted"), { name: "AbortError" })));
+          setTimeout(() => controller.abort(), 5);
+        },
+      }), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } });
+    },
+    signal: controller.signal,
+    sleep: async () => {},
+  });
+  await assert.rejects(client.getCallerIdentity(), (error) => {
+    assert.equal(error.name, "ToolCallAbortedError", error.message);
+    return true;
+  });
+  assert.equal(sent, 4, "the abort lands during the fourth and last attempt");
+});
+
 test("LaunchdarklyApiClient keeps the token and echoed credentials out of the error it raises after retrying", async () => {
   const echoed = `{"code":"unavailable","message":"Authorization: ${TEST_TOKEN} rejected; see https://api.example.com/v1/x?token=${LD_RETRY_CANARY}"}`;
   const scripted = scriptedFetch(Array(10).fill(() => new Response(echoed, { status: 503, statusText: "Service Unavailable", headers: { "content-type": "application/json", "retry-after": "1" } })));

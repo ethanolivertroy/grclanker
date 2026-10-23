@@ -1016,6 +1016,31 @@ test("MulesoftApiClient stops at once when the tool call is aborted during a ret
   assert.equal(sent, 1, "an aborted request is not retried as a timeout");
 });
 
+test("MulesoftApiClient reports an abort that lands while the last attempt's body is read as the abort, not as a timeout", async () => {
+  const controller = new AbortController();
+  let sent = 0;
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init) => {
+      sent += 1;
+      if (sent < 4) return jsonResponse({}, { status: 503, statusText: "Service Unavailable" });
+      return new Response(new ReadableStream({
+        start(stream) {
+          stream.enqueue(new TextEncoder().encode('{"id":'));
+          init.signal.addEventListener("abort", () => stream.error(new DOMException("This operation was aborted", "AbortError")));
+          setTimeout(() => controller.abort(), 5);
+        },
+      }), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } });
+    },
+    signal: controller.signal,
+    sleepImpl: async () => {},
+  });
+  await assert.rejects(client.getOrganization(), (error) => {
+    assert.equal(error.name, "ToolCallAbortedError", error.message);
+    return true;
+  });
+  assert.equal(sent, 4, "the abort lands during the fourth and last attempt");
+});
+
 test("MulesoftApiClient keeps the token and echoed credentials out of the error it raises after retrying", async () => {
   const echoed = { message: `Bearer ${SAMPLE_TOKEN} rejected upstream; client_secret=${PLANTED.echoedClientSecret}` };
   const scripted = scriptedAnypointFetch(Array(10).fill(() => jsonResponse(echoed, { status: 502, statusText: "Bad Gateway", headers: { "retry-after": "1" } })));

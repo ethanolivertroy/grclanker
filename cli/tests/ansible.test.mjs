@@ -1869,6 +1869,19 @@ test("retries: aborting the tool call during a backoff wait ends the read at onc
   assert.equal(requests.length, 1, "no attempt follows the abort");
 });
 
+test("retries: an abort that lands while a response body is read ends the read with the abort, never a network error or a retry", async () => {
+  const controller = new AbortController();
+  const { client, requests, waits } = scriptedAapClient({
+    "GET /api/v2/hosts/": [(init) => {
+      setTimeout(() => controller.abort(), 5);
+      return stalledBody(init);
+    }],
+  }, { signal: controller.signal });
+  await assert.rejects(() => client.get("/api/v2/hosts/"), { name: "ToolCallAbortedError" });
+  assert.equal(requests.length, 1, "no attempt follows the abort");
+  assert.deepEqual(waits, []);
+});
+
 test("session login: a POST /api/login/ that times out or loses its connection is sent once, since AAP may have opened a session that a second login would expire; 429 and 5xx login answers are retried", async () => {
   const session = { token: undefined, username: "auditor", password: RETRY_PASSWORD_CANARY, timeoutMs: 20 };
   const loginPage = () => new Response("<html>login</html>", { status: 200, headers: { "content-type": "text/html", "set-cookie": "csrftoken=csrftokenfortests1; Path=/" } });

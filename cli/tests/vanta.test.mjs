@@ -554,6 +554,26 @@ test("VantaAuditorClient stops a retry wait as soon as the tool call aborts", as
   clearVantaTokenCacheForTests();
 });
 
+test("VantaAuditorClient ends a read with the abort, not a retry, when the tool call aborts while the body is read", async () => {
+  clearVantaTokenCacheForTests();
+  const controller = new AbortController();
+  let auditRequests = 0;
+  const client = vantaClient(withVantaToken(async (_url, init) => {
+    auditRequests += 1;
+    return new Response(new ReadableStream({
+      start(stream) {
+        stream.enqueue(new TextEncoder().encode("{\"results\":"));
+        init.signal.addEventListener("abort", () => stream.error(init.signal.reason), { once: true });
+        setTimeout(() => controller.abort(new Error("operator stopped the call")), 5);
+      },
+    }));
+  }), undefined, { signal: controller.signal });
+
+  await assert.rejects(client.listAudits(), { name: "ToolCallAbortedError" });
+  assert.equal(auditRequests, 1, "no attempt follows the abort");
+  clearVantaTokenCacheForTests();
+});
+
 test("VantaAuditorClient keeps credentials out of errors when retries run out", async () => {
   const planted = {
     clientId: "Kd4Rw8Nq2Lx6Hv1Z",
