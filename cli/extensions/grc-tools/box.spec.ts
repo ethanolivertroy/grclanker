@@ -585,9 +585,10 @@ export const BOX_SPEC = buildBatchIntegrationSpec({
   ],
   rateLimit: {
     documentedLimit: "Box rate limits vary by endpoint, user, and enterprise",
-    retryHeaders: ["Retry-After", "X-Rate-Limit-Limit", "X-Rate-Limit-Remaining"],
-    retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Honor Retry-After up to 60 seconds and retry three times with bounded exponential delay.",
+    retryHeaders: ["Retry-After"],
+    retryableStatuses: [429],
+    retryableStatusRanges: [{ from: 500, to: 599 }],
+    backoffPolicy: "Retry 429, every 5xx status, request timeouts (30 seconds unless timeout_seconds or BOX_TIMEOUT sets it), and network errors up to max_retries times after the first attempt (3 by default, BOX_MAX_RETRIES), on API and OAuth token requests alike; every token attempt carries a freshly signed JWT assertion. A Retry-After header in seconds or as an HTTP date is honored on any retryable response and clamped to 60 seconds; otherwise wait 500 ms doubled per attempt, capped at 8 seconds. A tool-call abort is never retried. An exhausted read stays unreadable, and its error names the method and path, the last status, timeout, or network error, and the attempt count.",
   },
   runtimeBehavior: BOX_RUNTIME_BEHAVIOR,
   knownGaps: ["CSV, HTML, SARIF, TUI output, and several policy reads remain absent."],

@@ -68,7 +68,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
 | `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 
 #### `box_assess_identity_access`
 
@@ -88,7 +88,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
 | `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 | `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
 | `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
 | `user_limit` | number | no | Maximum enterprise users to inspect. Defaults to 1000. |
@@ -114,7 +114,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
 | `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 | `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
 | `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
 | `stale_allowlist_days` | number | no | Age in days after which a collaboration allowlist entry is flagged for review. Defaults to 365. |
@@ -138,7 +138,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
 | `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 | `list_limit` | number | no | Maximum records to inspect per paginated list (collaboration allowlist entries and exempt users, device pins, policies, and assignments). A list that hits the cap while Box reports more records is marked truncated and downgrades dependent findings to warn. Defaults to 500. |
 
 #### `box_assess_shield_monitoring`
@@ -159,7 +159,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
 | `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 | `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
 | `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
 
@@ -181,7 +181,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
 | `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 | `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
 | `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
 | `user_limit` | number | no | Maximum enterprise users to inspect. Defaults to 1000. |
@@ -323,7 +323,7 @@ Credential refresh: POST https://api.box.com/oauth2/token using the selected JWT
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| Box Security Inspector | Box rate limits vary by endpoint, user, and enterprise | `Retry-After`, `X-Rate-Limit-Limit`, `X-Rate-Limit-Remaining` | 429, 500, 502, 503, 504 | Honor Retry-After up to 60 seconds and retry three times with bounded exponential delay. |
+| Box Security Inspector | Box rate limits vary by endpoint, user, and enterprise | `Retry-After` | 429, 500-599 | Retry 429, every 5xx status, request timeouts (30 seconds unless timeout_seconds or BOX_TIMEOUT sets it), and network errors up to max_retries times after the first attempt (3 by default, BOX_MAX_RETRIES), on API and OAuth token requests alike; every token attempt carries a freshly signed JWT assertion. A Retry-After header in seconds or as an HTTP date is honored on any retryable response and clamped to 60 seconds; otherwise wait 500 ms doubled per attempt, capped at 8 seconds. A tool-call abort is never retried. An exhausted read stays unreadable, and its error names the method and path, the last status, timeout, or network error, and the attempt count. |
 
 ## Checks
 
