@@ -228,7 +228,7 @@ The Reporting API allows:
 The client:
 
 - Spaces requests at least 250 ms apart.
-- Retries `429`, `500`, `502`, `503`, and `504` responses, timeouts, and network errors up to 3 more times. It waits as long as `Retry-After` asks, up to 60 seconds, or 1, 2, then 4 seconds without it.
+- Retries `429`, `500`, `502`, `503`, and `504` responses, timeouts (the timeout runs until the whole body has arrived), and network errors up to 3 more times. It waits as long as `Retry-After` asks, up to 60 seconds, or 1, 2, then 4 seconds without it.
 - Pages every list endpoint with `page` and `per_page` (500 per page, or 10 for training campaigns as documented).
 
 A request that still fails after its last attempt fails the whole read. The error names the method and path (never the query), the status, the timeout (`timed out after 30000ms`), or the network error, and the number of attempts, for example `KnowBe4 request failed after 4 attempts (503 Service Unavailable) GET /v1/users`. A list whose later page fails is reported as not readable, never as a shorter list, so a check that depends on it can't pass.

@@ -369,7 +369,7 @@ Finally, every bundle file and every tool result passes through the configured-s
 
 ### Retries and timeouts
 
-A request answered with HTTP 429 or any 5xx status is retried up to 4 times. Each retry waits as long as `Retry-After` asks (seconds or an HTTP date), clamped to 30 seconds; without a usable header it waits 500 ms, doubled per attempt and capped at 15 seconds. A GET that times out (`TENABLE_TIMEOUT`, 30 seconds by default) or fails before Tenable answers is retried the same way, so export status polls and chunk downloads get the same retries as every list read.
+A request answered with HTTP 429 or any 5xx status is retried up to 4 times. Each retry waits as long as `Retry-After` asks (seconds or an HTTP date), clamped to 30 seconds; without a usable header it waits 500 ms, doubled per attempt and capped at 15 seconds. A GET that times out (`TENABLE_TIMEOUT`, 30 seconds by default) or fails before its whole answer arrives is retried the same way, so export status polls and chunk downloads get the same retries as every list read. The timeout runs until the whole body has arrived, so a body that stalls is retried instead of holding the run open. Raise `TENABLE_TIMEOUT` (up to 600 seconds) when export chunks take longer than that to download.
 
 The POST that starts an asset or vulnerability export is the exception. After a timeout or a network failure it is not sent again, because Tenable may already have started that export and a second request could start another. The export is then unreadable and the controls that read it are `manual`. A POST that Tenable answered with 429 or a 5xx status is sent again like a GET.
 
