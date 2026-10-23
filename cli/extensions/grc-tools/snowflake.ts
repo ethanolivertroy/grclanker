@@ -41,6 +41,8 @@ const DEFAULT_STATEMENT_TIMEOUT_SECONDS = 120;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_MS = 500;
+const MAX_RETRY_AFTER_MS = 30_000;
+const MAX_BACKOFF_MS = 15_000;
 const DEFAULT_MAX_PARTITIONS = 50;
 const DEFAULT_ROW_LIMIT = 20_000;
 const DEFAULT_LOOKBACK_DAYS = 30;
@@ -1727,6 +1729,9 @@ interface SnowflakeApiResponse {
   payload: JsonRecord;
   headers: Headers;
   nonJsonBody?: string;
+  /** The method and path (never the query) that answered, and how many attempts it took. */
+  endpoint?: string;
+  attempts?: number;
 }
 
 export type SnowflakeStatementErrorKind = Exclude<SnowflakeStatementStatus, "ok">;
@@ -1854,14 +1859,46 @@ function classifyErrorMessage(message: string, statusCode?: number): "denied" | 
 function extractApiError(response: SnowflakeApiResponse): string {
   const outcome = response.status >= 200 && response.status < 300 ? "returned an unreadable response" : "failed";
   const statusLine = `${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+  // A transient status names the endpoint and the attempts spent on it; a statement error is already named by its statement.
+  const where = response.endpoint && isRetryableStatus(response.status) ? ` at ${response.endpoint}${attemptsSuffix(response.attempts ?? 1)}` : "";
   if (response.nonJsonBody !== undefined) {
-    return `Snowflake SQL API request ${outcome} (${statusLine}): ${response.nonJsonBody}`;
+    return `Snowflake SQL API request ${outcome} (${statusLine})${where}: ${response.nonJsonBody}`;
   }
   const message = asString(response.payload.message) ?? asString(response.payload.error) ?? "";
   const code = asString(response.payload.code);
   const sqlState = asString(response.payload.sqlState);
   const detail = [code ? `code ${code}` : undefined, sqlState ? `sqlState ${sqlState}` : undefined].filter(Boolean).join(", ");
-  return `Snowflake SQL API request ${outcome} (${statusLine})${message ? `: ${message}` : ""}${detail ? ` [${detail}]` : ""}`;
+  return `Snowflake SQL API request ${outcome} (${statusLine})${where}${message ? `: ${message}` : ""}${detail ? ` [${detail}]` : ""}`;
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function attemptsSuffix(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
+/** The wait a Retry-After header asks for: delta-seconds, or an HTTP-date measured against `nowMs`. */
+function retryAfterMs(header: string | null, nowMs: number): number | undefined {
+  const seconds = asNumber(header);
+  if (seconds !== undefined) return seconds >= 0 ? seconds * 1000 : undefined;
+  if (!header || !/[a-z]/i.test(header)) return undefined;
+  const dateMs = Date.parse(header);
+  return Number.isNaN(dateMs) ? undefined : Math.max(0, dateMs - nowMs);
+}
+
+/**
+ * The URL a statement submission is resent on: the original requestId plus
+ * retry=true, which the SQL API documents as never executing the statement a
+ * second time. Without a requestId there is nothing to deduplicate on, so
+ * there is no resubmission URL.
+ */
+function resubmissionUrl(url: string): string | undefined {
+  const parsed = new URL(url);
+  if (!parsed.searchParams.has("requestId")) return undefined;
+  parsed.searchParams.set("retry", "true");
+  return parsed.href;
 }
 
 export class SnowflakeSqlClient {
@@ -1871,10 +1908,13 @@ export class SnowflakeSqlClient {
   private readonly now: () => Date;
   private jwt?: { token: string; expiresAt: number };
 
-  constructor(config: SnowflakeResolvedConfig, options: { fetchImpl?: FetchImpl; now?: () => Date; signal?: AbortSignal } = {}) {
+  constructor(
+    config: SnowflakeResolvedConfig,
+    options: { fetchImpl?: FetchImpl; sleep?: (ms: number) => Promise<void>; now?: () => Date; signal?: AbortSignal } = {},
+  ) {
     this.config = config;
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
-    this.sleep = abortableSleep(options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
     this.now = options.now ?? (() => new Date());
     registerConfiguredSecrets([config.token, config.privateKeyPem, config.privateKeyPassphrase]);
   }
@@ -1923,10 +1963,19 @@ export class SnowflakeSqlClient {
     return redactSecrets(message, this.configuredSecrets());
   }
 
+  /**
+   * One SQL API request with retries: a 429 or 5xx response, the per-request
+   * timeout, and a transport failure are retried up to maxRetries times. A
+   * timeout or transport failure on a statement submission is retried only
+   * when it can be resent with retry=true, since the server may already have
+   * accepted it. A status poll hands a 429 that carries its statement handle
+   * back to the poll loop, which keeps polling until the statement deadline.
+   */
   private async request(
     method: "GET" | "POST",
     pathname: string,
     body?: JsonRecord,
+    options: { statusPoll?: boolean } = {},
   ): Promise<SnowflakeApiResponse> {
     // The URL is resolved onto the configured origin before any credential is
     // built or attached, so a path that would move the host is refused with
@@ -1936,6 +1985,8 @@ export class SnowflakeSqlClient {
       throw new SnowflakeStatementError(`Snowflake SQL API request refused: the request URL ${resolution.refusal}, so no request was sent.`, { kind: "error" });
     }
     const url = resolution.url;
+    const resendUrl = method === "POST" ? resubmissionUrl(url) : url;
+    const endpoint = `${method} ${new URL(url).pathname}`;
     let attempt = 0;
     for (;;) {
       // A credential that cannot be turned into a bearer token is a
@@ -1952,7 +2003,7 @@ export class SnowflakeSqlClient {
           authorization,
           "x-snowflake-authorization-token-type": this.config.tokenType,
         });
-        const response = await this.fetchImpl(url, {
+        const response = await this.fetchImpl(attempt > 0 && resendUrl ? resendUrl : url, {
           method,
           headers,
           body: body ? JSON.stringify(body) : undefined,
@@ -1972,26 +2023,27 @@ export class SnowflakeSqlClient {
             nonJsonBody = describeNonJsonBody(response, rawText);
           }
         }
-        const retryable = response.status === 429 || response.status >= 500;
-        if (retryable && attempt < this.config.maxRetries && !(response.status === 429 && method === "GET" && asString(payload.statementHandle))) {
+        const pollHandlesIt = options.statusPoll === true && response.status === 429 && asString(payload.statementHandle) !== undefined;
+        if (isRetryableStatus(response.status) && attempt < this.config.maxRetries && !pollHandlesIt) {
           attempt += 1;
           await this.sleep(this.retryDelay(attempt, response.headers));
           continue;
         }
-        return { status: response.status, statusText: response.statusText, payload, headers: response.headers, nonJsonBody };
+        return { status: response.status, statusText: response.statusText, payload, headers: response.headers, nonJsonBody, endpoint, attempts: attempt + 1 };
       } catch (error) {
         rethrowIfAborted(error);
-        const message = error instanceof Error ? error.message : String(error);
-        if (controller.signal.aborted) {
-          throw new SnowflakeStatementError(`Snowflake SQL API request timed out after ${this.config.timeoutMs}ms (${method} ${pathname})`, { kind: "timeout" });
-        }
         if (error instanceof SnowflakeStatementError) throw error;
-        if (attempt < this.config.maxRetries) {
+        const timedOut = controller.signal.aborted;
+        if (resendUrl !== undefined && attempt < this.config.maxRetries) {
           attempt += 1;
           await this.sleep(this.retryDelay(attempt));
           continue;
         }
-        throw new SnowflakeStatementError(`Snowflake SQL API request failed (${method} ${pathname}): ${this.redact(message)}`);
+        if (timedOut) {
+          throw new SnowflakeStatementError(`Snowflake SQL API request timed out after ${this.config.timeoutMs}ms (${endpoint})${attemptsSuffix(attempt + 1)}`, { kind: "timeout" });
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        throw new SnowflakeStatementError(`Snowflake SQL API request failed (${endpoint})${attemptsSuffix(attempt + 1)}: ${this.redact(message)}`);
       } finally {
         clearTimeout(timeout);
       }
@@ -1999,9 +2051,9 @@ export class SnowflakeSqlClient {
   }
 
   private retryDelay(attempt: number, headers?: Headers): number {
-    const retryAfter = asNumber(headers?.get("retry-after"));
-    if (retryAfter !== undefined) return Math.min(retryAfter * 1000, 30_000);
-    return Math.min(this.config.retryBaseMs * 2 ** (attempt - 1), 15_000);
+    const retryAfter = retryAfterMs(headers?.get("retry-after") ?? null, this.now().getTime());
+    if (retryAfter !== undefined) return Math.min(retryAfter, MAX_RETRY_AFTER_MS);
+    return Math.min(this.config.retryBaseMs * 2 ** (attempt - 1), MAX_BACKOFF_MS);
   }
 
   async execute(statement: string, options: { timeoutSeconds?: number } = {}): Promise<SnowflakeResultSet> {
@@ -2030,8 +2082,8 @@ export class SnowflakeSqlClient {
       if (this.now().getTime() > deadline) {
         throw new SnowflakeStatementError(`Snowflake statement ${handle ?? ""} did not complete before the ${this.config.statementTimeoutSeconds}s statement timeout.`, { kind: "timeout" });
       }
-      await this.sleep(this.pollDelay(submit.headers));
-      latest = await this.request("GET", statusUrl);
+      await this.sleep(this.pollDelay(latest.headers));
+      latest = await this.request("GET", statusUrl, undefined, { statusPoll: true });
       handle = asString(latest.payload.statementHandle) ?? handle;
     }
 
@@ -2045,8 +2097,8 @@ export class SnowflakeSqlClient {
   }
 
   private pollDelay(headers: Headers): number {
-    const retryAfter = asNumber(headers.get("retry-after"));
-    if (retryAfter !== undefined) return Math.min(retryAfter * 1000, 30_000);
+    const retryAfter = retryAfterMs(headers.get("retry-after"), this.now().getTime());
+    if (retryAfter !== undefined) return Math.min(retryAfter, MAX_RETRY_AFTER_MS);
     return this.config.pollIntervalMs;
   }
 

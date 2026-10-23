@@ -54,6 +54,7 @@ const DEFAULT_PAGE_LIMIT = 500;
 const DEFAULT_ENTITY_LIMIT = 1000;
 const DEFAULT_SCRIPT_SAMPLE_LIMIT = 25;
 const DEFAULT_MAX_RETRIES = 3;
+const MAX_RETRY_DELAY_MS = 15_000;
 const MAX_PAGES = 200;
 const NRQL_MAX_ROWS = 2000;
 const CAUSE_MAX_LENGTH = 200;
@@ -873,23 +874,35 @@ export function resolveNewrelicConfiguration(
   };
 }
 
-function retryDelayFromResponse(response: Response, attempt: number): number {
-  const retryAfter = response.headers.get("retry-after");
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds >= 0) {
-      return Math.min(seconds * 1000, 15_000);
-    }
-  }
+/** The wait a Retry-After header asks for: delta-seconds, or an HTTP-date measured against `now`. */
+function retryAfterMs(header: string | null, now: number): number | undefined {
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : undefined;
+  const date = Date.parse(header);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - now);
+}
+
+function retryDelayFromResponse(response: Response, attempt: number, now: number): number {
+  const retryAfter = retryAfterMs(response.headers.get("retry-after"), now);
+  if (retryAfter !== undefined) return Math.min(retryAfter, MAX_RETRY_DELAY_MS);
   const reset = response.headers.get("x-ratelimit-reset");
   if (reset) {
     const epochSeconds = Number(reset);
     if (Number.isFinite(epochSeconds)) {
-      const delta = epochSeconds * 1000 - Date.now();
-      return Math.min(Math.max(delta, 250), 15_000);
+      const delta = epochSeconds * 1000 - now;
+      return Math.min(Math.max(delta, 250), MAX_RETRY_DELAY_MS);
     }
   }
-  return Math.min(500 * 2 ** attempt, 15_000);
+  return backoffDelay(attempt);
+}
+
+function backoffDelay(attempt: number): number {
+  return Math.min(500 * 2 ** attempt, MAX_RETRY_DELAY_MS);
+}
+
+function attemptsSuffix(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -1594,6 +1607,7 @@ export class NewrelicApiClient {
   private readonly config: NewrelicResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: SleepImpl;
+  private readonly now: () => number;
   private readonly maxRetries: number;
   private discoveredAccountIds?: Promise<number[]>;
 
@@ -1602,6 +1616,7 @@ export class NewrelicApiClient {
     options: {
       fetchImpl?: FetchImpl;
       sleep?: SleepImpl;
+      now?: () => number;
       maxRetries?: number;
       signal?: AbortSignal;
     } = {},
@@ -1609,6 +1624,7 @@ export class NewrelicApiClient {
     this.config = config;
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleep = abortableSleep(options.signal, options.sleep);
+    this.now = options.now ?? Date.now;
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
   }
 
@@ -1631,35 +1647,41 @@ export class NewrelicApiClient {
     return httpStatus === undefined && !badApiKey ? new Error(message) : new NewrelicApiError(httpStatus, message, badApiKey);
   }
 
-  private async requestWithRetry(url: string, init: RequestInit): Promise<Response> {
-    for (let attempt = 0; ; attempt += 1) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
-      let response: Response;
-      try {
-        response = await this.fetchImpl(url, { ...init, signal: controller.signal });
-      } catch (error) {
-        rethrowIfAborted(error);
-        const aborted = controller.signal.aborted;
-        const message = error instanceof Error ? error.message : String(error);
-        throw this.failure(
-          aborted ? `New Relic request timed out after ${Math.round(this.config.timeoutMs / 1000)}s` : "New Relic request failed",
-          aborted ? url : message,
-        );
-      } finally {
-        clearTimeout(timeout);
-      }
+  private async sendOnce(url: string, init: RequestInit): Promise<{ response: Response } | { timedOut: boolean; reason: string }> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    try {
+      return { response: await this.fetchImpl(url, { ...init, signal: controller.signal }) };
+    } catch (error) {
+      rethrowIfAborted(error);
+      return { timedOut: controller.signal.aborted, reason: error instanceof Error ? error.message : String(error) };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
 
-      if (isRetryableStatus(response.status) && attempt < this.maxRetries) {
-        await this.sleep(retryDelayFromResponse(response, attempt));
+  /**
+   * Every New Relic request is a read (NerdGraph queries and REST GETs), so a timeout or transport failure is retried
+   * like a 429 or 5xx. The response that ends the loop is returned with the attempt count for the caller's error.
+   */
+  private async requestWithRetry(url: string, init: RequestInit): Promise<{ response: Response; attempts: number }> {
+    for (let attempt = 0; ; attempt += 1) {
+      const outcome = await this.sendOnce(url, init);
+      const retryable = "response" in outcome ? isRetryableStatus(outcome.response.status) : true;
+      if (retryable && attempt < this.maxRetries) {
+        await this.sleep("response" in outcome ? retryDelayFromResponse(outcome.response, attempt, this.now()) : backoffDelay(attempt));
         continue;
       }
-      return response;
+      if ("response" in outcome) return { response: outcome.response, attempts: attempt + 1 };
+      const endpoint = `${init.method ?? "GET"} ${new URL(url).pathname}${attemptsSuffix(attempt + 1)}`;
+      throw outcome.timedOut
+        ? this.failure(`New Relic request timed out after ${Math.round(this.config.timeoutMs / 1000)}s at ${endpoint}`, undefined)
+        : this.failure(`New Relic request failed at ${endpoint}`, outcome.reason);
     }
   }
 
   async nerdgraph(query: string, variables: JsonRecord = {}): Promise<JsonRecord> {
-    const response = await this.requestWithRetry(this.config.nerdgraphUrl, {
+    const { response, attempts } = await this.requestWithRetry(this.config.nerdgraphUrl, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -1679,7 +1701,12 @@ export class NewrelicApiClient {
       const detail = errors.length > 0
         ? nerdgraphErrorSummary(errors)
         : describeOpaqueBody(response, rawText, parsed ? "JSON error body without an errors array" : "non-JSON error body");
-      throw this.failure(`NerdGraph request failed (${httpStatusLabel(response)}) at POST ${new URL(this.config.nerdgraphUrl).pathname}`, detail, response.status, badApiKey);
+      throw this.failure(
+        `NerdGraph request failed (${httpStatusLabel(response)}) at POST ${new URL(this.config.nerdgraphUrl).pathname}${attemptsSuffix(attempts)}`,
+        detail,
+        response.status,
+        badApiKey,
+      );
     }
     const data = asObject(payload.data);
     if (errors.length > 0) {
@@ -1736,7 +1763,7 @@ export class NewrelicApiClient {
 
   async restGet(pathOrUrl: string, query: JsonRecord = {}): Promise<{ payload: JsonRecord; nextLink: ParsedNextLink }> {
     const url = resolveSameOriginUrl(this.buildRestUrl(pathOrUrl, query), this.config.restBaseUrl).toString();
-    const response = await this.requestWithRetry(url, {
+    const { response, attempts } = await this.requestWithRetry(url, {
       method: "GET",
       headers: {
         accept: "application/json",
@@ -1749,7 +1776,11 @@ export class NewrelicApiClient {
       // Only the documented error.title is echoed (scrubbed); any other body is described by type and length.
       const title = parsed ? asString(asObject(parsed.error)?.title) : undefined;
       const detail = title ?? describeOpaqueBody(response, rawText, parsed ? "JSON error body without a documented error.title" : "non-JSON error body");
-      throw this.failure(`REST API v2 request failed for GET ${new URL(url).pathname} (${httpStatusLabel(response)})`, detail, response.status);
+      throw this.failure(
+        `REST API v2 request failed for GET ${new URL(url).pathname} (${httpStatusLabel(response)})${attemptsSuffix(attempts)}`,
+        detail,
+        response.status,
+      );
     }
     return { payload: parsed ?? {}, nextLink: parseNextLinkHeader(response.headers.get("link")) };
   }

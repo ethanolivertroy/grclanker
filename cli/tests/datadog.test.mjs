@@ -48,6 +48,7 @@ import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } fr
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 
@@ -790,6 +791,160 @@ test("DatadogApiClient surfaces exhausted retries, redacts keys, and reports tim
     }),
   });
   await assert.rejects(() => slow.validateApiKey(), /timed out after 20ms/);
+});
+
+/**
+ * A fetch that settles only when the client's own request timeout aborts it, rejecting as fetch does. The timeout is
+ * fired through the mocked clock, so no test waits on a real timer.
+ */
+function timingOutFetch(t, timeoutMs) {
+  return (_input, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+    t.mock.timers.tick(timeoutMs);
+  });
+}
+
+test("DatadogApiClient retries a GET after a timeout, a transport failure, and a 500 before it succeeds", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const config = sampleConfig();
+  const timeout = timingOutFetch(t, config.timeoutMs);
+  const sleeps = [];
+  let calls = 0;
+  const client = new DatadogApiClient(config, {
+    fetchImpl: async (input, init) => {
+      calls += 1;
+      if (calls === 1) return timeout(input, init);
+      if (calls === 2) throw new TypeError("fetch failed");
+      if (calls === 3) return jsonResponse({ errors: ["Internal Server Error"] }, { status: 500 });
+      return jsonResponse({ valid: true });
+    },
+    sleepImpl: async (ms) => { sleeps.push(ms); },
+  });
+
+  assert.equal((await client.validateApiKey()).valid, true);
+  assert.equal(calls, 4);
+  assert.deepEqual(sleeps, [500, 1000, 2000]);
+});
+
+test("DatadogApiClient honors Retry-After as delta-seconds or an HTTP-date, keeps X-RateLimit-Reset first on a 429, and caps every wait at 60 s", async () => {
+  const at = (seconds) => new Date(NOW.getTime() + seconds * 1000).toUTCString();
+  const responses = [
+    () => jsonResponse({ errors: ["rate limited"] }, { status: 429, headers: { "X-RateLimit-Reset": "3", "Retry-After": "9" } }),
+    () => jsonResponse({ errors: ["rate limited"] }, { status: 429, headers: { "Retry-After": at(5) } }),
+    () => jsonResponse({ errors: ["unavailable"] }, { status: 503, headers: { "Retry-After": at(7) } }),
+    () => jsonResponse({ errors: ["bad gateway"] }, { status: 502, headers: { "Retry-After": "120" } }),
+    () => jsonResponse({ valid: true }),
+  ];
+  const sleeps = [];
+  let calls = 0;
+  const client = new DatadogApiClient(sampleConfig({ maxRetries: 4 }), {
+    fetchImpl: async () => responses[calls++](),
+    sleepImpl: async (ms) => { sleeps.push(ms); },
+    now: () => NOW,
+  });
+
+  assert.equal((await client.validateApiKey()).valid, true);
+  assert.equal(calls, 5);
+  assert.deepEqual(sleeps, [3000, 5000, 7000, 60_000]);
+});
+
+test("DatadogApiClient names the endpoint, the last failure, and the attempt count when retries run out, with planted keys scrubbed", async (t) => {
+  const planted = { apiKey: "8fWy3fvwaFccmu2iJGZsKr7HbU7PMZ7m", appKey: "VtZF355PT8SM8B5Ug77LbsDCEVu7bWGw" };
+  assertPlantedValuesWellFormed(assert, planted, [JSON.stringify(sampleConfig()), JSON.stringify(user("alice"))]);
+  const config = sampleConfig(planted);
+  const echo = `api_key=${planted.apiKey} app_key=${planted.appKey}`;
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const timeout = timingOutFetch(t, config.timeoutMs);
+  const cases = [
+    {
+      label: "503 on every attempt",
+      fetchImpl: async () => jsonResponse({ errors: [`upstream rejected ${echo}`] }, { status: 503, statusText: "Service Unavailable", headers: { "x-echo": echo } }),
+      expected: /^Datadog request failed \(503 Service Unavailable\) GET \/api\/v2\/users after 4 attempts: /,
+    },
+    {
+      label: "transport failure on every attempt",
+      fetchImpl: async () => { throw new TypeError(`fetch failed: connect ECONNRESET (${echo})`); },
+      expected: /^Datadog request failed: GET \/api\/v2\/users after 4 attempts: fetch failed: connect ECONNRESET/,
+    },
+    {
+      label: "timeout on every attempt",
+      fetchImpl: timeout,
+      expected: /^Datadog request timed out after 30000ms: GET \/api\/v2\/users after 4 attempts$/,
+    },
+  ];
+  for (const { label, fetchImpl, expected } of cases) {
+    const sleeps = [];
+    let calls = 0;
+    const client = new DatadogApiClient(config, {
+      fetchImpl: async (input, init) => {
+        calls += 1;
+        return fetchImpl(input, init);
+      },
+      sleepImpl: async (ms) => { sleeps.push(ms); },
+    });
+    await assert.rejects(() => client.listUsers(), (error) => {
+      assert.match(error.message, expected, label);
+      assert.doesNotMatch(error.message, /page\[|\?/, `${label}: no query string in the error`);
+      assertFragmentsAbsent(assert, `${error.message} ${JSON.stringify(error)}`, Object.values(planted), label);
+      return true;
+    });
+    assert.equal(calls, 4, `${label}: one request plus three retries`);
+    assert.equal(sleeps.length, 3, label);
+  }
+});
+
+test("DatadogApiClient stops at once when the tool call is aborted during a retry wait, without another request", async () => {
+  const failures = [
+    ["503 response", async () => jsonResponse({ errors: ["unavailable"] }, { status: 503 })],
+    ["transport failure", async () => { throw new TypeError("fetch failed"); }],
+  ];
+  for (const [label, failure] of failures) {
+    const controller = new AbortController();
+    let calls = 0;
+    const client = new DatadogApiClient(sampleConfig(), {
+      fetchImpl: async () => {
+        calls += 1;
+        return failure();
+      },
+      sleepImpl: () => {
+        queueMicrotask(() => controller.abort());
+        return new Promise(() => {});
+      },
+      signal: controller.signal,
+    });
+    await assert.rejects(() => client.validateApiKey(), (error) => {
+      assert.equal(error.name, "ToolCallAbortedError", label);
+      return true;
+    });
+    assert.equal(calls, 1, `${label}: no request after the abort`);
+  }
+});
+
+test("a Datadog users page that times out on every attempt leaves the user inventory unreadable, so no user-dependent identity check passes", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const config = sampleConfig();
+  const users = fill(150, (index) => user(`u${index + 1}`));
+  const routes = routesFromClient(healthyClient({ listUsers: async () => users }));
+  const servePage = routes["GET /api/v2/users"];
+  const timeout = timingOutFetch(t, config.timeoutMs);
+  const pages = [];
+  routes["GET /api/v2/users"] = (url, init) => {
+    pages.push(url.searchParams.get("page[number]"));
+    return url.searchParams.get("page[number]") === "0" ? servePage(url, init) : timeout(url, init);
+  };
+  const client = new DatadogApiClient(config, { fetchImpl: createDatadogRouter(routes), sleepImpl: async () => {} });
+
+  const result = await assessDatadogIdentity(client, { now: NOW });
+
+  assert.deepEqual(pages, ["0", "1", "1", "1", "1"], "page 1 was tried once and retried three times");
+  const failure = "Datadog request timed out after 30000ms: GET /api/v2/users after 4 attempts";
+  assert.ok(result.errors.some((error) => error.includes(failure)), JSON.stringify(result.errors));
+  for (const id of ["DD-02", "DD-04"]) {
+    assert.equal(findingStatus(result, id), "manual", id);
+    assert.ok(findingById(result, id).summary.includes(failure), findingById(result, id).summary);
+  }
+  assert.equal(findingById(result, "DD-03").evidence.total_users, null, "the user population is unknown, never the first page's count");
+  assert.equal(result.summary.users, null);
 });
 
 test("DatadogApiClient validates the key pair with GET /api/v2/validate_keys", async () => {
@@ -3826,10 +3981,11 @@ test("rule 9 / addendum 6: a malformed .dogrc whose bad line carries a credentia
         assertCanaryWindowsAbsent(assert, resolverMessage, [DOGRC_CANARY], `${shape.name} resolver message`);
       }
 
-      const access = await checkTool.execute("call-dogrc", checkTool.prepareArguments({ config_file: configPath }));
+      // max_retries 0: every request fails in transport, and the tools wait out real backoff between retries.
+      const access = await checkTool.execute("call-dogrc", checkTool.prepareArguments({ config_file: configPath, max_retries: 0 }));
       assertCanaryWindowsAbsent(assert, JSON.stringify(access), [DOGRC_CANARY], `${shape.name} check_access payload`);
       // The export records unreachable surfaces as collection errors rather than failing, so whatever it wrote is scanned.
-      const exported = await exportTool.execute("call-dogrc-export", exportTool.prepareArguments({ config_file: configPath, output_dir: outputDir }));
+      const exported = await exportTool.execute("call-dogrc-export", exportTool.prepareArguments({ config_file: configPath, output_dir: outputDir, max_retries: 0 }));
       assertCanaryWindowsAbsent(assert, JSON.stringify(exported), [DOGRC_CANARY], `${shape.name} export payload`);
       if (existsSync(outputDir)) {
         for (const entry of readdirSync(outputDir)) {

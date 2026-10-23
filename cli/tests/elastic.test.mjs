@@ -48,6 +48,7 @@ import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } fr
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 
 const DAY_MS = 86_400_000;
 // The configured API key: its base64 form and the secret half of its decoded id:api_key form are both alphanumeric and
@@ -984,7 +985,7 @@ test("ElasticApiClient stops retrying after maxRetries and surfaces the last sta
   await assert.rejects(() => client.getLicense(), (error) => {
     assert.ok(error instanceof ElasticRequestError);
     assert.equal(error.status, 503);
-    assert.match(error.message, /GET \/_license failed \(503 Service Unavailable\): shard down: unavailable/);
+    assert.match(error.message, /GET \/_license failed \(503 Service Unavailable\) after 3 attempts: shard down: unavailable/);
     return true;
   });
   assert.equal(attempts, 3);
@@ -1012,7 +1013,18 @@ test("ElasticApiClient does not retry 4xx errors and redacts secrets in error me
   assert.equal(attempts, 1);
 });
 
-test("ElasticApiClient retries transient network failures and aborts on timeout", async () => {
+/**
+ * A fetch that settles only when the client's own request timeout aborts it, rejecting as fetch does. The timeout is
+ * fired through the mocked clock, so no test waits on a real timer.
+ */
+function timingOutFetch(t, timeoutMs) {
+  return (_input, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+    t.mock.timers.tick(timeoutMs);
+  });
+}
+
+test("ElasticApiClient retries transient network failures and reports a timeout once its retries run out", async (t) => {
   let attempts = 0;
   const fetchImpl = async () => {
     attempts += 1;
@@ -1023,15 +1035,170 @@ test("ElasticApiClient retries transient network failures and aborts on timeout"
   assert.deepEqual(await client.authenticate(), { username: "audit" });
   assert.equal(attempts, 2);
 
-  const hanging = (_input, init) => new Promise((_resolve, reject) => {
-    init.signal.addEventListener("abort", () => {
-      const error = new Error("This operation was aborted");
-      error.name = "AbortError";
-      reject(error);
-    });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let slowAttempts = 0;
+  const hanging = timingOutFetch(t, 20);
+  const slow = new ElasticApiClient(sampleConfig({ timeoutMs: 20 }), {
+    fetchImpl: (input, init) => {
+      slowAttempts += 1;
+      return hanging(input, init);
+    },
+    sleepImpl: async () => {},
   });
-  const slow = new ElasticApiClient(sampleConfig({ timeoutMs: 20 }), { fetchImpl: hanging, sleepImpl: async () => {} });
-  await assert.rejects(() => slow.authenticate(), /timed out after 20ms/);
+  await assert.rejects(() => slow.authenticate(), /GET \/_security\/_authenticate timed out after 20ms after 4 attempts$/);
+  assert.equal(slowAttempts, 4);
+});
+
+test("ElasticApiClient retries a 500 response and a request timeout before it succeeds", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const config = sampleConfig();
+  const timeout = timingOutFetch(t, config.timeoutMs);
+  const sleeps = [];
+  let attempts = 0;
+  const fetchImpl = async (input, init) => {
+    attempts += 1;
+    if (attempts === 1) return jsonResponse({ error: { type: "internal_server_error" } }, { status: 500, statusText: "Internal Server Error" });
+    if (attempts === 2) return timeout(input, init);
+    return jsonResponse({ license: { type: "basic" } });
+  };
+  const client = new ElasticApiClient(config, { fetchImpl, sleepImpl: async (ms) => { sleeps.push(ms); } });
+
+  assert.equal((await client.getLicense()).license.type, "basic");
+  assert.equal(attempts, 3);
+  assert.deepEqual(sleeps, [250, 500]);
+});
+
+test("ElasticApiClient honors an HTTP-date Retry-After and caps every Retry-After wait at 30 s", async () => {
+  const now = new Date("2026-09-21T00:00:00.000Z");
+  const at = (ms) => new Date(now.getTime() + ms).toUTCString();
+  const responses = [
+    () => jsonResponse({ error: { type: "too_many_requests" } }, { status: 429, headers: { "retry-after": at(4000) } }),
+    () => jsonResponse({ error: { type: "unavailable" } }, { status: 503, headers: { "retry-after": at(600_000) } }),
+    () => jsonResponse({ error: { type: "bad_gateway" } }, { status: 502, headers: { "retry-after": "120" } }),
+    () => jsonResponse({ license: { type: "basic" } }),
+  ];
+  const sleeps = [];
+  let attempts = 0;
+  const client = new ElasticApiClient(sampleConfig(), {
+    fetchImpl: async () => responses[attempts++](),
+    sleepImpl: async (ms) => { sleeps.push(ms); },
+    now: () => now,
+  });
+
+  assert.equal((await client.getLicense()).license.type, "basic");
+  assert.equal(attempts, 4);
+  assert.deepEqual(sleeps, [4000, 30_000, 30_000]);
+});
+
+test("ElasticApiClient names the endpoint, the last failure, and the attempt count when retries run out, with the planted key scrubbed", async (t) => {
+  const plantedSecret = "vNsdWUpGkDWauM2ycLqAnQUrxgoDTEhd";
+  assertPlantedValuesWellFormed(assert, { plantedSecret }, [JSON.stringify(sampleConfig({ apiKey: undefined })), JSON.stringify(healthyFixtures(0))]);
+  const apiKey = Buffer.from(`audit-key-id:${plantedSecret}`).toString("base64");
+  const config = sampleConfig({ apiKey });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const cases = [
+    {
+      label: "503 on every attempt",
+      fetchImpl: async () => jsonResponse(
+        { error: { type: "unavailable", reason: `node rejected ApiKey ${apiKey} (${plantedSecret})` } },
+        { status: 503, statusText: "Service Unavailable" },
+      ),
+      expected: /^elasticsearch request GET \/_license failed \(503 Service Unavailable\) after 4 attempts: /,
+    },
+    {
+      label: "transport failure on every attempt",
+      fetchImpl: async () => { throw new TypeError(`fetch failed: ECONNRESET while sending ApiKey ${apiKey} (${plantedSecret})`); },
+      expected: /^elasticsearch request GET \/_license failed after 4 attempts: fetch failed: ECONNRESET/,
+    },
+    {
+      label: "timeout on every attempt",
+      fetchImpl: timingOutFetch(t, config.timeoutMs),
+      expected: /^elasticsearch request GET \/_license timed out after 5000ms after 4 attempts$/,
+    },
+  ];
+  for (const { label, fetchImpl, expected } of cases) {
+    const sleeps = [];
+    let attempts = 0;
+    const client = new ElasticApiClient(config, {
+      fetchImpl: async (input, init) => {
+        attempts += 1;
+        return fetchImpl(input, init);
+      },
+      sleepImpl: async (ms) => { sleeps.push(ms); },
+    });
+    await assert.rejects(() => client.getLicense(), (error) => {
+      assert.match(error.message, expected, label);
+      const text = `${error.message} ${JSON.stringify(error)}`;
+      assert.ok(!text.includes(apiKey), `${label}: the configured key is absent`);
+      assertFragmentsAbsent(assert, text, [plantedSecret], label);
+      return true;
+    });
+    assert.equal(attempts, 4, `${label}: one request plus three retries`);
+    assert.deepEqual(sleeps, [250, 500, 1000], label);
+  }
+});
+
+test("ElasticApiClient stops at once when the tool call is aborted during a retry wait, without another request", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const config = sampleConfig();
+  const failures = [
+    ["500 response", async () => jsonResponse({ error: { type: "internal_server_error" } }, { status: 500, statusText: "Internal Server Error" })],
+    ["timeout", timingOutFetch(t, config.timeoutMs)],
+  ];
+  for (const [label, failure] of failures) {
+    const controller = new AbortController();
+    let attempts = 0;
+    const client = new ElasticApiClient(config, {
+      fetchImpl: async (input, init) => {
+        attempts += 1;
+        return failure(input, init);
+      },
+      sleepImpl: () => {
+        queueMicrotask(() => controller.abort());
+        return new Promise(() => {});
+      },
+      signal: controller.signal,
+    });
+    await assert.rejects(() => client.getLicense(), (error) => {
+      assert.equal(error.name, "ToolCallAbortedError", label);
+      return true;
+    });
+    assert.equal(attempts, 1, `${label}: no request after the abort`);
+  }
+});
+
+test("an Elastic API key page that fails with a 500 on every attempt leaves the key inventory unreadable, so no key-dependent identity check passes", async () => {
+  const fixtures = healthyFixtures();
+  const template = fixtures.apiKeys[0];
+  const apiKeys = Array.from({ length: 150 }, (_, index) => ({
+    ...template,
+    id: `key-${index + 1}`,
+    name: `ci-reader-${index + 1}`,
+    _sort: [template.creation + index, `ci-reader-${index + 1}`],
+  }));
+  const routes = healthyRoutes(fixtures);
+  const keyPages = [];
+  routes["POST /_security/_query/api_key"] = (_url, init) => {
+    const body = JSON.parse(init.body);
+    keyPages.push(body.search_after ? "after" : "first");
+    if (body.search_after) {
+      return jsonResponse({ error: { type: "internal_server_error", reason: "shard failure" } }, { status: 500, statusText: "Internal Server Error" });
+    }
+    const page = apiKeys.slice(0, body.size);
+    return { total: apiKeys.length, count: page.length, api_keys: page };
+  };
+  const client = new ElasticApiClient(sampleConfig(), { fetchImpl: createRouter(routes), sleepImpl: async () => {} });
+
+  const result = await assessElasticIdentity(client);
+
+  assert.deepEqual(keyPages, ["first", "after", "after", "after", "after"], "the second page was tried once and retried three times");
+  const failure = "elasticsearch request POST /_security/_query/api_key failed (500 Internal Server Error) after 4 attempts";
+  assert.ok(result.errors.some((error) => error.includes(failure)), JSON.stringify(result.errors));
+  for (const id of ["ELASTIC-09", "ELASTIC-10"]) {
+    const item = findingById(result, id);
+    assert.equal(item.status, "manual", id);
+    assert.ok(item.summary.includes(failure), item.summary);
+  }
 });
 
 test("checkElasticAccess reports healthy when every surface is readable and privileges are granted", async () => {

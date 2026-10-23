@@ -39,6 +39,7 @@ const DEFAULT_ACS_BASE_URL = "https://admin.splunk.com";
 const DEFAULT_CONFIG_FILE = join(homedir(), ".config", "grclanker", "splunk.json");
 const DEFAULT_RETRY_ATTEMPTS = 3;
 const DEFAULT_RETRY_DELAY_MS = 400;
+const MAX_RETRY_WAIT_MS = 30_000;
 const ADMIN_ROLE_NAMES = new Set(["admin", "sc_admin", "splunk-system-role", "can_delete"]);
 const ACS_ALLOWLIST_FEATURES = ["search-api", "hec", "s2s", "search-ui"] as const;
 const CORE_APP_PREFIXES = ["splunk_", "splunk-", "SplunkForwarder", "SplunkLightForwarder", "SA-", "DA-", "TA-"];
@@ -1454,15 +1455,14 @@ export class SplunkApiError extends Error {
    * body contributes only splunkd's documented messages[].text (or message)
    * field, and the configured secrets are removed before the pattern pass.
    */
-  static fromResponse(endpoint: string, response: Response, body: ParsedResponseBody, secrets: Array<string | undefined>): SplunkApiError {
+  static fromResponse(endpoint: string, response: Response, body: ParsedResponseBody, secrets: Array<string | undefined>, attempts = 1): SplunkApiError {
     const messages = asArray(body.payload.messages)
       .map((item) => asString(asObject(item)?.text))
       .filter((item): item is string => Boolean(item));
     const detail = body.nonJsonBody ?? (messages.join("; ") || asString(body.payload.message) || "");
     const outcome = response.ok ? "returned an unreadable response" : "failed";
-    const statusLine = `${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
     return new SplunkApiError(
-      scrubErrorText(`Splunk request to ${endpoint} ${outcome} (${statusLine})${detail ? `: ${detail}` : ""}`, secrets),
+      scrubErrorText(`Splunk request to ${endpoint} ${outcome} (${statusLine(response)})${attemptsSuffix(attempts)}${detail ? `: ${detail}` : ""}`, secrets),
       endpoint,
       response.status,
     );
@@ -1547,10 +1547,28 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+function statusLine(response: Response): string {
+  return `${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+}
+
+function attemptsSuffix(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
+/** The wait a Retry-After header asks for: delta-seconds, or an HTTP-date measured against `now`. */
+function retryAfterMs(header: string | null, now: number): number | undefined {
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : undefined;
+  const date = Date.parse(header);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - now);
+}
+
 export class SplunkApiClient {
   private readonly config: SplunkResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly now: () => number;
   private readonly retryAttempts: number;
   private readonly retryDelayMs: number;
   private readonly pageSize: number;
@@ -1562,6 +1580,8 @@ export class SplunkApiClient {
     config: SplunkResolvedConfig,
     options: {
       fetchImpl?: FetchImpl;
+      sleep?: (ms: number) => Promise<void>;
+      now?: () => number;
       retryAttempts?: number;
       retryDelayMs?: number;
       pageSize?: number;
@@ -1571,7 +1591,8 @@ export class SplunkApiClient {
   ) {
     this.config = config;
     this.fetchImpl = abortableFetch(options.fetchImpl ?? (config.verifyTls ? fetch : createInsecureTlsFetch()), options.signal);
-    this.sleep = abortableSleep(options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
+    this.now = options.now ?? Date.now;
     registerConfiguredSecrets([config.token, config.password, config.acsToken]);
     this.retryAttempts = clampNumber(options.retryAttempts, DEFAULT_RETRY_ATTEMPTS, 1, 10);
     this.retryDelayMs = clampNumber(options.retryDelayMs, DEFAULT_RETRY_DELAY_MS, 0, 30_000);
@@ -1604,41 +1625,63 @@ export class SplunkApiClient {
     return url.toString();
   }
 
-  private async rawRequest(url: string, init: RequestInit, endpoint: string): Promise<Response> {
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= this.retryAttempts; attempt += 1) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
-      try {
-        const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
-        if (isRetryableStatus(response.status) && attempt < this.retryAttempts) {
-          await response.text().catch(() => "");
-          await this.sleep(this.retryDelayMs * 2 ** (attempt - 1));
-          continue;
-        }
-        return response;
-      } catch (error) {
-        rethrowIfAborted(error);
-        lastError = error;
-        if (attempt < this.retryAttempts) {
-          await this.sleep(this.retryDelayMs * 2 ** (attempt - 1));
-          continue;
-        }
-      } finally {
-        clearTimeout(timeout);
-      }
+  private async sendOnce(url: string, init: RequestInit): Promise<{ response: Response } | { timedOut: boolean; reason: string }> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    try {
+      return { response: await this.fetchImpl(url, { ...init, signal: controller.signal }) };
+    } catch (error) {
+      rethrowIfAborted(error);
+      return { timedOut: controller.signal.aborted, reason: errorMessage(error) };
+    } finally {
+      clearTimeout(timeout);
     }
-    throw new SplunkApiError(`Splunk request to ${endpoint} failed: ${this.redact(errorMessage(lastError))}`, endpoint);
   }
 
-  private async readJson(response: Response, endpoint: string): Promise<JsonRecord> {
+  /**
+   * `retryAttempts` counts every attempt, the first included. A Retry-After
+   * longer than MAX_RETRY_WAIT_MS ends the request instead of being waited
+   * out. Every request is retried, the oneshot search-job POST included.
+   */
+  private async rawRequest(url: string, init: RequestInit, endpoint: string): Promise<{ response: Response; attempts: number }> {
+    for (let attempt = 1; ; attempt += 1) {
+      const outcome = await this.sendOnce(url, init);
+      const backoffMs = Math.min(this.retryDelayMs * 2 ** (attempt - 1), MAX_RETRY_WAIT_MS);
+      if (!("response" in outcome)) {
+        if (attempt >= this.retryAttempts) {
+          throw new SplunkApiError(
+            this.redact(outcome.timedOut
+              ? `Splunk request to ${endpoint} timed out after ${this.config.timeoutMs} ms${attemptsSuffix(attempt)}`
+              : `Splunk request to ${endpoint} failed${attemptsSuffix(attempt)}: ${outcome.reason}`),
+            endpoint,
+          );
+        }
+        await this.sleep(backoffMs);
+        continue;
+      }
+      const { response } = outcome;
+      if (!isRetryableStatus(response.status) || attempt >= this.retryAttempts) return { response, attempts: attempt };
+      await response.text().catch(() => "");
+      const retryAfter = retryAfterMs(response.headers.get("retry-after"), this.now());
+      if (retryAfter !== undefined && retryAfter > MAX_RETRY_WAIT_MS) {
+        throw new SplunkApiError(
+          this.redact(`Splunk request to ${endpoint} failed (${statusLine(response)})${attemptsSuffix(attempt)}: the server asked to retry after ${Math.ceil(retryAfter / 1000)} s, more than the ${MAX_RETRY_WAIT_MS / 1000} s limit`),
+          endpoint,
+          response.status,
+        );
+      }
+      await this.sleep(retryAfter ?? backoffMs);
+    }
+  }
+
+  private async readJson({ response, attempts }: { response: Response; attempts: number }, endpoint: string): Promise<JsonRecord> {
     // A body that is not JSON (a proxy error page, an HTML sign-in form) is
     // never copied into an error string: SplunkApiError.fromResponse
     // describes it by content type and size only, and a 2xx non-JSON body is
     // an unreadable surface rather than an empty inventory.
     const body = parseResponseBody(response, await response.text());
     if (!response.ok || body.nonJsonBody !== undefined) {
-      throw SplunkApiError.fromResponse(endpoint, response, body, this.configuredSecrets());
+      throw SplunkApiError.fromResponse(endpoint, response, body, this.configuredSecrets(), attempts);
     }
     return body.payload;
   }
@@ -1652,12 +1695,12 @@ export class SplunkApiClient {
       password: this.config.password,
       output_mode: "json",
     });
-    const response = await this.rawRequest(this.buildUrl(this.config.url, "/services/auth/login", {}), {
+    const exchange = await this.rawRequest(this.buildUrl(this.config.url, "/services/auth/login", {}), {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
       body: body.toString(),
     }, "/services/auth/login");
-    const payload = await this.readJson(response, "/services/auth/login");
+    const payload = await this.readJson(exchange, "/services/auth/login");
     const sessionKey = asString(payload.sessionKey);
     if (!sessionKey) {
       throw new SplunkApiError("Splunk login response did not include a sessionKey.", "/services/auth/login");
@@ -1680,16 +1723,16 @@ export class SplunkApiClient {
 
   async getJson(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
     const url = this.buildUrl(this.config.url, path, { ...query, output_mode: "json" });
-    const response = await this.rawRequest(url, {
+    const exchange = await this.rawRequest(url, {
       method: "GET",
       headers: { accept: "application/json", authorization: await this.authorizationHeader() },
     }, path);
-    return this.readJson(response, path);
+    return this.readJson(exchange, path);
   }
 
   async postJson(path: string, form: Record<string, string>): Promise<JsonRecord> {
     const url = this.buildUrl(this.config.url, path, { output_mode: "json" });
-    const response = await this.rawRequest(url, {
+    const exchange = await this.rawRequest(url, {
       method: "POST",
       headers: {
         accept: "application/json",
@@ -1698,7 +1741,7 @@ export class SplunkApiClient {
       },
       body: new URLSearchParams(form).toString(),
     }, path);
-    return this.readJson(response, path);
+    return this.readJson(exchange, path);
   }
 
   /**
@@ -1824,11 +1867,11 @@ export class SplunkApiClient {
     }
     const base = `${this.config.acsBaseUrl}/${encodeURIComponent(this.config.stack)}/adminconfig/v2`;
     const url = this.buildUrl(base, path, query);
-    const response = await this.rawRequest(url, {
+    const exchange = await this.rawRequest(url, {
       method: "GET",
       headers: { accept: "application/json", authorization: `Bearer ${this.config.acsToken}` },
     }, `acs:${path}`);
-    return this.readJson(response, `acs:${path}`);
+    return this.readJson(exchange, `acs:${path}`);
   }
 
   async acsListAll(path: string, key: string): Promise<{ items: JsonRecord[]; truncated: boolean }> {

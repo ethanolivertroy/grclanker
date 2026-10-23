@@ -32,6 +32,7 @@ const DEFAULT_OUTPUT_DIR = "./export/elastic";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_MS = 250;
+const MAX_RETRY_AFTER_MS = 30_000;
 const DEFAULT_CLOUD_API_URL = "https://api.elastic-cloud.com";
 const DEFAULT_CONFIG_DIR = ".elastic-sec-inspector";
 const DEFAULT_CONFIG_FILE = "config.yaml";
@@ -1464,33 +1465,47 @@ function describeOpaqueBody(response: Response, rawText: string, parsedJson: boo
 }
 
 function isRetryableStatus(status: number): boolean {
-  return status === 429 || status === 502 || status === 503 || status === 504;
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
-function retryDelayMs(attempt: number, retryAfterHeader: string | null): number {
-  const retryAfterSeconds = retryAfterHeader ? Number(retryAfterHeader) : Number.NaN;
-  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
-    return Math.min(retryAfterSeconds * 1000, 30_000);
-  }
+/** The wait a Retry-After header asks for: delta-seconds, or an HTTP-date measured against `nowMs`. */
+function retryAfterMs(header: string | null, nowMs: number): number | undefined {
+  const seconds = asNumber(header ?? undefined);
+  if (seconds !== undefined) return seconds >= 0 ? seconds * 1000 : undefined;
+  if (!header || !/[a-z]/i.test(header)) return undefined;
+  const dateMs = Date.parse(header);
+  return Number.isNaN(dateMs) ? undefined : Math.max(0, dateMs - nowMs);
+}
+
+function retryDelayMs(attempt: number, retryAfterHeader: string | null, nowMs: number): number {
+  const retryAfter = retryAfterMs(retryAfterHeader, nowMs);
+  if (retryAfter !== undefined) return Math.min(retryAfter, MAX_RETRY_AFTER_MS);
   return Math.min(DEFAULT_RETRY_BASE_MS * 2 ** attempt, 10_000);
+}
+
+function attemptsSuffix(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
 }
 
 export class ElasticApiClient {
   private readonly config: ElasticResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleepImpl: (ms: number) => Promise<void>;
+  private readonly now: () => Date;
 
   constructor(
     config: ElasticResolvedConfig,
     options: {
       fetchImpl?: FetchImpl;
       sleepImpl?: (ms: number) => Promise<void>;
+      now?: () => Date;
       signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
+    this.now = options.now ?? (() => new Date());
     // The configured secrets are scrubbed from every recorded error string in every encoded form from here on.
     registerConfiguredSecrets(config);
   }
@@ -1579,7 +1594,7 @@ export class ElasticApiClient {
           signal: controller.signal,
         });
         if (isRetryableStatus(response.status) && attempt < this.config.maxRetries) {
-          await this.sleepImpl(retryDelayMs(attempt, response.headers.get("retry-after")));
+          await this.sleepImpl(retryDelayMs(attempt, response.headers.get("retry-after"), this.now().getTime()));
           continue;
         }
         const rawText = await response.text();
@@ -1595,7 +1610,7 @@ export class ElasticApiClient {
         if (!response.ok) {
           const detail = (parsedJson ? elasticErrorSummary(payload, this.config) : undefined) ?? describeOpaqueBody(response, rawText, parsedJson);
           throw new ElasticRequestError(
-            redactSecrets(`${target} request ${method} ${path} failed (${response.status} ${response.statusText}): ${detail}`, this.config),
+            redactSecrets(`${target} request ${method} ${path} failed (${response.status} ${response.statusText})${attemptsSuffix(attempt + 1)}: ${detail}`, this.config),
             response.status,
             target,
           );
@@ -1620,15 +1635,15 @@ export class ElasticApiClient {
       } catch (error) {
         rethrowIfAborted(error);
         if (error instanceof ElasticRequestError) throw error;
-        const aborted = error instanceof Error && error.name === "AbortError";
-        if (!aborted && attempt < this.config.maxRetries && isNetworkError(error)) {
-          await this.sleepImpl(retryDelayMs(attempt, null));
+        const timedOut = controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
+        if ((timedOut || isNetworkError(error)) && attempt < this.config.maxRetries) {
+          await this.sleepImpl(retryDelayMs(attempt, null, this.now().getTime()));
           continue;
         }
         throw new Error(redactSecrets(
-          aborted
-            ? `${target} request ${method} ${path} timed out after ${this.config.timeoutMs}ms`
-            : `${target} request ${method} ${path} failed: ${errorMessage(error)}`,
+          timedOut
+            ? `${target} request ${method} ${path} timed out after ${this.config.timeoutMs}ms${attemptsSuffix(attempt + 1)}`
+            : `${target} request ${method} ${path} failed${attemptsSuffix(attempt + 1)}: ${errorMessage(error)}`,
           this.config,
         ));
       } finally {
