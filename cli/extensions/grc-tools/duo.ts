@@ -2065,7 +2065,7 @@ export class DuoAuditorClient {
             : signV2(this.config.ikey, this.config.skey, method, this.config.apiHost, path, normalizedParams, date),
         Date: date,
         Host: this.config.apiHost,
-        "User-Agent": "grclanker/0.1.3 duo-audit",
+        "User-Agent": "grclanker/0.1.4 duo-audit",
       };
       if (method !== "GET" && body.length > 0) {
         headers["Content-Type"] = signatureVersion === 5 ? "application/json" : "application/x-www-form-urlencoded";

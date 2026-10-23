@@ -11,7 +11,7 @@ If you want the fast path, do this in order. For Windows notes, pinned versions,
 curl -fsSL https://grclanker.com/install | bash
 ```
 
-This installs the newest release bundle, currently `v0.1.3`, with all 241 domain tools, `grclanker tools`, and `grclanker flue run`. To run unreleased changes from `main` instead, [install from source](/docs/getting-started/installation#install-from-source) and `npm link` it so the `grclanker` commands below run that build.
+This installs the newest release bundle, currently `v0.1.4`, with all 241 domain tools, `grclanker tools`, and `grclanker flue run`. To run unreleased changes from `main` instead, [install from source](/docs/getting-started/installation#install-from-source) and `npm link` it so the `grclanker` commands below run that build.
 
 ## 2. Set up a model
 
@@ -70,7 +70,7 @@ grclanker "Is CVE-2024-3400 in the CISA KEV catalog?"
 
 The older `v0.0.1` bundle does not take either form. There, name the vendor, product, CVE, or framework in the session once it opens.
 
-Leave a session with `/quit` or Ctrl+D. To reopen an earlier conversation, start `grclanker` and run `/resume`. On exit, grclanker also prints a `grclanker --session <id>` command. The `v0.1.3` bundle rejects that command as unknown, and a source checkout of `main` accepts it.
+Leave a session with `/quit` or Ctrl+D. To reopen an earlier conversation, start `grclanker` and run `/resume`. On exit, grclanker also prints a `grclanker --session <id>` command that reopens the same session. The `v0.1.3` and older bundles reject that command as unknown.
 
 ## 4. Ask one useful first question
 

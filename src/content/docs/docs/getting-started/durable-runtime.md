@@ -7,7 +7,7 @@ description: "Experimental: run the grclanker agent under Pi Durable, from the c
 
 `grclanker durable` runs the GRC agent under [Pi Durable](https://www.npmjs.com/package/@earendil-works/pi-durable), Pi's durable conversation runtime. Pi Durable writes the conversation and each tool round to a SQLite database as the run goes. If the process crashes, is killed, or is stopped with Ctrl-C, a later command picks the session up where it stopped instead of starting over.
 
-The command ships in the `v0.1.3` release bundle. `v0.1.2` and older do not have it.
+The command ships in the `v0.1.3` and later release bundles. `v0.1.2` and older do not have it.
 
 ## What the runtime maps
 
