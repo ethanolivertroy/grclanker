@@ -1555,8 +1555,8 @@ export const KNOWBE4_SPEC = buildBatchIntegrationSpec({
   rateLimit: {
     documentedLimit: "KnowBe4 documents per-second, burst, and daily request limits per account for the Reporting API; the collector does not read rate-limit headers.",
     retryHeaders: ["Retry-After"],
-    retryableStatuses: [429, 503],
-    backoffPolicy: "Retry 429 and 503 up to 3 times after the first attempt. A Retry-After whose ECMAScript Number value is finite and 0 or more waits that many seconds; one that Date.parse reads as a date waits until then, or not at all when it has passed; otherwise the wait is 1 second, doubling on each later retry. Every wait is capped at 60 seconds, and every attempt starts at least 250 milliseconds after the previous one. Requests that time out (30 seconds unless timeout_seconds or KNOWBE4_TIMEOUT sets it), network errors, and PhishER responses carrying GraphQL errors are not retried.",
+    retryableStatuses: [429, 500, 502, 503, 504],
+    backoffPolicy: "Retry 429, 500, 502, 503, and 504, requests that time out, and network errors up to 3 times after the first attempt; every request is a GET or a PhishER GraphQL query, so sending one again changes nothing. A Retry-After whose ECMAScript Number value is finite and 0 or more waits that many seconds; one that Date.parse reads as a date waits until then on the client clock, or not at all when it has passed; otherwise, and after a timeout or a network error, the wait is 1 second, doubling on each later retry. Every wait is capped at 60 seconds, and every attempt starts at least 250 milliseconds after the previous one. A request times out after 30 seconds unless timeout_seconds or KNOWBE4_TIMEOUT sets it, and the timer covers reading the body. When the retries run out, the request fails with its method and path (never its query), the HTTP status, the timeout (\"timed out after <ms>ms\"), or the network error, and the number of attempts, and the dataset it was reading is reported as not readable. Other statuses, including 501, and PhishER responses carrying GraphQL errors are not retried.",
   },
   runtimeBehavior: [],
   knownGaps: [],

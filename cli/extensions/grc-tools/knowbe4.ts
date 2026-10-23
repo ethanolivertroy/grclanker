@@ -54,6 +54,8 @@ const MIN_REQUEST_INTERVAL_MS = 250;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 60_000;
+// Throttling and passing outages only: 501 and the rarer 5xx statuses report conditions a retry won't clear, so they fail at once.
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 /** Documented JSON error detail is kept to this many characters, after the scrub has run over it at full length. */
 const MAX_ERROR_DETAIL_CHARS = 300;
 const DEFAULT_USER_LIMIT = 5_000;
@@ -992,16 +994,20 @@ function describeQuery(query: JsonRecord): string {
   return text ? `?${text}` : "";
 }
 
-function retryDelayMs(retryAfter: string | null, attempt: number): number {
+function retryDelayMs(retryAfter: string | null, attempt: number, now: number): number {
   const seconds = retryAfter ? Number(retryAfter) : Number.NaN;
   if (Number.isFinite(seconds) && seconds >= 0) {
     return Math.min(seconds * 1000, MAX_RETRY_DELAY_MS);
   }
   const retryDate = retryAfter ? Date.parse(retryAfter) : Number.NaN;
   if (Number.isFinite(retryDate)) {
-    return Math.min(Math.max(retryDate - Date.now(), 0), MAX_RETRY_DELAY_MS);
+    return Math.min(Math.max(retryDate - now, 0), MAX_RETRY_DELAY_MS);
   }
   return Math.min(DEFAULT_RETRY_BASE_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
+}
+
+function attemptCount(attempts: number): string {
+  return `${attempts} attempt${attempts === 1 ? "" : "s"}`;
 }
 
 /**
@@ -1212,6 +1218,7 @@ export class Knowbe4ApiClient {
   private readonly config: Knowbe4ResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleepImpl: SleepImpl;
+  private readonly now: () => number;
   private readonly maxRetries: number;
   private readonly minRequestIntervalMs: number;
   private lastRequestAt = 0;
@@ -1222,6 +1229,7 @@ export class Knowbe4ApiClient {
     options: {
       fetchImpl?: FetchImpl;
       sleepImpl?: SleepImpl;
+      now?: () => number;
       maxRetries?: number;
       minRequestIntervalMs?: number;
       signal?: AbortSignal;
@@ -1230,6 +1238,7 @@ export class Knowbe4ApiClient {
     this.config = config;
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
+    this.now = options.now ?? Date.now;
     this.maxRetries = clampInteger(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     this.minRequestIntervalMs = clampInteger(options.minRequestIntervalMs, MIN_REQUEST_INTERVAL_MS, 0, 10_000);
     // The configured tokens are scrubbed from every recorded error string in every encoded form from here on.
@@ -1269,15 +1278,16 @@ export class Knowbe4ApiClient {
   }
 
   private async throttle(): Promise<void> {
-    const waitMs = this.lastRequestAt + this.minRequestIntervalMs - Date.now();
+    const waitMs = this.lastRequestAt + this.minRequestIntervalMs - this.now();
     if (waitMs > 0) await this.sleepImpl(waitMs);
-    this.lastRequestAt = Date.now();
+    this.lastRequestAt = this.now();
   }
 
   /**
    * Every failure surfaces as a Knowbe4ApiError naming the request that was actually made ("GET /v1/users") and the
    * status it observed (null for a timeout or transport failure), so the surfaces and findings downstream never
-   * have to name an endpoint or status from a constant.
+   * have to name an endpoint or status from a constant. A failure the client retries also names how many attempts
+   * were made before the retries ran out.
    */
   private async request(url: string, init: RequestInit, token: string, shape: Knowbe4ResponseShape, label?: string): Promise<unknown> {
     const method = init.method ?? "GET";
@@ -1289,30 +1299,37 @@ export class Knowbe4ApiClient {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
       let response: Response;
+      let rawText: string;
+      // The body is read under the same timer, so a body that stalls times out like a request that never answers.
       try {
         const headers = new Headers(init.headers ?? {});
         headers.set("accept", "application/json");
         headers.set("authorization", `Bearer ${token}`);
         response = await this.fetchImpl(url, { ...init, headers, signal: controller.signal });
+        rawText = await response.text();
       } catch (error) {
         rethrowIfAborted(error);
-        if (controller.signal.aborted) {
-          throw new Knowbe4ApiError(this.redact(`KnowBe4 request timed out after ${this.config.timeoutMs}ms: ${target}`), null, endpoint);
+        // Every request is a GET or a PhishER GraphQL query, so sending one again cannot change anything.
+        if (attempt < this.maxRetries) {
+          await this.sleepImpl(retryDelayMs(null, attempt, this.now()));
+          continue;
         }
-        throw new Knowbe4ApiError(this.redact(`KnowBe4 request failed: ${target}: ${describeThrown(error)}`), null, endpoint);
+        const reason = controller.signal.aborted ? `timed out after ${this.config.timeoutMs}ms` : describeThrown(error);
+        throw new Knowbe4ApiError(this.redact(`KnowBe4 request failed after ${attemptCount(attempt + 1)}: ${target}: ${reason}`), null, endpoint);
       } finally {
         clearTimeout(timeout);
       }
 
-      const rawText = await response.text();
-      if ((response.status === 429 || response.status === 503) && attempt < this.maxRetries) {
-        await this.sleepImpl(retryDelayMs(response.headers.get("retry-after"), attempt));
+      const retryable = RETRYABLE_STATUSES.has(response.status);
+      if (retryable && attempt < this.maxRetries) {
+        await this.sleepImpl(retryDelayMs(response.headers.get("retry-after"), attempt, this.now()));
         continue;
       }
       if (!response.ok) {
         const detail = knowbe4ErrorDetail(response, rawText);
+        const attempts = retryable ? ` after ${attemptCount(attempt + 1)}` : "";
         throw new Knowbe4ApiError(
-          this.redact(`KnowBe4 request failed (${statusLine(response)}) ${target}${detail ? `: ${detail}` : ""}`),
+          this.redact(`KnowBe4 request failed${attempts} (${statusLine(response)}) ${target}${detail ? `: ${detail}` : ""}`),
           response.status,
           endpoint,
         );
