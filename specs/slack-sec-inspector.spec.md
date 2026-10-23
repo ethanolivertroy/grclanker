@@ -284,7 +284,7 @@ Malformed configuration: Reject malformed or ambiguous configuration before any 
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| Slack Security Inspector | Method-specific Slack rate tiers | `Retry-After` | 429, 500, 502, 503, 504 | Honor Retry-After up to the runtime bound and retry 429 responses twice; exhausted reads stay explicit. |
+| Slack Security Inspector | Method-specific Slack rate tiers | `Retry-After` | 429, 500, 502, 503, 504 | Every request reads, so 429, 500, 502, 503, and 504 responses, request timeouts (30 s by default, covering the body read), and network failures are retried three times (four attempts). Retry-After is honored as delta-seconds or an HTTP-date; without it the wait backs off exponentially from 1 s to an 8 s cap. A Retry-After beyond 60 s fails closed at once and names the time, and an exhausted request names the method or path, the last HTTP status or failure, and the attempt count, so the read stays explicit and its inventory is never complete. |
 
 ## Checks
 

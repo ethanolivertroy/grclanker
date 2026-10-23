@@ -145,7 +145,7 @@ Otherwise it:
 
 ## How the tools handle evidence
 
-This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict and how the tools page through the API and report incomplete listings. You don't need it to set up or run the integration.
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how failed requests are retried. You don't need it to set up or run the integration.
 
 ### Verdict rules
 
@@ -162,6 +162,27 @@ This section is reference for reviewing findings and bundles: how unread, partia
   - Every JSON file in the bundle passes a key-name redaction belt.
   - A test exports a canary-laden tenant and walks every bundle file and zip entry.
 - A rerun of the export allocates a new directory and a zip with the same stem, so prior bundles are never overwritten.
+
+### Retries and timeouts
+
+Each request has a 30-second deadline that also covers reading the response body. A request is retried up to four times (five attempts) when it:
+
+- Gets a `429`, or a `403` that carries a rate-limit marker (`x-ratelimit-remaining: 0` or a rate limit message). A `403` without one is a permission denial and is not retried.
+- Gets a `500`, `502`, `503`, or `504`.
+- Times out or fails at the network level.
+
+Retries cover REST reads, GraphQL queries, and the GitHub App installation token request. In App mode, the one token refresh after a `401` counts toward the five attempts.
+
+The wait before each retry follows GitHub's [rate limit guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#handle-rate-limit-errors-appropriately):
+
+- The `Retry-After` header (seconds or an HTTP date) when the response carries one.
+- Otherwise `x-ratelimit-reset` when `x-ratelimit-remaining` is `0`.
+- Otherwise one minute for a rate limit that names no wait. GitHub asks for a longer wait each time the limit repeats, which would pass the 60-second cap, so a repeat on the same request fails it.
+- Otherwise, for server errors, timeouts, and network failures, a wait that doubles from 0.5 seconds up to 8 seconds.
+
+A wait longer than 60 seconds is never slept through: the request fails at once and the error names the time.
+
+A request that runs out of attempts fails with the method and path (never the query), the last HTTP status or failure, and the attempt count, for example `GitHub request failed (503) for GET /orgs/example-org after 5 attempts: Service Unavailable`. A network failure is described only by its system error code, such as `network error (ECONNRESET)`. The endpoint is then unread, and its findings follow the verdict rules above. A listing whose later page fails is unread as a whole: the pages already read are not kept as the inventory.
 
 ## Official documentation
 

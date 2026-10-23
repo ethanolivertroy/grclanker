@@ -17,11 +17,11 @@ import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZOOM_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
-import { ConfigFileError, readJsonConfig } from "./hardening/index.js";
+import { ConfigFileError, readJsonConfig, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { ZOOM_SPEC } from "./zoom.spec.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -39,8 +39,13 @@ const DEFAULT_MAX_ADMINS = 10;
 const DEFAULT_MAX_RECORDING_RETENTION_DAYS = 120;
 const DEFAULT_MAX_SESSION_INACTIVITY_MINUTES = 120;
 const DEFAULT_ROLE_MEMBER_LIMIT = 3000;
-const MAX_RATE_LIMIT_RETRIES = 3;
-const MAX_RETRY_AFTER_MS = 30_000;
+const MAX_RETRIES = 3;
+const MAX_ATTEMPTS = MAX_RETRIES + 1;
+// A server-named wait longer than this is not slept through: the request fails closed and names the time.
+const MAX_RETRY_WAIT_MS = 60_000;
+const BASE_RETRY_BACKOFF_MS = 1_000;
+const MAX_RETRY_BACKOFF_MS = 8_000;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const MAX_LIST_PAGES = 500;
 const REDACTED = "[REDACTED]";
 const DEFAULT_CONFIG_FILE_NAMES = [".zoom.json", ".grclanker-zoom.json"];
@@ -728,6 +733,7 @@ function zoomErrorSummary(payload: unknown): string | undefined {
 }
 
 export class ZoomApiError extends Error {
+  /** The last HTTP status, or 0 when the last attempt got no response (it timed out or the network failed). */
   readonly status: number;
   readonly retryAfterMs?: number;
   readonly rejection?: ZoomCredentialRejection;
@@ -901,14 +907,50 @@ function toRecords(items: unknown[]): JsonRecord[] {
   return items.map(asObject).filter((item): item is JsonRecord => Boolean(item));
 }
 
+function describeAttempts(attempts: number): string {
+  return `after ${attempts} attempt${attempts === 1 ? "" : "s"}`;
+}
+
+/**
+ * Retry-After as milliseconds from `now`: delta-seconds, or an HTTP-date (RFC 9110 section 10.2.3)
+ * already past counts as 0. Undefined when the header is absent or is neither form. The digit test
+ * comes first because Date.parse reads a bare number such as "120" as a year.
+ */
+function parseRetryAfterMs(header: string | null, now: number): number | undefined {
+  const value = header?.trim();
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return Number.parseInt(value, 10) * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(date - now, 0) : undefined;
+}
+
+function retryBackoffMs(attempt: number): number {
+  return Math.min(BASE_RETRY_BACKOFF_MS * 2 ** (attempt - 1), MAX_RETRY_BACKOFF_MS);
+}
+
+// A failed request never echoes the fetch library's message, which can carry a URL or a proxy's
+// text: only a system error code shaped like one (ECONNRESET), on the error or its cause, is kept.
+function describeTransportFailure(error: unknown): string {
+  const cause = error instanceof Error ? error.cause : undefined;
+  const code = systemErrorCode(error) ?? systemErrorCode(cause);
+  return code ? `network error (${code})` : "network error";
+}
+
+/** One request: the response with its body read, or why no response arrived in time. */
+type ZoomAttempt =
+  | { kind: "response"; response: Response; rawText: string }
+  | { kind: "failed"; reason: string };
+
 export class ZoomApiClient {
   private readonly config: ZoomResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
+  private readonly signal?: AbortSignal;
   private accessToken?: string;
   private accessTokenExpiresAt = 0;
   private accessTokenPromise?: Promise<string>;
+  private accessTokenFailure?: unknown;
 
   constructor(
     config: ZoomResolvedConfig,
@@ -924,6 +966,7 @@ export class ZoomApiClient {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleep = abortableSleep(options.signal, options.sleep);
     this.now = options.now ?? (() => Date.now());
+    this.signal = options.signal;
     if (config.token) {
       this.accessToken = config.token;
       this.accessTokenExpiresAt = Number.MAX_SAFE_INTEGER;
@@ -948,54 +991,83 @@ export class ZoomApiClient {
   }
 
   /**
-   * Defensive fallback: ZOOM_DOCS.rateLimits documents HTTP 429 and asks
-   * clients to wait before retrying but does not name a Retry-After header.
-   * The header is honored when present (delta-seconds or HTTP-date, capped at
-   * MAX_RETRY_AFTER_MS); otherwise the wait defaults to one second.
+   * One request and its body read under the configured deadline. The deadline is raced as well as passed as the
+   * request signal, so a fetch that ignores its signal still ends. A tool-call abort is rethrown and never retried.
    */
-  private parseRetryAfter(response: Response): number {
-    const header = response.headers.get("retry-after");
-    const seconds = asNumber(header);
-    if (seconds !== undefined) return Math.min(Math.max(seconds, 1) * 1000, MAX_RETRY_AFTER_MS);
-    const at = header ? Date.parse(header) : Number.NaN;
-    if (Number.isFinite(at)) return Math.min(Math.max(at - this.now(), 1000), MAX_RETRY_AFTER_MS);
-    return 1000;
+  private async sendOnce(url: string, init: RequestInit): Promise<ZoomAttempt> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(controller.signal.reason);
+      }, this.config.timeoutMs);
+    });
+    const exchange = (async (): Promise<ZoomAttempt> => {
+      const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
+      return { kind: "response", response, rawText: await response.text() };
+    })();
+    try {
+      return await Promise.race([unlessAborted(exchange, this.signal), deadline]);
+    } catch (error) {
+      rethrowIfAborted(error);
+      if (this.signal?.aborted) throw new ToolCallAbortedError(this.signal);
+      if (controller.signal.aborted) return { kind: "failed", reason: `timed out after ${this.config.timeoutMs} ms` };
+      return { kind: "failed", reason: describeTransportFailure(error) };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
+  /**
+   * Sends a request until it gets a response that is not retried. Every request reads (the token exchange only
+   * mints a token), so every request is safe to repeat. 429, 500, 502, 503, and 504 responses, timeouts, and network
+   * failures are retried MAX_RETRIES times. ZOOM_DOCS.rateLimits documents HTTP 429 and asks clients to wait before
+   * retrying but does not name a Retry-After header, so the header is honored when present (delta-seconds or an
+   * HTTP-date) and the wait otherwise backs off exponentially. A Retry-After past MAX_RETRY_WAIT_MS fails closed at
+   * once and names the time. A failed token exchange is thrown as is, never retried again by the request it serves.
+   */
   private async fetchJson(
     url: string,
     init: RequestInit = {},
     options: { skipAuth?: boolean; tokenRequest?: boolean } = {},
   ): Promise<JsonRecord> {
-    for (let attempt = 0; ; attempt += 1) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
-      try {
-        const headers = new Headers(init.headers ?? {});
-        if (!headers.has("accept")) headers.set("accept", "application/json");
-        if (!options.skipAuth) {
-          headers.set("authorization", `Bearer ${await this.getAccessToken()}`);
-        }
+    const method = (init.method ?? "GET").toUpperCase();
+    for (let attempt = 1; ; attempt += 1) {
+      const headers = new Headers(init.headers ?? {});
+      if (!headers.has("accept")) headers.set("accept", "application/json");
+      if (!options.skipAuth) {
+        headers.set("authorization", `Bearer ${await this.getAccessToken()}`);
+      }
 
-        const response = await this.fetchImpl(url, { ...init, headers, signal: controller.signal });
-        const rawText = await response.text();
-        const body = parseJsonBody(rawText);
-        if (response.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
-          await this.sleep(this.parseRetryAfter(response));
+      const outcome = await this.sendOnce(url, { ...init, headers });
+      if (outcome.kind === "failed") {
+        if (attempt < MAX_ATTEMPTS) {
+          await this.sleep(retryBackoffMs(attempt));
           continue;
         }
-        if (!response.ok) {
-          throw new ZoomApiError(
-            this.describeFailure(url, init.method ?? "GET", response, rawText, body),
-            response.status,
-            response.status === 429 ? this.parseRetryAfter(response) : undefined,
-            options.tokenRequest ? tokenRequestRejection(response.status, body) : undefined,
-          );
-        }
-        return body.payload;
-      } finally {
-        clearTimeout(timeout);
+        throw new ZoomApiError(
+          scrubErrorText(`Zoom request failed for ${method} ${new URL(url).pathname} ${describeAttempts(attempt)}: ${outcome.reason}`, credentialValues(this.config)),
+          0,
+        );
       }
+      const { response, rawText } = outcome;
+      const body = parseJsonBody(rawText);
+      if (response.ok) return body.payload;
+      const rejection = options.tokenRequest ? tokenRequestRejection(response.status, body) : undefined;
+      if (!RETRYABLE_STATUSES.has(response.status)) {
+        throw new ZoomApiError(this.describeFailure(url, method, response, rawText, body), response.status, undefined, rejection);
+      }
+      const now = this.now();
+      const retryAfter = parseRetryAfterMs(response.headers.get("retry-after"), now);
+      if (retryAfter !== undefined && retryAfter > MAX_RETRY_WAIT_MS) {
+        const note = `Retry-After asks for a wait until ${new Date(now + retryAfter).toISOString()}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap`;
+        throw new ZoomApiError(this.describeFailure(url, method, response, rawText, body, { attempts: attempt, note }), response.status, retryAfter, rejection);
+      }
+      if (attempt >= MAX_ATTEMPTS) {
+        throw new ZoomApiError(this.describeFailure(url, method, response, rawText, body, { attempts: attempt }), response.status, retryAfter, rejection);
+      }
+      await this.sleep(retryAfter ?? retryBackoffMs(attempt));
     }
   }
 
@@ -1005,7 +1077,9 @@ export class ZoomApiClient {
    * byte length. Only the documented JSON error fields (message, error,
    * reason, errors[]) are echoed, and they pass through scrubErrorText with
    * the configured credentials, so a proxy error page, an HTML sign-in page,
-   * or a debug dump can never reach a finding, a summary, or the bundle.
+   * or a debug dump can never reach a finding, a summary, or the bundle. A
+   * failure that ended retrying names the path alone, since a later page's
+   * query carries a next_page_token, and how many attempts were made.
    */
   private describeFailure(
     url: string,
@@ -1013,6 +1087,7 @@ export class ZoomApiClient {
     response: Response,
     rawText: string,
     body: ParsedJsonBody,
+    retry?: { attempts: number; note?: string },
   ): string {
     const target = new URL(url);
     const statusText = response.statusText ? ` ${response.statusText}` : "";
@@ -1027,10 +1102,13 @@ export class ZoomApiClient {
         : summary
           ? `${scrubErrorText(summary, secrets)} (${bodyDescriptor})`
           : `${bodyDescriptor} carried no documented message field`;
+    const endpoint = retry ? target.pathname : `${target.pathname}${target.search}`;
+    const attempts = retry ? ` ${describeAttempts(retry.attempts)}` : "";
+    const note = retry?.note ? `; ${retry.note}` : "";
     // The status parenthetical sits after the endpoint so a path ending in
     // "token" followed by ": detail" cannot read as a token assignment.
     return scrubErrorText(
-      `Zoom request failed for ${method.toUpperCase()} ${target.pathname}${target.search} (${response.status}${statusText}): ${detail}`,
+      `Zoom request failed for ${method.toUpperCase()} ${endpoint} (${response.status}${statusText})${attempts}: ${detail}${note}`,
       secrets,
     );
   }
@@ -1063,15 +1141,23 @@ export class ZoomApiClient {
     return accessToken;
   }
 
+  /**
+   * A failed token exchange fails every later request of this client at once: the collectors read surface after
+   * surface, so a down token endpoint would otherwise cost one retry sequence each.
+   */
   private async getAccessToken(): Promise<string> {
     if (this.accessToken && this.now() < this.accessTokenExpiresAt) {
       return this.accessToken;
     }
+    if (this.accessTokenFailure) throw this.accessTokenFailure;
     if (!this.accessTokenPromise) {
       this.accessTokenPromise = this.fetchAccessToken();
     }
     try {
       return await this.accessTokenPromise;
+    } catch (error) {
+      if (!(error instanceof ToolCallAbortedError)) this.accessTokenFailure = error;
+      throw error;
     } finally {
       this.accessTokenPromise = undefined;
     }
@@ -1247,7 +1333,7 @@ async function captureSurface<T>(
       docUrl,
       status: isDeniedError(error) ? "denied" : "error",
       error: errorMessage(error),
-      httpStatus: error instanceof ZoomApiError ? error.status : undefined,
+      httpStatus: error instanceof ZoomApiError && error.status > 0 ? error.status : undefined,
       ...(rejection ? { rejection } : {}),
     };
   }

@@ -42,6 +42,15 @@ const DEFAULT_OUTPUT_DIR = "./export/github";
 const DEFAULT_LOOKBACK_DAYS = 30;
 const API_VERSION = "2026-03-10";
 const MAX_RETRIES = 4;
+const MAX_ATTEMPTS = MAX_RETRIES + 1;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+// A server-named wait longer than this is not slept through: the request fails closed and names the time.
+const MAX_RETRY_WAIT_MS = 60_000;
+const BASE_RETRY_BACKOFF_MS = 500;
+const MAX_RETRY_BACKOFF_MS = 8_000;
+// GitHub asks for at least a minute before retrying a rate limit that names no wait.
+const UNTIMED_RATE_LIMIT_WAIT_MS = 60_000;
+const RETRYABLE_SERVER_STATUSES = new Set([500, 502, 503, 504]);
 const PAGE_SIZE = 100;
 const MAX_AUDIT_EVENTS = 200;
 const INSTALLATION_TOKEN_SKEW_MS = 60 * 1000;
@@ -1278,7 +1287,8 @@ function sanitizeGraphqlError(record: JsonRecord, query: string): GitHubGraphqlE
 // value becomes a surface error string here, so the scrub runs here as well as in GitHubHttpError.
 function summarizeError(error: unknown): string {
   if (error instanceof GitHubHttpError) {
-    return scrubErrorText(`GitHub request failed (${error.status}) for ${error.method} ${error.path}: ${error.message}`);
+    const status = error.status > 0 ? ` (${error.status})` : "";
+    return scrubErrorText(`GitHub request failed${status} for ${error.method} ${error.path}${describeAttempts(error.attempts)}: ${error.message}`);
   }
   return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
@@ -1348,6 +1358,88 @@ export function describeRequestTarget(pathname: string): string {
   return keptParams.length > 0 ? `${path}?${keptParams.join("&")}` : path;
 }
 
+// A failure that followed retries names the path alone: a later page's query carries a pagination
+// cursor or a search phrase, which is not part of the endpoint.
+function describeRequestPath(pathname: string): string {
+  return describeRequestTarget(pathname).split("?", 1)[0];
+}
+
+function describeAttempts(attempts: number | undefined): string {
+  return attempts === undefined ? "" : ` after ${attempts} attempt${attempts === 1 ? "" : "s"}`;
+}
+
+/**
+ * Retry-After as milliseconds from `now`: delta-seconds, or an HTTP-date (RFC 9110 section 10.2.3)
+ * already past counts as 0. Undefined when the header is absent or is neither form. The digit test
+ * comes first because Date.parse reads a bare number such as "120" as a year.
+ */
+function parseRetryAfterMs(header: string | null, now: number): number | undefined {
+  const value = header?.trim();
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return Number.parseInt(value, 10) * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(date - now, 0) : undefined;
+}
+
+function retryBackoffMs(attempt: number): number {
+  return Math.min(BASE_RETRY_BACKOFF_MS * 2 ** (attempt - 1), MAX_RETRY_BACKOFF_MS);
+}
+
+// A failed request never echoes the fetch library's message, which can carry a URL or a proxy's
+// text: only a system error code shaped like one (ECONNRESET), on the error or its cause, is kept.
+function describeTransportFailure(error: unknown): string {
+  const code = systemErrorCode(error) ?? systemErrorCode(asRecord(error).cause);
+  return code ? `network error (${code})` : "network error";
+}
+
+// GitHub signals its primary and secondary rate limits with 403 as well as 429; a 403 counts only
+// with a rate-limit marker, so a permission denial is never retried.
+function isRateLimitedResponse(response: Response, rawText: string): boolean {
+  if (response.status === 429) return true;
+  if (response.status !== 403) return false;
+  if (headerValue(response, "x-ratelimit-remaining") === "0") return true;
+  const message = asString(asRecord(parseJsonSafely(rawText)).message)?.toLowerCase() ?? rawText.toLowerCase();
+  return message.includes("rate limit");
+}
+
+type RetryDecision =
+  | { kind: "final" }
+  | { kind: "wait"; ms: number; rateLimited: boolean }
+  | { kind: "over_cap"; note: string };
+
+/**
+ * Whether a failed response is retried, and after what wait. Rate-limited responses and 500, 502,
+ * 503, and 504 are retried. The server's wait is honored first (Retry-After, then x-ratelimit-reset
+ * once x-ratelimit-remaining is 0). A rate limit that names neither waits a minute, doubled for each
+ * earlier rate limit on the same request, and any other retried response backs off exponentially.
+ * All three waits are what GitHub's rate-limit guidance asks for. A wait past MAX_RETRY_WAIT_MS fails
+ * closed and names the time.
+ */
+function decideRetry(response: Response, rawText: string, attempt: number, now: number, priorRateLimits: number): RetryDecision {
+  const rateLimited = isRateLimitedResponse(response, rawText);
+  if (!rateLimited && !RETRYABLE_SERVER_STATUSES.has(response.status)) return { kind: "final" };
+  const retryAfter = parseRetryAfterMs(headerValue(response, "retry-after"), now);
+  if (retryAfter !== undefined) {
+    return retryAfter > MAX_RETRY_WAIT_MS
+      ? { kind: "over_cap", note: `Retry-After asks for a wait until ${new Date(now + retryAfter).toISOString()}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap` }
+      : { kind: "wait", ms: retryAfter, rateLimited };
+  }
+  const reset = Number.parseInt(headerValue(response, "x-ratelimit-reset") ?? "", 10);
+  if (rateLimited && headerValue(response, "x-ratelimit-remaining") === "0" && Number.isFinite(reset)) {
+    const resetMs = Math.max(reset * 1000 - now, 0);
+    return resetMs > MAX_RETRY_WAIT_MS
+      ? { kind: "over_cap", note: `the rate limit resets at ${new Date(reset * 1000).toISOString()}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap` }
+      : { kind: "wait", ms: resetMs, rateLimited };
+  }
+  if (rateLimited) {
+    const waitMs = UNTIMED_RATE_LIMIT_WAIT_MS * 2 ** priorRateLimits;
+    return waitMs > MAX_RETRY_WAIT_MS
+      ? { kind: "over_cap", note: `the rate limit names no wait, and after a repeated one GitHub asks for a wait until ${new Date(now + waitMs).toISOString()}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap` }
+      : { kind: "wait", ms: waitMs, rateLimited };
+  }
+  return { kind: "wait", ms: retryBackoffMs(attempt), rateLimited };
+}
+
 function extractRecords(payload: unknown): JsonRecord[] {
   if (Array.isArray(payload)) {
     return payload.filter((item): item is JsonRecord => Boolean(item) && typeof item === "object");
@@ -1401,16 +1493,20 @@ async function collectDataset<T>(
 }
 
 export class GitHubHttpError extends Error {
+  /** The last HTTP status, or 0 when the last attempt got no response (it timed out or the network failed). */
   status: number;
   method: string;
   path: string;
+  /** Requests sent, set when the failure is a retryable one that ran out of retries or was refused a retry. */
+  attempts: number | undefined;
 
-  constructor(status: number, message: string, method: string = "GET", path: string = "unknown") {
+  constructor(status: number, message: string, method: string = "GET", path: string = "unknown", attempts?: number) {
     super(scrubErrorText(message));
     this.name = "GitHubHttpError";
     this.status = status;
     this.method = method;
     this.path = path;
+    this.attempts = attempts;
   }
 }
 
@@ -1624,17 +1720,65 @@ type ResponseEnvelope<T> = {
   rawText: string;
 };
 
+type AttemptOutcome =
+  | { kind: "response"; response: Response; rawText: string }
+  | { kind: "failed"; reason: string };
+
+export interface GitHubClientOptions {
+  signal?: AbortSignal;
+  /** The wait between retries; tests pass one that records the waits instead of sleeping. */
+  sleep?: (ms: number) => Promise<void>;
+  /** The clock a Retry-After HTTP-date and x-ratelimit-reset are measured against. */
+  now?: () => number;
+  /** The deadline for one request and its body read. Defaults to 30 seconds. */
+  timeoutMs?: number;
+}
+
 export class GitHubAuditorClient {
   private readonly config: GitHubResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly signal: AbortSignal | undefined;
+  private readonly now: () => number;
+  private readonly timeoutMs: number;
 
-  constructor(config: GitHubResolvedConfig, fetchImpl: FetchImpl = fetch, options: { signal?: AbortSignal } = {}) {
+  constructor(config: GitHubResolvedConfig, fetchImpl: FetchImpl = fetch, options: GitHubClientOptions = {}) {
     this.config = config;
     this.fetchImpl = abortableFetch(fetchImpl, options.signal);
-    this.sleep = abortableSleep(options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
     this.signal = options.signal;
+    this.now = options.now ?? Date.now;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  }
+
+  /**
+   * One request and its body read under one deadline. The deadline is raced as well as passed as the
+   * request signal, so a fetch that ignores its signal still ends. A tool-call abort is rethrown and
+   * never retried; a timeout or a network failure comes back as a failed attempt.
+   */
+  private async sendOnce(url: string, init: RequestInit): Promise<AttemptOutcome> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(controller.signal.reason);
+      }, this.timeoutMs);
+    });
+    const exchange = (async (): Promise<AttemptOutcome> => {
+      const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
+      return { kind: "response", response, rawText: await response.text() };
+    })();
+    try {
+      return await Promise.race([unlessAborted(exchange, this.signal), deadline]);
+    } catch (error) {
+      rethrowIfAborted(error);
+      if (this.signal?.aborted) throw new ToolCallAbortedError(this.signal);
+      if (controller.signal.aborted) return { kind: "failed", reason: `timed out after ${this.timeoutMs} ms` };
+      return { kind: "failed", reason: describeTransportFailure(error) };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async getInstallationToken(forceRefresh: boolean = false): Promise<string> {
@@ -1657,38 +1801,60 @@ export class GitHubAuditorClient {
       }
     }
 
+    // The exchange only mints a token, so a lost response is safe to repeat.
     const pending = unlessAborted((async () => {
-      const jwt = buildGitHubAppJwt(this.config);
-      const response = await this.fetchImpl(
-        `${this.config.apiBaseUrl}/app/installations/${this.config.installationId}/access_tokens`,
-        {
+      const tokenPath = `/app/installations/${this.config.installationId}/access_tokens`;
+      let rateLimits = 0;
+      for (let attempt = 1; ; attempt += 1) {
+        const outcome = await this.sendOnce(`${this.config.apiBaseUrl}${tokenPath}`, {
           method: "POST",
           headers: {
             Accept: "application/vnd.github+json",
-            Authorization: `Bearer ${jwt}`,
+            Authorization: `Bearer ${buildGitHubAppJwt(this.config)}`,
             "User-Agent": "grclanker",
             "X-GitHub-Api-Version": API_VERSION,
           },
-        },
-      );
+        });
+        if (outcome.kind === "failed") {
+          if (attempt < MAX_ATTEMPTS) {
+            await this.sleep(retryBackoffMs(attempt));
+            continue;
+          }
+          throw new GitHubAppTokenError(
+            0,
+            `GitHub App installation token request failed for POST ${tokenPath}${describeAttempts(attempt)}: ${outcome.reason}`,
+          );
+        }
 
-      const text = await response.text();
-      const payload = parseJsonSafely(text) as JsonRecord | undefined;
-      const tokenValue = asString(asRecord(payload).token);
-      if (!response.ok || !tokenValue) {
-        const detail = response.ok
-          ? "the response did not include a token"
-          : describeErrorBody(response.status, payload, text, headerValue(response, "content-type"));
-        throw new GitHubAppTokenError(
-          response.status,
-          `GitHub App installation token request failed (${response.status}): ${detail}`,
-        );
+        const { response, rawText: text } = outcome;
+        const payload = parseJsonSafely(text) as JsonRecord | undefined;
+        if (!response.ok) {
+          const decision = decideRetry(response, text, attempt, this.now(), rateLimits);
+          if (decision.kind === "wait" && attempt < MAX_ATTEMPTS) {
+            if (decision.rateLimited) rateLimits += 1;
+            await this.sleep(decision.ms);
+            continue;
+          }
+          const detail = describeErrorBody(response.status, payload, text, headerValue(response, "content-type"));
+          throw new GitHubAppTokenError(
+            response.status,
+            decision.kind === "final"
+              ? `GitHub App installation token request failed (${response.status}): ${detail}`
+              : `GitHub App installation token request failed (${response.status}) for POST ${tokenPath}${describeAttempts(attempt)}: ${decision.kind === "over_cap" ? `${detail}; ${decision.note}` : detail}`,
+          );
+        }
+
+        const tokenValue = asString(asRecord(payload).token);
+        if (!tokenValue) {
+          throw new GitHubAppTokenError(
+            response.status,
+            `GitHub App installation token request failed (${response.status}): the response did not include a token`,
+          );
+        }
+        const expiresAt = Date.parse(asString(asRecord(payload).expires_at) ?? "") || (Date.now() + (60 * 60 * 1000));
+        installationTokenCache.set(cacheKey, { token: tokenValue, expiresAt });
+        return tokenValue;
       }
-
-      const token = tokenValue;
-      const expiresAt = Date.parse(asString(asRecord(payload).expires_at) ?? "") || (Date.now() + (60 * 60 * 1000));
-      installationTokenCache.set(cacheKey, { token, expiresAt });
-      return token;
     })(), this.signal);
 
     installationTokenCache.set(cacheKey, { ...existing, pending });
@@ -1721,47 +1887,21 @@ export class GitHubAuditorClient {
     return `${this.config.apiBaseUrl}${trimmed}`;
   }
 
-  private async waitForRetry(response: Response, rawText: string, attempt: number): Promise<boolean> {
-    if (attempt >= MAX_RETRIES) return false;
-    if (!(response.status === 403 || response.status === 429)) return false;
-
-    const retryAfterHeader = response.headers.get("retry-after");
-    const remaining = response.headers.get("x-ratelimit-remaining");
-    const resetHeader = response.headers.get("x-ratelimit-reset");
-    const payload = parseJsonSafely(rawText);
-    const message = asString(asRecord(payload).message)?.toLowerCase() ?? rawText.toLowerCase();
-    const isRateLimited = response.status === 429
-      || remaining === "0"
-      || message.includes("secondary rate limit")
-      || message.includes("rate limit");
-    if (!isRateLimited) return false;
-
-    let waitMs = 0;
-    const retryAfterSeconds = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) : Number.NaN;
-    if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
-      waitMs = retryAfterSeconds * 1000;
-    } else if (resetHeader) {
-      const resetMs = (Number.parseInt(resetHeader, 10) * 1000) - Date.now();
-      waitMs = Number.isFinite(resetMs) ? Math.max(resetMs, 0) : 0;
-    } else {
-      waitMs = 250 * (attempt + 1);
-    }
-
-    await this.sleep(waitMs);
-    return true;
-  }
-
+  // Every request is a read except the GraphQL POST, which only runs queries, so every request is
+  // safe to repeat. MAX_ATTEMPTS bounds the attempts, the one 401 token refresh included.
   async requestJson<T = unknown>(
     pathname: string,
     options: RequestOptions = {},
   ): Promise<ResponseEnvelope<T>> {
-    let attempt = 0;
+    let refreshed = false;
     let forceRefresh = false;
+    let rateLimits = 0;
     const method = options.method ?? (options.body ? "POST" : "GET");
 
-    while (attempt <= MAX_RETRIES) {
+    for (let attempt = 1; ; attempt += 1) {
       const token = await this.getAccessToken(forceRefresh);
-      const response = await this.fetchImpl(this.buildUrl(pathname), {
+      forceRefresh = false;
+      const outcome = await this.sendOnce(this.buildUrl(pathname), {
         method,
         headers: {
           Accept: "application/vnd.github+json",
@@ -1773,8 +1913,15 @@ export class GitHubAuditorClient {
         },
         body: options.body ? JSON.stringify(options.body) : undefined,
       });
+      if (outcome.kind === "failed") {
+        if (attempt < MAX_ATTEMPTS) {
+          await this.sleep(retryBackoffMs(attempt));
+          continue;
+        }
+        throw new GitHubHttpError(0, outcome.reason, method, describeRequestPath(pathname), attempt);
+      }
 
-      const rawText = await response.text();
+      const { response, rawText } = outcome;
       const payload = rawText.length > 0 ? parseJsonSafely(rawText) as T | null : null;
 
       if (options.allow404 && response.status === 404) {
@@ -1785,22 +1932,30 @@ export class GitHubAuditorClient {
         return { response, payload, rawText };
       }
 
-      if (response.status === 401 && this.config.authMode === "app" && !forceRefresh) {
+      if (response.status === 401 && this.config.authMode === "app" && !refreshed && attempt < MAX_ATTEMPTS) {
+        refreshed = true;
         forceRefresh = true;
-        attempt += 1;
         continue;
       }
 
-      if (await this.waitForRetry(response, rawText, attempt)) {
-        attempt += 1;
+      const decision = decideRetry(response, rawText, attempt, this.now(), rateLimits);
+      if (decision.kind === "wait" && attempt < MAX_ATTEMPTS) {
+        if (decision.rateLimited) rateLimits += 1;
+        await this.sleep(decision.ms);
         continue;
       }
-
       const detail = describeErrorBody(response.status, payload, rawText, headerValue(response, "content-type"));
-      throw new GitHubHttpError(response.status, detail, method, describeRequestTarget(pathname));
+      if (decision.kind === "final") {
+        throw new GitHubHttpError(response.status, detail, method, describeRequestTarget(pathname));
+      }
+      throw new GitHubHttpError(
+        response.status,
+        decision.kind === "over_cap" ? `${detail}; ${decision.note}` : detail,
+        method,
+        describeRequestPath(pathname),
+        attempt,
+      );
     }
-
-    throw new Error(`GitHub request retries exhausted for ${method} ${describeRequestTarget(pathname)}`);
   }
 
   async graphql<T = JsonRecord>(
@@ -2907,7 +3062,7 @@ export async function runGitHubAccessCheck(
         ? "unauthorized"
         : isMissingInstallation(error)
           ? "installation_not_found"
-          : (error instanceof GitHubHttpError && (error.status === 403 || error.status === 404) ? "forbidden" : "error");
+          : (error instanceof GitHubHttpError && error.attempts === undefined && (error.status === 403 || error.status === 404) ? "forbidden" : "error");
       probes.push({
         key: probe.key,
         path: probe.path(config.organization),

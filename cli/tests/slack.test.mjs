@@ -352,6 +352,187 @@ test("SlackApiClient treats ok:false and HTTP 403 as errors and honors Retry-Aft
   assert.deepEqual(waits, [3000]);
 });
 
+const RETRY_TOKEN_CANARY = "xoxp-CANARY-RETRY-TOKEN-55";
+const RETRY_SCIM_CANARY = "CANARY-RETRY-SCIM-56";
+
+/** A client whose fetch answers with `steps` in order (repeating the last one), recording requests and waits. */
+function retryHarness(steps, { timeoutMs, signal } = {}) {
+  const calls = [];
+  const waits = [];
+  const fetchImpl = async (input, init) => {
+    calls.push(await requestParams(input, init));
+    return steps[Math.min(calls.length, steps.length) - 1](init);
+  };
+  const resolved = resolveSlackConfiguration({ token: RETRY_TOKEN_CANARY, scim_token: RETRY_SCIM_CANARY, org_id: "E1" }, EMPTY_ENV);
+  const config = timeoutMs === undefined ? resolved : { ...resolved, timeoutMs };
+  const client = new SlackApiClient(config, { fetchImpl, now: () => NOW, sleep: async (ms) => { waits.push(ms); }, signal });
+  return { client, calls, waits };
+}
+
+const hangUntilAborted = (init) => new Promise((_resolve, reject) => {
+  init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+});
+const neverSettles = () => new Promise(() => {});
+const connectionReset = () => {
+  throw new TypeError(`fetch failed for https://slack.com/api/users.list?token=${RETRY_TOKEN_CANARY}`, {
+    cause: Object.assign(new Error(`read ECONNRESET ${RETRY_SCIM_CANARY}`), { code: "ECONNRESET" }),
+  });
+};
+
+test("SlackApiClient retries 429, 500, 502, 503, and 504 with exponential backoff and honors Retry-After as delta-seconds or an HTTP-date", async () => {
+  const { client, calls, waits } = retryHarness([
+    () => jsonResponse({ ok: false, error: "internal_error" }, 500),
+    () => new Response("bad gateway", { status: 502 }),
+    () => jsonResponse({ ok: false, error: "service_unavailable" }, 503, { "retry-after": new Date(NOW.getTime() + 7_000).toUTCString() }),
+    () => jsonResponse({ ok: true, team_id: "T1" }),
+  ]);
+  assert.equal((await client.web("auth.test")).team_id, "T1");
+  assert.equal(calls.length, 4);
+  assert.deepEqual(waits, [1000, 2000, 7000], "backoff doubles without a Retry-After; an HTTP-date is measured against the injected clock");
+
+  const later = retryHarness([
+    () => jsonResponse({ ok: false, error: "ratelimited" }, 429, { "retry-after": new Date(NOW.getTime() - 60_000).toUTCString() }),
+    () => jsonResponse({ ok: false, error: "fatal_error" }, 504, { "retry-after": "2" }),
+    () => jsonResponse({ ok: true, members: [], response_metadata: { next_cursor: "" } }),
+  ]);
+  await later.client.web("users.list");
+  assert.deepEqual(later.waits, [0, 2000], "an HTTP-date already past waits 0 and a 5xx Retry-After is honored");
+
+  for (const status of [400, 404, 501]) {
+    const final = retryHarness([() => jsonResponse({ ok: false, error: "invalid_arguments" }, status)]);
+    await assert.rejects(final.client.web("users.list"), (error) => {
+      assert.equal(error.message, `Slack Web API users.list failed (HTTP ${status}) error=invalid_arguments`);
+      return true;
+    });
+    assert.equal(final.calls.length, 1, `HTTP ${status} is not retried`);
+  }
+});
+
+test("SlackApiClient fails closed without waiting when Retry-After exceeds the 60 s cap and names the time", async () => {
+  for (const [header, until] of [["120", "2026-09-21T00:02:00.000Z"], [new Date(NOW.getTime() + 300_000).toUTCString(), "2026-09-21T00:05:00.000Z"]]) {
+    const { client, calls, waits } = retryHarness([() => jsonResponse({ ok: false, error: "ratelimited" }, 429, { "retry-after": header })]);
+    await assert.rejects(client.web("users.list", { cursor: "CANARY-CURSOR-1" }), (error) => {
+      assert.equal(error.message, `Slack Web API users.list failed (HTTP 429) after 1 attempt: error=ratelimited; Retry-After asks for a wait until ${until}, beyond the 60 s retry cap`);
+      assert.equal(error.code, "http_429");
+      return true;
+    });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(waits, []);
+  }
+  const fiveXx = retryHarness([() => jsonResponse({ ok: false, error: "service_unavailable" }, 503, { "retry-after": "61" })]);
+  await assert.rejects(fiveXx.client.audit("/logs"), /^SlackApiError: Slack Audit Logs \/logs failed \(HTTP 503\) after 1 attempt: error=service_unavailable; Retry-After asks for a wait until 2026-09-21T00:01:01\.000Z, beyond the 60 s retry cap$/);
+});
+
+test("SlackApiClient retry exhaustion names the endpoint, the last status, and the attempt count, never a query value or a token", async () => {
+  const { client, calls, waits } = retryHarness([() => jsonResponse({ ok: false, error: "service_unavailable" }, 503)]);
+  await assert.rejects(client.web("users.list", { cursor: "CANARY-CURSOR-2" }), (error) => {
+    assert.equal(error.message, "Slack Web API users.list failed (HTTP 503) after 4 attempts: error=service_unavailable");
+    assert.equal(error.code, "http_503");
+    assert.equal(error.httpStatus, 503);
+    return true;
+  });
+  assert.equal(calls.length, 4);
+  assert.deepEqual(waits, [1000, 2000, 4000]);
+
+  const post = retryHarness([() => jsonResponse({ ok: false, error: "ratelimited" }, 429)]);
+  await assert.rejects(post.client.web("admin.conversations.search", { query: "CANARY-QUERY-3", cursor: "CANARY-CURSOR-3" }), /^SlackApiError: Slack Web API admin\.conversations\.search failed \(HTTP 429\) after 4 attempts: error=ratelimited$/);
+  assert.deepEqual(post.calls.map((call) => call.method), ["POST", "POST", "POST", "POST"], "every method this module calls reads, so a POST is retried too");
+
+  const scim = retryHarness([() => new Response("<html>gateway</html>", { status: 502, headers: { "content-type": "text/html" } })]);
+  await assert.rejects(scim.client.scim("/Users", { filter: "userName eq \"CANARY-FILTER-4\"" }), (error) => {
+    assert.equal(error.message, "Slack SCIM /Users failed (HTTP 502) after 4 attempts: non-JSON text/html body (20 characters) withheld");
+    assert.doesNotMatch(error.message, /CANARY|xoxp/);
+    return true;
+  });
+});
+
+test("SlackApiClient retries a request or body read that outlives the timeout and names the timeout when every attempt does", async () => {
+  const recovered = retryHarness([hangUntilAborted, () => jsonResponse({ ok: true, team_id: "T1" })], { timeoutMs: 20 });
+  assert.equal((await recovered.client.web("auth.test")).team_id, "T1");
+  assert.deepEqual(recovered.waits, [1000]);
+
+  const stalled = retryHarness([neverSettles], { timeoutMs: 20 });
+  await assert.rejects(stalled.client.web("users.list", { cursor: "CANARY-CURSOR-5" }), (error) => {
+    assert.equal(error.message, "Slack Web API users.list failed after 4 attempts: timed out after 20 ms");
+    assert.equal(error.code, "timeout");
+    return true;
+  });
+  assert.equal(stalled.calls.length, 4, "a fetch that ignores its abort signal still ends at the deadline");
+  assert.deepEqual(stalled.waits, [1000, 2000, 4000]);
+
+  const slowBody = retryHarness([() => new Response(new ReadableStream({ start() {} }), { status: 200 })], { timeoutMs: 20 });
+  await assert.rejects(slowBody.client.scim("/Users"), /^SlackApiError: Slack SCIM \/Users failed after 4 attempts: timed out after 20 ms$/);
+  assert.equal(slowBody.calls.length, 4, "the deadline covers reading the body");
+});
+
+test("SlackApiClient retries network failures and names only the system error code", async () => {
+  const recovered = retryHarness([connectionReset, () => jsonResponse({ ok: true, team_id: "T1" })]);
+  assert.equal((await recovered.client.web("auth.test")).team_id, "T1");
+  assert.deepEqual(recovered.waits, [1000]);
+
+  const down = retryHarness([connectionReset]);
+  await assert.rejects(down.client.scim("/Users", { startIndex: 1 }), (error) => {
+    assert.equal(error.message, "Slack SCIM /Users failed after 4 attempts: network error (ECONNRESET)");
+    assert.equal(error.code, "network_error");
+    assert.doesNotMatch(error.message, /CANARY|xoxp|https?:/);
+    return true;
+  });
+  assert.equal(down.calls.length, 4);
+  assert.deepEqual(down.waits, [1000, 2000, 4000]);
+});
+
+test("SlackApiClient stops at once when the tool call is aborted during a retry wait or a request", async () => {
+  const duringWait = new AbortController();
+  let waitCalls = 0;
+  const waiting = new SlackApiClient(resolveSlackConfiguration({ token: "xoxp-test" }, EMPTY_ENV), {
+    fetchImpl: async () => {
+      waitCalls += 1;
+      return jsonResponse({ ok: false, error: "service_unavailable" }, 503);
+    },
+    now: () => NOW,
+    signal: duringWait.signal,
+    sleep: () => {
+      duringWait.abort();
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(waiting.web("users.list"), { name: "ToolCallAbortedError" });
+  assert.equal(waitCalls, 1);
+
+  const duringRequest = new AbortController();
+  let requestCalls = 0;
+  const requesting = new SlackApiClient(resolveSlackConfiguration({ token: "xoxp-test" }, EMPTY_ENV), {
+    fetchImpl: async (_input, init) => {
+      requestCalls += 1;
+      setTimeout(() => duringRequest.abort(), 5);
+      return hangUntilAborted(init);
+    },
+    now: () => NOW,
+    signal: duringRequest.signal,
+    sleep: async () => {},
+  });
+  await assert.rejects(requesting.web("users.list"), { name: "ToolCallAbortedError" });
+  assert.equal(requestCalls, 1, "a tool-call abort is not retried as a timeout");
+});
+
+test("a page that fails after retries fails the whole Slack inventory closed instead of passing the pages already read", async () => {
+  const usersList = (request) => request.pathname === "/api/users.list";
+  let laterPageCalls = 0;
+  const client = makeClient((request) => {
+    if (!usersList(request)) return compliantFixture(request);
+    if (!request.params.get("cursor")) return { ...compliantFixture(request), response_metadata: { next_cursor: "CANARY-CURSOR-6" } };
+    laterPageCalls += 1;
+    return jsonResponse({ ok: false, error: "service_unavailable" }, 503);
+  });
+  const result = await assessSlackIdentity(client);
+  assert.equal(laterPageCalls, 4);
+  const finding = byId(result, "SLACK-ID-01");
+  assert.notEqual(finding.status, "pass");
+  assert.match(finding.summary, /users\.list failed \(HTTP 503\) after 4 attempts: error=service_unavailable/);
+  assert.notEqual(finding.evidence?.inventory_complete, true);
+  assertNoCanaryWindows(assert, result, ["CANARY-CURSOR-6"], "a pagination cursor never reaches a finding");
+});
+
 test("SlackApiClient uses bot tokens only for bot-capable methods", async () => {
   const seen = [];
   const client = makeClient((request) => {
@@ -1709,7 +1890,7 @@ test("non-JSON response bodies are described, never quoted, and every error stri
   const gateway = makeClient(() => html(502));
   await assert.rejects(gateway.web("users.list"), (error) => {
     assert.equal(error.name, "SlackApiError");
-    assert.equal(error.message, `Slack Web API users.list failed (HTTP 502) non-JSON text/html body (${page.length} characters) withheld`);
+    assert.equal(error.message, `Slack Web API users.list failed (HTTP 502) after 4 attempts: non-JSON text/html body (${page.length} characters) withheld`);
     assert.equal(error.code, "http_502");
     return true;
   });
@@ -1721,9 +1902,9 @@ test("non-JSON response bodies are described, never quoted, and every error stri
   });
   await assert.rejects(okHtml.scim("/Users"), /Slack SCIM \/Users failed \(HTTP 200\) non-JSON text\/html body/);
   await assert.rejects(okHtml.audit("/logs"), /Slack Audit Logs \/logs failed \(HTTP 200\) non-JSON text\/html body/);
-  await assert.rejects(gateway.probeAnalyticsExport(), /admin\.analytics\.getFile failed \(HTTP 502\) non-JSON text\/html body/);
+  await assert.rejects(gateway.probeAnalyticsExport(), /admin\.analytics\.getFile failed \(HTTP 502\) after 4 attempts: non-JSON text\/html body/);
   const untyped = makeClient(() => new Response(new TextEncoder().encode("upstream request timeout"), { status: 504 }));
-  await assert.rejects(untyped.web("users.list"), /failed \(HTTP 504\) non-JSON unknown content type body \(24 characters\) withheld$/);
+  await assert.rejects(untyped.web("users.list"), /failed \(HTTP 504\) after 4 attempts: non-JSON unknown content type body \(24 characters\) withheld$/);
 
   const tokenised = "https://example.invalid/cb?access_token=CANARY-URLTOKEN-2&state=x";
   const jsonForbidden = makeClient(() => jsonResponse({ ok: false, error: `invalid_auth: see ${tokenised}`, response_metadata: { messages: [`redirect ${tokenised}`] } }, 403));
@@ -2091,7 +2272,7 @@ test("API family: a Web API or Audit Logs error body carrying a gateway detail f
     return true;
   });
   await assert.rejects(makeClient(() => jsonResponse(webBody, 502)).probeAnalyticsExport(), (error) => {
-    assert.equal(error.message, "Slack Web API admin.analytics.getFile failed (HTTP 502) error=invalid_auth");
+    assert.equal(error.message, "Slack Web API admin.analytics.getFile failed (HTTP 502) after 4 attempts: error=invalid_auth");
     return true;
   });
   await assert.rejects(makeClient(() => jsonResponse(auditBody, 401)).audit("/logs"), (error) => {

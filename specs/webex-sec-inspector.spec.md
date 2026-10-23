@@ -318,7 +318,7 @@ Credential refresh: POST /access_token with application/x-www-form-urlencoded gr
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| Webex REST API | Not published | `Retry-After` | 429 | Retry at most 2 times, cap each Retry-After delay at 30000 milliseconds, then report the surface unreadable. |
+| Webex REST API | Not published | `Retry-After` | 429, 500, 502, 503, 504 | Reads and the refresh grant retry 429, 500, 502, 503, and 504 responses, request timeouts (30 s by default, covering the body read), and network failures 3 times (4 attempts). Retry-After is honored as delta-seconds or an HTTP-date; without it the wait backs off exponentially from 1 s, capped at 8 s. A Retry-After beyond 60 s fails closed at once and names the time, and an exhausted request names the path, the last HTTP status or failure, and the attempt count, then the surface is reported unreadable. A refresh grant that failed is not sent again by the same client, so every later surface reports that failure. |
 
 ## Checks
 

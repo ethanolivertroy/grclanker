@@ -16,7 +16,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   ConfigFileError,
@@ -26,6 +26,7 @@ import {
   parseYamlConfigText,
   readConfigText,
   resolveSameOriginUrl,
+  systemErrorCode,
   type ParsedNextLink,
 } from "./hardening/index.js";
 import { REDACTED, createCredentialScrubber, isCredentialDataKey } from "./credential-scrub.js";
@@ -68,7 +69,11 @@ const DEFAULT_TIMEOUT_MS: number = WEBEX_DEFAULTS.timeoutMs;
 const DEFAULT_CONFIG_DIR = WEBEX_DEFAULTS.configDir;
 const CONFIG_FILE_NAMES = WEBEX_DEFAULTS.configFileNames;
 const MAX_RETRY_AFTER_MS: number = WEBEX_DEFAULTS.maxRetryAfterMs;
-const MAX_429_RETRIES: number = WEBEX_DEFAULTS.max429Retries;
+const MAX_RETRIES: number = WEBEX_DEFAULTS.maxRetries;
+const MAX_ATTEMPTS = MAX_RETRIES + 1;
+const BASE_RETRY_BACKOFF_MS: number = WEBEX_DEFAULTS.baseRetryBackoffMs;
+const MAX_RETRY_BACKOFF_MS: number = WEBEX_DEFAULTS.maxRetryBackoffMs;
+const RETRYABLE_STATUSES: ReadonlySet<number> = new Set(WEBEX_DEFAULTS.retryableStatuses);
 const MAX_LIST_PAGES: number = WEBEX_DEFAULTS.maxListPages;
 const PAGE_MAX = WEBEX_PAGE_MAX;
 const MIN_MEETING_PASSWORD_LENGTH: number = WEBEX_DEFAULTS.minimumMeetingPasswordLength;
@@ -159,6 +164,7 @@ export interface WebexPage {
 }
 
 export class WebexApiError extends Error {
+  /** The last HTTP status, or 0 when the last attempt got no response (it timed out or the network failed). */
   readonly status: number;
   readonly endpoint: string;
 
@@ -560,6 +566,55 @@ function describeErrorBody(payload: JsonRecord | undefined, rawText: string, con
   return webexErrorSummary(payload) ?? `JSON error body without a message field (${bytes} bytes)`;
 }
 
+function describeAttempts(attempts: number): string {
+  return `after ${attempts} attempt${attempts === 1 ? "" : "s"}`;
+}
+
+/**
+ * Retry-After as milliseconds from `now`: delta-seconds, or an HTTP-date (RFC 9110 section 10.2.3)
+ * already past counts as 0. Undefined when the header is absent or is neither form. The digit test
+ * comes first because Date.parse reads a bare number such as "120" as a year.
+ */
+function parseRetryAfterMs(header: string | null, now: number): number | undefined {
+  const value = header?.trim();
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return Number.parseInt(value, 10) * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(date - now, 0) : undefined;
+}
+
+function retryBackoffMs(attempt: number): number {
+  return Math.min(BASE_RETRY_BACKOFF_MS * 2 ** (attempt - 1), MAX_RETRY_BACKOFF_MS);
+}
+
+// A failed request never echoes the fetch library's message, which can carry a URL or a proxy's
+// text: only a system error code shaped like one (ECONNRESET), on the error or its cause, is kept.
+function describeTransportFailure(error: unknown): string {
+  const cause = error instanceof Error ? error.cause : undefined;
+  const code = systemErrorCode(error) ?? systemErrorCode(cause);
+  return code ? `network error (${code})` : "network error";
+}
+
+/** One request: the response with its body read, or why no response arrived in time. */
+type WebexAttempt =
+  | { kind: "response"; response: Response; rawText: string }
+  | { kind: "failed"; reason: string };
+
+/**
+ * Where a request's retries ended. A response carries `retry` only when its status is retried and retrying
+ * stopped, because the attempts ran out or Retry-After named a wait past the cap (`note`).
+ */
+type WebexOutcome =
+  | { kind: "response"; response: Response; rawText: string; retry?: { attempts: number; note?: string } }
+  | { kind: "failed"; reason: string; attempts: number };
+
+function describeRetry(retry: { attempts: number; note?: string } | undefined): { attempts: string; note: string } {
+  return {
+    attempts: retry ? ` ${describeAttempts(retry.attempts)}` : "",
+    note: retry?.note ? `; ${retry.note}` : "",
+  };
+}
+
 const CONFIG_FILE_OPTIONS = { label: "Webex" } as const;
 
 /**
@@ -674,7 +729,10 @@ export class WebexApiClient {
   private readonly now: () => Date;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly maxPages: number;
+  private readonly signal?: AbortSignal;
   private accessToken?: string;
+  private accessTokenPromise?: Promise<string>;
+  private accessTokenFailure?: unknown;
 
   constructor(
     config: WebexResolvedConfig,
@@ -691,6 +749,7 @@ export class WebexApiClient {
     this.now = options.now ?? (() => new Date());
     this.sleep = abortableSleep(options.signal, options.sleep);
     this.maxPages = clampNumber(options.maxPages, MAX_LIST_PAGES, 1, 100_000);
+    this.signal = options.signal;
     this.accessToken = config.token;
     webexCredentialScrubber.registerSecrets(webexCredentialValues(config, this.accessToken));
   }
@@ -737,12 +796,17 @@ export class WebexApiClient {
       client_secret: refresh.clientSecret,
       refresh_token: refresh.refreshToken,
     });
-    const response = await this.fetchImpl(this.buildUrl(WEBEX_ENDPOINTS.tokenRefresh), {
+    const url = this.buildUrl(WEBEX_ENDPOINTS.tokenRefresh);
+    const endpoint = new URL(url).pathname;
+    const outcome = await this.send(url, async () => ({
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
       body: body.toString(),
-    });
-    const rawText = await response.text();
+    }));
+    if (outcome.kind === "failed") {
+      throw new WebexTokenRefreshError(`Webex token refresh failed for ${endpoint} ${describeAttempts(outcome.attempts)}: ${outcome.reason}`, 0);
+    }
+    const { response, rawText, retry } = outcome;
     const payload = parseJsonObject(rawText);
     if (!response.ok) {
       const detail = describeErrorBody(payload, rawText, response.headers.get("content-type"));
@@ -750,7 +814,13 @@ export class WebexApiClient {
       const rejection: CredentialRejection | undefined = response.status === 401 || (response.status === 400 && code)
         ? { source: "token_request", status: response.status, ...(code ? { code } : {}) }
         : undefined;
-      throw new WebexTokenRefreshError(`Webex token refresh failed (${response.status})${detail ? `: ${detail}` : ""}`, response.status, rejection);
+      const { attempts, note } = describeRetry(retry);
+      const target = retry ? ` for ${endpoint}${attempts}` : "";
+      throw new WebexTokenRefreshError(
+        `Webex token refresh failed (${response.status})${target}${detail ? `: ${detail}` : ""}${note}`,
+        response.status,
+        rejection,
+      );
     }
     if (payload === undefined) {
       throw new WebexApiError(
@@ -766,63 +836,131 @@ export class WebexApiClient {
     return accessToken;
   }
 
+  /**
+   * One refresh grant serves every request waiting on it, and a failed grant fails every later request of this
+   * client at once: the collectors read their surfaces concurrently, so each would otherwise send its own grant and,
+   * against a down token endpoint, its own retry sequence.
+   */
   private async currentToken(): Promise<string> {
     if (this.accessToken) return this.accessToken;
-    return this.refreshAccessToken();
+    if (this.accessTokenFailure) throw this.accessTokenFailure;
+    if (!this.accessTokenPromise) {
+      this.accessTokenPromise = this.refreshAccessToken();
+    }
+    try {
+      return await this.accessTokenPromise;
+    } catch (error) {
+      if (!(error instanceof ToolCallAbortedError)) this.accessTokenFailure = error;
+      throw error;
+    } finally {
+      this.accessTokenPromise = undefined;
+    }
   }
 
+  /**
+   * One request and its body read under the configured deadline. The deadline is raced as well as passed as the
+   * request signal, so a fetch that ignores its signal still ends. A tool-call abort is rethrown and never retried.
+   */
+  private async sendOnce(url: string, init: RequestInit): Promise<WebexAttempt> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(controller.signal.reason);
+      }, this.config.timeoutMs);
+    });
+    const exchange = (async (): Promise<WebexAttempt> => {
+      const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
+      return { kind: "response", response, rawText: await response.text() };
+    })();
+    try {
+      return await Promise.race([unlessAborted(exchange, this.signal), deadline]);
+    } catch (error) {
+      rethrowIfAborted(error);
+      if (this.signal?.aborted) throw new ToolCallAbortedError(this.signal);
+      if (controller.signal.aborted) return { kind: "failed", reason: `timed out after ${this.config.timeoutMs} ms` };
+      return { kind: "failed", reason: describeTransportFailure(error) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Sends a request until it gets a response that is not retried. Every request is a read or the refresh grant, so
+   * every request is safe to repeat: 429, 500, 502, 503, and 504 responses, timeouts, and network failures are
+   * retried MAX_RETRIES times. Retry-After is honored as delta-seconds or an HTTP-date, and the wait otherwise backs
+   * off exponentially; a Retry-After past MAX_RETRY_AFTER_MS ends retrying at once with a note naming the time.
+   * `init` runs before each attempt, so a failed refresh grant fails the request it serves without another attempt.
+   */
+  private async send(url: string, init: () => Promise<RequestInit>): Promise<WebexOutcome> {
+    for (let attempt = 1; ; attempt += 1) {
+      const outcome = await this.sendOnce(url, await init());
+      if (outcome.kind === "failed") {
+        if (attempt < MAX_ATTEMPTS) {
+          await this.sleep(retryBackoffMs(attempt));
+          continue;
+        }
+        return { ...outcome, attempts: attempt };
+      }
+      const { response } = outcome;
+      if (response.ok || !RETRYABLE_STATUSES.has(response.status)) return outcome;
+      const now = this.now().getTime();
+      const retryAfter = parseRetryAfterMs(response.headers.get("retry-after"), now);
+      if (retryAfter !== undefined && retryAfter > MAX_RETRY_AFTER_MS) {
+        const note = `Retry-After asks for a wait until ${new Date(now + retryAfter).toISOString()}, beyond the ${MAX_RETRY_AFTER_MS / 1000} s retry cap`;
+        return { ...outcome, retry: { attempts: attempt, note } };
+      }
+      if (attempt >= MAX_ATTEMPTS) return { ...outcome, retry: { attempts: attempt } };
+      await this.sleep(retryAfter ?? retryBackoffMs(attempt));
+    }
+  }
+
+  /**
+   * A GET whose failure names the path alone, never the query (a later page's cursor rides in it), and, once
+   * retrying stopped, how many attempts were made.
+   */
   private async fetchJson(
     url: string,
-    attempt = 0,
     allowPlainText = false,
   ): Promise<{ payload: JsonRecord; rawText: string; nextLink: ParsedNextLink }> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     const endpoint = new URL(url).pathname;
-
-    try {
-      const response = await this.fetchImpl(url, {
-        method: "GET",
-        headers: {
-          accept: "application/json",
-          authorization: `Bearer ${await this.currentToken()}`,
-        },
-        signal: controller.signal,
-      });
-
-      if (response.status === 429 && attempt < MAX_429_RETRIES) {
-        const retryAfterSeconds = asNumber(response.headers.get("retry-after")) ?? 1;
-        await this.sleep(Math.min(Math.max(retryAfterSeconds, 1) * 1000, MAX_RETRY_AFTER_MS));
-        return this.fetchJson(url, attempt + 1, allowPlainText);
-      }
-
-      const rawText = await response.text();
-      const payload = parseJsonObject(rawText);
-
-      if (!response.ok) {
-        const detail = describeErrorBody(payload, rawText, response.headers.get("content-type"));
-        throw new WebexApiError(
-          `Webex request failed (${response.status} ${response.statusText}) for ${endpoint}${detail ? `: ${detail}` : ""}`,
-          response.status,
-          endpoint,
-        );
-      }
-      if (payload === undefined && !allowPlainText) {
-        throw new WebexApiError(
-          `Webex request returned ${describeInvalidJsonResponse(rawText, response.headers.get("content-type"))} for ${endpoint}.`,
-          response.status,
-          endpoint,
-        );
-      }
-
-      return {
-        payload: payload ?? {},
-        rawText,
-        nextLink: parseNextLinkHeader(response.headers.get("link")),
-      };
-    } finally {
-      clearTimeout(timeout);
+    const outcome = await this.send(url, async () => ({
+      method: "GET",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${await this.currentToken()}`,
+      },
+    }));
+    if (outcome.kind === "failed") {
+      throw new WebexApiError(`Webex request failed for ${endpoint} ${describeAttempts(outcome.attempts)}: ${outcome.reason}`, 0, endpoint);
     }
+    const { response, rawText, retry } = outcome;
+    const payload = parseJsonObject(rawText);
+
+    if (!response.ok) {
+      const detail = describeErrorBody(payload, rawText, response.headers.get("content-type"));
+      const statusText = response.statusText ? ` ${response.statusText}` : "";
+      const { attempts, note } = describeRetry(retry);
+      throw new WebexApiError(
+        `Webex request failed (${response.status}${statusText}) for ${endpoint}${attempts}${detail ? `: ${detail}` : ""}${note}`,
+        response.status,
+        endpoint,
+      );
+    }
+    if (payload === undefined && !allowPlainText) {
+      throw new WebexApiError(
+        `Webex request returned ${describeInvalidJsonResponse(rawText, response.headers.get("content-type"))} for ${endpoint}.`,
+        response.status,
+        endpoint,
+      );
+    }
+
+    return {
+      payload: payload ?? {},
+      rawText,
+      nextLink: parseNextLinkHeader(response.headers.get("link")),
+    };
   }
 
   async get(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
@@ -916,7 +1054,7 @@ export class WebexApiClient {
    * answers with a bare number in a text/plain body.
    */
   async getGuestCount(): Promise<JsonRecord> {
-    const { payload, rawText } = await this.fetchJson(this.buildUrl(WEBEX_ENDPOINTS.guestCount), 0, true);
+    const { payload, rawText } = await this.fetchJson(this.buildUrl(WEBEX_ENDPOINTS.guestCount), true);
     const fromObject = Object.values(payload).map(asNumber).find((value) => value !== undefined);
     const count = fromObject ?? asNumber(rawText.trim());
     if (count === undefined) {
@@ -1016,7 +1154,7 @@ type WebexClientLike = Pick<
 > & { knownSecrets?: () => string[] };
 
 function errorStatus(error: unknown): number | undefined {
-  if (error instanceof WebexApiError) return error.status;
+  if (error instanceof WebexApiError) return error.status > 0 ? error.status : undefined;
   const status = asNumber(asObject(error)?.status);
   return status;
 }

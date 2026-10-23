@@ -247,7 +247,7 @@ Credential refresh: POST /oauth/token?grant_type=account_credentials&account_id=
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| Zoom Security Inspector | Zoom applies endpoint labels and app-level daily request limits | `Retry-After`, `X-RateLimit-Category`, `X-RateLimit-Remaining` | 429, 500, 502, 503, 504 | Honor Retry-After up to 30 seconds and retry three times with bounded backoff. |
+| Zoom Security Inspector | Zoom applies endpoint labels and app-level daily request limits | `Retry-After` | 429, 500, 502, 503, 504 | Every request reads (the OAuth token exchange only mints a token), so 429, 500, 502, 503, and 504 responses, request timeouts (30 s by default, covering the body read), and network failures are retried three times (four attempts). Zoom's rate-limit page asks clients to wait before retrying a 429 but names no header, so Retry-After is honored when present, as delta-seconds or an HTTP-date; without it the wait backs off exponentially from 1 s to an 8 s cap. A Retry-After beyond 60 s fails closed at once and names the time, and an exhausted request names the method and path, the last HTTP status or failure, and the attempt count, so the read stays explicit and its inventory is never complete. A failed token exchange, including one Zoom rejects without a retry, is not sent again by the same client, so every later request reports that failure. |
 
 ## Checks
 
