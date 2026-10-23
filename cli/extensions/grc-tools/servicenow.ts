@@ -1068,8 +1068,30 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+/** A request that got no response: the client's own timeout fired or the transport failed. Retried like a 5xx. */
+class ServicenowTransportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ServicenowTransportError";
+  }
+}
+
+/** Retry-After in milliseconds, as delta-seconds or an HTTP-date measured against `now`; undefined when absent or unreadable. */
+function retryAfterMs(value: string | null, now: Date): number | undefined {
+  if (value === null) return undefined;
+  const seconds = asNumber(value);
+  if (seconds !== undefined) return Math.max(seconds, 0) * 1000;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : Math.max(date - now.getTime(), 0);
+}
+
+/** Names the attempt count once a request was retried, so an exhausted retry budget reads as such. */
+function afterAttempts(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
 const REJECTED_TOKEN_ERRORS = new Set(["invalid_client", "invalid_grant", "unauthorized_client"]);
-const TOKEN_REQUEST_FAILURE = /^ServiceNow OAuth token request failed \((\d{3})\b[^)]*\) for \/oauth_token\.do(?:: (invalid_client|invalid_grant|unauthorized_client)\b)?/;
+const TOKEN_REQUEST_FAILURE = /^ServiceNow OAuth token request failed \((\d{3})\b[^)]*\) for \/oauth_token\.do(?: after \d+ attempts)?(?:: (invalid_client|invalid_grant|unauthorized_client)\b)?/;
 
 /** ServiceNow refused the credential itself: a 401 from any request, or a token request refused with an OAuth credential error. */
 function isRejectedCredentials(result: { statusCode?: number; error?: string }): boolean {
@@ -1241,28 +1263,53 @@ export class ServicenowApiClient implements ServicenowReadClient {
     return url.toString();
   }
 
-  private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  private async fetchWithTimeout(url: string, init: RequestInit, attempts: number): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
       return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
       rethrowIfAborted(error);
+      const pathname = requestPathname(url);
       if (controller.signal.aborted) {
-        throw new Error(`ServiceNow request timed out after ${this.config.timeoutMs}ms: ${requestPathname(url)}`);
+        throw new ServicenowTransportError(
+          `ServiceNow request timed out after ${this.config.timeoutMs}ms: ${pathname}${attempts > 1 ? `, after ${attempts} attempts` : ""}`,
+        );
       }
-      throw new Error(`ServiceNow request failed: ${this.redact(errorMessage(error))}`);
+      throw new ServicenowTransportError(`ServiceNow request failed for ${pathname}${afterAttempts(attempts)}: ${this.redact(errorMessage(error))}`);
     } finally {
       clearTimeout(timeout);
     }
   }
 
-  private retryDelayMs(response: Response, attempt: number): number {
-    const retryAfter = asNumber(response.headers.get("retry-after"));
-    if (response.status === 429 && retryAfter !== undefined) {
-      return Math.min(Math.max(retryAfter, 0) * 1000, MAX_RETRY_AFTER_MS);
-    }
+  private retryDelayMs(response: Response | undefined, attempt: number): number {
+    const retryAfter = retryAfterMs(response?.headers.get("retry-after") ?? null, this.now());
+    if (retryAfter !== undefined) return Math.min(retryAfter, MAX_RETRY_AFTER_MS);
     return Math.min(500 * 2 ** attempt, 8_000);
+  }
+
+  /**
+   * Sends one read (a GET or the token POST, which has no side effect), retrying a timeout, a transport failure, a 429,
+   * or a 5xx up to maxRetries times; a tool-call abort is never retried. `init` runs before every attempt, so each one
+   * carries a current Authorization header. Resolves with the final response, its body, and the attempts made.
+   */
+  private async send(url: string, init: () => Promise<RequestInit>): Promise<{ response: Response; rawText: string; attempts: number }> {
+    for (let attempt = 0; ; attempt += 1) {
+      const requestInit = await init();
+      let response: Response;
+      try {
+        response = await this.fetchWithTimeout(url, requestInit, attempt + 1);
+      } catch (error) {
+        if (!(error instanceof ServicenowTransportError) || attempt >= this.config.maxRetries) throw error;
+        await this.sleepImpl(this.retryDelayMs(undefined, attempt));
+        continue;
+      }
+      const rawText = await response.text();
+      if (!isRetryableStatus(response.status) || attempt >= this.config.maxRetries) {
+        return { response, rawText, attempts: attempt + 1 };
+      }
+      await this.sleepImpl(this.retryDelayMs(response, attempt));
+    }
   }
 
   private async authorizationHeader(): Promise<string> {
@@ -1306,15 +1353,14 @@ export class ServicenowApiClient implements ServicenowReadClient {
 
   private async fetchAccessToken(): Promise<string> {
     const body = this.tokenRequestBody();
-    const response = await this.fetchWithTimeout(`${this.config.instanceUrl}/oauth_token.do`, {
+    const { response, rawText, attempts } = await this.send(`${this.config.instanceUrl}/oauth_token.do`, async () => ({
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded",
         accept: "application/json",
       },
       body: body.toString(),
-    });
-    const rawText = await response.text();
+    }));
     const parsed = parseJsonBody(rawText);
     const payload: JsonRecord = parsed ?? {};
     if (!response.ok) {
@@ -1326,7 +1372,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
       // detail passes through the client's redact too: it knows the configured credentials, including
       // ones shorter than the remembered-secret minimum that the constructor's pass cannot see.
       throw new ServicenowApiError(
-        this.redact(`ServiceNow OAuth token request failed (${describeStatus(response)}) for /oauth_token.do${detail ? `: ${detail}` : ""}`),
+        this.redact(`ServiceNow OAuth token request failed (${describeStatus(response)}) for /oauth_token.do${afterAttempts(attempts)}${detail ? `: ${detail}` : ""}`),
         response.status,
         detail === undefined ? undefined : this.redact(detail),
       );
@@ -1365,15 +1411,14 @@ export class ServicenowApiClient implements ServicenowReadClient {
     // refused before the Authorization header is attached, whatever path led here.
     const refusal = refusedUrlClause(url, this.config.instanceUrl);
     if (refusal !== undefined) throw new Error(`ServiceNow request URL ${refusal}; the request was not sent.`);
-    let attempt = 0;
     let reauthenticated = false;
     for (;;) {
-      const headers = new Headers(init.headers ?? {});
-      if (!headers.has("accept")) headers.set("accept", "application/json");
-      headers.set("authorization", await this.authorizationHeader());
-
-      const response = await this.fetchWithTimeout(url, { ...init, headers });
-      const rawText = await response.text();
+      const { response, rawText, attempts } = await this.send(url, async () => {
+        const headers = new Headers(init.headers ?? {});
+        if (!headers.has("accept")) headers.set("accept", "application/json");
+        headers.set("authorization", await this.authorizationHeader());
+        return { ...init, headers };
+      });
       const parsed = parseJsonBody(rawText);
       const payload: JsonRecord = parsed ?? {};
 
@@ -1386,15 +1431,9 @@ export class ServicenowApiClient implements ServicenowReadClient {
         continue;
       }
 
-      if (isRetryableStatus(response.status) && attempt < this.config.maxRetries) {
-        await this.sleepImpl(this.retryDelayMs(response, attempt));
-        attempt += 1;
-        continue;
-      }
-
       const detail = servicenowErrorDetail(payload) ?? (rawText.length > 0 ? describeOpaqueBody(response, rawText, parsed !== undefined) : undefined);
       throw new ServicenowApiError(
-        this.redact(`ServiceNow request failed (${describeStatus(response)}) for ${new URL(url).pathname}${detail ? `: ${detail}` : ""}`),
+        this.redact(`ServiceNow request failed (${describeStatus(response)}) for ${new URL(url).pathname}${afterAttempts(attempts)}${detail ? `: ${detail}` : ""}`),
         response.status,
         detail === undefined ? undefined : this.redact(detail),
       );
@@ -4355,7 +4394,7 @@ const authParams = {
   refresh_token: Type.Optional(Type.String({ description: "OAuth refresh token issued earlier to the client; with client_id and client_secret the first token exchange uses the refresh_token grant. Defaults to SERVICENOW_REFRESH_TOKEN." })),
   config_file: Type.Optional(Type.String({ description: "YAML config file. Defaults to SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml." })),
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout in seconds. Defaults to 30.", default: 30 })),
-  max_retries: Type.Optional(Type.Number({ description: "Retries for 429 and 5xx responses. Defaults to 3.", default: 3 })),
+  max_retries: Type.Optional(Type.Number({ description: "Retries for 429 and 5xx responses, timeouts, and connection failures. Defaults to 3.", default: 3 })),
   page_size: Type.Optional(Type.Number({ description: "Table API page size (sysparm_limit). Defaults to 500.", default: 500 })),
 };
 

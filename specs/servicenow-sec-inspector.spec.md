@@ -68,7 +68,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `refresh_token` | string | no | OAuth refresh token issued earlier to the client; with client_id and client_secret the first token exchange uses the refresh_token grant. Defaults to SERVICENOW_REFRESH_TOKEN. |
 | `config_file` | string | no | YAML config file. Defaults to SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures. Defaults to 3. |
 | `page_size` | number | no | Table API page size (sysparm_limit). Defaults to 500. |
 
 #### `servicenow_assess_identity_access`
@@ -86,7 +86,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `refresh_token` | string | no | OAuth refresh token issued earlier to the client; with client_id and client_secret the first token exchange uses the refresh_token grant. Defaults to SERVICENOW_REFRESH_TOKEN. |
 | `config_file` | string | no | YAML config file. Defaults to SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures. Defaults to 3. |
 | `page_size` | number | no | Table API page size (sysparm_limit). Defaults to 500. |
 | `record_limit` | number | no | Maximum rows to page through per table before recording truncation. Defaults to 10000. |
 | `inactive_days` | number | no | Days without login before a user counts as inactive. Defaults to 90. |
@@ -109,7 +109,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `refresh_token` | string | no | OAuth refresh token issued earlier to the client; with client_id and client_secret the first token exchange uses the refresh_token grant. Defaults to SERVICENOW_REFRESH_TOKEN. |
 | `config_file` | string | no | YAML config file. Defaults to SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures. Defaults to 3. |
 | `page_size` | number | no | Table API page size (sysparm_limit). Defaults to 500. |
 | `record_limit` | number | no | Maximum rows to page through per table before recording truncation. Defaults to 10000. |
 | `max_session_timeout_minutes` | number | no | Maximum acceptable glide.ui.session_timeout in minutes. Defaults to 60 (ServiceNow hardening guidance); the spec suggests 30. |
@@ -129,7 +129,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `refresh_token` | string | no | OAuth refresh token issued earlier to the client; with client_id and client_secret the first token exchange uses the refresh_token grant. Defaults to SERVICENOW_REFRESH_TOKEN. |
 | `config_file` | string | no | YAML config file. Defaults to SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures. Defaults to 3. |
 | `page_size` | number | no | Table API page size (sysparm_limit). Defaults to 500. |
 | `record_limit` | number | no | Maximum rows to page through per table before recording truncation. Defaults to 10000. |
 
@@ -148,7 +148,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `refresh_token` | string | no | OAuth refresh token issued earlier to the client; with client_id and client_secret the first token exchange uses the refresh_token grant. Defaults to SERVICENOW_REFRESH_TOKEN. |
 | `config_file` | string | no | YAML config file. Defaults to SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures. Defaults to 3. |
 | `page_size` | number | no | Table API page size (sysparm_limit). Defaults to 500. |
 | `record_limit` | number | no | Maximum rows to page through per table before recording truncation. Defaults to 10000. |
 
@@ -167,7 +167,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `refresh_token` | string | no | OAuth refresh token issued earlier to the client; with client_id and client_secret the first token exchange uses the refresh_token grant. Defaults to SERVICENOW_REFRESH_TOKEN. |
 | `config_file` | string | no | YAML config file. Defaults to SERVICENOW_CONFIG_FILE, ./.servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429 and 5xx responses. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures. Defaults to 3. |
 | `page_size` | number | no | Table API page size (sysparm_limit). Defaults to 500. |
 | `record_limit` | number | no | Maximum rows to page through per table before recording truncation. Defaults to 10000. |
 | `inactive_days` | number | no | Days without login before a user counts as inactive. Defaults to 90. |
@@ -364,7 +364,7 @@ Credential refresh: POST /oauth_token.do with client_credentials or refresh_toke
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| ServiceNow Security Inspector | Instance and node configuration determine ServiceNow inbound REST limits | `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining` | 429, 500, 502, 503, 504 | Honor bounded Retry-After and retry transient reads three times; exhausted reads remain unavailable. |
+| ServiceNow Security Inspector | Instance and node configuration determine ServiceNow inbound REST limits | `Retry-After` | 429, 500-599 | Retry 429, every 5xx status, request timeouts (30 seconds unless timeout_seconds or SERVICENOW_TIMEOUT sets it), and network errors up to max_retries times after the first attempt (3 by default, SERVICENOW_MAX_RETRIES), on Table, Aggregate, and OAuth token requests alike. A Retry-After header in seconds or as an HTTP date is honored on any retryable response and clamped to 60 seconds; otherwise wait 500 ms doubled per attempt, capped at 8 seconds. A tool-call abort is never retried. An exhausted read stays unavailable, and its error names the path, the last status, timeout, or network error, and the attempt count. |
 
 ## Checks
 

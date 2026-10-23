@@ -227,7 +227,7 @@ The client follows classic `limit`/`offset` pagination using the `more` flag (10
 
 `GET /change_events` declares no `more` or `total` field. So the client keeps reading offset pages until a page comes back shorter than requested. A full final page at the requested limit is recorded as incomplete.
 
-The client retries 429 and 5xx responses, waiting for the `ratelimit-reset` or `Retry-After` value when present. It redacts tokens from error messages.
+The client retries 429 and 5xx responses, its own request timeouts, and connection failures up to 3 times (4 attempts), on the REST API and on the Scoped OAuth token request. It waits for the `ratelimit-reset` value or for `Retry-After` (delta-seconds or an HTTP-date) when present, held between 250 ms and 30 s, and otherwise backs off 1, 2, then 4 seconds. A cancelled tool call is never retried, and its retry wait ends at once. When the attempts run out, the error names the path, the last status, timeout, or connection error, and the attempt count, and the dataset is recorded as unread rather than empty, including when a later page or one of the per-item reads (team members, schedule details, business service dependencies) fails. It redacts tokens from error messages.
 
 ### Verdict safety rules
 
@@ -349,7 +349,7 @@ These responses are described as "non-JSON body (text/html, 5120 bytes)" or "JSO
 
 Such a response is a proxy or WAF page, whatever its content type claims, or JSON of another shape.
 
-A timeout is reported as "PagerDuty request timed out after Nms: \<path>" with the path only.
+A timeout is reported as "PagerDuty request timed out after Nms: \<path>" with the path only, followed by ", after 4 attempts" once the retries are spent. A connection failure is reported as "PagerDuty request failed for \<path> after 4 attempts: \<reason>".
 
 `PagerdutyRequestError` is the one error class the client throws for HTTP failures. Its constructor runs the redaction pass over the message it was given.
 

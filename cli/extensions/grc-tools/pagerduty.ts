@@ -1334,6 +1334,32 @@ export class PagerdutyRequestError extends Error {
   }
 }
 
+/** A request that got no response: the client's own timeout fired or the transport failed. Retried like a 5xx. */
+class PagerdutyTransportError extends Error {
+  /** The request path, without the query string. */
+  readonly path: string;
+
+  constructor(message: string, path: string) {
+    super(message);
+    this.name = "PagerdutyTransportError";
+    this.path = path;
+  }
+}
+
+/** Retry-After in milliseconds, as delta-seconds or an HTTP-date measured against `now`; undefined when absent or unreadable. */
+function retryAfterMs(value: string | null, now: Date): number | undefined {
+  if (value === null) return undefined;
+  const seconds = asNumber(value);
+  if (seconds !== undefined) return seconds >= 0 ? seconds * 1000 : undefined;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : Math.max(date - now.getTime(), 0);
+}
+
+/** Names the attempt count once a request was retried, so an exhausted retry budget reads as such. */
+function afterAttempts(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
 /** The RFC 6749 section 5.2 token errors that mean the server refused the client credentials themselves. */
 const REJECTED_CREDENTIAL_OAUTH_ERRORS = ["invalid_client", "invalid_grant", "unauthorized_client"] as const;
 type RejectedCredentialOauthError = typeof REJECTED_CREDENTIAL_OAUTH_ERRORS[number];
@@ -1427,38 +1453,30 @@ export class PagerdutyApiClient {
       client_secret: this.config.clientSecret,
       scope: [`as_account-${this.config.region}.${this.config.subdomain}`, ...OAUTH_SCOPES].join(" "),
     });
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
-    try {
-      const response = await this.fetchImpl(this.config.identityTokenUrl, {
-        method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-        body: body.toString(),
-        signal: controller.signal,
-      });
-      const rawText = await response.text();
-      const parsed = parseJsonBody(rawText);
-      const payload = parsed ?? {};
-      if (!response.ok) {
-        // RFC 6749 error and error_description are the documented fields; anything else is described by shape.
-        const detail = asString(payload.error_description) ?? asString(payload.error) ?? describeOpaqueBody(response, rawText, parsed !== undefined) ?? "empty response body";
-        throw new PagerdutyTokenRequestError(
-          response.status,
-          this.redact(`PagerDuty OAuth token request failed (${response.status}) for ${requestPath(this.config.identityTokenUrl)}: ${detail}`),
-          requestPath(this.config.identityTokenUrl),
-          payload,
-        );
-      }
-      const token = asString(payload.access_token);
-      if (!token) throw new Error(`PagerDuty OAuth token response did not include access_token (${describeOpaqueBody(response, rawText, parsed !== undefined) ?? "empty response body"}).`);
-      const expiresIn = asNumber(payload.expires_in) ?? 3600;
-      this.bearerToken = token;
-      this.bearerExpiresAt = this.now().getTime() + Math.max((expiresIn - 60) * 1000, 60_000);
-      rememberSecrets(token);
-      return token;
-    } finally {
-      clearTimeout(timeout);
+    const { response, rawText, attempts } = await this.send(this.config.identityTokenUrl, async () => ({
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+      body: body.toString(),
+    }));
+    const parsed = parseJsonBody(rawText);
+    const payload = parsed ?? {};
+    if (!response.ok) {
+      // RFC 6749 error and error_description are the documented fields; anything else is described by shape.
+      const detail = asString(payload.error_description) ?? asString(payload.error) ?? describeOpaqueBody(response, rawText, parsed !== undefined) ?? "empty response body";
+      throw new PagerdutyTokenRequestError(
+        response.status,
+        this.redact(`PagerDuty OAuth token request failed (${response.status}) for ${requestPath(this.config.identityTokenUrl)}${afterAttempts(attempts)}: ${detail}`),
+        requestPath(this.config.identityTokenUrl),
+        payload,
+      );
     }
+    const token = asString(payload.access_token);
+    if (!token) throw new Error(`PagerDuty OAuth token response did not include access_token (${describeOpaqueBody(response, rawText, parsed !== undefined) ?? "empty response body"}).`);
+    const expiresIn = asNumber(payload.expires_in) ?? 3600;
+    this.bearerToken = token;
+    this.bearerExpiresAt = this.now().getTime() + Math.max((expiresIn - 60) * 1000, 60_000);
+    rememberSecrets(token);
+    return token;
   }
 
   private async authorizationHeader(): Promise<string> {
@@ -1480,61 +1498,79 @@ export class PagerdutyApiClient {
     }
   }
 
-  private retryDelayMs(response: Response, attempt: number): number {
-    const resetSeconds = asNumber(response.headers.get("ratelimit-reset"))
-      ?? asNumber(response.headers.get("retry-after"));
-    const backoff = Math.min(1000 * 2 ** attempt, MAX_RETRY_DELAY_MS);
-    if (resetSeconds !== undefined && resetSeconds >= 0) {
-      return Math.min(Math.max(resetSeconds * 1000, 250), MAX_RETRY_DELAY_MS);
-    }
-    return backoff;
+  private retryDelayMs(response: Response | undefined, attempt: number): number {
+    const resetSeconds = asNumber(response?.headers.get("ratelimit-reset"));
+    const waitMs = resetSeconds !== undefined && resetSeconds >= 0
+      ? resetSeconds * 1000
+      : retryAfterMs(response?.headers.get("retry-after") ?? null, this.now());
+    if (waitMs !== undefined) return Math.min(Math.max(waitMs, 250), MAX_RETRY_DELAY_MS);
+    return Math.min(1000 * 2 ** attempt, MAX_RETRY_DELAY_MS);
   }
 
-  private async fetchOnce(url: string): Promise<Response> {
+  private async fetchOnce(url: string, init: RequestInit, attempts: number): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
-      const headers: Record<string, string> = {
-        accept: ACCEPT_HEADER,
-        authorization: await this.authorizationHeader(),
-      };
-      if (this.config.fromEmail) headers.from = this.config.fromEmail;
-      return await this.fetchImpl(url, { method: "GET", headers, signal: controller.signal });
+      return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
       rethrowIfAborted(error);
-      // A token exchange failure is already a PagerdutyRequestError carrying its status and path.
-      if (error instanceof PagerdutyRequestError) throw error;
-      if (error instanceof Error && error.name === "AbortError") {
-        throw new Error(`PagerDuty request timed out after ${this.config.timeoutMs}ms: ${requestPath(url)}`);
+      const path = requestPath(url);
+      if (controller.signal.aborted) {
+        throw new PagerdutyTransportError(`PagerDuty request timed out after ${this.config.timeoutMs}ms: ${path}${attempts > 1 ? `, after ${attempts} attempts` : ""}`, path);
       }
-      throw new Error(this.redact(errorMessage(error)));
+      throw new PagerdutyTransportError(`PagerDuty request failed for ${path}${afterAttempts(attempts)}: ${this.redact(errorMessage(error))}`, path);
     } finally {
       clearTimeout(timeout);
     }
   }
 
-  async get(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
-    const url = this.buildUrl(path, query);
+  /**
+   * Sends one read (a GET, or the token POST, which has no side effect), retrying a timeout, a transport failure,
+   * a 429, or a 5xx up to maxRetries times; a tool-call abort is never retried. `init` runs before every attempt
+   * and outside its timeout, so each attempt carries a current Authorization header and a token exchange never
+   * spends the request's own time. Resolves with the final response, its body, and the attempts made.
+   */
+  private async send(url: string, init: () => Promise<RequestInit>): Promise<{ response: Response; rawText: string; attempts: number }> {
     for (let attempt = 0; ; attempt += 1) {
-      const response = await this.fetchOnce(url);
+      const requestInit = await init();
+      let response: Response;
+      try {
+        response = await this.fetchOnce(url, requestInit, attempt + 1);
+      } catch (error) {
+        if (!(error instanceof PagerdutyTransportError) || attempt >= this.maxRetries) throw error;
+        await this.sleep(this.retryDelayMs(undefined, attempt));
+        continue;
+      }
       const retryable = response.status === 429 || response.status >= 500;
       if (retryable && attempt < this.maxRetries) {
         await this.sleep(this.retryDelayMs(response, attempt));
         continue;
       }
-      const rawText = await response.text();
-      const parsed = parseJsonBody(rawText);
-      const payload: JsonRecord = parsed ?? {};
-      if (!response.ok) {
-        const detail = pagerdutyErrorSummary(payload) ?? describeOpaqueBody(response, rawText, parsed !== undefined);
-        throw new PagerdutyRequestError(
-          response.status,
-          this.redact(`PagerDuty request failed (${response.status} ${response.statusText}) for ${path}${detail ? `: ${detail}` : ""}`),
-          path,
-        );
-      }
-      return payload;
+      return { response, rawText: await response.text(), attempts: attempt + 1 };
     }
+  }
+
+  async get(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
+    const url = this.buildUrl(path, query);
+    const { response, rawText, attempts } = await this.send(url, async () => {
+      const headers: Record<string, string> = {
+        accept: ACCEPT_HEADER,
+        authorization: await this.authorizationHeader(),
+      };
+      if (this.config.fromEmail) headers.from = this.config.fromEmail;
+      return { method: "GET", headers };
+    });
+    const parsed = parseJsonBody(rawText);
+    const payload: JsonRecord = parsed ?? {};
+    if (!response.ok) {
+      const detail = pagerdutyErrorSummary(payload) ?? describeOpaqueBody(response, rawText, parsed !== undefined);
+      throw new PagerdutyRequestError(
+        response.status,
+        this.redact(`PagerDuty request failed (${response.status} ${response.statusText}) for ${path}${afterAttempts(attempts)}${detail ? `: ${detail}` : ""}`),
+        path,
+      );
+    }
+    return payload;
   }
 
   async list(
@@ -1786,7 +1822,7 @@ async function capture<T>(fallback: T, load: () => Promise<T>): Promise<Snapshot
     rethrowIfAborted(error);
     const message = errorMessage(error);
     const status = error instanceof PagerdutyRequestError ? error.status : requestStatus(message);
-    const endpoint = (error instanceof PagerdutyRequestError ? error.path : undefined) ?? requestEndpoint(message);
+    const endpoint = (error instanceof PagerdutyRequestError || error instanceof PagerdutyTransportError ? error.path : undefined) ?? requestEndpoint(message);
     return {
       data: fallback,
       error: message,
