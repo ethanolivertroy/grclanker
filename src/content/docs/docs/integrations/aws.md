@@ -418,15 +418,22 @@ Each of these secondary reads is attempted individually and recorded on failure,
 
 #### Retries and timeouts
 
-Every SDK client the tools build, including the clients the credential providers create, runs the SDK's standard retry mode with at most 3 attempts per request. The tools set these values on each client, so `AWS_MAX_ATTEMPTS` and `AWS_RETRY_MODE` from the environment or the shared config file do not change them.
+The tools leave the retry mode and the attempt limit to the AWS SDK, which resolves them for each client the way it does for any SDK client:
 
-- Throttling (HTTP 429 or a throttling error code such as `ThrottlingException`), HTTP 500, 502, 503, and 504, timeouts, and network failures are retried with the SDK's jittered exponential backoff. Any other error, a denial included, is final at once.
+1. `AWS_RETRY_MODE` and `AWS_MAX_ATTEMPTS` in the environment.
+2. `retry_mode` and `max_attempts` in the selected profile of the shared config file: the `profile` argument, otherwise `AWS_PROFILE`, otherwise `default`.
+3. Otherwise, standard mode with 3 attempts per request.
+
+This covers every SDK client the tools build, including the STS and SSO clients the credential providers create. The tools set only the timeouts on those clients.
+
+- Standard and adaptive mode both retry throttling (HTTP 429 or a throttling error code such as `ThrottlingException`), HTTP 500, 502, 503, and 504, timeouts, and network failures with the SDK's jittered exponential backoff. Adaptive mode also slows the client's sending rate once it is throttled. Any other error, a denial included, is final at once.
 - The SDK waits for a `Retry-After` or `x-amz-retry-after` header only up to 5 seconds past its own backoff delay.
 - Each attempt has 10 seconds to connect and 30 seconds for the service to start answering. An attempt past either limit fails with `TimeoutError` and is retried.
+- A network failure is recognized by its Node.js error code: `ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `ETIMEDOUT`, `EHOSTUNREACH`, `ENETUNREACH`, `ENOTFOUND`, or `EAI_AGAIN`, on the error or along its cause chain.
 
 When the attempts run out, the read is unreadable, never empty or partial:
 
-- Its error names the code, the status, and the attempt count, for example `ThrottlingException (HTTP 400) after 3 attempts: Rate exceeded`.
+- Its error names the code, the status, and the attempt count the SDK reports, for example `ThrottlingException (HTTP 400) after 3 attempts: Rate exceeded`. When the settings allow a single attempt, the error has no count.
 - The findings that depend on it render `manual` or cap at `warn` (see [Unreadable datasets](#unreadable-datasets)).
 - A list that fails on a later page keeps none of its earlier pages, so it never passes as a complete or truncated inventory.
 - In `aws_check_access`, the probe is `not_readable` and a note says the check is incomplete: `This check is incomplete: the probes for iam_users ran out of retries without an answer (each surface records its last error), so whether that surface is readable is unknown.` The next step says to wait for AWS to stop throttling or failing the requests, or to restore network access to the AWS endpoints, and names services to grant only for the other unreadable surfaces.
@@ -571,7 +578,7 @@ Tests run every fixed-text integration message through the scrub and verify that
 The client throws fixed text, not the SDK's error. Every SDK client the auditor holds is guarded so a failed `send()` surfaces as `AwsApiError`:
 
 - **Message:** `describeError`'s text (for example `SyntaxError (HTTP 200): non-JSON body (text/plain, 18 bytes)` for a 200 answer whose body is a short non-JSON page).
-- **Structured fields:** Only `code`, `httpStatus`, and a numbers-only `$metadata` (`httpStatusCode` and the SDK's `attempts`).
+- **Structured fields:** Only `code`, `httpStatus`, `networkErrorCode` (one of the Node.js error codes listed under [Retries and timeouts](#retries-and-timeouts), for a request that got no response), and a numbers-only `$metadata` (`httpStatusCode` and the SDK's `attempts`).
 - **Not retained:** The SDK's `$response`, `$responseBodyText`, and cause.
 
 A caller that logs the thrown error therefore cannot re-emit a body or request context, and a scrub at the tool boundary is not what protects it.

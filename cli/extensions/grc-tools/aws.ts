@@ -104,7 +104,8 @@ import {
   AWS_IAM_ACTIONS,
   AWS_REQUIRED_OUTPUT_MEMBERS,
   AWS_REQUIRED_PUBLIC_ACCESS_FLAGS,
-  AWS_SDK_RETRY,
+  AWS_SDK_DEFAULT_RETRY,
+  AWS_SDK_TIMEOUTS,
   AWS_SPEC,
   AWS_VERDICT_VALUES,
 } from "./aws.spec.js";
@@ -454,15 +455,44 @@ const AWS_RETRIED_ERROR_CODES: ReadonlySet<string> = new Set([
 const AWS_RETRIED_STATUSES: readonly number[] = [429, 500, 502, 503, 504];
 
 /**
+ * Node.js error codes of a request that got no response, which the SDK retries as transient, mirrored from
+ * @smithy/core's NODEJS_TIMEOUT_ERROR_CODES and NODEJS_NETWORK_ERROR_CODES for the same reason.
+ */
+const AWS_RETRIED_NETWORK_ERROR_CODES: ReadonlySet<string> = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+]);
+
+/** How deep along an error's cause chain the SDK looks for a transient error code. */
+const SDK_CAUSE_DEPTH_LIMIT = 10;
+
+/** The network error code on the error or, where the SDK also looks, along its cause chain; undefined for any other failure. */
+function errorNetworkCode(error: unknown, depth = 0): string | undefined {
+  if (error instanceof AwsApiError) return error.networkErrorCode;
+  const object = asObject(error);
+  if (!object) return undefined;
+  const code = asString(object.code);
+  if (code !== undefined && AWS_RETRIED_NETWORK_ERROR_CODES.has(code)) return code;
+  return depth <= SDK_CAUSE_DEPTH_LIMIT ? errorNetworkCode(object.cause, depth + 1) : undefined;
+}
+
+/**
  * A failure the SDK's retries ended on without an answer about access: throttling, a service fault, a timeout, or a
- * network failure. Whether the surface it probed is readable is unknown, which is not a permission gap.
+ * network failure, however many attempts the retry settings allowed. Whether the surface it probed is readable is
+ * unknown, which is not a permission gap.
  */
 function isUnansweredFailure(error: unknown): boolean {
   if (error instanceof AwsCredentialProviderError) return false;
   const status = errorHttpStatus(error);
-  if (AWS_RETRIED_ERROR_CODES.has(errorCode(error)) || (status !== undefined && AWS_RETRIED_STATUSES.includes(status))) return true;
-  // A network failure such as DNS or a refused connection has no status and no retryable code, but the SDK retried it.
-  return status === undefined && (errorAttempts(error) ?? 1) > 1;
+  return AWS_RETRIED_ERROR_CODES.has(errorCode(error))
+    || (status !== undefined && AWS_RETRIED_STATUSES.includes(status))
+    || errorNetworkCode(error) !== undefined;
 }
 
 const REDACTED_ERROR_VALUE = "[REDACTED]";
@@ -1235,14 +1265,16 @@ function errorMessage(error: unknown): string {
  * the text and the whole source when it is 21 characters or shorter) or echo request context, so a caller that
  * logs the thrown error would re-emit it; a scrub at the tool boundary does not protect that caller. This error
  * carries describeError()'s text and only the structured fields the classifiers read: the SDK error name as
- * `code` and the observed HTTP status. Nothing that can hold body text ($response, $responseBodyText, the
- * cause) is retained.
+ * `code`, the observed HTTP status, and the network error code of a request that got no response. Nothing that
+ * can hold body text ($response, $responseBodyText, the cause) is retained.
  */
 export class AwsApiError extends Error {
   /** The SDK error name (for example AccessDeniedException, SyntaxError), or "" when the SDK error had none. */
   readonly code: string;
   /** HTTP status the request observed; undefined for transport failures (timeouts, connection errors). */
   readonly httpStatus: number | undefined;
+  /** One of the Node.js network error codes the SDK retries (ECONNREFUSED, ENOTFOUND, ...); undefined for any other failure. */
+  readonly networkErrorCode: string | undefined;
   /** Kept in the SDK's shape so callers that read $metadata.httpStatusCode or attempts keep working; it holds numbers only. */
   readonly $metadata: { httpStatusCode?: number; attempts?: number };
 
@@ -1251,6 +1283,7 @@ export class AwsApiError extends Error {
     this.name = "AwsApiError";
     this.code = errorCode(cause);
     this.httpStatus = errorHttpStatus(cause);
+    this.networkErrorCode = errorNetworkCode(cause);
     this.$metadata = sdkMetadata(this.httpStatus, errorAttempts(cause));
   }
 }
@@ -1675,18 +1708,16 @@ function guardCredentialProvider(provider: string, resolve: AwsCredentialProvide
 }
 
 /**
- * Retry and timeout settings for every SDK client, the STS and SSO clients the credential providers build
- * included. Standard mode retries throttling, 500, 502, 503, 504, and transport failures; throwOnRequestTimeout
- * makes an attempt past its timeout fail, and so be retried, where the handler would otherwise only log a
- * warning and keep waiting.
+ * Timeout settings for every SDK client, the STS and SSO clients the credential providers build included. The retry
+ * mode and attempt limit are left out so the SDK reads them from AWS_RETRY_MODE and AWS_MAX_ATTEMPTS or the profile.
+ * throwOnRequestTimeout makes an attempt past its timeout fail, and so be retried, where the handler would otherwise
+ * only log a warning and keep waiting.
  */
-function sdkRetrySettings() {
+function sdkTimeoutSettings() {
   return {
-    maxAttempts: AWS_SDK_RETRY.maxAttempts,
-    retryMode: AWS_SDK_RETRY.retryMode,
     requestHandler: {
-      requestTimeout: AWS_SDK_RETRY.requestTimeoutMs,
-      connectionTimeout: AWS_SDK_RETRY.connectionTimeoutMs,
+      requestTimeout: AWS_SDK_TIMEOUTS.requestTimeoutMs,
+      connectionTimeout: AWS_SDK_TIMEOUTS.connectionTimeoutMs,
       throwOnRequestTimeout: true,
     },
   };
@@ -1695,12 +1726,14 @@ function sdkRetrySettings() {
 /**
  * The credential provider for the resolved configuration: the named profile through fromIni, otherwise the
  * same default chain the SDK would use (environment, shared files, SSO, process, container, and instance
- * metadata providers), both guarded so provider errors never reach an error string verbatim.
+ * metadata providers), both guarded so provider errors never reach an error string verbatim. The STS and SSO
+ * clients fromIni builds are given the profile too, since without it they read AWS_PROFILE's or the default
+ * profile's retry settings rather than the named profile's.
  */
 function credentialProviderFor(config: AwsResolvedConfig): AwsCredentialProvider {
   return config.profile
-    ? guardCredentialProvider(`fromIni (profile ${config.profile})`, fromIni({ profile: config.profile, clientConfig: sdkRetrySettings() }), config.profile)
-    : guardCredentialProvider("fromNodeProviderChain (default credential chain)", fromNodeProviderChain({ clientConfig: { region: config.region, ...sdkRetrySettings() } }));
+    ? guardCredentialProvider(`fromIni (profile ${config.profile})`, fromIni({ profile: config.profile, clientConfig: { profile: config.profile, ...sdkTimeoutSettings() } }), config.profile)
+    : guardCredentialProvider("fromNodeProviderChain (default credential chain)", fromNodeProviderChain({ clientConfig: { region: config.region, ...sdkTimeoutSettings() } }));
 }
 
 /** The recorded line for a failed read: the command label, whether it was a denial, and the scrubbed error text. */
@@ -2090,9 +2123,8 @@ export class AwsAuditorClient {
     // Static credentials in the environment are configured secrets from construction on, before any request
     // is signed; the guarded chain registers whatever it resolves at the first signed request as well.
     registerConfiguredSecrets(process.env.AWS_SECRET_ACCESS_KEY, process.env.AWS_SESSION_TOKEN);
-    const credentials = credentialProviderFor(config);
-    const clientConfig = { region: config.region, credentials, ...sdkRetrySettings() };
-    this.credentials = credentials;
+    this.credentials = credentialProviderFor(config);
+    const clientConfig = this.clientConfigFor(config.region);
     this.signal = options.signal;
     // Every SDK client is guarded so the error a read throws is fixed text (AwsApiError), never the SDK's message.
     this.sts = guardSdkClient(new STSClient(clientConfig), this.signal);
@@ -2199,10 +2231,19 @@ export class AwsAuditorClient {
     }
   }
 
+  /**
+   * Config for an SDK client in region. The profile lets the SDK read that profile's retry_mode and max_attempts
+   * when the run names it by argument rather than AWS_PROFILE; the client's credentials still come from the guarded
+   * provider.
+   */
+  private clientConfigFor(region: string) {
+    return { region, profile: this.config.profile, credentials: this.credentials, ...sdkTimeoutSettings() };
+  }
+
   private ec2For(region: string): EC2Client {
     let client = this.ec2Clients.get(region);
     if (!client) {
-      client = guardSdkClient(new EC2Client({ region, credentials: this.credentials, ...sdkRetrySettings() }), this.signal);
+      client = guardSdkClient(new EC2Client(this.clientConfigFor(region)), this.signal);
       this.ec2Clients.set(region, client);
     }
     return client;
@@ -2212,7 +2253,7 @@ export class AwsAuditorClient {
     if (region === this.config.region) return this.cloudTrail;
     let client = this.cloudTrailClients.get(region);
     if (!client) {
-      client = guardSdkClient(new CloudTrailClient({ region, credentials: this.credentials, ...sdkRetrySettings() }), this.signal);
+      client = guardSdkClient(new CloudTrailClient(this.clientConfigFor(region)), this.signal);
       this.cloudTrailClients.set(region, client);
     }
     return client;
@@ -2221,7 +2262,7 @@ export class AwsAuditorClient {
   private rdsFor(region: string): RDSClient {
     let client = this.rdsClients.get(region);
     if (!client) {
-      client = guardSdkClient(new RDSClient({ region, credentials: this.credentials, ...sdkRetrySettings() }), this.signal);
+      client = guardSdkClient(new RDSClient(this.clientConfigFor(region)), this.signal);
       this.rdsClients.set(region, client);
     }
     return client;
@@ -2230,7 +2271,7 @@ export class AwsAuditorClient {
   private kmsFor(region: string): KMSClient {
     let client = this.kmsClients.get(region);
     if (!client) {
-      client = guardSdkClient(new KMSClient({ region, credentials: this.credentials, ...sdkRetrySettings() }), this.signal);
+      client = guardSdkClient(new KMSClient(this.clientConfigFor(region)), this.signal);
       this.kmsClients.set(region, client);
     }
     return client;
@@ -5541,17 +5582,17 @@ export function awsFixedTexts(): readonly string[] {
   const noBucketPolicy = { name: "NoSuchBucketPolicy", message: "The bucket policy does not exist", $metadata: { httpStatusCode: 404 } };
   const htmlPage = { name: "SyntaxError", $metadata: { httpStatusCode: 502 }, $bodyNote: `non-JSON body (text/html, ${Buffer.byteLength(html, "utf8")} bytes)` };
   const timeout = { name: "TimeoutError", message: "Request did not complete within 10000 ms" };
-  const attempts = AWS_SDK_RETRY.maxAttempts;
+  const attempts = AWS_SDK_DEFAULT_RETRY.maxAttempts;
   const throttled = new AwsApiError({ name: "ThrottlingException", message: "Rate exceeded", $metadata: { httpStatusCode: 400, attempts } });
   const unavailable = new AwsApiError({ name: "ServiceUnavailableException", message: "Service Unavailable", $metadata: { httpStatusCode: 503, attempts } });
   const requestTimedOut = new AwsApiError({
     name: "TimeoutError",
-    message: `@smithy/node-http-handler - [ERROR] a request has exceeded the configured ${AWS_SDK_RETRY.requestTimeoutMs} ms requestTimeout.`,
+    message: `@smithy/node-http-handler - [ERROR] a request has exceeded the configured ${AWS_SDK_TIMEOUTS.requestTimeoutMs} ms requestTimeout.`,
     $metadata: { attempts },
   });
   const connectTimedOut = new AwsApiError({
     name: "TimeoutError",
-    message: `@smithy/node-http-handler - the request socket did not establish a connection with the server within the configured timeout of ${AWS_SDK_RETRY.connectionTimeoutMs} ms.`,
+    message: `@smithy/node-http-handler - the request socket did not establish a connection with the server within the configured timeout of ${AWS_SDK_TIMEOUTS.connectionTimeoutMs} ms.`,
     $metadata: { attempts },
   });
   const retriedPage = new AwsApiError({ name: "SyntaxError", $metadata: { httpStatusCode: 502, attempts }, $bodyNote: `non-JSON body (text/html, ${Buffer.byteLength(html, "utf8")} bytes)` });
