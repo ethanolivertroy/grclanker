@@ -677,6 +677,33 @@ test("VeracodeApiClient stops at once when the call is aborted during a retry wa
   }
 });
 
+test("VeracodeApiClient reports an abort that lands while a body is read as the call's abort, not as a timeout, even with no retry left", async () => {
+  const controller = new AbortController();
+  let requests = 0;
+  const client = new VeracodeApiClient(sampleConfig({ retries: 0 }), {
+    fetchImpl: async (_input, init) => {
+      requests += 1;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "content-type": "application/json" }),
+        text: () => {
+          const reading = new Promise((_resolve, reject) => {
+            init.signal.addEventListener("abort", () => reject(veracodeTimeout()), { once: true });
+          });
+          controller.abort();
+          return reading;
+        },
+      };
+    },
+    sleep: async () => {},
+    signal: controller.signal,
+  });
+  await assert.rejects(() => client.get("/appsec/v1/policies"), (error) => error.name === "ToolCallAbortedError");
+  assert.equal(requests, 1, "nothing is sent after the abort");
+});
+
 test("a list page that fails on every attempt leaves the inventory unread, so no check built on it passes and the bundle records the failure", async () => {
   const base = createTempBase("grclanker-veracode-retry-exhausted-");
   for (const [label, failPage, expected] of [

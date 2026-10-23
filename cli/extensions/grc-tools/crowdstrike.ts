@@ -21,7 +21,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { CROWDSTRIKE_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1293,7 +1293,7 @@ function attemptsText(attempts: number): string {
   return `after ${attempts} attempt${attempts === 1 ? "" : "s"}`;
 }
 
-/** A request that drew no HTTP response: the client's own timeout fired or the transport failed. */
+/** A request whose response never arrived in full: the client's own timeout fired or the transport failed. */
 class CrowdstrikeTransportError extends Error {
   constructor(message: string) {
     super(scrubSecretText(message));
@@ -1348,6 +1348,7 @@ export class CrowdstrikeApiClient {
   private readonly sleep: SleepImpl;
   private readonly retryLimit: number;
   private readonly now: () => number;
+  private readonly signal?: AbortSignal;
   private accessToken?: string;
   private accessTokenExpiresAt = 0;
   private accessTokenPromise?: Promise<string>;
@@ -1368,6 +1369,7 @@ export class CrowdstrikeApiClient {
     this.sleep = abortableSleep(options.signal, options.sleep);
     this.retryLimit = clampNumber(options.retryLimit, DEFAULT_RETRY_LIMIT, 0, 10);
     this.now = options.now ?? Date.now;
+    this.signal = options.signal;
     rememberSecrets(config.clientSecret);
   }
 
@@ -1394,11 +1396,17 @@ export class CrowdstrikeApiClient {
     return url.toString();
   }
 
-  private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  /**
+   * One request under the configured timeout. The body is read before the timer is cleared, so a body that stalls
+   * times out like a request that never answers. The call's abort is raced against the body read as well, since an
+   * abort there would otherwise surface as an AbortError and be reported as a timeout.
+   */
+  private async fetchWithTimeout(url: string, init: RequestInit): Promise<{ response: Response; rawText: string }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
-      return await this.fetchImpl(url, { ...init, signal: controller.signal });
+      const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
+      return { response, rawText: await unlessAborted(response.text(), this.signal) };
     } catch (error) {
       rethrowIfAborted(error);
       if (error instanceof Error && error.name === "AbortError") {
@@ -1415,31 +1423,32 @@ export class CrowdstrikeApiClient {
    * waits as the rate-limit headers ask (clamped to MAX_RETRY_DELAY_MS), and a timeout or transport failure waits
    * a backoff. Every request this client sends only reads (GETs, the token POST, and the read-only search and
    * lookup POSTs), so sending one again cannot change the tenant. `retryNow` resends at once for a reason of the
-   * caller's own (a refreshed token). `failure` heads the error when the last attempt drew no response.
+   * caller's own (a refreshed token). `failure` heads the error when the last attempt's response never arrived in full.
    */
   private async send(
     url: string,
     init: () => Promise<RequestInit>,
     failure: string,
     retryNow: (response: Response) => boolean = () => false,
-  ): Promise<{ response: Response; attempts: number }> {
+  ): Promise<{ response: Response; rawText: string; attempts: number }> {
     for (let attempt = 0; ; attempt += 1) {
       const requestInit = await init();
-      let response: Response;
+      let answer: { response: Response; rawText: string };
       try {
-        response = await this.fetchWithTimeout(url, requestInit);
+        answer = await this.fetchWithTimeout(url, requestInit);
       } catch (error) {
         if (!(error instanceof CrowdstrikeTransportError)) throw error;
         if (attempt >= this.retryLimit) throw new Error(this.redact(`${failure} ${attemptsText(attempt + 1)}: ${error.message}`));
         await this.sleep(backoffDelay(attempt));
         continue;
       }
+      const { response } = answer;
       if (retryNow(response)) continue;
       if (isRetryableStatus(response.status) && attempt < this.retryLimit) {
         await this.sleep(retryDelayFromResponse(response, attempt, this.now()));
         continue;
       }
-      return { response, attempts: attempt + 1 };
+      return { ...answer, attempts: attempt + 1 };
     }
   }
 
@@ -1453,7 +1462,7 @@ export class CrowdstrikeApiClient {
     }
 
     const failure = "CrowdStrike OAuth2 token request failed";
-    const { response, attempts } = await this.send(`${this.config.baseUrl}/oauth2/token`, async () => ({
+    const { response, rawText, attempts } = await this.send(`${this.config.baseUrl}/oauth2/token`, async () => ({
       method: "POST",
       headers: {
         accept: "application/json",
@@ -1461,7 +1470,6 @@ export class CrowdstrikeApiClient {
       },
       body: body.toString(),
     }), failure);
-    const rawText = await response.text();
     const payload = parseJsonBody(rawText);
     if (!response.ok) {
       const retried = isRetryableStatus(response.status) ? ` ${attemptsText(attempts)}` : "";
@@ -1511,7 +1519,7 @@ export class CrowdstrikeApiClient {
     const url = this.buildUrl(path, options.query);
     const failure = `CrowdStrike request failed for ${path}`;
     let refreshedToken = false;
-    const { response, attempts } = await this.send(url, async () => {
+    const { response, rawText, attempts } = await this.send(url, async () => {
       const headers = new Headers({ accept: "application/json" });
       headers.set("authorization", `Bearer ${await this.getAccessToken()}`);
       if (options.body !== undefined) headers.set("content-type", "application/json");
@@ -1527,7 +1535,6 @@ export class CrowdstrikeApiClient {
       return true;
     });
 
-    const rawText = await response.text();
     const payload = parseJsonBody(rawText);
     if (!response.ok) {
       const retried = isRetryableStatus(response.status) ? ` ${attemptsText(attempts)}` : "";

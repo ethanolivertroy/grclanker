@@ -20,7 +20,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
-import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1927,6 +1927,7 @@ abstract class TenableHttpClient {
   protected readonly sleepImpl: SleepImpl;
   protected readonly retryLimit: number;
   protected readonly now: () => number;
+  protected readonly signal?: AbortSignal;
   protected readonly secrets: string[];
 
   constructor(baseUrl: string, timeoutMs: number, secrets: string[], options: HttpClientOptions = {}) {
@@ -1936,6 +1937,7 @@ abstract class TenableHttpClient {
     this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     this.retryLimit = options.retryLimit ?? DEFAULT_RETRY_LIMIT;
     this.now = options.now ?? Date.now;
+    this.signal = options.signal;
     this.secrets = secrets;
   }
 
@@ -1990,27 +1992,33 @@ abstract class TenableHttpClient {
     for (let attempt = 0; ; attempt += 1) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-      let response: Response;
+      let response: Response | undefined;
+      let rawText: string;
+      // The body is read under the same timer, so a body that stalls times out like a request that never answers.
+      // The call's abort is raced against the body read too, or an abort there would be reported as a timeout.
       try {
         response = await this.fetchImpl(url, {
           ...init,
           headers: { accept: "application/json", ...this.authHeaders(), ...(init.headers as Record<string, string> | undefined ?? {}) },
           signal: controller.signal,
         });
+        rawText = await unlessAborted(response.text(), this.signal);
       } catch (error) {
-        clearTimeout(timer);
         if (error instanceof ToolCallAbortedError) throw error;
         if (resendUnanswered && attempt < this.retryLimit) {
           await this.sleepImpl(backoffMs(attempt));
           continue;
         }
-        const message = this.scrub(error instanceof Error ? error.message : String(error));
+        const message = this.scrub(error instanceof Error ? error.message : String(error)).replace(/\.+$/, "");
         const aborted = (error instanceof Error && error.name === "AbortError") || /abort/i.test(message);
-        const failure = aborted ? `: timed out after ${this.timeoutMs}ms` : ` without an HTTP response: ${message.replace(/\.+$/, "")}`;
-        const notResent = resendUnanswered ? "" : "; a POST that drew no answer is not sent again, since Tenable may already have acted on it";
+        const failure = aborted
+          ? `: timed out after ${this.timeoutMs}ms`
+          : response === undefined ? ` without an HTTP response: ${message}` : ` while reading the response body: ${message}`;
+        const notResent = resendUnanswered ? "" : "; a POST that drew no complete answer is not sent again, since Tenable may already have acted on it";
         throw this.fail(`Tenable request ${endpoint} failed after ${attemptCount(attempt + 1)}${failure}${notResent}.`, 0, endpoint);
+      } finally {
+        clearTimeout(timer);
       }
-      clearTimeout(timer);
 
       const retryable = response.status === 429 || response.status >= 500;
       if (retryable && attempt < this.retryLimit) {
@@ -2018,7 +2026,6 @@ abstract class TenableHttpClient {
         continue;
       }
 
-      const rawText = await response.text();
       if (!response.ok) {
         const attempts = retryable ? ` after ${attemptCount(attempt + 1)}` : "";
         throw this.fail(`Tenable request ${endpoint} failed${attempts} (${describeErrorBody(response, rawText, (text) => this.scrub(text))})`, response.status, endpoint);

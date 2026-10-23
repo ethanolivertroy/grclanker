@@ -861,6 +861,23 @@ function csTimeout() {
   return new DOMException("This operation was aborted", "AbortError");
 }
 
+/** Headers that arrive, then a body that stalls until the request signal aborts; `onRead` runs as the body read starts. */
+function csStalledBody(init, onRead = () => {}) {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: new Headers({ "content-type": "application/json" }),
+    text: () => {
+      const reading = new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(csTimeout()), { once: true });
+      });
+      onRead();
+      return reading;
+    },
+  };
+}
+
 /** A connection failure that echoes the planted credentials, as a proxy or TLS error might. */
 function csTransportFailure() {
   return new TypeError(`fetch failed: ECONNRESET while sending client_secret=${CS_RETRY_SECRET} and Bearer ${CS_RETRY_TOKEN}`);
@@ -1005,6 +1022,65 @@ test("CrowdstrikeApiClient stops at once when the call is aborted during a retry
 
   await assert.rejects(client.listHostGroups(), (error) => error instanceof ToolCallAbortedError);
   assert.deepEqual(sent, ["/oauth2/token", "/devices/combined/host-groups/v1"], "the timed-out read is not sent again after the abort");
+});
+
+test("CrowdstrikeApiClient sends a token request or read whose body stalls past the timer again, and names the timeout and attempt count when every attempt stalls", async () => {
+  const sleeps = [];
+  let tokenRequests = 0;
+  let reads = 0;
+  const recovering = new CrowdstrikeApiClient(sampleConfig({ timeoutMs: 1 }), {
+    fetchImpl: async (input, init) => {
+      if (new URL(String(input)).pathname === "/oauth2/token") {
+        return tokenRequests++ === 0 ? csStalledBody(init) : jsonResponse({ access_token: CS_RETRY_TOKEN, expires_in: 1799 });
+      }
+      return reads++ === 0 ? csStalledBody(init) : jsonResponse({ resources: [{ id: "hg-1" }], meta: { pagination: { total: 1 } } });
+    },
+    sleep: async (ms) => { sleeps.push(ms); },
+  });
+  const groups = await recovering.listHostGroups();
+  assert.deepEqual(groups.items.map((group) => group.id), ["hg-1"]);
+  assert.deepEqual({ tokenRequests, reads }, { tokenRequests: 2, reads: 2 }, "each stalled body is read again from a fresh request");
+  assert.deepEqual(sleeps, [250, 250], "each retry waits the first backoff step");
+
+  for (const [label, stallsOn, message] of [
+    ["the token response", "/oauth2/token", "CrowdStrike OAuth2 token request failed after 5 attempts: timed out after 1ms"],
+    ["a read", "/devices/combined/host-groups/v1", "CrowdStrike request failed for /devices/combined/host-groups/v1 after 5 attempts: timed out after 1ms"],
+  ]) {
+    const sent = [];
+    const stalling = new CrowdstrikeApiClient(sampleConfig({ timeoutMs: 1 }), {
+      fetchImpl: async (input, init) => {
+        const { pathname } = new URL(String(input));
+        sent.push(pathname);
+        return pathname === stallsOn ? csStalledBody(init) : jsonResponse({ access_token: CS_RETRY_TOKEN, expires_in: 1799 });
+      },
+      sleep: async () => {},
+    });
+    await assert.rejects(stalling.listHostGroups(10), { message }, label);
+    assert.equal(sent.filter((path) => path === stallsOn).length, 5, `${label}: the first attempt and four retries`);
+  }
+});
+
+test("CrowdstrikeApiClient reports an abort that lands while a body is read as the call's abort, not as a timeout, even with no retry left", async () => {
+  for (const [label, stallsOn, expected] of [
+    ["the token response", "/oauth2/token", ["/oauth2/token"]],
+    ["a read", "/devices/combined/host-groups/v1", ["/oauth2/token", "/devices/combined/host-groups/v1"]],
+  ]) {
+    const controller = new AbortController();
+    const sent = [];
+    const client = new CrowdstrikeApiClient(sampleConfig(), {
+      fetchImpl: async (input, init) => {
+        const { pathname } = new URL(String(input));
+        sent.push(pathname);
+        if (pathname === stallsOn) return csStalledBody(init, () => controller.abort(new Error("operator cancelled")));
+        return jsonResponse({ access_token: CS_RETRY_TOKEN, expires_in: 1799 });
+      },
+      sleep: async () => {},
+      retryLimit: 0,
+      signal: controller.signal,
+    });
+    await assert.rejects(client.listHostGroups(), (error) => error instanceof ToolCallAbortedError, label);
+    assert.deepEqual(sent, expected, `${label}: nothing is sent after the abort`);
+  }
 });
 
 test("a hosts page that fails on every attempt after page 1 leaves the hosts inventory unread: CS-13 and CS-14 go manual naming the failure, and no planted credential reaches the results or the bundle", async () => {

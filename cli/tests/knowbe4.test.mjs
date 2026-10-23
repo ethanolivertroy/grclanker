@@ -675,14 +675,18 @@ function neverAnswers(_input, init = {}) {
   });
 }
 
-/** Headers that arrive, then a body that stalls until the client's timer aborts the request signal. */
-function stalledBody(input, init = {}) {
+/** Headers that arrive, then a body that stalls until the request signal aborts; `onRead` runs as the body read starts. */
+function stalledBody(input, init = {}, onRead = () => {}) {
   return {
     ok: true,
     status: 200,
     statusText: "OK",
     headers: new Headers({ "content-type": "application/json" }),
-    text: () => neverAnswers(input, init),
+    text: () => {
+      const reading = neverAnswers(input, init);
+      onRead();
+      return reading;
+    },
   };
 }
 
@@ -834,6 +838,23 @@ test("Knowbe4ApiClient stops at once when the call is aborted during a retry wai
     assert.equal(requests, 1, `${label}: nothing is sent after the abort`);
     assert.equal(waits.length, 1, label);
   }
+});
+
+test("Knowbe4ApiClient reports an abort that lands while a body is read as the call's abort, not as a failed read, even with no retry left", async () => {
+  const controller = new AbortController();
+  let requests = 0;
+  const client = new Knowbe4ApiClient(sampleConfig(), {
+    fetchImpl: async (input, init) => {
+      requests += 1;
+      return stalledBody(input, init, () => controller.abort());
+    },
+    sleepImpl: async () => {},
+    maxRetries: 0,
+    minRequestIntervalMs: 0,
+    signal: controller.signal,
+  });
+  await assert.rejects(() => client.getAccount(), (error) => error.name === "ToolCallAbortedError");
+  assert.equal(requests, 1, "nothing is sent after the abort");
 });
 
 test("Knowbe4ApiClient shapes Reporting API list requests with the documented query parameters", async () => {

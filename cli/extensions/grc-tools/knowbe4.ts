@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
-import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { KNOWBE4_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1221,6 +1221,7 @@ export class Knowbe4ApiClient {
   private readonly now: () => number;
   private readonly maxRetries: number;
   private readonly minRequestIntervalMs: number;
+  private readonly signal?: AbortSignal;
   private lastRequestAt = 0;
   private requestCount = 0;
 
@@ -1241,6 +1242,7 @@ export class Knowbe4ApiClient {
     this.now = options.now ?? Date.now;
     this.maxRetries = clampInteger(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     this.minRequestIntervalMs = clampInteger(options.minRequestIntervalMs, MIN_REQUEST_INTERVAL_MS, 0, 10_000);
+    this.signal = options.signal;
     // The configured tokens are scrubbed from every recorded error string in every encoded form from here on.
     credentialScrubber.registerSecrets([config.apiToken, config.phisherApiToken]);
   }
@@ -1301,12 +1303,13 @@ export class Knowbe4ApiClient {
       let response: Response;
       let rawText: string;
       // The body is read under the same timer, so a body that stalls times out like a request that never answers.
+      // The call's abort is raced against the body read too, or an abort there would be reported as a failed read.
       try {
         const headers = new Headers(init.headers ?? {});
         headers.set("accept", "application/json");
         headers.set("authorization", `Bearer ${token}`);
         response = await this.fetchImpl(url, { ...init, headers, signal: controller.signal });
-        rawText = await response.text();
+        rawText = await unlessAborted(response.text(), this.signal);
       } catch (error) {
         rethrowIfAborted(error);
         // Every request is a GET or a PhishER GraphQL query, so sending one again cannot change anything.

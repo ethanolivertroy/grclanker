@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { QUALYS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1009,6 +1009,7 @@ export class QualysApiClient {
   private readonly fetchImpl: FetchImpl;
   private readonly sleepImpl: SleepImpl;
   private readonly now: () => Date;
+  private readonly signal?: AbortSignal;
   private bearerToken?: string;
   private bearerExpiresAt = 0;
   lastRateLimit: JsonRecord = {};
@@ -1021,6 +1022,7 @@ export class QualysApiClient {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     this.now = options.now ?? (() => new Date());
+    this.signal = options.signal;
     if (config.token) {
       this.bearerToken = config.token;
       this.bearerExpiresAt = Number.MAX_SAFE_INTEGER;
@@ -1124,14 +1126,15 @@ export class QualysApiClient {
   }
 
   // One request under the configured timeout. The body is read before the timer is cleared, so a body that stalls
-  // times out like a request that never answers.
+  // times out like a request that never answers. The call's abort is raced against the body read as well, since an
+  // abort there would otherwise surface as an AbortError and be reported as a timeout.
   private async sendOnce(url: string, init: { method: string; headers: Headers; body?: string }): Promise<{ response: Response; text: string }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
       const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
       this.recordRateLimit(response.headers);
-      return { response, text: await response.text() };
+      return { response, text: await unlessAborted(response.text(), this.signal) };
     } finally {
       clearTimeout(timeout);
     }

@@ -1706,6 +1706,33 @@ test("QualysApiClient stops at once when the call is aborted during a retry wait
   assert.equal(sent, 1, "the timed-out read is not sent again after the abort");
 });
 
+test("QualysApiClient reports an abort that lands while a body is read as the call's abort, not as a timeout, even with no retry left", async () => {
+  const controller = new AbortController();
+  let sent = 0;
+  const client = new QualysApiClient(sampleConfig({ maxRetries: 0 }), {
+    fetchImpl: async (_url, init) => {
+      sent += 1;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "content-type": "application/xml" }),
+        text: () => {
+          const reading = new Promise((_resolve, reject) => {
+            init.signal.addEventListener("abort", () => reject(qualysTimeout()), { once: true });
+          });
+          controller.abort(new Error("operator cancelled"));
+          return reading;
+        },
+      };
+    },
+    sleepImpl: async () => {},
+    signal: controller.signal,
+  });
+  await assert.rejects(client.listAppliances(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(sent, 1, "nothing is sent after the abort");
+});
+
 test("a host page that times out on every attempt leaves the host inventory unreadable, so no check built on it passes", async () => {
   const continuation = "https://qualysapi.qualys.com/api/2.0/fo/asset/host/?action=list&id_min=2";
   const firstPage = `<?xml version="1.0" encoding="UTF-8" ?><HOST_LIST_OUTPUT><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME><HOST_LIST>${xmlFromRecord("HOST", tenant.hosts.slice(0, 1))}</HOST_LIST><WARNING><CODE>1980</CODE><TEXT>truncated</TEXT><URL><![CDATA[${continuation}]]></URL></WARNING></RESPONSE></HOST_LIST_OUTPUT>`;

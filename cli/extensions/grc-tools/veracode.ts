@@ -19,7 +19,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
-import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, VERACODE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -1554,6 +1554,7 @@ export class VeracodeApiClient {
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
+  private readonly signal?: AbortSignal;
 
   constructor(
     config: VeracodeResolvedConfig,
@@ -1563,6 +1564,7 @@ export class VeracodeApiClient {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleep = abortableSleep(options.signal, options.sleep);
     this.now = options.now ?? Date.now;
+    this.signal = options.signal;
     registerConfiguredSecrets([config.apiKeySecret]);
   }
 
@@ -1597,6 +1599,7 @@ export class VeracodeApiClient {
       let response: Response;
       let rawText: string;
       // The body is read under the same timer, so a body that stalls times out like a request that never answers.
+      // The call's abort is raced against the body read too, or an abort there would be reported as a timeout.
       try {
         response = await this.fetchImpl(url.toString(), {
           method: "GET",
@@ -1606,7 +1609,7 @@ export class VeracodeApiClient {
           },
           signal: controller.signal,
         });
-        rawText = await response.text();
+        rawText = await unlessAborted(response.text(), this.signal);
       } catch (error) {
         rethrowIfAborted(error);
         if (attempt <= this.config.retries) {

@@ -141,6 +141,34 @@ function tenableTimeout() {
   return new DOMException("This operation was aborted", "AbortError");
 }
 
+// Headers that arrive, then a body that stalls until the request signal aborts; `onRead` runs as the body read starts.
+function stalledBody(init, onRead = () => {}) {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: new Headers({ "content-type": "application/json" }),
+    text: () => {
+      const reading = new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(tenableTimeout()), { once: true });
+      });
+      onRead();
+      return reading;
+    },
+  };
+}
+
+// Headers that arrive, then a body the connection drops partway through, which undici reports as "terminated".
+function cutOffBody() {
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"scans":['));
+      controller.error(new TypeError("terminated"));
+    },
+  });
+  return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+}
+
 // The "METHOD /path" a router matches a request on.
 function requestKey(url, init = {}) {
   return `${(init.method ?? "GET").toUpperCase()} ${new URL(url).pathname}`;
@@ -677,7 +705,7 @@ test("TenableApiClient runs the export workflow: request, poll status, download 
   assert.equal(capped.truncated, true);
 });
 
-test("TenableApiClient sends a read that timed out or drew no answer again with backoff, and names the endpoint, the reason, and the attempt count when every attempt fails", async () => {
+test("TenableApiClient sends a read that timed out, drew no answer, or lost its body partway again with backoff, and names the endpoint, the reason, and the attempt count when every attempt fails", async () => {
   let sent = 0;
   const waits = [];
   const recovering = createTenableClients(vmConfig(), {
@@ -685,24 +713,26 @@ test("TenableApiClient sends a read that timed out or drew no answer again with 
       sent += 1;
       if (sent === 1) throw tenableTimeout();
       if (sent === 2) throw new TypeError("fetch failed");
+      if (sent === 3) return cutOffBody();
       return jsonResponse({ scans: [{ id: 1, name: "ok" }] });
     },
     sleepImpl: async (ms) => { waits.push(ms); },
   });
   assert.equal((await recovering.vm.listScans()).length, 1);
-  assert.equal(sent, 3, "a timeout and a network failure are each followed by another request");
-  assert.deepEqual(waits, [500, 1000]);
+  assert.equal(sent, 4, "a timeout, a network failure, and a body cut off partway are each followed by another request");
+  assert.deepEqual(waits, [500, 1000, 2000]);
 
-  for (const [name, failure, reason] of [
-    ["timeout", tenableTimeout, ": timed out after 30000ms"],
-    ["network failure", () => new TypeError("fetch failed"), " without an HTTP response: fetch failed"],
+  for (const [name, answer, reason] of [
+    ["timeout", () => { throw tenableTimeout(); }, ": timed out after 30000ms"],
+    ["network failure", () => { throw new TypeError("fetch failed"); }, " without an HTTP response: fetch failed"],
+    ["body cut off", cutOffBody, " while reading the response body: terminated"],
   ]) {
     const requests = [];
     const delays = [];
     const exhausted = createTenableClients(vmConfig(), {
       fetchImpl: async (url, init) => {
         requests.push(requestKey(url, init));
-        throw failure();
+        return answer();
       },
       sleepImpl: async (ms) => { delays.push(ms); },
     });
@@ -732,6 +762,64 @@ test("TenableApiClient stops at once when the call is aborted during a retry wai
   });
   await assert.rejects(clients.vm.listScans(), (error) => error instanceof ToolCallAbortedError);
   assert.equal(sent, 1, "the timed-out read is not sent again after the abort");
+});
+
+test("a read whose body stalls past the timer is sent again like a read that drew no answer, and an export request whose body stalls is sent once", async () => {
+  const fastTimeout = { ...vmConfig(), timeoutMs: 1 };
+  let reads = 0;
+  const waits = [];
+  const recovering = createTenableClients(fastTimeout, {
+    fetchImpl: async (_url, init = {}) => (reads++ === 0 ? stalledBody(init) : jsonResponse({ scans: [{ id: 1, name: "ok" }] })),
+    sleepImpl: async (ms) => { waits.push(ms); },
+  });
+  assert.equal((await recovering.vm.listScans()).length, 1);
+  assert.equal(reads, 2, "the stalled read is sent again");
+  assert.deepEqual(waits, [500]);
+
+  for (const [name, read, request, attempts, failure] of [
+    ["a read", (clients) => clients.vm.listScans(), "GET /scans", 5, "failed after 5 attempts: timed out after 1ms."],
+    [
+      "an export request",
+      (clients) => clients.vm.exportAssets(),
+      "POST /assets/export",
+      1,
+      "failed after 1 attempt: timed out after 1ms; a POST that drew no complete answer is not sent again, since Tenable may already have acted on it.",
+    ],
+  ]) {
+    const sent = [];
+    const clients = createTenableClients(fastTimeout, {
+      fetchImpl: async (url, init = {}) => {
+        sent.push(requestKey(url, init));
+        return stalledBody(init);
+      },
+      sleepImpl: async () => {},
+    });
+    const thrown = await read(clients).then(() => null, (error) => error);
+    assert.ok(thrown instanceof TenableApiError, name);
+    assert.equal(thrown.message, `Tenable request ${request} ${failure}`, name);
+    assert.deepEqual(sent, Array(attempts).fill(request), `${name}: the request is sent ${attempts} time(s)`);
+  }
+});
+
+test("TenableApiClient reports an abort that lands while a body is read as the call's abort, not as a timeout, even with no retry left", async () => {
+  for (const [name, read, expected] of [
+    ["a read", (clients) => clients.vm.listScans(), ["GET /scans"]],
+    ["an export request", (clients) => clients.vm.exportAssets(), ["POST /assets/export"]],
+  ]) {
+    const controller = new AbortController();
+    const sent = [];
+    const clients = createTenableClients(vmConfig(), {
+      fetchImpl: async (url, init = {}) => {
+        sent.push(requestKey(url, init));
+        return stalledBody(init, () => controller.abort(new Error("operator cancelled")));
+      },
+      sleepImpl: async () => {},
+      retryLimit: 0,
+      signal: controller.signal,
+    });
+    await assert.rejects(read(clients), (error) => error instanceof ToolCallAbortedError, name);
+    assert.deepEqual(sent, expected, `${name}: nothing is sent after the abort`);
+  }
 });
 
 test("TenableApiClient waits for Retry-After as seconds or as an HTTP date on the injected clock, capped at 30 seconds, and backs off when the header is unreadable", async () => {
@@ -808,18 +896,19 @@ test("an export request that timed out or drew no answer is sent once, since Ten
   await runAll(control.clients, { expectedAssetCount: 2 });
   assert.ok(exportRequests(control.sent).includes("POST /assets/export") && exportRequests(control.sent).includes("POST /vulns/export"), "the control run requests both exports");
 
-  for (const [name, failure, reason] of [
-    ["timeout", tenableTimeout, ": timed out after 30000ms"],
-    ["network failure", () => new TypeError("fetch failed"), " without an HTTP response: fetch failed"],
+  for (const [name, answer, reason] of [
+    ["timeout", () => { throw tenableTimeout(); }, ": timed out after 30000ms"],
+    ["network failure", () => { throw new TypeError("fetch failed"); }, " without an HTTP response: fetch failed"],
+    ["body cut off", cutOffBody, " while reading the response body: terminated"],
   ]) {
     const routed = routerFetch(healthyRoutes());
     const { clients, sent, waits } = recording(async (url, init) => {
-      if ((init.method ?? "GET").toUpperCase() === "POST") throw failure();
+      if ((init.method ?? "GET").toUpperCase() === "POST") return answer();
       return routed(url, init);
     });
     const thrown = await clients.vm.exportAssets().then(() => null, (error) => error);
     assert.ok(thrown instanceof TenableApiError, name);
-    assert.equal(thrown.message, `Tenable request POST /assets/export failed after 1 attempt${reason}; a POST that drew no answer is not sent again, since Tenable may already have acted on it.`, name);
+    assert.equal(thrown.message, `Tenable request POST /assets/export failed after 1 attempt${reason}; a POST that drew no complete answer is not sent again, since Tenable may already have acted on it.`, name);
     assert.equal(thrown.status, 0, name);
     assert.equal(thrown.endpoint, "POST /assets/export", name);
     assert.deepEqual(sent, ["POST /assets/export"], `${name}: the export request is not sent again and no status is polled`);
@@ -914,6 +1003,7 @@ test("an export chunk that fails on every attempt leaves the export truncated, n
   for (const [name, failure, reason, httpStatus] of [
     ["timeout", () => { throw tenableTimeout(); }, ": timed out after 30000ms.", null],
     ["network failure", () => { throw new TypeError("fetch failed"); }, " without an HTTP response: fetch failed.", null],
+    ["body cut off", cutOffBody, " while reading the response body: terminated.", null],
     ["HTTP 503", () => jsonResponse({ error: "unavailable" }, 503), " (HTTP 503; unavailable)", 503],
   ]) {
     const routed = routerFetch(chunkRoutes());
@@ -2539,7 +2629,7 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, capp
     /"credentials dataset: Tenable request GET \/credentials failed \(HTTP 403; forbidden\)"/,
     /"credentials dataset: Tenable request GET \/credentials failed after 5 attempts \(HTTP 502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)\)"/,
     /"credentials dataset: Tenable request GET \/credentials failed after 5 attempts: timed out after 30000ms\."/,
-    /"asset_export dataset: Tenable request POST \/assets\/export failed after 1 attempt: timed out after 30000ms; a POST that drew no answer is not sent again, since Tenable may already have acted on it\."/,
+    /"asset_export dataset: Tenable request POST \/assets\/export failed after 1 attempt: timed out after 30000ms; a POST that drew no complete answer is not sent again, since Tenable may already have acted on it\."/,
     /"networks dataset: partial view \(10000 of unknown records retrieved; the walk stopped at the 200-page cap\)\."/,
     // The role note names the Basic role, which is also a scheme word, and keeps its whole text.
     /"server_properties requires role Basic; GET \/server\/properties refused the API key with HTTP 403: Tenable request GET \/server\/properties failed \(HTTP 403; forbidden\)"/,
