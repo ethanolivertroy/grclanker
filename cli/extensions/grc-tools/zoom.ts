@@ -1142,8 +1142,8 @@ export class ZoomApiClient {
   }
 
   /**
-   * A token exchange that failed, after its own retries, fails every later request of this client at once: the
-   * collectors read surface after surface, so a down token endpoint would otherwise cost one retry sequence each.
+   * A failed token exchange fails every later request of this client at once: the collectors read surface after
+   * surface, so a down token endpoint would otherwise cost one retry sequence each.
    */
   private async getAccessToken(): Promise<string> {
     if (this.accessToken && this.now() < this.accessTokenExpiresAt) {

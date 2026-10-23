@@ -837,9 +837,9 @@ export class WebexApiClient {
   }
 
   /**
-   * One refresh grant serves every request waiting on it, and a grant that failed, after its own retries, fails
-   * every later request of this client at once: the collectors read their surfaces concurrently, so each would
-   * otherwise send its own grant and, against a down token endpoint, its own retry sequence.
+   * One refresh grant serves every request waiting on it, and a failed grant fails every later request of this
+   * client at once: the collectors read their surfaces concurrently, so each would otherwise send its own grant and,
+   * against a down token endpoint, its own retry sequence.
    */
   private async currentToken(): Promise<string> {
     if (this.accessToken) return this.accessToken;

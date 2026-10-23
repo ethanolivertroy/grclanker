@@ -67,6 +67,8 @@ Deviation: The spec names `config.toml`. JSON or YAML is accepted instead so no 
 
 When `client_id`, `client_secret`, and `refresh_token` are present and no token is, the client posts `grant_type=refresh_token` to `POST /access_token` and uses the returned `access_token`.
 
+Concurrent reads share one grant, which is retried like any other request (see [Endpoints](#endpoints)). A failed grant, including one Webex rejects without a retry, is not sent again in the same tool call, so every later surface reports that same failure.
+
 The refresh is the integration and Service App token flow documented on the [integrations](https://developer.webex.com/docs/integrations) and [Service Apps](https://developer.webex.com/docs/service-apps) pages.
 
 ## Run it
@@ -249,4 +251,8 @@ Not read, cited as proof of absence:
 
 `max` is sent only to the endpoints whose reference documents it (`/people`, `/events`, `/adminAudit/events`, `/admin/recordings`, `/meetings`, `/devices`, `/workspaces`, `/rooms`, `/webhooks`), within each documented ceiling.
 
-Pagination follows the RFC 5988 `Link` header with `rel="next"` until absent, and reports truncation when an item limit stops early. 429 responses honor `Retry-After`. Both are documented on the [basics](https://developer.webex.com/docs/api/basics) page.
+Pagination follows the RFC 5988 `Link` header with `rel="next"` until absent, and reports truncation when an item limit stops early. The `Link` header and the `Retry-After` header on 429 responses are both documented on the [basics](https://developer.webex.com/docs/api/basics) page.
+
+Each request, the refresh grant included, has a deadline (`WEBEX_TIMEOUT` or `timeout_seconds`, 30 seconds by default) that also covers reading the response body. A `429`, `500`, `502`, `503`, or `504` response, a timeout, or a network failure is retried up to three times (four attempts). The wait is the `Retry-After` value (seconds or an HTTP date) when the response carries one, and otherwise doubles from 1 second up to 8 seconds. When `Retry-After` asks for more than 60 seconds, the request fails at once and the error names the time.
+
+A request that runs out of attempts fails with the path (never the query, which carries the next page's cursor), the last HTTP status or failure, and the attempt count, for example `Webex request failed for /v1/people after 4 attempts: timed out after 30000 ms`. A network failure is described only by its system error code, such as `network error (ECONNRESET)`. The surface is then reported unreadable and keeps none of its data, so a people page that fails after earlier pages arrived leaves the whole people inventory unread.

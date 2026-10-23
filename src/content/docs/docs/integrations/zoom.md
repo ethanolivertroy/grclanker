@@ -186,7 +186,7 @@ With credentials, the script runs `zoom_check_access` and all three assessments 
 
 ## How the tools handle evidence
 
-This section is reference for reviewing findings and bundles: how the tools page through the API and report incomplete listings and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+This section is reference for reviewing findings and bundles: how the tools retry failed requests, page through the API, and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
 
 ### Pagination and retries
 
@@ -201,10 +201,16 @@ The single-response lists (`/roles`, `/im/groups`, managed domains) are complete
 
 Every truncated list demotes its dependent findings to warn with seen versus total counts.
 
-`429` responses are retried up to three times ([rate limits](https://developers.zoom.us/docs/api/rate-limits/)). The rate limits page documents the 429 status and asks clients to wait before retrying, but it names no header. The `Retry-After` read is therefore a defensive fallback:
+Each request, the `POST /oauth/token` exchange included, has a deadline (`ZOOM_TIMEOUT` or `timeout_seconds`, 30 seconds by default) that also covers reading the response body. A `429`, `500`, `502`, `503`, or `504` response, a timeout, or a network failure is retried up to three times (four attempts).
 
-- The header is honored when present (delta-seconds or HTTP-date, capped at 30 seconds per wait).
-- The wait otherwise defaults to one second.
+The [rate limits](https://developers.zoom.us/docs/api/rate-limits/) page documents the 429 status and asks clients to wait before retrying, but it names no header. The `Retry-After` read is therefore a defensive fallback:
+
+- The header is honored when present (delta-seconds or HTTP-date). A wait longer than 60 seconds is not slept through: the request fails at once and the error names the time.
+- The wait otherwise doubles from one second up to eight seconds.
+
+A request that runs out of attempts fails with the method and path (never the query, which carries the `next_page_token`), the last HTTP status or failure, and the attempt count, for example `Zoom request failed for GET /v2/users after 4 attempts: timed out after 30000 ms`. A network failure is described only by its system error code, such as `network error (ECONNRESET)`. The surface is then reported as failed and keeps none of its data, so a users page that fails after earlier pages arrived fails the whole user inventory instead of passing on the pages already read.
+
+A failed token exchange, including one Zoom rejects without a retry, fails every later request in the same tool call at once. A token endpoint that stays down therefore costs one retry sequence, and every surface names `POST /oauth/token`.
 
 ### Secret hygiene
 
@@ -222,7 +228,7 @@ Every written file is scrubbed again before it lands on disk.
 
 A failing response body is never copied into an error string. The client:
 
-- Describes a failure by HTTP status, method and endpoint, content type, and body length (`Zoom request failed for GET /v2/users (502 Bad Gateway): non-JSON text/html body of 236 bytes omitted`).
+- Describes a failure by HTTP status, method and endpoint, content type, body length, and, once retries ran out, the attempt count (`Zoom request failed for GET /v2/users (502 Bad Gateway) after 4 attempts: non-JSON text/html body of 236 bytes omitted`).
 - Echoes only the documented JSON error fields (`message`, `error`, `reason`, `errors[]`).
 - Passes every error string through one exported scrub, `scrubErrorText`, at three points:
   - The `ZoomApiError` constructor.

@@ -437,7 +437,7 @@ export const SLACK_SPEC = buildBatchIntegrationSpec({
     documentedLimit: "Method-specific Slack rate tiers",
     retryHeaders: ["Retry-After"],
     retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Every request reads, so 429, 500, 502, 503, and 504 responses, request timeouts (30 s by default, covering the body read), and network failures are retried three times (four attempts); the 429 budget was raised from two retries to three so one budget covers every retried failure. Retry-After is honored as delta-seconds or an HTTP-date; without it the wait backs off exponentially from 1 s to an 8 s cap. A Retry-After beyond 60 s fails closed at once and names the time, and an exhausted request names the method or path, the last HTTP status or failure, and the attempt count, so the read stays explicit and its inventory is never complete.",
+    backoffPolicy: "Every request reads, so 429, 500, 502, 503, and 504 responses, request timeouts (30 s by default, covering the body read), and network failures are retried three times (four attempts). Retry-After is honored as delta-seconds or an HTTP-date; without it the wait backs off exponentially from 1 s to an 8 s cap. A Retry-After beyond 60 s fails closed at once and names the time, and an exhausted request names the method or path, the last HTTP status or failure, and the attempt count, so the read stays explicit and its inventory is never complete.",
   },
   runtimeBehavior: SLACK_RUNTIME_BEHAVIOR,
   knownGaps: [

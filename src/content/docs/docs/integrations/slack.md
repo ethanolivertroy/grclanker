@@ -15,7 +15,7 @@ Every method call is read-only. Every field the tools read is traceable to a pub
 | `SLACK_BOT_TOKEN` | Optional bot token (`xoxb-`). Used only for methods whose reference page lists bot tokens (`auth.test`, `users.list`, `team.preferences.list`). Admin methods are refused locally with `not_allowed_token_type` when only a bot token is present. |
 | `SLACK_SCIM_TOKEN` | SCIM bearer token (Business+ or Enterprise Grid). Enables provisioning and lifecycle checks. |
 | `SLACK_ORG_ID` (or `SLACK_ENTERPRISE_ID`) | Enterprise Grid org ID (`E...`). Passed as `enterprise_id` to the app inventory methods. |
-| `SLACK_TIMEOUT` | Optional request timeout in seconds (default 30, clamped to 1 through 300). |
+| `SLACK_TIMEOUT` | Optional request timeout in seconds, per attempt and covering the response body (default 30, clamped to 1 through 300). |
 | `SLACK_WEB_API_BASE_URL`, `SLACK_SCIM_BASE_URL`, `SLACK_AUDIT_BASE_URL` | Optional API base overrides. Defaults are `https://slack.com/api`, `https://api.slack.com/scim/v2`, and `https://api.slack.com/audit/v1`. |
 | `SLACK_CONFIG_FILE` | Optional JSON file with `user_token` (or `token`), `bot_token`, `scim_token`, and `org_id`. Defaults to `~/.config/grclanker/slack.json` when present. Arguments override environment variables, which override the file. A file that cannot be read reports `Unable to read Slack config file <path> (<code>)` with only the system error code (for example `EISDIR` or `EACCES`); a file that is not valid JSON reports a fixed `Unable to parse Slack config file <path>: the file is not valid JSON` message, so neither the file contents nor a library message can appear in the error. |
 
@@ -179,7 +179,7 @@ The script prints a skip message and exits 0 when none of `SLACK_USER_TOKEN`, `S
 
 ## How the tools handle evidence
 
-This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools retry failed requests, page through the API, and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
 
 ### Multi-inventory findings
 
@@ -204,7 +204,9 @@ The same applies to reads that were never issued because their input inventory f
 
 ### Rate limits and pagination
 
-The client honors `429` responses by sleeping for the `Retry-After` value (capped at 60 seconds) and retrying twice.
+Each request has a deadline (`SLACK_TIMEOUT`, 30 seconds by default) that also covers reading the response body. A `429`, `500`, `502`, `503`, or `504` response, a timeout, or a network failure is retried up to three times (four attempts). The wait is the `Retry-After` value (seconds or an HTTP date) when the response carries one, and otherwise doubles from 1 second up to 8 seconds. When `Retry-After` asks for more than 60 seconds, the request fails at once and the error names the time.
+
+A request that runs out of attempts fails with the Web API method or the SCIM or Audit Logs path (never the query, which carries the cursor), the last HTTP status or failure, and the attempt count, for example `Slack Web API users.list failed (HTTP 503) after 4 attempts: error=service_unavailable`. A network failure is described only by its system error code, such as `network error (ECONNRESET)`. The listing is then unread, never complete: a page that fails after earlier pages arrived fails the whole listing, and its dependent findings do not pass.
 
 Pagination follows `response_metadata.next_cursor` (or the top-level `next_cursor` on `admin.conversations.search`) up to each method's documented `limit` maximum.
 
