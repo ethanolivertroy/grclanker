@@ -51,7 +51,7 @@ import {
   statementDeniesInsecureTransport,
   unrestrictedSecurityGroupRules,
 } from "../dist/extensions/grc-tools/aws.js";
-import { AWS_SPEC } from "../dist/extensions/grc-tools/aws.spec.js";
+import { AWS_IAM_ACTIONS, AWS_SPEC } from "../dist/extensions/grc-tools/aws.spec.js";
 import { checkContract, evaluateVerdictCriteria } from "../dist/extensions/grc-tools/spec-model.js";
 import {
   AWS_CANARIES,
@@ -466,6 +466,18 @@ test("checkAwsAccess probes EC2, S3, KMS, RDS, Audit Manager, and Account surfac
   assert.equal(usersDenied.status, "limited", "a denied IAM.ListUsers is visible in the access check instead of leaving it healthy");
   assert.equal(usersDenied.surfaces.find((surface) => surface.name === "iam_users")?.status, "not_readable");
   assert.equal(usersDenied.surfaces.find((surface) => surface.name === "iam_users")?.count, null);
+
+  const bucketsDenied = await checkAwsAccess(compliantBundleClient({
+    async listBuckets() {
+      throw accessDenied();
+    },
+  }));
+  const buckets = bucketsDenied.surfaces.find((surface) => surface.name === "s3_buckets");
+  assert.deepEqual(
+    { status: buckets?.status, command: buckets?.command },
+    { status: "not_readable", command: "s3:ListAllMyBuckets" },
+    "a denied S3 ListBuckets probe names the IAM action to grant, which S3 calls s3:ListAllMyBuckets",
+  );
 });
 
 test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", async () => {
@@ -1139,6 +1151,64 @@ test("control catalog covers all 25 spec controls and mappings carry framework p
       assert.ok(AWS_CONTROL_CATALOG[controlNumber], `control ${controlNumber} must exist in the catalog`);
     }
   }
+});
+
+/**
+ * The IAM action that authorizes each API operation the AWS tools call, as the Service Authorization Reference
+ * and the S3 required-permissions table list it. S3 names four of them differently from the operation.
+ */
+const SERVICE_AUTHORIZATION_ACTIONS = {
+  "sts-get-caller-identity": "sts:GetCallerIdentity",
+  "iam-get-account-summary": "iam:GetAccountSummary",
+  "iam-get-account-password-policy": "iam:GetAccountPasswordPolicy",
+  "iam-list-users": "iam:ListUsers",
+  "iam-list-mfa-devices": "iam:ListMFADevices",
+  "iam-list-access-keys": "iam:ListAccessKeys",
+  "iam-get-access-key-last-used": "iam:GetAccessKeyLastUsed",
+  "iam-get-account-authorization-details": "iam:GetAccountAuthorizationDetails",
+  "iam-list-policies": "iam:ListPolicies",
+  "iam-get-policy-version": "iam:GetPolicyVersion",
+  "cloudtrail-lookup-events": "cloudtrail:LookupEvents",
+  "cloudtrail-describe-trails": "cloudtrail:DescribeTrails",
+  "cloudtrail-get-trail-status": "cloudtrail:GetTrailStatus",
+  "cloudtrail-get-event-selectors": "cloudtrail:GetEventSelectors",
+  "securityhub-describe-hub": "securityhub:DescribeHub",
+  "securityhub-get-enabled-standards": "securityhub:GetEnabledStandards",
+  "config-describe-configuration-recorders": "config:DescribeConfigurationRecorders",
+  "config-describe-configuration-recorder-status": "config:DescribeConfigurationRecorderStatus",
+  "guardduty-list-detectors": "guardduty:ListDetectors",
+  "guardduty-get-detector": "guardduty:GetDetector",
+  "organizations-describe-organization": "organizations:DescribeOrganization",
+  "organizations-list-accounts": "organizations:ListAccounts",
+  "organizations-list-policies": "organizations:ListPolicies",
+  "organizations-list-targets-for-policy": "organizations:ListTargetsForPolicy",
+  "access-analyzer-list-analyzers": "access-analyzer:ListAnalyzers",
+  "access-analyzer-list-findings": "access-analyzer:ListFindings",
+  "sso-admin-list-instances": "sso:ListInstances",
+  "auditmanager-list-assessments": "auditmanager:ListAssessments",
+  "account-get-alternate-contact": "account:GetAlternateContact",
+  "ec2-describe-regions": "ec2:DescribeRegions",
+  "s3-get-account-public-access-block": "s3:GetAccountPublicAccessBlock",
+  "s3-list-buckets": "s3:ListAllMyBuckets",
+  "s3-get-public-access-block": "s3:GetBucketPublicAccessBlock",
+  "s3-get-bucket-policy-status": "s3:GetBucketPolicyStatus",
+  "s3-get-bucket-encryption": "s3:GetEncryptionConfiguration",
+  "s3-get-bucket-policy": "s3:GetBucketPolicy",
+  "ec2-get-ebs-encryption-by-default": "ec2:GetEbsEncryptionByDefault",
+  "ec2-describe-vpcs": "ec2:DescribeVpcs",
+  "ec2-describe-flow-logs": "ec2:DescribeFlowLogs",
+  "ec2-describe-network-acls": "ec2:DescribeNetworkAcls",
+  "ec2-describe-security-groups": "ec2:DescribeSecurityGroups",
+  "rds-describe-db-instances": "rds:DescribeDBInstances",
+  "kms-list-keys": "kms:ListKeys",
+  "kms-describe-key": "kms:DescribeKey",
+  "kms-get-key-rotation-status": "kms:GetKeyRotationStatus",
+};
+
+test("AWS_IAM_ACTIONS names the IAM action that authorizes each API operation, not the operation name", () => {
+  assert.deepEqual({ ...AWS_IAM_ACTIONS }, SERVICE_AUTHORIZATION_ACTIONS);
+  const permissions = Object.fromEntries(AWS_SPEC.permissions.map((permission) => [permission.unlocks[0], permission.value]));
+  assert.deepEqual(permissions, SERVICE_AUTHORIZATION_ACTIONS, "the spec's permission list is the same reviewed list");
 });
 
 test("isAwsAccessDenied recognizes SDK denial codes and 403 metadata", () => {
@@ -2548,7 +2618,7 @@ test("verdict rule 9: exportAwsAuditBundle never writes access key ids or the se
 // shapes, SDK error decoration, and the error-string sink are exercised end to end (see helpers/aws-sdk-fixture).
 // ---------------------------------------------------------------------------------------------------------------
 
-/** Probe names in core_data/access.json keyed by the IAM action each probe issues. */
+/** Probe names in core_data/access.json keyed by the request each probe issues. */
 const ACCESS_PROBES = {
   "iam:GetAccountSummary": "iam_summary",
   "iam:ListUsers": "iam_users",
@@ -2566,6 +2636,13 @@ const ACCESS_PROBES = {
   "auditmanager:ListAssessments": "audit_manager",
   "account:GetAlternateContact": "account_contacts",
 };
+
+/** A probe names the IAM action its request needs as its command; S3 names this one differently from the request. */
+const PROBE_IAM_ACTIONS = { "s3:ListBuckets": "s3:ListAllMyBuckets" };
+
+function probeCommand(request) {
+  return PROBE_IAM_ACTIONS[request] ?? request;
+}
 
 /**
  * Summary leaves that depend on each command and must render null, never a defaulted count or flag, when that
@@ -3491,7 +3568,7 @@ test("denied-list markers: a failed probe or inventory keeps count and flags nul
         assert.equal(degraded.access.status, "limited", `${label}: a failed probe makes the check limited`);
         assert.deepEqual(
           { status: probe.status, count: probe.count, truncated: probe.truncated, command: probe.command, region: probe.region, error_code: probe.error_code, http_status: probe.http_status },
-          { status: "not_readable", count: null, truncated: null, command: action, region: "us-east-1", error_code: expected.code, http_status: expected.status },
+          { status: "not_readable", count: null, truncated: null, command: probeCommand(action), region: "us-east-1", error_code: expected.code, http_status: expected.status },
           `${label}: the probe row names what failed and what the service answered, with no count`,
         );
         assert.match(probe.error, new RegExp(expected.code), `${label}: the probe error carries the SDK code`);
@@ -3521,7 +3598,7 @@ test("denied-list markers: the exported bundle writes null probe counts with the
     const probe = access.surfaces.find((surface) => surface.name === probeName);
     assert.deepEqual(
       { status: probe.status, count: probe.count, truncated: probe.truncated, command: probe.command, region: probe.region, error_code: probe.error_code, http_status: probe.http_status },
-      { status: "not_readable", count: null, truncated: null, command: action, region: "us-east-1", error_code: "AccessDeniedException", http_status: 403 },
+      { status: "not_readable", count: null, truncated: null, command: probeCommand(action), region: "us-east-1", error_code: "AccessDeniedException", http_status: 403 },
       `${action}: core_data/access.json carries the marker shape`,
     );
     assert.equal(access.status, "limited");
@@ -3572,6 +3649,11 @@ function namedActions(text) {
   return new Set((text.match(/\b[a-z0-9-]+:[A-Z][A-Za-z]+\b/g) ?? []).filter((token) => !token.startsWith("aws:")));
 }
 
+/** The request a named action stands for: a probe's IAM action maps back to the request it authorized. */
+function requestFor(action) {
+  return Object.keys(PROBE_IAM_ACTIONS).find((request) => PROBE_IAM_ACTIONS[request] === action) ?? action;
+}
+
 function namedStatuses(text) {
   const statuses = new Set();
   for (const match of text.matchAll(/HTTP (\d{3})\b/g)) statuses.add(Number(match[1]));
@@ -3601,14 +3683,14 @@ test("request matching: every IAM action and HTTP status named in any output cor
   const text = [JSON.stringify(outputs), ...readBundleFiles(exported.outputDir).values()].join("\n");
   const actions = namedActions(text);
   const statuses = namedStatuses(text);
-  for (const action of [...Object.keys(ACCESS_PROBES), "iam:ListAccessKeys", "kms:ListKeys", "organizations:ListAccounts", "ec2:DescribeFlowLogs"]) {
+  for (const action of [...Object.keys(ACCESS_PROBES).map(probeCommand), "iam:ListAccessKeys", "kms:ListKeys", "organizations:ListAccounts", "ec2:DescribeFlowLogs"]) {
     assert.ok(actions.has(action), `the outputs name ${action}: every probe carries its command and every failed read names the command that failed`);
   }
   assert.ok(statuses.has(403) && statuses.has(502) && statuses.has(503), "the outputs name the observed failure statuses");
   assert.ok(!statuses.has(200), "successful responses are not described as failures");
   const requested = recordedActions(log);
   for (const action of actions) {
-    assert.ok(requested.has(action), `action ${action} is named in output but the run never issued it`);
+    assert.ok(requested.has(requestFor(action)), `action ${action} is named in output but the run never issued it`);
   }
   for (const status of statuses) {
     assert.ok(observedStatuses.has(status), `status ${status} is named in output but no response carried it`);
@@ -3927,7 +4009,7 @@ for (const [shape, response] of Object.entries(SILENT_SUCCESS_SHAPES)) {
         assert.deepEqual([...namedStatuses(text)], [200], "the only status named anywhere is the one every response carried");
         const requested = new Set(requests.map((request) => request.label));
         for (const action of namedActions(text)) {
-          assert.ok(requested.has(action), `action ${action} is named in output but the run never issued it (requested: ${[...requested].join(", ")})`);
+          assert.ok(requested.has(requestFor(action)), `action ${action} is named in output but the run never issued it (requested: ${[...requested].join(", ")})`);
         }
         assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, `outputs and bundle under ${shape}`);
         assert.doesNotMatch(text, PARSER_WORDING);

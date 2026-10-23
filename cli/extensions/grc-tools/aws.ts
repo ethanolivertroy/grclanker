@@ -187,7 +187,7 @@ export interface AwsResolvedConfig {
 export interface AwsAccessSurface {
   name: string;
   service: string;
-  /** IAM action the probe issued, for example iam:ListUsers. */
+  /** IAM action that authorizes the probe's request, for example iam:ListUsers, or s3:ListAllMyBuckets for ListBuckets. */
   command: string;
   /** Region the probe was sent to. */
   region: string;
