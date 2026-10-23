@@ -8,7 +8,7 @@ import { shortcutHandler } from '../lib/shortcut-keys.mjs';
 const BANNER =
   '%c  ┌─────────────────────────┐\n' +
   '  │  (@>@)  GRCLANKER       │\n' +
-  '  │  /(   )\\  v0.1.3        │\n' +
+  '  │  /(   )\\  v0.1.4        │\n' +
   '  │   `---´                 │\n' +
   '  │  Put a clanker on it.   │\n' +
   '  │ethanolivertroy/grclanker│\n' +
