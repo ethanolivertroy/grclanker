@@ -1751,7 +1751,9 @@ export class SplunkApiClient {
    * consumers demote; `totalKnown` is false whenever splunkd omitted the total.
    * A page repeats only when the same entries (by id, or by name within
    * acl.app and acl.owner) come back, so namespaced objects that share a name
-   * across a page boundary do not read as a repeated page.
+   * across a page boundary do not read as a repeated page. A 404 on a later
+   * page loses its status, because callers read a 404 as "this file or
+   * endpoint does not exist" and would report the list as complete and empty.
    */
   async list(path: string, query: JsonRecord = {}): Promise<SplunkListResult> {
     const entries: SplunkEntry[] = [];
@@ -1760,7 +1762,10 @@ export class SplunkApiClient {
     let previousPage: string | undefined;
     const cappedResult = (): SplunkListResult => ({ entries, total: Math.max(total ?? 0, entries.length), truncated: true, totalKnown: total !== undefined });
     for (;;) {
-      const payload = await this.getJson(path, { ...query, count: this.pageSize, offset });
+      const payload = await this.getJson(path, { ...query, count: this.pageSize, offset }).catch((error: unknown) => {
+        if (offset === 0 || !(error instanceof SplunkApiError) || error.status !== 404) throw error;
+        throw new SplunkApiError(`The list at ${path} is incomplete: the page at offset ${offset} returned 404 after ${entries.length} of ${total ?? "an unknown number of"} entries were read (${error.message}).`, error.endpoint);
+      });
       const rawEntries = asArray(payload.entry).filter((item) => asObject(item) !== undefined);
       const pageEntries = rawEntries.map(parseEntry).filter((item): item is SplunkEntry => Boolean(item));
       total = asNumber(asObject(payload.paging)?.total) ?? total;

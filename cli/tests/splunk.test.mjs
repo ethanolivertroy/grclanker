@@ -629,6 +629,26 @@ test("a Splunk roles page that times out on every attempt leaves the role invent
   }
 });
 
+test("an audit.conf page that returns 404 after the first page reads as incomplete, not as an absent file, so control 17 does not pass on the documented default", async () => {
+  const fixture = { ...HARDENED, "/services/configs/conf-audit": [entry("auditTrail", { queueing: "0" }), entry("default", {})] };
+  const healthy = await assessSplunkAuditMonitoring(client(fixture, { pageSize: 1 }).client);
+  assert.equal(byId(healthy, "SPLUNK-AUD-17").status, "warn", "queueing=0 on the first page caps control 17 at warn");
+
+  const { fetchImpl: healthyFetch } = createFetch(fixture);
+  const fetchImpl = (input, init) => {
+    const url = new URL(input.toString());
+    if (url.pathname === "/services/configs/conf-audit" && url.searchParams.get("offset") === "1") return jsonResponse({ messages: [{ type: "ERROR", text: "Not Found" }] }, 404);
+    return healthyFetch(input, init);
+  };
+  const result = await assessSplunkAuditMonitoring(new SplunkApiClient(sampleConfig(), { fetchImpl, retryDelayMs: 0, pageSize: 1 }));
+  const item = byId(result, "SPLUNK-AUD-17");
+  const incomplete = "The list at /services/configs/conf-audit is incomplete: the page at offset 1 returned 404 after 1 of 2 entries were read";
+  assert.equal(item.status, "warn", item.summary);
+  assert.equal(item.evidence.audit_conf_readable, false);
+  assert.ok(item.summary.includes(`audit.conf could not be read (the endpoint could not be read (${incomplete}`), item.summary);
+  assert.ok(result.errors.some((line) => line.startsWith(`[conf-audit] ${incomplete}`)), JSON.stringify(result.errors));
+});
+
 test("tokens without iat or exp claims are bucketed separately and cap the verdict at warn", async () => {
   const fixture = {
     ...HARDENED,
