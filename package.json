@@ -9,7 +9,8 @@
   },
   "scripts": {
     "dev": "next dev",
-    "build": "next build && node scripts/check-links.mjs",
+    "build": "node scripts/check-doc-identifiers.mjs && next build && node scripts/check-links.mjs",
+    "check:doc-identifiers": "node scripts/check-doc-identifiers.mjs",
     "check:links": "node scripts/check-links.mjs",
     "test:site": "node --test \"scripts/*.test.mjs\"",
     "preview": "npm run build && wrangler dev",

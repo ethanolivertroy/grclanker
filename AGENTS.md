@@ -11,7 +11,7 @@ Most contributor work lands in `cli/extensions/grc-tools/` for native tools, `cl
 
 ## Build, Test, and Development Commands
 - `npm run dev`: run the site locally
-- `npm run build`: type-check and export the site to `out/`, then check links, docs sidebar coverage, and search coverage
+- `npm run build`: type-check, check the tool names and environment variables in the docs and README against the code, export the site to `out/`, then check links, docs sidebar coverage, and search coverage
 - `npm run test:site`: run the site build helper tests in `scripts/`
 - `npm --prefix cli run build`: compile the CLI to `cli/dist/`
 - `npm --prefix cli run dev`: run the CLI entrypoint with `tsx`
