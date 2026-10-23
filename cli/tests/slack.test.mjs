@@ -423,6 +423,18 @@ test("SlackApiClient fails closed without waiting when Retry-After exceeds the 6
   await assert.rejects(fiveXx.client.audit("/logs"), /^SlackApiError: Slack Audit Logs \/logs failed \(HTTP 503\) after 1 attempt: error=service_unavailable; Retry-After asks for a wait until 2026-09-21T00:01:01\.000Z, beyond the 60 s retry cap$/);
 });
 
+test("SlackApiClient fails closed with a SlackApiError when Retry-After ends past the latest representable date", async () => {
+  for (const header of ["100000000000000", "9".repeat(400)]) {
+    const { client, calls, waits } = retryHarness([() => jsonResponse({ ok: false, error: "ratelimited" }, 429, { "retry-after": header })]);
+    await assert.rejects(
+      client.web("users.list"),
+      /^SlackApiError: Slack Web API users\.list failed \(HTTP 429\) after 1 attempt: error=ratelimited; Retry-After asks for a wait past the latest representable date, beyond the 60 s retry cap$/,
+    );
+    assert.equal(calls.length, 1);
+    assert.deepEqual(waits, []);
+  }
+});
+
 test("SlackApiClient retry exhaustion names the endpoint, the last status, and the attempt count, never a query value or a token", async () => {
   const { client, calls, waits } = retryHarness([() => jsonResponse({ ok: false, error: "service_unavailable" }, 503)]);
   await assert.rejects(client.web("users.list", { cursor: "CANARY-CURSOR-2" }), (error) => {

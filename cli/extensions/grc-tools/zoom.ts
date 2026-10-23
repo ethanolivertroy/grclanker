@@ -924,6 +924,13 @@ function parseRetryAfterMs(header: string | null, now: number): number | undefin
   return Number.isFinite(date) ? Math.max(date - now, 0) : undefined;
 }
 
+// Retry-After delta-seconds has no upper bound, and toISOString throws a RangeError for a time past
+// the latest one a Date holds (+275760-09-13), so a wait that ends later is described instead.
+function describeWaitEnd(epochMs: number): string {
+  const end = new Date(epochMs);
+  return Number.isNaN(end.getTime()) ? "past the latest representable date" : `until ${end.toISOString()}`;
+}
+
 function retryBackoffMs(attempt: number): number {
   return Math.min(BASE_RETRY_BACKOFF_MS * 2 ** (attempt - 1), MAX_RETRY_BACKOFF_MS);
 }
@@ -1061,7 +1068,7 @@ export class ZoomApiClient {
       const now = this.now();
       const retryAfter = parseRetryAfterMs(response.headers.get("retry-after"), now);
       if (retryAfter !== undefined && retryAfter > MAX_RETRY_WAIT_MS) {
-        const note = `Retry-After asks for a wait until ${new Date(now + retryAfter).toISOString()}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap`;
+        const note = `Retry-After asks for a wait ${describeWaitEnd(now + retryAfter)}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap`;
         throw new ZoomApiError(this.describeFailure(url, method, response, rawText, body, { attempts: attempt, note }), response.status, retryAfter, rejection);
       }
       if (attempt >= MAX_ATTEMPTS) {

@@ -2008,6 +2008,32 @@ test("review fixes 5, 6, 8: ZOOM_DOCS cites live reference paths, a 429 without 
   assert.deepEqual(lockViews, ["account_lock_settings:meeting_security"]);
 });
 
+test("ZoomApiClient fails closed with a ZoomApiError when Retry-After ends past the latest representable date", async () => {
+  for (const header of ["100000000000000", "9".repeat(400)]) {
+    let attempts = 0;
+    const sleeps = [];
+    const client = new ZoomApiClient(sampleConfig(), {
+      fetchImpl: async () => {
+        attempts += 1;
+        return jsonResponse({ code: 429, message: "rate limited" }, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": header } });
+      },
+      sleep: async (ms) => { sleeps.push(ms); },
+      now: () => NOW.getTime(),
+    });
+    await assert.rejects(client.getAccountSettings("security"), (error) => {
+      assert.ok(error instanceof ZoomApiError);
+      assert.equal(error.status, 429);
+      assert.equal(
+        error.message,
+        "Zoom request failed for GET /v2/accounts/acct-123/settings (429 Too Many Requests) after 1 attempt: rate limited (application/json body of 37 bytes); Retry-After asks for a wait past the latest representable date, beyond the 60 s retry cap",
+      );
+      return true;
+    });
+    assert.equal(attempts, 1);
+    assert.deepEqual(sleeps, []);
+  }
+});
+
 const GROUP_DEPENDENT_IDS = ["ZOOM-COLLAB-02", "ZOOM-COLLAB-03", "ZOOM-COLLAB-07", "ZOOM-MTG-01", "ZOOM-MTG-02", "ZOOM-MTG-03", "ZOOM-MTG-04", "ZOOM-MTG-05", "ZOOM-MTG-06", "ZOOM-MTG-07", "ZOOM-MTG-08", "ZOOM-MTG-09", "ZOOM-MTG-10"];
 
 function denyScoped() {
