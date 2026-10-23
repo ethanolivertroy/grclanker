@@ -1537,6 +1537,19 @@ export class PaloaltoApiError extends Error {
 }
 
 /**
+ * A request that got no answer: its retries ran out on a timeout or a network error. reason is that
+ * last failure and the attempts made, scrubbed like the message, for the reads a PAN-OS device then skips.
+ */
+class PaloaltoNoAnswerError extends PaloaltoApiError {
+  readonly reason: string;
+
+  constructor(message: string, endpoint: string, reason: string) {
+    super(message, null, endpoint);
+    this.reason = redactErrorText(reason);
+  }
+}
+
+/**
  * PAN-OS's documented answer to a refused API key or keygen login: error code 403 with the
  * message Invalid Credential. Code 403 also covers an admin role without API access, so
  * only that message marks the credential itself as refused.
@@ -2509,8 +2522,8 @@ async function attemptOnce(url: string, init: RequestInit, options: HttpOptions)
  * Sends a request, retrying 429, 500, 502, 503, 504, a timeout, or a network error up to retryAttempts times. The
  * wait is Retry-After when the response carries it, else exponential backoff. A Retry-After beyond
  * MAX_RETRY_AFTER_MS is not waited out: the last answer is returned at once with the refusal noted. A timeout or
- * network error that outlasts the retries throws, naming the request by label (never by URL) and the attempts made;
- * endpoint is the request the error records.
+ * network error that outlasts the retries throws a PaloaltoNoAnswerError, naming the request by label (never by
+ * URL) and the attempts made; endpoint is the request the error records.
  */
 async function sendWithRetries(url: string, init: RequestInit, options: HttpOptions, endpoint: string, label: string): Promise<PaloaltoExchange> {
   for (let attempt = 1; ; attempt += 1) {
@@ -2523,7 +2536,11 @@ async function sendWithRetries(url: string, init: RequestInit, options: HttpOpti
       continue;
     }
     if ("failure" in result) {
-      throw new PaloaltoApiError(redactSecrets(`${label} failed ${attemptsText(attempt)} (${result.failure})`, options.secrets), null, endpoint);
+      throw new PaloaltoNoAnswerError(
+        redactSecrets(`${label} failed ${attemptsText(attempt)} (${result.failure})`, options.secrets),
+        endpoint,
+        redactSecrets(`${result.failure}, ${attemptsText(attempt)}`, options.secrets),
+      );
     }
     return { ...result, retried: { attempts: attempt, refusal } };
   }
@@ -3097,6 +3114,8 @@ export class PanosApiClient {
   private readonly verifyTls: boolean;
   private apiKey?: string;
   private keyPromise?: Promise<string>;
+  /** The request this device did not answer and why, once that request's retries ran out on a timeout or network error. */
+  private unanswered?: { endpoint: string; reason: string };
 
   constructor(config: PaloaltoPanosHostConfig, options: PaloaltoClientOptions & { verifyTls?: boolean } = {}) {
     this.config = config;
@@ -3160,11 +3179,11 @@ export class PanosApiClient {
     }
     const body = new URLSearchParams({ type: "keygen", user: this.config.username, password: this.config.password });
     const context = `keygen for ${this.config.host}`;
-    const exchange = await sendWithRetries(`${this.config.baseUrl}/api/`, {
+    const exchange = await this.send(`${this.config.baseUrl}/api/`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
-    }, this.http, endpoint, `PAN-OS ${context}`);
+    }, endpoint, `PAN-OS ${context}`);
     const { response, rawText } = exchange;
     if (!response.ok && rawText.length === 0) {
       const notes = retryNotes(exchange);
@@ -3187,15 +3206,37 @@ export class PanosApiClient {
     }
   }
 
+  /**
+   * A request whose retries run out on a timeout or network error marks this device unanswered, so its later
+   * reads fail at once instead of each waiting out the same retries. An HTTP answer of any status, or the tool
+   * call's abort, never does: a device that answers may still serve its other reads.
+   */
+  private async send(url: string, init: RequestInit, endpoint: string, label: string): Promise<PaloaltoExchange> {
+    try {
+      return await sendWithRetries(url, init, this.http, endpoint, label);
+    } catch (error) {
+      if (error instanceof PaloaltoNoAnswerError) this.unanswered ??= { endpoint: error.endpoint, reason: error.reason };
+      throw error;
+    }
+  }
+
   async request(params: Record<string, string>, context: string): Promise<XmlNode> {
     const url = new URL(`${this.config.baseUrl}/api/`);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
     const endpoint = panosEndpoint("GET", params);
+    if (this.unanswered !== undefined) {
+      // A skipped read names the request that got no answer, never its own unsent one, as a read whose keygen failed names keygen.
+      throw new PaloaltoApiError(
+        redactSecrets(`PAN-OS ${context} was not attempted because ${this.config.host} did not answer an earlier request (${this.unanswered.reason}).`, this.http.secrets),
+        null,
+        this.unanswered.endpoint,
+      );
+    }
     const label = `${context} on ${this.config.host}`;
-    const exchange = await sendWithRetries(url.toString(), {
+    const exchange = await this.send(url.toString(), {
       method: "GET",
       headers: { "X-PAN-KEY": await this.getApiKey(), accept: "application/xml" },
-    }, this.http, endpoint, `PAN-OS ${label}`);
+    }, endpoint, `PAN-OS ${label}`);
     const { response, rawText } = exchange;
     if (!response.ok && rawText.length === 0) {
       const notes = retryNotes(exchange);

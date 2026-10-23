@@ -419,6 +419,7 @@ export const PALOALTO_RUNTIME_BEHAVIOR = [
   "PAN-OS XML responses are projected to the exact configuration subtrees used by each finding and credential-bearing values are scrubbed before tool or bundle output.",
   "Paged alert and Compute inventories retain total and truncation state; displayed records do not decide verdicts.",
   "A page that fails after its retries fails the whole alert or Compute walk, and a PAN-OS read that fails after its retries fails that subtree on that device, so the records already read are never reported as the inventory and no finding that reads the surface passes.",
+  "A PAN-OS request, keygen included, that runs out of retries on a timeout or network error stops that device's later reads for the rest of the tool call: each fails at once without being sent, names the earlier failure and the request that got no answer, and is unreadable, so no finding on that device passes. An HTTP answer of any status stops nothing, and other devices are unaffected.",
 ] as const;
 
 export const PALOALTO_SPEC = buildBatchIntegrationSpec({

@@ -439,6 +439,7 @@ Response bodies are never echoed.
 - An XML error contributes only the `<msg>` or `<line>` text and the response `code`, scrubbed before the 300-character cap.
 - A request that ended on a 429, 500, 502, 503, or 504 also names its attempt count, as in `failed after 4 attempts ({status})`, or `(status {n}, {n} bytes, not echoed) after 4 attempts` in the PAN-OS non-XML note. A refused `Retry-After` is named after the detail.
 - A timeout or network error that outlasts the retries is described as `failed after 4 attempts (timed out after {n} ms)` or `failed after 4 attempts (network error: {message})`. The error names the request, never its URL.
+- A PAN-OS read skipped because its device gave no answer is described as `was not attempted because {host} did not answer an earlier request ({timeout or network error}, after 4 attempts)`; see [Retries and rate limits](#retries-and-rate-limits).
 
 ### Retries and rate limits
 
@@ -453,7 +454,16 @@ A request that runs out of retries fails with the request, the attempt count, an
 - A page that fails partway through the alert walk or a Compute walk fails the whole walk, so the pages already read are not reported as the inventory.
 - A PAN-OS read that fails on one device leaves that subtree on that device unreadable, and the findings that need it name the device.
 
-Because a timeout is retried, a request to a host that never answers takes four timeouts and 3.5 seconds of waits, about two minutes at the 30-second default, before its surface is reported unreadable. A PAN-OS device's reads run one after another, so a device that never answers costs that for each of them. Lower `timeout_seconds` or `PALOALTO_TIMEOUT` when a listed device may be offline.
+Because a timeout is retried, a request to a host that never answers takes four timeouts and 3.5 seconds of waits, about two minutes at the 30-second default, before its surface is reported unreadable.
+
+When a PAN-OS request, keygen included, runs out of retries on a timeout or a network error, that device is not asked again for the rest of the tool call:
+
+- Each of its later reads fails at once without being sent, for example `PAN-OS config show /config/shared was not attempted because fw1.example.com did not answer an earlier request (timed out after 30000 ms, after 4 attempts).`
+- Each skipped read is unreadable like any failed read. Its not-collected marker names the request that got no answer, with a `null` status, and no finding passes on that device.
+- An HTTP answer of any status skips nothing. A 403, an `Invalid Credential`, a 5xx after its retries, or a refused `Retry-After` means the device answered, so its other reads are still sent.
+- Other devices are not affected.
+
+A device that never answers therefore costs about two minutes at the 30-second default in each tool call that reads it (`paloalto_check_access`, an assessment, or `paloalto_export_audit_bundle`), rather than two minutes for each of its reads. The export pays it once, in its access probe, because it collects through the same clients. Lower `timeout_seconds` or `PALOALTO_TIMEOUT` to shorten that wait when a listed device may be offline.
 
 ### Verdict-safety rules
 
@@ -558,7 +568,7 @@ A surface that was refused, failed, or never reached is never written as an empt
 - `seen` and `truncated` render `null` for a surface that was not read.
 - `seen` renders `null` for a truncated walk that delivered no record, because `0` would read as an empty inventory.
 
-Every endpoint or status code named anywhere in a finding, summary, tool result, or `_errors.log` line is the request that was actually made and the status it actually returned. The method and path are taken from the thrown error. A transport failure records a `null` status.
+Every endpoint or status code named anywhere in a finding, summary, tool result, or `_errors.log` line is the request that was actually made and the status it actually returned. The method and path are taken from the thrown error. A transport failure records a `null` status. A PAN-OS read that was not attempted names the earlier request its device did not answer, also with a `null` status.
 
 #### Export reruns
 
