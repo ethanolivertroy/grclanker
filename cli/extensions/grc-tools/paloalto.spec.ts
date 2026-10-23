@@ -418,6 +418,7 @@ export const PALOALTO_RUNTIME_BEHAVIOR = [
   "Prisma Cloud CSPM, Prisma Cloud Compute, and each PAN-OS device are independent products; a product without credentials emits explicit manual findings rather than empty compliant inventories.",
   "PAN-OS XML responses are projected to the exact configuration subtrees used by each finding and credential-bearing values are scrubbed before tool or bundle output.",
   "Paged alert and Compute inventories retain total and truncation state; displayed records do not decide verdicts.",
+  "A page that fails after its retries fails the whole alert or Compute walk, and a PAN-OS read that fails after its retries fails that subtree on that device, so the records already read are never reported as the inventory and no finding that reads the surface passes.",
 ] as const;
 
 export const PALOALTO_SPEC = buildBatchIntegrationSpec({
@@ -456,7 +457,7 @@ export const PALOALTO_SPEC = buildBatchIntegrationSpec({
     documentedLimit: "Tenant, product, and endpoint specific",
     retryHeaders: ["Retry-After"],
     retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Honor bounded Retry-After and retry transient requests with bounded exponential delay; exhausted reads remain unreadable.",
+    backoffPolicy: "Retry 429, 500, 502, 503, 504, a request that times out (30 seconds unless timeout_seconds or PALOALTO_TIMEOUT sets it, with the response body read inside that time), and a network error up to 3 times after the first attempt, for every Prisma Cloud, Compute, and PAN-OS request including the Prisma login, Compute authentication, and PAN-OS keygen. The wait is Retry-After when the response carries it, as delta-seconds or an HTTP date, else 500 milliseconds doubled after each retry and capped at 8 seconds. A Retry-After above 30 seconds is not waited out: the request fails at once and its error names the wait the server asked for. An exhausted request fails with the request, the attempt count, and the last status, timeout, or network error, and its surface remains unreadable.",
   },
   runtimeBehavior: PALOALTO_RUNTIME_BEHAVIOR,
   knownGaps: ["Controls whose required Prisma Compute product or PAN-OS subtree is not configured remain manual and identify the missing evidence."],

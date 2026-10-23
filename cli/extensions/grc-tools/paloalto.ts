@@ -47,6 +47,10 @@ type JsonRecord = Record<string, unknown>;
 const DEFAULT_OUTPUT_DIR = "./export/paloalto";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_RETRY_ATTEMPTS = 3;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+const RETRY_BASE_DELAY_MS = 500;
+const MAX_BACKOFF_MS = 8_000;
+const MAX_RETRY_AFTER_MS = 30_000;
 const DEFAULT_ALERT_LIMIT = 500;
 const DEFAULT_ALERT_PAGE_SIZE = 100;
 const DEFAULT_COMPUTE_PAGE_SIZE = 50;
@@ -2377,6 +2381,17 @@ interface HttpOptions {
   fetchImpl: FetchImpl;
   secrets: Array<string | undefined>;
   sleepImpl: (ms: number) => Promise<void>;
+  now: () => Date;
+}
+
+/** How a Prisma Cloud or PAN-OS client sends: tools pass the timeout and abort signal; tests also inject fetch, the clock, and the retry wait. */
+export interface PaloaltoClientOptions {
+  fetchImpl?: FetchImpl;
+  timeoutMs?: number;
+  retryAttempts?: number;
+  sleepImpl?: (ms: number) => Promise<void>;
+  now?: () => Date;
+  signal?: AbortSignal;
 }
 
 /**
@@ -2432,33 +2447,85 @@ export function createInsecureFetch(): FetchImpl {
   });
 }
 
-// endpoint names the request for the error thrown when no response arrives; the
-// URL is never used for that because a PAN-OS URL carries the API key in its query.
-async function fetchWithRetry(url: string, init: RequestInit, options: HttpOptions, endpoint: string): Promise<Response> {
-  let attempt = 0;
-  for (;;) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
-    try {
-      const response = await options.fetchImpl(url, { ...init, signal: controller.signal });
-      if ((response.status === 429 || response.status >= 500) && attempt < options.retryAttempts) {
-        attempt += 1;
-        const retryAfter = asNumber(response.headers.get("retry-after"));
-        await options.sleepImpl(retryAfter ? retryAfter * 1000 : 250 * 2 ** attempt);
-        continue;
-      }
-      return response;
-    } catch (error) {
-      rethrowIfAborted(error);
-      if (attempt < options.retryAttempts && !(error instanceof Error && error.name === "AbortError")) {
-        attempt += 1;
-        await options.sleepImpl(250 * 2 ** attempt);
-        continue;
-      }
-      throw new PaloaltoApiError(redactSecrets(`Request to ${url} failed: ${errorMessage(error)}`, options.secrets), null, endpoint);
-    } finally {
-      clearTimeout(timeout);
+/** The wait a Retry-After header asks for, in milliseconds: delta-seconds or an HTTP date measured from `now`. */
+function retryAfterMs(value: string | null, now: Date): number | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  if (/^\d+(\.\d+)?$/.test(text)) return Number(text) * 1000;
+  const date = Date.parse(text);
+  return Number.isNaN(date) ? undefined : Math.max(date - now.getTime(), 0);
+}
+
+function backoffMs(attempt: number): number {
+  return Math.min(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), MAX_BACKOFF_MS);
+}
+
+function attemptsText(attempts: number): string {
+  return `after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}`;
+}
+
+function retryAfterRefusal(waitMs: number): string {
+  return `the server asked to retry after ${Math.ceil(waitMs / 1000)} s, more than the ${MAX_RETRY_AFTER_MS / 1000} s limit`;
+}
+
+/**
+ * A request's last answer with its body, read under the same timeout. retried is set when that answer has a
+ * retryable status, so the request ended because the retries ran out or a Retry-After was refused.
+ */
+interface PaloaltoExchange {
+  response: Response;
+  rawText: string;
+  retried?: { attempts: number; refusal?: string };
+}
+
+/** The attempts and any refused Retry-After of an answer the retries ended on, as text to splice into an error; empty otherwise. */
+function retryNotes(exchange: PaloaltoExchange): { attempts: string; refusal: string } {
+  const { retried } = exchange;
+  return { attempts: retried ? ` ${attemptsText(retried.attempts)}` : "", refusal: retried?.refusal ? `; ${retried.refusal}` : "" };
+}
+
+/** `<label> failed (<status>): <detail>` for a failed answer, naming the attempts and any refused Retry-After when the retries ended on it. */
+function failedAnswerText(label: string, exchange: PaloaltoExchange, detail: string): string {
+  const notes = retryNotes(exchange);
+  return `${label} failed${notes.attempts} (${exchange.response.status}): ${detail}${notes.refusal}`;
+}
+
+/** One attempt under the timeout, body included. The tool call's abort is rethrown; any other failure is returned as its reason. */
+async function attemptOnce(url: string, init: RequestInit, options: HttpOptions): Promise<{ response: Response; rawText: string } | { failure: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
+  try {
+    const response = await options.fetchImpl(url, { ...init, signal: controller.signal });
+    return { response, rawText: await response.text() };
+  } catch (error) {
+    rethrowIfAborted(error);
+    return { failure: controller.signal.aborted ? `timed out after ${options.timeoutMs} ms` : `network error: ${errorMessage(error)}` };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Sends a request, retrying 429, 500, 502, 503, 504, a timeout, or a network error up to retryAttempts times. The
+ * wait is Retry-After when the response carries it, else exponential backoff. A Retry-After beyond
+ * MAX_RETRY_AFTER_MS is not waited out: the last answer is returned at once with the refusal noted. A timeout or
+ * network error that outlasts the retries throws, naming the request by label (never by URL) and the attempts made;
+ * endpoint is the request the error records.
+ */
+async function sendWithRetries(url: string, init: RequestInit, options: HttpOptions, endpoint: string, label: string): Promise<PaloaltoExchange> {
+  for (let attempt = 1; ; attempt += 1) {
+    const result = await attemptOnce(url, init, options);
+    if ("response" in result && !RETRYABLE_STATUSES.has(result.response.status)) return result;
+    const askedMs = "response" in result ? retryAfterMs(result.response.headers.get("retry-after"), options.now()) : undefined;
+    const refusal = askedMs !== undefined && askedMs > MAX_RETRY_AFTER_MS ? retryAfterRefusal(askedMs) : undefined;
+    if (attempt <= options.retryAttempts && refusal === undefined) {
+      await options.sleepImpl(askedMs ?? backoffMs(attempt));
+      continue;
     }
+    if ("failure" in result) {
+      throw new PaloaltoApiError(redactSecrets(`${label} failed ${attemptsText(attempt)} (${result.failure})`, options.secrets), null, endpoint);
+    }
+    return { ...result, retried: { attempts: attempt, refusal } };
   }
 }
 
@@ -2635,10 +2702,7 @@ export class PrismaCloudClient {
   private prismaId?: string;
   private tokenPromise?: Promise<string>;
 
-  constructor(
-    config: PaloaltoPrismaConfig,
-    options: { fetchImpl?: FetchImpl; timeoutMs?: number; retryAttempts?: number; sleepImpl?: (ms: number) => Promise<void>; signal?: AbortSignal } = {},
-  ) {
+  constructor(config: PaloaltoPrismaConfig, options: PaloaltoClientOptions = {}) {
     this.config = config;
     this.http = {
       fetchImpl: abortableFetch(options.fetchImpl ?? fetch, options.signal),
@@ -2646,6 +2710,7 @@ export class PrismaCloudClient {
       retryAttempts: options.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS,
       secrets: [config.secretKey, config.accessKeyId],
       sleepImpl: abortableSleep(options.signal, options.sleepImpl),
+      now: options.now ?? (() => new Date()),
     };
   }
 
@@ -2660,14 +2725,15 @@ export class PrismaCloudClient {
 
   private async login(): Promise<string> {
     const endpoint = PRISMA_LOGIN_ENDPOINT;
-    const response = await fetchWithRetry(`${this.config.apiUrl}/login`, {
+    const exchange = await sendWithRetries(`${this.config.apiUrl}/login`, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json; charset=UTF-8" },
       body: JSON.stringify({ username: this.config.accessKeyId, password: this.config.secretKey }),
-    }, this.http, endpoint);
-    const rawText = await response.text();
+    }, this.http, endpoint, "Prisma Cloud POST /login");
+    const { response, rawText } = exchange;
     if (!response.ok) {
-      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud login failed (${response.status}): ${describePrismaErrorBody(response, rawText, this.scrub)}`, this.http.secrets), response.status, endpoint);
+      const label = exchange.retried ? "Prisma Cloud POST /login" : "Prisma Cloud login";
+      throw new PaloaltoApiError(redactSecrets(failedAnswerText(label, exchange, describePrismaErrorBody(response, rawText, this.scrub)), this.http.secrets), response.status, endpoint);
     }
     // The same shape guard as every other 2xx answer: an empty or non-JSON body, or a JSON
     // document without the documented token member, is an unreadable surface described by
@@ -2721,7 +2787,7 @@ export class PrismaCloudClient {
       url.searchParams.set(key, String(value));
     }
     const endpoint = `${method} ${path.startsWith("/") ? path : `/${path}`}`;
-    const response = await fetchWithRetry(url.toString(), {
+    const exchange = await sendWithRetries(url.toString(), {
       method,
       headers: {
         accept: "application/json; charset=UTF-8",
@@ -2729,14 +2795,14 @@ export class PrismaCloudClient {
         "x-redlock-auth": await this.getToken(),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-    }, this.http, endpoint);
-    const rawText = await response.text();
+    }, this.http, endpoint, `Prisma Cloud ${method} ${path}`);
+    const { response, rawText } = exchange;
     if (response.status === 401 && retryAuth) {
       this.token = undefined;
       return this.requestDocument(method, path, query, body, false);
     }
     if (!response.ok) {
-      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud ${method} ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText, this.scrub)}`, this.http.secrets), response.status, endpoint);
+      throw new PaloaltoApiError(redactSecrets(failedAnswerText(`Prisma Cloud ${method} ${path}`, exchange, describePrismaErrorBody(response, rawText, this.scrub)), this.http.secrets), response.status, endpoint);
     }
     const document: PrismaDocument = { value: rawText.length === 0 ? undefined : safeJsonParse(rawText), response, rawText, endpoint, label: `Prisma Cloud ${method} ${path}` };
     if (document.value === undefined) throw nonDocumentError(document, { kind: "document" }, this.http.secrets);
@@ -2883,12 +2949,11 @@ export class PrismaComputeClient {
   private async authHeaders(): Promise<Record<string, string>> {
     if (this.useRedlockHeader) return { "x-redlock-auth": await this.cspm.getToken() };
     if (this.bearer && Date.now() < this.bearerExpiresAt) return { authorization: `Bearer ${this.bearer}` };
-    const response = await fetchWithRetry(`${this.consoleUrl}/api/v1/authenticate`, {
+    const { response, rawText } = await sendWithRetries(`${this.consoleUrl}/api/v1/authenticate`, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify(this.cspm.credentials),
-    }, this.http, "POST /api/v1/authenticate");
-    const rawText = await response.text();
+    }, this.http, "POST /api/v1/authenticate", "Prisma Cloud Compute POST /api/v1/authenticate");
     const token = response.ok ? asString(asObject(safeJsonParse(rawText))?.token) : undefined;
     if (!token) {
       this.useRedlockHeader = true;
@@ -2913,13 +2978,13 @@ export class PrismaComputeClient {
       url.searchParams.set(key, String(value));
     }
     const endpoint = `GET /api/v1${path.startsWith("/") ? path : `/${path}`}`;
-    const response = await fetchWithRetry(url.toString(), {
+    const exchange = await sendWithRetries(url.toString(), {
       method: "GET",
       headers: { accept: "application/json", ...(await this.authHeaders()) },
-    }, this.http, endpoint);
-    const rawText = await response.text();
+    }, this.http, endpoint, `Prisma Cloud Compute GET ${path}`);
+    const { response, rawText } = exchange;
     if (!response.ok) {
-      throw new PaloaltoApiError(redactSecrets(`Prisma Cloud Compute GET ${path} failed (${response.status}): ${describePrismaErrorBody(response, rawText, this.scrub)}`, this.http.secrets), response.status, endpoint);
+      throw new PaloaltoApiError(redactSecrets(failedAnswerText(`Prisma Cloud Compute GET ${path}`, exchange, describePrismaErrorBody(response, rawText, this.scrub)), this.http.secrets), response.status, endpoint);
     }
     const document: PrismaDocument = { value: rawText.length === 0 ? undefined : safeJsonParse(rawText), response, rawText, endpoint, label: `Prisma Cloud Compute GET ${path}` };
     if (document.value === undefined) throw nonDocumentError(document, { kind: "document" }, this.http.secrets);
@@ -3033,10 +3098,7 @@ export class PanosApiClient {
   private apiKey?: string;
   private keyPromise?: Promise<string>;
 
-  constructor(
-    config: PaloaltoPanosHostConfig,
-    options: { fetchImpl?: FetchImpl; timeoutMs?: number; retryAttempts?: number; sleepImpl?: (ms: number) => Promise<void>; verifyTls?: boolean; signal?: AbortSignal } = {},
-  ) {
+  constructor(config: PaloaltoPanosHostConfig, options: PaloaltoClientOptions & { verifyTls?: boolean } = {}) {
     this.config = config;
     this.apiKey = config.apiKey;
     this.verifyTls = options.verifyTls !== false;
@@ -3046,6 +3108,7 @@ export class PanosApiClient {
       retryAttempts: options.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS,
       secrets: [config.apiKey, config.password],
       sleepImpl: abortableSleep(options.signal, options.sleepImpl),
+      now: options.now ?? (() => new Date()),
     };
   }
 
@@ -3068,11 +3131,13 @@ export class PanosApiClient {
    * and length only. Error responses keep the documented msg or line text,
    * scrubbed of any credential-shaped value the device echoed.
    */
-  private parseResponse(response: Response, rawText: string, context: string, endpoint: string): XmlNode {
+  private parseResponse(exchange: PaloaltoExchange, context: string, endpoint: string): XmlNode {
+    const { response, rawText } = exchange;
+    const notes = retryNotes(exchange);
     const document = parseXml(rawText);
     const responseNode = xmlChild(document, "response");
     if (!responseNode) {
-      throw new PaloaltoApiError(`PAN-OS ${context} returned a non-XML ${responseContentType(response)} response (status ${response.status}, ${rawText.length} bytes, not echoed).`, response.status, endpoint);
+      throw new PaloaltoApiError(`PAN-OS ${context} returned a non-XML ${responseContentType(response)} response (status ${response.status}, ${rawText.length} bytes, not echoed)${notes.attempts}${notes.refusal}.`, response.status, endpoint);
     }
     if (responseNode.attributes.status !== "success") {
       const message = xmlText(xmlPath(responseNode, ["result", "msg"]))
@@ -3081,7 +3146,7 @@ export class PanosApiClient {
         || "no message";
       const code = /^[a-z0-9_-]{1,16}$/i.test(responseNode.attributes.code ?? "") ? responseNode.attributes.code : "unknown";
       const detail = redactSecrets(message.replace(/\s+/g, " "), this.http.secrets).slice(0, 300);
-      const text = redactSecrets(`PAN-OS ${context} failed (code ${code}, status ${response.status}): ${detail}`, this.http.secrets);
+      const text = redactSecrets(`PAN-OS ${context} failed${notes.attempts} (code ${code}, status ${response.status}): ${detail}${notes.refusal}`, this.http.secrets);
       const invalidCredential = (code === "403" || response.status === 403) && /^invalid credentials?\.?$/i.test(message.trim());
       throw invalidCredential ? new PanosInvalidCredentialError(text, response.status, endpoint) : new PaloaltoApiError(text, response.status, endpoint);
     }
@@ -3094,16 +3159,18 @@ export class PanosApiClient {
       throw new PaloaltoApiError(`PAN-OS ${this.config.host} has no API key and no username/password for keygen.`, null, endpoint);
     }
     const body = new URLSearchParams({ type: "keygen", user: this.config.username, password: this.config.password });
-    const response = await fetchWithRetry(`${this.config.baseUrl}/api/`, {
+    const context = `keygen for ${this.config.host}`;
+    const exchange = await sendWithRetries(`${this.config.baseUrl}/api/`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
-    }, this.http, endpoint);
-    const rawText = await response.text();
+    }, this.http, endpoint, `PAN-OS ${context}`);
+    const { response, rawText } = exchange;
     if (!response.ok && rawText.length === 0) {
-      throw new PaloaltoApiError(`PAN-OS keygen for ${this.config.host} failed (${response.status}).`, response.status, endpoint);
+      const notes = retryNotes(exchange);
+      throw new PaloaltoApiError(`PAN-OS ${context} failed${notes.attempts} (${response.status})${notes.refusal}.`, response.status, endpoint);
     }
-    const key = xmlText(xmlPath(this.parseResponse(response, rawText, `keygen for ${this.config.host}`, endpoint), ["result", "key"]));
+    const key = xmlText(xmlPath(this.parseResponse(exchange, context, endpoint), ["result", "key"]));
     if (!key) throw new PaloaltoApiError(`PAN-OS keygen for ${this.config.host} did not return a key.`, response.status, endpoint);
     this.apiKey = key;
     this.http.secrets.push(key);
@@ -3124,15 +3191,17 @@ export class PanosApiClient {
     const url = new URL(`${this.config.baseUrl}/api/`);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
     const endpoint = panosEndpoint("GET", params);
-    const response = await fetchWithRetry(url.toString(), {
+    const label = `${context} on ${this.config.host}`;
+    const exchange = await sendWithRetries(url.toString(), {
       method: "GET",
       headers: { "X-PAN-KEY": await this.getApiKey(), accept: "application/xml" },
-    }, this.http, endpoint);
-    const rawText = await response.text();
+    }, this.http, endpoint, `PAN-OS ${label}`);
+    const { response, rawText } = exchange;
     if (!response.ok && rawText.length === 0) {
-      throw new PaloaltoApiError(`PAN-OS ${context} on ${this.config.host} failed (${response.status} ${response.statusText}).`, response.status, endpoint);
+      const notes = retryNotes(exchange);
+      throw new PaloaltoApiError(`PAN-OS ${label} failed${notes.attempts} (${response.status} ${response.statusText})${notes.refusal}.`, response.status, endpoint);
     }
-    return this.parseResponse(response, rawText, `${context} on ${this.config.host}`, endpoint);
+    return this.parseResponse(exchange, label, endpoint);
   }
 
   async showConfig(xpath: string): Promise<XmlNode> {
