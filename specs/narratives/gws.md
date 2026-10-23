@@ -4,4 +4,4 @@ Inspect Google Workspace identity, delegated administration, third-party OAuth e
 
 ## Design guidance
 
-This is the tenant security inspector, not the `gws` operator bridge. Keep directory, reporting, Alert Center, per-user token, and Cloud Identity policy evidence distinct. A failed child token read or unavailable policy token must demote every dependent finding.
+This is the tenant security inspector, not the `gws` operator bridge. Keep directory, reporting, Alert Center, per-user token, and Cloud Identity policy evidence distinct. A failed child token read or unavailable policy token must demote every dependent finding. Retry quota throttling, server errors, timeouts, and transport failures a bounded number of times; a read that still fails is a request error that leaves its dataset unreadable, never a missing scope or an empty listing.

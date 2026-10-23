@@ -24,7 +24,7 @@ Inspect Google Workspace identity, delegated administration, third-party OAuth e
 
 ## Design guidance
 
-This is the tenant security inspector, not the `gws` operator bridge. Keep directory, reporting, Alert Center, per-user token, and Cloud Identity policy evidence distinct. A failed child token read or unavailable policy token must demote every dependent finding.
+This is the tenant security inspector, not the `gws` operator bridge. Keep directory, reporting, Alert Center, per-user token, and Cloud Identity policy evidence distinct. A failed child token read or unavailable policy token must demote every dependent finding. Retry quota throttling, server errors, timeouts, and transport failures a bounded number of times; a read that still fails is a request error that leaves its dataset unreadable, never a missing scope or an empty listing.
 
 ## Shared integration contract
 
@@ -227,7 +227,7 @@ Credential refresh: POST https://oauth2.googleapis.com/token with a signed JWT b
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| Google Workspace Inspector | Per-project and per-customer Google API quotas | `Retry-After` | 429, 500, 502, 503, 504 | Use bounded exponential backoff with jitter and honor Retry-After; exhausted requests become unreadable evidence. |
+| Google Workspace Inspector | Per-project and per-customer Google API quotas | `Retry-After` | 429, 500-599 | Retry 429 and every 5xx answer, a 403 whose error reason is one of Google's documented quota signals (userRateLimitExceeded, rateLimitExceeded, quotaExceeded), attempts that pass the 30-second per-request timeout, and transport failures up to four times (five attempts), the service-account token request included; any other 403 is a final denial. Each wait honors Retry-After (delta-seconds or HTTP-date) on any retried status, else exponential backoff from 1 second with jitter, capped at 30 seconds; a Retry-After above 30 seconds ends the read without waiting. A 401 in service-account mode discards the token and repeats the request once with a new one. Exhaustion names the path, the last status or failure, and the attempt count, and leaves the dataset unreadable evidence, a throttled 403 recorded as a request error rather than a missing scope; a tool-call abort is never retried. |
 
 ## Checks
 

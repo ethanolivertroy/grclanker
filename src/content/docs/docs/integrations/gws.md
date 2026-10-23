@@ -278,6 +278,12 @@ Every finding applies these rules. `cli/tests/gws.test.mjs` carries a regression
     - `cli/tests/gws.test.mjs` sweeps 34 denial scenarios (eleven surfaces by three failure kinds plus the never-collected Policy API dataset) over every finding line, snapshot field, and `core_data/` file. The sweep uses two generic guards:
       - No `0` or `[]` beside an unreadable, not collected, or unknown status.
       - No complete or partial status naming an endpoint the run never requested.
+12. A throttled, failing, or stalled request is retried a bounded number of times, and then its dataset fails closed.
+    - **Retried:** A 429 or 5xx answer, a 403 whose error reason is one of Google's documented quota signals (`userRateLimitExceeded`, `rateLimitExceeded`, `quotaExceeded`), an attempt that runs past the 30-second per-request timeout (headers and body together), and a transport failure such as a reset connection. Each request gets up to four retries (five attempts), the service-account token request included.
+    - **Waits:** `Retry-After` (delta-seconds or an HTTP-date) on any retried status, else exponential backoff from 1 second with jitter, capped at 30 seconds. A `Retry-After` above 30 seconds ends the read at once rather than being slept: `Google Workspace API request failed for /admin/directory/v1/users after 1 attempt: 429 Too Many Requests, Retry-After asked for 120 seconds (more than the 30-second cap)`.
+    - **Not retried:** Any other answer is final on its first attempt, including a 403 for a missing scope or admin role (`insufficientPermissions`) and a daily-limit 403 (`dailyLimitExceeded`). In service-account mode a 401 discards the cached token and repeats the request once with a new one. Canceling the tool call stops it at once, mid-wait included.
+    - **Exhaustion:** The error names the request path without its query, the attempt count, and the last status or failure, for example `Google Workspace API request failed for /admin/directory/v1/users after 5 attempts: 503 Service Unavailable` or `after 5 attempts: timed out after 30000 ms`. It is scrubbed like every other error (rule 9). A quota 403 that outlasts its retries is a request error, never a missing scope or admin role: the finding reads `could not be assessed: request error.` and the `gws_check_access` probe reads `error`.
+    - **Mid-listing failure:** A page that still fails after its retries makes the whole listing unreadable. The pages read before it are dropped, and every finding that reads the listing follows rules 1 and 11.
 
 ## Endpoint reference
 

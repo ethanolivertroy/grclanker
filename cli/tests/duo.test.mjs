@@ -31,11 +31,13 @@ import {
   redactErrorText,
   redactFields,
   redactIntegrationRecords,
+  registerDuoTools,
   resolveDuoConfiguration,
   resolveSecureOutputPath,
   runDuoAccessCheck,
   scrubSnapshotValue,
 } from "../dist/extensions/grc-tools/duo.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { DUO_SPEC } from "../dist/extensions/grc-tools/duo.spec.js";
 import { assertBundlePathsMatchSpec, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
@@ -93,6 +95,7 @@ import {
   withPlantedRoutes,
 } from "./helpers/redaction-table.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed, assertSecretFragmentsAbsent } from "./helpers/planted-values.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1503,7 +1506,8 @@ test("DuoAuditorClient handles v2/v5 signing, retries, and pagination", async ()
     throw new Error(`Unexpected request: ${requestUrl.pathname}`);
   };
 
-  const client = new DuoAuditorClient(createSampleConfig(), { fetchImpl });
+  const sleeps = [];
+  const client = new DuoAuditorClient(createSampleConfig(), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); }, jitter: (delayMs) => delayMs });
   const users = await client.listUsers();
   const integrations = await client.listIntegrations();
   const logs = await client.listAuthenticationLogs(2, 10);
@@ -1512,9 +1516,348 @@ test("DuoAuditorClient handles v2/v5 signing, retries, and pagination", async ()
   assert.equal(integrations.length, 1);
   assert.equal(logs.length, 2);
   assert.equal(state.userRetries, 1);
+  assert.deepEqual(sleeps, [1000], "the 429 is retried once, after the first backoff");
   assert.equal(state.capturedAuthHeaders.length >= 4, true);
   assert.match(state.capturedAuthHeaders[0], /^Basic /);
   assert.notEqual(state.capturedAuthHeaders[0], state.capturedAuthHeaders[state.capturedAuthHeaders.length - 1]);
+});
+
+const RETRY_NOW = Date.parse("2026-10-23T12:00:00Z");
+const RETRY_STATUS_TEXT = { 429: "Too Many Requests", 500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout" };
+
+/** A client whose waits are recorded instead of slept and move its clock forward, and whose backoff has no jitter, so every wait and every signed Date is exact. */
+function retryingDuoClient(fetchImpl, options = {}) {
+  const sleeps = [];
+  let clock = RETRY_NOW;
+  const client = new DuoAuditorClient(createSampleConfig(), {
+    fetchImpl,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      clock += ms;
+    },
+    jitter: (delayMs) => delayMs,
+    now: () => clock,
+    ...options,
+  });
+  return { client, sleeps };
+}
+
+/** Answers request n with answers[n] (the last one repeats); each answer builds a fresh Response or throws. */
+function scriptedFetch(answers) {
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    requests.push({ url: String(input), init });
+    return answers[Math.min(requests.length, answers.length) - 1](init);
+  };
+  return { fetchImpl, requests };
+}
+
+const busy = (status, headers = {}) => () => new Response(null, { status, statusText: RETRY_STATUS_TEXT[status], headers });
+const rateLimited = (headers = {}) => () =>
+  new Response(JSON.stringify({ stat: "FAIL", code: 42901, message: "Too Many Requests" }), {
+    status: 429,
+    statusText: "Too Many Requests",
+    headers: { "content-type": "application/json", ...headers },
+  });
+const settingsPage = () => okEnvelope(compliantSettings());
+const resetConnection = () => {
+  throw new TypeError("fetch failed", { cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }) });
+};
+/** Never answers: the attempt ends only when its own timeout signal fires. */
+const hang = (init) => new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+
+test("DuoAuditorClient retries 429, 500, 502, 503, and 504 with doubling backoff and returns any other answer at once", async () => {
+  for (const status of [429, 500, 502, 503, 504]) {
+    const { fetchImpl, requests } = scriptedFetch([busy(status), busy(status), settingsPage]);
+    const { client, sleeps } = retryingDuoClient(fetchImpl);
+    const settings = await client.getSettings();
+    assert.equal(settings.helpdesk_bypass, "deny", `${status}: the third attempt is read`);
+    assert.equal(requests.length, 3, `${status}: retried twice`);
+    assert.deepEqual(sleeps, [1000, 2000], `${status}: backoff starts at 1 second and doubles`);
+  }
+  for (const status of [400, 401, 403, 404, 501]) {
+    const { fetchImpl, requests } = scriptedFetch([() => new Response(JSON.stringify({ stat: "FAIL", code: 40001, message: "refused" }), { status })]);
+    const { client, sleeps } = retryingDuoClient(fetchImpl);
+    await assert.rejects(() => client.getSettings(), (error) => {
+      assert.equal(error.status, status);
+      assert.doesNotMatch(error.message, /attempt/);
+      return true;
+    });
+    assert.equal(requests.length, 1, `${status} is not retried`);
+    assert.deepEqual(sleeps, []);
+  }
+});
+
+test("DuoAuditorClient waits as Retry-After says on any retried status, as delta-seconds or an HTTP date, and fails closed without waiting when it asks for more than 30 seconds", async () => {
+  const honored = [
+    ["delta-seconds on a 503", busy(503, { "retry-after": "7" }), 7000],
+    ["an HTTP date on a 500", busy(500, { "retry-after": new Date(RETRY_NOW + 9000).toUTCString() }), 9000],
+    ["an HTTP date already past on a 502", busy(502, { "retry-after": new Date(RETRY_NOW - 60_000).toUTCString() }), 0],
+    ["exactly the 30-second cap on a 429", rateLimited({ "retry-after": "30" }), 30_000],
+    ["an unparseable Retry-After on a 504", busy(504, { "retry-after": "soon" }), 1000],
+  ];
+  for (const [label, answer, wait] of honored) {
+    const { fetchImpl, requests } = scriptedFetch([answer, settingsPage]);
+    const { client, sleeps } = retryingDuoClient(fetchImpl);
+    await client.getSettings();
+    assert.equal(requests.length, 2, label);
+    assert.deepEqual(sleeps, [wait], label);
+  }
+
+  const refused = [
+    [
+      "a long delta-seconds on a 429",
+      rateLimited({ "retry-after": "120" }),
+      "Duo API request failed for /admin/v1/settings (429 Too Many Requests) after 1 attempt, Retry-After asked for 120 seconds (more than the 30-second cap): Too Many Requests",
+      429,
+    ],
+    [
+      "a far HTTP date on a 503",
+      busy(503, { "retry-after": new Date(RETRY_NOW + 3_600_000).toUTCString() }),
+      "Duo API request failed for /admin/v1/settings (503 Service Unavailable) after 1 attempt, Retry-After asked for 3600 seconds (more than the 30-second cap)",
+      503,
+    ],
+  ];
+  for (const [label, answer, message, status] of refused) {
+    const { fetchImpl, requests } = scriptedFetch([answer, settingsPage]);
+    const { client, sleeps } = retryingDuoClient(fetchImpl);
+    await assert.rejects(() => client.getSettings(), (error) => {
+      assert.equal(error.message, message, label);
+      assert.equal(error.status, status, label);
+      return true;
+    });
+    assert.equal(requests.length, 1, `${label}: no second request`);
+    assert.deepEqual(sleeps, [], `${label}: the client does not sleep through a wait it will not honor`);
+  }
+  assert.ok(duoFixedTexts().includes(refused[0][2]), "the Retry-After refusal is a fixed text the scrub keeps");
+});
+
+test("DuoAuditorClient retries a transport failure or a timed-out attempt, each attempt under its own timeout and signed with its own Date", async () => {
+  const { fetchImpl, requests } = scriptedFetch([resetConnection, hang, settingsPage]);
+  const { client, sleeps } = retryingDuoClient(fetchImpl, { timeoutMs: 5 });
+  await client.getSettings();
+  assert.equal(requests.length, 3);
+  assert.deepEqual(sleeps, [1000, 2000]);
+  assert.notEqual(requests[0].init.signal, requests[1].init.signal, "every attempt gets a fresh timeout");
+  assert.deepEqual(
+    requests.map((request) => request.init.headers.Date),
+    [RETRY_NOW, RETRY_NOW + 1000, RETRY_NOW + 3000].map((at) => new Date(at).toUTCString()),
+    "each attempt is signed when it is sent, so a long run of retries never sends a Date Duo would refuse as stale",
+  );
+  assert.equal(new Set(requests.map((request) => request.init.headers.Authorization)).size, 3, "each Date is signed afresh");
+});
+
+test("DuoAuditorClient stops after five attempts and names the path, never the query, with the last status or failure and the attempt count", async () => {
+  const exhaust = async (answer, call, options) => {
+    const { fetchImpl, requests } = scriptedFetch([answer]);
+    const { client, sleeps } = retryingDuoClient(fetchImpl, options);
+    const error = await call(client).then(() => assert.fail("expected the request to fail"), (thrown) => thrown);
+    return { error, requests, sleeps };
+  };
+
+  const status = await exhaust(busy(503), (client) => client.listAuthenticationLogs(30, 400));
+  assert.equal(status.error.message, "Duo API request failed for /admin/v2/logs/authentication (503 Service Unavailable) after 5 attempts");
+  assert.equal(status.error.status, 503);
+  assert.equal(status.error.path, "/admin/v2/logs/authentication");
+  assert.equal(status.requests.length, 5);
+  assert.ok(new URL(status.requests[0].url).searchParams.has("mintime"), "the request carried a query the message leaves out");
+  assert.deepEqual(status.sleeps, [1000, 2000, 4000, 8000], "four waits, none after the last attempt");
+
+  const limited = await exhaust(rateLimited(), (client) => client.getSettings());
+  assert.equal(limited.error.message, "Duo API request failed for /admin/v1/settings (429 Too Many Requests) after 5 attempts: Too Many Requests");
+  assert.ok(duoFixedTexts().includes(limited.error.message), "the exhausted 429 rendering is a fixed text the scrub keeps");
+
+  const transport = await exhaust(resetConnection, (client) => client.getSettings());
+  assert.equal(transport.error.message, "Duo API request failed for /admin/v1/settings (network error: fetch failed (ECONNRESET)) after 5 attempts");
+  assert.equal(transport.error.status, undefined);
+  assert.equal(transport.requests.length, 5);
+  assert.ok(duoFixedTexts().includes(transport.error.message), "the exhausted transport rendering is a fixed text the scrub keeps");
+
+  const headers = await exhaust(hang, (client) => client.getSettings(), { timeoutMs: 5 });
+  assert.equal(headers.error.message, "Duo API request failed for /admin/v1/settings (timed out after 5 ms) after 5 attempts");
+  assert.equal(headers.requests.length, 5);
+
+  const stalledBody = (init) => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("{"));
+      init.signal.addEventListener("abort", () => controller.error(init.signal.reason), { once: true });
+    },
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  const body = await exhaust(stalledBody, (client) => client.getSettings(), { timeoutMs: 5 });
+  assert.equal(body.error.message, "Duo API request failed for /admin/v1/settings (timed out after 5 ms) after 5 attempts", "the timeout covers the body too");
+});
+
+test("DuoAuditorClient gives each attempt 30 seconds by default", async (t) => {
+  const timers = t.mock.method(globalThis, "setTimeout");
+  const { client } = retryingDuoClient(scriptedFetch([busy(503), settingsPage]).fetchImpl);
+  await client.getSettings();
+  assert.deepEqual(timers.mock.calls.map((call) => call.arguments[1]), [30_000, 30_000], "one timer per attempt");
+});
+
+test("DuoAuditorClient never retries a tool-call abort, during a request or during the wait before a retry", async () => {
+  const duringWait = new AbortController();
+  let waitRequests = 0;
+  const waiting = new DuoAuditorClient(createSampleConfig(), {
+    fetchImpl: async () => {
+      waitRequests += 1;
+      return busy(503)();
+    },
+    signal: duringWait.signal,
+    sleep: () => {
+      duringWait.abort(new Error("the operator stopped the call"));
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(() => waiting.getSettings(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(waitRequests, 1, "no request follows an abort during the wait");
+
+  const duringRequest = new AbortController();
+  let sent = 0;
+  const requesting = new DuoAuditorClient(createSampleConfig(), {
+    fetchImpl: async () => {
+      sent += 1;
+      duringRequest.abort(new Error("the operator stopped the call"));
+      throw new DOMException("This operation was aborted", "AbortError");
+    },
+    signal: duringRequest.signal,
+    sleep: async () => assert.fail("an aborted request is never retried"),
+  });
+  await assert.rejects(() => requesting.getSettings(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(sent, 1);
+});
+
+test("a Duo inventory page that still fails after its retries leaves the whole inventory unreadable, so no finding reads the pages before it as complete", async () => {
+  const config = createSampleConfig();
+  const healthy = routedFetch(healthyDuoRoutes());
+  const userOffsets = [];
+  const fetchImpl = async (input, init) => {
+    const requestUrl = new URL(String(input));
+    if (requestUrl.pathname !== "/admin/v1/users") return healthy(input, init);
+    userOffsets.push(requestUrl.searchParams.get("offset"));
+    if (requestUrl.searchParams.get("offset") === "0") return okEnvelope([compliantUser("DU1")], { next_offset: 1, total_objects: 2 });
+    return busy(503)();
+  };
+  const sleeps = [];
+  const client = new DuoAuditorClient(config, { fetchImpl, sleep: async (ms) => { sleeps.push(ms); }, jitter: (delayMs) => delayMs });
+  const data = await collectDuoAuthenticationData(client, config.lookbackDays);
+  assert.deepEqual(userOffsets, ["0", "1", "1", "1", "1", "1"], "the second page is tried five times");
+  assert.deepEqual(sleeps, [1000, 2000, 4000, 8000]);
+  assert.deepEqual(data.users.data, [], "the first page is not kept as if it were the inventory");
+  assert.equal(data.users.error, "Duo API request failed for /admin/v1/users (503 Service Unavailable) after 5 attempts");
+  assert.equal(data.users.status, 503);
+
+  const result = assessDuoAuthentication(data, config);
+  for (const id of ["DUO-AUTH-008", "DUO-AUTH-009", "DUO-AUTH-010"]) {
+    const finding = findingById(result, id);
+    assert.notEqual(finding.status, "Pass", `${id} cannot pass without the user inventory`);
+    assert.ok(finding.evidence.some((line) => line.includes("(503 Service Unavailable) after 5 attempts")), `${id} names the read that ran out of retries`);
+  }
+  assert.equal(result.snapshotSummary.users, null, "the snapshot renders the user count unread, not 1");
+});
+
+test("DUO-AUTH-010 caps full WebAuthn adoption at Partial when the credential inventory is unreadable or truncated, and keeps Fail when no user record lists a credential", () => {
+  const config = createSampleConfig();
+  const exhausted = "Duo API request failed for /admin/v1/webauthncredentials (503 Service Unavailable) after 5 attempts";
+
+  const unreadable = compliantAuthenticationData();
+  unreadable.webauthnCredentials = { data: [], error: exhausted, endpoint: "/admin/v1/webauthncredentials", status: 503 };
+  const capped = findingById(assessDuoAuthentication(unreadable, config), "DUO-AUTH-010");
+  assert.equal(capped.status, "Partial");
+  assert.match(
+    capped.summary,
+    /^\d+ percent of enrolled users have a WebAuthn credential and no deprecated U2F tokens remain, but the WebAuthn credential inventory could not be read: \/admin\/v1\/webauthncredentials \(503 Service Unavailable\) after 5 attempts\. Adoption could not be confirmed against that inventory, so the verdict is capped at Partial\.$/,
+  );
+  assert.ok(capped.evidence.includes(`webauthn_inventory_error=${exhausted}`));
+  assert.match(capped.recommendation, /Grant resource - Read/);
+
+  const truncated = compliantAuthenticationData();
+  truncated.webauthnCredentials = { ...truncated.webauthnCredentials, complete: false, total: 30 };
+  const partial = findingById(assessDuoAuthentication(truncated, config), "DUO-AUTH-010");
+  assert.equal(partial.status, "Partial");
+  assert.ok(
+    partial.summary.endsWith(`but the WebAuthn credential inventory is incomplete: paging stopped after ${truncated.webauthnCredentials.data.length} of 30 credentials. Adoption could not be confirmed against that inventory, so the verdict is capped at Partial.`),
+    partial.summary,
+  );
+  assert.ok(partial.evidence.some((line) => line.startsWith("webauthn_credentials_")), "the truncation is named in evidence");
+
+  const none = compliantAuthenticationData();
+  none.users = dataset([compliantUser("DU1", { webauthncredentials: [] })]);
+  none.webauthnCredentials = { data: [], error: exhausted };
+  const fail = findingById(assessDuoAuthentication(none, config), "DUO-AUTH-010");
+  assert.equal(fail.status, "Fail", "no user record lists a credential, whatever the credential inventory holds");
+  assert.match(fail.summary, /^No enrolled user has a WebAuthn credential\. The WebAuthn credential inventory could not be read: \/admin\/v1\/webauthncredentials \(503 Service Unavailable\) after 5 attempts\.$/);
+
+  assert.equal(findingById(assessDuoAuthentication(compliantAuthenticationData(), config), "DUO-AUTH-010").status, "Pass", "a fully read credential inventory keeps the Pass");
+});
+
+test("planted Duo keys echoed by a retried failure, in the body, the headers, or a transport error, never reach a thrown error, a tool result, or a bundle file", async () => {
+  const planted = { ikey: "DIK7RW2QX9MZ4TPV6NBH", skey: "Vq3LtZ8xRk2WmN6pYs9JbHd4CgF7uTe5AzQw1KnP" };
+  const values = Object.values(planted);
+  const config = { ...createSampleConfig(), ...planted };
+  /** Runs the access check and the four assess tools on `fetchImpl` with instant waits and returns each tool's text and details. */
+  const runTools = async (fetchImpl, keys) => {
+    const tools = new Map();
+    registerDuoTools({ registerTool: (definition) => tools.set(definition.name, definition) }, { fetchImpl, sleep: async () => {} });
+    tools.delete("duo_export_audit_bundle");
+    const outputs = [];
+    for (const [name, definition] of tools) {
+      const result = await definition.execute(`call-${name}`, definition.prepareArguments({ api_host: config.apiHost, ...keys }));
+      outputs.push([`${name} text`, result.content.map((part) => part.text ?? "").join("\n")], [`${name} details`, JSON.stringify(result.details ?? {})]);
+    }
+    return outputs;
+  };
+  const healthyRoutes = healthyDuoRoutes();
+  const healthyBundle = await exportDuoAuditBundle(
+    new DuoAuditorClient(createSampleConfig(), { fetchImpl: routedFetch(healthyRoutes) }),
+    createSampleConfig(),
+    createTempBase("grclanker-duo-healthy-"),
+  );
+  assertPlantedValuesWellFormed(assert, planted, [
+    ...await Promise.all(Object.entries(healthyRoutes).map(async ([path, route]) => [path, await route().text()])),
+    ["config", JSON.stringify(createSampleConfig())],
+    ...await runTools(routedFetch(healthyRoutes), { ikey: DUO_IKEY_CANARY, skey: DUO_SKEY_CANARY }),
+    ...readBundleFiles(healthyBundle.outputDir),
+  ]);
+
+  /** Every API answer echoes both keys in the envelope fields the client quotes and in the headers. */
+  const echoing = () => new Response(JSON.stringify({ stat: "FAIL", code: 50301, message: `backend unavailable for ikey ${planted.ikey}`, message_detail: `skey ${planted.skey} refused` }), {
+    status: 503,
+    statusText: "Service Unavailable",
+    headers: { "content-type": "application/json", "retry-after": planted.skey, "www-authenticate": `Basic realm="${planted.ikey}"`, "x-debug-token": planted.skey },
+  });
+  const transportEcho = () => {
+    throw new TypeError(`fetch failed: proxy refused ikey ${planted.ikey} (skey ${planted.skey})`, { cause: Object.assign(new Error(planted.skey), { code: "ECONNREFUSED" }) });
+  };
+  const retrying = (answer) => new DuoAuditorClient(config, { fetchImpl: async () => answer(), sleep: async () => {}, jitter: (delayMs) => delayMs });
+  const assertNoFragments = (outputs, label) => {
+    assert.ok(outputs.some(([, content]) => content.includes("after 5 attempts") && content.includes("[REDACTED]")), `${label}: the outputs name the exhausted reads, with the echo removed`);
+    assertSecretFragmentsAbsent(assert, outputs, values, label);
+  };
+
+  for (const [label, answer, scrubbed] of [
+    ["echoing 503", echoing, "Duo API request failed for /admin/v1/settings (503 Service Unavailable) after 5 attempts: backend unavailable for ikey [REDACTED]: skey [REDACTED] refused"],
+    ["transport error", transportEcho, "Duo API request failed for /admin/v1/settings (network error: fetch failed: proxy refused ikey [REDACTED] (skey [REDACTED]) (ECONNREFUSED)) after 5 attempts"],
+  ]) {
+    const thrown = await retrying(answer).getSettings().then(() => assert.fail(`${label}: expected the read to fail`), (error) => error);
+    assert.equal(thrown.message, scrubbed, `${label}: the echo reaches the error and is removed there`);
+    assertFragmentsAbsent(assert, thrown.message, values, `${label}: thrown error`);
+
+    const client = retrying(answer);
+    const assessed = [
+      assessDuoAuthentication(await collectDuoAuthenticationData(client, config.lookbackDays), config),
+      assessDuoAdminAccess(await collectDuoAdminAccessData(client, config.lookbackDays), config),
+      assessDuoIntegrations(await collectDuoIntegrationData(client), config),
+      assessDuoMonitoring(await collectDuoMonitoringData(client, config.lookbackDays), config),
+    ];
+    assertNoFragments([["assessments", JSON.stringify(assessed)]], `${label}: assessments`);
+
+    const bundle = await exportDuoAuditBundle(retrying(answer), config, createTempBase("grclanker-duo-planted-"));
+    assert.ok(bundle.errorCount > 0, label);
+    assertNoFragments([...readBundleFiles(bundle.outputDir)], `${label}: bundle`);
+    assertSecretFragmentsAbsent(assert, readZipEntries(bundle.zipPath), values, `${label}: zip`);
+
+    assertNoFragments(await runTools(answer, planted), `${label}: tools`);
+  }
 });
 
 test("Duo assessments generate mapped findings across all focus areas", async () => {
@@ -2042,9 +2385,12 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
     "not collected: this client does not expose the endpoint, so no request was attempted",
     "Access forbidden: Insufficient permissions",
     "Duo API request failed for /admin/v1/settings (403 Forbidden): Access forbidden: Insufficient permissions",
-    "Duo API request failed for /admin/v1/settings (network error: fetch failed)",
+    "Duo API request failed for /admin/v1/settings (network error: fetch failed (ECONNRESET)) after 5 attempts",
+    "Duo API request failed for /admin/v1/settings (timed out after 30000 ms) after 5 attempts",
     "Duo API request returned an unexpected payload for /admin/v1/settings",
-    "Duo API request exceeded retry budget for /admin/v1/settings (429 Too Many Requests).",
+    "Duo API request failed for /admin/v1/settings (429 Too Many Requests) after 5 attempts: Too Many Requests",
+    "Duo API request failed for /admin/v1/settings (429 Too Many Requests) after 1 attempt, Retry-After asked for 120 seconds (more than the 30-second cap): Too Many Requests",
+    "Duo API request failed for /admin/v1/webauthncredentials (503 Service Unavailable) after 5 attempts",
     "/admin/v1/settings (403 Forbidden): Access forbidden: Insufficient permissions",
     "users: unread",
     "bypass codes: unread",
@@ -2060,7 +2406,8 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
   // The renderings the client throws, built the way requestJson and parseDetailFromBody build them, survive too.
   const thrown = [
     "Duo API request failed for /admin/v1/settings (403 Forbidden): Access forbidden: Insufficient permissions",
-    "Duo API request failed for /admin/v2/logs/telephony (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+    "Duo API request failed for /admin/v2/logs/telephony (502 Bad Gateway) after 5 attempts: non-JSON body (text/html, 5120 bytes)",
+    "Duo API request failed for /admin/v1/users (timed out after 30000 ms) after 5 attempts",
     "Duo API request returned an unexpected payload for /admin/v1/settings: non-JSON body (text/plain, 21 bytes)",
     "Duo API request failed for /admin/v1/users (401 Unauthorized): Invalid signature in request credentials",
   ];
@@ -2359,7 +2706,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       ["json", canaryJsonResponse, REDACTED_CANARY_URL],
     ]) {
       const label = `${surface} (${variant})`;
-      const client = new DuoAuditorClient(config, { fetchImpl: routedFetch({ ...healthyDuoRoutes(), [surface]: response }) });
+      const client = new DuoAuditorClient(config, { fetchImpl: routedFetch({ ...healthyDuoRoutes(), [surface]: response }), sleep: async () => {} });
 
       const access = await runDuoAccessCheck(client, config);
       assertNoCanaryWindows(assert, access, DUO_PLANTED_CANARIES, `${label} check_access`);
@@ -2397,7 +2744,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       assertNoCanaryWindowsInFiles(assert, readZipEntries(exported.zipPath), DUO_PLANTED_CANARIES, `${label} zip`);
       assert.ok(exported.errorCount > 0, `${label}: the export records the failed read`);
       assert.match(files.get("_errors.log"), expectedNote, `${label}: _errors.log carries the expected note`);
-      if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway\): non-JSON body \(text\/html/);
+      if (variant === "html") assert.match(files.get("_errors.log"), /502 Bad Gateway\) after 5 attempts: non-JSON body \(text\/html/);
     }
   }
 });
@@ -2455,9 +2802,12 @@ const SECONDARY_DENIALS = [
     fallback: [],
     expect: {
       "DUO-AUTH-010": (finding) => {
-        assert.equal(finding.status, "Pass", "adoption is measured from the readable user inventory");
+        assert.equal(finding.status, "Partial", "adoption counted from the user inventory cannot pass while the credential inventory behind it is unread");
+        assert.match(finding.summary, /but the WebAuthn credential inventory could not be read: \/admin\/v1\/webauthncredentials \(403 Forbidden\).*capped at Partial\.$/);
+        assert.equal(finding.summary.includes("Duo API request failed for"), false, "the endpoint is named once, not through the raw client prefix");
         assert.ok(finding.evidence.some((line) => line.startsWith("webauthn_inventory_error=") && line.includes("/admin/v1/webauthncredentials")));
         assert.equal(finding.evidence.some((line) => line.startsWith("webauthn_credentials_total=")), false, "no phantom credential count");
+        assert.match(finding.recommendation, /Grant resource - Read/);
       },
     },
   },
@@ -2832,7 +3182,7 @@ test("request matching: every endpoint path and HTTP status named in any output 
     "/admin/v2/logs/telephony": () => canaryHtmlResponse(),
     "/admin/v1/admins/allowed_auth_methods": () => new Response("", { status: 404, statusText: "Not Found" }),
   };
-  const client = new DuoAuditorClient(config, { fetchImpl: recordingFetch(routes, log) });
+  const client = new DuoAuditorClient(config, { fetchImpl: recordingFetch(routes, log), sleep: async () => {} });
 
   const outputs = [JSON.stringify(await runDuoAccessCheck(client, config))];
   outputs.push(JSON.stringify(assessDuoAuthentication(await collectDuoAuthenticationData(client, config.lookbackDays), config)));
@@ -2900,13 +3250,13 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
   };
   const note = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
   const config = createSampleConfig();
-  const client = new DuoAuditorClient(config, { fetchImpl });
+  const client = new DuoAuditorClient(config, { fetchImpl, sleep: async () => {} });
 
   await assert.rejects(() => client.getSettings(), (error) => {
     assert.equal(error.name, "DuoApiError");
     assertNoCanaryWindows(assert, error.message, [PARSER_SNIPPET_CANARY], "thrown client error");
     assert.doesNotMatch(error.message, PARSER_WORDING, `the parser's message was interpolated: ${error.message}`);
-    assert.equal(error.message, `Duo API request failed for /admin/v1/settings (network error: ${note})`);
+    assert.equal(error.message, `Duo API request failed for /admin/v1/settings (network error: ${note}) after 5 attempts`);
     return true;
   });
 

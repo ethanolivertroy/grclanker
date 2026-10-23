@@ -135,7 +135,7 @@ A forbidden or errored call never produces `Pass`.
 | 14 | Trust Monitor configuration | DUO-MON-002 | Automated where the edition exposes Trust Monitor events |
 | 15 | Authentication log anomalies | DUO-MON-005 (attempt outcomes, impossible travel), DUO-MON-001 (factor hygiene) | Automated; travel analysis needs `access_device.location` (Advantage and Premier) |
 | 16 | Telephony credit monitoring | DUO-MON-003 | Automated; Manual when `telephony_credits_remaining` is absent (unknown credits never pass) |
-| 17 | U2F/WebAuthn credential inventory | DUO-AUTH-010 | Automated |
+| 17 | U2F/WebAuthn credential inventory | DUO-AUTH-010 | Automated; a Pass caps at Partial when `/admin/v1/webauthncredentials` could not be read in full |
 | 18 | Offline access configuration | DUO-AUTH-011 | Manual: Policy Section Data documents no offline access section; offline enrollment events are collected as evidence |
 | 19 | Self-service portal policy | DUO-INTEGRATIONS-003 | Automated per integration (`self_service_allowed` from `/admin/v3/integrations`); the legacy `global_ssp_policy_enforced` setting is evidence only |
 | 20 | API permission audit | DUO-INTEGRATIONS-004 | Automated (`adminapi_*` flags) |
@@ -197,13 +197,19 @@ This section is reference for reviewing findings and bundles: how unread, partia
 - **Secondary reads are named, never assumed.** When a finding combines a deciding read with a supporting one, a failed supporting read is reported as `unread` with the endpoint, the HTTP status, and the permission to grant. It is never rendered as a configuration fact.
   - DUO-AUTH-006 caps an empty bypass code inventory at Partial when `/admin/v1/settings` (help desk issuance limits) failed.
   - DUO-AUTH-001 keeps its global policy verdict but records `admin_allowed_auth_methods=unread` when `/admin/v1/admins/allowed_auth_methods` failed. An unread payload never softens a Fail into Partial.
-  - DUO-AUTH-010 records `webauthn_inventory_error` when `/admin/v1/webauthncredentials` failed, instead of reporting a zero credential count.
+  - DUO-AUTH-010 records `webauthn_inventory_error` when `/admin/v1/webauthncredentials` failed, instead of reporting a zero credential count. A failed or early-stopped credential inventory caps a Pass at Partial, and the summary says the inventory `could not be read` or `is incomplete`, so adoption was not confirmed against it. A tenant where no enrolled user lists a WebAuthn credential keeps its Fail.
 - **Every pager exits when it cannot advance.**
   - Offset endpoints stop, and report the walk incomplete, when `metadata.next_offset` repeats or moves backwards, is a value the pager cannot send back, or arrives with an empty page.
   - A numeric string `next_offset` is accepted as the documented integer.
   - The authentication, activity, and telephony log cursors and the Trust Monitor cursor stop on a repeated cursor or an empty page with a cursor.
   - An incomplete walk caps every dependent finding at Partial with `inventory_seen`, `inventory_total`, and `collection_cap` evidence.
 - **Unknown paging is not complete paging.** A client that tracks paging outcomes but recorded none for a list marks that list incomplete, so the dependent findings cannot pass on an unverified walk.
+- **Transient failures are retried a bounded number of times, then fail closed.**
+  - **Retried:** A 429, a 500, 502, 503, or 504 answer, an attempt that runs past the 30-second per-request timeout, and a transport failure such as a reset connection. Each request gets up to four retries (five attempts), and each attempt is signed again with a new `Date`.
+  - **Waits:** `Retry-After` (delta-seconds or an HTTP-date) on any retried status, else exponential backoff from 1 second with jitter, capped at 30 seconds. A `Retry-After` above 30 seconds ends the read at once rather than being slept: `Duo API request failed for /admin/v1/settings (429 Too Many Requests) after 1 attempt, Retry-After asked for 120 seconds (more than the 30-second cap): ...`.
+  - **Not retried:** Any other answer, such as a 401 or a 403, is final on its first attempt. Canceling the tool call stops it at once, mid-wait included.
+  - **Exhaustion:** The error names the path without its query, the last status or failure, and the attempt count, for example `Duo API request failed for /admin/v1/webauthncredentials (503 Service Unavailable) after 5 attempts` or `(timed out after 30000 ms) after 5 attempts`.
+  - **Mid-walk failure:** A page that still fails after its retries makes the whole list unreadable. The pages read before it are dropped, `core_data/` writes the not-collected marker, and the dependent findings follow the rules above.
 
 ### Bundle redaction
 

@@ -18,7 +18,7 @@ import {
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
 import { DUO_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -51,6 +51,11 @@ const TRUST_MONITOR_PAGE_SIZE = 200;
 const OFFLINE_ENROLLMENT_PAGE_SIZE = 1000;
 const MAX_OFFLINE_ENROLLMENT_RECORDS = 5000;
 const MAX_RETRIES = 4;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+const RETRY_BASE_DELAY_MS = 1000;
+/** The longest wait before a retry; a Retry-After asking for more ends the read instead of being slept. */
+const MAX_RETRY_DELAY_MS = 30_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const INACTIVE_USER_DAYS = 90;
 const LOCKOUT_THRESHOLD_MAX = 10;
 const IMPOSSIBLE_TRAVEL_WINDOW_MS = 60 * 60 * 1000;
@@ -1932,16 +1937,82 @@ export function redactBypassCodeRecords(records: JsonRecord[]): JsonRecord[] {
   return redactFields(records, BYPASS_CODE_FIELDS);
 }
 
+/** Equal jitter: half of the exponential delay is kept and the other half is random, so parallel runs spread out without a near-zero wait. */
+function defaultJitter(delayMs: number): number {
+  return Math.round(delayMs / 2 + Math.random() * (delayMs / 2));
+}
+
+/** The wait before retry number `retry` (0 for the first) when the server named none: 1 s doubling per retry, clamped to MAX_RETRY_DELAY_MS. */
+function backoffDelay(retry: number, jitter: (delayMs: number) => number): number {
+  return Math.min(Math.max(jitter(RETRY_BASE_DELAY_MS * 2 ** retry), 0), MAX_RETRY_DELAY_MS);
+}
+
+/** Retry-After as delta-seconds or an HTTP-date, in milliseconds from `now`; undefined when absent or unparseable. */
+function retryAfterMs(header: string | null, now: number): number | undefined {
+  const value = header?.trim();
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : undefined;
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.max(at - now, 0);
+}
+
+/** A fetch rejection's recorded text plus its cause's network code (ECONNRESET, ENOTFOUND, UND_ERR_SOCKET), which undici keeps off its "fetch failed" message. */
+function transportFailure(error: unknown): string {
+  const message = describeThrown(error);
+  const cause = error instanceof Error ? error.cause : undefined;
+  const code = typeof cause === "object" && cause !== null ? (cause as { code?: unknown }).code : undefined;
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{1,40}$/.test(code) && !message.includes(code) ? `${message} (${code})` : message;
+}
+
+function attemptCount(count: number): string {
+  return count === 1 ? "1 attempt" : `${count} attempts`;
+}
+
+function parseEnvelope(text: string): JsonRecord | null {
+  if (text.trim().length === 0) return null;
+  try {
+    return JSON.parse(text) as JsonRecord;
+  } catch {
+    return null;
+  }
+}
+
+/** Only the documented message fields of a JSON envelope are quoted; anything else is described by shape. */
+function envelopeDetail(response: Response, text: string, parsed: JsonRecord | null = parseEnvelope(text)): string | undefined {
+  return parsed ? parseDetailFromBody(parsed) : describeNonJsonBody(response, text);
+}
+
+interface DuoClientOptions {
+  fetchImpl?: FetchImpl;
+  signal?: AbortSignal;
+  /** The wait between attempts; it is still raced against `signal`. */
+  sleep?: (ms: number) => Promise<void>;
+  /** The clock each attempt's signed Date header and a Retry-After HTTP-date are read from. */
+  now?: () => number;
+  jitter?: (delayMs: number) => number;
+  /** How long one attempt may run, headers and body together, before it counts as timed out. */
+  timeoutMs?: number;
+}
+
 export class DuoAuditorClient {
   private readonly config: DuoResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly signal: AbortSignal | undefined;
+  private readonly now: () => number;
+  private readonly jitter: (delayMs: number) => number;
+  private readonly timeoutMs: number;
   private readonly collectionStatuses = new Map<string, DuoCollectionStatus>();
 
-  constructor(config: DuoResolvedConfig, options?: { fetchImpl?: FetchImpl; signal?: AbortSignal }) {
+  constructor(config: DuoResolvedConfig, options: DuoClientOptions = {}) {
     this.config = config;
-    this.fetchImpl = abortableFetch(options?.fetchImpl ?? fetch, options?.signal);
-    this.sleep = abortableSleep(options?.signal);
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
+    this.signal = options.signal;
+    this.now = options.now ?? Date.now;
+    this.jitter = options.jitter ?? defaultJitter;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     registerConfiguredSecrets(config.ikey, config.skey);
   }
 
@@ -1975,29 +2046,7 @@ export class DuoAuditorClient {
     const method = options?.method ?? "GET";
     const signatureVersion = options?.signatureVersion ?? (isV5Path(path) ? 5 : 2);
     const normalizedParams = compactParams(params);
-    const date = new Date().toUTCString();
     const body = options?.body ?? "";
-    const authorization =
-      signatureVersion === 5
-        ? signV5(
-            this.config.ikey,
-            this.config.skey,
-            method,
-            this.config.apiHost,
-            path,
-            normalizedParams,
-            date,
-            body,
-          )
-        : signV2(
-            this.config.ikey,
-            this.config.skey,
-            method,
-            this.config.apiHost,
-            path,
-            normalizedParams,
-            date,
-          );
 
     let url = `https://${this.config.apiHost}${path}`;
     const query = canonParams(normalizedParams);
@@ -2005,68 +2054,91 @@ export class DuoAuditorClient {
       url = `${url}?${query}`;
     }
 
-    const headers: Record<string, string> = {
-      Authorization: authorization,
-      Date: date,
-      Host: this.config.apiHost,
-      "User-Agent": "grclanker/0.1.3 duo-audit",
+    // Each attempt is signed with its own Date: Duo refuses a timestamp more than five minutes from its clock
+    // (40105), and five attempts with their timeouts and waits can run longer than that.
+    const signedInit = (): RequestInit => {
+      const date = new Date(this.now()).toUTCString();
+      const headers: Record<string, string> = {
+        Authorization:
+          signatureVersion === 5
+            ? signV5(this.config.ikey, this.config.skey, method, this.config.apiHost, path, normalizedParams, date, body)
+            : signV2(this.config.ikey, this.config.skey, method, this.config.apiHost, path, normalizedParams, date),
+        Date: date,
+        Host: this.config.apiHost,
+        "User-Agent": "grclanker/0.1.3 duo-audit",
+      };
+      if (method !== "GET" && body.length > 0) {
+        headers["Content-Type"] = signatureVersion === 5 ? "application/json" : "application/x-www-form-urlencoded";
+      }
+      return { method, headers, body: body || undefined };
     };
 
-    if (method !== "GET" && body.length > 0) {
-      headers["Content-Type"] = signatureVersion === 5 ? "application/json" : "application/x-www-form-urlencoded";
+    const { response, text } = await this.send(url, path, signedInit);
+    const parsed = parseEnvelope(text);
+    const detail = envelopeDetail(response, text, parsed);
+
+    if (!response.ok) {
+      throw new DuoApiError(
+        redactErrorText(`Duo API request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`),
+        path,
+        response.status,
+      );
     }
 
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
-      let response: Response;
-      let text: string;
+    if (!parsed || asString(parsed.stat) !== "OK") {
+      throw new DuoApiError(
+        redactErrorText(`Duo API request returned an unexpected payload for ${path}${detail ? `: ${detail}` : ""}`),
+        path,
+        response.status,
+      );
+    }
+
+    return parsed;
+  }
+
+  /**
+   * Sends one request and reads its body, retrying a 429 or transient 5xx answer, an attempt that runs past
+   * timeoutMs, and a transport failure up to MAX_RETRIES times. The first other answer is returned whatever its
+   * status. Running out of retries, or a Retry-After asking for more than MAX_RETRY_DELAY_MS, throws an error
+   * naming the path (never the query), the last status or failure, and the attempt count. `init` is built per
+   * attempt.
+   */
+  private async send(url: string, path: string, init: () => RequestInit): Promise<{ response: Response; text: string }> {
+    for (let attempt = 1; ; attempt += 1) {
+      const requestInit = init();
+      const timeout = new AbortController();
+      const timer = setTimeout(() => timeout.abort(), this.timeoutMs);
+      let status: number | undefined;
+      let failure: string;
+      let waitMs: number | undefined;
       try {
-        response = await this.fetchImpl(url, { method, headers, body: body || undefined });
-        text = await response.text();
+        const response = await this.fetchImpl(url, { ...requestInit, signal: timeout.signal });
+        const text = await response.text();
+        if (!RETRYABLE_STATUSES.has(response.status)) return { response, text };
+        const detail = envelopeDetail(response, text);
+        const requested = retryAfterMs(response.headers.get("retry-after"), this.now());
+        status = response.status;
+        failure = `(${response.status} ${response.statusText}) after ${attemptCount(attempt)}`;
+        if (requested !== undefined && requested > MAX_RETRY_DELAY_MS) {
+          failure += `, Retry-After asked for ${Math.ceil(requested / 1000)} seconds (more than the ${MAX_RETRY_DELAY_MS / 1000}-second cap)`;
+        } else {
+          waitMs = requested ?? backoffDelay(attempt - 1, this.jitter);
+        }
+        if (detail) failure += `: ${detail}`;
       } catch (error) {
         rethrowIfAborted(error);
-        throw new DuoApiError(`Duo API request failed for ${path} (network error: ${describeThrown(error)})`, path);
+        if (this.signal?.aborted) throw new ToolCallAbortedError(this.signal);
+        const reason = timeout.signal.aborted ? `timed out after ${this.timeoutMs} ms` : `network error: ${transportFailure(error)}`;
+        failure = `(${reason}) after ${attemptCount(attempt)}`;
+        waitMs = backoffDelay(attempt - 1, this.jitter);
+      } finally {
+        clearTimeout(timer);
       }
-      let parsed: JsonRecord | null = null;
-
-      if (text.trim().length > 0) {
-        try {
-          parsed = JSON.parse(text) as JsonRecord;
-        } catch {
-          parsed = null;
-        }
+      if (waitMs === undefined || attempt > MAX_RETRIES) {
+        throw new DuoApiError(redactErrorText(`Duo API request failed for ${path} ${failure}`), path, status);
       }
-
-      if (response.status === 429 && attempt < MAX_RETRIES) {
-        const retryAfterHeader = response.headers.get("retry-after");
-        const retryAfterMs = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) * 1000 : 0;
-        const backoffMs = retryAfterMs > 0 ? retryAfterMs : (attempt + 1) * 1000 + Math.floor(Math.random() * 250);
-        await this.sleep(backoffMs);
-        continue;
-      }
-
-      // Only the documented message fields of a JSON envelope are quoted; anything else is described by shape.
-      const detail = parsed ? parseDetailFromBody(parsed) : describeNonJsonBody(response, text);
-
-      if (!response.ok) {
-        throw new DuoApiError(
-          redactErrorText(`Duo API request failed for ${path} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`),
-          path,
-          response.status,
-        );
-      }
-
-      if (!parsed || asString(parsed.stat) !== "OK") {
-        throw new DuoApiError(
-          redactErrorText(`Duo API request returned an unexpected payload for ${path}${detail ? `: ${detail}` : ""}`),
-          path,
-          response.status,
-        );
-      }
-
-      return parsed;
+      await this.sleep(waitMs);
     }
-
-    throw new DuoApiError(`Duo API request exceeded retry budget for ${path} (429 Too Many Requests).`, path, 429);
   }
 
   private async request<T>(
@@ -2793,6 +2865,15 @@ function describeReadFailure(endpoint: string, error: string): string {
   return `${endpoint} ${error.startsWith(prefix) ? error.slice(prefix.length) : `failed: ${error}`}`;
 }
 
+/** Why the WebAuthn credential inventory cannot back an adoption count, or undefined when it was read in full. */
+function webauthnInventoryGap(credentials: CollectedDataset<JsonRecord[]>): string | undefined {
+  if (credentials.error) return `could not be read: ${describeReadFailure(DUO_ENDPOINTS.webauthnCredentials, credentials.error)}`;
+  if (credentials.complete === false) {
+    return `is incomplete: paging stopped after ${credentials.data.length} of ${credentials.total ?? "an unknown number of"} credentials`;
+  }
+  return undefined;
+}
+
 /** Snapshot count for a list dataset: null (rendered "unread") when the read failed or was never collected. */
 function readCount(dataset: CollectedDataset<unknown[]> | undefined): number | null {
   if (!dataset || dataset.error) return null;
@@ -3128,22 +3209,28 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
     const enrolledWithWebauthn = enrolledUsers.filter(userHasWebauthn);
     const u2fUsers = enrolledUsers.filter((user) => asArray(user.u2f_tokens).length > 0);
     const adoptionPercent = percentage(enrolledWithWebauthn.length, enrolledUsers.length);
-    const credentialInventory = data.webauthnCredentials.data;
+    const credentials = data.webauthnCredentials;
+    const credentialInventory = credentials.data;
     const uvCapable = credentialInventory.filter((credential) => asBoolean(credential.uv_capable) === true).length;
+    const credentialGap = webauthnInventoryGap(credentials);
+    const credentialNote = credentials.error ? undefined : inventoryNote(credentials);
     const adoptionEvidence = [
       `enrolled_users=${enrolledUsers.length}`,
       `users_with_webauthn=${enrolledWithWebauthn.length}`,
       `webauthn_adoption_percent=${adoptionPercent}`,
       `users_with_deprecated_u2f=${u2fUsers.length}`,
-      data.webauthnCredentials.error
-        ? `webauthn_inventory_error=${data.webauthnCredentials.error}`
+      credentials.error
+        ? `webauthn_inventory_error=${credentials.error}`
         : `webauthn_credentials_total=${credentialInventory.length} uv_capable=${uvCapable}`,
+      ...(credentialNote ? [`webauthn_credentials_${credentialNote}`] : []),
     ];
     recordDuoDecisionFacts("DUO-AUTH-010", {
       readable: true,
       complete: completeDuoDatasets(data.users),
       enrolled_user_count: enrolledUsers.length,
-      webauthn_user_count: enrolledWithWebauthn.length,
+      // A positive count the credential inventory could not back is unknown rather than proven, so it can never
+      // pass; a zero count stays zero, because no user record lists a credential whatever that inventory holds.
+      webauthn_user_count: credentialGap && enrolledWithWebauthn.length > 0 ? null : enrolledWithWebauthn.length,
       deprecated_u2f_user_count: u2fUsers.length,
     });
     if (enrolledUsers.length === 0) {
@@ -3156,7 +3243,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
           "Confirm enrollment first, then measure phishing-resistant credential adoption.",
         ),
       );
-    } else if (adoptionPercent >= 75 && u2fUsers.length === 0) {
+    } else if (adoptionPercent >= 75 && u2fUsers.length === 0 && !credentialGap) {
       findings.push(
         withInventoryCap(
           buildFinding(
@@ -3169,13 +3256,26 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
           data.users,
         ),
       );
+    } else if (adoptionPercent >= 75 && u2fUsers.length === 0) {
+      findings.push(
+        withInventoryCap(
+          buildFinding(
+            "DUO-AUTH-010",
+            "Partial",
+            `${adoptionPercent} percent of enrolled users have a WebAuthn credential and no deprecated U2F tokens remain, but the WebAuthn credential inventory ${credentialGap}. Adoption could not be confirmed against that inventory, so the verdict is capped at Partial.`,
+            adoptionEvidence,
+            `Rerun once ${DUO_ENDPOINTS.webauthnCredentials} can be read in full (it requires ${DUO_PERMISSIONS.readResource}), and keep WebAuthn as the default enrollment path.`,
+          ),
+          data.users,
+        ),
+      );
     } else if (enrolledWithWebauthn.length > 0) {
       findings.push(
         withInventoryCap(
           buildFinding(
             "DUO-AUTH-010",
             "Partial",
-            `${adoptionPercent} percent of enrolled users have a WebAuthn credential${u2fUsers.length > 0 ? ` and ${u2fUsers.length} still hold deprecated U2F tokens` : ""}.`,
+            `${adoptionPercent} percent of enrolled users have a WebAuthn credential${u2fUsers.length > 0 ? ` and ${u2fUsers.length} still hold deprecated U2F tokens` : ""}.${credentialGap ? ` The WebAuthn credential inventory ${credentialGap}.` : ""}`,
             adoptionEvidence,
             "Expand WebAuthn enrollment toward full coverage and migrate U2F tokens to WebAuthn.",
           ),
@@ -3188,7 +3288,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
           buildFinding(
             "DUO-AUTH-010",
             "Fail",
-            "No enrolled user has a WebAuthn credential.",
+            `No enrolled user has a WebAuthn credential.${credentialGap ? ` The WebAuthn credential inventory ${credentialGap}.` : ""}`,
             adoptionEvidence,
             "Enable WebAuthn in the authentication methods policy and run an enrollment campaign for security keys or platform authenticators.",
           ),
@@ -5618,7 +5718,8 @@ function normalizeExportArgs(args: RawConfigArgs & { output_dir?: string }): Raw
   };
 }
 
-export function registerDuoTools(pi: any): void {
+/** Every client a tool call builds gets `clientOptions` plus the call's own abort signal. */
+export function registerDuoTools(pi: any, clientOptions: Omit<DuoClientOptions, "signal"> = {}): void {
   pi = withIntegrationToolContracts(pi, DUO_SPEC);
   const authParams = {
     api_host: Type.Optional(
@@ -5659,7 +5760,7 @@ export function registerDuoTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config, { signal });
+        const client = new DuoAuditorClient(config, { ...clientOptions, signal });
         const result = await runDuoAccessCheck(client, config);
         return renderAccessCheck(result);
       } catch (error) {
@@ -5681,7 +5782,7 @@ export function registerDuoTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config, { signal });
+        const client = new DuoAuditorClient(config, { ...clientOptions, signal });
         const data = await collectDuoAuthenticationData(client, config.lookbackDays);
         return renderAssessmentToolResult(assessDuoAuthentication(data, config));
       } catch (error) {
@@ -5703,7 +5804,7 @@ export function registerDuoTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config, { signal });
+        const client = new DuoAuditorClient(config, { ...clientOptions, signal });
         const data = await collectDuoAdminAccessData(client, config.lookbackDays);
         return renderAssessmentToolResult(assessDuoAdminAccess(data, config));
       } catch (error) {
@@ -5725,7 +5826,7 @@ export function registerDuoTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config, { signal });
+        const client = new DuoAuditorClient(config, { ...clientOptions, signal });
         const data = await collectDuoIntegrationData(client);
         return renderAssessmentToolResult(assessDuoIntegrations(data, config));
       } catch (error) {
@@ -5747,7 +5848,7 @@ export function registerDuoTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config, { signal });
+        const client = new DuoAuditorClient(config, { ...clientOptions, signal });
         const data = await collectDuoMonitoringData(client, config.lookbackDays);
         return renderAssessmentToolResult(assessDuoMonitoring(data, config));
       } catch (error) {
@@ -5776,7 +5877,7 @@ export function registerDuoTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs & { output_dir?: string }, signal?: AbortSignal) {
       try {
         const config = resolveDuoConfiguration(args);
-        const client = new DuoAuditorClient(config, { signal });
+        const client = new DuoAuditorClient(config, { ...clientOptions, signal });
         const outputRoot = resolve(process.cwd(), args.output_dir ?? DEFAULT_OUTPUT_DIR);
         const result = await exportDuoAuditBundle(client, config, outputRoot, { signal });
         return textResult(buildExportText(config, result), {
@@ -5808,9 +5909,14 @@ export function duoFixedTexts(): readonly string[] {
   const htmlResponse = new Response(html, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
   const plainResponse = new Response("upstream unavailable", { status: 200, statusText: "OK" });
   const deniedDetail = parseDetailFromBody({ stat: "FAIL", code: 40301, message: "Access forbidden", message_detail: "Insufficient permissions" }) ?? "";
+  const rateLimitedDetail = parseDetailFromBody({ stat: "FAIL", code: 42901, message: "Too Many Requests" }) ?? "";
+  const attempts = attemptCount(MAX_RETRIES + 1);
   const settingsDenied = `Duo API request failed for ${DUO_ENDPOINTS.settings} (403 Forbidden): ${deniedDetail}`;
   const adminMethodsDenied = `Duo API request failed for ${DUO_ENDPOINTS.adminAllowedAuthMethods} (403 Forbidden): ${deniedDetail}`;
   const settingsReadFailure = describeReadFailure(DUO_ENDPOINTS.settings, settingsDenied);
+  const credentialsExhausted = `Duo API request failed for ${DUO_ENDPOINTS.webauthnCredentials} (503 Service Unavailable) after ${attempts}`;
+  const credentialsUnread = webauthnInventoryGap({ data: [], error: credentialsExhausted });
+  const credentialsTruncated = webauthnInventoryGap({ data: [{}, {}], total: 3, complete: false });
   return Object.freeze([
     PARSE_ERROR_NOTE,
     describeNonJsonBody(htmlResponse, html) ?? "",
@@ -5818,17 +5924,25 @@ export function duoFixedTexts(): readonly string[] {
     deniedDetail,
     settingsDenied,
     adminMethodsDenied,
-    `Duo API request failed for ${DUO_ENDPOINTS.telephonyLogs} (502 Bad Gateway): ${describeNonJsonBody(htmlResponse, html)}`,
-    `Duo API request failed for ${DUO_ENDPOINTS.settings} (network error: fetch failed)`,
+    `Duo API request failed for ${DUO_ENDPOINTS.telephonyLogs} (502 Bad Gateway) after ${attempts}: ${describeNonJsonBody(htmlResponse, html)}`,
+    `Duo API request failed for ${DUO_ENDPOINTS.settings} (429 Too Many Requests) after ${attempts}: ${rateLimitedDetail}`,
+    `Duo API request failed for ${DUO_ENDPOINTS.settings} (429 Too Many Requests) after ${attemptCount(1)}, Retry-After asked for 120 seconds (more than the ${MAX_RETRY_DELAY_MS / 1000}-second cap): ${rateLimitedDetail}`,
+    `Duo API request failed for ${DUO_ENDPOINTS.settings} (network error: fetch failed (ECONNRESET)) after ${attempts}`,
+    `Duo API request failed for ${DUO_ENDPOINTS.settings} (timed out after ${DEFAULT_REQUEST_TIMEOUT_MS} ms) after ${attempts}`,
+    credentialsExhausted,
     `Duo API request returned an unexpected payload for ${DUO_ENDPOINTS.settings}: ${describeNonJsonBody(plainResponse, "upstream unavailable")}`,
     `Duo API request returned an unexpected payload for ${DUO_ENDPOINTS.settings}`,
-    `Duo API request exceeded retry budget for ${DUO_ENDPOINTS.settings} (429 Too Many Requests).`,
     `${DUO_ENDPOINTS.offlineEnrollmentLogs} was not attempted: this client does not expose it.`,
     `${DUO_ENDPOINTS.infoSummary} was not attempted: this client does not expose it.`,
     `${DUO_ENDPOINTS.authenticationAttempts} was not attempted: this client does not expose it.`,
     uncollectedMarker(undefined).error,
     settingsReadFailure,
     describeReadFailure(DUO_ENDPOINTS.settings, "network error: fetch failed"),
+    describeReadFailure(DUO_ENDPOINTS.webauthnCredentials, credentialsExhausted),
+    `100 percent of enrolled users have a WebAuthn credential and no deprecated U2F tokens remain, but the WebAuthn credential inventory ${credentialsUnread}. Adoption could not be confirmed against that inventory, so the verdict is capped at Partial.`,
+    `100 percent of enrolled users have a WebAuthn credential and no deprecated U2F tokens remain, but the WebAuthn credential inventory ${credentialsTruncated}. Adoption could not be confirmed against that inventory, so the verdict is capped at Partial.`,
+    `No enrolled user has a WebAuthn credential. The WebAuthn credential inventory ${credentialsUnread}.`,
+    `Rerun once ${DUO_ENDPOINTS.webauthnCredentials} can be read in full (it requires ${DUO_PERMISSIONS.readResource}), and keep WebAuthn as the default enrollment path.`,
     "users: unread",
     "bypass codes: unread",
     `admin_allowed_auth_methods=unread (${describeReadFailure(DUO_ENDPOINTS.adminAllowedAuthMethods, adminMethodsDenied)}; requires ${DUO_PERMISSIONS.adminsRead}); administrator WebAuthn posture was not confirmed.`,

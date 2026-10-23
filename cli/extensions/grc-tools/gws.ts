@@ -80,6 +80,12 @@ const MAX_POLICIES = 1000;
 const MAX_PAGES = 1000;
 const MAX_TOKEN_USERS = 50;
 const MAX_RETRIES = 4;
+const RETRY_BASE_DELAY_MS = 1000;
+/** The longest wait before a retry; a Retry-After asking for more ends the read instead of being slept. */
+const MAX_RETRY_DELAY_MS = 30_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+/** The 403 reasons Google documents for quota exhaustion (Admin SDK Directory API limits); a 403 without one is a denial and is final. */
+const THROTTLE_REASONS = new Set(["userRateLimitExceeded", "rateLimitExceeded", "quotaExceeded"]);
 const TOKEN_SKEW_MS = 60 * 1000;
 const DORMANT_DAYS = 90;
 /** Endpoint names as they appear in every status, evidence line, and core_data marker. */
@@ -473,15 +479,19 @@ function scrubErrorText(text: string): string {
 }
 
 export class GwsApiError extends Error {
-  status: number;
+  /** Undefined when the last attempt timed out or failed in transport, so no status was read. */
+  status: number | undefined;
   url: string;
+  /** The last answer was a 403 naming a quota reason: the read was throttled, not denied for a missing scope or role. */
+  throttled: boolean;
 
   /** The message is scrubbed at construction, so `error.message` is already safe for every consumer. */
-  constructor(status: number, message: string, url: string) {
+  constructor(status: number | undefined, message: string, url: string, throttled = false) {
     super(scrubErrorText(message));
     this.name = "GwsApiError";
     this.status = status;
     this.url = url;
+    this.throttled = throttled;
   }
 }
 
@@ -1023,21 +1033,26 @@ export function describeErrorReasons(payload: JsonRecord): string[] {
   const reasons: string[] = [];
   const tokenErrorCode = errorIdentifier(payload.error);
   if (tokenErrorCode) reasons.push(`error ${tokenErrorCode}`);
-  const error = asRecord(payload.error);
-  const status = errorIdentifier(error.status);
+  const status = errorIdentifier(asRecord(payload.error).status);
   if (status) reasons.push(`status ${status}`);
-  const reasonCodes = [...asArray(error.errors), ...asArray(error.details)]
-    .map((entry) => errorIdentifier(asRecord(entry).reason))
-    .filter((value): value is string => value !== undefined);
-  for (const reason of Array.from(new Set(reasonCodes))) {
+  for (const reason of errorReasonCodes(payload)) {
     reasons.push(`reason ${reason}`);
   }
   return reasons;
 }
 
+/** The distinct `error.errors[].reason` and `error.details[].reason` identifiers of an error body. */
+function errorReasonCodes(payload: JsonRecord): string[] {
+  const error = asRecord(payload.error);
+  const reasonCodes = [...asArray(error.errors), ...asArray(error.details)]
+    .map((entry) => errorIdentifier(asRecord(entry).reason))
+    .filter((value): value is string => value !== undefined);
+  return Array.from(new Set(reasonCodes));
+}
+
 function classifyError(error: unknown): GwsEndpointStatus {
   if (error instanceof GwsApiError) {
-    if (error.status === 403) return "forbidden";
+    if (error.status === 403 && !error.throttled) return "forbidden";
     if (error.status === 401) return "unauthorized";
   }
   return "error";
@@ -2227,17 +2242,11 @@ export async function resolveGwsConfiguration(
 type JsonBody = { payload: JsonRecord; failure?: undefined } | { payload?: undefined; failure: string };
 
 /**
- * Reads a response body as text and parses the JSON itself, so a body that is not JSON yields a fixed description (the
- * content type and byte count) instead of the parser's message, which quotes the first characters of the body.
+ * Parses a response body read as text, so a body that is not JSON yields a fixed description (the content type and
+ * byte count) instead of the parser's message, which quotes the first characters of the body.
  */
-async function readJsonBody(response: Response): Promise<JsonBody> {
+function parseJsonBody(response: Response, text: string): JsonBody {
   const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || "untyped";
-  let text: string;
-  try {
-    text = await response.text();
-  } catch {
-    return { failure: `unreadable ${contentType} body withheld` };
-  }
   try {
     return { payload: asRecord(JSON.parse(text)) };
   } catch {
@@ -2253,26 +2262,85 @@ function describeFailedResponse(status: number, body: JsonBody): string {
   return reasons.length > 0 ? `${base} (${reasons.join(", ")})` : base;
 }
 
+function isThrottled(status: number, body: JsonBody): boolean {
+  return status === 403
+    && body.failure === undefined
+    && errorReasonCodes(body.payload).some((reason) => THROTTLE_REASONS.has(reason));
+}
+
+function isRetryableAnswer(status: number, body: JsonBody): boolean {
+  return status === 429 || status >= 500 || isThrottled(status, body);
+}
+
+/** Equal jitter: half of the exponential delay is kept and the other half is random, so parallel runs spread out without a near-zero wait. */
+function defaultJitter(delayMs: number): number {
+  return Math.round(delayMs / 2 + Math.random() * (delayMs / 2));
+}
+
+/** The wait before retry number `retry` (0 for the first) when the server named none: 1 s doubling per retry, clamped to MAX_RETRY_DELAY_MS. */
+function backoffDelay(retry: number, jitter: (delayMs: number) => number): number {
+  return Math.min(Math.max(jitter(RETRY_BASE_DELAY_MS * 2 ** retry), 0), MAX_RETRY_DELAY_MS);
+}
+
+/** Retry-After as delta-seconds or an HTTP-date, in milliseconds from `now`; undefined when absent or unparseable. */
+function retryAfterMs(header: string | null, now: number): number | undefined {
+  const value = header?.trim();
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : undefined;
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.max(at - now, 0);
+}
+
+/** A fetch rejection's message plus its cause's network code (ECONNRESET, ENOTFOUND, UND_ERR_SOCKET), which undici keeps off its "fetch failed" message. */
+function transportFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const cause = error instanceof Error ? error.cause : undefined;
+  const code = typeof cause === "object" && cause !== null ? (cause as { code?: unknown }).code : undefined;
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{1,40}$/.test(code) && !message.includes(code) ? `${message} (${code})` : message;
+}
+
+function attemptCount(count: number): string {
+  return count === 1 ? "1 attempt" : `${count} attempts`;
+}
+
+interface GwsClientOptions {
+  signal?: AbortSignal;
+  /** The wait between attempts; it is still raced against `signal`. */
+  sleep?: (ms: number) => Promise<void>;
+  /** The clock a Retry-After HTTP-date is measured against. */
+  now?: () => number;
+  jitter?: (delayMs: number) => number;
+  /** How long one attempt may run, headers and body together, before it counts as timed out. */
+  timeoutMs?: number;
+}
+
 export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly signal?: AbortSignal;
+  private readonly now: () => number;
+  private readonly jitter: (delayMs: number) => number;
+  private readonly timeoutMs: number;
 
   constructor(
     private readonly config: GwsResolvedConfig,
     fetchImpl: FetchImpl = fetch,
-    options: { signal?: AbortSignal } = {},
+    options: GwsClientOptions = {},
   ) {
     this.fetchImpl = abortableFetch(fetchImpl, options.signal);
-    this.sleep = abortableSleep(options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
     this.signal = options.signal;
+    this.now = options.now ?? Date.now;
+    this.jitter = options.jitter ?? defaultJitter;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     rememberConfigSecrets(config);
   }
 
   /** A successful status with a body that is not JSON is an explicit error naming the status, content type, and size; the body is never quoted. */
   async fetchJson(url: string, scopes: string[] = GWS_READ_SCOPES): Promise<JsonRecord> {
-    const response = await this.request(url, scopes);
-    const body = await readJsonBody(response);
+    const { response, body } = await this.request(url, scopes);
+    if (!response.ok) throw new GwsApiError(response.status, describeFailedResponse(response.status, body), url);
     if (body.failure !== undefined) {
       throw new GwsApiError(response.status, `${httpStatusLabel(response.status)} with ${body.failure}`, url);
     }
@@ -2282,7 +2350,7 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
   async probe(url: string, scopes: string[] = GWS_READ_SCOPES): Promise<GwsAccessProbe> {
     const pathname = new URL(url).pathname;
     try {
-      const response = await this.request(url, scopes, { allowFailure: true });
+      const { response, body } = await this.request(url, scopes);
       if (!response.ok) {
         return {
           key: basename(pathname) || pathname,
@@ -2293,7 +2361,6 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
       }
       // A 2xx whose body is not JSON (an intercepting proxy page, a sign-in page) is not API access; the probe reports
       // the same fixed description the assessments render for that response, and never the body.
-      const body = await readJsonBody(response);
       if (body.failure !== undefined) {
         return {
           key: basename(pathname) || pathname,
@@ -2445,40 +2512,72 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
     return asArray(payload.items).map(asRecord);
   }
 
-  private async request(
-    url: string,
-    scopes: string[],
-    options: { allowFailure?: boolean; attempt?: number } = {},
-  ): Promise<Response> {
-    const attempt = options.attempt ?? 0;
-    const token = await this.getAccessToken(scopes);
-    const response = await this.fetchImpl(url, {
-      method: "GET",
-      headers: {
-        authorization: `Bearer ${token}`,
-        accept: "application/json",
-      },
-    });
-
-    if (response.ok || options.allowFailure) {
-      return response;
+  /**
+   * A GET with the bearer token for `scopes`. In service-account mode a 401 evicts the cached token and the request is
+   * sent once more with a new one; a direct access token has nothing to refresh, so its 401 is the answer.
+   */
+  private async request(url: string, scopes: string[]): Promise<{ response: Response; body: JsonBody }> {
+    let reauthenticated = false;
+    while (true) {
+      const token = await this.getAccessToken(scopes);
+      const answer = await this.send(url, "Google Workspace API request", () => ({
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/json",
+        },
+      }));
+      if (answer.response.status === 401 && this.config.authMode === "service_account" && !reauthenticated) {
+        reauthenticated = true;
+        this.clearToken(scopes);
+        continue;
+      }
+      return answer;
     }
-
-    if (response.status === 401 && attempt < MAX_RETRIES) {
-      this.clearToken(scopes);
-      return this.request(url, scopes, { ...options, attempt: attempt + 1 });
-    }
-
-    if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
-      await this.sleep(250 * 2 ** attempt);
-      return this.request(url, scopes, { ...options, attempt: attempt + 1 });
-    }
-
-    throw new GwsApiError(response.status, await this.readError(response), url);
   }
 
-  private async readError(response: Response): Promise<string> {
-    return describeFailedResponse(response.status, await readJsonBody(response));
+  /**
+   * Sends one request and reads its body, retrying a 429, 5xx, or throttling 403 answer, an attempt that runs past
+   * timeoutMs, and a transport failure up to MAX_RETRIES times. The first other answer is returned whatever its
+   * status. Running out of retries, or a Retry-After asking for more than MAX_RETRY_DELAY_MS, throws a GwsApiError
+   * naming the path (never the query), the attempt count, and the last status or failure. `init` is built per attempt.
+   */
+  private async send(url: string, label: string, init: () => RequestInit): Promise<{ response: Response; body: JsonBody }> {
+    const path = new URL(url).pathname;
+    for (let attempt = 1; ; attempt += 1) {
+      const requestInit = init();
+      const timeout = new AbortController();
+      const timer = setTimeout(() => timeout.abort(), this.timeoutMs);
+      let status: number | undefined;
+      let throttled = false;
+      let failure: string;
+      let waitMs: number | undefined;
+      try {
+        const response = await this.fetchImpl(url, { ...requestInit, signal: timeout.signal });
+        const body = parseJsonBody(response, await response.text());
+        if (!isRetryableAnswer(response.status, body)) return { response, body };
+        const requested = retryAfterMs(response.headers.get("retry-after"), this.now());
+        status = response.status;
+        throttled = isThrottled(response.status, body);
+        failure = describeFailedResponse(response.status, body);
+        if (requested !== undefined && requested > MAX_RETRY_DELAY_MS) {
+          failure += `, Retry-After asked for ${Math.ceil(requested / 1000)} seconds (more than the ${MAX_RETRY_DELAY_MS / 1000}-second cap)`;
+        } else {
+          waitMs = requested ?? backoffDelay(attempt - 1, this.jitter);
+        }
+      } catch (error) {
+        rethrowIfAborted(error);
+        if (this.signal?.aborted) throw new ToolCallAbortedError(this.signal);
+        failure = timeout.signal.aborted ? `timed out after ${this.timeoutMs} ms` : `network error: ${transportFailure(error)}`;
+        waitMs = backoffDelay(attempt - 1, this.jitter);
+      } finally {
+        clearTimeout(timer);
+      }
+      if (waitMs === undefined || attempt > MAX_RETRIES) {
+        throw new GwsApiError(status, `${label} failed for ${path} after ${attemptCount(attempt)}: ${failure}`, url, throttled);
+      }
+      await this.sleep(waitMs);
+    }
   }
 
   private clearToken(scopes: string[]): void {
@@ -2519,9 +2618,10 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
     return pending;
   }
 
+  /** Minting a token creates no server-side state, so the POST is retried like a read; one assertion (valid for an hour) serves every attempt. */
   private async fetchServiceAccountAccessToken(scopes: string[]): Promise<{ token: string; expiresAt: number }> {
     const assertion = buildJwtAssertion(this.config, scopes);
-    const response = await this.fetchImpl(this.config.tokenUri, {
+    const { response, body } = await this.send(this.config.tokenUri, "Google access token request", () => ({
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded",
@@ -2530,17 +2630,15 @@ export class GoogleWorkspaceAuditorClient implements GwsAuditCollector {
         grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
         assertion,
       }),
-    });
+    }));
 
     if (!response.ok) {
-      const failure = await readJsonBody(response);
       throw new GwsTokenExchangeError(
-        `Failed to obtain Google access token: ${describeFailedResponse(response.status, failure)}`,
-        failure.failure === undefined ? errorIdentifier(failure.payload.error) : undefined,
+        `Failed to obtain Google access token: ${describeFailedResponse(response.status, body)}`,
+        body.failure === undefined ? errorIdentifier(body.payload.error) : undefined,
       );
     }
 
-    const body = await readJsonBody(response);
     if (body.failure !== undefined) {
       throw new Error(`Google token exchange returned ${httpStatusLabel(response.status)} with ${body.failure}.`);
     }
@@ -4259,7 +4357,8 @@ export async function exportGwsAuditBundle(
   };
 }
 
-export function registerGwsTools(pi: any): void {
+/** Every client a tool call builds gets `clientOptions` plus the call's own abort signal. */
+export function registerGwsTools(pi: any, clientOptions: Omit<GwsClientOptions, "signal"> = {}): void {
   pi = withIntegrationToolContracts(pi, GWS_SPEC);
   const authParams = {
     auth_mode: Type.Optional(
@@ -4316,7 +4415,7 @@ export function registerGwsTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { ...clientOptions, signal });
         const result = await runGwsAccessCheck(client, config);
         return renderAccessCheck(result, config);
       } catch (error) {
@@ -4335,7 +4434,7 @@ export function registerGwsTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { ...clientOptions, signal });
         const data = await collectGwsIdentityData(client);
         return renderAssessmentToolResult(assessGwsIdentity(data, config), config);
       } catch (error) {
@@ -4354,7 +4453,7 @@ export function registerGwsTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { ...clientOptions, signal });
         const data = await collectGwsAdminAccessData(client);
         return renderAssessmentToolResult(assessGwsAdminAccess(data, config), config);
       } catch (error) {
@@ -4373,7 +4472,7 @@ export function registerGwsTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { ...clientOptions, signal });
         const data = await collectGwsIntegrationData(client);
         return renderAssessmentToolResult(assessGwsIntegrations(data, config), config);
       } catch (error) {
@@ -4392,7 +4491,7 @@ export function registerGwsTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { ...clientOptions, signal });
         const data = await collectGwsMonitoringData(client);
         return renderAssessmentToolResult(assessGwsMonitoring(data, config), config);
       } catch (error) {
@@ -4423,7 +4522,7 @@ export function registerGwsTools(pi: any): void {
     async execute(_toolCallId: string, args: RawConfigArgs & { output_dir?: string; frameworks?: string[] }, signal?: AbortSignal) {
       try {
         const config = await resolveGwsConfiguration(args);
-        const client = new GoogleWorkspaceAuditorClient(config, fetch, { signal });
+        const client = new GoogleWorkspaceAuditorClient(config, fetch, { ...clientOptions, signal });
         const frameworks = normalizeFrameworkSelection(args.frameworks);
         const result = await exportGwsAuditBundle(
           client,

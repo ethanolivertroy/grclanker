@@ -186,7 +186,7 @@ const decisions: Readonly<Record<string, string>> = {
   "OKTA-INTEG-001": "return fail when any ACTIVE trusted origin uses HTTP or a wildcard, pass when at least one ACTIVE origin exists and none is insecure, info when the complete inventory has no ACTIVE origin because origins are optional, and manual when the inventory is unreadable.",
   "OKTA-INTEG-002": "return pass when at least one ACTIVE non-system, non-LegacyIpZone custom zone exists, warn when a non-empty complete zone inventory has none, and manual when the zone inventory is empty or unreadable.",
   "OKTA-INTEG-003": "return fail when any ACTIVE OIDC app uses password or implicit grants, warn when only inactive apps retain those grants, and pass when no app does.",
-  "OKTA-INTEG-004": "return pass when any ACTIVE sign-on or access rule uses risk, device, behavior, or network context, warn when custom zones exist without such a rule or reads are partial, and fail when complete evidence has neither.",
+  "OKTA-INTEG-004": "return pass when any ACTIVE sign-on or access rule uses risk, device, behavior, or network context and the network-zone inventory was read, warn when custom zones exist without such a rule, reads are partial, or the zone inventory is unreadable beside such a rule, fail when complete evidence has neither, and manual when policies are unreadable or no such rule exists and the zone inventory is unreadable.",
   "OKTA-INTEG-005": "return pass when every application is ACTIVE, warn when any application is inactive or restricted, and manual when the app inventory is empty or unreadable.",
   "OKTA-INTEG-006": "return pass when any ACTIVE provisioning app has PUSH_USER_DEACTIVATION, fail when provisioning exists but none pushes deactivation, warn when no provisioning feature is visible or group rules are partial, and manual when apps are unavailable.",
   "OKTA-MON-001": "return pass when any ACTIVE log stream exists, warn when only ACTIVE event hooks exist or a pass has partial companion evidence, and fail when complete evidence has neither.",
@@ -297,7 +297,8 @@ const inputWith = (
 ): Readonly<Record<string, string>> => Object.fromEntries(
   names.map((name) => [name, overrides[name] ?? input(name)[name]]),
 );
-const unavailable = any(ne("readable", true), { op: "not", condition: { op: "defined", operand: path("readable") } });
+const missing = (name: string): VerdictCondition => ({ op: "not", condition: { op: "defined", operand: path(name) } });
+const unavailable = any(ne("readable", true), missing("readable"));
 const incomplete = ne("complete", true);
 
 const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>> = {
@@ -495,11 +496,16 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     }),
   },
   "OKTA-INTEG-004": {
-    inputs: input("policy_readable", "complete", "risk_aware_rule_count", "custom_zone_count"),
+    inputs: inputWith(
+      {
+        custom_zone_count: "Non-negative cardinality of ACTIVE network zones that are neither system zones nor the LegacyIpZone, or null when the network-zone read failed, was denied, or was not collected, so custom zone coverage is unknown.",
+      },
+      "policy_readable", "complete", "risk_aware_rule_count", "custom_zone_count",
+    ),
     rules: ordered({
-      manual: ne("policy_readable", true),
+      manual: any(ne("policy_readable", true), all(eq("risk_aware_rule_count", 0), missing("custom_zone_count"))),
       fail: all(eq("risk_aware_rule_count", 0), eq("custom_zone_count", 0)),
-      warn: any(incomplete, eq("risk_aware_rule_count", 0)),
+      warn: any(incomplete, eq("risk_aware_rule_count", 0), missing("custom_zone_count")),
       pass: gt("risk_aware_rule_count", 0),
     }),
   },
@@ -713,13 +719,13 @@ export const OKTA_SPEC = buildBatchIntegrationSpec({
     documentedLimit: "Endpoint-specific Okta rate-limit buckets",
     retryHeaders: ["Retry-After", "X-Rate-Limit-Reset"],
     retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Honor bounded Retry-After or reset delays, then use bounded exponential retry; preserve exhaustion as unreadable evidence.",
+    backoffPolicy: "Retry 429 and 500/502/503/504 answers, attempts that pass the 30-second per-request timeout, and transport failures up to four times (five attempts), the OAuth token request included. Each wait honors Retry-After (delta-seconds or HTTP-date) on any retried status, else X-Rate-Limit-Reset on a 429, else exponential backoff from 1 second with jitter, every wait clamped to 15 seconds. Exhaustion names the path, the last status or failure, and the attempt count, and leaves the dataset unreadable evidence; a tool-call abort is never retried.",
   },
   runtimeBehavior: OKTA_RUNTIME_BEHAVIOR,
   knownGaps: [
     "Lifecycle workflow and broader trust-center evidence remain manual or deferred.",
     "OKTA-ADMIN-004 has a collector-unreachable mismatched-ID state in which zero of N identified privileged users receive factor results. Across 36 deduplicated measured variants, main emits Pass for 31, Partial for 3, and Manual for 2; this branch preserves the 2 Manual variants but its strict metadata/runtime assertion throws for the other 34. A separate runtime fix must define one stable non-pass outcome and matching prose without disguising the current inconsistency.",
-    "OKTA-INTEG-004 can emit Pass when a readable contextual policy rule exists even if the network-zone read is denied. Network-zone denial does not make its `complete` fact false; this main-compatible limitation requires a separate runtime change if zone evidence is to gate Pass.",
+    "OKTA-INTEG-004 records the custom zone count as unknown when the network-zone read is denied, fails, or exhausts its retries, so a readable contextual policy rule yields Partial rather than Pass and its absence yields Manual. Network-zone denial still does not make its `complete` fact false, because only zone truncation owns that fact; the unknown zone count is what keeps the finding below Pass.",
     "OKTA-AUTH-001 and OKTA-AUTH-009 can retain Pass when the organization-factor read is denied because their runtime readability gate is owned by the authenticator inventory and their completeness fact considers truncation, not organization-factor read errors or denials. A separate runtime change is required if organization-factor readability should gate Pass.",
   ],
   sensitiveFields: ["apiToken", "clientAssertion", "privateKey", "credentials", "authorization", "cookie"],
