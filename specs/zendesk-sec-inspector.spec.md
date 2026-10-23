@@ -295,7 +295,7 @@ Malformed configuration: Reject malformed or ambiguous configuration before any 
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| Zendesk Security Inspector | 400 requests/minute on Team and 700 requests/minute on Professional or Enterprise by default | `Retry-After`, `X-Rate-Limit`, `X-Rate-Limit-Remaining` | 429, 500, 502, 503, 504 | Honor bounded Retry-After and retry transient failures; expose exhausted reads without copying response bodies. |
+| Zendesk Security Inspector | 400 requests/minute on Team and 700 requests/minute on Professional or Enterprise by default | `Retry-After` | 429, 500-599 | Retry a 429 up to 3 times, waiting for its Retry-After header (seconds or an HTTP date) or else 1 second doubled per retry. Retry every 5xx status, request timeouts (30 seconds unless timeout_seconds or ZENDESK_TIMEOUT sets it), and network errors up to 2 times between them, waiting for a 5xx's Retry-After or else 500 ms, then 1 second. Every wait is clamped to 30 seconds, and a read makes at most 6 attempts. A tool-call abort is never retried. An exhausted read stays unreadable, and its error names the path, the last status, timeout, or network error, and the attempt count, describing a non-JSON body without copying it. |
 
 ## Checks
 

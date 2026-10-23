@@ -38,6 +38,7 @@ const DEFAULT_MAX_ITEMS = 2000;
 const DEFAULT_MAX_PAGES = 100;
 const DEFAULT_RATE_LIMIT_RETRIES = 3;
 const DEFAULT_SERVER_ERROR_RETRIES = 2;
+const MAX_RETRY_WAIT_MS = 30_000;
 const DEFAULT_ADMIN_THRESHOLD = 5;
 const DEFAULT_SUSPENDED_TICKET_AGE_DAYS = 30;
 const DEFAULT_STALE_DAYS = 90;
@@ -1545,6 +1546,20 @@ function endpointLabel(url: string): string {
   }
 }
 
+// The path an error message names for a read: a next link or a built URL loses its origin and query.
+function requestPath(pathOrUrl: string): string {
+  try {
+    return new URL(pathOrUrl).pathname;
+  } catch {
+    return pathOrUrl.split("?")[0];
+  }
+}
+
+// Names the attempt count once a read was retried, so an exhausted retry budget reads as such.
+function afterAttempts(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
 /**
  * A server-supplied next link (links.next, next_page) the client refused to follow: the
  * request that would have carried the credential to it never left. The message is fixed
@@ -1777,23 +1792,20 @@ export function describeNonDocumentBody(response: Response, rawText: string, mem
   return `${base} with a JSON ${jsonValueKind(body.parsed)} response body (${size}) where the documented JSON document was expected`;
 }
 
-function retryDelayMs(response: Response): number {
-  const retryAfter = response.headers.get("retry-after");
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 30_000);
-    const asDate = new Date(retryAfter);
-    if (!Number.isNaN(asDate.getTime())) {
-      return Math.min(Math.max(asDate.getTime() - Date.now(), 0), 30_000);
-    }
-  }
-  return 1000;
+// Retry-After in milliseconds, as delta-seconds or an HTTP-date measured against `now`; undefined when absent or unreadable.
+function retryAfterMs(value: string | null, now: Date): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : undefined;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : Math.max(date - now.getTime(), 0);
 }
 
 export class ZendeskApiClient {
   private readonly config: ZendeskResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly now: () => Date;
 
   constructor(
     config: ZendeskResolvedConfig,
@@ -1801,11 +1813,13 @@ export class ZendeskApiClient {
       fetchImpl?: FetchImpl;
       sleep?: (ms: number) => Promise<void>;
       signal?: AbortSignal;
+      now?: () => Date;
     } = {},
   ) {
     this.config = config;
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleep = abortableSleep(options.signal, options.sleep);
+    this.now = options.now ?? (() => new Date());
   }
 
   getResolvedConfig(): ZendeskResolvedConfig {
@@ -1847,12 +1861,12 @@ export class ZendeskApiClient {
     return url.toString();
   }
 
-  private async request(url: string, attempt = 0, serverErrors = 0): Promise<Response> {
+  // A response that never arrived (the request timed out or the transport failed) is a ZendeskApiError with status 0.
+  private async fetchOnce(url: string, attempts: number): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
-    let response: Response;
     try {
-      response = await this.fetchImpl(url, {
+      return await this.fetchImpl(url, {
         method: "GET",
         headers: {
           accept: "application/json",
@@ -1862,21 +1876,50 @@ export class ZendeskApiClient {
       });
     } catch (error) {
       rethrowIfAborted(error);
-      const message = error instanceof Error ? error.message : String(error);
-      throw new ZendeskApiError(this.redact(`Zendesk request failed for ${url}: ${message}`), 0, endpointLabel(url));
+      const reason = controller.signal.aborted
+        ? `timed out after ${this.config.timeoutMs} ms`
+        : error instanceof Error ? error.message : String(error);
+      throw new ZendeskApiError(this.redact(`Zendesk request failed for ${requestPath(url)}${afterAttempts(attempts)}: ${reason}`), 0, endpointLabel(url));
     } finally {
       clearTimeout(timeout);
     }
+  }
 
-    if (response.status === 429 && attempt < DEFAULT_RATE_LIMIT_RETRIES) {
-      await this.sleep(retryDelayMs(response));
-      return this.request(url, attempt + 1, serverErrors);
+  // The wait before a retry: the server's Retry-After when it sent one, else `backoffMs`, never past the 30 s cap.
+  private retryDelayMs(response: Response, backoffMs: number): number {
+    return Math.min(retryAfterMs(response.headers.get("retry-after"), this.now()) ?? backoffMs, MAX_RETRY_WAIT_MS);
+  }
+
+  /**
+   * One GET, retried up to DEFAULT_RATE_LIMIT_RETRIES times on a 429 and up to DEFAULT_SERVER_ERROR_RETRIES
+   * times on a 5xx, a timeout, or a transport failure, with exponential backoff; a tool-call abort is never
+   * retried. Resolves with the final response and the attempts made.
+   */
+  private async request(url: string): Promise<{ response: Response; attempts: number }> {
+    let rateLimited = 0;
+    let serverErrors = 0;
+    for (let attempts = 1; ; attempts += 1) {
+      let response: Response;
+      try {
+        response = await this.fetchOnce(url, attempts);
+      } catch (error) {
+        if (!(error instanceof ZendeskApiError) || serverErrors >= DEFAULT_SERVER_ERROR_RETRIES) throw error;
+        await this.sleep(500 * 2 ** serverErrors);
+        serverErrors += 1;
+        continue;
+      }
+      if (response.status === 429 && rateLimited < DEFAULT_RATE_LIMIT_RETRIES) {
+        await this.sleep(this.retryDelayMs(response, 1000 * 2 ** rateLimited));
+        rateLimited += 1;
+        continue;
+      }
+      if (response.status >= 500 && serverErrors < DEFAULT_SERVER_ERROR_RETRIES) {
+        await this.sleep(this.retryDelayMs(response, 500 * 2 ** serverErrors));
+        serverErrors += 1;
+        continue;
+      }
+      return { response, attempts };
     }
-    if (response.status >= 500 && serverErrors < DEFAULT_SERVER_ERROR_RETRIES) {
-      await this.sleep(500 * (serverErrors + 1));
-      return this.request(url, attempt, serverErrors + 1);
-    }
-    return response;
   }
 
   async get(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
@@ -1926,11 +1969,11 @@ export class ZendeskApiClient {
    * record it as an error with that status and never as an empty inventory.
    */
   private async getDocument(url: string, path: string): Promise<ZendeskDocument> {
-    const response = await this.request(url);
+    const { response, attempts } = await this.request(url);
     const rawText = await response.text();
     if (!response.ok) {
       throw new ZendeskApiError(
-        this.redact(`Zendesk request failed for ${path} (${describeErrorBody(response, rawText, (text) => this.redact(text))})`),
+        this.redact(`Zendesk request failed for ${requestPath(path)}${afterAttempts(attempts)} (${describeErrorBody(response, rawText, (text) => this.redact(text))})`),
         response.status,
         endpointLabel(url),
       );
