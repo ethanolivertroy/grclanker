@@ -4817,7 +4817,7 @@ const authParams = {
   base_url: Type.Optional(Type.String({ description: "Explicit API base URL override (for example https://api.ddog-gov.com). Defaults to DD_HOST or https://api.<site>." })),
   config_file: Type.Optional(Type.String({ description: "Path to a dogshell-style INI config with a [Connection] section (apikey, appkey, api_host). Defaults to DD_CONFIG_FILE, then ~/.dogrc." })),
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout in seconds. Defaults to 30.", default: 30 })),
-  max_retries: Type.Optional(Type.Number({ description: "Retries for 429 and 5xx responses (429 honors X-RateLimit-Reset). Defaults to 3.", default: 3 })),
+  max_retries: Type.Optional(Type.Number({ description: "Retries for 429 and 5xx responses, timeouts, and transport failures (429 honors X-RateLimit-Reset, then Retry-After). Defaults to 3.", default: 3 })),
 };
 
 const identityParams = {
