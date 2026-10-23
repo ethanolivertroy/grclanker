@@ -2241,11 +2241,16 @@ function truncationNote(
 function truncationCaveat(notes: LaunchdarklyTruncationNote[]): string {
   const parts = notes.map((note) =>
     `${note.collection}${note.scope ? ` for ${note.scope}` : ""} (${note.seen} of ${note.total ?? "an unknown total"} collected${note.reason ? `; ${note.reason}` : ""})`);
-  // A listing that stopped for a reason other than its cap is not fixed by raising the cap, so its option is not offered.
-  const options = uniqueStrings(notes.filter((note) => !note.reason).map((note) => note.option).filter((option): option is string => Boolean(option)));
-  const remedy = options.length > 0
-    ? `raise ${options.join(" and ")} and rerun for a complete evaluation`
-    : "review the uncollected items manually";
+  // Raising a cap is offered only for a listing that stopped at a cap an argument controls. A listing that stopped for
+  // another reason, or whose cap no argument raises, is left to manual review, so a rerun is never promised to complete it.
+  const raisable = notes.filter((note) => !note.reason && note.option);
+  const options = uniqueStrings(raisable.map((note) => note.option).filter((option): option is string => Boolean(option)));
+  const unraisable = uniqueStrings(notes.filter((note) => !raisable.includes(note)).map((note) => note.collection));
+  const remedy = options.length === 0
+    ? "review the uncollected items manually"
+    : unraisable.length === 0
+      ? `raise ${options.join(" and ")} and rerun for a complete evaluation`
+      : `raise ${options.join(" and ")} and rerun, and review the uncollected ${unraisable.join(" and ")} manually`;
   return `Truncated listing: ${parts.join("; ")}. The verdict covers only the collected items, so ${remedy}.`;
 }
 
@@ -2419,7 +2424,7 @@ export async function assessLaunchdarklyIdentity(
 
   const memberNotes = truncationNote("members", "member_limit", memberCollection);
   const teamNotes = truncationNote("teams", "team_limit", teamCollection);
-  const teamRoleNotes = teamRoles.flatMap((team) => truncationNote("team_roles", "role_limit", team.collection, `team ${team.key}`));
+  const teamRoleNotes = teamRoles.flatMap((team) => truncationNote("team_roles", undefined, team.collection, `team ${team.key}`));
   const membersGap = inventoryGap(
     "members",
     MEMBERS_REQUEST,
@@ -2918,7 +2923,7 @@ export async function assessLaunchdarklyAccessControl(
   const membersComplete = isComplete(memberCollection);
   const roleNotes = truncationNote("custom_roles", "role_limit", roleCollection);
   const tokenNotes = truncationNote("access_tokens", "token_limit", tokenCollection);
-  const memberNotes = truncationNote("members", "member_limit", memberCollection);
+  const memberNotes = truncationNote("members", undefined, memberCollection);
   const callerIdentity = parseCallerIdentity(callerRead.payload);
   const rolesGap = inventoryGap(
     "custom_roles",
@@ -3249,7 +3254,14 @@ function environmentsRequest(projectKey: string): string {
 async function collectEnvironmentContexts(
   client: Pick<LaunchdarklyApiClient, "listProjects" | "listEnvironments">,
   errors: string[],
-  options: { projectLimit: number; environmentLimit: number; projectKeys: string[]; productionPattern: RegExp; projectLimitOption?: string },
+  options: {
+    projectLimit: number;
+    environmentLimit: number;
+    projectKeys: string[];
+    productionPattern: RegExp;
+    projectLimitOption?: string;
+    environmentLimitOption?: string;
+  },
 ): Promise<EnvironmentInventory> {
   const projects = withKeyFilterReason(
     await collectList(
@@ -3289,7 +3301,7 @@ async function collectEnvironmentContexts(
   const notes = [
     ...truncationNote("projects", options.projectLimitOption, projects),
     ...environmentCollections.flatMap((entry) =>
-      truncationNote("environments", "environment_limit", entry.collection, `project ${entry.projectKey}`)),
+      truncationNote("environments", options.environmentLimitOption, entry.collection, `project ${entry.projectKey}`)),
   ];
   const unreadableProjects = environmentCollections.filter((entry) => !isRead(entry.collection)).map((entry) => entry.projectKey);
   const request = projectsRequest(options.projectKeys);
@@ -3565,6 +3577,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
     projectKeys: options.projectKeys && options.projectKeys.length > 0 ? options.projectKeys : config.projectKeys,
     productionPattern,
     projectLimitOption: "project_limit",
+    environmentLimitOption: "environment_limit",
   });
   const projects = inventory.projects.items;
   const environments = inventory.environments;
@@ -3586,7 +3599,7 @@ export async function assessLaunchdarklyEnvironmentGovernance(
   }));
   const unreadableSdkKeyEnvironments = sdkKeyResults.filter((result) => !result.readable);
 
-  const roleNotes = truncationNote("custom_roles", "role_limit", roleCollection);
+  const roleNotes = truncationNote("custom_roles", undefined, roleCollection);
   const sdkKeyNotes = sdkKeyResults.flatMap((result) =>
     truncationNote("sdk_keys", undefined, result.collection, `environment ${environmentLabel(result.context)}`));
   const rolesGap = inventoryGap(

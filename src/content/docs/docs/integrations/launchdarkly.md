@@ -221,7 +221,7 @@ Otherwise it runs `launchdarkly_check_access` and the access control assessment,
     - Every finding carries a `token_inventory` evidence block.
 - Listing limits are verdict boundaries, not silent caps.
   - Defaults are 1000 members, 100 teams, 200 roles, 500 tokens, 50 projects, 50 environments per project, and 500 flags per environment.
-  - When an account exceeds a limit, the affected findings `warn` with the seen versus total counts and name the argument to raise. They never `pass` on a slice of the data.
+  - When an account exceeds a limit, the affected findings `warn` with the seen versus total counts and name the argument to raise, or say to review the uncollected items manually when no argument raises that listing's cap. They never `pass` on a slice of the data.
 - Audit log sampling is intentional (20 entries per query) and is not treated as truncation. Controls 12 and 13 are presence probes rather than inventory claims.
 
 ## How the tools handle evidence
@@ -366,7 +366,7 @@ The cap argument is not offered as the remedy, because raising it cannot help.
 When a finding depends on a truncated collection:
 
 - A clean verdict becomes `warn`.
-- The summary ends with `Truncated listing: <collection> (<seen> of <total> collected)` plus the argument to raise. When no argument applies (SDK keys, the single-request listings, or a listing that stopped for another reason), it says to review the uncollected items manually instead.
+- The summary ends with `Truncated listing: <collection> (<seen> of <total> collected)` plus the argument to raise. When no argument applies (team roles, SDK keys, a listing the assessment reads at its fixed default cap, the single-request listings, or a listing that stopped for another reason), it says to review the uncollected items manually instead. When only some of the truncated listings have an argument, it names those arguments and says to review the other listings manually.
 - The evidence carries `truncated_collections` with the seen versus total counts.
 
 Failing verdicts stay `fail`.

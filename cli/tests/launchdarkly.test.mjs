@@ -1550,9 +1550,88 @@ test("assessLaunchdarklyAccessControl never passes role or token controls on tru
   // "No personal token is orphaned" is an absence claim over the member listing, which a truncated read cannot support.
   assert.equal(finding(truncatedMembers, "LD-11").evidence.orphaned_personal_tokens, null);
   assert.equal(truncatedMembers.summary.orphaned_personal_tokens, null);
+  // launchdarkly_assess_access_control takes no member_limit, so the caveat cannot offer one.
   assert.deepEqual(finding(truncatedMembers, "LD-11").evidence.truncated_collections, [
-    { collection: "members", option: "member_limit", seen: 1, total: 400 },
+    { collection: "members", seen: 1, total: 400 },
   ]);
+  assert.match(finding(truncatedMembers, "LD-11").summary, /review the uncollected items manually/);
+  assert.doesNotMatch(finding(truncatedMembers, "LD-11").summary, /member_limit/);
+});
+
+test("a truncated listing advises raising only a limit argument its assessment accepts and applies to that listing", async () => {
+  // Where each paginated listing passes its cap to the client.
+  const CAP_ARGUMENT = {
+    members: { method: "listMembers", position: 0 },
+    teams: { method: "listTeams", position: 0 },
+    team_roles: { method: "listTeamRoles", position: 1 },
+    custom_roles: { method: "listCustomRoles", position: 0 },
+    access_tokens: { method: "listTokens", position: 0 },
+    projects: { method: "listProjects", position: 0 },
+    environments: { method: "listEnvironments", position: 1 },
+    flags: { method: "listFlags", position: 2 },
+  };
+  const RAISED = 321;
+  const tools = new Map();
+  registerLaunchdarklyTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const truncatingClient = (calls = []) => {
+    const reference = healthyClient();
+    return healthyClient(Object.fromEntries(Object.values(CAP_ARGUMENT).map(({ method }) => [method, (...args) => {
+      calls.push({ method, args });
+      return truncatedListing(reference, method, 1, 999, ...args);
+    }])));
+  };
+  const optionKey = (argument) => argument.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+
+  const problems = [];
+  for (const [toolName, assess] of [
+    ["launchdarkly_assess_identity", assessLaunchdarklyIdentity],
+    ["launchdarkly_assess_access_control", assessLaunchdarklyAccessControl],
+    ["launchdarkly_assess_environment_governance", assessLaunchdarklyEnvironmentGovernance],
+    ["launchdarkly_assess_flag_hygiene", assessLaunchdarklyFlagHygiene],
+    ["launchdarkly_assess_monitoring_integrations", assessLaunchdarklyMonitoringIntegrations],
+  ]) {
+    const accepted = Object.keys(tools.get(toolName).parameters.properties).filter((name) => name.endsWith("_limit"));
+    const result = await assess(truncatingClient(), { now: NOW });
+    const advice = new Map();
+    for (const note of result.findings.flatMap((item) => item.evidence?.truncated_collections ?? [])) {
+      if (note.option) advice.set(`${note.collection} ${note.option}`, note);
+    }
+    for (const { collection, option } of advice.values()) {
+      if (!accepted.includes(option)) problems.push(`${toolName}: ${collection} advises raising ${option}, which the tool does not accept`);
+      const calls = [];
+      await assess(truncatingClient(calls), { now: NOW, [optionKey(option)]: RAISED });
+      const { method, position } = CAP_ARGUMENT[collection];
+      const caps = calls.filter((call) => call.method === method).map((call) => call.args[position]);
+      if (caps.length === 0 || caps.some((cap) => cap !== RAISED)) {
+        const requested = caps.length === 0 ? "never requested" : `still requested with cap ${caps.map((cap) => cap ?? "(client default)").join(", ")}`;
+        problems.push(`${toolName}: ${collection} advises raising ${option}, but with ${option}=${RAISED} it is ${requested}`);
+      }
+    }
+    const advised = new Set([...advice.values()].map((note) => note.option));
+    for (const argument of accepted.filter((name) => !advised.has(name))) {
+      problems.push(`${toolName}: accepts ${argument} but never advises raising it for a truncated listing`);
+    }
+  }
+  assert.deepEqual(problems, []);
+});
+
+test("a truncated team role listing says to review the uncollected roles manually, because no argument raises its cap", async () => {
+  const reference = healthyClient();
+  const truncatedTeamRoles = (...args) => truncatedListing(reference, "listTeamRoles", 1, 250, ...args);
+
+  const rolesOnly = finding(await assessLaunchdarklyIdentity(healthyClient({ listTeamRoles: truncatedTeamRoles }), { now: NOW }), "LD-07");
+  assert.equal(rolesOnly.status, "warn");
+  assert.match(rolesOnly.summary, /Truncated listing: team_roles for team platform \(1 of 250 collected\)\. The verdict covers only the collected items, so review the uncollected items manually\./);
+  assert.doesNotMatch(rolesOnly.summary, /role_limit/);
+  assert.deepEqual(rolesOnly.evidence.truncated_collections, [{ collection: "team_roles", seen: 1, total: 250, scope: "team platform" }]);
+
+  // With a raisable listing truncated too, the caveat offers its argument without promising that rerunning completes the rest.
+  const withMembers = finding(await assessLaunchdarklyIdentity(healthyClient({
+    listMembers: () => truncatedListing(reference, "listMembers", 3, 400),
+    listTeamRoles: truncatedTeamRoles,
+  }), { now: NOW }), "LD-07");
+  assert.match(withMembers.summary, /The verdict covers only the collected items, so raise member_limit and rerun, and review the uncollected team_roles manually\./);
+  assert.doesNotMatch(withMembers.summary, /complete evaluation/);
 });
 
 test("CodeRabbit on #77: a token listing stopped by a refused next link renders the refusal in the token inventory caveat with no token_limit remedy, while a cap stop still offers token_limit", async () => {
