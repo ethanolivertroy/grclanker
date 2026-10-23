@@ -40,6 +40,7 @@ import {
   runGwsAccessCheck,
 } from "../dist/extensions/grc-tools/gws.js";
 import { GWS_SPEC } from "../dist/extensions/grc-tools/gws.spec.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
 import {
@@ -50,6 +51,7 @@ import {
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed, assertSecretFragmentsAbsent } from "./helpers/planted-values.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_LOGIN = new Date(Date.now() - 2 * DAY_MS).toISOString();
@@ -576,6 +578,456 @@ test("GoogleWorkspaceAuditorClient refreshes service-account tokens and handles 
   assert.equal(access.status, "healthy");
   assert.equal(access.probes.find((probe) => probe.key === "policies").status, "forbidden");
   assert.ok(access.notes.some((note) => /GWS-ID-005 will render Manual/.test(note)));
+});
+
+const RETRY_NOW = Date.parse("2026-10-23T12:00:00Z");
+const RETRY_STATUS_TEXT = { 429: "Too Many Requests", 500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout" };
+const ROLES_PATH = "/admin/directory/v1/customer/my_customer/roles";
+
+/** A client whose waits are recorded instead of slept, whose backoff has no jitter, and whose clock is fixed, so every wait is exact. */
+function retryingGwsClient(fetchImpl, { config = {}, ...options } = {}) {
+  const sleeps = [];
+  const client = new GoogleWorkspaceAuditorClient(createSampleConfig(config), fetchImpl, {
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+    jitter: (delayMs) => delayMs,
+    now: () => RETRY_NOW,
+    ...options,
+  });
+  return { client, sleeps };
+}
+
+/** Answers request n with answers[n] (the last one repeats); each answer builds a fresh Response or throws. */
+function scriptedFetch(answers) {
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    requests.push({ url: String(input), init });
+    return answers[Math.min(requests.length, answers.length) - 1](init);
+  };
+  return { fetchImpl, requests };
+}
+
+const busy = (status, headers = {}) => () => new Response(null, { status, statusText: RETRY_STATUS_TEXT[status], headers });
+const quotaExhausted = (headers = {}) => () => new Response(JSON.stringify({
+  error: { code: 429, message: "Quota exceeded for quota metric 'Queries'", status: "RESOURCE_EXHAUSTED", errors: [{ reason: "rateLimitExceeded", domain: "usageLimits" }] },
+}), { status: 429, headers: { "content-type": "application/json", ...headers } });
+const rolesPage = () => jsonResponse({ items: [{ roleId: "1", roleName: "_SEED_ADMIN_ROLE", isSuperAdminRole: true }] });
+const resetConnection = () => {
+  throw new TypeError("fetch failed", { cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }) });
+};
+/** Never answers: the attempt ends only when its own timeout signal fires. */
+const hang = (init) => new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+
+test("GoogleWorkspaceAuditorClient retries 429 and every 5xx with doubling backoff and returns any other answer at once", async () => {
+  for (const status of [429, 500, 501, 502, 503, 504]) {
+    const { fetchImpl, requests } = scriptedFetch([busy(status), busy(status), rolesPage]);
+    const { client, sleeps } = retryingGwsClient(fetchImpl);
+    const roles = await client.collectRoles();
+    assert.deepEqual(roles.items.map((role) => role.roleId), ["1"], `${status}: the third attempt is read`);
+    assert.equal(requests.length, 3, `${status}: retried twice`);
+    assert.deepEqual(sleeps, [1000, 2000], `${status}: backoff starts at 1 second and doubles`);
+  }
+  for (const status of [400, 401, 403, 404, 409]) {
+    const { fetchImpl, requests } = scriptedFetch([() => jsonResponse({ error: { code: status, message: "refused", status: "FAILED_PRECONDITION" } }, status)]);
+    const { client, sleeps } = retryingGwsClient(fetchImpl);
+    await assert.rejects(() => client.collectRoles(), (error) => {
+      assert.equal(error.status, status);
+      assert.doesNotMatch(error.message, /attempt/);
+      return true;
+    });
+    assert.equal(requests.length, 1, `${status} is not retried, and a direct access token's 401 is not re-sent`);
+    assert.deepEqual(sleeps, []);
+  }
+});
+
+const throttledBy = (reason, status = 403) => () => jsonResponse({
+  error: { code: status, message: "Quota exceeded for quota metric 'Queries'", errors: [{ reason, domain: "usageLimits" }] },
+}, status);
+
+test("GoogleWorkspaceAuditorClient retries a 403 whose reason is a documented quota signal, and keeps every other 403 a final denial", async () => {
+  for (const reason of ["userRateLimitExceeded", "rateLimitExceeded", "quotaExceeded"]) {
+    const { fetchImpl, requests } = scriptedFetch([throttledBy(reason), throttledBy(reason), rolesPage]);
+    const { client, sleeps } = retryingGwsClient(fetchImpl);
+    const roles = await client.collectRoles();
+    assert.deepEqual(roles.items.map((role) => role.roleId), ["1"], `${reason}: the third attempt is read`);
+    assert.equal(requests.length, 3, `${reason}: retried twice`);
+    assert.deepEqual(sleeps, [1000, 2000], `${reason}: the same backoff as a 429`);
+  }
+
+  const denials = [
+    ["a permission denial", () => jsonResponse({ error: { code: 403, message: "Not Authorized to access this resource/api", status: "PERMISSION_DENIED", errors: [{ reason: "insufficientPermissions" }] } }, 403)],
+    ["a daily quota, which no wait within the run restores", throttledBy("dailyLimitExceeded")],
+    ["a quota reason on a 400", throttledBy("rateLimitExceeded", 400)],
+    ["a quota word only in the free-text message", () => jsonResponse({ error: { code: 403, message: "userRateLimitExceeded", errors: [{ reason: "forbidden" }] } }, 403)],
+    ["a non-JSON 403 that mentions a quota reason", () => new Response("<html>userRateLimitExceeded</html>", { status: 403, headers: { "content-type": "text/html" } })],
+  ];
+  for (const [label, answer] of denials) {
+    const { fetchImpl, requests } = scriptedFetch([answer, rolesPage]);
+    const { client, sleeps } = retryingGwsClient(fetchImpl);
+    await assert.rejects(() => client.collectRoles(), (error) => {
+      assert.ok(error instanceof GwsApiError, label);
+      assert.equal(error.throttled, false, label);
+      assert.doesNotMatch(error.message, /attempt/, label);
+      return true;
+    });
+    assert.equal(requests.length, 1, `${label} is not retried`);
+    assert.deepEqual(sleeps, [], label);
+  }
+});
+
+test("GoogleWorkspaceAuditorClient waits as Retry-After says on any retried status, as delta-seconds or an HTTP date, and fails closed without waiting when it asks for more than 30 seconds", async () => {
+  const honored = [
+    ["delta-seconds on a 503", busy(503, { "retry-after": "7" }), 7000],
+    ["an HTTP date on a 500", busy(500, { "retry-after": new Date(RETRY_NOW + 9000).toUTCString() }), 9000],
+    ["an HTTP date already past on a 502", busy(502, { "retry-after": new Date(RETRY_NOW - 60_000).toUTCString() }), 0],
+    ["exactly the 30-second cap on a 429", quotaExhausted({ "retry-after": "30" }), 30_000],
+    ["an unparseable Retry-After on a 504", busy(504, { "retry-after": "soon" }), 1000],
+  ];
+  for (const [label, answer, wait] of honored) {
+    const { fetchImpl, requests } = scriptedFetch([answer, rolesPage]);
+    const { client, sleeps } = retryingGwsClient(fetchImpl);
+    await client.collectRoles();
+    assert.equal(requests.length, 2, label);
+    assert.deepEqual(sleeps, [wait], label);
+  }
+
+  const refused = [
+    [
+      "a long delta-seconds on a 429",
+      quotaExhausted({ "retry-after": "120" }),
+      `Google Workspace API request failed for ${ROLES_PATH} after 1 attempt: 429 Too Many Requests (status RESOURCE_EXHAUSTED, reason rateLimitExceeded), Retry-After asked for 120 seconds (more than the 30-second cap)`,
+      429,
+    ],
+    [
+      "a far HTTP date on a 503",
+      busy(503, { "retry-after": new Date(RETRY_NOW + 3_600_000).toUTCString() }),
+      `Google Workspace API request failed for ${ROLES_PATH} after 1 attempt: 503 Service Unavailable, Retry-After asked for 3600 seconds (more than the 30-second cap)`,
+      503,
+    ],
+  ];
+  for (const [label, answer, message, status] of refused) {
+    const { fetchImpl, requests } = scriptedFetch([answer, rolesPage]);
+    const { client, sleeps } = retryingGwsClient(fetchImpl);
+    await assert.rejects(() => client.collectRoles(), (error) => {
+      assert.ok(error instanceof GwsApiError, label);
+      assert.equal(error.message, message, label);
+      assert.equal(error.status, status, label);
+      return true;
+    });
+    assert.equal(requests.length, 1, `${label}: no second request`);
+    assert.deepEqual(sleeps, [], `${label}: the client does not sleep through a wait it will not honor`);
+  }
+});
+
+test("GoogleWorkspaceAuditorClient retries a transport failure or a timed-out attempt, each attempt under its own timeout", async () => {
+  const { fetchImpl, requests } = scriptedFetch([resetConnection, hang, rolesPage]);
+  const { client, sleeps } = retryingGwsClient(fetchImpl, { timeoutMs: 5 });
+  const roles = await client.collectRoles();
+  assert.deepEqual(roles.items.map((role) => role.roleId), ["1"]);
+  assert.equal(requests.length, 3);
+  assert.deepEqual(sleeps, [1000, 2000]);
+  assert.notEqual(requests[0].init.signal, requests[1].init.signal, "every attempt gets a fresh timeout");
+});
+
+test("GoogleWorkspaceAuditorClient stops after five attempts and names the path, never the query, with the attempt count and the last status or failure", async () => {
+  const exhaust = async (answer, call, options) => {
+    const { fetchImpl, requests } = scriptedFetch([answer]);
+    const { client, sleeps } = retryingGwsClient(fetchImpl, options);
+    const error = await call(client).then(() => assert.fail("expected the request to fail"), (thrown) => thrown);
+    return { error, requests, sleeps };
+  };
+
+  const status = await exhaust(busy(503), (client) => client.collectUsers());
+  assert.ok(status.error instanceof GwsApiError);
+  assert.equal(status.error.message, "Google Workspace API request failed for /admin/directory/v1/users after 5 attempts: 503 Service Unavailable");
+  assert.equal(status.error.status, 503);
+  assert.equal(status.requests.length, 5);
+  assert.ok(new URL(status.requests[0].url).searchParams.has("maxResults"), "the request carried a query the message leaves out");
+  assert.deepEqual(status.sleeps, [1000, 2000, 4000, 8000], "four waits, none after the last attempt");
+
+  const quota = await exhaust(quotaExhausted(), (client) => client.collectRoles());
+  assert.equal(quota.error.message, `Google Workspace API request failed for ${ROLES_PATH} after 5 attempts: 429 Too Many Requests (status RESOURCE_EXHAUSTED, reason rateLimitExceeded)`, "the free-text quota message is never kept");
+
+  const transport = await exhaust(resetConnection, (client) => client.collectRoles());
+  assert.equal(transport.error.message, `Google Workspace API request failed for ${ROLES_PATH} after 5 attempts: network error: fetch failed (ECONNRESET)`);
+  assert.equal(transport.error.status, undefined);
+  assert.equal(transport.requests.length, 5);
+
+  const headers = await exhaust(hang, (client) => client.collectRoles(), { timeoutMs: 5 });
+  assert.equal(headers.error.message, `Google Workspace API request failed for ${ROLES_PATH} after 5 attempts: timed out after 5 ms`);
+  assert.equal(headers.requests.length, 5);
+
+  const stalledBody = (init) => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("{"));
+      init.signal.addEventListener("abort", () => controller.error(init.signal.reason), { once: true });
+    },
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  const body = await exhaust(stalledBody, (client) => client.collectRoles(), { timeoutMs: 5 });
+  assert.equal(body.error.message, `Google Workspace API request failed for ${ROLES_PATH} after 5 attempts: timed out after 5 ms`, "the timeout covers the body too");
+});
+
+test("GoogleWorkspaceAuditorClient gives each attempt 30 seconds by default", async (t) => {
+  const timers = t.mock.method(globalThis, "setTimeout");
+  const { client } = retryingGwsClient(scriptedFetch([busy(503), rolesPage]).fetchImpl);
+  await client.collectRoles();
+  assert.deepEqual(timers.mock.calls.map((call) => call.arguments[1]), [30_000, 30_000], "one timer per attempt");
+});
+
+test("GoogleWorkspaceAuditorClient never retries a tool-call abort, during a request or during the wait before a retry", async () => {
+  const duringWait = new AbortController();
+  let waitRequests = 0;
+  const waiting = new GoogleWorkspaceAuditorClient(createSampleConfig(), async () => {
+    waitRequests += 1;
+    return busy(503)();
+  }, {
+    signal: duringWait.signal,
+    sleep: () => {
+      duringWait.abort(new Error("the operator stopped the call"));
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(() => waiting.collectRoles(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(waitRequests, 1, "no request follows an abort during the wait");
+
+  const duringRequest = new AbortController();
+  let sent = 0;
+  const requesting = new GoogleWorkspaceAuditorClient(createSampleConfig(), async () => {
+    sent += 1;
+    duringRequest.abort(new Error("the operator stopped the call"));
+    throw new DOMException("This operation was aborted", "AbortError");
+  }, {
+    signal: duringRequest.signal,
+    sleep: async () => assert.fail("an aborted request is never retried"),
+  });
+  await assert.rejects(() => requesting.collectRoles(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(sent, 1);
+});
+
+test("GoogleWorkspaceAuditorClient retries the service-account token request and keeps one 401 re-authentication", async () => {
+  clearGwsTokenCacheForTests();
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const config = {
+    authMode: "service_account",
+    accessToken: undefined,
+    serviceAccountEmail: "svc@example-project.iam.gserviceaccount.com",
+    serviceAccountPrivateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+  };
+  const isTokenRequest = (input) => new URL(String(input)).pathname === "/token";
+  const minted = (count) => jsonResponse({ access_token: `minted-access-token-${count}`, expires_in: 3600, token_type: "Bearer" });
+
+  let tokenRequests = 0;
+  let apiRequests = 0;
+  const recovering = retryingGwsClient(async (input, init = {}) => {
+    if (isTokenRequest(input)) {
+      tokenRequests += 1;
+      return tokenRequests === 1 ? busy(503)() : minted(tokenRequests);
+    }
+    apiRequests += 1;
+    assert.equal(new Headers(init.headers).get("authorization"), "Bearer minted-access-token-2");
+    return rolesPage();
+  }, { config });
+  assert.deepEqual((await recovering.client.collectRoles()).items.map((role) => role.roleId), ["1"]);
+  assert.equal(tokenRequests, 2, "the 503 token answer is retried");
+  assert.deepEqual(recovering.sleeps, [1000]);
+  assert.equal(apiRequests, 1);
+  clearGwsTokenCacheForTests();
+
+  const refused = scriptedFetch([() => jsonResponse({ error: "invalid_grant", error_description: "Invalid JWT Signature." }, 400)]);
+  const refusedClient = retryingGwsClient(refused.fetchImpl, { config });
+  await assert.rejects(() => refusedClient.client.collectRoles(), { message: "Failed to obtain Google access token: 400 Bad Request (error invalid_grant)" });
+  assert.equal(refused.requests.length, 1, "a refused token request is not retried");
+  assert.deepEqual(refusedClient.sleeps, []);
+  clearGwsTokenCacheForTests();
+
+  const stalled = scriptedFetch([hang]);
+  const stalledClient = retryingGwsClient(stalled.fetchImpl, { config, timeoutMs: 5 });
+  await assert.rejects(() => stalledClient.client.collectRoles(), { message: "Google access token request failed for /token after 5 attempts: timed out after 5 ms" });
+  assert.equal(stalled.requests.length, 5, "a timed-out token request is retried");
+  clearGwsTokenCacheForTests();
+
+  let tokens = 0;
+  let unauthorized = 0;
+  const rejected = retryingGwsClient(async (input) => {
+    if (isTokenRequest(input)) return minted(++tokens);
+    unauthorized += 1;
+    return jsonResponse({ error: { code: 401, message: "Invalid Credentials", status: "UNAUTHENTICATED" } }, 401);
+  }, { config });
+  await assert.rejects(() => rejected.client.collectRoles(), (error) => error.status === 401 && !/attempt/.test(error.message));
+  assert.equal(tokens, 2, "one fresh token after the first 401");
+  assert.equal(unauthorized, 2, "the second 401 is final");
+  assert.deepEqual(rejected.sleeps, []);
+  clearGwsTokenCacheForTests();
+});
+
+test("a Google Workspace inventory page that still fails after its retries leaves the whole inventory unreadable, so no finding reads the pages before it as complete", async () => {
+  const config = createSampleConfig();
+  const pageTokens = [];
+  const fetchImpl = routeEndpoints([[(url) => url.pathname === "/admin/directory/v1/users", (url) => {
+    pageTokens.push(url.searchParams.get("pageToken"));
+    return url.searchParams.has("pageToken") ? busy(503)() : jsonResponse({ users: createUsers().slice(0, 2), nextPageToken: "page-2" });
+  }]]);
+  const sleeps = [];
+  const client = new GoogleWorkspaceAuditorClient(config, fetchImpl, { sleep: async (ms) => { sleeps.push(ms); }, jitter: (delayMs) => delayMs });
+  const data = await collectGwsAuditData(client);
+  assert.deepEqual(pageTokens, [null, "page-2", "page-2", "page-2", "page-2", "page-2"], "the second page is tried five times");
+  assert.deepEqual(sleeps, [1000, 2000, 4000, 8000]);
+  const exhausted = "Google Workspace API request failed for /admin/directory/v1/users after 5 attempts: 503 Service Unavailable";
+  assert.deepEqual(data.identity.users.data, [], "the first page is not kept as if it were the inventory");
+  assert.equal(data.identity.users.error, exhausted);
+  assert.equal(data.identity.users.errorKind, "error");
+  assert.match(data.integrations.tokenInventory.notCollected, /^Directory users\.list was unreadable \(Google Workspace API request failed/);
+
+  const readsUsers = (check) => check.completeness.complete.sources.some((source) => source.surfaceId === "directory-users" && source.falseWhen.includes("error"));
+  const dependent = new Set(GWS_SPEC.checks.filter(readsUsers).map((check) => check.id));
+  assert.ok(dependent.size >= 8, `the user listing decides several checks: ${[...dependent].join(", ")}`);
+  const findings = [
+    ...assessGwsIdentity(data.identity, config).findings,
+    ...assessGwsAdminAccess(data.adminAccess, config).findings,
+    ...assessGwsIntegrations(data.integrations, config).findings,
+    ...assessGwsMonitoring(data.monitoring, config).findings,
+  ].filter((finding) => dependent.has(finding.id));
+  assert.equal(new Set(findings.map((finding) => finding.id)).size, dependent.size, "every dependent check was assessed");
+  for (const finding of findings) {
+    assert.notEqual(finding.status, "Pass", `${finding.id} cannot pass without the user inventory`);
+    assert.ok(finding.evidence.some((line) => line.includes(exhausted)), `${finding.id} names the read that ran out of retries: ${finding.evidence.join(" | ")}`);
+  }
+});
+
+test("a Google Workspace read still throttled by quota 403s after its retries is a request error, never a missing scope or admin role", async () => {
+  const config = createSampleConfig();
+  let roleRequests = 0;
+  const fetchImpl = routeEndpoints([[(url) => url.pathname === ROLES_PATH, () => {
+    roleRequests += 1;
+    return throttledBy("userRateLimitExceeded")();
+  }]]);
+  const sleeps = [];
+  const client = new GoogleWorkspaceAuditorClient(config, fetchImpl, { sleep: async (ms) => { sleeps.push(ms); }, jitter: (delayMs) => delayMs });
+  const exhausted = `Google Workspace API request failed for ${ROLES_PATH} after 5 attempts: 403 Forbidden (reason userRateLimitExceeded)`;
+
+  const error = await client.collectRoles().then(() => assert.fail("expected the read to fail"), (thrown) => thrown);
+  assert.ok(error instanceof GwsApiError);
+  assert.equal(error.message, exhausted);
+  assert.equal(error.status, 403, "the status is the one the last attempt observed");
+  assert.equal(error.throttled, true);
+  assert.equal(roleRequests, 5);
+  assert.deepEqual(sleeps, [1000, 2000, 4000, 8000]);
+
+  const data = await collectGwsAuditData(client);
+  assert.equal(data.adminAccess.roles.error, exhausted);
+  assert.equal(data.adminAccess.roles.errorKind, "error", "a throttled read is not recorded as forbidden");
+  const findings = [
+    ...assessGwsIdentity(data.identity, config).findings,
+    ...assessGwsAdminAccess(data.adminAccess, config).findings,
+    ...assessGwsIntegrations(data.integrations, config).findings,
+  ];
+  const unreadable = findings.filter((finding) => finding.summary.startsWith("Directory roles.list was not readable"));
+  assert.ok(unreadable.length > 0, "some finding reports the roles read as unreadable");
+  for (const finding of unreadable) {
+    assert.equal(finding.status, "Manual", finding.id);
+    assert.match(finding.summary, /could not be assessed: request error\.$/, finding.id);
+  }
+  for (const finding of findings) {
+    assert.doesNotMatch(`${finding.summary} ${finding.evidence.join(" ")}`, /missing scope/, `${finding.id} does not blame a scope for throttling`);
+  }
+
+  const access = await runGwsAccessCheck(client, config);
+  const roles = access.probes.find((probe) => probe.key === "roles");
+  assert.equal(roles.status, "error", "the access check does not report a throttled probe as forbidden");
+  assert.equal(roles.detail, exhausted);
+  assert.equal(access.status, "limited");
+});
+
+test("planted credentials echoed by a retried failure, in the body, the headers, or a transport error, never reach a thrown error, a tool result, or a bundle file", async () => {
+  clearGwsTokenCacheForTests();
+  const planted = { accessToken: "Wq9ZkTr4XmPvLsNbYhJcDgQx", mintedToken: "Rz6HnQx3VtKpMwBsLeGuFjYv" };
+  const values = Object.values(planted);
+  const healthyTools = registeredTools();
+  const healthyArgs = { auth_mode: "access_token", access_token: "ya29.healthy-run-token", domain: "example.com" };
+  const healthyText = await withRoutedFetch(routeEndpoints(), async () => {
+    const results = [];
+    for (const name of INSPECTOR_TOOLS) results.push(await healthyTools.run(name, healthyArgs));
+    return results.map((result) => `${result.text}\n${result.json}`).join("\n");
+  });
+  assertPlantedValuesWellFormed(assert, planted, [
+    ["users", JSON.stringify(createUsers())],
+    ["roles", JSON.stringify(createRoles())],
+    ["role assignments", JSON.stringify(createRoleAssignments())],
+    ["config", JSON.stringify(createSampleConfig())],
+    ["healthy tool results", healthyText],
+  ]);
+
+  /** Every API answer echoes `secret` in each identifier-shaped and free-text field Google uses, and in the headers. */
+  const echoing = (secret) => () => new Response(JSON.stringify({
+    error: {
+      code: 503,
+      message: `backend unavailable for Bearer ${secret}`,
+      status: secret,
+      errors: [{ message: secret, domain: "global", reason: secret }],
+      details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: secret, domain: "googleapis.com", metadata: { token: secret } }],
+    },
+  }), {
+    status: 503,
+    headers: { "content-type": "application/json", "retry-after": secret, "www-authenticate": `Bearer realm="${secret}"`, "x-debug-token": secret },
+  });
+  const transportEcho = (secret) => () => {
+    throw new TypeError(`fetch failed: proxy refused Bearer ${secret} (token ${secret})`, { cause: Object.assign(new Error(secret), { code: "ECONNREFUSED" }) });
+  };
+
+  const tokenArgs = { auth_mode: "access_token", access_token: planted.accessToken, domain: "example.com" };
+  const tools = registeredTools();
+  for (const [label, answer] of [["echoing 503", echoing(planted.accessToken)], ["transport error", transportEcho(planted.accessToken)]]) {
+    const config = createSampleConfig({ accessToken: planted.accessToken });
+    const { client } = retryingGwsClient(answer, { config: { accessToken: planted.accessToken } });
+    const thrown = await client.collectRoles().then(() => assert.fail(`${label}: expected the read to fail`), (error) => error);
+    assert.match(thrown.message, /after 5 attempts/, label);
+    assertFragmentsAbsent(assert, thrown.message, values, `${label}: thrown error`);
+
+    await withRoutedFetch(answer, async () => {
+      for (const name of INSPECTOR_TOOLS) {
+        const result = await tools.run(name, tokenArgs);
+        assert.match(result.text, /after 5 attempts/, `${label}: ${name} names the exhausted read`);
+        assertFragmentsAbsent(assert, result.text, values, `${label}: ${name} text`);
+        assertFragmentsAbsent(assert, result.json, values, `${label}: ${name} details`);
+      }
+    });
+
+    const bundle = await exportGwsAuditBundle(retryingGwsClient(answer, { config: { accessToken: planted.accessToken } }).client, config, createTempBase("grclanker-gws-planted-"));
+    assert.ok(bundle.errorCount > 0, label);
+    const files = listFilesRecursively(bundle.outputDir).map((file) => [relative(bundle.outputDir, file), readFileSync(file, "utf8")]);
+    assert.ok(files.some(([, content]) => content.includes("after 5 attempts")), `${label}: the bundle records the exhausted reads`);
+    assertSecretFragmentsAbsent(assert, files, values, `${label}: bundle`);
+    assertSecretFragmentsAbsent(assert, readZipEntries(bundle.zipPath), values, `${label}: zip`);
+  }
+
+  // Service-account mode: the token Google mints is echoed back by every failing read.
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const serviceAccountArgs = {
+    auth_mode: "service_account",
+    credentials_json: JSON.stringify({
+      type: "service_account",
+      client_email: "svc@example-project.iam.gserviceaccount.com",
+      private_key: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+      token_uri: "https://oauth2.googleapis.com/token",
+    }),
+    admin_email: "admin@example.com",
+    domain: "example.com",
+  };
+  const mintingEcho = async (input) => {
+    if (new URL(String(input)).pathname === "/token") return jsonResponse({ access_token: planted.mintedToken, expires_in: 3600, token_type: "Bearer" });
+    return echoing(planted.mintedToken)();
+  };
+  await withRoutedFetch(mintingEcho, async () => {
+    for (const name of INSPECTOR_TOOLS) {
+      clearGwsTokenCacheForTests();
+      const result = await tools.run(name, serviceAccountArgs);
+      assert.match(result.text, /after 5 attempts/, `minted token: ${name} names the exhausted read`);
+      assertFragmentsAbsent(assert, result.text, values, `minted token: ${name} text`);
+      assertFragmentsAbsent(assert, result.json, values, `minted token: ${name} details`);
+    }
+  });
+  clearGwsTokenCacheForTests();
 });
 
 test("access check: when every probe is refused for its credentials the check fails and names the GWS settings that carried them; a readable probe, a 403, or a delegation gap keeps the limited wording, and no credential reaches the result", async () => {
@@ -1804,10 +2256,10 @@ test("rule 9: a service-account token evicted by a 401 mid-run is still scrubbed
   clearGwsTokenCacheForTests();
 });
 
-/** Registers the inspector tools against a stand-in host and returns them keyed by name, applying prepareArguments the way the host does. */
+/** Registers the inspector tools against a stand-in host and returns them keyed by name, applying prepareArguments the way the host does; retry waits return at once. */
 function registeredTools() {
   const tools = new Map();
-  registerGwsTools({ registerTool: (definition) => tools.set(definition.name, definition) });
+  registerGwsTools({ registerTool: (definition) => tools.set(definition.name, definition) }, { sleep: async () => {} });
   return {
     run: async (name, rawArgs) => {
       const definition = tools.get(name);
@@ -1861,6 +2313,8 @@ test("rule 9 (tool path): a transport error carrying credentials is scrubbed whe
   const toolArgs = { auth_mode: "access_token", access_token: runToken, domain: "example.com" };
   const scrubbed = "proxy CONNECT failed for Bearer [REDACTED]; access_token=[REDACTED]; echo [REDACTED]; see https://proxy.example/x";
   const scrubbedPattern = new RegExp(scrubbed.replace(/[.()[\]]/g, "\\$&"));
+  // The client retries a transport failure, so a read that keeps failing ends with the exhausted-read wording around the scrubbed reason.
+  const rolesFailure = `Google Workspace API request failed for ${ROLES_PATH} after 5 attempts: network error: ${scrubbed}`;
 
   // The error class and summarizeError scrub at creation, so the library surfaces are already clean.
   const apiError = new GwsApiError(502, "upstream said Bearer ya29.PLANTEDr5ctor0123456789 at https://proxy.example/y?token=PLANTEDr5query0123", "https://admin.googleapis.com/x");
@@ -1880,15 +2334,15 @@ test("rule 9 (tool path): a transport error carrying credentials is scrubbed whe
       }
     }
     const adminAccess = await tools.run("gws_assess_admin_access", toolArgs);
-    assert.match(adminAccess.text, new RegExp(`^- privileged_users_status: unreadable: Directory roles\\.list \\(${scrubbed.replace(/[.()[\]]/g, "\\$&")}\\)$`, "m"));
+    assert.match(adminAccess.text, new RegExp(`^- privileged_users_status: unreadable: Directory roles\\.list \\(${rolesFailure.replace(/[.()[\]]/g, "\\$&")}\\)$`, "m"));
     assert.equal(adminAccess.details.snapshot_summary.privileged_users, null);
-    assert.equal(adminAccess.details.snapshot_summary.privileged_users_status, `unreadable: Directory roles.list (${scrubbed})`);
-    assert.ok(findingById(adminAccess.details, "GWS-ADMIN-001").evidence.some((line) => line.includes(scrubbed)), "the evidence names the scrubbed failure");
+    assert.equal(adminAccess.details.snapshot_summary.privileged_users_status, `unreadable: Directory roles.list (${rolesFailure})`);
+    assert.ok(findingById(adminAccess.details, "GWS-ADMIN-001").evidence.some((line) => line.includes(rolesFailure)), "the evidence names the scrubbed failure");
     const access = await tools.run("gws_check_access", toolArgs);
     const rolesProbe = access.details.probes.find((probe) => probe.key === "roles");
     assert.equal(rolesProbe.status, "error");
-    assert.equal(rolesProbe.detail, scrubbed);
-    assert.match(access.text, /roles\s+│\s+error\s+│\s+proxy CONNECT failed for Bearer \[REDACTED\]; access_token=\[REDACTED\]; echo \[REDACTED\]; see https:\/\/proxy\.example\/x/);
+    assert.equal(rolesProbe.detail, rolesFailure);
+    assert.match(access.text, /roles\s+│\s+error\s+│\s+Google Workspace API request failed for \/admin\/directory\/v1\/customer\/my_customer\/roles after 5 attempts: network error: proxy CONNECT failed for Bearer \[REDACTED\]; access_token=\[REDACTED\]; echo \[REDACTED\]; see https:\/\/proxy\.example\/x/);
   });
 
   // A documented free-text field echoing credentials reaches INTEG-002 evidence only through the tool payload scrub (the bundle's redactSecrets layer).

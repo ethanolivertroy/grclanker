@@ -525,8 +525,9 @@ export const GWS_SPEC = buildBatchIntegrationSpec({
   rateLimit: {
     documentedLimit: "Per-project and per-customer Google API quotas",
     retryHeaders: ["Retry-After"],
-    retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Use bounded exponential backoff with jitter and honor Retry-After; exhausted requests become unreadable evidence.",
+    retryableStatuses: [429],
+    retryableStatusRanges: [{ from: 500, to: 599 }],
+    backoffPolicy: "Retry 429 and every 5xx answer, a 403 whose error reason is one of Google's documented quota signals (userRateLimitExceeded, rateLimitExceeded, quotaExceeded), attempts that pass the 30-second per-request timeout, and transport failures up to four times (five attempts), the service-account token request included; any other 403 is a final denial. Each wait honors Retry-After (delta-seconds or HTTP-date) on any retried status, else exponential backoff from 1 second with jitter, capped at 30 seconds; a Retry-After above 30 seconds ends the read without waiting. A 401 in service-account mode discards the token and repeats the request once with a new one. Exhaustion names the path, the last status or failure, and the attempt count, and leaves the dataset unreadable evidence, a throttled 403 recorded as a request error rather than a missing scope; a tool-call abort is never retried.",
   },
   runtimeBehavior: GWS_RUNTIME_BEHAVIOR,
   knownGaps: ["Installed-app OAuth, Chrome Policy, endpoint device controls, and group-membership expansion are not shipped."],
