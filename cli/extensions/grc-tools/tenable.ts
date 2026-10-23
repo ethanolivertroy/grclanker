@@ -37,9 +37,8 @@ const DEFAULT_OUTPUT_DIR = "./export/tenable";
 const DEFAULT_CLOUD_URL = "https://cloud.tenable.com";
 const FEDRAMP_CLOUD_URL = "https://fedcloud.tenable.com";
 const DEFAULT_TIMEOUT_MS = 30_000;
-const MAX_TIMEOUT_SECONDS = 600;
-// A body still arriving after this long is on a link too slow for another attempt to beat.
-const ATTEMPT_CAP_MS = MAX_TIMEOUT_SECONDS * 1000;
+// An attempt may run this many times TENABLE_TIMEOUT; a body still arriving then is on a link too slow for another attempt to beat.
+const ATTEMPT_CAP_TIMEOUTS = 20;
 const DEFAULT_RETRY_LIMIT = 4;
 const DEFAULT_EXPORT_TIMEOUT_MS = 300_000;
 const DEFAULT_EXPORT_POLL_MS = 2_000;
@@ -1869,7 +1868,7 @@ export function resolveTenableConfiguration(
     platform: vm ? "vm" : "sc",
     vm,
     securityCenter,
-    timeoutMs: clampInteger(asNumber(timeout.value), DEFAULT_TIMEOUT_MS / 1000, 1, MAX_TIMEOUT_SECONDS) * 1000,
+    timeoutMs: clampInteger(asNumber(timeout.value), DEFAULT_TIMEOUT_MS / 1000, 1, 600) * 1000,
     sourceChain: [...new Set(sourceChain.filter(Boolean))],
   };
 }
@@ -1912,6 +1911,11 @@ function backoffMs(attempt: number): number {
 
 function attemptCount(attempts: number): string {
   return `${attempts} attempt${attempts === 1 ? "" : "s"}`;
+}
+
+function minuteCount(ms: number): string {
+  const minutes = Math.round(ms / 6_000) / 10;
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
 }
 
 /** Which of an attempt's limits ended it: TENABLE_TIMEOUT with nothing arriving, or the cap on the attempt as a whole. */
@@ -2076,6 +2080,11 @@ abstract class TenableHttpClient {
     }
   }
 
+  /** The longest one attempt may run, however steadily its body arrives. */
+  private get attemptCapMs(): number {
+    return this.timeoutMs * ATTEMPT_CAP_TIMEOUTS;
+  }
+
   /**
    * One attempt. TENABLE_TIMEOUT bounds the wait for the headers and every gap between pieces of the body, so an
    * export chunk of hundreds of MB that keeps arriving is not cut off by it while a body that stalls times out; the
@@ -2091,8 +2100,7 @@ abstract class TenableHttpClient {
       controller.abort();
     };
     let gap = setTimeout(() => stop("gap"), this.timeoutMs);
-    // Before the headers the cap can only tie the gap timer, at TENABLE_TIMEOUT's maximum, and that much silence is a stall.
-    const cap = setTimeout(() => stop(response === undefined ? "gap" : "cap"), ATTEMPT_CAP_MS);
+    const cap = setTimeout(() => stop("cap"), this.attemptCapMs);
     const progressed = () => {
       clearTimeout(gap);
       if (!controller.signal.aborted) gap = setTimeout(() => stop("gap"), this.timeoutMs);
@@ -2119,7 +2127,9 @@ abstract class TenableHttpClient {
 
   /** Why an attempt drew no complete answer: the limit that ended it, or the transport error, before or after the headers arrived. */
   private describeFailedAttempt(attempt: Extract<Attempt, { failed: true }>): string {
-    if (attempt.limit === "cap") return `: the response body was still arriving when the per-attempt cap of ${ATTEMPT_CAP_MS}ms (${ATTEMPT_CAP_MS / 60_000} minutes) ran out`;
+    if (attempt.limit === "cap") {
+      return `: the response body was still arriving when the per-attempt cap of ${minuteCount(this.attemptCapMs)} ran out (the cap is ${ATTEMPT_CAP_TIMEOUTS} times TENABLE_TIMEOUT, so raising TENABLE_TIMEOUT or timeout_seconds raises it)`;
+    }
     const { error, response } = attempt;
     const message = this.scrub(error instanceof Error ? error.message : String(error)).replace(/\.+$/, "");
     const stalled = attempt.limit === "gap" || (error instanceof Error && error.name === "AbortError") || /abort/i.test(message);

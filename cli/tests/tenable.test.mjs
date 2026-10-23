@@ -251,6 +251,13 @@ function vmConfig(extra = {}) {
   return resolveTenableConfiguration({ access_key: FIXTURE_ACCESS_KEY, secret_key: FIXTURE_SECRET_KEY, config_file: EMPTY_CONFIG_FILE, ...extra }, EMPTY_ENV);
 }
 
+// The configuration with TENABLE_TIMEOUT raised in the environment, the way an operator on a slow link raises it.
+function vmConfigWithTimeout(seconds) {
+  const config = resolveTenableConfiguration({ access_key: FIXTURE_ACCESS_KEY, secret_key: FIXTURE_SECRET_KEY, config_file: EMPTY_CONFIG_FILE }, { ...EMPTY_ENV, TENABLE_TIMEOUT: String(seconds) });
+  assert.equal(config.timeoutMs, seconds * 1000, "TENABLE_TIMEOUT reaches the configuration");
+  return config;
+}
+
 function healthyUsers() {
   return [
     { id: 1, uuid: "u-1", username: "admin@example.com", email: "admin@example.com", permissions: 64, enabled: true, ui_permitted: true, two_factor: { sms_enabled: 1 }, ui_saml_only: false, lastlogin: NOW - 86_400_000, login_fail_count: 0, locked: false, role: { name: "Administrator" }, last_apikey_access: NOW - 3_600_000 },
@@ -1016,38 +1023,77 @@ test("a body that sends a piece and then stalls for TENABLE_TIMEOUT is requested
   }
 });
 
-test("a body that keeps trickling past the 10 minute cap on one attempt ends at the cap, naming it, and is not requested again", async (t) => {
+test("a body that keeps trickling past the per-attempt cap of 20 times TENABLE_TIMEOUT ends at the cap on its one attempt, naming the cap in minutes, and is not requested again", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const chunk = "GET /assets/export/asset-export-1/chunks/1";
-  // A piece every 10 seconds never leaves a gap that reaches the 30 second timeout, and the whole would take 16 minutes.
-  const trickle = (index) => (index === 0 ? "[" : index < 99 ? " " : index === 99 ? "]" : undefined);
+  // A piece every 10 seconds never leaves a gap that reaches the timeout. At the 30 second default the whole would take
+  // 16 minutes against a 10 minute cap, and with TENABLE_TIMEOUT at 60 it would take 25 minutes against a 20 minute cap.
+  for (const [config, pieces, capMs, cap] of [
+    [vmConfig(), 100, 600_000, "10 minutes"],
+    [vmConfigWithTimeout(60), 150, 1_200_000, "20 minutes"],
+  ]) {
+    const trickle = (index) => (index === 0 ? "[" : index < pieces - 1 ? " " : index === pieces - 1 ? "]" : undefined);
+    const routed = routerFetch(healthyRoutes());
+    const sent = [];
+    const waits = [];
+    const clients = createTenableClients(config, {
+      fetchImpl: async (url, init = {}) => {
+        const key = requestKey(url, init);
+        sent.push(key);
+        return key === chunk ? streamedBody(init, trickle, { everyMs: 10_000 }) : routed(url, init);
+      },
+      sleepImpl: async (ms) => { waits.push(ms); },
+      exportPollMs: 0,
+      exportTimeoutMs: 5_000,
+    });
+    const outcome = await onFakeTime(t, clients.vm.exportAssets());
+    assert.ok(outcome.settled && !outcome.error, `${cap}: ${outcome.error ?? "the export never settled"}`);
+    assert.equal(outcome.elapsedMs, capMs, `${cap}: the attempt ends at the cap`);
+    const result = outcome.value;
+    assert.deepEqual(
+      { records: result.records.length, fetchedChunks: result.fetchedChunks, downloadFailures: result.downloadFailures, truncated: result.truncated, endpoint: result.endpoint, httpStatus: result.httpStatus },
+      { records: 0, fetchedChunks: 0, downloadFailures: 1, truncated: true, endpoint: chunk, httpStatus: null },
+      cap,
+    );
+    assert.ok(
+      result.reason.includes(`1 chunk downloads failed: Tenable request ${chunk} failed after 1 attempt: the response body was still arriving when the per-attempt cap of ${cap} ran out (the cap is 20 times TENABLE_TIMEOUT, so raising TENABLE_TIMEOUT or timeout_seconds raises it); a GET cut off at the cap is not sent again, since another attempt would arrive just as slowly.`),
+      result.reason,
+    );
+    assert.deepEqual(sent.filter((key) => key === chunk), [chunk], `${cap}: the chunk is requested once`);
+    assert.deepEqual(waits, [], `${cap}: nothing is waited on before giving up`);
+  }
+});
+
+test("with TENABLE_TIMEOUT at 60, a vulnerability export chunk that trickles in for 17 minutes, past the default cap, is read whole with every record and requested once", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const chunk = "GET /vulns/export/vuln-export-1/chunks/1";
+  const records = healthyVulns();
+  const text = JSON.stringify(records);
+  // The records arrive in the first piece and the closing bracket in the 50th, 20 seconds apart, so the body closes 17
+  // minutes in: past the 10 minute cap at the default, within the 20 minute cap at 60 seconds.
+  const trickle = (index) => (index === 0 ? text.slice(0, -1) : index < 49 ? " " : index === 49 ? "]" : undefined);
   const routed = routerFetch(healthyRoutes());
   const sent = [];
-  const waits = [];
-  const clients = createTenableClients(vmConfig(), {
+  const clients = createTenableClients(vmConfigWithTimeout(60), {
     fetchImpl: async (url, init = {}) => {
       const key = requestKey(url, init);
       sent.push(key);
-      return key === chunk ? streamedBody(init, trickle, { everyMs: 10_000 }) : routed(url, init);
+      return key === chunk ? streamedBody(init, trickle, { everyMs: 20_000 }) : routed(url, init);
     },
-    sleepImpl: async (ms) => { waits.push(ms); },
+    sleepImpl: async () => {},
     exportPollMs: 0,
     exportTimeoutMs: 5_000,
   });
-  const outcome = await onFakeTime(t, clients.vm.exportAssets());
+  const outcome = await onFakeTime(t, clients.vm.exportVulnerabilities(RECENT_SECONDS));
   assert.ok(outcome.settled && !outcome.error, String(outcome.error ?? "the export never settled"));
-  assert.equal(outcome.elapsedMs, 600_000, "the attempt ends at the cap");
+  assert.equal(outcome.elapsedMs, 1_020_000, "the body arrives whole 17 minutes in");
   const result = outcome.value;
+  assert.deepEqual(result.records, records, "every record arrives");
   assert.deepEqual(
-    { records: result.records.length, fetchedChunks: result.fetchedChunks, downloadFailures: result.downloadFailures, truncated: result.truncated, endpoint: result.endpoint, httpStatus: result.httpStatus },
-    { records: 0, fetchedChunks: 0, downloadFailures: 1, truncated: true, endpoint: chunk, httpStatus: null },
-  );
-  assert.ok(
-    result.reason.includes(`1 chunk downloads failed: Tenable request ${chunk} failed after 1 attempt: the response body was still arriving when the per-attempt cap of 600000ms (10 minutes) ran out; a GET cut off at the cap is not sent again, since another attempt would arrive just as slowly.`),
-    result.reason,
+    { fetchedChunks: result.fetchedChunks, downloadFailures: result.downloadFailures, truncated: result.truncated, reason: result.reason },
+    { fetchedChunks: 1, downloadFailures: 0, truncated: false, reason: undefined },
   );
   assert.deepEqual(sent.filter((key) => key === chunk), [chunk], "the chunk is requested once");
-  assert.deepEqual(waits, [], "nothing is waited on before giving up");
 });
 
 test("an abort that lands while an export chunk is streaming ends the export as the call's abort, with nothing sent after it", async (t) => {
@@ -1099,7 +1145,7 @@ test("a key echoed in a streamed body or in the error that breaks it off reaches
     [
       "cap",
       (init) => streamedBody(init, (index) => (index === 0 ? `{"error":"${echo}` : " "), { everyMs: 10_000 }),
-      "failed after 1 attempt: the response body was still arriving when the per-attempt cap of 600000ms (10 minutes) ran out",
+      "failed after 1 attempt: the response body was still arriving when the per-attempt cap of 10 minutes ran out (the cap is 20 times TENABLE_TIMEOUT, so raising TENABLE_TIMEOUT or timeout_seconds raises it)",
     ],
   ]) {
     const routed = routerFetch(healthyRoutes());
