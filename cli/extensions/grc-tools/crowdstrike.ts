@@ -1258,16 +1258,20 @@ function paginationOf(payload: JsonRecord): JsonRecord {
   return asObject(asObject(payload.meta)?.pagination) ?? {};
 }
 
-function retryDelayFromResponse(response: Response, attempt: number): number {
+function backoffDelay(attempt: number): number {
+  return Math.min(DEFAULT_RETRY_BASE_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
+}
+
+function retryDelayFromResponse(response: Response, attempt: number, now: number): number {
   const retryAfterHeader = response.headers.get("x-ratelimit-retryafter") ?? response.headers.get("retry-after");
   if (retryAfterHeader) {
     const parsed = Number(retryAfterHeader);
     if (Number.isFinite(parsed) && parsed >= 0) {
       let deltaMs: number;
       if (parsed > 1_000_000_000_000) {
-        deltaMs = parsed - Date.now();
+        deltaMs = parsed - now;
       } else if (parsed > 1_000_000_000) {
-        deltaMs = parsed * 1000 - Date.now();
+        deltaMs = parsed * 1000 - now;
       } else {
         deltaMs = parsed * 1000;
       }
@@ -1275,10 +1279,26 @@ function retryDelayFromResponse(response: Response, attempt: number): number {
     }
     const asDate = Date.parse(retryAfterHeader);
     if (Number.isFinite(asDate)) {
-      return Math.min(Math.max(asDate - Date.now(), DEFAULT_RETRY_BASE_MS), MAX_RETRY_DELAY_MS);
+      return Math.min(Math.max(asDate - now, DEFAULT_RETRY_BASE_MS), MAX_RETRY_DELAY_MS);
     }
   }
-  return Math.min(DEFAULT_RETRY_BASE_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
+  return backoffDelay(attempt);
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function attemptsText(attempts: number): string {
+  return `after ${attempts} attempt${attempts === 1 ? "" : "s"}`;
+}
+
+/** A request that drew no HTTP response: the client's own timeout fired or the transport failed. */
+class CrowdstrikeTransportError extends Error {
+  constructor(message: string) {
+    super(scrubSecretText(message));
+    this.name = "CrowdstrikeTransportError";
+  }
 }
 
 /** The parsed JSON object of a response body, or undefined when the body is empty, not JSON, or not an object. */
@@ -1327,6 +1347,7 @@ export class CrowdstrikeApiClient {
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: SleepImpl;
   private readonly retryLimit: number;
+  private readonly now: () => number;
   private accessToken?: string;
   private accessTokenExpiresAt = 0;
   private accessTokenPromise?: Promise<string>;
@@ -1337,6 +1358,8 @@ export class CrowdstrikeApiClient {
       fetchImpl?: FetchImpl;
       sleep?: SleepImpl;
       retryLimit?: number;
+      /** The clock an HTTP-date or epoch retry header is measured against. */
+      now?: () => number;
       signal?: AbortSignal;
     } = {},
   ) {
@@ -1344,6 +1367,7 @@ export class CrowdstrikeApiClient {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleep = abortableSleep(options.signal, options.sleep);
     this.retryLimit = clampNumber(options.retryLimit, DEFAULT_RETRY_LIMIT, 0, 10);
+    this.now = options.now ?? Date.now;
     rememberSecrets(config.clientSecret);
   }
 
@@ -1378,11 +1402,44 @@ export class CrowdstrikeApiClient {
     } catch (error) {
       rethrowIfAborted(error);
       if (error instanceof Error && error.name === "AbortError") {
-        throw new Error(`CrowdStrike request timed out after ${this.config.timeoutMs}ms: ${new URL(url).pathname}`);
+        throw new CrowdstrikeTransportError(`timed out after ${this.config.timeoutMs}ms`);
       }
-      throw new Error(this.redact(`CrowdStrike request failed: ${summarizeError(error)}`));
+      throw new CrowdstrikeTransportError(this.redact(summarizeError(error)));
     } finally {
       clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Sends a request until it draws a response not worth retrying or the retry budget is spent: a 429 or 5xx
+   * waits as the rate-limit headers ask (clamped to MAX_RETRY_DELAY_MS), and a timeout or transport failure waits
+   * a backoff. Every request this client sends only reads (GETs, the token POST, and the read-only search and
+   * lookup POSTs), so sending one again cannot change the tenant. `retryNow` resends at once for a reason of the
+   * caller's own (a refreshed token). `failure` heads the error when the last attempt drew no response.
+   */
+  private async send(
+    url: string,
+    init: () => Promise<RequestInit>,
+    failure: string,
+    retryNow: (response: Response) => boolean = () => false,
+  ): Promise<{ response: Response; attempts: number }> {
+    for (let attempt = 0; ; attempt += 1) {
+      const requestInit = await init();
+      let response: Response;
+      try {
+        response = await this.fetchWithTimeout(url, requestInit);
+      } catch (error) {
+        if (!(error instanceof CrowdstrikeTransportError)) throw error;
+        if (attempt >= this.retryLimit) throw new Error(this.redact(`${failure} ${attemptsText(attempt + 1)}: ${error.message}`));
+        await this.sleep(backoffDelay(attempt));
+        continue;
+      }
+      if (retryNow(response)) continue;
+      if (isRetryableStatus(response.status) && attempt < this.retryLimit) {
+        await this.sleep(retryDelayFromResponse(response, attempt, this.now()));
+        continue;
+      }
+      return { response, attempts: attempt + 1 };
     }
   }
 
@@ -1395,19 +1452,21 @@ export class CrowdstrikeApiClient {
       body.set("member_cid", this.config.memberCid);
     }
 
-    const response = await this.fetchWithTimeout(`${this.config.baseUrl}/oauth2/token`, {
+    const failure = "CrowdStrike OAuth2 token request failed";
+    const { response, attempts } = await this.send(`${this.config.baseUrl}/oauth2/token`, async () => ({
       method: "POST",
       headers: {
         accept: "application/json",
         "content-type": "application/x-www-form-urlencoded",
       },
       body: body.toString(),
-    });
+    }), failure);
     const rawText = await response.text();
     const payload = parseJsonBody(rawText);
     if (!response.ok) {
+      const retried = isRetryableStatus(response.status) ? ` ${attemptsText(attempts)}` : "";
       throw new CrowdstrikeHttpError(
-        this.redact(`CrowdStrike OAuth2 token request failed (${response.status})${errorDetail(response, rawText, payload)}`),
+        this.redact(`${failure}${retried} (${response.status})${errorDetail(response, rawText, payload)}`),
         response.status,
         "/oauth2/token",
         tokenRequestRefused(response.status, payload),
@@ -1450,47 +1509,42 @@ export class CrowdstrikeApiClient {
     options: { query?: JsonRecord; body?: unknown } = {},
   ): Promise<JsonRecord> {
     const url = this.buildUrl(path, options.query);
+    const failure = `CrowdStrike request failed for ${path}`;
     let refreshedToken = false;
-    for (let attempt = 0; ; attempt += 1) {
+    const { response, attempts } = await this.send(url, async () => {
       const headers = new Headers({ accept: "application/json" });
       headers.set("authorization", `Bearer ${await this.getAccessToken()}`);
       if (options.body !== undefined) headers.set("content-type", "application/json");
-
-      const response = await this.fetchWithTimeout(url, {
+      return {
         method,
         headers,
         body: options.body === undefined ? undefined : JSON.stringify(options.body),
-      });
+      };
+    }, failure, (response) => {
+      if (response.status !== 401 || refreshedToken) return false;
+      refreshedToken = true;
+      this.invalidateToken();
+      return true;
+    });
 
-      if (response.status === 401 && !refreshedToken) {
-        refreshedToken = true;
-        this.invalidateToken();
-        continue;
-      }
-
-      if ((response.status === 429 || response.status >= 500) && attempt < this.retryLimit) {
-        await this.sleep(retryDelayFromResponse(response, attempt));
-        continue;
-      }
-
-      const rawText = await response.text();
-      const payload = parseJsonBody(rawText);
-      if (!response.ok) {
-        throw new CrowdstrikeHttpError(
-          this.redact(`CrowdStrike request failed for ${path} (${response.status})${errorDetail(response, rawText, payload)}`),
-          response.status,
-          path,
-        );
-      }
-      if (!payload) {
-        throw new Error(
-          this.redact(
-            `CrowdStrike response for ${path} (${response.status}) was malformed: expected a JSON object, received ${describeMalformedSuccessBody(response, rawText)}.`,
-          ),
-        );
-      }
-      return payload;
+    const rawText = await response.text();
+    const payload = parseJsonBody(rawText);
+    if (!response.ok) {
+      const retried = isRetryableStatus(response.status) ? ` ${attemptsText(attempts)}` : "";
+      throw new CrowdstrikeHttpError(
+        this.redact(`${failure}${retried} (${response.status})${errorDetail(response, rawText, payload)}`),
+        response.status,
+        path,
+      );
     }
+    if (!payload) {
+      throw new Error(
+        this.redact(
+          `CrowdStrike response for ${path} (${response.status}) was malformed: expected a JSON object, received ${describeMalformedSuccessBody(response, rawText)}.`,
+        ),
+      );
+    }
+    return payload;
   }
 
   /**

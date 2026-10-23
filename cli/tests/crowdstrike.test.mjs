@@ -58,6 +58,7 @@ import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFe
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 
 const observedDecisionFacts = observeRuntimeDecisionFacts(CROWDSTRIKE_SPEC);
 const testFilterActive = process.execArgv.some((argument) => /^--test-(?:name-pattern|skip-pattern|only)(?:=|$)/.test(argument));
@@ -848,6 +849,207 @@ test("CrowdstrikeApiClient redacts secrets in errors and gives up after the retr
     assert.doesNotMatch(error.message, /FAKE_PROXY_ECHOED_SECRET/, "a non-JSON error body is never copied into the error string");
     return true;
   });
+});
+
+/** Planted credentials for the retry tests: random-looking, so the fragment-window assertion is sound. */
+const CS_RETRY_SECRET = "Qm7vTz2KpX9wLr4N";
+const CS_RETRY_TOKEN = "Hb3ZsY8cVn5RtJ1q";
+const CS_RETRY_CLOCK = Date.parse("2026-03-01T12:00:00Z");
+
+/** How the client's own timeout ends a fetch: the request signal aborts and fetch rejects with an AbortError. */
+function csTimeout() {
+  return new DOMException("This operation was aborted", "AbortError");
+}
+
+/** A connection failure that echoes the planted credentials, as a proxy or TLS error might. */
+function csTransportFailure() {
+  return new TypeError(`fetch failed: ECONNRESET while sending client_secret=${CS_RETRY_SECRET} and Bearer ${CS_RETRY_TOKEN}`);
+}
+
+/** A 503 whose body and headers echo the planted credentials. */
+function csEchoing503() {
+  return jsonResponse(
+    { errors: [{ code: 503, message: `service unavailable for client_secret ${CS_RETRY_SECRET} token ${CS_RETRY_TOKEN}` }] },
+    { status: 503, headers: { "x-echo-secret": CS_RETRY_SECRET, "x-echo-token": CS_RETRY_TOKEN } },
+  );
+}
+
+test("CrowdStrike retry fixture plants well-formed credentials", () => {
+  assertPlantedValuesWellFormed(assert, { secret: CS_RETRY_SECRET, token: CS_RETRY_TOKEN }, [
+    ["healthy hosts page", JSON.stringify({ resources: [{ device_id: "aid-1", hostname: "ws-01" }] })],
+    ["sample config", JSON.stringify(sampleConfig())],
+  ]);
+});
+
+test("CrowdstrikeApiClient retries the OAuth2 token request after a 503, a timeout, and a transport failure", async () => {
+  const sleeps = [];
+  let tokenRequests = 0;
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/oauth2/token") {
+      tokenRequests += 1;
+      if (tokenRequests === 1) return csEchoing503();
+      if (tokenRequests === 2) throw csTimeout();
+      if (tokenRequests === 3) throw csTransportFailure();
+      return jsonResponse({ access_token: CS_RETRY_TOKEN, expires_in: 1799 });
+    }
+    return jsonResponse({ resources: [{ id: "hg-1", name: "Workstations" }], meta: { pagination: { total: 1 } } });
+  };
+  const client = new CrowdstrikeApiClient(sampleConfig({ clientSecret: CS_RETRY_SECRET }), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); } });
+
+  const groups = await client.listHostGroups();
+
+  assert.deepEqual(groups.items.map((group) => group.id), ["hg-1"]);
+  assert.equal(tokenRequests, 4, "the token request is sent until it is issued");
+  assert.deepEqual(sleeps, [250, 500, 1000], "each retry waits the exponential backoff");
+});
+
+test("CrowdstrikeApiClient retries a read that timed out or failed in transport and measures an HTTP-date Retry-After against its clock", async () => {
+  const sleeps = [];
+  let reads = 0;
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: CS_RETRY_TOKEN, expires_in: 1799 });
+    reads += 1;
+    if (reads === 1) {
+      return jsonResponse({ errors: [{ code: 503, message: "unavailable" }] }, { status: 503, headers: { "retry-after": new Date(CS_RETRY_CLOCK + 7000).toUTCString() } });
+    }
+    if (reads === 2) throw csTimeout();
+    if (reads === 3) throw csTransportFailure();
+    return jsonResponse({ resources: [{ id: "hg-1" }], meta: { pagination: { total: 1 } } });
+  };
+  const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); }, now: () => CS_RETRY_CLOCK });
+
+  const groups = await client.listHostGroups();
+
+  assert.deepEqual(groups.items.map((group) => group.id), ["hg-1"]);
+  assert.equal(reads, 4);
+  assert.deepEqual(sleeps, [7000, 500, 1000], "the HTTP date is 7 s past the injected clock; the timeout and transport retries back off");
+});
+
+test("CrowdstrikeApiClient clamps a retry header past its 15 s cap, whether delta seconds or an epoch measured against its clock", async () => {
+  for (const headers of [
+    { "retry-after": "120" },
+    { "X-RateLimit-RetryAfter": String(Math.floor(CS_RETRY_CLOCK / 1000) + 120) },
+    { "X-RateLimit-RetryAfter": String(CS_RETRY_CLOCK + 120_000) },
+  ]) {
+    const sleeps = [];
+    let reads = 0;
+    const fetchImpl = async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: CS_RETRY_TOKEN, expires_in: 1799 });
+      reads += 1;
+      if (reads === 1) return jsonResponse({ errors: [{ code: 429, message: "Rate limit exceeded" }] }, { status: 429, headers });
+      return jsonResponse({ resources: [], meta: { pagination: { total: 0 } } });
+    };
+    const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); }, now: () => CS_RETRY_CLOCK });
+    await client.listHostGroups();
+    assert.deepEqual(sleeps, [15_000], `the ${JSON.stringify(headers)} wait is clamped to the cap`);
+  }
+});
+
+test("CrowdstrikeApiClient names the path, the last failure, and the attempt count when retries run out, and leaks no planted credential", async () => {
+  const cases = [
+    { label: "503 on every read", read: () => csEchoing503(), message: /^CrowdStrike request failed for \/devices\/combined\/host-groups\/v1 after 5 attempts \(503\): service unavailable/ },
+    { label: "timeout on every read", read: () => { throw csTimeout(); }, message: /^CrowdStrike request failed for \/devices\/combined\/host-groups\/v1 after 5 attempts: timed out after 30000ms$/ },
+    { label: "transport failure on every read", read: () => { throw csTransportFailure(); }, message: /^CrowdStrike request failed for \/devices\/combined\/host-groups\/v1 after 5 attempts: fetch failed: ECONNRESET/ },
+    { label: "503 on every token request", token: () => csEchoing503(), message: /^CrowdStrike OAuth2 token request failed after 5 attempts \(503\): service unavailable/ },
+    { label: "timeout on every token request", token: () => { throw csTimeout(); }, message: /^CrowdStrike OAuth2 token request failed after 5 attempts: timed out after 30000ms$/ },
+  ];
+  for (const item of cases) {
+    const sleeps = [];
+    const sent = [];
+    const fetchImpl = async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      sent.push(url.pathname);
+      if (url.pathname === "/oauth2/token") return item.token ? item.token() : jsonResponse({ access_token: CS_RETRY_TOKEN, expires_in: 1799 });
+      return item.read();
+    };
+    const client = new CrowdstrikeApiClient(sampleConfig({ clientSecret: CS_RETRY_SECRET }), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); } });
+    await assert.rejects(client.listHostGroups(10), (error) => {
+      assert.match(error.message, item.message, item.label);
+      assert.doesNotMatch(error.message, /limit=|offset=/, `${item.label}: the error names the path, never the query`);
+      assertFragmentsAbsent(assert, error.message, [CS_RETRY_SECRET, CS_RETRY_TOKEN], `${item.label} error`);
+      return true;
+    });
+    const failingPath = item.token ? "/oauth2/token" : "/devices/combined/host-groups/v1";
+    assert.equal(sent.filter((path) => path === failingPath).length, 5, `${item.label}: the default budget is 4 retries`);
+    assert.deepEqual(sleeps, [250, 500, 1000, 2000], `${item.label}: exponential backoff between attempts`);
+  }
+
+  const single = new CrowdstrikeApiClient(sampleConfig(), {
+    fetchImpl: async (input) => (new URL(String(input)).pathname === "/oauth2/token" ? jsonResponse({ access_token: CS_RETRY_TOKEN, expires_in: 1799 }) : Promise.reject(csTimeout())),
+    sleep: async () => {},
+    retryLimit: 0,
+  });
+  await assert.rejects(single.listHostGroups(), /after 1 attempt: timed out after 30000ms$/);
+});
+
+test("CrowdstrikeApiClient stops at once when the call is aborted during a retry wait, sending no further request", async () => {
+  const controller = new AbortController();
+  const sent = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    sent.push(url.pathname);
+    if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: CS_RETRY_TOKEN, expires_in: 1799 });
+    throw csTimeout();
+  };
+  const client = new CrowdstrikeApiClient(sampleConfig(), {
+    fetchImpl,
+    sleep: () => {
+      controller.abort(new Error("operator cancelled"));
+      return new Promise(() => {});
+    },
+    signal: controller.signal,
+  });
+
+  await assert.rejects(client.listHostGroups(), (error) => error instanceof ToolCallAbortedError);
+  assert.deepEqual(sent, ["/oauth2/token", "/devices/combined/host-groups/v1"], "the timed-out read is not sent again after the abort");
+});
+
+test("a hosts page that fails on every attempt after page 1 leaves the hosts inventory unread: CS-13 and CS-14 go manual naming the failure, and no planted credential reaches the results or the bundle", async () => {
+  const failures = {
+    timeout: () => { throw csTimeout(); },
+    transport: () => { throw csTransportFailure(); },
+    "server error": () => csEchoing503(),
+  };
+  for (const [kind, fail] of Object.entries(failures)) {
+    const hostPages = [];
+    const sleeps = [];
+    const fetchImpl = async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      if (url.pathname === "/devices/combined/devices/v1" && !url.searchParams.get("filter")) {
+        hostPages.push(url.searchParams.get("offset"));
+        if (url.searchParams.get("offset")) return fail();
+        return jsonResponse({
+          resources: [{ device_id: "aid-1", hostname: "ws-01", platform_name: "Windows", last_seen: isoDaysAgo(1), groups: ["hg-1"] }],
+          meta: { pagination: { total: 2, offset: 1 } },
+        });
+      }
+      return csHealthyResponse(url.pathname);
+    };
+    const config = sampleConfig({ clientSecret: CS_RETRY_SECRET });
+    const client = new CrowdstrikeApiClient(config, { fetchImpl, sleep: async (ms) => { sleeps.push(ms); } });
+
+    const result = await assessCrowdstrikeSensorCoverage(client);
+
+    assert.deepEqual(hostPages, [null, "1", "1", "1", "1", "1"], `${kind}: page 1 once, then page 2 for the whole budget of 5 attempts`);
+    assert.deepEqual(sleeps, [250, 500, 1000, 2000], `${kind}: the page 2 retries back off`);
+    for (const id of ["CS-13", "CS-14"]) {
+      const found = findingById(result, id);
+      assert.equal(found.status, "manual", `${kind}: ${id} must not pass on a partial host inventory`);
+      assert.equal(found.evidence.unreadable_dataset, "hosts");
+      assert.match(found.summary, /The hosts read failed \(hosts: CrowdStrike request failed for \/devices\/combined\/devices\/v1 after 5 attempts/, `${kind}: ${found.summary}`);
+    }
+    assert.equal(result.summary.sampled_hosts, null, `${kind}: no host count is derived from the partial read`);
+    assert.match(result.summary.inventories.hosts, /^unread \(hosts: CrowdStrike request failed for \/devices\/combined\/devices\/v1 after 5 attempts/);
+    assertFragmentsAbsent(assert, JSON.stringify(result), [CS_RETRY_SECRET, CS_RETRY_TOKEN], `${kind} assessment`);
+
+    const exported = await exportCrowdstrikeAuditBundle(client, config, createTempBase("grclanker-cs-retry-bundle-"));
+    const files = readBundleFiles(exported.outputDir);
+    assert.match(files.get("_errors.log") ?? "", /hosts: CrowdStrike request failed for \/devices\/combined\/devices\/v1 after 5 attempts/, `${kind}: the bundle records the failed read`);
+    assertSecretFragmentsAbsent(assert, [...files, ...readZipEntries(exported.zipPath)], [CS_RETRY_SECRET, CS_RETRY_TOKEN], `${kind} bundle`);
+  }
 });
 
 test("checkCrowdstrikeAccess reports healthy when every read surface responds", async () => {
@@ -2802,11 +3004,12 @@ const CROWDSTRIKE_FIXED_TEXTS = [
   "Unable to parse CrowdStrike config file: invalid JSON in /tmp/grclanker-crowdstrike-loader-Ab3dEf/short.json",
   "Unable to parse CrowdStrike config file: invalid JSON in /tmp/grclanker-crowdstrike-loader-Ab3dEf/trailing-comma.json at line 3",
   "Unable to parse CrowdStrike config file: /home/svc/.crowdstrike/config.json must contain a JSON object",
-  "CrowdStrike OAuth2 token request failed (502): non-JSON body (text/html, 5120 bytes)",
+  "CrowdStrike OAuth2 token request failed after 5 attempts (502): non-JSON body (text/html, 5120 bytes)",
   "CrowdStrike OAuth2 token request failed (401): access denied, invalid bearer token",
   "CrowdStrike request failed for /policy/combined/prevention/v1 (403): JSON body without a documented error field (application/json, 27 bytes)",
-  "CrowdStrike request failed for /user-management/queries/users/v1 (429): non-JSON body (text/plain, 12 bytes)",
-  "CrowdStrike request timed out after 30000ms: /devices/combined/devices/v1",
+  "CrowdStrike request failed for /user-management/queries/users/v1 after 5 attempts (429): non-JSON body (text/plain, 12 bytes)",
+  "CrowdStrike request failed for /devices/combined/devices/v1 after 5 attempts: timed out after 30000ms",
+  "CrowdStrike OAuth2 token request failed after 1 attempt: fetch failed",
   CS_SAMPLE_DENIAL,
   `unread (${CS_SAMPLE_DENIAL})`,
   "not requested (the device control policies list was not read)",
