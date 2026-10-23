@@ -57,7 +57,7 @@ The client posts `client_id` and `client_secret` as a form body to `POST /signin
 Optional tuning:
 
 - `ZSCALER_TIMEOUT` (seconds, default 30)
-- `ZSCALER_MAX_RETRIES` (default 3, honoring `Retry-After` on 429 and 5xx responses)
+- `ZSCALER_MAX_RETRIES` (default 3, honoring `Retry-After` on 429, 502, 503, and 504 responses)
 
 ## Run it
 
