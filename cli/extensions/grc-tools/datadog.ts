@@ -1125,6 +1125,19 @@ function statusLine(response: Response): string {
   return response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
 }
 
+/** The wait a Retry-After header asks for: delta-seconds, or an HTTP-date measured against `nowMs`. */
+function retryAfterMs(header: string | null, nowMs: number): number | undefined {
+  const seconds = asNumber(header ?? undefined);
+  if (seconds !== undefined) return seconds >= 0 ? seconds * 1000 : undefined;
+  if (!header || !/[a-z]/i.test(header)) return undefined;
+  const dateMs = Date.parse(header);
+  return Number.isNaN(dateMs) ? undefined : Math.max(0, dateMs - nowMs);
+}
+
+function attemptsSuffix(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
 /**
  * The documented shape of a successful body per endpoint: the v2 API answers with a `data` container, the v1 API with
  * bare arrays or named containers (`orgs`, `dashboards`, `indexes`, `accounts`, `pipeline_ids`), and the key checks
@@ -1185,18 +1198,21 @@ export class DatadogApiClient {
   private readonly config: DatadogResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleepImpl: SleepImpl;
+  private readonly now: () => Date;
 
   constructor(
     config: DatadogResolvedConfig,
     options: {
       fetchImpl?: FetchImpl;
       sleepImpl?: SleepImpl;
+      now?: () => Date;
       signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
+    this.now = options.now ?? (() => new Date());
     // The configured keys are scrubbed from every recorded error string in every encoded form from here on.
     credentialScrubber.registerSecrets([config.apiKey, config.appKey]);
   }
@@ -1232,18 +1248,24 @@ export class DatadogApiClient {
     return headers;
   }
 
+  /** X-RateLimit-Reset first on a 429, then Retry-After on any retryable status, then exponential backoff; every wait is capped. */
   private retryDelayMs(response: Response, attempt: number): number {
     if (response.status === 429) {
       const resetSeconds = asNumber(response.headers.get("x-ratelimit-reset") ?? undefined);
       if (resetSeconds !== undefined && resetSeconds >= 0) {
         return Math.min(Math.max(resetSeconds, 1) * 1000, MAX_RATE_LIMIT_WAIT_MS);
       }
-      return Math.min(1000 * 2 ** attempt, MAX_RATE_LIMIT_WAIT_MS);
     }
+    const retryAfter = retryAfterMs(response.headers.get("retry-after"), this.now().getTime());
+    if (retryAfter !== undefined) return Math.min(retryAfter, MAX_RATE_LIMIT_WAIT_MS);
+    return response.status === 429 ? Math.min(1000 * 2 ** attempt, MAX_RATE_LIMIT_WAIT_MS) : this.backoffMs(attempt);
+  }
+
+  private backoffMs(attempt: number): number {
     return Math.min(500 * 2 ** attempt, 10_000);
   }
 
-  private async performRequest(method: string, url: string, body: unknown): Promise<Response> {
+  private async performRequest(method: string, url: string, body: unknown, attempts: number): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
@@ -1255,10 +1277,11 @@ export class DatadogApiClient {
       });
     } catch (error) {
       rethrowIfAborted(error);
+      const endpoint = `${method} ${new URL(url).pathname}${attemptsSuffix(attempts)}`;
       if (controller.signal.aborted) {
-        throw new Error(this.redact(`Datadog request timed out after ${this.config.timeoutMs}ms: ${method} ${new URL(url).pathname}`));
+        throw new Error(this.redact(`Datadog request timed out after ${this.config.timeoutMs}ms: ${endpoint}`));
       }
-      throw new Error(this.redact(`Datadog request failed: ${method} ${new URL(url).pathname}: ${describeThrown(error)}`));
+      throw new Error(this.redact(`Datadog request failed: ${endpoint}: ${describeThrown(error)}`));
     } finally {
       clearTimeout(timeout);
     }
@@ -1267,7 +1290,15 @@ export class DatadogApiClient {
   async request(method: string, path: string, query: JsonRecord = {}, body: unknown, shape: DatadogResponseShape): Promise<unknown> {
     const url = this.buildUrl(path, query);
     for (let attempt = 0; ; attempt += 1) {
-      const response = await this.performRequest(method, url, body);
+      let response: Response;
+      try {
+        response = await this.performRequest(method, url, body, attempt + 1);
+      } catch (error) {
+        rethrowIfAborted(error);
+        if (method !== "GET" || attempt >= this.config.maxRetries) throw error;
+        await this.sleepImpl(this.backoffMs(attempt));
+        continue;
+      }
       const retryable = response.status === 429 || response.status >= 500;
       if (retryable && attempt < this.config.maxRetries) {
         await response.text().catch(() => "");
@@ -1294,7 +1325,7 @@ export class DatadogApiClient {
           ? ""
           : (parsedJson ? datadogErrorSummary(payload) : undefined) ?? describeOpaqueBody(response, rawText, parsedJson);
         throw new DatadogApiError(
-          this.redact(`Datadog request failed (${statusLine(response)}) ${method} ${path}${detail ? `: ${detail}` : ""}`),
+          this.redact(`Datadog request failed (${statusLine(response)}) ${method} ${path}${attemptsSuffix(attempt + 1)}${detail ? `: ${detail}` : ""}`),
           response.status,
           path,
         );
@@ -4786,7 +4817,7 @@ const authParams = {
   base_url: Type.Optional(Type.String({ description: "Explicit API base URL override (for example https://api.ddog-gov.com). Defaults to DD_HOST or https://api.<site>." })),
   config_file: Type.Optional(Type.String({ description: "Path to a dogshell-style INI config with a [Connection] section (apikey, appkey, api_host). Defaults to DD_CONFIG_FILE, then ~/.dogrc." })),
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout in seconds. Defaults to 30.", default: 30 })),
-  max_retries: Type.Optional(Type.Number({ description: "Retries for 429 and 5xx responses (429 honors X-RateLimit-Reset). Defaults to 3.", default: 3 })),
+  max_retries: Type.Optional(Type.Number({ description: "Retries for 429 and 5xx responses, timeouts, and transport failures (429 honors X-RateLimit-Reset, then Retry-After). Defaults to 3.", default: 3 })),
 };
 
 const identityParams = {

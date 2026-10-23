@@ -244,6 +244,7 @@ This section is reference for reviewing findings and bundles: how unread, partia
 Every verdict follows the same evidence rules, so a `pass` is never produced from missing or partial data:
 
 - A forbidden (401/403), timed out, or errored source endpoint never yields `pass`. Without an observed violation, the verdict becomes `manual` or `warn`. The summary names the endpoint and error. A `manual` summary also lists what to collect.
+  - A request that answers `429`, `500`, `502`, `503`, or `504`, times out, or fails in transit is retried up to three times with exponential backoff, honoring `Retry-After` in seconds or as an HTTP date (capped at 30 seconds). Only then does the endpoint count as timed out or errored, and its error names the path, the last status or failure, and the number of attempts.
 - Observed violations (for example too many superusers) still `fail` even when a secondary source is unreadable.
 - An empty inventory never passes by default. Each control states how emptiness is judged:
   - Zero users, roles, spaces, certificates, or ingest pipelines is `manual`, because Elasticsearch and Kibana always return built-in entries.

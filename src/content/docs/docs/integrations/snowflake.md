@@ -263,7 +263,7 @@ This section is reference for reviewing findings and bundles: how unread, partia
 
 ### Statement execution
 
-Statements are submitted with `POST /api/v2/statements?async=true` and polled with `GET /api/v2/statements/{handle}` while the API returns `202`, honoring `Retry-After`.
+Statements are submitted with `POST /api/v2/statements?async=true` and polled with `GET /api/v2/statements/{handle}` while the API returns `202`, or a `429` that carries the statement handle. Each poll waits for the previous response's `Retry-After` (in seconds or as an HTTP date, capped at 30 seconds), or `poll_interval_ms` without one, until the statement timeout passes.
 
 - **Status URL:** The poll follows the `statementStatusUrl` the API returned only when it carries no userinfo and is one of these:
   - A root path on the configured account origin.
@@ -280,7 +280,10 @@ Statements are submitted with `POST /api/v2/statements?async=true` and polled wi
 - **Request URLs:** The request layer refuses the same shapes before any credential is built (`Snowflake SQL API request refused: the request URL <reason>, so no request was sent.`).
 - **Refusal text:** Every refusal is fixed text naming only the configured origin and the rejected origin. No path, query, fragment, or userinfo of the returned URL reaches any text.
 - **Partitions:** The response that completes the statement carries partition 0 in its `data`. When `resultSetMetaData.partitionInfo` lists more than one partition, each additional partition (1 through the last, within `max_partitions`) is fetched with `GET /api/v2/statements/{handle}?partition=N`.
-- **Errors:** `429` and `5xx` responses are retried with exponential backoff. HTTP timeouts abort the request. Error messages are scrubbed by the [error text rules](#error-text-carriers).
+- **Errors:** `429` and `5xx` responses, HTTP timeouts, and transport failures are retried up to `max_retries` times, waiting out exponential backoff from `retry_base_ms` (capped at 15 seconds) or the response's `Retry-After` (in seconds or as an HTTP date, capped at 30 seconds).
+  - A statement submission is resent only with its original `requestId` plus `retry=true`, which the SQL API documents as not executing the statement again when it has already run successfully.
+  - Once the retries run out, the statement is recorded as failed or timed out, never as an empty result. The error names the method and path (never the query), the last status or failure, and the number of attempts.
+  - Error messages are scrubbed by the [error text rules](#error-text-carriers).
 
 Every statement outcome carries `status` (`ok`, `denied`, `error`, `timeout`, or `not_requested`). The outcome carries `numRows`, `partitionCount`, `fetchedPartitions`, and `truncated` only when `ok`. A statement that did not complete has all four set to `null` rather than `0` or `false`.
 

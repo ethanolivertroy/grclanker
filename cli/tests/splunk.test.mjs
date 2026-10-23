@@ -24,6 +24,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 
 const NOW_SECONDS = Math.floor(Date.now() / 1000);
 
@@ -445,6 +446,207 @@ test("SplunkApiClient calls ACS with the ACS bearer token and retries 429 respon
   const users = await flaky.listUsers();
   assert.equal(users.entries.length, 1);
   assert.equal(restAttempts, 3);
+});
+
+const RETRY_NOW_MS = Date.parse("2026-01-15T12:00:00Z");
+
+function statusResponse(status, statusText, body, headers = {}) {
+  return new Response(JSON.stringify(body), { status, statusText, headers: { "content-type": "application/json", ...headers } });
+}
+
+/** A fetch that never answers: the client's own request timeout aborts it, and the mock clock jumps straight to that deadline. */
+function timingOutFetch(t, timeoutMs) {
+  return (_input, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+    t.mock.timers.tick(timeoutMs);
+  });
+}
+
+/** Answers each request with the next reply factory, repeating the last one. */
+function scriptedFetch(replies) {
+  const state = { calls: 0 };
+  const fetchImpl = (input, init) => {
+    const reply = replies[Math.min(state.calls, replies.length - 1)];
+    state.calls += 1;
+    return reply(input, init);
+  };
+  return { fetchImpl, state };
+}
+
+test("SplunkApiClient retries a timeout and a transport failure before it succeeds, backing off through the injected sleep", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { fetchImpl, state } = scriptedFetch([
+    timingOutFetch(t, 30000),
+    async () => { throw new TypeError("fetch failed: socket hang up"); },
+    async () => jsonResponse(entryList([entry("admin", { roles: ["admin"] })])),
+  ]);
+  const sleeps = [];
+  const api = new SplunkApiClient(sampleConfig(), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); }, retryDelayMs: 100 });
+  const users = await api.listUsers();
+  assert.equal(users.entries.length, 1);
+  assert.equal(state.calls, 3);
+  assert.deepEqual(sleeps, [100, 200]);
+});
+
+test("SplunkApiClient honors Retry-After as delta-seconds or an HTTP-date on 429 and 5xx responses", async () => {
+  const { fetchImpl, state } = scriptedFetch([
+    async () => statusResponse(429, "Too Many Requests", { messages: [{ text: "slow down" }] }, { "retry-after": "2" }),
+    async () => statusResponse(503, "Service Unavailable", { messages: [{ text: "temporarily unavailable" }] }, { "retry-after": new Date(RETRY_NOW_MS + 5000).toUTCString() }),
+    async () => statusResponse(502, "Bad Gateway", { messages: [{ text: "bad gateway" }] }),
+    async () => jsonResponse(entryList([entry("admin", { roles: ["admin"] })])),
+  ]);
+  const sleeps = [];
+  const api = new SplunkApiClient(sampleConfig(), {
+    fetchImpl,
+    sleep: async (ms) => { sleeps.push(ms); },
+    now: () => RETRY_NOW_MS,
+    retryAttempts: 4,
+    retryDelayMs: 100,
+  });
+  const users = await api.listUsers();
+  assert.equal(users.entries.length, 1);
+  assert.equal(state.calls, 4);
+  assert.deepEqual(sleeps, [2000, 5000, 400], "a 502 with no Retry-After falls back to the exponential backoff");
+});
+
+test("SplunkApiClient fails closed without waiting when Retry-After asks for more than 30 s", async () => {
+  const cases = [
+    {
+      label: "delta-seconds on the first attempt",
+      replies: [async () => statusResponse(429, "Too Many Requests", { messages: [{ text: "slow down" }] }, { "retry-after": "120" })],
+      message: "Splunk request to /services/authentication/users failed (429 Too Many Requests): the server asked to retry after 120 s, more than the 30 s limit",
+      status: 429,
+      calls: 1,
+      sleeps: [],
+    },
+    {
+      label: "an HTTP-date on the second attempt",
+      replies: [
+        async () => statusResponse(503, "Service Unavailable", { messages: [{ text: "temporarily unavailable" }] }, { "retry-after": "1" }),
+        async () => statusResponse(503, "Service Unavailable", { messages: [{ text: "temporarily unavailable" }] }, { "retry-after": new Date(RETRY_NOW_MS + 600_000).toUTCString() }),
+      ],
+      message: "Splunk request to /services/authentication/users failed (503 Service Unavailable) after 2 attempts: the server asked to retry after 600 s, more than the 30 s limit",
+      status: 503,
+      calls: 2,
+      sleeps: [1000],
+    },
+  ];
+  for (const { label, replies, message, status, calls, sleeps: expectedSleeps } of cases) {
+    const { fetchImpl, state } = scriptedFetch(replies);
+    const sleeps = [];
+    const api = new SplunkApiClient(sampleConfig(), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); }, now: () => RETRY_NOW_MS, retryDelayMs: 0 });
+    await assert.rejects(api.listUsers(), (error) => {
+      assert.equal(error.message, message, label);
+      assert.equal(error.status, status, label);
+      return true;
+    });
+    assert.equal(state.calls, calls, label);
+    assert.deepEqual(sleeps, expectedSleeps, `${label}: the over-limit wait is never slept`);
+  }
+});
+
+test("SplunkApiClient names the endpoint, the last failure, and the attempt count when retries run out, with the planted token scrubbed", async (t) => {
+  const plantedToken = "TAgXYC6qr79e4KFucKQ4CaRjFw3w6o4P";
+  assertPlantedValuesWellFormed(assert, { plantedToken }, [JSON.stringify(HARDENED), JSON.stringify(sampleConfig({ token: undefined }))]);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const cases = [
+    {
+      label: "503",
+      reply: async () => statusResponse(503, "Service Unavailable", { messages: [{ text: `upstream refused Bearer ${plantedToken}` }] }),
+      expected: /^Splunk request to \/services\/authentication\/users failed \(503 Service Unavailable\) after 3 attempts: upstream refused /,
+    },
+    {
+      label: "transport",
+      reply: async () => { throw new TypeError(`fetch failed: connect ECONNREFUSED (sent ${plantedToken})`); },
+      expected: /^Splunk request to \/services\/authentication\/users failed after 3 attempts: fetch failed: connect ECONNREFUSED /,
+    },
+    {
+      label: "timeout",
+      reply: timingOutFetch(t, 30000),
+      expected: /^Splunk request to \/services\/authentication\/users timed out after 30000 ms after 3 attempts$/,
+    },
+  ];
+  for (const { label, reply, expected } of cases) {
+    const { fetchImpl, state } = scriptedFetch([reply]);
+    const sleeps = [];
+    const api = new SplunkApiClient(sampleConfig({ token: plantedToken }), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); }, retryDelayMs: 100 });
+    const error = await api.listUsers().then(() => assert.fail(`${label}: listUsers resolved`), (caught) => caught);
+    assert.equal(error.name, "SplunkApiError", label);
+    assert.equal(error.endpoint, "/services/authentication/users", label);
+    assert.match(error.message, expected, label);
+    assert.ok(!error.message.includes("?") && !error.message.includes("offset="), `${label}: the query string stays out of the error`);
+    assertFragmentsAbsent(assert, `${error.message}\n${error.stack}`, [plantedToken], label);
+    assert.equal(state.calls, 3, `${label}: the default budget is 3 attempts`);
+    assert.deepEqual(sleeps, [100, 200], label);
+  }
+});
+
+test("SplunkApiClient stops at once when the tool call is aborted during a retry wait, without another request", async () => {
+  for (const [label, reply] of [
+    ["503", async () => statusResponse(503, "Service Unavailable", { messages: [{ text: "temporarily unavailable" }] })],
+    ["transport", async () => { throw new TypeError("fetch failed: other side closed"); }],
+  ]) {
+    const controller = new AbortController();
+    const { fetchImpl, state } = scriptedFetch([reply]);
+    const api = new SplunkApiClient(sampleConfig(), {
+      fetchImpl,
+      signal: controller.signal,
+      retryDelayMs: 0,
+      sleep: () => {
+        queueMicrotask(() => controller.abort());
+        return new Promise(() => {});
+      },
+    });
+    await assert.rejects(api.listUsers(), (error) => error.name === "ToolCallAbortedError", label);
+    assert.equal(state.calls, 1, `${label}: no request after the abort`);
+  }
+});
+
+test("a Splunk roles page that times out on every attempt leaves the role inventory unreadable, so no role-dependent access check passes", async (t) => {
+  const roleChecks = ["SPLUNK-AC-07", "SPLUNK-AC-09", "SPLUNK-AC-10", "SPLUNK-AC-12"];
+  const healthy = await assessSplunkAccessControl(client(HARDENED, { pageSize: 3 }).client);
+  for (const id of roleChecks) assert.equal(byId(healthy, id).status, "pass", `${id} passes when every role page reads`);
+
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { fetchImpl: healthyFetch, seen } = createFetch(HARDENED);
+  const timeout = timingOutFetch(t, 30000);
+  const fetchImpl = (input, init) => {
+    const url = new URL(input.toString());
+    if (url.pathname !== "/services/authorization/roles" || url.searchParams.get("offset") !== "3") return healthyFetch(input, init);
+    seen.push({ pathname: url.pathname, search: url.search, method: init.method ?? "GET" });
+    return timeout(input, init);
+  };
+  const api = new SplunkApiClient(sampleConfig(), { fetchImpl, sleep: async () => {}, retryDelayMs: 0, pageSize: 3 });
+  const result = await assessSplunkAccessControl(api);
+  const failure = "Splunk request to /services/authorization/roles timed out after 30000 ms after 3 attempts";
+  const roleOffsets = seen.filter((item) => item.pathname === "/services/authorization/roles").map((item) => new URLSearchParams(item.search).get("offset"));
+  assert.deepEqual(roleOffsets, ["0", "3", "3", "3"], "page 1 once, then page 2 for every attempt in the budget");
+  assert.ok(result.errors.includes(`[roles] ${failure}`), JSON.stringify(result.errors));
+  for (const id of roleChecks) {
+    const item = byId(result, id);
+    assert.equal(item.status, "manual", `${id} does not pass on a partial role list`);
+    assert.ok(item.summary.includes(failure), `${id} names the failure: ${item.summary}`);
+  }
+});
+
+test("an audit.conf page that returns 404 after the first page reads as incomplete, not as an absent file, so control 17 does not pass on the documented default", async () => {
+  const fixture = { ...HARDENED, "/services/configs/conf-audit": [entry("auditTrail", { queueing: "0" }), entry("default", {})] };
+  const healthy = await assessSplunkAuditMonitoring(client(fixture, { pageSize: 1 }).client);
+  assert.equal(byId(healthy, "SPLUNK-AUD-17").status, "warn", "queueing=0 on the first page caps control 17 at warn");
+
+  const { fetchImpl: healthyFetch } = createFetch(fixture);
+  const fetchImpl = (input, init) => {
+    const url = new URL(input.toString());
+    if (url.pathname === "/services/configs/conf-audit" && url.searchParams.get("offset") === "1") return jsonResponse({ messages: [{ type: "ERROR", text: "Not Found" }] }, 404);
+    return healthyFetch(input, init);
+  };
+  const result = await assessSplunkAuditMonitoring(new SplunkApiClient(sampleConfig(), { fetchImpl, retryDelayMs: 0, pageSize: 1 }));
+  const item = byId(result, "SPLUNK-AUD-17");
+  const incomplete = "The list at /services/configs/conf-audit is incomplete: the page at offset 1 returned 404 after 1 of 2 entries were read";
+  assert.equal(item.status, "warn", item.summary);
+  assert.equal(item.evidence.audit_conf_readable, false);
+  assert.ok(item.summary.includes(`audit.conf could not be read (the endpoint could not be read (${incomplete}`), item.summary);
+  assert.ok(result.errors.some((line) => line.startsWith(`[conf-audit] ${incomplete}`)), JSON.stringify(result.errors));
 });
 
 test("tokens without iat or exp claims are bucketed separately and cap the verdict at warn", async () => {

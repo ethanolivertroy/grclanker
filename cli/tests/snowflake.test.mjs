@@ -45,6 +45,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 
 const { privateKey: testPrivateKey, publicKey: testPublicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const TEST_PRIVATE_KEY_PEM = testPrivateKey.export({ type: "pkcs8", format: "pem" });
@@ -1846,6 +1847,289 @@ test("SnowflakeSqlClient classifies insufficient privileges, timeouts, and redac
   });
 });
 
+const RETRY_NOW_MS = Date.parse("2026-01-15T12:00:00Z");
+
+/** A fetch that never answers: the client's own request timeout aborts it, and the mock clock jumps straight to that deadline. */
+function timingOutFetch(t, timeoutMs) {
+  return (_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+    t.mock.timers.tick(timeoutMs);
+  });
+}
+
+function resultPayload(handle, rows, partitionRowCounts) {
+  return {
+    code: "090001",
+    statementHandle: handle,
+    resultSetMetaData: {
+      numRows: partitionRowCounts.reduce((sum, count) => sum + count, 0),
+      format: "jsonv2",
+      rowType: [{ name: "NAME", type: "text" }],
+      partitionInfo: partitionRowCounts.map((rowCount) => ({ rowCount })),
+    },
+    data: rows,
+  };
+}
+
+test("SnowflakeSqlClient retries a status poll and a partition download after a timeout or a transport failure", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const timeout = timingOutFetch(t, 5000);
+  const calls = [];
+  let statusPolls = 0;
+  let partitionReads = 0;
+  const fetchImpl = (url, init) => {
+    const target = new URL(String(url));
+    calls.push(`${init.method} ${target.pathname}${target.search}`.replace(/requestId=[0-9a-f-]+/, "requestId=<id>"));
+    if (init.method === "POST") {
+      return Promise.resolve(jsonResponse({ code: "333334", message: "Asynchronous execution in progress.", statementHandle: "handle-7", statementStatusUrl: "/api/v2/statements/handle-7" }, { status: 202 }));
+    }
+    if (target.search === "") {
+      statusPolls += 1;
+      return statusPolls === 1 ? timeout(url, init) : Promise.resolve(jsonResponse(resultPayload("handle-7", [["a"], ["b"]], [2, 1])));
+    }
+    partitionReads += 1;
+    if (partitionReads === 1) return timeout(url, init);
+    if (partitionReads === 2) return Promise.reject(new TypeError("fetch failed: other side closed"));
+    return Promise.resolve(jsonResponse({ data: [["c"]] }));
+  };
+  const sleeps = [];
+  const client = new SnowflakeSqlClient(sampleConfig({ retryBaseMs: 500 }), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); } });
+  const result = await client.execute("SELECT NAME FROM T");
+  assert.deepEqual(result.rows.map((row) => row.NAME), ["a", "b", "c"]);
+  assert.equal(result.truncated, false);
+  assert.deepEqual(calls, [
+    "POST /api/v2/statements?async=true&requestId=<id>",
+    "GET /api/v2/statements/handle-7",
+    "GET /api/v2/statements/handle-7",
+    "GET /api/v2/statements/handle-7?partition=1",
+    "GET /api/v2/statements/handle-7?partition=1",
+    "GET /api/v2/statements/handle-7?partition=1",
+  ]);
+  assert.deepEqual(sleeps, [0, 500, 500, 1000], "the poll interval, then the backoff before each retry");
+});
+
+test("SnowflakeSqlClient resends a statement submission only with its original requestId and retry=true", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const cases = [
+    ["timeout", timingOutFetch(t, 5000)],
+    ["transport failure", async () => { throw new TypeError("fetch failed: read ECONNRESET"); }],
+    ["503", async () => jsonResponse({ message: "upstream unavailable" }, { status: 503, statusText: "Service Unavailable" })],
+  ];
+  for (const [label, firstReply] of cases) {
+    const submissions = [];
+    const fetchImpl = (url, init) => {
+      submissions.push({ url: new URL(String(url)), body: init.body });
+      return submissions.length === 1 ? firstReply(url, init) : Promise.resolve(jsonResponse(resultPayload("handle-5", [["a"]], [1])));
+    };
+    const sleeps = [];
+    const client = new SnowflakeSqlClient(sampleConfig({ retryBaseMs: 500 }), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); } });
+    const result = await client.execute("SELECT NAME FROM T");
+    assert.deepEqual(result.rows, [{ NAME: "a" }], label);
+    assert.equal(submissions.length, 2, label);
+    const [first, resent] = submissions;
+    assert.match(first.url.searchParams.get("requestId"), /^[0-9a-f-]{36}$/, label);
+    assert.equal(first.url.searchParams.has("retry"), false, `${label}: the first submission is not marked as a retry`);
+    assert.equal(resent.url.searchParams.get("requestId"), first.url.searchParams.get("requestId"), `${label}: the resubmission keeps the requestId`);
+    assert.equal(resent.url.searchParams.get("retry"), "true", `${label}: the resubmission asks Snowflake not to run the statement twice`);
+    assert.equal(resent.url.searchParams.get("async"), "true", label);
+    assert.equal(resent.body, first.body, label);
+    assert.deepEqual(sleeps, [500], label);
+  }
+});
+
+test("SnowflakeSqlClient does not resend a submission that has no requestId after a timeout or a transport failure", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const cases = [
+    ["timeout", timingOutFetch(t, 5000), /^Snowflake SQL API request timed out after 5000ms \(POST \/api\/v2\/statements\)$/],
+    ["transport failure", async () => { throw new TypeError("fetch failed: read ECONNRESET"); }, /^Snowflake SQL API request failed \(POST \/api\/v2\/statements\): fetch failed: read ECONNRESET$/],
+  ];
+  for (const [label, reply, expected] of cases) {
+    let calls = 0;
+    const sleeps = [];
+    const client = new SnowflakeSqlClient(sampleConfig({ retryBaseMs: 500 }), {
+      fetchImpl: (url, init) => {
+        calls += 1;
+        return reply(url, init);
+      },
+      sleep: async (ms) => { sleeps.push(ms); },
+    });
+    await assert.rejects(client.request("POST", "/api/v2/statements?async=true", { statement: "SELECT 1" }), (error) => {
+      assert.match(error.message, expected, label);
+      return true;
+    });
+    assert.equal(calls, 1, `${label}: a submission that cannot be deduplicated is sent once`);
+    assert.deepEqual(sleeps, [], label);
+  }
+});
+
+test("SnowflakeSqlClient honors an HTTP-date Retry-After and caps every Retry-After wait at 30 s", async () => {
+  const replies = [
+    () => jsonResponse({ message: "upstream unavailable" }, { status: 503, statusText: "Service Unavailable", headers: { "retry-after": new Date(RETRY_NOW_MS + 4000).toUTCString() } }),
+    () => jsonResponse({ message: "slow down" }, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": new Date(RETRY_NOW_MS + 600_000).toUTCString() } }),
+    () => jsonResponse(resultPayload("handle-6", [["a"]], [1])),
+  ];
+  let calls = 0;
+  const sleeps = [];
+  const client = new SnowflakeSqlClient(sampleConfig(), {
+    fetchImpl: async () => replies[Math.min(calls++, replies.length - 1)](),
+    sleep: async (ms) => { sleeps.push(ms); },
+    now: () => new Date(RETRY_NOW_MS),
+  });
+  const result = await client.execute("SELECT NAME FROM T");
+  assert.deepEqual(result.rows, [{ NAME: "a" }]);
+  assert.equal(calls, 3);
+  assert.deepEqual(sleeps, [4000, 30_000]);
+});
+
+test("the Snowflake status poll waits out the Retry-After of a 429 that carries the statement handle", async () => {
+  const calls = [];
+  const fetchImpl = async (_url, init) => {
+    calls.push(init.method);
+    if (init.method === "POST") {
+      return jsonResponse({ code: "333334", message: "Asynchronous execution in progress.", statementHandle: "handle-8", statementStatusUrl: "/api/v2/statements/handle-8" }, { status: 202 });
+    }
+    if (calls.length === 2) {
+      return jsonResponse({ message: "Too many requests", statementHandle: "handle-8" }, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": new Date(RETRY_NOW_MS + 7000).toUTCString() } });
+    }
+    return jsonResponse(resultPayload("handle-8", [["a"]], [1]));
+  };
+  const sleeps = [];
+  const client = new SnowflakeSqlClient(sampleConfig({ pollIntervalMs: 250 }), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); }, now: () => new Date(RETRY_NOW_MS) });
+  const result = await client.execute("SELECT NAME FROM T");
+  assert.deepEqual(result.rows, [{ NAME: "a" }]);
+  assert.deepEqual(calls, ["POST", "GET", "GET"]);
+  assert.deepEqual(sleeps, [250, 7000], "the first poll waits the poll interval, the next one the 429's Retry-After");
+});
+
+test("SnowflakeSqlClient retries a partition download that answers 429 and honors its Retry-After", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    const target = new URL(String(url));
+    calls.push(`${init.method} ${target.pathname}${target.search}`);
+    if (init.method === "POST") return jsonResponse(resultPayload("handle-9", [["a"]], [1, 1]));
+    if (calls.length === 2) {
+      return jsonResponse({ message: "Too many requests", statementHandle: "handle-9" }, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": new Date(RETRY_NOW_MS + 3000).toUTCString() } });
+    }
+    return jsonResponse({ data: [["b"]] });
+  };
+  const sleeps = [];
+  const client = new SnowflakeSqlClient(sampleConfig(), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); }, now: () => new Date(RETRY_NOW_MS) });
+  const result = await client.execute("SELECT NAME FROM T");
+  assert.deepEqual(result.rows.map((row) => row.NAME), ["a", "b"]);
+  assert.deepEqual(calls.slice(1), ["GET /api/v2/statements/handle-9?partition=1", "GET /api/v2/statements/handle-9?partition=1"]);
+  assert.deepEqual(sleeps, [3000]);
+});
+
+test("SnowflakeSqlClient names the endpoint, the last failure, and the attempt count when retries run out, with the planted token scrubbed", async (t) => {
+  const plantedToken = "gtbYqvbqKUkywb9wy66ZxoWXv7CZAXUE";
+  const config = sampleConfig({ tokenType: "OAUTH", token: plantedToken, privateKeyPem: undefined, retryBaseMs: 500 });
+  assertPlantedValuesWellFormed(assert, { plantedToken }, [JSON.stringify({ ...config, token: undefined })]);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const cases = [
+    {
+      label: "503",
+      reply: async () => jsonResponse({ message: `upstream unavailable for Bearer ${plantedToken}` }, { status: 503, statusText: "Service Unavailable" }),
+      expected: /^Snowflake SQL API request failed \(503 Service Unavailable\) at POST \/api\/v2\/statements after 4 attempts: upstream unavailable for Bearer /,
+      kind: "error",
+    },
+    {
+      label: "transport",
+      reply: async () => { throw new TypeError(`fetch failed: read ECONNRESET (Bearer ${plantedToken})`); },
+      expected: /^Snowflake SQL API request failed \(POST \/api\/v2\/statements\) after 4 attempts: fetch failed: read ECONNRESET /,
+      kind: "error",
+    },
+    {
+      label: "timeout",
+      reply: timingOutFetch(t, 5000),
+      expected: /^Snowflake SQL API request timed out after 5000ms \(POST \/api\/v2\/statements\) after 4 attempts$/,
+      kind: "timeout",
+    },
+  ];
+  for (const { label, reply, expected, kind } of cases) {
+    let calls = 0;
+    const sleeps = [];
+    const client = new SnowflakeSqlClient(config, {
+      fetchImpl: (url, init) => {
+        calls += 1;
+        return reply(url, init);
+      },
+      sleep: async (ms) => { sleeps.push(ms); },
+    });
+    const error = await client.execute("SELECT 1").then(() => assert.fail(`${label}: execute resolved`), (caught) => caught);
+    assert.ok(error instanceof SnowflakeStatementError, label);
+    assert.equal(error.kind, kind, label);
+    assert.match(error.message, expected, label);
+    assert.ok(!/requestId|async=|\?/.test(error.message), `${label}: the query string stays out of the error: ${error.message}`);
+    assertFragmentsAbsent(assert, `${error.message}\n${error.stack}`, [plantedToken], label);
+    assert.equal(calls, 4, `${label}: the default budget is 3 retries`);
+    assert.deepEqual(sleeps, [500, 1000, 2000], label);
+  }
+});
+
+test("SnowflakeSqlClient stops at once when the tool call is aborted during a retry wait, without another request", async () => {
+  for (const [label, reply] of [
+    ["503", async () => jsonResponse({ message: "upstream unavailable" }, { status: 503, statusText: "Service Unavailable" })],
+    ["transport", async () => { throw new TypeError("fetch failed: other side closed"); }],
+  ]) {
+    const controller = new AbortController();
+    let calls = 0;
+    const client = new SnowflakeSqlClient(sampleConfig(), {
+      fetchImpl: (url, init) => {
+        calls += 1;
+        return reply(url, init);
+      },
+      signal: controller.signal,
+      sleep: () => {
+        queueMicrotask(() => controller.abort());
+        return new Promise(() => {});
+      },
+    });
+    await assert.rejects(client.execute("SELECT 1"), (error) => error.name === "ToolCallAbortedError", label);
+    assert.equal(calls, 1, `${label}: no request after the abort`);
+  }
+});
+
+test("a Snowflake user partition that times out on every attempt leaves the user inventory unreadable, so no user-dependent check passes", async (t) => {
+  const usersStatement = normalizeStatement(SNOWFLAKE_STATEMENTS.users(sampleConfig().rowLimit));
+  const makeFetch = (partitionReply) => {
+    const partitionReads = [];
+    const healthy = sqlApiFetch();
+    const fetchImpl = (url, init) => {
+      if (init.method === "GET") {
+        partitionReads.push(new URL(String(url)).search);
+        return partitionReply(url, init);
+      }
+      if (normalizeStatement(JSON.parse(init.body).statement) !== usersStatement) return healthy(url, init);
+      return Promise.resolve(jsonResponse({
+        statementHandle: "handle-users",
+        resultSetMetaData: { numRows: HEALTHY_USERS.length, rowType: USER_COLUMNS.map((name) => ({ name, type: "text" })), partitionInfo: [{ rowCount: 2 }, { rowCount: HEALTHY_USERS.length - 2 }] },
+        data: HEALTHY_USERS.slice(0, 2),
+      }));
+    };
+    return { fetchImpl, partitionReads };
+  };
+  const userChecks = [SNOWFLAKE_CONTROLS[3].id, SNOWFLAKE_CONTROLS[5].id];
+
+  const healthy = makeFetch(async () => jsonResponse({ data: HEALTHY_USERS.slice(2) }));
+  const healthyResult = await assessSnowflakeNetworkAndAuthentication(new SnowflakeSqlClient(sampleConfig(), { fetchImpl: healthy.fetchImpl, sleep: async () => {} }));
+  for (const id of userChecks) assert.equal(findingById(healthyResult, id).status, "pass", `${id} passes when every user partition reads`);
+
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const failing = makeFetch(timingOutFetch(t, 5000));
+  const result = await assessSnowflakeNetworkAndAuthentication(new SnowflakeSqlClient(sampleConfig(), { fetchImpl: failing.fetchImpl, sleep: async () => {} }));
+  const failure = "Snowflake SQL API request timed out after 5000ms (GET /api/v2/statements/handle-users) after 4 attempts";
+  assert.deepEqual(failing.partitionReads, Array(4).fill("?partition=1"), "partition 1 is requested once per attempt in the budget");
+  const users = result.statements.find((outcome) => outcome.key === "users");
+  assert.equal(users.status, "timeout");
+  assert.equal(users.error, failure);
+  assert.equal(users.numRows, null);
+  for (const id of userChecks) {
+    const item = findingById(result, id);
+    assert.equal(item.status, "manual", `${id} does not pass on a partial user inventory`);
+    assert.ok(item.summary.includes(`users timed out: ${failure}`), `${id} names the failure: ${item.summary}`);
+  }
+});
+
 test("SnowflakeSqlClient refuses statements that are not read-only", async () => {
   const client = new SnowflakeSqlClient(sampleConfig(), { fetchImpl: async () => { throw new Error("should not be called"); } });
   await assert.rejects(client.execute("CREATE TABLE t (id INT)"), /non read-only/);
@@ -3204,7 +3488,7 @@ test("rule 9: every Snowflake statement that fails with a 502 HTML page or a JSO
       assert.ok(errorStrings.length >= 1, `${label}: the failing statement is recorded as an error`);
       for (const text of errorStrings) {
         if (variant === "html") {
-          assert.match(text, /failed \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)$/, `${label}: the error carries the status-and-length note, got ${text}`);
+          assert.match(text, /failed \(502 Bad Gateway\) at POST \/api\/v2\/statements: non-JSON body \(text\/html, \d+ bytes\)$/, `${label}: the error carries the status-and-length note, got ${text}`);
         } else {
           assert.match(text, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for this key/, `${label}: the URL keeps scheme, host, and path and its query collapses to a marker, got ${text}`);
           assert.match(text, /Authorization: Bearer \[REDACTED\]/, `${label}: the authorization scheme stays and its value is redacted, got ${text}`);

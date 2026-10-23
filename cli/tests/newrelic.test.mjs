@@ -787,9 +787,9 @@ test("NewrelicApiClient redacts the API key from NerdGraph and transport errors"
   const transportFailure = async () => {
     throw new Error(`connect ECONNREFUSED while sending Api-Key: ${secret}`);
   };
-  const transportClient = new NewrelicApiClient(sampleConfig({ apiKey: secret }), { fetchImpl: transportFailure });
+  const transportClient = new NewrelicApiClient(sampleConfig({ apiKey: secret }), { fetchImpl: transportFailure, sleep: async () => {} });
   await assert.rejects(transportClient.getCurrentUser(), (error) => {
-    assert.match(error.message, /New Relic request failed/);
+    assert.match(error.message, /New Relic request failed at POST \/graphql after 4 attempts/);
     assert.doesNotMatch(error.message, /SUPERSECRETVALUE/);
     return true;
   });
@@ -880,13 +880,170 @@ test("scrubErrorText removes every credential shape and leaves query paths, ids,
   assert.equal(scrubErrorText("the word key appears here", ["key"]), "the word key appears here");
 });
 
-test("NewrelicApiClient aborts requests that exceed the configured timeout", async () => {
-  const fetchImpl = (_input, init = {}) => new Promise((_resolve, reject) => {
-    init.signal.addEventListener("abort", () => reject(new Error("The operation was aborted")));
+/**
+ * A fetch that settles only when the client's own request timeout aborts it, rejecting as fetch does. The timeout is
+ * fired through the mocked clock, so no test waits on a real timer.
+ */
+function timingOutFetch(t, timeoutMs) {
+  return (_input, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+    t.mock.timers.tick(timeoutMs);
   });
-  const client = new NewrelicApiClient(sampleConfig({ timeoutMs: 20 }), { fetchImpl });
+}
 
-  await assert.rejects(client.getCurrentUser(), /timed out after 0s/);
+test("NewrelicApiClient times out requests that exceed the configured timeout and reports the attempts spent", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let calls = 0;
+  const timeout = timingOutFetch(t, 30_000);
+  const fetchImpl = (input, init) => {
+    calls += 1;
+    return timeout(input, init);
+  };
+  const client = new NewrelicApiClient(sampleConfig(), { fetchImpl, sleep: async () => {} });
+
+  await assert.rejects(client.getCurrentUser(), /^Error: New Relic request timed out after 30s at POST \/graphql after 4 attempts$/);
+  assert.equal(calls, 4);
+});
+
+test("NewrelicApiClient retries a NerdGraph request after a timeout and a transport failure before it succeeds", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const timeout = timingOutFetch(t, 30_000);
+  const sleeps = [];
+  let calls = 0;
+  const fetchImpl = async (input, init) => {
+    calls += 1;
+    if (calls === 1) return timeout(input, init);
+    if (calls === 2) throw new TypeError("fetch failed: other side closed");
+    return jsonResponse({ data: { actor: { user: { id: "u-1", email: "auditor@example.com", name: "Auditor" } } } });
+  };
+  const client = new NewrelicApiClient(sampleConfig(), { fetchImpl, sleep: async (ms) => { sleeps.push(ms); } });
+
+  assert.equal((await client.getCurrentUser()).email, "auditor@example.com");
+  assert.equal(calls, 3);
+  assert.deepEqual(sleeps, [500, 1000]);
+});
+
+test("NewrelicApiClient honors an HTTP-date Retry-After and caps every Retry-After wait at 15 s", async () => {
+  const at = (ms) => new Date(NOW + ms).toUTCString();
+  const responses = [
+    () => new Response("rate limited", { status: 429, headers: { "retry-after": at(6000) } }),
+    () => new Response("upstream unavailable", { status: 503, headers: { "retry-after": at(600_000) } }),
+    () => new Response("bad gateway", { status: 502, headers: { "retry-after": "120" } }),
+    () => jsonResponse({ data: { actor: { user: { id: "u-1", email: "auditor@example.com", name: "Auditor" } } } }),
+  ];
+  const sleeps = [];
+  let calls = 0;
+  const client = new NewrelicApiClient(sampleConfig(), {
+    fetchImpl: async () => responses[calls++](),
+    sleep: async (ms) => { sleeps.push(ms); },
+    now: () => NOW,
+  });
+
+  assert.equal((await client.getCurrentUser()).email, "auditor@example.com");
+  assert.equal(calls, 4);
+  assert.deepEqual(sleeps, [6000, 15_000, 15_000]);
+});
+
+test("NewrelicApiClient names the endpoint, the last failure, and the attempt count when retries run out, with the planted key scrubbed", async (t) => {
+  const plantedKey = "Pw9vqvHCSPh6GMeeZNjkbkruXCDwoSKA";
+  assertPlantedValuesWellFormed(assert, { plantedKey }, [JSON.stringify(sampleConfig()), ...SCRUB_BENIGN]);
+  const config = sampleConfig({ apiKey: plantedKey });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const cases = [
+    {
+      label: "NerdGraph 503 on every attempt",
+      run: (client) => client.getCurrentUser(),
+      fetchImpl: async () => new Response(`upstream rejected Api-Key ${plantedKey}`, { status: 503, statusText: "Service Unavailable", headers: { "content-type": "text/plain" } }),
+      expected: /^NerdGraph request failed \(503 Service Unavailable\) at POST \/graphql after 4 attempts: /,
+    },
+    {
+      label: "REST API v2 503 on every attempt",
+      run: (client) => client.restGet("/v2/applications.json", { "filter[name]": "checkout" }),
+      fetchImpl: async () => jsonResponse({ error: { title: `key ${plantedKey} is throttled` } }, { status: 503 }),
+      expected: /^REST API v2 request failed for GET \/v2\/applications\.json \(503[^)]*\) after 4 attempts: /,
+    },
+    {
+      label: "transport failure on every attempt",
+      run: (client) => client.getCurrentUser(),
+      fetchImpl: async () => { throw new TypeError(`fetch failed: connect ECONNRESET while sending Api-Key: ${plantedKey}`); },
+      expected: /^New Relic request failed at POST \/graphql after 4 attempts: fetch failed: connect ECONNRESET/,
+    },
+    {
+      label: "timeout on every attempt",
+      run: (client) => client.getCurrentUser(),
+      fetchImpl: timingOutFetch(t, config.timeoutMs),
+      expected: /^New Relic request timed out after 30s at POST \/graphql after 4 attempts$/,
+    },
+  ];
+  for (const { label, run, fetchImpl, expected } of cases) {
+    const sleeps = [];
+    let calls = 0;
+    const client = new NewrelicApiClient(config, {
+      fetchImpl: async (input, init) => {
+        calls += 1;
+        return fetchImpl(input, init);
+      },
+      sleep: async (ms) => { sleeps.push(ms); },
+    });
+    await assert.rejects(run(client), (error) => {
+      assert.match(error.message, expected, label);
+      assert.doesNotMatch(error.message, /checkout|filter/, `${label}: no query value in the error`);
+      assertFragmentsAbsent(assert, `${error.message} ${JSON.stringify(error)}`, [plantedKey], label);
+      return true;
+    });
+    assert.equal(calls, 4, `${label}: one request plus three retries`);
+    assert.equal(sleeps.length, 3, label);
+  }
+});
+
+test("NewrelicApiClient stops at once when the tool call is aborted during a retry wait, without another request", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const failures = [
+    ["timeout", timingOutFetch(t, 30_000)],
+    ["transport failure", async () => { throw new TypeError("fetch failed"); }],
+  ];
+  for (const [label, failure] of failures) {
+    const controller = new AbortController();
+    let calls = 0;
+    const client = new NewrelicApiClient(sampleConfig(), {
+      fetchImpl: async (input, init) => {
+        calls += 1;
+        return failure(input, init);
+      },
+      sleep: () => {
+        queueMicrotask(() => controller.abort());
+        return new Promise(() => {});
+      },
+      signal: controller.signal,
+    });
+    await assert.rejects(client.getCurrentUser(), (error) => {
+      assert.equal(error.name, "ToolCallAbortedError", label);
+      return true;
+    });
+    assert.equal(calls, 1, `${label}: no request after the abort`);
+  }
+});
+
+test("a New Relic authentication domain page that fails in transport on every attempt leaves the domain inventory unreadable, so no dependent identity check passes", async () => {
+  const cursors = [];
+  const fetchImpl = async (_input, init = {}) => {
+    const { variables } = JSON.parse(init.body);
+    cursors.push(variables.cursor ?? "first");
+    if (variables.cursor) throw new TypeError("fetch failed: other side closed");
+    const page = { nextCursor: "page-2", totalCount: 2, authenticationDomains: [{ id: "domain-1", name: "Corporate SSO", provisioningType: "SCIM" }] };
+    return jsonResponse({ data: { actor: { organization: { userManagement: { authenticationDomains: page } } } } });
+  };
+  const live = new NewrelicApiClient(sampleConfig(), { fetchImpl, sleep: async () => {} });
+
+  const result = await assessNewrelicIdentity(identityClient({ listAuthenticationDomains: () => live.listAuthenticationDomains() }), { now: NOW });
+
+  assert.deepEqual(cursors, ["first", "page-2", "page-2", "page-2", "page-2"], "the second page was tried once and retried three times");
+  const failure = "New Relic request failed at POST /graphql after 4 attempts";
+  assert.ok(result.errors.some((error) => error.includes(`${failure}: fetch failed: other side closed`)), JSON.stringify(result.errors));
+  assert.ok(result.findings.every((item) => item.status !== "pass"), JSON.stringify(result.findings.map((item) => [item.id, item.status])));
+  for (const id of ["NR-01-SSO-ENFORCEMENT", "NR-02-USER-TYPE-LEAST-PRIVILEGE", "NR-03-ADMIN-MINIMIZATION", "NR-19-INACTIVE-USER-ACCOUNTS"]) {
+    assert.ok(findingById(result, id).summary.includes(failure), `${id}: ${findingById(result, id).summary}`);
+  }
 });
 
 test("NewrelicApiClient follows REST API v2 Link headers with the Api-Key header", async () => {
