@@ -4425,6 +4425,146 @@ test("a members page that keeps failing after the first page read fails the whol
   assert.match(members.error, /after 4 attempts \(503 Service Unavailable\)/);
 });
 
+test("a later page that fails through every retry leaves a fixed-cap listing unreadable with no truncation caveat, while the same listing read to its cap keeps the manual-review caveat", async () => {
+  const records = (count, make) => Array.from({ length: count }, (_, index) => make(index));
+  // The listings their assessments read at a cap that no argument of theirs raises, each grown one record past that cap.
+  const environmentCase = (assess) => ({
+    assess,
+    route: "GET /api/v2/projects/{project}/environments",
+    collection: "environments",
+    scope: "project web",
+    cap: 50,
+    unraisedOption: "environment_limit",
+    endpoint: "GET /api/v2/projects/web/environments",
+    grow: (fixture) => fixture.environments.web.push(...records(49, (index) => ({ key: `qa-${index}`, name: `QA ${index}`, critical: false, secureMode: true, defaultTtl: 0 }))),
+  });
+  const cases = [
+    {
+      assess: assessLaunchdarklyIdentity,
+      route: "GET /api/v2/teams/{team}/roles",
+      collection: "team_roles",
+      scope: "team platform",
+      cap: 200,
+      unraisedOption: "role_limit",
+      endpoint: "GET /api/v2/teams/platform/roles",
+      grow: (fixture) => fixture.teamRoles.platform.push(...records(200, (index) => ({ key: `team-role-${index}`, name: `Team role ${index}` }))),
+    },
+    {
+      assess: assessLaunchdarklyAccessControl,
+      route: "GET /api/v2/members",
+      collection: "members",
+      cap: 1000,
+      unraisedOption: "member_limit",
+      endpoint: "GET /api/v2/members",
+      grow: (fixture) => fixture.members.push(...records(998, (index) => ({ _id: `m-extra-${index}`, email: `extra-${index}@example.com`, role: "reader", mfa: "enabled", teams: [] }))),
+    },
+    {
+      assess: assessLaunchdarklyEnvironmentGovernance,
+      route: "GET /api/v2/roles",
+      collection: "custom_roles",
+      cap: 200,
+      unraisedOption: "role_limit",
+      endpoint: "GET /api/v2/roles",
+      grow: (fixture) => fixture.customRoles.push(...records(200, (index) => ({ key: `viewer-${index}`, basePermissions: "no_access", policy: [{ effect: "allow", actions: ["viewProject"], resources: ["proj/web"] }] }))),
+    },
+    environmentCase(assessLaunchdarklyFlagHygiene),
+    environmentCase(assessLaunchdarklyMonitoringIntegrations),
+  ];
+  const unavailable = () => jsonResponse({ code: "internal_server_error", message: "upstream" }, { status: 503, statusText: "Service Unavailable" });
+  const run = async (fixture, assess, routes) => {
+    const { fetchImpl, config } = httpLaunchdarkly(fixture, { routes });
+    const waits = [];
+    const client = new LaunchdarklyApiClient(config, { fetchImpl, sleep: async (ms) => { waits.push(ms); }, now: () => NOW });
+    return { result: await assess(client, { now: NOW }), waits };
+  };
+
+  for (const { assess, route, collection, scope, cap, unraisedOption, endpoint, grow } of cases) {
+    const fixture = ldFixture();
+    grow(fixture);
+    const inventory = scope ? `${collection} for ${scope}` : collection;
+    const label = `${assess.name}: ${inventory}`;
+    const serve = ldRoutes(fixture)[route];
+
+    // Read to its cap after one transient 503 that a retry absorbs: a truncated listing that says to review the rest manually.
+    let flaked = false;
+    const capped = await run(fixture, assess, {
+      [route]: (url, params) => {
+        if (flaked) return serve(url, params);
+        flaked = true;
+        return unavailable();
+      },
+    });
+    assert.deepEqual(capped.waits, [500], `${label}: the transient 503 is retried once`);
+    const caveat = `Truncated listing: ${inventory} (${cap} of ${cap + 1} collected). The verdict covers only the collected items, so review the uncollected items manually.`;
+    const cappedReaders = capped.result.findings.filter((item) => item.evidence?.truncated_collections);
+    assert.ok(cappedReaders.length > 0, `${label}: a finding reads the capped listing`);
+    for (const item of cappedReaders) {
+      assert.notEqual(item.status, "pass", `${label} ${item.id}`);
+      assert.ok(item.summary.includes(caveat), `${label} ${item.id}: ${item.summary}`);
+      assert.ok(!item.summary.includes(unraisedOption), `${label} ${item.id}: ${item.summary}`);
+      assert.deepEqual(item.evidence.truncated_collections, [{ collection, seen: cap, total: cap + 1, ...(scope ? { scope } : {}) }], `${label} ${item.id}`);
+    }
+    for (const item of capped.result.findings) {
+      assert.ok(!item.evidence?.unreadable_inventories?.some((gap) => gap.inventory === inventory), `${label} ${item.id}: a capped listing is not unreadable`);
+    }
+
+    // The same listing when a later page fails through every retry: unreadable, and never a truncation caveat.
+    let laterPageRequests = 0;
+    const failed = await run(fixture, assess, {
+      [route]: (url, params) => {
+        if (url.searchParams.get("offset") === "0") {
+          const firstPage = new URL(url);
+          firstPage.searchParams.set("limit", "1");
+          return serve(firstPage, params);
+        }
+        laterPageRequests += 1;
+        return unavailable();
+      },
+    });
+    assert.equal(laterPageRequests, 4, `${label}: the later page is retried three times`);
+    assert.deepEqual(failed.waits, [500, 1000, 2000], label);
+    const gap = `Unreadable inventory: ${inventory} (${endpoint}: LaunchDarkly request failed after 4 attempts (503 Service Unavailable) for ${endpoint}: internal_server_error: upstream)`;
+    const failedReaders = failed.result.findings.filter((item) => item.evidence?.unreadable_inventories?.some((entry) => entry.inventory === inventory));
+    assert.ok(failedReaders.length > 0, `${label}: a finding reads the failed listing`);
+    for (const item of failedReaders) {
+      assert.notEqual(item.status, "pass", `${label} ${item.id}`);
+      assert.ok(item.summary.includes(gap), `${label} ${item.id}: ${item.summary}`);
+    }
+    for (const item of failed.result.findings) {
+      assert.equal(item.evidence?.truncated_collections, undefined, `${label} ${item.id}: the failed listing is not truncated`);
+      assert.doesNotMatch(item.summary, /Truncated listing|review the uncollected items manually/, `${label} ${item.id}`);
+    }
+  }
+});
+
+test("a finding that reads a capped listing and a listing whose later page failed offers the cap's argument for the capped one and reports the failed one only as unreadable", async () => {
+  const fixture = ldFixture();
+  fixture.teamRoles.platform.push({ key: "incident-commander", name: "Incident commander" });
+  const serve = ldRoutes(fixture)["GET /api/v2/teams/{team}/roles"];
+  const { fetchImpl, config } = httpLaunchdarkly(fixture, {
+    routes: {
+      "GET /api/v2/teams/{team}/roles": (url, params) => {
+        if (url.searchParams.get("offset") !== "0") {
+          return jsonResponse({ code: "internal_server_error", message: "upstream" }, { status: 503, statusText: "Service Unavailable" });
+        }
+        const firstPage = new URL(url);
+        firstPage.searchParams.set("limit", "1");
+        return serve(firstPage, params);
+      },
+    },
+  });
+  const client = new LaunchdarklyApiClient(config, { fetchImpl, sleep: async () => {}, now: () => NOW });
+
+  const teamRoleFinding = finding(await assessLaunchdarklyIdentity(client, { now: NOW, memberLimit: 2 }), "LD-07");
+  assert.ok(teamRoleFinding.summary.includes("Truncated listing: members (2 of 3 collected). The verdict covers only the collected items, so raise member_limit and rerun for a complete evaluation."), teamRoleFinding.summary);
+  assert.ok(teamRoleFinding.summary.includes("Unreadable inventory: team_roles for team platform (GET /api/v2/teams/platform/roles: LaunchDarkly request failed after 4 attempts (503 Service Unavailable)"), teamRoleFinding.summary);
+  // The failed team role listing is not a truncated one, so the caveat does not fall back to the mixed manual-review wording.
+  assert.doesNotMatch(teamRoleFinding.summary, /review the uncollected/);
+  assert.deepEqual(teamRoleFinding.evidence.truncated_collections, [{ collection: "members", option: "member_limit", seen: 2, total: 3 }]);
+  assert.deepEqual(teamRoleFinding.evidence.unreadable_inventories.map((entry) => entry.inventory), ["team_roles for team platform"]);
+  assert.notEqual(teamRoleFinding.status, "pass");
+});
+
 test("the assess tool names a read that failed closed on an over-limit Retry-After in its findings and its partial collection warnings", async () => {
   const fixture = ldPrincipalFixture();
   const { fetchImpl } = httpLaunchdarkly(fixture, {
