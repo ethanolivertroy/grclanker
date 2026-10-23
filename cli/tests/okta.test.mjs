@@ -1042,6 +1042,37 @@ test("OktaAuditorClient retries the OAuth token request with a freshly signed as
   clearOktaTokenCacheForTests();
 });
 
+test("OktaAuditorClient sends a prebuilt client assertion once, since Okta refuses a jti it has already seen", async () => {
+  const config = { authMode: "PrivateKey", clientId: "client-id", clientAssertion: "prebuilt-signed-jwt", scopes: ["okta.groups.read"] };
+  const notRetried = "It was not retried because a prebuilt client_assertion can be used only once; rerun with a fresh one, or with a private key in its place.";
+  const failures = [
+    [busy(503), `Okta API request failed for /oauth2/v1/token (503 Service Unavailable). ${notRetried}`],
+    [resetConnection, `Okta API request failed for /oauth2/v1/token (network error: fetch failed (ECONNRESET)). ${notRetried}`],
+    [hang, `Okta API request failed for /oauth2/v1/token (timed out after 5 ms). ${notRetried}`],
+  ];
+  for (const [answer, message] of failures) {
+    clearOktaTokenCacheForTests();
+    const token = scriptedFetch([answer]);
+    const { client, sleeps } = retryingOktaClient(token.fetchImpl, { config, timeoutMs: 5 });
+    await assert.rejects(() => client.listGroups(), { message });
+    assert.deepEqual(token.requests.map(({ url }) => new URL(url).pathname), ["/oauth2/v1/token"], "the prebuilt assertion is not resent");
+    assert.deepEqual(sleeps, []);
+  }
+
+  clearOktaTokenCacheForTests();
+  const replayed = scriptedFetch([() => Response.json({ error: "invalid_client", error_description: "The client_assertion token has already been used." }, { status: 401, statusText: "Unauthorized" })]);
+  await assert.rejects(
+    () => retryingOktaClient(replayed.fetchImpl, { config }).client.listGroups(),
+    (error) => /^Okta OAuth token request failed \(401 Unauthorized\)/.test(error.message) && !error.message.includes(notRetried),
+  );
+
+  clearOktaTokenCacheForTests();
+  const access = await runOktaAccessCheck(retryingOktaClient(scriptedFetch([busy(503)]).fetchImpl, { config }).client, { orgUrl: RETRY_ORG_URL, sourceChain: ["tests"], ...config });
+  assert.ok(access.probes.every((probe) => probe.status === "error" && probe.detail.endsWith(notRetried)), JSON.stringify(access.probes));
+  assert.ok(!JSON.stringify(access).includes("prebuilt-signed-jwt"), "the client assertion is never echoed");
+  clearOktaTokenCacheForTests();
+});
+
 test("planted Okta credentials echoed by a retried failure, in the body, the headers, or a transport error, never reach a thrown error, a tool result, or a bundle file", async () => {
   clearOktaTokenCacheForTests();
   const planted = { apiToken: "Tq8MvRz3KpXw6NbLhJ2cYsGd", mintedToken: "Hy5WnKq9ZtRm3VbXpLs7JcDf" };

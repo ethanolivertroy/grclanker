@@ -719,7 +719,7 @@ export const OKTA_SPEC = buildBatchIntegrationSpec({
     documentedLimit: "Endpoint-specific Okta rate-limit buckets",
     retryHeaders: ["Retry-After", "X-Rate-Limit-Reset"],
     retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Retry 429 and 500/502/503/504 answers, attempts that pass the 30-second per-request timeout, and transport failures up to four times (five attempts), the OAuth token request included. Each wait honors Retry-After (delta-seconds or HTTP-date) on any retried status, else X-Rate-Limit-Reset on a 429, else exponential backoff from 1 second with jitter, every wait clamped to 15 seconds. Exhaustion names the path, the last status or failure, and the attempt count, and leaves the dataset unreadable evidence; a tool-call abort is never retried.",
+    backoffPolicy: "Retry 429 and 500/502/503/504 answers, attempts that pass the 30-second per-request timeout, and transport failures up to four times (five attempts), the OAuth token request included when grclanker signs its client assertion; a prebuilt client_assertion is sent once, since Okta refuses a jti it has already seen. Each wait honors Retry-After (delta-seconds or HTTP-date) on any retried status, else X-Rate-Limit-Reset on a 429, else exponential backoff from 1 second with jitter, every wait clamped to 15 seconds. Exhaustion names the path, the last status or failure, and the attempt count, and leaves the dataset unreadable evidence; a tool-call abort is never retried.",
   },
   runtimeBehavior: OKTA_RUNTIME_BEHAVIOR,
   knownGaps: [
