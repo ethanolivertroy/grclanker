@@ -226,7 +226,19 @@ Otherwise it runs `launchdarkly_check_access` and the access control assessment,
 
 ## How the tools handle evidence
 
-This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+This section is reference for reviewing findings and bundles: how the tools retry failed requests, how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Retries
+
+A request that gets a 429 or 5xx answer, times out, or loses its connection is retried up to three times, so it makes at most four attempts.
+
+- Between attempts the client waits as long as the server asks. On a 429 it reads LaunchDarkly's `X-Ratelimit-Auth-Token-Reset` or `X-Ratelimit-Reset` time first. Otherwise it reads `Retry-After`, in seconds or as an HTTP date. Without either, it waits 0.5, 1, then 2 seconds.
+- A wait longer than 30 seconds is not waited out or shortened. The request fails at once and its error names the wait: `LaunchDarkly request failed (429 Too Many Requests; the server asked to retry after 120 s, more than the 30 s limit) for GET /api/v2/members`.
+- Each attempt gets the full timeout (`timeout_seconds`, default 30), and the timer runs until the response body is read.
+- When the retries run out, the error names the attempts and the last outcome, for example `LaunchDarkly request failed after 4 attempts (503 Service Unavailable) for GET /api/v2/members` or `LaunchDarkly request failed after 4 attempts for GET /api/v2/caller-identity: timed out after 30000ms`.
+- Any other status is not retried, and neither is a 2xx whose body is empty, not JSON, or not the documented shape.
+- When a response reports a rate limit remaining of 0, the next request waits for the reset time, at most 30 seconds.
+- A listing whose later page still fails after the retries keeps none of its pages. The collection is unreadable rather than truncated, so the findings that read it follow [Unreadable inventories](#unreadable-inventories), and its `core_data/` record is a `not_readable` marker with `items: null`.
 
 ### Redaction and projection
 
@@ -252,7 +264,7 @@ The assessment tools return findings, summaries, and errors without the raw snap
 
 An unreadable endpoint never produces a `pass`. It produces `warn` or `manual`, and it is recorded in the assessment `errors` list and the bundle `_errors.log`.
 
-The rule holds for every inventory a finding reads, not only its primary one. A finding that combines several collections never `pass`es while any of them is unreadable (403, 401, 5xx, or a transport error). That holds even when the readable collections alone would satisfy the control.
+The rule holds for every inventory a finding reads, not only its primary one. A finding that combines several collections never `pass`es while any of them is unreadable (a 401 or 403, a 429 or 5xx that outlasted the [retries](#retries), a timeout, or a transport error). That holds even when the readable collections alone would satisfy the control.
 
 The summary then carries `Unreadable inventory: <collection> (<endpoint>: <error>), so <what was not checked>. Collect manually: <evidence>`. The evidence lists the same under `unreadable_inventories` and `manual_evidence`.
 

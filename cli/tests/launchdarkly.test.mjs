@@ -54,6 +54,8 @@ const FUTURE_MS = NOW + 90 * 24 * 60 * 60 * 1000;
 // The configured token is itself a planted credential: alphanumeric and random-looking so every 6-to-24-character
 // window of it can be asserted absent from every output (see helpers/canary-windows.mjs).
 const TEST_TOKEN = "U7ktAa5zEHKELrac4CfrjWJF3zBQuiEx";
+/** A credential a failing server echoes in the error body of every retried attempt. */
+const LD_RETRY_CANARY = "Hb4VxKq8RzN2mWt6YcJ9pLs3DfG7aEu5";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -560,6 +562,241 @@ test("LaunchdarklyApiClient retries 429 using X-Ratelimit-Reset and retries 5xx 
   assert.equal(attempt, 3);
   assert.ok(waits.length >= 2);
   assert.ok(waits.every((ms) => ms >= 0 && ms <= 30000));
+});
+
+/** A fetch that answers `failures` in order and then succeeds, counting every request it serves. */
+function scriptedFetch(failures, success = () => jsonResponse({ accountId: "acct-123" })) {
+  const state = { calls: 0 };
+  state.fetchImpl = async (input, init) => {
+    const failure = failures[state.calls];
+    state.calls += 1;
+    return failure ? failure(input, init) : success(input, init);
+  };
+  return state;
+}
+
+function retryClient(fetchImpl, overrides = {}) {
+  const waits = [];
+  const client = new LaunchdarklyApiClient(sampleConfig(overrides.config), {
+    fetchImpl,
+    sleep: async (ms) => {
+      waits.push(ms);
+    },
+    now: () => NOW,
+    ...(overrides.signal ? { signal: overrides.signal } : {}),
+  });
+  return { client, waits };
+}
+
+test("LaunchdarklyApiClient waits what the server asks before retrying a 429 or a 5xx: Retry-After as delta-seconds or an HTTP-date, and a 429's reset header first", async () => {
+  const cases = [
+    { label: "429 delta-seconds", status: 429, headers: { "retry-after": "7" }, wait: 7000 },
+    { label: "503 delta-seconds", status: 503, headers: { "retry-after": "2" }, wait: 2000 },
+    { label: "429 HTTP-date", status: 429, headers: { "retry-after": new Date(NOW + 12_000).toUTCString() }, wait: 12_000 },
+    { label: "502 HTTP-date", status: 502, headers: { "retry-after": new Date(NOW + 5_000).toUTCString() }, wait: 5_000 },
+    { label: "an HTTP-date already past retries at once", status: 503, headers: { "retry-after": new Date(NOW - 60_000).toUTCString() }, wait: 0 },
+    { label: "the 429 reset header wins over Retry-After", status: 429, headers: { "x-ratelimit-reset": String(NOW + 3_000), "retry-after": "20" }, wait: 3_000 },
+    { label: "the auth-token reset header wins over the route reset header", status: 429, headers: { "x-ratelimit-auth-token-reset": String(NOW + 4_000), "x-ratelimit-reset": String(NOW + 9_000) }, wait: 4_000 },
+    { label: "a 5xx does not read the rate-limit reset header", status: 500, headers: { "x-ratelimit-reset": String(NOW + 3_000) }, wait: 500 },
+    { label: "an unparseable Retry-After falls back to the backoff", status: 429, headers: { "retry-after": "soon" }, wait: 500 },
+    { label: "exactly the 30 s limit is honored", status: 429, headers: { "retry-after": "30" }, wait: 30_000 },
+  ];
+  for (const { label, status, headers, wait } of cases) {
+    const scripted = scriptedFetch([() => jsonResponse({ code: "unavailable", message: "try later" }, { status, statusText: "Retry", headers })]);
+    const { client, waits } = retryClient(scripted.fetchImpl);
+    const identity = await client.getCallerIdentity();
+    assert.equal(identity.accountId, "acct-123", label);
+    assert.equal(scripted.calls, 2, label);
+    assert.deepEqual(waits, [wait], label);
+  }
+});
+
+test("LaunchdarklyApiClient fails closed after three retries of a persistent 429 or 5xx, naming the attempts, the status, and the request, and never retries a 4xx", async () => {
+  for (const [status, statusText] of [[429, "Too Many Requests"], [500, "Internal Server Error"], [502, "Bad Gateway"], [503, "Service Unavailable"], [504, "Gateway Timeout"]]) {
+    const scripted = scriptedFetch(Array(10).fill(() => jsonResponse({ code: "unavailable", message: "try later" }, { status, statusText })));
+    const { client, waits } = retryClient(scripted.fetchImpl);
+    await assert.rejects(client.listMembers(5), (error) => {
+      assert.ok(error instanceof LaunchdarklyApiError);
+      assert.equal(error.status, status);
+      assert.equal(error.endpoint, "GET /api/v2/members");
+      assert.equal(error.message, `LaunchDarkly request failed after 4 attempts (${status} ${statusText}) for GET /api/v2/members: unavailable: try later`);
+      return true;
+    });
+    assert.equal(scripted.calls, 4, `${status}: one request and three retries`);
+    assert.deepEqual(waits, [500, 1000, 2000], `${status}: exponential backoff from 500 ms`);
+  }
+
+  for (const [status, statusText] of [[400, "Bad Request"], [401, "Unauthorized"], [403, "Forbidden"], [404, "Not Found"], [409, "Conflict"]]) {
+    const scripted = scriptedFetch([() => jsonResponse({ code: "denied", message: "no" }, { status, statusText })]);
+    const { client, waits } = retryClient(scripted.fetchImpl);
+    await assert.rejects(client.listMembers(5), (error) => {
+      assert.equal(error.status, status);
+      assert.equal(error.message, `LaunchDarkly request failed (${status} ${statusText}) for GET /api/v2/members: denied: no`);
+      return true;
+    });
+    assert.equal(scripted.calls, 1, `${status} is not retried`);
+    assert.deepEqual(waits, []);
+  }
+
+  // maxRetries 0 sends one request and names no attempt count.
+  const once = scriptedFetch([() => jsonResponse({}, { status: 503, statusText: "Service Unavailable" })]);
+  const single = new LaunchdarklyApiClient(sampleConfig(), { fetchImpl: once.fetchImpl, maxRetries: 0, sleep: async () => {} });
+  await assert.rejects(single.getCallerIdentity(), (error) => {
+    assert.match(error.message, /^LaunchDarkly request failed \(503 Service Unavailable\) for GET \/api\/v2\/caller-identity: /);
+    return true;
+  });
+  assert.equal(once.calls, 1);
+});
+
+test("LaunchdarklyApiClient fails closed at once, without retrying early, when the server asks to wait longer than 30 s", async () => {
+  const cases = [
+    { label: "Retry-After seconds on a 429", status: 429, statusText: "Too Many Requests", headers: { "retry-after": "120" }, asked: 120 },
+    { label: "Retry-After HTTP-date on a 503", status: 503, statusText: "Service Unavailable", headers: { "retry-after": new Date(NOW + 90_000).toUTCString() }, asked: 90 },
+    { label: "reset header on a 429", status: 429, statusText: "Too Many Requests", headers: { "x-ratelimit-reset": String(NOW + 45_500) }, asked: 46 },
+    { label: "Retry-After one second over the limit on a 500", status: 500, statusText: "Internal Server Error", headers: { "retry-after": "31" }, asked: 31 },
+  ];
+  for (const { label, status, statusText, headers, asked } of cases) {
+    const scripted = scriptedFetch(Array(10).fill(() => jsonResponse({ code: "rate_limited", message: "slow down" }, { status, statusText, headers })));
+    const { client, waits } = retryClient(scripted.fetchImpl);
+    await assert.rejects(client.getCallerIdentity(), (error) => {
+      assert.ok(error instanceof LaunchdarklyApiError, label);
+      assert.equal(error.status, status, label);
+      assert.equal(
+        error.message,
+        `LaunchDarkly request failed (${status} ${statusText}; the server asked to retry after ${asked} s, more than the 30 s limit) for GET /api/v2/caller-identity: rate_limited: slow down`,
+        label,
+      );
+      return true;
+    });
+    assert.equal(scripted.calls, 1, `${label}: no early retry`);
+    assert.deepEqual(waits, [], `${label}: no wait`);
+  }
+
+  // A retry that is honored and then meets an over-limit wait still names the attempts it made.
+  const later = scriptedFetch([
+    () => jsonResponse({}, { status: 503, statusText: "Service Unavailable" }),
+    () => jsonResponse({ code: "rate_limited", message: "slow down" }, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "600" } }),
+  ]);
+  const { client, waits } = retryClient(later.fetchImpl);
+  await assert.rejects(client.getCallerIdentity(), (error) => {
+    assert.equal(error.message, "LaunchDarkly request failed after 2 attempts (429 Too Many Requests; the server asked to retry after 600 s, more than the 30 s limit) for GET /api/v2/caller-identity: rate_limited: slow down");
+    return true;
+  });
+  assert.equal(later.calls, 2);
+  assert.deepEqual(waits, [500]);
+});
+
+test("LaunchdarklyApiClient retries a timeout, a body that stalls after the headers, and a lost connection, then fails closed naming the attempts", async () => {
+  const abortError = () => Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+  const hanging = (_input, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(abortError()));
+  });
+  const stalledBody = (_input, init) => {
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"accountId":'));
+        init.signal.addEventListener("abort", () => controller.error(abortError()));
+      },
+    });
+    return Promise.resolve(new Response(body, { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }));
+  };
+  const refused = () => Promise.reject(new TypeError("fetch failed"));
+
+  for (const [label, failure, detail] of [
+    ["a request that never answers", hanging, "timed out after 20ms"],
+    ["a body that stalls after the headers", stalledBody, "timed out after 20ms"],
+    ["a refused connection", refused, "fetch failed"],
+  ]) {
+    const scripted = scriptedFetch(Array(10).fill(failure));
+    const { client, waits } = retryClient(scripted.fetchImpl, { config: { timeoutMs: 20 } });
+    await assert.rejects(client.getCallerIdentity(), (error) => {
+      assert.ok(error instanceof LaunchdarklyApiError, label);
+      assert.equal(error.status, null, `${label}: no response, so no status`);
+      assert.equal(error.message, `LaunchDarkly request failed after 4 attempts for GET /api/v2/caller-identity: ${detail}`, label);
+      return true;
+    });
+    assert.equal(scripted.calls, 4, label);
+    assert.deepEqual(waits, [500, 1000, 2000], label);
+
+    const recovering = scriptedFetch([failure, failure]);
+    const retried = retryClient(recovering.fetchImpl, { config: { timeoutMs: 20 } });
+    assert.equal((await retried.client.getCallerIdentity()).accountId, "acct-123", `${label}: a later attempt that succeeds is used`);
+    assert.equal(recovering.calls, 3, label);
+  }
+
+  // A 2xx whose body is not JSON is a definite answer, not a transient failure: it is not retried.
+  const portal = scriptedFetch(Array(10).fill(() => new Response("<html>login</html>", { status: 200, statusText: "OK", headers: { "content-type": "text/html" } })));
+  const { client } = retryClient(portal.fetchImpl);
+  await assert.rejects(client.getCallerIdentity(), /was not valid JSON/);
+  assert.equal(portal.calls, 1);
+});
+
+test("LaunchdarklyApiClient stops at once when the tool call is aborted during a retry wait or a request, and never retries an abort", async () => {
+  const duringWait = new AbortController();
+  const failing = scriptedFetch(Array(10).fill(() => jsonResponse({}, { status: 503, statusText: "Service Unavailable" })));
+  const waitingClient = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: failing.fetchImpl,
+    signal: duringWait.signal,
+    sleep: () => {
+      duringWait.abort();
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(waitingClient.getCallerIdentity(), (error) => error.name === "ToolCallAbortedError");
+  assert.equal(failing.calls, 1, "the abort ends the wait; no retry is sent");
+
+  const duringRequest = new AbortController();
+  let sent = 0;
+  const requestClient = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: (_input, init) => {
+      sent += 1;
+      setTimeout(() => duringRequest.abort(), 5);
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+      });
+    },
+    signal: duringRequest.signal,
+    sleep: async () => {},
+  });
+  await assert.rejects(requestClient.getCallerIdentity(), (error) => error.name === "ToolCallAbortedError");
+  assert.equal(sent, 1, "an aborted request is not retried as a timeout");
+});
+
+test("LaunchdarklyApiClient reports an abort that lands while the last attempt's body is read as the abort, not as a timeout", async () => {
+  const controller = new AbortController();
+  let sent = 0;
+  const client = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init) => {
+      sent += 1;
+      if (sent < 4) return jsonResponse({}, { status: 503, statusText: "Service Unavailable" });
+      return new Response(new ReadableStream({
+        start(stream) {
+          stream.enqueue(new TextEncoder().encode('{"accountId":'));
+          init.signal.addEventListener("abort", () => stream.error(Object.assign(new Error("This operation was aborted"), { name: "AbortError" })));
+          setTimeout(() => controller.abort(), 5);
+        },
+      }), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } });
+    },
+    signal: controller.signal,
+    sleep: async () => {},
+  });
+  await assert.rejects(client.getCallerIdentity(), (error) => {
+    assert.equal(error.name, "ToolCallAbortedError", error.message);
+    return true;
+  });
+  assert.equal(sent, 4, "the abort lands during the fourth and last attempt");
+});
+
+test("LaunchdarklyApiClient keeps the token and echoed credentials out of the error it raises after retrying", async () => {
+  const echoed = `{"code":"unavailable","message":"Authorization: ${TEST_TOKEN} rejected; see https://api.example.com/v1/x?token=${LD_RETRY_CANARY}"}`;
+  const scripted = scriptedFetch(Array(10).fill(() => new Response(echoed, { status: 503, statusText: "Service Unavailable", headers: { "content-type": "application/json", "retry-after": "1" } })));
+  const { client, waits } = retryClient(scripted.fetchImpl);
+  await assert.rejects(client.listMembers(5), (error) => {
+    assert.match(error.message, /^LaunchDarkly request failed after 4 attempts \(503 Service Unavailable\) for GET \/api\/v2\/members: unavailable: /);
+    assertCanaryWindowsAbsent(assert, error.message, [TEST_TOKEN, LD_RETRY_CANARY], "retried error");
+    return true;
+  });
+  assert.deepEqual(waits, [1000, 1000, 1000]);
 });
 
 test("LaunchdarklyApiClient surfaces LaunchDarkly error details and redacts tokens", async () => {
@@ -3984,6 +4221,12 @@ const LD_FIXED_TEXT_MESSAGES = [
   "LaunchDarkly request failed (502 Bad Gateway) for GET /api/v2/tokens?showAll=true: 502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
   "LaunchDarkly response for GET /api/v2/members was not valid JSON (200 OK: non-JSON body (text/html, 1024 bytes, not echoed)).",
   "LaunchDarkly request failed for GET /api/v2/caller-identity: timed out after 30000ms",
+  "LaunchDarkly request failed after 4 attempts for GET /api/v2/caller-identity: timed out after 30000ms",
+  "LaunchDarkly request failed after 4 attempts for GET /api/v2/caller-identity: fetch failed",
+  "LaunchDarkly request failed after 4 attempts (503 Service Unavailable) for GET /api/v2/members: internal_server_error: upstream",
+  "LaunchDarkly request failed after 4 attempts (429 Too Many Requests) for GET /api/v2/tokens?showAll=true: rate_limited: slow down",
+  "LaunchDarkly request failed (429 Too Many Requests; the server asked to retry after 120 s, more than the 30 s limit) for GET /api/v2/members: rate_limited: slow down",
+  "LaunchDarkly request failed after 2 attempts (503 Service Unavailable; the server asked to retry after 3600 s, more than the 30 s limit) for GET /api/v2/auditlog?spec=member%2F*",
   "LaunchDarkly request failed for GET /api/v2/caller-identity: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
   "LaunchDarkly request failed (403 Forbidden) for GET /api/v2/auditlog?spec=member%2F*: forbidden: You do not have permission to view the audit log",
   "The caller identity was not readable (HTTP 403), so the token name, token kind, and member are unknown.",
@@ -4136,4 +4379,207 @@ test("checkLaunchdarklyAccess keeps the limited result when a probe reads, a pro
     assert.equal(result.recommendedNextStep, LD_LIMITED_NEXT_STEP, label);
     assert.ok(result.notes.every((note) => !/rejected|were not checked/.test(note)), `${label}: ${result.notes.join(" | ")}`);
   }
+});
+
+test("a members page that keeps failing after the first page read fails the whole listing closed: the pages already read are never reported as the inventory", async () => {
+  const fixture = ldPrincipalFixture();
+  let laterPageRequests = 0;
+  const routes = {
+    "GET /api/v2/members": (url) => {
+      if (url.searchParams.get("offset") !== "0") {
+        laterPageRequests += 1;
+        return jsonResponse({ code: "internal_server_error", message: "upstream" }, { status: 503, statusText: "Service Unavailable" });
+      }
+      const firstPage = new URL(url);
+      firstPage.searchParams.set("limit", "1");
+      return ldPage(fixture.members, firstPage);
+    },
+  };
+  const { fetchImpl, config } = httpLaunchdarkly(fixture, { routes });
+  const waits = [];
+  const client = new LaunchdarklyApiClient(config, { fetchImpl, sleep: async (ms) => { waits.push(ms); }, now: () => NOW });
+
+  await assert.rejects(client.listMembers(), (error) => {
+    assert.equal(error.status, 503);
+    assert.equal(error.message, "LaunchDarkly request failed after 4 attempts (503 Service Unavailable) for GET /api/v2/members: internal_server_error: upstream");
+    return true;
+  });
+  assert.equal(laterPageRequests, 4, "the failing page is retried three times");
+  assert.deepEqual(waits, [500, 1000, 2000]);
+
+  const identity = await assessLaunchdarklyIdentity(client, { now: NOW });
+  const failure = "Unreadable inventory: members (GET /api/v2/members: LaunchDarkly request failed after 4 attempts (503 Service Unavailable) for GET /api/v2/members: internal_server_error: upstream)";
+  assert.ok(identity.errors.some((text) => text.includes("LaunchDarkly request failed after 4 attempts (503 Service Unavailable) for GET /api/v2/members")), identity.errors.join("\n"));
+  for (const id of ["LD-02", "LD-03", "LD-06", "LD-24"]) {
+    assert.equal(findingStatus(identity, id), "manual", `${id} is not judged on a members listing that stopped part way`);
+    assert.ok(finding(identity, id).summary.includes(failure), `${id}: ${finding(identity, id).summary}`);
+  }
+  assert.ok(finding(identity, "LD-07").summary.includes(`${failure}, so member posture was not checked`), finding(identity, "LD-07").summary);
+
+  const exported = await exportLaunchdarklyAuditBundle(client, config, createTempBase("grclanker-ld-retry-"), { now: NOW });
+  const members = JSON.parse(readBundleFiles(exported.outputDir).get("core_data/members.json"));
+  assert.equal(members.collected, false);
+  assert.equal(members.status, 503);
+  assert.equal(members.reason, "not_readable");
+  assert.equal(members.items, null, "no partial member list is written as the inventory");
+  assert.match(members.error, /after 4 attempts \(503 Service Unavailable\)/);
+});
+
+test("a later page that fails through every retry leaves a fixed-cap listing unreadable with no truncation caveat, while the same listing read to its cap keeps the manual-review caveat", async () => {
+  const records = (count, make) => Array.from({ length: count }, (_, index) => make(index));
+  // The listings their assessments read at a cap that no argument of theirs raises, each grown one record past that cap.
+  const environmentCase = (assess) => ({
+    assess,
+    route: "GET /api/v2/projects/{project}/environments",
+    collection: "environments",
+    scope: "project web",
+    cap: 50,
+    unraisedOption: "environment_limit",
+    endpoint: "GET /api/v2/projects/web/environments",
+    grow: (fixture) => fixture.environments.web.push(...records(49, (index) => ({ key: `qa-${index}`, name: `QA ${index}`, critical: false, secureMode: true, defaultTtl: 0 }))),
+  });
+  const cases = [
+    {
+      assess: assessLaunchdarklyIdentity,
+      route: "GET /api/v2/teams/{team}/roles",
+      collection: "team_roles",
+      scope: "team platform",
+      cap: 200,
+      unraisedOption: "role_limit",
+      endpoint: "GET /api/v2/teams/platform/roles",
+      grow: (fixture) => fixture.teamRoles.platform.push(...records(200, (index) => ({ key: `team-role-${index}`, name: `Team role ${index}` }))),
+    },
+    {
+      assess: assessLaunchdarklyAccessControl,
+      route: "GET /api/v2/members",
+      collection: "members",
+      cap: 1000,
+      unraisedOption: "member_limit",
+      endpoint: "GET /api/v2/members",
+      grow: (fixture) => fixture.members.push(...records(998, (index) => ({ _id: `m-extra-${index}`, email: `extra-${index}@example.com`, role: "reader", mfa: "enabled", teams: [] }))),
+    },
+    {
+      assess: assessLaunchdarklyEnvironmentGovernance,
+      route: "GET /api/v2/roles",
+      collection: "custom_roles",
+      cap: 200,
+      unraisedOption: "role_limit",
+      endpoint: "GET /api/v2/roles",
+      grow: (fixture) => fixture.customRoles.push(...records(200, (index) => ({ key: `viewer-${index}`, basePermissions: "no_access", policy: [{ effect: "allow", actions: ["viewProject"], resources: ["proj/web"] }] }))),
+    },
+    environmentCase(assessLaunchdarklyFlagHygiene),
+    environmentCase(assessLaunchdarklyMonitoringIntegrations),
+  ];
+  const unavailable = () => jsonResponse({ code: "internal_server_error", message: "upstream" }, { status: 503, statusText: "Service Unavailable" });
+  const run = async (fixture, assess, routes) => {
+    const { fetchImpl, config } = httpLaunchdarkly(fixture, { routes });
+    const waits = [];
+    const client = new LaunchdarklyApiClient(config, { fetchImpl, sleep: async (ms) => { waits.push(ms); }, now: () => NOW });
+    return { result: await assess(client, { now: NOW }), waits };
+  };
+
+  for (const { assess, route, collection, scope, cap, unraisedOption, endpoint, grow } of cases) {
+    const fixture = ldFixture();
+    grow(fixture);
+    const inventory = scope ? `${collection} for ${scope}` : collection;
+    const label = `${assess.name}: ${inventory}`;
+    const serve = ldRoutes(fixture)[route];
+
+    // Read to its cap after one transient 503 that a retry absorbs: a truncated listing that says to review the rest manually.
+    let flaked = false;
+    const capped = await run(fixture, assess, {
+      [route]: (url, params) => {
+        if (flaked) return serve(url, params);
+        flaked = true;
+        return unavailable();
+      },
+    });
+    assert.deepEqual(capped.waits, [500], `${label}: the transient 503 is retried once`);
+    const caveat = `Truncated listing: ${inventory} (${cap} of ${cap + 1} collected). The verdict covers only the collected items, so review the uncollected items manually.`;
+    const cappedReaders = capped.result.findings.filter((item) => item.evidence?.truncated_collections);
+    assert.ok(cappedReaders.length > 0, `${label}: a finding reads the capped listing`);
+    for (const item of cappedReaders) {
+      assert.notEqual(item.status, "pass", `${label} ${item.id}`);
+      assert.ok(item.summary.includes(caveat), `${label} ${item.id}: ${item.summary}`);
+      assert.ok(!item.summary.includes(unraisedOption), `${label} ${item.id}: ${item.summary}`);
+      assert.deepEqual(item.evidence.truncated_collections, [{ collection, seen: cap, total: cap + 1, ...(scope ? { scope } : {}) }], `${label} ${item.id}`);
+    }
+    for (const item of capped.result.findings) {
+      assert.ok(!item.evidence?.unreadable_inventories?.some((gap) => gap.inventory === inventory), `${label} ${item.id}: a capped listing is not unreadable`);
+    }
+
+    // The same listing when a later page fails through every retry: unreadable, and never a truncation caveat.
+    let laterPageRequests = 0;
+    const failed = await run(fixture, assess, {
+      [route]: (url, params) => {
+        if (url.searchParams.get("offset") === "0") {
+          const firstPage = new URL(url);
+          firstPage.searchParams.set("limit", "1");
+          return serve(firstPage, params);
+        }
+        laterPageRequests += 1;
+        return unavailable();
+      },
+    });
+    assert.equal(laterPageRequests, 4, `${label}: the later page is retried three times`);
+    assert.deepEqual(failed.waits, [500, 1000, 2000], label);
+    const gap = `Unreadable inventory: ${inventory} (${endpoint}: LaunchDarkly request failed after 4 attempts (503 Service Unavailable) for ${endpoint}: internal_server_error: upstream)`;
+    const failedReaders = failed.result.findings.filter((item) => item.evidence?.unreadable_inventories?.some((entry) => entry.inventory === inventory));
+    assert.ok(failedReaders.length > 0, `${label}: a finding reads the failed listing`);
+    for (const item of failedReaders) {
+      assert.notEqual(item.status, "pass", `${label} ${item.id}`);
+      assert.ok(item.summary.includes(gap), `${label} ${item.id}: ${item.summary}`);
+    }
+    for (const item of failed.result.findings) {
+      assert.equal(item.evidence?.truncated_collections, undefined, `${label} ${item.id}: the failed listing is not truncated`);
+      assert.doesNotMatch(item.summary, /Truncated listing|review the uncollected items manually/, `${label} ${item.id}`);
+    }
+  }
+});
+
+test("a finding that reads a capped listing and a listing whose later page failed offers the cap's argument for the capped one and reports the failed one only as unreadable", async () => {
+  const fixture = ldFixture();
+  fixture.teamRoles.platform.push({ key: "incident-commander", name: "Incident commander" });
+  const serve = ldRoutes(fixture)["GET /api/v2/teams/{team}/roles"];
+  const { fetchImpl, config } = httpLaunchdarkly(fixture, {
+    routes: {
+      "GET /api/v2/teams/{team}/roles": (url, params) => {
+        if (url.searchParams.get("offset") !== "0") {
+          return jsonResponse({ code: "internal_server_error", message: "upstream" }, { status: 503, statusText: "Service Unavailable" });
+        }
+        const firstPage = new URL(url);
+        firstPage.searchParams.set("limit", "1");
+        return serve(firstPage, params);
+      },
+    },
+  });
+  const client = new LaunchdarklyApiClient(config, { fetchImpl, sleep: async () => {}, now: () => NOW });
+
+  const teamRoleFinding = finding(await assessLaunchdarklyIdentity(client, { now: NOW, memberLimit: 2 }), "LD-07");
+  assert.ok(teamRoleFinding.summary.includes("Truncated listing: members (2 of 3 collected). The verdict covers only the collected items, so raise member_limit and rerun for a complete evaluation."), teamRoleFinding.summary);
+  assert.ok(teamRoleFinding.summary.includes("Unreadable inventory: team_roles for team platform (GET /api/v2/teams/platform/roles: LaunchDarkly request failed after 4 attempts (503 Service Unavailable)"), teamRoleFinding.summary);
+  // The failed team role listing is not a truncated one, so the caveat does not fall back to the mixed manual-review wording.
+  assert.doesNotMatch(teamRoleFinding.summary, /review the uncollected/);
+  assert.deepEqual(teamRoleFinding.evidence.truncated_collections, [{ collection: "members", option: "member_limit", seen: 2, total: 3 }]);
+  assert.deepEqual(teamRoleFinding.evidence.unreadable_inventories.map((entry) => entry.inventory), ["team_roles for team platform"]);
+  assert.notEqual(teamRoleFinding.status, "pass");
+});
+
+test("the assess tool names a read that failed closed on an over-limit Retry-After in its findings and its partial collection warnings", async () => {
+  const fixture = ldPrincipalFixture();
+  const { fetchImpl } = httpLaunchdarkly(fixture, {
+    routes: {
+      "GET /api/v2/members": () => jsonResponse({ code: "rate_limited", message: "slow down" }, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "120" } }),
+    },
+  });
+  const tool = await runLaunchdarklyTool("launchdarkly_assess_identity", fetchImpl, { token: TEST_TOKEN });
+  const text = tool.content[0].text;
+  const failure = "LaunchDarkly request failed (429 Too Many Requests; the server asked to retry after 120 s, more than the 30 s limit) for GET /api/v2/members: rate_limited: slow down";
+  assert.match(text, /^Partial collection warnings:$/m);
+  assert.ok(text.split("\n").some((line) => line.startsWith("- ") && line.endsWith(failure)), text);
+  for (const id of ["LD-02", "LD-03", "LD-06", "LD-24"]) {
+    assert.equal(findingStatus(tool.details, id), "manual", id);
+    assert.ok(finding(tool.details, id).summary.includes(`Unreadable inventory: members (GET /api/v2/members: ${failure})`), `${id}: ${finding(tool.details, id).summary}`);
+  }
+  assertCanaryWindowsAbsent(assert, [["text", text], ["details", JSON.stringify(tool.details)]], [TEST_TOKEN], "rate-limited assess tool");
 });

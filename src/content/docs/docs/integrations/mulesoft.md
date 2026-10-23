@@ -27,7 +27,7 @@ Set the organization ID and one credential source. Explicit tool arguments win o
 | Control plane | `control_plane` (`us`, `eu`, `gov`) | `ANYPOINT_CONTROL_PLANE` | `control_plane` (or `region`) |
 | Custom base URL | `base_url` | `ANYPOINT_BASE_URL` | `base_url` |
 | Environment filter | `environments` (comma-separated names or IDs) | `ANYPOINT_ENVIRONMENTS` (or `ANYPOINT_ENVIRONMENT_IDS`) | `environments` (array) |
-| Request timeout (seconds, default 30) | `timeout_seconds` | `ANYPOINT_TIMEOUT` | `timeout` (or `timeout_seconds`) |
+| Request timeout per attempt (seconds, default 30) | `timeout_seconds` | `ANYPOINT_TIMEOUT` | `timeout` (or `timeout_seconds`) |
 | Config file path | `config_file` | `MULESOFT_SEC_INSPECTOR_CONFIG` (or `ANYPOINT_CONFIG_FILE`) | default `~/.config/mulesoft-sec-inspector/config.toml` |
 
 Auth mode is chosen in this order: pre-issued token, connected app client credentials, then username and password.
@@ -232,7 +232,19 @@ The script exits 0 with a skip message when no credentials are present. With cre
 
 ## How the tools handle evidence
 
-This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+This section is reference for reviewing findings and bundles: how failed requests are retried, how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Retries
+
+A request that gets a 429 or 5xx answer, times out, or loses its connection is retried up to three times, so it makes at most four attempts. This covers the token exchange, `/accounts/login`, and the audit log query as well as every `GET`.
+
+- Between attempts the client waits as long as the answer's `Retry-After` header asks, in seconds or as an HTTP date. Without one, it waits 0.5, 1, then 2 seconds.
+- A `Retry-After` longer than 30 seconds is not waited out. The request fails at once, and its error names the wait, for example `Anypoint request failed (429 Too Many Requests; the server asked to retry after 120 s, more than the 30 s limit) for GET /exchange/api/v2/assets/search`.
+- Each attempt gets the full `timeout_seconds`, and the timer runs until the response body has been read.
+- When the retries run out, the error names the attempts and the last outcome, for example `Anypoint request failed after 4 attempts (503 Service Unavailable) for GET <path>` or `Anypoint request failed after 4 attempts for GET <path>: timed out after 30000 ms`. A timeout or a lost connection carries no HTTP status.
+- Any other status is not retried. Neither is a 2xx answer whose body is not JSON, which fails as `Anypoint response for GET <path> (200 OK) was not valid JSON: non-JSON body (text/html, <n> bytes)`.
+- A list whose later page still fails after the retries keeps none of its pages. The source is recorded as `unread (<error>)` in the `inventories` map, its snapshot is the `collected: false` marker, and the findings that read it follow the [verdict safety](#verdict-safety) rules.
+- The control 16 certificate probe is a TLS handshake, not an API request, and is not retried. A host that cannot be probed is reported as undated, as described under [Limitations and manual controls](#limitations-and-manual-controls).
 
 ### Verdict safety
 

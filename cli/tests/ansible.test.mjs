@@ -94,6 +94,7 @@ import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const SUPERUSER = { id: 1, username: "auditor", is_superuser: true, is_system_auditor: false };
 const LIMITED_USER = { id: 2, username: "ops", is_superuser: false, is_system_auditor: false };
+const noSleep = async () => {};
 
 const JOB_HEALTH_CONTROLS = [1, 2, 3, 4, 5, 28];
 const HOST_COVERAGE_CONTROLS = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
@@ -446,7 +447,7 @@ test("createTlsOptOutFetch accepts a self-signed certificate that the default fe
     const me = await client.get("/api/v2/me/");
     assert.equal(me.results[0].username, "auditor");
 
-    const verifying = new AnsibleAapClient({ baseUrl: `https://127.0.0.1:${port}`, token: "scoped", timeoutMs: 5_000, verifySsl: true, sourceChain: ["tests"] });
+    const verifying = new AnsibleAapClient({ baseUrl: `https://127.0.0.1:${port}`, token: "scoped", timeoutMs: 5_000, verifySsl: true, sourceChain: ["tests"] }, { sleep: noSleep });
     await assert.rejects(() => verifying.get("/api/v2/me/"));
     assert.equal(process.env.NODE_TLS_REJECT_UNAUTHORIZED, before);
   } finally {
@@ -1701,6 +1702,7 @@ test("verdict rule 9: AnsibleAapClient error messages keep the structured detail
         }
         return new Response(htmlBody, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
       },
+      sleep: noSleep,
     },
   );
   await assert.rejects(() => client.get("/api/v2/jobs/"), (error) => {
@@ -1709,12 +1711,268 @@ test("verdict rule 9: AnsibleAapClient error messages keep the structured detail
     return true;
   });
   await assert.rejects(() => client.get("/api/v2/hosts/"), (error) => {
-    assert.equal(error.message, `AAP request failed: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, ${Buffer.byteLength(htmlBody, "utf8")} bytes)`);
+    assert.equal(error.message, `AAP request failed after 4 attempts: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, ${Buffer.byteLength(htmlBody, "utf8")} bytes)`);
     assertNoCanaryWindows(assert, error.message, [ANSIBLE_ERROR_BODY_CANARIES.html], "non-JSON body");
     assert.equal(error.status, 502);
     assert.equal(error.endpoint, "/api/v2/hosts/");
     return true;
   });
+});
+
+const RETRY_PASSWORD_CANARY = "Rk7pQ2vXw9LmZt4N";
+
+/**
+ * A client whose fetch answers each `METHOD path` from its own list in turn, repeating the last answer, and
+ * records every request it served and every backoff wait it was asked for.
+ */
+function scriptedAapClient(script, { config = {}, maxRetries, signal, sleep } = {}) {
+  const requests = [];
+  const waits = [];
+  const served = new Map();
+  const client = new AnsibleAapClient(
+    { ...AAP_CLIENT_CONFIG, ...config },
+    {
+      fetchImpl: async (input, init = {}) => {
+        const url = new URL(typeof input === "string" ? input : input.toString());
+        const key = `${init.method ?? "GET"} ${url.pathname}`;
+        const answers = script[key];
+        if (!answers) throw new Error(`Unexpected request: ${key}`);
+        const index = served.get(key) ?? 0;
+        served.set(key, index + 1);
+        requests.push(key);
+        return answers[Math.min(index, answers.length - 1)](init);
+      },
+      now: () => NOW,
+      sleep: sleep ?? (async (ms) => { waits.push(ms); }),
+      ...(maxRetries === undefined ? {} : { maxRetries }),
+      ...(signal ? { signal } : {}),
+    },
+  );
+  return { client, requests, waits };
+}
+
+const unavailable = (headers = {}, body = "") => () => new Response(body, { status: 503, statusText: "Service Unavailable", headers });
+const throttled = (headers = {}) => () => new Response("", { status: 429, statusText: "Too Many Requests", headers });
+const badGateway = () => new Response("<html>bad gateway</html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
+const meOk = () => jsonResponse({ count: 1, results: [SUPERUSER] });
+const connectionLost = () => { throw new TypeError("fetch failed"); };
+const hangs = (init) => new Promise((_, reject) => {
+  init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")));
+});
+/** Headers arrive, then the body stalls until the request signal aborts it. */
+const stalledBody = (init) => new Response(new ReadableStream({
+  start(controller) {
+    controller.enqueue(new TextEncoder().encode('{"count":'));
+    init.signal.addEventListener("abort", () => controller.error(new DOMException("This operation was aborted", "AbortError")));
+  },
+}), { status: 200, headers: { "content-type": "application/json" } });
+
+test("retries: a 429 or 5xx answer is retried with exponential backoff that honors Retry-After as delta-seconds or an HTTP-date", async () => {
+  const { client, requests, waits } = scriptedAapClient({
+    "GET /api/v2/me/": [
+      throttled({ "retry-after": "2" }),
+      unavailable({ "retry-after": new Date(NOW.getTime() + 5_000).toUTCString() }),
+      badGateway,
+      meOk,
+    ],
+  });
+  assert.equal((await client.get("/api/v2/me/")).results[0].username, "auditor");
+  assert.equal(requests.length, 4);
+  assert.deepEqual(waits, [2_000, 5_000, 2_000], "Retry-After seconds, then an HTTP-date, then the third backoff step");
+
+  const pastOrUnparseable = scriptedAapClient({
+    "GET /api/v2/me/": [
+      unavailable({ "retry-after": new Date(NOW.getTime() - 60_000).toUTCString() }),
+      unavailable({ "retry-after": "soon" }),
+      meOk,
+    ],
+  });
+  await pastOrUnparseable.client.get("/api/v2/me/");
+  assert.deepEqual(pastOrUnparseable.waits, [0, 1_000], "a past HTTP-date waits 0; an unparseable value falls back to backoff");
+
+  const atTheCap = scriptedAapClient({ "GET /api/v2/me/": [throttled({ "retry-after": "30" }), meOk] });
+  await atTheCap.client.get("/api/v2/me/");
+  assert.deepEqual(atTheCap.waits, [30_000], "a Retry-After of exactly 30 s is honored");
+});
+
+test("retries: a read still failing when the retries run out fails closed with the attempt count and the last status, and a 4xx is never retried", async () => {
+  const { client, requests, waits } = scriptedAapClient({ "GET /api/v2/hosts/": [unavailable()] });
+  await assert.rejects(() => client.get("/api/v2/hosts/"), (error) => {
+    assert.equal(error.name, "AnsibleApiError");
+    assert.equal(error.message, "AAP request failed after 4 attempts: /api/v2/hosts/ (503 Service Unavailable)");
+    assert.equal(error.status, 503);
+    assert.equal(error.endpoint, "/api/v2/hosts/");
+    return true;
+  });
+  assert.equal(requests.length, 4, "three retries follow the first attempt");
+  assert.deepEqual(waits, [500, 1_000, 2_000]);
+
+  const denied = scriptedAapClient({ "GET /api/v2/hosts/": [aapForbidden] });
+  await assert.rejects(() => denied.client.get("/api/v2/hosts/"), {
+    message: "AAP request failed: /api/v2/hosts/ (403 Forbidden) You do not have permission to perform this action.",
+  });
+  assert.equal(denied.requests.length, 1);
+  assert.deepEqual(denied.waits, []);
+
+  const noRetries = scriptedAapClient({ "GET /api/v2/hosts/": [unavailable()] }, { maxRetries: 0 });
+  await assert.rejects(() => noRetries.client.get("/api/v2/hosts/"), { message: "AAP request failed: /api/v2/hosts/ (503 Service Unavailable)" });
+  assert.equal(noRetries.requests.length, 1);
+});
+
+test("retries: a Retry-After longer than 30 s fails closed at once with the wait the server asked for", async () => {
+  for (const retryAfter of ["120", new Date(NOW.getTime() + 120_000).toUTCString()]) {
+    const { client, requests, waits } = scriptedAapClient({ "GET /api/v2/hosts/": [throttled({ "retry-after": retryAfter }), meOk] });
+    await assert.rejects(() => client.get("/api/v2/hosts/"), (error) => {
+      assert.equal(error.message, "AAP request failed: /api/v2/hosts/ (429 Too Many Requests; the server asked to retry after 120 s, more than the 30 s limit)");
+      assert.equal(error.status, 429);
+      return true;
+    });
+    assert.equal(requests.length, 1, `Retry-After ${retryAfter}: no second attempt`);
+    assert.deepEqual(waits, []);
+  }
+});
+
+test("retries: a timed-out request, a stalled body, or a lost connection is retried, and fails closed with the cause when every attempt fails", async () => {
+  const timedOut = scriptedAapClient({ "GET /api/v2/ping/": [hangs] }, { config: { timeoutMs: 20 } });
+  await assert.rejects(() => timedOut.client.get("/api/v2/ping/"), (error) => {
+    assert.equal(error.message, "AAP request failed after 4 attempts: /api/v2/ping/ (timed out after 20 ms)");
+    assert.equal(error.status, undefined);
+    assert.equal(error.endpoint, "/api/v2/ping/");
+    return true;
+  });
+  assert.equal(timedOut.requests.length, 4);
+  assert.deepEqual(timedOut.waits, [500, 1_000, 2_000]);
+
+  const stalled = scriptedAapClient({ "GET /api/v2/me/": [stalledBody, meOk] }, { config: { timeoutMs: 20 } });
+  assert.equal((await stalled.client.get("/api/v2/me/")).results[0].username, "auditor", "the timer covers the body, so a stalled body is retried");
+  assert.equal(stalled.requests.length, 2);
+
+  const recovered = scriptedAapClient({ "GET /api/v2/me/": [connectionLost, connectionLost, meOk] });
+  assert.equal((await recovered.client.get("/api/v2/me/")).results[0].username, "auditor");
+  assert.deepEqual(recovered.waits, [500, 1_000]);
+
+  const down = scriptedAapClient({ "GET /api/v2/ping/": [connectionLost] });
+  await assert.rejects(() => down.client.get("/api/v2/ping/"), { message: "AAP request failed after 4 attempts: /api/v2/ping/ (network error: fetch failed)" });
+  assert.equal(down.requests.length, 4);
+});
+
+test("retries: aborting the tool call during a backoff wait ends the read at once with the abort", async () => {
+  const controller = new AbortController();
+  const { client, requests } = scriptedAapClient({ "GET /api/v2/hosts/": [unavailable()] }, {
+    signal: controller.signal,
+    sleep: () => {
+      controller.abort();
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(() => client.get("/api/v2/hosts/"), { name: "ToolCallAbortedError" });
+  assert.equal(requests.length, 1, "no attempt follows the abort");
+});
+
+test("retries: an abort that lands while a response body is read ends the read with the abort, never a network error or a retry", async () => {
+  const controller = new AbortController();
+  const { client, requests, waits } = scriptedAapClient({
+    "GET /api/v2/hosts/": [(init) => {
+      setTimeout(() => controller.abort(), 5);
+      return stalledBody(init);
+    }],
+  }, { signal: controller.signal });
+  await assert.rejects(() => client.get("/api/v2/hosts/"), { name: "ToolCallAbortedError" });
+  assert.equal(requests.length, 1, "no attempt follows the abort");
+  assert.deepEqual(waits, []);
+});
+
+test("session login: a POST /api/login/ that times out or loses its connection is sent once, since AAP may have opened a session that a second login would expire; 429 and 5xx login answers are retried", async () => {
+  const session = { token: undefined, username: "auditor", password: RETRY_PASSWORD_CANARY, timeoutMs: 20 };
+  const loginPage = () => new Response("<html>login</html>", { status: 200, headers: { "content-type": "text/html", "set-cookie": "csrftoken=csrftokenfortests1; Path=/" } });
+  const loggedIn = () => new Response("", { status: 200, headers: { "set-cookie": "sessionid=sessionidfortests1; Path=/; HttpOnly" } });
+
+  for (const [label, failure, expected] of [
+    ["timeout", hangs, "AAP session login failed (timed out after 20 ms)."],
+    ["lost connection", connectionLost, "AAP session login failed (network error: fetch failed)."],
+  ]) {
+    const { client, requests } = scriptedAapClient({
+      "GET /api/login/": [loginPage],
+      "POST /api/login/": [failure, loggedIn],
+      "GET /api/v2/me/": [meOk],
+    }, { config: session });
+    await assert.rejects(() => client.get("/api/v2/me/"), (error) => {
+      assert.equal(error.message, expected, label);
+      assert.equal(error.endpoint, "/api/login/");
+      return true;
+    });
+    assert.deepEqual(requests, ["GET /api/login/", "POST /api/login/"], `${label}: the login is sent once`);
+  }
+
+  const retried = scriptedAapClient({
+    "GET /api/login/": [hangs, unavailable(), loginPage],
+    "POST /api/login/": [throttled({ "retry-after": "1" }), unavailable(), loggedIn],
+    "GET /api/v2/me/": [meOk],
+  }, { config: session });
+  assert.equal((await retried.client.get("/api/v2/me/")).results[0].username, "auditor");
+  assert.deepEqual(retried.requests, [
+    "GET /api/login/", "GET /api/login/", "GET /api/login/",
+    "POST /api/login/", "POST /api/login/", "POST /api/login/",
+    "GET /api/v2/me/",
+  ], "the bootstrap GET is retried on a timeout and a 503; the login POST on a 429 and a 503");
+  assert.deepEqual(retried.waits, [500, 1_000, 1_000, 1_000]);
+
+  const echoedPassword = `<html>login failed for auditor / ${RETRY_PASSWORD_CANARY}</html>`;
+  const exhausted = scriptedAapClient({
+    "GET /api/login/": [loginPage],
+    "POST /api/login/": [unavailable({ "content-type": "text/html" }, echoedPassword)],
+  }, { config: session });
+  await assert.rejects(() => exhausted.client.get("/api/v2/me/"), (error) => {
+    assert.equal(error.message, "AAP session login failed after 4 attempts (503 Service Unavailable).");
+    assertNoCanaryWindows(assert, error.message, [RETRY_PASSWORD_CANARY], "retried login error");
+    return true;
+  });
+  assert.equal(exhausted.requests.filter((request) => request === "POST /api/login/").length, 4);
+});
+
+test("retries: an error body that echoes the token on every retried attempt never reaches the thrown error", async () => {
+  const echo = () => new Response(JSON.stringify({ detail: `upstream rejected Bearer ${ANSIBLE_RUN_TOKEN_CANARY}` }), {
+    status: 503,
+    statusText: "Service Unavailable",
+    headers: { "content-type": "application/json" },
+  });
+  const { client, requests } = scriptedAapClient({ "GET /api/v2/hosts/": [echo] });
+  await assert.rejects(() => client.get("/api/v2/hosts/"), (error) => {
+    assert.match(error.message, /^AAP request failed after 4 attempts: \/api\/v2\/hosts\/ \(503 Service Unavailable\) upstream rejected/);
+    assertNoCanaryWindows(assert, error.message, [ANSIBLE_RUN_TOKEN_CANARY], "retried error detail");
+    return true;
+  });
+  assert.equal(requests.length, 4);
+});
+
+test("retries: a page that still fails after the retries leaves its list not collected in every tool, never a partial list reported complete", async () => {
+  const hosts = HEALTHY_ROUTES["/api/v2/hosts/"];
+  const log = [];
+  const client = aapClient({
+    ...healthyAapRoutes(),
+    "/api/v2/hosts/": (url) => (url.searchParams.get("page") === "2"
+      ? new Response("", { status: 503, statusText: "Service Unavailable" })
+      : jsonResponse({ count: hosts.length + 1, next: "/api/v2/hosts/?page=2&page_size=100", previous: null, results: hosts })),
+  }, log);
+  const assessments = await runAllAssessments(client);
+  const exported = await exportAnsibleAuditBundle(client, AAP_CLIENT_CONFIG, createTempBase("grclanker-ansible-retry-page-"));
+  const files = readBundleFiles(exported.outputDir);
+
+  const failedPages = log.filter((entry) => entry.path === "/api/v2/hosts/" && entry.status === 503).length;
+  assert.ok(failedPages >= 4 && failedPages % 4 === 0, `each failing page read made 4 attempts (${failedPages} failed requests)`);
+  const exhausted = /AAP request failed after 4 attempts: \/api\/v2\/hosts\/\?page=2\S* \(503 Service Unavailable\)/;
+
+  const marker = JSON.parse(files.get("core_data/hosts.json"));
+  assert.deepEqual(Object.keys(marker).sort(), ["collected", "endpoint", "error", "status"], "the partly read list is a marker, not the first page");
+  assert.equal(marker.collected, false);
+  assert.equal(marker.status, 503);
+  assert.equal(marker.endpoint, "/api/v2/hosts/");
+  assert.match(marker.error, exhausted);
+  assert.match(files.get("_errors.log"), exhausted);
+
+  assert.equal(assessments[1].summary.total_hosts, null, "no host total is reported from the first page alone");
+  assert.equal(assessments[1].summary.hosts_total_reported, null);
+  assert.ok(assessments.flatMap((assessment) => assessment.errors).some((error) => exhausted.test(error)), "the assessment errors name the exhausted read");
 });
 
 test("verdict rule 10: survey spec and error notification probes capped at 50 templates demote controls 18 and 27 with seen versus total", async () => {
@@ -1886,7 +2144,7 @@ function aapRoutedFetch(routes, log) {
 }
 
 function aapClient(routes, log) {
-  return new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl: aapRoutedFetch(routes, log), now: () => NOW });
+  return new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl: aapRoutedFetch(routes, log), now: () => NOW, sleep: noSleep });
 }
 
 /** Runs the access check, the three assessments, and the export, keeping the thrown text when a step fails outright. */
@@ -1960,6 +2218,12 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
     "AAP session login failed (network error: fetch failed).",
     "AAP session login failed (401 Unauthorized).",
     "AAP session auth requires AAP_USERNAME and AAP_PASSWORD.",
+    "AAP request failed after 4 attempts: /api/v2/ping/ (network error: fetch failed)",
+    "AAP request failed after 4 attempts: /api/v2/ping/ (timed out after 30000 ms)",
+    "AAP request failed: /api/v2/hosts/ (429 Too Many Requests; the server asked to retry after 120 s, more than the 30 s limit)",
+    "AAP login bootstrap failed after 4 attempts (503 Service Unavailable).",
+    "AAP session login failed after 4 attempts (503 Service Unavailable).",
+    "AAP session login failed (timed out after 30000 ms).",
     "ACTIVITY_STREAM_ENABLED is not exposed by the system settings, so it was not confirmed",
     "authentication settings (/api/v2/settings/authentication/): no documented settings key returned",
     "system settings (/api/v2/settings/system/): no documented settings key returned",
@@ -1980,6 +2244,8 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
     "AAP request failed: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, 46 bytes)",
     "AAP request failed: /api/v2/ping/ (200 OK): non-JSON body (text/plain, 21 bytes)",
     "AAP request failed: /api/v2/tokens/ (401 Unauthorized) Authentication credentials were not provided.",
+    "AAP request failed after 4 attempts: /api/v2/hosts/ (502 Bad Gateway): non-JSON body (text/html, 46 bytes)",
+    "AAP request failed after 4 attempts: /api/v2/hosts/ (503 Service Unavailable)",
   ];
   for (const message of thrown) {
     assert.equal(redactErrorText(message), message, `the thrown rendering survives the scrub: ${message}`);
@@ -2655,13 +2921,13 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
     throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
   };
   const note = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
-  const client = new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl, now: () => NOW });
+  const client = new AnsibleAapClient(AAP_CLIENT_CONFIG, { fetchImpl, now: () => NOW, sleep: noSleep });
 
   await assert.rejects(() => client.get("/api/v2/me/"), (error) => {
     assert.equal(error.name, "AnsibleApiError");
     assertNoCanaryWindows(assert, error.message, [PARSER_SNIPPET_CANARY], "thrown client error");
     assert.doesNotMatch(error.message, PARSER_WORDING, `the parser's message was interpolated: ${error.message}`);
-    assert.equal(error.message, `AAP request failed: /api/v2/me/ (network error: ${note})`);
+    assert.equal(error.message, `AAP request failed after 4 attempts: /api/v2/me/ (network error: ${note})`);
     return true;
   });
 

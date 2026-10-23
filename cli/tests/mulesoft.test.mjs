@@ -789,6 +789,331 @@ test("MulesoftApiClient surfaces non-retryable errors with status and redacted s
   );
 });
 
+const RETRY_NOW = Date.parse("2026-09-21T00:00:00Z");
+const ORG_PATH = `/accounts/api/organizations/${ORG_ID}`;
+
+/** A fetch that answers `failures` in order and then succeeds, counting every request it serves. */
+function scriptedAnypointFetch(failures, success = () => jsonResponse({ id: ORG_ID, name: "Acme" })) {
+  const state = { calls: 0 };
+  state.fetchImpl = async (input, init) => {
+    const failure = failures[state.calls];
+    state.calls += 1;
+    return failure ? failure(input, init) : success(input, init);
+  };
+  return state;
+}
+
+function retryingAnypointClient(fetchImpl, options = {}) {
+  const sleeps = [];
+  const client = new MulesoftApiClient(sampleConfig(options.config), {
+    fetchImpl,
+    sleepImpl: async (ms) => {
+      sleeps.push(ms);
+    },
+    now: () => RETRY_NOW,
+  });
+  return { client, sleeps };
+}
+
+test("MulesoftApiClient waits what Retry-After asks before retrying a 429 or a 5xx, as delta-seconds or an HTTP-date", async () => {
+  const cases = [
+    { label: "429 delta-seconds", status: 429, headers: { "retry-after": "7" }, wait: 7000 },
+    { label: "503 delta-seconds", status: 503, headers: { "retry-after": "2" }, wait: 2000 },
+    { label: "429 HTTP-date", status: 429, headers: { "retry-after": new Date(RETRY_NOW + 12_000).toUTCString() }, wait: 12_000 },
+    { label: "502 HTTP-date", status: 502, headers: { "retry-after": new Date(RETRY_NOW + 5_000).toUTCString() }, wait: 5_000 },
+    { label: "an HTTP-date already past retries at once", status: 503, headers: { "retry-after": new Date(RETRY_NOW - 60_000).toUTCString() }, wait: 0 },
+    { label: "Retry-After 0 retries at once", status: 429, headers: { "retry-after": "0" }, wait: 0 },
+    { label: "an unparseable Retry-After falls back to the backoff", status: 429, headers: { "retry-after": "soon" }, wait: 500 },
+    { label: "no Retry-After falls back to the backoff", status: 500, headers: {}, wait: 500 },
+    { label: "exactly the 30 s limit is honored", status: 503, headers: { "retry-after": "30" }, wait: 30_000 },
+  ];
+  for (const { label, status, headers, wait } of cases) {
+    const scripted = scriptedAnypointFetch([() => jsonResponse({ message: "try later" }, { status, statusText: "Retry", headers })]);
+    const { client, sleeps } = retryingAnypointClient(scripted.fetchImpl);
+    assert.equal((await client.getOrganization()).name, "Acme", label);
+    assert.equal(scripted.calls, 2, label);
+    assert.deepEqual(sleeps, [wait], label);
+  }
+});
+
+test("MulesoftApiClient fails closed after three retries of a persistent 429 or 5xx, naming the attempts, the status, and the request, and never retries a 4xx", async () => {
+  for (const [status, statusText] of [[429, "Too Many Requests"], [500, "Internal Server Error"], [502, "Bad Gateway"], [503, "Service Unavailable"], [504, "Gateway Timeout"]]) {
+    const scripted = scriptedAnypointFetch(Array(10).fill(() => jsonResponse({ message: "try later" }, { status, statusText })));
+    const { client, sleeps } = retryingAnypointClient(scripted.fetchImpl);
+    await assert.rejects(client.getOrganization(), (error) => {
+      assert.ok(error instanceof MulesoftApiError);
+      assert.equal(error.status, status);
+      assert.equal(error.endpoint, ORG_PATH);
+      assert.equal(error.message, `Anypoint request failed after 4 attempts (${status} ${statusText}) for GET ${ORG_PATH}: try later`);
+      return true;
+    });
+    assert.equal(scripted.calls, 4, `${status}: one request and three retries`);
+    assert.deepEqual(sleeps, [500, 1000, 2000], `${status}: exponential backoff from 500 ms`);
+  }
+
+  for (const [status, statusText] of [[400, "Bad Request"], [401, "Unauthorized"], [403, "Forbidden"], [404, "Not Found"]]) {
+    const scripted = scriptedAnypointFetch([() => jsonResponse({ message: "no" }, { status, statusText })]);
+    const { client, sleeps } = retryingAnypointClient(scripted.fetchImpl);
+    await assert.rejects(client.getOrganization(), (error) => {
+      assert.equal(error.status, status);
+      assert.equal(error.message, `Anypoint request failed (${status} ${statusText}) for GET ${ORG_PATH}: no`);
+      return true;
+    });
+    assert.equal(scripted.calls, 1, `${status} is not retried`);
+    assert.deepEqual(sleeps, []);
+  }
+});
+
+test("MulesoftApiClient fails closed at once, without retrying early, when Retry-After asks for longer than 30 s", async () => {
+  const cases = [
+    { label: "seconds on a 429", status: 429, statusText: "Too Many Requests", retryAfter: "120", asked: 120 },
+    { label: "an HTTP-date on a 503", status: 503, statusText: "Service Unavailable", retryAfter: new Date(RETRY_NOW + 90_000).toUTCString(), asked: 90 },
+    { label: "one second over the limit on a 500", status: 500, statusText: "Internal Server Error", retryAfter: "31", asked: 31 },
+  ];
+  for (const { label, status, statusText, retryAfter, asked } of cases) {
+    const scripted = scriptedAnypointFetch(Array(10).fill(() => jsonResponse({ message: "slow down" }, { status, statusText, headers: { "retry-after": retryAfter } })));
+    const { client, sleeps } = retryingAnypointClient(scripted.fetchImpl);
+    await assert.rejects(client.getOrganization(), (error) => {
+      assert.ok(error instanceof MulesoftApiError, label);
+      assert.equal(error.status, status, label);
+      assert.equal(error.message, `Anypoint request failed (${status} ${statusText}; the server asked to retry after ${asked} s, more than the 30 s limit) for GET ${ORG_PATH}: slow down`, label);
+      return true;
+    });
+    assert.equal(scripted.calls, 1, `${label}: no early retry`);
+    assert.deepEqual(sleeps, [], `${label}: no wait`);
+  }
+
+  const later = scriptedAnypointFetch([
+    () => jsonResponse({}, { status: 503, statusText: "Service Unavailable" }),
+    () => jsonResponse({ message: "slow down" }, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "600" } }),
+  ]);
+  const { client, sleeps } = retryingAnypointClient(later.fetchImpl);
+  await assert.rejects(client.getOrganization(), (error) => {
+    assert.equal(error.message, `Anypoint request failed after 2 attempts (429 Too Many Requests; the server asked to retry after 600 s, more than the 30 s limit) for GET ${ORG_PATH}: slow down`);
+    return true;
+  });
+  assert.deepEqual(sleeps, [500]);
+});
+
+test("MulesoftApiClient retries a timeout, a body that stalls after the headers, and a lost connection, then fails closed with an error that names the request", async () => {
+  const abortError = () => new DOMException("This operation was aborted", "AbortError");
+  const hanging = (_input, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(abortError()));
+  });
+  const stalledBody = (_input, init) => {
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"id":'));
+        init.signal.addEventListener("abort", () => controller.error(abortError()));
+      },
+    });
+    return Promise.resolve(new Response(body, { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }));
+  };
+  const refused = () => Promise.reject(new TypeError("fetch failed"));
+
+  for (const [label, failure, detail] of [
+    ["a request that never answers", hanging, "timed out after 20 ms"],
+    ["a body that stalls after the headers", stalledBody, "timed out after 20 ms"],
+    ["a refused connection", refused, "fetch failed"],
+  ]) {
+    const scripted = scriptedAnypointFetch(Array(10).fill(failure));
+    const { client, sleeps } = retryingAnypointClient(scripted.fetchImpl, { config: { timeoutMs: 20 } });
+    await assert.rejects(client.getOrganization(), (error) => {
+      assert.ok(error instanceof MulesoftApiError, `${label}: a MulesoftApiError, so the read's marker names the request`);
+      assert.equal(error.status, undefined, `${label}: no response, so no status`);
+      assert.equal(error.endpoint, ORG_PATH, label);
+      assert.equal(error.message, `Anypoint request failed after 4 attempts for GET ${ORG_PATH}: ${detail}`, label);
+      return true;
+    });
+    assert.equal(scripted.calls, 4, label);
+    assert.deepEqual(sleeps, [500, 1000, 2000], label);
+
+    const recovering = scriptedAnypointFetch([failure, failure]);
+    const retried = retryingAnypointClient(recovering.fetchImpl, { config: { timeoutMs: 20 } });
+    assert.equal((await retried.client.getOrganization()).name, "Acme", `${label}: a later attempt that succeeds is used`);
+    assert.equal(recovering.calls, 3, label);
+  }
+
+  const once = new MulesoftApiClient(sampleConfig({ timeoutMs: 20 }), { fetchImpl: hanging, sleepImpl: async () => {}, maxRetries: 0 });
+  await assert.rejects(once.getOrganization(), (error) => {
+    assert.equal(error.message, `Anypoint request failed for GET ${ORG_PATH}: timed out after 20 ms`, "a single attempt names no attempt count");
+    return true;
+  });
+});
+
+test("MulesoftApiClient does not retry a 2xx whose body is not JSON: the answer is recorded with its status and the body is not echoed", async () => {
+  const portal = scriptedAnypointFetch(Array(10).fill(() => new Response(`<html>sign in ${PLANTED.bearer}</html>`, { status: 200, statusText: "OK", headers: { "content-type": "text/html" } })));
+  const { client, sleeps } = retryingAnypointClient(portal.fetchImpl);
+  await assert.rejects(client.getOrganization(), (error) => {
+    assert.ok(error instanceof MulesoftApiError);
+    assert.equal(error.status, 200);
+    assert.equal(error.endpoint, ORG_PATH);
+    assert.equal(error.message, `Anypoint response for GET ${ORG_PATH} (200 OK) was not valid JSON: non-JSON body (text/html, 39 bytes)`);
+    assertFragmentsAbsent(assert, error.message, [PLANTED.bearer], "non-JSON 2xx body");
+    return true;
+  });
+  assert.equal(portal.calls, 1);
+  assert.deepEqual(sleeps, []);
+});
+
+test("MulesoftApiClient retries the connected-app token request on a 429 or a 5xx and names the attempts when the token endpoint stays down", async () => {
+  const config = { authMode: "connected_app", token: undefined, clientId: "app-1", clientSecret: PLANTED.clientSecret };
+  const tokenThenOrg = (input) => {
+    const url = new URL(String(input));
+    return url.pathname === "/accounts/api/v2/oauth2/token"
+      ? jsonResponse({ access_token: PLANTED.bearer, expires_in: 3600 })
+      : jsonResponse({ id: ORG_ID, name: "Acme" });
+  };
+  const recovering = scriptedAnypointFetch([
+    () => jsonResponse({ message: "busy" }, { status: 503, statusText: "Service Unavailable" }),
+    () => jsonResponse({ message: "busy" }, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "1" } }),
+  ], tokenThenOrg);
+  const { client, sleeps } = retryingAnypointClient(recovering.fetchImpl, { config });
+  assert.equal((await client.getOrganization()).name, "Acme");
+  assert.equal(recovering.calls, 4, "two failed token requests, the token, then the read");
+  assert.deepEqual(sleeps, [500, 1000]);
+
+  const down = scriptedAnypointFetch(Array(10).fill(() => jsonResponse({ message: `busy for client_secret=${PLANTED.clientSecret}` }, { status: 503, statusText: "Service Unavailable" })));
+  const failing = retryingAnypointClient(down.fetchImpl, { config });
+  await assert.rejects(failing.client.getOrganization(), (error) => {
+    assert.ok(error instanceof MulesoftApiError);
+    assert.equal(error.status, 503);
+    assert.match(error.message, /^Anypoint request failed after 4 attempts \(503 Service Unavailable\) for POST \/accounts\/api\/v2\/oauth2\/token: /);
+    assertFragmentsAbsent(assert, error.message, [PLANTED.clientSecret], "token request error");
+    return true;
+  });
+  assert.equal(down.calls, 4, "the read is never sent without a token");
+});
+
+test("MulesoftApiClient stops at once when the tool call is aborted during a retry wait or a request, and never retries an abort", async () => {
+  const duringWait = new AbortController();
+  const failing = scriptedAnypointFetch(Array(10).fill(() => jsonResponse({}, { status: 503, statusText: "Service Unavailable" })));
+  const waitingClient = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: failing.fetchImpl,
+    signal: duringWait.signal,
+    sleepImpl: () => {
+      duringWait.abort();
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(waitingClient.getOrganization(), (error) => error.name === "ToolCallAbortedError");
+  assert.equal(failing.calls, 1, "the abort ends the wait; no retry is sent");
+
+  const duringRequest = new AbortController();
+  let sent = 0;
+  const requestClient = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: (_input, init) => {
+      sent += 1;
+      setTimeout(() => duringRequest.abort(), 5);
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+      });
+    },
+    signal: duringRequest.signal,
+    sleepImpl: async () => {},
+  });
+  await assert.rejects(requestClient.getOrganization(), (error) => error.name === "ToolCallAbortedError");
+  assert.equal(sent, 1, "an aborted request is not retried as a timeout");
+});
+
+test("MulesoftApiClient reports an abort that lands while the last attempt's body is read as the abort, not as a timeout", async () => {
+  const controller = new AbortController();
+  let sent = 0;
+  const client = new MulesoftApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init) => {
+      sent += 1;
+      if (sent < 4) return jsonResponse({}, { status: 503, statusText: "Service Unavailable" });
+      return new Response(new ReadableStream({
+        start(stream) {
+          stream.enqueue(new TextEncoder().encode('{"id":'));
+          init.signal.addEventListener("abort", () => stream.error(new DOMException("This operation was aborted", "AbortError")));
+          setTimeout(() => controller.abort(), 5);
+        },
+      }), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } });
+    },
+    signal: controller.signal,
+    sleepImpl: async () => {},
+  });
+  await assert.rejects(client.getOrganization(), (error) => {
+    assert.equal(error.name, "ToolCallAbortedError", error.message);
+    return true;
+  });
+  assert.equal(sent, 4, "the abort lands during the fourth and last attempt");
+});
+
+test("MulesoftApiClient keeps the token and echoed credentials out of the error it raises after retrying", async () => {
+  const echoed = { message: `Bearer ${SAMPLE_TOKEN} rejected upstream; client_secret=${PLANTED.echoedClientSecret}` };
+  const scripted = scriptedAnypointFetch(Array(10).fill(() => jsonResponse(echoed, { status: 502, statusText: "Bad Gateway", headers: { "retry-after": "1" } })));
+  const { client, sleeps } = retryingAnypointClient(scripted.fetchImpl);
+  await assert.rejects(client.listMembers(), (error) => {
+    assert.match(error.message, new RegExp(`^Anypoint request failed after 4 attempts \\(502 Bad Gateway\\) for GET ${ORG_PATH}/members: `));
+    assertFragmentsAbsent(assert, error.message, [SAMPLE_TOKEN, PLANTED.echoedClientSecret], "retried error");
+    return true;
+  });
+  assert.deepEqual(sleeps, [1000, 1000, 1000]);
+});
+
+test("a role group page that keeps failing after the first page read fails the whole listing closed: admin concentration is never judged on the groups already read", async () => {
+  let laterPageRequests = 0;
+  const firstPage = Array.from({ length: 100 }, (_, index) => ({ role_group_id: `rg-${index}`, name: `Group ${index}` }));
+  const fetchImpl = async (input) => {
+    const url = new URL(String(input));
+    if (url.searchParams.get("offset") === "0") return jsonResponse({ data: firstPage, total: 150 });
+    laterPageRequests += 1;
+    return jsonResponse({ message: "upstream unavailable" }, { status: 503, statusText: "Service Unavailable" });
+  };
+  const { client, sleeps } = retryingAnypointClient(fetchImpl);
+  const failure = `Anypoint request failed after 4 attempts (503 Service Unavailable) for GET ${ORG_PATH}/rolegroups: upstream unavailable`;
+  await assert.rejects(client.listRoleGroups(), (error) => {
+    assert.equal(error.status, 503);
+    assert.equal(error.message, failure);
+    return true;
+  });
+  assert.equal(laterPageRequests, 4, "the failing page is retried three times");
+  assert.deepEqual(sleeps, [500, 1000, 2000]);
+
+  const identity = await assessMulesoftIdentityAccess(healthyIdentityClient({ listRoleGroups: () => client.listRoleGroups() }));
+  assert.ok(identity.errors.includes(`role_groups: ${failure}`), identity.errors.join("\n"));
+  for (const id of ["MULESOFT-IAM-03", "MULESOFT-IAM-04", "MULESOFT-IAM-05"]) {
+    assert.equal(statusOf(identity, id), "manual", `${id} passes on the healthy fixture and must not be judged on a listing that stopped part way`);
+    assert.ok(findingById(identity, id).summary.startsWith(`Could not evaluate: role_groups could not be read, the read errored: ${failure}.`), `${id}: ${findingById(identity, id).summary}`);
+  }
+
+  const exported = await exportMulesoftAuditBundle(healthyBundleClient({ listRoleGroups: () => client.listRoleGroups() }), sampleConfig(), createTempBase("grclanker-mulesoft-retry-"));
+  const files = readBundleFiles(exported.outputDir);
+  const analysis = JSON.parse(files.get(`analysis/${identity.category}.json`));
+  assert.equal(analysis.summary.inventories.role_groups, `unread (${failure})`);
+  assert.equal(analysis.summary.role_groups, null, "no count is derived from the groups already read");
+  assert.equal(analysis.summary.organization_admins, null);
+  assert.deepEqual(JSON.parse(files.get("core_data/role_groups.json")), {
+    collected: false,
+    dataset: "role_groups",
+    status: 503,
+    endpoint: `${ORG_PATH}/rolegroups`,
+    error: failure,
+  });
+});
+
+test("a read that times out on every attempt is exported as not collected with the request it tried, so the marker names the endpoint even without a status", async () => {
+  const hanging = (_input, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+  });
+  const { client } = retryingAnypointClient(hanging, { config: { timeoutMs: 20 } });
+  const failure = `Anypoint request failed after 4 attempts for GET ${ORG_PATH}/rolegroups: timed out after 20 ms`;
+  const exported = await exportMulesoftAuditBundle(healthyBundleClient({ listRoleGroups: () => client.listRoleGroups() }), sampleConfig(), createTempBase("grclanker-mulesoft-timeout-"));
+  const files = readBundleFiles(exported.outputDir);
+  assert.deepEqual(JSON.parse(files.get("core_data/role_groups.json")), {
+    collected: false,
+    dataset: "role_groups",
+    status: null,
+    endpoint: `${ORG_PATH}/rolegroups`,
+    error: failure,
+  });
+  const analysis = JSON.parse(files.get("analysis/identity_access.json"));
+  assert.equal(statusOf(analysis, "MULESOFT-IAM-03"), "manual");
+  assert.ok(findingById(analysis, "MULESOFT-IAM-03").summary.includes(`role_groups could not be read, the read errored: ${failure}`));
+});
+
 test("redaction helpers mask secret-bearing keys and token text", () => {
   const redacted = redactSnapshot({
     client_id: "app-1",
@@ -3996,16 +4321,23 @@ const MULESOFT_FIXED_TEXTS = [
   "ANYPOINT_ORG_ID, an organization_id argument, or org_id in config.toml is required.",
   "Provide connected app credentials (ANYPOINT_CLIENT_ID and ANYPOINT_CLIENT_SECRET), username and password (ANYPOINT_USERNAME and ANYPOINT_PASSWORD), a pre-issued ANYPOINT_TOKEN, or the matching arguments or config.toml keys.",
   'Unsupported MuleSoft control plane "apac". Use us, eu, or gov, or pass base_url.',
-  "Anypoint response was not valid JSON.",
+  "Anypoint response for GET /accounts/api/me (200 OK) was not valid JSON: non-JSON body (text/html, 1024 bytes)",
   `Anypoint request failed (502 Bad Gateway) for GET /accounts/api/organizations/${ORG_ID}/members: non-JSON body (text/html, 5120 bytes)`,
+  `Anypoint request failed after 4 attempts (503 Service Unavailable) for GET /accounts/api/organizations/${ORG_ID}/members: upstream unavailable`,
+  "Anypoint request failed after 4 attempts (429 Too Many Requests) for POST /accounts/api/v2/oauth2/token: non-JSON body (text/plain, 12 bytes)",
+  "Anypoint request failed (429 Too Many Requests; the server asked to retry after 120 s, more than the 30 s limit) for GET /exchange/api/v2/assets/search: slow down",
+  `Anypoint request failed after 2 attempts (503 Service Unavailable; the server asked to retry after 3600 s, more than the 30 s limit) for GET /cloudhub/api/v2/applications: non-JSON body (unknown content type, 64 bytes)`,
   "Anypoint request failed (403 Forbidden) for GET /cloudhub/api/v2/applications: JSON body without a recognized error field (application/json, 27 bytes)",
   "Anypoint request failed (429 Too Many Requests) for GET /exchange/api/v2/assets/search: non-JSON body (text/plain, 12 bytes)",
   "Anypoint request failed (503 Service Unavailable) for GET /hybrid/api/v1/servers: non-JSON body (unknown content type, 64 bytes)",
   "Anypoint request failed (502 Bad Gateway) for POST /accounts/api/v2/oauth2/token: non-JSON body (text/html, 5120 bytes)",
   "Anypoint request failed (401 Unauthorized) for POST /accounts/api/v2/oauth2/token: Client authentication failed; invalid_client",
   "Anypoint request failed (401 Unauthorized) for POST /accounts/login: Unauthorized",
-  `Anypoint request to GET /accounts/api/organizations/${ORG_ID}/members timed out after 30000 ms`,
+  `Anypoint request failed for GET /accounts/api/organizations/${ORG_ID}/members: timed out after 30000 ms`,
+  `Anypoint request failed after 4 attempts for GET /accounts/api/organizations/${ORG_ID}/members: timed out after 30000 ms`,
   "Anypoint request failed for GET /hybrid/api/v1/servers: fetch failed",
+  "Anypoint request failed after 4 attempts for GET /hybrid/api/v1/servers: fetch failed",
+  "hybrid_servers could not be read, the read errored: Anypoint request failed after 4 attempts for GET /hybrid/api/v1/servers: fetch failed",
   "TLS probe of prod-dlb.lb.anypointdns.net timed out.",
   "Load balancer did not expose a domain to probe.",
   MS_SAMPLE_DENIAL,

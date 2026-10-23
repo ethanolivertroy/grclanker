@@ -16,7 +16,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { DEFAULT_DATA_SCRUB_DEPTH, REDACTED, createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -32,6 +32,7 @@ const DEFAULT_API_VERSION = "20240415";
 const BETA_API_VERSION = "beta";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 500;
 const MAX_RATE_LIMIT_WAIT_MS = 30_000;
 const DEFAULT_PAGE_SIZE = 50;
 const AUDIT_LOG_PAGE_SIZE = 20;
@@ -803,6 +804,25 @@ function statusLine(response: Response): string {
   return response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
 }
 
+/** Retry-After in milliseconds: delta-seconds, or an HTTP-date measured against `now`; a past date is 0. */
+function retryAfterMs(value: string | null, now: number): number | undefined {
+  if (value === null) return undefined;
+  const seconds = asNumber(value);
+  if (seconds !== undefined) return Math.max(seconds * 1000, 0);
+  if (!/^(mon|tue|wed|thu|fri|sat|sun)/i.test(value.trim())) return undefined;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(date - now, 0) : undefined;
+}
+
+/** " after N attempts" once a request was retried, so a failure says how hard it was tried. */
+function attemptsNote(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
+function backoffMs(attempt: number): number {
+  return Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, MAX_RATE_LIMIT_WAIT_MS);
+}
+
 /**
  * Describes a body that is not the documented JSON error shape by status, content type, and length instead of
  * echoing it: an HTML or proxy error page can reflect the request (including its Authorization header) back at us.
@@ -1444,6 +1464,8 @@ export class LaunchdarklyApiClient {
   private readonly config: LaunchdarklyResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: SleepImpl;
+  private readonly now: () => number;
+  private readonly signal: AbortSignal | undefined;
   private readonly maxRetries: number;
   private pauseUntil = 0;
   /**
@@ -1459,11 +1481,15 @@ export class LaunchdarklyApiClient {
       sleep?: SleepImpl;
       maxRetries?: number;
       signal?: AbortSignal;
+      /** Clock in epoch milliseconds for rate-limit reset headers and HTTP-date Retry-After values. */
+      now?: () => number;
     } = {},
   ) {
     this.config = config;
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleep = abortableSleep(options.signal, options.sleep);
+    this.now = options.now ?? (() => Date.now());
+    this.signal = options.signal;
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     // The configured token is scrubbed from every recorded error string in every encoded form from here on.
     credentialScrubber.registerSecrets([config.token]);
@@ -1512,29 +1538,35 @@ export class LaunchdarklyApiClient {
       const remaining = asNumber(headers.get(remainingHeader));
       const reset = asNumber(headers.get(resetHeader));
       if (remaining !== undefined && remaining <= 0 && reset !== undefined) {
-        this.pauseUntil = Math.max(this.pauseUntil, Math.min(reset, Date.now() + MAX_RATE_LIMIT_WAIT_MS));
+        this.pauseUntil = Math.max(this.pauseUntil, Math.min(reset, this.now() + MAX_RATE_LIMIT_WAIT_MS));
       }
     }
   }
 
-  private rateLimitWaitMs(headers: Headers, attempt: number): number {
-    const reset = asNumber(headers.get("x-ratelimit-auth-token-reset")) ?? asNumber(headers.get("x-ratelimit-reset"));
-    if (reset !== undefined) {
-      return Math.min(Math.max(reset - Date.now(), 0), MAX_RATE_LIMIT_WAIT_MS);
+  /**
+   * The wait the server asked for before retrying a 429 or 5xx answer, or undefined when it named none: a 429 reads
+   * LaunchDarkly's reset header (epoch milliseconds) first, and either status falls back to Retry-After.
+   */
+  private serverRetryWaitMs(response: Response): number | undefined {
+    const now = this.now();
+    if (response.status === 429) {
+      const reset = asNumber(response.headers.get("x-ratelimit-auth-token-reset")) ?? asNumber(response.headers.get("x-ratelimit-reset"));
+      if (reset !== undefined) return Math.max(reset - now, 0);
     }
-    const retryAfterSeconds = asNumber(headers.get("retry-after"));
-    if (retryAfterSeconds !== undefined) {
-      return Math.min(Math.max(retryAfterSeconds * 1000, 0), MAX_RATE_LIMIT_WAIT_MS);
-    }
-    return Math.min(500 * 2 ** attempt, MAX_RATE_LIMIT_WAIT_MS);
+    return retryAfterMs(response.headers.get("retry-after"), now);
   }
 
+  /**
+   * A 429, a 5xx, a timeout, or a lost connection is retried up to maxRetries times, waiting what the server asked
+   * for or else an exponential backoff. A server that asks for more than MAX_RATE_LIMIT_WAIT_MS is not retried
+   * early; the read fails closed at once with the wait it asked for.
+   */
   private async fetchJson(url: string, options: { apiVersion?: string; shape?: LaunchdarklyResponseShape } = {}): Promise<JsonRecord> {
     // Every error names the request as it was actually issued (path plus non-pagination query), never a template.
     const endpoint = requestLabel(url);
     const shape = options.shape ?? LIST_SHAPE;
     for (let attempt = 0; ; attempt += 1) {
-      const pause = this.pauseUntil - Date.now();
+      const pause = this.pauseUntil - this.now();
       if (pause > 0) await this.sleep(Math.min(pause, MAX_RATE_LIMIT_WAIT_MS));
 
       const controller = new AbortController();
@@ -1555,34 +1587,38 @@ export class LaunchdarklyApiClient {
         rawText = await response.text();
       } catch (error) {
         rethrowIfAborted(error);
-        const timedOut = error instanceof Error && error.name === "AbortError";
+        if (this.signal?.aborted) throw new ToolCallAbortedError(this.signal);
+        const timedOut = controller.signal.aborted;
         if (attempt < this.maxRetries) {
-          await this.sleep(Math.min(500 * 2 ** attempt, MAX_RATE_LIMIT_WAIT_MS));
+          await this.sleep(backoffMs(attempt));
           continue;
         }
         // No response was observed, so no status is recorded; a transport SyntaxError is named without its message.
         const detail = timedOut ? `timed out after ${this.config.timeoutMs}ms` : errorMessage(error);
-        throw new LaunchdarklyApiError(this.redact(`LaunchDarkly request failed for ${endpoint}: ${detail}`), null, endpoint);
+        throw new LaunchdarklyApiError(this.redact(`LaunchDarkly request failed${attemptsNote(attempt + 1)} for ${endpoint}: ${detail}`), null, endpoint);
       } finally {
         clearTimeout(timer);
       }
 
       this.recordRateLimitHeaders(response.headers);
 
-      if (response.status === 429 && attempt < this.maxRetries) {
-        await this.sleep(this.rateLimitWaitMs(response.headers, attempt));
-        continue;
-      }
-      if (response.status >= 500 && attempt < this.maxRetries) {
-        await this.sleep(Math.min(500 * 2 ** attempt, MAX_RATE_LIMIT_WAIT_MS));
-        continue;
+      let refusedWait: string | undefined;
+      if (response.status === 429 || response.status >= 500) {
+        const askedMs = this.serverRetryWaitMs(response);
+        if (askedMs !== undefined && askedMs > MAX_RATE_LIMIT_WAIT_MS) {
+          refusedWait = `the server asked to retry after ${Math.ceil(askedMs / 1000)} s, more than the ${MAX_RATE_LIMIT_WAIT_MS / 1000} s limit`;
+        } else if (attempt < this.maxRetries) {
+          await this.sleep(askedMs ?? backoffMs(attempt));
+          continue;
+        }
       }
 
       const payload = parseJsonSafely(rawText);
       if (!response.ok) {
         const detail = launchdarklyErrorDetail(response, payload, rawText, (text) => this.redact(text));
+        const status = refusedWait ? `${statusLine(response)}; ${refusedWait}` : statusLine(response);
         throw new LaunchdarklyApiError(
-          this.redact(`LaunchDarkly request failed (${statusLine(response)}) for ${endpoint}${detail ? `: ${detail}` : ""}`),
+          this.redact(`LaunchDarkly request failed${attemptsNote(attempt + 1)} (${status}) for ${endpoint}${detail ? `: ${detail}` : ""}`),
           response.status,
           endpoint,
         );

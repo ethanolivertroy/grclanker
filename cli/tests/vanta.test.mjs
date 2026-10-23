@@ -19,10 +19,12 @@ import {
   resolveVantaCredentials,
   exportVantaAuditPackage,
   escapeCsvCell,
+  registerVantaTools,
   sanitizeFilename,
 } from "../dist/extensions/grc-tools/vanta.js";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 import { readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -35,11 +37,29 @@ function jsonResponse(body, status = 200) {
   });
 }
 
-function vantaClient(fetchImpl, credentials = { clientId: "client-id", clientSecret: "client-secret" }) {
+const noSleep = async () => {};
+
+function recordSleeps() {
+  const sleeps = [];
+  return { sleeps, sleep: async (ms) => { sleeps.push(ms); } };
+}
+
+/** A response that never arrives; it rejects as fetch does once the request's signal aborts. */
+function hangUntilAborted(init) {
+  return new Promise((_, reject) => {
+    init.signal.addEventListener("abort", () => {
+      reject(Object.assign(new Error("This operation was aborted"), { name: "AbortError" }));
+    }, { once: true });
+  });
+}
+
+function vantaClient(fetchImpl, credentials = { clientId: "client-id", clientSecret: "client-secret" }, options = {}) {
   return new VantaAuditorClient(credentials, {
     baseUrl: "http://vanta.test/v1",
     tokenUrl: "http://vanta.test/oauth/token",
     fetchImpl,
+    sleep: noSleep,
+    ...options,
   });
 }
 
@@ -398,6 +418,214 @@ test("VantaAuditorClient redacts a secret that straddles the error body limit", 
   clearVantaTokenCacheForTests();
 });
 
+test("VantaAuditorClient retries the token grant and API reads on transport errors, 429, and 5xx, honoring Retry-After", async () => {
+  clearVantaTokenCacheForTests();
+  const { sleeps, sleep } = recordSleeps();
+  const tokenOutcomes = ["transport", 503, 200];
+  const auditOutcomes = [429, 502, 200];
+  const calls = [];
+  const client = vantaClient(async (input, init = {}) => {
+    const url = new URL(String(input));
+    calls.push(`${init.method ?? "GET"} ${url.pathname}`);
+    if (url.pathname === "/oauth/token") {
+      const outcome = tokenOutcomes.shift();
+      if (outcome === "transport") throw new TypeError("fetch failed");
+      if (outcome === 503) return jsonResponse({ error: "unavailable" }, 503);
+      return jsonResponse({ access_token: "token-1", expires_in: 3600 });
+    }
+    const outcome = auditOutcomes.shift();
+    if (outcome === 429) return new Response("slow down", { status: 429, headers: { "retry-after": "2" } });
+    if (outcome === 502) return new Response("bad gateway", { status: 502 });
+    return jsonResponse(auditPage("audit-1", { hasNextPage: false, endCursor: null }));
+  }, undefined, { sleep });
+
+  assert.deepEqual((await client.listAudits()).map((audit) => audit.id), ["audit-1"]);
+  assert.deepEqual(calls, [
+    "POST /oauth/token",
+    "POST /oauth/token",
+    "POST /oauth/token",
+    "GET /v1/audits",
+    "GET /v1/audits",
+    "GET /v1/audits",
+  ]);
+  assert.deepEqual(sleeps, [500, 1000, 2000, 1000], "exponential backoff, except where Retry-After names the wait");
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient measures an HTTP-date Retry-After against its clock", async () => {
+  clearVantaTokenCacheForTests();
+  const { sleeps, sleep } = recordSleeps();
+  const now = Date.parse("Wed, 21 Oct 2026 07:28:00 GMT");
+  const retryAfter = ["Wed, 21 Oct 2026 07:28:05 GMT", "Tue, 20 Oct 2026 07:28:00 GMT"];
+  const client = vantaClient(withVantaToken(async () => {
+    const value = retryAfter.shift();
+    if (value) return new Response("busy", { status: 503, headers: { "retry-after": value } });
+    return jsonResponse(auditPage("audit-1", { hasNextPage: false, endCursor: null }));
+  }), undefined, { sleep, now: () => now });
+
+  assert.equal((await client.listAudits()).length, 1);
+  assert.deepEqual(sleeps, [5000, 0], "a future date waits until then and a past date retries at once");
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient fails closed when retries run out partway through pagination", async () => {
+  clearVantaTokenCacheForTests();
+  const { sleeps, sleep } = recordSleeps();
+  let secondPageRequests = 0;
+  const client = vantaClient(withVantaToken(async (url) => {
+    if (!url.searchParams.get("pageCursor")) {
+      return jsonResponse(auditPage("audit-1", { hasNextPage: true, endCursor: "cursor-1" }));
+    }
+    secondPageRequests += 1;
+    return new Response("upstream unavailable", { status: 503, statusText: "Service Unavailable" });
+  }), undefined, { sleep });
+
+  await assert.rejects(
+    client.listAudits(),
+    /^Error: Vanta API request failed for \/audits \(503 Service Unavailable\) after 4 attempts: upstream unavailable$/,
+  );
+  assert.equal(secondPageRequests, 4, "the first try and three retries");
+  assert.deepEqual(sleeps, [500, 1000, 2000]);
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient fails closed at once when Retry-After asks for more than 30 seconds", async () => {
+  clearVantaTokenCacheForTests();
+  const { sleeps, sleep } = recordSleeps();
+  let requests = 0;
+  const client = vantaClient(withVantaToken(async () => {
+    requests += 1;
+    return new Response("rate limited", {
+      status: 429,
+      statusText: "Too Many Requests",
+      headers: { "retry-after": "120" },
+    });
+  }), undefined, { sleep });
+
+  await assert.rejects(
+    client.listAudits(),
+    /\(429 Too Many Requests\): the server asked to retry after 120 s, more than the 30 s limit: rate limited$/,
+  );
+  assert.equal(requests, 1);
+  assert.deepEqual(sleeps, []);
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient times out a hung request, retries it, and names the timeout when retries run out", async () => {
+  clearVantaTokenCacheForTests();
+  const { sleeps, sleep } = recordSleeps();
+  let auditRequests = 0;
+  const recovering = vantaClient(withVantaToken(async (_url, init) => {
+    auditRequests += 1;
+    if (auditRequests === 1) return hangUntilAborted(init);
+    return jsonResponse(auditPage("audit-1", { hasNextPage: false, endCursor: null }));
+  }), undefined, { sleep, timeoutMs: 20 });
+  assert.equal((await recovering.listAudits()).length, 1);
+  assert.equal(auditRequests, 2);
+  assert.deepEqual(sleeps, [500]);
+
+  clearVantaTokenCacheForTests();
+  // A body that never finishes is a timeout too, since the timer runs until the body is read.
+  const stalledBody = vantaClient(withVantaToken(async (_url, init) => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("{\"results\":"));
+      init.signal.addEventListener("abort", () => controller.error(init.signal.reason), { once: true });
+    },
+  }))), undefined, { timeoutMs: 20 });
+  await assert.rejects(stalledBody.listAudits(), /^Error: Vanta API request failed for \/audits after 4 attempts: timed out after 20 ms$/);
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient stops a retry wait as soon as the tool call aborts", async () => {
+  clearVantaTokenCacheForTests();
+  const controller = new AbortController();
+  let waits = 0;
+  const client = vantaClient(withVantaToken(async () => new Response("busy", { status: 503 })), undefined, {
+    signal: controller.signal,
+    sleep: () => {
+      waits += 1;
+      controller.abort(new Error("operator stopped the call"));
+      return new Promise(() => {});
+    },
+  });
+
+  await assert.rejects(client.listAudits(), { name: "ToolCallAbortedError" });
+  assert.equal(waits, 1);
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient ends a read with the abort, not a retry, when the tool call aborts while the body is read", async () => {
+  clearVantaTokenCacheForTests();
+  const controller = new AbortController();
+  let auditRequests = 0;
+  const client = vantaClient(withVantaToken(async (_url, init) => {
+    auditRequests += 1;
+    return new Response(new ReadableStream({
+      start(stream) {
+        stream.enqueue(new TextEncoder().encode("{\"results\":"));
+        init.signal.addEventListener("abort", () => stream.error(init.signal.reason), { once: true });
+        setTimeout(() => controller.abort(new Error("operator stopped the call")), 5);
+      },
+    }));
+  }), undefined, { signal: controller.signal });
+
+  await assert.rejects(client.listAudits(), { name: "ToolCallAbortedError" });
+  assert.equal(auditRequests, 1, "no attempt follows the abort");
+  clearVantaTokenCacheForTests();
+});
+
+test("VantaAuditorClient keeps credentials out of errors when retries run out", async () => {
+  const planted = {
+    clientId: "Kd4Rw8Nq2Lx6Hv1Z",
+    clientSecret: "Tm9Fb3Yc7Gs5Pj0W",
+    accessToken: "Ua6Xe2Vk8Qn4Dr1J",
+  };
+  assertPlantedValuesWellFormed(assert, planted, [
+    JSON.stringify(auditPage("audit-1", { hasNextPage: false, endCursor: null })),
+    "Vanta API request failed for /audits (503 Service Unavailable) after 4 attempts: timed out after 20 ms",
+  ]);
+  const credentials = { clientId: planted.clientId, clientSecret: planted.clientSecret };
+  const tokenEcho = JSON.stringify({ error: "unavailable", ...credentials });
+  const echo = JSON.stringify({ error: "unavailable", ...planted });
+  const failures = [];
+  const capture = async (promise) => {
+    await assert.rejects(promise, (error) => {
+      failures.push(error.message);
+      return true;
+    });
+  };
+
+  clearVantaTokenCacheForTests();
+  await capture(vantaClient(async () => new Response(tokenEcho, { status: 503, statusText: "Service Unavailable" }), credentials).listAudits());
+
+  clearVantaTokenCacheForTests();
+  await capture(vantaClient(async (input) => {
+    if (new URL(String(input)).pathname === "/oauth/token") throw new TypeError(`connect failed for ${planted.clientSecret}`);
+    return jsonResponse(auditPage("audit-1", { hasNextPage: false, endCursor: null }));
+  }, credentials).listAudits());
+
+  for (const apiFailure of [
+    async () => new Response(echo, { status: 503, statusText: "Service Unavailable" }),
+    async () => new Response(echo, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "90" } }),
+    async () => { throw new TypeError(`socket hang up after Bearer ${planted.accessToken}`); },
+  ]) {
+    clearVantaTokenCacheForTests();
+    await capture(vantaClient(async (input, init = {}) => {
+      if ((init.method ?? "GET") === "POST") return jsonResponse({ access_token: planted.accessToken, expires_in: 3600 });
+      return apiFailure();
+    }, credentials).listAudits());
+  }
+  clearVantaTokenCacheForTests();
+
+  assert.equal(failures.length, 5);
+  assert.match(failures[0], /^Vanta authentication failed \(503 Service Unavailable\) after 4 attempts: /);
+  assert.match(failures[1], /^Vanta authentication failed after 4 attempts: connect failed for \[redacted\]$/);
+  assert.match(failures[2], /^Vanta API request failed for \/audits \(503 Service Unavailable\) after 4 attempts: /);
+  assert.match(failures[3], /^Vanta API request failed for \/audits \(429 Too Many Requests\): the server asked to retry after 90 s/);
+  assert.match(failures[4], /^Vanta API request failed for \/audits after 4 attempts: socket hang up after Bearer \[redacted\]$/);
+  assertFragmentsAbsent(assert, failures.join("\n"), Object.values(planted), "Vanta retry errors");
+});
+
 test("checkVantaAuditorAccess reports healthy access when audits are visible", async () => {
   const result = await checkVantaAuditorAccess({
     async listAudits() {
@@ -554,6 +782,8 @@ test("exportVantaAuditPackage writes offline evidence package and zip archive", 
   assert.equal(result.totalFilesExported, 3);
   assert.equal(result.totalControlFolders, 3);
   assert.equal(result.errorCount, 0);
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.incompleteEvidence, []);
   assert.ok(existsSync(result.outputDir));
   assert.ok(existsSync(result.zipPath));
   assert.equal(readFileSync(result.zipPath).subarray(0, 2).toString("utf8"), "PK");
@@ -561,15 +791,21 @@ test("exportVantaAuditPackage writes offline evidence package and zip archive", 
   const auditInfo = JSON.parse(readFileSync(join(result.outputDir, "_audit_info.json"), "utf8"));
   assert.equal(auditInfo.customer_name, "Acme Security");
   assert.equal(auditInfo.total_files_exported, 3);
+  assert.equal(auditInfo.complete, true);
+  assert.deepEqual(auditInfo.incomplete_evidence, []);
 
   const csv = readFileSync(join(result.outputDir, "_index.csv"), "utf8");
   assert.match(csv, /'=Danger Evidence/);
+  assert.match(csv.split("\n")[0], /,"export_status"$/);
+  assert.equal(csv.trim().split("\n").slice(1).every((row) => row.endsWith(',"complete"')), true);
 
   const accessMetadata = JSON.parse(
     readFileSync(join(result.outputDir, "IAM", "metadata.json"), "utf8"),
   );
   assert.equal(accessMetadata.evidence_items.length, 2);
   assert.deepEqual(accessMetadata.evidence_items[0].files, ["control-evidence.pdf"]);
+  assert.equal(accessMetadata.evidence_items[0].export_status, "complete");
+  assert.equal("missing_files" in accessMetadata.evidence_items[0], false);
 
   const cryptoMetadata = JSON.parse(
     readFileSync(join(result.outputDir, "Crypto", "metadata.json"), "utf8"),
@@ -632,13 +868,15 @@ test("exportVantaAuditPackage records partial download failures in _errors.log",
   const base = createTempBase("grclanker-vanta-errors-");
   const result = await exportVantaAuditPackage(mockClient, audit, resolve(base, "exports"), {
     fetchImpl,
+    sleep: noSleep,
   });
 
   assert.equal(result.errorCount, 1);
+  assert.equal(result.complete, false);
   assert.ok(existsSync(join(result.outputDir, "_errors.log")));
   assert.match(
     readFileSync(join(result.outputDir, "_errors.log"), "utf8"),
-    /Failed to download broken\.pdf/,
+    /Failed to download broken\.pdf for Broken file \(Failures\): Download failed \(500 Internal Server Error\) after 4 attempts/,
   );
 });
 
@@ -699,19 +937,21 @@ test("exportVantaAuditPackage allocates fresh bundles on sequential reruns", asy
   const base = createTempBase("grclanker-vanta-rerun-");
   const outputRoot = resolve(base, "exports");
 
-  const first = await exportVantaAuditPackage(client, audit, outputRoot, { fetchImpl });
+  const first = await exportVantaAuditPackage(client, audit, outputRoot, { fetchImpl, sleep: noSleep });
   const firstZipBytes = readFileSync(first.zipPath);
   assert.equal(first.errorCount, 1);
+  assert.equal(first.complete, false);
   assert.ok(existsSync(join(first.outputDir, "_errors.log")));
   assert.ok([...readZipEntries(first.zipPath).values()].includes("stale-run"));
 
   failDownload = false;
-  const second = await exportVantaAuditPackage(client, audit, outputRoot, { fetchImpl });
+  const second = await exportVantaAuditPackage(client, audit, outputRoot, { fetchImpl, sleep: noSleep });
 
   assert.notEqual(second.outputDir, first.outputDir);
   assert.notEqual(second.zipPath, first.zipPath);
   assert.deepEqual(readFileSync(first.zipPath), firstZipBytes);
   assert.equal(second.errorCount, 0);
+  assert.equal(second.complete, true);
   assert.equal(existsSync(join(second.outputDir, "_errors.log")), false);
   const secondZipEntries = readZipEntries(second.zipPath);
   assert.ok([...secondZipEntries.keys()].every((name) => !name.endsWith("/_errors.log")));
@@ -799,16 +1039,23 @@ test("exportVantaAuditPackage writes the bundle again with fresh counts when ano
     return new Response("evidence", { status: 200, headers: { "content-length": "8" } });
   };
 
-  const result = await exportVantaAuditPackage(client, audit, outputRoot, { fetchImpl, downloadConcurrency: 1 });
+  const result = await exportVantaAuditPackage(client, audit, outputRoot, { fetchImpl, downloadConcurrency: 1, sleep: noSleep });
 
   assert.equal(result.outputDir, join(outputRoot, `${takenName}_1`));
-  assert.equal(fetches, 4, "the second run downloads the evidence again");
+  // Each run fetches good.txt once and bad.txt four times: the first try and three retries of its 500.
+  assert.equal(fetches, 10, "the second run downloads the evidence again");
   assert.equal(result.totalFilesExported, 1);
   assert.equal(result.totalSizeBytes, 8);
   assert.equal(result.errorCount, 1);
-  assert.equal(JSON.parse(readFileSync(join(result.outputDir, "_audit_info.json"), "utf8")).total_files_exported, 1);
+  assert.equal(result.filesNotDownloaded, 1, "the rerun counts the missing file once");
+  assert.deepEqual(result.incompleteEvidence.map((entry) => entry.missingFiles), [["IAM/bad.txt"]]);
+  const auditInfo = JSON.parse(readFileSync(join(result.outputDir, "_audit_info.json"), "utf8"));
+  assert.equal(auditInfo.total_files_exported, 1);
+  assert.equal(auditInfo.files_not_downloaded, 1);
   assert.equal(readFileSync(join(result.outputDir, "_errors.log"), "utf8").trim().split("\n").length, 1);
-  assert.deepEqual(JSON.parse(readFileSync(join(result.outputDir, "IAM", "metadata.json"), "utf8")).evidence_items[0].files, ["good.txt", "bad.txt"]);
+  const [raceItem] = JSON.parse(readFileSync(join(result.outputDir, "IAM", "metadata.json"), "utf8")).evidence_items;
+  assert.deepEqual(raceItem.files, ["good.txt", "bad.txt"]);
+  assert.deepEqual(raceItem.missing_files, ["bad.txt"]);
   assert.ok([...readZipEntries(result.zipPath).keys()].every((name) => name.startsWith(`${takenName}_1/`)));
   assert.deepEqual(readdirSync(join(outputRoot, takenName)), [], "the other process's directory is untouched");
   assert.deepEqual(readdirSync(outputRoot).sort(), [takenName, `${takenName}_1`, `${takenName}_1.zip`].sort());
@@ -862,6 +1109,257 @@ test("exportVantaAuditPackage omits signed URL secrets from redirect errors", as
   assert.match(log, /Redirected to non-HTTPS URL: http:\/\/downloads\.example\.com\/file\.pdf/);
   assert.equal(log.includes(signature), false);
   assert.equal(log.includes("signed-user"), false);
+});
+
+const GAP_AUDIT = {
+  id: "audit-gap-123456",
+  customerDisplayName: "Gap Test",
+  customerOrganizationName: "Gap Test LLC",
+  framework: "SOC 2",
+  auditStartDate: "2026-01-01T00:00:00.000Z",
+  auditEndDate: "2026-12-31T00:00:00.000Z",
+};
+
+function evidenceItem(id, name) {
+  return {
+    id,
+    evidenceId: `ev-${id}`,
+    name,
+    status: "SUBMITTED",
+    description: null,
+    evidenceType: "UPLOADED_DOCUMENT",
+    testStatus: null,
+    relatedControls: [{ name: "IAM" }],
+    creationDate: "2026-01-02T00:00:00.000Z",
+    statusUpdatedDate: "2026-01-03T00:00:00.000Z",
+  };
+}
+
+function resultsPage(data, pageInfo = { hasNextPage: false, endCursor: null }) {
+  return { results: { data, pageInfo } };
+}
+
+function downloadable(filename) {
+  return { id: `url-${filename}`, url: `https://downloads.example.com/${filename}`, filename, isDownloadable: true };
+}
+
+/** _index.csv rows keyed by audit evidence ID; every cell is quoted and none of these fixtures holds a quote. */
+function readIndexRows(outputDir) {
+  const [header, ...rows] = readFileSync(join(outputDir, "_index.csv"), "utf8").trim().split("\n");
+  const cells = (line) => line.slice(1, -1).split("\",\"");
+  const columns = cells(header);
+  return new Map(rows.map((line) => {
+    const record = Object.fromEntries(cells(line).map((cell, index) => [columns[index], cell]));
+    return [record.audit_evidence_id, record];
+  }));
+}
+
+function readControlItems(outputDir, control) {
+  const metadata = JSON.parse(readFileSync(join(outputDir, control, "metadata.json"), "utf8"));
+  return new Map(metadata.evidence_items.map((item) => [item.id, item]));
+}
+
+test("exportVantaAuditPackage marks evidence whose file listing ran out of retries as unknown, not empty", async () => {
+  clearVantaTokenCacheForTests();
+  const evidence = [
+    evidenceItem("ae-listed", "Listed evidence"),
+    evidenceItem("ae-unlisted", "Unlisted evidence"),
+    evidenceItem("ae-empty", "Evidence with no files"),
+  ];
+  let unlistedRequests = 0;
+  const client = vantaClient(withVantaToken(async (url) => {
+    const path = url.pathname;
+    if (path === `/v1/audits/${GAP_AUDIT.id}/evidence`) return jsonResponse(resultsPage(evidence));
+    if (path.endsWith("/ae-listed/urls")) return jsonResponse(resultsPage([downloadable("listed.txt")]));
+    if (path.endsWith("/ae-empty/urls")) return jsonResponse(resultsPage([]));
+    if (path.endsWith("/ae-unlisted/urls")) {
+      unlistedRequests += 1;
+      if (!url.searchParams.get("pageCursor")) {
+        return jsonResponse(resultsPage([downloadable("first-page.txt")], { hasNextPage: true, endCursor: "cursor-2" }));
+      }
+      return new Response("upstream unavailable", { status: 503, statusText: "Service Unavailable" });
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  }));
+  const downloads = [];
+  const fetchImpl = async (input) => {
+    downloads.push(String(input));
+    return new Response("evidence", { status: 200, headers: { "content-length": "8" } });
+  };
+
+  const result = await exportVantaAuditPackage(client, GAP_AUDIT, resolve(createTempBase("grclanker-vanta-unlisted-"), "exports"), {
+    fetchImpl,
+    sleep: noSleep,
+  });
+
+  assert.equal(unlistedRequests, 5, "the first page, then the first try and three retries of the second");
+  assert.deepEqual(downloads, ["https://downloads.example.com/listed.txt"], "a failed listing's first page is not exported as its whole list");
+  assert.equal(result.complete, false);
+  assert.equal(result.evidenceWithUnknownUrls, 1);
+  assert.equal(result.evidenceWithMissingFiles, 0);
+  assert.equal(result.totalFilesExported, 1);
+  const listingError = `Vanta API request failed for /audits/${GAP_AUDIT.id}/evidence/ae-unlisted/urls (503 Service Unavailable) after 4 attempts: upstream unavailable`;
+  assert.deepEqual(result.incompleteEvidence, [
+    { id: "ae-unlisted", name: "Unlisted evidence", status: "urls_unknown", missingFiles: [], reason: listingError },
+  ]);
+
+  const rows = readIndexRows(result.outputDir);
+  assert.deepEqual([rows.get("ae-listed").file_count, rows.get("ae-listed").export_status], ["1", "complete"]);
+  assert.deepEqual([rows.get("ae-unlisted").file_count, rows.get("ae-unlisted").export_status], ["unknown", "urls_unknown"]);
+  assert.deepEqual([rows.get("ae-empty").file_count, rows.get("ae-empty").export_status], ["0", "complete"]);
+
+  const items = readControlItems(result.outputDir, "IAM");
+  assert.equal(items.get("ae-unlisted").files, null, "unknown files are not written as an empty list");
+  assert.equal(items.get("ae-unlisted").export_status, "urls_unknown");
+  assert.equal(items.get("ae-unlisted").export_error, listingError);
+  assert.deepEqual(items.get("ae-empty").files, []);
+  assert.equal(items.get("ae-empty").export_status, "complete");
+
+  const auditInfo = JSON.parse(readFileSync(join(result.outputDir, "_audit_info.json"), "utf8"));
+  assert.equal(auditInfo.complete, false);
+  assert.equal(auditInfo.evidence_items_with_unknown_urls, 1);
+  assert.equal(auditInfo.files_not_downloaded, 0);
+  assert.deepEqual(auditInfo.incomplete_evidence, [
+    { id: "ae-unlisted", name: "Unlisted evidence", export_status: "urls_unknown", missing_files: [], reason: listingError },
+  ]);
+  assert.ok(
+    readFileSync(join(result.outputDir, "_errors.log"), "utf8")
+      .includes(`Failed to list evidence URLs for Unlisted evidence (ae-unlisted): ${listingError}`),
+  );
+  clearVantaTokenCacheForTests();
+});
+
+test("exportVantaAuditPackage retries a download after 503 and a transport error, then keeps the file", async () => {
+  const { sleeps, sleep } = recordSleeps();
+  const client = {
+    async listEvidence() {
+      return [evidenceItem("ae-retry", "Retried evidence")];
+    },
+    async listEvidenceUrls() {
+      return [downloadable("retried.txt")];
+    },
+  };
+  let attempts = 0;
+  const fetchImpl = async () => {
+    attempts += 1;
+    if (attempts === 1) return new Response("busy", { status: 503, headers: { "retry-after": "3" } });
+    if (attempts === 2) throw new TypeError("fetch failed");
+    return new Response("evidence", { status: 200, headers: { "content-length": "8" } });
+  };
+
+  const result = await exportVantaAuditPackage(client, GAP_AUDIT, resolve(createTempBase("grclanker-vanta-download-retry-"), "exports"), {
+    fetchImpl,
+    sleep,
+  });
+
+  assert.equal(attempts, 3);
+  assert.deepEqual(sleeps, [3000, 1000]);
+  assert.equal(result.complete, true);
+  assert.equal(result.errorCount, 0);
+  assert.equal(readFileSync(join(result.outputDir, "IAM", "retried.txt"), "utf8"), "evidence");
+});
+
+test("exportVantaAuditPackage removes a download whose body stalls or breaks partway and records it missing", async () => {
+  const client = {
+    async listEvidence() {
+      return [evidenceItem("ae-partial", "Partial evidence")];
+    },
+    async listEvidenceUrls() {
+      return [downloadable("stalled.txt"), downloadable("broken.txt"), downloadable("whole.txt")];
+    },
+  };
+  const fetchImpl = async (input) => {
+    const filename = String(input).split("/").pop();
+    if (filename === "whole.txt") return new Response("evidence", { status: 200, headers: { "content-length": "8" } });
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("partial "));
+        if (filename === "broken.txt") setTimeout(() => controller.error(new Error("connection reset")), 5);
+      },
+    }), { status: 200 });
+  };
+
+  const result = await exportVantaAuditPackage(client, GAP_AUDIT, resolve(createTempBase("grclanker-vanta-partial-"), "exports"), {
+    fetchImpl,
+    timeoutMs: 50,
+  });
+
+  assert.equal(result.complete, false);
+  assert.equal(result.totalFilesExported, 1);
+  assert.equal(result.filesNotDownloaded, 2);
+  const [gap] = result.incompleteEvidence;
+  assert.deepEqual(gap.missingFiles, ["IAM/broken.txt", "IAM/stalled.txt"]);
+  assert.equal(gap.reason, "Download failed partway: connection reset; Download stalled: no data for 50 ms");
+  assert.deepEqual(readdirSync(join(result.outputDir, "IAM")).sort(), ["metadata.json", "whole.txt"], "no truncated file stays in the package");
+  assert.deepEqual([...readZipEntries(result.zipPath).keys()].filter((name) => /stalled|broken/.test(name)), []);
+  const item = readControlItems(result.outputDir, "IAM").get("ae-partial");
+  assert.deepEqual(item.files, ["stalled.txt", "broken.txt", "whole.txt"]);
+  assert.deepEqual(item.missing_files, ["broken.txt", "stalled.txt"]);
+  assert.equal(item.export_status, "files_missing");
+  assert.equal(readIndexRows(result.outputDir).get("ae-partial").export_status, "files_missing");
+});
+
+test("vanta_export_audit says in its text and details that a package with gaps is incomplete", async (t) => {
+  clearVantaTokenCacheForTests();
+  const tools = new Map();
+  registerVantaTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const evidence = [
+    evidenceItem("ae-whole", "Whole evidence"),
+    evidenceItem("ae-forbidden", "Forbidden evidence"),
+    evidenceItem("ae-missing", "Missing evidence"),
+  ];
+  const savedFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = savedFetch;
+    clearVantaTokenCacheForTests();
+  });
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    if ((init.method ?? "GET") === "POST" && url.pathname.endsWith("/oauth/token")) {
+      return jsonResponse({ access_token: "token-1", expires_in: 3600 });
+    }
+    if (url.pathname.endsWith("/v1/audits")) return jsonResponse(resultsPage([GAP_AUDIT]));
+    if (url.pathname.endsWith(`/audits/${GAP_AUDIT.id}/evidence`)) return jsonResponse(resultsPage(evidence));
+    if (url.pathname.endsWith("/ae-whole/urls")) return jsonResponse(resultsPage([downloadable("whole.txt")]));
+    if (url.pathname.endsWith("/ae-forbidden/urls")) {
+      return new Response(JSON.stringify({ error: "forbidden" }), { status: 403, statusText: "Forbidden" });
+    }
+    if (url.pathname.endsWith("/ae-missing/urls")) return jsonResponse(resultsPage([downloadable("missing.txt")]));
+    if (url.href === "https://downloads.example.com/whole.txt") {
+      return new Response("evidence", { status: 200, headers: { "content-length": "8" } });
+    }
+    if (url.href === "https://downloads.example.com/missing.txt") return new Response("gone", { status: 404, statusText: "Not Found" });
+    throw new Error(`unexpected request: ${url.href}`);
+  };
+
+  const result = await tools.get("vanta_export_audit").execute("call-incomplete", {
+    audit_id: GAP_AUDIT.id,
+    client_id: "client-id",
+    client_secret: "client-secret",
+    output_dir: resolve(createTempBase("grclanker-vanta-tool-incomplete-"), "exports"),
+  });
+
+  const text = result.content[0].text;
+  assert.equal(result.isError, undefined);
+  assert.match(text, /^Exported Vanta audit "Gap Test - SOC 2" as an incomplete package\./);
+  assert.ok(text.includes(
+    "The package is incomplete: 1 evidence item has unknown files because its file URL listing failed, "
+      + "and 1 file for 1 evidence item could not be downloaded. See _errors.log and _audit_info.json.",
+  ), text);
+  assert.ok(text.includes(
+    `  - Forbidden evidence (ae-forbidden): file URLs unknown: Vanta API request failed for /audits/${GAP_AUDIT.id}/evidence/ae-forbidden/urls (403 Forbidden): {"error":"forbidden"}`,
+  ), text);
+  assert.ok(text.includes("  - Missing evidence (ae-missing): 1 file not downloaded (IAM/missing.txt): Download failed (404 Not Found)"), text);
+  assert.equal(result.details.complete, false);
+  assert.match(result.details.incomplete_reason, /^The package is incomplete: /);
+  assert.equal(result.details.evidence_items_with_unknown_urls, 1);
+  assert.equal(result.details.evidence_items_with_missing_files, 1);
+  assert.equal(result.details.files_not_downloaded, 1);
+  assert.equal(result.details.total_files_exported, 1);
+  assert.deepEqual(
+    result.details.incomplete_evidence.map((entry) => [entry.id, entry.export_status, entry.missing_files]),
+    [["ae-forbidden", "urls_unknown", []], ["ae-missing", "files_missing", ["IAM/missing.txt"]]],
+  );
 });
 
 test("secure output helpers reject symlink escapes and filename helpers stay safe", () => {
