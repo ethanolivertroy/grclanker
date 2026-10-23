@@ -37,6 +37,7 @@ import {
   vendorErrorCode,
   xmlToRecord,
 } from "../dist/extensions/grc-tools/qualys.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { QUALYS_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
 import { QUALYS_SPEC } from "../dist/extensions/grc-tools/qualys.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -1541,6 +1542,225 @@ test("QualysApiClient follows WARNING/URL continuation, retries 409 with X-RateL
     sleepImpl: async () => {},
   });
   await assert.rejects(() => qpsError.searchWebApps(), /WAS module is not enabled/);
+});
+
+const APPLIANCE_LIST_XML = listOutputXml("APPLIANCE_LIST_OUTPUT", "APPLIANCE_LIST", "APPLIANCE", []);
+
+function qualysTimeout() {
+  return new DOMException("This operation was aborted", "AbortError");
+}
+
+test("QualysApiClient retries a request that timed out or never got an answer, then names the endpoint, the timeout, and the attempt count", async () => {
+  const waits = [];
+  const answers = [() => { throw qualysTimeout(); }, () => { throw new TypeError("fetch failed"); }, () => xmlResponse(APPLIANCE_LIST_XML)];
+  let sent = 0;
+  const recovering = new QualysApiClient(sampleConfig(), {
+    fetchImpl: async () => answers[sent++](),
+    sleepImpl: async (ms) => { waits.push(ms); },
+  });
+  const appliances = await recovering.listAppliances();
+  assert.equal(appliances.truncated, false);
+  assert.equal(sent, 3, "a timeout and a network failure are each followed by another request");
+  assert.deepEqual(waits, [2000, 4000]);
+
+  for (const [name, failure, reason] of [
+    ["timeout", qualysTimeout, "timed out after 30000ms"],
+    ["network failure", () => new TypeError("fetch failed"), "fetch failed"],
+  ]) {
+    const requests = [];
+    const exhausted = new QualysApiClient(sampleConfig(), {
+      fetchImpl: async (url) => {
+        requests.push(String(url));
+        throw failure();
+      },
+      sleepImpl: async () => {},
+    });
+    const thrown = await exhausted.listAppliances().then(() => null, (error) => error);
+    assert.ok(thrown instanceof QualysApiError, name);
+    assert.equal(thrown.message, `Qualys request to /api/2.0/fo/appliance/ failed after 3 attempts: ${reason}`, name);
+    assert.equal(thrown.status, 0, name);
+    assert.equal(thrown.endpoint, "/api/2.0/fo/appliance/", name);
+    assert.equal(requests.length, 3, `${name}: the first request and QUALYS_MAX_RETRIES=2 retries`);
+  }
+});
+
+test("QualysApiClient waits for Retry-After as seconds or as an HTTP date on the injected clock when X-RateLimit-ToWait-Sec is absent, capped at 30 seconds", async () => {
+  const clock = new Date("2026-10-23T12:00:00Z");
+  const at = (offsetMs) => new Date(clock.getTime() + offsetMs).toUTCString();
+  const sequence = [
+    { status: 503, headers: { "Retry-After": "soon" } },
+    { status: 503, headers: { "Retry-After": "7" } },
+    { status: 429, headers: { "Retry-After": at(12_000) } },
+    { status: 503, headers: { "Retry-After": "120" } },
+    { status: 409, headers: { "X-RateLimit-ToWait-Sec": "3", "Retry-After": "9" } },
+    { status: 503, headers: { "Retry-After": at(-60_000) } },
+  ];
+  const waits = [];
+  let sent = 0;
+  const client = new QualysApiClient(sampleConfig({ maxRetries: sequence.length }), {
+    fetchImpl: async () => {
+      const answer = sequence[sent++];
+      return answer ? new Response("busy", { status: answer.status, headers: { "content-type": "text/plain", ...answer.headers } }) : xmlResponse(APPLIANCE_LIST_XML);
+    },
+    sleepImpl: async (ms) => { waits.push(ms); },
+    now: () => clock,
+  });
+
+  const appliances = await client.listAppliances();
+  assert.equal(appliances.truncated, false);
+  assert.equal(sent, sequence.length + 1);
+  assert.deepEqual(waits, [
+    2000, // an unreadable Retry-After falls back to the backoff for the first retry
+    7000,
+    12_000, // the HTTP date 12 seconds after the injected clock
+    30_000, // 120 seconds asked, capped at 30
+    3000, // X-RateLimit-ToWait-Sec wins over Retry-After
+    0, // an HTTP date already past asks for no wait
+  ]);
+});
+
+test("QualysApiClient reports a retryable status that outlasts the retries with the status, the endpoint, and the attempt count", async () => {
+  const cases = [
+    {
+      name: "XML surface answering 503",
+      call: (client) => client.listAppliances(),
+      respond: () => new Response("Service Unavailable", { status: 503, headers: { "content-type": "text/html" } }),
+      message: "Qualys request failed (503) for /api/2.0/fo/appliance/ after 3 attempts: non-XML error body (text/html; 19 bytes)",
+    },
+    {
+      name: "XML surface answering 409 with the concurrency envelope",
+      call: (client) => client.listAppliances(),
+      respond: () => xmlResponse("<SIMPLE_RETURN><RESPONSE><CODE>1960</CODE><TEXT>concurrency limit reached</TEXT></RESPONSE></SIMPLE_RETURN>", { status: 409 }),
+      message: "Qualys request failed (409) for /api/2.0/fo/appliance/ after 3 attempts: code 1960: concurrency limit reached",
+    },
+    {
+      name: "QPS surface answering 500",
+      call: (client) => client.searchTags(10),
+      respond: () => new Response("upstream error", { status: 500, headers: { "content-type": "text/plain" } }),
+      message: "Qualys QPS request failed (500) for /qps/rest/2.0/search/am/tag after 3 attempts: non-JSON error body (text/plain; 14 bytes)",
+    },
+  ];
+  for (const { name, call, respond, message } of cases) {
+    let sent = 0;
+    const client = routedClient(async () => {
+      sent += 1;
+      return respond();
+    });
+    const thrown = await call(client).then(() => null, (error) => error);
+    assert.ok(thrown instanceof QualysApiError, name);
+    assert.equal(thrown.message, message, name);
+    assert.equal(sent, 3, name);
+  }
+
+  const denied = routedClient(async () => xmlResponse("<SIMPLE_RETURN><RESPONSE><CODE>2010</CODE><TEXT>Forbidden</TEXT></RESPONSE></SIMPLE_RETURN>", { status: 403 }));
+  assert.equal(
+    await denied.listAppliances().then(() => null, (error) => error.message),
+    "Qualys request failed (403) for /api/2.0/fo/appliance/: code 2010: Forbidden",
+    "a status that is never retried carries no attempt count",
+  );
+});
+
+test("QualysApiClient does not retry a failed gateway token request or a configuration error around the request that needed the token", async () => {
+  const requests = [];
+  const waits = [];
+  const unavailableGateway = routedClient(async (url) => {
+    requests.push(new URL(url).pathname);
+    return new Response("unavailable", { status: 503, headers: { "content-type": "text/plain" } });
+  }, { authMode: "oauth" });
+  const thrown = await unavailableGateway.listAppliances().then(() => null, (error) => error);
+  assert.ok(thrown instanceof QualysApiError);
+  assert.equal(thrown.message, "Qualys gateway token request failed (503) for /auth after 3 attempts: error body (text/plain; 11 bytes)");
+  assert.deepEqual(requests, ["/auth", "/auth", "/auth"], "the token request's own retries only, and the read is never sent");
+
+  let unconfiguredRequests = 0;
+  const unconfigured = new QualysApiClient(sampleConfig({ authMode: "oauth", username: undefined, password: undefined }), {
+    fetchImpl: async () => {
+      unconfiguredRequests += 1;
+      return xmlResponse(APPLIANCE_LIST_XML);
+    },
+    sleepImpl: async (ms) => { waits.push(ms); },
+  });
+  await assert.rejects(unconfigured.listAppliances(), (error) => {
+    assert.equal(error.message, "Qualys OAuth mode requires QUALYS_USERNAME and QUALYS_PASSWORD.");
+    return true;
+  });
+  assert.equal(unconfiguredRequests, 0, "a configuration error sends nothing");
+  assert.deepEqual(waits, [], "a configuration error is not waited on and retried");
+});
+
+test("QualysApiClient stops at once when the call is aborted during a retry wait, sending no further request", async () => {
+  const controller = new AbortController();
+  let sent = 0;
+  const client = new QualysApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      sent += 1;
+      throw qualysTimeout();
+    },
+    sleepImpl: () => {
+      controller.abort(new Error("operator cancelled"));
+      return new Promise(() => {});
+    },
+    signal: controller.signal,
+  });
+  await assert.rejects(client.listAppliances(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(sent, 1, "the timed-out read is not sent again after the abort");
+});
+
+test("QualysApiClient reports an abort that lands while a body is read as the call's abort, not as a timeout, even with no retry left", async () => {
+  const controller = new AbortController();
+  let sent = 0;
+  const client = new QualysApiClient(sampleConfig({ maxRetries: 0 }), {
+    fetchImpl: async (_url, init) => {
+      sent += 1;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "content-type": "application/xml" }),
+        text: () => {
+          const reading = new Promise((_resolve, reject) => {
+            init.signal.addEventListener("abort", () => reject(qualysTimeout()), { once: true });
+          });
+          controller.abort(new Error("operator cancelled"));
+          return reading;
+        },
+      };
+    },
+    sleepImpl: async () => {},
+    signal: controller.signal,
+  });
+  await assert.rejects(client.listAppliances(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(sent, 1, "nothing is sent after the abort");
+});
+
+test("a host page that times out on every attempt leaves the host inventory unreadable, so no check built on it passes", async () => {
+  const continuation = "https://qualysapi.qualys.com/api/2.0/fo/asset/host/?action=list&id_min=2";
+  const firstPage = `<?xml version="1.0" encoding="UTF-8" ?><HOST_LIST_OUTPUT><RESPONSE><DATETIME>${daysAgo(0)}</DATETIME><HOST_LIST>${xmlFromRecord("HOST", tenant.hosts.slice(0, 1))}</HOST_LIST><WARNING><CODE>1980</CODE><TEXT>truncated</TEXT><URL><![CDATA[${continuation}]]></URL></WARNING></RESPONSE></HOST_LIST_OUTPUT>`;
+  let secondPageRequests = 0;
+  const router = async (url, init) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== "/api/2.0/fo/asset/host/") return compliantRouter(url, init);
+    if (!parsed.searchParams.has("id_min")) return xmlResponse(firstPage);
+    secondPageRequests += 1;
+    throw qualysTimeout();
+  };
+  const dependsOnHosts = (finding) => finding.evidence.collection.sources.some((source) => source.name === "hosts");
+
+  const baseline = allFindings(await runAllAssessments(routedClient(compliantRouter))).filter(dependsOnHosts);
+  assert.ok(baseline.some((finding) => finding.status === "pass"), "positive control: a host-dependent check passes when every host page reads");
+
+  const results = await runAllAssessments(routedClient(router));
+  assert.ok(secondPageRequests >= 3, "the second page was requested on every attempt before the walk gave up");
+  const errors = results.flatMap((result) => result.errors);
+  assert.ok(errors.some((entry) => entry.includes("Qualys request to /api/2.0/fo/asset/host/ failed after 3 attempts: timed out after 30000ms")), errors.join(" | "));
+  const dependent = allFindings(results).filter(dependsOnHosts);
+  assert.ok(dependent.length > 0);
+  for (const finding of dependent) {
+    assert.notEqual(finding.status, "pass", `${finding.id} cannot pass on a host inventory missing its second page`);
+    const source = finding.evidence.collection.sources.find((item) => item.name === "hosts");
+    assert.equal(source.status, "unreadable", finding.id);
+    assert.match(source.reason, /after 3 attempts: timed out after 30000ms/, finding.id);
+  }
 });
 
 test("QualysApiClient follows only same-origin WARNING/URL continuations without userinfo", async () => {
@@ -3227,10 +3447,12 @@ test("scrubErrorText redacts every credential shape in free text and leaves beni
   const benign = [
     "Qualys request failed (403) for /api/2.0/fo/asset/host/vm/detection/: code 2010: Forbidden, module not subscribed for this user",
     "Qualys QPS request failed (403) for /qps/rest/2.0/search/am/assetdataconnector: responseCode UNAUTHORIZED: User is not authorized to access this module",
-    "Qualys request failed (502) for /api/2.0/fo/asset/host/: non-XML error body (text/html; 236 bytes)",
-    "Qualys QPS request failed (500) for /qps/rest/3.0/search/was/wasscanschedule: non-JSON error body (text/csv; 180 bytes)",
+    "Qualys request failed (502) for /api/2.0/fo/asset/host/ after 4 attempts: non-XML error body (text/html; 236 bytes)",
+    "Qualys QPS request failed (500) for /qps/rest/3.0/search/was/wasscanschedule after 4 attempts: non-JSON error body (text/csv; 180 bytes)",
     "Qualys request failed (200) for /msp/user_list.php: error 999: Forbidden: this account is not authorized to list users",
-    "Qualys request to /api/2.0/fo/schedule/scan/ failed: fetch failed",
+    "Qualys request to /api/2.0/fo/schedule/scan/ failed after 4 attempts: fetch failed",
+    "Qualys request to /api/2.0/fo/asset/host/vm/detection/ failed after 4 attempts: timed out after 60000ms",
+    "Qualys gateway token request failed (503) for /auth after 4 attempts: error body (text/plain; 11 bytes)",
     "X-Requested-With: grclanker",
     "token: user",
     "SCHEDULE_SCAN_LIST_OUTPUT, HOST_LIST_VM_DETECTION_OUTPUT, LAST_VM_AUTH_SCANNED_DATE, KNOWLEDGE_BASE_VULN_LIST_OUTPUT",
@@ -3335,7 +3557,9 @@ test("error-body walk: every surface the collectors call, failing in four body s
       assert.equal(thrown.status, shape.status, `${label}: the error carries the HTTP status`);
       assert.equal(thrown.endpoint, endpoint, `${label}: the error carries the endpoint`);
       assertNoCanary(thrown.message, `${label} thrown message`);
-      assert.match(thrown.message, new RegExp(`^Qualys (?:QPS )?request failed \\(${shape.status}\\) for ${endpoint.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}: `), label);
+      // sampleConfig allows 2 retries, so a retryable status is reported after the third request.
+      const attempts = shape.status >= 500 ? " after 3 attempts" : "";
+      assert.match(thrown.message, new RegExp(`^Qualys (?:QPS )?request failed \\(${shape.status}\\) for ${endpoint.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}${attempts}: `), label);
       assert.match(thrown.message, shape.disclosure, `${label}: the failure is described by content type and length or by the parsed code`);
       assert.doesNotMatch(thrown.message, /<html|<p>|Bad Gateway|"Date","Action"/, `${label}: no body text is echoed`);
 

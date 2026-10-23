@@ -18,6 +18,7 @@ PhishER is a separate product with its own API key. Without the key the tool doe
 ## Runtime behavior
 
 - The tool only reads. Every Reporting API request is a GET, and the PhishER requests are GraphQL queries, which change nothing.
+- A throttled or failed request is retried before it counts as failed: HTTP 429, 500, 502, 503, and 504 answers, timeouts, and network errors get up to 3 more attempts, each waiting as long as Retry-After asks up to 60 seconds, or 1, 2, then 4 seconds without one. A request that still fails names its method and path, the status, timeout, or network error, and the number of attempts, and the dataset it was reading is reported as not readable, never as an empty or partial list.
 - Users stop at user_limit (5000), training enrollments at enrollment_limit (20000), PhishER messages at phisher_message_limit (1000), and every other list, including each sampled test's recipient list, at 20000 records.
 - Training campaigns are read 10 per page, other Reporting API lists 500 per page, and PhishER messages 200 per page.
 - A refused or failed read never counts as an empty list. A check whose decision needs that read is manual, and a check that uses it only as supporting evidence cannot pass.

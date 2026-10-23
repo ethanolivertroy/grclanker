@@ -32,6 +32,7 @@ import {
   resolveSecureOutputPath,
   resolveTenableConfiguration,
 } from "../dist/extensions/grc-tools/tenable.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { TENABLE_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
 import { TENABLE_SPEC } from "../dist/extensions/grc-tools/tenable.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -135,8 +136,126 @@ function jsonResponse(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 }
 
+// What fetch throws when the client's own per-request timer aborts the request.
+function tenableTimeout() {
+  return new DOMException("This operation was aborted", "AbortError");
+}
+
+// Headers that arrive, then a body that stalls until the request signal aborts; `onRead` runs as the body read starts.
+function stalledBody(init, onRead = () => {}) {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: new Headers({ "content-type": "application/json" }),
+    text: () => {
+      const reading = new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(tenableTimeout()), { once: true });
+      });
+      onRead();
+      return reading;
+    },
+  };
+}
+
+// Headers that arrive, then a body the connection drops partway through, which undici reports as "terminated".
+function cutOffBody() {
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"scans":['));
+      controller.error(new TypeError("terminated"));
+    },
+  });
+  return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+}
+
+// A 200 whose body arrives in pieces, one every `everyMs`, and then closes ("close"), sends nothing more ("stall"),
+// or breaks off with the given error. `pieces` is a list, or a function of the piece index that returns undefined
+// after the last piece. As undici's does, the body errors with an AbortError when the request signal aborts.
+// `onPiece` runs as each piece is sent.
+function streamedBody(init, pieces, { everyMs, end = "close", onPiece = () => {} }) {
+  const pieceAt = typeof pieces === "function" ? pieces : (index) => pieces[index];
+  const encoder = new TextEncoder();
+  let timer;
+  let ended = false;
+  const finish = () => {
+    ended = true;
+    clearTimeout(timer);
+  };
+  const body = new ReadableStream({
+    start(controller) {
+      const sendFrom = (index) => {
+        timer = setTimeout(() => {
+          if (ended) return;
+          const piece = pieceAt(index);
+          if (piece !== undefined) {
+            controller.enqueue(typeof piece === "string" ? encoder.encode(piece) : piece);
+            onPiece(index);
+            if (!ended) sendFrom(index + 1);
+          } else if (end === "close") {
+            finish();
+            controller.close();
+          } else if (end instanceof Error) {
+            finish();
+            controller.error(end);
+          }
+        }, everyMs);
+      };
+      sendFrom(0);
+      init.signal?.addEventListener("abort", () => {
+        if (ended) return;
+        finish();
+        controller.error(tenableTimeout());
+      }, { once: true });
+    },
+    cancel: finish,
+  });
+  return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+}
+
+// The UTF-8 bytes of `text` in about `count` pieces, the first cut falling inside the first multi-byte character so
+// that a reader decoding each piece on its own would garble it.
+function bytePieces(text, count) {
+  const bytes = new TextEncoder().encode(text);
+  const firstCut = bytes.findIndex((byte) => byte >= 0x80) + 1;
+  assert.ok(firstCut > 0, "the text carries a multi-byte character");
+  const size = Math.ceil((bytes.length - firstCut) / (count - 1));
+  const pieces = [bytes.slice(0, firstCut)];
+  for (let start = firstCut; start < bytes.length; start += size) pieces.push(bytes.slice(start, start + size));
+  return pieces;
+}
+
+// Runs `work` on fake time: setTimeout fires only as the mocked clock moves here, one second per turn of the event
+// loop with that turn's promise work and I/O run in between, so minutes of streaming take milliseconds. Only work
+// that never settles spends real time, up to the 10 second budget, and is reported unsettled.
+async function onFakeTime(t, work) {
+  let outcome;
+  work.then((value) => { outcome = { value }; }, (error) => { outcome = { error }; });
+  const giveUpAt = performance.now() + 10_000;
+  let elapsedMs = 0;
+  for (;;) {
+    await new Promise((resolve) => setImmediate(resolve));
+    if (outcome !== undefined) return { settled: true, elapsedMs, ...outcome };
+    if (performance.now() >= giveUpAt) return { settled: false, elapsedMs };
+    t.mock.timers.tick(1_000);
+    elapsedMs += 1_000;
+  }
+}
+
+// The "METHOD /path" a router matches a request on.
+function requestKey(url, init = {}) {
+  return `${(init.method ?? "GET").toUpperCase()} ${new URL(url).pathname}`;
+}
+
 function vmConfig(extra = {}) {
   return resolveTenableConfiguration({ access_key: FIXTURE_ACCESS_KEY, secret_key: FIXTURE_SECRET_KEY, config_file: EMPTY_CONFIG_FILE, ...extra }, EMPTY_ENV);
+}
+
+// The configuration with TENABLE_TIMEOUT raised in the environment, the way an operator on a slow link raises it.
+function vmConfigWithTimeout(seconds) {
+  const config = resolveTenableConfiguration({ access_key: FIXTURE_ACCESS_KEY, secret_key: FIXTURE_SECRET_KEY, config_file: EMPTY_CONFIG_FILE }, { ...EMPTY_ENV, TENABLE_TIMEOUT: String(seconds) });
+  assert.equal(config.timeoutMs, seconds * 1000, "TENABLE_TIMEOUT reaches the configuration");
+  return config;
 }
 
 function healthyUsers() {
@@ -664,6 +783,641 @@ test("TenableApiClient runs the export workflow: request, poll status, download 
   assert.equal(capped.fetchedChunks, 1);
   assert.equal(capped.totalChunks, 3);
   assert.equal(capped.truncated, true);
+});
+
+test("TenableApiClient sends a read that timed out, drew no answer, or lost its body partway again with backoff, and names the endpoint, the reason, and the attempt count when every attempt fails", async () => {
+  let sent = 0;
+  const waits = [];
+  const recovering = createTenableClients(vmConfig(), {
+    fetchImpl: async () => {
+      sent += 1;
+      if (sent === 1) throw tenableTimeout();
+      if (sent === 2) throw new TypeError("fetch failed");
+      if (sent === 3) return cutOffBody();
+      return jsonResponse({ scans: [{ id: 1, name: "ok" }] });
+    },
+    sleepImpl: async (ms) => { waits.push(ms); },
+  });
+  assert.equal((await recovering.vm.listScans()).length, 1);
+  assert.equal(sent, 4, "a timeout, a network failure, and a body cut off partway are each followed by another request");
+  assert.deepEqual(waits, [500, 1000, 2000]);
+
+  for (const [name, answer, reason] of [
+    ["timeout", () => { throw tenableTimeout(); }, ": timed out after 30000ms"],
+    ["network failure", () => { throw new TypeError("fetch failed"); }, " without an HTTP response: fetch failed"],
+    ["body cut off", cutOffBody, " while reading the response body: terminated"],
+  ]) {
+    const requests = [];
+    const delays = [];
+    const exhausted = createTenableClients(vmConfig(), {
+      fetchImpl: async (url, init) => {
+        requests.push(requestKey(url, init));
+        return answer();
+      },
+      sleepImpl: async (ms) => { delays.push(ms); },
+    });
+    const thrown = await exhausted.vm.listScans().then(() => null, (error) => error);
+    assert.ok(thrown instanceof TenableApiError, name);
+    assert.equal(thrown.message, `Tenable request GET /scans failed after 5 attempts${reason}.`, name);
+    assert.equal(thrown.status, 0, name);
+    assert.equal(thrown.endpoint, "GET /scans", name);
+    assert.deepEqual(requests, Array(5).fill("GET /scans"), `${name}: the first request and four retries`);
+    assert.deepEqual(delays, [500, 1000, 2000, 4000], `${name}: the backoff doubles between attempts`);
+  }
+});
+
+test("TenableApiClient stops at once when the call is aborted during a retry wait, sending no further request", async () => {
+  const controller = new AbortController();
+  let sent = 0;
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async () => {
+      sent += 1;
+      throw tenableTimeout();
+    },
+    sleepImpl: () => {
+      controller.abort(new Error("operator cancelled"));
+      return new Promise(() => {});
+    },
+    signal: controller.signal,
+  });
+  await assert.rejects(clients.vm.listScans(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(sent, 1, "the timed-out read is not sent again after the abort");
+});
+
+test("a read whose body stalls past the timer is sent again like a read that drew no answer, and an export request whose body stalls is sent once", async () => {
+  const fastTimeout = { ...vmConfig(), timeoutMs: 1 };
+  let reads = 0;
+  const waits = [];
+  const recovering = createTenableClients(fastTimeout, {
+    fetchImpl: async (_url, init = {}) => (reads++ === 0 ? stalledBody(init) : jsonResponse({ scans: [{ id: 1, name: "ok" }] })),
+    sleepImpl: async (ms) => { waits.push(ms); },
+  });
+  assert.equal((await recovering.vm.listScans()).length, 1);
+  assert.equal(reads, 2, "the stalled read is sent again");
+  assert.deepEqual(waits, [500]);
+
+  for (const [name, read, request, attempts, failure] of [
+    ["a read", (clients) => clients.vm.listScans(), "GET /scans", 5, "failed after 5 attempts: timed out after 1ms with no data while reading the response body."],
+    [
+      "an export request",
+      (clients) => clients.vm.exportAssets(),
+      "POST /assets/export",
+      1,
+      "failed after 1 attempt: timed out after 1ms with no data while reading the response body; a POST that drew no complete answer is not sent again, since Tenable may already have acted on it.",
+    ],
+  ]) {
+    const sent = [];
+    const clients = createTenableClients(fastTimeout, {
+      fetchImpl: async (url, init = {}) => {
+        sent.push(requestKey(url, init));
+        return stalledBody(init);
+      },
+      sleepImpl: async () => {},
+    });
+    const thrown = await read(clients).then(() => null, (error) => error);
+    assert.ok(thrown instanceof TenableApiError, name);
+    assert.equal(thrown.message, `Tenable request ${request} ${failure}`, name);
+    assert.deepEqual(sent, Array(attempts).fill(request), `${name}: the request is sent ${attempts} time(s)`);
+  }
+});
+
+test("TenableApiClient reports an abort that lands while a body is read as the call's abort, not as a timeout, even with no retry left", async () => {
+  for (const [name, read, expected] of [
+    ["a read", (clients) => clients.vm.listScans(), ["GET /scans"]],
+    ["an export request", (clients) => clients.vm.exportAssets(), ["POST /assets/export"]],
+  ]) {
+    const controller = new AbortController();
+    const sent = [];
+    const clients = createTenableClients(vmConfig(), {
+      fetchImpl: async (url, init = {}) => {
+        sent.push(requestKey(url, init));
+        return stalledBody(init, () => controller.abort(new Error("operator cancelled")));
+      },
+      sleepImpl: async () => {},
+      retryLimit: 0,
+      signal: controller.signal,
+    });
+    await assert.rejects(read(clients), (error) => error instanceof ToolCallAbortedError, name);
+    assert.deepEqual(sent, expected, `${name}: nothing is sent after the abort`);
+  }
+});
+
+test("TENABLE_TIMEOUT bounds each gap in a body rather than the whole body, so an export chunk or a Security Center answer that keeps arriving for longer than the timeout is read whole and requested once", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  // Pieces 10 seconds apart: no gap reaches the 30 second default timeout, and the whole body takes over a minute.
+  const everyMs = 10_000;
+  const assets = [{ ...healthyAssets()[0], network_name: "Zürich" }, healthyAssets()[1]];
+  const vulns = [{ ...healthyVulns()[0], plugin: { ...healthyVulns()[0].plugin, name: "Zürich" } }, healthyVulns()[1]];
+  for (const [chunk, records, run] of [
+    ["GET /assets/export/asset-export-1/chunks/1", assets, (clients) => clients.vm.exportAssets()],
+    ["GET /vulns/export/vuln-export-1/chunks/1", vulns, (clients) => clients.vm.exportVulnerabilities(RECENT_SECONDS)],
+  ]) {
+    const routed = routerFetch(healthyRoutes());
+    const sent = [];
+    const clients = createTenableClients(vmConfig(), {
+      fetchImpl: async (url, init = {}) => {
+        const key = requestKey(url, init);
+        sent.push(key);
+        return key === chunk ? streamedBody(init, bytePieces(JSON.stringify(records), 6), { everyMs }) : routed(url, init);
+      },
+      sleepImpl: async () => {},
+      exportPollMs: 0,
+      exportTimeoutMs: 5_000,
+    });
+    const outcome = await onFakeTime(t, run(clients));
+    assert.ok(outcome.settled && !outcome.error, `${chunk}: ${outcome.error ?? "the export never settled"}`);
+    const result = outcome.value;
+    assert.deepEqual(result.records, records, `${chunk}: every record arrives intact, the character split across two pieces included`);
+    assert.deepEqual(
+      { fetchedChunks: result.fetchedChunks, downloadFailures: result.downloadFailures, truncated: result.truncated, reason: result.reason },
+      { fetchedChunks: 1, downloadFailures: 0, truncated: false, reason: undefined },
+      chunk,
+    );
+    assert.deepEqual(sent.filter((key) => key === chunk), [chunk], `${chunk}: the chunk is requested once`);
+    assert.ok(outcome.elapsedMs > 30_000, `${chunk}: the body took ${outcome.elapsedMs}ms, longer than the timeout`);
+  }
+
+  // Tenable Security Center reads take the same path.
+  const scans = [{ id: 1, name: "Zürich weekly", status: "Completed" }];
+  const scSent = [];
+  const sc = createTenableClients(vmConfig(SC_FIXTURE), {
+    fetchImpl: async (url, init = {}) => {
+      scSent.push(requestKey(url, init));
+      return streamedBody(init, bytePieces(JSON.stringify({ type: "regular", response: scans, error_code: 0, error_msg: "" }), 6), { everyMs });
+    },
+    sleepImpl: async () => {},
+  });
+  const scRead = await onFakeTime(t, sc.securityCenter.listScans());
+  assert.ok(scRead.settled && !scRead.error, String(scRead.error ?? "the Security Center read never settled"));
+  assert.deepEqual(scRead.value, scans);
+  assert.deepEqual(scSent, ["GET /rest/scan"], "the Security Center read is sent once");
+  assert.ok(scRead.elapsedMs > 30_000, `the Security Center body took ${scRead.elapsedMs}ms, longer than the timeout`);
+});
+
+test("a body that sends a piece and then stalls for TENABLE_TIMEOUT is requested again, and when every attempt stalls the export is truncated and no check that reads it passes", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const stallAfterAPiece = (init) => streamedBody(init, ['[{"id":"a-1",'], { everyMs: 1_000, end: "stall" });
+
+  // One stalled attempt: the chunk is requested again and its records are read.
+  const chunk = "GET /assets/export/asset-export-1/chunks/1";
+  const routed = routerFetch(healthyRoutes());
+  const sent = [];
+  const waits = [];
+  let chunkRequests = 0;
+  const recovering = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init = {}) => {
+      const key = requestKey(url, init);
+      sent.push(key);
+      return key === chunk && chunkRequests++ === 0 ? stallAfterAPiece(init) : routed(url, init);
+    },
+    sleepImpl: async (ms) => { waits.push(ms); },
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const recovered = await onFakeTime(t, recovering.vm.exportAssets());
+  assert.ok(recovered.settled && !recovered.error, String(recovered.error ?? "the export never settled after the stalled attempt"));
+  assert.deepEqual(
+    { records: recovered.value.records, fetchedChunks: recovered.value.fetchedChunks, truncated: recovered.value.truncated },
+    { records: healthyAssets(), fetchedChunks: 1, truncated: false },
+  );
+  assert.deepEqual(sent.filter((key) => key === chunk), [chunk, chunk], "the stalled chunk is requested again");
+  assert.deepEqual(waits, [500]);
+  assert.equal(recovered.elapsedMs, 31_000, "the stall is caught TENABLE_TIMEOUT after the last piece arrived, not after the headers");
+
+  // Every attempt stalls: with every chunk answering, each check that reads the exports passes; with one chunk of
+  // each export stalling on every attempt, none does.
+  const chunkRoutes = () => threeChunkRoutes([healthyAssets(), [THIRD_ASSET], [THIRD_ASSET]], [healthyVulns(), [THIRD_VULN], [THIRD_VULN]]);
+  const control = await onFakeTime(t, runAll(clientsFor(chunkRoutes()), { expectedAssetCount: 3 }));
+  assert.ok(control.settled && !control.error, String(control.error ?? "the control run never settled"));
+  for (const id of EXPORT_CAPPED) assert.equal(byId(control.value, id).status, "pass", `${id} passes when every chunk answers`);
+
+  const lostChunks = new Set(["GET /assets/export/asset-export-1/chunks/2", "GET /vulns/export/vuln-export-1/chunks/2"]);
+  const routedChunks = routerFetch(chunkRoutes());
+  const lost = [];
+  const stalling = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init = {}) => {
+      const key = requestKey(url, init);
+      if (!lostChunks.has(key)) return routedChunks(url, init);
+      lost.push(key);
+      return stallAfterAPiece(init);
+    },
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const exported = await onFakeTime(t, stalling.vm.exportAssets());
+  assert.ok(exported.settled && !exported.error, String(exported.error ?? "the export never settled"));
+  const result = exported.value;
+  assert.deepEqual(
+    { records: result.records.length, fetchedChunks: result.fetchedChunks, downloadFailures: result.downloadFailures, truncated: result.truncated, endpoint: result.endpoint, httpStatus: result.httpStatus },
+    { records: 3, fetchedChunks: 2, downloadFailures: 1, truncated: true, endpoint: "GET /assets/export/asset-export-1/chunks/2", httpStatus: null },
+  );
+  assert.ok(result.reason.includes("1 chunk downloads failed: Tenable request GET /assets/export/asset-export-1/chunks/2 failed after 5 attempts: timed out after 30000ms with no data while reading the response body."), result.reason);
+  assert.deepEqual(lost, Array(5).fill("GET /assets/export/asset-export-1/chunks/2"), "the chunk is requested once and sent again four times");
+
+  const assessed = await onFakeTime(t, runAll(stalling, { expectedAssetCount: 3 }));
+  assert.ok(assessed.settled && !assessed.error, String(assessed.error ?? "the assessments never settled"));
+  for (const id of EXPORT_CAPPED) {
+    const item = byId(assessed.value, id);
+    assert.ok(["warn", "manual"].includes(item.status), `${id} never passes on an export whose chunk stalled: ${item.status} ${item.summary}`);
+  }
+});
+
+test("a body that keeps trickling past the per-attempt cap of 20 times TENABLE_TIMEOUT ends at the cap on its one attempt, naming the cap in minutes, and is not requested again", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const chunk = "GET /assets/export/asset-export-1/chunks/1";
+  // A piece every 10 seconds never leaves a gap that reaches the timeout. At the 30 second default the whole would take
+  // 16 minutes against a 10 minute cap, and with TENABLE_TIMEOUT at 60 it would take 25 minutes against a 20 minute cap.
+  for (const [config, pieces, capMs, cap] of [
+    [vmConfig(), 100, 600_000, "10 minutes"],
+    [vmConfigWithTimeout(60), 150, 1_200_000, "20 minutes"],
+  ]) {
+    const trickle = (index) => (index === 0 ? "[" : index < pieces - 1 ? " " : index === pieces - 1 ? "]" : undefined);
+    const routed = routerFetch(healthyRoutes());
+    const sent = [];
+    const waits = [];
+    const clients = createTenableClients(config, {
+      fetchImpl: async (url, init = {}) => {
+        const key = requestKey(url, init);
+        sent.push(key);
+        return key === chunk ? streamedBody(init, trickle, { everyMs: 10_000 }) : routed(url, init);
+      },
+      sleepImpl: async (ms) => { waits.push(ms); },
+      exportPollMs: 0,
+      exportTimeoutMs: 5_000,
+    });
+    const outcome = await onFakeTime(t, clients.vm.exportAssets());
+    assert.ok(outcome.settled && !outcome.error, `${cap}: ${outcome.error ?? "the export never settled"}`);
+    assert.equal(outcome.elapsedMs, capMs, `${cap}: the attempt ends at the cap`);
+    const result = outcome.value;
+    assert.deepEqual(
+      { records: result.records.length, fetchedChunks: result.fetchedChunks, downloadFailures: result.downloadFailures, truncated: result.truncated, endpoint: result.endpoint, httpStatus: result.httpStatus },
+      { records: 0, fetchedChunks: 0, downloadFailures: 1, truncated: true, endpoint: chunk, httpStatus: null },
+      cap,
+    );
+    assert.ok(
+      result.reason.includes(`1 chunk downloads failed: Tenable request ${chunk} failed after 1 attempt: the response body was still arriving when the per-attempt cap of ${cap} ran out (the cap is 20 times TENABLE_TIMEOUT, so raising TENABLE_TIMEOUT or timeout_seconds raises it); a GET cut off at the cap is not sent again, since another attempt would arrive just as slowly.`),
+      result.reason,
+    );
+    assert.deepEqual(sent.filter((key) => key === chunk), [chunk], `${cap}: the chunk is requested once`);
+    assert.deepEqual(waits, [], `${cap}: nothing is waited on before giving up`);
+  }
+});
+
+test("with TENABLE_TIMEOUT at 60, a vulnerability export chunk that trickles in for 17 minutes, past the default cap, is read whole with every record and requested once", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const chunk = "GET /vulns/export/vuln-export-1/chunks/1";
+  const records = healthyVulns();
+  const text = JSON.stringify(records);
+  // The records arrive in the first piece and the closing bracket in the 50th, 20 seconds apart, so the body closes 17
+  // minutes in: past the 10 minute cap at the default, within the 20 minute cap at 60 seconds.
+  const trickle = (index) => (index === 0 ? text.slice(0, -1) : index < 49 ? " " : index === 49 ? "]" : undefined);
+  const routed = routerFetch(healthyRoutes());
+  const sent = [];
+  const clients = createTenableClients(vmConfigWithTimeout(60), {
+    fetchImpl: async (url, init = {}) => {
+      const key = requestKey(url, init);
+      sent.push(key);
+      return key === chunk ? streamedBody(init, trickle, { everyMs: 20_000 }) : routed(url, init);
+    },
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const outcome = await onFakeTime(t, clients.vm.exportVulnerabilities(RECENT_SECONDS));
+  assert.ok(outcome.settled && !outcome.error, String(outcome.error ?? "the export never settled"));
+  assert.equal(outcome.elapsedMs, 1_020_000, "the body arrives whole 17 minutes in");
+  const result = outcome.value;
+  assert.deepEqual(result.records, records, "every record arrives");
+  assert.deepEqual(
+    { fetchedChunks: result.fetchedChunks, downloadFailures: result.downloadFailures, truncated: result.truncated, reason: result.reason },
+    { fetchedChunks: 1, downloadFailures: 0, truncated: false, reason: undefined },
+  );
+  assert.deepEqual(sent.filter((key) => key === chunk), [chunk], "the chunk is requested once");
+});
+
+test("an abort that lands while an export chunk is streaming ends the export as the call's abort, with nothing sent after it", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const controller = new AbortController();
+  const chunk = "GET /assets/export/asset-export-1/chunks/1";
+  const routed = routerFetch(healthyRoutes());
+  const sent = [];
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init = {}) => {
+      const key = requestKey(url, init);
+      sent.push(key);
+      if (key !== chunk) return routed(url, init);
+      return streamedBody(init, ['[{"id":"a-1",', '"has_agent":true},', '{"id":"a-2","has_agent":false}]'], {
+        everyMs: 10_000,
+        onPiece: (index) => {
+          if (index === 1) controller.abort(new Error("operator cancelled"));
+        },
+      });
+    },
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+    signal: controller.signal,
+  });
+  const outcome = await onFakeTime(t, clients.vm.exportAssets());
+  assert.ok(outcome.settled, "the export settles");
+  assert.ok(outcome.error instanceof ToolCallAbortedError, `the call's abort, not a timeout or a failed chunk: ${outcome.error ?? JSON.stringify(outcome.value)}`);
+  assert.equal(outcome.elapsedMs, 20_000, "the call ends as the abort lands, between pieces of the body");
+  assert.deepEqual(sent, ["POST /assets/export", "GET /assets/export/asset-export-1/status", chunk], "nothing is sent after the abort");
+});
+
+test("a key echoed in a streamed body or in the error that breaks it off reaches no error, export result, assessment, audit bundle, or tool result, whether the body stalls, breaks off, or runs into the cap", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const echo = `X-ApiKeys: accessKey=${FIXTURE_ACCESS_KEY};secretKey=${FIXTURE_SECRET_KEY}`;
+  const planted = [...secretForms(FIXTURE_ACCESS_KEY), ...secretForms(FIXTURE_SECRET_KEY)];
+  const failing = ["GET /scans", "GET /assets/export/asset-export-1/chunks/1", "GET /vulns/export/vuln-export-1/chunks/1"];
+  for (const [name, answer, failure] of [
+    [
+      "stall",
+      (init) => streamedBody(init, [`{"error":"${echo}"`], { everyMs: 1_000, end: "stall" }),
+      "failed after 5 attempts: timed out after 30000ms with no data while reading the response body.",
+    ],
+    [
+      "break off",
+      (init) => streamedBody(init, [`{"error":"${echo}"`], { everyMs: 1_000, end: new TypeError(`terminated: ${echo}`) }),
+      "failed after 5 attempts while reading the response body: terminated: ",
+    ],
+    [
+      "cap",
+      (init) => streamedBody(init, (index) => (index === 0 ? `{"error":"${echo}` : " "), { everyMs: 10_000 }),
+      "failed after 1 attempt: the response body was still arriving when the per-attempt cap of 10 minutes ran out (the cap is 20 times TENABLE_TIMEOUT, so raising TENABLE_TIMEOUT or timeout_seconds raises it)",
+    ],
+  ]) {
+    const routed = routerFetch(healthyRoutes());
+    const fetchImpl = async (url, init = {}) => (failing.includes(requestKey(url, init)) ? answer(init) : routed(url, init));
+    const clients = createTenableClients(vmConfig(), { fetchImpl, sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 5_000 });
+    const outputs = new Map();
+    const settledValue = async (work, what) => {
+      const outcome = await onFakeTime(t, work);
+      assert.ok(outcome.settled && !outcome.error, `${name}: ${what}: ${outcome.error ?? "never settled"}`);
+      return outcome.value;
+    };
+
+    const read = await onFakeTime(t, clients.vm.listScans());
+    assert.ok(read.error instanceof TenableApiError, `${name}: ${read.error ?? "the read did not fail"}`);
+    assert.ok(read.error.message.startsWith(`Tenable request GET /scans ${failure}`), `${name}: ${read.error.message}`);
+    outputs.set("thrown error", read.error.message);
+    outputs.set("export result", JSON.stringify(await settledValue(clients.vm.exportAssets(), "export")));
+    outputs.set("assessments", JSON.stringify(await settledValue(runAll(clients, { expectedAssetCount: 2 }), "assessments")));
+    const bundle = await settledValue(exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-planted-stream-")), { now: NOW, expectedAssetCount: 2 }), "bundle");
+    for (const [file, text] of readBundleFiles(bundle.outputDir)) outputs.set(file, text);
+    for (const [entry, text] of readZipEntries(bundle.zipPath)) outputs.set(`zip ${entry}`, text);
+    assert.ok(outputs.get("_errors.log").includes(`Tenable request GET /assets/export/asset-export-1/chunks/1 ${failure}`), `${name}: ${outputs.get("_errors.log")}`);
+
+    if (name === "cap") {
+      // A tool waits between retries on a real timer that fake time does not reach, so only the cap, which is never
+      // retried, runs through one.
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = fetchImpl;
+      try {
+        const tools = new Map();
+        registerTenableTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+        const tool = tools.get("tenable_assess_vulnerability_management");
+        const args = tool.prepareArguments({ access_key: FIXTURE_ACCESS_KEY, secret_key: FIXTURE_SECRET_KEY, config_file: EMPTY_CONFIG_FILE, expected_asset_count: 2 });
+        const result = JSON.stringify(await settledValue(tool.execute("call-planted-cap", args), "tool call"));
+        assert.ok(result.includes(failure), `${name}: the tool result names the cap: ${result}`);
+        outputs.set("tool result", result);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    }
+    assertNoSecretWindows(outputs, planted, name);
+  }
+});
+
+test("TenableApiClient waits for Retry-After as seconds or as an HTTP date on the injected clock, capped at 30 seconds, and backs off when the header is unreadable", async () => {
+  const clock = Date.parse("2026-10-23T12:00:00Z");
+  const at = (offsetMs) => new Date(clock + offsetMs).toUTCString();
+  const sequence = [
+    { status: 503, headers: { "retry-after": "soon" } },
+    { status: 429, headers: { "retry-after": "7" } },
+    { status: 429, headers: { "retry-after": at(12_000) } },
+    { status: 503, headers: { "retry-after": "120" } },
+    { status: 503, headers: { "retry-after": at(-60_000) } },
+  ];
+  const waits = [];
+  let sent = 0;
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async () => {
+      const answer = sequence[sent++];
+      return answer ? jsonResponse({ error: "busy" }, answer.status, answer.headers) : jsonResponse({ scans: [{ id: 1, name: "ok" }] });
+    },
+    sleepImpl: async (ms) => { waits.push(ms); },
+    retryLimit: sequence.length,
+    now: () => clock,
+  });
+  assert.equal((await clients.vm.listScans()).length, 1);
+  assert.equal(sent, sequence.length + 1);
+  assert.deepEqual(waits, [
+    500, // an unreadable Retry-After falls back to the backoff for the first retry
+    7000,
+    12_000, // the HTTP date 12 seconds after the injected clock
+    30_000, // 120 seconds asked, capped at 30
+    250, // an HTTP date already past waits the 250 ms floor
+  ]);
+});
+
+test("TenableApiClient names the endpoint, the status, and the attempt count when a 429 or 5xx outlasts the retries, and a refusal that is never retried carries no attempt count", async () => {
+  for (const [name, respond, retryLimit, message, attempts] of [
+    ["429 under the default retry limit", () => jsonResponse({ error: "slow down" }, 429, { "retry-after": "1" }), undefined, "Tenable request GET /scans failed after 5 attempts (HTTP 429; slow down)", 5],
+    ["502 under a retry limit of 1", () => jsonResponse({ error: "down" }, 502), 1, "Tenable request GET /scans failed after 2 attempts (HTTP 502; down)", 2],
+    ["403", () => jsonResponse({ error: "forbidden" }, 403), undefined, "Tenable request GET /scans failed (HTTP 403; forbidden)", 1],
+  ]) {
+    let sent = 0;
+    const clients = createTenableClients(vmConfig(), {
+      fetchImpl: async () => {
+        sent += 1;
+        return respond();
+      },
+      sleepImpl: async () => {},
+      ...(retryLimit === undefined ? {} : { retryLimit }),
+    });
+    const thrown = await clients.vm.listScans().then(() => null, (error) => error);
+    assert.ok(thrown instanceof TenableApiError, name);
+    assert.equal(thrown.message, message, name);
+    assert.equal(sent, attempts, name);
+  }
+});
+
+test("an export request that timed out or drew no answer is sent once, since Tenable may already have started the export, and every check that reads the export is manual naming the request, the reason, and the attempt count", async () => {
+  const recording = (fetchImpl) => {
+    const sent = [];
+    const waits = [];
+    const clients = createTenableClients(vmConfig(), {
+      fetchImpl: async (url, init = {}) => {
+        sent.push(requestKey(url, init));
+        return fetchImpl(url, init);
+      },
+      sleepImpl: async (ms) => { waits.push(ms); },
+      exportPollMs: 0,
+      exportTimeoutMs: 5_000,
+    });
+    return { clients, sent, waits };
+  };
+  const exportRequests = (sent) => sent.filter((key) => key.startsWith("POST ")).sort();
+  const control = recording(routerFetch(healthyRoutes()));
+  await runAll(control.clients, { expectedAssetCount: 2 });
+  assert.ok(exportRequests(control.sent).includes("POST /assets/export") && exportRequests(control.sent).includes("POST /vulns/export"), "the control run requests both exports");
+
+  for (const [name, answer, reason] of [
+    ["timeout", () => { throw tenableTimeout(); }, ": timed out after 30000ms"],
+    ["network failure", () => { throw new TypeError("fetch failed"); }, " without an HTTP response: fetch failed"],
+    ["body cut off", cutOffBody, " while reading the response body: terminated"],
+  ]) {
+    const routed = routerFetch(healthyRoutes());
+    const { clients, sent, waits } = recording(async (url, init) => {
+      if ((init.method ?? "GET").toUpperCase() === "POST") return answer();
+      return routed(url, init);
+    });
+    const thrown = await clients.vm.exportAssets().then(() => null, (error) => error);
+    assert.ok(thrown instanceof TenableApiError, name);
+    assert.equal(thrown.message, `Tenable request POST /assets/export failed after 1 attempt${reason}; a POST that drew no complete answer is not sent again, since Tenable may already have acted on it.`, name);
+    assert.equal(thrown.status, 0, name);
+    assert.equal(thrown.endpoint, "POST /assets/export", name);
+    assert.deepEqual(sent, ["POST /assets/export"], `${name}: the export request is not sent again and no status is polled`);
+    assert.deepEqual(waits, [], `${name}: nothing is waited on`);
+
+    sent.length = 0;
+    const results = await runAll(clients, { expectedAssetCount: 2 });
+    assert.deepEqual(exportRequests(sent), exportRequests(control.sent), `${name}: each export the run reads is requested exactly once, as in the control run`);
+    for (const id of EXPORT_CAPPED) {
+      const item = byId(results, id);
+      const request = ["TENABLE-14", "TENABLE-15"].includes(id) ? "POST /vulns/export" : "POST /assets/export";
+      assert.equal(item.status, "manual", `${name}: ${id} is manual when the export request drew no answer: ${item.summary}`);
+      assert.ok(item.summary.includes(`Tenable request ${request} failed after 1 attempt${reason}`), `${name}: ${id} names the request, the reason, and the attempt count: ${item.summary}`);
+      assert.deepEqual(
+        { not_collected: item.evidence.not_collected, dataset_status: item.evidence.dataset_status, http_status: item.evidence.http_status, endpoint: item.evidence.endpoint },
+        { not_collected: true, dataset_status: "error", http_status: null, endpoint: request },
+        `${name}: ${id} evidence`,
+      );
+    }
+  }
+});
+
+test("an export request answered 429 or 503 is sent again after the wait, since Tenable answered without starting the export", async () => {
+  const routed = routerFetch(healthyRoutes());
+  const sent = [];
+  const waits = [];
+  let starts = 0;
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init = {}) => {
+      const key = requestKey(url, init);
+      sent.push(key);
+      if (key === "POST /assets/export") {
+        starts += 1;
+        if (starts === 1) return jsonResponse({ error: "too many requests" }, 429, { "retry-after": "3" });
+        if (starts === 2) return jsonResponse({ error: "unavailable" }, 503);
+      }
+      return routed(url, init);
+    },
+    sleepImpl: async (ms) => { waits.push(ms); },
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const result = await clients.vm.exportAssets();
+  assert.deepEqual({ status: result.status, records: result.records.length, truncated: result.truncated }, { status: "FINISHED", records: 2, truncated: false });
+  assert.deepEqual(sent.slice(0, 3), ["POST /assets/export", "POST /assets/export", "POST /assets/export"]);
+  assert.deepEqual(waits, [3000, 1000]);
+});
+
+test("an export status poll or chunk download that timed out or drew no answer is sent again, so one lost answer neither fails nor truncates the export", async () => {
+  const routed = routerFetch(healthyRoutes());
+  const pending = new Map([
+    ["GET /assets/export/asset-export-1/status", [tenableTimeout]],
+    ["GET /assets/export/asset-export-1/chunks/1", [() => new TypeError("fetch failed"), tenableTimeout]],
+  ]);
+  const sent = [];
+  const waits = [];
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init = {}) => {
+      const key = requestKey(url, init);
+      sent.push(key);
+      const failure = pending.get(key)?.shift();
+      if (failure) throw failure();
+      return routed(url, init);
+    },
+    sleepImpl: async (ms) => { waits.push(ms); },
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const result = await clients.vm.exportAssets();
+  assert.deepEqual(
+    { status: result.status, records: result.records.length, fetchedChunks: result.fetchedChunks, downloadFailures: result.downloadFailures, truncated: result.truncated, reason: result.reason },
+    { status: "FINISHED", records: 2, fetchedChunks: 1, downloadFailures: 0, truncated: false, reason: undefined },
+  );
+  assert.deepEqual(sent, [
+    "POST /assets/export",
+    "GET /assets/export/asset-export-1/status",
+    "GET /assets/export/asset-export-1/status",
+    "GET /assets/export/asset-export-1/chunks/1",
+    "GET /assets/export/asset-export-1/chunks/1",
+    "GET /assets/export/asset-export-1/chunks/1",
+  ]);
+  assert.deepEqual(waits, [500, 500, 1000], "the status poll waits once and the chunk download twice");
+});
+
+test("an export chunk that fails on every attempt leaves the export truncated, naming the chunk, the reason, and the attempt count, and no check that reads the export passes", async () => {
+  const chunkRoutes = () => threeChunkRoutes([healthyAssets(), [THIRD_ASSET], [THIRD_ASSET]], [healthyVulns(), [THIRD_VULN], [THIRD_VULN]]);
+  // Control: with every chunk answering, every check that reads the exports passes.
+  const controlVerdicts = verdictMap(await runAll(clientsFor(chunkRoutes()), { expectedAssetCount: 3 }));
+  for (const id of EXPORT_CAPPED) assert.equal(controlVerdicts.get(id), "pass", `${id} passes when every chunk answers`);
+
+  const lostChunks = new Set(["GET /assets/export/asset-export-1/chunks/2", "GET /vulns/export/vuln-export-1/chunks/2"]);
+  for (const [name, failure, reason, httpStatus] of [
+    ["timeout", () => { throw tenableTimeout(); }, ": timed out after 30000ms.", null],
+    ["network failure", () => { throw new TypeError("fetch failed"); }, " without an HTTP response: fetch failed.", null],
+    ["body cut off", cutOffBody, " while reading the response body: terminated.", null],
+    ["HTTP 503", () => jsonResponse({ error: "unavailable" }, 503), " (HTTP 503; unavailable)", 503],
+  ]) {
+    const routed = routerFetch(chunkRoutes());
+    const lost = [];
+    const clients = createTenableClients(vmConfig(), {
+      fetchImpl: async (url, init = {}) => {
+        const key = requestKey(url, init);
+        if (!lostChunks.has(key)) return routed(url, init);
+        lost.push(key);
+        return failure();
+      },
+      sleepImpl: async () => {},
+      exportPollMs: 0,
+      exportTimeoutMs: 5_000,
+    });
+    const result = await clients.vm.exportAssets();
+    assert.deepEqual(
+      { status: result.status, records: result.records.length, fetchedChunks: result.fetchedChunks, totalChunks: result.totalChunks, downloadFailures: result.downloadFailures, truncated: result.truncated, endpoint: result.endpoint, httpStatus: result.httpStatus },
+      { status: "FINISHED", records: 3, fetchedChunks: 2, totalChunks: 3, downloadFailures: 1, truncated: true, endpoint: "GET /assets/export/asset-export-1/chunks/2", httpStatus },
+      name,
+    );
+    const lostChunkText = `1 chunk downloads failed: Tenable request GET /assets/export/asset-export-1/chunks/2 failed after 5 attempts${reason}`;
+    assert.ok(result.reason.includes(lostChunkText), `${name}: ${result.reason}`);
+    assert.deepEqual(lost, Array(5).fill("GET /assets/export/asset-export-1/chunks/2"), `${name}: the chunk is requested once and retried four times`);
+
+    const results = await runAll(clients, { expectedAssetCount: 3 });
+    for (const id of EXPORT_CAPPED) {
+      const item = byId(results, id);
+      assert.ok(["warn", "manual"].includes(item.status), `${name}: ${id} never passes on a truncated export: ${item.status} ${item.summary}`);
+    }
+    const [, sensor, , vuln] = results;
+    assert.equal(sensor.summary.collection.asset_export.truncated, true, `${name}: the asset export is reported truncated`);
+    assert.equal(vuln.summary.collection.vuln_export.truncated, true, `${name}: the vulnerability export is reported truncated`);
+
+    const bundle = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-lost-chunk-")), { now: NOW, expectedAssetCount: 3 });
+    const files = readBundleFiles(bundle.outputDir);
+    const written = JSON.parse(files.get(join("core_data", "assets_export.json")));
+    assert.deepEqual(
+      { collected: written.collected, complete: written.complete, truncated: written.truncated, fetched_chunks: written.fetched_chunks, total_chunks: written.total_chunks, download_failures: written.download_failures, records: written.records.length },
+      { collected: true, complete: false, truncated: true, fetched_chunks: 2, total_chunks: 3, download_failures: 1, records: 3 },
+      `${name}: assets_export.json is a partial marker`,
+    );
+    assert.ok(files.get("_errors.log").includes(`asset_export dataset: partial view (3 of unknown records retrieved; ${lostChunkText}`), `${name}: ${files.get("_errors.log")}`);
+    const bundledFindings = JSON.parse(files.get(join("analysis", "findings.json")));
+    for (const id of EXPORT_CAPPED) assert.notEqual(bundledFindings.find((entry) => entry.id === id).status, "pass", `${name}: ${id} in the bundle`);
+  }
 });
 
 test("checkTenableAccess reports healthy when every surface is readable by an Administrator key", async () => {
@@ -2157,6 +2911,7 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, capp
     ["every read refused", clientsFor(routes, { status: 403 })],
     ["every read unavailable", clientsFor(routes, { status: 404 })],
     ["every read behind a proxy page", everyRoute(() => new Response("<html><body>502 Bad Gateway</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } }))],
+    ["every read timing out", everyRoute(() => { throw tenableTimeout(); })],
     ["every read an empty success", everyRoute(() => new Response("", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }))],
     ["a page-capped walk", createTenableClients(vmConfig(), {
       fetchImpl: async (url, init) => (new URL(url).pathname === "/networks" ? cappedNetworks(url) : fallback(url, init)),
@@ -2240,7 +2995,9 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, capp
     /Tenable request GET \/users failed \(HTTP 404; forbidden\)/,
     // The error line of a dataset named for what it holds keeps its whole message.
     /"credentials dataset: Tenable request GET \/credentials failed \(HTTP 403; forbidden\)"/,
-    /"credentials dataset: Tenable request GET \/credentials failed \(HTTP 502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)\)"/,
+    /"credentials dataset: Tenable request GET \/credentials failed after 5 attempts \(HTTP 502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)\)"/,
+    /"credentials dataset: Tenable request GET \/credentials failed after 5 attempts: timed out after 30000ms\."/,
+    /"asset_export dataset: Tenable request POST \/assets\/export failed after 1 attempt: timed out after 30000ms; a POST that drew no complete answer is not sent again, since Tenable may already have acted on it\."/,
     /"networks dataset: partial view \(10000 of unknown records retrieved; the walk stopped at the 200-page cap\)\."/,
     // The role note names the Basic role, which is also a scheme word, and keeps its whole text.
     /"server_properties requires role Basic; GET \/server\/properties refused the API key with HTTP 403: Tenable request GET \/server\/properties failed \(HTTP 403; forbidden\)"/,

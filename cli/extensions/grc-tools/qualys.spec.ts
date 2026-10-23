@@ -2027,10 +2027,10 @@ export const QUALYS_SPEC = buildBatchIntegrationSpec({
   ],
   rateLimit: {
     documentedLimit: "Subscription-specific: responses report X-RateLimit-Limit calls per X-RateLimit-Window-Sec seconds and X-Concurrency-Limit-Limit concurrent calls.",
-    retryHeaders: ["X-RateLimit-ToWait-Sec"],
+    retryHeaders: ["X-RateLimit-ToWait-Sec", "Retry-After"],
     retryableStatuses: [409, 429],
     retryableStatusRanges: [{ from: 500, to: 599 }],
-    backoffPolicy: "Retry 409, 429, every 5xx status, and network errors up to 3 times after the first attempt. Wait X-RateLimit-ToWait-Sec seconds when a retried response carries it as a number, otherwise 2, 4, then 8 seconds, capped at 30 seconds; Retry-After is ignored. Requests that time out (60 seconds by default) are not retried.",
+    backoffPolicy: "Retry 409, 429, every 5xx status, requests that time out (60 seconds by default, and the timer covers reading the body), and network errors up to QUALYS_MAX_RETRIES times after the first attempt (3 by default). Every Qualys request only reads, the QPS search POSTs and the gateway token request included, so each one is retried. Wait X-RateLimit-ToWait-Sec seconds when a retried response carries it as a number, otherwise Retry-After as delta-seconds or as an HTTP date measured against the client clock, otherwise 2, 4, then 8 seconds, doubling for any further retry; every wait is capped at 30 seconds. A failed gateway token request is retried by its own retries only, never again around the read that needed the token. When the retries run out the read fails with the endpoint path, the HTTP status or the timeout, and the number of attempts.",
   },
   runtimeBehavior: [],
   knownGaps: [

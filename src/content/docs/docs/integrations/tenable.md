@@ -367,6 +367,18 @@ The same redacted objects feed the findings and tool results, so nothing the ass
 
 Finally, every bundle file and every tool result passes through the configured-secret pass on its way out. Each string is checked for the configured keys in every encoded form, so a key echoed by an upstream body cannot survive even where the general scrub would have left evidence alone.
 
+### Retries and timeouts
+
+A request answered with HTTP 429 or any 5xx status is retried up to 4 times. Each retry waits as long as `Retry-After` asks (seconds or an HTTP date), clamped to 30 seconds; without a usable header it waits 500 ms, doubled per attempt and capped at 15 seconds. A GET that times out (`TENABLE_TIMEOUT`, 30 seconds by default) or fails before its whole answer arrives is retried the same way, so export status polls and chunk downloads get the same retries as every list read.
+
+The POST that starts an asset or vulnerability export is the exception. After a timeout or a network failure it is not sent again, because Tenable may already have started that export and a second request could start another. The export is then unreadable and the controls that read it are `manual`. A POST that Tenable answered with 429 or a 5xx status is sent again like a GET.
+
+`TENABLE_TIMEOUT` bounds the wait for the response headers and each pause between pieces of the body, not the body as a whole. Every piece that arrives restarts it, so a large export chunk that keeps arriving is not cut off by it, while a body that sends nothing for `TENABLE_TIMEOUT` times out and is retried instead of holding the run open. Tenable Security Center reads use the same timer.
+
+An attempt as a whole may run 20 times `TENABLE_TIMEOUT`: 10 minutes at the 30 second default and up to 200 minutes at the 600 second maximum. A body still arriving when that cap runs out is on a link too slow for another attempt to finish sooner, so the request is not sent again and fails naming the cap. The export chunk sizes are fixed, so on a link that slow, raise `TENABLE_TIMEOUT`: the cap rises with it, and a stalled body takes that much longer to time out.
+
+A request that still fails names its method and path, the status, the limit that ended it, or the network error, and the number of attempts, for example `Tenable request GET /assets/export/<uuid>/chunks/2 failed after 5 attempts: timed out after 30000ms with no data while reading the response body.` At the cap it reads `Tenable request GET /assets/export/<uuid>/chunks/2 failed after 1 attempt: the response body was still arriving when the per-attempt cap of 10 minutes ran out (the cap is 20 times TENABLE_TIMEOUT, so raising TENABLE_TIMEOUT or timeout_seconds raises it); a GET cut off at the cap is not sent again, since another attempt would arrive just as slowly.` A chunk that fails on every attempt or runs into the cap counts as a failed download: the export is marked truncated, and the controls that read it are capped at `warn` or rendered `manual`, never passed on the chunks that did arrive.
+
 ### Missing and partial datasets
 
 A dataset that was refused, failed, or never requested is never written as an empty list or `null`. Its `core_data/` file holds a marker in its place: `{ "collected": false, "status": <observed HTTP status or null>, "dataset_status": "forbidden" | "error" | "not_configured", "endpoint": "GET /...", "error": "<scrubbed message>" }`.

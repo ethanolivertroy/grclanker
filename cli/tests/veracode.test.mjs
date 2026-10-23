@@ -529,6 +529,224 @@ test("VeracodeApiClient signs requests, paginates HAL pages to completion, retri
   assert.equal(truncated.items.length, 2);
 });
 
+/** What fetch rejects with when the client's own request timer aborts the request. */
+function veracodeTimeout() {
+  return new DOMException("This operation was aborted", "AbortError");
+}
+
+function statusResponse(status, statusText, body = { message: "try later" }, headers = {}) {
+  return new Response(JSON.stringify(body), { status, statusText, headers: { "content-type": "application/json", ...headers } });
+}
+
+test("VeracodeApiClient waits for Retry-After as seconds or as an HTTP date on the injected clock, clamped to 30 seconds, and backs off without one", async () => {
+  const clock = Date.parse("2026-09-21T12:00:00Z");
+  const scripted = async (answers, retries) => {
+    let requests = 0;
+    const waits = [];
+    const fetchImpl = async () => {
+      requests += 1;
+      return answers[requests - 1]?.() ?? jsonResponse({ user_name: "svc-api" });
+    };
+    const body = await new VeracodeApiClient(sampleConfig({ retries }), { fetchImpl, sleep: async (ms) => { waits.push(ms); }, now: () => clock }).get("/api/authn/v2/users/self");
+    return { body, requests, waits };
+  };
+
+  const honored = await scripted([
+    () => statusResponse(429, "Too Many Requests", undefined, { "retry-after": "7" }),
+    () => statusResponse(503, "Service Unavailable", undefined, { "retry-after": new Date(clock + 12_000).toUTCString() }),
+    () => statusResponse(429, "Too Many Requests", undefined, { "retry-after": "120" }),
+  ], 3);
+  assert.equal(honored.body.user_name, "svc-api");
+  assert.equal(honored.requests, 4);
+  assert.deepEqual(honored.waits, [7_000, 12_000, 30_000], "seconds and a date on the injected clock are honored, and a longer wait is cut to 30 seconds");
+
+  const fallback = await scripted([
+    () => statusResponse(502, "Bad Gateway"),
+    () => statusResponse(429, "Too Many Requests", undefined, { "retry-after": "soon" }),
+    () => statusResponse(503, "Service Unavailable", undefined, { "retry-after": "1.5" }),
+    () => statusResponse(500, "Internal Server Error", undefined, { "retry-after": new Date(clock - 60_000).toUTCString() }),
+  ], 4);
+  assert.equal(fallback.body.user_name, "svc-api");
+  assert.equal(fallback.requests, 5);
+  assert.deepEqual(fallback.waits, [500, 1_000, 2_000, 0], "a missing or unreadable Retry-After backs off, and a date already past asks for no wait");
+});
+
+test("VeracodeApiClient sends a request that timed out or drew no answer again with backoff, and names the path, the timeout, and the attempt count when the retries run out", async () => {
+  const run = async (fail, { retries = 3, recoverAfter } = {}) => {
+    const requests = [];
+    const waits = [];
+    const fetchImpl = async (input) => {
+      const url = new URL(input);
+      requests.push(`${url.pathname}${url.search}`);
+      if (recoverAfter !== undefined && requests.length > recoverAfter) {
+        return jsonResponse({ _embedded: { applications: [{ guid: "app-1" }] }, page: { number: 0, size: 100, total_elements: 1, total_pages: 1 } });
+      }
+      return fail();
+    };
+    const client = new VeracodeApiClient(sampleConfig({ retries }), { fetchImpl, sleep: async (ms) => { waits.push(ms); } });
+    const outcome = await client.listApplications().then((value) => ({ value }), (error) => ({ error }));
+    return { ...outcome, requests, waits };
+  };
+
+  const timedOut = await run(() => { throw veracodeTimeout(); });
+  assert.equal(timedOut.requests.length, 4, "the first attempt and 3 retries");
+  assert.ok(timedOut.requests.every((request) => request === "/appsec/v1/applications?page=0&size=100"), "each retry asks for the same page");
+  assert.deepEqual(timedOut.waits, [500, 1_000, 2_000]);
+  assert.equal(timedOut.error.name, "VeracodeApiError");
+  assert.equal(timedOut.error.message, "Veracode request failed after 4 attempts for /appsec/v1/applications: timed out after 30000ms");
+  assert.equal(timedOut.error.statusCode, undefined);
+  assert.equal(timedOut.error.endpoint, "/appsec/v1/applications");
+
+  const unanswered = await run(() => { throw new TypeError("fetch failed"); });
+  assert.equal(unanswered.requests.length, 4);
+  assert.equal(unanswered.error.message, "Veracode request failed after 4 attempts for /appsec/v1/applications: fetch failed");
+
+  const single = await run(() => { throw new TypeError("fetch failed"); }, { retries: 0 });
+  assert.equal(single.requests.length, 1);
+  assert.deepEqual(single.waits, []);
+  assert.equal(single.error.message, "Veracode request failed after 1 attempt for /appsec/v1/applications: fetch failed");
+
+  const stalled = await run(() => ({ ok: true, status: 200, statusText: "OK", headers: new Headers(), text: async () => { throw veracodeTimeout(); } }));
+  assert.equal(stalled.requests.length, 4, "a body that stalls past the timer is retried like a request that never answers");
+  assert.equal(stalled.error.message, "Veracode request failed after 4 attempts for /appsec/v1/applications: timed out after 30000ms");
+
+  const recovered = await run(() => { throw veracodeTimeout(); }, { recoverAfter: 2 });
+  assert.equal(recovered.error, undefined);
+  assert.deepEqual(recovered.value.items.map((item) => item.guid), ["app-1"]);
+  assert.equal(recovered.value.complete, true);
+  assert.equal(recovered.requests.length, 3);
+  assert.deepEqual(recovered.waits, [500, 1_000]);
+});
+
+test("VeracodeApiClient names the path, the status, and the attempt count when a 429 or 5xx outlasts the retries, and a refusal fails at once without a count", async () => {
+  const run = async (status, statusText, retries) => {
+    const requests = [];
+    const waits = [];
+    const fetchImpl = async (input) => {
+      requests.push(new URL(input).search);
+      return statusResponse(status, statusText);
+    };
+    const error = await new VeracodeApiClient(sampleConfig({ retries }), { fetchImpl, sleep: async (ms) => { waits.push(ms); } })
+      .listApplications()
+      .then(() => assert.fail("expected the request to fail"), (caught) => caught);
+    return { error, requests, waits };
+  };
+
+  const unavailable = await run(503, "Service Unavailable", 3);
+  assert.equal(unavailable.requests.length, 4);
+  assert.deepEqual(unavailable.waits, [500, 1_000, 2_000]);
+  assert.equal(unavailable.error.message, "Veracode request failed after 4 attempts (503 Service Unavailable) for /appsec/v1/applications: try later");
+  assert.equal(unavailable.error.statusCode, 503);
+  assert.equal(unavailable.error.endpoint, "/appsec/v1/applications");
+  assert.ok(unavailable.requests.every((search) => search === "?page=0&size=100") && !unavailable.error.message.includes("page="), "the message names the path without the query");
+
+  const throttled = await run(429, "Too Many Requests", 0);
+  assert.equal(throttled.requests.length, 1);
+  assert.equal(throttled.error.message, "Veracode request failed after 1 attempt (429 Too Many Requests) for /appsec/v1/applications: try later");
+
+  const refused = await run(403, "Forbidden", 3);
+  assert.equal(refused.requests.length, 1, "a refusal is not retried");
+  assert.deepEqual(refused.waits, []);
+  assert.equal(refused.error.message, "Veracode request failed (403 Forbidden) for /appsec/v1/applications: try later");
+  assert.equal(refused.error.statusCode, 403);
+});
+
+test("VeracodeApiClient stops at once when the call is aborted during a retry wait", async () => {
+  for (const [label, answer] of [
+    ["a 503 with Retry-After", () => statusResponse(503, "Service Unavailable", undefined, { "retry-after": "5" })],
+    ["a timeout", () => { throw veracodeTimeout(); }],
+  ]) {
+    const controller = new AbortController();
+    let requests = 0;
+    const waits = [];
+    const client = new VeracodeApiClient(sampleConfig({ retries: 3 }), {
+      fetchImpl: async () => {
+        requests += 1;
+        return answer();
+      },
+      sleep: (ms) => {
+        waits.push(ms);
+        controller.abort();
+        return new Promise(() => {});
+      },
+      signal: controller.signal,
+    });
+    await assert.rejects(() => client.get("/appsec/v1/policies"), (error) => error.name === "ToolCallAbortedError", label);
+    assert.equal(requests, 1, `${label}: nothing is sent after the abort`);
+    assert.equal(waits.length, 1, label);
+  }
+});
+
+test("VeracodeApiClient reports an abort that lands while a body is read as the call's abort, not as a timeout, even with no retry left", async () => {
+  const controller = new AbortController();
+  let requests = 0;
+  const client = new VeracodeApiClient(sampleConfig({ retries: 0 }), {
+    fetchImpl: async (_input, init) => {
+      requests += 1;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "content-type": "application/json" }),
+        text: () => {
+          const reading = new Promise((_resolve, reject) => {
+            init.signal.addEventListener("abort", () => reject(veracodeTimeout()), { once: true });
+          });
+          controller.abort();
+          return reading;
+        },
+      };
+    },
+    sleep: async () => {},
+    signal: controller.signal,
+  });
+  await assert.rejects(() => client.get("/appsec/v1/policies"), (error) => error.name === "ToolCallAbortedError");
+  assert.equal(requests, 1, "nothing is sent after the abort");
+});
+
+test("a list page that fails on every attempt leaves the inventory unread, so no check built on it passes and the bundle records the failure", async () => {
+  const base = createTempBase("grclanker-veracode-retry-exhausted-");
+  for (const [label, failPage, expected] of [
+    ["timeout", () => { throw veracodeTimeout(); }, { status: null, error: "Veracode request failed after 4 attempts for /appsec/v1/applications: timed out after 30000ms" }],
+    ["503", () => statusResponse(503, "Service Unavailable", { message: "upstream unavailable" }), { status: 503, error: "Veracode request failed after 4 attempts (503 Service Unavailable) for /appsec/v1/applications: upstream unavailable" }],
+  ]) {
+    const fixture = healthyFixture();
+    const { fetchImpl: serve } = recordingVeracodeFetch({ fixture });
+    const pages = [];
+    const waits = [];
+    const fetchImpl = async (input, init) => {
+      const url = new URL(input);
+      if (url.pathname !== "/appsec/v1/applications") return serve(input, init);
+      const page = Number(url.searchParams.get("page"));
+      pages.push(page);
+      if (page === 1) return failPage();
+      return jsonResponse({ _embedded: { applications: [fixture.applications[0]] }, page: { number: 0, size: 1, total_elements: fixture.applications.length, total_pages: fixture.applications.length } });
+    };
+    const client = new VeracodeApiClient(sampleConfig({ retries: 3 }), { fetchImpl, sleep: async (ms) => { waits.push(ms); } });
+
+    const scanCoverage = await assessVeracodeScanCoverage(client, { now: NOW });
+    assert.deepEqual(pages, [0, 1, 1, 1, 1], `${label}: the failed page is asked for 4 times`);
+    assert.deepEqual(waits, [500, 1_000, 2_000], label);
+    assert.deepEqual(scanCoverage.rawData.applications, { collected: false, status: expected.status, endpoint: "/appsec/v1/applications", error: expected.error }, `${label}: the first page read is not kept as the inventory`);
+    const policyCompliance = await assessVeracodePolicyCompliance(client, {});
+    const findingsHygiene = await assessVeracodeFindingsHygiene(client, { now: NOW });
+    const findings = [scanCoverage, policyCompliance, findingsHygiene].flatMap((result) => result.findings);
+    for (const number of [1, 2, 3, 4, 10, 12, 16, 17, 19]) {
+      const finding = findings.find((item) => item.id === `VERACODE-${String(number).padStart(2, "0")}`);
+      assert.equal(finding.status, "manual", `${label}: VERACODE-${number} is manual, got ${finding.status}: ${finding.summary}`);
+    }
+    assert.ok(findings.find((item) => item.id === "VERACODE-01").summary.includes(expected.error), `${label}: the summary carries the exhaustion error`);
+
+    const exported = await exportVeracodeAuditBundle(client, sampleConfig(), join(base, label), { now: NOW });
+    assert.ok(readFileSync(join(exported.outputDir, "_errors.log"), "utf8").includes(expected.error), `${label}: _errors.log records the exhaustion error`);
+    const bundled = JSON.parse(readFileSync(join(exported.outputDir, "analysis", "findings.json"), "utf8"));
+    const bundledFindings = Array.isArray(bundled) ? bundled : bundled.findings;
+    for (const number of [1, 2, 3, 4, 10, 12, 16, 17, 19]) {
+      assert.notEqual(bundledFindings.find((item) => item.id === `VERACODE-${String(number).padStart(2, "0")}`).status, "pass", `${label}: VERACODE-${number} does not pass in the bundle`);
+    }
+  }
+});
+
 test("checkVeracodeAccess reports healthy access and names missing roles when degraded", async () => {
   const healthy = await checkVeracodeAccess(mockClient());
   assert.equal(healthy.status, "healthy");
@@ -2444,7 +2662,7 @@ function veracodeSummarySentences(kind, value) {
         `2026-09-21T12:00:00.000Z api credentials (svc-api): Veracode request failed (403 Forbidden) for ${value}`,
       ];
     case "host":
-      return [`Using Veracode API base ${value} (region us, credentials from environment-api-key-id -> environment-api-key-secret -> region-us).`, `Veracode request failed for ${value}/appsec/v1/applications: fetch failed`];
+      return [`Using Veracode API base ${value} (region us, credentials from environment-api-key-id -> environment-api-key-secret -> region-us).`, `Veracode request failed after 4 attempts for ${value}/appsec/v1/applications: fetch failed`];
     case "name":
       return [
         `Authenticated as ${value} with roles ${value}, Administrator.`,
@@ -2477,10 +2695,12 @@ const VERACODE_FIXED_TEXTS = [
   'Unknown Veracode region "mars". Use us, eu, or us-fed.',
   "Veracode request failed (403 Forbidden) for /appsec/v1/policies: role Security Insights required",
   "Veracode request failed (401 Unauthorized) for /api/authn/v2/users/self",
-  "Veracode request failed (500 Internal Server Error) for /api/authn/v2/users/self: JSON response body (24 bytes) carried no message field",
+  "Veracode request failed after 4 attempts (500 Internal Server Error) for /api/authn/v2/users/self: JSON response body (24 bytes) carried no message field",
+  "Veracode request failed after 1 attempt (429 Too Many Requests) for /appsec/v1/policies",
   "Veracode request failed (400 Bad Request) for /api/authn/v2/users/self: non-JSON body (text/html, 30 bytes)",
   "Veracode request to /appsec/v1/applications returned an unreadable response (200 OK): non-JSON body (text/html, 5120 bytes)",
-  "Veracode request failed for /appsec/v1/applications: The operation was aborted due to timeout",
+  "Veracode request failed after 4 attempts for /appsec/v1/applications: timed out after 30000ms",
+  "Veracode request failed after 4 attempts for /appsec/v1/applications: fetch failed",
   "all_for_org=true was refused (403), so only teams the API user is a member of were listed and the team inventory is a partial view.",
   "Not requested: the application inventory was not readable, so no sandbox list was requested.",
   "Not requested: the Dynamic Analysis list was not readable, so no scan list or scan configuration was requested.",
@@ -2494,8 +2714,8 @@ const VERACODE_FIXED_TEXTS = [
   "Not requested: the user list was empty, so no credential record was requested.",
   "Not requested: the user list carried no active API account, so no credential record was requested.",
   "The applications (Security Insights or Reviewer role) endpoint was forbidden (403), so the control could not be verified: Veracode request failed (403 Forbidden) for /appsec/v1/applications",
-  "The users (Administrator role) endpoint returned an error (500), so the control could not be verified: Veracode request failed (500 Internal Server Error) for /api/authn/v2/users",
-  "The api_credentials (Administrator role) endpoint could not be read, so the control could not be verified: Veracode request failed for /api/authn/v2/api_credentials/user_id/u-2: The operation was aborted due to timeout",
+  "The users (Administrator role) endpoint returned an error (500), so the control could not be verified: Veracode request failed after 4 attempts (500 Internal Server Error) for /api/authn/v2/users",
+  "The api_credentials (Administrator role) endpoint could not be read, so the control could not be verified: Veracode request failed after 4 attempts for /api/authn/v2/api_credentials/user_id/u-2: timed out after 30000ms",
   "The policies surface was not read.",
   "The Dynamic Analysis API was not available to this credential (403); Dynamic Analysis may be unlicensed or the API user lacks a Dynamic Analysis role, so the control is not applicable through the API.",
   "The SCA Agent API was not available to this credential (404); agent-based SCA may be unlicensed or the API user lacks a Workspace role, so the control is not applicable through the API.",

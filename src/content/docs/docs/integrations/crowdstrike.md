@@ -62,7 +62,8 @@ The client:
 - Exchanges the credentials with `POST /oauth2/token` (form-encoded `client_id`, `client_secret`, optional `member_cid`).
 - Caches the bearer token until shortly before `expires_in`.
 - Refreshes once on a 401.
-- Retries 429 and 5xx responses with exponential backoff while honoring `X-RateLimit-RetryAfter` and `Retry-After`.
+- Retries 429 and 5xx responses, timeouts (the timeout runs until the whole body has arrived), and network failures up to 4 times, for the token request as well as every read. A 429 or 5xx waits for `X-RateLimit-RetryAfter` or `Retry-After` (seconds, an epoch time, or an HTTP date), otherwise backs off exponentially from 250 milliseconds, and every wait is clamped to 250 milliseconds through 15 seconds.
+- Reports a request that still fails after its last retry with the endpoint path, the HTTP status or the timeout, and the number of attempts, for example `CrowdStrike request failed for /devices/combined/devices/v1 after 5 attempts: timed out after 30000ms`. The checks built on that read are reported as manual, never as passing on a partial list.
 - Passes every error message through a redaction pass that removes the client secret, every bearer token, and other credential values. [Error string redaction](#error-string-redaction) lists exactly what it removes.
 
 Required API client scopes (all Read):

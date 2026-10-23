@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { QUALYS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -981,6 +981,27 @@ interface QualysHttpResponse {
   status: number;
   text: string;
   headers: Headers;
+  // Requests sent to obtain this response, the first one included.
+  attempts?: number;
+}
+
+// Qualys answers 409 when the subscription's concurrency limit is reached.
+function isRetryableStatus(status: number): boolean {
+  return status === 409 || status === 429 || status >= 500;
+}
+
+function attemptCount(attempts: number): string {
+  return `${attempts} attempt${attempts === 1 ? "" : "s"}`;
+}
+
+// Retry-After carries delta-seconds or an HTTP date (RFC 9110 section 10.2.3); a date is measured against the
+// client's clock, and a date already past asks for no wait.
+function retryAfterMs(value: string | null, now: Date): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  const date = Date.parse(trimmed);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - now.getTime());
 }
 
 export class QualysApiClient {
@@ -988,6 +1009,7 @@ export class QualysApiClient {
   private readonly fetchImpl: FetchImpl;
   private readonly sleepImpl: SleepImpl;
   private readonly now: () => Date;
+  private readonly signal?: AbortSignal;
   private bearerToken?: string;
   private bearerExpiresAt = 0;
   lastRateLimit: JsonRecord = {};
@@ -1000,6 +1022,7 @@ export class QualysApiClient {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     this.now = options.now ?? (() => new Date());
+    this.signal = options.signal;
     if (config.token) {
       this.bearerToken = config.token;
       this.bearerExpiresAt = Number.MAX_SAFE_INTEGER;
@@ -1039,8 +1062,9 @@ export class QualysApiClient {
     return [...credentialValues(this.config), ...(this.bearerToken && this.bearerToken.length >= 4 ? [this.bearerToken] : [])];
   }
 
-  private failure(what: string, response: Pick<QualysHttpResponse, "status">, endpoint: string, detail: string | undefined): QualysApiError {
-    return new QualysApiError(`${what} failed (${response.status}) for ${endpoint}${detail ? `: ${detail}` : ""}`, response.status, endpoint, this.secrets());
+  private failure(what: string, response: Pick<QualysHttpResponse, "status" | "attempts">, endpoint: string, detail: string | undefined): QualysApiError {
+    const attempts = isRetryableStatus(response.status) && response.attempts !== undefined ? ` after ${attemptCount(response.attempts)}` : "";
+    return new QualysApiError(`${what} failed (${response.status}) for ${endpoint}${attempts}${detail ? `: ${detail}` : ""}`, response.status, endpoint, this.secrets());
   }
 
   private async fetchGatewayToken(): Promise<string> {
@@ -1101,55 +1125,63 @@ export class QualysApiClient {
     if (Object.keys(captured).length > 0) this.lastRateLimit = captured;
   }
 
+  // One request under the configured timeout. The body is read before the timer is cleared, so a body that stalls
+  // times out like a request that never answers. The call's abort is raced against the body read as well, since an
+  // abort there would otherwise surface as an AbortError and be reported as a timeout.
+  private async sendOnce(url: string, init: { method: string; headers: Headers; body?: string }): Promise<{ response: Response; text: string }> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    try {
+      const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
+      this.recordRateLimit(response.headers);
+      return { response, text: await unlessAborted(response.text(), this.signal) };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   private async rawRequest(
     method: string,
     url: string,
     options: { body?: string; contentType?: string; accept?: string; skipAuth?: boolean } = {},
   ): Promise<QualysHttpResponse> {
-    let attempt = 0;
-    for (;;) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
-      try {
-        const headers = new Headers();
-        headers.set("X-Requested-With", USER_AGENT_HEADER);
-        headers.set("Accept", options.accept ?? "application/xml");
-        if (options.contentType) headers.set("Content-Type", options.contentType);
-        if (!options.skipAuth) headers.set("Authorization", await this.authorizationHeader());
+    const endpoint = this.endpointLabel(url);
+    const maxAttempts = this.config.maxRetries + 1;
+    const backoffMs = (attempt: number) => Math.min(1000 * 2 ** attempt, DEFAULT_MAX_RATE_LIMIT_WAIT_MS);
+    for (let attempt = 1; ; attempt += 1) {
+      // The gateway token request runs its own retries, so a token or configuration failure is thrown as it is
+      // rather than retried again around this request.
+      const authorization = options.skipAuth ? undefined : await this.authorizationHeader();
+      const headers = new Headers();
+      headers.set("X-Requested-With", USER_AGENT_HEADER);
+      headers.set("Accept", options.accept ?? "application/xml");
+      if (options.contentType) headers.set("Content-Type", options.contentType);
+      if (authorization) headers.set("Authorization", authorization);
 
-        const response = await this.fetchImpl(url, {
-          method,
-          headers,
-          body: options.body,
-          signal: controller.signal,
-        });
-        this.recordRateLimit(response.headers);
-        const text = await response.text();
-        if ((response.status === 409 || response.status === 429 || response.status >= 500) && attempt < this.config.maxRetries) {
-          attempt += 1;
-          const toWait = asNumber(response.headers.get("X-RateLimit-ToWait-Sec"));
-          const waitMs = Math.min(
-            toWait !== undefined ? toWait * 1000 : 1000 * 2 ** attempt,
-            DEFAULT_MAX_RATE_LIMIT_WAIT_MS,
-          );
-          await this.sleepImpl(waitMs);
-          continue;
-        }
-        return { status: response.status, text, headers: response.headers };
+      let response: Response;
+      let text: string;
+      try {
+        ({ response, text } = await this.sendOnce(url, { method, headers, body: options.body }));
       } catch (error) {
         rethrowIfAborted(error);
-        // A gateway token request rejected with 401 cannot succeed on retry, and rewrapping it would drop the status.
-        if (isRejectedCredentials(error)) throw error;
-        if (attempt < this.config.maxRetries && error instanceof Error && error.name !== "AbortError") {
-          attempt += 1;
-          await this.sleepImpl(Math.min(1000 * 2 ** attempt, DEFAULT_MAX_RATE_LIMIT_WAIT_MS));
+        // Every Qualys request reads (QPS searches and the gateway token request included), so a request that
+        // timed out or never got an answer is safe to send again.
+        if (attempt < maxAttempts) {
+          await this.sleepImpl(backoffMs(attempt));
           continue;
         }
-        const message = error instanceof Error ? error.message : String(error);
-        throw new QualysApiError(`Qualys request to ${this.endpointLabel(url)} failed: ${message}`, 0, this.endpointLabel(url), this.secrets());
-      } finally {
-        clearTimeout(timeout);
+        const reason = error instanceof Error && error.name === "AbortError"
+          ? `timed out after ${this.config.timeoutMs}ms`
+          : error instanceof Error ? error.message : String(error);
+        throw new QualysApiError(`Qualys request to ${endpoint} failed after ${attemptCount(attempt)}: ${reason}`, 0, endpoint, this.secrets());
       }
+      if (isRetryableStatus(response.status) && attempt < maxAttempts) {
+        const toWait = asNumber(response.headers.get("X-RateLimit-ToWait-Sec"));
+        const askedMs = toWait !== undefined ? toWait * 1000 : retryAfterMs(response.headers.get("Retry-After"), this.now());
+        await this.sleepImpl(Math.min(askedMs ?? backoffMs(attempt), DEFAULT_MAX_RATE_LIMIT_WAIT_MS));
+        continue;
+      }
+      return { status: response.status, text, headers: response.headers, attempts: attempt };
     }
   }
 

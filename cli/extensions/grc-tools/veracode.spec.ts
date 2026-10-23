@@ -1834,11 +1834,11 @@ export const VERACODE_SPEC = buildBatchIntegrationSpec({
     singleRead(["self_api_credentials"], "One read of the API user's own API credentials, by veracode_check_access only."),
   ],
   rateLimit: {
-    documentedLimit: "Veracode documents 500 REST API calls per minute from one IP address, answering a 429 with a retry-after time in seconds beyond it; the collector reads neither the limit nor the retry-after time.",
-    retryHeaders: [],
+    documentedLimit: "Veracode documents 500 REST API calls per minute from one IP address, answering a 429 with a retry-after time in seconds beyond it; the collector honors the retry-after time but does not track the limit.",
+    retryHeaders: ["Retry-After"],
     retryableStatuses: [429],
     retryableStatusRanges: [{ from: 500, to: 599 }],
-    backoffPolicy: "Retry 429, every status of 500 or above, network errors, and requests that time out up to 3 times after the first attempt, waiting 500, 1000, then 2000 milliseconds; Retry-After is ignored. A request times out after timeout_seconds, else VERACODE_TIMEOUT, else 30 seconds, truncated and clamped to 1 through 300. A 2xx body that is not JSON is a refusal and is not retried.",
+    backoffPolicy: "Retry 429, every status of 500 or above, network errors, and requests that time out up to 3 times after the first attempt. A Retry-After header in seconds or as an HTTP date measured against the client clock is honored, and a date already past asks for no wait; a wait longer than 30 seconds is cut to 30 seconds rather than refused, so a retry sent early that is throttled again spends an attempt. Without a readable Retry-After, and after a timeout or a network error, wait 500, 1000, then 2000 milliseconds. A request times out after timeout_seconds, else VERACODE_TIMEOUT, else 30 seconds, truncated and clamped to 1 through 300, and the timer covers reading the body. When the retries run out, the request fails with its path (never its query), the HTTP status, the timeout (\"timed out after <ms>ms\"), or the network error, and the number of attempts, and the dataset it was reading is reported as not collected. A 2xx body that is not JSON is a refusal and is not retried.",
   },
   runtimeBehavior: [],
   knownGaps: [

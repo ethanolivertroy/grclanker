@@ -311,7 +311,9 @@ The client records these headers from every response:
 - `X-Concurrency-Limit-Limit`
 - `X-Concurrency-Limit-Running`
 
-On HTTP 409 or 429 it waits for `X-RateLimit-ToWait-Sec` (capped at 30 seconds, exponential backoff when the header is absent) and retries up to `QUALYS_MAX_RETRIES` times.
+On HTTP 409, 429, or any 5xx status, and when a request times out (the timeout runs until the whole body has arrived) or fails before its whole answer arrives, the client retries up to `QUALYS_MAX_RETRIES` times. It waits for `X-RateLimit-ToWait-Sec`, otherwise for `Retry-After` (seconds or an HTTP date), otherwise 2, 4, then 8 seconds; every wait is capped at 30 seconds. A failed gateway token request is retried on its own and is not retried again around the read that needed the token.
+
+A read that still fails after its last retry is reported with its endpoint path, the HTTP status or the timeout, and the number of attempts, for example `Qualys request to /api/2.0/fo/asset/host/ failed after 4 attempts: timed out after 60000ms`. The checks that depend on that read are reported as manual, never as passing on a partial list.
 
 ### Error messages and secrets
 

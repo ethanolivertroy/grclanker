@@ -650,10 +650,11 @@ test("Knowbe4ApiClient stops retrying after max retries and redacts tokens in er
     fetchImpl: async () => {
       throw new Error("connect failed while sending super-secret-token and phisher-secret");
     },
+    sleepImpl: async () => {},
     minRequestIntervalMs: 0,
   });
   await assert.rejects(() => leaking.getAccount(), (error) => {
-    assert.match(error.message, /KnowBe4 request failed: GET \/v1\/account/);
+    assert.match(error.message, /^KnowBe4 request failed after 4 attempts: GET \/v1\/account: connect failed while sending/);
     assert.ok(!error.message.includes("super-secret-token"));
     assert.ok(!error.message.includes("phisher-secret"));
     assert.match(error.message, /\[REDACTED\]/);
@@ -665,6 +666,195 @@ test("Knowbe4ApiClient stops retrying after max retries and redacts tokens in er
     minRequestIntervalMs: 0,
   });
   await assert.rejects(() => unauthorized.getAccount(), /401 Unauthorized.*Unauthorized/);
+});
+
+/** A fetch that never answers on its own: only the client's timer, aborting the request signal, settles it. */
+function neverAnswers(_input, init = {}) {
+  return new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+  });
+}
+
+/** Headers that arrive, then a body that stalls until the request signal aborts; `onRead` runs as the body read starts. */
+function stalledBody(input, init = {}, onRead = () => {}) {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: new Headers({ "content-type": "application/json" }),
+    text: () => {
+      const reading = neverAnswers(input, init);
+      onRead();
+      return reading;
+    },
+  };
+}
+
+function statusAnswer(status, statusText, headers = {}) {
+  return () => jsonResponse({ message: statusText }, { status, statusText, headers });
+}
+
+test("Knowbe4ApiClient retries 429, 500, 502, 503, and 504, waits for Retry-After as seconds or as an HTTP date on the injected clock up to 60 seconds, backs off without one, and fails at once on any other status", async () => {
+  const clock = Date.parse("2026-09-21T12:00:00Z");
+  const run = async (answers) => {
+    const sleeps = [];
+    let served = 0;
+    const client = new Knowbe4ApiClient(sampleConfig(), {
+      fetchImpl: async () => answers[Math.min(served++, answers.length - 1)](),
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
+      now: () => clock,
+      minRequestIntervalMs: 0,
+    });
+    try {
+      return { account: await client.getAccount(), sleeps, requests: client.getRequestCount() };
+    } catch (error) {
+      return { error, sleeps, requests: client.getRequestCount() };
+    }
+  };
+  const ok = () => jsonResponse({ name: "Acme Corp" });
+
+  for (const [status, text] of [[429, "Too Many Requests"], [500, "Internal Server Error"], [502, "Bad Gateway"], [503, "Service Unavailable"], [504, "Gateway Timeout"]]) {
+    const { account, sleeps, requests } = await run([statusAnswer(status, text), ok]);
+    assert.equal(account?.name, "Acme Corp", `${status} is retried`);
+    assert.deepEqual(sleeps, [1000], `${status}: one second before the first retry`);
+    assert.equal(requests, 2, String(status));
+  }
+
+  const waitFor = async (retryAfter) => (await run([statusAnswer(503, "Service Unavailable", { "retry-after": retryAfter }), ok])).sleeps;
+  assert.deepEqual(await waitFor("7"), [7_000], "delta-seconds");
+  assert.deepEqual(await waitFor(new Date(clock + 12_000).toUTCString()), [12_000], "an HTTP date is measured against the injected clock");
+  assert.deepEqual(await waitFor(new Date(clock - 5_000).toUTCString()), [0], "a date already past asks for no wait");
+  assert.deepEqual(await waitFor("600"), [60_000], "a longer wait is cut to 60 seconds");
+  assert.deepEqual(await waitFor(new Date(clock + 600_000).toUTCString()), [60_000], "a later date is cut to 60 seconds");
+  assert.deepEqual(await waitFor("soon"), [1_000], "an unreadable Retry-After falls back to the backoff");
+
+  const exhausted = await run([statusAnswer(504, "Gateway Timeout")]);
+  assert.equal(exhausted.error.message, "KnowBe4 request failed after 4 attempts (504 Gateway Timeout) GET /v1/account: Gateway Timeout");
+  assert.equal(exhausted.error.status, 504);
+  assert.equal(exhausted.error.endpoint, "GET /v1/account");
+  assert.deepEqual(exhausted.sleeps, [1_000, 2_000, 4_000], "the wait doubles before each later retry");
+  assert.equal(exhausted.requests, 4);
+
+  for (const [status, text] of [[501, "Not Implemented"], [404, "Not Found"], [400, "Bad Request"]]) {
+    const refused = await run([statusAnswer(status, text), ok]);
+    assert.equal(refused.error.message, `KnowBe4 request failed (${status} ${text}) GET /v1/account: ${text}`, `${status} fails at once, so no attempt count is named`);
+    assert.deepEqual(refused.sleeps, [], String(status));
+    assert.equal(refused.requests, 1, String(status));
+  }
+});
+
+test("Knowbe4ApiClient sends a request that timed out, stalled in its body, or drew no answer again with backoff, and names the method, path, timeout, and attempt count when the retries run out", async () => {
+  const make = (fetchImpl, overrides = {}) => {
+    const sleeps = [];
+    const client = new Knowbe4ApiClient(sampleConfig({ timeoutMs: 1, ...overrides }), {
+      fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
+      minRequestIntervalMs: 0,
+    });
+    return { client, sleeps };
+  };
+
+  // The users listing carries status, page, and per_page in its query; the error names the path alone.
+  const timedOut = make(neverAnswers);
+  await assert.rejects(() => timedOut.client.listUsers(), (error) => {
+    assert.equal(error.message, "KnowBe4 request failed after 4 attempts: GET /v1/users: timed out after 1ms");
+    assert.equal(error.status, null);
+    assert.equal(error.endpoint, "GET /v1/users");
+    return true;
+  });
+  assert.deepEqual(timedOut.sleeps, [1_000, 2_000, 4_000]);
+  assert.equal(timedOut.client.getRequestCount(), 4);
+
+  let stalls = 0;
+  const recovered = make((input, init) => (stalls++ === 0 ? stalledBody(input, init) : jsonResponse([{ id: 1 }])));
+  const users = await recovered.client.listUsers();
+  assert.deepEqual(users.items.map((item) => item.id), [1], "a body that stalled is read again from a fresh request");
+  assert.deepEqual(recovered.sleeps, [1_000]);
+  assert.equal(recovered.client.getRequestCount(), 2);
+
+  await assert.rejects(() => make(stalledBody).client.getAccount(), { message: "KnowBe4 request failed after 4 attempts: GET /v1/account: timed out after 1ms" });
+
+  let drops = 0;
+  const flaky = make(async () => {
+    drops += 1;
+    if (drops === 1) throw new TypeError("fetch failed");
+    return jsonResponse({ name: "Acme Corp" });
+  });
+  assert.equal((await flaky.client.getAccount()).name, "Acme Corp");
+  assert.deepEqual(flaky.sleeps, [1_000]);
+
+  const unreachable = make(async () => {
+    throw new TypeError("fetch failed");
+  });
+  await assert.rejects(() => unreachable.client.getAccount(), (error) => {
+    assert.equal(error.message, "KnowBe4 request failed after 4 attempts: GET /v1/account: fetch failed");
+    assert.equal(error.status, null);
+    return true;
+  });
+  assert.equal(unreachable.client.getRequestCount(), 4);
+
+  // The PhishER query is a POST, sent again unchanged: it only reads, so a second copy changes nothing.
+  const bodies = [];
+  const phisher = make(async (_input, init) => {
+    bodies.push(init.body);
+    return bodies.length === 1
+      ? new Response("<html>502</html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } })
+      : jsonResponse({ data: { phisherMessages: { pagination: { totalCount: 3 } } } });
+  }, { phisherApiToken: "phisher-token" });
+  assert.equal(await phisher.client.countPhisherMessages("reported_at:[2026-06-23 TO *]"), 3);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[1], bodies[0]);
+  assert.deepEqual(phisher.sleeps, [1_000]);
+});
+
+test("Knowbe4ApiClient stops at once when the call is aborted during a retry wait", async () => {
+  for (const [label, answer] of [
+    ["a 503 with Retry-After", statusAnswer(503, "Service Unavailable", { "retry-after": "5" })],
+    ["a network error", () => {
+      throw new TypeError("fetch failed");
+    }],
+  ]) {
+    const controller = new AbortController();
+    let requests = 0;
+    const waits = [];
+    const client = new Knowbe4ApiClient(sampleConfig(), {
+      fetchImpl: async () => {
+        requests += 1;
+        return answer();
+      },
+      sleepImpl: (ms) => {
+        waits.push(ms);
+        controller.abort();
+        return new Promise(() => {});
+      },
+      minRequestIntervalMs: 0,
+      signal: controller.signal,
+    });
+    await assert.rejects(() => client.getAccount(), (error) => error.name === "ToolCallAbortedError", label);
+    assert.equal(requests, 1, `${label}: nothing is sent after the abort`);
+    assert.equal(waits.length, 1, label);
+  }
+});
+
+test("Knowbe4ApiClient reports an abort that lands while a body is read as the call's abort, not as a failed read, even with no retry left", async () => {
+  const controller = new AbortController();
+  let requests = 0;
+  const client = new Knowbe4ApiClient(sampleConfig(), {
+    fetchImpl: async (input, init) => {
+      requests += 1;
+      return stalledBody(input, init, () => controller.abort());
+    },
+    sleepImpl: async () => {},
+    maxRetries: 0,
+    minRequestIntervalMs: 0,
+    signal: controller.signal,
+  });
+  await assert.rejects(() => client.getAccount(), (error) => error.name === "ToolCallAbortedError");
+  assert.equal(requests, 1, "nothing is sent after the abort");
 });
 
 test("Knowbe4ApiClient shapes Reporting API list requests with the documented query parameters", async () => {
@@ -2242,7 +2432,7 @@ function kbMentionedEndpoints(text) {
 function kbMentionedStatusCodes(text) {
   const codes = new Set();
   for (const match of text.matchAll(/\b([1-5]\d\d) (?:OK|Forbidden|Unauthorized|Bad Request|Not Found|Too Many Requests|Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|Error)\b/g)) codes.add(Number(match[1]));
-  for (const match of text.matchAll(/request failed \(([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
+  for (const match of text.matchAll(/request failed(?: after \d+ attempts?)? \(([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
   for (const match of text.matchAll(/"(?:http_)?status":\s*([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
   for (const match of text.matchAll(/\bHTTP ([1-5]\d\d)\b/g)) codes.add(Number(match[1]));
   return [...codes];
@@ -2339,7 +2529,7 @@ test("verdict rule 9 / addendum 2: the KnowBe4 bundle, its zip, every assess pay
 
   // The non-JSON body is described by status and length; the JSON error is quoted with its URL query scrubbed.
   const errors = files.get("_errors.log");
-  assert.match(errors, /^groups: KnowBe4 request failed \(502 Bad Gateway\) GET \/v1\/groups: 502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)$/m);
+  assert.match(errors, /^groups: KnowBe4 request failed after 1 attempt \(502 Bad Gateway\) GET \/v1\/groups: 502 Bad Gateway: non-JSON body \(text\/html, \d+ bytes, not echoed\)$/m);
   assert.match(errors, /^store_purchases: KnowBe4 request failed \(403 Forbidden\) GET \/v1\/training\/store_purchases: Forbidden; see https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for details$/m);
   assert.equal(result.errorCount, 2, `only the two failing surfaces are recorded:\n${errors}`);
 
@@ -2357,7 +2547,7 @@ test("verdict rule 9 / addendum 2: the KnowBe4 bundle, its zip, every assess pay
   const risk = assessments[2];
   const coverage = findingFor(risk, 8);
   assert.equal(coverage.status, "manual");
-  assert.match(coverage.summary, /^Unreadable inventory: groups \(GET \/v1\/groups: KnowBe4 request failed \(502 Bad Gateway\) GET \/v1\/groups: 502 Bad Gateway: non-JSON body/);
+  assert.match(coverage.summary, /^Unreadable inventory: groups \(GET \/v1\/groups: KnowBe4 request failed after 1 attempt \(502 Bad Gateway\) GET \/v1\/groups: 502 Bad Gateway: non-JSON body/);
   assert.doesNotMatch(coverage.summary, /403/);
   assert.equal(coverage.evidence.unreadable_inventories[0].http_status, 502);
   const currency = findingFor(assessments[1], 11);
@@ -2832,7 +3022,7 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
     maxRetries: 0,
   });
   await assert.rejects(() => client.getAccount(), (error) => {
-    assert.equal(error.message, "KnowBe4 request failed: GET /v1/account: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body");
+    assert.equal(error.message, "KnowBe4 request failed after 1 attempt: GET /v1/account: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body");
     assert.equal(error.status, null);
     return true;
   });
@@ -2858,10 +3048,11 @@ const KB_FIXED_TEXT_MESSAGES = [
   'Unsupported KnowBe4 region "mars". Use one of: us, eu, ca, uk, de.',
   "502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
   "403 Forbidden: JSON body without a documented error field (64 bytes, not echoed)",
-  "KnowBe4 request failed (502 Bad Gateway) GET /v1/groups: 502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
+  "KnowBe4 request failed after 4 attempts (502 Bad Gateway) GET /v1/groups: 502 Bad Gateway: non-JSON body (text/html, 5120 bytes, not echoed)",
   "KnowBe4 request failed (403 Forbidden) GET /v1/training/store_purchases: Forbidden; see https://api.example.com/v1/x?[REDACTED] for details",
-  "KnowBe4 request timed out after 30000ms: GET /v1/users?page=1&per_page=500",
-  "KnowBe4 request failed: GET /v1/account: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+  "KnowBe4 request failed after 4 attempts: GET /v1/users: timed out after 30000ms",
+  "KnowBe4 request failed after 4 attempts: POST /graphql (PhishER GraphQL): fetch failed",
+  "KnowBe4 request failed after 1 attempt: GET /v1/account: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
   "Using KnowBe4 region us (https://us.api.knowbe4.com).",
   "Regenerate the Reporting API key in the KnowBe4 console (Account Settings, API section) and confirm the region matches where the account is hosted.",
   "Config precedence resolved from: environment-api-token -> config-region -> config-file-present.",
@@ -3011,6 +3202,102 @@ test("silent success: a 2xx whose body is empty, an HTML page, or JSON of anothe
   await assert.rejects(() => account.client.getAccount(), /returned 200 OK with a JSON body that is not the documented JSON object \(one of name, type, domains, admins, subscription_level, subscription_end_date, number_of_seats, current_risk_score\) \(\d+ bytes, not echoed\)/);
   const phisher = httpKnowbe4(healthyFixture(), { routes: { [KB_PHISHER_ROUTE]: () => jsonResponse({ hello: "world" }) } });
   await assert.rejects(() => phisher.client.graphql("query { x }"), /returned 200 OK with a JSON body that is not the documented GraphQL response object \(data or errors\) \(\d+ bytes, not echoed\)/);
+});
+
+test("a list page that fails on every attempt leaves the inventory unread, so no check built on it passes and the bundle records the failure", async () => {
+  const padded = () => {
+    const fixture = healthyFixture();
+    // Twelve campaigns fill the ten-record first page of /v1/training/campaigns, so the walk asks for a second page.
+    for (let index = 1; index <= 10; index += 1) {
+      fixture.trainingCampaigns.push({ ...fixture.trainingCampaigns[0], campaign_id: 710 + index, name: `Refresher Wave ${index}` });
+    }
+    return fixture;
+  };
+  const retrying = (fixture, failPage, configOverrides = {}) => {
+    const sleeps = [];
+    const servePage = kbRoutes(fixture)["GET /v1/training/campaigns"];
+    let failedPageRequests = 0;
+    const routes = failPage
+      ? {
+        "GET /v1/training/campaigns": (url, pstId, init) => {
+          if (url.searchParams.get("page") === "1") return servePage(url);
+          failedPageRequests += 1;
+          return failPage(url, init);
+        },
+      }
+      : {};
+    const config = sampleConfig({ apiToken: KB_TEST_TOKEN, phisherApiToken: KB_PHISHER_TOKEN, ...configOverrides });
+    const client = new Knowbe4ApiClient(config, {
+      fetchImpl: kbRouter({ ...kbRoutes(fixture), ...routes }),
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
+      minRequestIntervalMs: 0,
+    });
+    return { client, config, sleeps, failedPageRequests: () => failedPageRequests };
+  };
+  const campaignsRow = (files) => JSON.parse(files.get("core_data/collection_status.json")).inventories.find((row) => row.inventory === "training_campaigns");
+
+  const healthy = retrying(padded());
+  const baselineFiles = readBundleFiles((await exportKnowbe4AuditBundle(healthy.client, healthy.config, createTempBase("grclanker-knowbe4-retry-baseline-"), { now: NOW })).outputDir);
+  const baselineRow = campaignsRow(baselineFiles);
+  assert.deepEqual({ status: baselineRow.status, complete: baselineRow.complete, seen: baselineRow.seen }, { status: "readable", complete: true, seen: 12 });
+  assert.deepEqual(healthy.sleeps, []);
+  assert.match([...baselineFiles.values()].join("\n"), /Refresher Wave 1\b/, "a complete read reports the first page's campaigns");
+  const baseline = JSON.parse(baselineFiles.get("analysis/findings.json"));
+
+  const cases = [
+    {
+      label: "a 503 on every attempt",
+      failPage: () => jsonResponse({ message: "Service Unavailable" }, { status: 503, statusText: "Service Unavailable" }),
+      config: {},
+      markerStatus: 503,
+      httpStatus: 503,
+      error: "KnowBe4 request failed after 4 attempts (503 Service Unavailable) GET /v1/training/campaigns: Service Unavailable",
+    },
+    {
+      label: "a timeout on every attempt",
+      failPage: (url, init) => neverAnswers(url, init),
+      config: { timeoutMs: 1 },
+      markerStatus: "error",
+      httpStatus: null,
+      error: "KnowBe4 request failed after 4 attempts: GET /v1/training/campaigns: timed out after 1ms",
+    },
+  ];
+  for (const { label, failPage, config, markerStatus, httpStatus, error } of cases) {
+    const failing = retrying(padded(), failPage, config);
+    const files = readBundleFiles((await exportKnowbe4AuditBundle(failing.client, failing.config, createTempBase("grclanker-knowbe4-retry-"), { now: NOW })).outputDir);
+    assert.equal(failing.failedPageRequests(), 4, `${label}: the second page is sent once and retried three times`);
+    assert.deepEqual(failing.sleeps, [1_000, 2_000, 4_000], label);
+
+    const marker = JSON.parse(files.get("core_data/training_campaigns.json"));
+    assert.deepEqual(
+      { collected: marker.collected, status: marker.status, endpoint: marker.endpoint, error: marker.error, reason: marker.reason },
+      { collected: false, status: markerStatus, endpoint: "GET /v1/training/campaigns", error, reason: "not_readable" },
+      `${label}: core_data carries a marker, not the first page's records`,
+    );
+    const row = campaignsRow(files);
+    assert.deepEqual(
+      { status: row.status, collected: row.collected, http_status: row.http_status, complete: row.complete, truncated: row.truncated, seen: row.seen },
+      { status: "not_readable", collected: false, http_status: httpStatus, complete: null, truncated: null, seen: null },
+      label,
+    );
+    assert.ok(files.get("_errors.log").split("\n").includes(`training_campaigns: ${error}`), `${label}:\n${files.get("_errors.log")}`);
+    assert.doesNotMatch([...files.values()].join("\n"), /Refresher Wave/, `${label}: no campaign from the page that did arrive is reported`);
+
+    const findings = JSON.parse(files.get("analysis/findings.json"));
+    const gated = findings.filter((finding) => (finding.evidence?.unreadable_inventories ?? []).some((gap) => gap.inventory === "training_campaigns"));
+    assert.ok(gated.length > 0, `${label}: the checks built on training campaigns name the unread inventory`);
+    for (const finding of gated) {
+      assert.notEqual(finding.status, "pass", `${label}: KNOWBE4-${finding.control} passed on an unread inventory: ${finding.summary}`);
+    }
+    for (const finding of findings) {
+      const before = baseline.find((item) => item.control === finding.control);
+      if (before.status === finding.status) continue;
+      assert.ok(["manual", "warn"].includes(finding.status), `${label}: KNOWBE4-${finding.control} moved ${before.status} -> ${finding.status}: ${finding.summary}`);
+    }
+    assert.ok(gated.some((finding) => baseline.find((item) => item.control === finding.control).status === "pass"), `${label}: a check that passed on the full inventory no longer does`);
+  }
 });
 
 test("verdict rule 10: an entry that is not a JSON object in the user, enrollment, or recipient walk keeps every check built on that list from passing, and the caveat names the page", async () => {

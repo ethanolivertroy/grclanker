@@ -20,7 +20,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
-import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
@@ -37,6 +37,8 @@ const DEFAULT_OUTPUT_DIR = "./export/tenable";
 const DEFAULT_CLOUD_URL = "https://cloud.tenable.com";
 const FEDRAMP_CLOUD_URL = "https://fedcloud.tenable.com";
 const DEFAULT_TIMEOUT_MS = 30_000;
+// An attempt may run this many times TENABLE_TIMEOUT; a body still arriving then is on a link too slow for another attempt to beat.
+const ATTEMPT_CAP_TIMEOUTS = 20;
 const DEFAULT_RETRY_LIMIT = 4;
 const DEFAULT_EXPORT_TIMEOUT_MS = 300_000;
 const DEFAULT_EXPORT_POLL_MS = 2_000;
@@ -1892,21 +1894,90 @@ function endpointLabel(method: string | undefined, path: string): string {
   return `${(method ?? "GET").toUpperCase()} ${path.startsWith("/") ? path : `/${path}`}`;
 }
 
-function retryDelayMs(response: Response, attempt: number): number {
+function retryDelayMs(response: Response, attempt: number, now: number): number {
   const retryAfter = response.headers.get("retry-after");
   if (retryAfter) {
     const seconds = Number(retryAfter);
     if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 30_000);
     const dateMs = Date.parse(retryAfter);
-    if (Number.isFinite(dateMs)) return Math.min(Math.max(dateMs - Date.now(), 250), 30_000);
+    if (Number.isFinite(dateMs)) return Math.min(Math.max(dateMs - now, 250), 30_000);
   }
+  return backoffMs(attempt);
+}
+
+function backoffMs(attempt: number): number {
   return Math.min(500 * 2 ** attempt, 15_000);
+}
+
+function attemptCount(attempts: number): string {
+  return `${attempts} attempt${attempts === 1 ? "" : "s"}`;
+}
+
+function minuteCount(ms: number): string {
+  const minutes = Math.round(ms / 6_000) / 10;
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
+/** Which of an attempt's limits ended it: TENABLE_TIMEOUT with nothing arriving, or the cap on the attempt as a whole. */
+type AttemptLimit = "gap" | "cap";
+
+/** One attempt: the answer read whole, or the error that ended it, the limit that fired, and the response when its headers had arrived. */
+type Attempt =
+  | { failed: false; response: Response; rawText: string }
+  | { failed: true; error: unknown; limit: AttemptLimit | undefined; response: Response | undefined };
+
+/** Settles as `promise` does, or rejects as soon as `stopped` aborts, so a fetch implementation that ignores its signal still stops. */
+function untilStopped<T>(promise: Promise<T>, stopped: AbortSignal): Promise<T> {
+  if (stopped.aborted) {
+    promise.catch(() => undefined);
+    return Promise.reject(stopped.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(stopped.reason);
+    stopped.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        stopped.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        stopped.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Reads a body piece by piece, calling `progressed` as each piece arrives. A response without a body stream is read whole. */
+async function readBody(response: Response, stopped: AbortSignal, progressed: () => void): Promise<string> {
+  const body = response.body;
+  if (!body) return await untilStopped(response.text(), stopped);
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const pieces: string[] = [];
+  let finished = false;
+  try {
+    for (;;) {
+      const { done, value } = await untilStopped(reader.read(), stopped);
+      if (done) {
+        finished = true;
+        pieces.push(decoder.decode());
+        return pieces.join("");
+      }
+      progressed();
+      pieces.push(decoder.decode(value, { stream: true }));
+    }
+  } finally {
+    if (!finished) reader.cancel().catch(() => undefined);
+  }
 }
 
 interface HttpClientOptions {
   fetchImpl?: FetchImpl;
   sleepImpl?: SleepImpl;
   retryLimit?: number;
+  /** The clock an HTTP-date Retry-After is measured against. */
+  now?: () => number;
   signal?: AbortSignal;
 }
 
@@ -1916,6 +1987,8 @@ abstract class TenableHttpClient {
   protected readonly fetchImpl: FetchImpl;
   protected readonly sleepImpl: SleepImpl;
   protected readonly retryLimit: number;
+  protected readonly now: () => number;
+  protected readonly signal?: AbortSignal;
   protected readonly secrets: string[];
 
   constructor(baseUrl: string, timeoutMs: number, secrets: string[], options: HttpClientOptions = {}) {
@@ -1924,6 +1997,8 @@ abstract class TenableHttpClient {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     this.retryLimit = options.retryLimit ?? DEFAULT_RETRY_LIMIT;
+    this.now = options.now ?? Date.now;
+    this.signal = options.signal;
     this.secrets = secrets;
   }
 
@@ -1972,43 +2047,94 @@ abstract class TenableHttpClient {
   protected async requestDocument(path: string, init: RequestInit = {}, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<TenableDocument> {
     const url = this.buildUrl(path, query);
     const endpoint = endpointLabel(init.method, path);
+    // A request that timed out or drew no answer may still have reached Tenable, so only a read is sent
+    // again: an export request sent twice could start a second export.
+    const resendUnanswered = (init.method ?? "GET").toUpperCase() === "GET";
     for (let attempt = 0; ; attempt += 1) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-      let response: Response;
-      try {
-        response = await this.fetchImpl(url, {
-          ...init,
-          headers: { accept: "application/json", ...this.authHeaders(), ...(init.headers as Record<string, string> | undefined ?? {}) },
-          signal: controller.signal,
-        });
-      } catch (error) {
-        clearTimeout(timer);
-        if (error instanceof ToolCallAbortedError) throw error;
-        const message = this.scrub(error instanceof Error ? error.message : String(error));
-        const aborted = (error instanceof Error && error.name === "AbortError") || /abort/i.test(message);
-        if (aborted) throw this.fail(`Tenable request ${endpoint} timed out after ${this.timeoutMs}ms.`, 0, endpoint);
-        if (attempt < this.retryLimit) {
-          await this.sleepImpl(Math.min(500 * 2 ** attempt, 15_000));
+      const sent = await this.send(url, init);
+      if (sent.failed) {
+        if (sent.limit !== "cap" && resendUnanswered && attempt < this.retryLimit) {
+          await this.sleepImpl(backoffMs(attempt));
           continue;
         }
-        throw this.fail(`Tenable request ${endpoint} failed without an HTTP response: ${message}`, 0, endpoint);
+        const notResent = !resendUnanswered
+          ? "; a POST that drew no complete answer is not sent again, since Tenable may already have acted on it"
+          : sent.limit === "cap" ? "; a GET cut off at the cap is not sent again, since another attempt would arrive just as slowly" : "";
+        throw this.fail(`Tenable request ${endpoint} failed after ${attemptCount(attempt + 1)}${this.describeFailedAttempt(sent)}${notResent}.`, 0, endpoint);
       }
-      clearTimeout(timer);
+      const { response, rawText } = sent;
 
-      if ((response.status === 429 || response.status >= 500) && attempt < this.retryLimit) {
-        await this.sleepImpl(retryDelayMs(response, attempt));
+      const retryable = response.status === 429 || response.status >= 500;
+      if (retryable && attempt < this.retryLimit) {
+        await this.sleepImpl(retryDelayMs(response, attempt, this.now()));
         continue;
       }
 
-      const rawText = await response.text();
       if (!response.ok) {
-        throw this.fail(`Tenable request ${endpoint} failed (${describeErrorBody(response, rawText, (text) => this.scrub(text))})`, response.status, endpoint);
+        const attempts = retryable ? ` after ${attemptCount(attempt + 1)}` : "";
+        throw this.fail(`Tenable request ${endpoint} failed${attempts} (${describeErrorBody(response, rawText, (text) => this.scrub(text))})`, response.status, endpoint);
       }
       const body = rawText.length === 0 ? undefined : parseJsonBody(rawText);
       if (body === undefined) throw this.nonDocument({ value: undefined, response, rawText, endpoint }, { kind: "document" });
       return { value: body.parsed, response, rawText, endpoint };
     }
+  }
+
+  /** The longest one attempt may run, however steadily its body arrives. */
+  private get attemptCapMs(): number {
+    return this.timeoutMs * ATTEMPT_CAP_TIMEOUTS;
+  }
+
+  /**
+   * One attempt. TENABLE_TIMEOUT bounds the wait for the headers and every gap between pieces of the body, so an
+   * export chunk of hundreds of MB that keeps arriving is not cut off by it while a body that stalls times out; the
+   * cap bounds the attempt as a whole. The call's abort is raced against the body read too, or an abort there would
+   * be reported as a timeout.
+   */
+  private async send(url: string, init: RequestInit): Promise<Attempt> {
+    const controller = new AbortController();
+    let response: Response | undefined;
+    let limit: AttemptLimit | undefined;
+    const stop = (reached: AttemptLimit) => {
+      limit ??= reached;
+      controller.abort();
+    };
+    let gap = setTimeout(() => stop("gap"), this.timeoutMs);
+    const cap = setTimeout(() => stop("cap"), this.attemptCapMs);
+    const progressed = () => {
+      clearTimeout(gap);
+      if (!controller.signal.aborted) gap = setTimeout(() => stop("gap"), this.timeoutMs);
+    };
+    try {
+      response = await untilStopped(this.fetchImpl(url, {
+        ...init,
+        headers: { accept: "application/json", ...this.authHeaders(), ...(init.headers as Record<string, string> | undefined ?? {}) },
+        signal: controller.signal,
+      }), controller.signal);
+      progressed();
+      const rawText = await unlessAborted(readBody(response, controller.signal, progressed), this.signal);
+      return { failed: false, response, rawText };
+    } catch (error) {
+      if (error instanceof ToolCallAbortedError) throw error;
+      return { failed: true, error, limit, response };
+    } finally {
+      clearTimeout(gap);
+      clearTimeout(cap);
+      // A body read the call's abort left running stops here instead of restarting the gap timer.
+      controller.abort();
+    }
+  }
+
+  /** Why an attempt drew no complete answer: the limit that ended it, or the transport error, before or after the headers arrived. */
+  private describeFailedAttempt(attempt: Extract<Attempt, { failed: true }>): string {
+    if (attempt.limit === "cap") {
+      return `: the response body was still arriving when the per-attempt cap of ${minuteCount(this.attemptCapMs)} ran out (the cap is ${ATTEMPT_CAP_TIMEOUTS} times TENABLE_TIMEOUT, so raising TENABLE_TIMEOUT or timeout_seconds raises it)`;
+    }
+    const { error, response } = attempt;
+    const message = this.scrub(error instanceof Error ? error.message : String(error)).replace(/\.+$/, "");
+    const stalled = attempt.limit === "gap" || (error instanceof Error && error.name === "AbortError") || /abort/i.test(message);
+    if (stalled) return response === undefined ? `: timed out after ${this.timeoutMs}ms` : `: timed out after ${this.timeoutMs}ms with no data while reading the response body`;
+    return response === undefined ? ` without an HTTP response: ${message}` : ` while reading the response body: ${message}`;
   }
 
   protected nonDocument(document: TenableDocument, expected: DocumentExpectation): TenableApiError {

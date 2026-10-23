@@ -33,6 +33,7 @@ Most lists arrive through WARNING/URL continuations or QPS searches that stop at
 - The tool only reads. QPS searches are POST requests that change nothing, and the OAuth mode's token request to the platform gateway is the only other POST.
 - Lists stop at 5000 records and 25 pages unless the list states another cap; hosts and detections stop at host_limit and detection_limit.
 - A refused or failed read never counts as an empty list: the checks that need it are manual and name the read, and when Qualys answers that a module is unavailable the finding says the module may be unlicensed or the role not permitted.
+- A throttled or failed read is retried before it counts as failed: HTTP 409, 429, and 5xx answers, timeouts, and network errors get up to QUALYS_MAX_RETRIES more attempts, each waiting as long as X-RateLimit-ToWait-Sec or Retry-After asks, up to 30 seconds. A read that still fails names its endpoint, the status or the timeout, and the number of attempts.
 - The knowledge base is looked up only for the QIDs of open detections, 200 QIDs per request and at most 2000 QIDs.
 - The WAS scan history search runs only for web applications the lookback scan search did not resolve, and is recorded as not collected when no web application needed it or when an earlier WAS read failed.
 - Agent activation keys are read only to tell whether one is present and are never exported.
@@ -433,7 +434,7 @@ Credential refresh: POST {gateway}/auth with the form fields username, password,
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| Qualys Security Inspector | Subscription-specific: responses report X-RateLimit-Limit calls per X-RateLimit-Window-Sec seconds and X-Concurrency-Limit-Limit concurrent calls. | `X-RateLimit-ToWait-Sec` | 409, 429, 500-599 | Retry 409, 429, every 5xx status, and network errors up to 3 times after the first attempt. Wait X-RateLimit-ToWait-Sec seconds when a retried response carries it as a number, otherwise 2, 4, then 8 seconds, capped at 30 seconds; Retry-After is ignored. Requests that time out (60 seconds by default) are not retried. |
+| Qualys Security Inspector | Subscription-specific: responses report X-RateLimit-Limit calls per X-RateLimit-Window-Sec seconds and X-Concurrency-Limit-Limit concurrent calls. | `X-RateLimit-ToWait-Sec`, `Retry-After` | 409, 429, 500-599 | Retry 409, 429, every 5xx status, requests that time out (60 seconds by default, and the timer covers reading the body), and network errors up to QUALYS_MAX_RETRIES times after the first attempt (3 by default). Every Qualys request only reads, the QPS search POSTs and the gateway token request included, so each one is retried. Wait X-RateLimit-ToWait-Sec seconds when a retried response carries it as a number, otherwise Retry-After as delta-seconds or as an HTTP date measured against the client clock, otherwise 2, 4, then 8 seconds, doubling for any further retry; every wait is capped at 30 seconds. A failed gateway token request is retried by its own retries only, never again around the read that needed the token. When the retries run out the read fails with the endpoint path, the HTTP status or the timeout, and the number of attempts. |
 
 ## Checks
 

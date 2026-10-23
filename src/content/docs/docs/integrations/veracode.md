@@ -164,6 +164,12 @@ A finding that reads an incomplete list never passes: `pass` drops to `warn` and
 
 Per-item sampling caps (`max_applications`, `max_workspaces`, `max_analyses`, ten scans per analysis, 200 API accounts) are stated the same way: `Only S of T <items> were sampled, so the verdict reflects a partial view`. They demote `pass` to `warn`.
 
+### Retries and timeouts
+
+A request answered with HTTP 429 or any 5xx status, a request that times out (`timeout_seconds` or `VERACODE_TIMEOUT`, 30 seconds by default, counted until the whole body has arrived), and a request that fails before its whole answer arrives are retried up to 3 times. Each retry waits as long as `Retry-After` asks (seconds or an HTTP date), cut to 30 seconds when it asks for more; without a usable header it waits 500, 1000, then 2000 milliseconds. A retry sent before a longer requested wait has passed may be throttled again, and that spends an attempt like any other failure. Any other 4xx answer is not retried.
+
+A request that still fails names its path, the status, the timeout, or the network error, and the number of attempts, for example `Veracode request failed after 4 attempts for /appsec/v1/applications: timed out after 30000ms`. The dataset it was reading is written as an [unread surface](#unread-surfaces), even when earlier pages of the same list were read, and the checks built on it follow the [verdict safety rules](#verdict-safety-rules), so none of them passes on the pages that did arrive.
+
 ### JSON document redaction
 
 Every JSON document passes through the same redaction before it is written:
