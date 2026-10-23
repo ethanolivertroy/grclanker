@@ -79,7 +79,7 @@ The response starts with the control's title, family, conformity cadence, relati
 - the number of assessment objectives, with the first five
 - each evidence request, with its artifact name and description
 
-The call fails if the control, its assessment objectives, or, with `framework`, the crosswalk cannot be read. Evidence requests are read one at a time. When some of them cannot be read, the control still comes back with the ones that were, and a closing warning such as `Warnings: 2 of 3 evidence request lookups failed, so the evidence request list is incomplete:` lists each missing request ID with its error.
+The call fails if the control, its assessment objectives, or, with `framework`, the crosswalk cannot be read. Each evidence request is a separate read. When some of them cannot be read, the control still comes back with the ones that were, and a closing warning such as `Warnings: 2 of 3 evidence request lookups failed, so the evidence request list is incomplete:` lists each missing request ID with its error.
 
 `control_id` ignores case. `framework` takes a framework ID or name, resolved the same way as in `scf_get_crosswalk`. A control ID that does not exist fails with `404 Not Found`.
 

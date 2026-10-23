@@ -35,7 +35,7 @@ Scores above 10% are usually worth fast triage. That note is part of the `kevs_g
 
 ## When a feed fails
 
-Each request to either feed gets up to four attempts, and each attempt times out after 30 seconds. A timeout, a network error, or a `429`, `500`, `502`, `503`, or `504` answer is retried after the wait the feed's `Retry-After` header asks for, or after 1, 2, and then 4 seconds when it names none. Any other error, such as `404`, is not retried, and neither is an answer that asks for a wait longer than 30 seconds. The final error names the feed URL without its query string, and the number of attempts. A failed read is never cached, so the next call tries the feed again.
+Each request to either feed gets up to four attempts, and each attempt times out after 30 seconds. A timeout, a network error, or a `429`, `500`, `502`, `503`, or `504` answer is retried after the wait the feed's `Retry-After` header asks for, or after 1, 2, and then 4 seconds when it names none. Any other error, such as `404`, is not retried, and neither is an answer that asks for a wait longer than 30 seconds. The final error names the feed URL without its query string and, when the request was retried, the number of attempts. A failed read is never cached, so the next call tries the feed again.
 
 When the retries run out:
 
