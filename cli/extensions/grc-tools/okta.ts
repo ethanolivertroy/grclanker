@@ -2380,6 +2380,10 @@ function transportFailure(error: unknown): string {
   return typeof code === "string" && /^[A-Z][A-Z0-9_]{1,40}$/.test(code) && !message.includes(code) ? `${message} (${code})` : message;
 }
 
+function attemptsSuffix(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
 interface OktaClientOptions {
   fetchImpl?: FetchImpl;
   signal?: AbortSignal;
@@ -2432,7 +2436,9 @@ export class OktaAuditorClient {
     }
 
     const pending = unlessAborted((async () => {
-      // Each attempt signs its own assertion: Okta refuses a client assertion whose jti it has already seen.
+      // Okta refuses a client assertion whose jti it has already seen, so each retry signs a new one. A prebuilt
+      // assertion cannot be re-signed, so it is sent once: resent after an attempt that reached Okta, it fails as invalid_client.
+      const prebuilt = Boolean(this.config.clientAssertion);
       const { response, text } = await this.send(`${this.config.orgUrl}${TOKEN_ENDPOINT_PATH}`, TOKEN_ENDPOINT_PATH, () => ({
         method: "POST",
         headers: {
@@ -2447,7 +2453,10 @@ export class OktaAuditorClient {
             "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
           client_assertion: buildClientAssertion(this.config),
         }).toString(),
-      }));
+      }), prebuilt ? 0 : DEFAULT_RATE_LIMIT_RETRIES).catch((error: unknown) => {
+        if (!prebuilt || !(error instanceof OktaApiError)) throw error;
+        throw new OktaApiError(`${error.message}. It was not retried because a prebuilt client_assertion can be used only once; rerun with a fresh one, or with a private key in its place.`, error.status, error.endpoint);
+      });
 
       if (!response.ok) {
         const detail = errorDetail(response, text);
@@ -2497,14 +2506,15 @@ export class OktaAuditorClient {
 
   /**
    * Sends one request and reads its body, retrying a 429 or transient 5xx answer, an attempt that runs past
-   * timeoutMs, and a transport failure up to DEFAULT_RATE_LIMIT_RETRIES times. The first other answer is
-   * returned whatever its status. Running out of retries throws an error naming the path (never the query),
-   * the last status or failure, and the attempt count. `init` is built per attempt.
+   * timeoutMs, and a transport failure up to `retries` times. The first other answer is returned whatever its
+   * status. Running out of retries throws an error naming the path (never the query), the last status or
+   * failure, and the attempt count when there was more than one. `init` is built per attempt.
    */
   private async send(
     url: string,
     endpoint: string,
     init: () => RequestInit,
+    retries = DEFAULT_RATE_LIMIT_RETRIES,
   ): Promise<{ response: Response; text: string }> {
     for (let attempt = 1; ; attempt += 1) {
       const requestInit = init();
@@ -2519,18 +2529,18 @@ export class OktaAuditorClient {
         if (!RETRYABLE_STATUSES.has(response.status)) return { response, text };
         const detail = errorDetail(response, text);
         status = response.status;
-        failure = `(${response.status} ${response.statusText}) after ${attempt} attempts${detail ? `: ${detail}` : ""}`;
+        failure = `(${response.status} ${response.statusText})${attemptsSuffix(attempt)}${detail ? `: ${detail}` : ""}`;
         waitMs = retryDelayFromResponse(response, attempt - 1, this.now(), this.jitter);
       } catch (error) {
         rethrowIfAborted(error);
         if (this.signal?.aborted) throw new ToolCallAbortedError(this.signal);
         const reason = timeout.signal.aborted ? `timed out after ${this.timeoutMs} ms` : `network error: ${transportFailure(error)}`;
-        failure = `(${reason}) after ${attempt} attempts`;
+        failure = `(${reason})${attemptsSuffix(attempt)}`;
         waitMs = backoffDelay(attempt - 1, this.jitter);
       } finally {
         clearTimeout(timer);
       }
-      if (attempt > DEFAULT_RATE_LIMIT_RETRIES) {
+      if (attempt > retries) {
         throw new OktaApiError(this.redactSecrets(`Okta API request failed for ${endpoint} ${failure}`), status, endpoint);
       }
       await this.sleep(waitMs);
