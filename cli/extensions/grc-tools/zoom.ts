@@ -733,6 +733,7 @@ function zoomErrorSummary(payload: unknown): string | undefined {
 }
 
 export class ZoomApiError extends Error {
+  /** The last HTTP status, or 0 when the last attempt got no response (it timed out or the network failed). */
   readonly status: number;
   readonly retryAfterMs?: number;
   readonly rejection?: ZoomCredentialRejection;
@@ -949,6 +950,7 @@ export class ZoomApiClient {
   private accessToken?: string;
   private accessTokenExpiresAt = 0;
   private accessTokenPromise?: Promise<string>;
+  private accessTokenFailure?: unknown;
 
   constructor(
     config: ZoomResolvedConfig,
@@ -1139,15 +1141,23 @@ export class ZoomApiClient {
     return accessToken;
   }
 
+  /**
+   * A token exchange that failed, after its own retries, fails every later request of this client at once: the
+   * collectors read surface after surface, so a down token endpoint would otherwise cost one retry sequence each.
+   */
   private async getAccessToken(): Promise<string> {
     if (this.accessToken && this.now() < this.accessTokenExpiresAt) {
       return this.accessToken;
     }
+    if (this.accessTokenFailure) throw this.accessTokenFailure;
     if (!this.accessTokenPromise) {
       this.accessTokenPromise = this.fetchAccessToken();
     }
     try {
       return await this.accessTokenPromise;
+    } catch (error) {
+      if (!(error instanceof ToolCallAbortedError)) this.accessTokenFailure = error;
+      throw error;
     } finally {
       this.accessTokenPromise = undefined;
     }
@@ -1323,7 +1333,7 @@ async function captureSurface<T>(
       docUrl,
       status: isDeniedError(error) ? "denied" : "error",
       error: errorMessage(error),
-      httpStatus: error instanceof ZoomApiError ? error.status : undefined,
+      httpStatus: error instanceof ZoomApiError && error.status > 0 ? error.status : undefined,
       ...(rejection ? { rejection } : {}),
     };
   }

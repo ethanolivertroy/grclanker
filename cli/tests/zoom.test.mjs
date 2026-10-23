@@ -766,6 +766,23 @@ test("ZoomApiClient retries the OAuth token exchange and fails closed naming POS
   });
   assert.equal(exhausted.calls.length, 4, "the request the token serves does not retry the exhausted exchange again");
   assert.ok(exhausted.calls.every((call) => call.pathname === "/oauth/token"));
+  await assert.rejects(exhausted.client.listRoles(), /POST \/oauth\/token \(502 Bad Gateway\) after 4 attempts/);
+  assert.equal(exhausted.calls.length, 4, "a later request fails with the same token failure instead of exchanging again");
+});
+
+test("a Zoom token endpoint that stays down costs one retry sequence and fails every surface closed naming it", async () => {
+  const { client, calls } = zoomRetryHarness([
+    () => jsonResponse({ reason: "unavailable" }, { status: 503, statusText: "Service Unavailable" }),
+  ], { config: ZOOM_RETRY_OAUTH });
+  const snapshot = await collectZoomSnapshot(client, { now: NOW });
+  assert.equal(calls.length, 4);
+  assert.ok(calls.every((call) => call.pathname === "/oauth/token"));
+  for (const surface of [snapshot.currentUser, snapshot.users, snapshot.roles, snapshot.groups, snapshot.operationLogs]) {
+    assert.equal(surface.status, "error", surface.name);
+    assert.equal(surface.data, undefined, surface.name);
+    assert.match(surface.error, /^Zoom request failed for POST \/oauth\/token \(503 Service Unavailable\) after 4 attempts: unavailable/, surface.name);
+    assert.equal(surface.httpStatus, 503, surface.name);
+  }
 });
 
 test("ZoomApiClient retries a request or body read that outlives the timeout and names the timeout when every attempt does", async () => {
@@ -786,6 +803,14 @@ test("ZoomApiClient retries a request or body read that outlives the timeout and
   const slowBody = zoomRetryHarness([() => new Response(new ReadableStream({ start() {} }), { status: 200 })], { timeoutMs: 20 });
   await assert.rejects(slowBody.client.getCurrentUser(), /Zoom request failed for GET \/v2\/users\/me after 4 attempts: timed out after 20 ms$/);
   assert.equal(slowBody.calls.length, 4, "the deadline covers reading the body");
+
+  const surfaced = await collectZoomSnapshot(zoomRetryHarness([zoomNeverSettles], { timeoutMs: 20 }).client, {
+    now: NOW,
+    include: { identity: false, collaboration: false, meeting: false },
+  });
+  assert.equal(surfaced.currentUser.status, "error");
+  assert.equal(surfaced.currentUser.error, "Zoom request failed for GET /v2/users/me after 4 attempts: timed out after 20 ms");
+  assert.equal(surfaced.currentUser.httpStatus, undefined, "a request that got no response reports no HTTP status");
 });
 
 test("ZoomApiClient retries network failures and names only the system error code", async () => {
