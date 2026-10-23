@@ -1049,6 +1049,28 @@ test("GitHubAuditorClient fails closed at once when the server asks for a wait p
       status: 403,
       note: /the rate limit resets at 2026-10-23T13:00:00\.000Z, beyond the 60 s retry cap/,
     },
+    {
+      label: "Retry-After delta-seconds past the latest representable date",
+      response: () => jsonResponse({ message: "Too Many Requests" }, { "retry-after": "100000000000000" }, 429),
+      status: 429,
+      note: /Retry-After asks for a wait past the latest representable date, beyond the 60 s retry cap$/,
+    },
+    {
+      label: "Retry-After delta-seconds too long for a number",
+      response: () => jsonResponse({ message: "Too Many Requests" }, { "retry-after": "9".repeat(400) }, 429),
+      status: 429,
+      note: /Retry-After asks for a wait past the latest representable date, beyond the 60 s retry cap$/,
+    },
+    {
+      label: "primary rate limit reset past the latest representable date",
+      response: () => jsonResponse(
+        { message: "API rate limit exceeded for installation ID 1." },
+        { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "100000000000000" },
+        403,
+      ),
+      status: 403,
+      note: /the rate limit resets past the latest representable date, beyond the 60 s retry cap$/,
+    },
   ];
   for (const { label, response, status, note } of cases) {
     const { fetchImpl, requests } = sequenceFetch([response]);

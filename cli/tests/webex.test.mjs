@@ -1083,6 +1083,22 @@ test("a Webex Retry-After beyond 60 s fails closed at once and names the reset t
   }
 });
 
+test("a Webex Retry-After that ends past the latest representable date fails closed with a WebexApiError", async () => {
+  for (const header of ["100000000000000", "9".repeat(400)]) {
+    const { client, calls, waits } = webexRetryHarness([
+      () => jsonResponse({ message: "rate limited" }, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": header } }),
+    ]);
+    await assert.rejects(client.listPeople(), (error) => {
+      assert.ok(error instanceof WebexApiError);
+      assert.equal(error.status, 429);
+      assert.equal(error.message, "Webex request failed (429 Too Many Requests) for /v1/people after 1 attempt: rate limited; Retry-After asks for a wait past the latest representable date, beyond the 60 s retry cap");
+      return true;
+    });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(waits, []);
+  }
+});
+
 test("WebexApiClient retry exhaustion names the path, the last status, and the attempt count, never a query value or a credential", async () => {
   const { client, calls, waits } = webexRetryHarness([webexUnavailable]);
   await assert.rejects(client.get("/people", { email: "CANARY-QUERY-EMAIL-84@example.com", cursor: "CANARY-PAGE-CURSOR-85" }), (error) => {

@@ -1381,6 +1381,13 @@ function parseRetryAfterMs(header: string | null, now: number): number | undefin
   return Number.isFinite(date) ? Math.max(date - now, 0) : undefined;
 }
 
+// Retry-After delta-seconds and x-ratelimit-reset have no upper bound, and toISOString throws a
+// RangeError for a time past the latest one a Date holds (+275760-09-13), so such a time is described.
+function describeServerTime(preposition: "until" | "at", epochMs: number): string {
+  const time = new Date(epochMs);
+  return Number.isNaN(time.getTime()) ? "past the latest representable date" : `${preposition} ${time.toISOString()}`;
+}
+
 function retryBackoffMs(attempt: number): number {
   return Math.min(BASE_RETRY_BACKOFF_MS * 2 ** (attempt - 1), MAX_RETRY_BACKOFF_MS);
 }
@@ -1421,14 +1428,14 @@ function decideRetry(response: Response, rawText: string, attempt: number, now: 
   const retryAfter = parseRetryAfterMs(headerValue(response, "retry-after"), now);
   if (retryAfter !== undefined) {
     return retryAfter > MAX_RETRY_WAIT_MS
-      ? { kind: "over_cap", note: `Retry-After asks for a wait until ${new Date(now + retryAfter).toISOString()}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap` }
+      ? { kind: "over_cap", note: `Retry-After asks for a wait ${describeServerTime("until", now + retryAfter)}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap` }
       : { kind: "wait", ms: retryAfter, rateLimited };
   }
   const reset = Number.parseInt(headerValue(response, "x-ratelimit-reset") ?? "", 10);
   if (rateLimited && headerValue(response, "x-ratelimit-remaining") === "0" && Number.isFinite(reset)) {
     const resetMs = Math.max(reset * 1000 - now, 0);
     return resetMs > MAX_RETRY_WAIT_MS
-      ? { kind: "over_cap", note: `the rate limit resets at ${new Date(reset * 1000).toISOString()}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap` }
+      ? { kind: "over_cap", note: `the rate limit resets ${describeServerTime("at", reset * 1000)}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap` }
       : { kind: "wait", ms: resetMs, rateLimited };
   }
   if (rateLimited) {
