@@ -50,6 +50,10 @@ The cache status is one of:
 - `cached`: read from the cache
 - `stale`: GitHub was unreachable, so an expired cache was served, with a note saying why
 
+Each GitHub read gets up to four attempts, and each attempt times out after 30 seconds. A timeout, a network error, or a `429`, `500`, `502`, `503`, or `504` answer is retried after the wait the `Retry-After` header asks for, or after 1, 2, and then 4 seconds. When the GitHub API rate limit is used up, a read waits for `Retry-After`, or for the `x-ratelimit-reset` time, if that is 30 seconds away or less. Otherwise it fails at once with the reset time. An expired cache is served as `stale` only after the retries run out.
+
+The blob SHA, file URL, and repository update time come from the GitHub API rather than the rules file. When that read fails, the rules still load, those fields show as unavailable, and a note says why.
+
 To force a fresh copy, ask for a source check with a refresh:
 
 ```text
@@ -72,6 +76,8 @@ fedramp_get_ksi {"query":"KSI-CNA-EIS"}
 ```
 
 Search looks at IDs, names, and statement text. Exact matches rank first, then matches at the start of a field, then matches anywhere, then results that contain every word of the query. `section` narrows results to `definition`, `process`, `requirement`, or `ksi`. `limit` defaults to 10 and accepts 1 to 50.
+
+A search that finds nothing still ends with the source line, followed by any notes. A miss from a `stale` cache says so, and says why the refresh failed, because a newer rules version might match.
 
 A requirement lookup returns the full statement, its keyword (such as MUST or SHOULD), the rule subset, checklist items, terms, notes, and dated updates. A KSI lookup returns the indicator text for each certification class and the Rev5 controls it maps to, such as `si-7.1`.
 
@@ -244,7 +250,7 @@ Both generators write under `./export/fedramp` in the working directory unless `
 
 ## Troubleshooting
 
-- **The supporting source shows as unavailable with a 403.** The repository check uses the unauthenticated GitHub API, which allows 60 requests an hour. The rules file comes from `raw.githubusercontent.com` and still loads. Only metadata such as the blob SHA shows as unavailable until the limit resets.
+- **The supporting source shows as unavailable with a 403.** The repository check uses the unauthenticated GitHub API, which allows 60 requests an hour. The rules file comes from `raw.githubusercontent.com` and still loads. Only metadata such as the blob SHA shows as unavailable until the limit resets, and `fedramp_check_sources` lists a note saying when to retry.
 - **The cache status is `stale`.** GitHub could not be reached, so the last cached copy was used. Run `fedramp_check_sources {"refresh":true}` once the network is back.
 - **A query matched multiple items.** Use the full ID, such as `CDS-CSO-PUB` or `KSI-CNA-EIS`, or one of the candidate names from the error.
 - **A generator refuses the output directory.** The path is a symlink or an existing file. Pass a plain directory in `output_dir`.

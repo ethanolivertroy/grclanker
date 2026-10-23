@@ -34,6 +34,8 @@ The tools read a static JSON API at [hackidle.github.io/scf-api](https://hackidl
 
 Each response is cached in memory for 24 hours, so repeat lookups in one session do not refetch. Nothing is written to disk, and the cache starts empty each time `grclanker` starts. There is no offline copy, so the tools need to reach `hackidle.github.io`.
 
+Each request gets up to four attempts, and each attempt times out after 30 seconds. A timeout, a network error, or a `429`, `500`, `502`, `503`, or `504` answer is retried after the wait the API's `Retry-After` header asks for, or after 1, 2, and then 4 seconds. A `404` is not retried. A failed read is never cached.
+
 Results follow the SCF release the API serves, so mappings and counts can differ from the examples on this page.
 
 ## Search controls
@@ -76,6 +78,8 @@ The response starts with the control's title, family, conformity cadence, relati
 - with `framework`, the mapped controls in that framework, here `AC-02`, or a note that there are none
 - the number of assessment objectives, with the first five
 - each evidence request, with its artifact name and description
+
+The call fails if the control, its assessment objectives, or, with `framework`, the crosswalk cannot be read. Evidence requests are read one at a time. When some of them cannot be read, the control still comes back with the ones that were, and a closing warning such as `Warnings: 2 of 3 evidence request lookups failed, so the evidence request list is incomplete:` lists each missing request ID with its error.
 
 `control_id` ignores case. `framework` takes a framework ID or name, resolved the same way as in `scf_get_crosswalk`. A control ID that does not exist fails with `404 Not Found`.
 
@@ -175,7 +179,8 @@ The FedRAMP, SCF, and OSCAL tools chain together. This path starts from a KSI an
 - **"matched multiple SCF frameworks."** Pass one of the listed IDs as `framework`.
 - **"No SCF framework matched."** The name is not in SCF's framework list. SOC 2, for example, appears as Trust Services Criteria (TSC) (2017), so use `TSC` or `general-aicpa-tsc-2017`.
 - **"Fetch failed: ... (404 Not Found)."** The control or evidence request ID does not exist. Search for the control, or check the ID's shape, such as `IAC-15.1` or `E-IAM-07`.
-- **Any other fetch failure.** The API was unreachable. The tools keep no offline copy, so retry once the network is back.
+- **Any other fetch failure.** The API could not be read, even after the retries described in [Where the data comes from](#where-the-data-comes-from). The tools keep no offline copy, so try again once the network is back.
+- **A control ends with "the evidence request list is incomplete".** The listed evidence requests could not be read. Look each one up with `scf_get_evidence_request` once the API answers again.
 
 ## Related
 
