@@ -5,7 +5,7 @@ description: Read-only Snowflake security posture checks over the SQL REST API w
 
 The Snowflake integration runs read-only `SHOW` commands and `SNOWFLAKE.ACCOUNT_USAGE` queries through the Snowflake SQL REST API. It turns the results into normalized findings for the 25 controls in the [Snowflake Security Inspector spec](/specs/snowflake-sec-inspector/), with FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP mappings.
 
-It never issues `CREATE`, `ALTER`, `DROP`, `GRANT`, or `USE ROLE`. The client rejects any statement that does not start with `SHOW`, `DESCRIBE`, `SELECT`, `WITH`, or `EXPLAIN`.
+It never issues `CREATE`, `ALTER`, `DROP`, `GRANT`, or `USE ROLE`. The client rejects any statement that does not start with `SHOW`, `DESCRIBE`, `DESC`, `SELECT`, `WITH`, or `EXPLAIN`.
 
 ## What it inspects
 
@@ -138,7 +138,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 A rerun allocates a new `-2`, `-3` directory and archive instead of overwriting.
 
-All tools accept the same authentication arguments: `account`, `user`, `private_key_path`, `private_key`, `private_key_passphrase`, `token`, `token_type`, `role`, `warehouse`, `database`, `schema`, `base_url`, `connection`, `timeout_seconds`, `statement_timeout_seconds`, and `row_limit`.
+All tools accept the same connection arguments: `account`, `user`, `private_key_path`, `private_key`, `private_key_passphrase`, `token`, `token_type`, `role`, `warehouse`, `database`, `schema`, `base_url`, `connection`, `timeout_seconds`, `statement_timeout_seconds`, `poll_interval_ms` (default 1000), `max_retries` (default 3), `retry_base_ms` (default 500), `max_partitions` (default 50), and `row_limit`.
 
 The assessment and export tools add thresholds:
 

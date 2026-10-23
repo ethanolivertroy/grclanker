@@ -175,7 +175,7 @@ The audit bundle writes one report per framework under `compliance/`. It also wr
 KNOWBE4_API_TOKEN=... KNOWBE4_REGION=us npm --prefix cli run test:knowbe4:live
 ```
 
-The script skips with exit code 0 when no Reporting API key or config file is present. Otherwise it runs `knowbe4_check_access` and the account governance assessment with PII redaction enabled. It prints the readable surfaces, the five governance findings, and the number of API requests consumed.
+The script skips with exit code 0 when no Reporting API key or config file is present. Otherwise it runs `knowbe4_check_access` and stops with exit code 1 unless the status is `healthy`. When the status is `healthy`, it runs the account governance assessment with PII redaction enabled. It prints the readable surfaces, the five governance findings, and the number of API requests consumed.
 
 ## Limitations and manual controls
 

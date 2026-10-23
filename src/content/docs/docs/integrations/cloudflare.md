@@ -147,7 +147,7 @@ CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... npm --prefix cli run test:clo
 
 The script exits 0 with a skip message when neither `CLOUDFLARE_API_TOKEN` nor the `CLOUDFLARE_EMAIL` + `CLOUDFLARE_API_KEY` pair is set.
 
-Otherwise it runs the access check and one zone security assessment on up to three zones.
+Otherwise it runs the access check and stops with exit code 1 unless the status is `healthy`. When the status is `healthy`, it runs one zone security assessment on up to three zones.
 
 ## Limitations and manual controls
 

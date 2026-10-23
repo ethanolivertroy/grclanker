@@ -246,7 +246,7 @@ export DD_SITE="datadoghq.com"   # or datadoghq.eu, us3, us5, ap1, ddog-gov.com
 npm --prefix cli run test:datadog:live
 ```
 
-The script prints a skip message and exits 0 when `DD_API_KEY` or `DD_APP_KEY` is missing. Otherwise it runs `datadog_check_access` and the identity assessment against the real organization and prints each surface and finding.
+The script prints a skip message and exits 0 when the API key (`DD_API_KEY` or `DATADOG_API_KEY`) or the application key (`DD_APP_KEY`, `DD_APPLICATION_KEY`, or `DATADOG_APP_KEY`) is missing. Otherwise it runs `datadog_check_access` and the identity assessment against the real organization and prints each surface and finding. If the access check reports `failed`, the script stops with exit 1 before the assessment.
 
 ## Limitations and manual controls
 

@@ -119,7 +119,7 @@ The export bundle writes `compliance/unified_compliance_matrix.md` plus one repo
 npm --prefix cli run test:veracode:live
 ```
 
-The script skips with exit code 0 when no credentials are configured. Otherwise it runs `veracode_check_access` and the policy compliance assessment against the real tenant. If the access check reports `failed`, the script stops with exit code 1 before the assessment and prints the check's next step.
+The script skips with exit code 0 when no credentials are configured. Otherwise it runs `veracode_check_access` and the policy compliance assessment against the real tenant. If the access check reports `failed`, the script stops with exit code 1 before the assessment and prints the check's next step. If the access check reports `limited`, the assessment still runs and the script then exits with code 1.
 
 ## Limitations and manual controls
 

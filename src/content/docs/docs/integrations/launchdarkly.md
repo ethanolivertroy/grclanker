@@ -339,7 +339,7 @@ So every fixed message and every finding summary, manual-evidence instruction, a
 
 A truncated listing never produces a `pass` either.
 
-Every paginated collection (members, teams, team roles, custom roles, access tokens, projects, environments, SDK keys, flags) is fetched up to its `*_limit` argument. The client reports whether more items remained: `_links.next` still present, or `totalCount` above the collected count.
+Members, teams, custom roles, access tokens, projects, environments, and flags are fetched up to their `*_limit` arguments (`member_limit`, `team_limit`, `role_limit`, `token_limit`, `project_limit`, `environment_limit`, `flag_limit`). Team role listings are capped at 200 per team and SDK key listings at 100 per environment, and no argument changes either cap. Some assessments always read a listing at its default cap, in the export bundle too: access control reads members at 1,000, environment governance reads custom roles at 200, and flag hygiene and monitoring read environments at 50 per project. The client reports whether more items remained: `_links.next` still present, or `totalCount` above the collected count.
 
 Every exit that can leave items behind is flagged:
 
@@ -366,7 +366,7 @@ The cap argument is not offered as the remedy, because raising it cannot help.
 When a finding depends on a truncated collection:
 
 - A clean verdict becomes `warn`.
-- The summary ends with `Truncated listing: <collection> (<seen> of <total> collected)` plus the argument to raise.
+- The summary ends with `Truncated listing: <collection> (<seen> of <total> collected)` plus the argument to raise. When no argument applies (SDK keys, the single-request listings, or a listing that stopped for another reason), it says to review the uncollected items manually instead.
 - The evidence carries `truncated_collections` with the seen versus total counts.
 
 Failing verdicts stay `fail`.

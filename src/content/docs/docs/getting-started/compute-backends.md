@@ -30,7 +30,7 @@ Model/provider settings still decide which LLM answers questions. Compute backen
 
 | Kind | Bucket | State | Runtime path | Snapshot / restore | GPU | Workspace staging | Artifact sync-back |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `host` | host | shipped | Pi's native local shell operations wrapped in the output redaction guard (the `createHostBackend` contract adapter is exercised by tests and `env list` only) | no | no | in place | in place |
+| `host` | host | shipped | Pi's native local shell operations wrapped in the output redaction guard (the `createHostBackend` contract adapter is exercised by unit tests only) | no | no | in place | in place |
 | `sandbox-runtime` | sandboxed | shipped | contract adapter for bash, grep, and find; file tools stay local with the same FS policy | no | no | in place | in place |
 | `docker` | sandboxed | shipped | contract adapter over `docker run` | no | no | bind mount | bind mount |
 | `parallels-vm` | sandboxed | shipped | contract adapter (disposable clone, `prlctl exec`) | yes (`prlctl snapshot`, `prlctl snapshot-switch`), exercised by `env smoke-test` | no | shared folder | shared folder |

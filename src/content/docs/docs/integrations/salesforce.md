@@ -124,7 +124,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 - `_errors.log`, when collection partially failed.
 - A zip named after the allocated output directory.
 
-All tools accept the connection arguments: `instance_url`, `login_url`, `username`, `password`, `security_token`, `consumer_key`, `consumer_secret`, `private_key_file`, `refresh_token`, `access_token`, `credentials_file`, `api_version`, `sandbox`, and `timeout_seconds` (default 30).
+All tools accept the connection arguments: `instance_url`, `login_url`, `username`, `password`, `security_token`, `consumer_key`, `consumer_secret`, `private_key_file`, `private_key`, `refresh_token`, `access_token`, `credentials_file`, `api_version`, `sandbox`, and `timeout_seconds` (default 30).
 
 The assessment and export tools add `record_limit` (default 2000 rows per SOQL dataset). Tool-specific options:
 

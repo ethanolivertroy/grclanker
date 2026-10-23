@@ -221,7 +221,7 @@ The `manual` cases are:
 npm --prefix cli run test:paloalto:live
 ```
 
-The script exits 0 with a skip message when neither product is configured. Otherwise it runs `paloalto_check_access` and one assessment: cloud posture when Prisma Cloud is configured, firewall policy otherwise. If the access check reports `failed`, the script stops with exit 1 before the assessment and prints the check's next step.
+The script exits 0 with a skip message unless `PRISMA_ACCESS_KEY_ID` and `PRISMA_SECRET_KEY`, or `PANOS_HOST` with `PANOS_API_KEY` (or `PANOS_USERNAME` and `PANOS_PASSWORD`), are set in the environment; a configuration file alone does not start it. Otherwise it runs `paloalto_check_access` and one assessment: cloud posture when Prisma Cloud is configured, firewall policy otherwise. If the access check reports `failed`, the script stops with exit 1 before the assessment and prints the check's next step. It also stops with exit 1 when the check reports `unconfigured`.
 
 ## Limitations
 
