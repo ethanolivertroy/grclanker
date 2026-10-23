@@ -60,6 +60,13 @@ interface EpssResponse {
   data: EpssEntry[];
 }
 
+interface EpssLookup {
+  scores: Map<string, EpssEntry>;
+  /** CVE IDs whose request failed: their scores are unknown, which is not the same as unscored. */
+  unavailable: Set<string>;
+  errors: string[];
+}
+
 type SearchArgs = { query: string; limit?: number };
 type EpssArgs = { cve_ids: string[] };
 type RecentArgs = { days?: number; limit?: number };
@@ -216,7 +223,8 @@ function normalizeRansomwareArgs(args: unknown): RansomwareArgs {
   return {};
 }
 
-function formatKev(vulnerability: KevVulnerability, epss?: EpssEntry): string {
+function formatKev(vulnerability: KevVulnerability, lookup: EpssLookup): string {
+  const epss = lookup.scores.get(vulnerability.cveID);
   const lines = [
     `${vulnerability.cveID} - ${vulnerability.vulnerabilityName}`,
     `  Vendor:      ${vulnerability.vendorProject}`,
@@ -239,6 +247,8 @@ function formatKev(vulnerability: KevVulnerability, epss?: EpssEntry): string {
       `  EPSS:        ${score}% probability (${percentile}th percentile)` +
         (scoreDate ? `, scored ${scoreDate}` : ""),
     );
+  } else if (lookup.unavailable.has(vulnerability.cveID)) {
+    lines.push("  EPSS:        Unavailable (the EPSS API request failed)");
   }
 
   if (vulnerability.notes) {
@@ -248,11 +258,13 @@ function formatKev(vulnerability: KevVulnerability, epss?: EpssEntry): string {
   return lines.join("\n");
 }
 
-async function fetchEpss(cveIds: string[], signal?: AbortSignal): Promise<Map<string, EpssEntry>> {
-  const scores = new Map<string, EpssEntry>();
-  if (cveIds.length === 0) {
-    return scores;
-  }
+/**
+ * Scores the CVE IDs in batches of 100. A batch that still fails after the
+ * shared fetch's retries does not fail the KEV tools, which stand without EPSS,
+ * but its CVE IDs are recorded as unavailable so no tool reports them unscored.
+ */
+async function fetchEpss(cveIds: string[], signal?: AbortSignal): Promise<EpssLookup> {
+  const lookup: EpssLookup = { scores: new Map(), unavailable: new Set(), errors: [] };
 
   for (let index = 0; index < cveIds.length; index += 100) {
     const batch = cveIds.slice(index, index + 100);
@@ -260,17 +272,43 @@ async function fetchEpss(cveIds: string[], signal?: AbortSignal): Promise<Map<st
 
     try {
       const data = await throttledFetch<EpssResponse>(url, 100, signal);
+      if (!Array.isArray(data?.data)) {
+        throw new Error(`EPSS response from ${EPSS_URL} has no data list`);
+      }
       for (const entry of data.data) {
-        scores.set(entry.cve, entry);
+        lookup.scores.set(entry.cve, entry);
       }
     } catch (error) {
       rethrowIfAborted(error);
       if (signal?.aborted) throw error;
-      // EPSS enrichment is best-effort. Keep the base KEV response working.
+      for (const cveId of batch) lookup.unavailable.add(cveId);
+      const reason = error instanceof Error ? error.message : String(error);
+      if (!lookup.errors.includes(reason)) lookup.errors.push(reason);
     }
   }
 
-  return scores;
+  return lookup;
+}
+
+function epssFailureReasons(lookup: EpssLookup): string {
+  return lookup.errors.join("; ").replace(/\.$/, "");
+}
+
+/** The closing paragraph of a KEV listing whose EPSS enrichment lost a batch, or "" when every score was read. */
+function epssGapNote(lookup: EpssLookup, entryCount: number): string {
+  const missing = lookup.unavailable.size;
+  if (missing === 0) return "";
+  return (
+    `\n\nEPSS enrichment is incomplete: scores are unavailable for ${missing} of ${entryCount} ` +
+    `entr${entryCount === 1 ? "y" : "ies"} because the EPSS API request failed: ${epssFailureReasons(lookup)}. ` +
+    "Those entries are not known to be unscored."
+  );
+}
+
+function epssGapDetails(lookup: EpssLookup): Record<string, unknown> {
+  return lookup.unavailable.size === 0
+    ? {}
+    : { epss_incomplete: true, epss_unavailable: [...lookup.unavailable], epss_errors: lookup.errors };
 }
 
 function epssScoreDates(
@@ -343,8 +381,8 @@ export function registerKevsTools(pi: any): void {
         }
 
         const matchedCveIds = matches.map((vulnerability) => vulnerability.cveID);
-        const epssScores = await fetchEpss(matchedCveIds, signal);
-        const scoreDates = epssScoreDates(epssScores, matchedCveIds);
+        const epss = await fetchEpss(matchedCveIds, signal);
+        const scoreDates = epssScoreDates(epss.scores, matchedCveIds);
         const heading = capped
           ? `Showing ${matches.length} of ${allMatches.length} KEV entries matching "${args.query}" ` +
             `(catalog size: ${catalog.count}). Results are capped at ${MAX_SEARCH_LIMIT}; ` +
@@ -356,15 +394,15 @@ export function registerKevsTools(pi: any): void {
               `(catalog size: ${catalog.count}):`;
         return textResult(
           `${heading}\n\n` +
-            matches
-              .map((vulnerability) => formatKev(vulnerability, epssScores.get(vulnerability.cveID)))
-              .join("\n\n"),
+            matches.map((vulnerability) => formatKev(vulnerability, epss)).join("\n\n") +
+            epssGapNote(epss, matches.length),
           {
             query: args.query,
             count: matches.length,
             ...(truncated ? { total_matches: allMatches.length } : {}),
             ...(capped ? { capped: true } : {}),
             ...(Object.keys(scoreDates).length > 0 ? { epss_score_dates: scoreDates } : {}),
+            ...epssGapDetails(epss),
           },
         );
       } catch (error) {
@@ -397,22 +435,39 @@ export function registerKevsTools(pi: any): void {
       }
 
       try {
-        const epssScores = await fetchEpss(args.cve_ids, signal);
+        const epss = await fetchEpss(args.cve_ids, signal);
+        const incomplete = epss.unavailable.size > 0;
+        const gapDetails = incomplete
+          ? { incomplete: true, unavailable: [...epss.unavailable], epss_errors: epss.errors }
+          : {};
 
-        if (epssScores.size === 0) {
+        if (args.cve_ids.every((cveId) => epss.unavailable.has(cveId))) {
+          const count = epss.unavailable.size;
+          const scope =
+            count === 1
+              ? "The score for this CVE ID is unavailable, which does not mean it is unscored."
+              : `Scores for all ${count} CVE IDs are unavailable, which does not mean they are unscored.`;
+          return errorResult(`EPSS API error: ${epssFailureReasons(epss)}. ${scope}`, {
+            cve_ids: args.cve_ids,
+            count: 0,
+            ...gapDetails,
+          });
+        }
+
+        if (epss.scores.size === 0 && !incomplete) {
           return textResult(
             "No EPSS scores found for the provided CVE IDs. They may be too new or not yet scored.",
             { cve_ids: args.cve_ids, count: 0 },
           );
         }
 
-        const scoreDates = epssScoreDates(epssScores, args.cve_ids);
+        const scoreDates = epssScoreDates(epss.scores, args.cve_ids);
         const hasScoreDates = Object.keys(scoreDates).length > 0;
         const rows = args.cve_ids.map((cveId) => {
-          const entry = epssScores.get(cveId);
+          const entry = epss.scores.get(cveId);
           const dateColumn = hasScoreDates ? [scoreDates[cveId] ?? "N/A"] : [];
           if (!entry) {
-            return [cveId, "Not scored", "N/A", ...dateColumn];
+            return [cveId, epss.unavailable.has(cveId) ? "Unavailable" : "Not scored", "N/A", ...dateColumn];
           }
 
           const score = (parseFloat(entry.epss) * 100).toFixed(2);
@@ -420,15 +475,21 @@ export function registerKevsTools(pi: any): void {
           return [cveId, `${score}%`, `${percentile}th`, ...dateColumn];
         });
         const headers = ["CVE ID", "EPSS Score", "Percentile", ...(hasScoreDates ? ["Score Date"] : [])];
+        const gapNote = incomplete
+          ? `\n\nScores marked Unavailable could not be read because the EPSS API request failed: ${epssFailureReasons(epss)}. ` +
+            "Those CVE IDs are not known to be unscored; retry later."
+          : "";
 
         return textResult(
-          "EPSS Exploit Probability Scores:\n\n" +
+          `EPSS Exploit Probability Scores${incomplete ? " (incomplete)" : ""}:\n\n` +
             formatTable(headers, rows) +
+            gapNote +
             "\n\nEPSS estimates exploitation likelihood in the next 30 days. Scores above 10% are usually worth fast triage.",
           {
             cve_ids: args.cve_ids,
             count: rows.length,
             ...(hasScoreDates ? { epss_score_dates: scoreDates } : {}),
+            ...gapDetails,
           },
         );
       } catch (error) {
@@ -482,19 +543,19 @@ export function registerKevsTools(pi: any): void {
           });
         }
 
-        const epssScores = await fetchEpss(recent.map((vulnerability) => vulnerability.cveID), signal);
+        const epss = await fetchEpss(recent.map((vulnerability) => vulnerability.cveID), signal);
         const heading = truncated
           ? `Showing ${recent.length} of ${added.length} KEV entries added in the last ${days} days:`
           : `${recent.length} KEV entr${recent.length === 1 ? "y" : "ies"} added in the last ${days} days:`;
         return textResult(
           `${heading}\n\n` +
-            recent
-              .map((vulnerability) => formatKev(vulnerability, epssScores.get(vulnerability.cveID)))
-              .join("\n\n"),
+            recent.map((vulnerability) => formatKev(vulnerability, epss)).join("\n\n") +
+            epssGapNote(epss, recent.length),
           {
             days,
             count: recent.length,
             ...(truncated ? { total_matches: added.length } : {}),
+            ...epssGapDetails(epss),
           },
         );
       } catch (error) {

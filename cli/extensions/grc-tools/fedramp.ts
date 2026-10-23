@@ -543,6 +543,19 @@ function formatSearchText(
   ].join("\n");
 }
 
+/** A miss is only as current as the catalog searched, so it names the source and why it may be out of date. */
+function formatNoSearchMatchesText(query: string, loaded: Awaited<ReturnType<typeof loadFedrampCatalog>>): string {
+  const lines = [
+    `No official FedRAMP Consolidated Rules matches found for "${query}".`,
+    "",
+    formatProvenanceNote({ ...loaded.provenance, cacheStatus: loaded.cacheStatus }),
+  ];
+  if (loaded.notes.length > 0) {
+    lines.push("", "Notes:", ...loaded.notes.map((note) => `- ${note}`));
+  }
+  return lines.join("\n");
+}
+
 function formatProcessText(
   process: ReturnType<typeof resolveFedrampProcess>,
   requirements: ReturnType<typeof processRequirements>,
@@ -3593,13 +3606,15 @@ export function registerFedrampTools(pi: any): void {
         });
 
         if (matches.length === 0) {
-          return textResult(`No official FedRAMP Consolidated Rules matches found for "${args.query}".`, {
+          return textResult(formatNoSearchMatchesText(args.query, loaded), {
             tool: "fedramp_search_frmr",
             query: args.query,
             section: args.section ?? "any",
             applies_to: args.applies_to ?? "any",
             count: 0,
             provenance: loaded.provenance,
+            cache_status: loaded.cacheStatus,
+            notes: loaded.notes,
           });
         }
 

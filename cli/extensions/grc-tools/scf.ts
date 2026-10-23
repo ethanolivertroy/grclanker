@@ -90,6 +90,7 @@ export interface ScfControlBundle {
   control: ScfControl;
   assessment_objectives: ScfAssessmentObjective[];
   evidence_requests: ScfEvidenceRequest[];
+  /** One entry per evidence request that could not be read: its ID, then why. */
   evidence_request_errors: string[];
   framework?: ScfFrameworkIndexEntry;
   framework_mappings?: string[];
@@ -379,9 +380,10 @@ export async function loadScfControlBundle(
   signal?: AbortSignal,
 ): Promise<ScfControlBundle> {
   const control = await fetchControl(controlId, signal);
+  const evidenceIds = control.evidence_requests ?? [];
   const [objectivesPayload, evidenceResults, frameworkIndex] = await Promise.all([
     fetchAssessmentObjectives(control.control_id, signal),
-    Promise.allSettled((control.evidence_requests ?? []).map((erlId) => fetchEvidenceRequest(erlId, signal))),
+    Promise.allSettled(evidenceIds.map((erlId) => fetchEvidenceRequest(erlId, signal))),
     frameworkQuery ? fetchCrosswalkIndex(signal) : Promise.resolve(undefined),
   ]);
   signal?.throwIfAborted();
@@ -389,12 +391,13 @@ export async function loadScfControlBundle(
   const evidence_requests: ScfEvidenceRequest[] = [];
   const evidence_request_errors: string[] = [];
 
-  for (const result of evidenceResults) {
+  for (const [index, result] of evidenceResults.entries()) {
     if (result.status === "fulfilled") {
       evidence_requests.push(result.value);
     } else {
       rethrowIfAborted(result.reason);
-      evidence_request_errors.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
+      const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      evidence_request_errors.push(`${evidenceIds[index]}: ${reason}`);
     }
   }
 
@@ -484,9 +487,13 @@ function buildControlBundleText(bundle: ScfControlBundle): string {
   }
 
   if (bundle.evidence_request_errors.length > 0) {
+    const failed = bundle.evidence_request_errors.length;
+    const total = failed + bundle.evidence_requests.length;
     lines.push(
       "",
-      `Warnings: ${bundle.evidence_request_errors.length} evidence request lookup(s) failed.`,
+      `Warnings: ${failed} of ${total} evidence request lookup${total === 1 ? "" : "s"} failed, ` +
+        "so the evidence request list is incomplete:",
+      ...bundle.evidence_request_errors.map((error) => `- ${error}`),
     );
   }
 

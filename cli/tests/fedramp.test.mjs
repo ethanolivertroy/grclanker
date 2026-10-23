@@ -28,6 +28,7 @@ import { buildFedrampDocsSnapshot } from "../dist/extensions/grc-tools/fedramp-d
 import {
   persistentCachesEnabled,
   runWithoutPersistentCaches,
+  setGrcFetchTimingForTests,
 } from "../dist/extensions/grc-tools/shared.js";
 import {
   buildFedrampAdsSite,
@@ -390,15 +391,30 @@ test("loadFedrampCatalog writes cache and falls back to stale disk data if refre
     assert.ok(calls.some((url) => url.includes("fedramp-consolidated-rules.json")));
 
     clearFedrampCachesForTests();
-    globalThis.fetch = async () => {
+    let rawAttempts = 0;
+    globalThis.fetch = async (input) => {
+      if (!String(input).startsWith("https://raw.githubusercontent.com/")) {
+        return new Response("not found", { status: 404, statusText: "Not Found" });
+      }
+      rawAttempts += 1;
       throw new Error("network unavailable");
     };
+    const waits = [];
+    setGrcFetchTimingForTests({ sleep: async (ms) => void waits.push(ms) });
 
     const stale = await loadFedrampCatalog({ refresh: true, homeDir });
     assert.equal(stale.cacheStatus, "stale");
-    assert.match(stale.notes[0] ?? "", /stale FedRAMP cache/i);
+    assert.equal(
+      stale.notes[0],
+      "Serving stale FedRAMP cache because the live GitHub source could not be refreshed: " +
+        "Fetch failed: https://raw.githubusercontent.com/FedRAMP/rules/main/fedramp-consolidated-rules.json " +
+        "(network unavailable) after 4 attempts",
+    );
     assert.equal(stale.catalog.info.version, "2026.07.02.02");
+    assert.equal(rawAttempts, 4, "the catalog read is retried before the stale cache is served");
+    assert.deepEqual(waits, [1_000, 2_000, 4_000]);
   } finally {
+    setGrcFetchTimingForTests();
     globalThis.fetch = originalFetch;
     clearFedrampCachesForTests();
     rmSync(homeDir, { recursive: true, force: true });
@@ -557,6 +573,56 @@ test("fedramp_get_requirement shows notifications, control mappings, notes, and 
     );
     assert.doesNotMatch(text, /\u2014/);
   } finally {
+    globalThis.fetch = originalFetch;
+    if (originalHome === undefined) delete process.env.GRCLANKER_HOME;
+    else process.env.GRCLANKER_HOME = originalHome;
+    clearFedrampCachesForTests();
+    rmSync(homeBase, { recursive: true, force: true });
+  }
+});
+
+test("fedramp_search_frmr says a miss came from a stale catalog and why the refresh failed", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalHome = process.env.GRCLANKER_HOME;
+  const homeBase = mkdtempSync(join(tmpdir(), "grclanker-fedramp-search-"));
+  const grclankerHome = join(homeBase, ".grclanker");
+  const rawUrl = "https://raw.githubusercontent.com/FedRAMP/rules/main/fedramp-consolidated-rules.json";
+  const tools = new Map();
+  registerFedrampTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+
+  process.env.GRCLANKER_HOME = grclankerHome;
+  globalThis.fetch = async (input) =>
+    String(input) === rawUrl
+      ? jsonResponse(consolidatedRulesFixture)
+      : new Response("not found", { status: 404, statusText: "Not Found" });
+  clearFedrampCachesForTests();
+
+  try {
+    assert.equal((await loadFedrampCatalog()).cacheStatus, "live");
+    const cachePath = join(grclankerHome, ".state", "fedramp", "catalog.json");
+    const payload = JSON.parse(readFileSync(cachePath, "utf8"));
+    payload.fetchedAt = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    writeFileSync(cachePath, JSON.stringify(payload));
+    clearFedrampCachesForTests();
+
+    globalThis.fetch = async () => new Response("unavailable", { status: 503, statusText: "Service Unavailable" });
+    setGrcFetchTimingForTests({ sleep: async () => {} });
+
+    const result = await tools.get("fedramp_search_frmr").execute("call-1", { query: "no-such-term" });
+    const text = result.content[0].text;
+
+    assert.equal(result.isError, undefined, text);
+    assert.match(text, /^No official FedRAMP Consolidated Rules matches found for "no-such-term"\.\n\nSource: /);
+    assert.match(text, /Consolidated Rules 2026\.07\.02\.02 · upstream 2026-07-02 · stale\n/);
+    assert.match(
+      text,
+      /\nNotes:\n- Serving stale FedRAMP cache because the live GitHub source could not be refreshed: Fetch failed: https:\/\/raw\.githubusercontent\.com\/FedRAMP\/rules\/main\/fedramp-consolidated-rules\.json \(503 Service Unavailable\) after 4 attempts(?:\n|$)/,
+    );
+    assert.equal(result.details.count, 0);
+    assert.equal(result.details.cache_status, "stale");
+    assert.match(result.details.notes[0], /^Serving stale FedRAMP cache because/);
+  } finally {
+    setGrcFetchTimingForTests();
     globalThis.fetch = originalFetch;
     if (originalHome === undefined) delete process.env.GRCLANKER_HOME;
     else process.env.GRCLANKER_HOME = originalHome;

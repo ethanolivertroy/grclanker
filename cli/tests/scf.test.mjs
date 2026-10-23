@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
-import { clearGrcSharedCachesForTests } from "../dist/extensions/grc-tools/shared.js";
+import { clearGrcSharedCachesForTests, setGrcFetchTimingForTests } from "../dist/extensions/grc-tools/shared.js";
 import {
   findMatchingScfControls,
   loadScfControlBundle,
@@ -10,6 +10,8 @@ import {
   registerScfTools,
   resolveScfFrameworkMatch,
 } from "../dist/extensions/grc-tools/scf.js";
+
+const SCF_API = "https://hackidle.github.io/scf-api/api";
 
 function jsonResponse(payload) {
   return new Response(JSON.stringify(payload), {
@@ -322,6 +324,86 @@ test("scf_get_crosswalk shows the advertised default number of overview rows whe
     }
   } finally {
     globalThis.fetch = originalFetch;
+    clearGrcSharedCachesForTests();
+  }
+});
+
+test("scf_get_control names each evidence request that could not be read and says the list is incomplete", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  const waits = [];
+  let clock = Date.parse("2026-10-23T00:00:00Z");
+
+  globalThis.fetch = async (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+    requests.push(url);
+
+    if (url.endsWith("/controls/GOV-01.json")) {
+      return jsonResponse({
+        control_id: "GOV-01",
+        title: "Security, Compliance & Resilience Program",
+        family: "GOV",
+        evidence_requests: ["E-GOV-01", "E-GOV-02", "E-GOV-03"],
+      });
+    }
+
+    if (url.endsWith("/assessment-objectives/GOV-01.json")) {
+      return jsonResponse({ scf_control_id: "GOV-01", total: 0, assessment_objectives: [] });
+    }
+
+    if (url.endsWith("/evidence-requests/E-GOV-01.json")) {
+      return jsonResponse({
+        erl_id: "E-GOV-01",
+        area: "Cybersecurity & Data Protection Management",
+        artifact_name: "Charter - Cybersecurity Program",
+        artifact_description: "Documented evidence of a charter.",
+        scf_controls: ["GOV-01"],
+        cmmc_mapping: "",
+      });
+    }
+
+    if (url.endsWith("/evidence-requests/E-GOV-02.json")) {
+      return new Response("busy", { status: 503, statusText: "Service Unavailable" });
+    }
+
+    return new Response("not found", { status: 404, statusText: "Not Found" });
+  };
+  setGrcFetchTimingForTests({
+    now: () => clock,
+    sleep: async (ms) => {
+      waits.push(ms);
+      clock += ms;
+    },
+  });
+  clearGrcSharedCachesForTests();
+
+  try {
+    const tools = new Map();
+    registerScfTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+    const result = await tools.get("scf_get_control").execute("call-1", { control_id: "GOV-01" });
+    const text = result.content[0].text;
+    const errors = [
+      `E-GOV-02: Fetch failed: ${SCF_API}/evidence-requests/E-GOV-02.json (503 Service Unavailable) after 4 attempts`,
+      `E-GOV-03: Fetch failed: ${SCF_API}/evidence-requests/E-GOV-03.json (404 Not Found)`,
+    ];
+
+    assert.equal(result.isError, undefined);
+    assert.match(text, /^- E-GOV-01: Charter - Cybersecurity Program/m);
+    assert.ok(
+      text.endsWith(
+        "\n\nWarnings: 2 of 3 evidence request lookups failed, so the evidence request list is incomplete:\n" +
+          errors.map((error) => `- ${error}`).join("\n"),
+      ),
+      text,
+    );
+    assert.equal(result.details.evidence_request_count, 1);
+    assert.deepEqual(result.details.evidence_request_errors, errors);
+    assert.equal(requests.filter((url) => url.endsWith("/evidence-requests/E-GOV-02.json")).length, 4);
+    assert.equal(requests.filter((url) => url.endsWith("/evidence-requests/E-GOV-03.json")).length, 1, "a 404 is not retried");
+    assert.deepEqual(waits, [1_000, 2_000, 4_000]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    setGrcFetchTimingForTests();
     clearGrcSharedCachesForTests();
   }
 });
