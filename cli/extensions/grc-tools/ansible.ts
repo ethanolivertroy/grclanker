@@ -15,7 +15,7 @@ import { request as httpRequest } from "node:http";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
+import { ToolCallAbortedError, abortableFetch, abortableSleep, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -30,6 +30,10 @@ const DEFAULT_USER_LIMIT = 200;
 const DEFAULT_ROLE_PROBE_LIMIT = 50;
 const DEFAULT_TEMPLATE_PROBE_LIMIT = 50;
 const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 500;
+const MAX_RETRY_WAIT_MS = 30_000;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const TOKEN_SKEW_MS = 5 * 60 * 1000;
 const REMEDIATION_WINDOW_DAYS = 7;
 const MISSED_RUN_MULTIPLIER = 1.5;
@@ -61,9 +65,27 @@ export interface AnsibleAapConfiguration {
 
 interface AnsibleAapClientOptions {
   fetchImpl?: FetchImpl;
+  /** Clock for assessment windows and HTTP-date Retry-After values. */
   now?: () => Date;
   signal?: AbortSignal;
+  /** Retries after the first attempt for 429, 5xx, timeouts, and transport errors (default 3, at most 10). */
+  maxRetries?: number;
+  /** Waits between attempts; the tool call's abort ends a wait at once. */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/** One attempt: the answer with its body read under the timer, or why there was no answer. */
+type AapAttempt =
+  | { response: Response; text: string; failure?: undefined }
+  | { response?: undefined; text: ""; failure: string };
+
+type AapSendResult = {
+  response?: Response;
+  text: string;
+  attempts: number;
+  /** The last attempt's timeout or transport failure, or why retrying stopped early. */
+  failure?: string;
+};
 
 interface AapListResponse<T> {
   count?: number;
@@ -1367,6 +1389,21 @@ export class AnsibleApiError extends Error {
   }
 }
 
+/** Retry-After in milliseconds: delta-seconds, or an HTTP-date measured against `now`; a past date is 0. */
+function retryAfterMs(value: string | null, now: number): number | undefined {
+  if (value === null) return undefined;
+  const seconds = asNumber(value);
+  if (seconds !== undefined) return Math.max(seconds * 1000, 0);
+  if (!/^(mon|tue|wed|thu|fri|sat|sun)/i.test(value.trim())) return undefined;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(date - now, 0) : undefined;
+}
+
+/** " after N attempts" once a request was retried, so a failure says how hard it was tried. */
+function attemptsNote(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
 /** Path component of a request target, so an error names the endpoint without its query string. */
 function requestPath(target: string): string {
   try {
@@ -1895,6 +1932,9 @@ export function projectPing(ping: unknown): JsonRecord | undefined {
 export class AnsibleAapClient {
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
+  private readonly signal?: AbortSignal;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly maxRetries: number;
   private sessionCookie?: string;
   private csrfToken?: string;
   private sessionPromise?: Promise<void>;
@@ -1906,6 +1946,9 @@ export class AnsibleAapClient {
   ) {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? (config.verifySsl === false ? createTlsOptOutFetch() : fetch), options.signal);
     this.now = options.now ?? (() => new Date());
+    this.signal = options.signal;
+    this.sleep = abortableSleep(options.signal, options.sleep);
+    this.maxRetries = Math.min(Math.max(Math.trunc(options.maxRetries ?? DEFAULT_MAX_RETRIES), 0), 10);
     registerConfiguredSecrets(config.token, config.password);
   }
 
@@ -1924,13 +1967,41 @@ export class AnsibleAapClient {
     return `${this.config.baseUrl}${normalizedPath}`;
   }
 
-  private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  /** One attempt under the request timeout, which runs until the body is read so a stalled body times out too. */
+  private async attempt(url: string, init: RequestInit): Promise<AapAttempt> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
-      return await this.fetchImpl(url, { ...init, signal: controller.signal });
+      const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
+      return { response, text: await response.text() };
+    } catch (error) {
+      rethrowIfAborted(error);
+      if (this.signal?.aborted) throw new ToolCallAbortedError(this.signal);
+      if (controller.signal.aborted) return { text: "", failure: `timed out after ${this.config.timeoutMs} ms` };
+      return { text: "", failure: `network error: ${errorMessage(error)}` };
     } finally {
       clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Sends until the answer is neither 429 nor a retryable 5xx, the retry budget is spent, or Retry-After asks for
+   * more than MAX_RETRY_WAIT_MS. A timeout or transport failure is retried only when `retryUnanswered` is set: it
+   * leaves open whether the server acted on the request.
+   */
+  private async send(url: string, init: RequestInit, retryUnanswered: boolean): Promise<AapSendResult> {
+    for (let attempt = 1; ; attempt += 1) {
+      const result = await this.attempt(url, init);
+      const retryable = result.response ? RETRYABLE_STATUSES.has(result.response.status) : retryUnanswered;
+      if (!retryable || attempt > this.maxRetries) return { ...result, attempts: attempt };
+      const askedMs = result.response
+        ? retryAfterMs(result.response.headers.get("retry-after"), this.now().getTime())
+        : undefined;
+      if (askedMs !== undefined && askedMs > MAX_RETRY_WAIT_MS) {
+        const failure = `the server asked to retry after ${Math.ceil(askedMs / 1000)} s, more than the ${MAX_RETRY_WAIT_MS / 1000} s limit`;
+        return { ...result, attempts: attempt, failure };
+      }
+      await this.sleep(askedMs ?? Math.min(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), MAX_RETRY_WAIT_MS));
     }
   }
 
@@ -1953,15 +2024,21 @@ export class AnsibleAapClient {
     const loginUrl = this.resolveUrl("/api/login/");
     const loginPath = requestPath(loginUrl);
     // Login responses are described by status only: their bodies are HTML pages that echo form values.
-    const initial = await this.fetchWithTimeout(loginUrl, {
+    const bootstrap = await this.send(loginUrl, {
       method: "GET",
       headers: { accept: "text/html,application/json" },
-    }).catch((error: unknown) => {
-      rethrowIfAborted(error);
-      throw new AnsibleApiError(`AAP login bootstrap failed (network error: ${errorMessage(error)}).`, undefined, loginPath);
-    });
+    }, true);
+    const initial = bootstrap.response;
+    if (!initial) {
+      throw new AnsibleApiError(`AAP login bootstrap failed${attemptsNote(bootstrap.attempts)} (${bootstrap.failure}).`, undefined, loginPath);
+    }
     if (!initial.ok) {
-      throw new AnsibleApiError(`AAP login bootstrap failed (${initial.status} ${initial.statusText}).`, initial.status, loginPath);
+      const reason = bootstrap.failure ? `; ${bootstrap.failure}` : "";
+      throw new AnsibleApiError(
+        `AAP login bootstrap failed${attemptsNote(bootstrap.attempts)} (${initial.status} ${initial.statusText}${reason}).`,
+        initial.status,
+        loginPath,
+      );
     }
 
     const bootstrapCookie = cookieHeaderFromHeaders(initial.headers);
@@ -1971,7 +2048,9 @@ export class AnsibleAapClient {
       password: this.config.password,
     });
 
-    const response = await this.fetchWithTimeout(loginUrl, {
+    // A login that timed out or lost its connection may still have opened a session, and AAP's SESSIONS_PER_USER
+    // limit expires the user's oldest sessions when another opens, so only a 429 or 5xx answer is retried here.
+    const login = await this.send(loginUrl, {
       method: "POST",
       headers: {
         accept: "application/json",
@@ -1981,13 +2060,19 @@ export class AnsibleAapClient {
         referer: loginUrl,
       },
       body,
-    }).catch((error: unknown) => {
-      rethrowIfAborted(error);
-      throw new AnsibleApiError(`AAP session login failed (network error: ${errorMessage(error)}).`, undefined, loginPath);
-    });
+    }, false);
+    const response = login.response;
+    if (!response) {
+      throw new AnsibleApiError(`AAP session login failed${attemptsNote(login.attempts)} (${login.failure}).`, undefined, loginPath);
+    }
 
     if (!response.ok) {
-      throw new AnsibleApiError(`AAP session login failed (${response.status} ${response.statusText}).`, response.status, loginPath);
+      const reason = login.failure ? `; ${login.failure}` : "";
+      throw new AnsibleApiError(
+        `AAP session login failed${attemptsNote(login.attempts)} (${response.status} ${response.statusText}${reason}).`,
+        response.status,
+        loginPath,
+      );
     }
 
     const loginCookie = cookieHeaderFromHeaders(response.headers);
@@ -2022,14 +2107,17 @@ export class AnsibleAapClient {
 
     const url = this.resolveUrl(pathOrUrl);
     const endpoint = requestPath(url);
-    const response = await this.fetchWithTimeout(url, { method: "GET", headers }).catch((error: unknown) => {
-      rethrowIfAborted(error);
-      throw new AnsibleApiError(`AAP request failed: ${pathOrUrl} (network error: ${errorMessage(error)})`, undefined, endpoint);
-    });
+    const result = await this.send(url, { method: "GET", headers }, true);
+    const failed = `AAP request failed${attemptsNote(result.attempts)}: ${pathOrUrl}`;
+    const response = result.response;
+    if (!response) {
+      throw new AnsibleApiError(`${failed} (${result.failure})`, undefined, endpoint);
+    }
     const contentType = response.headers.get("content-type");
-    const text = await response.text();
+    const text = result.text;
     if (!response.ok) {
-      throw new AnsibleApiError(`AAP request failed: ${pathOrUrl} (${response.status} ${response.statusText})${responseDetail(text, contentType)}`, response.status, endpoint);
+      const reason = result.failure ? `; ${result.failure}` : "";
+      throw new AnsibleApiError(`${failed} (${response.status} ${response.statusText}${reason})${responseDetail(text, contentType)}`, response.status, endpoint);
     }
 
     if (text.length === 0) return undefined as T;
@@ -4557,6 +4645,13 @@ export function ansibleFixedTexts(): readonly string[] {
     "AAP session login failed (network error: fetch failed).",
     "AAP session login failed (401 Unauthorized).",
     "AAP session auth requires AAP_USERNAME and AAP_PASSWORD.",
+    `AAP request failed${attemptsNote(4)}: /api/v2/hosts/ (502 Bad Gateway)${responseDetail(html, "text/html")}`,
+    `AAP request failed${attemptsNote(4)}: /api/v2/ping/ (network error: fetch failed)`,
+    `AAP request failed${attemptsNote(4)}: /api/v2/ping/ (timed out after ${DEFAULT_TIMEOUT_MS} ms)`,
+    `AAP request failed: /api/v2/hosts/ (429 Too Many Requests; the server asked to retry after 120 s, more than the ${MAX_RETRY_WAIT_MS / 1000} s limit)`,
+    `AAP login bootstrap failed${attemptsNote(4)} (503 Service Unavailable).`,
+    `AAP session login failed${attemptsNote(4)} (503 Service Unavailable).`,
+    `AAP session login failed (timed out after ${DEFAULT_TIMEOUT_MS} ms).`,
     ...partialNotes(unknownScope, inventories, inventory("hosts", { data: { items: [{}], complete: false, total: 40, truncation: "page cap reached" } })),
     ...refusalNotes,
     inventory("users", { data: { items: [{}], complete: false, total: 2, truncation: refusalNotes[0] } }).partial ?? "",
