@@ -68,7 +68,7 @@ interface AnsibleAapClientOptions {
   /** Clock for assessment windows and HTTP-date Retry-After values. */
   now?: () => Date;
   signal?: AbortSignal;
-  /** Retries after the first attempt for 429, 5xx, timeouts, and transport errors (default 3, at most 10). */
+  /** Retries after the first attempt for 429, 500, 502, 503, 504, timeouts, and transport errors (default 3, at most 10). */
   maxRetries?: number;
   /** Waits between attempts; the tool call's abort ends a wait at once. */
   sleep?: (ms: number) => Promise<void>;
