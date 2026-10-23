@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { createServer } from "node:http";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 
@@ -570,6 +571,31 @@ test("resolvePaloaltoConfiguration prefers args over env over config file and su
   assert.equal(fromArgs.timeoutMs, 5000);
   assert.equal(fromArgs.verifyTls, true);
   assert.ok(fromArgs.sourceChain.includes("arguments-prisma-access-key"));
+});
+
+test("the default config file the auth contract names is the file the resolver reads", () => {
+  const home = createTempBase("grclanker-paloalto-home-");
+  const defaults = PALOALTO_SPEC.authentication.configLocations.filter((location) => location.startsWith("~/"));
+  assert.equal(defaults.length, 1, `the contract names one default config file: ${defaults.join(", ")}`);
+  const configFile = join(home, defaults[0].slice(2));
+  mkdirSync(dirname(configFile), { recursive: true });
+  writeFileSync(configFile, JSON.stringify({ PANOS_HOST: "default-fw.example.com", PANOS_API_KEY: "default-file-key" }));
+  const moduleUrl = new URL("../dist/extensions/grc-tools/paloalto.js", import.meta.url).href;
+  const script = [
+    `const { resolvePaloaltoConfiguration } = await import(${JSON.stringify(moduleUrl)});`,
+    "try {",
+    "  const config = resolvePaloaltoConfiguration({}, {});",
+    "  process.stdout.write(JSON.stringify({ hosts: config.panos.map((item) => item.host), sourceChain: config.sourceChain }));",
+    "} catch (error) {",
+    "  process.stdout.write(JSON.stringify({ error: error.message }));",
+    "}",
+  ].join("\n");
+  // The module fixes its default path from homedir() at import, so HOME must be set in a fresh process.
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const resolved = JSON.parse(child.stdout);
+  assert.deepEqual(resolved.hosts, ["default-fw.example.com"], `${defaults[0]} is read by default: ${child.stdout}`);
+  assert.ok(resolved.sourceChain.includes("config-file-panos-host"), resolved.sourceChain.join(", "));
 });
 
 test("resolvePaloaltoConfiguration honors config-file TLS settings with secure precedence and defaults", () => {

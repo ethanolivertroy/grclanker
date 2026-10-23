@@ -322,7 +322,7 @@ export const PALOALTO_AUTH_RESOLVER = {
     "PANOS_VERIFY_TLS",
     "PALOALTO_TIMEOUT",
   ],
-  configLocations: ["~/.config/grclanker/paloalto.json", "Explicit path from config_file or PALOALTO_CONFIG_FILE"],
+  configLocations: ["~/.grclanker/paloalto.json", "Explicit path from config_file or PALOALTO_CONFIG_FILE"],
   variants: ["Prisma Cloud CSPM", "Prisma Cloud Compute", "One or more PAN-OS devices", "Per-client PAN-OS TLS verification override"],
   configFields: [
     "PRISMA_ACCESS_KEY_ID", "prisma_access_key_id", "PRISMA_SECRET_KEY", "prisma_secret_key",

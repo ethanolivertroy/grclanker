@@ -521,7 +521,7 @@ function buildCrosswalkText(
     ].join("\n");
   }
 
-  const limit = clampLimit(args.limit, 8);
+  const limit = clampLimit(args.limit);
   const scfRows = Object.entries(crosswalk.scf_to_framework.mappings)
     .slice(0, limit)
     .map(([controlId, mapped]) => [controlId, summarizeList(mapped, 3)]);
@@ -707,8 +707,8 @@ export function registerScfTools(pi: any): void {
       ),
       limit: Type.Optional(
         Type.Number({
-          description: "Sample size when returning an overview (default: 8).",
-          default: 8,
+          description: "Sample size when returning an overview (default: 10).",
+          default: DEFAULT_LIMIT,
         }),
       ),
     }),

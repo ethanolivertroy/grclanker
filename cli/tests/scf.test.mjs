@@ -7,6 +7,7 @@ import {
   findMatchingScfControls,
   loadScfControlBundle,
   loadScfFrameworkCrosswalk,
+  registerScfTools,
   resolveScfFrameworkMatch,
 } from "../dist/extensions/grc-tools/scf.js";
 
@@ -255,6 +256,70 @@ test("loadScfFrameworkCrosswalk resolves framework query and fetches mapping fil
     assert.equal(result.framework.framework_id, "general-nist-800-53-r5-2");
     assert.deepEqual(result.crosswalk.scf_to_framework.mappings["GOV-01"], ["PM-01"]);
     assert.deepEqual(result.crosswalk.framework_to_scf.mappings["PM-01"], ["GOV-01", "GOV-02"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearGrcSharedCachesForTests();
+  }
+});
+
+test("scf_get_crosswalk shows the advertised default number of overview rows when limit is omitted", async () => {
+  const originalFetch = globalThis.fetch;
+  const ids = (prefix) => Array.from({ length: 20 }, (_, index) => `${prefix}-${String(index + 1).padStart(2, "0")}`);
+  const scfIds = ids("GOV");
+  const frameworkIds = ids("PM");
+
+  globalThis.fetch = async (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+
+    if (url.endsWith("/crosswalks.json")) {
+      return jsonResponse({
+        total_frameworks: 1,
+        frameworks: [
+          {
+            framework_id: "general-nist-800-53-r5-2",
+            display_name: "NIST SP 800-53 R5",
+            scf_controls_mapped: scfIds.length,
+            framework_controls_mapped: frameworkIds.length,
+          },
+        ],
+      });
+    }
+
+    if (url.endsWith("/crosswalks/general-nist-800-53-r5-2.json")) {
+      return jsonResponse({
+        display_name: "NIST SP 800-53 R5",
+        framework_id: "general-nist-800-53-r5-2",
+        scf_to_framework: {
+          total_mappings: scfIds.length,
+          mappings: Object.fromEntries(scfIds.map((id, index) => [id, [frameworkIds[index]]])),
+        },
+        framework_to_scf: {
+          total_mappings: frameworkIds.length,
+          mappings: Object.fromEntries(frameworkIds.map((id, index) => [id, [scfIds[index]]])),
+        },
+      });
+    }
+
+    return new Response("not found", { status: 404, statusText: "Not Found" });
+  };
+
+  clearGrcSharedCachesForTests();
+
+  try {
+    const tools = new Map();
+    registerScfTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+    const crosswalk = tools.get("scf_get_crosswalk");
+    const limitSchema = crosswalk.parameters.properties.limit;
+    const advertised = limitSchema.default;
+    assert.match(limitSchema.description, new RegExp(`\\(default: ${advertised}\\)`), "the description and the schema default name the same number");
+
+    const omitted = { framework: "NIST SP 800-53 R5" };
+    for (const [label, args] of [["prepared", crosswalk.prepareArguments(omitted)], ["unprepared", omitted]]) {
+      const result = await crosswalk.execute("call-scf-crosswalk", args);
+      const text = result.content[0].text;
+      assert.equal(text.match(/^ GOV-\d+ /gm)?.length, advertised, `${label}: SCF -> framework rows\n${text}`);
+      assert.equal(text.match(/^ PM-\d+ /gm)?.length, advertised, `${label}: framework -> SCF rows\n${text}`);
+    }
   } finally {
     globalThis.fetch = originalFetch;
     clearGrcSharedCachesForTests();

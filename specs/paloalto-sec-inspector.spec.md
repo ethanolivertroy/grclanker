@@ -165,7 +165,7 @@ Credential precedence, highest first:
 
 Environment variables: `PALOALTO_CONFIG_FILE`, `PRISMA_ACCESS_KEY_ID`, `PRISMA_SECRET_KEY`, `PRISMA_API_URL`, `PRISMA_COMPUTE_URL`, `PANOS_HOST`, `PANOS_API_KEY`, `PANOS_USERNAME`, `PANOS_PASSWORD`, `PANOS_VERIFY_TLS`, `PALOALTO_TIMEOUT`
 
-Configuration locations: ~/.config/grclanker/paloalto.json, Explicit path from config_file or PALOALTO_CONFIG_FILE
+Configuration locations: ~/.grclanker/paloalto.json, Explicit path from config_file or PALOALTO_CONFIG_FILE
 
 Credential and deployment variants: Prisma Cloud CSPM, Prisma Cloud Compute, One or more PAN-OS devices, Per-client PAN-OS TLS verification override
 

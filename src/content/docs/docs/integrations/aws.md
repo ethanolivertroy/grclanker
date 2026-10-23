@@ -136,7 +136,7 @@ Calls `sts:GetCallerIdentity`, then probes 15 read surfaces with a minimal reque
 
 Returns `healthy` only when every surface is readable, and `limited` otherwise, naming the services to grant. A missing security contact is readable evidence (count 0), not a denial.
 
-Every probe records the `command` it issued (`iam:ListUsers`) and the `region` it was sent to. Other probe fields:
+Every probe records in `command` the IAM action its request needs (`iam:ListUsers`; the S3 bucket probe calls `ListBuckets` and records `s3:ListAllMyBuckets`) and the `region` it was sent to. Other probe fields:
 
 - **Readable paged probe:** Carries its `count` and `truncated: false`. When it stopped at its page cap, it carries `truncated: true` beside a floor count.
 - **Single-object and unpaged probes:** Carry `truncated: null`.
