@@ -305,9 +305,10 @@ Other API behavior:
 - Every field in every NerdGraph selection is traceable to a public docs.newrelic.com page or to the public NerdGraph schema. See [NerdGraph field provenance](#nerdgraph-field-provenance).
 - A NerdGraph response that carries `errors` entries is treated as a failed read even when it also carries partial `data`.
 - REST API v2 calls send `Api-Key` and follow RFC 5988 `Link` headers (`rel="next"`) or the `page=` parameter.
-- HTTP 429, 500, 502, 503, and 504 responses are retried up to three times.
-  - The delay honors `Retry-After` or `X-RateLimit-Reset` when present. Otherwise it backs off exponentially, capped at 15 seconds per wait.
+- HTTP 429, 500, 502, 503, and 504 responses, request timeouts, and transport failures are retried up to three times. Every request is a read, so a retry cannot repeat a change.
+  - The delay honors `Retry-After` (in seconds or as an HTTP date), then `X-RateLimit-Reset`, when present. Otherwise it backs off exponentially. Every wait is capped at 15 seconds.
   - New Relic documents a REST API v2 limit of 1000 calls per minute per key.
+  - Once the retries run out, the error names the method, the path, the last status or failure, and the number of attempts.
 - Every request has a timeout (30 seconds by default).
 
 ### Verdict safety
@@ -398,10 +399,10 @@ Every finding follows the same evidence rules. `cli/tests/newrelic.test.mjs` car
 
 13. **Error text hygiene:** An upstream error body is never copied into an error message.
 
-    A failed NerdGraph or REST exchange becomes an error at one point per protocol: the client's failure constructors. Each records the status and the endpoint or query path, then one of these:
+    A failed NerdGraph or REST exchange becomes an error at one point per protocol: the client's failure constructors. Each records the status, the endpoint or query path, and the number of attempts when the request was retried, then one of these:
 
     - The documented error fields. For NerdGraph, these are `errors[].message`, `errors[].extensions.errorClass`, and `path`. For REST v2, it is `error.title`.
-    - Only the content type and byte length for a non-JSON or undocumented body. For example: `NerdGraph request failed (502 Bad Gateway) at POST /graphql: non-JSON error body (text/html; 412 bytes)`.
+    - Only the content type and byte length for a non-JSON or undocumented body. For example: `NerdGraph request failed (502 Bad Gateway) at POST /graphql after 4 attempts: non-JSON error body (text/html; 412 bytes)`.
 
     Every message passes through `scrubErrorText`, which removes:
 

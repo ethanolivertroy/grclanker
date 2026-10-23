@@ -300,7 +300,10 @@ This section is reference for reviewing findings and bundles: how unread, partia
 - Every truncation entry in `errors` includes the inventory, limit, seen count, total when known, stop reason, and an actionable next step.
   - User, role, key, rule, signal, monitor, and posture finding messages can name their exposed `*_limit` argument.
   - Shared dashboards use a fixed collector cap of 2,000 and org connections use a fixed collector cap of 10,000. Their messages direct the user to inspect the full inventory manually in Dashboards > Shared Dashboards or Organization Settings > Org Connections.
-- `429` responses are retried after the number of seconds in `X-RateLimit-Reset` (capped at 60 seconds), and `5xx` responses are retried with exponential backoff, up to `max_retries` times, following the [rate limits reference](https://docs.datadoghq.com/api/latest/rate-limits/).
+- `429` and `5xx` responses, request timeouts, and transport failures are retried up to `max_retries` times with exponential backoff, following the [rate limits reference](https://docs.datadoghq.com/api/latest/rate-limits/).
+  - A `429` waits for the number of seconds in `X-RateLimit-Reset`. Otherwise a `Retry-After` header, in seconds or as an HTTP date, sets the wait.
+  - Every wait is capped at 60 seconds.
+  - Once the retries run out, the error names the method, the path, the last status or failure, and the number of attempts.
 - Requests time out after `timeout_seconds`.
 - API and application key values are redacted from every error message and from the exported bundle.
   - Non-JSON error bodies are described by content type and length rather than echoed.

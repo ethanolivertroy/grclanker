@@ -424,6 +424,7 @@ These rules apply to every control.
 - An unreadable or forbidden endpoint is `manual`.
   - The summary names the endpoint the failed request actually went to and the observed cause (`401`, `403`, `404`, or the scrubbed error text).
   - Evidence carries `endpoint`, `error`, and `http_status` (`null` when there was no HTTP response).
+  - An endpoint counts as unreadable only once its retries run out. Every request, the login and oneshot search `POST` requests included, gets three attempts in all on a `429` or `5xx` response, a timeout, or a transport failure, waiting out exponential backoff or the `Retry-After` delay (in seconds or as an HTTP date). A `Retry-After` longer than 30 seconds ends the request at once. The error names the endpoint, the last status or failure, and the number of attempts.
 - An empty inventory is `manual` (or `fail` where the control's intent requires the inventory).
 - A partial inventory never yields `pass` for the findings that read it.
   - The summary states `seen N of M` or `N (total unknown)`.

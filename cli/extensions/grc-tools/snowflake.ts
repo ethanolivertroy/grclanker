@@ -1890,9 +1890,9 @@ function retryAfterMs(header: string | null, nowMs: number): number | undefined 
 
 /**
  * The URL a statement submission is resent on: the original requestId plus
- * retry=true, which the SQL API documents as never executing the statement a
- * second time. Without a requestId there is nothing to deduplicate on, so
- * there is no resubmission URL.
+ * retry=true, which the SQL API documents as not executing the statement again
+ * when it has already run successfully. Without a requestId there is nothing
+ * to deduplicate on, so there is no resubmission URL.
  */
 function resubmissionUrl(url: string): string | undefined {
   const parsed = new URL(url);
