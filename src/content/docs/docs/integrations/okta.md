@@ -191,6 +191,7 @@ The inventories each finding reads for this purpose are:
 A `Manual` verdict caused by an unreadable dataset names that dataset's own failure:
 
 - `the endpoint returned 403 Forbidden`, `401 Unauthorized`, or `404 Not Found`, only when the request observed that status.
+- `the endpoint request still failed after 5 attempts`, when a 429, a 5xx answer, a timeout, or a transport failure outlasted the retries in rule 10 of [Verdict safety](#verdict-safety).
 - `the collector did not expose this endpoint`, when the client has no method for it.
 - `the inventory it depends on was not collected, so its request was never issued`, for a per-parent list whose parent was unreadable.
 
@@ -214,7 +215,7 @@ A `Manual` verdict caused by an unreadable dataset names that dataset's own fail
 | Trusted-origin hygiene | `okta_assess_integrations` | OKTA-INTEG-001 | Fail on ACTIVE `http://` or wildcard origins; Info when none exist; Manual on 403. |
 | Custom network-zone coverage | `okta_assess_integrations` | OKTA-INTEG-002 | Pass with an ACTIVE non-system zone; Partial with only system, legacy, or inactive zones; Manual on 403 or an empty list. |
 | Risky OIDC grant types | `okta_assess_integrations` | OKTA-INTEG-003 | Fail when an ACTIVE app uses `password` or `implicit`; Partial when only inactive apps do; Manual on 403 or an empty app list. |
-| Contextual access conditions | `okta_assess_integrations` | OKTA-INTEG-004 | Pass when an ACTIVE rule under an ACTIVE policy uses risk, device, network, or auth-context conditions; capped at Partial on partial rule data. |
+| Contextual access conditions | `okta_assess_integrations` | OKTA-INTEG-004 | Manual when both policy lists are unreadable. Pass only when an ACTIVE rule under an ACTIVE policy uses risk, device, network, or auth-context conditions and the network-zone inventory was read. Partial when custom zones exist without such a rule, on partial rule data, or when such a rule exists but the zone inventory was unreadable: the summary says custom zone coverage is unknown and this cannot pass, and evidence records `Network zones unreadable (custom zone count unknown): ...`. Manual when no such rule exists and the zone inventory was unreadable; Fail when complete evidence has neither. |
 | Inactive application review | `okta_assess_integrations` | OKTA-INTEG-005 | Partial when any app is not ACTIVE; Manual on 403 or an empty list. |
 | Lifecycle automation (follow-on) | `okta_assess_integrations` | OKTA-INTEG-006 | Manual when the app list is unreadable (its own status named) or empty. Pass when an ACTIVE app has `PUSH_USER_DEACTIVATION` and the group rule list was readable; with group rules unreadable the Pass caps at Partial, the summary adds `group rules were unreadable, so rule-driven assignment automation could not be confirmed`, and evidence records `ACTIVE group rules: unread (<error>)` instead of a count. Fail when provisioning-enabled apps never push deactivation; Partial when no ACTIVE app exposes provisioning features. |
 | Log streaming and SIEM forwarding | `okta_assess_monitoring` | OKTA-MON-001 | Pass with an ACTIVE log stream; Partial with only ACTIVE event hooks; Fail when both inventories are empty; Manual when both are unreadable. |
@@ -322,6 +323,12 @@ The assessors follow these rules so a verdict never rests on missing or partial 
    - Every counter derived from it renders `null` in the assess tool `snapshot` and in `core_data/collection_status.json`, never `0` or `truncated: false`.
    - Every HTTP status or endpoint named anywhere in the output comes from a request the run actually made. Markers, probe results, and `Manual` causes carry the failed request's own status and path.
    - A per-parent list that was skipped because its parent was unreadable says so without inventing a status or endpoint.
+10. A throttled, failing, or stalled request is retried a bounded number of times, and then its dataset fails closed.
+    - **Retried:** A 429, a 500, 502, 503, or 504 answer, an attempt that runs past the 30-second per-request timeout (headers and body together), and a transport failure such as a reset connection. Each request gets up to four retries (five attempts), the OAuth token request included, and each token attempt signs a new client assertion.
+    - **Waits:** `Retry-After` (delta-seconds or an HTTP-date) on any retried status, else `X-Rate-Limit-Reset` on a 429, else exponential backoff from 1 second with jitter. Every wait is clamped to 15 seconds.
+    - **Not retried:** Any other answer, such as a 403 or a 404, is final on its first attempt. In OAuth mode a 401 discards the cached access token and repeats the request once with a new one. Canceling the tool call stops it at once, mid-wait included.
+    - **Exhaustion:** The error names the request path without its query, the last status or failure, and the attempt count, for example `Okta API request failed for /api/v1/zones (503 Service Unavailable) after 5 attempts` or `(timed out after 30000 ms) after 5 attempts`. It is scrubbed like every other error (see [Error text carriers](#error-text-carriers)).
+    - **Mid-walk failure:** A page that still fails after its retries makes the whole dataset unreadable. The pages read before it are dropped, the dataset is written as a marker, and every finding that reads it follows rules 1 and 9. For example, OKTA-INTEG-004 caps at `Partial` beside a contextual rule when the network-zone walk fails on its second page.
 
 ### Record redaction
 

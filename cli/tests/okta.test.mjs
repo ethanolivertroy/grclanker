@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { generateKeyPairSync } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -36,6 +37,7 @@ import {
   scrubErrorText,
 } from "../dist/extensions/grc-tools/okta.js";
 import { OKTA_SPEC } from "../dist/extensions/grc-tools/okta.spec.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
@@ -47,6 +49,7 @@ import {
 } from "./helpers/byte-differential-fixtures.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 import { assertValidOscal } from "./helpers/oscal-schema.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed, assertSecretFragmentsAbsent } from "./helpers/planted-values.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -824,6 +827,311 @@ test("OktaAuditorClient handles OAuth token refresh, rate limits, and pagination
   clearOktaTokenCacheForTests();
 });
 
+const RETRY_ORG_URL = "https://tenant.example.okta.com";
+const RETRY_NOW = Date.parse("2026-10-23T12:00:00Z");
+const RETRY_STATUS_TEXT = { 429: "Too Many Requests", 500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout" };
+
+/** A client whose waits are recorded instead of slept, whose backoff has no jitter, and whose clock is fixed, so every wait is exact. */
+function retryingOktaClient(fetchImpl, { config = {}, ...options } = {}) {
+  const sleeps = [];
+  const client = new OktaAuditorClient(
+    { orgUrl: RETRY_ORG_URL, authMode: "SSWS", token: "00rtyNJ2qLsPW5j9bFB7ZVsGWawJFvjtz2ryUf9WQk", scopes: [], sourceChain: ["tests"], ...config },
+    { fetchImpl, sleep: async (ms) => { sleeps.push(ms); }, jitter: (delayMs) => delayMs, now: () => RETRY_NOW, ...options },
+  );
+  return { client, sleeps };
+}
+
+/** Answers request n with answers[n] (the last one repeats); each answer builds a fresh Response or throws. */
+function scriptedFetch(answers) {
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    requests.push({ url: String(input), init });
+    return answers[Math.min(requests.length, answers.length) - 1](init);
+  };
+  return { fetchImpl, requests };
+}
+
+const busy = (status, headers = {}) => () => new Response(null, { status, statusText: RETRY_STATUS_TEXT[status], headers });
+const groupsPage = () => Response.json([{ id: "group-1" }]);
+const resetConnection = () => {
+  throw new TypeError("fetch failed", { cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }) });
+};
+/** Never answers: the attempt ends only when its own timeout signal fires. */
+const hang = (init) => new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+
+test("OktaAuditorClient retries 429, 500, 502, 503, and 504 with doubling backoff and returns any other answer at once", async () => {
+  for (const status of [429, 500, 502, 503, 504]) {
+    const { fetchImpl, requests } = scriptedFetch([busy(status), busy(status), groupsPage]);
+    const { client, sleeps } = retryingOktaClient(fetchImpl);
+    const groups = await client.listGroups();
+    assert.deepEqual(groups.items.map((group) => group.id), ["group-1"], `${status}: the third attempt is read`);
+    assert.equal(requests.length, 3, `${status}: retried twice`);
+    assert.deepEqual(sleeps, [1000, 2000], `${status}: backoff starts at 1 second and doubles`);
+  }
+  for (const status of [400, 401, 403, 404, 501]) {
+    const { fetchImpl, requests } = scriptedFetch([() => Response.json({ errorSummary: "refused" }, { status })]);
+    const { client, sleeps } = retryingOktaClient(fetchImpl);
+    await assert.rejects(() => client.listGroups(), (error) => {
+      assert.equal(error.status, status);
+      assert.doesNotMatch(error.message, /attempts/);
+      return true;
+    });
+    assert.equal(requests.length, 1, `${status} is not retried`);
+    assert.deepEqual(sleeps, []);
+  }
+});
+
+test("OktaAuditorClient waits as Retry-After says on any retried status, as delta-seconds or an HTTP date, clamped to 15 seconds", async () => {
+  const resetIn4s = String((RETRY_NOW + 4000) / 1000);
+  const cases = [
+    ["delta-seconds on a 503", busy(503, { "retry-after": "7" }), 7000],
+    ["an HTTP date on a 500", busy(500, { "retry-after": new Date(RETRY_NOW + 9000).toUTCString() }), 9000],
+    ["an HTTP date already past on a 502", busy(502, { "retry-after": new Date(RETRY_NOW - 60_000).toUTCString() }), 0],
+    ["a long delta-seconds on a 429", busy(429, { "retry-after": "120" }), 15_000],
+    ["a far HTTP date on a 504", busy(504, { "retry-after": new Date(RETRY_NOW + 3_600_000).toUTCString() }), 15_000],
+    ["X-Rate-Limit-Reset on a 429", busy(429, { "x-rate-limit-reset": resetIn4s }), 4000],
+    ["X-Rate-Limit-Reset on a 503, which only describes the rate-limit window", busy(503, { "x-rate-limit-reset": resetIn4s }), 1000],
+    ["an unparseable Retry-After", busy(503, { "retry-after": "soon" }), 1000],
+  ];
+  for (const [label, answer, wait] of cases) {
+    const { fetchImpl } = scriptedFetch([answer, groupsPage]);
+    const { client, sleeps } = retryingOktaClient(fetchImpl);
+    await client.listGroups();
+    assert.deepEqual(sleeps, [wait], label);
+  }
+});
+
+test("OktaAuditorClient retries a transport failure or a timed-out attempt, each attempt under its own timeout", async () => {
+  const { fetchImpl, requests } = scriptedFetch([resetConnection, hang, groupsPage]);
+  const { client, sleeps } = retryingOktaClient(fetchImpl, { timeoutMs: 5 });
+  const groups = await client.listGroups();
+  assert.deepEqual(groups.items.map((group) => group.id), ["group-1"]);
+  assert.equal(requests.length, 3);
+  assert.deepEqual(sleeps, [1000, 2000]);
+  assert.notEqual(requests[0].init.signal, requests[1].init.signal, "every attempt gets a fresh timeout");
+});
+
+test("OktaAuditorClient stops after five attempts and names the path, the last status or failure, and the attempt count", async () => {
+  const exhaust = async (answer, call, options) => {
+    const { fetchImpl, requests } = scriptedFetch([answer]);
+    const { client, sleeps } = retryingOktaClient(fetchImpl, options);
+    const error = await call(client).then(() => assert.fail("expected the request to fail"), (thrown) => thrown);
+    return { error, requests, sleeps };
+  };
+
+  const status = await exhaust(
+    busy(503),
+    (client) => client.listPaginatedWithMeta(`${RETRY_ORG_URL}/api/v1/zones?limit=200&filter=usage%20eq%20%22POLICY%22&after=cursor-9`),
+  );
+  assert.equal(status.error.message, "Okta API request failed for /api/v1/zones (503 Service Unavailable) after 5 attempts");
+  assert.equal(status.error.status, 503);
+  assert.equal(status.error.endpoint, "/api/v1/zones");
+  assert.equal(status.requests.length, 5);
+  assert.deepEqual(status.sleeps, [1000, 2000, 4000, 8000], "four waits, none after the last attempt");
+
+  const transport = await exhaust(resetConnection, (client) => client.listGroups());
+  assert.equal(transport.error.message, "Okta API request failed for /api/v1/groups (network error: fetch failed (ECONNRESET)) after 5 attempts");
+  assert.equal(transport.error.status, null);
+  assert.equal(transport.requests.length, 5);
+
+  const headers = await exhaust(hang, (client) => client.listGroups(), { timeoutMs: 5 });
+  assert.equal(headers.error.message, "Okta API request failed for /api/v1/groups (timed out after 5 ms) after 5 attempts");
+  assert.equal(headers.requests.length, 5);
+
+  const stalledBody = (init) => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("["));
+      init.signal.addEventListener("abort", () => controller.error(init.signal.reason), { once: true });
+    },
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  const body = await exhaust(stalledBody, (client) => client.listGroups(), { timeoutMs: 5 });
+  assert.equal(body.error.message, "Okta API request failed for /api/v1/groups (timed out after 5 ms) after 5 attempts", "the timeout covers the body too");
+});
+
+test("OktaAuditorClient gives each attempt 30 seconds by default", async (t) => {
+  const timers = t.mock.method(globalThis, "setTimeout");
+  const { client } = retryingOktaClient(scriptedFetch([busy(503), groupsPage]).fetchImpl);
+  await client.listGroups();
+  assert.deepEqual(timers.mock.calls.map((call) => call.arguments[1]), [30_000, 30_000], "one timer per attempt");
+});
+
+test("OktaAuditorClient never retries a tool-call abort, during a request or during the wait before a retry", async () => {
+  const config = { orgUrl: RETRY_ORG_URL, authMode: "SSWS", token: "00rtyNJ2qLsPW5j9bFB7ZVsGWawJFvjtz2ryUf9WQk", scopes: [], sourceChain: ["tests"] };
+
+  const duringWait = new AbortController();
+  let waitRequests = 0;
+  const waiting = new OktaAuditorClient(config, {
+    fetchImpl: async () => {
+      waitRequests += 1;
+      return busy(503)();
+    },
+    signal: duringWait.signal,
+    sleep: () => {
+      duringWait.abort(new Error("the operator stopped the call"));
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(() => waiting.listGroups(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(waitRequests, 1, "no request follows an abort during the wait");
+
+  const duringRequest = new AbortController();
+  let sent = 0;
+  const requesting = new OktaAuditorClient(config, {
+    fetchImpl: async () => {
+      sent += 1;
+      duringRequest.abort(new Error("the operator stopped the call"));
+      throw new DOMException("This operation was aborted", "AbortError");
+    },
+    signal: duringRequest.signal,
+    sleep: async () => assert.fail("an aborted request is never retried"),
+  });
+  await assert.rejects(() => requesting.listGroups(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(sent, 1);
+});
+
+test("OktaAuditorClient retries the OAuth token request with a freshly signed assertion and keeps one 401 re-authentication", async () => {
+  clearOktaTokenCacheForTests();
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const config = { authMode: "PrivateKey", clientId: "client-id", privateKey: privateKey.export({ type: "pkcs8", format: "pem" }), scopes: ["okta.groups.read"] };
+  const isTokenRequest = (input) => new URL(String(input)).pathname === "/oauth2/v1/token";
+  const minted = (count) => Response.json({ access_token: `minted-access-token-${count}`, expires_in: 3600 });
+
+  const jtis = [];
+  let apiRequests = 0;
+  const recovering = retryingOktaClient(async (input, init = {}) => {
+    if (isTokenRequest(input)) {
+      const assertion = new URLSearchParams(init.body).get("client_assertion");
+      jtis.push(JSON.parse(Buffer.from(assertion.split(".")[1], "base64url").toString("utf8")).jti);
+      return jtis.length === 1 ? busy(503)() : minted(jtis.length);
+    }
+    apiRequests += 1;
+    assert.equal(new Headers(init.headers).get("authorization"), "Bearer minted-access-token-2");
+    return groupsPage();
+  }, { config });
+  assert.deepEqual((await recovering.client.listGroups()).items.map((group) => group.id), ["group-1"]);
+  assert.equal(jtis.length, 2, "the 503 token answer is retried");
+  assert.notEqual(jtis[0], jtis[1], "each attempt signs a new assertion, since Okta refuses a jti it has seen");
+  assert.deepEqual(recovering.sleeps, [1000]);
+  assert.equal(apiRequests, 1);
+  clearOktaTokenCacheForTests();
+
+  const refused = scriptedFetch([() => Response.json({ error: "invalid_client" }, { status: 400, statusText: "Bad Request" })]);
+  const refusedClient = retryingOktaClient(refused.fetchImpl, { config });
+  await assert.rejects(() => refusedClient.client.listGroups(), /Okta OAuth token request failed \(400 Bad Request\)/);
+  assert.equal(refused.requests.length, 1, "a refused token request is not retried");
+  assert.deepEqual(refusedClient.sleeps, []);
+  clearOktaTokenCacheForTests();
+
+  const stalled = scriptedFetch([hang]);
+  const stalledClient = retryingOktaClient(stalled.fetchImpl, { config, timeoutMs: 5 });
+  await assert.rejects(() => stalledClient.client.listGroups(), { message: "Okta API request failed for /oauth2/v1/token (timed out after 5 ms) after 5 attempts" });
+  assert.equal(stalled.requests.length, 5, "a timed-out token request is retried");
+  clearOktaTokenCacheForTests();
+
+  let tokens = 0;
+  let unauthorized = 0;
+  const rejected = retryingOktaClient(async (input) => {
+    if (isTokenRequest(input)) return minted(++tokens);
+    unauthorized += 1;
+    return Response.json({ errorSummary: "Invalid session" }, { status: 401, statusText: "Unauthorized" });
+  }, { config });
+  await assert.rejects(() => rejected.client.listGroups(), (error) => error.status === 401 && !/attempts/.test(error.message));
+  assert.equal(tokens, 2, "one fresh token after the first 401");
+  assert.equal(unauthorized, 2, "the second 401 is final");
+  assert.deepEqual(rejected.sleeps, []);
+  clearOktaTokenCacheForTests();
+});
+
+test("planted Okta credentials echoed by a retried failure, in the body, the headers, or a transport error, never reach a thrown error, a tool result, or a bundle file", async () => {
+  clearOktaTokenCacheForTests();
+  const planted = { apiToken: "Tq8MvRz3KpXw6NbLhJ2cYsGd", mintedToken: "Hy5WnKq9ZtRm3VbXpLs7JcDf" };
+  const values = Object.values(planted);
+  /** Runs the access check and the four assess tools on `fetchImpl` with instant waits and returns each tool's text and details. */
+  const runTools = async (fetchImpl, args) => {
+    const tools = new Map();
+    registerOktaTools({ registerTool: (definition) => tools.set(definition.name, definition) }, { fetchImpl, sleep: async () => {} });
+    tools.delete("okta_export_audit_bundle");
+    const outputs = [];
+    for (const [name, definition] of tools) {
+      clearOktaTokenCacheForTests();
+      const result = await definition.execute(`call-${name}`, definition.prepareArguments(args));
+      outputs.push([`${name} text`, result.content.map((part) => part.text ?? "").join("\n")], [`${name} details`, JSON.stringify(result.details ?? {})]);
+    }
+    return outputs;
+  };
+  const sample = createSampleClient();
+  const serveSample = async (input) => {
+    const body = await oktaFixtureBody(sample, new URL(String(input)));
+    return body === null || body === undefined ? Response.json({ errorSummary: "Not found" }, { status: 404, statusText: "Not Found" }) : Response.json(body);
+  };
+  const healthyBundle = await exportOktaAuditBundle(retryingOktaClient(serveSample).client, createSampleConfig(), createTempBase("grclanker-okta-healthy-"));
+  assertPlantedValuesWellFormed(assert, planted, [
+    ["authentication data", JSON.stringify(createSampleAuthenticationData())],
+    ["admin data", JSON.stringify(createSampleAdminData())],
+    ["integration data", JSON.stringify(createSampleIntegrationData())],
+    ["monitoring data", JSON.stringify(createSampleMonitoringData())],
+    ["config", JSON.stringify(createSampleConfig())],
+    ...await runTools(serveSample, { org_url: RETRY_ORG_URL, auth_mode: "SSWS", api_token: "okta-healthy-run-token" }),
+    ...readBundleFiles(healthyBundle.outputDir),
+  ]);
+
+  /** Every API answer echoes `secret` in each field errorDetail reads and in the headers. */
+  const echoing = (secret) => () => Response.json({
+    errorCode: secret,
+    errorSummary: `backend unavailable for SSWS ${secret}`,
+    errorId: secret,
+    errorCauses: [{ errorSummary: secret }],
+    error_description: `token ${secret} refused`,
+  }, {
+    status: 503,
+    statusText: "Service Unavailable",
+    headers: { "retry-after": secret, "www-authenticate": `SSWS realm="${secret}"`, "x-okta-request-id": secret, "x-debug-token": secret },
+  });
+  const transportEcho = (secret) => () => {
+    throw new TypeError(`fetch failed: proxy refused SSWS ${secret} (token ${secret})`, { cause: Object.assign(new Error(secret), { code: "ECONNREFUSED" }) });
+  };
+  const assertNoFragments = (outputs, label) => {
+    assert.ok(outputs.some(([, content]) => content.includes("after 5 attempts") && content.includes("[REDACTED]")), `${label}: the outputs name the exhausted reads, with the echo removed`);
+    assertSecretFragmentsAbsent(assert, outputs, values, label);
+  };
+
+  const sswsConfig = { orgUrl: RETRY_ORG_URL, authMode: "SSWS", token: planted.apiToken, scopes: [], sourceChain: ["tests"] };
+  for (const [label, answer, scrubbed] of [
+    ["echoing 503", echoing(planted.apiToken), "Okta API request failed for /api/v1/groups (503 Service Unavailable) after 5 attempts: token [REDACTED] refused"],
+    ["transport error", transportEcho(planted.apiToken), "Okta API request failed for /api/v1/groups (network error: fetch failed: proxy refused SSWS [REDACTED] (token [REDACTED]) (ECONNREFUSED)) after 5 attempts"],
+  ]) {
+    const { client } = retryingOktaClient(answer, { config: { token: planted.apiToken } });
+    const thrown = await client.listGroups().then(() => assert.fail(`${label}: expected the read to fail`), (error) => error);
+    assert.equal(thrown.message, scrubbed, `${label}: the echo reaches the error and is removed there`);
+    assertFragmentsAbsent(assert, thrown.message, values, `${label}: thrown error`);
+
+    const assessed = await runAllAssessments(retryingOktaClient(answer, { config: { token: planted.apiToken } }).client, sswsConfig);
+    assertNoFragments([["assessments", JSON.stringify(assessed)]], `${label}: assessments`);
+
+    const bundle = await exportOktaAuditBundle(retryingOktaClient(answer, { config: { token: planted.apiToken } }).client, sswsConfig, createTempBase("grclanker-okta-planted-"));
+    assert.ok(bundle.errorCount > 0, label);
+    assertNoFragments([...readBundleFiles(bundle.outputDir)], `${label}: bundle`);
+    assertSecretFragmentsAbsent(assert, readZipEntries(bundle.zipPath), values, `${label}: zip`);
+
+    assertNoFragments(await runTools(answer, { org_url: RETRY_ORG_URL, auth_mode: "SSWS", api_token: planted.apiToken }), `${label}: tools`);
+  }
+
+  // PrivateKey mode: the access token Okta mints is echoed back by every failing read.
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const mintingEcho = async (input) => new URL(String(input)).pathname === "/oauth2/v1/token"
+    ? Response.json({ access_token: planted.mintedToken, token_type: "Bearer", expires_in: 3600 })
+    : echoing(planted.mintedToken)();
+  const privateKeyArgs = {
+    org_url: RETRY_ORG_URL,
+    auth_mode: "PrivateKey",
+    client_id: "0oa1serviceapp",
+    private_key: privateKey.export({ type: "pkcs8", format: "pem" }),
+    scopes: ["okta.groups.read"],
+  };
+  assertNoFragments(await runTools(mintingEcho, privateKeyArgs), "minted token: tools");
+  clearOktaTokenCacheForTests();
+});
+
 test("Okta assessments generate mapped findings across authentication, admin, integration, and monitoring", async () => {
   const config = createSampleConfig();
 
@@ -1283,6 +1591,72 @@ test("OKTA-AUTH-002 keeps the legacy Partial finding when only MFA enrollment po
   assert.ok(finding.evidence.includes("Partial data: MFA_ENROLL pagination cursor repeated after 1 item; total unknown"));
 });
 
+test("OKTA-INTEG-004 never passes when the network-zone inventory failed or is truncated", async () => {
+  const config = createSampleConfig();
+
+  const denied = createSampleIntegrationData();
+  denied.networkZones = dataset([], "Okta API request failed for /api/v1/zones?limit=200 (403 Forbidden): denied");
+  const withRule = await captureOktaFacts("OKTA-INTEG-004", () => assessOktaIntegrations(denied, config));
+  const partial = findingById(withRule.result, "OKTA-INTEG-004");
+  assert.equal(partial.status, "Partial", "a contextual rule beside an unreadable zone inventory is not a pass");
+  assert.equal(withRule.facts.custom_zone_count, null);
+  assert.match(partial.summary, /network-zone inventory was unreadable, so custom zone coverage is unknown and this cannot pass/);
+  assert.ok(partial.evidence.some((line) => /^Network zones unreadable \(custom zone count unknown\): .*\(403 Forbidden\)/.test(line)));
+
+  const noRule = createSampleIntegrationData();
+  noRule.networkZones = dataset([], "Okta API request failed for /api/v1/zones (503 Service Unavailable) after 5 attempts");
+  noRule.accessPolicyRules = dataset({ "access-1": [{ id: "access-rule-2", name: "Plain allow", status: "ACTIVE", conditions: {} }] });
+  noRule.signOnPolicyRules = dataset({ "signon-1": [{ id: "signon-rule-2", name: "Plain sign-on", status: "ACTIVE", conditions: {} }] });
+  const withoutRule = await captureOktaFacts("OKTA-INTEG-004", () => assessOktaIntegrations(noRule, config));
+  const manual = findingById(withoutRule.result, "OKTA-INTEG-004");
+  assert.equal(manual.status, "Manual", "with no contextual rule an unreadable zone inventory cannot tell Fail from Partial");
+  assert.equal(withoutRule.facts.risk_aware_rule_count, 0);
+  assert.equal(withoutRule.facts.custom_zone_count, null);
+  assert.match(manual.summary, /network-zone inventory was unreadable \(the endpoint request still failed after 5 attempts\), so custom zone coverage is unknown/);
+
+  const truncated = createSampleIntegrationData();
+  truncated.networkZones = {
+    data: truncated.networkZones.data,
+    truncated: true,
+    truncationNote: 'GET /api/v1/zones?limit=200 stopped after 1 pages (2 items): the Link rel="next" cursor repeated a page already read, total unknown.',
+  };
+  assert.equal(findingById(assessOktaIntegrations(truncated, config), "OKTA-INTEG-004").status, "Partial");
+  assert.equal(findingById(assessOktaIntegrations(createSampleIntegrationData(), config), "OKTA-INTEG-004").status, "Pass", "a readable zone inventory still passes");
+
+  // End to end: the zone walk's second page keeps answering 502, so the walk is recorded as unreadable, never as its first page.
+  const policyAnswers = (url) => {
+    if (url.pathname === "/api/v1/policies" && url.searchParams.get("type") === "ACCESS_POLICY") {
+      return Response.json([{ id: "access-1", name: "Workforce Access Policy", status: "ACTIVE" }]);
+    }
+    if (url.pathname === "/api/v1/policies/access-1/rules") {
+      return Response.json([{ id: "access-rule-1", name: "High risk step-up", status: "ACTIVE", conditions: { risk: { level: "HIGH" } } }]);
+    }
+    return Response.json([]);
+  };
+  const zoneCursors = [];
+  const { client, sleeps } = retryingOktaClient(async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname !== "/api/v1/zones") return policyAnswers(url);
+    zoneCursors.push(url.searchParams.get("after"));
+    if (!url.searchParams.has("after")) {
+      return Response.json([{ id: "zone-1", name: "Corporate HQ", system: false, status: "ACTIVE" }], {
+        headers: { link: `<${RETRY_ORG_URL}/api/v1/zones?limit=200&after=zone-1>; rel="next"` },
+      });
+    }
+    return busy(502)();
+  });
+  const collected = await collectOktaIntegrationData(client);
+  assert.deepEqual(zoneCursors, [null, "zone-1", "zone-1", "zone-1", "zone-1", "zone-1"], "the first page once, then five attempts at the second");
+  assert.deepEqual(collected.networkZones.data, [], "the first page is not kept as the inventory");
+  assert.equal(collected.networkZones.error, "Okta API request failed for /api/v1/zones (502 Bad Gateway) after 5 attempts");
+  assert.deepEqual(collected.networkZones.notCollected, { collected: false, status: 502, endpoint: "/api/v1/zones", error: collected.networkZones.error });
+  assert.deepEqual(sleeps, [1000, 2000, 4000, 8000]);
+  const assessed = assessOktaIntegrations(collected, config);
+  assert.equal(findingById(assessed, "OKTA-INTEG-004").status, "Partial");
+  assert.equal(findingById(assessed, "OKTA-INTEG-002").status, "Manual");
+  assert.match(findingById(assessed, "OKTA-INTEG-002").summary, /still failed after 5 attempts/);
+});
+
 portableContractTest("portable completeness contracts match 103 runtime permission cases with truncation-only exceptions", async () => {
   const onePolicyFamily = createSampleAuthenticationData();
   onePolicyFamily.signOnPolicies = dataset([], "403 denied sign-on policies");
@@ -1327,6 +1701,8 @@ portableContractTest("portable completeness contracts match 103 runtime permissi
     ...Array.from({ length: 22 }, (_, index) => ({
       id: "OKTA-INTEG-004",
       source: "network-zones",
+      // The zone denial leaves complete true, but the unknown custom zone count keeps the finding below Pass.
+      expected: "Partial",
       run: () => {
         const data = createSampleIntegrationData();
         data.networkZones = dataset([], `403 denied network zones case ${index}`);
@@ -1343,7 +1719,8 @@ portableContractTest("portable completeness contracts match 103 runtime permissi
     assert.ok(source, `${testCase.id}: ${testCase.source} is explicitly owned`);
     assert.equal(source.falseWhen.includes("denied"), false, `${testCase.id}: denial does not change complete`);
     assert.equal(source.falseWhen.includes("error"), false, `${testCase.id}: an error does not change complete`);
-    assert.equal(findingById(result, testCase.id).status, "Pass", `${testCase.id}: current-main outcome remains Pass`);
+    const expected = testCase.expected ?? "Pass";
+    assert.equal(findingById(result, testCase.id).status, expected, `${testCase.id}: ${testCase.source} denial yields ${expected}`);
   }
 });
 
@@ -2012,14 +2389,15 @@ test("rule 9: OktaAuditorClient error strings drop the request cursor, raw bodie
   };
   const client = new OktaAuditorClient(
     { orgUrl: "https://tenant.example.okta.com", authMode: "SSWS", token, scopes: [], sourceChain: ["tests"] },
-    { fetchImpl },
+    { fetchImpl, sleep: async () => {} },
   );
 
   await assert.rejects(
     () => client.listPaginatedWithMeta("https://tenant.example.okta.com/api/v1/apps?limit=200&after=cursor-2"),
     (error) => {
-      assert.match(error.message, /^Okta API request failed for \/api\/v1\/apps\?limit=200 \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)$/);
+      assert.match(error.message, /^Okta API request failed for \/api\/v1\/apps \(502 Bad Gateway\) after 5 attempts: non-JSON body \(text\/html, \d+ bytes\)$/);
       assert.ok(!error.message.includes("after="));
+      assert.ok(!error.message.includes("limit="));
       assertNoWindowOf(error.message, token, "502 HTML error string");
       assert.ok(!error.message.includes("<html>"));
       return true;
@@ -2036,7 +2414,7 @@ test("rule 9: OktaAuditorClient error strings drop the request cursor, raw bodie
   await assert.rejects(
     () => client.listNetworkZones(),
     (error) => {
-      assert.match(error.message, /\(500 Internal Server Error\): JSON error body without errorSummary \(\d+ bytes\)$/);
+      assert.match(error.message, /\(500 Internal Server Error\) after 5 attempts: JSON error body without errorSummary \(\d+ bytes\)$/);
       assertNoWindowOf(error.message, token, "500 JSON error string");
       return true;
     },

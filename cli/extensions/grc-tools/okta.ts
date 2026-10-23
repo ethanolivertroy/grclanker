@@ -44,6 +44,10 @@ const PAGE_LIMIT = 200;
 const LOOKBACK_DAYS = 30;
 const TOKEN_SKEW_MS = 60 * 1000;
 const DEFAULT_RATE_LIMIT_RETRIES = 4;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+const RETRY_BASE_DELAY_MS = 1000;
+const MAX_RETRY_DELAY_MS = 15_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DAYS_90_MS = 90 * 24 * 60 * 60 * 1000;
 const DAYS_30_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_USER_PAGES = 50;
@@ -2299,8 +2303,7 @@ function describeNonJsonBody(response: Response, rawText: string): string {
 }
 
 /** Keeps only the vendor's error summary fields; a body without them is described by content type and size so a token echoed by a proxy never lands in an error string. */
-async function readErrorDetail(response: Response): Promise<string> {
-  const text = await response.text();
+function errorDetail(response: Response, text: string): string {
   if (!text) return "";
   try {
     const parsed = JSON.parse(text) as JsonRecord;
@@ -2317,8 +2320,7 @@ async function readErrorDetail(response: Response): Promise<string> {
 }
 
 /** Parses a successful body as JSON; a body that is not JSON is described by content type and size only, so no fragment of it (which V8 would quote) reaches an error string. */
-async function readJsonBody(response: Response, target: string): Promise<unknown> {
-  const text = await response.text();
+function parseJsonBody(response: Response, text: string, target: string): unknown {
   try {
     return JSON.parse(text) as unknown;
   } catch {
@@ -2330,25 +2332,64 @@ async function readJsonBody(response: Response, target: string): Promise<unknown
   }
 }
 
-function retryDelayFromResponse(response: Response): number {
-  const retryAfter = response.headers.get("retry-after");
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds >= 0) {
-      return Math.min(seconds * 1000, 15_000);
-    }
-  }
+/** Equal jitter: half of the exponential delay is kept and the other half is random, so parallel runs spread out without a near-zero wait. */
+function defaultJitter(delayMs: number): number {
+  return Math.round(delayMs / 2 + Math.random() * (delayMs / 2));
+}
+
+/** The wait before retry number `retry` (0 for the first) when the server named none: 1 s doubling per retry, clamped to MAX_RETRY_DELAY_MS. */
+function backoffDelay(retry: number, jitter: (delayMs: number) => number): number {
+  return Math.min(Math.max(jitter(RETRY_BASE_DELAY_MS * 2 ** retry), 0), MAX_RETRY_DELAY_MS);
+}
+
+/** Retry-After as delta-seconds or an HTTP-date, in milliseconds from `now`; undefined when absent or unparseable. */
+function retryAfterMs(header: string | null, now: number): number | undefined {
+  const value = header?.trim();
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : undefined;
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.max(at - now, 0);
+}
+
+/**
+ * The wait before retrying a 429 or 5xx answer, clamped to MAX_RETRY_DELAY_MS: Retry-After when the answer
+ * carries one, else the X-Rate-Limit-Reset epoch on a 429 (on a 5xx it only describes the rate-limit
+ * window), else the exponential backoff.
+ */
+function retryDelayFromResponse(response: Response, retry: number, now: number, jitter: (delayMs: number) => number): number {
+  const retryAfter = retryAfterMs(response.headers.get("retry-after"), now);
+  if (retryAfter !== undefined) return Math.min(retryAfter, MAX_RETRY_DELAY_MS);
 
   const reset = response.headers.get("x-rate-limit-reset");
-  if (reset) {
+  if (response.status === 429 && reset) {
     const epochSeconds = Number(reset);
     if (Number.isFinite(epochSeconds)) {
-      const delta = epochSeconds * 1000 - Date.now();
-      return Math.min(Math.max(delta, 250), 15_000);
+      return Math.min(Math.max(epochSeconds * 1000 - now, 250), MAX_RETRY_DELAY_MS);
     }
   }
 
-  return 1000;
+  return backoffDelay(retry, jitter);
+}
+
+/** A fetch rejection's message plus its cause's network code (ECONNRESET, ENOTFOUND, UND_ERR_SOCKET), which undici keeps off its "fetch failed" message. */
+function transportFailure(error: unknown): string {
+  const message = errorText(error);
+  const cause = error instanceof Error ? error.cause : undefined;
+  const code = typeof cause === "object" && cause !== null ? (cause as { code?: unknown }).code : undefined;
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{1,40}$/.test(code) && !message.includes(code) ? `${message} (${code})` : message;
+}
+
+interface OktaClientOptions {
+  fetchImpl?: FetchImpl;
+  signal?: AbortSignal;
+  /** The wait between attempts; it is still raced against `signal`. */
+  sleep?: (ms: number) => Promise<void>;
+  /** The clock a Retry-After HTTP-date and an X-Rate-Limit-Reset epoch are measured against. */
+  now?: () => number;
+  jitter?: (delayMs: number) => number;
+  /** How long one attempt may run, headers and body together, before it counts as timed out. */
+  timeoutMs?: number;
 }
 
 export class OktaAuditorClient {
@@ -2356,12 +2397,18 @@ export class OktaAuditorClient {
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly signal: AbortSignal | undefined;
+  private readonly now: () => number;
+  private readonly jitter: (delayMs: number) => number;
+  private readonly timeoutMs: number;
 
-  constructor(config: OktaResolvedConfig, options?: { fetchImpl?: FetchImpl; signal?: AbortSignal }) {
+  constructor(config: OktaResolvedConfig, options: OktaClientOptions = {}) {
     this.config = config;
-    this.fetchImpl = abortableFetch(options?.fetchImpl ?? fetch, options?.signal);
-    this.sleep = abortableSleep(options?.signal);
-    this.signal = options?.signal;
+    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
+    this.sleep = abortableSleep(options.signal, options.sleep);
+    this.signal = options.signal;
+    this.now = options.now ?? Date.now;
+    this.jitter = options.jitter ?? defaultJitter;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     registerConfiguredSecrets([config.token, config.privateKey, config.clientAssertion]);
   }
 
@@ -2385,27 +2432,25 @@ export class OktaAuditorClient {
     }
 
     const pending = unlessAborted((async () => {
-      const clientAssertion = buildClientAssertion(this.config);
-      const body = new URLSearchParams({
-        grant_type: "client_credentials",
-        scope: this.config.scopes.join(" "),
-        client_id: this.config.clientId ?? "",
-        client_assertion_type:
-          "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-        client_assertion: clientAssertion,
-      });
-
-      const response = await this.fetchImpl(`${this.config.orgUrl}${TOKEN_ENDPOINT_PATH}`, {
+      // Each attempt signs its own assertion: Okta refuses a client assertion whose jti it has already seen.
+      const { response, text } = await this.send(`${this.config.orgUrl}${TOKEN_ENDPOINT_PATH}`, TOKEN_ENDPOINT_PATH, () => ({
         method: "POST",
         headers: {
           "content-type": "application/x-www-form-urlencoded",
           accept: "application/json",
         },
-        body: body.toString(),
-      });
+        body: new URLSearchParams({
+          grant_type: "client_credentials",
+          scope: this.config.scopes.join(" "),
+          client_id: this.config.clientId ?? "",
+          client_assertion_type:
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+          client_assertion: buildClientAssertion(this.config),
+        }).toString(),
+      }));
 
       if (!response.ok) {
-        const detail = await readErrorDetail(response);
+        const detail = errorDetail(response, text);
         throw new OktaApiError(
           this.redactSecrets(
             `Okta OAuth token request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
@@ -2415,7 +2460,7 @@ export class OktaAuditorClient {
         );
       }
 
-      const payload = asRecord(await readJsonBody(response, TOKEN_ENDPOINT_PATH));
+      const payload = asRecord(parseJsonBody(response, text, TOKEN_ENDPOINT_PATH));
       const accessToken = asString(payload.access_token);
       if (!accessToken) {
         throw new Error("Okta OAuth token response did not include access_token.");
@@ -2450,60 +2495,79 @@ export class OktaAuditorClient {
     return `Bearer ${token}`;
   }
 
-  private async request(
-    pathOrUrl: string,
-    init: RequestInit = {},
-    attempt = 0,
-  ): Promise<Response> {
+  /**
+   * Sends one request and reads its body, retrying a 429 or transient 5xx answer, an attempt that runs past
+   * timeoutMs, and a transport failure up to DEFAULT_RATE_LIMIT_RETRIES times. The first other answer is
+   * returned whatever its status. Running out of retries throws an error naming the path (never the query),
+   * the last status or failure, and the attempt count. `init` is built per attempt.
+   */
+  private async send(
+    url: string,
+    endpoint: string,
+    init: () => RequestInit,
+  ): Promise<{ response: Response; text: string }> {
+    for (let attempt = 1; ; attempt += 1) {
+      const requestInit = init();
+      const timeout = new AbortController();
+      const timer = setTimeout(() => timeout.abort(), this.timeoutMs);
+      let status: number | null = null;
+      let failure: string;
+      let waitMs: number;
+      try {
+        const response = await this.fetchImpl(url, { ...requestInit, signal: timeout.signal });
+        const text = await response.text();
+        if (!RETRYABLE_STATUSES.has(response.status)) return { response, text };
+        const detail = errorDetail(response, text);
+        status = response.status;
+        failure = `(${response.status} ${response.statusText}) after ${attempt} attempts${detail ? `: ${detail}` : ""}`;
+        waitMs = retryDelayFromResponse(response, attempt - 1, this.now(), this.jitter);
+      } catch (error) {
+        rethrowIfAborted(error);
+        if (this.signal?.aborted) throw new ToolCallAbortedError(this.signal);
+        const reason = timeout.signal.aborted ? `timed out after ${this.timeoutMs} ms` : `network error: ${transportFailure(error)}`;
+        failure = `(${reason}) after ${attempt} attempts`;
+        waitMs = backoffDelay(attempt - 1, this.jitter);
+      } finally {
+        clearTimeout(timer);
+      }
+      if (attempt > DEFAULT_RATE_LIMIT_RETRIES) {
+        throw new OktaApiError(this.redactSecrets(`Okta API request failed for ${endpoint} ${failure}`), status, endpoint);
+      }
+      await this.sleep(waitMs);
+    }
+  }
+
+  private async request(pathOrUrl: string): Promise<{ response: Response; text: string }> {
     const resolution = resolveOnConfiguredOrigin(this.config, pathOrUrl);
     if (resolution.url === undefined) {
       throw new OktaApiError(`Okta API request refused: the request URL ${resolution.refusal}, so no request was sent.`, null, REFUSED_ENDPOINT);
     }
-    const headers = new Headers(init.headers ?? {});
-    headers.set("accept", "application/json");
-    if (!headers.has("authorization")) {
-      headers.set("authorization", await this.authHeader());
-    }
-
+    const url = resolution.url;
     const target = describeRequestTarget(this.config, pathOrUrl);
-    let response: Response;
-    try {
-      response = await this.fetchImpl(resolution.url, {
-        ...init,
-        headers,
-      });
-    } catch (error) {
-      rethrowIfAborted(error);
-      throw new OktaApiError(
-        this.redactSecrets(`Okta API request failed for ${target}: ${errorText(error)}`),
-        null,
-        target,
-      );
-    }
+    let reauthenticated = false;
+    while (true) {
+      const headers = { accept: "application/json", authorization: await this.authHeader() };
+      const { response, text } = await this.send(url, new URL(url).pathname, () => ({ headers }));
 
-    if (response.status === 429 && attempt < DEFAULT_RATE_LIMIT_RETRIES) {
-      await this.sleep(retryDelayFromResponse(response));
-      return this.request(pathOrUrl, init, attempt + 1);
-    }
+      if (response.status === 401 && this.config.authMode === "PrivateKey" && !reauthenticated) {
+        reauthenticated = true;
+        tokenCache.delete(buildTokenCacheKey(this.config));
+        continue;
+      }
 
-    if (response.status === 401 && this.config.authMode === "PrivateKey" && attempt < 1) {
-      const cacheKey = buildTokenCacheKey(this.config);
-      tokenCache.delete(cacheKey);
-      return this.request(pathOrUrl, init, attempt + 1);
-    }
+      if (!response.ok) {
+        const detail = errorDetail(response, text);
+        throw new OktaApiError(
+          this.redactSecrets(
+            `Okta API request failed for ${target} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+          ),
+          response.status,
+          target,
+        );
+      }
 
-    if (!response.ok) {
-      const detail = await readErrorDetail(response);
-      throw new OktaApiError(
-        this.redactSecrets(
-          `Okta API request failed for ${target} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
-        ),
-        response.status,
-        target,
-      );
+      return { response, text };
     }
-
-    return response;
   }
 
   /** Removes the configured secrets (API token, cached access token, private key, client assertion) in every encoded form, then applies the shape rules. */
@@ -2513,8 +2577,8 @@ export class OktaAuditorClient {
   }
 
   async getJson<T>(pathOrUrl: string): Promise<T> {
-    const response = await this.request(pathOrUrl);
-    return (await readJsonBody(response, describeRequestTarget(this.config, pathOrUrl))) as T;
+    const { response, text } = await this.request(pathOrUrl);
+    return parseJsonBody(response, text, describeRequestTarget(this.config, pathOrUrl)) as T;
   }
 
   async tryGetJson<T>(pathOrUrl: string): Promise<T | null> {
@@ -2555,8 +2619,8 @@ export class OktaAuditorClient {
         return truncatedList(`the ${maxPages}-page cap was reached with a Link rel="next" page unread`);
       }
       visited.add(resolveOnConfiguredOrigin(this.config, nextUrl).url ?? nextUrl);
-      const response = await this.request(nextUrl);
-      const payload = await readJsonBody(response, target);
+      const { response, text } = await this.request(nextUrl);
+      const payload = parseJsonBody(response, text, target);
       if (!Array.isArray(payload)) {
         throw new OktaApiError(`Expected array response from ${target}`, null, target);
       }
@@ -3530,6 +3594,8 @@ function describeEndpointError(error: string): string {
   if (/\(404 /.test(error)) return "the endpoint returned 404 Not Found (feature not enabled on this org edition)";
   if (UNEXPECTED_SHAPE_PATTERN.test(error)) return "the endpoint returned a 200 body that is not the expected object (unexpected response shape)";
   if (/not available on this client/i.test(error)) return "the collector did not expose this endpoint";
+  const attempts = / after (\d+) attempts\b/.exec(error);
+  if (attempts) return `the endpoint request still failed after ${attempts[1]} attempts`;
   return "the endpoint request failed";
 }
 
@@ -4919,7 +4985,7 @@ export function assessOktaIntegrations(
       data.networkZones,
     ),
     risk_aware_rule_count: riskAwareRules.length,
-    custom_zone_count: customZones.length,
+    custom_zone_count: data.networkZones.error ? null : customZones.length,
   });
   if (data.signOnPolicies.error && data.accessPolicies.error) {
     findings.push(
@@ -4931,15 +4997,25 @@ export function assessOktaIntegrations(
         `Errors: ${policyErrors.join(" | ")}`,
       ),
     );
+  } else if (riskAwareRules.length === 0 && data.networkZones.error) {
+    findings.push(
+      manualFinding(
+        "OKTA-INTEG-004",
+        "Contextual access controls",
+        `no ACTIVE policy rule uses contextual signals and the network-zone inventory was unreadable (${describeEndpointError(data.networkZones.error)}), so custom zone coverage is unknown`,
+        "Review ACTIVE sign-on and authentication policy rules and Security > Networks, and record which rules use network, device, risk, or behavior conditions and which custom zones exist.",
+        `Errors: ${[data.networkZones.error, ...policyErrors].join(" | ")}`,
+      ),
+    );
   } else {
     const baseStatus: OktaFindingStatus =
       riskAwareRules.length > 0 ? "Pass" : customZones.length > 0 ? "Partial" : "Fail";
     findings.push(
       buildFinding(
         "OKTA-INTEG-004",
-        policyErrors.length > 0 ? capAtPartial(baseStatus) : baseStatus,
+        policyErrors.length > 0 || data.networkZones.error ? capAtPartial(baseStatus) : baseStatus,
         riskAwareRules.length > 0
-          ? `${riskAwareRules.length} ACTIVE policy rules include contextual, device, network, or risk conditions${policyErrors.length > 0 ? " (policy data partially read)" : ""}.`
+          ? `${riskAwareRules.length} ACTIVE policy rules include contextual, device, network, or risk conditions${policyErrors.length > 0 ? " (policy data partially read)" : ""}${data.networkZones.error ? ", but the network-zone inventory was unreadable, so custom zone coverage is unknown and this cannot pass" : ""}.`
           : customZones.length > 0
             ? "Custom zones exist, but no ACTIVE policy rule with contextual access signals was returned."
             : "No ACTIVE contextual access rules or custom zones were detected.",
@@ -6188,7 +6264,8 @@ function buildExportText(config: OktaResolvedConfig, result: OktaAuditBundleResu
   ].join("\n");
 }
 
-export function registerOktaTools(pi: any): void {
+/** Every client a tool call builds gets `clientOptions` plus the call's own abort signal. */
+export function registerOktaTools(pi: any, clientOptions: Omit<OktaClientOptions, "signal"> = {}): void {
   pi = withIntegrationToolContracts(pi, OKTA_SPEC);
   const authParams = {
     org_url: Type.Optional(
@@ -6258,7 +6335,7 @@ export function registerOktaTools(pi: any): void {
     async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config, { signal });
+        const client = new OktaAuditorClient(config, { ...clientOptions, signal });
         const result = await runOktaAccessCheck(client, config);
         return renderAccessCheck(result);
       } catch (error) {
@@ -6280,7 +6357,7 @@ export function registerOktaTools(pi: any): void {
     async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config, { signal });
+        const client = new OktaAuditorClient(config, { ...clientOptions, signal });
         const data = await collectOktaAuthenticationData(client);
         return renderAssessmentToolResult(assessOktaAuthentication(data, config));
       } catch (error) {
@@ -6302,7 +6379,7 @@ export function registerOktaTools(pi: any): void {
     async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config, { signal });
+        const client = new OktaAuditorClient(config, { ...clientOptions, signal });
         const data = await collectOktaAdminAccessData(client);
         return renderAssessmentToolResult(assessOktaAdminAccess(data, config));
       } catch (error) {
@@ -6324,7 +6401,7 @@ export function registerOktaTools(pi: any): void {
     async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config, { signal });
+        const client = new OktaAuditorClient(config, { ...clientOptions, signal });
         const data = await collectOktaIntegrationData(client);
         return renderAssessmentToolResult(assessOktaIntegrations(data, config));
       } catch (error) {
@@ -6346,7 +6423,7 @@ export function registerOktaTools(pi: any): void {
     async execute(_toolCallId: string, args: AssessmentArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config, { signal });
+        const client = new OktaAuditorClient(config, { ...clientOptions, signal });
         const data = await collectOktaMonitoringData(client);
         return renderAssessmentToolResult(assessOktaMonitoring(data, config));
       } catch (error) {
@@ -6375,7 +6452,7 @@ export function registerOktaTools(pi: any): void {
     async execute(_toolCallId: string, args: ExportArgs, signal?: AbortSignal) {
       try {
         const config = await resolveOktaConfiguration(args);
-        const client = new OktaAuditorClient(config, { signal });
+        const client = new OktaAuditorClient(config, { ...clientOptions, signal });
         const outputRoot = resolve(process.cwd(), args.output_dir ?? DEFAULT_OUTPUT_DIR);
         const result = await exportOktaAuditBundle(client, config, outputRoot, { signal });
         return textResult(buildExportText(config, result), {
