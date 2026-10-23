@@ -45,11 +45,14 @@ import {
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
 import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { CLOUD_RETRYABLE_STATUSES, cloudRetryPolicy } from "../dist/extensions/grc-tools/cloud-retry.js";
 import { GCP_COMPLETENESS_SOURCES, GCP_SPEC } from "../dist/extensions/grc-tools/gcp.spec.js";
 import * as specModel from "../dist/extensions/grc-tools/spec-model.js";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
+/** Retry waits resolve at once, so a test that serves retryable failures does not spend the real backoff. */
+const NO_SLEEP = async () => {};
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -213,8 +216,8 @@ function routeCompliant(url, init, data = COMPLIANT) {
   throw new Error(`Unrouted URL in fixture: ${method} ${url}`);
 }
 
-function createClient(fetchImpl, config = sampleConfig()) {
-  return new GcpAuditorClient(config, { fetchImpl, now: () => NOW });
+function createClient(fetchImpl, config = sampleConfig(), options = {}) {
+  return new GcpAuditorClient(config, { fetchImpl, now: () => NOW, sleepImpl: NO_SLEEP, ...options });
 }
 
 async function runAllAssessments(client, options = {}) {
@@ -678,7 +681,7 @@ test("project identifiers come only from the documented full resource name", asy
   assert.ok(seen.some((url) => url.includes("/compute/v1/projects/111/")));
   assert.ok(!seen.some((url) => url.includes("ignored-attribute")));
 
-  const singleProject = new GcpAuditorClient(sampleConfig({ organizationId: undefined }), { fetchImpl: async () => jsonResponse({}), now: () => NOW });
+  const singleProject = new GcpAuditorClient(sampleConfig({ organizationId: undefined }), { fetchImpl: async () => jsonResponse({}), now: () => NOW, sleepImpl: NO_SLEEP });
   const inventory = await singleProject.listProjectInventory();
   assert.deepEqual(inventory.projects, [{ name: "//cloudresourcemanager.googleapis.com/projects/prod-audit", displayName: "prod-audit" }]);
 });
@@ -1286,8 +1289,10 @@ test("GCP-IAM-02 and GCP-IAM-03 service-account-key scope aggregate matches all 
   let findingCases = 0;
   for (const scenario of cases) {
     let attemptedAccounts = 0;
-    let attemptedKeys = 0;
-    let failedKeys = 0;
+    // Counted per key read, not per attempt: a read the client retries is still one read, and the read chosen to
+    // fail answers the same status on every attempt, so no retry turns the scenario into a success.
+    const keyReads = [];
+    const failedReads = new Map();
     const requests = [];
     const data = scenario.data ?? TWO_PROJECTS;
     const client = createClient(async (url, init) => {
@@ -1297,17 +1302,18 @@ test("GCP-IAM-02 and GCP-IAM-03 service-account-key scope aggregate matches all 
       }
       const keyRequest = request.host === "iam.googleapis.com" && request.path.endsWith("/keys");
       if (keyRequest) {
-        attemptedKeys += 1;
+        const read = String(url);
+        if (!keyReads.includes(read)) keyReads.push(read);
         const fails = scenario.status !== undefined
           && (
             scenario.failureScope === "all"
             || (scenario.failureScope === "mixed" && requestProject(url, init) === SECOND_PROJECT)
             || (scenario.failureScope === "first" && requestProject(url, init) === "prod-audit")
-            || scenario.failedKeyOrdinals?.includes(attemptedKeys)
+            || scenario.failedKeyOrdinals?.includes(keyReads.indexOf(read) + 1)
           );
         if (fails) {
-          failedKeys += 1;
-          requests.push({ project: requestProject(url, init), status: scenario.status });
+          if (!failedReads.has(read)) requests.push({ project: requestProject(url, init), status: scenario.status });
+          failedReads.set(read, (failedReads.get(read) ?? 0) + 1);
           return denied(scenario.status);
         }
       }
@@ -1315,6 +1321,8 @@ test("GCP-IAM-02 and GCP-IAM-03 service-account-key scope aggregate matches all 
     }, scenario.config ?? sampleConfig());
     const captured = await captureBatchDecisionFacts(() =>
       assessGcpIdentity(client, { maxProjects: 5, ...(scenario.maxKeys ? { maxKeys: scenario.maxKeys } : {}) }));
+    const attemptedKeys = keyReads.length;
+    const failedKeys = failedReads.size;
     const runtimeFacts = gcpFactsByCheck(captured.captures);
     const findings = findingsById([captured.result]);
     const failureModes = scenario.status === undefined ? [] : [statusMode(scenario.status)];
@@ -1374,6 +1382,10 @@ test("GCP-IAM-02 and GCP-IAM-03 service-account-key scope aggregate matches all 
     if (scenario.status !== undefined) {
       assert.equal(requests.length, scenario.expectedFailures, `${scenario.label}: injected key failures`);
       assert.ok(requests.every((request) => request.status === scenario.status), `${scenario.label}: exact injected status`);
+      const expectedAttempts = [429, 500].includes(scenario.status) ? 4 : 1;
+      for (const [read, attempts] of failedReads) {
+        assert.equal(attempts, expectedAttempts, `${scenario.label}: ${read} was attempted ${expectedAttempts === 4 ? "once and retried 3 times" : "once, since its status is not retryable"}`);
+      }
     }
     if (scenario.label === "zero-service-accounts") {
       assert.equal(attemptedAccounts, 2, "both readable projects returned a successful empty service-account list");
@@ -1844,8 +1856,10 @@ function sweepClient(requests, match, status = 403, mode = "full", config = samp
   }, config);
 }
 
+/** The status as a finding renders it; a retryable status was attempted four times before the read gave up. */
 function statusText(status) {
-  return status === 403 ? `${status} Forbidden` : `${status} Error`;
+  const text = status === 403 ? `${status} Forbidden` : `${status} Error`;
+  return CLOUD_RETRYABLE_STATUSES.includes(status) ? `${text} after 4 attempts` : text;
 }
 
 function assertEveryRequestClassified(requests, label) {
@@ -2587,7 +2601,7 @@ test("GcpApiError describes a failed response by status, method, endpoint, and t
   assert.equal(other.message, `401 Unauthorized: JSON error body without a google.rpc.Status envelope (application/json; ${Buffer.byteLength(JSON.stringify({ message: `denied for ${ERROR_CANARIES.bearer}`, token: ERROR_CANARIES.bearer }))} bytes) (GET ${instances})`);
 
   const html = await failure(respondWith(canaryHtmlPage(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } }));
-  assert.equal(html.message, `502 Bad Gateway: non-JSON error body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (GET ${instances})`);
+  assert.equal(html.message, `502 Bad Gateway after 4 attempts: non-JSON error body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (GET ${instances})`);
   assert.equal(html.status, 502);
 
   const untyped = await failure(respondWith(`Access denied for credential ${ERROR_CANARIES.longToken}`, { status: 403, statusText: "Forbidden" }));
@@ -2604,7 +2618,7 @@ test("GcpApiError describes a failed response by status, method, endpoint, and t
   const network = await failure(createClient(async () => {
     throw new TypeError(`fetch failed: request headers Authorization: Bearer ${ERROR_CANARIES.bearer}`);
   }));
-  assert.equal(network.message, `GET ${instances} failed before a response arrived: fetch failed: request headers Authorization: Bearer [REDACTED]`);
+  assert.equal(network.message, `GET ${instances} failed before a response arrived after 4 attempts: fetch failed: request headers Authorization: Bearer [REDACTED]`);
   assert.equal(network.status, undefined);
   assert.equal(network.endpoint, instances);
 
@@ -2617,12 +2631,12 @@ test("GcpApiError describes a failed response by status, method, endpoint, and t
   const thrownExact = await failure(createClient(async () => {
     throw new TypeError("fetch failed: proxy rejected header value opaquesecretvalue");
   }, sampleConfig({ accessToken: "opaquesecretvalue" })));
-  assert.equal(thrownExact.message, `GET ${instances} failed before a response arrived: fetch failed: proxy rejected header value [REDACTED]`, "a shapeless configured token in a thrown message is caught by the constructor's exact-match layer, which describeError alone cannot know");
+  assert.equal(thrownExact.message, `GET ${instances} failed before a response arrived after 4 attempts: fetch failed: proxy rejected header value [REDACTED]`, "a shapeless configured token in a thrown message is caught by the constructor's exact-match layer, which describeError alone cannot know");
 });
 
 test("token exchange failures never echo the token endpoint's body and the exchanged token is an exact secret in later errors", async () => {
   const credentials = { type: "authorized_user", clientId: "client-id", clientSecret: ERROR_CANARIES.clientSecret, refreshToken: ERROR_CANARIES.refreshToken, tokenUri: "https://oauth2.googleapis.com/token" };
-  const exchange = (body, init) => exchangeGcpCredentials(credentials, async () => new Response(body, init), NOW).then(() => null, (error) => error);
+  const exchange = (body, init) => exchangeGcpCredentials(credentials, async () => new Response(body, init), NOW, cloudRetryPolicy({ sleepImpl: NO_SLEEP })).then(() => null, (error) => error);
 
   const oauth = await exchange(JSON.stringify({ error: "invalid_grant", error_description: `Token has been expired or revoked: ${ERROR_CANARIES.refreshToken} for client ${ERROR_CANARIES.clientSecret}` }), { status: 400, statusText: "Bad Request", headers: { "content-type": "application/json" } });
   assert.ok(oauth instanceof GcpApiError);
@@ -2631,7 +2645,7 @@ test("token exchange failures never echo the token endpoint's body and the excha
   assert.equal(oauth.endpoint, "https://oauth2.googleapis.com/token");
 
   const html = await exchange(canaryHtmlPage(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
-  assert.equal(html.message, `Token exchange failed: 502 Bad Gateway: non-JSON error body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (POST https://oauth2.googleapis.com/token)`);
+  assert.equal(html.message, `Token exchange failed: 502 Bad Gateway after 4 attempts: non-JSON error body (text/html; ${Buffer.byteLength(canaryHtmlPage())} bytes) (POST https://oauth2.googleapis.com/token)`);
 
   const unexpected = await exchange(JSON.stringify({ token_type: "Bearer", secret: ERROR_CANARIES.bearer }), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } });
   assert.equal(unexpected.message, "Token exchange response did not include access_token (POST https://oauth2.googleapis.com/token)");
@@ -2691,11 +2705,199 @@ test("access check: when every probe is refused for its credentials the check fa
   }
 });
 
+const SERVICE_ACCOUNTS_PATH = "/v1/projects/prod-audit/serviceAccounts";
+const PROJECT_INVENTORY_PATH = "/v1/organizations/123456789012:searchAllResources";
+const GCP_TOKEN_URI = "https://oauth2.googleapis.com/token";
+const RETRYABLE_STATUS_TEXT = { 429: "Too Many Requests", 500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout" };
+const GRANT_READ_ACCESS_STEP = "Grant roles/cloudasset.viewer, roles/iam.securityReviewer, roles/logging.viewer, roles/orgpolicy.policyViewer, roles/compute.viewer, and roles/securitycenter.findingsViewer to the audit principal and enable the corresponding APIs. roles/iam.securityReviewer already includes storage.buckets.list for project bucket inventory. If the principal does not have roles/iam.securityReviewer, grant a custom role containing only storage.buckets.list at the organization or each audited project.";
+
+/** A google.rpc.Status answer with a status the client retries. */
+const throttled = (status = 429, headers = {}) => () => new Response(
+  JSON.stringify({ error: { code: status, message: "Quota exceeded for quota metric 'Read requests'.", status: status === 429 ? "RESOURCE_EXHAUSTED" : "UNAVAILABLE" } }),
+  { status, statusText: RETRYABLE_STATUS_TEXT[status], headers: { "content-type": "application/json", ...headers } },
+);
+const unreachable = () => { throw new TypeError("fetch failed"); };
+
+/** A route that gives `answers` in order and then repeats the last one, counting the requests it served. */
+function answerSequence(...answers) {
+  let calls = 0;
+  const route = () => answers[Math.min(calls++, answers.length - 1)]();
+  Object.defineProperty(route, "calls", { get: () => calls });
+  return route;
+}
+
+/** The compliant fixture, except that each path in `overrides` is answered by its route. */
+function routedFetch(overrides = {}) {
+  return async (url, init) => {
+    const route = overrides[new URL(url).pathname];
+    return route ? route(url, init) : jsonResponse(routeCompliant(url, init));
+  };
+}
+
+/** A client over `fetchImpl` whose retry waits are recorded instead of slept. */
+function recordingClient(fetchImpl, options = {}, config = sampleConfig()) {
+  const waits = [];
+  const client = createClient(fetchImpl, config, { sleepImpl: async (ms) => { waits.push(ms); }, ...options });
+  return { client, waits };
+}
+
+test("bounded retries: a read answered 429, 500, 502, 503, or 504 is retried after 1 s and then 2 s and returns the answer that finally succeeds, while a 400, 401, 403, or 404 is answered once with no wait", async () => {
+  for (const status of CLOUD_RETRYABLE_STATUSES) {
+    const route = answerSequence(throttled(status), throttled(status), () => jsonResponse(COMPLIANT.serviceAccounts));
+    const { client, waits } = recordingClient(routedFetch({ [SERVICE_ACCOUNTS_PATH]: route }));
+    const page = await client.listServiceAccounts("prod-audit");
+    assert.deepEqual({ emails: page.items.map((item) => item.email), truncated: page.truncated }, { emails: ["svc@prod-audit.iam.gserviceaccount.com"], truncated: false }, `${status}`);
+    assert.equal(route.calls, 3, `${status}: two failed attempts and the one that succeeded`);
+    assert.deepEqual(waits, [1000, 2000], `${status}: the backoff doubles from 1 s`);
+  }
+  for (const status of [400, 401, 403, 404]) {
+    const route = answerSequence(() => jsonResponse({ error: { code: status, message: "Not allowed.", status: "PERMISSION_DENIED" } }, status));
+    const { client, waits } = recordingClient(routedFetch({ [SERVICE_ACCOUNTS_PATH]: route }));
+    await assert.rejects(() => client.listServiceAccounts("prod-audit"), (error) => error instanceof GcpApiError && error.status === status && !error.message.includes("attempts"), `${status}`);
+    assert.deepEqual({ calls: route.calls, waits }, { calls: 1, waits: [] }, `${status} is not retried`);
+  }
+});
+
+test("bounded retries: a read still throttled after four attempts fails closed: every finding that needed it is manual, says the read failed rather than that it was denied, names the status and attempt count, and renders no count for what was never listed", async () => {
+  const route = answerSequence(throttled(429));
+  const { client, waits } = recordingClient(routedFetch({ [SERVICE_ACCOUNTS_PATH]: route }));
+  const identity = await assessGcpIdentity(client);
+  assert.equal(route.calls, 4, "one request and three retries");
+  assert.deepEqual(waits, [1000, 2000, 4000]);
+  for (const id of ["GCP-IAM-02", "GCP-IAM-03"]) {
+    const finding = identity.findings.find((item) => item.id === id);
+    assert.equal(finding.status, "manual", id);
+    assert.ok(finding.summary.startsWith("Manual: the read of service accounts (iam.googleapis.com/v1/projects/{project}/serviceAccounts) failed in every sampled project. Partial view: service accounts unreadable for 1 of 1 projects (prod-audit) via iam.googleapis.com/v1/projects/{project}/serviceAccounts (429 Too Many Requests after 4 attempts);"), `${id}: ${finding.summary}`);
+    assert.doesNotMatch(finding.summary, /denied/, `${id}: throttling is not a permission denial`);
+    assert.equal(finding.evidence.seen, null, `${id}: no count stands in for the accounts that were never listed`);
+  }
+  assert.ok(identity.errors.includes("prod-audit: 429 Too Many Requests after 4 attempts: RESOURCE_EXHAUSTED: Quota exceeded for quota metric 'Read requests'. (GET https://iam.googleapis.com/v1/projects/prod-audit/serviceAccounts)"), JSON.stringify(identity.errors));
+});
+
+test("bounded retries: Retry-After in delta-seconds or as an HTTP date sets the wait, and one above 30 s ends the read at once with the requested wait named in the finding", async () => {
+  const seconds = answerSequence(throttled(429, { "retry-after": "7" }), () => jsonResponse(COMPLIANT.serviceAccounts));
+  const bySeconds = recordingClient(routedFetch({ [SERVICE_ACCOUNTS_PATH]: seconds }));
+  await bySeconds.client.listServiceAccounts("prod-audit");
+  assert.deepEqual({ calls: seconds.calls, waits: bySeconds.waits }, { calls: 2, waits: [7000] });
+
+  const dated = answerSequence(throttled(503, { "retry-after": new Date(NOW.getTime() + 12_000).toUTCString() }), () => jsonResponse(COMPLIANT.serviceAccounts));
+  const byDate = recordingClient(routedFetch({ [SERVICE_ACCOUNTS_PATH]: dated }));
+  await byDate.client.listServiceAccounts("prod-audit");
+  assert.deepEqual({ calls: dated.calls, waits: byDate.waits }, { calls: 2, waits: [12000] }, "the HTTP date is measured from the client's clock");
+
+  const refused = answerSequence(throttled(503, { "retry-after": "120" }));
+  const tooLong = recordingClient(routedFetch({ [SERVICE_ACCOUNTS_PATH]: refused }));
+  const identity = await assessGcpIdentity(tooLong.client);
+  assert.deepEqual({ calls: refused.calls, waits: tooLong.waits }, { calls: 1, waits: [] }, "a wait above the limit is neither slept nor retried");
+  const finding = identity.findings.find((item) => item.id === "GCP-IAM-02");
+  assert.equal(finding.status, "manual");
+  assert.ok(finding.summary.includes("service accounts unreadable for 1 of 1 projects (prod-audit) via iam.googleapis.com/v1/projects/{project}/serviceAccounts (503 Service Unavailable (the server asked to retry after 120 s, more than the 30 s limit))"), finding.summary);
+});
+
+test("bounded retries: an attempt with no answer within the per-request timeout is abandoned and retried, and after four attempts the finding records no response with the timeout", async () => {
+  let hung = 0;
+  const healthy = routedFetch();
+  const fetchImpl = (url, init) => {
+    if (new URL(url).pathname !== SERVICE_ACCOUNTS_PATH) return healthy(url, init);
+    hung += 1;
+    return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+  };
+  const { client, waits } = recordingClient(fetchImpl, { requestTimeoutMs: 20 });
+  const identity = await assessGcpIdentity(client);
+  assert.deepEqual({ hung, waits }, { hung: 4, waits: [1000, 2000, 4000] });
+  const finding = identity.findings.find((item) => item.id === "GCP-IAM-02");
+  assert.equal(finding.status, "manual");
+  assert.ok(finding.summary.includes("service accounts unreadable for 1 of 1 projects (prod-audit) via iam.googleapis.com/v1/projects/{project}/serviceAccounts (no response after 4 attempts: TimeoutError: the request did not complete within 20 ms)"), finding.summary);
+  assert.ok(identity.errors.includes("prod-audit: GET https://iam.googleapis.com/v1/projects/prod-audit/serviceAccounts failed before a response arrived after 4 attempts: TimeoutError: the request did not complete within 20 ms"), JSON.stringify(identity.errors));
+});
+
+test("bounded retries: a later page that still fails after four attempts fails the whole read, so the pages before it are never reported as the inventory", async () => {
+  const firstPage = { accounts: [{ name: "projects/prod-audit/serviceAccounts/first-page@prod-audit.iam.gserviceaccount.com", email: "first-page@prod-audit.iam.gserviceaccount.com" }], nextPageToken: "page2" };
+  let laterPage = 0;
+  const route = (url) => {
+    if (!new URL(url).searchParams.has("pageToken")) return jsonResponse(firstPage);
+    laterPage += 1;
+    return new Response("", { status: 503, statusText: "Service Unavailable" });
+  };
+  const { client, waits } = recordingClient(routedFetch({ [SERVICE_ACCOUNTS_PATH]: route }));
+  await assert.rejects(() => client.listServiceAccounts("prod-audit"), (error) => error instanceof GcpApiError && error.status === 503 && error.message === "503 Service Unavailable after 4 attempts (GET https://iam.googleapis.com/v1/projects/prod-audit/serviceAccounts)");
+  assert.deepEqual({ laterPage, waits }, { laterPage: 4, waits: [1000, 2000, 4000] });
+
+  const identity = await assessGcpIdentity(client);
+  for (const id of ["GCP-IAM-02", "GCP-IAM-03"]) {
+    const finding = identity.findings.find((item) => item.id === id);
+    assert.equal(finding.status, "manual", id);
+    assert.ok(finding.summary.includes("service accounts unreadable for 1 of 1 projects (prod-audit) via iam.googleapis.com/v1/projects/{project}/serviceAccounts (503 Service Unavailable after 4 attempts)"), `${id}: ${finding.summary}`);
+  }
+  assert.ok(!JSON.stringify(identity).includes("first-page@"), "no account from the page that did arrive is rendered");
+});
+
+test("bounded retries: the token exchange is retried like any read, and the access probes share one exchange, so a token endpoint that keeps failing leaves every probe unanswered rather than refused", async () => {
+  const credentials = { type: "authorized_user", clientId: "client-id", clientSecret: "client-secret-value", refreshToken: "refresh-token-value", tokenUri: GCP_TOKEN_URI };
+  const config = sampleConfig({ accessToken: undefined, credentials });
+  const tokenUnavailable = () => new Response("", { status: 503, statusText: "Service Unavailable" });
+  const accessWith = async (tokenRoute) => {
+    let exchanges = 0;
+    const healthy = routedFetch();
+    const fetchImpl = async (url, init) => {
+      if (url !== GCP_TOKEN_URI) return healthy(url, init);
+      exchanges += 1;
+      return tokenRoute();
+    };
+    const { client, waits } = recordingClient(fetchImpl, {}, config);
+    return { access: await checkGcpAccess(client), exchanges, waits };
+  };
+
+  const recovered = await accessWith(answerSequence(tokenUnavailable, () => jsonResponse({ access_token: "exchanged-token", expires_in: 3599, token_type: "Bearer" })));
+  assert.deepEqual({ status: recovered.access.status, exchanges: recovered.exchanges, waits: recovered.waits }, { status: "healthy", exchanges: 2, waits: [1000] }, "one retried exchange serves every probe");
+
+  const unavailable = await accessWith(tokenUnavailable);
+  assert.deepEqual({ exchanges: unavailable.exchanges, waits: unavailable.waits }, { exchanges: 4, waits: [1000, 2000, 4000] }, "ten probes, one four-attempt exchange");
+  assert.equal(unavailable.access.status, "limited", "a token endpoint that keeps failing has not refused the credentials");
+  for (const probe of unavailable.access.surfaces) {
+    assert.match(probe.error, /^(?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/\S+ failed before a response arrived: Token exchange failed: 503 Service Unavailable after 4 attempts \(POST https:\/\/oauth2\.googleapis\.com\/token\)$/, probe.name);
+  }
+  assert.ok(unavailable.access.notes.includes("This check is incomplete: the probes for organization, projects, iam_policies, logging_settings, log_sinks, security_command_center, org_policy, compute_firewalls, storage_buckets, kms_crypto_keys ran out of retries without an answer (each surface records its last error), so whether those surfaces are readable is unknown."), JSON.stringify(unavailable.access.notes));
+  assert.equal(unavailable.access.recommendedNextStep, "Wait for Google Cloud to stop throttling or failing the requests, then re-run gcp_check_access.");
+
+  const offline = await accessWith(unreachable);
+  assert.deepEqual({ status: offline.access.status, exchanges: offline.exchanges }, { status: "limited", exchanges: 4 });
+  assert.equal(offline.access.recommendedNextStep, "Restore network access to the Google Cloud APIs (DNS, TLS, proxy), then re-run gcp_check_access.");
+});
+
+test("bounded retries: an access probe that ran out of retries is reported as unknown rather than denied, and the next step waits or restores the network instead of granting access when nothing was denied", async () => {
+  const accessWith = (fetchImpl) => checkGcpAccess(recordingClient(fetchImpl).client);
+
+  const one = await accessWith(routedFetch({ [PROJECT_INVENTORY_PATH]: throttled(429) }));
+  assert.equal(one.status, "healthy", "nine of ten probes are readable");
+  assert.ok(one.notes.includes("This check is incomplete: the probes for projects ran out of retries without an answer (each surface records its last error), so whether that surface is readable is unknown."), JSON.stringify(one.notes));
+
+  const all = await accessWith(async () => throttled(503)());
+  assert.equal(all.status, "limited");
+  assert.ok(all.notes.some((note) => note.startsWith("This check is incomplete: the probes for organization, projects, iam_policies, logging_settings, log_sinks, security_command_center, org_policy, compute_firewalls, storage_buckets, kms_crypto_keys ran out of retries") && note.endsWith("so whether those surfaces are readable is unknown.")), JSON.stringify(all.notes));
+  assert.equal(all.recommendedNextStep, "Wait for Google Cloud to stop throttling or failing the requests, then re-run gcp_check_access.");
+
+  const offline = await accessWith(async () => unreachable());
+  assert.equal(offline.recommendedNextStep, "Restore network access to the Google Cloud APIs (DNS, TLS, proxy), then re-run gcp_check_access.");
+
+  const onCompute = (respond, otherwise) => async (url) => (new URL(url).hostname === "compute.googleapis.com" ? respond() : otherwise());
+  const both = await accessWith(onCompute(unreachable, throttled(429)));
+  assert.equal(both.recommendedNextStep, "Wait for Google Cloud to stop throttling or failing the requests and restore network access to the Google Cloud APIs (DNS, TLS, proxy), then re-run gcp_check_access.");
+
+  const mixed = await accessWith(onCompute(forbidden, throttled(429)));
+  assert.equal(mixed.recommendedNextStep, `${GRANT_READ_ACCESS_STEP} For the probes that ran out of retries, wait for Google Cloud to stop throttling or failing the requests, then re-run gcp_check_access.`);
+  assert.ok(!mixed.notes.some((note) => note.includes("compute_firewalls")), "the denied probe is not reported as unanswered");
+
+  const denied = await accessWith(async () => forbidden());
+  assert.equal(denied.recommendedNextStep, GRANT_READ_ACCESS_STEP);
+  assert.ok(!denied.notes.some((note) => note.startsWith("This check is incomplete")), "a denial is an answer about access");
+});
+
 const ERROR_BODY_SHAPES = {
   "502 text/html with bearer, session cookie, and API key canaries": {
     status: 502,
     respond: () => new Response(canaryHtmlPage(), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } }),
-    disclosure: /502 Bad Gateway: non-JSON error body \(text\/html; \d+ bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\//,
+    disclosure: /502 Bad Gateway after 4 attempts: non-JSON error body \(text\/html; \d+ bytes\) \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\//,
   },
   "403 JSON whose error.message embeds a tokenised URL": {
     status: 403,
@@ -2712,14 +2914,14 @@ const ERROR_BODY_SHAPES = {
   "500 JSON whose free-text error.message carries a long token": {
     status: 500,
     respond: () => new Response(JSON.stringify({ error: { code: 500, message: `Backend rejected credential ${ERROR_CANARIES.longToken} for session ${ERROR_CANARIES.session}`, status: "INTERNAL" } }), { status: 500, statusText: "Internal Server Error", headers: { "content-type": "application/json; charset=UTF-8" } }),
-    disclosure: /500 Internal Server Error: INTERNAL: Backend rejected credential \[REDACTED\] for session \[REDACTED\] \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\//,
+    disclosure: /500 Internal Server Error after 4 attempts: INTERNAL: Backend rejected credential \[REDACTED\] for session \[REDACTED\] \((?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\//,
   },
   "thrown network error carrying the Authorization and Cookie headers": {
     status: undefined,
     respond: () => {
       throw new TypeError(`fetch failed: request headers Authorization: Bearer ${ERROR_CANARIES.bearer}; Cookie: __Secure-1PSID=${ERROR_CANARIES.session}`);
     },
-    disclosure: /(?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/\S+ failed before a response arrived: fetch failed: request headers Authorization: Bearer \[REDACTED\]; Cookie: \[REDACTED\]/,
+    disclosure: /(?:GET|POST) https:\/\/[a-z]+\.googleapis\.com\/\S+ failed before a response arrived after 4 attempts: fetch failed: request headers Authorization: Bearer \[REDACTED\]; Cookie: \[REDACTED\]/,
   },
 };
 

@@ -309,7 +309,7 @@ Credential refresh: POST the credential token_uri with a JWT bearer assertion or
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| GCP Security Inspector | API and quota-project specific | `Retry-After` | 429, 500, 502, 503, 504 | Honor bounded Retry-After and retry transient responses with bounded exponential delay; exhausted reads remain unreadable. |
+| GCP Security Inspector | API and quota-project specific | `Retry-After` | 429, 500, 502, 503, 504 | Retry 429, 500, 502, 503, 504 responses, transport failures, and attempts that run past the 30 s per-request timeout up to 3 times (4 attempts in all), token requests included. Wait the Retry-After delay when the response gives one (delta-seconds or HTTP-date), otherwise 1 s, 2 s, 4 s. A Retry-After above 30 s ends the retries at once, and the error names the wait the server asked for. A read whose retries run out is unreadable, and its error names the last status or failure and the attempt count; a list that fails on a later page keeps none of its earlier pages. |
 
 ## Checks
 

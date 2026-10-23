@@ -104,7 +104,7 @@ test("batch 2 executable decisions reject undeclared, missing, and null evidence
       }
     }
   }
-  assert.equal(inputUses, 811);
+  assert.equal(inputUses, 812);
 });
 
 test("batch 2 completeness primitives have exact per-check sources, failure modes, and rendered semantics", () => {

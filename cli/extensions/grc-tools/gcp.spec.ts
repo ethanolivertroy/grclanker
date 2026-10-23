@@ -19,6 +19,7 @@ import {
   type Batch2CheckRow,
 } from "./batch2-spec-helpers.js";
 import { GCP_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
+import { CLOUD_RETRY_POLICY_TEXT, CLOUD_RETRYABLE_STATUSES } from "./cloud-retry.js";
 
 const ASSET_DOCS = "https://cloud.google.com/asset-inventory/docs/reference/rest";
 export const GCP_MAX_KMS_ROTATION_DAYS = 365;
@@ -369,8 +370,8 @@ export const GCP_SPEC = buildBatchIntegrationSpec({
   rateLimit: {
     documentedLimit: "API and quota-project specific",
     retryHeaders: ["Retry-After"],
-    retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Honor bounded Retry-After and retry transient responses with bounded exponential delay; exhausted reads remain unreadable.",
+    retryableStatuses: CLOUD_RETRYABLE_STATUSES,
+    backoffPolicy: CLOUD_RETRY_POLICY_TEXT,
   },
   runtimeBehavior: GCP_RUNTIME_BEHAVIOR,
   knownGaps: ["Organization-wide enumeration is bounded by explicit runtime caps and some organization-policy checks use a configured or sampled project as their effective-policy target."],

@@ -103,7 +103,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Purpose | Notable arguments |
 |------|---------|-------------------|
-| `gcp_check_access` | Probe the core surfaces and report which are readable. When every probe is refused for its credentials (a 401, or a token exchange refused with 401, `invalid_grant`, `invalid_client`, `deleted_client`, or `disabled_client`), the status is `failed` and the next step names the access token or credentials file settings to fix. A 403 or any readable probe keeps the status `limited`. | `organization_id`, `project_id`, `access_token`, `credentials_file` |
+| `gcp_check_access` | Probe the core surfaces and report which are readable. When every probe is refused for its credentials (a 401, or a token exchange refused with 401, `invalid_grant`, `invalid_client`, `deleted_client`, or `disabled_client`), the status is `failed` and the next step names the access token or credentials file settings to fix. Otherwise, including when a probe returns 403 or runs out of retries, the status is `healthy` when at least seven of the ten probes are readable and `limited` when fewer are. A probe that ran out of retries adds a note that the check is incomplete (see [Retries and timeouts](#retries-and-timeouts)). | `organization_id`, `project_id`, `access_token`, `credentials_file` |
 | `gcp_assess_identity` | Controls 1, 2, 13, 14 | `stale_days` (90), `max_keys` (200), `project_limit` |
 | `gcp_assess_logging_detection` | Control 5 plus Security Command Center visibility | `max_findings` (200), `project_limit` |
 | `gcp_assess_org_guardrails` | Controls 6, 8, 11, 12, 23 | `max_assets` (2000), `project_limit` |
@@ -122,7 +122,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 | `pass` | Every inventoried resource satisfied the check and every inventory the finding depends on was complete (no cap, no truncated page, no denied project, no unreadable dependent inventory). |
 | `warn` | A violation on a lower-impact check, a partial inventory (project cap, truncated page, denied or API-disabled project, a dependent inventory unreadable in part or in whole), items missing a required date, or a dry-run or unresolved configuration. |
 | `fail` | A documented violation was found in a complete inventory. |
-| `manual` | The inventory the finding scores was forbidden or errored, the inventory was empty where emptiness is not compliant by intent, the API is disabled, or the control is outside the configured scope. The summary names the dataset, the endpoint, and the evidence to collect. |
+| `manual` | The inventory the finding scores was forbidden, errored, or ran out of retries (see [Retries and timeouts](#retries-and-timeouts)), the inventory was empty where emptiness is not compliant by intent, the API is disabled, or the control is outside the configured scope. The summary names the dataset, the endpoint, and the evidence to collect. |
 
 Emptiness passes only for two findings:
 
@@ -234,9 +234,24 @@ Every paginated list follows `nextPageToken` until the API stops returning one. 
 
 The summary then reads `N seen, total unknown`.
 
+### Retries and timeouts
+
+Every Google API request and token exchange gets at most 4 attempts: the first and up to 3 retries.
+
+- **Retried:** A 429, 500, 502, 503, or 504 response, a request that got no response (a DNS, TLS, or connection failure), and an attempt still unanswered after 30 seconds, which is abandoned. Any other status, 401 and 403 included, is final on the first answer.
+- **Wait:** The `Retry-After` value when the response carries one, as delta-seconds or an HTTP date, and otherwise 1, 2, then 4 seconds.
+- **Long waits:** A `Retry-After` above 30 seconds ends the retries at once instead of stalling the run. The error names the wait the server asked for: `503 Service Unavailable (the server asked to retry after 120 s, more than the 30 s limit)`.
+
+When the retries run out, the read is unreadable, never an empty or partial inventory:
+
+- Its error names the last status or failure and the attempt count (see [Error text](#error-text)).
+- The findings that depend on it follow [Unreadable inventories](#unreadable-inventories), and their summaries carry the attempt count: `Partial view: service accounts unreadable for 1 of 1 projects (prod-audit) via iam.googleapis.com/v1/projects/{project}/serviceAccounts (429 Too Many Requests after 4 attempts)`.
+- A list that fails on a later page fails as a whole. The pages read before it are dropped, so they are never reported as the inventory.
+- In `gcp_check_access`, the probe is `not_readable` and a note says the check is incomplete: `This check is incomplete: the probes for projects ran out of retries without an answer (each surface records its last error), so whether that surface is readable is unknown.` The status thresholds count readable probes only, so the status can still be `healthy` beside that note. The next step says to wait for Google Cloud, or to restore network access to the Google Cloud APIs when a request never got a response, and recommends a grant only for the probes that were refused.
+
 ### Unreadable inventories
 
-Every finding also tracks each inventory it depends on. When any of them is unreadable (403, 401, or an error), for the whole scope or for one project, the finding drops below `pass`. This happens even if its primary inventory was read completely.
+Every finding also tracks each inventory it depends on. When any of them is unreadable (403, 401, an error, or a read whose retries ran out), for the whole scope or for one project, the finding drops below `pass`. This happens even if its primary inventory was read completely.
 
 - The finding is `manual` when the unreadable inventory is the one the finding scores, and `warn` otherwise.
 - The summary names the dataset and the endpoint, for example:
@@ -288,6 +303,8 @@ Error text follows the same rule as snapshots and finding evidence. A failed req
 - For any other body, `non-JSON error body (<content type>; N bytes)`.
 
 The body itself is never copied into an error.
+
+A retried request names its attempt count after the status: `429 Too Many Requests after 4 attempts: RESOURCE_EXHAUSTED: Quota exceeded for quota metric 'Read requests'. (GET https://iam.googleapis.com/v1/projects/prod-audit/serviceAccounts)`. A request that never got a response reads `GET <endpoint> failed before a response arrived after 4 attempts: <reason>`, where the reason is the scrubbed transport error or `TimeoutError: the request did not complete within 30 s`.
 
 A 2xx whose body is not a JSON object is an unreadable surface, never an empty inventory:
 

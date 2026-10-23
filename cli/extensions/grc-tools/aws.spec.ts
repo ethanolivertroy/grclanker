@@ -53,6 +53,37 @@ export const AWS_DEFAULTS = {
   sensitivePorts: [21, 22, 23, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200, 27017],
 } as const;
 
+/**
+ * Timeouts given to every SDK client the integration builds, the clients the credential providers build included.
+ * Nothing else about retries is set on a client, so the SDK resolves the retry mode and the attempt limit as it does
+ * for any client: AWS_RETRY_MODE and AWS_MAX_ATTEMPTS, then the profile's retry_mode and max_attempts.
+ */
+export const AWS_SDK_TIMEOUTS = {
+  requestTimeoutMs: 30_000,
+  connectionTimeoutMs: 10_000,
+} as const;
+
+/**
+ * The retry mode and attempt limit the SDK falls back to when neither the environment nor the shared config file
+ * sets them, mirrored from @smithy/core's DEFAULT_RETRY_MODE and DEFAULT_MAX_ATTEMPTS for the policy text and the
+ * fixtures. No client is given them, and no error takes its attempt count from them.
+ */
+export const AWS_SDK_DEFAULT_RETRY = {
+  retryMode: "standard",
+  maxAttempts: 3,
+} as const;
+
+/** How the SDK treats a Retry-After hint in either retry mode: it waits no longer than this past its own backoff delay. */
+const SDK_RETRY_AFTER_ALLOWANCE_SECONDS = 5;
+
+export const AWS_RETRY_POLICY_TEXT = [
+  `The AWS SDK runs the retries in the retry mode and up to the attempt limit set by AWS_RETRY_MODE and AWS_MAX_ATTEMPTS, or by the profile's retry_mode and max_attempts in the shared config file, and otherwise in ${AWS_SDK_DEFAULT_RETRY.retryMode} mode with ${AWS_SDK_DEFAULT_RETRY.maxAttempts} attempts per request.`,
+  "Standard and adaptive mode both retry 429, 500, 502, 503, and 504 responses, throttling error codes, timeouts, and network failures with jittered exponential backoff; adaptive mode also limits how fast the client sends once it is throttled.",
+  `The SDK waits for Retry-After or x-amz-retry-after only up to ${SDK_RETRY_AFTER_ALLOWANCE_SECONDS} s past its own backoff delay.`,
+  `The integration sets only the timeouts: each attempt allows ${AWS_SDK_TIMEOUTS.connectionTimeoutMs / 1000} s to connect and ${AWS_SDK_TIMEOUTS.requestTimeoutMs / 1000} s for the service to start answering, and an attempt past either limit fails with TimeoutError and is retried.`,
+  "A read whose attempts run out is unreadable, its error names the code, the status, and the attempt count the SDK reports, and the findings that depend on it are demoted; a list that fails on a later page keeps none of its earlier pages.",
+].join(" ");
+
 export const AWS_VERDICT_VALUES = {
   minimumPasswordLength: 14,
   passwordComplexityFields: ["RequireSymbols", "RequireNumbers", "RequireUppercaseCharacters", "RequireLowercaseCharacters"],
@@ -1100,9 +1131,9 @@ export const AWS_SPEC: IntegrationSpecContract = {
   rateLimits: [{
     scope: "AWS service APIs",
     documentedLimit: null,
-    retryHeaders: [],
+    retryHeaders: ["Retry-After", "x-amz-retry-after"],
     retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Use the service client's bounded retry behavior. If retries are exhausted, mark the surface unreadable and demote dependent findings.",
+    backoffPolicy: AWS_RETRY_POLICY_TEXT,
   }],
   controls: AWS_CONTROLS,
   checks: AWS_CHECKS,

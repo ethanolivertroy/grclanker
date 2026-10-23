@@ -79,7 +79,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 
 | Tool | Findings |
 |------|----------|
-| `azure_check_access` | Probes eight Graph and ARM surfaces and reports which are readable; a probe that stopped at its page cap or at a refused next link carries `truncated: true` (with the refusal as `truncation`) and its count is a floor. When every probe is refused for its credentials (a 401, or a token request refused as `invalid_client`, `unauthorized_client`, or `AADSTS90002` for an unknown tenant), the status is `failed` and the next step says the credentials were rejected, naming `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` for a refused token request, or `AZURE_GRAPH_TOKEN` and `AZURE_MANAGEMENT_TOKEN` (alias `AZURE_ACCESS_TOKEN`) for refused tokens. Otherwise, including when a probe returns 403 or fails for another reason, the status is `healthy` when at least six of the eight probes are readable and `limited` when fewer are |
+| `azure_check_access` | Probes eight Graph and ARM surfaces and reports which are readable; a probe that stopped at its page cap or at a refused next link carries `truncated: true` (with the refusal as `truncation`) and its count is a floor. When every probe is refused for its credentials (a 401, or a token request refused as `invalid_client`, `unauthorized_client`, or `AADSTS90002` for an unknown tenant), the status is `failed` and the next step says the credentials were rejected, naming `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` for a refused token request, or `AZURE_GRAPH_TOKEN` and `AZURE_MANAGEMENT_TOKEN` (alias `AZURE_ACCESS_TOKEN`) for refused tokens. Otherwise, including when a probe returns 403 or fails for another reason, the status is `healthy` when at least six of the eight probes are readable and `limited` when fewer are. A probe that ran out of retries adds a note that the check is incomplete (see [Retries and timeouts](#retries-and-timeouts)) |
 | `azure_assess_identity` | AZURE-ID-01 to AZURE-ID-13 |
 | `azure_assess_monitoring` | AZURE-MON-01 to AZURE-MON-07 |
 | `azure_assess_subscription_guardrails` | AZURE-SUB-01 to AZURE-SUB-05 (`max_assignments`, default 500) |
@@ -93,7 +93,7 @@ For a posture readout or a framework mapping, use the [assess](/docs/workflows/a
 - `warn`: Compliant with caveats, a partial inventory (seen and total counts are reported), or items missing dates.
 - `fail`: Evidence collected and non-compliant, including empty inventories where emptiness fails by intent (no Conditional Access policies, no diagnostic settings, no security contacts, no labels, no compliance policies, no policy assignments).
 - `manual`: Any of these:
-  - The endpoint returned 401/403 or errored. The finding names the endpoint, the missing permission or role, and the evidence to collect.
+  - The endpoint returned 401/403, errored, or ran out of retries (see [Retries and timeouts](#retries-and-timeouts)). The finding names the endpoint, the missing permission or role, and the evidence to collect.
   - A license or service is absent (Entra ID P2, Intune, Purview).
   - The API does not expose the control.
 
@@ -123,7 +123,7 @@ Verdicts on unread, partial, or truncated data follow the [verdict safety rules]
 | 16 | Defender Enabled | monitoring | AZURE-MON-04 | pass when every plan is Standard; a truncated pricing page caps at warn; a failed alerts read is named in evidence |
 | 17 | RBAC Least Privilege | subscription_guardrails | AZURE-SUB-01, AZURE-SUB-02 | Owner above 2 or Contributor above 5 fails |
 | 18 | Security Contacts | subscription_guardrails | AZURE-SUB-03 | pass with an emails value |
-| 19 | Audit Log Retention | monitoring | AZURE-MON-02, AZURE-MON-03, AZURE-MON-06, AZURE-MON-07 | Log Analytics retentionInDays 90+; Entra export is manual |
+| 19 | Audit Log Retention | monitoring | AZURE-MON-02, AZURE-MON-03, AZURE-MON-06, AZURE-MON-07 | Log Analytics retentionInDays 90+; a truncated diagnostic settings or workspace page caps AZURE-MON-06 at warn; Entra export is manual |
 | 20 | Mail Forwarding | data_protection | AZURE-DP-06, AZURE-DP-07 | inbox rules automated (denied mailboxes are named as a MailboxSettings.Read gap and cap at warn; all denied is manual); mailbox forwarding and transport rules manual |
 | 21 | External Sharing | data_protection | AZURE-DP-08 | pass with disabled or existing-guest sharing; anonymous links fail |
 | 22 | App Registrations | identity | AZURE-ID-12, AZURE-ID-13 | expired credentials fail; missing dates, long-lived secrets, or no owners warn; risky AllPrincipals grants fail; zero grants manual |
@@ -162,6 +162,22 @@ The script skips with exit 0 unless `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID
 
 This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
 
+### Retries and timeouts
+
+Every Graph, ARM, and token request gets at most 4 attempts: the first and up to 3 retries.
+
+- **Retried:** A 429, 500, 502, 503, or 504 response, a request that got no response (a DNS, TLS, or connection failure), and an attempt still unanswered after 30 seconds, which is abandoned. Any other status, 401 and 403 included, is final on the first answer.
+- **Wait:** The `Retry-After` value when the response carries one, as delta-seconds or an HTTP date, and otherwise 1, 2, then 4 seconds.
+- **Long waits:** A `Retry-After` above 30 seconds ends the retries at once instead of stalling the run. The error names the wait the server asked for: `503 Service Unavailable (the server asked to retry after 120 s, more than the 30 s limit)`.
+- **Token requests:** Reads that start together share one token request per resource, retries included. A token request that failed is not kept, so the next read asks again.
+
+When the retries run out, the read is unreadable, never an empty or partial inventory:
+
+- Its error names the last status or failure and the attempt count: `429 Too Many Requests after 4 attempts: TooManyRequests: Too many requests.` or `no response after 4 attempts (TimeoutError: the request did not complete within 30 s)`.
+- The findings that depend on it follow the [verdict safety rules](#verdict-safety-rules) for a failed read. A `manual` finding says the read is incomplete and recommends waiting, not a grant: `GET /v1.0/identity/conditionalAccess/policies returned 429 Too Many Requests after 4 attempts: TooManyRequests: Too many requests, so this read is incomplete. Wait for Microsoft Graph to stop throttling or failing the request, then re-run; the read needs Policy.Read.All. Or collect ... manually.`
+- A list that fails on a later page fails as a whole. The pages read before it are dropped, so they are never reported as the inventory.
+- In `azure_check_access`, the probe is `not_readable` and a note says the check is incomplete: `This check is incomplete: the probes for conditional_access ran out of retries without an answer (each surface records its last error), so whether that surface is readable is unknown.` The status thresholds count readable probes only, so the status can still be `healthy` beside that note. The next step says to wait for Microsoft Graph or Azure Resource Manager, or to restore network access to a host that never answered, and recommends a grant only for the probes that were refused.
+
 ### Failed request attribution
 
 When the failure behind a `manual` finding was the token request itself, the finding names that request and states that no resource request was made. The named request is taken from the observed request URL, not from the finding's endpoint constant.
@@ -180,22 +196,22 @@ The same attribution appears in:
 - The AZURE-ID-01 and AZURE-ID-02 security-defaults note.
 - `azure_check_access`, whose notes add `POST /<tenant>/oauth2/v2.0/token returned 403 Forbidden; no resource request was made for organization, conditional_access, ...` beside the `not_readable` surfaces whose `request_url` is the token endpoint.
 
-The same attribution holds when the token request was rejected before any response arrived (a DNS, TLS, connection, or timeout failure). The rejection is wrapped with the token URL, so:
+The same attribution holds when every attempt at the token request was rejected before any response arrived (a DNS, TLS, connection, or timeout failure). The rejection is wrapped with the token URL, so:
 
-- The finding reads `POST /<tenant>/oauth2/v2.0/token received no response (TypeError: fetch failed (ENOTFOUND)), so no Microsoft Graph request was made for this finding. Restore network access to login.microsoftonline.com (DNS, TLS, proxy) so the token request receives a response; the read then needs Policy.Read.All. Or collect ... manually.`
+- The finding reads `POST /<tenant>/oauth2/v2.0/token received no response after 4 attempts (TypeError: fetch failed (ENOTFOUND)), so no Microsoft Graph request was made for this finding. Restore network access to login.microsoftonline.com (DNS, TLS, proxy) so the token request receives a response; the read then needs Policy.Read.All. Or collect ... manually.`
 - The finding's `http_status` is `null`.
 - `request_url` is the token endpoint.
 - `resource_request` carries the not-attempted marker.
 - No Graph or ARM endpoint or HTTP status is named anywhere in the findings, the `errors` array, `_errors.log`, or `azure_check_access`.
-- In `azure_check_access`, the note reads `POST /<tenant>/oauth2/v2.0/token received no response (...); no resource request was made for ...`, and the next step names the network path rather than the client credentials.
+- In `azure_check_access`, the note reads `POST /<tenant>/oauth2/v2.0/token received no response after 4 attempts (...); no resource request was made for ...`, and the next step names the network path rather than the client credentials.
 
 The transport message is scrubbed like any other error string. Only the error's name, its scrubbed message, and the cause's network code (`ENOTFOUND`, `ECONNREFUSED`) are kept.
 
-A Graph or ARM request rejected before any response:
+A Graph or ARM request whose every attempt was rejected before any response:
 
 - Keeps its own endpoint and observed `request_url`.
 - Records `http_status: null`.
-- Reads `GET /v1.0/identity/conditionalAccess/policies received no response (...). Restore network access to graph.microsoft.com (DNS, TLS, proxy) and re-run; the read needs Policy.Read.All.` instead of recommending a permission grant for a request that was never answered.
+- Reads `GET /v1.0/identity/conditionalAccess/policies received no response after 4 attempts (...). Restore network access to graph.microsoft.com (DNS, TLS, proxy) and re-run; the read needs Policy.Read.All.` instead of recommending a permission grant for a request that was never answered.
 
 ### Verdict safety rules
 
@@ -209,7 +225,7 @@ A Graph or ARM request rejected before any response:
 - AZURE-DP-06 counts denied mailboxes (401/403) separately from mailboxes that errored without a permission failure (typically users without an Exchange mailbox). The finding names `MailboxSettings.Read (application)` for the denied subset and caps at `warn`. Every mailbox denied renders `manual`.
 - Every pagination walk reports `truncated: true` on each early exit.
   - Early exits: The item cap, a next link that repeats the page just fetched, an empty page that still advertises a next link, and a next link that leaves the configured origin.
-  - Truncated pages cap `pass` at `warn` with seen and total counts (AZURE-MON-04 and AZURE-MON-05 included).
+  - Truncated pages cap `pass` at `warn` with seen and total counts (AZURE-MON-04, AZURE-MON-05, and AZURE-MON-06 included).
   - `azure_check_access` keeps the flag next to a capped probe count, so `core_data/access.json` never presents a page cap as an inventory size.
 - A server-supplied next link (`@odata.nextLink`, `nextLink`) is followed only when it resolves onto the configured Graph or ARM origin: same scheme, host, and port, and no userinfo.
   - These links are refused before any request is made for them, so the bearer token never leaves for them:

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { validateToolArguments } from "@earendil-works/pi-ai";
+import { STSClient } from "@aws-sdk/client-sts";
 import {
   chmodSync,
   existsSync,
@@ -51,7 +52,7 @@ import {
   statementDeniesInsecureTransport,
   unrestrictedSecurityGroupRules,
 } from "../dist/extensions/grc-tools/aws.js";
-import { AWS_IAM_ACTIONS, AWS_SPEC } from "../dist/extensions/grc-tools/aws.spec.js";
+import { AWS_IAM_ACTIONS, AWS_SDK_DEFAULT_RETRY, AWS_SDK_TIMEOUTS, AWS_SPEC } from "../dist/extensions/grc-tools/aws.spec.js";
 import { checkContract, evaluateVerdictCriteria } from "../dist/extensions/grc-tools/spec-model.js";
 import {
   AWS_CANARIES,
@@ -478,6 +479,110 @@ test("checkAwsAccess probes EC2, S3, KMS, RDS, Audit Manager, and Account surfac
     { status: "not_readable", command: "s3:ListAllMyBuckets" },
     "a denied S3 ListBuckets probe names the IAM action to grant, which S3 calls s3:ListAllMyBuckets",
   );
+});
+
+test("checkAwsAccess reports a probe whose retries ran out on throttling, a 503, a timeout, or a network failure as unanswered: a note says the check is incomplete and the next step says to wait or restore the network, never to grant access for it", async () => {
+  const dnsFailure = () => Object.assign(new Error("getaddrinfo ENOTFOUND access-analyzer.us-east-1.amazonaws.com"), {
+    code: "ENOTFOUND",
+    $metadata: { attempts: 3, totalRetryDelay: 900 },
+  });
+  const unanswered = await checkAwsAccess(compliantBundleClient({
+    async listIamUsers() {
+      throw sdkThrottled();
+    },
+    async describeTrails() {
+      throw sdkServiceUnavailable();
+    },
+    async listDetectors() {
+      throw sdkTimeout();
+    },
+    async listAnalyzers() {
+      throw dnsFailure();
+    },
+  }));
+  assert.equal(unanswered.status, "limited");
+  for (const name of ["iam_users", "cloudtrail", "guardduty", "access_analyzer"]) {
+    const surface = unanswered.surfaces.find((item) => item.name === name);
+    assert.equal(surface?.status, "not_readable", name);
+    assert.equal(surface.count, null, name);
+    assert.match(surface.error, / after 3 attempts/, `${name} records the attempt count beside its last error: ${surface.error}`);
+  }
+  assert.ok(unanswered.notes.includes("11/15 AWS audit surfaces are readable."), unanswered.notes.join(" | "));
+  assert.ok(
+    unanswered.notes.includes("This check is incomplete: the probes for iam_users, cloudtrail, guardduty, access_analyzer ran out of retries without an answer (each surface records its last error), so whether those surfaces are readable is unknown."),
+    unanswered.notes.join(" | "),
+  );
+  assert.equal(
+    unanswered.recommendedNextStep,
+    "Wait for AWS to stop throttling or failing the requests and restore network access to the AWS endpoints (DNS, TLS, proxy), then re-run aws_check_access; unreadable surfaces render manual findings, never pass.",
+    "no unreadable surface was refused, so the next step names no grant",
+  );
+
+  const mixed = await checkAwsAccess(compliantBundleClient({
+    async listIamUsers() {
+      throw sdkThrottled();
+    },
+    async listKmsKeys() {
+      throw accessDenied();
+    },
+  }));
+  assert.ok(
+    mixed.notes.includes("This check is incomplete: the probes for iam_users ran out of retries without an answer (each surface records its last error), so whether that surface is readable is unknown."),
+    mixed.notes.join(" | "),
+  );
+  assert.equal(
+    mixed.recommendedNextStep,
+    "For the probes that ran out of retries, wait for AWS to stop throttling or failing the requests, then re-run aws_check_access. Grant read-only access for the audit principal to the remaining surfaces marked not_readable (kms); unreadable surfaces render manual findings, never pass.",
+    "the grant names only the refused service, never the throttled one",
+  );
+
+  const denied = await checkAwsAccess(compliantBundleClient({
+    async listKmsKeys() {
+      throw accessDenied();
+    },
+  }));
+  assert.ok(!denied.notes.some((note) => note.startsWith("This check is incomplete")), `a denial is an answer, so the check is not incomplete: ${denied.notes.join(" | ")}`);
+  assert.equal(
+    denied.recommendedNextStep,
+    "Grant read-only access for the audit principal to the surfaces marked not_readable (kms); unreadable surfaces render manual findings, never pass.",
+  );
+});
+
+test("checkAwsAccess recognizes a network failure by its Node.js error code, on the error or along its cause chain, so a probe the SDK made a single attempt at (AWS_MAX_ATTEMPTS=1) is unanswered, while a credential provider that failed on the network stays a credential failure", async () => {
+  const singleAttempt = { attempts: 1, totalRetryDelay: 0 };
+  const unanswered = await checkAwsAccess(compliantBundleClient({
+    async listIamUsers() {
+      throw Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:443"), { code: "ECONNREFUSED", $metadata: singleAttempt });
+    },
+    async listDetectors() {
+      throw Object.assign(new Error("getaddrinfo ENOTFOUND guardduty.us-east-1.amazonaws.com"), { code: "ENOTFOUND", $metadata: singleAttempt });
+    },
+    async listAnalyzers() {
+      const cause = Object.assign(new Error("getaddrinfo EAI_AGAIN access-analyzer.us-east-1.amazonaws.com"), { code: "EAI_AGAIN" });
+      throw Object.assign(new Error("request failed"), { cause, $metadata: singleAttempt });
+    },
+  }));
+  for (const name of ["iam_users", "guardduty", "access_analyzer"]) {
+    const surface = unanswered.surfaces.find((item) => item.name === name);
+    assert.equal(surface?.status, "not_readable", name);
+    assert.doesNotMatch(surface.error, / after \d+ attempts/, `${name}: a single attempt has no attempt count: ${surface.error}`);
+  }
+  assert.ok(
+    unanswered.notes.includes("This check is incomplete: the probes for iam_users, guardduty, access_analyzer ran out of retries without an answer (each surface records its last error), so whether those surfaces are readable is unknown."),
+    unanswered.notes.join(" | "),
+  );
+  assert.equal(
+    unanswered.recommendedNextStep,
+    "Restore network access to the AWS endpoints (DNS, TLS, proxy), then re-run aws_check_access; unreadable surfaces render manual findings, never pass.",
+  );
+
+  const credentials = await checkAwsAccess(compliantBundleClient({
+    async listIamUsers() {
+      throw new AwsCredentialProviderError("fromIni (profile audit)", Object.assign(new Error("getaddrinfo ENOTFOUND oidc.us-east-1.amazonaws.com"), { code: "ENOTFOUND" }), "audit");
+    },
+  }));
+  assert.equal(credentials.surfaces.find((item) => item.name === "iam_users")?.status, "not_readable");
+  assert.ok(!credentials.notes.some((note) => note.startsWith("This check is incomplete")), `a credential failure is not an unanswered probe: ${credentials.notes.join(" | ")}`);
 });
 
 test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", async () => {
@@ -3802,13 +3907,36 @@ const STS_IDENTITY_RESPONSE = Object.freeze({
 });
 
 /**
+ * The retry settings the client that sent `req` resolved: its attempt limit from the amz-sdk-request header the SDK
+ * sends with every attempt, and its retry mode from the metrics in its user agent, where the SDK writes E for
+ * standard mode and F for adaptive mode.
+ */
+function sdkRetrySettingsOf(req) {
+  const [, attempt, maxAttempts] = /^attempt=(\d+); max=(\d+)$/.exec(String(req.headers["amz-sdk-request"] ?? "")) ?? [];
+  const metrics = /(?:^| )m\/(\S+)/.exec(String(req.headers["user-agent"] ?? ""))?.[1].split(",") ?? [];
+  const retryMode = metrics.includes("F") ? "adaptive" : metrics.includes("E") ? "standard" : undefined;
+  return { attempt: Number(attempt), maxAttempts: Number(maxAttempts), retryMode };
+}
+
+/** The HTTP handler settings every client the tools build, credential-provider clients included, must carry. */
+const EXPECTED_HANDLER_TIMEOUTS = Object.freeze({
+  requestTimeout: AWS_SDK_TIMEOUTS.requestTimeoutMs,
+  connectionTimeout: AWS_SDK_TIMEOUTS.connectionTimeoutMs,
+  throwOnRequestTimeout: true,
+});
+
+/**
  * Runs `run` with the real AWS SDK sending every request to a local server that answers with respond(request), or
  * never answers when respond returns null. The SDK reaches it through AWS_ENDPOINT_URL with static environment
- * credentials and a single attempt per request; `localhost` and its subdomains resolve to the server for the run
- * (S3 Control prefixes the account id to the endpoint host). Every request is logged as
- * { service, action, label, status }, and `run` also gets the server side of every connection.
+ * credentials. AWS_MAX_ATTEMPTS and AWS_RETRY_MODE are cleared and AWS_CONFIG_FILE names a new file without
+ * max_attempts or retry_mode, so the SDK's own retry defaults apply unless options.env (where undefined clears a
+ * variable) or options.config set them; each run gets its own config file path because the SDK caches a parsed
+ * config file by its path. `localhost` and its subdomains resolve to the server for the run (S3 Control prefixes
+ * the account id to the endpoint host). Every request is logged as { service, action, label, status, retry }, where
+ * retry is { attempt, maxAttempts, retryMode } as the sending client resolved them; `run` also gets the server side
+ * of every connection and timeoutsFor(request), the timeouts of the HTTP handler that sent the request.
  */
-async function withLocalAwsEndpoint(respond, run) {
+async function withLocalAwsEndpoint(respond, run, options = {}) {
   const requests = [];
   const connections = [];
   const server = createServer((req, res) => {
@@ -3816,6 +3944,7 @@ async function withLocalAwsEndpoint(respond, run) {
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
       const described = describeSdkRequest(req, Buffer.concat(chunks).toString("utf8"));
+      const sent = { ...described, invocationId: req.headers["amz-sdk-invocation-id"], retry: sdkRetrySettingsOf(req) };
       let response;
       try {
         response = respond(described);
@@ -3824,10 +3953,10 @@ async function withLocalAwsEndpoint(respond, run) {
         response = { status: 599, contentType: "text/plain", body: `fixture error for ${described.label}: ${error.message}` };
       }
       if (response === null) {
-        requests.push({ ...described, status: "unanswered" });
+        requests.push({ ...sent, status: "unanswered" });
         return;
       }
-      requests.push({ ...described, status: response.status });
+      requests.push({ ...sent, status: response.status });
       const headers = { "content-length": String(Buffer.byteLength(response.body)) };
       if (response.contentType !== undefined) headers["content-type"] = response.contentType;
       res.writeHead(response.status, headers);
@@ -3836,21 +3965,39 @@ async function withLocalAwsEndpoint(respond, run) {
   });
   server.on("connection", (socket) => connections.push(socket));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const configFile = join(createNameShapedFixtureDir(), "config");
+  writeFileSync(configFile, options.config ?? "[default]\nregion = us-east-1\n");
   const env = {
     AWS_ENDPOINT_URL: `http://localhost:${server.address().port}`,
-    AWS_MAX_ATTEMPTS: "1",
-    AWS_RETRY_MODE: "standard",
     AWS_ACCESS_KEY_ID: "AKIALOCALENDPOINT001",
     AWS_SECRET_ACCESS_KEY: "local-endpoint-fixture-secret-access-key-2026",
     AWS_REGION: "us-east-1",
     AWS_EC2_METADATA_DISABLED: "true",
     AWS_SHARED_CREDENTIALS_FILE: "/nonexistent/credentials",
-    AWS_CONFIG_FILE: "/nonexistent/config",
+    AWS_CONFIG_FILE: configFile,
+    AWS_MAX_ATTEMPTS: undefined,
+    AWS_RETRY_MODE: undefined,
+    AWS_PROFILE: undefined,
+    AWS_SESSION_TOKEN: undefined,
+    ...options.env,
   };
-  const cleared = ["AWS_PROFILE", "AWS_SESSION_TOKEN"];
-  const previous = Object.fromEntries([...Object.keys(env), ...cleared].map((key) => [key, process.env[key]]));
-  for (const key of cleared) delete process.env[key];
-  Object.assign(process.env, env);
+  const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  // Handler timeouts never reach the wire, so the handler that sends each request is recorded by its invocation id.
+  const handlerPrototype = Object.getPrototypeOf(new STSClient({}).config.requestHandler);
+  const originalHandle = handlerPrototype.handle;
+  const senders = new Map();
+  handlerPrototype.handle = function handleAndRecordSender(request, handlerOptions) {
+    senders.set(request.headers["amz-sdk-invocation-id"], this);
+    return originalHandle.call(this, request, handlerOptions);
+  };
+  const timeoutsFor = (request) => {
+    const { requestTimeout, connectionTimeout, throwOnRequestTimeout } = senders.get(request.invocationId)?.httpHandlerConfigs() ?? {};
+    return { requestTimeout, connectionTimeout, throwOnRequestTimeout };
+  };
   const originalLookup = dns.lookup;
   dns.lookup = function lookupLocalEndpoint(hostname, options, callback) {
     if (typeof options === "function") {
@@ -3863,9 +4010,10 @@ async function withLocalAwsEndpoint(respond, run) {
     return originalLookup.call(dns, hostname, options, callback);
   };
   try {
-    return await run({ requests, connections });
+    return await run({ requests, connections, timeoutsFor });
   } finally {
     dns.lookup = originalLookup;
+    handlerPrototype.handle = originalHandle;
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
@@ -3962,7 +4110,7 @@ for (const [shape, response] of Object.entries(SILENT_SUCCESS_SHAPES)) {
               assert.match(error.message, HTML_PARSE_NOTE, name);
             }
             assert.deepEqual(
-              Object.getOwnPropertyNames(error).filter((key) => !["stack", "message", "name", "code", "httpStatus", "$metadata"].includes(key)),
+              Object.getOwnPropertyNames(error).filter((key) => !["stack", "message", "name", "code", "httpStatus", "networkErrorCode", "$metadata"].includes(key)),
               [],
               `${name}: nothing that can hold body text is retained on the thrown error`,
             );
@@ -4462,26 +4610,220 @@ test("rule 9: a server-controlled error code (<Code>Bearer …</Code>, a __type 
   );
 });
 
-test("rule 9: a 502 HTML page through the real SDK parser path is recorded on every protocol as the non-JSON body note with the observed status, measured from the response rather than quoted from the SDK error", async () => {
+test("rule 9: a 502 HTML page through the real SDK parser path is retried up to the SDK's default attempt limit and recorded on every protocol as the non-JSON body note with the observed status and the attempt count, measured from the response rather than quoted from the SDK error", async () => {
   const page = { status: 502, contentType: "text/html; charset=utf-8", body: canaryHtmlBody() };
+  const attempts = AWS_SDK_DEFAULT_RETRY.maxAttempts;
   await withLocalAwsEndpoint(() => page, async ({ requests }) => {
     const client = realAwsClient();
     for (const [name, , call] of LOCAL_AWS_METHODS) {
+      const sentBefore = requests.length;
       await assert.rejects(() => call(client), (error) => {
         const record = thrownErrorRecord(error);
         assert.ok(error instanceof AwsApiError, `${name}: ${record}`);
         assert.equal(error.httpStatus, 502, name);
-        assert.match(error.message, new RegExp(`^(?:Unknown|SyntaxError) \\(HTTP 502\\): non-JSON body \\(text/html, ${Buffer.byteLength(page.body)} bytes\\)$`), `${name}: ${error.message}`);
+        assert.match(error.message, new RegExp(`^(?:Unknown|SyntaxError) \\(HTTP 502\\) after ${attempts} attempts: non-JSON body \\(text/html, ${Buffer.byteLength(page.body)} bytes\\)$`), `${name}: ${error.message}`);
         assertNoCanaryWindows(assert, record, AWS_PLANTED_CANARIES, `${name} thrown error`);
         assert.doesNotMatch(record, PARSER_WORDING, name);
         return true;
       });
+      assert.equal(requests.length - sentBefore, attempts, `${name}: the SDK sent the request ${attempts} times`);
     }
-    assert.ok(requests.length >= LOCAL_AWS_METHODS.length && requests.every((request) => request.status === 502));
+    assert.ok(requests.every((request) => request.status === 502));
     const text = await runAwsTool("aws_check_access", { region: "us-east-1", account_id: FIXTURE_ACCOUNT });
-    assert.match(text, /AWS access check failed: Unknown \(HTTP 502\): non-JSON body \(text\/html, \d+ bytes\)/);
+    assert.match(text, new RegExp(`AWS access check failed: Unknown \\(HTTP 502\\) after ${attempts} attempts: non-JSON body \\(text/html, \\d+ bytes\\)`));
     assertNoCanaryWindows(assert, text, AWS_PLANTED_CANARIES, "aws_check_access payload");
   });
+});
+
+/** IAM's Query-protocol answer when the service is unavailable, which both retry modes retry. */
+const IAM_SERVICE_UNAVAILABLE = Object.freeze({
+  status: 503,
+  contentType: "text/xml",
+  body: '<ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><Error><Type>Receiver</Type><Code>ServiceUnavailable</Code><Message>Service is unavailable</Message></Error><RequestId>req-1</RequestId></ErrorResponse>',
+});
+
+/** aws_check_access as the agent runs it: the registered tool resolves its configuration from `args` and the environment, then builds its own clients. */
+async function runAwsCheckAccess(args) {
+  const registered = [];
+  registerAwsTools({ registerTool: (tool) => registered.push(tool) });
+  const result = await registered.find((tool) => tool.name === "aws_check_access").execute("call-retry-settings", args);
+  assert.notEqual(result.isError, true, result.content[0].text);
+  return result.details;
+}
+
+test("aws_check_access through the real SDK: a probe answered 503 on every attempt is retried up to the SDK's default attempt limit, then reported as unanswered with the attempt count, and the next step says to wait rather than grant", async () => {
+  const attempts = AWS_SDK_DEFAULT_RETRY.maxAttempts;
+  await withLocalAwsEndpoint(
+    (request) => (request.label === "iam:ListUsers" ? IAM_SERVICE_UNAVAILABLE : documentedLocalResponse(request)),
+    async ({ requests }) => {
+      const access = await checkAwsAccess(realAwsClient());
+      assert.equal(requests.filter((request) => request.label === "iam:ListUsers").length, attempts, `the probe was sent ${attempts} times`);
+      const users = access.surfaces.find((surface) => surface.name === "iam_users");
+      assert.deepEqual(
+        { status: users.status, count: users.count, error_code: users.error_code, http_status: users.http_status },
+        { status: "not_readable", count: null, error_code: "ServiceUnavailable", http_status: 503 },
+      );
+      assert.equal(users.error, `ServiceUnavailable (HTTP 503) after ${attempts} attempts: Service is unavailable`);
+      assert.equal(access.surfaces.filter((surface) => surface.status === "readable").length, access.surfaces.length - 1, "every other probe was answered");
+      assert.ok(
+        access.notes.includes("This check is incomplete: the probes for iam_users ran out of retries without an answer (each surface records its last error), so whether that surface is readable is unknown."),
+        access.notes.join(" | "),
+      );
+      assert.equal(access.recommendedNextStep, "Wait for AWS to stop throttling or failing the requests, then re-run aws_check_access; unreadable surfaces render manual findings, never pass.");
+    },
+  );
+});
+
+/** A profile whose retry settings differ from the SDK's defaults in both the mode and the attempt limit. */
+const RETRY_PROFILE_CONFIG = [
+  "[default]",
+  "region = us-east-1",
+  "[profile retry-audit]",
+  "aws_access_key_id = AKIARETRYPROFILE0001",
+  "aws_secret_access_key = retry-profile-fixture-secret-access-key",
+  "max_attempts = 4",
+  "retry_mode = adaptive",
+  "",
+].join("\n");
+
+const retrySettingsOf = (request) => ({ retryMode: request.retry.retryMode, maxAttempts: request.retry.maxAttempts });
+
+test("AWS retry settings through the real SDK: every client the tools build takes its retry mode and attempt limit from AWS_RETRY_MODE and AWS_MAX_ATTEMPTS, then from the profile's retry_mode and max_attempts, otherwise the SDK's standard mode with 3 attempts, and keeps the tools' timeouts", async (t) => {
+  const cases = [
+    { name: "nothing set", expected: { ...AWS_SDK_DEFAULT_RETRY } },
+    { name: "AWS_MAX_ATTEMPTS=5", env: { AWS_MAX_ATTEMPTS: "5" }, expected: { ...AWS_SDK_DEFAULT_RETRY, maxAttempts: 5 } },
+    { name: "AWS_RETRY_MODE=adaptive", env: { AWS_RETRY_MODE: "adaptive" }, expected: { ...AWS_SDK_DEFAULT_RETRY, retryMode: "adaptive" } },
+    { name: "the profile argument's max_attempts and retry_mode", args: { profile: "retry-audit" }, config: RETRY_PROFILE_CONFIG, expected: { retryMode: "adaptive", maxAttempts: 4 } },
+    { name: "AWS_PROFILE's max_attempts and retry_mode", env: { AWS_PROFILE: "retry-audit" }, config: RETRY_PROFILE_CONFIG, expected: { retryMode: "adaptive", maxAttempts: 4 } },
+    {
+      name: "AWS_MAX_ATTEMPTS and AWS_RETRY_MODE over the profile's settings",
+      env: { AWS_MAX_ATTEMPTS: "2", AWS_RETRY_MODE: "standard" },
+      args: { profile: "retry-audit" },
+      config: RETRY_PROFILE_CONFIG,
+      expected: { retryMode: "standard", maxAttempts: 2 },
+    },
+  ];
+  const everyClient = new Set(LOCAL_AWS_METHODS.map(([, service]) => service));
+  for (const { name, env, args, config, expected } of cases) {
+    await t.test(name, () => withLocalAwsEndpoint(
+      (request) => (request.label === "iam:ListUsers" ? IAM_SERVICE_UNAVAILABLE : documentedLocalResponse(request)),
+      async ({ requests, timeoutsFor }) => {
+        const toolArgs = { region: "us-east-1", account_id: FIXTURE_ACCOUNT, ...args };
+        const access = await runAwsCheckAccess(toolArgs);
+        // The access check reads every service but S3 Control, whose one reader runs on a client built the way the tools build it.
+        await new AwsAuditorClient(resolveAwsConfiguration(toolArgs)).getAccountPublicAccessBlock(FIXTURE_ACCOUNT);
+        assert.deepEqual(new Set(requests.map((request) => request.service)), everyClient, "every SDK client sent a request");
+        assert.equal(requests.filter((request) => request.label === "iam:ListUsers").length, expected.maxAttempts, `the 503 was sent ${expected.maxAttempts} times`);
+        assert.equal(
+          access.surfaces.find((surface) => surface.name === "iam_users").error,
+          `ServiceUnavailable (HTTP 503) after ${expected.maxAttempts} attempts: Service is unavailable`,
+          "the error carries the attempt count the SDK reported",
+        );
+        for (const request of requests) {
+          assert.deepEqual(retrySettingsOf(request), expected, request.label);
+          assert.deepEqual(timeoutsFor(request), EXPECTED_HANDLER_TIMEOUTS, request.label);
+        }
+      },
+      { env, config },
+    ));
+  }
+});
+
+const ASSUMED_ROLE_ACCESS_KEY = "ASIAASSUMEDROLE00001";
+
+/** STS's answer to a role assumption, with credentials that outlive the run. */
+function assumedRoleResponse(action) {
+  return {
+    status: 200,
+    contentType: "text/xml",
+    body: `<${action}Response xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><${action}Result><Credentials><AccessKeyId>${ASSUMED_ROLE_ACCESS_KEY}</AccessKeyId><SecretAccessKey>assumed-role-fixture-secret-access-key</SecretAccessKey><SessionToken>assumed-role-fixture-session-token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials><AssumedRoleUser><AssumedRoleId>AROAAUDITOR000000001:grclanker</AssumedRoleId><Arn>arn:aws:sts::${FIXTURE_ACCOUNT}:assumed-role/auditor/grclanker</Arn></AssumedRoleUser></${action}Result><ResponseMetadata><RequestId>req-${action}</RequestId></ResponseMetadata></${action}Response>`,
+  };
+}
+
+test("AWS credential providers through the real SDK: the STS client a provider builds gets the tools' timeouts and no retry settings, so it resolves them from the environment or the selected profile like every other client", async (t) => {
+  const tokenFile = join(createNameShapedFixtureDir(), "web-identity-token");
+  writeFileSync(tokenFile, "web-identity-fixture-token");
+  const roleArn = `arn:aws:iam::${FIXTURE_ACCOUNT}:role/auditor`;
+  const cases = [
+    {
+      name: "fromIni assuming the role of the profile argument, whose profile sets max_attempts and retry_mode",
+      action: "AssumeRole",
+      args: { profile: "retry-role" },
+      config: [
+        "[default]",
+        "region = us-east-1",
+        "[profile retry-source]",
+        "aws_access_key_id = AKIARETRYSOURCE00001",
+        "aws_secret_access_key = retry-source-fixture-secret-access-key",
+        "[profile retry-role]",
+        `role_arn = ${roleArn}`,
+        "source_profile = retry-source",
+        "max_attempts = 4",
+        "retry_mode = adaptive",
+        "",
+      ].join("\n"),
+      expected: { retryMode: "adaptive", maxAttempts: 4 },
+    },
+    {
+      name: "fromNodeProviderChain exchanging a web identity token, with AWS_MAX_ATTEMPTS and AWS_RETRY_MODE set",
+      action: "AssumeRoleWithWebIdentity",
+      env: {
+        AWS_ACCESS_KEY_ID: undefined,
+        AWS_SECRET_ACCESS_KEY: undefined,
+        AWS_WEB_IDENTITY_TOKEN_FILE: tokenFile,
+        AWS_ROLE_ARN: roleArn,
+        AWS_ROLE_SESSION_NAME: "grclanker-retry-settings",
+        AWS_MAX_ATTEMPTS: "5",
+        AWS_RETRY_MODE: "adaptive",
+      },
+      expected: { retryMode: "adaptive", maxAttempts: 5 },
+    },
+  ];
+  for (const { name, action, env, args, config, expected } of cases) {
+    await t.test(name, () => withLocalAwsEndpoint(
+      (request) => (request.action === action ? assumedRoleResponse(action) : documentedLocalResponse(request)),
+      async ({ requests, timeoutsFor }) => {
+        const access = await runAwsCheckAccess({ region: "us-east-1", account_id: FIXTURE_ACCOUNT, ...args });
+        assert.equal(access.status, "healthy", access.notes.join(" | "));
+        const assumptions = requests.filter((request) => request.action === action);
+        assert.ok(assumptions.length > 0, `the provider called ${action}`);
+        for (const assumed of assumptions) {
+          assert.deepEqual(retrySettingsOf(assumed), expected, "the provider's STS client resolved the retry settings itself");
+          assert.deepEqual(timeoutsFor(assumed), EXPECTED_HANDLER_TIMEOUTS, "the provider's STS client has the tools' timeouts");
+        }
+        for (const request of requests.filter((item) => item.action !== action)) {
+          assert.equal(request.accessKeyId, ASSUMED_ROLE_ACCESS_KEY, `${request.label} was signed with the assumed role's credentials`);
+          assert.deepEqual(retrySettingsOf(request), expected, request.label);
+        }
+      },
+      { env, config },
+    ));
+  }
+});
+
+test("aws_check_access through the real SDK: with AWS_MAX_ATTEMPTS=1 a refused connection gets one attempt and is still reported as unanswered, so the next step says to restore network access rather than grant", async () => {
+  const closed = createServer();
+  await new Promise((resolve) => closed.listen(0, "127.0.0.1", resolve));
+  const closedPort = closed.address().port;
+  await new Promise((resolve) => closed.close(resolve));
+  await withLocalAwsEndpoint(
+    documentedLocalResponse,
+    async ({ requests }) => {
+      const access = await runAwsCheckAccess({ region: "us-east-1", account_id: FIXTURE_ACCOUNT });
+      assert.ok(requests.length > 0 && requests.every((request) => request.service !== "iam" && request.retry.maxAttempts === 1), "IAM never reached the local server, and every client allowed one attempt");
+      for (const name of ["iam_summary", "iam_users"]) {
+        const surface = access.surfaces.find((item) => item.name === name);
+        assert.deepEqual({ status: surface.status, http_status: surface.http_status }, { status: "not_readable", http_status: null }, name);
+        assert.equal(surface.error, `Error: connect ECONNREFUSED 127.0.0.1:${closedPort}`, `${name}: one attempt, so no attempt count`);
+      }
+      assert.ok(
+        access.notes.includes("This check is incomplete: the probes for iam_summary, iam_users ran out of retries without an answer (each surface records its last error), so whether those surfaces are readable is unknown."),
+        access.notes.join(" | "),
+      );
+      assert.equal(access.recommendedNextStep, "Restore network access to the AWS endpoints (DNS, TLS, proxy), then re-run aws_check_access; unreadable surfaces render manual findings, never pass.");
+    },
+    { env: { AWS_MAX_ATTEMPTS: "1", AWS_ENDPOINT_URL_IAM: `http://localhost:${closedPort}` } },
+  );
 });
 
 writeFailureTest("exportAwsAuditBundle leaves nothing under the output root when a write fails partway", async () => {
