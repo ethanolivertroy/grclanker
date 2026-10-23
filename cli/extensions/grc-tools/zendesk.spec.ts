@@ -134,7 +134,7 @@ const decisions = [
   "return fail when any active team member explicitly lacks 2FA or account enforcement is disabled without enforced SSO, pass when enforcement is enabled and every member in a complete inventory reports 2FA enabled, warn for missing enrollment flags or partial coverage, and manual when MFA depends on the identity provider.",
   "return pass for the Recommended preset or a Custom policy with length at least 12, complexity at least two, mixed case, at most ten failed attempts, email-local-part rejection, and history at least five or unlimited; warn for High or a deficient Custom policy, and fail for every lower preset.",
   "return pass when IP restriction is enabled with at least one range, warn when enabled with no range, and fail when disabled.",
-  "return pass when positive agent and applicable mobile inactivity timeouts are at or below the configured threshold, fail when the agent timeout is zero or above three times the threshold, and warn for every other threshold violation.",
+  "return pass when positive agent and applicable mobile inactivity timeouts are at or below the configured threshold, fail when the agent timeout or the applicable mobile timeout is zero or above three times the threshold, and warn for every other threshold violation.",
   "return fail when any populated custom role grants administrator-equivalent permissions, warn for partial inventories, unassigned administrator-equivalent roles, or an all-unrestricted agent population, and pass when complete role and team inventories show none.",
   "return fail when active administrators exceed the configured threshold, warn when any administrator is stale, undated, or the inventory is partial, and pass when the non-empty complete inventory is within the threshold and all administrators are recent.",
   "return pass when complete inventories contain more than one group and at least one membership, and warn when only one group exists, no membership exists, or either inventory is truncated.",
@@ -272,7 +272,15 @@ const ZENDESK_EXECUTABLE_DECISIONS: Readonly<Record<string, ZendeskExecutableDec
     inputs: input("readable", "agent_session_timeout", "mobile_app_access", "mobile_app_session_timeout", "threshold_minutes", "severe_threshold_minutes"),
     rules: [
       rule("manual", any(ne("readable", true), { op: "not", condition: { op: "defined", operand: path("agent_session_timeout") } })),
-      rule("fail", any(lte("agent_session_timeout", 0), { op: "gt", left: path("agent_session_timeout"), right: path("severe_threshold_minutes") })),
+      rule("fail", any(
+        lte("agent_session_timeout", 0),
+        { op: "gt", left: path("agent_session_timeout"), right: path("severe_threshold_minutes") },
+        all(
+          ne("mobile_app_access", false),
+          { op: "defined", operand: path("mobile_app_session_timeout") },
+          any(lte("mobile_app_session_timeout", 0), { op: "gt", left: path("mobile_app_session_timeout"), right: path("severe_threshold_minutes") }),
+        ),
+      )),
       rule("warn", any(
         { op: "gt", left: path("agent_session_timeout"), right: path("threshold_minutes") },
         all(

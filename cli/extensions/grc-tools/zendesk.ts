@@ -3084,7 +3084,8 @@ function assessSessionTimeout(securitySnap: ZendeskSnapshot<JsonRecord>, securit
     const mobileNote = mobileAccess !== false && mobileTimeout !== undefined ? ` and mobile_app_session_timeout=${mobileTimeout} minutes` : "";
     return finding(5, title, "medium", "pass", `security_settings.agent_session_timeout=${agentTimeout} minutes${mobileNote} of inactivity are within the ${thresholdMinutes}-minute threshold.${maxNote}${endUserNote}`, evidence);
   }
-  const severe = agentTimeout <= 0 || agentTimeout > thresholdMinutes * 3;
+  const isSevere = (timeout: number) => timeout <= 0 || timeout > thresholdMinutes * 3;
+  const severe = isSevere(agentTimeout) || (mobileAccess !== false && mobileTimeout !== undefined && isSevere(mobileTimeout));
   return finding(5, title, "medium", severe ? "fail" : "warn", `${issues.join("; ")}.${maxNote}${endUserNote}`, evidence);
 }
 
