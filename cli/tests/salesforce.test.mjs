@@ -33,6 +33,7 @@ import {
   resolveSalesforceConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/salesforce.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { SALESFORCE_SPEC } from "../dist/extensions/grc-tools/salesforce.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertBundlePathsMatchSpec, assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
@@ -580,6 +581,216 @@ test("SalesforceApiClient paginates SOQL with nextRecordsUrl, records truncation
   const tooling = await client.toolingQuery("SELECT Score FROM SecurityHealthCheck");
   assert.equal(tooling.records[0].Score, 77);
   assert.ok(calls.some((call) => call.startsWith("GET /services/data/v64.0/tooling/query?q=SELECT")));
+});
+
+/** Hangs until the client's own request timeout aborts it; mock timers advance past the timeout at once, so no real time passes. */
+function hangUntilTimeout(t, init, timeoutMs = 30_000) {
+  return new Promise((_, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+    t.mock.timers.tick(timeoutMs);
+  });
+}
+
+function recordingClient(fetchImpl, sleeps, config = sampleConfig({ maxRetries: 3 })) {
+  return new SalesforceApiClient(config, {
+    fetchImpl,
+    now: () => NOW,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+}
+
+/** Planted credentials for the retry tests: random-looking, so the fragment-window assertion is sound. */
+const SF_RETRY_PLANTED = {
+  accessToken: "Qm4XwTz8RbVn2KpLd7",
+  password: "Hs9GvYc3NjWq6TeB2m",
+  securityToken: "Zr5KfUx7PdLa3VgQ9n",
+  consumerSecret: "Tb8MwEq2YhJs6RcN4x",
+  bearer: "Wk3PzDn7GfXu5LbV8q",
+};
+
+test("SalesforceApiClient retries a timeout, a transport failure, and a 503 whose Retry-After is an HTTP-date, then reads", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const failures = [
+    (init) => hangUntilTimeout(t, init),
+    () => Promise.reject(new TypeError("fetch failed")),
+    () => Promise.resolve(jsonResponse([{ errorCode: "SERVER_UNAVAILABLE", message: "maintenance" }], { status: 503, headers: { "retry-after": new Date(NOW.getTime() + 7_000).toUTCString() } })),
+  ];
+  let requests = 0;
+  const fetchImpl = (input, init) => {
+    requests += 1;
+    const next = failures.shift();
+    return next ? next(init) : Promise.resolve(jsonResponse({ DailyApiRequests: { Max: 100000, Remaining: 99000 } }));
+  };
+  const sleeps = [];
+
+  assert.equal((await recordingClient(fetchImpl, sleeps).getLimits()).DailyApiRequests.Remaining, 99000);
+  assert.equal(requests, 4);
+  assert.deepEqual(sleeps, [500, 1000, 7000], "exponential backoff after the timeout and the transport failure, then the HTTP-date measured against the injected clock");
+});
+
+test("SalesforceApiClient stops without waiting when Retry-After asks for more than 30 s, and caps its own backoff at 30 s", async () => {
+  const sleeps = [];
+  let requests = 0;
+  const tooLong = recordingClient(async () => {
+    requests += 1;
+    return jsonResponse([{ errorCode: "REQUEST_LIMIT", message: "slow down" }], { status: 429, headers: { "retry-after": "120" } });
+  }, sleeps);
+  await assert.rejects(tooLong.getLimits(), (error) => {
+    assert.ok(error instanceof SalesforceApiError);
+    assert.equal(error.status, 429);
+    assert.equal(error.message, "Salesforce request /services/data/v64.0/limits failed (429) REQUEST_LIMIT, not retried because the server asked to retry after 120 s, more than the 30 s limit: slow down");
+    return true;
+  });
+  assert.equal(requests, 1);
+  assert.deepEqual(sleeps, []);
+
+  const responses = [
+    () => jsonResponse([{ errorCode: "SERVER_UNAVAILABLE", message: "maintenance" }], { status: 503, headers: { "retry-after": "2" } }),
+    () => jsonResponse([{ errorCode: "SERVER_UNAVAILABLE", message: "maintenance" }], { status: 503, headers: { "retry-after": new Date(NOW.getTime() + 90_000).toUTCString() } }),
+  ];
+  const laterDate = recordingClient(async () => responses.shift()?.() ?? jsonResponse({}), sleeps);
+  await assert.rejects(laterDate.getLimits(), (error) => {
+    assert.equal(error.message, "Salesforce request /services/data/v64.0/limits failed (503) SERVER_UNAVAILABLE after 2 attempts, then stopped because the server asked to retry after 90 s, more than the 30 s limit: maintenance");
+    return true;
+  });
+  assert.equal(responses.length, 0);
+  assert.deepEqual(sleeps, [2000]);
+
+  sleeps.length = 0;
+  let unavailable = 0;
+  const backoff = recordingClient(async () => {
+    unavailable += 1;
+    return new Response("", { status: 503 });
+  }, sleeps, sampleConfig({ maxRetries: 8 }));
+  await assert.rejects(backoff.getLimits(), { message: "Salesforce request /services/data/v64.0/limits failed (503) after 9 attempts" });
+  assert.equal(unavailable, 9);
+  assert.deepEqual(sleeps, [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000]);
+});
+
+test("SalesforceApiClient fails closed after four attempts with the endpoint path, the last failure, and the attempt count, and no planted credential survives", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const planted = Object.values(SF_RETRY_PLANTED);
+  assertPlantedValuesWellFormed(assert, SF_RETRY_PLANTED, [JSON.stringify(sampleConfig()), JSON.stringify(goodUsers), JSON.stringify(goodProfiles)]);
+  const echo = `password=${SF_RETRY_PLANTED.password}${SF_RETRY_PLANTED.securityToken} client_secret=${SF_RETRY_PLANTED.consumerSecret} Authorization: Bearer ${SF_RETRY_PLANTED.bearer}`;
+  const echoHeaders = { "x-debug-authorization": `Bearer ${SF_RETRY_PLANTED.accessToken}`, "retry-after": "1" };
+  const scenarios = [
+    {
+      label: "timeout",
+      respond: (init) => hangUntilTimeout(t, init),
+      expected: /^Salesforce request to \/services\/data\/v64\.0\/query timed out after 30000 ms, after 4 attempts$/,
+    },
+    {
+      label: "transport failure",
+      respond: () => Promise.reject(new TypeError(`connect ECONNREFUSED with Bearer ${SF_RETRY_PLANTED.accessToken}; ${echo}`)),
+      expected: /^Salesforce request to \/services\/data\/v64\.0\/query failed after 4 attempts: connect ECONNREFUSED /,
+    },
+    {
+      label: "503",
+      respond: () => Promise.resolve(jsonResponse([{ errorCode: "SERVER_UNAVAILABLE", message: echo }], { status: 503, headers: echoHeaders })),
+      expected: /^Salesforce request \/services\/data\/v64\.0\/query failed \(503\) SERVER_UNAVAILABLE after 4 attempts: /,
+    },
+    {
+      label: "502 HTML",
+      respond: () => Promise.resolve(new Response(`<html><body>${echo}</body></html>`, { status: 502, headers: { "content-type": "text/html", ...echoHeaders } })),
+      expected: /^Salesforce request \/services\/data\/v64\.0\/query failed \(502\) after 4 attempts: non-JSON body \(text\/html, \d+ bytes\)$/,
+    },
+  ];
+  for (const scenario of scenarios) {
+    let requests = 0;
+    const sleeps = [];
+    const fetchImpl = (input, init) => {
+      requests += 1;
+      return scenario.respond(init);
+    };
+    const client = recordingClient(fetchImpl, sleeps, sampleConfig({ accessToken: SF_RETRY_PLANTED.accessToken, maxRetries: 3 }));
+    const error = await client.listUsers(5).then(() => assert.fail("expected a rejection"), (caught) => caught);
+    assert.ok(error instanceof SalesforceApiError, scenario.label);
+    assert.equal(requests, 4, `${scenario.label}: one request and three retries`);
+    assert.equal(sleeps.length, 3, scenario.label);
+    assert.match(error.message, scenario.expected, `${scenario.label}: ${error.message}`);
+    assert.equal(/SELECT|Username|CreatedDate/.test(error.message), false, `${scenario.label}: no query value in ${error.message}`);
+    assertFragmentsAbsent(assert, error.message, planted, `${scenario.label} error`);
+  }
+
+  let tokenRequests = 0;
+  const passwordConfig = sampleConfig({
+    authMode: "password", username: "auditor@acme.example", password: SF_RETRY_PLANTED.password, securityToken: SF_RETRY_PLANTED.securityToken,
+    consumerKey: "ck", consumerSecret: SF_RETRY_PLANTED.consumerSecret, maxRetries: 3,
+  });
+  const tokenClient = recordingClient(async () => {
+    tokenRequests += 1;
+    return jsonResponse({ error: "server_error", error_description: echo }, { status: 503, headers: echoHeaders });
+  }, [], passwordConfig);
+  const tokenError = await tokenClient.getLimits().then(() => assert.fail("expected a rejection"), (caught) => caught);
+  assert.equal(tokenRequests, 4);
+  assert.equal(tokenError.status, 503);
+  assert.match(tokenError.message, /^Salesforce token request failed \(503\) server_error after 4 attempts: /);
+  assertFragmentsAbsent(assert, tokenError.message, planted, "token endpoint error");
+
+  let soapRequests = 0;
+  const soapClient = recordingClient(async () => {
+    soapRequests += 1;
+    return xmlResponse(`${SOAP_ENVELOPE_OPEN}<soapenv:Fault><faultcode>sf:UNKNOWN_EXCEPTION</faultcode><faultstring>${echo}</faultstring></soapenv:Fault>${SOAP_ENVELOPE_CLOSE}`, 503);
+  }, [], sampleConfig({ accessToken: SF_RETRY_PLANTED.accessToken, maxRetries: 3 }));
+  const soapError = await soapClient.readSecuritySettings().then(() => assert.fail("expected a rejection"), (caught) => caught);
+  assert.equal(soapRequests, 4);
+  assert.match(soapError.message, /^Salesforce Metadata API readMetadata\(SecuritySettings\) failed \(503\) UNKNOWN_EXCEPTION after 4 attempts: /);
+  assertFragmentsAbsent(assert, soapError.message, planted, "Metadata API error");
+});
+
+test("SalesforceApiClient: an abort during the wait before a retry ends the read at once and sends no further request", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const controller = new AbortController();
+  let requests = 0;
+  const client = new SalesforceApiClient(sampleConfig({ maxRetries: 3 }), {
+    fetchImpl: (input, init) => {
+      requests += 1;
+      return hangUntilTimeout(t, init);
+    },
+    signal: controller.signal,
+    sleep: () => {
+      controller.abort();
+      return new Promise(() => {});
+    },
+    now: () => NOW,
+  });
+  await assert.rejects(client.getLimits(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(requests, 1);
+});
+
+test("a second User page that times out on every attempt leaves the user inventory unread: no identity check that rests on it passes and the finding names the timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const healthy = sfCanaryFetch({ surface: null, flavor: null });
+  const laterPage = "/services/data/v64.0/query/01gD0000002HU6KIAW-2";
+  let laterPageRequests = 0;
+  const fetchImpl = (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname === laterPage) {
+      laterPageRequests += 1;
+      return hangUntilTimeout(t, init);
+    }
+    if (url.pathname.endsWith("/query") && url.searchParams.get("q")?.match(/\bFROM\s+(\w+)/i)?.[1] === "User") {
+      return Promise.resolve(jsonResponse({ totalSize: goodUsers.length, done: false, nextRecordsUrl: laterPage, records: goodUsers.slice(0, 2) }));
+    }
+    return healthy(input, init);
+  };
+  const baseline = await assessSalesforceIdentityAccess(recordingClient(healthy, []), { now: NOW });
+  const result = await assessSalesforceIdentityAccess(recordingClient(fetchImpl, []), { now: NOW });
+
+  assert.equal(laterPageRequests, 4, "page 2 is requested once and retried three times");
+  // The query locator in the cursor path is token-shaped, so the scrubber withholds it.
+  const failure = "Salesforce request to /services/data/v64.0/query/[REDACTED] timed out after 30000 ms, after 4 attempts";
+  assert.ok(result.errors.includes(`User read: error (${failure})`), JSON.stringify(result.errors));
+  const passedOnFullRead = baseline.findings.filter((item) => item.status === "pass").map((item) => item.id);
+  assert.deepEqual(passedOnFullRead, ["SF-04", "SF-07", "SF-09", "SF-10", "SF-13"]);
+  for (const id of passedOnFullRead) {
+    const item = result.findings.find((candidate) => candidate.id === id);
+    assert.equal(item.status, "manual", `${id}: ${item.summary}`);
+    assert.ok(item.summary.includes(`because the User query failed (${failure})`), `${id} names the failed read: ${item.summary}`);
+  }
+  assert.equal(result.findings.filter((item) => item.status === "pass").length, 0);
 });
 
 test("SalesforceApiClient reads SecuritySettings through Metadata API readMetadata and surfaces SOAP faults", async () => {
@@ -2545,6 +2756,14 @@ const SALESFORCE_FIXED_TEXTS = [
   "Salesforce Metadata API listMetadata(Profile) failed (403): SOAP body without a fault string (text/xml, 210 bytes)",
   "Salesforce Metadata API readMetadata(Profile) failed (500) INSUFFICIENT_ACCESS: insufficient access rights",
   "Salesforce request to /services/data/v64.0/query timed out after 30000 ms",
+  // Retry exhaustion and a Retry-After past the 30 s cap name the attempt count or the refused wait.
+  "Salesforce request to /services/data/v64.0/query timed out after 30000 ms, after 4 attempts",
+  "Salesforce request to /services/data/v64.0/query failed after 4 attempts: fetch failed",
+  "Salesforce request /services/data/v64.0/query failed (502) after 4 attempts: non-JSON body (text/html, 5120 bytes)",
+  "Salesforce request /services/data/v64.0/limits failed (429), not retried because the server asked to retry after 120 s, more than the 30 s limit",
+  "Salesforce request /services/data/v64.0/limits failed (503) after 2 attempts, then stopped because the server asked to retry after 90 s, more than the 30 s limit",
+  "Salesforce token request failed (503) after 4 attempts: non-JSON body (text/html, 5120 bytes)",
+  "Salesforce Metadata API readMetadata(SecuritySettings) failed (503) after 4 attempts: non-SOAP body (text/html, 5120 bytes)",
   SF_SAMPLE_DENIAL,
   `User read: unread (forbidden: ${SF_SAMPLE_DENIAL})`,
   `TenantSecret read: unread (forbidden: ${SF_SAMPLE_DENIAL})`,

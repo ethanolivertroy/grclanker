@@ -38,8 +38,10 @@ import {
   zendeskAssessmentToolDetails,
 } from "../dist/extensions/grc-tools/zendesk.js";
 import { ZENDESK_SPEC } from "../dist/extensions/grc-tools/zendesk.spec.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import {
   byteDifferentialEnabled,
   prepareByteDifferentialExportRoot,
@@ -899,6 +901,216 @@ test("ZendeskApiClient retries 429 with Retry-After and 5xx before succeeding", 
   assert.ok(delays[1] > 0);
 });
 
+/** Hangs until the client's own request timeout aborts it; mock timers advance past the timeout at once, so no real time passes. */
+function hangUntilTimeout(t, init, timeoutMs = 30_000) {
+  return new Promise((_, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+    t.mock.timers.tick(timeoutMs);
+  });
+}
+
+function scriptedClient(steps, sleeps, config = sampleConfig()) {
+  let requests = 0;
+  const client = new ZendeskApiClient(config, {
+    fetchImpl: (url, init) => {
+      const step = steps[Math.min(requests, steps.length - 1)];
+      requests += 1;
+      return step(init);
+    },
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+    now: () => NOW,
+  });
+  return { client, requests: () => requests };
+}
+
+const ZD_SETTINGS_OK = () => Promise.resolve(jsonResponse({ settings: healthySettings() }));
+
+test("ZendeskApiClient retries a timeout and a transport failure, honors Retry-After on a 5xx in seconds or as an HTTP-date, and backs off exponentially on a 429 without one", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const sleeps = [];
+  const noResponse = scriptedClient([(init) => hangUntilTimeout(t, init), () => Promise.reject(new TypeError("fetch failed")), ZD_SETTINGS_OK], sleeps);
+  assert.equal((await noResponse.client.getAccountSettings()).active_features.sandbox, true);
+  assert.equal(noResponse.requests(), 3);
+  assert.deepEqual(sleeps, [500, 1000], "500 ms after the timeout, then 1 s after the transport failure");
+
+  sleeps.length = 0;
+  const serverAsked = scriptedClient([
+    () => Promise.resolve(jsonResponse({ error: "Upstream" }, { status: 503, headers: { "retry-after": "3" } })),
+    () => Promise.resolve(jsonResponse({ error: "Upstream" }, { status: 502, headers: { "retry-after": new Date(NOW.getTime() + 7_000).toUTCString() } })),
+    () => Promise.resolve(jsonResponse({ error: "RateLimited" }, { status: 429, headers: { "retry-after": new Date(NOW.getTime() + 4_000).toUTCString() } })),
+    ZD_SETTINGS_OK,
+  ], sleeps);
+  await serverAsked.client.getAccountSettings();
+  assert.equal(serverAsked.requests(), 4);
+  assert.deepEqual(sleeps, [3000, 7000, 4000], "Retry-After on a 5xx, and an HTTP-date measured against the injected clock");
+
+  sleeps.length = 0;
+  const unhinted = scriptedClient([
+    () => Promise.resolve(jsonResponse({ error: "RateLimited" }, { status: 429 })),
+    () => Promise.resolve(jsonResponse({ error: "RateLimited" }, { status: 429 })),
+    () => Promise.resolve(jsonResponse({ error: "RateLimited" }, { status: 429 })),
+    ZD_SETTINGS_OK,
+  ], sleeps);
+  await unhinted.client.getAccountSettings();
+  assert.deepEqual(sleeps, [1000, 2000, 4000]);
+
+  sleeps.length = 0;
+  const tooLong = scriptedClient([
+    () => Promise.resolve(jsonResponse({ error: "RateLimited" }, { status: 429, headers: { "retry-after": "120" } })),
+    () => Promise.resolve(jsonResponse({ error: "Upstream" }, { status: 504, headers: { "retry-after": new Date(NOW.getTime() + 600_000).toUTCString() } })),
+    ZD_SETTINGS_OK,
+  ], sleeps);
+  await tooLong.client.getAccountSettings();
+  assert.deepEqual(sleeps, [30_000, 30_000], "a longer Retry-After in either form is clamped to the 30 s cap");
+});
+
+/** Planted credentials for the retry tests: random-looking, so the fragment-window assertion is sound. */
+const ZD_RETRY_PLANTED = {
+  apiToken: "Lq7RmX2vKp9TzW4nB8",
+  bearer: "Dz5HwQ8cNf3VyJ6kT2",
+  session: "Pm2XrB7tLq4WzK9sV5",
+  proxyPassword: "Gc6YeJ3uSa8DfN1hR4",
+};
+
+test("ZendeskApiClient fails closed when retries run out, naming the path, the last failure, and the attempt count, and no planted credential survives", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const planted = Object.values(ZD_RETRY_PLANTED);
+  const config = sampleConfig({ apiToken: ZD_RETRY_PLANTED.apiToken });
+  const basic = Buffer.from(`${config.email}/token:${ZD_RETRY_PLANTED.apiToken}`).toString("base64");
+  assertPlantedValuesWellFormed(assert, ZD_RETRY_PLANTED, [JSON.stringify(sampleConfig()), JSON.stringify(await healthyHttpRoutes())]);
+  const echo = `token ${ZD_RETRY_PLANTED.apiToken} sent Authorization: Basic ${basic} and Bearer ${ZD_RETRY_PLANTED.bearer} with Cookie: _zendesk_session=${ZD_RETRY_PLANTED.session}`;
+  const echoHeaders = { "x-debug-authorization": `Bearer ${ZD_RETRY_PLANTED.bearer}`, "set-cookie": `_zendesk_session=${ZD_RETRY_PLANTED.session}` };
+  const scenarios = [
+    {
+      label: "timeout",
+      respond: (init) => hangUntilTimeout(t, init),
+      requests: 3,
+      message: "Zendesk request failed for /api/v2/account/settings after 3 attempts: timed out after 30000 ms",
+      status: 0,
+    },
+    {
+      label: "transport failure",
+      respond: () => Promise.reject(new TypeError(`connect ECONNREFUSED via https://svc:${ZD_RETRY_PLANTED.proxyPassword}@proxy.example.com; ${echo}`)),
+      requests: 3,
+      message: /^Zendesk request failed for \/api\/v2\/account\/settings after 3 attempts: connect ECONNREFUSED via https:\/\/\[REDACTED\]@proxy\.example\.com; /,
+      status: 0,
+    },
+    {
+      label: "503",
+      respond: () => Promise.resolve(jsonResponse({ error: "Upstream", description: echo }, { status: 503, statusText: "Service Unavailable", headers: { ...echoHeaders, "retry-after": "1" } })),
+      requests: 3,
+      message: /^Zendesk request failed for \/account\/settings after 3 attempts \(503 Service Unavailable; Upstream; token \[REDACTED\] /,
+      status: 503,
+    },
+    {
+      label: "429",
+      respond: () => Promise.resolve(jsonResponse({ error: "RateLimited", description: echo }, { status: 429, statusText: "Too Many Requests", headers: { ...echoHeaders, "retry-after": "120" } })),
+      requests: 4,
+      message: /^Zendesk request failed for \/account\/settings after 4 attempts \(429 Too Many Requests; RateLimited; token \[REDACTED\] /,
+      status: 429,
+    },
+  ];
+  for (const scenario of scenarios) {
+    const sleeps = [];
+    const { client, requests } = scriptedClient([scenario.respond], sleeps, config);
+    const error = await client.getAccountSettings().then(() => assert.fail(`${scenario.label}: expected a rejection`), (caught) => caught);
+    assert.ok(error instanceof ZendeskApiError, scenario.label);
+    assert.equal(requests(), scenario.requests, `${scenario.label}: one request and ${scenario.requests - 1} retries`);
+    assert.equal(sleeps.length, scenario.requests - 1, scenario.label);
+    assert.equal(error.status, scenario.status, scenario.label);
+    assert.equal(error.endpoint, "GET /api/v2/account/settings", scenario.label);
+    if (typeof scenario.message === "string") assert.equal(error.message, scenario.message, scenario.label);
+    else assert.match(error.message, scenario.message, `${scenario.label}: ${error.message}`);
+    assertFragmentsAbsent(assert, error.message, planted, `${scenario.label} error`);
+    assert.equal(error.message.includes(basic), false, `${scenario.label}: the composed Basic credential survived`);
+
+    const assessed = await assessZendeskAuthentication(scriptedClient([scenario.respond], [], config).client, { now: () => NOW });
+    const rendered = JSON.stringify(assessed);
+    assertFragmentsAbsent(assert, rendered, planted, `${scenario.label} assessment`);
+    assert.equal(rendered.includes(basic), false, `${scenario.label}: the composed Basic credential reached the assessment`);
+    assert.equal(assessed.findings.some((item) => item.status === "pass"), false, `${scenario.label}: nothing passes when no read succeeded`);
+  }
+});
+
+test("ZendeskApiClient: an abort during the wait before a retry ends the read at once, and an abort mid-request is never retried", async () => {
+  const waiting = new AbortController();
+  let requests = 0;
+  const duringWait = new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      requests += 1;
+      throw new TypeError("fetch failed");
+    },
+    signal: waiting.signal,
+    sleep: () => {
+      waiting.abort();
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(duringWait.getAccountSettings(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(requests, 1, "no request after the abort");
+
+  const midRequest = new AbortController();
+  let sent = 0;
+  const sleeps = [];
+  const inFlight = new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: (url, init) => {
+      sent += 1;
+      return new Promise((_, reject) => {
+        init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+        midRequest.abort();
+      });
+    },
+    signal: midRequest.signal,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+  await assert.rejects(inFlight.getAccountSettings(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(sent, 1);
+  assert.deepEqual(sleeps, []);
+});
+
+test("a second team member page that times out on every attempt leaves the team inventory unread: no check that rests on it passes and the finding names the timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const routes = await healthyHttpRoutes();
+  const members = routes["/users"].users;
+  assert.ok(members.length >= 2, "the fixture has a second page to read");
+  const laterPage = "https://acme.zendesk.com/api/v2/users?page%5Bsize%5D=100&page%5Bafter%5D=c2&role%5B%5D=agent&role%5B%5D=admin";
+  let laterPageRequests = 0;
+  const fetchImpl = (url, init) => {
+    const key = zendeskRouteKey(url);
+    if (key === "/users") {
+      if (new URL(url).searchParams.get("page[after]") === "c2") {
+        laterPageRequests += 1;
+        return hangUntilTimeout(t, init);
+      }
+      return Promise.resolve(jsonResponse({ users: members.slice(0, 1), meta: { has_more: true, after_cursor: "c2" }, links: { next: laterPage } }));
+    }
+    return Promise.resolve(jsonResponse(routes[key]));
+  };
+  const options = { now: () => NOW };
+  const run = async (client) => [await assessZendeskAuthentication(client, options), await assessZendeskAccessControl(client, options)];
+  const baseline = statusMap(await run(httpClient(routes)));
+  const results = await run(new ZendeskApiClient(sampleConfig(), { fetchImpl, sleep: async () => {}, now: () => NOW }));
+
+  assert.equal(laterPageRequests, 6, "each assessment requests page 2 once and retries it twice");
+  const failure = "Zendesk request failed for /api/v2/users after 3 attempts: timed out after 30000 ms";
+  for (const result of results) {
+    assert.ok(result.errors.includes(`team_members dataset: ${failure}`), JSON.stringify(result.errors));
+    assert.equal(result.summary.collection.team_members.status, "error");
+    assert.equal(result.summary.collection.team_members.seen, null, "the one page read is never reported as the inventory");
+  }
+  const dependents = ["ZD-02", "ZD-06", "ZD-07"];
+  for (const id of dependents) {
+    assert.equal(baseline.get(id), "pass", `${id} passes on the full inventory`);
+    const item = results.map((result) => result.findings.find((candidate) => candidate.id === id)).find(Boolean);
+    assert.equal(item.status, "manual", `${id}: ${item.summary}`);
+    assert.ok(item.summary.includes(`could not be read: ${failure}`), `${id} names the failed read: ${item.summary}`);
+  }
+});
+
 test("ZendeskApiClient surfaces API errors with status codes and redacts secrets", async () => {
   const fetchImpl = async () => jsonResponse({ error: "Forbidden", description: `token ${FIXTURE_API_TOKEN} was rejected` }, { status: 403, statusText: "Forbidden" });
   const client = new ZendeskApiClient(sampleConfig(), { fetchImpl });
@@ -915,6 +1127,7 @@ test("ZendeskApiClient surfaces API errors with status codes and redacts secrets
     fetchImpl: async () => {
       throw new Error(`connect ECONNREFUSED ${FIXTURE_API_TOKEN}`);
     },
+    sleep: async () => {},
   });
   await assert.rejects(failing.getCurrentUser(), /ECONNREFUSED \[REDACTED\]/);
 });
@@ -3401,8 +3614,8 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, and 
     /"dataset_status":\s*"forbidden"/,
     /"dataset_status":\s*"not_found"/,
     /"dataset_status":\s*"error"/,
-    // The error line of a dataset named for what it holds keeps its whole message.
-    /"oauth_tokens dataset: Zendesk request failed for https:\/\/acme\.zendesk\.com\/api\/v2\/oauth\/tokens\?all=true\S* \(403 Forbidden; Forbidden; You do not have access to this page/,
+    // The error line of a dataset named for what it holds keeps its whole message, which names the path without its query.
+    /"oauth_tokens dataset: Zendesk request failed for \/api\/v2\/oauth\/tokens \(403 Forbidden; Forbidden; You do not have access to this page/,
     /"oauth_tokens dataset: Zendesk request GET \/api\/v2\/oauth\/tokens returned 200 OK with an empty response body/,
     /returned 403 \(credential lacks permission\)\./,
     /returned 404 \(endpoint unavailable on this account or plan\)\./,

@@ -41,7 +41,7 @@ The inspector supports the three server-side auth flows Box documents.
 | `BOX_REFRESH_TOKEN` | OAuth 2.0 refresh token, used with the client ID and secret when a 401 is returned. |
 | `BOX_CONFIG_PATH` | YAML config file path (default `~/.box-sec-inspector/config.yaml`). |
 | `BOX_API_BASE_URL` (also `BOX_BASE_URL`), `BOX_TOKEN_URL` | Override `https://api.box.com/2.0` and `https://api.box.com/oauth2/token`. |
-| `BOX_TIMEOUT`, `BOX_MAX_RETRIES` | Request timeout in seconds (default 30) and retries for 429 and 5xx responses (default 3). |
+| `BOX_TIMEOUT`, `BOX_MAX_RETRIES` | Request timeout in seconds (default 30, clamped to 1-300) and retries for 429 and 5xx responses, timeouts, and connection failures (default 3, clamped to 0-10). |
 
 Precedence is explicit tool arguments, then environment variables, then the config file.
 
@@ -232,7 +232,7 @@ The script exits 0 with a skip message unless one of these is configured: `BOX_J
   - Raise `event_limit` for large enterprises. A sample that hit the cap while a `next_stream_position` remained is reported as `warn`. A sample that happens to contain exactly `event_limit` events with nothing left on the stream is complete.
 - Enterprise configuration, Shield lists, and Shield rules come from the versioned `2025.0` endpoints and require Manage enterprise properties.
 - Retention and legal hold endpoints require Box Governance, and Shield endpoints require Box Shield. Missing licenses surface as `manual` findings with the reason.
-- Box's published rate limit is 1000 API requests per minute per user. The client honors `retry-after` on 429 and applies exponential backoff on 5xx.
+- Box's published rate limit is 1000 API requests per minute per user. The client retries 429 and 5xx responses, its own request timeouts, and connection failures up to `max_retries` times (3 by default, so 4 attempts), on the API and on the token request, which signs a fresh JWT assertion for every attempt. It waits for `Retry-After` (delta-seconds or an HTTP-date) when present, clamped to 60 seconds, and otherwise backs off 500 ms doubled per attempt, capped at 8 seconds. A cancelled tool call is never retried, and its retry wait ends at once. When the attempts run out, the error names the method and path, the last status, timeout, or connection error, and the attempt count, and the dataset is recorded as unreadable rather than empty, including when a later page or one policy's assignment read fails.
 - Watermarking and classification are verified at the enterprise feature level. Sampled folder reviews remain a human step and are listed in `manualEvidence`.
 - The event stream check (BOX-16) verifies only that `admin_logs` is active and readable. Whether a SIEM consumes it is not exposed by the API and stays in `manualEvidence`.
 

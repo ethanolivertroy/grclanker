@@ -41,7 +41,7 @@ Configuration precedence is explicit tool arguments, then environment variables,
 | `ZENDESK_API_TOKEN` | API token (API token mode). |
 | `ZENDESK_OAUTH_TOKEN` or `ZENDESK_ACCESS_TOKEN` | OAuth access token (bearer mode). When both an OAuth token and an API token are present, the credential from the higher-ranked source wins (arguments, then environment, then config file; the API token counts at the lower rank of its `api_token` and `email` sources), and OAuth wins a tie. |
 | `ZENDESK_BASE_URL` | Optional API base override. Defaults to `https://{subdomain}.zendesk.com/api/v2`. |
-| `ZENDESK_TIMEOUT` | Optional HTTP timeout in seconds. Defaults to 30. |
+| `ZENDESK_TIMEOUT` | Optional HTTP timeout in seconds. Defaults to 30. A request that times out is retried up to 2 times. |
 | `ZENDESK_CONFIG_FILE` | Optional path to a JSON config file. Defaults to `~/.zendesk/config.json`. |
 
 ### Configuration file
@@ -396,6 +396,8 @@ The test suite drives every fixed text the module emits on refused, unavailable,
 ### Missing and partial snapshots
 
 A snapshot that was refused, not on the plan, or failed is never written as an empty list or `null`. Its `core_data/` file holds a marker in its place: `{ "collected": false, "status": <observed HTTP status or null>, "dataset_status": "forbidden" | "not_found" | "error", "endpoint": "GET /api/v2/...", "error": "<scrubbed message>" }`.
+
+Before a read counts as failed, a 429 is retried up to 3 times, and a 5xx, a timeout, or a network error up to 2 times, waiting for the response's `Retry-After` (in seconds or as an HTTP date, clamped to 30 seconds) when it sends one. A read that still fails names the path, the last status, timeout, or network error, and the attempt count in its error ("Zendesk request failed for /api/v2/users after 3 attempts: timed out after 30000 ms"). A failure on a later page leaves the whole list unread, never a shorter one.
 
 Every assessment summary carries a `collection` object with one entry per snapshot it read (`status`, `endpoint`, `http_status`, `seen`, `truncated`, `truncation_reason`, `pages`, `error`).
 

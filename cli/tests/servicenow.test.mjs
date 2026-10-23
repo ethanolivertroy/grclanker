@@ -34,6 +34,7 @@ import {
   resolveServicenowConfiguration,
 } from "../dist/extensions/grc-tools/servicenow.js";
 import { SERVICENOW_SPEC } from "../dist/extensions/grc-tools/servicenow.spec.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertBundlePathsMatchSpec, assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
@@ -740,6 +741,183 @@ test("ServicenowApiClient gives up after max retries and reports the failing sta
   assert.equal(snapshot.statusCode, 500);
   assert.equal(snapshot.rows.length, 0);
   assert.match(snapshot.error, /500/);
+});
+
+/** Hangs until the client's own request timeout aborts it; mock timers advance past the timeout at once, so no real time passes. */
+function hangUntilTimeout(t, init, timeoutMs = 30_000) {
+  return new Promise((_, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+    t.mock.timers.tick(timeoutMs);
+  });
+}
+
+test("ServicenowApiClient retries a timeout, a transport failure, and a 503 whose Retry-After is an HTTP-date, then reads the table", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const inner = fixtureFetch(healthyFixture());
+  const failures = [
+    (init) => hangUntilTimeout(t, init),
+    () => Promise.reject(new TypeError("fetch failed")),
+    () => Promise.resolve(jsonResponse({ error: { message: "Service unavailable" } }, { status: 503, headers: { "Retry-After": new Date(FIXED_NOW.getTime() + 7_000).toUTCString() } })),
+  ];
+  let requests = 0;
+  const fetchImpl = (input, init) => {
+    requests += 1;
+    const next = failures.shift();
+    return next ? next(init) : inner.fetchImpl(input, init);
+  };
+  const sleeps = [];
+  const snapshot = await createClient(fetchImpl, {}, sleeps).queryTable("sys_user_role");
+
+  assert.equal(snapshot.error, undefined);
+  assert.equal(snapshot.rows.length, 2);
+  assert.equal(requests, 4);
+  assert.deepEqual(sleeps, [500, 1000, 7000], "exponential backoff after the timeout and the transport failure, then the HTTP-date measured against the injected clock");
+});
+
+test("ServicenowApiClient honors Retry-After on 5xx as well as 429 and clamps a longer delta-seconds or HTTP-date wait to the 60 s cap", async () => {
+  const inner = fixtureFetch(healthyFixture());
+  const responses = [
+    () => jsonResponse({ error: { message: "Bad gateway" } }, { status: 502, headers: { "Retry-After": "3" } }),
+    () => jsonResponse({ error: { message: "Rate limit" } }, { status: 429, headers: { "Retry-After": "120" } }),
+    () => jsonResponse({ error: { message: "Gateway timeout" } }, { status: 504, headers: { "Retry-After": new Date(FIXED_NOW.getTime() + 600_000).toUTCString() } }),
+  ];
+  const fetchImpl = async (input, init) => {
+    const next = responses.shift();
+    return next ? next() : inner.fetchImpl(input, init);
+  };
+  const sleeps = [];
+  const snapshot = await createClient(fetchImpl, {}, sleeps).queryTable("sys_user_role");
+
+  assert.equal(snapshot.error, undefined);
+  assert.deepEqual(sleeps, [3000, 60_000, 60_000]);
+});
+
+test("ServicenowApiClient retries the OAuth token request on a 5xx, a timeout, and a transport failure before it reads", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const inner = fixtureFetch(healthyFixture(), { oauthToken: "retried-grant-token" });
+  const tokenFailures = [
+    () => Promise.resolve(new Response("<html>503</html>", { status: 503, statusText: "Service Unavailable", headers: { "content-type": "text/html" } })),
+    (init) => hangUntilTimeout(t, init),
+    () => Promise.reject(new TypeError("fetch failed")),
+  ];
+  let tokenRequests = 0;
+  const fetchImpl = (input, init) => {
+    if (new URL(String(input)).pathname === "/oauth_token.do") {
+      tokenRequests += 1;
+      const next = tokenFailures.shift();
+      if (next) return next(init);
+    }
+    return inner.fetchImpl(input, init);
+  };
+  const sleeps = [];
+  const client = createClient(fetchImpl, { authMode: "oauth", username: undefined, password: undefined, clientId: "client-id", clientSecret: "client-secret" }, sleeps);
+  const snapshot = await client.queryTable("sys_user_role");
+
+  assert.equal(snapshot.error, undefined);
+  assert.equal(snapshot.rows.length, 2);
+  assert.equal(tokenRequests, 4);
+  assert.deepEqual(sleeps, [500, 1000, 2000]);
+  assert.equal(inner.calls.at(-1).init.headers.get("authorization"), "Bearer retried-grant-token");
+});
+
+test("ServicenowApiClient fails closed after four attempts with the endpoint path, the last failure, and the attempt count, and no planted credential survives", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const planted = [SNOW_CANARY.password, SNOW_CANARY.clientSecret, SNOW_CANARY.bearer, SNOW_CANARY.urlToken];
+  const echo = `password=${SNOW_CANARY.password} client_secret=${SNOW_CANARY.clientSecret} Authorization: Bearer ${SNOW_CANARY.bearer} at ${SNOW_CANARY_URL}`;
+  const echoHeaders = { "x-debug-authorization": `Bearer ${SNOW_CANARY.bearer}`, "Retry-After": "1" };
+  const query = { query: "user_name=alice.admin", fields: ["sys_id"] };
+  const scenarios = [
+    {
+      label: "timeout",
+      respond: (init) => hangUntilTimeout(t, init),
+      expected: /^ServiceNow request timed out after 30000ms: \/api\/now\/table\/sys_user, after 4 attempts$/,
+    },
+    {
+      label: "transport failure",
+      respond: () => Promise.reject(new TypeError(`connect ECONNREFUSED https://audit.reader:${SNOW_CANARY.password}@dev12345.service-now.com/?token=${SNOW_CANARY.urlToken}`)),
+      expected: /^ServiceNow request failed for \/api\/now\/table\/sys_user after 4 attempts: connect ECONNREFUSED https:\/\/\[REDACTED\]@dev12345\.service-now\.com\/\?\[REDACTED\]$/,
+    },
+    {
+      label: "503",
+      respond: () => Promise.resolve(jsonResponse({ error: { message: echo } }, { status: 503, headers: echoHeaders })),
+      expected: /^ServiceNow request failed \(503 Service Unavailable\) for \/api\/now\/table\/sys_user after 4 attempts: /,
+    },
+  ];
+  for (const scenario of scenarios) {
+    let requests = 0;
+    const sleeps = [];
+    const fetchImpl = (input, init) => {
+      requests += 1;
+      return scenario.respond(init);
+    };
+    const client = createClient(fetchImpl, { authMode: "basic", password: SNOW_CANARY.password, clientSecret: SNOW_CANARY.clientSecret }, sleeps);
+    const snapshot = await client.queryTable("sys_user", query);
+    assert.equal(requests, 4, `${scenario.label}: one request and three retries`);
+    assert.equal(sleeps.length, 3, scenario.label);
+    assert.deepEqual(snapshot.rows, [], scenario.label);
+    assert.match(snapshot.error, scenario.expected, `${scenario.label}: ${snapshot.error}`);
+    assert.equal(snapshot.error.includes("sysparm_query") || snapshot.error.includes("alice.admin"), false, `${scenario.label}: no query value in ${snapshot.error}`);
+    assertFragmentsAbsent(assert, snapshot.error, planted, `${scenario.label} error`);
+  }
+
+  let tokenRequests = 0;
+  const tokenFetch = async () => {
+    tokenRequests += 1;
+    return jsonResponse({ error: { message: echo }, error_description: echo }, { status: 503, headers: echoHeaders });
+  };
+  const oauth = createClient(tokenFetch, { authMode: "oauth", username: undefined, password: undefined, clientId: "client-id", clientSecret: SNOW_CANARY.clientSecret });
+  const tokenError = await oauth.requestJson(`${sampleConfig().instanceUrl}/api/now/table/sys_user`).then(() => assert.fail("expected a rejection"), (error) => error);
+  assert.equal(tokenRequests, 4);
+  assert.ok(tokenError instanceof ServicenowApiError);
+  assert.equal(tokenError.status, 503);
+  assert.match(tokenError.message, /^ServiceNow OAuth token request failed \(503 Service Unavailable\) for \/oauth_token\.do after 4 attempts: /);
+  assertFragmentsAbsent(assert, `${tokenError.message} ${tokenError.detail}`, planted, "token endpoint error");
+});
+
+test("an abort during the wait before a retry ends the read at once and sends no further request", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const controller = new AbortController();
+  let requests = 0;
+  const client = new ServicenowApiClient(sampleConfig(), {
+    fetchImpl: (input, init) => {
+      requests += 1;
+      return hangUntilTimeout(t, init);
+    },
+    signal: controller.signal,
+    sleep: () => {
+      controller.abort();
+      return new Promise(() => {});
+    },
+    now: () => FIXED_NOW,
+  });
+  await assert.rejects(client.queryTable("sys_user"), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(requests, 1);
+});
+
+test("a second sys_user page that times out on every attempt leaves the user inventory unread: no dependent check passes and the finding names the timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const inner = fixtureFetch(healthyFixture());
+  const laterPageAttempts = new Map();
+  const fetchImpl = (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/now/table/sys_user" && Number(url.searchParams.get("sysparm_offset")) > 0) {
+      laterPageAttempts.set(url.toString(), (laterPageAttempts.get(url.toString()) ?? 0) + 1);
+      return hangUntilTimeout(t, init);
+    }
+    return inner.fetchImpl(input, init);
+  };
+  const result = await assessServicenowIdentityAccess(createClient(fetchImpl, { pageSize: 2 }));
+  const byId = findingsById(result);
+
+  assert.ok(laterPageAttempts.size > 0, "at least one sys_user read reached a second page");
+  for (const [url, attempts] of laterPageAttempts) assert.equal(attempts, 4, `${url}: one request and three retries`);
+  const usersUnread = /sys_user read failed \(ServiceNow request timed out after 30000ms: \/api\/now\/table\/sys_user, after 4 attempts\)/;
+  assert.ok(result.errors.some((issue) => usersUnread.test(issue)), result.errors.join("\n"));
+  const dependent = result.findings.filter((item) => usersUnread.test(item.summary));
+  assert.ok(dependent.length > 0, "a finding names the failed sys_user read");
+  for (const item of dependent) assert.notEqual(item.status, "pass", `${item.id}: ${item.summary}`);
+  assert.equal(byId.get("SNOW-04").status, "manual", byId.get("SNOW-04").summary);
+  assert.match(byId.get("SNOW-04").summary, /^Verdict unknown: /);
 });
 
 test("ServicenowApiClient redacts credentials from error messages", async () => {
@@ -1636,13 +1814,13 @@ test("ServicenowApiClient describes non-JSON error bodies by shape and logs only
   };
   const oauth = createClient(tokenFetch, { authMode: "oauth", username: undefined, password: undefined, clientId: "client-id", clientSecret: "client-secret" });
   const tokenFailure = await oauth.queryTable("sys_user", { fields: ["sys_id"] });
-  assert.match(tokenFailure.error, /OAuth token request failed \(502 Bad Gateway\) for \/oauth_token\.do: non-JSON body \(text\/html, \d+ bytes\)$/);
+  assert.match(tokenFailure.error, /OAuth token request failed \(502 Bad Gateway\) for \/oauth_token\.do after 4 attempts: non-JSON body \(text\/html, \d+ bytes\)$/);
   assertFragmentsAbsent(assert, tokenFailure.error, [FAKE_SNOW_SECRETS.secretToken1], "token endpoint 502 HTML error string");
 
   const hangingFetch = (input, init) => new Promise((_, reject) => {
     init.signal.addEventListener("abort", () => reject(new Error("aborted")));
   });
-  const timedOut = await createClient(hangingFetch, { timeoutMs: 5 }).queryTable("sys_user", { query: "user_name=alice.admin", fields: ["sys_id"] });
+  const timedOut = await createClient(hangingFetch, { timeoutMs: 5, maxRetries: 0 }).queryTable("sys_user", { query: "user_name=alice.admin", fields: ["sys_id"] });
   assert.match(timedOut.error, /timed out after 5ms: \/api\/now\/table\/sys_user$/);
   assert.equal(timedOut.error.includes("sysparm_query"), false);
   assert.equal(timedOut.error.includes("alice.admin"), false);
@@ -2436,7 +2614,7 @@ async function snowCanaryRun(configOverrides, fail, fixtureOptions = {}) {
   assert.ok(errorStrings.length > 0, `${context}: the failing surface must be recorded by the access check, an assessment, or the export`);
   for (const errorString of errorStrings) {
     if (fail.flavor === "html") {
-      assert.match(errorString, /\(502 Bad Gateway\) for \/[^\s:]+: non-JSON body \(text\/html, \d+ bytes\)/, `${context}: ${errorString}`);
+      assert.match(errorString, /\(502 Bad Gateway\) for \/[^\s:]+ after 4 attempts: non-JSON body \(text\/html, \d+ bytes\)/, `${context}: ${errorString}`);
     } else {
       assert.match(errorString, /\(403 Forbidden\) for \/[^\s:]+: [^\n]*https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\]/, `${context}: ${errorString}`);
       assert.ok(!errorString.includes("token="), `${context}: ${errorString}`);
@@ -2510,7 +2688,9 @@ test("addendum 4: an OAuth token endpoint that answers with a 502 HTML page or a
     for (const surface of run.access.surfaces) {
       assert.equal(surface.status, flavor === "html" ? "not_readable" : "forbidden");
       assert.equal(surface.http_status, flavor === "html" ? 502 : 403);
-      assert.match(surface.error, /^ServiceNow OAuth token request failed \((502 Bad Gateway|403 Forbidden)\) for \/oauth_token\.do: /);
+      assert.match(surface.error, flavor === "html"
+        ? /^ServiceNow OAuth token request failed \(502 Bad Gateway\) for \/oauth_token\.do after 4 attempts: /
+        : /^ServiceNow OAuth token request failed \(403 Forbidden\) for \/oauth_token\.do: /);
     }
     assert.ok(run.requests.every((request) => request.path === "/oauth_token.do"), `${flavor}: no Table API request is issued without a bearer token`);
   }
@@ -2577,7 +2757,11 @@ const SERVICENOW_FIXED_TEXTS = [
   "ServiceNow request failed (403 Forbidden) for /api/now/table/password_policy: Insufficient rights to query records",
   "ServiceNow request failed (429 Too Many Requests) for /api/now/stats/sys_audit: non-JSON body (text/plain, 12 bytes)",
   "ServiceNow OAuth token request failed (502 Bad Gateway) for /oauth_token.do: non-JSON body (text/html, 5120 bytes)",
+  "ServiceNow OAuth token request failed (503 Service Unavailable) for /oauth_token.do after 4 attempts: non-JSON body (text/html, 5120 bytes)",
+  "ServiceNow request failed (503 Service Unavailable) for /api/now/table/sys_user after 4 attempts: non-JSON body (text/html, 5120 bytes)",
   "ServiceNow request timed out after 30000ms: /api/now/table/sys_user",
+  "ServiceNow request timed out after 30000ms: /api/now/table/sys_user, after 4 attempts",
+  "ServiceNow request failed for /api/now/table/sys_user after 4 attempts: fetch failed",
   "not requested: the sys_security_acl read failed, so there were no ACL ids to look up",
   "sys_security_acl_role was not requested (the sys_security_acl read returned no rows, so there were no ACL ids to look up)",
   "sys_user read was forbidden (403)",

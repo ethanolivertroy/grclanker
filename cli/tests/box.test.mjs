@@ -41,6 +41,7 @@ import {
   scrubErrorText,
 } from "../dist/extensions/grc-tools/box.js";
 import { BOX_SPEC } from "../dist/extensions/grc-tools/box.spec.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
@@ -52,6 +53,7 @@ import {
 } from "./helpers/byte-differential-fixtures.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
+import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
 
@@ -1363,6 +1365,280 @@ test("BoxApiClient retries 429 and 5xx responses with backoff and redacts secret
   assert.deepEqual(delays, [500, 1000], "5xx retries use exponential backoff until maxRetries is exhausted");
 
   assert.equal(redactSecrets("Authorization: Bearer abc.def-ghi and secret shh-secret-value", ["shh-secret-value", "tiny"]), "Authorization: Bearer [REDACTED] and secret [REDACTED]");
+});
+
+/** Hangs until the client's own request timeout aborts it; mock timers advance past the timeout at once, so no real time passes. */
+function hangUntilTimeout(t, init, timeoutMs = 30_000) {
+  return new Promise((_, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+    t.mock.timers.tick(timeoutMs);
+  });
+}
+
+function boxErrorResponse(status, statusText, body, headers = {}) {
+  return new Response(JSON.stringify(body), { status, statusText, headers: { "content-type": "application/json", ...headers } });
+}
+
+const BOX_OAUTH_CONFIG = { authMode: "oauth", accessToken: "oauth-fixture-access-2026", clientId: undefined, clientSecret: undefined };
+
+/** A BoxApiClient whose nth request gets the nth step (the last step repeats), recording every retry wait. */
+function scriptedBoxClient(steps, sleeps, config = sampleConfig(BOX_OAUTH_CONFIG)) {
+  let requests = 0;
+  const client = new BoxApiClient(config, {
+    fetchImpl: (input, init) => {
+      const step = steps[Math.min(requests, steps.length - 1)];
+      requests += 1;
+      return step(init, new URL(typeof input === "string" ? input : input.toString()));
+    },
+    now: () => NOW,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+  return { client, requests: () => requests };
+}
+
+const BOX_CURRENT_USER = () => Promise.resolve(jsonResponse({ id: "service-1", type: "user", enterprise: { id: "123456", type: "enterprise" } }));
+
+test("BoxApiClient retries a timeout and a connection failure, honors Retry-After on a 429 or a 5xx in seconds or as an HTTP-date, and clamps a longer wait to 60 seconds", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const sleeps = [];
+  const noResponse = scriptedBoxClient([(init) => hangUntilTimeout(t, init), () => Promise.reject(new TypeError("fetch failed")), BOX_CURRENT_USER], sleeps);
+  assert.equal((await noResponse.client.getCurrentUser()).id, "service-1");
+  assert.equal(noResponse.requests(), 3);
+  assert.deepEqual(sleeps, [500, 1000], "500 ms after the timeout, then 1 s after the connection failure");
+
+  sleeps.length = 0;
+  const serverAsked = scriptedBoxClient([
+    () => Promise.resolve(boxErrorResponse(429, "Too Many Requests", { code: "rate_limit_exceeded" }, { "retry-after": new Date(NOW.getTime() + 7_000).toUTCString() })),
+    () => Promise.resolve(boxErrorResponse(503, "Service Unavailable", { message: "unavailable" }, { "retry-after": "3" })),
+    () => Promise.resolve(boxErrorResponse(502, "Bad Gateway", { message: "bad gateway" }, { "retry-after": new Date(NOW.getTime() - 5_000).toUTCString() })),
+    BOX_CURRENT_USER,
+  ], sleeps);
+  await serverAsked.client.getCurrentUser();
+  assert.equal(serverAsked.requests(), 4);
+  assert.deepEqual(sleeps, [7000, 3000, 0], "an HTTP-date is measured against the injected clock, a 5xx's Retry-After is honored, and a date already past waits not at all");
+
+  sleeps.length = 0;
+  const tooLong = scriptedBoxClient([
+    () => Promise.resolve(boxErrorResponse(429, "Too Many Requests", { code: "rate_limit_exceeded" }, { "retry-after": "120" })),
+    () => Promise.resolve(boxErrorResponse(503, "Service Unavailable", { message: "unavailable" }, { "retry-after": new Date(NOW.getTime() + 600_000).toUTCString() })),
+    BOX_CURRENT_USER,
+  ], sleeps);
+  await tooLong.client.getCurrentUser();
+  assert.deepEqual(sleeps, [60_000, 60_000], "a longer Retry-After in either form is clamped to the 60 s cap");
+});
+
+/** Planted credentials for the retry tests: random-looking, so the fragment-window assertion is sound. */
+const BOX_RETRY_PLANTED = {
+  accessToken: "Wq4TnZ8rKd2VbX6mH3",
+  clientSecret: "Jf7PsL3yQc9GwN5tR2",
+  proxyPassword: "Hx2MkV6dYa4ZrT8pB7",
+};
+
+test("BoxApiClient fails closed when retries run out, naming the method and path, the last failure, and the attempt count, and no planted credential survives", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const planted = Object.values(BOX_RETRY_PLANTED);
+  assertPlantedValuesWellFormed(assert, BOX_RETRY_PLANTED, [JSON.stringify(sampleConfig()), JSON.stringify(hardenedFixture()), ...BOX_FIXED_TEXT_MESSAGES]);
+  const apiConfig = sampleConfig({ ...BOX_OAUTH_CONFIG, accessToken: BOX_RETRY_PLANTED.accessToken });
+  const tokenConfig = sampleConfig({ clientSecret: BOX_RETRY_PLANTED.clientSecret });
+  const echo = `token ${BOX_RETRY_PLANTED.accessToken} sent Authorization: Bearer ${BOX_RETRY_PLANTED.accessToken} with client_secret=${BOX_RETRY_PLANTED.clientSecret} and secret ${BOX_RETRY_PLANTED.clientSecret}`;
+  const scenarios = [
+    {
+      label: "timeout",
+      respond: (init) => hangUntilTimeout(t, init),
+      errorClass: BoxTransportError,
+      message: "Box request timed out after 30000ms: GET /2.0/users/me, after 4 attempts",
+      sleeps: [500, 1000, 2000],
+    },
+    {
+      label: "connection failure",
+      respond: () => Promise.reject(new TypeError(`connect ECONNREFUSED via https://svc:${BOX_RETRY_PLANTED.proxyPassword}@proxy.example.com; ${echo}`)),
+      errorClass: BoxTransportError,
+      message: /^Box request failed: GET \/2\.0\/users\/me after 4 attempts: connect ECONNREFUSED via https:\/\//,
+      sleeps: [500, 1000, 2000],
+    },
+    {
+      label: "503",
+      respond: () => Promise.resolve(boxErrorResponse(503, "Service Unavailable", { type: "error", status: 503, message: echo })),
+      errorClass: BoxApiError,
+      status: 503,
+      message: /^Box request failed \(503 Service Unavailable\) for GET \/2\.0\/users\/me after 4 attempts: token \[REDACTED\] /,
+      sleeps: [500, 1000, 2000],
+    },
+    {
+      label: "429",
+      respond: () => Promise.resolve(boxErrorResponse(429, "Too Many Requests", { type: "error", status: 429, code: "rate_limit_exceeded", message: echo }, { "retry-after": "120" })),
+      errorClass: BoxApiError,
+      status: 429,
+      message: /^Box request failed \(429 Too Many Requests\) for GET \/2\.0\/users\/me after 4 attempts: token \[REDACTED\] /,
+      sleeps: [60_000, 60_000, 60_000],
+    },
+    {
+      label: "token 429",
+      config: tokenConfig,
+      respond: () => Promise.resolve(boxErrorResponse(429, "Too Many Requests", { type: "error", status: 429, code: "rate_limit_exceeded", message: echo }, { "retry-after": "2" })),
+      errorClass: BoxApiError,
+      status: 429,
+      request: "POST /oauth2/token",
+      message: /^Box request failed \(429 Too Many Requests\) for POST \/oauth2\/token after 4 attempts: token \[REDACTED\] /,
+      sleeps: [2000, 2000, 2000],
+    },
+  ];
+  for (const scenario of scenarios) {
+    const config = scenario.config ?? apiConfig;
+    const sleeps = [];
+    const { client, requests } = scriptedBoxClient([scenario.respond], sleeps, config);
+    const error = await client.getCurrentUser().then(() => assert.fail(`${scenario.label}: expected a rejection`), (caught) => caught);
+    assert.ok(error instanceof scenario.errorClass, `${scenario.label}: ${error}`);
+    assert.equal(requests(), 4, `${scenario.label}: one request and three retries`);
+    assert.deepEqual(sleeps, scenario.sleeps, scenario.label);
+    assert.equal(error.status, scenario.status, scenario.label);
+    if (scenario.request) assert.equal(error.request, scenario.request, scenario.label);
+    else assert.match(error.request, /^GET \/2\.0\/users\/me\?fields=/, scenario.label);
+    if (typeof scenario.message === "string") assert.equal(error.message, scenario.message, scenario.label);
+    else assert.match(error.message, scenario.message, `${scenario.label}: ${error.message}`);
+    assertFragmentsAbsent(assert, error.message, planted, `${scenario.label} error`);
+
+    const access = await checkBoxAccess(scriptedBoxClient([scenario.respond], [], config).client);
+    assert.equal(access.status, "limited", `${scenario.label}: a transient failure is neither healthy nor rejected credentials`);
+    const currentUser = access.surfaces.find((surface) => surface.name === "current_user");
+    assert.equal(currentUser.status, "not_readable", scenario.label);
+    assert.match(currentUser.error, / after 4 attempts/, `${scenario.label}: ${currentUser.error}`);
+    assert.ok(access.surfaces.every((surface) => surface.status !== "readable"), `${scenario.label}: no surface reads when every request fails`);
+    assertFragmentsAbsent(assert, JSON.stringify(access), planted, `${scenario.label} check_access`);
+
+    const identity = await assessBoxIdentityAccess(scriptedBoxClient([scenario.respond], [], config).client);
+    assert.equal(identity.findings.some((finding) => finding.status === "pass"), false, `${scenario.label}: nothing passes when no read succeeded`);
+    assertFragmentsAbsent(assert, JSON.stringify(identity), planted, `${scenario.label} assessment`);
+  }
+});
+
+test("BoxApiClient retries the token request after a 5xx and a timeout with a freshly signed JWT assertion each time, so Box's one-use jti cannot turn a retry into rejected credentials", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const base = createTempBase("grclanker-box-jwt-retry-");
+  const { pathname } = generateJwtConfig(base);
+  const config = resolveBoxConfiguration({}, { BOX_JWT_CONFIG_PATH: pathname }, { homeDir: base });
+  const seenJtis = new Set();
+  let tokenRequests = 0;
+  let apiAuthorization;
+  const sleeps = [];
+  const fetchImpl = (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname !== "/oauth2/token") {
+      apiAuthorization = headerValue(init.headers, "authorization");
+      return Promise.resolve(jsonResponse({ id: "service-1", type: "user", enterprise: { id: "987654", type: "enterprise" } }));
+    }
+    tokenRequests += 1;
+    const { jti } = decodeSegment(new URLSearchParams(init.body).get("assertion").split(".")[1]);
+    // Box refuses an assertion whose jti it has already received, whatever happened to the earlier request.
+    if (seenJtis.has(jti)) return Promise.resolve(boxErrorResponse(400, "Bad Request", { error: "invalid_grant", error_description: "Please check the 'jti' claim." }));
+    seenJtis.add(jti);
+    if (tokenRequests === 1) return Promise.resolve(boxErrorResponse(503, "Service Unavailable", { message: "maintenance" }));
+    if (tokenRequests === 2) return hangUntilTimeout(t, init, config.timeoutMs);
+    return Promise.resolve(jsonResponse({ access_token: "jwt-retry-access-token", expires_in: 3600, token_type: "bearer" }));
+  };
+  const client = new BoxApiClient(config, { fetchImpl, now: () => NOW, sleep: async (ms) => {
+    sleeps.push(ms);
+  } });
+  assert.equal((await client.getCurrentUser()).id, "service-1");
+  assert.equal(tokenRequests, 3, "the token request and two retries");
+  assert.equal(seenJtis.size, 3, "every attempt carried a jti Box had not received");
+  assert.deepEqual(sleeps, [500, 1000]);
+  assert.equal(apiAuthorization, "Bearer jwt-retry-access-token");
+});
+
+test("BoxApiClient: an abort during the wait before a retry ends the read at once, and an abort mid-request is never retried", async () => {
+  const waiting = new AbortController();
+  let requests = 0;
+  const duringWait = new BoxApiClient(sampleConfig(BOX_OAUTH_CONFIG), {
+    fetchImpl: async () => {
+      requests += 1;
+      throw new TypeError("fetch failed");
+    },
+    now: () => NOW,
+    signal: waiting.signal,
+    sleep: () => {
+      waiting.abort();
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(duringWait.getCurrentUser(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(requests, 1, "no request after the abort");
+
+  // Without an injected sleep the wait is a real timer: a 30 s Retry-After must end the moment the call aborts.
+  const realWait = new AbortController();
+  let rateLimited = 0;
+  const started = Date.now();
+  const timed = new BoxApiClient(sampleConfig(BOX_OAUTH_CONFIG), {
+    fetchImpl: async () => {
+      rateLimited += 1;
+      setImmediate(() => realWait.abort());
+      return boxErrorResponse(429, "Too Many Requests", { code: "rate_limit_exceeded" }, { "retry-after": "30" });
+    },
+    now: () => NOW,
+    signal: realWait.signal,
+  });
+  await assert.rejects(timed.getCurrentUser(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(rateLimited, 1);
+  assert.ok(Date.now() - started < 5_000, "the retry wait ended with the abort");
+
+  const midRequest = new AbortController();
+  let sent = 0;
+  const sleeps = [];
+  const inFlight = new BoxApiClient(sampleConfig(BOX_OAUTH_CONFIG), {
+    fetchImpl: (input, init) => {
+      sent += 1;
+      return new Promise((_, reject) => {
+        init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+        midRequest.abort();
+      });
+    },
+    now: () => NOW,
+    signal: midRequest.signal,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+  await assert.rejects(inFlight.getCurrentUser(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(sent, 1);
+  assert.deepEqual(sleeps, []);
+});
+
+test("a second user page that times out on every attempt leaves the user inventory unread: the checks that rest on it do not pass, and the findings name the timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const fixture = hardenedFixture();
+  let laterPageRequests = 0;
+  const { fetchImpl, config } = httpBox(fixture, {
+    routes: {
+      "GET /2.0/users": (url, params, init) => {
+        if (url.searchParams.get("marker") === "page-2") {
+          laterPageRequests += 1;
+          return hangUntilTimeout(t, init);
+        }
+        return jsonResponse({ entries: fixture.users.slice(0, 2), limit: 1000, next_marker: "page-2" });
+      },
+    },
+  });
+  const sleeps = [];
+  const client = new BoxApiClient(config, { fetchImpl, now: () => NOW, sleep: async (ms) => {
+    sleeps.push(ms);
+  } });
+  const baseline = await assessBoxIdentityAccess(httpBox(fixture).client);
+  const result = await assessBoxIdentityAccess(client);
+
+  assert.equal(laterPageRequests, 4, "page 2 is requested once and retried three times");
+  assert.deepEqual(sleeps, [500, 1000, 2000]);
+  const failure = "Box request timed out after 30000ms: GET /2.0/users, after 4 attempts";
+  assert.ok(result.errors.includes(`users: ${failure}`), JSON.stringify(result.errors));
+  for (const id of ["BOX-02", "BOX-03", "BOX-17", "BOX-18", "BOX-24"]) {
+    assert.equal(findingById(baseline, id).status, "pass", `${id} passes on the full inventory`);
+    const finding = findingById(result, id);
+    assert.equal(finding.status, "manual", `${id}: ${finding.summary}`);
+    assert.ok(finding.summary.includes(failure), `${id} names the failed read: ${finding.summary}`);
+  }
+  const stillPassing = result.findings.filter((finding) => finding.status === "pass").map((finding) => finding.id);
+  assert.deepEqual(stillPassing, ["BOX-01", "BOX-21", "BOX-22"], "only the checks that read enterprise settings alone still pass");
 });
 
 test("Box scrubber: a quoted header value in a recorded error is removed whole, in double or single quotes, with or without spaces, and JSON-escaped", () => {
@@ -2965,7 +3241,8 @@ test("row (a): a Box 403 body echoing weak values under credential-named keys re
   const retention = access.surfaces.find((surface) => surface.name === "retention_policies");
   assert.deepEqual({ status: retention.status, httpStatus: retention.httpStatus }, { status: "not_readable", httpStatus: 403 });
   assert.ok(log.some((entry) => entry.status === 403), "the 403 was observed on the wire");
-  assert.match(retention.error, /^Box request failed \(403\) for GET \/2\.0\/retention_policies\?[^:]*: Access denied: /);
+  assert.match(retention.error, /^Box request failed \(403\) for GET \/2\.0\/retention_policies: Access denied: /);
+  assert.match(retention.endpoint, /^GET \/2\.0\/retention_policies\?/, "the endpoint keeps the request's query; the message names the path only");
   for (const key of WEAK_PAIR_KEYS) assert.ok(retention.error.includes(`${key}=[REDACTED]`) || retention.error.includes(`${key}: [REDACTED]`), `${key} keeps its name and gets the marker: ${retention.error}`);
   assertCanaryWindowsAbsent(assert, JSON.stringify(access), WEAK_PAIR_VALUES, "check_access payload");
 });
@@ -3299,7 +3576,7 @@ test("config loader errors: a SyntaxError raised by the Box transport is recorde
   });
   await assert.rejects(() => client.getCurrentUser(), (error) => {
     assert.ok(error instanceof BoxTransportError);
-    assert.match(error.message, /^Box request failed: GET \/2\.0\/users\/me\?fields=[A-Za-z0-9_%]+: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body$/);
+    assert.equal(error.message, "Box request failed: GET /2.0/users/me: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body");
     assert.match(error.request, /^GET \/2\.0\/users\/me\?fields=/);
     assertCanaryWindowsAbsent(assert, error.message, [BOX_PARSER_SNIPPET_CANARY], "transport error");
     return true;
@@ -3335,15 +3612,19 @@ const BOX_FIXED_TEXT_MESSAGES = [
   "Box OAuth 2.0 access token expired and no refresh token with client credentials is available.",
   "Box token response did not include access_token.",
   "Unable to determine the Box enterprise ID; set BOX_ENTERPRISE_ID explicitly.",
-  "Box request timed out after 30000ms: GET /2.0/users/me?fields=id%2Ctype%2Cname%2Clogin%2Crole%2Cstatus%2Centerprise%2Cis_platform_access_only",
-  "Box request failed: GET /2.0/users/me?fields=id%2Ctype%2Cname%2Clogin%2Crole%2Cstatus%2Centerprise%2Cis_platform_access_only: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
-  "Box request GET /2.0/users?fields=id%2Clogin&limit=1000 returned 200 OK with an empty body (0 bytes); the endpoint is not serving the JSON API",
-  "Box request GET /2.0/users?limit=1000 returned 200 OK with a non-JSON text/html; charset=utf-8 response body (128 bytes, not echoed); the endpoint is not serving the JSON API",
-  "Box request GET /2.0/users?limit=1000 returned 200 OK with a JSON body that is not the documented list object with an entries array (64 bytes, not echoed); the endpoint is not serving the JSON API",
+  "Box request timed out after 30000ms: GET /2.0/users/me",
+  "Box request timed out after 30000ms: GET /2.0/users, after 4 attempts",
+  "Box request failed: GET /2.0/users/me: SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body",
+  "Box request failed: GET /2.0/users after 4 attempts: fetch failed",
+  "Box request GET /2.0/users returned 200 OK with an empty body (0 bytes); the endpoint is not serving the JSON API",
+  "Box request GET /2.0/users returned 200 OK with a non-JSON text/html; charset=utf-8 response body (128 bytes, not echoed); the endpoint is not serving the JSON API",
+  "Box request GET /2.0/users returned 200 OK with a JSON body that is not the documented list object with an entries array (64 bytes, not echoed); the endpoint is not serving the JSON API",
   "Box request POST /oauth2/token returned 200 OK with a JSON body that is not the documented resource object with any of access_token (32 bytes, not echoed); the endpoint is not serving the JSON API",
-  "Box request failed (502 Bad Gateway) for GET /2.0/retention_policies?limit=100: non-JSON text/html response body (5120 bytes, not echoed)",
-  "Box request failed (403 Forbidden) for GET /2.0/retention_policies?limit=100: JSON body without a documented error field (42 bytes, not echoed)",
-  "Box request failed (403 Forbidden) for GET /2.0/shield_information_barriers?limit=100: Access denied - insufficient permission",
+  "Box request failed (502 Bad Gateway) for GET /2.0/retention_policies: non-JSON text/html response body (5120 bytes, not echoed)",
+  "Box request failed (503 Service Unavailable) for GET /2.0/users after 4 attempts: upstream unavailable",
+  "Box request failed (429 Too Many Requests) for POST /oauth2/token after 4 attempts",
+  "Box request failed (403 Forbidden) for GET /2.0/retention_policies: JSON body without a documented error field (42 bytes, not echoed)",
+  "Box request failed (403 Forbidden) for GET /2.0/shield_information_barriers: Access denied - insufficient permission",
   "Box request failed (404 Not Found) for GET /2.0/metadata_templates/enterprise/securityClassification-6VMVochwUWo/schema: Not Found",
   "Box reported more users (a next_marker remained)",
   "Box reported more events (a next_stream_position remained)",

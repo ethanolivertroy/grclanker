@@ -39,6 +39,7 @@ import {
   runPagerdutyOncallCoverageAssessment,
   scheduleCoverageGaps,
 } from "../dist/extensions/grc-tools/pagerduty.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
@@ -620,6 +621,188 @@ test("PagerdutyApiClient retries 429 and 5xx responses using ratelimit headers",
   assert.deepEqual(abilities, ["sso", "teams"]);
   assert.equal(attempts, 3);
   assert.deepEqual(sleeps, [2000, 2000]);
+});
+
+/** Hangs until the client's own request timeout aborts it; mock timers advance past the timeout at once, so no real time passes. */
+function hangUntilTimeout(t, init, timeoutMs = 30_000) {
+  return new Promise((_, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")), { once: true });
+    t.mock.timers.tick(timeoutMs);
+  });
+}
+
+function recordingClient(fetchImpl, sleeps, config = sampleConfig()) {
+  return new PagerdutyApiClient(config, {
+    fetchImpl,
+    now: () => NOW,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+}
+
+test("PagerdutyApiClient retries a timeout, a transport failure, and a 503 whose Retry-After is an HTTP-date, then reads", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const failures = [
+    (init) => hangUntilTimeout(t, init),
+    () => Promise.reject(new TypeError("fetch failed")),
+    () => Promise.resolve(jsonResponse({ error: { message: "Service unavailable" } }, { status: 503, headers: { "Retry-After": new Date(NOW.getTime() + 7_000).toUTCString() } })),
+  ];
+  let requests = 0;
+  const fetchImpl = (input, init) => {
+    requests += 1;
+    const next = failures.shift();
+    return next ? next(init) : Promise.resolve(jsonResponse({ abilities: ["sso"] }));
+  };
+  const sleeps = [];
+
+  assert.deepEqual(await recordingClient(fetchImpl, sleeps).getAbilities(), ["sso"]);
+  assert.equal(requests, 4);
+  assert.deepEqual(sleeps, [1000, 2000, 7000], "exponential backoff after the timeout and the transport failure, then the HTTP-date measured against the injected clock");
+});
+
+test("PagerdutyApiClient honors Retry-After as delta-seconds or an HTTP-date on 429 and 5xx, reads ratelimit-reset first, and clamps a longer wait to the 30 s cap", async () => {
+  const responses = [
+    () => jsonResponse({ error: { message: "Bad gateway" } }, { status: 502, headers: { "Retry-After": "3" } }),
+    () => jsonResponse({ error: { message: "Rate limited", code: 2020 } }, { status: 429, headers: { "Retry-After": new Date(NOW.getTime() + 600_000).toUTCString() } }),
+    () => jsonResponse({ error: { message: "Rate limited", code: 2020 } }, { status: 429, headers: { "ratelimit-reset": "120", "Retry-After": "1" } }),
+  ];
+  const fetchImpl = async () => responses.shift()?.() ?? jsonResponse({ abilities: ["sso"] });
+  const sleeps = [];
+
+  assert.deepEqual(await recordingClient(fetchImpl, sleeps).getAbilities(), ["sso"]);
+  assert.deepEqual(sleeps, [3000, 30_000, 30_000]);
+});
+
+test("PagerdutyApiClient retries the Scoped OAuth token request on a 5xx, a timeout, and a transport failure before it reads", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const tokenFailures = [
+    () => Promise.resolve(new Response("<html>503</html>", { status: 503, statusText: "Service Unavailable", headers: { "content-type": "text/html" } })),
+    (init) => hangUntilTimeout(t, init),
+    () => Promise.reject(new TypeError("fetch failed")),
+  ];
+  let tokenRequests = 0;
+  const apiAuthorization = [];
+  const fetchImpl = (input, init = {}) => {
+    if (new URL(String(input)).pathname === "/oauth/token") {
+      tokenRequests += 1;
+      const next = tokenFailures.shift();
+      return next ? next(init) : Promise.resolve(jsonResponse({ access_token: "retriedOauthAccess", token_type: "bearer", expires_in: 3600 }));
+    }
+    apiAuthorization.push(headerValue(init.headers, "authorization"));
+    return Promise.resolve(jsonResponse({ abilities: ["sso"] }));
+  };
+  const sleeps = [];
+  const config = sampleConfig({ authMode: "oauth_client_credentials", apiToken: undefined, clientId: "pd-client-id", clientSecret: PD_CANARY.clientSecret, subdomain: "example" });
+
+  assert.deepEqual(await recordingClient(fetchImpl, sleeps, config).getAbilities(), ["sso"]);
+  assert.equal(tokenRequests, 4);
+  assert.deepEqual(sleeps, [1000, 2000, 4000]);
+  assert.deepEqual(apiAuthorization, ["Bearer retriedOauthAccess"]);
+});
+
+test("PagerdutyApiClient fails closed after four attempts with the endpoint path, the last failure, and the attempt count, and no planted credential survives", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const planted = [PD_CANARY.apiToken, PD_CANARY.clientSecret, PD_CANARY.bearer, PD_CANARY.session, PD_CANARY.urlToken];
+  const echo = `token=${PD_CANARY.apiToken} client_secret=${PD_CANARY.clientSecret} Authorization: Bearer ${PD_CANARY.bearer} at ${PD_CANARY_URL}`;
+  const echoHeaders = { "x-debug-authorization": `Bearer ${PD_CANARY.bearer}`, "set-cookie": `session=${PD_CANARY.session}`, "Retry-After": "1" };
+  const scenarios = [
+    {
+      label: "timeout",
+      respond: (init) => hangUntilTimeout(t, init),
+      expected: /^PagerDuty request timed out after 30000ms: \/users, after 4 attempts$/,
+    },
+    {
+      label: "transport failure",
+      respond: () => Promise.reject(new TypeError(`connect ECONNREFUSED https://svc:${PD_CANARY.clientSecret}@api.pagerduty.com/?token=${PD_CANARY.urlToken}`)),
+      expected: /^PagerDuty request failed for \/users after 4 attempts: connect ECONNREFUSED https:\/\/\[REDACTED\]@api\.pagerduty\.com\/\?\[REDACTED\]$/,
+    },
+    {
+      label: "503",
+      respond: () => Promise.resolve(jsonResponse({ error: { message: echo, code: 2001 } }, { status: 503, statusText: "Service Unavailable", headers: echoHeaders })),
+      expected: /^PagerDuty request failed \(503 Service Unavailable\) for \/users after 4 attempts: /,
+    },
+  ];
+  for (const scenario of scenarios) {
+    let requests = 0;
+    const sleeps = [];
+    const fetchImpl = (input, init) => {
+      requests += 1;
+      return scenario.respond(init);
+    };
+    const client = recordingClient(fetchImpl, sleeps, sampleConfig({ apiToken: PD_CANARY.apiToken }));
+    const error = await client.listUsers(5).then(() => assert.fail("expected a rejection"), (caught) => caught);
+    assert.equal(requests, 4, `${scenario.label}: one request and three retries`);
+    assert.equal(sleeps.length, 3, scenario.label);
+    assert.match(error.message, scenario.expected, `${scenario.label}: ${error.message}`);
+    assert.equal(/offset|include|contact_methods/.test(error.message), false, `${scenario.label}: no query value in ${error.message}`);
+    assertFragmentsAbsent(assert, error.message, planted, `${scenario.label} error`);
+  }
+
+  let tokenRequests = 0;
+  const tokenFetch = async () => {
+    tokenRequests += 1;
+    return jsonResponse({ error: "server_error", error_description: echo }, { status: 503, headers: echoHeaders });
+  };
+  const config = sampleConfig({ authMode: "oauth_client_credentials", apiToken: undefined, clientId: "pd-client-id", clientSecret: PD_CANARY.clientSecret, subdomain: "example" });
+  const tokenError = await recordingClient(tokenFetch, [], config).getAbilities().then(() => assert.fail("expected a rejection"), (caught) => caught);
+  assert.equal(tokenRequests, 4);
+  assert.ok(tokenError instanceof PagerdutyRequestError);
+  assert.equal(tokenError.status, 503);
+  assert.match(tokenError.message, /^PagerDuty OAuth token request failed \(503\) for \/oauth\/token after 4 attempts: /);
+  assertFragmentsAbsent(assert, tokenError.message, planted, "token endpoint error");
+});
+
+test("PagerdutyApiClient: an abort during the wait before a retry ends the read at once and sends no further request", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const controller = new AbortController();
+  let requests = 0;
+  const client = new PagerdutyApiClient(sampleConfig(), {
+    fetchImpl: (input, init) => {
+      requests += 1;
+      return hangUntilTimeout(t, init);
+    },
+    signal: controller.signal,
+    sleep: () => {
+      controller.abort();
+      return new Promise(() => {});
+    },
+    now: () => NOW,
+  });
+  await assert.rejects(client.getAbilities(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(requests, 1);
+});
+
+test("a second /users page that times out on every attempt leaves the user inventory unread: no access control check passes on it and the finding names the timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const fixture = pagerdutyApiFixture();
+  const laterPageOffsets = [];
+  const fetchImpl = (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users") {
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      if (offset > 0) {
+        laterPageOffsets.push(offset);
+        return hangUntilTimeout(t, init);
+      }
+      return Promise.resolve(jsonResponse({ users: fixture.fixtures.users.slice(0, 2), more: true, total: 4, limit: 100, offset: 0 }));
+    }
+    return fixture.fetchImpl(input, init);
+  };
+  const result = await runPagerdutyAccessControlAssessment(recordingClient(fetchImpl, []), { maxAdmins: 3 });
+
+  assert.deepEqual(laterPageOffsets, [2, 2, 2, 2], "page 2 is requested once and retried three times");
+  const failure = "PagerDuty request timed out after 30000ms: /users, after 4 attempts";
+  assert.equal(result.summary.inventories.users, `users: unread (${failure})`);
+  assert.equal(result.summary.users_seen, null);
+  assert.ok(result.errors.some((issue) => issue.includes(failure)), JSON.stringify(result.errors));
+  // PD-01 through PD-04 rest on the user directory.
+  for (const control of [1, 2, 3, 4]) {
+    const item = findingById(result, control);
+    assert.equal(item.status, "manual", `${item.id}: ${item.summary}`);
+    assert.ok(item.summary.includes(failure), `${item.id} names the failed read: ${item.summary}`);
+  }
+  assert.equal(result.findings.filter((item) => item.status === "pass").length, 0);
 });
 
 test("PagerdutyApiClient surfaces API errors with redacted tokens", async () => {
@@ -3253,7 +3436,10 @@ test("addendum 4: a Scoped OAuth token endpoint that answers with a 502 HTML pag
     for (const surface of run.access.surfaces) {
       assert.equal(surface.status, "not_readable");
       assert.equal(surface.http_status, flavor === "html" ? 502 : 403);
-      assert.match(surface.error, /^PagerDuty OAuth token request failed \(\d{3}\) for \/oauth\/token: /);
+      // The 502 is retried; the 403 is not.
+      assert.match(surface.error, flavor === "html"
+        ? /^PagerDuty OAuth token request failed \(502\) for \/oauth\/token after 4 attempts: /
+        : /^PagerDuty OAuth token request failed \(403\) for \/oauth\/token: /);
     }
     assert.ok(run.requests.every((request) => request.path === "/oauth/token"), `${flavor}: no API request is issued without a bearer token`);
   }

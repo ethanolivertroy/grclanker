@@ -481,9 +481,10 @@ export const SERVICENOW_SPEC = buildBatchIntegrationSpec({
   }],
   rateLimit: {
     documentedLimit: "Instance and node configuration determine ServiceNow inbound REST limits",
-    retryHeaders: ["Retry-After", "X-RateLimit-Limit", "X-RateLimit-Remaining"],
-    retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Honor bounded Retry-After and retry transient reads three times; exhausted reads remain unavailable.",
+    retryHeaders: ["Retry-After"],
+    retryableStatuses: [429],
+    retryableStatusRanges: [{ from: 500, to: 599 }],
+    backoffPolicy: "Retry 429, every 5xx status, request timeouts (30 seconds unless timeout_seconds or SERVICENOW_TIMEOUT sets it), and network errors up to max_retries times after the first attempt (3 by default, SERVICENOW_MAX_RETRIES), on Table, Aggregate, and OAuth token requests alike. A Retry-After header in seconds or as an HTTP date is honored on any retryable response and clamped to 60 seconds; otherwise wait 500 ms doubled per attempt, capped at 8 seconds. A tool-call abort is never retried. An exhausted read stays unavailable, and its error names the path, the last status, timeout, or network error, and the attempt count.",
   },
   runtimeBehavior: SERVICENOW_RUNTIME_BEHAVIOR,
   knownGaps: ["The configuration parser recognizes the legacy mtls selector only to reject it with an explicit unsupported-mode error; no mTLS transport is implemented.", "Several Instance Security Center, Scan, DKIM, adaptive MFA, MID mutual-authentication, and retention proofs remain manual."],

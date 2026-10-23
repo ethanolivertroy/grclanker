@@ -64,7 +64,7 @@ Configuration precedence is explicit tool arguments, then environment variables,
 | `SERVICENOW_ACCESS_TOKEN` (or `SERVICENOW_TOKEN`) | Pre-issued bearer token |
 | `SERVICENOW_REFRESH_TOKEN` | Refresh token issued earlier to the OAuth client; with the client ID and secret, the first exchange uses the `refresh_token` grant |
 | `SERVICENOW_CONFIG_FILE` | YAML config file path |
-| `SERVICENOW_TIMEOUT`, `SERVICENOW_MAX_RETRIES`, `SERVICENOW_PAGE_SIZE` | HTTP timeout in seconds (default 30, clamped to 1-300), retries for 429 and 5xx (default 3, clamped to 0-10), Table API page size (default 500, clamped to 1-10000) |
+| `SERVICENOW_TIMEOUT`, `SERVICENOW_MAX_RETRIES`, `SERVICENOW_PAGE_SIZE` | HTTP timeout in seconds (default 30, clamped to 1-300), retries for 429, 5xx, timeouts, and network errors (default 3, clamped to 0-10), Table API page size (default 500, clamped to 1-10000) |
 
 Only the first config file found is read:
 
@@ -237,7 +237,7 @@ Otherwise it:
   - Such a read counts as a partial input under [Partial and unread inputs](#partial-and-unread-inputs). A would-be `pass` on it becomes `warn`, and an absence-driven `fail` is capped at `manual` with the names of the things not seen dropped.
   - A `fail` observed on a visible row stands.
   - A finding that reads several inventories stays `manual` while any one of them is forbidden.
-- Rate limiting (429 with `Retry-After`) and 5xx responses are retried with backoff up to `max_retries`.
+- Rate limiting (429), 5xx responses, request timeouts, and network errors are retried with backoff up to `max_retries`, on Table, Aggregate, and OAuth token requests. A `Retry-After` header (seconds or an HTTP date) is honored on any of those responses and capped at 60 seconds. A read that still fails is reported unread, with the path, the last status, timeout, or network error, and the attempt count, so its findings go to `manual` or `warn` instead of passing.
 - Instance Security Center hardening scores, Instance Scan results, Edge Encryption, DKIM configuration, MID Server mutual authentication, and audit retention are not read. The corresponding findings state the evidence to collect.
 - MFA enforcement is read from the Role-based multi-factor authentication record in `multi_factor_criteria` (Active flag and its Multi-factor Roles list, when the Table API returns it) plus `sys_user.enable_multifactor_authn`.
   - Adaptive authentication MFA policies are not read.

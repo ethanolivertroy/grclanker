@@ -1220,6 +1220,25 @@ export function describeBoxRequest(method: string, url: string): string {
   }
 }
 
+/** "GET /users": the method and path an error message names; the query stays on the request label. */
+function requestPath(request: string): string {
+  return request.split("?")[0];
+}
+
+/** Retry-After in milliseconds, as delta-seconds or an HTTP-date measured against `now`; undefined when absent or unreadable. */
+function retryAfterMs(value: string | null, now: Date): number | undefined {
+  if (value === null) return undefined;
+  const seconds = asNumber(value);
+  if (seconds !== undefined) return Math.max(seconds, 0) * 1000;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : Math.max(date - now.getTime(), 0);
+}
+
+/** Names the attempt count once a request was sent more than once, so an exhausted retry budget reads as such. */
+function afterAttempts(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
 /** "403 Forbidden", or just "403" when the response carried no status text. */
 function statusLine(response: Response): string {
   return response.statusText ? `${response.status} ${response.statusText}` : String(response.status);
@@ -1416,36 +1435,44 @@ export class BoxApiClient implements BoxReadClient {
     return url.toString();
   }
 
-  private async fetchWithTimeout(url: string, init: RequestInit, request: string): Promise<Response> {
+  private async fetchWithTimeout(url: string, init: RequestInit, request: string, attempts: number): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
       return await this.fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
       rethrowIfAborted(error);
+      const path = requestPath(request);
       if (controller.signal.aborted) {
-        throw new BoxTransportError(`Box request timed out after ${this.config.timeoutMs}ms: ${request}`, request);
+        throw new BoxTransportError(
+          `Box request timed out after ${this.config.timeoutMs}ms: ${path}${attempts > 1 ? `, after ${attempts} attempts` : ""}`,
+          request,
+        );
       }
-      throw new BoxTransportError(`Box request failed: ${request}: ${errorMessage(error)}`, request);
+      throw new BoxTransportError(`Box request failed: ${path}${afterAttempts(attempts)}: ${errorMessage(error)}`, request);
     } finally {
       clearTimeout(timeout);
     }
   }
 
-  private retryDelayMs(response: Response, attempt: number): number {
-    const retryAfter = asNumber(response.headers.get("retry-after"));
-    if (response.status === 429 && retryAfter !== undefined) {
-      return Math.min(Math.max(retryAfter, 0) * 1000, MAX_RETRY_AFTER_MS);
-    }
+  private retryDelayMs(response: Response | undefined, attempt: number): number {
+    const retryAfter = retryAfterMs(response?.headers.get("retry-after") ?? null, this.now());
+    if (retryAfter !== undefined) return Math.min(retryAfter, MAX_RETRY_AFTER_MS);
     return Math.min(500 * 2 ** attempt, 8_000);
   }
 
+  /**
+   * Sends one read (a GET, or the token POST, which has no side effect), retrying a timeout, a transport failure, a
+   * 429, or a 5xx up to maxRetries times; a tool-call abort is never retried. `options.body`, when given, builds the
+   * body again for every attempt.
+   */
   private async requestJson(
     url: string,
     init: RequestInit,
-    options: { skipAuth?: boolean; allowRefresh?: boolean; shape: BoxResponseShape },
+    options: { skipAuth?: boolean; allowRefresh?: boolean; shape: BoxResponseShape; body?: () => string },
   ): Promise<JsonRecord> {
     let attempt = 0;
+    let sent = 0;
     let refreshed = false;
     const request = describeBoxRequest(init.method ?? "GET", url);
     for (;;) {
@@ -1454,8 +1481,18 @@ export class BoxApiClient implements BoxReadClient {
       if (!options.skipAuth) {
         headers.set("authorization", `Bearer ${await this.getAccessToken()}`);
       }
+      const attemptInit: RequestInit = { ...init, headers, ...(options.body ? { body: options.body() } : {}) };
 
-      const response = await this.fetchWithTimeout(url, { ...init, headers }, request);
+      sent += 1;
+      let response: Response;
+      try {
+        response = await this.fetchWithTimeout(url, attemptInit, request, sent);
+      } catch (error) {
+        if (!(error instanceof BoxTransportError) || attempt >= this.config.maxRetries) throw error;
+        await this.sleep(this.retryDelayMs(undefined, attempt));
+        attempt += 1;
+        continue;
+      }
       const rawText = await response.text();
       let parsed: unknown;
       let payload: JsonRecord | undefined;
@@ -1484,7 +1521,7 @@ export class BoxApiClient implements BoxReadClient {
               : `with a JSON body that is not the documented ${describeResponseShape(options.shape)} (${rawText.length} bytes, not echoed)`;
         if (silentSuccess !== undefined) {
           throw new BoxApiError(
-            this.redact(`Box request ${request} returned ${statusLine(response)} ${silentSuccess}; the endpoint is not serving the JSON API`),
+            this.redact(`Box request ${requestPath(request)} returned ${statusLine(response)} ${silentSuccess}; the endpoint is not serving the JSON API`),
             response.status,
             undefined,
             undefined,
@@ -1513,7 +1550,7 @@ export class BoxApiClient implements BoxReadClient {
       }
       const detail = summary.message ?? bodyNote;
       throw new BoxApiError(
-        this.redact(`Box request failed (${statusLine(response)}) for ${request}${detail ? `: ${detail}` : ""}`),
+        this.redact(`Box request failed (${statusLine(response)}) for ${requestPath(request)}${afterAttempts(sent)}${detail ? `: ${detail}` : ""}`),
         response.status,
         summary.code,
         summary.requestId,
@@ -1585,11 +1622,12 @@ export class BoxApiClient implements BoxReadClient {
   }
 
   private async fetchAccessToken(): Promise<string> {
+    // Every attempt gets a fresh body: Box refuses a JWT assertion whose jti it has already seen or whose exp has
+    // passed, and that refusal would read as rejected credentials.
     const payload = await this.requestJson(this.config.tokenUrl, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: this.tokenRequestBody().toString(),
-    }, { skipAuth: true, shape: TOKEN_RESPONSE_SHAPE });
+    }, { skipAuth: true, shape: TOKEN_RESPONSE_SHAPE, body: () => this.tokenRequestBody().toString() });
 
     const accessToken = asString(payload.access_token);
     if (!accessToken) {
@@ -4421,7 +4459,7 @@ const authParams = {
   base_url: Type.Optional(Type.String({ description: `Box Content API base URL. Defaults to ${DEFAULT_BASE_URL}.` })),
   token_url: Type.Optional(Type.String({ description: `Box OAuth 2.0 token endpoint. Defaults to ${DEFAULT_TOKEN_URL}.` })),
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout in seconds. Defaults to 30.", default: 30 })),
-  max_retries: Type.Optional(Type.Number({ description: "Retries for 429 and 5xx responses with backoff. Defaults to 3.", default: 3 })),
+  max_retries: Type.Optional(Type.Number({ description: "Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3.", default: 3 })),
 };
 
 const eventParams = {
