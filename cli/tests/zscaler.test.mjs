@@ -3882,7 +3882,7 @@ function bodyStalls(init) {
   return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
 }
 
-test("ZIA and ZPA retry 429 and 5xx answers after Retry-After, read from the header as delta-seconds or an HTTP date, or from the field ZIA puts in a 429 body", async () => {
+test("ZIA and ZPA retry 429, 500, 502, 503, and 504 answers after Retry-After, read from the header as delta-seconds or an HTTP date, or from the field ZIA puts in a 429 body", async () => {
   const zia = zscalerRetryHarness("zia", ({ url, attempt }) => {
     if (url.pathname !== "/api/v1/adminRoles/lite") return undefined;
     if (attempt === 1) return jsonResponse(ZIA_RATE_LIMITED, { status: 429, headers: { "retry-after": "2" } });
@@ -4104,6 +4104,35 @@ test("a ZIA or ZPA list whose later page runs out of retries is unreadable, not 
   assert.equal(segments.status, "manual", segments.summary);
   assert.ok(segments.summary.includes(`ZPA GET ${ZPA_APPLICATION} failed after 4 attempts (network error: fetch failed)`), segments.summary);
   assert.deepEqual(zpaWaits, [500, 1_000, 2_000]);
+});
+
+test("a 501 on a later ZPA page is sent once with retries to spare, and leaves the segment group inventory unreadable and ZS-08 short of a pass", async () => {
+  const segmentGroupPath = `${ZPA_V1}/segmentGroup`;
+  const groups = Array.from({ length: 600 }, (_, index) => ({ id: `sg-${index + 1}`, name: `Group ${index + 1}`, enabled: true }));
+  const stub = zpaTenantFetch(zpaCompliantTenant({ segmentGroup: groups }));
+  const groupPages = [];
+  const waits = [];
+  const zpa = new ZpaApiClient(zpaConfig(), {
+    maxRetries: 3,
+    now: () => NOW,
+    sleep: async (ms) => { waits.push(ms); },
+    fetchImpl: async (input, init = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === segmentGroupPath) groupPages.push(url.searchParams.get("page"));
+      if (url.pathname === segmentGroupPath && url.searchParams.get("page") === "2") return jsonResponse({ id: "NOT_IMPLEMENTED", reason: "Not implemented" }, { status: 501 });
+      return stub.fetchImpl(input, init);
+    },
+  });
+  const result = await assessZpa(zpa);
+  assert.deepEqual(groupPages, ["1", "2"], "page 1 once, then page 2 once: a 501 is not retried");
+  assert.deepEqual(waits, []);
+  const error = `ZPA GET ${segmentGroupPath} failed (501): Not implemented`;
+  assert.ok(result.errors.some((entry) => entry.includes(error)), `501 not disclosed in errors: ${result.errors.join(" | ")}`);
+  const segmentation = findingById(result, "ZS-08");
+  assert.equal(segmentation.status, "warn", segmentation.summary);
+  assert.equal(segmentation.evidence.segment_groups, null, "the 500 groups on page 1 are not reported as the inventory");
+  assert.deepEqual(segmentation.evidence.unreadable_inventories, [{ inventory: "segment group", endpoint: "GET /segmentGroup", status_code: 501, error }]);
+  assert.ok(segmentation.summary.endsWith("The segment group inventory could not be read (GET /segmentGroup returned 501), so this verdict is capped at warn."), segmentation.summary);
 });
 
 test("a ZIA sub-location or ZPA SCIM group read that runs out of retries leaves its fan-out partial and the finding short of a pass", async () => {

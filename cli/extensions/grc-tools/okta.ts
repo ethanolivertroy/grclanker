@@ -2353,8 +2353,8 @@ function retryAfterMs(header: string | null, now: number): number | undefined {
 }
 
 /**
- * The wait before retrying a 429 or 5xx answer, clamped to MAX_RETRY_DELAY_MS: Retry-After when the answer
- * carries one, else the X-Rate-Limit-Reset epoch on a 429 (on a 5xx it only describes the rate-limit
+ * The wait before retrying a 429, 500, 502, 503, or 504 answer, clamped to MAX_RETRY_DELAY_MS: Retry-After when
+ * the answer carries one, else the X-Rate-Limit-Reset epoch on a 429 (on a 5xx it only describes the rate-limit
  * window), else the exponential backoff.
  */
 function retryDelayFromResponse(response: Response, retry: number, now: number, jitter: (delayMs: number) => number): number {

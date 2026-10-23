@@ -4130,7 +4130,7 @@ const authParams = {
   zpa_customer_id: Type.Optional(Type.String({ description: "ZPA customer ID. Defaults to ZPA_CUSTOMER_ID." })),
   config_file: Type.Optional(Type.String({ description: "YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml." })),
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout in seconds. Defaults to 30.", default: 30 })),
-  max_retries: Type.Optional(Type.Number({ description: "Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3.", default: 3 })),
+  max_retries: Type.Optional(Type.Number({ description: "Retries for 429, 500, 502, 503, 504, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3.", default: 3 })),
 };
 
 export function registerZscalerTools(pi: any): void {

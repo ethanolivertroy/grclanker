@@ -418,7 +418,7 @@ test("VantaAuditorClient redacts a secret that straddles the error body limit", 
   clearVantaTokenCacheForTests();
 });
 
-test("VantaAuditorClient retries the token grant and API reads on transport errors, 429, and 5xx, honoring Retry-After", async () => {
+test("VantaAuditorClient retries the token grant and API reads on transport errors and 429, 500, 502, 503, and 504 answers, honoring Retry-After", async () => {
   clearVantaTokenCacheForTests();
   const { sleeps, sleep } = recordSleeps();
   const tokenOutcomes = ["transport", 503, 200];

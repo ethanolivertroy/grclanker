@@ -68,7 +68,7 @@ interface AnsibleAapClientOptions {
   /** Clock for assessment windows and HTTP-date Retry-After values. */
   now?: () => Date;
   signal?: AbortSignal;
-  /** Retries after the first attempt for 429, 5xx, timeouts, and transport errors (default 3, at most 10). */
+  /** Retries after the first attempt for 429, 500, 502, 503, 504, timeouts, and transport errors (default 3, at most 10). */
   maxRetries?: number;
   /** Waits between attempts; the tool call's abort ends a wait at once. */
   sleep?: (ms: number) => Promise<void>;
@@ -2049,7 +2049,8 @@ export class AnsibleAapClient {
     });
 
     // A login that timed out or lost its connection may still have opened a session, and AAP's SESSIONS_PER_USER
-    // limit expires the user's oldest sessions when another opens, so only a 429 or 5xx answer is retried here.
+    // limit expires the user's oldest sessions when another opens, so only a 429, 500, 502, 503, or 504 answer is
+    // retried here.
     const login = await this.send(loginUrl, {
       method: "POST",
       headers: {

@@ -65,7 +65,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
 | `config_file` | string | no | YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429, 500, 502, 503, 504, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
 
 #### `zscaler_assess_zia_access_control`
 
@@ -83,7 +83,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
 | `config_file` | string | no | YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429, 500, 502, 503, 504, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
 | `max_super_admins` | number | no | Maximum acceptable Super Admin count before failing. Defaults to 5. |
 
 #### `zscaler_assess_zia_policy`
@@ -102,7 +102,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
 | `config_file` | string | no | YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429, 500, 502, 503, 504, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
 | `max_ssl_exemptions` | number | no | Maximum acceptable SSL inspection exempted URLs before warning. Defaults to 50. |
 
 #### `zscaler_assess_zpa`
@@ -121,7 +121,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
 | `config_file` | string | no | YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429, 500, 502, 503, 504, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
 | `cert_expiry_warn_days` | number | no | Warn when a certificate expires within this many days. Defaults to 30. |
 | `stale_connector_days` | number | no | Days since last broker connect before a connector is reported stale. Defaults to 30. |
 | `max_timeout_hours` | number | no | Maximum acceptable reauthentication timeout in hours. Defaults to 24. |
@@ -142,7 +142,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
 | `config_file` | string | no | YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429, 500, 502, 503, 504, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
 | `output_dir` | string | no | Root directory for bundles. Defaults to ./export/zscaler. |
 | `max_super_admins` | number | no | Maximum acceptable Super Admin count. Defaults to 5. |
 | `max_ssl_exemptions` | number | no | Maximum acceptable SSL exempted URLs. Defaults to 50. |
