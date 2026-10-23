@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import {
   SlackApiClient,
   assessSlackAdminAccess,
@@ -10,8 +14,10 @@ import {
   resolveSlackConfiguration,
 } from "../dist/extensions/grc-tools/slack.js";
 
-if (!process.env.SLACK_USER_TOKEN && !process.env.SLACK_BOT_TOKEN && !process.env.SLACK_CONFIG_FILE) {
-  console.log("Skipping Slack live smoke: set SLACK_USER_TOKEN (or SLACK_BOT_TOKEN, or SLACK_CONFIG_FILE) to run.");
+const hasCredentials = ["SLACK_USER_TOKEN", "SLACK_TOKEN", "SLACK_BOT_TOKEN", "SLACK_CONFIG_FILE"].some((name) => process.env[name]?.trim())
+  || existsSync(join(homedir(), ".config", "grclanker", "slack.json"));
+if (!hasCredentials) {
+  console.log("Skipping Slack live smoke: set SLACK_USER_TOKEN (or SLACK_TOKEN, or SLACK_BOT_TOKEN), or a config file at SLACK_CONFIG_FILE or ~/.config/grclanker/slack.json, to run.");
   process.exit(0);
 }
 

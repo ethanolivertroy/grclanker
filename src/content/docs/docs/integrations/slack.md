@@ -131,7 +131,7 @@ Layout:
 npm --prefix cli run test:slack:live
 ```
 
-The script prints a skip message and exits 0 when none of `SLACK_USER_TOKEN`, `SLACK_BOT_TOKEN`, or `SLACK_CONFIG_FILE` is set. Otherwise, it runs `slack_check_access` and every assess tool.
+The script prints a skip message and exits 0 when none of `SLACK_USER_TOKEN`, `SLACK_TOKEN`, `SLACK_BOT_TOKEN`, or `SLACK_CONFIG_FILE` is set and `~/.config/grclanker/slack.json` does not exist. Otherwise, it runs `slack_check_access` and every assess tool.
 
 ## Method table
 
