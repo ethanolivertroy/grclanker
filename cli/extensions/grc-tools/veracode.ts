@@ -60,6 +60,7 @@ const DEFAULT_MAX_UNRESTRICTED_USERS = 10;
 const DEFAULT_INACTIVE_DAYS = 90;
 const DEFAULT_MAX_CREDENTIAL_AGE_DAYS = 365;
 const DEFAULT_RETRIES = 3;
+const MAX_RETRY_WAIT_MS = 30_000;
 const DAY_MS = 86_400_000;
 const REQUEST_VERSION = "vcode_request_version_1";
 const AUTH_SCHEME = "VERACODE-HMAC-SHA-256";
@@ -1529,18 +1530,39 @@ function readPageMetadata(payload: JsonRecord): { totalPages?: number; totalElem
   };
 }
 
+function backoffMs(attempt: number): number {
+  return Math.min(250 * 2 ** attempt, 8_000);
+}
+
+function attemptCount(attempts: number): string {
+  return `${attempts} attempt${attempts === 1 ? "" : "s"}`;
+}
+
+// Retry-After carries delta-seconds or an HTTP date (RFC 9110 section 10.2.3), and a date always names its day and
+// month. A date is measured against the client's clock, and a date already past asks for no wait.
+function retryAfterMs(value: string | null, now: number): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  if (!/[a-z]/i.test(trimmed)) return undefined;
+  const date = Date.parse(trimmed);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - now);
+}
+
 export class VeracodeApiClient {
   private readonly config: VeracodeResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly now: () => number;
 
   constructor(
     config: VeracodeResolvedConfig,
-    options: { fetchImpl?: FetchImpl; sleep?: (ms: number) => Promise<void>; signal?: AbortSignal } = {},
+    options: { fetchImpl?: FetchImpl; sleep?: (ms: number) => Promise<void>; now?: () => number; signal?: AbortSignal } = {},
   ) {
     this.config = config;
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleep = abortableSleep(options.signal, options.sleep);
+    this.now = options.now ?? Date.now;
     registerConfiguredSecrets([config.apiKeySecret]);
   }
 
@@ -1569,12 +1591,14 @@ export class VeracodeApiClient {
 
   async get(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
     const url = this.buildUrl(path, query);
-    let attempt = 0;
-    for (;;) {
+    for (let attempt = 1; ; attempt += 1) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+      let response: Response;
+      let rawText: string;
+      // The body is read under the same timer, so a body that stalls times out like a request that never answers.
       try {
-        const response = await this.fetchImpl(url.toString(), {
+        response = await this.fetchImpl(url.toString(), {
           method: "GET",
           headers: {
             accept: "application/json",
@@ -1582,33 +1606,34 @@ export class VeracodeApiClient {
           },
           signal: controller.signal,
         });
-        const rawText = await response.text();
-        if (response.ok) return parseSuccessBody(response, rawText, url.pathname);
-        const retryable = response.status === 429 || response.status >= 500;
-        if (retryable && attempt < this.config.retries) {
-          attempt += 1;
-          await this.sleep(Math.min(250 * 2 ** attempt, 8_000));
-          continue;
-        }
-        const detail = scrubErrorText(errorDetailFrom(response, rawText), configuredSecretsOf(this.config));
-        throw new VeracodeApiError(
-          `Veracode request failed (${response.status} ${response.statusText}) for ${url.pathname}${detail ? `: ${detail}` : ""}`,
-          response.status,
-          url.pathname,
-        );
+        rawText = await response.text();
       } catch (error) {
         rethrowIfAborted(error);
-        if (error instanceof VeracodeApiError) throw error;
-        const message = scrubErrorText(error instanceof Error ? error.message : String(error), configuredSecretsOf(this.config));
-        if (attempt < this.config.retries) {
-          attempt += 1;
-          await this.sleep(Math.min(250 * 2 ** attempt, 8_000));
+        if (attempt <= this.config.retries) {
+          await this.sleep(backoffMs(attempt));
           continue;
         }
-        throw new VeracodeApiError(`Veracode request failed for ${url.pathname}: ${message}`, undefined, url.pathname);
+        const reason = error instanceof Error && error.name === "AbortError"
+          ? `timed out after ${this.config.timeoutMs}ms`
+          : scrubErrorText(error instanceof Error ? error.message : String(error), configuredSecretsOf(this.config));
+        throw new VeracodeApiError(`Veracode request failed after ${attemptCount(attempt)} for ${url.pathname}: ${reason}`, undefined, url.pathname);
       } finally {
         clearTimeout(timeout);
       }
+      if (response.ok) return parseSuccessBody(response, rawText, url.pathname);
+      const retryable = response.status === 429 || response.status >= 500;
+      if (retryable && attempt <= this.config.retries) {
+        const askedMs = retryAfterMs(response.headers.get("retry-after"), this.now());
+        await this.sleep(askedMs === undefined ? backoffMs(attempt) : Math.min(askedMs, MAX_RETRY_WAIT_MS));
+        continue;
+      }
+      const detail = scrubErrorText(errorDetailFrom(response, rawText), configuredSecretsOf(this.config));
+      const attempts = retryable ? ` after ${attemptCount(attempt)}` : "";
+      throw new VeracodeApiError(
+        `Veracode request failed${attempts} (${response.status} ${response.statusText}) for ${url.pathname}${detail ? `: ${detail}` : ""}`,
+        response.status,
+        url.pathname,
+      );
     }
   }
 
