@@ -191,7 +191,7 @@ The inventories each finding reads for this purpose are:
 A `Manual` verdict caused by an unreadable dataset names that dataset's own failure:
 
 - `the endpoint returned 403 Forbidden`, `401 Unauthorized`, or `404 Not Found`, only when the request observed that status.
-- `the endpoint request still failed after 5 attempts`, when a 429, a 5xx answer, a timeout, or a transport failure outlasted the retries in rule 10 of [Verdict safety](#verdict-safety).
+- `the endpoint request still failed after 5 attempts`, when a 429, a 500, 502, 503, or 504 answer, a timeout, or a transport failure outlasted the retries in rule 10 of [Verdict safety](#verdict-safety).
 - `the collector did not expose this endpoint`, when the client has no method for it.
 - `the inventory it depends on was not collected, so its request was never issued`, for a per-parent list whose parent was unreadable.
 

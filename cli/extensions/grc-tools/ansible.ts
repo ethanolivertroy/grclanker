@@ -2049,7 +2049,8 @@ export class AnsibleAapClient {
     });
 
     // A login that timed out or lost its connection may still have opened a session, and AAP's SESSIONS_PER_USER
-    // limit expires the user's oldest sessions when another opens, so only a 429 or 5xx answer is retried here.
+    // limit expires the user's oldest sessions when another opens, so only a 429, 500, 502, 503, or 504 answer is
+    // retried here.
     const login = await this.send(loginUrl, {
       method: "POST",
       headers: {

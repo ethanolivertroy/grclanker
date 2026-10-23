@@ -5054,7 +5054,7 @@ function bodyStalls(init) {
   return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
 }
 
-test("Prisma Cloud, Compute, and PAN-OS retry 429 and 5xx answers after Retry-After, read as delta-seconds or an HTTP date, and otherwise after 500, 1000, then 2000 ms", async () => {
+test("Prisma Cloud, Compute, and PAN-OS retry 429, 500, 502, 503, and 504 answers after Retry-After, read as delta-seconds or an HTTP date, and otherwise after 500, 1000, then 2000 ms", async () => {
   const prisma = prismaRetryHarness(({ url, attempt }) => {
     if (url.pathname !== "/v2/policy") return undefined;
     if (attempt === 1) return unavailable(429, { "retry-after": "2" });

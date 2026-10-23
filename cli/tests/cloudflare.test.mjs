@@ -2593,7 +2593,7 @@ function neverAnswers(init) {
   });
 }
 
-test("Cloudflare retries 429 and 5xx answers after the Retry-After wait, given in delta-seconds or as an HTTP date read against the client clock", async () => {
+test("Cloudflare retries 429, 500, 502, 503, and 504 answers after the Retry-After wait, given in delta-seconds or as an HTTP date read against the client clock", async () => {
   const { client, waits, requests } = retryHarness((attempt) => {
     if (attempt === 1) return cloudflareJson(429, "Too Many Requests", CLOUDFLARE_RATE_LIMITED, { "retry-after": "2" });
     if (attempt === 2) return cloudflareJson(503, "Service Unavailable", CLOUDFLARE_UNAVAILABLE, { "retry-after": new Date(RETRY_NOW.getTime() + 7_000).toUTCString() });

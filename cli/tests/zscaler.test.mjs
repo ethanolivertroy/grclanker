@@ -3882,7 +3882,7 @@ function bodyStalls(init) {
   return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
 }
 
-test("ZIA and ZPA retry 429 and 5xx answers after Retry-After, read from the header as delta-seconds or an HTTP date, or from the field ZIA puts in a 429 body", async () => {
+test("ZIA and ZPA retry 429, 500, 502, 503, and 504 answers after Retry-After, read from the header as delta-seconds or an HTTP date, or from the field ZIA puts in a 429 body", async () => {
   const zia = zscalerRetryHarness("zia", ({ url, attempt }) => {
     if (url.pathname !== "/api/v1/adminRoles/lite") return undefined;
     if (attempt === 1) return jsonResponse(ZIA_RATE_LIMITED, { status: 429, headers: { "retry-after": "2" } });

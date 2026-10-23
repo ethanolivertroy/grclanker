@@ -1767,7 +1767,7 @@ const stalledBody = (init) => new Response(new ReadableStream({
   },
 }), { status: 200, headers: { "content-type": "application/json" } });
 
-test("retries: a 429 or 5xx answer is retried with exponential backoff that honors Retry-After as delta-seconds or an HTTP-date", async () => {
+test("retries: a 429, 500, 502, 503, or 504 answer is retried with exponential backoff that honors Retry-After as delta-seconds or an HTTP-date", async () => {
   const { client, requests, waits } = scriptedAapClient({
     "GET /api/v2/me/": [
       throttled({ "retry-after": "2" }),
@@ -1882,7 +1882,7 @@ test("retries: an abort that lands while a response body is read ends the read w
   assert.deepEqual(waits, []);
 });
 
-test("session login: a POST /api/login/ that times out or loses its connection is sent once, since AAP may have opened a session that a second login would expire; 429 and 5xx login answers are retried", async () => {
+test("session login: a POST /api/login/ that times out or loses its connection is sent once, since AAP may have opened a session that a second login would expire; 429, 500, 502, 503, and 504 login answers are retried", async () => {
   const session = { token: undefined, username: "auditor", password: RETRY_PASSWORD_CANARY, timeoutMs: 20 };
   const loginPage = () => new Response("<html>login</html>", { status: 200, headers: { "content-type": "text/html", "set-cookie": "csrftoken=csrftokenfortests1; Path=/" } });
   const loggedIn = () => new Response("", { status: 200, headers: { "set-cookie": "sessionid=sessionidfortests1; Path=/; HttpOnly" } });
