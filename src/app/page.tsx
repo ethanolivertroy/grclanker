@@ -60,7 +60,7 @@ function releaseFacts(integrationSpecCount: number) {
     {
       label: '241 domain tools',
       detail:
-        'Native checks, assessments, and evidence exports cover 35 vendor integrations, plus CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools. The v0.1.3 release bundle carries all of them.',
+        'Native checks, assessments, and evidence exports cover 35 vendor integrations, plus CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools. The v0.1.4 release bundle carries all of them.',
     },
     {
       label: 'Four runtime paths',
@@ -82,40 +82,40 @@ function releaseFacts(integrationSpecCount: number) {
 
 const whatsNewCards = [
   {
-    label: 'Experimental durable runtime',
+    label: 'Retries, then fails closed',
     color: 'text-sapphire',
     detail:
-      'grclanker durable, a fourth runtime path, runs the agent under Pi Durable 1.3.0, so a crashed or stopped run resumes instead of starting over. It is opt-in: the Pi CLI, Agent SDK, and Flue paths do not use it.',
+      '32 integrations and the KEV, EPSS, CMVP, SCF, and FedRAMP tools retry rate limits, server errors, and timeouts. A read that still fails is reported as unread, never as empty, though a check can still pass on the reads that succeeded.',
   },
   {
-    label: 'Atomic exports, clean stops',
+    label: 'Rejected credentials named',
     color: 'text-yellow',
     detail:
-      'Exports build in a hidden staging directory and move into place when done. Stopping a run cancels its API requests and child processes, and a stopped export writes nothing.',
+      'When a vendor refuses the credentials on every probe, 29 access checks now report failed instead of a permission gap, and the next step names the variable or setting to fix.',
   },
   {
-    label: 'Fewer passes on partial evidence',
+    label: 'Smoother first run',
     color: 'text-peach',
     detail:
-      'Cloudflare, Zscaler, Vanta, CrowdStrike, Snowflake, Zoom, and other checks now warn or fail instead of passing when the evidence they read is incomplete.',
+      'grclanker --version prints the version, grclanker --session <id> reopens a session, and a first launch without a terminal exits with a message instead of a stack trace.',
   },
   {
-    label: 'Pi 1.3.0 and Node.js 24',
+    label: 'Failed upgrades roll back',
     color: 'text-green',
     detail:
-      'The CLI moves to Pi 1.3.0 and the release bundles to Node.js 24.22.0 LTS, with Flue 2.3.0 and sandbox-runtime 0.0.79.',
+      'Both installers put the previous install back when extraction fails, and the skills installers keep the installed skill when a download is cut off or wrong.',
   },
   {
-    label: 'Redaction and config hardening',
+    label: 'Bundles tested on their own OS',
     color: 'text-mauve',
     detail:
-      'Flue scrubs tool-input credentials from errors and replies, a broken sandbox.json fails closed, and installers stop when a checksum cannot be verified.',
+      'Each of the six release bundles is installed and run on a native macOS, Linux, or Windows runner, and a release gate refuses to publish unless every check passes.',
   },
   {
-    label: 'Readable spec pages',
+    label: 'Tools match their docs',
     color: 'text-blue',
     detail:
-      'Spec pages render as documents with headings, tables, and a contents list. Search finds body text and IDs such as SRG-APP-000148, and corrects one-letter typos.',
+      'kevs_search puts an exact CVE ID first, AWS lists the S3 IAM actions a policy needs, and Zendesk ZD-05, LaunchDarkly, and SCF now do what their docs say.',
   },
 ];
 
@@ -168,7 +168,7 @@ export default function HomePage() {
               </div>
 
               <p className="hero-support-copy">
-                The curl installer ships the v0.1.3 release bundle with all 241 domain tools and its own Node.js runtime.
+                The curl installer ships the v0.1.4 release bundle with all 241 domain tools and its own Node.js runtime.
                 To run unreleased changes,{' '}
                 <Link href="/docs/getting-started/installation/#install-from-source">build from source</Link> (Node 22.19
                 or newer).
@@ -193,7 +193,7 @@ export default function HomePage() {
               sizes="(min-width: 912px) 862px, calc(100vw - 50px)"
               width={1750}
               height={1316}
-              alt="grclanker CLI start screen from the v0.1.3 release bundle: 248 tools and 2 agents, the investigate, audit, assess, and validate workflows, and 241 domain tools ready"
+              alt="grclanker CLI start screen from the v0.1.4 release bundle: 248 tools and 2 agents, the investigate, audit, assess, and validate workflows, and 241 domain tools ready"
               className="hero-preview-image"
               loading="eager"
               fetchPriority="low"
@@ -210,9 +210,9 @@ export default function HomePage() {
             <div className="hero-briefing-top">
               <div>
                 <h2 className="font-semibold text-sm tracking-widest uppercase text-blue">What You Ask → What It Does</h2>
-                <p className="text-subtext0 text-sm mt-1 italic">Shipped in v0.1.3, not a roadmap.</p>
+                <p className="text-subtext0 text-sm mt-1 italic">Shipped in v0.1.4, not a roadmap.</p>
               </div>
-              <div className="hero-briefing-version">v0.1.3 // released</div>
+              <div className="hero-briefing-version">v0.1.4 // released</div>
             </div>
 
             <div className="hero-briefing-grid">
@@ -248,11 +248,12 @@ export default function HomePage() {
             <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
               <div>
                 <h2 id="whats-new-heading" className="font-semibold text-sm tracking-widest uppercase text-blue">
-                  What's New in v0.1.3
+                  What's New in v0.1.4
                 </h2>
                 <p className="text-subtext0 text-sm mt-1 italic">
-                  Adds an experimental, opt-in durable runtime and moves to Pi 1.3.0 and Node.js 24.22.0. The tool surface
-                  is unchanged, and the changelog has upgrade notes, including a downgrade caveat for durable sessions.
+                  Retries rate limits and brief outages, names rejected credentials in 29 access checks, and rolls back a
+                  failed install.
+                  The tool surface is unchanged, and the changelog has upgrade notes for the results that change.
                 </p>
               </div>
               <Link href="/docs/changelog/" className="spec-action-btn spec-action-btn-primary self-start md:self-auto">
