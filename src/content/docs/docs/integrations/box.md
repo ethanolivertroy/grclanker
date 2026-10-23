@@ -221,7 +221,7 @@ The export bundle renders them in `compliance/unified_compliance_matrix.md` and 
 npm --prefix cli run test:box:live
 ```
 
-The script exits 0 with a skip message unless `BOX_JWT_CONFIG_PATH`, all of `BOX_CLIENT_ID`, `BOX_CLIENT_SECRET`, and `BOX_ENTERPRISE_ID`, or `BOX_ACCESS_TOKEN` or `BOX_DEVELOPER_TOKEN` is set. With credentials, it runs `box_check_access` and stops with exit code 1 unless access is `healthy`. When access is `healthy`, it runs the identity and access assessment against the real enterprise.
+The script exits 0 with a skip message unless one of these is configured: `BOX_JWT_CONFIG_PATH`; `BOX_CLIENT_ID` and `BOX_CLIENT_SECRET` with `BOX_ENTERPRISE_ID` or `BOX_SUBJECT_ID`; `BOX_ACCESS_TOKEN`, `BOX_TOKEN`, or `BOX_DEVELOPER_TOKEN`; `BOX_REFRESH_TOKEN` with `BOX_CLIENT_ID` and `BOX_CLIENT_SECRET`; or a config file at `BOX_CONFIG_PATH` or `~/.box-sec-inspector/config.yaml`. With credentials, it runs `box_check_access` and stops with exit code 1 unless access is `healthy`. When access is `healthy`, it runs the identity and access assessment against the real enterprise.
 
 ## Limitations and manual controls
 

@@ -199,7 +199,7 @@ Reruns allocate `-2`, `-3`, and so on. The zip name derives from the allocated d
 npm --prefix cli run test:gcp:live
 ```
 
-The script prints a skip message and exits 0 when no credential hint exists: none of `GCP_ACCESS_TOKEN`, `GOOGLE_OAUTH_ACCESS_TOKEN`, `GCP_CREDENTIALS_FILE`, `GOOGLE_APPLICATION_CREDENTIALS`, `GCP_ORGANIZATION_ID`, `GCP_ORG_ID`, `GCP_PROJECT_ID`, or `GOOGLE_CLOUD_PROJECT` is set and no ADC file exists.
+The script prints a skip message and exits 0 when no credential hint exists: none of `GCP_ACCESS_TOKEN`, `GOOGLE_OAUTH_ACCESS_TOKEN`, `GOOGLE_ACCESS_TOKEN`, `GCP_CREDENTIALS_FILE`, `GOOGLE_APPLICATION_CREDENTIALS`, `GCP_ORGANIZATION_ID`, `GCP_ORG_ID`, `GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, or `GCLOUD_PROJECT` is set and no ADC file exists.
 
 Otherwise it runs `gcp_check_access` and stops with exit code 1 unless the status is `healthy`. When the status is `healthy`, it runs every assess tool with a small project and asset cap.
 

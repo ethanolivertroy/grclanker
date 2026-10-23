@@ -20,12 +20,14 @@ function hasCredentialHints() {
   return (
     Boolean(process.env.GCP_ACCESS_TOKEN?.trim())
     || Boolean(process.env.GOOGLE_OAUTH_ACCESS_TOKEN?.trim())
+    || Boolean(process.env.GOOGLE_ACCESS_TOKEN?.trim())
     || Boolean(process.env.GCP_CREDENTIALS_FILE?.trim())
     || Boolean(process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim())
     || Boolean(process.env.GCP_ORGANIZATION_ID?.trim())
     || Boolean(process.env.GCP_ORG_ID?.trim())
     || Boolean(process.env.GCP_PROJECT_ID?.trim())
     || Boolean(process.env.GOOGLE_CLOUD_PROJECT?.trim())
+    || Boolean(process.env.GCLOUD_PROJECT?.trim())
     || existsSync(defaultAdcPath())
   );
 }
@@ -48,7 +50,7 @@ function logAssessment(result) {
 try {
   if (!hasCredentialHints()) {
     log(
-      "Skipping live GCP smoke test: set GCP_ORGANIZATION_ID (or GCP_ORG_ID) or GCP_PROJECT_ID plus GCP_ACCESS_TOKEN, GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, or an ADC file to run against a real organization.",
+      "Skipping live GCP smoke test: set GCP_ORGANIZATION_ID (or GCP_ORG_ID) or GCP_PROJECT_ID (or GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT) plus GCP_ACCESS_TOKEN (or GOOGLE_OAUTH_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN), GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, or an ADC file to run against a real organization.",
     );
     process.exit(0);
   }

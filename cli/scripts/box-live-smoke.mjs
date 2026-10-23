@@ -1,3 +1,7 @@
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import {
   BoxApiClient,
   assessBoxIdentityAccess,
@@ -16,15 +20,18 @@ function hasValue(name) {
 
 function hasConfigHints() {
   const jwt = hasValue("BOX_JWT_CONFIG_PATH");
-  const ccg = hasValue("BOX_CLIENT_ID") && hasValue("BOX_CLIENT_SECRET") && hasValue("BOX_ENTERPRISE_ID");
-  const oauth = hasValue("BOX_ACCESS_TOKEN") || hasValue("BOX_DEVELOPER_TOKEN");
-  return jwt || ccg || oauth;
+  const clientCredentials = hasValue("BOX_CLIENT_ID") && hasValue("BOX_CLIENT_SECRET");
+  const ccg = clientCredentials && (hasValue("BOX_ENTERPRISE_ID") || hasValue("BOX_SUBJECT_ID"));
+  const oauth = hasValue("BOX_ACCESS_TOKEN") || hasValue("BOX_TOKEN") || hasValue("BOX_DEVELOPER_TOKEN")
+    || (hasValue("BOX_REFRESH_TOKEN") && clientCredentials);
+  const configFile = hasValue("BOX_CONFIG_PATH") || existsSync(join(homedir(), ".box-sec-inspector", "config.yaml"));
+  return jwt || ccg || oauth || configFile;
 }
 
 try {
   if (!hasConfigHints()) {
     log(
-      "Skipping live Box smoke test: set BOX_JWT_CONFIG_PATH (JWT), or BOX_CLIENT_ID, BOX_CLIENT_SECRET, and BOX_ENTERPRISE_ID (Client Credentials Grant), or BOX_ACCESS_TOKEN (OAuth 2.0) to run against a real enterprise.",
+      "Skipping live Box smoke test: set BOX_JWT_CONFIG_PATH (JWT); BOX_CLIENT_ID and BOX_CLIENT_SECRET with BOX_ENTERPRISE_ID or BOX_SUBJECT_ID (Client Credentials Grant); BOX_ACCESS_TOKEN, BOX_TOKEN, or BOX_DEVELOPER_TOKEN, or BOX_REFRESH_TOKEN with BOX_CLIENT_ID and BOX_CLIENT_SECRET (OAuth 2.0); or a config file at BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml to run against a real enterprise.",
     );
     process.exit(0);
   }

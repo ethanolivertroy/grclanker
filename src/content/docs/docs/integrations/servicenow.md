@@ -214,7 +214,7 @@ The audit bundle writes one report per framework under `compliance/`, plus a uni
 npm --prefix cli run test:servicenow:live
 ```
 
-The script prints a skip message and exits 0 when none of `SERVICENOW_INSTANCE`, `SERVICENOW_URL`, or `SERVICENOW_CONFIG_FILE` is set and neither `.servicenow.yaml` in the working directory nor `~/.servicenow-sec-inspector/config.yaml` exists.
+The script prints a skip message and exits 0 when none of `SERVICENOW_INSTANCE`, `SERVICENOW_URL`, `SERVICENOW_INSTANCE_URL`, or `SERVICENOW_CONFIG_FILE` is set and neither `.servicenow.yaml` in the working directory nor `~/.servicenow-sec-inspector/config.yaml` exists.
 
 Otherwise it:
 
