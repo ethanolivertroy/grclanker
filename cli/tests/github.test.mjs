@@ -47,6 +47,15 @@ function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+// Retry waits are recorded, never slept, so a retried response costs no wall-clock time.
+function recordingSleep() {
+  const waits = [];
+  const sleep = async (ms) => {
+    waits.push(ms);
+  };
+  return { waits, sleep };
+}
+
 function dataset(data, error) {
   return error ? { data, error } : { data };
 }
@@ -926,7 +935,8 @@ test("GitHubAuditorClient handles installation token refresh, rate limits, and p
     throw new Error(`Unexpected request: ${url.toString()}`);
   };
 
-  const client = new GitHubAuditorClient(config, fetchImpl);
+  const { waits, sleep } = recordingSleep();
+  const client = new GitHubAuditorClient(config, fetchImpl, { sleep });
   const repos = await client.listRepositories();
   const rulesets = await client.listOrgRulesets();
 
@@ -935,6 +945,304 @@ test("GitHubAuditorClient handles installation token refresh, rate limits, and p
   assert.equal(state.tokenRequests, 2);
   assert.equal(state.repo401Count, 1);
   assert.equal(state.rulesetRateLimitCount, 1);
+  assert.deepEqual(waits, [0], "the secondary limit is retried once its x-ratelimit-reset has passed");
+});
+
+const RETRY_NOW = Date.parse("2026-10-23T12:00:00.000Z");
+const RETRY_CANARIES = {
+  cursor: "CANARY_RETRY_CURSOR_4f2a9c",
+  body: "CANARY_RETRY_BODY_9b3c1e",
+  transport: "CANARY_RETRY_TRANSPORT_7d1e5a",
+};
+
+// Serves `steps` in order and repeats the last one, recording every request sent.
+function sequenceFetch(steps) {
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(String(input));
+    requests.push({ url, method: init.method ?? "GET" });
+    return steps[Math.min(requests.length, steps.length) - 1](url, init);
+  };
+  return { fetchImpl, requests };
+}
+
+function hangUntilAborted(_url, init) {
+  return new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+  });
+}
+
+function connectionReset() {
+  const cause = Object.assign(new Error(`read ECONNRESET while sending Authorization: Bearer ${RETRY_CANARIES.transport}`), { code: "ECONNRESET" });
+  throw new TypeError(`fetch failed for https://api.github.com/orgs/example-org?token=${RETRY_CANARIES.transport}`, { cause });
+}
+
+function unavailable(headers = {}) {
+  return () => jsonResponse({ message: `Service Unavailable (${RETRY_CANARIES.body})` }, headers, 503);
+}
+
+function retryClient(fetchImpl, options = {}) {
+  const recorder = recordingSleep();
+  const client = new GitHubAuditorClient(createSampleConfig(), fetchImpl, { sleep: recorder.sleep, now: () => RETRY_NOW, ...options });
+  return { client, waits: recorder.waits };
+}
+
+function assertRetryCanaryFree(text, label) {
+  for (const [name, canary] of Object.entries(RETRY_CANARIES)) {
+    assert.ok(!text.includes(canary), `${label}: canary ${name} leaked`);
+  }
+}
+
+test("GitHubAuditorClient retries 500, 502, 503, and 504 with exponential backoff", async () => {
+  const { fetchImpl, requests } = sequenceFetch([
+    () => jsonResponse({ message: "Server Error" }, {}, 500),
+    () => new Response("<html>502 Bad Gateway</html>", { status: 502, headers: { "content-type": "text/html" } }),
+    unavailable(),
+    () => jsonResponse({ message: "Gateway Timeout" }, {}, 504),
+    () => jsonResponse({ login: "example-org" }),
+  ]);
+  const { client, waits } = retryClient(fetchImpl);
+
+  const { payload } = await client.requestJson("/orgs/example-org");
+
+  assert.equal(payload.login, "example-org");
+  assert.equal(requests.length, 5);
+  assert.deepEqual(waits, [500, 1000, 2000, 4000]);
+});
+
+test("GitHubAuditorClient honors Retry-After as delta-seconds or an HTTP-date on 429 and 5xx", async () => {
+  const { fetchImpl, requests } = sequenceFetch([
+    () => jsonResponse({ message: "Too Many Requests" }, { "retry-after": "3" }, 429),
+    unavailable({ "retry-after": "Fri, 23 Oct 2026 12:00:07 GMT" }),
+    unavailable({ "retry-after": "Fri, 23 Oct 2026 11:59:00 GMT" }),
+    () => jsonResponse({ login: "example-org" }),
+  ]);
+  const { client, waits } = retryClient(fetchImpl);
+
+  await client.requestJson("/orgs/example-org");
+
+  assert.equal(requests.length, 4);
+  assert.deepEqual(waits, [3000, 7000, 0], "an HTTP-date is measured against the injected clock, and one already past waits 0");
+});
+
+test("GitHubAuditorClient fails closed at once when the server asks for a wait past the 60 s cap", async () => {
+  const cases = [
+    {
+      label: "Retry-After delta-seconds",
+      response: () => jsonResponse({ message: "Too Many Requests" }, { "retry-after": "120" }, 429),
+      status: 429,
+      note: /Retry-After asks for a wait until 2026-10-23T12:02:00\.000Z, beyond the 60 s retry cap/,
+    },
+    {
+      label: "Retry-After HTTP-date",
+      response: unavailable({ "retry-after": "Fri, 23 Oct 2026 12:05:00 GMT" }),
+      status: 503,
+      note: /Retry-After asks for a wait until 2026-10-23T12:05:00\.000Z, beyond the 60 s retry cap/,
+    },
+    {
+      label: "primary rate limit reset",
+      response: () => jsonResponse(
+        { message: "API rate limit exceeded for installation ID 1." },
+        { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(RETRY_NOW / 1000 + 3600) },
+        403,
+      ),
+      status: 403,
+      note: /the rate limit resets at 2026-10-23T13:00:00\.000Z, beyond the 60 s retry cap/,
+    },
+  ];
+  for (const { label, response, status, note } of cases) {
+    const { fetchImpl, requests } = sequenceFetch([response]);
+    const { client, waits } = retryClient(fetchImpl);
+
+    const error = await rejection(client.requestJson("/orgs/example-org"));
+
+    assert.equal(requests.length, 1, `${label}: no retry`);
+    assert.deepEqual(waits, [], `${label}: no wait`);
+    assert.equal(error.status, status, label);
+    assert.equal(error.attempts, 1, label);
+    assert.match(error.message, note, label);
+  }
+
+  const { fetchImpl } = sequenceFetch([cases[2].response]);
+  const result = await runGitHubAccessCheck(retryClient(fetchImpl).client, createSampleConfig());
+  const probe = result.probes[0];
+  assert.equal(probe.status, "error", "a rate limit is not reported as a permission denial");
+  assert.match(probe.detail, /^GitHub request failed \(403\) for GET \/orgs\/example-org after 1 attempt: API rate limit exceeded .*resets at 2026-10-23T13:00:00\.000Z/);
+});
+
+test("GitHubAuditorClient names the path, last status, and attempt count when retries run out", async () => {
+  const { fetchImpl, requests } = sequenceFetch([unavailable()]);
+  const { client, waits } = retryClient(fetchImpl);
+
+  const error = await rejection(client.requestJson(`/orgs/example-org/audit-log?per_page=100&phrase=created:>=2026-09-23&after=${RETRY_CANARIES.cursor}`));
+
+  assert.equal(requests.length, 5);
+  assert.deepEqual(waits, [500, 1000, 2000, 4000]);
+  assert.equal(error.status, 503);
+  assert.equal(error.path, "/orgs/example-org/audit-log", "the endpoint is the path alone");
+  assert.equal(error.attempts, 5);
+
+  const result = await runGitHubAccessCheck(retryClient(fetchImpl).client, createSampleConfig());
+  assert.ok(result.probes.every((probe) => probe.status === "error"));
+  assert.match(result.probes[0].detail, /^GitHub request failed \(503\) for GET \/orgs\/example-org after 5 attempts: Service Unavailable/);
+  assertRetryCanaryFree(`${error.message}\n${JSON.stringify(error)}\n${JSON.stringify(result)}`, "exhausted 503");
+});
+
+test("GitHubAuditorClient retries a request that times out, including a fetch that ignores its signal", async () => {
+  const { fetchImpl, requests } = sequenceFetch([hangUntilAborted, () => jsonResponse({ login: "example-org" })]);
+  const { client, waits } = retryClient(fetchImpl, { timeoutMs: 20 });
+
+  const { payload } = await client.requestJson("/orgs/example-org");
+  assert.equal(payload.login, "example-org");
+  assert.equal(requests.length, 2);
+  assert.deepEqual(waits, [500]);
+
+  const stuck = sequenceFetch([() => new Promise(() => {})]);
+  const stuckClient = retryClient(stuck.fetchImpl, { timeoutMs: 20 });
+  const error = await rejection(stuckClient.client.requestJson("/orgs/example-org/members?per_page=100&role=all"));
+  assert.equal(stuck.requests.length, 5);
+  assert.equal(error.status, 0, "no HTTP status was received");
+  assert.equal(error.path, "/orgs/example-org/members");
+  assert.equal(error.attempts, 5);
+  assert.equal(error.message, "timed out after 20 ms");
+
+  const result = await runGitHubAccessCheck(retryClient(stuck.fetchImpl, { timeoutMs: 5 }).client, createSampleConfig());
+  assert.equal(result.probes[0].detail, "GitHub request failed for GET /orgs/example-org after 5 attempts: timed out after 5 ms");
+});
+
+test("GitHubAuditorClient retries a network failure and reports only its system error code", async () => {
+  const { fetchImpl, requests } = sequenceFetch([connectionReset, () => jsonResponse({ login: "example-org" })]);
+  const { client, waits } = retryClient(fetchImpl);
+
+  await client.requestJson("/orgs/example-org");
+  assert.equal(requests.length, 2);
+  assert.deepEqual(waits, [500]);
+
+  const failing = sequenceFetch([connectionReset]);
+  const error = await rejection(retryClient(failing.fetchImpl).client.requestJson("/orgs/example-org"));
+  assert.equal(failing.requests.length, 5);
+  assert.equal(error.status, 0);
+  assert.equal(error.attempts, 5);
+  assert.equal(error.message, "network error (ECONNRESET)");
+
+  const result = await runGitHubAccessCheck(retryClient(failing.fetchImpl).client, createSampleConfig());
+  assert.equal(result.probes[0].detail, "GitHub request failed for GET /orgs/example-org after 5 attempts: network error (ECONNRESET)");
+  assertRetryCanaryFree(`${error.message}\n${JSON.stringify(error)}\n${JSON.stringify(result)}`, "network failure");
+});
+
+test("GitHubAuditorClient retries the GraphQL query POST", async () => {
+  const { fetchImpl, requests } = sequenceFetch([
+    unavailable(),
+    connectionReset,
+    () => jsonResponse({ data: { viewer: { login: "octocat" } } }),
+  ]);
+  const { waits, sleep } = recordingSleep();
+  const client = new GitHubAuditorClient(createGraphqlConfig(), fetchImpl, { sleep });
+
+  const result = await client.graphql("query { viewer { login } }");
+
+  assert.deepEqual(result.data, { viewer: { login: "octocat" } });
+  assert.deepEqual(requests.map((request) => `${request.method} ${request.url.pathname}`), Array(3).fill("POST /graphql"));
+  assert.deepEqual(waits, [500, 1000]);
+});
+
+test("GitHubAuditorClient retries the installation token exchange and names it when retries run out", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const config = createSampleConfig({
+    authMode: "app",
+    apiToken: undefined,
+    appId: "12345",
+    appPrivateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    installationId: "98765",
+  });
+  const tokenGranted = () => jsonResponse({ token: "ghs_retry_token", expires_at: "2035-01-01T00:00:00Z" }, {}, 201);
+  const route = (tokenSteps) => {
+    let tokenCalls = 0;
+    const requests = [];
+    const fetchImpl = async (input, init = {}) => {
+      const url = new URL(String(input));
+      requests.push(`${init.method ?? "GET"} ${url.pathname}`);
+      if (url.pathname === "/app/installations/98765/access_tokens") {
+        tokenCalls += 1;
+        return tokenSteps[Math.min(tokenCalls, tokenSteps.length) - 1](url, init);
+      }
+      return jsonResponse({ login: "example-org" });
+    };
+    return { fetchImpl, requests };
+  };
+
+  clearGitHubTokenCacheForTests();
+  const recovering = route([unavailable(), hangUntilAborted, connectionReset, tokenGranted]);
+  const recorder = recordingSleep();
+  const client = new GitHubAuditorClient(config, recovering.fetchImpl, { sleep: recorder.sleep, now: () => RETRY_NOW, timeoutMs: 20 });
+  await client.requestJson("/orgs/example-org");
+  assert.deepEqual(recovering.requests, [
+    ...Array(4).fill("POST /app/installations/98765/access_tokens"),
+    "GET /orgs/example-org",
+  ]);
+  assert.deepEqual(recorder.waits, [500, 1000, 2000]);
+
+  clearGitHubTokenCacheForTests();
+  const exhausted = route([unavailable()]);
+  const result = await runGitHubAccessCheck(
+    new GitHubAuditorClient(config, exhausted.fetchImpl, { sleep: recordingSleep().sleep }),
+    config,
+  );
+  assert.equal(result.probes[0].status, "error");
+  assert.match(result.probes[0].detail, /^GitHub App installation token request failed \(503\) for POST \/app\/installations\/98765\/access_tokens after 5 attempts: Service Unavailable/);
+  assertRetryCanaryFree(JSON.stringify(result), "token exchange");
+
+  clearGitHubTokenCacheForTests();
+  const timingOut = route([hangUntilAborted]);
+  const timedOut = await rejection(new GitHubAuditorClient(config, timingOut.fetchImpl, { sleep: recordingSleep().sleep, timeoutMs: 5 }).requestJson("/orgs/example-org"));
+  assert.equal(timedOut.message, "GitHub App installation token request failed for POST /app/installations/98765/access_tokens after 5 attempts: timed out after 5 ms");
+  clearGitHubTokenCacheForTests();
+});
+
+test("GitHubAuditorClient ends a retry wait when the tool call is aborted", async () => {
+  const controller = new AbortController();
+  const { fetchImpl, requests } = sequenceFetch([unavailable()]);
+  const sleep = () => {
+    setTimeout(() => controller.abort(), 5);
+    return new Promise(() => {});
+  };
+  const client = new GitHubAuditorClient(createSampleConfig(), fetchImpl, { sleep, signal: controller.signal });
+
+  const error = await rejection(client.requestJson("/orgs/example-org"));
+
+  assert.equal(error.name, "ToolCallAbortedError");
+  assert.equal(requests.length, 1, "no request is sent after the abort");
+});
+
+test("GitHubAuditorClient fails a listing closed when a later page runs out of retries", async () => {
+  const { fetchImpl, requests } = sequenceFetch([
+    () => jsonResponse(
+      [{ name: "repo-one", full_name: "example-org/repo-one", owner: { login: "example-org" }, default_branch: "main" }],
+      { link: `<https://api.github.com/orgs/example-org/repos?per_page=100&type=all&page=2&cursor=${RETRY_CANARIES.cursor}>; rel="next"` },
+    ),
+    unavailable(),
+  ]);
+  const { client } = retryClient(fetchImpl);
+
+  const error = await rejection(client.listRepositories());
+  assert.equal(requests.length, 6);
+  assert.equal(error.path, "/orgs/example-org/repos");
+  assert.equal(error.attempts, 5);
+
+  const { fetchImpl: repoFetch } = sequenceFetch([
+    (url) => (url.pathname === "/orgs/example-org/repos" && !url.searchParams.has("page")
+      ? jsonResponse(
+        [{ name: "repo-one", full_name: "example-org/repo-one", owner: { login: "example-org" }, default_branch: "main" }],
+        { link: `<https://api.github.com/orgs/example-org/repos?per_page=100&type=all&page=2&cursor=${RETRY_CANARIES.cursor}>; rel="next"` },
+      )
+      : (url.pathname === "/orgs/example-org/repos" ? unavailable()() : jsonResponse(url.pathname === "/orgs/example-org" ? { login: "example-org" } : []))),
+  ]);
+  const data = await collectGitHubRepoProtectionData(retryClient(repoFetch).client);
+  assert.deepEqual(data.repositories.data, [], "page 1 is not kept as the inventory");
+  assert.match(data.repositories.error, /^GitHub request failed \(503\) for GET \/orgs\/example-org\/repos after 5 attempts: /);
+  const assessment = assessGitHubRepoProtection(data, createSampleConfig());
+  assert.ok(assessment.findings.every((finding) => finding.status !== "Pass"), "no repository finding passes on a partial inventory");
+  assertRetryCanaryFree(`${error.message}\n${JSON.stringify(data)}\n${JSON.stringify(assessment)}`, "mid-pagination failure");
 });
 
 test("GitHubAuditorClient follows only same-origin REST next links without userinfo", async () => {
@@ -4261,7 +4569,7 @@ const ERROR_BODY_WALK_ROWS = [
 async function runErrorBodyScenario(key, shape) {
   const outputRoot = createTempBase("grclanker-github-error-body-");
   const { fetchImpl, requests, deniedTargets } = createSweepFetch({ variant: "A", deny: [key], respond: (deniedKey) => shape.response(deniedKey) });
-  const client = new GitHubAuditorClient(SWEEP_CONFIG, fetchImpl);
+  const client = new GitHubAuditorClient(SWEEP_CONFIG, fetchImpl, { sleep: recordingSleep().sleep });
   const [orgAccess, repoProtection, actions, codeSecurity, integrations, accessCheck] = await Promise.all([
     collectGitHubOrgAccessData(client, SWEEP_CONFIG),
     collectGitHubRepoProtectionData(client),

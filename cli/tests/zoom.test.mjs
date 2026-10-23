@@ -668,6 +668,196 @@ test("ZoomApiClient marks truncation when the caller limit stops pagination and 
   assert.equal(logs.truncated, true);
 });
 
+const ZOOM_RETRY_TOKEN = "zoom-CANARY-RETRY-TOKEN-71";
+const ZOOM_RETRY_OAUTH = { token: undefined, clientId: "retry-client-id", clientSecret: "CANARY-RETRY-CLIENT-SECRET-73" };
+
+/** A client whose fetch answers with `steps` in order (repeating the last one), recording requests and waits. */
+function zoomRetryHarness(steps, { timeoutMs = 30000, signal, config = {} } = {}) {
+  const calls = [];
+  const waits = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    calls.push({ method: (init.method ?? "GET").toUpperCase(), pathname: url.pathname, search: url.search });
+    return steps[Math.min(calls.length, steps.length) - 1](init, url);
+  };
+  const client = new ZoomApiClient(sampleConfig({ token: ZOOM_RETRY_TOKEN, timeoutMs, ...config }), {
+    fetchImpl,
+    sleep: async (ms) => { waits.push(ms); },
+    now: () => NOW.getTime(),
+    signal,
+  });
+  return { client, calls, waits };
+}
+
+const zoomHangUntilAborted = (init) => new Promise((_resolve, reject) => {
+  init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+});
+const zoomNeverSettles = () => new Promise(() => {});
+const zoomConnectionReset = () => {
+  throw new TypeError(`fetch failed for https://api.zoom.us/v2/users?access_token=${ZOOM_RETRY_TOKEN}`, {
+    cause: Object.assign(new Error(`read ECONNRESET ${ZOOM_RETRY_OAUTH.clientSecret}`), { code: "ECONNRESET" }),
+  });
+};
+
+test("ZoomApiClient retries 500, 502, 503, and 504 with exponential backoff and honors Retry-After on a 5xx", async () => {
+  const { client, calls, waits } = zoomRetryHarness([
+    () => jsonResponse({ code: 500, message: "internal" }, { status: 500 }),
+    () => new Response("bad gateway", { status: 502 }),
+    () => jsonResponse({ code: 503, message: "unavailable" }, { status: 503, headers: { "retry-after": new Date(NOW.getTime() + 7_000).toUTCString() } }),
+    () => jsonResponse({ id: "user-1", email: "auditor@example.com" }),
+  ]);
+  assert.equal((await client.getCurrentUser()).id, "user-1");
+  assert.equal(calls.length, 4);
+  assert.deepEqual(waits, [1000, 2000, 7000], "backoff doubles without a Retry-After; an HTTP-date is measured against the injected clock");
+
+  const delta = zoomRetryHarness([
+    () => jsonResponse({ code: 504, message: "timeout" }, { status: 504, headers: { "retry-after": "2" } }),
+    () => jsonResponse({ id: "user-1" }),
+  ]);
+  await delta.client.getCurrentUser();
+  assert.deepEqual(delta.waits, [2000]);
+
+  for (const status of [400, 404, 501]) {
+    const final = zoomRetryHarness([() => jsonResponse({ code: status, message: "not retried" }, { status })]);
+    await assert.rejects(final.client.getCurrentUser(), (error) => error instanceof ZoomApiError && error.status === status && !/attempt/.test(error.message));
+    assert.equal(final.calls.length, 1, `HTTP ${status} is not retried`);
+  }
+});
+
+test("ZoomApiClient retry exhaustion names the path, the last status, and the attempt count, never a query value or a credential", async () => {
+  const unavailable = { code: 503, message: "Service temporarily unavailable" };
+  const { client, calls, waits } = zoomRetryHarness([() => jsonResponse(unavailable, { status: 503, statusText: "Service Unavailable" })]);
+  await assert.rejects(client.get("/users", { status: "active", next_page_token: "CANARY-PAGE-TOKEN-72" }), (error) => {
+    assert.ok(error instanceof ZoomApiError);
+    assert.equal(error.status, 503);
+    assert.equal(error.message, `Zoom request failed for GET /v2/users (503 Service Unavailable) after 4 attempts: Service temporarily unavailable (application/json body of ${Buffer.byteLength(JSON.stringify(unavailable))} bytes)`);
+    return true;
+  });
+  assert.equal(calls.length, 4);
+  assert.ok(calls.every((call) => call.search.includes("next_page_token=CANARY-PAGE-TOKEN-72")), "every attempt repeats the same request");
+  assert.deepEqual(waits, [1000, 2000, 4000]);
+
+  const limited = zoomRetryHarness([() => jsonResponse({ code: 429, message: "rate limited" }, { status: 429, statusText: "Too Many Requests" })]);
+  await assert.rejects(limited.client.getAccountSettings("security"), /^ZoomApiError: Zoom request failed for GET \/v2\/accounts\/acct-123\/settings \(429 Too Many Requests\) after 4 attempts: rate limited/);
+  assert.deepEqual(limited.waits, [1000, 2000, 4000]);
+});
+
+test("ZoomApiClient retries the OAuth token exchange and fails closed naming POST /oauth/token when it is exhausted", async () => {
+  const recovered = zoomRetryHarness([
+    () => jsonResponse({ reason: "busy" }, { status: 503 }),
+    () => jsonResponse({ access_token: "CANARY-MINTED-TOKEN-74", token_type: "bearer", expires_in: 3600 }),
+    (init) => {
+      assert.equal(new Headers(init.headers).get("authorization"), "Bearer CANARY-MINTED-TOKEN-74");
+      return jsonResponse({ id: "user-1" });
+    },
+  ], { config: ZOOM_RETRY_OAUTH });
+  assert.equal((await recovered.client.getCurrentUser()).id, "user-1");
+  assert.deepEqual(recovered.calls.map((call) => `${call.method} ${call.pathname}`), ["POST /oauth/token", "POST /oauth/token", "GET /v2/users/me"]);
+  assert.deepEqual(recovered.waits, [1000]);
+
+  const exhausted = zoomRetryHarness([
+    () => new Response("<html>upstream</html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } }),
+  ], { config: ZOOM_RETRY_OAUTH });
+  await assert.rejects(exhausted.client.getCurrentUser(), (error) => {
+    assert.equal(error.message, "Zoom request failed for POST /oauth/token (502 Bad Gateway) after 4 attempts: non-JSON text/html body of 21 bytes omitted");
+    assert.equal(error.rejection, undefined, "an exhausted token exchange is not a credential rejection");
+    assert.doesNotMatch(error.message, /CANARY/);
+    return true;
+  });
+  assert.equal(exhausted.calls.length, 4, "the request the token serves does not retry the exhausted exchange again");
+  assert.ok(exhausted.calls.every((call) => call.pathname === "/oauth/token"));
+});
+
+test("ZoomApiClient retries a request or body read that outlives the timeout and names the timeout when every attempt does", async () => {
+  const recovered = zoomRetryHarness([zoomHangUntilAborted, () => jsonResponse({ id: "user-1" })], { timeoutMs: 20 });
+  assert.equal((await recovered.client.getCurrentUser()).id, "user-1");
+  assert.deepEqual(recovered.waits, [1000]);
+
+  const stalled = zoomRetryHarness([zoomNeverSettles], { timeoutMs: 20 });
+  await assert.rejects(stalled.client.get("/users", { next_page_token: "CANARY-PAGE-TOKEN-75" }), (error) => {
+    assert.ok(error instanceof ZoomApiError);
+    assert.equal(error.message, "Zoom request failed for GET /v2/users after 4 attempts: timed out after 20 ms");
+    assert.equal(error.status, 0);
+    return true;
+  });
+  assert.equal(stalled.calls.length, 4, "a fetch that ignores its abort signal still ends at the deadline");
+  assert.deepEqual(stalled.waits, [1000, 2000, 4000]);
+
+  const slowBody = zoomRetryHarness([() => new Response(new ReadableStream({ start() {} }), { status: 200 })], { timeoutMs: 20 });
+  await assert.rejects(slowBody.client.getCurrentUser(), /Zoom request failed for GET \/v2\/users\/me after 4 attempts: timed out after 20 ms$/);
+  assert.equal(slowBody.calls.length, 4, "the deadline covers reading the body");
+});
+
+test("ZoomApiClient retries network failures and names only the system error code", async () => {
+  const recovered = zoomRetryHarness([zoomConnectionReset, () => jsonResponse({ id: "user-1" })]);
+  assert.equal((await recovered.client.getCurrentUser()).id, "user-1");
+  assert.deepEqual(recovered.waits, [1000]);
+
+  const down = zoomRetryHarness([zoomConnectionReset]);
+  await assert.rejects(down.client.getCurrentUser(), (error) => {
+    assert.equal(error.message, "Zoom request failed for GET /v2/users/me after 4 attempts: network error (ECONNRESET)");
+    assert.doesNotMatch(error.message, /CANARY|https?:/);
+    return true;
+  });
+  assert.equal(down.calls.length, 4);
+  assert.deepEqual(down.waits, [1000, 2000, 4000]);
+});
+
+test("ZoomApiClient stops at once when the tool call is aborted during a retry wait or a request", async () => {
+  const duringWait = new AbortController();
+  let waitCalls = 0;
+  const waiting = new ZoomApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      waitCalls += 1;
+      return jsonResponse({ code: 503, message: "unavailable" }, { status: 503 });
+    },
+    signal: duringWait.signal,
+    sleep: () => {
+      duringWait.abort();
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(waiting.getCurrentUser(), { name: "ToolCallAbortedError" });
+  assert.equal(waitCalls, 1);
+
+  const duringRequest = new AbortController();
+  let requestCalls = 0;
+  const requesting = new ZoomApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init) => {
+      requestCalls += 1;
+      setTimeout(() => duringRequest.abort(), 5);
+      return zoomHangUntilAborted(init);
+    },
+    signal: duringRequest.signal,
+    sleep: async () => {},
+  });
+  await assert.rejects(requesting.getCurrentUser(), { name: "ToolCallAbortedError" });
+  assert.equal(requestCalls, 1, "a tool-call abort is not retried as a timeout");
+});
+
+test("a users page that fails after retries fails the Zoom user inventory closed instead of keeping the pages already read", async () => {
+  let laterPageCalls = 0;
+  const client = httpAccountClient({}, {
+    "/users": (url) => {
+      if (!url.searchParams.get("next_page_token")) {
+        return jsonResponse({ users: [{ id: "user-1", email: "user-1@example.com", status: "active", type: 2, login_types: [101] }], total_records: 2, next_page_token: "CANARY-PAGE-TOKEN-76" });
+      }
+      laterPageCalls += 1;
+      return jsonResponse({ code: 503, message: "Service temporarily unavailable" }, { status: 503, statusText: "Service Unavailable" });
+    },
+  });
+  const snapshot = await collectZoomSnapshot(client, { now: NOW });
+  assert.equal(laterPageCalls, 4);
+  assert.equal(snapshot.users.status, "error");
+  assert.equal(snapshot.users.data, undefined, "no partial user list is kept");
+  assert.match(snapshot.users.error, /^Zoom request failed for GET \/v2\/users \(503 Service Unavailable\) after 4 attempts: /);
+  const identity = assessZoomIdentityFromSnapshot(snapshot, { now: NOW });
+  for (const id of ["ZOOM-ID-01", "ZOOM-ID-05"]) {
+    assert.notEqual(findingById(identity, id).status, "pass", id);
+  }
+  assert.doesNotMatch(JSON.stringify({ snapshot, identity }), /CANARY-PAGE-TOKEN-76/);
+});
+
 test("ZoomApiClient surfaces 403 as ZoomApiError with the status code and calls documented endpoints", async () => {
   const seen = [];
   const fetchImpl = async (input) => {
@@ -1737,10 +1927,8 @@ test("review fixes 5, 6, 8: ZOOM_DOCS cites live reference paths, a 429 without 
     { name: "no header", headers: {}, expected: 1000 },
     { name: "delta seconds", headers: { "retry-after": "3" }, expected: 3000 },
     { name: "unparseable", headers: { "retry-after": "soon" }, expected: 1000 },
-    { name: "HTTP-date far in the future is capped", headers: { "retry-after": "Wed, 21 Oct 2099 07:28:00 GMT" }, expected: 30000 },
-    { name: "HTTP-date 90 seconds after the injected clock", headers: { "retry-after": new Date(NOW.getTime() + 90_000).toUTCString() }, expected: 30000 },
     { name: "HTTP-date 20 seconds after the injected clock", headers: { "retry-after": new Date(NOW.getTime() + 20_000).toUTCString() }, expected: 20000 },
-    { name: "HTTP-date already past the injected clock floors at one second", headers: { "retry-after": new Date(NOW.getTime() - 60_000).toUTCString() }, expected: 1000 },
+    { name: "HTTP-date already past the injected clock retries at once", headers: { "retry-after": new Date(NOW.getTime() - 60_000).toUTCString() }, expected: 0 },
   ];
   for (const scenario of scenarios) {
     let attempts = 0;
@@ -1754,6 +1942,37 @@ test("review fixes 5, 6, 8: ZOOM_DOCS cites live reference paths, a 429 without 
     const settings = await client.getAccountSettings("security");
     assert.deepEqual(sleeps, [scenario.expected], scenario.name);
     assert.equal(settings.security.sign_in_with_two_factor_auth, "all", scenario.name);
+  }
+
+  // A wait beyond the 60 s cap is not slept through, shortened, or retried: the read fails closed and names the time.
+  const overCap = [
+    { name: "HTTP-date far in the future", header: "Wed, 21 Oct 2099 07:28:00 GMT", until: "2099-10-21T07:28:00.000Z" },
+    { name: "HTTP-date 90 seconds after the injected clock", header: new Date(NOW.getTime() + 90_000).toUTCString(), until: new Date(NOW.getTime() + 90_000).toISOString() },
+    { name: "delta seconds one past the cap", header: "61", until: new Date(NOW.getTime() + 61_000).toISOString() },
+  ];
+  for (const scenario of overCap) {
+    let attempts = 0;
+    const sleeps = [];
+    const client = new ZoomApiClient(sampleConfig(), {
+      fetchImpl: async () => {
+        attempts += 1;
+        return jsonResponse({ code: 429, message: "rate limited" }, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": scenario.header } });
+      },
+      sleep: async (ms) => { sleeps.push(ms); },
+      now: () => NOW.getTime(),
+    });
+    await assert.rejects(client.getAccountSettings("security"), (error) => {
+      assert.ok(error instanceof ZoomApiError, scenario.name);
+      assert.equal(error.status, 429, scenario.name);
+      assert.equal(
+        error.message,
+        `Zoom request failed for GET /v2/accounts/acct-123/settings (429 Too Many Requests) after 1 attempt: rate limited (application/json body of 37 bytes); Retry-After asks for a wait until ${scenario.until}, beyond the 60 s retry cap`,
+        scenario.name,
+      );
+      return true;
+    });
+    assert.equal(attempts, 1, scenario.name);
+    assert.deepEqual(sleeps, [], scenario.name);
   }
 
   const access = await checkZoomAccess(compliantClient(), { now: NOW });
@@ -2035,7 +2254,9 @@ test("error-body walk: every surface the collectors call, failing in three body 
       const thrown = await client.get(directPath, Object.fromEntries(targetUrl.searchParams)).then(() => null, (error) => error);
       assert.ok(thrown instanceof ZoomApiError, `${label}: the direct client call throws a ZoomApiError`);
       assertNoCanary(thrown.message, `${label} thrown message`);
-      assert.match(thrown.message, /^Zoom request failed for (GET|POST) \/\S+ \((502 Bad Gateway|403 Forbidden)\): /, label);
+      assert.match(thrown.message, shape.startsWith("502")
+        ? /^Zoom request failed for (GET|POST) \/\S+ \(502 Bad Gateway\) after 4 attempts: /
+        : /^Zoom request failed for (GET|POST) \/\S+ \(403 Forbidden\): /, label);
       assert.match(thrown.message, /(text\/html|application\/json) body of \d+ bytes/, label);
       assert.ok(thrown.message.includes(targetUrl.pathname), `${label}: the thrown message names the endpoint`);
 

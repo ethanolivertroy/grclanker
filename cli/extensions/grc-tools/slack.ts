@@ -18,11 +18,11 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
-import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SLACK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
-import { ConfigFileError, readConfigText } from "./hardening/index.js";
+import { ConfigFileError, readConfigText, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SLACK_SPEC } from "./slack.spec.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -38,9 +38,14 @@ const DEFAULT_LOOKBACK_DAYS = 30;
 const DEFAULT_MIN_RETENTION_DAYS = 365;
 const DEFAULT_OUTPUT_DIR = "./export/slack";
 const DEFAULT_CONFIG_FILE = join(homedir(), ".config", "grclanker", "slack.json");
-const MAX_RATE_LIMIT_RETRIES = 2;
+const MAX_RETRIES = 3;
+const MAX_ATTEMPTS = MAX_RETRIES + 1;
 const MAX_PAGES_PER_LIST = 50;
-const MAX_RETRY_AFTER_SECONDS = 60;
+// A server-named wait longer than this is not slept through: the request fails closed and names the time.
+const MAX_RETRY_WAIT_MS = 60_000;
+const BASE_RETRY_BACKOFF_MS = 1_000;
+const MAX_RETRY_BACKOFF_MS = 8_000;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -885,6 +890,44 @@ function withheldBody(response: Response, text: string): string {
   return `non-JSON ${contentType} body (${text.length} characters) withheld`;
 }
 
+function describeAttempts(attempts: number): string {
+  return `after ${attempts} attempt${attempts === 1 ? "" : "s"}`;
+}
+
+/**
+ * Retry-After as milliseconds from `now`: delta-seconds, or an HTTP-date (RFC 9110 section 10.2.3)
+ * already past counts as 0. Undefined when the header is absent or is neither form. The digit test
+ * comes first because Date.parse reads a bare number such as "120" as a year.
+ */
+function parseRetryAfterMs(header: string | null, now: number): number | undefined {
+  const value = header?.trim();
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return Number.parseInt(value, 10) * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(date - now, 0) : undefined;
+}
+
+function retryBackoffMs(attempt: number): number {
+  return Math.min(BASE_RETRY_BACKOFF_MS * 2 ** (attempt - 1), MAX_RETRY_BACKOFF_MS);
+}
+
+// A failed request never echoes the fetch library's message, which can carry a URL or a proxy's
+// text: only a system error code shaped like one (ECONNRESET), on the error or its cause, is kept.
+function describeTransportFailure(error: unknown): string {
+  const cause = error instanceof Error ? error.cause : undefined;
+  const code = systemErrorCode(error) ?? systemErrorCode(cause);
+  return code ? `network error (${code})` : "network error";
+}
+
+async function readText(response: Response): Promise<string> {
+  return response.text();
+}
+
+/** One request: the response with its body read, or why no response arrived in time. */
+type SlackAttempt =
+  | { kind: "response"; response: Response; text: string }
+  | { kind: "failed"; reason: string; code: "timeout" | "network_error" };
+
 /** Why a paginated collection stopped before the cursor was exhausted. */
 export type SlackTruncation = "item_cap" | "page_cap" | "stalled_cursor" | "unknown_total";
 
@@ -900,6 +943,7 @@ export class SlackApiClient {
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly signal?: AbortSignal;
 
   constructor(
     private readonly config: SlackConfiguration,
@@ -908,27 +952,70 @@ export class SlackApiClient {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
     this.sleep = abortableSleep(options.signal, options.sleep);
+    this.signal = options.signal;
   }
 
-  private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  /**
+   * One request and its body read under the configured deadline. The deadline is raced as well as passed as the
+   * request signal, so a fetch that ignores its signal still ends. A tool-call abort is rethrown and never retried.
+   */
+  private async sendOnce(url: string, init: RequestInit, readBody: (response: Response) => Promise<string>): Promise<SlackAttempt> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(controller.signal.reason);
+      }, this.config.timeoutMs);
+    });
+    const exchange = (async (): Promise<SlackAttempt> => {
+      const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
+      return { kind: "response", response, text: await readBody(response) };
+    })();
     try {
-      return await this.fetchImpl(url, { ...init, signal: controller.signal });
+      return await Promise.race([unlessAborted(exchange, this.signal), deadline]);
+    } catch (error) {
+      rethrowIfAborted(error);
+      if (this.signal?.aborted) throw new ToolCallAbortedError(this.signal);
+      if (controller.signal.aborted) return { kind: "failed", reason: `timed out after ${this.config.timeoutMs} ms`, code: "timeout" };
+      return { kind: "failed", reason: describeTransportFailure(error), code: "network_error" };
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(timer);
     }
   }
 
-  private async fetchWithRateLimit(url: URL, init: RequestInit): Promise<Response> {
-    for (let attempt = 0; ; attempt += 1) {
-      const response = await this.fetchWithTimeout(url.toString(), init);
-      if (response.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
-        const retryAfter = clampNumber(asNumber(response.headers.get("retry-after")), 1, 1, MAX_RETRY_AFTER_SECONDS);
-        await this.sleep(retryAfter * 1000);
-        continue;
+  /**
+   * Sends a request until it gets a response that is not retried. Every method this module calls reads, so every
+   * request is safe to repeat. 429, 500, 502, 503, and 504 responses, timeouts, and network failures are retried
+   * MAX_RETRIES times. A Retry-After (delta-seconds or an HTTP-date) is honored; past MAX_RETRY_WAIT_MS the
+   * request fails closed at once and names the time. Without one the wait backs off exponentially.
+   */
+  private async fetchWithRetry(
+    url: URL,
+    init: RequestInit,
+    label: string,
+    family: SlackApiFamily,
+    readBody: (response: Response) => Promise<string> = readText,
+  ): Promise<{ response: Response; text: string }> {
+    for (let attempt = 1; ; attempt += 1) {
+      const outcome = await this.sendOnce(url.toString(), init, readBody);
+      if (outcome.kind === "failed") {
+        if (attempt < MAX_ATTEMPTS) {
+          await this.sleep(retryBackoffMs(attempt));
+          continue;
+        }
+        throw new SlackApiError(`${label} failed ${describeAttempts(attempt)}: ${outcome.reason}`, label, outcome.code);
       }
-      return response;
+      const { response, text } = outcome;
+      if (!RETRYABLE_STATUSES.has(response.status)) return outcome;
+      const now = this.now().getTime();
+      const retryAfter = parseRetryAfterMs(response.headers.get("retry-after"), now);
+      if (retryAfter !== undefined && retryAfter > MAX_RETRY_WAIT_MS) {
+        const note = `Retry-After asks for a wait until ${new Date(now + retryAfter).toISOString()}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap`;
+        throw this.httpError(label, family, response, text, { attempts: attempt, note });
+      }
+      if (attempt >= MAX_ATTEMPTS) throw this.httpError(label, family, response, text, { attempts: attempt });
+      await this.sleep(retryAfter ?? retryBackoffMs(attempt));
     }
   }
 
@@ -951,9 +1038,17 @@ export class SlackApiClient {
     return json ? describeErrorFields(json, family, this.knownSecrets()) : withheldBody(response, text);
   }
 
-  private httpError(label: string, family: SlackApiFamily, response: Response, text: string): SlackApiError {
+  private httpError(
+    label: string,
+    family: SlackApiFamily,
+    response: Response,
+    text: string,
+    retry: { attempts?: number; note?: string } = {},
+  ): SlackApiError {
+    const attempts = retry.attempts === undefined ? "" : ` ${describeAttempts(retry.attempts)}:`;
+    const note = retry.note ? `; ${retry.note}` : "";
     return new SlackApiError(
-      `${label} failed (HTTP ${response.status}) ${this.describeBody(family, response, text)}`,
+      `${label} failed (HTTP ${response.status})${attempts} ${this.describeBody(family, response, text)}${note}`,
       label,
       response.status === 401 || response.status === 403 ? "http_forbidden" : `http_${response.status}`,
       response.status,
@@ -974,8 +1069,7 @@ export class SlackApiClient {
   }
 
   private async fetchJson(url: URL, init: RequestInit, label: string, family: SlackApiFamily): Promise<JsonRecord> {
-    const response = await this.fetchWithRateLimit(url, init);
-    const text = await response.text();
+    const { response, text } = await this.fetchWithRetry(url, init, label, family);
     if (!response.ok) throw this.httpError(label, family, response, text);
     return this.parseOkJson(label, response, text);
   }
@@ -990,20 +1084,18 @@ export class SlackApiClient {
     const label = `Slack Web API ${method}`;
     const url = new URL(`${this.config.webApiBaseUrl}/${method}`);
     url.search = encodeParams({ type: "public_channel", metadata_only: true }).toString();
-    const response = await this.fetchWithRateLimit(url, {
+    const isFile = (response: Response) => response.ok && (response.headers.get("content-type") ?? "").toLowerCase().includes("gzip");
+    const { response, text } = await this.fetchWithRetry(url, {
       method: "GET",
       headers: { accept: "application/gzip, application/json", authorization: `Bearer ${this.tokenFor(method)}` },
+    }, label, "web", async (candidate) => {
+      if (!isFile(candidate)) return candidate.text();
+      await candidate.body?.cancel().catch(() => undefined);
+      return "";
     });
     const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
-    if (!response.ok) {
-      const text = await response.text();
-      throw this.httpError(label, "web", response, text);
-    }
-    if (contentType.includes("gzip")) {
-      await response.body?.cancel().catch(() => undefined);
-      return { content_type: contentType };
-    }
-    const text = await response.text();
+    if (!response.ok) throw this.httpError(label, "web", response, text);
+    if (isFile(response)) return { content_type: contentType };
     const json = parseJsonRecord(text);
     if (json) this.parseOkJson(label, response, text);
     return { content_type: contentType || (json ? "application/json" : "unknown") };
