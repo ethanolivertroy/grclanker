@@ -25,7 +25,7 @@ Configure one product or both. When only one product is configured, the other pr
 
 The client sends `POST /login` with the access key ID as `username` and the secret key as `password`. It then reuses the returned JWT in the `x-redlock-auth` header.
 
-Tokens are refreshed by logging in again before the ten-minute expiry, and a `401` triggers one re-login. `429` and `5xx` responses are retried with exponential backoff (honoring `Retry-After`).
+Tokens are refreshed by logging in again before the ten-minute expiry, and a `401` triggers one re-login. Rate-limited, failing, and timed-out requests are retried a bounded number of times; see [Retries and rate limits](#retries-and-rate-limits).
 
 The access key inherits the permission group of the user who created it. Either of these is sufficient:
 
@@ -36,7 +36,7 @@ The access key inherits the permission group of the user who created it. Either 
 
 The Compute console has its own REST API under `/api/v1/`.
 
-The client first calls `POST /api/v1/authenticate` with the access key ID and secret key, and sends the returned token as `Authorization: Bearer`. When that fails, it falls back to the CSPM JWT in `x-redlock-auth`, the alternate method on the PCEE access page.
+The client first calls `POST /api/v1/authenticate` with the access key ID and secret key, and sends the returned token as `Authorization: Bearer`. When that request answers without a token, it falls back to the CSPM JWT in `x-redlock-auth`, the alternate method on the PCEE access page. When it gets no answer at all after its retries, the Compute read that needed it fails and that surface is unreadable.
 
 Only System Admin users (mapped to the Compute Administrator role) can call the Compute API.
 
@@ -59,7 +59,7 @@ Use a read-only administrator: the built-in `superreader`, or a custom admin rol
 
 Precedence is explicit tool arguments, then environment variables, then the config file, resolved per value. When `PANOS_USERNAME` and `PANOS_PASSWORD` both come from a higher-precedence source than `PANOS_API_KEY`, the client runs keygen and ignores the key. For example, both are arguments while the key sits in the environment.
 
-The HTTP timeout defaults to 30 seconds. It comes only from the `timeout_seconds` argument or the `PALOALTO_TIMEOUT` environment variable (seconds). The config file does not set it.
+The HTTP timeout defaults to 30 seconds and covers reading the response body as well as the headers. It comes only from the `timeout_seconds` argument or the `PALOALTO_TIMEOUT` environment variable (seconds). The config file does not set it.
 
 The file accepts exactly these keys. The environment variable spelling is read first, and the lowercase argument spelling is the fallback.
 
@@ -432,11 +432,38 @@ The test suite then serves each of the 13 array surfaces a documented list with 
 
 Response bodies are never echoed.
 
-- A Prisma Cloud or Compute error with a non-JSON body (an HTML 502 page, an SSO interstitial, a WAF block) is described only as `failed ({status}): non-JSON {content-type} response body ({n} bytes, not echoed)`, whatever content type the server claimed.
+- A Prisma Cloud or Compute error with a non-JSON body (an HTML error page, an SSO interstitial, a WAF block) is described only as `failed ({status}): non-JSON {content-type} response body ({n} bytes, not echoed)`, whatever content type the server claimed.
 - A JSON body contributes only Prisma Cloud's documented error fields: `message`, `i18nKey`, `error.message`, Compute's `err`, and the `i18nKey`, `message`, or `subject` entries of the `x-redlock-status` header. Each field is scrubbed before it is shortened to 200 characters.
 - A JSON body without those fields is described by length only.
 - A PAN-OS response without a `<response>` element is described as `returned a non-XML {content-type} response (status {n}, {n} bytes, not echoed)`.
 - An XML error contributes only the `<msg>` or `<line>` text and the response `code`, scrubbed before the 300-character cap.
+- A request that ended on a 429, 500, 502, 503, or 504 also names its attempt count, as in `failed after 4 attempts ({status})`, or `(status {n}, {n} bytes, not echoed) after 4 attempts` in the PAN-OS non-XML note. A refused `Retry-After` is named after the detail.
+- A timeout or network error that outlasts the retries is described as `failed after 4 attempts (timed out after {n} ms)` or `failed after 4 attempts (network error: {message})`. The error names the request, never its URL.
+- A PAN-OS read skipped because its device gave no answer is described as `was not attempted because {host} did not answer an earlier request ({timeout or network error}, after 4 attempts)`; see [Retries and rate limits](#retries-and-rate-limits).
+
+### Retries and rate limits
+
+Every Prisma Cloud, Compute, and PAN-OS request is retried when it gets a 429, 500, 502, 503, or 504, times out, or fails with a network error, up to 3 times after the first attempt. That includes the Prisma Cloud login, the Compute authentication, and PAN-OS keygen.
+
+- The wait before each retry is the server's `Retry-After`, as seconds or an HTTP date, when the response carries one. Otherwise it is 500 milliseconds, doubled after each retry and capped at 8 seconds.
+- A `Retry-After` above 30 seconds is not waited out. The request fails at once, and its error names the wait the server asked for.
+- Any other 4xx answer, such as 400, 403, or 404, is not retried. A PAN-OS error response is retried only when it arrives with one of those five statuses, so an error reply on a `200` fails at once. A Prisma Cloud `401` triggers the one re-login described under [Prisma Cloud](#prisma-cloud) instead.
+
+A request that runs out of retries fails with the request, the attempt count, and the last status, timeout, or network error, for example `Prisma Cloud GET /v2/policy failed after 4 attempts (503): Service temporarily unavailable`. Its surface is then unreadable and follows the rules below, so no finding that reads it passes:
+
+- A page that fails partway through the alert walk or a Compute walk fails the whole walk, so the pages already read are not reported as the inventory.
+- A PAN-OS read that fails on one device leaves that subtree on that device unreadable, and the findings that need it name the device.
+
+Because a timeout is retried, a request to a host that never answers takes four timeouts and 3.5 seconds of waits, about two minutes at the 30-second default, before its surface is reported unreadable.
+
+When a PAN-OS request, keygen included, runs out of retries on a timeout or a network error, that device is not asked again for the rest of the tool call:
+
+- Each of its later reads fails at once without being sent, for example `PAN-OS config show /config/shared was not attempted because fw1.example.com did not answer an earlier request (timed out after 30000 ms, after 4 attempts).`
+- Each skipped read is unreadable like any failed read. Its not-collected marker names the request that got no answer, with a `null` status, and no finding passes on that device.
+- An HTTP answer of any status skips nothing. A 403, an `Invalid Credential`, a 5xx after its retries, or a refused `Retry-After` means the device answered, so its other reads are still sent.
+- Other devices are not affected.
+
+A device that never answers therefore costs about two minutes at the 30-second default in each tool call that reads it (`paloalto_check_access`, an assessment, or `paloalto_export_audit_bundle`), rather than two minutes for each of its reads. The export pays it once, in its access probe, because it collects through the same clients. Lower `timeout_seconds` or `PALOALTO_TIMEOUT` to shorten that wait when a listed device may be offline.
 
 ### Verdict-safety rules
 
@@ -513,7 +540,7 @@ A finding that reads several surfaces never passes on a partial view. It is `man
 
 - `GET /v2/alert` for PA-02, PA-03, PA-05, and PA-06.
 - `GET /cloud/group` for PA-04.
-- `GET /defenders` for PA-08 and PA-09.
+- `GET /defenders` for PA-08, PA-09, and PA-10.
 - `GET /images` and `GET /stats/vulnerabilities` for PA-07.
 - `GET /registry` for PA-11.
 - `/config/shared` for PA-15's authentication profiles.
@@ -541,7 +568,7 @@ A surface that was refused, failed, or never reached is never written as an empt
 - `seen` and `truncated` render `null` for a surface that was not read.
 - `seen` renders `null` for a truncated walk that delivered no record, because `0` would read as an empty inventory.
 
-Every endpoint or status code named anywhere in a finding, summary, tool result, or `_errors.log` line is the request that was actually made and the status it actually returned. The method and path are taken from the thrown error. A transport failure records a `null` status.
+Every endpoint or status code named anywhere in a finding, summary, tool result, or `_errors.log` line is the request that was actually made and the status it actually returned. The method and path are taken from the thrown error. A transport failure records a `null` status. A PAN-OS read that was not attempted names the earlier request its device did not answer, also with a `null` status.
 
 #### Export reruns
 

@@ -55,6 +55,7 @@ import {
   xmlText,
   xmlToJson,
 } from "../dist/extensions/grc-tools/paloalto.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { PALOALTO_COMPLETENESS_SOURCES, PALOALTO_SPEC } from "../dist/extensions/grc-tools/paloalto.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -2904,7 +2905,7 @@ test("describePrismaErrorBody and PanosApiClient.parseResponse describe non-JSON
   const nonXml = new PanosApiClient({ host: "fw.example.com", baseUrl: "https://fw.example.com", apiKey: "LUFRPT-key" }, { fetchImpl: async () => htmlCanaryResponse(), retryAttempts: 0 });
   await assert.rejects(nonXml.showConfig("/config/shared"), (error) => {
     assertNoCanary(error.message, "PAN-OS HTML body");
-    assert.equal(error.message, `PAN-OS config show /config/shared on fw.example.com returned a non-XML text/html response (status 502, ${htmlText.length} bytes, not echoed).`);
+    assert.equal(error.message, `PAN-OS config show /config/shared on fw.example.com returned a non-XML text/html response (status 502, ${htmlText.length} bytes, not echoed) after 1 attempt.`);
     return true;
   });
   const nonJson = new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "k", secretKey: "s" }, {
@@ -4262,7 +4263,9 @@ test("addendum 5: an unreachable Compute console writes an unavailable marker na
   assert.equal(device.collection.system_info.seen, null);
   for (const xpath of FIREWALL_XPATHS) {
     assert.equal(device.config[xpath].collected, false, xpath);
-    assert.equal(device.config[xpath].endpoint, `GET /api/?type=config&action=show&xpath=${xpath}`, xpath);
+    assert.equal(device.config[xpath].status, null, xpath);
+    assert.equal(device.config[xpath].endpoint, systemInfoRead, `${xpath} was never sent, so its marker names the system info request that got no answer`);
+    assert.match(device.config[xpath].error, /was not attempted because fw2\.example\.com did not answer an earlier request \(.*ECONNREFUSED/, xpath);
   }
 
   // A device that must generate its key names the keygen request when that is what failed.
@@ -4967,4 +4970,655 @@ test("byte differential fixtures: Palo Alto assessments and export artifacts", {
 writeFailureTest("exportPaloaltoAuditBundle leaves nothing under the output root when a write fails partway", async () => {
   const base = createTempBase("grclanker-paloalto-write-failure-");
   await assertNoPartialBundleOnWriteFailure(base, () => exportPaloaltoAuditBundle(createPaloaltoClients(bothProductsConfig(), mockedFetch()), base));
+});
+
+// Retries: a 429, 500, 502, 503, or 504, a timeout, and a network error are retried up to three times after the
+// first attempt. Every harness injects the clock and records the retry waits instead of sleeping, so these tests
+// take milliseconds.
+const PALOALTO_RETRY_NOW = new Date("2026-10-23T04:00:00Z");
+const PRISMA_UNAVAILABLE = { message: "Service temporarily unavailable" };
+const RETRY_SESSION_TOKEN = "jwt-retry-session-7d2f9c41";
+
+function unavailable(status, headers = {}) {
+  return jsonResponse(PRISMA_UNAVAILABLE, { status, headers });
+}
+
+function panosUnavailable(headers = {}) {
+  return new Response("", { status: 503, statusText: "Service Unavailable", headers });
+}
+
+/**
+ * Prisma Cloud and Compute clients over one fetch whose answers come from `answer`; undefined falls through to a
+ * login that returns RETRY_SESSION_TOKEN, then to the healthy mock. Each request and each retry wait is recorded,
+ * and attempt counts each distinct URL apart, so the pages of one walk are counted separately.
+ */
+function prismaRetryHarness(answer, options = {}) {
+  const healthy = mockedFetch();
+  const waits = [];
+  const requests = [];
+  const attempts = new Map();
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const request = `${init.method ?? "GET"} ${url.pathname}`;
+    requests.push(request);
+    const attempt = (attempts.get(`${request}${url.search}`) ?? 0) + 1;
+    attempts.set(`${request}${url.search}`, attempt);
+    const answered = await answer({ url, init, attempt });
+    if (answered !== undefined) return answered;
+    if (url.pathname === "/login") return jsonResponse({ token: RETRY_SESSION_TOKEN });
+    return healthy(input, init);
+  };
+  const prisma = new PrismaCloudClient(
+    { apiUrl: "https://api2.prismacloud.io", accessKeyId: "key-id", secretKey: FIXTURE_SECRET_KEY },
+    { fetchImpl, now: () => PALOALTO_RETRY_NOW, sleepImpl: async (ms) => { waits.push(ms); }, ...options },
+  );
+  return { prisma, compute: new PrismaComputeClient("https://compute.example.com", prisma), waits, requests };
+}
+
+/** PAN-OS clients reached through keygen whose answers come from `answer`, keyed "<host> keygen" or "<host> <xpath or cmd>"; undefined falls through to the healthy mock. */
+function panosRetryHarness(answer, options = {}) {
+  const healthy = mockedFetch();
+  const waits = [];
+  const requests = [];
+  const attempts = new Map();
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const request = `${url.hostname} ${init.method === "POST" ? "keygen" : url.searchParams.get("xpath") ?? url.searchParams.get("cmd")}`;
+    requests.push(request);
+    const attempt = (attempts.get(request) ?? 0) + 1;
+    attempts.set(request, attempt);
+    return (await answer({ url, init, request, attempt })) ?? healthy(input, init);
+  };
+  const client = (host) => new PanosApiClient(
+    { host, baseUrl: `https://${host}`, username: "auditor", password: FIXTURE_PANOS_PASSWORD },
+    { fetchImpl, now: () => PALOALTO_RETRY_NOW, sleepImpl: async (ms) => { waits.push(ms); }, ...options },
+  );
+  return { client, waits, requests };
+}
+
+/** A request that never answers: it rejects only when the client's timeout aborts it. */
+function neverAnswers(init) {
+  return new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+  });
+}
+
+/** A 200 whose body stops partway: reading it fails only when the client's timeout aborts the request. */
+function bodyStalls(init) {
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('[{"name":'));
+      init.signal.addEventListener("abort", () => controller.error(init.signal.reason), { once: true });
+    },
+  });
+  return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+}
+
+test("Prisma Cloud, Compute, and PAN-OS retry 429 and 5xx answers after Retry-After, read as delta-seconds or an HTTP date, and otherwise after 500, 1000, then 2000 ms", async () => {
+  const prisma = prismaRetryHarness(({ url, attempt }) => {
+    if (url.pathname !== "/v2/policy") return undefined;
+    if (attempt === 1) return unavailable(429, { "retry-after": "2" });
+    if (attempt === 2) return unavailable(503, { "retry-after": new Date(PALOALTO_RETRY_NOW.getTime() + 7_000).toUTCString() });
+    if (attempt === 3) return unavailable(502);
+    return jsonResponse([{ name: "policy" }]);
+  });
+  assert.deepEqual(await prisma.prisma.listPolicies(), [{ name: "policy" }]);
+  assert.deepEqual(prisma.waits, [2_000, 7_000, 2_000], "Retry-After is waited out when the answer carries it, the backoff step otherwise");
+  assert.deepEqual(prisma.requests, ["POST /login", ...Array(4).fill("GET /v2/policy")], "a retry repeats the request it retries");
+
+  const edges = prismaRetryHarness(({ url, attempt }) => {
+    if (url.pathname !== "/cloud") return undefined;
+    if (attempt === 1) return unavailable(429, { "retry-after": "30" });
+    if (attempt === 2) return unavailable(500, { "retry-after": "0" });
+    return undefined;
+  });
+  assert.ok((await edges.prisma.listCloudAccounts()).length > 0);
+  assert.deepEqual(edges.waits, [30_000, 0], "a Retry-After of exactly 30 s is waited out, and one of 0 retries at once");
+
+  const compute = prismaRetryHarness(({ url, attempt }) => {
+    if (url.pathname !== "/api/v1/defenders") return undefined;
+    if (attempt === 1) return jsonResponse({ err: "Defender service busy" }, { status: 500 });
+    if (attempt === 2) return jsonResponse({ err: "Defender service busy" }, { status: 504 });
+    return undefined;
+  });
+  const defenders = await compute.compute.listDefenders();
+  assert.equal(defenders.items.length, 1);
+  assert.equal(defenders.truncated, false);
+  assert.deepEqual(compute.waits, [500, 1_000]);
+
+  const panos = panosRetryHarness(({ request, attempt }) => (request === "fw.example.com /config/shared" && attempt === 1 ? panosUnavailable() : undefined));
+  const shared = await panos.client("fw.example.com").showConfig("/config/shared");
+  assert.equal(xmlText(xmlPath(shared, ["shared", "ssl-tls-service-profile", "entry", "protocol-settings", "min-version"])), "tls1-2");
+  assert.deepEqual(panos.waits, [500]);
+  assert.deepEqual(panos.requests, ["fw.example.com keygen", "fw.example.com /config/shared", "fw.example.com /config/shared"]);
+});
+
+test("after 4 attempts a Prisma Cloud, Compute, or PAN-OS read fails naming the request, the attempt count, and the last status, and a 4xx answer is not retried", async () => {
+  for (const status of [429, 500, 502, 503, 504]) {
+    const harness = prismaRetryHarness(({ url }) => (url.pathname === "/v2/policy" ? unavailable(status) : undefined));
+    await assert.rejects(harness.prisma.listPolicies(), (error) => {
+      assert.ok(error instanceof PaloaltoApiError);
+      assert.equal(error.message, `Prisma Cloud GET /v2/policy failed after 4 attempts (${status}): Service temporarily unavailable`);
+      assert.equal(error.status, status);
+      assert.equal(error.endpoint, "GET /v2/policy");
+      return true;
+    });
+    assert.deepEqual(harness.waits, [500, 1_000, 2_000], `status ${status}`);
+    assert.equal(harness.requests.filter((request) => request === "GET /v2/policy").length, 4, `status ${status}`);
+  }
+
+  const login = prismaRetryHarness(({ url }) => (url.pathname === "/login" ? unavailable(502) : undefined));
+  await assert.rejects(login.prisma.listPolicies(), (error) => {
+    assert.equal(error.message, "Prisma Cloud POST /login failed after 4 attempts (502): Service temporarily unavailable");
+    assert.equal(error.endpoint, "POST /login");
+    return true;
+  });
+
+  const compute = prismaRetryHarness(({ url }) => (url.pathname === "/api/v1/defenders" ? jsonResponse({ err: "Defender service busy" }, { status: 503 }) : undefined));
+  await assert.rejects(compute.compute.listDefenders(), (error) => {
+    assert.equal(error.message, "Prisma Cloud Compute GET /defenders failed after 4 attempts (503): Defender service busy");
+    assert.equal(error.endpoint, "GET /api/v1/defenders");
+    return true;
+  });
+
+  const panos = panosRetryHarness(({ request }) => {
+    if (request === "fw.example.com /config/shared") return panosUnavailable();
+    if (request === "fw.example.com /config/mgt-config") return xmlResponse('<response status="error" code="22"><msg>Server busy</msg></response>', 502);
+    return undefined;
+  });
+  const device = panos.client("fw.example.com");
+  await assert.rejects(device.showConfig("/config/shared"), (error) => {
+    assert.equal(error.message, "PAN-OS config show /config/shared on fw.example.com failed after 4 attempts (503 Service Unavailable).");
+    assert.equal(error.status, 503);
+    assert.equal(error.endpoint, "GET /api/?type=config&action=show&xpath=/config/shared");
+    return true;
+  });
+  await assert.rejects(device.showConfig("/config/mgt-config"), (error) => {
+    assert.equal(error.message, "PAN-OS config show /config/mgt-config on fw.example.com failed after 4 attempts (code 22, status 502): Server busy");
+    return true;
+  });
+
+  const keygen = panosRetryHarness(({ request }) => (request === "fw.example.com keygen" ? panosUnavailable() : undefined));
+  await assert.rejects(keygen.client("fw.example.com").showSystemInfo(), (error) => {
+    assert.equal(error.message, "PAN-OS keygen for fw.example.com failed after 4 attempts (503).");
+    assert.equal(error.endpoint, "POST /api/?type=keygen");
+    return true;
+  });
+
+  const refused = prismaRetryHarness(({ url }) => (url.pathname === "/v2/policy" ? jsonResponse({ message: "Invalid filter" }, { status: 400 }) : undefined));
+  await assert.rejects(refused.prisma.listPolicies(), (error) => {
+    assert.equal(error.message, "Prisma Cloud GET /v2/policy failed (400): Invalid filter");
+    return true;
+  });
+  assert.deepEqual(refused.waits, []);
+  assert.deepEqual(refused.requests, ["POST /login", "GET /v2/policy"]);
+});
+
+test("a Retry-After over 30 s is not waited out: the Prisma Cloud or PAN-OS read fails at once and names the wait the server asked for", async () => {
+  const header = prismaRetryHarness(({ url }) => (url.pathname === "/v2/policy" ? unavailable(429, { "retry-after": "31" }) : undefined));
+  await assert.rejects(header.prisma.listPolicies(), (error) => {
+    assert.equal(error.message, "Prisma Cloud GET /v2/policy failed after 1 attempt (429): Service temporarily unavailable; the server asked to retry after 31 s, more than the 30 s limit");
+    assert.equal(error.status, 429);
+    return true;
+  });
+  assert.deepEqual(header.waits, []);
+  assert.deepEqual(header.requests, ["POST /login", "GET /v2/policy"]);
+
+  const date = prismaRetryHarness(({ url, attempt }) => {
+    if (url.pathname !== "/cloud") return undefined;
+    if (attempt === 1) return unavailable(503);
+    return unavailable(503, { "retry-after": new Date(PALOALTO_RETRY_NOW.getTime() + 120_000).toUTCString() });
+  });
+  await assert.rejects(date.prisma.listCloudAccounts(), (error) => {
+    assert.equal(error.message, "Prisma Cloud GET /cloud failed after 2 attempts (503): Service temporarily unavailable; the server asked to retry after 120 s, more than the 30 s limit");
+    return true;
+  });
+  assert.deepEqual(date.waits, [500], "only the wait before the refused answer was taken");
+
+  const panos = panosRetryHarness(({ request }) => (request === "fw.example.com /config/shared" ? panosUnavailable({ "retry-after": "45" }) : undefined));
+  await assert.rejects(panos.client("fw.example.com").showConfig("/config/shared"), (error) => {
+    assert.equal(error.message, "PAN-OS config show /config/shared on fw.example.com failed after 1 attempt (503 Service Unavailable); the server asked to retry after 45 s, more than the 30 s limit.");
+    return true;
+  });
+  assert.deepEqual(panos.waits, []);
+});
+
+test("a Prisma Cloud, Compute, or PAN-OS timeout, including a body that stalls after the headers, and a network error are retried, then fail naming the request rather than its URL", async () => {
+  const recovers = prismaRetryHarness(({ url, init, attempt }) => {
+    if (url.pathname !== "/v2/policy") return undefined;
+    if (attempt === 1) return neverAnswers(init);
+    if (attempt === 2) return bodyStalls(init);
+    return undefined;
+  }, { timeoutMs: 20 });
+  assert.ok((await recovers.prisma.listPolicies()).length > 0);
+  assert.deepEqual(recovers.waits, [500, 1_000]);
+
+  const stalls = prismaRetryHarness(({ url, init }) => (url.pathname === "/v2/policy" ? bodyStalls(init) : undefined), { timeoutMs: 20 });
+  await assert.rejects(stalls.prisma.listPolicies(), (error) => {
+    assert.ok(error instanceof PaloaltoApiError);
+    assert.equal(error.message, "Prisma Cloud GET /v2/policy failed after 4 attempts (timed out after 20 ms)");
+    assert.equal(error.status, null);
+    assert.equal(error.endpoint, "GET /v2/policy");
+    return true;
+  });
+  assert.deepEqual(stalls.waits, [500, 1_000, 2_000]);
+
+  const authenticate = prismaRetryHarness(({ url }) => (url.pathname === "/api/v1/authenticate" ? Promise.reject(new TypeError("fetch failed")) : undefined));
+  await assert.rejects(authenticate.compute.listDefenders(), (error) => {
+    assert.equal(error.message, "Prisma Cloud Compute POST /api/v1/authenticate failed after 4 attempts (network error: fetch failed)");
+    assert.equal(error.endpoint, "POST /api/v1/authenticate");
+    return true;
+  });
+
+  const offline = panosRetryHarness(({ request }) => (request === "fw.example.com /config/shared" ? Promise.reject(new TypeError("fetch failed")) : undefined));
+  await assert.rejects(offline.client("fw.example.com").showConfig("/config/shared"), (error) => {
+    assert.equal(error.message, "PAN-OS config show /config/shared on fw.example.com failed after 4 attempts (network error: fetch failed)");
+    assert.equal(error.status, null);
+    assert.equal(error.endpoint, "GET /api/?type=config&action=show&xpath=/config/shared");
+    return true;
+  });
+  assert.deepEqual(offline.waits, [500, 1_000, 2_000]);
+});
+
+test("a read that runs out of retries partway through a walk or on one device fails that whole surface, so no finding that reads it passes", async () => {
+  const alerts = prismaRetryHarness(({ url }) => {
+    if (url.pathname !== "/v2/alert") return undefined;
+    if (!url.searchParams.get("pageToken")) {
+      return jsonResponse({ items: [{ id: "alert-1", status: "open", policy: { name: "AWS S3 bucket public", policyType: "network", severity: "high" } }], nextPageToken: "page-2" });
+    }
+    return unavailable(503);
+  });
+  const cspm = await collectPrismaSnapshot(alerts.prisma);
+  assert.ok(cspm.failed.includes("open alerts"));
+  assert.deepEqual(cspm.alerts, [], "the page read before the failure is not reported as the inventory");
+  assert.equal(cspm.alertsTruncated, null);
+  assert.equal(cspm.failures["open alerts"].error, "Prisma Cloud GET /v2/alert failed after 4 attempts (503): Service temporarily unavailable");
+  const posture = assessPrismaCloudPosture(cspm);
+  for (const id of ["PA-02", "PA-03", "PA-05"]) {
+    const result = posture.find((item) => item.id === id);
+    assert.notEqual(result.status, "pass", `${id}: ${result.summary}`);
+    assert.ok(result.summary.includes("prisma-cloud open alerts unreadable"), `${id}: ${result.summary}`);
+  }
+
+  const fullPage = Array.from({ length: 50 }, (_, index) => ({ hostname: `node-${index}`, connected: true, version: "34.00.100", lastModified: "2026-09-01T00:00:00Z" }));
+  const defenders = prismaRetryHarness(({ url }) => {
+    if (url.pathname !== "/api/v1/defenders") return undefined;
+    return url.searchParams.get("offset") === "0" ? jsonResponse(fullPage) : jsonResponse({ err: "Defender service busy" }, { status: 503 });
+  });
+  const withCompute = await collectPrismaSnapshot(defenders.prisma, undefined, { client: defenders.compute });
+  assert.ok(withCompute.compute.failed.includes("defenders"));
+  assert.deepEqual(withCompute.compute.defenders, [], "the full first page is not reported as the inventory");
+  assert.equal(withCompute.compute.failures.defenders.error, "Prisma Cloud Compute GET /defenders failed after 4 attempts (503): Defender service busy");
+  const cwpp = assessPrismaCompute(withCompute);
+  for (const id of ["PA-08", "PA-09", "PA-10"]) {
+    const result = cwpp.find((item) => item.id === id);
+    assert.notEqual(result.status, "pass", `${id}: ${result.summary}`);
+    assert.ok(result.summary.includes("prisma-compute defenders unreadable"), `${id}: ${result.summary}`);
+  }
+
+  const fleet = panosRetryHarness(({ request }) => (request === "fw2.example.com /config/devices/entry/vsys" ? panosUnavailable() : undefined));
+  const devices = [await collectPanosSnapshot(fleet.client("fw1.example.com")), await collectPanosSnapshot(fleet.client("fw2.example.com"))];
+  assert.deepEqual(devices[0].failedXpaths, []);
+  assert.deepEqual(devices[1].failedXpaths, ["/config/devices/entry/vsys"]);
+  assert.equal(devices[1].failures["/config/devices/entry/vsys"].error, "PAN-OS config show /config/devices/entry/vsys on fw2.example.com failed after 4 attempts (503 Service Unavailable).");
+  const rulebase = assessPanosFirewallPolicy(devices).find((item) => item.id === "PA-12");
+  assert.notEqual(rulebase.status, "pass", rulebase.summary);
+  assert.ok(rulebase.summary.includes("fw2.example.com config show failed for /config/devices/entry/vsys"), rulebase.summary);
+});
+
+test("an abort during a Prisma Cloud or PAN-OS retry wait stops the read at once and sends no further request", async () => {
+  for (const product of ["prisma", "panos"]) {
+    const controller = new AbortController();
+    const waits = [];
+    let reads = 0;
+    const sleepImpl = (ms) => {
+      waits.push(ms);
+      controller.abort(new Error("operator cancelled"));
+      return new Promise(() => {});
+    };
+    const fetchImpl = async (input) => {
+      if (new URL(String(input)).pathname === "/login") return jsonResponse({ token: RETRY_SESSION_TOKEN });
+      reads += 1;
+      return product === "prisma" ? unavailable(503) : panosUnavailable();
+    };
+    const read = product === "prisma"
+      ? new PrismaCloudClient({ apiUrl: "https://api2.prismacloud.io", accessKeyId: "key-id", secretKey: FIXTURE_SECRET_KEY }, { fetchImpl, sleepImpl, signal: controller.signal }).listPolicies()
+      : new PanosApiClient({ host: "fw.example.com", baseUrl: "https://fw.example.com", apiKey: "LUFRPT-abort-key" }, { fetchImpl, sleepImpl, signal: controller.signal }).showConfig("/config/shared");
+    await assert.rejects(read, ToolCallAbortedError, product);
+    assert.equal(reads, 1, product);
+    assert.deepEqual(waits, [500], product);
+  }
+});
+
+test("Prisma Cloud and PAN-OS retry errors carry no credential when a transport failure or a 5xx body echoes one", async () => {
+  const transport = prismaRetryHarness(({ url }) => (url.pathname === "/v2/policy"
+    ? Promise.reject(new TypeError(`fetch failed: proxy refused x-redlock-auth ${RETRY_SESSION_TOKEN} with password ${FIXTURE_SECRET_KEY}`))
+    : undefined));
+  await assert.rejects(transport.prisma.listPolicies(), (error) => {
+    assert.match(error.message, /^Prisma Cloud GET \/v2\/policy failed after 4 attempts \(network error: fetch failed: proxy refused /);
+    for (const secret of [RETRY_SESSION_TOKEN, ...secretForms(FIXTURE_SECRET_KEY)]) assert.ok(!error.message.includes(secret), error.message);
+    return true;
+  });
+
+  const body = prismaRetryHarness(({ url }) => (url.pathname === "/cloud" ? jsonResponse({ message: `upstream rejected token ${RETRY_SESSION_TOKEN}` }, { status: 503 }) : undefined));
+  await assert.rejects(body.prisma.listCloudAccounts(), (error) => {
+    assert.match(error.message, /^Prisma Cloud GET \/cloud failed after 4 attempts \(503\): upstream rejected token /);
+    assert.ok(!error.message.includes(RETRY_SESSION_TOKEN), error.message);
+    return true;
+  });
+
+  const keygen = panosRetryHarness(({ request }) => (request === "fw.example.com keygen"
+    ? Promise.reject(new TypeError(`connect ETIMEDOUT while posting user=auditor&password=${encodeURIComponent(FIXTURE_PANOS_PASSWORD)}`))
+    : undefined));
+  await assert.rejects(keygen.client("fw.example.com").showSystemInfo(), (error) => {
+    assert.match(error.message, /^PAN-OS keygen for fw\.example\.com failed after 4 attempts \(network error: connect ETIMEDOUT while posting /);
+    for (const secret of secretForms(FIXTURE_PANOS_PASSWORD)) assert.ok(!error.message.includes(secret), error.message);
+    return true;
+  });
+
+  const echo = panosRetryHarness(({ request }) => (request === "fw.example.com /config/shared"
+    ? xmlResponse('<response status="error" code="22"><msg>Server busy for key LUFRPT-generated-fake</msg></response>', 503)
+    : undefined));
+  await assert.rejects(echo.client("fw.example.com").showConfig("/config/shared"), (error) => {
+    assert.match(error.message, /^PAN-OS config show \/config\/shared on fw\.example\.com failed after 4 attempts \(code 22, status 503\): Server busy for key /);
+    assert.ok(!error.message.includes("LUFRPT-generated-fake"), error.message);
+    return true;
+  });
+});
+
+// A PAN-OS device that gives no answer: once one request's retries run out on a timeout or a network error,
+// the device's later reads are not attempted. The timeout variant runs the client's 30 s default timeout on
+// mocked timers, so neither a timeout nor a retry wait really elapses.
+const OFFLINE_HOST = "fw-offline.example.com";
+const ONLINE_HOST = "fw-online.example.com";
+const OFFLINE_API_KEY = "Hq4vT9zKp2WmX7cRb5Nd";
+const SYSTEM_INFO_CMD = "<show><system><info></info></system></show>";
+const HA_STATE_CMD = "<show><high-availability><state></state></high-availability></show>";
+// Every read of a firewall, in the order the access check and the snapshot send them.
+const PANOS_READS = [SYSTEM_INFO_CMD, HA_STATE_CMD, ...FIREWALL_XPATHS];
+const PANOS_READ_LABELS = {
+  [SYSTEM_INFO_CMD]: `op ${SYSTEM_INFO_CMD}`,
+  [HA_STATE_CMD]: `op ${HA_STATE_CMD.slice(0, 60)}`,
+  ...Object.fromEntries(FIREWALL_XPATHS.map((xpath) => [xpath, `config show ${xpath}`])),
+};
+const PANOS_FAILURE_KEYS = { [SYSTEM_INFO_CMD]: "show system info", [HA_STATE_CMD]: "show high-availability state" };
+
+function panosReadEndpoint(read) {
+  return read.startsWith("<") ? `GET /api/?type=op&cmd=${read}` : `GET /api/?type=config&action=show&xpath=${read}`;
+}
+
+function panosSurfaceName(read) {
+  if (read === SYSTEM_INFO_CMD) return "system_info";
+  if (read === HA_STATE_CMD) return "ha_state";
+  return read.split("/").at(-1);
+}
+
+/** Runs `body` once per way a request gets no answer, the timeout variant on mocked timers. */
+async function forEachNoAnswer(t, body) {
+  for (const variant of ["timeout", "network error"]) {
+    if (variant === "timeout") t.mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      await body(variant, variant === "timeout" ? "timed out after 30000 ms" : "network error: fetch failed");
+    } finally {
+      t.mock.timers.reset();
+    }
+  }
+}
+
+/**
+ * PAN-OS clients for `env` over one fetch in which every request to an offline host gets no answer: it runs out
+ * the client's timeout on the mocked timers ("timeout") or fails at once with `failure` ("network error"). Other
+ * hosts get the healthy mock. Each request is recorded as "<host> <cmd, xpath, or keygen>" and, for
+ * paloaltoRequestObserved, under recorded; each retry wait is recorded instead of slept, and elapsedMs adds up the
+ * timeouts and the waits.
+ */
+function unansweredHarness(t, variant, env = { PANOS_HOST: OFFLINE_HOST, PANOS_API_KEY: OFFLINE_API_KEY }, { failure = () => new TypeError("fetch failed") } = {}) {
+  const config = resolvePaloaltoConfiguration({}, env);
+  const healthy = mockedFetch();
+  const harness = { requests: [], waits: [], elapsedMs: 0 };
+  const recording = recordingPaloaltoFetch(async (input, init = {}) => {
+    const url = new URL(String(input));
+    harness.requests.push(`${url.hostname} ${init.method === "POST" ? "keygen" : url.searchParams.get("xpath") ?? url.searchParams.get("cmd")}`);
+    if (url.hostname !== OFFLINE_HOST) return healthy(input, init);
+    if (variant === "network error") throw failure();
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      harness.elapsedMs += config.timeoutMs;
+      t.mock.timers.tick(config.timeoutMs);
+    });
+  });
+  harness.recorded = recording.requests;
+  const sleepImpl = async (ms) => {
+    harness.waits.push(ms);
+    harness.elapsedMs += ms;
+  };
+  const options = { fetchImpl: recording.fetchImpl, sleepImpl, now: () => PALOALTO_RETRY_NOW, timeoutMs: config.timeoutMs, retryAttempts: config.retryAttempts, verifyTls: config.verifyTls };
+  harness.clients = () => ({ config, panos: config.panos.map((host) => new PanosApiClient(host, options)) });
+  harness.sentTo = (host) => harness.requests.filter((request) => request.startsWith(`${host} `)).map((request) => request.slice(host.length + 1));
+  return harness;
+}
+
+/** Every endpoint `value` names, with the status it names, is a request the harness sent (to `host` when given): a skipped read names none of its own. */
+function assertNamesOnlySentRequests(harness, value, label, host) {
+  const sent = host === undefined ? harness.recorded : harness.recorded.filter((request) => request.host === host);
+  const mentions = endpointMentions(value, [label]);
+  assert.ok(mentions.length > 0, `${label} names no request`);
+  for (const mention of mentions) {
+    assert.ok(paloaltoRequestObserved(sent, mention.endpoint, mention.status), `${mention.at} names ${mention.endpoint} (status ${mention.status}) but no such request was sent${host === undefined ? "" : ` to ${host}`}`);
+  }
+}
+
+test("a PAN-OS device that never answers costs one read's 4 attempts: every later read is not attempted, fails naming the earlier timeout or network error, and no control passes", async (t) => {
+  await forEachNoAnswer(t, async (variant, reason) => {
+    const firstRead = `PAN-OS ${PANOS_READ_LABELS[SYSTEM_INFO_CMD]} on ${OFFLINE_HOST} failed after 4 attempts (${reason})`;
+    const skipped = (read) => `PAN-OS ${PANOS_READ_LABELS[read]} was not attempted because ${OFFLINE_HOST} did not answer an earlier request (${reason}, after 4 attempts).`;
+    const onlyTheFirstRead = Array(4).fill(`${OFFLINE_HOST} ${SYSTEM_INFO_CMD}`);
+    // Every read, sent or skipped, names the one request that got no answer.
+    const unanswered = panosReadEndpoint(SYSTEM_INFO_CMD);
+
+    const probe = unansweredHarness(t, variant);
+    const access = await checkPaloaltoAccess(probe.clients());
+    assert.deepEqual(probe.requests, onlyTheFirstRead, `${variant}: the access check sends the first read 4 times and nothing else`);
+    assert.deepEqual(probe.waits, [500, 1_000, 2_000], variant);
+    if (variant === "timeout") assert.equal(probe.elapsedMs, 4 * 30_000 + 3_500, "four 30 s timeouts and 3.5 s of waits, once for the whole device");
+    assert.equal(access.status, "degraded", variant);
+    assert.deepEqual(access.surfaces, PANOS_READS.map((read, index) => ({
+      product: "pan-os",
+      target: OFFLINE_HOST,
+      name: panosSurfaceName(read),
+      endpoint: unanswered,
+      status: "not_readable",
+      count: null,
+      partial: null,
+      httpStatus: null,
+      error: index === 0 ? firstRead : skipped(read),
+    })), variant);
+    assertNamesOnlySentRequests(probe, access, `${variant} check_access`);
+
+    const collect = unansweredHarness(t, variant);
+    const clients = collect.clients();
+    const snapshot = await collectPanosSnapshot(clients.panos[0]);
+    assert.deepEqual(collect.requests, onlyTheFirstRead, `${variant}: the snapshot sends the first read 4 times and nothing else`);
+    if (variant === "timeout") assert.equal(collect.elapsedMs, 123_500);
+    assert.equal(snapshot.reachable, false);
+    assert.equal(snapshot.haStateFailed, true);
+    assert.deepEqual(snapshot.configXpaths, []);
+    assert.deepEqual(snapshot.failedXpaths, FIREWALL_XPATHS);
+    assert.deepEqual(snapshot.failures, Object.fromEntries(PANOS_READS.map((read, index) => [
+      PANOS_FAILURE_KEYS[read] ?? read,
+      { endpoint: unanswered, status: null, error: index === 0 ? firstRead : skipped(read) },
+    ])), variant);
+    assert.equal(snapshot.errors.length, PANOS_READS.length);
+    const assessments = [
+      await assessPaloaltoFirewallPolicy(clients, [snapshot]),
+      await assessPaloaltoThreatPrevention(clients, [snapshot]),
+      await assessPaloaltoDeviceHardening(clients, {}, [snapshot]),
+    ];
+    const findings = assessments.flatMap((result) => result.findings);
+    assert.ok(findings.length >= 9, `${variant}: ${findings.length} findings`);
+    for (const finding of findings) assert.notEqual(finding.status, "pass", `${variant}: ${finding.id}: ${finding.summary}`);
+    assertNamesOnlySentRequests(collect, { failures: snapshot.failures, assessments }, `${variant} snapshot`);
+
+    // Keygen is a request too: when it gets no answer, the reads after it do not ask for a key again, and name keygen.
+    const keygen = unansweredHarness(t, variant, { PANOS_HOST: OFFLINE_HOST, PANOS_USERNAME: "auditor", PANOS_PASSWORD: FIXTURE_PANOS_PASSWORD });
+    const keygenAccess = await checkPaloaltoAccess(keygen.clients());
+    assert.deepEqual(keygen.requests, Array(4).fill(`${OFFLINE_HOST} keygen`), variant);
+    assert.deepEqual(keygenAccess.surfaces.map((surface) => [surface.name, surface.endpoint, surface.error]), PANOS_READS.map((read, index) => [
+      panosSurfaceName(read),
+      "POST /api/?type=keygen",
+      index === 0 ? `PAN-OS keygen for ${OFFLINE_HOST} failed after 4 attempts (${reason})` : skipped(read),
+    ]), variant);
+    assertNamesOnlySentRequests(keygen, keygenAccess, `${variant} keygen check_access`);
+
+    if (variant !== "network error") return;
+    // An export probes and then collects through the same clients, so the probe's 4 attempts are its only requests.
+    const exported = unansweredHarness(t, variant);
+    const bundle = await exportPaloaltoAuditBundle(exported.clients(), createTempBase("grclanker-paloalto-unanswered-"));
+    assert.deepEqual(exported.requests, onlyTheFirstRead);
+    const files = readBundleFiles(bundle.outputDir);
+    const device = JSON.parse(files.get(join("core_data", `panos_${OFFLINE_HOST}.json`)));
+    const marker = (read) => ({ collected: false, status: null, dataset_status: "error", endpoint: unanswered, error: skipped(read) });
+    assert.deepEqual(device.system_info, marker(SYSTEM_INFO_CMD));
+    assert.deepEqual(device.ha_state, marker(HA_STATE_CMD));
+    for (const xpath of FIREWALL_XPATHS) assert.deepEqual(device.config[xpath], marker(xpath), xpath);
+    const bundledAccess = JSON.parse(files.get(join("core_data", "access.json")));
+    assert.equal(bundledAccess.surfaces[0].error, firstRead);
+    const bundled = JSON.parse(files.get(join("analysis", "findings.json")));
+    assert.ok(bundled.length > 0);
+    for (const finding of bundled) assert.notEqual(finding.status, "pass", `${finding.id}: ${finding.summary}`);
+    assertNamesOnlySentRequests(exported, { device, access: bundledAccess, findings: bundled }, "bundle");
+  });
+});
+
+test("a PAN-OS device that answers, with a 403, an Invalid Credential, a 503 on every attempt, or a refused Retry-After, still has its HA and config reads attempted", async () => {
+  const host = "fw.example.com";
+  const systemInfo = `${host} ${SYSTEM_INFO_CMD}`;
+  const laterReads = [HA_STATE_CMD, ...FIREWALL_XPATHS].map((read) => `${host} ${read}`);
+  const keygenConfig = resolvePaloaltoConfiguration({}, { PANOS_HOST: host, PANOS_USERNAME: "auditor", PANOS_PASSWORD: FIXTURE_PANOS_PASSWORD });
+  const cases = [
+    { label: "403", answer: () => xmlResponse(PANOS_FORBIDDEN, 403), attempts: 1, status: 403 },
+    { label: "Invalid Credential", answer: () => xmlResponse(PANOS_INVALID_CREDENTIAL, 403), attempts: 1, status: 403 },
+    { label: "503 on every attempt", answer: () => panosUnavailable(), attempts: 4, status: 503 },
+    { label: "refused Retry-After", answer: () => panosUnavailable({ "retry-after": "120" }), attempts: 1, status: 503 },
+  ];
+  for (const { label, answer, attempts, status } of cases) {
+    const harness = panosRetryHarness(({ request }) => (request === systemInfo ? answer() : undefined));
+    const snapshot = await collectPanosSnapshot(harness.client(host));
+    assert.deepEqual(harness.requests, [`${host} keygen`, ...Array(attempts).fill(systemInfo), ...laterReads], label);
+    assert.deepEqual(Object.keys(snapshot.failures), ["show system info"], label);
+    assert.equal(snapshot.failures["show system info"].status, status, label);
+    assert.equal(snapshot.haStateFailed, false, label);
+    assert.deepEqual(snapshot.configXpaths, FIREWALL_XPATHS, label);
+
+    harness.requests.length = 0;
+    const access = await checkPaloaltoAccess({ config: keygenConfig, panos: [harness.client(host)] });
+    assert.deepEqual(harness.requests, [`${host} keygen`, ...Array(attempts).fill(systemInfo), ...laterReads], `${label} access check`);
+    assert.deepEqual(access.surfaces.filter((surface) => surface.status !== "readable").map((surface) => surface.name), ["system_info"], label);
+  }
+
+  // A keygen refused with Invalid Credential was answered too: the next read asks for a key again.
+  const keygen = panosRetryHarness(({ request, attempt }) => (request === `${host} keygen` && attempt === 1 ? xmlResponse(PANOS_INVALID_CREDENTIAL, 403) : undefined));
+  const snapshot = await collectPanosSnapshot(keygen.client(host));
+  assert.deepEqual(keygen.requests, [`${host} keygen`, `${host} keygen`, ...laterReads]);
+  assert.deepEqual(Object.keys(snapshot.failures), ["show system info"]);
+  assert.equal(snapshot.failures["show system info"].endpoint, "POST /api/?type=keygen");
+});
+
+test("a PAN-OS device that never answers leaves the other devices alone: every read of a healthy device is sent and readable", async (t) => {
+  await forEachNoAnswer(t, async (variant, reason) => {
+    const harness = unansweredHarness(t, variant, { PANOS_HOST: `${OFFLINE_HOST},${ONLINE_HOST}`, PANOS_API_KEY: OFFLINE_API_KEY });
+    const clients = harness.clients();
+    const access = await checkPaloaltoAccess(clients);
+    assert.deepEqual(harness.sentTo(OFFLINE_HOST), Array(4).fill(SYSTEM_INFO_CMD), variant);
+    // The probe reads system info twice on a device that answers: once as the probe, once to name the platform.
+    assert.deepEqual(harness.sentTo(ONLINE_HOST), [SYSTEM_INFO_CMD, ...PANOS_READS], variant);
+    assert.deepEqual(
+      access.surfaces.filter((surface) => surface.target === ONLINE_HOST).map((surface) => [surface.name, surface.status]),
+      PANOS_READS.map((read) => [panosSurfaceName(read), "readable"]),
+      variant,
+    );
+    assert.ok(access.surfaces.filter((surface) => surface.target === OFFLINE_HOST).every((surface) => surface.status === "not_readable"), variant);
+    for (const host of [OFFLINE_HOST, ONLINE_HOST]) {
+      assertNamesOnlySentRequests(harness, access.surfaces.filter((surface) => surface.target === host), `${variant} check_access ${host}`, host);
+    }
+
+    // Collected side by side, as the assessments and the export collect: the offline device is sent nothing more.
+    harness.requests.length = 0;
+    const [offline, online] = await Promise.all(clients.panos.map((device) => collectPanosSnapshot(device)));
+    assert.deepEqual(harness.sentTo(OFFLINE_HOST), [], variant);
+    assert.deepEqual(harness.sentTo(ONLINE_HOST), PANOS_READS, variant);
+    assert.equal(online.reachable, true, variant);
+    assert.equal(online.haStateFailed, false, variant);
+    assert.deepEqual(online.configXpaths, FIREWALL_XPATHS, variant);
+    assert.deepEqual(online.failures, {}, variant);
+    assert.deepEqual(online.errors, [], variant);
+    assert.deepEqual(offline.failedXpaths, FIREWALL_XPATHS, variant);
+    for (const failure of Object.values(offline.failures)) {
+      assert.ok(failure.error.endsWith(`was not attempted because ${OFFLINE_HOST} did not answer an earlier request (${reason}, after 4 attempts).`), failure.error);
+    }
+    assertNamesOnlySentRequests(harness, offline.failures, `${variant} snapshot ${OFFLINE_HOST}`, OFFLINE_HOST);
+  });
+});
+
+test("a PAN-OS device that never answers writes no planted API key or password into an error, a note, or a bundle file", async (t) => {
+  const keyForms = secretForms(OFFLINE_API_KEY);
+  const passwordForms = secretForms(FIXTURE_PANOS_PASSWORD);
+  const scenarios = [
+    {
+      label: "API key",
+      env: { PANOS_HOST: OFFLINE_HOST, PANOS_API_KEY: OFFLINE_API_KEY },
+      forms: keyForms,
+      failure: () => new TypeError(`fetch failed: proxy refused X-PAN-KEY ${keyForms.join(" ")}`),
+    },
+    {
+      label: "keygen",
+      env: { PANOS_HOST: OFFLINE_HOST, PANOS_USERNAME: "auditor", PANOS_PASSWORD: FIXTURE_PANOS_PASSWORD },
+      forms: passwordForms,
+      failure: () => new TypeError(`connect ETIMEDOUT while posting user=auditor&password=${passwordForms.join(" ")}`),
+    },
+  ];
+  for (const { label, env, forms, failure } of scenarios) {
+    for (const form of forms) assert.ok(failure().message.includes(form), `fixture self-check: ${label} echoes ${form}`);
+    const harness = unansweredHarness(t, "network error", env, { failure });
+    const clients = harness.clients();
+    const access = await checkPaloaltoAccess(clients);
+    const snapshot = await collectPanosSnapshot(harness.clients().panos[0]);
+    const assessments = [
+      await assessPaloaltoFirewallPolicy(clients),
+      await assessPaloaltoThreatPrevention(clients),
+      await assessPaloaltoDeviceHardening(clients),
+    ];
+    const bundle = await exportPaloaltoAuditBundle(harness.clients(), createTempBase("grclanker-paloalto-unanswered-secrets-"));
+
+    // Every error carries the scrubbed echo, the earlier failure inside each skipped read's error included.
+    const errors = [...access.surfaces.map((surface) => surface.error), ...snapshot.errors, ...assessments.flatMap((result) => result.errors)];
+    assert.equal(errors.filter((error) => error.includes(`did not answer an earlier request (network error: `)).length, errors.length - 2, label);
+    for (const error of errors) assert.ok(error.includes(REDACTION_MARKER), `${label}: ${error}`);
+    const payloads = [["access check", access], ["snapshot", snapshot], ...assessments.map((result) => [result.title, result])];
+    for (const [name, payload] of payloads) assertNoCanary(JSON.stringify(payload), `${label} ${name}`, forms);
+    const files = readBundleFiles(bundle.outputDir);
+    assert.ok(files.get("_errors.log").includes("was not attempted because"), label);
+    for (const [name, text] of files) assertNoCanary(text, `${label} bundle ${name}`, forms);
+    for (const [name, text] of readZipEntries(bundle.zipPath)) assertNoCanary(text, `${label} zip ${name}`, forms);
+  }
+});
+
+test("a tool-call abort on a PAN-OS request's last attempt does not mark the device unanswered", async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  const fetchImpl = async () => {
+    attempts += 1;
+    if (attempts < 4) throw new TypeError("fetch failed");
+    controller.abort(new Error("operator cancelled"));
+    return new Promise(() => {});
+  };
+  const device = new PanosApiClient({ host: OFFLINE_HOST, baseUrl: `https://${OFFLINE_HOST}`, apiKey: OFFLINE_API_KEY }, { fetchImpl, sleepImpl: noSleep, signal: controller.signal });
+  await assert.rejects(device.showSystemInfo(), ToolCallAbortedError);
+  assert.equal(attempts, 4);
+  // An unanswered device refuses the next read itself with a PaloaltoApiError; this one is stopped by the abort alone.
+  await assert.rejects(device.showConfig("/config/shared"), (error) => {
+    assert.ok(error instanceof ToolCallAbortedError, String(error));
+    return true;
+  });
+  assert.equal(attempts, 4);
 });

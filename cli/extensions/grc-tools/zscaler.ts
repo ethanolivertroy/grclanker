@@ -50,6 +50,9 @@ type JsonRecord = Record<string, unknown>;
 const DEFAULT_OUTPUT_DIR = "./export/zscaler";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+const RETRY_BASE_DELAY_MS = 500;
+const MAX_BACKOFF_MS = 8_000;
 const MAX_RETRY_AFTER_MS = 60_000;
 const ZIA_PAGE_SIZE = 1000;
 const ZIA_URL_RULE_PAGE_SIZE = 100;
@@ -379,13 +382,17 @@ function daysBetween(later: Date, earlier: Date): number {
   return Math.floor((later.getTime() - earlier.getTime()) / 86_400_000);
 }
 
+// A value that is already the marker is skipped, so a second pass cannot swallow the character after it, such as the
+// closing parenthesis of a message that wraps redacted text.
+const SESSION_COOKIE = /JSESSIONID=(?!\[REDACTED\])[^;\s"]+/g;
+
 export function redactSecrets(message: string, secrets: Array<string | undefined>): string {
   let redacted = message;
   for (const secret of secrets) {
     if (!secret || secret.length < 4) continue;
     redacted = redacted.split(secret).join("[REDACTED]");
   }
-  return redacted.replace(/JSESSIONID=[^;\s"]+/g, "JSESSIONID=[REDACTED]");
+  return redacted.replace(SESSION_COOKIE, "JSESSIONID=[REDACTED]");
 }
 
 function ensurePrivateDir(pathname: string): void {
@@ -720,17 +727,111 @@ function credentialRejection(error: unknown): ZscalerCredentialRejection | undef
   return error.rejection ?? (error.status === 401 ? { source: "api" } : undefined);
 }
 
-function isRetryableStatus(status: number): boolean {
-  return status === 429 || status === 502 || status === 503 || status === 504;
+/**
+ * The wait a Retry-After value asks for, in milliseconds: delta-seconds, seconds with a unit as ZIA writes them in a
+ * 429 body ("0 seconds", "13s"), or an HTTP date measured from `now`.
+ */
+function retryAfterMs(value: string | null | undefined, now: Date): number | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  const seconds = /^(\d+(?:\.\d+)?)\s*(?:s|secs?|seconds?)?$/i.exec(text);
+  if (seconds) return Number(seconds[1]) * 1000;
+  const date = Date.parse(text);
+  return Number.isNaN(date) ? undefined : Math.max(date - now.getTime(), 0);
 }
 
-function retryDelayMs(response: Response, attempt: number): number {
-  const header = response.headers.get("retry-after");
-  const seconds = header ? Number(header) : Number.NaN;
-  if (Number.isFinite(seconds) && seconds >= 0) {
-    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+/** The "Retry-After" field ZIA documents in a 429 body, read when the response has no Retry-After header. */
+function bodyRetryAfter(rawText: string): string | undefined {
+  return asString(asObject(parseJsonText(rawText))?.["Retry-After"]);
+}
+
+function backoffMs(attempt: number): number {
+  return Math.min(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), MAX_BACKOFF_MS);
+}
+
+function attemptsText(attempts: number): string {
+  return `after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}`;
+}
+
+function retryAfterRefusal(waitMs: number): string {
+  return `the server asked to retry after ${Math.ceil(waitMs / 1000)} s, more than the ${MAX_RETRY_AFTER_MS / 1000} s limit`;
+}
+
+/** What a ZIA or ZPA client sends requests with. `fetchImpl` and `sleep` already end on the tool call's abort. */
+interface ZscalerTransport {
+  fetchImpl: FetchImpl;
+  sleep: (ms: number) => Promise<void>;
+  now: () => Date;
+  timeoutMs: number;
+  maxRetries: number;
+}
+
+/** A request that got an HTTP answer: the last response and its body, and the attempts it took. */
+interface ZscalerReply {
+  response: Response;
+  rawText: string;
+  attempts: number;
+  /** The last status was retryable, so the request ended because the retries ran out or a Retry-After was refused. */
+  retryable: boolean;
+  refusal?: string;
+}
+
+/** One attempt under the timeout, body included. The tool call's abort is rethrown; any other failure is returned as its reason. */
+async function attemptOnce(
+  transport: ZscalerTransport,
+  url: string,
+  init: RequestInit,
+): Promise<{ response: Response; rawText: string } | { failure: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), transport.timeoutMs);
+  try {
+    const response = await transport.fetchImpl(url, { ...init, signal: controller.signal });
+    return { response, rawText: await response.text() };
+  } catch (error) {
+    rethrowIfAborted(error);
+    return { failure: controller.signal.aborted ? `timed out after ${transport.timeoutMs} ms` : `network error: ${errorMessage(error)}` };
+  } finally {
+    clearTimeout(timeout);
   }
-  return Math.min(500 * 2 ** attempt, MAX_RETRY_AFTER_MS);
+}
+
+/**
+ * Sends a request, retrying 429, 500, 502, 503, 504, a timeout, or a network error up to `maxRetries` times. Each wait
+ * is the longer of the exponential backoff step and Retry-After (the header, else the field ZIA puts in a 429 body).
+ * A Retry-After beyond MAX_RETRY_AFTER_MS is not waited out: the request ends at once and the reply says what the
+ * server asked for. A timeout or network error on the last attempt returns its reason instead of a reply.
+ */
+async function sendWithRetries(
+  transport: ZscalerTransport,
+  url: string,
+  init: RequestInit,
+): Promise<ZscalerReply | { failure: string; attempts: number }> {
+  for (let attempt = 1; ; attempt += 1) {
+    const result = await attemptOnce(transport, url, init);
+    if ("response" in result && !RETRYABLE_STATUSES.has(result.response.status)) {
+      return { ...result, attempts: attempt, retryable: false };
+    }
+    const askedMs = "response" in result
+      ? retryAfterMs(result.response.headers.get("retry-after") ?? bodyRetryAfter(result.rawText), transport.now())
+      : undefined;
+    const refusal = askedMs !== undefined && askedMs > MAX_RETRY_AFTER_MS ? retryAfterRefusal(askedMs) : undefined;
+    if (attempt <= transport.maxRetries && refusal === undefined) {
+      await transport.sleep(Math.max(askedMs ?? 0, backoffMs(attempt)));
+      continue;
+    }
+    return "response" in result
+      ? { ...result, attempts: attempt, retryable: true, refusal }
+      : { failure: result.failure, attempts: attempt };
+  }
+}
+
+/**
+ * A failed response as error text. A retryable status names the attempts made and any refused Retry-After, so a read
+ * that ran out of retries is told apart from one the server answered once.
+ */
+function replyFailureText(label: string, reply: ZscalerReply, detail: string | undefined): string {
+  const attempts = reply.retryable ? ` ${attemptsText(reply.attempts)}` : "";
+  return `${label} failed${attempts} (${reply.response.status})${detail ? `: ${detail}` : ""}${reply.refusal ? `; ${reply.refusal}` : ""}`;
 }
 
 function pageSignature(items: JsonRecord[]): string {
@@ -771,7 +872,6 @@ function scrubEchoedText(text: string): string {
 }
 
 const ERROR_BEARER_TOKEN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g;
-const ERROR_SESSION_COOKIE = /JSESSIONID=[^;\s"]+/g;
 // "/" and "." are not run characters, so API paths, hostnames, and file paths split into their segments.
 const ERROR_TOKEN_RUN = /[A-Za-z0-9+=_-]{16,}/g;
 // Uppercase codes (INVALID_INPUT_ARGUMENT, ZPN_STATUS_AUTHENTICATED) and hyphenated identifiers such as finding ids.
@@ -795,7 +895,7 @@ function scrubErrorText(text: string): string {
   return text
     .replace(ECHOED_SECRET_ASSIGNMENT, "$1[REDACTED]")
     .replace(ERROR_BEARER_TOKEN, "$1 [REDACTED]")
-    .replace(ERROR_SESSION_COOKIE, "JSESSIONID=[REDACTED]")
+    .replace(SESSION_COOKIE, "JSESSIONID=[REDACTED]")
     .replace(ERROR_TOKEN_RUN, (run) => (looksLikeToken(run) ? "[REDACTED]" : run));
 }
 
@@ -874,26 +974,37 @@ export interface ZiaReadClient {
   logout(): Promise<void>;
 }
 
+/** How a ZIA or ZPA client sends: tools pass the timeout, retry count, and abort signal; tests also inject fetch, the clock, and the retry wait. */
+export interface ZscalerClientOptions {
+  fetchImpl?: FetchImpl;
+  timeoutMs?: number;
+  maxRetries?: number;
+  now?: () => Date;
+  sleep?: (ms: number) => Promise<void>;
+  signal?: AbortSignal;
+}
+
+function createTransport(options: ZscalerClientOptions, now: () => Date): ZscalerTransport {
+  return {
+    fetchImpl: abortableFetch(options.fetchImpl ?? fetch, options.signal),
+    sleep: abortableSleep(options.signal, options.sleep),
+    now,
+    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    maxRetries: options.maxRetries ?? DEFAULT_MAX_RETRIES,
+  };
+}
+
 export class ZiaApiClient implements ZiaReadClient {
   private readonly config: ZiaResolvedConfig;
-  private readonly fetchImpl: FetchImpl;
-  private readonly sleep: (ms: number) => Promise<void>;
-  private readonly timeoutMs: number;
-  private readonly maxRetries: number;
+  private readonly transport: ZscalerTransport;
   private readonly now: () => Date;
   private sessionId?: string;
   private loginPromise?: Promise<string>;
 
-  constructor(
-    config: ZiaResolvedConfig,
-    options: { fetchImpl?: FetchImpl; timeoutMs?: number; maxRetries?: number; now?: () => Date; signal?: AbortSignal } = {},
-  ) {
+  constructor(config: ZiaResolvedConfig, options: ZscalerClientOptions = {}) {
     this.config = config;
-    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
-    this.sleep = abortableSleep(options.signal);
-    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.now = options.now ?? (() => new Date());
+    this.transport = createTransport(options, this.now);
   }
 
   getResolvedConfig(): ZiaResolvedConfig {
@@ -917,33 +1028,18 @@ export class ZiaApiClient implements ZiaReadClient {
     return url.toString();
   }
 
-  private async rawRequest(url: string, init: RequestInit): Promise<Response> {
-    for (let attempt = 0; ; attempt += 1) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-      let response: Response;
-      try {
-        response = await this.fetchImpl(url, { ...init, signal: controller.signal });
-      } catch (error) {
-        rethrowIfAborted(error);
-        clearTimeout(timeout);
-        if (attempt < this.maxRetries && (error instanceof Error && error.name === "AbortError")) {
-          continue;
-        }
-        throw new Error(this.redact(`ZIA request failed: ${errorMessage(error)}`));
-      }
-      clearTimeout(timeout);
-      if (isRetryableStatus(response.status) && attempt < this.maxRetries) {
-        await this.sleep(retryDelayMs(response, attempt));
-        continue;
-      }
-      return response;
+  /** Sends with retries. A timeout or network error that outlasts them throws, naming the endpoint and the attempts made. */
+  private async send(endpoint: string, url: string, init: RequestInit): Promise<ZscalerReply> {
+    const reply = await sendWithRetries(this.transport, url, init);
+    if ("failure" in reply) {
+      throw new Error(this.redact(`ZIA ${endpoint} failed ${attemptsText(reply.attempts)} (${reply.failure})`));
     }
+    return reply;
   }
 
   private async login(): Promise<string> {
     const timestamp = String(this.now().getTime());
-    const response = await this.rawRequest(this.buildUrl("/authenticatedSession"), {
+    const reply = await this.send("POST /authenticatedSession", this.buildUrl("/authenticatedSession"), {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify({
@@ -953,14 +1049,14 @@ export class ZiaApiClient implements ZiaReadClient {
         timestamp,
       }),
     });
-    const rawText = await response.text();
+    const { response, rawText } = reply;
     if (!response.ok) {
       const payload = parseJsonText(rawText);
       const detail = errorDetail(payload, rawText);
       throw new ZscalerApiError(
         "zia",
         response.status,
-        this.redact(`ZIA login failed (${response.status})${detail ? `: ${detail}` : ""}`),
+        this.redact(replyFailureText(reply.retryable ? "ZIA POST /authenticatedSession" : "ZIA login", reply, detail)),
         ziaLoginRejection(response.status, payload),
       );
     }
@@ -986,15 +1082,15 @@ export class ZiaApiClient implements ZiaReadClient {
 
   private async request(method: "GET" | "DELETE", path: string, query: JsonRecord = {}): Promise<unknown> {
     const sessionId = await this.getSession();
-    const response = await this.rawRequest(this.buildUrl(path, query), {
+    const endpoint = `${method} ${path}`;
+    const reply = await this.send(endpoint, this.buildUrl(path, query), {
       method,
       headers: { accept: "application/json", cookie: `JSESSIONID=${sessionId}` },
     });
-    const rawText = await response.text();
-    const payload = parseJsonText(rawText);
-    if (!response.ok) {
-      const detail = errorDetail(payload, rawText);
-      throw new ZscalerApiError("zia", response.status, this.redact(`ZIA ${method} ${path} failed (${response.status})${detail ? `: ${detail}` : ""}`));
+    const payload = parseJsonText(reply.rawText);
+    if (!reply.response.ok) {
+      const detail = errorDetail(payload, reply.rawText);
+      throw new ZscalerApiError("zia", reply.response.status, this.redact(replyFailureText(`ZIA ${endpoint}`, reply, detail)));
     }
     return payload;
   }
@@ -1354,8 +1450,9 @@ function dependsOn(inventory: string, endpoint: string, dataset: CollectedDatase
   return { inventory, endpoint, dataset };
 }
 
+/** A retryable status is only reported after the retries ran out or a Retry-After was refused, which the error names. */
 function unreadableCause({ endpoint, dataset }: InventoryDependency): string {
-  return dataset.statusCode !== undefined
+  return dataset.statusCode !== undefined && !RETRYABLE_STATUSES.has(dataset.statusCode)
     ? `${endpoint} returned ${dataset.statusCode}`
     : `${endpoint} failed: ${dataset.error ?? "unknown error"}`;
 }
@@ -1968,25 +2065,16 @@ export interface ZpaReadClient {
 
 export class ZpaApiClient implements ZpaReadClient {
   private readonly config: ZpaResolvedConfig;
-  private readonly fetchImpl: FetchImpl;
-  private readonly sleep: (ms: number) => Promise<void>;
-  private readonly timeoutMs: number;
-  private readonly maxRetries: number;
+  private readonly transport: ZscalerTransport;
   private readonly now: () => Date;
   private accessToken?: string;
   private accessTokenExpiresAt = 0;
   private tokenPromise?: Promise<string>;
 
-  constructor(
-    config: ZpaResolvedConfig,
-    options: { fetchImpl?: FetchImpl; timeoutMs?: number; maxRetries?: number; now?: () => Date; signal?: AbortSignal } = {},
-  ) {
+  constructor(config: ZpaResolvedConfig, options: ZscalerClientOptions = {}) {
     this.config = config;
-    this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
-    this.sleep = abortableSleep(options.signal);
-    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.now = options.now ?? (() => new Date());
+    this.transport = createTransport(options, this.now);
   }
 
   getResolvedConfig(): ZpaResolvedConfig {
@@ -2001,45 +2089,30 @@ export class ZpaApiClient implements ZpaReadClient {
     return redactSecrets(message, [this.config.clientSecret, this.accessToken]);
   }
 
-  private async rawRequest(url: string, init: RequestInit): Promise<Response> {
-    for (let attempt = 0; ; attempt += 1) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-      let response: Response;
-      try {
-        response = await this.fetchImpl(url, { ...init, signal: controller.signal });
-      } catch (error) {
-        rethrowIfAborted(error);
-        clearTimeout(timeout);
-        if (attempt < this.maxRetries && (error instanceof Error && error.name === "AbortError")) {
-          continue;
-        }
-        throw new Error(this.redact(`ZPA request failed: ${errorMessage(error)}`));
-      }
-      clearTimeout(timeout);
-      if (isRetryableStatus(response.status) && attempt < this.maxRetries) {
-        await this.sleep(retryDelayMs(response, attempt));
-        continue;
-      }
-      return response;
+  /** Sends with retries. A timeout or network error that outlasts them throws, naming the endpoint and the attempts made. */
+  private async send(endpoint: string, url: string, init: RequestInit): Promise<ZscalerReply> {
+    const reply = await sendWithRetries(this.transport, url, init);
+    if ("failure" in reply) {
+      throw new Error(this.redact(`ZPA ${endpoint} failed ${attemptsText(reply.attempts)} (${reply.failure})`));
     }
+    return reply;
   }
 
   private async signIn(): Promise<string> {
     const body = new URLSearchParams({ client_id: this.config.clientId, client_secret: this.config.clientSecret });
-    const response = await this.rawRequest(`${this.config.baseUrl}/signin`, {
+    const reply = await this.send("POST /signin", `${this.config.baseUrl}/signin`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
       body: body.toString(),
     });
-    const rawText = await response.text();
+    const { response, rawText } = reply;
     const payload = asObject(parseJsonText(rawText)) ?? {};
     if (!response.ok) {
       const detail = errorDetail(payload, rawText);
       throw new ZscalerApiError(
         "zpa",
         response.status,
-        this.redact(`ZPA signin failed (${response.status})${detail ? `: ${detail}` : ""}`),
+        this.redact(replyFailureText(reply.retryable ? "ZPA POST /signin" : "ZPA signin", reply, detail)),
         zpaSignInRejection(response.status, payload),
       );
     }
@@ -2076,15 +2149,14 @@ export class ZpaApiClient implements ZpaReadClient {
       if (value === undefined || value === null || value === "") continue;
       url.searchParams.set(key, String(value));
     }
-    const response = await this.rawRequest(url.toString(), {
+    const reply = await this.send(`GET ${path}`, url.toString(), {
       method: "GET",
       headers: { accept: "application/json", authorization: `Bearer ${token}` },
     });
-    const rawText = await response.text();
-    const payload = parseJsonText(rawText);
-    if (!response.ok) {
-      const detail = errorDetail(payload, rawText);
-      throw new ZscalerApiError("zpa", response.status, this.redact(`ZPA GET ${path} failed (${response.status})${detail ? `: ${detail}` : ""}`));
+    const payload = parseJsonText(reply.rawText);
+    if (!reply.response.ok) {
+      const detail = errorDetail(payload, reply.rawText);
+      throw new ZscalerApiError("zpa", reply.response.status, this.redact(replyFailureText(`ZPA GET ${path}`, reply, detail)));
     }
     return payload;
   }
@@ -4058,7 +4130,7 @@ const authParams = {
   zpa_customer_id: Type.Optional(Type.String({ description: "ZPA customer ID. Defaults to ZPA_CUSTOMER_ID." })),
   config_file: Type.Optional(Type.String({ description: "YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml." })),
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout in seconds. Defaults to 30.", default: 30 })),
-  max_retries: Type.Optional(Type.Number({ description: "Retries for 429/5xx responses, honoring Retry-After. Defaults to 3.", default: 3 })),
+  max_retries: Type.Optional(Type.Number({ description: "Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3.", default: 3 })),
 };
 
 export function registerZscalerTools(pi: any): void {

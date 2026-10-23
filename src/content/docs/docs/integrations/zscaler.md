@@ -57,7 +57,7 @@ The client posts `client_id` and `client_secret` as a form body to `POST /signin
 Optional tuning:
 
 - `ZSCALER_TIMEOUT` (seconds, default 30)
-- `ZSCALER_MAX_RETRIES` (default 3, honoring `Retry-After` on 429, 502, 503, and 504 responses)
+- `ZSCALER_MAX_RETRIES` (default 3, from 0 to 10; see [Retries and rate limits](#retries-and-rate-limits))
 
 ## Run it
 
@@ -192,11 +192,21 @@ A response that omits `totalPages` (or returns a bare array) leaves the total un
 
 Every one of these exits, plus the 200-page ceiling, is recorded as partial with the pages read versus the total (or "total unknown") and caps the dependent verdicts at `warn`.
 
+### Retries and rate limits
+
+ZIA and ZPA requests, including the ZIA login and the ZPA sign-in, are retried when they get a 429, 500, 502, 503, or 504, time out, or fail with a network error. By default a request is sent at most four times; `max_retries` or `ZSCALER_MAX_RETRIES` sets the number of retries, from 0 to 10. The timeout covers reading the response body as well as the headers.
+
+- The wait before each retry is 500 milliseconds, doubled after each retry and capped at 8 seconds, or the server's `Retry-After` when that is longer. `Retry-After` is read from the header, as seconds or an HTTP date, or else from the `Retry-After` field ZIA puts in a 429 body, such as `"0 seconds"`.
+- A `Retry-After` above 60 seconds is not waited out. The request fails at once, and its error names the wait the server asked for.
+- Any other 4xx answer, such as 400, 401, 403, or 404, is an answer rather than a transient failure and is not retried.
+
+A request that runs out of retries fails with the endpoint, the attempt count, and the last status, timeout, or network error, for example `ZIA GET /adminUsers failed after 4 attempts (503): Service temporarily unavailable`. The dataset is then unreadable, not partial: when a later page fails, the pages already read are not reported as the inventory, and the findings that read it follow the rules below, so none of them passes. When the read for one parent location, cloud app rule type, or SCIM-enabled IdP fails, controls 18, 19, and 12 name it and treat the records seen as a partial view, so they fall short of a pass.
+
 ### Verdict safety rules
 
 - A 401, 403, or errored endpoint never yields `pass`.
   - When it is the finding's primary inventory, the finding is `manual` and names the cause.
-  - When it is a secondary inventory the finding also reads, the finding caps at `warn`. It names the inventory and endpoint with the HTTP status in its summary, and lists it under `evidence.unreadable_inventories`.
+  - When it is a secondary inventory the finding also reads, the finding caps at `warn`. It names the inventory and endpoint with the HTTP status, or the timeout or network error, in its summary, and lists it under `evidence.unreadable_inventories`.
   - Examples of secondary inventories are ZPA `GET /serviceEdgeGroup` for control 21 and `GET /dlpDictionaries` for control 3.
 - An empty inventory fails or is `manual` per the control's intent. The summary says which.
 - Products that are not configured or not licensed render `manual`.

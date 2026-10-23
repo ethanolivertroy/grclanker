@@ -102,7 +102,7 @@ export const CLOUDFLARE_COMPLETENESS_SOURCES: Readonly<Record<string, readonly B
   "CF-TRF-03": zoneCompleteness(),
   "CF-TRF-04": [cfSource("account-audit-logs", CT)],
   "CF-TRF-05": [cfSource("account-ip-access-rules", CT)],
-  "CF-TRF-06": [cfSource("gateway-rules", CN), cfSource("gateway-account", CN)],
+  "CF-TRF-06": [cfSource("gateway-rules", CT), cfSource("gateway-account", CN)],
 };
 
 function owner(id: string): string {
@@ -200,8 +200,8 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     : id === "CF-TRF-06"
       ? {
           decisionInputs: {
-            evidence_readable: "Boolean. True only when Gateway rules and, for an empty rule list, the Gateway account provisioning object were readable.",
-            evidence_complete: "Boolean. True after the single unpaginated Gateway-rules response is readable. The runtime does not follow result_info pagination for this endpoint and therefore cannot detect omitted later pages.",
+            evidence_readable: "Boolean. True only when Gateway rules and, for an empty rule list, the Gateway account provisioning object were readable. An empty rule list whose result_info reports rules or later pages is not readable evidence.",
+            evidence_complete: "Boolean. The endpoint documents no paging parameters and is read with one request. False when that response's result_info reports, in total_count, count, or total_pages, more rules or pages than the response holds, because the rest cannot be requested; a response without result_info counts as complete.",
             gateway_provisioned: "Boolean. True when /accounts/{account_id}/gateway returns a non-empty gateway_tag.",
             gateway_rule_count: "Complete count of Gateway rules before presentation slicing.",
             blocking_or_isolating_rule_count: "Count of enabled rules whose action is block, isolate, or override.",
@@ -287,18 +287,26 @@ export const CLOUDFLARE_SPEC = buildBatchIntegrationSpec({
     pageCap: null,
     totalSemantics: "Completion requires reaching result_info.total_pages or total_count without a repeated or empty advancing page and remaining below every configured zone, member, token, or audit cap.",
     stopConditions: ["Reported final page", "Reported total reached", "Repeated page", "Empty advancing page", "Configured item cap"],
+  }, {
+    surfaceIds: ["gateway-rules"],
+    cursorFields: ["result_info.count", "result_info.total_count", "result_info.total_pages"],
+    pageSize: null,
+    itemCap: "none",
+    pageCap: 1,
+    totalSemantics: "One request, because the endpoint documents no paging parameters. The list is complete only when result_info, if present, reports no more rules or pages than the response holds; otherwise it is truncated with that reason.",
+    stopConditions: ["Single response"],
   }],
   rateLimit: {
     documentedLimit: "Endpoint and account-plan specific",
-    retryHeaders: ["Retry-After", "Ratelimit", "Ratelimit-Policy"],
+    retryHeaders: ["Retry-After"],
     retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Honor bounded Retry-After and use bounded retries for transient responses; exhausted reads remain unreadable.",
+    backoffPolicy: "Retry 429, 500, 502, 503, 504, a request that times out (30 seconds unless timeout_seconds or CLOUDFLARE_TIMEOUT sets it), and a network error up to 3 times after the first attempt. The wait is Retry-After when the response carries it, as delta-seconds or an HTTP date, else 500 milliseconds doubled after each retry and capped at 8 seconds. A Retry-After above 30 seconds is not waited out: the read fails at once and its error names the wait the server asked for. An exhausted read fails with the path, the last status or failure, and the attempt count, and remains unreadable. The Ratelimit and Ratelimit-Policy headers are not read.",
   },
   runtimeBehavior: CLOUDFLARE_RUNTIME_BEHAVIOR,
   knownGaps: [
     "Feature and plan ambiguity is preserved as manual evidence where the API cannot distinguish an unlicensed feature from an empty configuration.",
     "The shipped runtime has no framework mapping for CF-ZONE-15 (DNS record origin exposure); this migration preserves that gap rather than inventing a control mapping.",
-    "CF-TRF-06 reads Gateway rules with one unpaginated request. The runtime does not follow result_info pagination on that endpoint, so a first page can pass without proving that all rules were evaluated.",
+    "Gateway rules (CF-TRF-06) and page rules (CF-TRF-02) are read with one request each because their list endpoints document no paging parameters. When the response's result_info reports more items or pages than it holds, the list is marked truncated with that reason and cannot pass, and an empty truncated list is manual; the rest of the list cannot be requested. A response without result_info that omits items cannot be detected.",
   ],
   sensitiveFields: ["api_token", "api_key", "authorization", "x-auth-key", "x-auth-email", "cookie"],
   credentialFormats: ["Cloudflare API tokens", "Cloudflare Global API keys", "session cookies"],

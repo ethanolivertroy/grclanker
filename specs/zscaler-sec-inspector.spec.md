@@ -34,7 +34,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 - ZIA and ZPA authenticate independently; absent credentials produce explicit not-configured manual findings for that product.
 - The ZIA client logs out in a finally path, and ZIA API-key obfuscation plus session cookies are never written to findings or bundles.
-- List pagination and configured retry exhaustion remain partial or unreadable; presentation samples never establish compliance.
+- List pagination that stops early remains partial, and a request that runs out of retries or meets a refused Retry-After leaves its dataset unreadable, even after earlier pages arrived; presentation samples never establish compliance.
 - ZDX and OneAPI credentials are recognized by configuration but the shipped assessment tools cover ZIA and ZPA only.
 
 ## Tools
@@ -65,7 +65,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
 | `config_file` | string | no | YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429/5xx responses, honoring Retry-After. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
 
 #### `zscaler_assess_zia_access_control`
 
@@ -83,7 +83,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
 | `config_file` | string | no | YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429/5xx responses, honoring Retry-After. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
 | `max_super_admins` | number | no | Maximum acceptable Super Admin count before failing. Defaults to 5. |
 
 #### `zscaler_assess_zia_policy`
@@ -102,7 +102,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
 | `config_file` | string | no | YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429/5xx responses, honoring Retry-After. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
 | `max_ssl_exemptions` | number | no | Maximum acceptable SSL inspection exempted URLs before warning. Defaults to 50. |
 
 #### `zscaler_assess_zpa`
@@ -121,7 +121,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
 | `config_file` | string | no | YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429/5xx responses, honoring Retry-After. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
 | `cert_expiry_warn_days` | number | no | Warn when a certificate expires within this many days. Defaults to 30. |
 | `stale_connector_days` | number | no | Days since last broker connect before a connector is reported stale. Defaults to 30. |
 | `max_timeout_hours` | number | no | Maximum acceptable reauthentication timeout in hours. Defaults to 24. |
@@ -142,7 +142,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
 | `config_file` | string | no | YAML config file. Defaults to ZSCALER_CONFIG_FILE or ~/.zscaler/zscaler.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
-| `max_retries` | number | no | Retries for 429/5xx responses, honoring Retry-After. Defaults to 3. |
+| `max_retries` | number | no | Retries for 429, 5xx, timeouts, and network errors, honoring Retry-After up to 60 seconds. Defaults to 3. |
 | `output_dir` | string | no | Root directory for bundles. Defaults to ./export/zscaler. |
 | `max_super_admins` | number | no | Maximum acceptable Super Admin count. Defaults to 5. |
 | `max_ssl_exemptions` | number | no | Maximum acceptable SSL exempted URLs. Defaults to 50. |
@@ -387,7 +387,7 @@ Credential refresh: POST /authenticatedSession for ZIA; POST /signin for ZPA OAu
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| Zscaler Security Inspector | Cloud, product, and endpoint specific | `Retry-After` | 429, 500, 502, 503, 504 | Honor bounded Retry-After and retry transient responses up to the configured retry count; exhausted reads remain unreadable. |
+| Zscaler Security Inspector | Cloud, product, and endpoint specific | `Retry-After` | 429, 500, 502, 503, 504 | Retry 429, 500, 502, 503, 504, a request that times out (30 seconds unless timeout_seconds or ZSCALER_TIMEOUT sets it), and a network error up to 3 times after the first attempt, unless max_retries or ZSCALER_MAX_RETRIES sets another count from 0 to 10. The wait is the longer of the backoff step, 500 milliseconds doubled after each retry and capped at 8 seconds, and Retry-After, read from the header as delta-seconds or an HTTP date, or else from the Retry-After field ZIA puts in a 429 body, such as "0 seconds". A Retry-After above 60 seconds is not waited out: the read fails at once and its error names the wait the server asked for. An exhausted read fails with the endpoint, the last status or failure, and the attempt count, and remains unreadable. |
 
 ## Checks
 

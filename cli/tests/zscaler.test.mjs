@@ -31,6 +31,7 @@ import {
   resolveZpaBaseUrl,
   resolveZscalerConfiguration,
 } from "../dist/extensions/grc-tools/zscaler.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { ZSCALER_COMPLETENESS_SOURCES, ZSCALER_SPEC } from "../dist/extensions/grc-tools/zscaler.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -395,7 +396,11 @@ test("tool catch blocks render scrubbed text: a planted bearer thrown inside the
   };
   try {
     const probeResult = await checkAccess(ZIA_ARGS);
-    assert.match(probeResult.text, /ZIA request failed: socket closed while sending Authorization: Bearer \[REDACTED\]/);
+    assert.match(probeResult.text, /ZIA POST \/authenticatedSession failed after 1 attempt \(network error: socket closed while/);
+    assert.ok(
+      probeResult.serialized.includes("ZIA POST /authenticatedSession failed after 1 attempt (network error: socket closed while sending Authorization: Bearer [REDACTED])"),
+      probeResult.serialized,
+    );
     assert.ok(!probeResult.serialized.includes(bearerCanary) && !probeResult.serialized.includes("BRCANARY"), probeResult.serialized);
   } finally {
     globalThis.fetch = originalFetch;
@@ -428,10 +433,12 @@ test("ZiaApiClient logs in with an obfuscated key, reuses the session cookie, re
     return jsonResponse({ message: "not found" }, { status: 404 });
   };
 
-  const client = new ZiaApiClient(ziaConfig(), { fetchImpl, now: () => new Date(1700000000123) });
+  const waits = [];
+  const client = new ZiaApiClient(ziaConfig(), { fetchImpl, now: () => new Date(1700000000123), sleep: async (ms) => { waits.push(ms); } });
   const admins = await client.listAdminUsers();
   assert.deepEqual(admins.items.map((item) => item.loginName), ["admin@example.com"]);
   assert.equal(admins.truncated, false);
+  assert.deepEqual(waits, [500], "a Retry-After of 0 still waits the first backoff step");
   const login = JSON.parse(seen[0].body);
   assert.equal(seen[0].method, "POST");
   assert.equal(login.apiKey, "AAABCDCCCCID");
@@ -3006,7 +3013,7 @@ test("ZIA and ZPA clients never echo raw response bodies and scrub credential-sh
   };
   const zia = new ZiaApiClient(ziaConfig(), { fetchImpl: ziaFetch, maxRetries: 0 });
   await assert.rejects(() => zia.listAdminUsers(), (error) => {
-    assert.match(error.message, /^ZIA GET \/adminUsers failed \(500\): non-JSON response body of \d+ bytes omitted$/);
+    assert.match(error.message, /^ZIA GET \/adminUsers failed after 1 attempt \(500\): non-JSON response body of \d+ bytes omitted$/);
     return true;
   });
   await assert.rejects(() => zia.listAdminRoles(), (error) => {
@@ -3197,7 +3204,7 @@ test("exportZscalerAuditBundle leaks no canary from any credential carrier into 
   assert.equal(ziaPolicy.vpnCredentials.data[0].fqdn, "hq@example.com");
   assert.equal(ziaPolicy.greTunnels.data[0].comment, "[REDACTED]");
   assert.equal(ziaPolicy.greTunnels.data[0].sourceIp, "203.0.113.10");
-  assert.match(ziaPolicy.bandwidthRules.error, /failed \(500\): non-JSON response body of \d+ bytes omitted/);
+  assert.match(ziaPolicy.bandwidthRules.error, /failed after 1 attempt \(500\): non-JSON response body of \d+ bytes omitted/);
   const zpaData = JSON.parse(readFileSync(join(result.outputDir, "core_data/zpa.json"), "utf8"));
   assert.equal(zpaData.idpControllers.data[0].scimSharedSecret, "[REDACTED]");
   assert.equal(zpaData.idpControllers.data[0].scimEnabled, true);
@@ -3819,4 +3826,370 @@ test("checkZscalerAccess keeps the limited status and role wording when a probe 
   assert.equal(unconfigured.status, "unavailable");
   assert.equal(unconfigured.recommendedNextStep, ZSCALER_ROLE_STEP);
   assert.deepEqual(unconfigured.notes, [ZIA_NOT_CONFIGURED_NOTE, ZPA_NOT_CONFIGURED_NOTE, "0/0 Zscaler audit surfaces are readable."]);
+});
+
+const RETRY_NOW = new Date("2026-10-23T12:00:00Z");
+const ZIA_RATE_LIMITED = { message: "Rate Limit (1/SECOND) exceeded" };
+const ZIA_UNAVAILABLE = { code: "SERVICE_UNAVAILABLE", message: "Service temporarily unavailable" };
+const ZIA_UNAVAILABLE_DETAIL = "Service temporarily unavailable; SERVICE_UNAVAILABLE";
+const ZPA_UNAVAILABLE = { id: "SERVICE_UNAVAILABLE", reason: "Service temporarily unavailable" };
+const ZPA_APPLICATION = `${ZPA_V1}/application`;
+
+/**
+ * A real ZIA or ZPA client whose requests ("<METHOD> <path>") and retry waits are recorded; waits return at once and
+ * the clock reads RETRY_NOW. `answer` gets each request with its attempt number for that exact URL and may return a
+ * response, a rejection, or undefined, which leaves the session login, the sign-in, or a 404 to the default stub.
+ */
+function zscalerRetryHarness(product, answer, options = {}) {
+  const waits = [];
+  const requests = [];
+  const attempts = new Map();
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const method = init.method ?? "GET";
+    requests.push(`${method} ${url.pathname}`);
+    const key = `${method} ${url}`;
+    const attempt = (attempts.get(key) ?? 0) + 1;
+    attempts.set(key, attempt);
+    const answered = await answer({ url, init, attempt });
+    if (answered !== undefined) return answered;
+    if (url.pathname === "/api/v1/authenticatedSession") {
+      return method === "POST" ? jsonResponse({ authType: "ADMIN_LOGIN" }, { headers: { "set-cookie": "JSESSIONID=RETRYSESSION; Path=/" } }) : jsonResponse({});
+    }
+    if (url.pathname === "/signin") return jsonResponse({ token_type: "Bearer", access_token: "zpa-retry-token", expires_in: "3600" });
+    return jsonResponse({ message: `no stub for ${url.pathname}` }, { status: 404 });
+  };
+  const clientOptions = { fetchImpl, now: () => RETRY_NOW, sleep: async (ms) => { waits.push(ms); }, ...options };
+  const client = product === "zia" ? new ZiaApiClient(ziaConfig(), clientOptions) : new ZpaApiClient(zpaConfig(), clientOptions);
+  return { client, waits, requests };
+}
+
+/** A request that never answers: it rejects only when the client's timeout aborts it. */
+function neverAnswers(init) {
+  return new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+  });
+}
+
+/** A 200 whose body stops partway: reading it fails only when the client's timeout aborts the request. */
+function bodyStalls(init) {
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('[{"id":'));
+      init.signal.addEventListener("abort", () => controller.error(init.signal.reason), { once: true });
+    },
+  });
+  return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+}
+
+test("ZIA and ZPA retry 429 and 5xx answers after Retry-After, read from the header as delta-seconds or an HTTP date, or from the field ZIA puts in a 429 body", async () => {
+  const zia = zscalerRetryHarness("zia", ({ url, attempt }) => {
+    if (url.pathname !== "/api/v1/adminRoles/lite") return undefined;
+    if (attempt === 1) return jsonResponse(ZIA_RATE_LIMITED, { status: 429, headers: { "retry-after": "2" } });
+    if (attempt === 2) return jsonResponse(ZIA_UNAVAILABLE, { status: 503, headers: { "retry-after": new Date(RETRY_NOW.getTime() + 7_000).toUTCString() } });
+    if (attempt === 3) return jsonResponse({ ...ZIA_RATE_LIMITED, "Retry-After": "13 seconds" }, { status: 429 });
+    return jsonResponse([{ id: 10, name: "Super Admin" }]);
+  });
+  assert.deepEqual(await zia.client.listAdminRoles(), [{ id: 10, name: "Super Admin" }]);
+  assert.deepEqual(zia.waits, [2_000, 7_000, 13_000], "each wait is the one Retry-After asked for");
+  assert.deepEqual(zia.requests, ["POST /api/v1/authenticatedSession", ...Array(4).fill("GET /api/v1/adminRoles/lite")], "a retry repeats the request it retries");
+
+  const floor = zscalerRetryHarness("zia", ({ url, attempt }) => {
+    if (url.pathname !== "/api/v1/adminRoles/lite") return undefined;
+    if (attempt === 1) return jsonResponse({ ...ZIA_RATE_LIMITED, "Retry-After": "0 seconds" }, { status: 429 });
+    if (attempt === 2) return jsonResponse(ZIA_UNAVAILABLE, { status: 500, headers: { "retry-after": "0" } });
+    return jsonResponse([]);
+  });
+  assert.deepEqual(await floor.client.listAdminRoles(), []);
+  assert.deepEqual(floor.waits, [500, 1_000], "a Retry-After shorter than the backoff step waits the backoff step");
+
+  const zpa = zscalerRetryHarness("zpa", ({ url, attempt }) => {
+    if (url.pathname !== ZPA_APPLICATION) return undefined;
+    if (attempt === 1) return jsonResponse(ZPA_UNAVAILABLE, { status: 429, headers: { "retry-after": "60" } });
+    return jsonResponse({ totalPages: "1", list: [{ id: "seg-1" }] });
+  });
+  const segments = await zpa.client.listApplicationSegments();
+  assert.deepEqual(segments.items, [{ id: "seg-1" }]);
+  assert.equal(segments.truncated, false);
+  assert.deepEqual(zpa.waits, [60_000], "a Retry-After of exactly 60 s is waited out");
+});
+
+test("ZIA and ZPA back off 500, 1000, then 2000 ms and, after 4 attempts, fail the read naming the endpoint, the attempt count, and the last status", async () => {
+  for (const status of [429, 500, 502, 503, 504]) {
+    const zia = zscalerRetryHarness("zia", ({ url }) => (url.pathname === "/api/v1/authSettings" ? jsonResponse(ZIA_UNAVAILABLE, { status }) : undefined));
+    await assert.rejects(zia.client.getAuthSettings(), (error) => {
+      assert.equal(error.status, status);
+      assert.equal(error.product, "zia");
+      assert.equal(error.message, `ZIA GET /authSettings failed after 4 attempts (${status}): ${ZIA_UNAVAILABLE_DETAIL}`);
+      return true;
+    });
+    assert.deepEqual(zia.waits, [500, 1_000, 2_000], `${status}`);
+    assert.equal(zia.requests.filter((request) => request === "GET /api/v1/authSettings").length, 4, `${status}`);
+  }
+
+  const zpa = zscalerRetryHarness("zpa", ({ url }) => (url.pathname === `${ZPA_V1}/segmentGroup`
+    ? new Response("<html>upstream unavailable</html>", { status: 502, headers: { "content-type": "text/html" } })
+    : undefined));
+  await assert.rejects(zpa.client.listSegmentGroups(), (error) => {
+    assert.equal(error.status, 502);
+    assert.equal(error.product, "zpa");
+    assert.equal(error.message, `ZPA GET ${ZPA_V1}/segmentGroup failed after 4 attempts (502): non-JSON response body of 33 bytes omitted`);
+    return true;
+  });
+  assert.deepEqual(zpa.waits, [500, 1_000, 2_000]);
+
+  const unavailable = ({ url }) => (url.pathname === "/api/v1/authSettings" ? jsonResponse(ZIA_UNAVAILABLE, { status: 503 }) : undefined);
+  const longer = zscalerRetryHarness("zia", unavailable, { maxRetries: 6 });
+  await assert.rejects(longer.client.getAuthSettings(), { message: `ZIA GET /authSettings failed after 7 attempts (503): ${ZIA_UNAVAILABLE_DETAIL}` });
+  assert.deepEqual(longer.waits, [500, 1_000, 2_000, 4_000, 8_000, 8_000], "the backoff step stops growing at 8 s");
+  const once = zscalerRetryHarness("zia", unavailable, { maxRetries: 0 });
+  await assert.rejects(once.client.getAuthSettings(), { message: `ZIA GET /authSettings failed after 1 attempt (503): ${ZIA_UNAVAILABLE_DETAIL}` });
+  assert.deepEqual(once.waits, []);
+});
+
+test("ZIA and ZPA do not wait out a Retry-After beyond 60 seconds: the read fails at once and says what the server asked for", async () => {
+  for (const [label, response, seconds] of [
+    ["delta-seconds header", () => jsonResponse(ZIA_RATE_LIMITED, { status: 429, headers: { "retry-after": "61" } }), 61],
+    ["HTTP date header", () => jsonResponse(ZIA_RATE_LIMITED, { status: 429, headers: { "retry-after": new Date(RETRY_NOW.getTime() + 120_000).toUTCString() } }), 120],
+    ["429 body field", () => jsonResponse({ ...ZIA_RATE_LIMITED, "Retry-After": "3600 seconds" }, { status: 429 }), 3600],
+  ]) {
+    const zia = zscalerRetryHarness("zia", ({ url }) => (url.pathname === "/api/v1/adminRoles/lite" ? response() : undefined));
+    await assert.rejects(zia.client.listAdminRoles(), (error) => {
+      assert.equal(error.status, 429, label);
+      assert.equal(error.message, `ZIA GET /adminRoles/lite failed after 1 attempt (429): Rate Limit (1/SECOND) exceeded; the server asked to retry after ${seconds} s, more than the 60 s limit`, label);
+      return true;
+    });
+    assert.deepEqual(zia.waits, [], `${label}: nothing is waited out`);
+    assert.equal(zia.requests.filter((request) => request === "GET /api/v1/adminRoles/lite").length, 1, label);
+  }
+
+  const late = zscalerRetryHarness("zpa", ({ url, attempt }) => {
+    if (url.pathname !== ZPA_APPLICATION) return undefined;
+    return attempt === 1 ? jsonResponse(ZPA_UNAVAILABLE, { status: 503 }) : jsonResponse(ZPA_UNAVAILABLE, { status: 429, headers: { "retry-after": "600" } });
+  });
+  await assert.rejects(late.client.listApplicationSegments(), {
+    message: `ZPA GET ${ZPA_APPLICATION} failed after 2 attempts (429): Service temporarily unavailable; the server asked to retry after 600 s, more than the 60 s limit`,
+  });
+  assert.deepEqual(late.waits, [500], "a refusal after an earlier retry counts every attempt made");
+});
+
+test("ZIA login and ZPA sign-in are retried too, and one that runs out of retries names its endpoint instead of reading as a rejected credential", async () => {
+  const zia = zscalerRetryHarness("zia", ({ url, init }) => (url.pathname === "/api/v1/authenticatedSession" && init.method === "POST"
+    ? jsonResponse(ZIA_UNAVAILABLE, { status: 503 })
+    : undefined));
+  await assert.rejects(zia.client.listAdminRoles(), (error) => {
+    assert.equal(error.status, 503);
+    assert.equal(error.rejection, undefined, "an unavailable login says nothing about the credentials");
+    assert.equal(error.message, `ZIA POST /authenticatedSession failed after 4 attempts (503): ${ZIA_UNAVAILABLE_DETAIL}`);
+    return true;
+  });
+  assert.deepEqual(zia.requests, Array(4).fill("POST /api/v1/authenticatedSession"), "no API read is sent without a session");
+  assert.deepEqual(zia.waits, [500, 1_000, 2_000]);
+
+  const zpa = zscalerRetryHarness("zpa", ({ url, attempt }) => {
+    if (url.pathname === "/signin" && attempt === 1) return jsonResponse(ZPA_UNAVAILABLE, { status: 502 });
+    if (url.pathname === ZPA_APPLICATION) return jsonResponse({ totalPages: "1", list: [{ id: "seg-1" }] });
+    return undefined;
+  });
+  assert.deepEqual((await zpa.client.listApplicationSegments()).items, [{ id: "seg-1" }]);
+  assert.deepEqual(zpa.requests, ["POST /signin", "POST /signin", `GET ${ZPA_APPLICATION}`]);
+  assert.deepEqual(zpa.waits, [500]);
+
+  const exhausted = zscalerRetryHarness("zpa", ({ url }) => (url.pathname === "/signin" ? jsonResponse({ id: "RATE_LIMITED", reason: "Too many requests" }, { status: 429 }) : undefined));
+  await assert.rejects(exhausted.client.listApplicationSegments(), (error) => {
+    assert.equal(error.status, 429);
+    assert.equal(error.rejection, undefined);
+    assert.equal(error.message, "ZPA POST /signin failed after 4 attempts (429): Too many requests");
+    return true;
+  });
+});
+
+test("ZIA and ZPA retry a timeout, a body that stalls, and a network error with the same backoff and name the failure and attempt count once retries run out", async () => {
+  const timedOut = zscalerRetryHarness("zia", ({ url, init }) => (url.pathname === "/api/v1/adminRoles/lite" ? neverAnswers(init) : undefined), { timeoutMs: 5 });
+  await assert.rejects(timedOut.client.listAdminRoles(), (error) => {
+    assert.equal(error.status, undefined);
+    assert.equal(error.message, "ZIA GET /adminRoles/lite failed after 4 attempts (timed out after 5 ms)");
+    return true;
+  });
+  assert.deepEqual(timedOut.waits, [500, 1_000, 2_000]);
+
+  const stalled = zscalerRetryHarness("zia", ({ url, init }) => (url.pathname === "/api/v1/adminRoles/lite" ? bodyStalls(init) : undefined), { timeoutMs: 5 });
+  await assert.rejects(stalled.client.listAdminRoles(), { message: "ZIA GET /adminRoles/lite failed after 4 attempts (timed out after 5 ms)" });
+  assert.deepEqual(stalled.waits, [500, 1_000, 2_000], "the timeout covers reading the body, not only the headers");
+
+  const offline = zscalerRetryHarness("zpa", ({ url }) => (url.pathname === ZPA_APPLICATION ? Promise.reject(new TypeError("fetch failed")) : undefined));
+  await assert.rejects(offline.client.listApplicationSegments(), { message: `ZPA GET ${ZPA_APPLICATION} failed after 4 attempts (network error: fetch failed)` });
+  assert.deepEqual(offline.waits, [500, 1_000, 2_000]);
+
+  const recovered = zscalerRetryHarness("zpa", ({ url, init, attempt }) => {
+    if (url.pathname !== ZPA_APPLICATION) return undefined;
+    if (attempt === 1) return neverAnswers(init);
+    if (attempt === 2) return Promise.reject(new TypeError("fetch failed"));
+    return jsonResponse({ totalPages: "1", list: [{ id: "seg-1" }] });
+  }, { timeoutMs: 5 });
+  assert.deepEqual((await recovered.client.listApplicationSegments()).items, [{ id: "seg-1" }]);
+  assert.deepEqual(recovered.waits, [500, 1_000]);
+});
+
+test("ZIA and ZPA send a request answered 400, 401, 403, or 404 once, whatever its Retry-After: those are answers, not transient failures", async () => {
+  for (const status of [400, 401, 403, 404]) {
+    const zia = zscalerRetryHarness("zia", ({ url }) => (url.pathname === "/api/v1/authSettings"
+      ? jsonResponse({ code: "NOT_AUTHORIZED", message: "denied" }, { status, headers: { "retry-after": "1" } })
+      : undefined));
+    await assert.rejects(zia.client.getAuthSettings(), { message: `ZIA GET /authSettings failed (${status}): denied; NOT_AUTHORIZED` });
+    assert.equal(zia.requests.filter((request) => request === "GET /api/v1/authSettings").length, 1, `${status}`);
+    assert.deepEqual(zia.waits, [], `${status}`);
+  }
+
+  const zpa = zscalerRetryHarness("zpa", ({ url }) => (url.pathname === "/signin"
+    ? jsonResponse({ id: "invalid_client", reason: "invalid_client" }, { status: 401, headers: { "retry-after": "1" } })
+    : undefined));
+  await assert.rejects(zpa.client.listApplicationSegments(), (error) => {
+    assert.equal(error.message, "ZPA signin failed (401): invalid_client");
+    assert.deepEqual(error.rejection, { source: "sign_in", status: 401, code: "invalid_client" });
+    return true;
+  });
+  assert.deepEqual(zpa.requests, ["POST /signin"]);
+  assert.deepEqual(zpa.waits, []);
+});
+
+test("a ZIA or ZPA list whose later page runs out of retries is unreadable, not the pages before it, and its findings never pass", async () => {
+  const admins = Array.from({ length: 1001 }, (_, index) => ({
+    id: index + 1,
+    loginName: `admin${index}@example.com`,
+    disabled: false,
+    isPasswordLoginAllowed: false,
+    adminScope: { Type: "DEPARTMENT", ScopeEntities: [{ id: 5, name: "IT" }] },
+    role: { id: 11, name: "Policy Admin" },
+  }));
+  const ziaStub = ziaTenantFetch(ziaCompliantTenant({ adminUsers: admins }));
+  const ziaRequests = [];
+  const ziaWaits = [];
+  const zia = new ZiaApiClient(ziaConfig(), {
+    now: () => NOW,
+    sleep: async (ms) => { ziaWaits.push(ms); },
+    fetchImpl: async (input, init = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/v1/adminUsers") ziaRequests.push(url.searchParams.get("page"));
+      if (url.pathname === "/api/v1/adminUsers" && url.searchParams.get("page") === "2") return jsonResponse(ZIA_UNAVAILABLE, { status: 503 });
+      return ziaStub.fetchImpl(input, init);
+    },
+  });
+  const access = await collectZiaAccessControlData(zia);
+  assert.deepEqual(access.adminUsers.data, [], "the 1000 admins on page 1 are not reported as the inventory");
+  assert.equal(access.adminUsers.statusCode, 503);
+  assert.equal(access.adminUsers.error, `ZIA GET /adminUsers failed after 4 attempts (503): ${ZIA_UNAVAILABLE_DETAIL}`);
+  assert.deepEqual(ziaRequests, ["1", "2", "2", "2", "2"], "page 1 once, then page 2 four times");
+  assert.deepEqual(ziaWaits, [500, 1_000, 2_000]);
+  const accessFindings = assessZiaAccessControlData({ ...access, now: NOW });
+  for (const id of ["ZS-06", "ZS-07"]) {
+    const item = findingById(accessFindings, id);
+    assert.equal(item.status, "manual", `${id}: ${item.summary}`);
+    assert.ok(item.summary.includes(`ZIA GET /adminUsers failed after 4 attempts (503)`), `${id}: ${item.summary}`);
+  }
+
+  const zpaStub = zpaTenantFetch(zpaCompliantTenant({ applicationTotalPages: 3 }));
+  const zpaWaits = [];
+  const zpa = new ZpaApiClient(zpaConfig(), {
+    now: () => NOW,
+    sleep: async (ms) => { zpaWaits.push(ms); },
+    fetchImpl: async (input, init = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === ZPA_APPLICATION && url.searchParams.get("page") === "3") return Promise.reject(new TypeError("fetch failed"));
+      return zpaStub.fetchImpl(input, init);
+    },
+  });
+  const zpaResult = await assessZpa(zpa);
+  const segments = findingById(zpaResult, "ZS-08");
+  assert.equal(segments.status, "manual", segments.summary);
+  assert.ok(segments.summary.includes(`ZPA GET ${ZPA_APPLICATION} failed after 4 attempts (network error: fetch failed)`), segments.summary);
+  assert.deepEqual(zpaWaits, [500, 1_000, 2_000]);
+});
+
+test("a ZIA sub-location or ZPA SCIM group read that runs out of retries leaves its fan-out partial and the finding short of a pass", async () => {
+  const ziaStub = ziaTenantFetch(ziaCompliantTenant({
+    locations: [compliantLocation(100), compliantLocation(200)],
+    subLocations: { 100: [{ id: 101, name: "HQ Guest", parentId: 100, authRequired: true, sslScanEnabled: true, ofwEnabled: true }] },
+  }));
+  const zia = new ZiaApiClient(ziaConfig(), {
+    now: () => NOW,
+    sleep: async () => {},
+    fetchImpl: async (input, init = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/v1/locations/200/sublocations") return jsonResponse(ZIA_UNAVAILABLE, { status: 504 });
+      return ziaStub.fetchImpl(input, init);
+    },
+  });
+  const locations = findingById(await assessZiaPolicy(zia), "ZS-18");
+  assert.equal(locations.status, "warn", locations.summary);
+  assert.equal(locations.evidence.sub_locations_readable, false);
+  assert.ok(locations.summary.includes("Sub-locations could not be read for every parent"), locations.summary);
+  assert.ok(locations.summary.includes(`200: ZIA GET /locations/200/sublocations failed after 4 attempts (504): ${ZIA_UNAVAILABLE_DETAIL}`), locations.summary);
+  assert.equal(ziaStub.requests.filter((request) => request.url.pathname === "/api/v1/locations/100/sublocations").length, 1);
+
+  const zpaStub = zpaTenantFetch(zpaCompliantTenant());
+  const zpa = new ZpaApiClient(zpaConfig(), {
+    now: () => NOW,
+    sleep: async () => {},
+    fetchImpl: async (input, init = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === `${ZPA_USERCONFIG}/scimgroup/idpId/idp-1`) return jsonResponse(ZPA_UNAVAILABLE, { status: 503 });
+      return zpaStub.fetchImpl(input, init);
+    },
+  });
+  const identity = findingById(await assessZpa(zpa), "ZS-12");
+  assert.notEqual(identity.status, "pass", identity.summary);
+  assert.ok(identity.summary.includes(`idp-1: ZPA GET ${ZPA_USERCONFIG}/scimgroup/idpId/idp-1 failed after 4 attempts (503): Service temporarily unavailable`), identity.summary);
+});
+
+test("an abort during a ZIA or ZPA retry wait stops the read at once and sends no further request", async () => {
+  for (const product of ["zia", "zpa"]) {
+    const controller = new AbortController();
+    const waits = [];
+    let reads = 0;
+    const client = (product === "zia" ? (config, options) => new ZiaApiClient(config, options) : (config, options) => new ZpaApiClient(config, options))(
+      product === "zia" ? ziaConfig() : zpaConfig(),
+      {
+        signal: controller.signal,
+        sleep: (ms) => {
+          waits.push(ms);
+          controller.abort(new Error("operator cancelled"));
+          return new Promise(() => {});
+        },
+        fetchImpl: async (input, init = {}) => {
+          const url = new URL(String(input));
+          if (url.pathname === "/api/v1/authenticatedSession") return jsonResponse({}, { headers: { "set-cookie": "JSESSIONID=ABORTSESSION; Path=/" } });
+          if (url.pathname === "/signin") return jsonResponse({ access_token: "zpa-abort-token", expires_in: "3600" });
+          reads += 1;
+          return jsonResponse(ZIA_UNAVAILABLE, { status: 503 });
+        },
+      },
+    );
+    const read = product === "zia" ? client.getAuthSettings() : client.listApplicationSegments();
+    await assert.rejects(read, ToolCallAbortedError, product);
+    assert.equal(reads, 1, product);
+    assert.deepEqual(waits, [500], product);
+  }
+});
+
+test("ZIA and ZPA retry errors carry no credential when a transport failure or a 5xx body echoes one", async () => {
+  const ziaPassword = ziaConfig().password;
+  const offline = zscalerRetryHarness("zia", ({ url }) => (url.pathname === "/api/v1/authSettings"
+    ? Promise.reject(new TypeError(`fetch failed: proxy refused password ${ziaPassword} and JSESSIONID=RETRYSESSION`))
+    : undefined));
+  await assert.rejects(offline.client.getAuthSettings(), (error) => {
+    assert.match(error.message, /^ZIA GET \/authSettings failed after 4 attempts \(network error: fetch failed: proxy refused password \[REDACTED\] and JSESSIONID=\[REDACTED\]\)$/);
+    assert.ok(!error.message.includes(ziaPassword) && !error.message.includes("RETRYSESSION"), error.message);
+    return true;
+  });
+
+  const zpaSecret = zpaConfig().clientSecret;
+  const echoed = zscalerRetryHarness("zpa", ({ url }) => (url.pathname === ZPA_APPLICATION
+    ? jsonResponse({ id: "SERVICE_UNAVAILABLE", reason: `upstream rejected ${zpaSecret} with bearer zpa-retry-token` }, { status: 503 })
+    : undefined));
+  await assert.rejects(echoed.client.listApplicationSegments(), (error) => {
+    assert.match(error.message, new RegExp(`^ZPA GET ${ZPA_APPLICATION} failed after 4 attempts \\(503\\): upstream rejected \\[REDACTED\\] with bearer \\[REDACTED\\]$`));
+    assert.ok(!error.message.includes(zpaSecret) && !error.message.includes("zpa-retry-token"), error.message);
+    return true;
+  });
 });

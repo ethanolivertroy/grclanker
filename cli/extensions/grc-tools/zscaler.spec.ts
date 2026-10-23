@@ -375,7 +375,7 @@ const idsFor = (tool: string): string[] => checks.filter((check) => check.owner 
 export const ZSCALER_RUNTIME_BEHAVIOR = [
   "ZIA and ZPA authenticate independently; absent credentials produce explicit not-configured manual findings for that product.",
   "The ZIA client logs out in a finally path, and ZIA API-key obfuscation plus session cookies are never written to findings or bundles.",
-  "List pagination and configured retry exhaustion remain partial or unreadable; presentation samples never establish compliance.",
+  "List pagination that stops early remains partial, and a request that runs out of retries or meets a refused Retry-After leaves its dataset unreadable, even after earlier pages arrived; presentation samples never establish compliance.",
 ] as const;
 
 export const ZSCALER_SPEC = buildBatchIntegrationSpec({
@@ -413,7 +413,7 @@ export const ZSCALER_SPEC = buildBatchIntegrationSpec({
     documentedLimit: "Cloud, product, and endpoint specific",
     retryHeaders: ["Retry-After"],
     retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Honor bounded Retry-After and retry transient responses up to the configured retry count; exhausted reads remain unreadable.",
+    backoffPolicy: "Retry 429, 500, 502, 503, 504, a request that times out (30 seconds unless timeout_seconds or ZSCALER_TIMEOUT sets it), and a network error up to 3 times after the first attempt, unless max_retries or ZSCALER_MAX_RETRIES sets another count from 0 to 10. The wait is the longer of the backoff step, 500 milliseconds doubled after each retry and capped at 8 seconds, and Retry-After, read from the header as delta-seconds or an HTTP date, or else from the Retry-After field ZIA puts in a 429 body, such as \"0 seconds\". A Retry-After above 60 seconds is not waited out: the read fails at once and its error names the wait the server asked for. An exhausted read fails with the endpoint, the last status or failure, and the attempt count, and remains unreadable.",
   },
   runtimeBehavior: ZSCALER_RUNTIME_BEHAVIOR,
   knownGaps: [
