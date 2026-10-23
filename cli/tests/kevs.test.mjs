@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { registerKevsTools } from "../dist/extensions/grc-tools/kevs.js";
-import { clearGrcSharedCachesForTests } from "../dist/extensions/grc-tools/shared.js";
+import { clearGrcSharedCachesForTests, setGrcFetchTimingForTests } from "../dist/extensions/grc-tools/shared.js";
 
 const KEV_URL = "https://raw.githubusercontent.com/cisagov/kev-data/main/known_exploited_vulnerabilities.json";
 const EPSS_DATE = "2024-05-01";
@@ -439,4 +439,191 @@ test("kevs_search EPSS lines include the score date only when the API provides i
     assert.doesNotMatch(undated.content[0].text, /scored/);
     assert.deepEqual(undated.details, { query: "CVE-2023-0001", count: 1 });
   });
+});
+
+const EPSS_ENDPOINT = "https://api.first.org/data/v1/epss";
+
+/**
+ * Runs `run` with each request answered by `respond(url, attempt)`, where
+ * `attempt` counts the requests for that URL, on a virtual clock that records
+ * every wait instead of sleeping.
+ */
+async function withKevApis(respond, run) {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  const waits = [];
+  let clock = Date.parse("2026-10-23T00:00:00Z");
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    requests.push(url);
+    return respond(url, requests.filter((request) => request.href === url.href).length);
+  };
+  setGrcFetchTimingForTests({
+    now: () => clock,
+    sleep: async (ms) => {
+      waits.push(ms);
+      clock += ms;
+    },
+  });
+  clearGrcSharedCachesForTests();
+  try {
+    await run({ tools: loadKevsTools(), requests, waits });
+  } finally {
+    globalThis.fetch = originalFetch;
+    setGrcFetchTimingForTests();
+    clearGrcSharedCachesForTests();
+  }
+}
+
+function epssBatch(url) {
+  return url.searchParams.get("cve").split(",");
+}
+
+function epssScores(url, unscored = []) {
+  const cves = epssBatch(url).filter((cve) => !unscored.includes(cve));
+  return Response.json({
+    status: "OK",
+    total: cves.length,
+    data: cves.map((cve) => ({ cve, epss: "0.125", percentile: "0.9", date: EPSS_DATE })),
+  });
+}
+
+function unavailable() {
+  return new Response("busy", { status: 503, statusText: "Service Unavailable" });
+}
+
+test("kevs_get_epss reports CVE IDs from an EPSS batch that failed every attempt as unavailable, not unscored, and flags the result incomplete", async () => {
+  const cveIds = Array.from({ length: 101 }, (_, index) => kevEntry(index + 1).cveID);
+  const failedId = "CVE-2024-0101";
+  const reason = `Fetch failed: ${EPSS_ENDPOINT} (503 Service Unavailable) after 4 attempts`;
+
+  await withKevApis(
+    (url) => (epssBatch(url).includes(failedId) ? unavailable() : epssScores(url, ["CVE-2024-0002"])),
+    async ({ tools, requests, waits }) => {
+      const result = await tools.get("kevs_get_epss").execute("call-1", { cve_ids: cveIds });
+      const text = result.content[0].text;
+
+      assert.equal(result.isError, undefined, "the scores that were read are still reported");
+      assert.ok(text.startsWith("EPSS Exploit Probability Scores (incomplete):\n\n"), text.slice(0, 120));
+      assert.match(text, /CVE-2024-0001\s+│\s+12\.50%\s+│\s+90\.0th\s+│\s+2024-05-01/);
+      assert.match(text, /CVE-2024-0002\s+│\s+Not scored\s+│\s+N\/A/, "an ID EPSS answered without a score is still unscored");
+      assert.match(text, /CVE-2024-0101\s+│\s+Unavailable\s+│\s+N\/A/);
+      assert.doesNotMatch(text, /CVE-2024-0101\s+│\s+Not scored/);
+      assert.doesNotMatch(text, /No EPSS scores found/);
+      assert.ok(
+        text.includes(
+          `Scores marked Unavailable could not be read because the EPSS API request failed: ${reason}. ` +
+            "Those CVE IDs are not known to be unscored; retry later.",
+        ),
+        text.slice(-400),
+      );
+      assert.ok(!text.includes("cve="), "the error leaves the query string out");
+      assert.equal(result.details.count, 101);
+      assert.equal(result.details.incomplete, true);
+      assert.deepEqual(result.details.unavailable, [failedId]);
+      assert.deepEqual(result.details.epss_errors, [reason]);
+
+      assert.deepEqual(requests.map((url) => epssBatch(url).length), [100, 1, 1, 1, 1], "only the failed batch is retried");
+      assert.deepEqual(waits, [100, 1_000, 2_000, 4_000], "100 ms between EPSS requests, then the backoff");
+    },
+  );
+});
+
+test("kevs_get_epss fails closed when every EPSS batch fails instead of saying no scores were found", async () => {
+  const reason = `Fetch failed: ${EPSS_ENDPOINT} (fetch failed) after 4 attempts`;
+
+  await withKevApis(
+    () => Promise.reject(new TypeError("fetch failed")),
+    async ({ tools, requests, waits }) => {
+      const both = await tools.get("kevs_get_epss").execute("call-1", { cve_ids: ["CVE-2024-3400", "CVE-2023-0001"] });
+
+      assert.equal(both.isError, true);
+      assert.equal(
+        both.content[0].text,
+        `EPSS API error: ${reason}. Scores for all 2 CVE IDs are unavailable, which does not mean they are unscored.`,
+      );
+      assert.deepEqual(both.details, {
+        cve_ids: ["CVE-2024-3400", "CVE-2023-0001"],
+        count: 0,
+        incomplete: true,
+        unavailable: ["CVE-2024-3400", "CVE-2023-0001"],
+        epss_errors: [reason],
+      });
+      assert.equal(requests.length, 4);
+      assert.deepEqual(waits, [1_000, 2_000, 4_000]);
+
+      const one = await tools.get("kevs_get_epss").execute("call-2", { cve_ids: ["CVE-2024-3400"] });
+      assert.equal(one.isError, true);
+      assert.equal(
+        one.content[0].text,
+        `EPSS API error: ${reason}. The score for this CVE ID is unavailable, which does not mean it is unscored.`,
+      );
+      assert.doesNotMatch(`${both.content[0].text}\n${one.content[0].text}`, /No EPSS scores found|Not scored/);
+    },
+  );
+});
+
+test("kevs_get_epss waits as long as EPSS Retry-After asks and then reports a complete result", async () => {
+  await withKevApis(
+    (url, attempt) =>
+      attempt === 1
+        ? new Response("slow down", { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "2" } })
+        : epssScores(url),
+    async ({ tools, requests, waits }) => {
+      const result = await tools.get("kevs_get_epss").execute("call-1", { cve_ids: ["CVE-2024-3400"] });
+
+      assert.match(result.content[0].text, /^EPSS Exploit Probability Scores:\n\n/);
+      assert.match(result.content[0].text, /CVE-2024-3400\s+│\s+12\.50%\s+│\s+90\.0th\s+│\s+2024-05-01/);
+      assert.deepEqual(result.details, {
+        cve_ids: ["CVE-2024-3400"],
+        count: 1,
+        epss_score_dates: { "CVE-2024-3400": EPSS_DATE },
+      });
+      assert.equal(requests.length, 2);
+      assert.deepEqual(waits, [2_000]);
+    },
+  );
+});
+
+test("kevs_search and kevs_recent say when EPSS enrichment is incomplete instead of leaving the EPSS lines out", async () => {
+  const today = cutoffDay(0);
+  const vulnerabilities = [datedKev(1, today), datedKev(2, today)];
+  const catalog = { title: "KEV", catalogVersion: "1", dateReleased: today, count: 2, vulnerabilities };
+  const reason = `Fetch failed: ${EPSS_ENDPOINT} (503 Service Unavailable) after 4 attempts`;
+  const note =
+    `EPSS enrichment is incomplete: scores are unavailable for 2 of 2 entries because the EPSS API request failed: ${reason}. ` +
+    "Those entries are not known to be unscored.";
+
+  await withKevApis(
+    (url) => (url.hostname === "api.first.org" ? unavailable() : Response.json(catalog)),
+    async ({ tools }) => {
+      for (const [name, args] of [["kevs_search", { query: "acme" }], ["kevs_recent", { days: 30 }]]) {
+        const tool = tools.get(name);
+        const result = await tool.execute("call-1", tool.prepareArguments(args));
+        const text = result.content[0].text;
+
+        assert.equal(result.isError, undefined, name);
+        assert.equal(text.match(/^ {2}EPSS: {8}Unavailable \(the EPSS API request failed\)$/gm)?.length, 2, `${name}: ${text}`);
+        assert.ok(text.endsWith(`\n\n${note}`), `${name}: ${text.slice(-300)}`);
+        assert.equal(result.details.epss_incomplete, true, name);
+        assert.deepEqual([...result.details.epss_unavailable].sort(), ["CVE-2024-0001", "CVE-2024-0002"], name);
+        assert.deepEqual(result.details.epss_errors, [reason], name);
+        assert.equal(result.details.epss_score_dates, undefined, name);
+      }
+    },
+  );
+});
+
+test("kevs_search reports a KEV catalog that failed every attempt as an error, not as no matches", async () => {
+  await withKevApis(
+    () => new Response("bad gateway", { status: 502, statusText: "Bad Gateway" }),
+    async ({ tools, requests, waits }) => {
+      const result = await tools.get("kevs_search").execute("call-1", { query: "acme" });
+
+      assert.equal(result.isError, true);
+      assert.equal(result.content[0].text, `KEV search error: Fetch failed: ${KEV_URL} (502 Bad Gateway) after 4 attempts`);
+      assert.equal(requests.length, 4);
+      assert.deepEqual(waits, [1_000, 2_000, 4_000]);
+    },
+  );
 });

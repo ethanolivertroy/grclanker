@@ -32,3 +32,13 @@ The same four tools cover the vulnerability step in the [investigate](/docs/work
 | `kevs_check_ransomware` | Catalog entries with known ransomware campaign use, newest first. An optional `vendor` keeps entries whose vendor or product name contains that text | `limit` defaults to 20. A value below 1 uses 20 |
 
 Scores above 10% are usually worth fast triage. That note is part of the `kevs_get_epss` reply.
+
+## When a feed fails
+
+Each request to either feed gets up to four attempts, and each attempt times out after 30 seconds. A timeout, a network error, or a `429`, `500`, `502`, `503`, or `504` answer is retried after the wait the feed's `Retry-After` header asks for, or after 1, 2, and then 4 seconds when it names none. Any other error, such as `404`, is not retried, and neither is an answer that asks for a wait longer than 30 seconds. The final error names the feed URL without its query string and, when the request was retried, the number of attempts. A failed read is never cached, so the next call tries the feed again.
+
+When the retries run out:
+
+- **KEV catalog.** `kevs_search`, `kevs_recent`, and `kevs_check_ransomware` fail with the error. None of them answers "no matches" from a catalog it could not read.
+- **EPSS in `kevs_get_epss`.** CVE IDs are scored in batches of 100. Each CVE ID from a batch that failed shows `Unavailable`, the heading ends in `(incomplete)`, and a note gives the error. `Not scored` still means EPSS answered and had no score for that CVE ID. The result sets `incomplete` and lists the affected IDs under `unavailable`. When no batch succeeds, the tool fails instead of reporting that no scores were found.
+- **EPSS in `kevs_search` and `kevs_recent`.** The catalog entries still come back. Each entry whose score could not be read shows `EPSS: Unavailable (the EPSS API request failed)`, and a closing note says how many entries lack a score and why. The result sets `epss_incomplete` and lists those IDs under `epss_unavailable`.

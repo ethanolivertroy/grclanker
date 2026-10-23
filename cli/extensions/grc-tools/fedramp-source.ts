@@ -3,9 +3,15 @@ import { mkdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { ensureGrclankerHome, getGrclankerHome, getGrclankerStateDir } from "../../config/paths.js";
-import { abortableFetch, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
+import { rethrowIfAborted } from "./abort.js";
 import { writeFileAtomically } from "./atomic-output.js";
-import { persistentCachesEnabled } from "./shared.js";
+import {
+  defaultRetryPlan,
+  persistentCachesEnabled,
+  retryAfterMs,
+  retryingFetch,
+  type RetryPlan,
+} from "./shared.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SOURCE_STATUS_TTL_MS = 6 * 60 * 60 * 1000;
@@ -267,6 +273,7 @@ type SourceCachePayload = {
   fetchedAt: string;
   primary: FedrampPrimarySourceStatus;
   secondary: FedrampSupportingSourceStatus;
+  notes?: string[];
 };
 
 type CatalogCachePayload = {
@@ -274,6 +281,7 @@ type CatalogCachePayload = {
   fetchedAt: string;
   catalog: FedrampCatalog;
   provenance: FedrampPrimarySourceStatus;
+  notes?: string[];
 };
 
 type RepoOverviewResponse = {
@@ -442,23 +450,44 @@ function githubTokenFromEnv(env: NodeJS.ProcessEnv): string | null {
   return asString(env.GITHUB_TOKEN) ?? asString(env.GH_TOKEN);
 }
 
-function errorText(error: unknown): string {
-  if (!(error instanceof Error)) return String(error);
-  return error.cause instanceof Error && error.cause.message
-    ? `${error.message}: ${error.cause.message}`
-    : error.message;
+function rateLimitExhausted(response: Response): boolean {
+  return response.headers.get("x-ratelimit-remaining") === "0";
+}
+
+function githubRateLimited(response: Response): boolean {
+  return response.status === 429 ||
+    (response.status === 403 && (rateLimitExhausted(response) || response.headers.has("retry-after")));
+}
+
+/** x-ratelimit-reset in epoch ms; null when it is missing or not a representable time. */
+function rateLimitResetMs(response: Response): number | null {
+  const reset = response.headers.get("x-ratelimit-reset")?.trim() ?? "";
+  const resetMs = /^\d+$/.test(reset) ? Number(reset) * 1000 : Number.NaN;
+  return resetMs > 0 && !Number.isNaN(new Date(resetMs).getTime()) ? resetMs : null;
+}
+
+/**
+ * GitHub asks a rate-limited client to wait for Retry-After, or until
+ * x-ratelimit-reset once x-ratelimit-remaining is 0, and otherwise for at
+ * least a minute, longer than the shared fetch ever waits.
+ */
+function githubRetryPlan(response: Response, nowMs: number): RetryPlan {
+  if (!githubRateLimited(response)) return defaultRetryPlan(response, nowMs);
+  const retryAfter = retryAfterMs(response.headers.get("retry-after"), nowMs);
+  if (retryAfter !== null) return { waitMs: retryAfter };
+  const resetMs = rateLimitExhausted(response) ? rateLimitResetMs(response) : null;
+  return resetMs === null ? "stop" : { waitMs: Math.max(0, resetMs - nowMs) };
 }
 
 function rateLimitNote(response: Response): string | null {
-  const retryAfter = response.headers.get("retry-after");
-  const exhausted = response.headers.get("x-ratelimit-remaining") === "0";
-  if (response.status !== 429 && !(response.status === 403 && (exhausted || retryAfter !== null))) {
-    return null;
+  if (!githubRateLimited(response)) return null;
+  const retryAfter = response.headers.get("retry-after")?.trim() ?? "";
+  if (/^\d+$/.test(retryAfter)) {
+    return `GitHub rate limit exceeded; retry after ${retryAfter} second${retryAfter === "1" ? "" : "s"}.`;
   }
-  if (retryAfter !== null) return `GitHub rate limit exceeded; retry after ${retryAfter} seconds.`;
-  const resetSeconds = Number(response.headers.get("x-ratelimit-reset"));
-  return resetSeconds > 0
-    ? `GitHub rate limit exceeded; it resets at ${new Date(resetSeconds * 1000).toISOString()}.`
+  const resetMs = rateLimitResetMs(response);
+  return resetMs !== null
+    ? `GitHub rate limit exceeded; it resets at ${new Date(resetMs).toISOString()}.`
     : "GitHub rate limit exceeded.";
 }
 
@@ -482,35 +511,17 @@ function failedReadDetail(
  * The token goes to api.github.com only: raw.githubusercontent.com serves the
  * public catalog without one and answers a rejected token with 404.
  */
-async function fetchJson<T>(url: string, auth?: GitHubAuth, signal?: AbortSignal): Promise<T> {
+function fetchJson<T>(url: string, auth?: GitHubAuth, signal?: AbortSignal): Promise<T> {
   const apiRead = url.startsWith(`${GITHUB_API}/`);
   const token = apiRead ? (auth?.token ?? null) : null;
-  // fetch echoes an invalid header value, token included, in its error message.
-  const failure = (reason: string, detail: string | null = null): Error => {
-    const message = `Fetch failed: ${url} (${reason})${detail ? `. ${detail}` : ""}`;
-    return new Error(token ? message.replaceAll(token, "[REDACTED]") : message);
-  };
-
-  let response: Response;
-  try {
-    response = await abortableFetch(fetch, signal)(url, { headers: githubHeaders(token) });
-  } catch (error) {
-    rethrowIfAborted(error);
-    if (signal?.aborted) throw error;
-    throw failure(errorText(error));
-  }
-  if (!response.ok) {
-    throw failure(
-      `${response.status} ${response.statusText}`.trim(),
-      failedReadDetail(response, token, apiRead && auth !== undefined && !token),
-    );
-  }
-  try {
-    return (await response.json()) as T;
-  } catch (error) {
-    if (signal?.aborted) throw error;
-    throw failure(`unreadable JSON: ${errorText(error)}`);
-  }
+  return retryingFetch<T>(url, {
+    headers: githubHeaders(token),
+    signal,
+    // fetch echoes an invalid header value, token included, in its error message.
+    secrets: token ? [token] : [],
+    retryPlan: apiRead ? githubRetryPlan : defaultRetryPlan,
+    failureDetail: (response) => failedReadDetail(response, token, apiRead && auth !== undefined && !token),
+  });
 }
 
 async function fetchPrimarySourceMetadata(auth?: GitHubAuth, signal?: AbortSignal): Promise<{
@@ -616,20 +627,27 @@ function primarySourceStatus(
 async function fetchPrimarySourceCatalog(signal?: AbortSignal): Promise<{
   catalog: FedrampCatalog;
   provenance: FedrampPrimarySourceStatus;
+  notes: string[];
 }> {
-  const emptyRepoMetadata: RepoOverviewResponse = {};
-  const emptyFileMetadata: GitHubContentFileResponse = {};
+  const notes: string[] = [];
   const [rawCatalog, metadata] = await Promise.all([
     fetchJson<Record<string, unknown>>(FEDRAMP_RULES_SOURCE.rawUrl, undefined, signal),
-    fetchPrimarySourceMetadata(undefined, signal).catch(fallbackUnlessAborted({
-      repo: emptyRepoMetadata,
-      file: emptyFileMetadata,
-    })),
+    fetchPrimarySourceMetadata(undefined, signal).catch((error: unknown) => {
+      rethrowIfAborted(error);
+      notes.push(
+        `GitHub metadata for ${FEDRAMP_RULES_SOURCE.org}/${FEDRAMP_RULES_SOURCE.repo} is unavailable, so the blob SHA, file URL, and repo update time are missing: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return { repo: {} as RepoOverviewResponse, file: {} as GitHubContentFileResponse };
+    }),
   ]);
   signal?.throwIfAborted();
 
   const catalog = normalizeFedrampConsolidatedRules(rawCatalog);
-  return { catalog, provenance: primarySourceStatus(catalog, metadata) };
+  return { catalog, provenance: primarySourceStatus(catalog, metadata), notes };
+}
+
+function persistedNotes(notes: unknown): string[] {
+  return Array.isArray(notes) ? notes.filter((note): note is string => typeof note === "string") : [];
 }
 
 /**
@@ -1096,7 +1114,7 @@ export async function loadFedrampCatalog(options?: {
       provenance: cached.provenance,
       cacheStatus: "cached",
       fetchedAt: cached.fetchedAt,
-      notes: [],
+      notes: persistedNotes(cached.notes),
     };
     catalogMemoryCache = {
       key: cacheKey,
@@ -1114,6 +1132,7 @@ export async function loadFedrampCatalog(options?: {
       fetchedAt,
       catalog: live.catalog,
       provenance: live.provenance,
+      notes: live.notes,
     };
     await writeCacheFile(cachePath, payload, options?.signal);
     const value: FedrampLoadedCatalog = {
@@ -1121,7 +1140,7 @@ export async function loadFedrampCatalog(options?: {
       provenance: live.provenance,
       cacheStatus: "live",
       fetchedAt,
-      notes: [],
+      notes: live.notes,
     };
     catalogMemoryCache = {
       key: cacheKey,
@@ -1140,6 +1159,7 @@ export async function loadFedrampCatalog(options?: {
         fetchedAt: cached.fetchedAt,
         notes: [
           `Serving stale FedRAMP cache because the live GitHub source could not be refreshed: ${error instanceof Error ? error.message : String(error)}`,
+          ...persistedNotes(cached.notes),
         ],
       };
       catalogMemoryCache = {
@@ -1186,7 +1206,7 @@ export async function inspectFedrampOfficialSources(options?: {
       secondary: cached.secondary,
       cacheStatus: "cached",
       fetchedAt: cached.fetchedAt,
-      notes: [...cached.secondary.notes],
+      notes: cached.notes ? persistedNotes(cached.notes) : [...cached.secondary.notes],
     };
     sourceMemoryCache = {
       key: cacheKey,
@@ -1203,11 +1223,13 @@ export async function inspectFedrampOfficialSources(options?: {
     ]);
     options?.signal?.throwIfAborted();
     const fetchedAt = new Date().toISOString();
+    const notes = [...catalog.notes, ...secondary.notes];
     const payload: SourceCachePayload = {
       schemaVersion: FEDRAMP_CACHE_SCHEMA_VERSION,
       fetchedAt,
       primary: catalog.provenance,
       secondary,
+      notes,
     };
     await writeCacheFile(cachePath, payload, options?.signal);
     const value: FedrampSourceStatus = {
@@ -1215,7 +1237,7 @@ export async function inspectFedrampOfficialSources(options?: {
       secondary,
       cacheStatus: catalog.cacheStatus === "stale" ? "stale" : "live",
       fetchedAt,
-      notes: [...catalog.notes, ...secondary.notes],
+      notes,
     };
     sourceMemoryCache = {
       key: cacheKey,
@@ -1234,7 +1256,7 @@ export async function inspectFedrampOfficialSources(options?: {
         fetchedAt: cached.fetchedAt,
         notes: [
           `Serving stale FedRAMP source metadata because the live GitHub source check failed: ${error instanceof Error ? error.message : String(error)}`,
-          ...cached.secondary.notes,
+          ...(cached.notes ? persistedNotes(cached.notes) : cached.secondary.notes),
         ],
       };
       sourceMemoryCache = {
