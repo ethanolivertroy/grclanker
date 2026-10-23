@@ -17,7 +17,7 @@ import {
 import { readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
-import { abortableFetch, rethrowIfAborted } from "./abort.js";
+import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
@@ -45,6 +45,11 @@ type JsonRecord = Record<string, unknown>;
 
 const DEFAULT_OUTPUT_DIR = "./export/cloudflare";
 const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_RETRIES = 3;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+const RETRY_BASE_DELAY_MS = 500;
+const MAX_BACKOFF_MS = 8_000;
+const MAX_RETRY_AFTER_MS = 30_000;
 const DEFAULT_ZONE_LIMIT = 20;
 const DEFAULT_MEMBER_LIMIT = 200;
 const DEFAULT_TOKEN_LIMIT = 200;
@@ -177,6 +182,8 @@ export interface CloudflarePagedList {
   items: JsonRecord[];
   totalCount?: number;
   truncated: boolean;
+  /** Why a truncated list stopped short, when the client knows more than the counts say. */
+  truncationReason?: string;
 }
 
 type ListResult = JsonRecord[] | CloudflarePagedList;
@@ -1294,22 +1301,55 @@ function errorMessage(error: unknown): string {
   return redactErrorText(error instanceof Error ? error.message : String(error));
 }
 
+/** One GET: the response and its body, or why no response arrived (a timeout or a transport failure). */
+type CloudflareExchange =
+  | { response: Response; rawText: string; failure?: undefined }
+  | { response?: undefined; rawText?: undefined; failure: string };
+
+/** The wait a Retry-After value asks for in milliseconds: delta-seconds, or an HTTP date measured from `now`. */
+function retryAfterMs(value: string | null | undefined, now: Date): number | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  if (/^\d+(\.\d+)?$/.test(text)) return Number(text) * 1000;
+  const date = Date.parse(text);
+  return Number.isNaN(date) ? undefined : Math.max(date - now.getTime(), 0);
+}
+
+function backoffMs(attempt: number): number {
+  return Math.min(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), MAX_BACKOFF_MS);
+}
+
+function attemptsText(attempts: number): string {
+  return `after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}`;
+}
+
+function retryAfterRefusal(waitMs: number): string {
+  return `the server asked to retry after ${Math.ceil(waitMs / 1000)} s, more than the ${MAX_RETRY_AFTER_MS / 1000} s limit`;
+}
+
+function unpaginatedTruncation(path: string, returned: number, reported: string): string {
+  return `GET ${displayPath(path)} returned ${returned} ${returned === 1 ? "item" : "items"} while its result_info reported ${reported}; the endpoint takes no paging parameters, so the rest were not read.`;
+}
+
 export class CloudflareApiClient implements CloudflareReader {
   private readonly config: CloudflareResolvedConfig;
   private readonly fetchImpl: FetchImpl;
   private readonly now: () => Date;
+  private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(
     config: CloudflareResolvedConfig,
     options: {
       fetchImpl?: FetchImpl;
       now?: () => Date;
+      sleep?: (ms: number) => Promise<void>;
       signal?: AbortSignal;
     } = {},
   ) {
     this.config = config;
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.now = options.now ?? (() => new Date());
+    this.sleep = abortableSleep(options.signal, options.sleep);
     registerConfiguredSecrets(config.apiToken, config.apiKey);
   }
 
@@ -1331,6 +1371,11 @@ export class CloudflareApiClient implements CloudflareReader {
     return url.toString();
   }
 
+  /**
+   * A GET retried on 429, 500, 502, 503, 504, a timeout, or a transport failure, up to MAX_RETRIES times. The wait is
+   * Retry-After when the response carries it, else exponential backoff. A Retry-After beyond MAX_RETRY_AFTER_MS is
+   * not waited out: the read fails at once and the error says what the server asked for.
+   */
   private async requestJson(
     path: string,
     options: {
@@ -1338,71 +1383,95 @@ export class CloudflareApiClient implements CloudflareReader {
       allow404?: boolean;
     } = {},
   ): Promise<JsonRecord | null> {
+    for (let attempt = 1; ; attempt += 1) {
+      const exchange = await this.send(path, options.query);
+      if (exchange.response && !RETRYABLE_STATUSES.has(exchange.response.status)) {
+        return this.readPayload(path, exchange.response, exchange.rawText, options.allow404);
+      }
+      const askedMs = exchange.response ? retryAfterMs(exchange.response.headers?.get?.("retry-after"), this.now()) : undefined;
+      const refusal = askedMs !== undefined && askedMs > MAX_RETRY_AFTER_MS ? retryAfterRefusal(askedMs) : undefined;
+      if (attempt <= MAX_RETRIES && refusal === undefined) {
+        await this.sleep(askedMs ?? backoffMs(attempt));
+        continue;
+      }
+      if (!exchange.response) {
+        // Transport failures carry no HTTP status; the message names the path and the timeout budget, never a body.
+        throw new CloudflareApiError(`Cloudflare request failed for ${displayPath(path)} ${attemptsText(attempt)} (${exchange.failure})`, undefined, path);
+      }
+      return this.readPayload(path, exchange.response, exchange.rawText, options.allow404, { attempts: attempt, refusal });
+    }
+  }
+
+  /** One GET under the configured timeout. The tool call's abort is rethrown; any other failure is returned as its reason. */
+  private async send(path: string, query: JsonRecord | undefined): Promise<CloudflareExchange> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
-
     try {
-      let response: Response;
-      let rawText: string;
-      try {
-        response = await this.fetchImpl(this.buildUrl(path, options.query), {
-          method: "GET",
-          headers: buildHeaders(this.config),
-          signal: controller.signal,
-        });
-        rawText = await response.text();
-      } catch (error) {
-        rethrowIfAborted(error);
-        // Transport failures carry no HTTP status; the message names the path and the timeout budget, never a body.
-        const reason = controller.signal.aborted
+      const response = await this.fetchImpl(this.buildUrl(path, query), {
+        method: "GET",
+        headers: buildHeaders(this.config),
+        signal: controller.signal,
+      });
+      return { response, rawText: await response.text() };
+    } catch (error) {
+      rethrowIfAborted(error);
+      return {
+        failure: controller.signal.aborted
           ? `timed out after ${this.config.timeoutMs} ms`
-          : `network error: ${errorMessage(error)}`;
-        throw new CloudflareApiError(`Cloudflare request failed for ${displayPath(path)} (${reason})`, undefined, path);
-      }
-
-      let payload: JsonRecord = {};
-      let parsed = rawText.length === 0;
-      if (rawText.length > 0) {
-        try {
-          payload = asObject(JSON.parse(rawText)) ?? {};
-          parsed = true;
-        } catch {
-          payload = {};
-        }
-      }
-      const contentType = response.headers?.get?.("content-type") ?? null;
-
-      if (response.status === 404 && options.allow404) {
-        return null;
-      }
-
-      if (!response.ok) {
-        const detail = (parsed ? cloudflareErrorSummary(payload) : undefined) ?? describeNonJsonBody(contentType, rawText);
-        throw new CloudflareApiError(
-          `Cloudflare request failed for ${displayPath(path)} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
-          response.status,
-          path,
-          cloudflareCredentialRejection(payload),
-        );
-      }
-
-      // A 2xx answer that is not JSON (a proxy login page, an HTML error) is a failed read, not an empty inventory.
-      if (!parsed) {
-        throw new CloudflareApiError(
-          `Cloudflare request returned a non-JSON payload for ${displayPath(path)} (${response.status} ${response.statusText}): ${describeNonJsonBody(contentType, rawText)}`,
-          response.status,
-          path,
-        );
-      }
-
-      if (payload.success === false) {
-        throw new CloudflareApiError(cloudflareErrorSummary(payload) ?? `Cloudflare API reported failure for ${displayPath(path)}.`, response.status, path, cloudflareCredentialRejection(payload));
-      }
-
-      return payload;
+          : `network error: ${errorMessage(error)}`,
+      };
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  private readPayload(
+    path: string,
+    response: Response,
+    rawText: string,
+    allow404: boolean | undefined,
+    retried?: { attempts: number; refusal?: string },
+  ): JsonRecord | null {
+    let payload: JsonRecord = {};
+    let parsed = rawText.length === 0;
+    if (rawText.length > 0) {
+      try {
+        payload = asObject(JSON.parse(rawText)) ?? {};
+        parsed = true;
+      } catch {
+        payload = {};
+      }
+    }
+    const contentType = response.headers?.get?.("content-type") ?? null;
+
+    if (response.status === 404 && allow404) {
+      return null;
+    }
+
+    if (!response.ok) {
+      const detail = (parsed ? cloudflareErrorSummary(payload) : undefined) ?? describeNonJsonBody(contentType, rawText);
+      throw new CloudflareApiError(
+        `Cloudflare request failed for ${displayPath(path)}${retried ? ` ${attemptsText(retried.attempts)}` : ""} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}${retried?.refusal ? `; ${retried.refusal}` : ""}`,
+        response.status,
+        path,
+        cloudflareCredentialRejection(payload),
+      );
+    }
+
+    // A 2xx answer that is not JSON (a proxy login page, an HTML error) is a failed read, not an empty inventory.
+    if (!parsed) {
+      throw new CloudflareApiError(
+        `Cloudflare request returned a non-JSON payload for ${displayPath(path)} (${response.status} ${response.statusText}): ${describeNonJsonBody(contentType, rawText)}`,
+        response.status,
+        path,
+      );
+    }
+
+    if (payload.success === false) {
+      throw new CloudflareApiError(cloudflareErrorSummary(payload) ?? `Cloudflare API reported failure for ${displayPath(path)}.`, response.status, path, cloudflareCredentialRejection(payload));
+    }
+
+    return payload;
   }
 
   private async getObject(path: string, allow404 = true): Promise<JsonRecord | null> {
@@ -1411,11 +1480,19 @@ export class CloudflareApiClient implements CloudflareReader {
     return extractResultObject(payload) ?? null;
   }
 
+  /**
+   * A list endpoint documented without paging parameters. When its result_info still reports more items or pages
+   * than the response holds, the list is truncated: there is no documented way to request the rest.
+   */
   private async getUnpaginatedList(path: string, query: JsonRecord = {}): Promise<CloudflarePagedList> {
     const payload = await this.requestJson(path, { query, allow404: true });
     if (payload === null) return { items: [], truncated: false, totalCount: 0 };
     const items = extractResultArray(payload);
-    return { items, truncated: false, totalCount: items.length };
+    const resultInfo = asObject(payload.result_info);
+    const reported = Math.max(asNumber(resultInfo?.total_count) ?? 0, asNumber(resultInfo?.count) ?? 0);
+    const totalPages = asNumber(resultInfo?.total_pages) ?? 1;
+    if (reported <= items.length && totalPages <= 1) return { items, truncated: false, totalCount: items.length };
+    return { items, truncated: true, totalCount: reported > items.length ? reported : undefined, truncationReason: unpaginatedTruncation(path, items.length, reported > items.length ? `${reported} items` : `${totalPages} pages`) };
   }
 
   private async listPaginated(
@@ -1684,10 +1761,12 @@ function asPaged(value: unknown): CloudflarePagedList {
   if (Array.isArray(value)) return { items: asRecordArray(value), truncated: false, totalCount: value.length };
   const record = asObject(value);
   if (record && Array.isArray(record.items)) {
+    const truncationReason = asString(record.truncationReason);
     return {
       items: asRecordArray(record.items),
       totalCount: asNumber(record.totalCount) ?? asNumber(record.total_count),
       truncated: asBoolean(record.truncated) ?? false,
+      ...(truncationReason ? { truncationReason } : {}),
     };
   }
   return { items: [], truncated: false, totalCount: 0 };
@@ -1715,7 +1794,7 @@ function manualReason(endpoint: string, permission: string, evidence: string, er
 function partialInventoryNote(label: string, list: CloudflarePagedList): string | undefined {
   if (!list.truncated) return undefined;
   const total = list.totalCount === undefined ? "an unknown total" : `${list.totalCount} total`;
-  return `Partial ${label} inventory: ${list.items.length} seen of ${total}; unseen items were not assessed.`;
+  return `Partial ${label} inventory: ${list.items.length} seen of ${total}; unseen items were not assessed.${list.truncationReason ? ` ${list.truncationReason}` : ""}`;
 }
 
 interface ControlMapping {
@@ -3156,10 +3235,14 @@ export async function assessCloudflareTrafficControls(
 
     if (!pageRuleOutcome.ok) pageRules.push(verdict(name, manualReason("/zones/{zone_id}/pagerules", "Page Rules: Read", "the page rule list", pageRuleOutcome.error), { evidenceReadable: false }));
     else {
-      const risky = pageRuleOutcome.value.items.filter(pageRuleIsRisky);
-      if (risky.length > 0) pageRules.push(verdict(name, `${risky.length} active page rules weaken security (disable_security, security_level essentially_off, ssl off/flexible, or cache_everything on sensitive paths).`, { evidenceReadable: true, violationCount: risky.length }));
-      else if (pageRuleOutcome.value.items.length === 0) pageRules.push(verdict(name, "No active page rules exist (status=active); emptiness is compliant because no active rule can weaken security.", { evidenceReadable: true }));
-      else pageRules.push(verdict(name, `${pageRuleOutcome.value.items.length} active page rules, none security-degrading.`, { evidenceReadable: true }));
+      const activePageRules = pageRuleOutcome.value;
+      const risky = activePageRules.items.filter(pageRuleIsRisky);
+      const partial = partialInventoryNote("page rule", activePageRules);
+      if (risky.length > 0) pageRules.push(verdict(name, `${risky.length} active page rules weaken security (disable_security, security_level essentially_off, ssl off/flexible, or cache_everything on sensitive paths).${partial ? ` ${partial}` : ""}`, { evidenceReadable: true, violationCount: risky.length }));
+      else if (partial && activePageRules.items.length === 0) pageRules.push(verdict(name, `No active page rule was returned, so none could be assessed. ${partial}`, { evidenceReadable: false }));
+      else if (partial) pageRules.push(verdict(name, `${activePageRules.items.length} active page rules seen, none security-degrading. ${partial}`, { evidenceReadable: true, reviewCount: 1 }));
+      else if (activePageRules.items.length === 0) pageRules.push(verdict(name, "No active page rules exist (status=active); emptiness is compliant because no active rule can weaken security.", { evidenceReadable: true }));
+      else pageRules.push(verdict(name, `${activePageRules.items.length} active page rules, none security-degrading.`, { evidenceReadable: true }));
     }
 
     if (!botOutcome.ok) botControls.push(verdict(name, manualReason("/zones/{zone_id}/bot_management", "Bot Management: Read", "the Bot Fight Mode or Bot Management settings", botOutcome.error), { evidenceReadable: false }));
@@ -3266,7 +3349,14 @@ export async function assessCloudflareTrafficControls(
     const filters = new Set(enabled.flatMap((rule) => asArray(rule.filters).map((item) => asString(item) ?? "")));
     // quarantine is not a blocking action; only block, isolate, and override satisfy the control.
     const blocking = enabled.filter((rule) => ["block", "isolate", "override"].includes(asString(rule.action) ?? ""));
-    if (gatewayRules!.items.length === 0) {
+    const partial = partialInventoryNote("Gateway rule", gatewayRules!);
+    if (gatewayRules!.items.length === 0 && partial) {
+      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", `No Gateway rule was returned, so none could be assessed. ${partial} Review Zero Trust > Gateway > Firewall policies manually.`, 24, { account_id: accountId, gateway_rules: 0, gateway_rules_total: gatewayRules!.totalCount ?? null, truncated: true }, {
+        evidence_readable: false,
+        evidence_complete: false,
+        gateway_rule_count: 0,
+      }));
+    } else if (gatewayRules!.items.length === 0) {
       const gatewayTag = gatewayAccountOutcome!.ok ? asString(gatewayAccountOutcome!.value?.gateway_tag) : undefined;
       if (gatewayTag) {
         findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `Zero Trust Gateway is provisioned for this account (gateway_tag ${gatewayTag} from /accounts/{account_id}/gateway) but no Gateway DNS or HTTP policies exist.`, 24, { account_id: accountId, gateway_rules: 0, gateway_tag: gatewayTag }, {
@@ -3282,7 +3372,7 @@ export async function assessCloudflareTrafficControls(
         findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", `No Gateway rules exist and ${gatewayAccountOutcome!.ok ? "/accounts/{account_id}/gateway returned no gateway_tag" : `/accounts/{account_id}/gateway could not be read (${gatewayAccountOutcome!.error})`}. Zero Trust Gateway requires a Zero Trust subscription with the Gateway product; confirm whether Gateway is licensed and, if so, define DNS and HTTP filtering policies.`, 24, { account_id: accountId, gateway_rules: 0, gateway_tag: null }, {}));
       }
     } else if (blocking.length === 0 || !(filters.has("dns") || filters.has("http"))) {
-      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `${enabled.length} enabled Gateway rules, but none block, isolate, or override on DNS or HTTP filters.`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, filters: [...filters] }, {
+      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `${enabled.length} enabled Gateway rules, but none block, isolate, or override on DNS or HTTP filters.${partial ? ` ${partial}` : ""}`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, filters: [...filters], truncated: gatewayRules!.truncated }, {
         evidence_readable: true,
         evidence_complete: !gatewayRules!.truncated,
         gateway_provisioned: true,
@@ -3292,8 +3382,7 @@ export async function assessCloudflareTrafficControls(
         dns_or_http_filter_present: filters.has("dns") || filters.has("http"),
       }));
     } else {
-      const partial = partialInventoryNote("Gateway rule", gatewayRules!);
-      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", partial ? "warn" : "pass", `${enabled.length} enabled Gateway rules (${blocking.length} blocking or isolating) across filters ${[...filters].join(", ")}.${partial ? ` ${partial}` : ""}`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, blocking_rules: blocking.length, filters: [...filters] }, {
+      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", partial ? "warn" : "pass", `${enabled.length} enabled Gateway rules (${blocking.length} blocking or isolating) across filters ${[...filters].join(", ")}.${partial ? ` ${partial}` : ""}`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, blocking_rules: blocking.length, filters: [...filters], truncated: gatewayRules!.truncated }, {
         evidence_readable: true,
         evidence_complete: !gatewayRules!.truncated,
         gateway_provisioned: true,
@@ -3871,9 +3960,13 @@ export function cloudflareFixedTexts(): readonly string[] {
     denied,
     zonesDenied,
     policiesDenied,
-    `Cloudflare request failed for /zones/zone-1/settings/always_use_https (502 Bad Gateway): ${describeNonJsonBody("text/html", html)}`,
-    "Cloudflare request failed for /zones (timed out after 30000 ms)",
-    "Cloudflare request failed for /zones (network error: fetch failed)",
+    `Cloudflare request failed for /zones/zone-1/settings/always_use_https ${attemptsText(MAX_RETRIES + 1)} (502 Bad Gateway): ${describeNonJsonBody("text/html", html)}`,
+    `Cloudflare request failed for /zones ${attemptsText(MAX_RETRIES + 1)} (timed out after 30000 ms)`,
+    `Cloudflare request failed for /zones ${attemptsText(MAX_RETRIES + 1)} (network error: fetch failed)`,
+    `Cloudflare request failed for /zones ${attemptsText(1)} (429 Too Many Requests): ${cloudflareErrorSummary({ success: false, errors: [{ code: 971, message: "Please wait and consider throttling your request speed" }] }) ?? ""}; ${retryAfterRefusal(300_000)}`,
+    partialInventoryNote("Gateway rule", { items: [{}], truncated: true, totalCount: 2, truncationReason: unpaginatedTruncation("/accounts/acc-123/gateway/rules", 1, "2 items") }) ?? "",
+    `No Gateway rule was returned, so none could be assessed. ${partialInventoryNote("Gateway rule", { items: [], truncated: true, truncationReason: unpaginatedTruncation("/accounts/acc-123/gateway/rules", 0, "3 pages") }) ?? ""}`,
+    `No active page rule was returned, so none could be assessed. ${partialInventoryNote("page rule", { items: [], truncated: true, totalCount: 3, truncationReason: unpaginatedTruncation("/zones/zone-1/pagerules", 0, "3 items") }) ?? ""}`,
     `Cloudflare request returned a non-JSON payload for /zones (200 OK): ${describeNonJsonBody("text/html", html)}`,
     "Cloudflare API reported failure for /zones.",
     notAttempted("listAccessPolicies").error,

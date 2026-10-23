@@ -29,6 +29,7 @@ import {
   resolveSecureOutputPath,
   scrubSnapshotValue,
 } from "../dist/extensions/grc-tools/cloudflare.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { CLOUDFLARE_COMPLETENESS_SOURCES, CLOUDFLARE_SPEC } from "../dist/extensions/grc-tools/cloudflare.spec.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
@@ -103,6 +104,11 @@ function sampleConfig(overrides = {}) {
     sourceChain: ["tests"],
     ...overrides,
   };
+}
+
+/** A client whose retry waits return at once, so a fixture that answers 5xx, 429, or never runs in milliseconds. */
+function cloudflareClient(config, options = {}) {
+  return new CloudflareApiClient(config, { sleep: async () => {}, ...options });
 }
 
 function forbidden(path) {
@@ -790,7 +796,7 @@ test("verdict rule 7: pagination follows result_info to completion and flags tru
     }
     return { payload: { success: true, result: [] } };
   });
-  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl });
+  const client = cloudflareClient(sampleConfig(), { fetchImpl });
 
   const members = await client.listMembers("acc-123", 500);
   assert.equal(members.items.length, 51);
@@ -827,7 +833,7 @@ test("schema fidelity: client requests documented paths, phases, setting ids, an
     if (url.pathname.endsWith("/entrypoint")) return { payload: { success: true, result: { id: "rs", rules: [] } } };
     return { payload: { success: true, result: [] } };
   });
-  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl, now: () => new Date("2026-09-21T00:00:00Z") });
+  const client = cloudflareClient(sampleConfig(), { fetchImpl, now: () => new Date("2026-09-21T00:00:00Z") });
   const zone = "zone-1";
   const account = "acc-123";
 
@@ -1021,7 +1027,7 @@ test("review fix 3: page rules are requested with status=active so disabled rule
     }
     return { payload: { success: true, result: [] } };
   });
-  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl });
+  const client = cloudflareClient(sampleConfig(), { fetchImpl });
   const rules = await client.listPageRules("zone-1");
   assert.equal(rules.items.length, 1);
   assert.equal(calls[0].searchParams.get("status"), "active");
@@ -1071,7 +1077,7 @@ test("self-check (d): a fully compliant account built from documented fields pas
 });
 
 test("verdict rule 10: listCursorPaginated reports an empty page with a cursor, a repeated cursor, the page budget, and a mid-listing 404 as truncated", async () => {
-  const cursorClient = (handler) => new CloudflareApiClient(sampleConfig(), { fetchImpl: fakeFetch(handler).fetchImpl });
+  const cursorClient = (handler) => cloudflareClient(sampleConfig(), { fetchImpl: fakeFetch(handler).fetchImpl });
 
   const emptyPageWithCursor = await cursorClient((url) => {
     const cursor = url.searchParams.get("cursor");
@@ -1115,7 +1121,7 @@ test("verdict rule 10: listCursorPaginated reports an empty page with a cursor, 
 });
 
 test("CF-IAM-06 treats token-list 404 as complete safe-empty evidence and other failures as incomplete", async () => {
-  const notFoundClient = new CloudflareApiClient(sampleConfig(), {
+  const notFoundClient = cloudflareClient(sampleConfig(), {
     fetchImpl: fakeFetch(() => ({
       status: 404,
       payload: { success: false, errors: [{ code: 10000, message: "not found" }] },
@@ -1148,26 +1154,32 @@ test("CF-IAM-06 treats token-list 404 as complete safe-empty evidence and other 
   assert.equal(byId(failed.result, "CF-IAM-06").status, "warn");
 });
 
-test("CF-TRF-06 preserves the unpaginated Gateway-rules limitation in facts and metadata", async () => {
+test("CF-TRF-06 never passes on a Gateway-rules response whose result_info reports rules or pages it does not hold", async () => {
   assert.deepEqual(
     CLOUDFLARE_COMPLETENESS_SOURCES["CF-TRF-06"].find((entry) => entry.surfaceId === "gateway-rules")?.falseWhen,
-    [],
+    ["truncated"],
   );
-  const gatewayClient = new CloudflareApiClient(sampleConfig(), {
-    fetchImpl: fakeFetch(() => ({
-      payload: {
-        success: true,
-        result: [{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }],
-        result_info: { page: 1, per_page: 1, total_pages: 2, total_count: 2 },
-      },
-    })).fetchImpl,
-  });
-  const firstPage = await gatewayClient.listGatewayRules();
+  const gatewayClient = (resultInfo, result = [{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }]) => {
+    const { calls, fetchImpl } = fakeFetch(() => ({ payload: { success: true, result, ...(resultInfo ? { result_info: resultInfo } : {}) } }));
+    return { calls, client: cloudflareClient(sampleConfig(), { fetchImpl }) };
+  };
+
+  const { calls, client } = gatewayClient({ page: 1, per_page: 1, total_pages: 2, total_count: 2 });
+  const firstPage = await client.listGatewayRules("acc-123");
+  assert.equal(calls.length, 1, "the endpoint takes no paging parameters, so no second page is requested");
   assert.deepEqual(firstPage, {
     items: [{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }],
-    truncated: false,
-    totalCount: 1,
+    truncated: true,
+    totalCount: 2,
+    truncationReason: "GET /accounts/acc-123/gateway/rules returned 1 item while its result_info reported 2 items; the endpoint takes no paging parameters, so the rest were not read.",
   });
+  // total_pages alone, or count alone, is enough to show that rules were left out.
+  assert.equal((await gatewayClient({ total_pages: 3 }).client.listGatewayRules("acc-123")).truncated, true);
+  assert.equal((await gatewayClient({ count: 5 }).client.listGatewayRules("acc-123")).truncated, true);
+  // A response that holds everything its result_info reports, or carries no result_info, stays complete.
+  assert.deepEqual(await gatewayClient({ page: 1, total_pages: 1, count: 1, total_count: 1 }).client.listGatewayRules("acc-123"), { items: firstPage.items, truncated: false, totalCount: 1 });
+  assert.deepEqual(await gatewayClient(undefined).client.listGatewayRules("acc-123"), { items: firstPage.items, truncated: false, totalCount: 1 });
+
   const { result, captures } = await captureBatchDecisionFacts(() => assessCloudflareTrafficControls(fixtureClient("compliant", {
     async listGatewayRules() {
       return firstPage;
@@ -1175,8 +1187,46 @@ test("CF-TRF-06 preserves the unpaginated Gateway-rules limitation in facts and 
   })));
   const facts = captures.find((capture) =>
     capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-TRF-06"))?.checks.get("CF-TRF-06");
-  assert.equal(facts?.evidence_complete, true);
-  assert.equal(byId(result, "CF-TRF-06").status, "pass");
+  assert.equal(facts?.evidence_complete, false);
+  const partial = byId(result, "CF-TRF-06");
+  assert.equal(partial.status, "warn", partial.summary);
+  assert.match(partial.summary, /Partial Gateway rule inventory: 1 seen of 2 total; unseen items were not assessed\. GET \/accounts\/acc-123\/gateway\/rules returned 1 item while its result_info reported 2 items/);
+
+  // An empty response that still reports rules is not evidence that Gateway has none.
+  const emptyTruncated = (await gatewayClient({ total_count: 3, total_pages: 3 }, []).client.listGatewayRules("acc-123"));
+  assert.equal(emptyTruncated.truncated, true);
+  const empty = await captureBatchDecisionFacts(() => assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listGatewayRules() {
+      return emptyTruncated;
+    },
+  })));
+  const emptyFacts = empty.captures.find((capture) =>
+    capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-TRF-06"))?.checks.get("CF-TRF-06");
+  assert.equal(emptyFacts?.evidence_complete, false);
+  assert.equal(emptyFacts?.evidence_readable, false);
+  const none = byId(empty.result, "CF-TRF-06");
+  assert.equal(none.status, "manual", none.summary);
+  assert.match(none.summary, /No Gateway rule was returned, so none could be assessed\. Partial Gateway rule inventory: 0 seen of 3 total/);
+});
+
+test("CF-TRF-02 never passes on a page-rules response whose result_info reports rules it does not hold", async () => {
+  const pageRules = (result, resultInfo) => cloudflareClient(sampleConfig(), {
+    fetchImpl: fakeFetch(() => ({ payload: { success: true, result, result_info: resultInfo } })).fetchImpl,
+  }).listPageRules("zone-1");
+  const safeRule = { id: "pr-1", status: "active", targets: [{ target: "url", constraint: { operator: "matches", value: "example.com/*" } }], actions: [{ id: "always_use_https" }] };
+
+  const partial = await pageRules([safeRule], { page: 1, per_page: 1, total_pages: 3, total_count: 3, count: 1 });
+  assert.equal(partial.truncated, true);
+  assert.equal(partial.totalCount, 3);
+  assert.match(partial.truncationReason, /^GET \/zones\/zone-1\/pagerules returned 1 item while its result_info reported 3 items/);
+  const visible = byId(await assessCloudflareTrafficControls(fixtureClient("compliant", { async listPageRules() { return partial; } })), "CF-TRF-02");
+  assert.equal(visible.status, "warn", visible.summary);
+  assert.match(visible.summary, /Partial page rule inventory: 1 seen of 3 total/);
+
+  const emptyPartial = await pageRules([], { total_count: 3 });
+  const hidden = byId(await assessCloudflareTrafficControls(fixtureClient("compliant", { async listPageRules() { return emptyPartial; } })), "CF-TRF-02");
+  assert.equal(hidden.status, "manual", hidden.summary);
+  assert.match(hidden.summary, /No active page rule was returned, so none could be assessed\. Partial page rule inventory: 0 seen of 3 total/);
 });
 
 test("verdict rule 10: CF-IAM-04 caps at warn when the reusable Access policy list is truncated and names seen versus total", async () => {
@@ -1350,7 +1400,7 @@ test("verdict rule 9: non-JSON error bodies are described, never echoed, in Clou
       return `<html><body>Proxy error: Authorization: Bearer ${leaked}</body></html>`;
     },
   });
-  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl });
+  const client = cloudflareClient(sampleConfig(), { fetchImpl });
   await assert.rejects(client.listMembers("acc-123"), (error) => {
     assert.equal(error.status, 502);
     assert.equal(error.path, "/accounts/acc-123/members");
@@ -1360,7 +1410,7 @@ test("verdict rule 9: non-JSON error bodies are described, never echoed, in Clou
   });
 
   // A 2xx answer that is not JSON (a proxy login page) is a failed read, not an empty inventory.
-  const okHtml = new CloudflareApiClient(sampleConfig(), {
+  const okHtml = cloudflareClient(sampleConfig(), {
     fetchImpl: async () => new Response(`<html>Sign in with Bearer ${leaked}</html>`, { status: 200, statusText: "OK", headers: { "content-type": "text/html" } }),
   });
   await assert.rejects(okHtml.listMembers("acc-123"), (error) => {
@@ -1371,7 +1421,7 @@ test("verdict rule 9: non-JSON error bodies are described, never echoed, in Clou
   });
 
   // Transport failures carry the path and the failure class, never a status they did not observe.
-  const timedOut = new CloudflareApiClient(sampleConfig({ timeoutMs: 5 }), {
+  const timedOut = cloudflareClient(sampleConfig({ timeoutMs: 5 }), {
     fetchImpl: (_url, init) => new Promise((_resolve, reject) => {
       init.signal.addEventListener("abort", () => reject(new Error(`aborted while holding Bearer ${leaked}`)));
     }),
@@ -1388,12 +1438,12 @@ test("verdict rule 9: non-JSON error bodies are described, never echoed, in Clou
 test("rule 9: redactErrorText scrubs every credential shape anywhere in an error string and leaves prose alone", () => {
   assertRedactionCases(assert, redactErrorText);
   // The configured token is scrubbed wherever an upstream error echoes it.
-  new CloudflareApiClient(sampleConfig({ apiToken: CLOUDFLARE_CONFIGURED_TOKEN_CANARY }), { fetchImpl: async () => new Response("{}") });
+  cloudflareClient(sampleConfig({ apiToken: CLOUDFLARE_CONFIGURED_TOKEN_CANARY }), { fetchImpl: async () => new Response("{}") });
   assert.equal(redactErrorText(`proxy replayed ${CLOUDFLARE_CONFIGURED_TOKEN_CANARY} upstream`), "proxy replayed [REDACTED] upstream");
 });
 
 test("rule 9 scrub boundary: name-shaped values stay bare, any value in a carrier is removed, token-shaped values are removed bare, the configured secret is removed in every encoded form, and the integration's fixed texts survive", () => {
-  new CloudflareApiClient(sampleConfig({ apiToken: ENCODED_FORM_SECRET }), { fetchImpl: async () => new Response("{}") });
+  cloudflareClient(sampleConfig({ apiToken: ENCODED_FORM_SECRET }), { fetchImpl: async () => new Response("{}") });
   assertScrubBoundary(assert, redactErrorText, {
     configuredSecret: ENCODED_FORM_SECRET,
     mustKeep: [
@@ -1421,7 +1471,7 @@ test("rule 9 escapes (reviewer D round 5 escapes): a header carrier after a two-
   assert.ok(message.includes("\\n") && message.includes("\\u000a"), "the message carries the escapes as backslash text");
   const routes = healthyCloudflareRoutes();
   routes[`/accounts/${ACCOUNT}/members`] = () => new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message }], messages: [], result: null }), { status: 403, statusText: "Forbidden", headers: CLOUDFLARE_JSON_HEADERS });
-  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl: cloudflareRoutedFetch(routes) });
+  const client = cloudflareClient(sampleConfig(), { fetchImpl: cloudflareRoutedFetch(routes) });
   const access = await checkCloudflareAccess(client);
   const members = access.surfaces.find((entry) => entry.name === "members");
   assert.equal(members.status, "not_readable");
@@ -1437,7 +1487,7 @@ test("rule 9 depth control (reviewer D round 5 depth control): every string a sn
   assertDepthControl(assert, (tree) => scrubSnapshotValue({ result: [{ settings: tree }] }).result[0].settings, { label: "cloudflare.scrubSnapshotValue under an envelope", rootDepth: 4 });
   // The string half on its own: carriers go, identifiers stay (a 32-hex account id among them), the configured token goes in every form.
   const config = sampleConfig({ apiToken: CLOUDFLARE_RUN_TOKEN_CANARY });
-  new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes()) });
+  cloudflareClient(config, { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes()) });
   assertCarrierTextScrub(assert, redactCarrierText, { label: "cloudflare.redactCarrierText", configuredSecret: CLOUDFLARE_RUN_TOKEN_CANARY });
   for (const { label, id } of SERVER_ASSIGNED_HEX_IDS) {
     assert.equal(redactCarrierText(`/accounts/${id}/members read`), `/accounts/${id}/members read`, `a snapshot keeps a ${label} whole`);
@@ -1448,7 +1498,7 @@ test("rule 9 depth control (reviewer D round 5 depth control): every string a sn
   const planted = { count: 0 };
   const log = [];
   const run = await runEveryCloudflareTool(
-    new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(withPlantedRoutes(healthyCloudflareRoutes(), { planted }), log) }),
+    cloudflareClient(config, { fetchImpl: cloudflareRoutedFetch(withPlantedRoutes(healthyCloudflareRoutes(), { planted }), log) }),
     createTempBase("grclanker-cloudflare-depth-"),
   );
   assert.ok(planted.count >= Object.keys(healthyCloudflareRoutes()).length, `the fixture planted the tree into ${planted.count} objects`);
@@ -1469,8 +1519,9 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
     "not attempted: this client does not expose listAccessPolicies, so no request was made",
     "Not attempted: /zones could not be read (Cloudflare request failed for /zones (403 Forbidden): Authentication error)",
     "3 zone-scoped surfaces were not attempted because /zones could not be read (403).",
-    "Cloudflare request failed for /zones (timed out after 30000 ms)",
-    "Cloudflare request failed for /zones (network error: fetch failed)",
+    "Cloudflare request failed for /zones after 4 attempts (timed out after 30000 ms)",
+    "Cloudflare request failed for /zones after 4 attempts (network error: fetch failed)",
+    "Cloudflare request failed for /zones after 1 attempt (429 Too Many Requests): Please wait and consider throttling your request speed; the server asked to retry after 300 s, more than the 30 s limit",
     "Cloudflare API reported failure for /zones.",
     "The active API token reported status expired instead of active.",
     "Global API Key auth has no token to verify; create a scoped read-only API token and record its permission groups manually.",
@@ -1485,9 +1536,9 @@ test("rule 9 fixed texts (GWS note 1): every fixed-text message the integration 
   // The renderings the client throws, built the way requestJson builds them, survive too.
   const thrown = [
     "Cloudflare request failed for /accounts/acc-123/access/policies (403 Forbidden): Authentication error",
-    "Cloudflare request failed for /zones/zone-1/settings/always_use_https (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+    "Cloudflare request failed for /zones/zone-1/settings/always_use_https after 4 attempts (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
     "Cloudflare request returned a non-JSON payload for /zones (200 OK): non-JSON body (text/plain, 21 bytes)",
-    "Cloudflare request failed for /user/tokens/verify (timed out after 30000 ms)",
+    "Cloudflare request failed for /user/tokens/verify after 4 attempts (timed out after 30000 ms)",
   ];
   for (const message of thrown) {
     assert.equal(redactErrorText(message), message, `the thrown rendering survives the scrub: ${message}`);
@@ -1769,7 +1820,7 @@ test("fixture self-check: every planted canary is alphanumeric and random-lookin
     legitimate.set(`route ${path}`, await route(new URL(`https://api.cloudflare.com/client/v4${path}`)).text());
   }
   const run = await runEveryCloudflareTool(
-    new CloudflareApiClient(sampleConfig(), { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes()) }),
+    cloudflareClient(sampleConfig(), { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes()) }),
     createTempBase("grclanker-cloudflare-self-check-"),
   );
   legitimate.set("check_access", run.access);
@@ -1786,7 +1837,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
 
   // The healthy run proves the route table is the surface list: every route is requested and nothing else is.
   const healthyLog = [];
-  const healthy = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes(), healthyLog) });
+  const healthy = cloudflareClient(config, { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes(), healthyLog) });
   const healthyRun = await runEveryCloudflareTool(healthy, outputRoot);
   assert.equal(healthyRun.exported.errorCount, 0, "the healthy fixture records no errors");
   for (const assessment of healthyRun.assessments) {
@@ -1796,7 +1847,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
   const surfaces = Object.keys(healthyCloudflareRoutes()).filter((path) => !CLOUDFLARE_FALLBACK_ROUTES.has(path));
   assert.deepEqual([...requested].sort(), [...surfaces].sort(), "every documented surface is exercised by the access check, the assessments, or the export");
   const accessLog = [];
-  await checkCloudflareAccess(new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes(), accessLog) }));
+  await checkCloudflareAccess(cloudflareClient(config, { fetchImpl: cloudflareRoutedFetch(healthyCloudflareRoutes(), accessLog) }));
   const probed = new Set(accessLog.map((entry) => entry.path));
 
   for (const surface of surfaces) {
@@ -1805,7 +1856,7 @@ test("rule 9: a 502 HTML page or a JSON error message carrying credentials on an
       ["json", cloudflareCanaryJson, REDACTED_CANARY_URL],
     ]) {
       const label = `${surface} (${variant})`;
-      const client = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [surface]: response }) });
+      const client = cloudflareClient(config, { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [surface]: response }) });
       const { access, assessments, exported } = await runEveryCloudflareTool(client, createTempBase("grclanker-cloudflare-canary-"));
 
       assertNoCanaryWindows(assert, access, CLOUDFLARE_PLANTED_CANARIES, `${label} check_access`);
@@ -1864,7 +1915,7 @@ test("denied-list markers: a denied list writes a not-collected marker in core_d
 
   // Readable-but-empty lists keep an empty items array with real, observed flags.
   const emptyRoutes = { ...healthyCloudflareRoutes(), "/zones": cloudflareOk([]) };
-  const emptyRun = await runEveryCloudflareTool(new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(emptyRoutes) }), outputRoot);
+  const emptyRun = await runEveryCloudflareTool(cloudflareClient(config, { fetchImpl: cloudflareRoutedFetch(emptyRoutes) }), outputRoot);
   const emptyZones = JSON.parse(readBundleFiles(emptyRun.exported.outputDir).get("core_data/zones.json"));
   assert.deepEqual(emptyZones, { items: [], truncated: false, totalCount: 0 }, "a readable-but-empty zone list is written as an empty items array with observed flags");
   assert.equal(emptyRun.access.surfaces.find((entry) => entry.name === "zones").count, 0, "a readable-but-empty probe reports the real zero");
@@ -1882,7 +1933,7 @@ test("denied-list markers: a denied list writes a not-collected marker in core_d
 
   for (const entry of CLOUDFLARE_DENIAL_TABLE) {
     const log = [];
-    const client = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [entry.surface]: cloudflareForbidden }, log) });
+    const client = cloudflareClient(config, { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [entry.surface]: cloudflareForbidden }, log) });
     const { access, assessments, exported } = await runEveryCloudflareTool(client, outputRoot);
     const label = entry.surface;
     const files = readBundleFiles(exported.outputDir);
@@ -2005,7 +2056,7 @@ test("request matching: every endpoint path and HTTP status named in any output 
     [`/zones/${ZONE}/subscription`]: cloudflareForbidden,
     [`/accounts/${ACCOUNT}/gateway`]: cloudflareForbidden,
   };
-  const client = new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(routes, log) });
+  const client = cloudflareClient(config, { fetchImpl: cloudflareRoutedFetch(routes, log) });
   const { access, assessments, exported } = await runEveryCloudflareTool(client, outputRoot);
 
   const outputs = [JSON.stringify(access), ...assessments.map((assessment) => JSON.stringify(assessment)), ...readBundleFiles(exported.outputDir).values()];
@@ -2037,13 +2088,13 @@ test("config loader errors: a SyntaxError raised by the transport is recorded by
     throw new SyntaxError(`Unexpected token '<', "${snippet}"... is not valid JSON`);
   };
   const note = "SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body";
-  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl });
+  const client = cloudflareClient(sampleConfig(), { fetchImpl });
 
   await assert.rejects(() => client.listAccounts(), (error) => {
     assert.equal(error.name, "CloudflareApiError");
     assertNoCanaryWindows(assert, error.message, [PARSER_SNIPPET_CANARY], "thrown client error");
     assert.doesNotMatch(error.message, PARSER_WORDING, `the parser's message was interpolated: ${error.message}`);
-    assert.equal(error.message, `Cloudflare request failed for /accounts (network error: ${note})`);
+    assert.equal(error.message, `Cloudflare request failed for /accounts after 4 attempts (network error: ${note})`);
     return true;
   });
 
@@ -2064,7 +2115,7 @@ test("config loader errors: a 200 answer whose body is short non-JSON text is re
 
   const surface = "/accounts";
   const log = [];
-  const client = new CloudflareApiClient(sampleConfig(), { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [surface]: () => shortBodyResponse() }, log) });
+  const client = cloudflareClient(sampleConfig(), { fetchImpl: cloudflareRoutedFetch({ ...healthyCloudflareRoutes(), [surface]: () => shortBodyResponse() }, log) });
 
   // The thrown client error is fixed text: a scrub at the tool boundary would not protect a caller that logs it.
   await assert.rejects(() => client.listAccounts(), (error) => {
@@ -2105,7 +2156,7 @@ test("rule 9 server-assigned 32-hex ids (round 4 open ruling): a real Cloudflare
   routes[`/accounts/${account.id}/members`] = () => cloudflareForbidden();
   routes[`/zones/${zone.id}/dnssec`] = () => cloudflareForbidden();
   const log = [];
-  const client = new CloudflareApiClient(sampleConfig({ accountId: account.id }), { fetchImpl: cloudflareRoutedFetch(routes, log) });
+  const client = cloudflareClient(sampleConfig({ accountId: account.id }), { fetchImpl: cloudflareRoutedFetch(routes, log) });
   const { access, assessments, exported } = await runEveryCloudflareTool(client, createTempBase("grclanker-cloudflare-hex-ids-"));
   assert.ok(log.some((entry) => entry.path === `/accounts/${account.id}/members` && entry.status === 403), "the denied members request went to the real account path");
   assert.ok(log.some((entry) => entry.path === `/zones/${zone.id}/dnssec` && entry.status === 403), "the denied DNSSEC request went to the real zone path");
@@ -2440,7 +2491,7 @@ test("checkCloudflareAccess reports failed and names the credential settings whe
     },
   ];
   for (const entry of cases) {
-    const result = await checkCloudflareAccess(new CloudflareApiClient(entry.config, { fetchImpl: cloudflareRoutedFetch(entry.routes) }));
+    const result = await checkCloudflareAccess(cloudflareClient(entry.config, { fetchImpl: cloudflareRoutedFetch(entry.routes) }));
     assert.equal(result.status, "failed", entry.label);
     assert.equal(result.authMethod, entry.config.authMethod, entry.label);
     assert.equal(result.recommendedNextStep, entry.nextStep, entry.label);
@@ -2503,9 +2554,203 @@ test("checkCloudflareAccess keeps the limited result when a probe reads, 9109 an
   ];
   for (const entry of cases) {
     const config = entry.config ?? sampleConfig();
-    const result = await checkCloudflareAccess(new CloudflareApiClient(config, { fetchImpl: cloudflareRoutedFetch(entry.routes) }));
+    const result = await checkCloudflareAccess(cloudflareClient(config, { fetchImpl: cloudflareRoutedFetch(entry.routes) }));
     assert.equal(result.status, "limited", entry.label);
     assert.equal(result.recommendedNextStep, CLOUDFLARE_LIMITED_NEXT_STEP, entry.label);
     assert.equal(result.notes[0], `Authenticated with ${config.authMethod === "token" ? "an API token" : "a Global API Key"}.`, entry.label);
   }
+});
+
+const RETRY_NOW = new Date("2026-10-23T12:00:00Z");
+const CLOUDFLARE_RATE_LIMITED = { success: false, errors: [{ code: 971, message: "Please wait and consider throttling your request speed" }], messages: [], result: null };
+const CLOUDFLARE_UNAVAILABLE = { success: false, errors: [{ code: 10001, message: "Service temporarily unavailable" }], messages: [], result: null };
+
+function cloudflareJson(status, statusText, body, headers = {}) {
+  return new Response(JSON.stringify(body), { status, statusText, headers: { ...CLOUDFLARE_JSON_HEADERS, ...headers } });
+}
+
+/** A client whose requests and retry waits are recorded; `answer` gets the attempt number, waits return at once, and the clock reads RETRY_NOW. */
+function retryHarness(answer, config = sampleConfig()) {
+  const waits = [];
+  const requests = [];
+  const client = new CloudflareApiClient(config, {
+    now: () => RETRY_NOW,
+    sleep: async (ms) => {
+      waits.push(ms);
+    },
+    fetchImpl: async (url, init) => {
+      requests.push(new URL(url));
+      return answer(requests.length, init);
+    },
+  });
+  return { client, waits, requests };
+}
+
+/** A request that never answers: it rejects only when the client's timeout aborts it. */
+function neverAnswers(init) {
+  return new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+  });
+}
+
+test("Cloudflare retries 429 and 5xx answers after the Retry-After wait, given in delta-seconds or as an HTTP date read against the client clock", async () => {
+  const { client, waits, requests } = retryHarness((attempt) => {
+    if (attempt === 1) return cloudflareJson(429, "Too Many Requests", CLOUDFLARE_RATE_LIMITED, { "retry-after": "2" });
+    if (attempt === 2) return cloudflareJson(503, "Service Unavailable", CLOUDFLARE_UNAVAILABLE, { "retry-after": new Date(RETRY_NOW.getTime() + 7_000).toUTCString() });
+    if (attempt === 3) return cloudflareJson(500, "Internal Server Error", CLOUDFLARE_UNAVAILABLE, { "retry-after": "30" });
+    return cloudflareJson(200, "OK", { success: true, errors: [], messages: [], result: [{ id: "m1" }], result_info: { page: 1, per_page: 50, total_pages: 1, count: 1, total_count: 1 } });
+  });
+  assert.deepEqual(await client.listMembers(ACCOUNT), { items: [{ id: "m1" }], truncated: false, totalCount: 1 });
+  assert.deepEqual(waits, [2_000, 7_000, 30_000], "each wait is the one Retry-After asked for, up to and including the 30 s limit");
+  assert.equal(requests.length, 4);
+  for (const url of requests) {
+    assert.equal(url.pathname, "/client/v4/accounts/acc-123/members");
+    assert.equal(url.searchParams.get("page"), "1", "a retry repeats the request it retries");
+  }
+});
+
+test("Cloudflare backs off 500, 1000, then 2000 ms without Retry-After and, after 4 attempts, fails the read naming its path, the attempt count, and the last status", async () => {
+  const cases = [
+    { status: 429, statusText: "Too Many Requests", body: CLOUDFLARE_RATE_LIMITED, detail: "Please wait and consider throttling your request speed" },
+    { status: 500, statusText: "Internal Server Error", body: CLOUDFLARE_UNAVAILABLE, detail: "Service temporarily unavailable" },
+    { status: 502, statusText: "Bad Gateway", html: "<html>upstream unavailable</html>", detail: "non-JSON body (text/html, 33 bytes)" },
+    { status: 503, statusText: "Service Unavailable", body: CLOUDFLARE_UNAVAILABLE, detail: "Service temporarily unavailable" },
+    { status: 504, statusText: "Gateway Timeout", body: CLOUDFLARE_UNAVAILABLE, detail: "Service temporarily unavailable" },
+  ];
+  for (const entry of cases) {
+    const { client, waits, requests } = retryHarness(() => entry.html
+      ? new Response(entry.html, { status: entry.status, statusText: entry.statusText, headers: { "content-type": "text/html" } })
+      : cloudflareJson(entry.status, entry.statusText, entry.body));
+    await assert.rejects(client.listZones(), (error) => {
+      assert.ok(error instanceof CloudflareApiError, `${entry.status}`);
+      assert.equal(error.status, entry.status);
+      assert.equal(error.path, "/zones");
+      assert.equal(error.message, `Cloudflare request failed for /zones after 4 attempts (${entry.status} ${entry.statusText}): ${entry.detail}`);
+      return true;
+    });
+    assert.equal(requests.length, 4, `${entry.status}`);
+    assert.deepEqual(waits, [500, 1_000, 2_000], `${entry.status}`);
+  }
+});
+
+test("Cloudflare does not wait out a Retry-After beyond 30 seconds: the read fails at once and says what the server asked for", async () => {
+  for (const [label, retryAfter, seconds] of [
+    ["delta-seconds", "31", 31],
+    ["delta-seconds", "3600", 3600],
+    ["HTTP date", new Date(RETRY_NOW.getTime() + 120_000).toUTCString(), 120],
+  ]) {
+    const { client, waits, requests } = retryHarness(() => cloudflareJson(429, "Too Many Requests", CLOUDFLARE_RATE_LIMITED, { "retry-after": retryAfter }));
+    await assert.rejects(client.listZones(), (error) => {
+      assert.equal(error.status, 429, label);
+      assert.equal(error.message, `Cloudflare request failed for /zones after 1 attempt (429 Too Many Requests): Please wait and consider throttling your request speed; the server asked to retry after ${seconds} s, more than the 30 s limit`, label);
+      return true;
+    });
+    assert.deepEqual(waits, [], `${label} ${retryAfter}: nothing is waited out`);
+    assert.equal(requests.length, 1, label);
+  }
+
+  const late = retryHarness((attempt) => attempt === 1
+    ? cloudflareJson(503, "Service Unavailable", CLOUDFLARE_UNAVAILABLE)
+    : cloudflareJson(429, "Too Many Requests", CLOUDFLARE_RATE_LIMITED, { "retry-after": "600" }));
+  await assert.rejects(late.client.listZones(), /^CloudflareApiError: Cloudflare request failed for \/zones after 2 attempts \(429 Too Many Requests\): .*; the server asked to retry after 600 s, more than the 30 s limit$/);
+  assert.deepEqual(late.waits, [500], "a refusal after an earlier retry counts every attempt made");
+});
+
+test("Cloudflare retries timeouts and network errors with the same backoff and names the transport failure and attempt count once retries run out", async () => {
+  const config = sampleConfig({ timeoutMs: 5 });
+  const timedOut = retryHarness((_attempt, init) => neverAnswers(init), config);
+  await assert.rejects(timedOut.client.verifyCurrentToken(), (error) => {
+    assert.equal(error.status, undefined);
+    assert.equal(error.message, "Cloudflare request failed for /user/tokens/verify after 4 attempts (timed out after 5 ms)");
+    return true;
+  });
+  assert.equal(timedOut.requests.length, 4);
+  assert.deepEqual(timedOut.waits, [500, 1_000, 2_000]);
+
+  const offline = retryHarness(() => Promise.reject(new TypeError("fetch failed")));
+  await assert.rejects(offline.client.verifyCurrentToken(), { message: "Cloudflare request failed for /user/tokens/verify after 4 attempts (network error: fetch failed)" });
+  assert.equal(offline.requests.length, 4);
+
+  const recovered = retryHarness((attempt, init) => {
+    if (attempt === 1) return neverAnswers(init);
+    if (attempt === 2) return Promise.reject(new TypeError("fetch failed"));
+    return cloudflareJson(200, "OK", { success: true, errors: [], messages: [], result: { id: "tok-current", status: "active" } });
+  }, config);
+  assert.deepEqual(await recovered.client.verifyCurrentToken(), { id: "tok-current", status: "active" });
+  assert.deepEqual(recovered.waits, [500, 1_000]);
+});
+
+test("Cloudflare sends a request answered 400, 401, 403, or 404 once: those are answers, not transient failures", async () => {
+  for (const [status, statusText] of [[400, "Bad Request"], [401, "Unauthorized"], [403, "Forbidden"], [404, "Not Found"]]) {
+    const { client, waits, requests } = retryHarness(() => cloudflareJson(status, statusText, { success: false, errors: [{ code: 10000, message: "Authentication error" }], messages: [], result: null }, { "retry-after": "1" }));
+    await assert.rejects(client.listZones(), (error) => {
+      assert.equal(error.status, status);
+      assert.equal(error.message, `Cloudflare request failed for /zones (${status} ${statusText}): Authentication error`);
+      return true;
+    });
+    assert.equal(requests.length, 1, `${status}`);
+    assert.deepEqual(waits, [], `${status}`);
+  }
+});
+
+test("Cloudflare fails a list whose later page runs out of retries instead of reporting the pages before it, and the finding stays manual", async () => {
+  const firstPage = Array.from({ length: 50 }, (_, index) => ({
+    id: `m${index}`,
+    status: "accepted",
+    user: { email: `user${index}@example.com`, two_factor_authentication_enabled: true },
+    roles: [{ id: "r2", name: "Administrator Read Only" }],
+  }));
+  const routes = healthyCloudflareRoutes();
+  routes[`/accounts/${ACCOUNT}/members`] = (url) => url.searchParams.get("page") === "1"
+    ? cloudflareJson(200, "OK", { success: true, errors: [], messages: [], result: firstPage, result_info: { page: 1, per_page: 50, total_pages: 2, count: 50, total_count: 60 } })
+    : cloudflareJson(503, "Service Unavailable", CLOUDFLARE_UNAVAILABLE);
+  const log = [];
+  const identity = await assessCloudflareIdentity(cloudflareClient(sampleConfig(), { fetchImpl: cloudflareRoutedFetch(routes, log) }));
+  const members = byId(identity, "CF-IAM-03");
+  assert.equal(members.status, "manual", members.summary);
+  assert.equal(
+    members.summary,
+    "Manual review required: /accounts/acc-123/members could not be read (Cloudflare request failed for /accounts/acc-123/members after 4 attempts (503 Service Unavailable): Service temporarily unavailable). Grant Account Settings: Read to the audit token, or collect the account member and role list manually.",
+  );
+  assert.equal(members.evidence.members_seen, null, "the 50 members on the first page are not reported as the inventory");
+  assert.equal(members.evidence.members_http_status, 503);
+  assert.equal(log.filter((entry) => entry.path === `/accounts/${ACCOUNT}/members`).length, 5, "page 1 once, then page 2 four times");
+});
+
+test("Cloudflare stops at an abort that lands during a retry wait and sends no further request", async () => {
+  const controller = new AbortController();
+  const waits = [];
+  let requests = 0;
+  const client = new CloudflareApiClient(sampleConfig(), {
+    signal: controller.signal,
+    sleep: (ms) => {
+      waits.push(ms);
+      controller.abort(new Error("operator cancelled"));
+      return new Promise(() => {});
+    },
+    fetchImpl: async () => {
+      requests += 1;
+      return cloudflareJson(503, "Service Unavailable", CLOUDFLARE_UNAVAILABLE);
+    },
+  });
+  await assert.rejects(client.listZones(), ToolCallAbortedError);
+  assert.equal(requests, 1);
+  assert.deepEqual(waits, [500]);
+});
+
+test("Cloudflare retry errors carry no credential when a transport failure or a 5xx body echoes the token", async () => {
+  const secret = "cf-retry-canary-0123456789abcdefghij";
+  const config = sampleConfig({ apiToken: secret });
+  const transport = retryHarness(() => Promise.reject(new TypeError(`fetch failed: proxy refused Authorization: Bearer ${secret}`)), config);
+  await assert.rejects(transport.client.listZones(), (error) => {
+    assert.match(error.message, /^Cloudflare request failed for \/zones after 4 attempts \(network error: fetch failed: proxy refused /);
+    assert.ok(!error.message.includes(secret), error.message);
+    return true;
+  });
+  const echoed = retryHarness(() => cloudflareJson(503, "Service Unavailable", { success: false, errors: [{ code: 10001, message: `upstream rejected token ${secret}` }], messages: [], result: null }), config);
+  await assert.rejects(echoed.client.listZones(), (error) => {
+    assert.match(error.message, /^Cloudflare request failed for \/zones after 4 attempts \(503 Service Unavailable\): upstream rejected token \[REDACTED\]$/);
+    assert.ok(!error.message.includes(secret), error.message);
+    return true;
+  });
 });

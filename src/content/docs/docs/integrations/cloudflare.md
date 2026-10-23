@@ -21,7 +21,7 @@ Set `CLOUDFLARE_ACCOUNT_ID` (or pass `account_id`) when the token can see more t
 
 Zone checks sample up to `zone_limit` zones (default 20) from `GET /zones`, filtered by `account.id` when an account is configured.
 
-`CLOUDFLARE_API_BASE_URL` (or `base_url`) overrides the default `https://api.cloudflare.com/client/v4`. `CLOUDFLARE_TIMEOUT` (or `timeout_seconds`) sets the HTTP timeout in seconds (default 30). Tool arguments win over the environment.
+`CLOUDFLARE_API_BASE_URL` (or `base_url`) overrides the default `https://api.cloudflare.com/client/v4`. `CLOUDFLARE_TIMEOUT` (or `timeout_seconds`) sets the HTTP timeout in seconds (default 30). Tool arguments win over the environment. Rate-limited, failing, and timed-out reads are retried a bounded number of times; see [Retries and rate limits](#retries-and-rate-limits).
 
 | Surface | Token permission (read) |
 |---------|-------------------------|
@@ -272,6 +272,16 @@ Every fixed-text message the integration emits is held to the scrub by a test an
 - The `not attempted` and `Not attempted` wordings.
 - The manual-review, partial-inventory, and zone-plan prose.
 
+### Retries and rate limits
+
+Every Cloudflare read is retried when it gets a 429, 500, 502, 503, or 504, times out, or fails with a network error, up to 3 times after the first attempt. The timeout covers reading the response body as well as the headers.
+
+- The wait before each retry is the server's `Retry-After`, as seconds or an HTTP date, when the response carries one. Otherwise it is 500 milliseconds, doubled after each retry and capped at 8 seconds. The `Ratelimit` and `Ratelimit-Policy` headers are not read.
+- A `Retry-After` above 30 seconds is not waited out. The read fails at once, and its error names the wait the server asked for.
+- Any other 4xx answer, such as 400, 401, 403, or 404, is not retried.
+
+A read that runs out of retries fails with the path, the attempt count, and the last status, timeout, or network error, for example `Cloudflare request failed for /zones after 4 attempts (503 Service Unavailable)`. A page that fails partway through a listing fails the whole listing, so the pages already read are not reported as the inventory. The source is unreadable, and the findings that read it follow the rules below, so none of them passes.
+
 ### Verdict safety rules
 
 A 401, 403, or errored read never produces `pass`. That holds for every inventory a finding reads, not only its primary one:
@@ -290,6 +300,7 @@ A truncated listing never produces `pass` either. Every exit below reports `trun
 
 - Page-numbered listings stop at their item cap, or when `result_info.total_count` exceeds the collected items.
 - Cursor listings (`/zones/{zone_id}/rulesets`) stop at their cap, at a 100-page budget, at a cursor that repeats, or at an empty page that still carries a cursor.
+- Gateway rules (CF-TRF-06) and page rules (CF-TRF-02) are read with one request each, because their endpoints document no paging parameters. The list is truncated when its `result_info` reports more items or pages than the response holds, since the rest cannot be requested, and an empty truncated list is manual.
 - A 404 that arrives after items were collected keeps them.
 
 The dependent finding is capped at warn, with `Partial <inventory> inventory: <seen> seen of <total>` in its summary.
