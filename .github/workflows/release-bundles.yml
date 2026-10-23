@@ -2,7 +2,8 @@ name: release-bundles
 
 # Bundles are cross-built on Linux, so each one is installed with the real
 # installer and run on a runner of its own OS and architecture before a tag can
-# publish it. Pull requests, pushes to main, and manual runs stop at the release gate.
+# publish it. Pull requests, pushes to main, manual runs, and the weekly scheduled
+# run stop at the release gate.
 on:
   push:
     tags:
@@ -34,6 +35,10 @@ on:
       - "public/install"
       - "public/install.ps1"
   workflow_dispatch:
+  # Weekly on main, so a runner image change, such as a retired Intel Mac label, fails
+  # here before it fails a release. Off the hour, when GitHub delays fewer scheduled runs.
+  schedule:
+    - cron: "17 6 * * 1"
 
 permissions: {}
 

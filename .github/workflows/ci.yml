@@ -44,15 +44,24 @@ jobs:
         working-directory: cli
         run: npm run build
 
-      # The test:cli command, split into disjoint file shards. npm appends
-      # arguments after the file pattern, where node --test ignores them, so
-      # the shard flag cannot be passed through npm run test:cli.
+      # The PowerShell installer tests skip when pwsh is missing, so a runner
+      # image without it would pass them without running any.
+      - name: Require pwsh for the PowerShell installer tests
+        run: |
+          if ! pwsh -NoProfile -Command "exit 0"; then
+            echo "::error::pwsh is missing on this runner, so the PowerShell installer tests would skip"
+            exit 1
+          fi
+          pwsh --version
+
+      # The test:cli command, split into shards that take about as long as each
+      # other. scripts/test-shards.mjs says how, and how to refresh its weights.
       - name: Test CLI
         working-directory: cli
         env:
           SHARD: ${{ matrix.shard }}
           SHARD_TOTAL: ${{ strategy.job-total }}
-        run: node --test --test-shard="$SHARD/$SHARD_TOTAL" "tests/*.test.mjs"
+        run: node scripts/test-shards.mjs --shard "$SHARD/$SHARD_TOTAL"
 
   checks:
     runs-on: ubuntu-latest

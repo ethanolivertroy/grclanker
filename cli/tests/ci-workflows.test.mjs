@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { DEFAULT_NODE_VERSION, getTargetDefinitions } from "../scripts/build-native-bundle.mjs";
+import { TEST_FILE_PATTERN, assignShards, listTestFiles, readShardWeights } from "../scripts/test-shards.mjs";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
@@ -29,6 +30,7 @@ test("CI test shards run the test:cli command over every test file", () => {
   const { scripts } = JSON.parse(readFileSync(resolve(REPO_ROOT, "cli", "package.json"), "utf8"));
   const testCli = /^npm run build && node --test (\S.*)$/.exec(scripts["test:cli"]);
   assert.ok(testCli, "test:cli changed shape; update the cli-tests shards in ci.yml to match it");
+  assert.equal(testCli[1], JSON.stringify(TEST_FILE_PATTERN), "scripts/test-shards.mjs has to shard the files test:cli runs");
 
   const job = readWorkflow("ci.yml").jobs["cli-tests"];
   assert.deepEqual(Object.keys(job.strategy.matrix), ["shard"]);
@@ -36,10 +38,19 @@ test("CI test shards run the test:cli command over every test file", () => {
   assert.deepEqual(shards, shards.map((_, index) => index + 1), "shards must be numbered 1 through N");
 
   const runs = job.steps.map((step) => step.run);
-  const testStep = job.steps.find((step) => step.run?.startsWith("node --test"));
-  assert.equal(testStep.run, `node --test --test-shard="$SHARD/$SHARD_TOTAL" ${testCli[1]}`);
+  const testStep = job.steps.find((step) => step.name === "Test CLI");
+  assert.equal(testStep.run, 'node scripts/test-shards.mjs --shard "$SHARD/$SHARD_TOTAL"');
   assert.deepEqual(testStep.env, { SHARD: "${{ matrix.shard }}", SHARD_TOTAL: "${{ strategy.job-total }}" });
   assert.ok(runs.indexOf("npm run build") >= 0 && runs.indexOf("npm run build") < runs.indexOf(testStep.run));
+
+  const files = listTestFiles();
+  const sharded = assignShards(files, readShardWeights(), shards.length).flatMap((shard) => shard.files);
+  assert.deepEqual(sharded.sort(), files, "every test file has to run in exactly one shard");
+
+  // The PowerShell installer tests skip without pwsh, so a shard has to fail instead.
+  const pwshCheck = job.steps.find((step) => step.run?.includes("pwsh -NoProfile"));
+  assert.ok(pwshCheck && !pwshCheck.if && !pwshCheck["continue-on-error"], "cli-tests has to fail when pwsh is missing");
+  assert.ok(runs.indexOf(pwshCheck.run) < runs.indexOf(testStep.run), "cli-tests has to check for pwsh before it runs the tests");
 });
 
 test("the verify job waits on every other CI job", () => {
@@ -120,4 +131,10 @@ test("pull requests and pushes to main that touch a bundle input or an installer
   for (const path of paths) {
     assert.ok(existsSync(resolve(REPO_ROOT, path.replace(/\/\*\*$/, ""))), `${path} no longer exists`);
   }
+});
+
+test("release-bundles also builds and smokes every bundle once a week, so a retired runner image fails before a release", () => {
+  const { schedule } = readWorkflow("release-bundles.yml").on;
+  assert.equal(schedule?.length, 1, "release-bundles needs one weekly schedule");
+  assert.match(schedule[0].cron, /^\d+ \d+ \* \* [0-6]$/, "the schedule has to fire once a week");
 });
