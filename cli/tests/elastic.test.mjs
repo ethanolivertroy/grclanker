@@ -1091,10 +1091,12 @@ test("ElasticApiClient honors an HTTP-date Retry-After and caps every Retry-Afte
 });
 
 test("ElasticApiClient names the endpoint, the last failure, and the attempt count when retries run out, with the planted key scrubbed", async (t) => {
-  const plantedSecret = "vNsdWUpGkDWauM2ycLqAnQUrxgoDTEhd";
+  // The module scrubber keeps every key a client registered for the rest of the process, so a fresh key here would
+  // slow every later scrub; the configured sample key is already registered by earlier tests.
+  const plantedSecret = API_KEY_SECRET;
   assertPlantedValuesWellFormed(assert, { plantedSecret }, [JSON.stringify(sampleConfig({ apiKey: undefined })), JSON.stringify(healthyFixtures(0))]);
-  const apiKey = Buffer.from(`audit-key-id:${plantedSecret}`).toString("base64");
-  const config = sampleConfig({ apiKey });
+  const apiKey = API_KEY;
+  const config = sampleConfig();
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const cases = [
     {

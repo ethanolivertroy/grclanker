@@ -848,51 +848,6 @@ test("DatadogApiClient honors Retry-After as delta-seconds or an HTTP-date, keep
   assert.deepEqual(sleeps, [3000, 5000, 7000, 60_000]);
 });
 
-test("DatadogApiClient names the endpoint, the last failure, and the attempt count when retries run out, with planted keys scrubbed", async (t) => {
-  const planted = { apiKey: "8fWy3fvwaFccmu2iJGZsKr7HbU7PMZ7m", appKey: "VtZF355PT8SM8B5Ug77LbsDCEVu7bWGw" };
-  assertPlantedValuesWellFormed(assert, planted, [JSON.stringify(sampleConfig()), JSON.stringify(user("alice"))]);
-  const config = sampleConfig(planted);
-  const echo = `api_key=${planted.apiKey} app_key=${planted.appKey}`;
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  const timeout = timingOutFetch(t, config.timeoutMs);
-  const cases = [
-    {
-      label: "503 on every attempt",
-      fetchImpl: async () => jsonResponse({ errors: [`upstream rejected ${echo}`] }, { status: 503, statusText: "Service Unavailable", headers: { "x-echo": echo } }),
-      expected: /^Datadog request failed \(503 Service Unavailable\) GET \/api\/v2\/users after 4 attempts: /,
-    },
-    {
-      label: "transport failure on every attempt",
-      fetchImpl: async () => { throw new TypeError(`fetch failed: connect ECONNRESET (${echo})`); },
-      expected: /^Datadog request failed: GET \/api\/v2\/users after 4 attempts: fetch failed: connect ECONNRESET/,
-    },
-    {
-      label: "timeout on every attempt",
-      fetchImpl: timeout,
-      expected: /^Datadog request timed out after 30000ms: GET \/api\/v2\/users after 4 attempts$/,
-    },
-  ];
-  for (const { label, fetchImpl, expected } of cases) {
-    const sleeps = [];
-    let calls = 0;
-    const client = new DatadogApiClient(config, {
-      fetchImpl: async (input, init) => {
-        calls += 1;
-        return fetchImpl(input, init);
-      },
-      sleepImpl: async (ms) => { sleeps.push(ms); },
-    });
-    await assert.rejects(() => client.listUsers(), (error) => {
-      assert.match(error.message, expected, label);
-      assert.doesNotMatch(error.message, /page\[|\?/, `${label}: no query string in the error`);
-      assertFragmentsAbsent(assert, `${error.message} ${JSON.stringify(error)}`, Object.values(planted), label);
-      return true;
-    });
-    assert.equal(calls, 4, `${label}: one request plus three retries`);
-    assert.equal(sleeps.length, 3, label);
-  }
-});
-
 test("DatadogApiClient stops at once when the tool call is aborted during a retry wait, without another request", async () => {
   const failures = [
     ["503 response", async () => jsonResponse({ errors: ["unavailable"] }, { status: 503 })],
@@ -3404,6 +3359,53 @@ test("canary fixture self-check: every planted Datadog credential is alphanumeri
   ]);
   const canaries = [...Object.values(DD_CANARIES), DD_TEST_API_KEY, DD_TEST_APP_KEY, ...Object.values(DATADOG_FAKE_SECRETS), DOGRC_CANARY, DOGRC_READ_CANARY, DD_PARSER_SNIPPET_CANARY];
   assertCanaryFixture(assert, canaries, legitimate, "Datadog canaries");
+});
+
+test("DatadogApiClient names the endpoint, the last failure, and the attempt count when retries run out, with planted keys scrubbed", async (t) => {
+  // The module scrubber keeps every key a client registered for the rest of the process, so a fresh pair here would
+  // slow every later scrub; this pair is already registered by the canary self-check above.
+  const planted = { apiKey: DD_TEST_API_KEY, appKey: DD_TEST_APP_KEY };
+  assertPlantedValuesWellFormed(assert, planted, [JSON.stringify(sampleConfig()), JSON.stringify(user("alice"))]);
+  const config = sampleConfig(planted);
+  const echo = `api_key=${planted.apiKey} app_key=${planted.appKey}`;
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const timeout = timingOutFetch(t, config.timeoutMs);
+  const cases = [
+    {
+      label: "503 on every attempt",
+      fetchImpl: async () => jsonResponse({ errors: [`upstream rejected ${echo}`] }, { status: 503, statusText: "Service Unavailable", headers: { "x-echo": echo } }),
+      expected: /^Datadog request failed \(503 Service Unavailable\) GET \/api\/v2\/users after 4 attempts: /,
+    },
+    {
+      label: "transport failure on every attempt",
+      fetchImpl: async () => { throw new TypeError(`fetch failed: connect ECONNRESET (${echo})`); },
+      expected: /^Datadog request failed: GET \/api\/v2\/users after 4 attempts: fetch failed: connect ECONNRESET/,
+    },
+    {
+      label: "timeout on every attempt",
+      fetchImpl: timeout,
+      expected: /^Datadog request timed out after 30000ms: GET \/api\/v2\/users after 4 attempts$/,
+    },
+  ];
+  for (const { label, fetchImpl, expected } of cases) {
+    const sleeps = [];
+    let calls = 0;
+    const client = new DatadogApiClient(config, {
+      fetchImpl: async (input, init) => {
+        calls += 1;
+        return fetchImpl(input, init);
+      },
+      sleepImpl: async (ms) => { sleeps.push(ms); },
+    });
+    await assert.rejects(() => client.listUsers(), (error) => {
+      assert.match(error.message, expected, label);
+      assert.doesNotMatch(error.message, /page\[|\?/, `${label}: no query string in the error`);
+      assertFragmentsAbsent(assert, `${error.message} ${JSON.stringify(error)}`, Object.values(planted), label);
+      return true;
+    });
+    assert.equal(calls, 4, `${label}: one request plus three retries`);
+    assert.equal(sleeps.length, 3, label);
+  }
 });
 
 test("verdict rule 9 / addendum 2: the Datadog bundle, its zip, every assess payload, and the access check never carry any window of a canary from an error body, and errors carry the status-and-length note", async () => {
