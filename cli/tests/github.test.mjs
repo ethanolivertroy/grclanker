@@ -1070,6 +1070,30 @@ test("GitHubAuditorClient fails closed at once when the server asks for a wait p
   assert.match(probe.detail, /^GitHub request failed \(403\) for GET \/orgs\/example-org after 1 attempt: API rate limit exceeded .*resets at 2026-10-23T13:00:00\.000Z/);
 });
 
+test("GitHubAuditorClient waits the minute GitHub asks for on a rate limit that names no wait and fails closed when one repeats", async () => {
+  const secondaryLimit = () => jsonResponse({ message: "You have exceeded a secondary rate limit." }, {}, 403);
+  const recovered = sequenceFetch([secondaryLimit, () => jsonResponse({ login: "example-org" })]);
+  const recovering = retryClient(recovered.fetchImpl);
+  assert.equal((await recovering.client.requestJson("/orgs/example-org")).payload.login, "example-org");
+  assert.deepEqual(recovering.waits, [60_000]);
+
+  const repeated = sequenceFetch([() => jsonResponse({ message: "Too Many Requests" }, {}, 429), secondaryLimit]);
+  const repeating = retryClient(repeated.fetchImpl);
+  const error = await rejection(repeating.client.requestJson("/orgs/example-org"));
+  assert.equal(repeated.requests.length, 2);
+  assert.deepEqual(repeating.waits, [60_000], "the doubled wait a repeat asks for is past the cap, so it is not slept through");
+  assert.equal(error.status, 403);
+  assert.equal(error.attempts, 2);
+  assert.match(error.message, /secondary rate limit.*; the rate limit names no wait, and after a repeated one GitHub asks for a wait until 2026-10-23T12:02:00\.000Z, beyond the 60 s retry cap$/);
+
+  const denied = sequenceFetch([() => jsonResponse({ message: "Resource not accessible by integration" }, {}, 403)]);
+  const permission = retryClient(denied.fetchImpl);
+  const deniedError = await rejection(permission.client.requestJson("/orgs/example-org"));
+  assert.equal(denied.requests.length, 1, "a 403 without a rate-limit marker is a permission denial and is not retried");
+  assert.deepEqual(permission.waits, []);
+  assert.equal(deniedError.attempts, undefined);
+});
+
 test("GitHubAuditorClient names the path, last status, and attempt count when retries run out", async () => {
   const { fetchImpl, requests } = sequenceFetch([unavailable()]);
   const { client, waits } = retryClient(fetchImpl);

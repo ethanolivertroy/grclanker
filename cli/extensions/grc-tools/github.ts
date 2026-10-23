@@ -48,6 +48,8 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RETRY_WAIT_MS = 60_000;
 const BASE_RETRY_BACKOFF_MS = 500;
 const MAX_RETRY_BACKOFF_MS = 8_000;
+// GitHub asks for at least a minute before retrying a rate limit that names no wait.
+const UNTIMED_RATE_LIMIT_WAIT_MS = 60_000;
 const RETRYABLE_SERVER_STATUSES = new Set([500, 502, 503, 504]);
 const PAGE_SIZE = 100;
 const MAX_AUDIT_EVENTS = 200;
@@ -1402,32 +1404,40 @@ function isRateLimitedResponse(response: Response, rawText: string): boolean {
 
 type RetryDecision =
   | { kind: "final" }
-  | { kind: "wait"; ms: number }
+  | { kind: "wait"; ms: number; rateLimited: boolean }
   | { kind: "over_cap"; note: string };
 
 /**
  * Whether a failed response is retried, and after what wait. Rate-limited responses and 500, 502,
  * 503, and 504 are retried. The server's wait is honored first (Retry-After, then x-ratelimit-reset
- * once x-ratelimit-remaining is 0, as GitHub's rate-limit guidance asks), otherwise the wait backs
- * off exponentially. A server-named wait past MAX_RETRY_WAIT_MS fails closed and names the time.
+ * once x-ratelimit-remaining is 0). A rate limit that names neither waits a minute, doubled for each
+ * earlier rate limit on the same request, and any other retried response backs off exponentially.
+ * All three waits are what GitHub's rate-limit guidance asks for. A wait past MAX_RETRY_WAIT_MS fails
+ * closed and names the time.
  */
-function decideRetry(response: Response, rawText: string, attempt: number, now: number): RetryDecision {
+function decideRetry(response: Response, rawText: string, attempt: number, now: number, priorRateLimits: number): RetryDecision {
   const rateLimited = isRateLimitedResponse(response, rawText);
   if (!rateLimited && !RETRYABLE_SERVER_STATUSES.has(response.status)) return { kind: "final" };
   const retryAfter = parseRetryAfterMs(headerValue(response, "retry-after"), now);
   if (retryAfter !== undefined) {
     return retryAfter > MAX_RETRY_WAIT_MS
       ? { kind: "over_cap", note: `Retry-After asks for a wait until ${new Date(now + retryAfter).toISOString()}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap` }
-      : { kind: "wait", ms: retryAfter };
+      : { kind: "wait", ms: retryAfter, rateLimited };
   }
   const reset = Number.parseInt(headerValue(response, "x-ratelimit-reset") ?? "", 10);
   if (rateLimited && headerValue(response, "x-ratelimit-remaining") === "0" && Number.isFinite(reset)) {
     const resetMs = Math.max(reset * 1000 - now, 0);
     return resetMs > MAX_RETRY_WAIT_MS
       ? { kind: "over_cap", note: `the rate limit resets at ${new Date(reset * 1000).toISOString()}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap` }
-      : { kind: "wait", ms: resetMs };
+      : { kind: "wait", ms: resetMs, rateLimited };
   }
-  return { kind: "wait", ms: retryBackoffMs(attempt) };
+  if (rateLimited) {
+    const waitMs = UNTIMED_RATE_LIMIT_WAIT_MS * 2 ** priorRateLimits;
+    return waitMs > MAX_RETRY_WAIT_MS
+      ? { kind: "over_cap", note: `the rate limit names no wait, and after a repeated one GitHub asks for a wait until ${new Date(now + waitMs).toISOString()}, beyond the ${MAX_RETRY_WAIT_MS / 1000} s retry cap` }
+      : { kind: "wait", ms: waitMs, rateLimited };
+  }
+  return { kind: "wait", ms: retryBackoffMs(attempt), rateLimited };
 }
 
 function extractRecords(payload: unknown): JsonRecord[] {
@@ -1794,6 +1804,7 @@ export class GitHubAuditorClient {
     // The exchange only mints a token, so a lost response is safe to repeat.
     const pending = unlessAborted((async () => {
       const tokenPath = `/app/installations/${this.config.installationId}/access_tokens`;
+      let rateLimits = 0;
       for (let attempt = 1; ; attempt += 1) {
         const outcome = await this.sendOnce(`${this.config.apiBaseUrl}${tokenPath}`, {
           method: "POST",
@@ -1818,8 +1829,9 @@ export class GitHubAuditorClient {
         const { response, rawText: text } = outcome;
         const payload = parseJsonSafely(text) as JsonRecord | undefined;
         if (!response.ok) {
-          const decision = decideRetry(response, text, attempt, this.now());
+          const decision = decideRetry(response, text, attempt, this.now(), rateLimits);
           if (decision.kind === "wait" && attempt < MAX_ATTEMPTS) {
+            if (decision.rateLimited) rateLimits += 1;
             await this.sleep(decision.ms);
             continue;
           }
@@ -1882,6 +1894,7 @@ export class GitHubAuditorClient {
     options: RequestOptions = {},
   ): Promise<ResponseEnvelope<T>> {
     let forceRefresh = false;
+    let rateLimits = 0;
     const method = options.method ?? (options.body ? "POST" : "GET");
 
     for (let attempt = 1; ; attempt += 1) {
@@ -1922,8 +1935,9 @@ export class GitHubAuditorClient {
         continue;
       }
 
-      const decision = decideRetry(response, rawText, attempt, this.now());
+      const decision = decideRetry(response, rawText, attempt, this.now(), rateLimits);
       if (decision.kind === "wait" && attempt < MAX_ATTEMPTS) {
+        if (decision.rateLimited) rateLimits += 1;
         await this.sleep(decision.ms);
         continue;
       }
