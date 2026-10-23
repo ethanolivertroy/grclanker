@@ -993,6 +993,291 @@ test("WebexApiClient honors 429 Retry-After and surfaces 403 as WebexApiError", 
   await assert.rejects(() => denied.listPeople(), (error) => error instanceof WebexApiError && error.status === 403 && /\/v1\/people/.test(error.message));
 });
 
+const WEBEX_RETRY_TOKEN = "webex-CANARY-RETRY-TOKEN-81";
+const WEBEX_RETRY_REFRESH = { clientId: "retry-client-id", clientSecret: "CANARY-RETRY-CLIENT-SECRET-82", refreshToken: "CANARY-RETRY-REFRESH-TOKEN-83" };
+const WEBEX_RETRY_GRANT = { token: undefined, refresh: WEBEX_RETRY_REFRESH };
+const WEBEX_RETRY_NOW = new Date("2026-09-21T12:00:00.000Z");
+
+/** A client whose fetch answers with `steps` in order (repeating the last one), recording requests and waits. */
+function webexRetryHarness(steps, { timeoutMs = 30000, signal, config = {} } = {}) {
+  const calls = [];
+  const waits = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    calls.push({ method: (init.method ?? "GET").toUpperCase(), pathname: url.pathname, search: url.search });
+    return steps[Math.min(calls.length, steps.length) - 1](init, url);
+  };
+  const client = new WebexApiClient(sampleConfig({ token: WEBEX_RETRY_TOKEN, timeoutMs, ...config }), {
+    fetchImpl,
+    sleep: async (ms) => { waits.push(ms); },
+    now: () => WEBEX_RETRY_NOW,
+    signal,
+  });
+  return { client, calls, waits };
+}
+
+const webexHangUntilAborted = (init) => new Promise((_resolve, reject) => {
+  init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+});
+const webexNeverSettles = () => new Promise(() => {});
+const webexConnectionReset = () => {
+  throw new TypeError(`fetch failed for https://webexapis.com/v1/people/me?access_token=${WEBEX_RETRY_TOKEN}`, {
+    cause: Object.assign(new Error(`read ECONNRESET ${WEBEX_RETRY_REFRESH.clientSecret}`), { code: "ECONNRESET" }),
+  });
+};
+const webexUnavailable = () => jsonResponse({ message: "Service temporarily unavailable" }, { status: 503, statusText: "Service Unavailable" });
+
+test("WebexApiClient retries 500, 502, 503, and 504 with exponential backoff and honors Retry-After as delta-seconds or an HTTP-date", async () => {
+  const { client, calls, waits } = webexRetryHarness([
+    () => jsonResponse({ message: "internal" }, { status: 500, statusText: "Internal Server Error" }),
+    () => textResponse("bad gateway", { status: 502, statusText: "Bad Gateway" }),
+    () => jsonResponse({ message: "unavailable" }, { status: 503, statusText: "Service Unavailable", headers: { "retry-after": new Date(WEBEX_RETRY_NOW.getTime() + 7_000).toUTCString() } }),
+    () => jsonResponse({ id: "me-1", type: "person" }),
+  ]);
+  assert.equal((await client.getMe()).id, "me-1");
+  assert.equal(calls.length, 4);
+  assert.deepEqual(waits, [1000, 2000, 7000], "backoff doubles without a Retry-After; an HTTP-date is measured against the injected clock");
+
+  const delta = webexRetryHarness([
+    () => jsonResponse({ message: "gateway timeout" }, { status: 504, statusText: "Gateway Timeout", headers: { "retry-after": "2" } }),
+    () => jsonResponse({ id: "me-1" }),
+  ]);
+  await delta.client.getMe();
+  assert.deepEqual(delta.waits, [2000]);
+
+  const past = webexRetryHarness([
+    () => jsonResponse({}, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": new Date(WEBEX_RETRY_NOW.getTime() - 5_000).toUTCString() } }),
+    () => jsonResponse({ id: "me-1" }),
+  ]);
+  await past.client.getMe();
+  assert.deepEqual(past.waits, [0], "an HTTP-date already past asks for no wait");
+
+  const atCap = webexRetryHarness([
+    () => jsonResponse({}, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "60" } }),
+    () => jsonResponse({ id: "me-1" }),
+  ]);
+  await atCap.client.getMe();
+  assert.deepEqual(atCap.waits, [60000], "a wait of exactly the cap is honored, not clamped");
+
+  for (const status of [400, 404, 501]) {
+    const final = webexRetryHarness([() => jsonResponse({ message: "not retried" }, { status, statusText: "Not Retried" })]);
+    await assert.rejects(final.client.getMe(), (error) => error instanceof WebexApiError && error.status === status && !/attempt/.test(error.message));
+    assert.equal(final.calls.length, 1, `HTTP ${status} is not retried`);
+  }
+});
+
+test("a Webex Retry-After beyond 60 s fails closed at once and names the reset time", async () => {
+  const resetAt = new Date(WEBEX_RETRY_NOW.getTime() + 120_000);
+  for (const header of ["120", resetAt.toUTCString()]) {
+    const { client, calls, waits } = webexRetryHarness([
+      () => jsonResponse({ message: "rate limited" }, { status: 429, statusText: "Too Many Requests", headers: { "retry-after": header } }),
+    ]);
+    await assert.rejects(client.listPeople(), (error) => {
+      assert.ok(error instanceof WebexApiError);
+      assert.equal(error.status, 429);
+      assert.equal(error.message, `Webex request failed (429 Too Many Requests) for /v1/people after 1 attempt: rate limited; Retry-After asks for a wait until ${resetAt.toISOString()}, beyond the 60 s retry cap`);
+      return true;
+    });
+    assert.equal(calls.length, 1, `${header}: no second attempt`);
+    assert.deepEqual(waits, [], `${header}: the over-cap wait is never slept`);
+  }
+});
+
+test("WebexApiClient retry exhaustion names the path, the last status, and the attempt count, never a query value or a credential", async () => {
+  const { client, calls, waits } = webexRetryHarness([webexUnavailable]);
+  await assert.rejects(client.get("/people", { email: "CANARY-QUERY-EMAIL-84@example.com", cursor: "CANARY-PAGE-CURSOR-85" }), (error) => {
+    assert.ok(error instanceof WebexApiError);
+    assert.equal(error.status, 503);
+    assert.equal(error.endpoint, "/v1/people");
+    assert.equal(error.message, "Webex request failed (503 Service Unavailable) for /v1/people after 4 attempts: Service temporarily unavailable");
+    assert.doesNotMatch(error.message, /CANARY|REDACTED/);
+    return true;
+  });
+  assert.equal(calls.length, 4);
+  assert.ok(calls.every((call) => call.search.includes("cursor=CANARY-PAGE-CURSOR-85")), "every attempt repeats the same request");
+  assert.deepEqual(waits, [1000, 2000, 4000]);
+
+  const limited = webexRetryHarness([() => jsonResponse({}, { status: 429, statusText: "Too Many Requests" })]);
+  await assert.rejects(limited.client.listRoles(), /^WebexApiError: Webex request failed \(429 Too Many Requests\) for \/v1\/roles after 4 attempts: JSON error body without a message field \(2 bytes\)$/);
+  assert.deepEqual(limited.waits, [1000, 2000, 4000], "a 429 without Retry-After backs off like any other retried failure");
+
+  const http2 = webexRetryHarness([() => new Response(null, { status: 503 })]);
+  await assert.rejects(http2.client.listRoles(), /^WebexApiError: Webex request failed \(503\) for \/v1\/roles after 4 attempts$/, "an empty reason phrase leaves no dangling space");
+});
+
+test("WebexApiClient retries the refresh grant, shares one grant across concurrent reads, and fails closed naming /v1/access_token when it is exhausted", async () => {
+  const recovered = webexRetryHarness([
+    () => jsonResponse({ message: "busy" }, { status: 503, statusText: "Service Unavailable" }),
+    () => jsonResponse({ access_token: "CANARY-MINTED-TOKEN-86", expires_in: 1209600, token_type: "Bearer" }),
+    (init) => {
+      assert.equal(init.headers.authorization, "Bearer CANARY-MINTED-TOKEN-86");
+      return jsonResponse({ id: "me-1" });
+    },
+  ], { config: WEBEX_RETRY_GRANT });
+  assert.equal((await recovered.client.getMe()).id, "me-1");
+  assert.deepEqual(recovered.calls.map((call) => `${call.method} ${call.pathname}`), ["POST /v1/access_token", "POST /v1/access_token", "GET /v1/people/me"]);
+  assert.deepEqual(recovered.waits, [1000]);
+
+  const shared = webexRetryHarness([
+    () => jsonResponse({ access_token: "CANARY-MINTED-TOKEN-87", expires_in: 1209600 }),
+    () => jsonResponse({ items: [] }),
+  ], { config: WEBEX_RETRY_GRANT });
+  await Promise.all([shared.client.listPeople(), shared.client.listRoles(), shared.client.listLicenses()]);
+  assert.deepEqual(shared.calls.map((call) => `${call.method} ${call.pathname}`), ["POST /v1/access_token", "GET /v1/people", "GET /v1/roles", "GET /v1/licenses"], "concurrent reads wait on one grant");
+
+  const exhausted = webexRetryHarness([
+    () => textResponse("<html>upstream</html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } }),
+  ], { config: WEBEX_RETRY_GRANT });
+  await assert.rejects(exhausted.client.getMe(), (error) => {
+    assert.ok(error instanceof WebexApiError);
+    assert.equal(error.status, 502);
+    assert.equal(error.message, "Webex token refresh failed (502) for /v1/access_token after 4 attempts: non-JSON error body (text/html; 21 bytes)");
+    assert.equal(error.rejection, undefined, "an exhausted grant is not a credential rejection");
+    assert.doesNotMatch(error.message, /CANARY|REDACTED/);
+    return true;
+  });
+  assert.equal(exhausted.calls.length, 4, "the read the token serves does not retry the exhausted grant again");
+  assert.ok(exhausted.calls.every((call) => call.pathname === "/v1/access_token"));
+  assert.deepEqual(exhausted.waits, [1000, 2000, 4000]);
+  await assert.rejects(exhausted.client.listRoles(), /Webex token refresh failed \(502\) for \/v1\/access_token after 4 attempts/);
+  assert.equal(exhausted.calls.length, 4, "a later read fails with the same grant failure instead of granting again");
+});
+
+test("the Webex refresh grant has a deadline, and a token endpoint that stays down costs one retry sequence for the whole access check", async () => {
+  const stalled = webexRetryHarness([webexNeverSettles], { timeoutMs: 20, config: WEBEX_RETRY_GRANT });
+  await assert.rejects(stalled.client.getMe(), (error) => {
+    assert.ok(error instanceof WebexApiError);
+    assert.equal(error.message, "Webex token refresh failed for /v1/access_token after 4 attempts: timed out after 20 ms");
+    assert.equal(error.status, 0);
+    return true;
+  });
+  assert.equal(stalled.calls.length, 4, "a grant that never answers ends at the deadline and is retried");
+
+  const { client, calls } = webexRetryHarness([webexUnavailable], { config: WEBEX_RETRY_GRANT });
+  const result = await checkWebexAccess(client);
+  assert.equal(calls.length, 4);
+  assert.ok(calls.every((call) => call.pathname === "/v1/access_token"));
+  assert.notEqual(result.status, "healthy");
+  assert.ok(!result.surfaces.some((surface) => surface.status === "readable"), JSON.stringify(result.surfaces));
+  const probed = result.surfaces.filter((surface) => surface.status === "not_readable");
+  assert.ok(probed.length > 0);
+  for (const surface of probed) {
+    assert.equal(surface.error, "Webex token refresh failed (503) for /v1/access_token after 4 attempts: Service temporarily unavailable", surface.name);
+  }
+  assert.doesNotMatch(JSON.stringify(result), /CANARY/);
+});
+
+test("WebexApiClient retries a request or body read that outlives the timeout and names the timeout when every attempt does", async () => {
+  const recovered = webexRetryHarness([webexHangUntilAborted, () => jsonResponse({ id: "me-1" })], { timeoutMs: 20 });
+  assert.equal((await recovered.client.getMe()).id, "me-1");
+  assert.deepEqual(recovered.waits, [1000]);
+
+  const stalled = webexRetryHarness([webexNeverSettles], { timeoutMs: 20 });
+  await assert.rejects(stalled.client.get("/people", { cursor: "CANARY-PAGE-CURSOR-88" }), (error) => {
+    assert.ok(error instanceof WebexApiError);
+    assert.equal(error.message, "Webex request failed for /v1/people after 4 attempts: timed out after 20 ms");
+    assert.equal(error.status, 0);
+    return true;
+  });
+  assert.equal(stalled.calls.length, 4, "a fetch that ignores its abort signal still ends at the deadline");
+  assert.deepEqual(stalled.waits, [1000, 2000, 4000]);
+
+  const slowBody = webexRetryHarness([() => new Response(new ReadableStream({ start() {} }), { status: 200 })], { timeoutMs: 20 });
+  await assert.rejects(slowBody.client.getMe(), /^WebexApiError: Webex request failed for \/v1\/people\/me after 4 attempts: timed out after 20 ms$/);
+  assert.equal(slowBody.calls.length, 4, "the deadline covers reading the body");
+
+  const timedOutRoles = webexRetryHarness([webexNeverSettles], { timeoutMs: 20 }).client;
+  const identity = await assessWebexIdentity(compliantClient({ listRoles: (limit) => timedOutRoles.listRoles(limit) }));
+  assert.deepEqual(identity.summary.inventory_status.roles, {
+    readable: false,
+    status: null,
+    error: "Webex request failed for /v1/roles after 4 attempts: timed out after 20 ms",
+  }, "a request that got no response reports no HTTP status");
+});
+
+test("WebexApiClient retries network failures and names only the system error code", async () => {
+  const recovered = webexRetryHarness([webexConnectionReset, () => jsonResponse({ id: "me-1" })]);
+  assert.equal((await recovered.client.getMe()).id, "me-1");
+  assert.deepEqual(recovered.waits, [1000]);
+
+  const down = webexRetryHarness([webexConnectionReset]);
+  await assert.rejects(down.client.getMe(), (error) => {
+    assert.ok(error instanceof WebexApiError);
+    assert.equal(error.message, "Webex request failed for /v1/people/me after 4 attempts: network error (ECONNRESET)");
+    assert.equal(error.status, 0);
+    assert.doesNotMatch(error.message, /CANARY|REDACTED|https?:|webexapis/);
+    return true;
+  });
+  assert.equal(down.calls.length, 4);
+  assert.deepEqual(down.waits, [1000, 2000, 4000]);
+
+  const opaque = webexRetryHarness([() => { throw new Error(`socket hang up at https://webexapis.com/v1/people/me?token=${WEBEX_RETRY_TOKEN}`); }]);
+  await assert.rejects(opaque.client.getMe(), /^WebexApiError: Webex request failed for \/v1\/people\/me after 4 attempts: network error$/);
+});
+
+test("WebexApiClient stops at once when the tool call is aborted during a retry wait or a request", async () => {
+  const duringWait = new AbortController();
+  let waitCalls = 0;
+  const waiting = new WebexApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      waitCalls += 1;
+      return webexUnavailable();
+    },
+    signal: duringWait.signal,
+    sleep: () => {
+      duringWait.abort();
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(waiting.getMe(), { name: "ToolCallAbortedError" });
+  assert.equal(waitCalls, 1);
+
+  const duringRequest = new AbortController();
+  let requestCalls = 0;
+  const requesting = new WebexApiClient(sampleConfig(), {
+    fetchImpl: async (_input, init) => {
+      requestCalls += 1;
+      setTimeout(() => duringRequest.abort(), 5);
+      return webexHangUntilAborted(init);
+    },
+    signal: duringRequest.signal,
+    sleep: async () => {},
+  });
+  await assert.rejects(requesting.getMe(), { name: "ToolCallAbortedError" });
+  assert.equal(requestCalls, 1, "a tool-call abort is not retried as a timeout");
+});
+
+test("a people page that fails after retries fails the Webex people inventory closed instead of keeping the pages already read", async () => {
+  let laterPageCalls = 0;
+  const real = new WebexApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      const url = new URL(String(input));
+      if (!url.searchParams.get("cursor")) {
+        return jsonResponse(
+          { items: [{ id: "u1", displayName: "Full Admin", emails: ["admin@example.com"], type: "person", roles: ["role-full-admin"], created: "2021-01-01T00:00:00.000Z" }] },
+          { headers: { link: '<https://webexapis.com/v1/people?cursor=CANARY-PAGE-CURSOR-89>; rel="next"' } },
+        );
+      }
+      laterPageCalls += 1;
+      return webexUnavailable();
+    },
+    sleep: async () => {},
+  });
+  const failure = "Webex request failed (503 Service Unavailable) for /v1/people after 4 attempts: Service temporarily unavailable";
+  await assert.rejects(real.listPeople(), (error) => error instanceof WebexApiError && error.message === failure);
+  assert.equal(laterPageCalls, 4);
+
+  const baseline = await assessWebexIdentity(compliantClient({ listPeople: async () => page([{ id: "u1", emails: ["admin@example.com"], type: "person", roles: [] }]) }));
+  assert.match(JSON.stringify(baseline), /"u1"|admin@example\.com/, "positive control: a people page that is read does reach the assessment");
+  const identity = await assessWebexIdentity(compliantClient({ listPeople: (limit) => real.listPeople(limit) }));
+  assert.ok(identity.errors.some((error) => error.includes(failure)), JSON.stringify(identity.errors));
+  const guests = byId(identity.findings, "WEBEX-ID-07");
+  assert.equal(guests.status, "manual");
+  assert.ok(guests.summary.includes(`/people could not be read (${failure})`), guests.summary);
+  assert.doesNotMatch(JSON.stringify(identity), /CANARY-PAGE-CURSOR/);
+  assert.doesNotMatch(JSON.stringify(identity), /"u1"|admin@example\.com/, "the page read before the failure is not reported as the inventory");
+});
+
 test("WEBEX_DOCS cites the redirect-target reference pages and the repo no longer calls them unfetchable", () => {
   const referencePattern = /^https:\/\/developer\.webex\.com\/(admin|meeting|calling|messaging)\/docs\/api\/v1\/[a-z-]+\/?[a-z-]*$/;
   const guidePattern = /^https:\/\/developer\.webex\.com\/docs\/(api\/basics|integrations|service-apps|bots|api\/guides\/compliance)$/;
@@ -1112,6 +1397,7 @@ function rejectingClient(config, { respond = () => rejectedApiResponse([REJECTED
       requests.push(`${init.method ?? "GET"} ${url.pathname}`);
       return url.pathname.endsWith("/access_token") ? grant() : respond(url);
     },
+    sleep: async () => {},
   });
   return { client, requests };
 }
@@ -1171,8 +1457,7 @@ test("checkWebexAccess reports failed and names the refresh credential settings 
       `0/${WEBEX_PROBE_COUNT} probed Webex audit surfaces are readable; ${evidence}.`,
       webexRejectedNote("OAuth refresh credentials"),
     ], label);
-    assert.equal(requests.length, WEBEX_PROBE_COUNT, label);
-    assert.ok(requests.every((request) => request === "POST /v1/access_token"), `${label}: every probe stopped at the token request: ${requests.join(", ")}`);
+    assert.deepEqual(requests, ["POST /v1/access_token"], `${label}: one refused grant fails every probe, and no API request or second grant is sent`);
     for (const text of [...result.notes, result.recommendedNextStep]) assert.doesNotMatch(text, WEBEX_SCOPE_CLAIMS, `${label}: ${text}`);
     assert.equal(scrubErrorText(result.recommendedNextStep), result.recommendedNextStep, label);
     for (const canary of REJECTED_CANARIES) assertNoWindowOf(JSON.stringify(result), canary, `${label} access check result`);
@@ -2272,7 +2557,7 @@ async function errorPathRouter(input) {
 
 /** The secret-carrying fixture with two surfaces served through the real client and its real error path. */
 function errorPathClient() {
-  const real = new WebexApiClient(secretConfig(), { fetchImpl: errorPathRouter });
+  const real = new WebexApiClient(secretConfig(), { fetchImpl: errorPathRouter, sleep: async () => {} });
   return {
     ...secretClient(),
     listRooms: (limit) => real.listRooms(limit),
@@ -2317,13 +2602,14 @@ test("scrubErrorText is the one scrub for error strings: unanchored URL queries,
 });
 
 test("fetchJson never places a response body in an error string: non-JSON bodies become status, endpoint, content type and length; JSON messages are scrubbed", async () => {
-  const gateway = new WebexApiClient(sampleConfig(), { fetchImpl: errorPathRouter });
+  const noWait = async () => {};
+  const gateway = new WebexApiClient(sampleConfig(), { fetchImpl: errorPathRouter, sleep: noWait });
   const htmlBytes = Buffer.byteLength(gatewayHtmlBody(), "utf8");
   await assert.rejects(() => gateway.listWebhooks(), (error) => {
     assert.ok(error instanceof WebexApiError);
     assert.equal(error.status, 502);
     assert.equal(error.endpoint, "/v1/webhooks");
-    assert.equal(error.message, `Webex request failed (502 Bad Gateway) for /v1/webhooks: non-JSON error body (text/html; charset=utf-8; ${htmlBytes} bytes)`);
+    assert.equal(error.message, `Webex request failed (502 Bad Gateway) for /v1/webhooks after 4 attempts: non-JSON error body (text/html; charset=utf-8; ${htmlBytes} bytes)`);
     for (const canary of Object.values(ERROR_CANARIES)) assert.ok(!error.message.includes(canary));
     assert.ok(!error.message.includes("<html>"));
     return true;
@@ -2349,25 +2635,26 @@ test("fetchJson never places a response body in an error string: non-JSON bodies
     return true;
   });
 
-  const bareJson = new WebexApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ access_token: "leaked-if-copied", trackingId: "T1" }, { status: 500, statusText: "Internal Server Error" }) });
+  const bareJson = new WebexApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ access_token: "leaked-if-copied", trackingId: "T1" }, { status: 500, statusText: "Internal Server Error" }), sleep: noWait });
   await assert.rejects(() => bareJson.listRoles(), (error) => {
-    assert.equal(error.message, `Webex request failed (500 Internal Server Error) for /v1/roles: JSON error body without a message field (${Buffer.byteLength(JSON.stringify({ access_token: "leaked-if-copied", trackingId: "T1" }))} bytes)`);
+    assert.equal(error.message, `Webex request failed (500 Internal Server Error) for /v1/roles after 4 attempts: JSON error body without a message field (${Buffer.byteLength(JSON.stringify({ access_token: "leaked-if-copied", trackingId: "T1" }))} bytes)`);
     return true;
   });
   const emptyBody = new WebexApiClient(sampleConfig(), { fetchImpl: async () => new Response(null, { status: 404, statusText: "Not Found" }) });
   await assert.rejects(() => emptyBody.listRoles(), (error) => error instanceof WebexApiError && error.message === "Webex request failed (404 Not Found) for /v1/roles");
-  const unknownType = new WebexApiClient(sampleConfig(), { fetchImpl: async () => new Response("<b>nope</b>", { status: 503, statusText: "Service Unavailable" }) });
+  const unknownType = new WebexApiClient(sampleConfig(), { fetchImpl: async () => new Response("<b>nope</b>", { status: 503, statusText: "Service Unavailable" }), sleep: noWait });
   await assert.rejects(() => unknownType.listRoles(), (error) => /non-JSON error body \(text\/plain;charset=UTF-8; 11 bytes\)$/.test(error.message) || /non-JSON error body \(.*; 11 bytes\)$/.test(error.message));
 
   const refreshConfig = sampleConfig({ token: undefined, refresh: { clientId: "cid", clientSecret: "csecret", refreshToken: "rtoken" } });
   const refreshBody = `<html>Bearer ${ERROR_CANARIES.refresh_html_bearer}</html>`;
   const refreshHtml = new WebexApiClient(refreshConfig, {
     fetchImpl: async () => textResponse(refreshBody, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } }),
+    sleep: noWait,
   });
   await assert.rejects(() => refreshHtml.listRoles(), (error) => {
     assert.ok(error instanceof WebexApiError);
     assert.equal(error.endpoint, "/access_token");
-    assert.equal(error.message, `Webex token refresh failed (502): non-JSON error body (text/html; ${Buffer.byteLength(refreshBody, "utf8")} bytes)`);
+    assert.equal(error.message, `Webex token refresh failed (502) for /v1/access_token after 4 attempts: non-JSON error body (text/html; ${Buffer.byteLength(refreshBody, "utf8")} bytes)`);
     assert.ok(!error.message.includes(ERROR_CANARIES.refresh_html_bearer));
     return true;
   });
@@ -2425,14 +2712,14 @@ test("rule 9 error path: a JSON error with tokenised URLs and a 502 HTML page wi
   const errors = read("_errors.log");
   const htmlBytes = Buffer.byteLength(rawHtml, "utf8");
   assert.match(errors, /collaboration-governance: rooms: Webex request failed \(403 Forbidden\) for \/v1\/rooms: Forbidden: see https:\/\/idbroker\.webex\.com\/idb\/oauth2\/v1\/authorize; Access denied; sign in at https:\/\/idbroker\.webex\.com\/idb\/oauth2\/v1\/authorize to continue/, "negative control: the scrubbed error did travel to _errors.log");
-  assert.match(errors, new RegExp(`collaboration-governance: webhooks: Webex request failed \\(502 Bad Gateway\\) for /v1/webhooks: non-JSON error body \\(text/html; charset=utf-8; ${htmlBytes} bytes\\)`));
+  assert.match(errors, new RegExp(`collaboration-governance: webhooks: Webex request failed \\(502 Bad Gateway\\) for /v1/webhooks after 4 attempts: non-JSON error body \\(text/html; charset=utf-8; ${htmlBytes} bytes\\)`));
   assert.ok(!errors.includes("<html>") && !errors.includes("Set-Cookie"));
   const access = JSON.parse(read("core_data/access.json"));
   const roomsSurface = access.surfaces.find((item) => item.name === "rooms");
   const webhooksSurface = access.surfaces.find((item) => item.name === "webhooks");
   assert.equal(roomsSurface.status, "not_readable");
   assert.match(roomsSurface.error, /^Webex request failed \(403 Forbidden\) for \/v1\/rooms: Forbidden: see https:\/\/idbroker\.webex\.com\/idb\/oauth2\/v1\/authorize; /);
-  assert.equal(webhooksSurface.error, `Webex request failed (502 Bad Gateway) for /v1/webhooks: non-JSON error body (text/html; charset=utf-8; ${htmlBytes} bytes)`);
+  assert.equal(webhooksSurface.error, `Webex request failed (502 Bad Gateway) for /v1/webhooks after 4 attempts: non-JSON error body (text/html; charset=utf-8; ${htmlBytes} bytes)`);
   const rooms = JSON.parse(read("core_data/collaboration-governance/rooms.json"));
   assert.equal(rooms.status, 403);
   assert.match(rooms.error, /^Webex request failed \(403 Forbidden\) for \/v1\/rooms: /);
@@ -2440,7 +2727,7 @@ test("rule 9 error path: a JSON error with tokenised URLs and a 502 HTML page wi
   assert.equal(byId(findings, "WEBEX-COLLAB-04").status, "manual");
   assert.match(byId(findings, "WEBEX-COLLAB-04").summary, /^Manual: \/rooms returned 403/);
   assert.equal(byId(findings, "WEBEX-COLLAB-05").status, "manual");
-  assert.match(byId(findings, "WEBEX-COLLAB-05").summary, /^Manual: \/webhooks could not be read \(Webex request failed \(502 Bad Gateway\) for \/v1\/webhooks: non-JSON error body/);
+  assert.match(byId(findings, "WEBEX-COLLAB-05").summary, /^Manual: \/webhooks could not be read \(Webex request failed \(502 Bad Gateway\) for \/v1\/webhooks after 4 attempts: non-JSON error body/);
   assert.equal(byId(findings, "WEBEX-MTG-02").status, "pass", "the unrelated surfaces keep their complete-inventory verdicts");
 });
 
