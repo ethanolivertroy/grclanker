@@ -85,6 +85,12 @@ Implementation rules that differ from or refine the Go design in sections 7 to 9
   truncation is recorded, surfaced in `evidence.partial_view`, and downgrades
   `pass` to `warn`. An audit account that is neither `is_superuser` nor
   `is_system_auditor` is treated as a partial inventory for every control.
+- A 429, 500, 502, 503, or 504 answer, a timeout, or a lost connection is retried
+  up to three times, waiting for `Retry-After` and otherwise backing off
+  exponentially; a `Retry-After` above 30 seconds fails the request at once. The
+  session login `POST` is never retried after a timeout or lost connection, since
+  it may already have opened a session. A list whose later page still fails after
+  the retries is treated as unreadable, never as a partial inventory.
 - Every documented flag a verdict depends on is read: schedule `enabled`,
   template `ask_credential_on_launch`, `ask_variables_on_launch`, and
   `ask_execution_environment_on_launch`, credential `kind` and `inputs.vault_id`,

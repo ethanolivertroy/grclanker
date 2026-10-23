@@ -41,7 +41,7 @@ The bundle never records the token or password used to authenticate. It also doe
 | `AAP_TOKEN` | OAuth2 bearer token for a local or gateway account. Preferred for automation. |
 | `AAP_USERNAME` and `AAP_PASSWORD` | Session login for LDAP, SAML, or local accounts. The password is only ever read from the environment; passing it as a tool argument is rejected. |
 | `AAP_VERIFY_SSL` | Set to `false` only for approved non-production troubleshooting against a self-signed controller. The opt-out is scoped to the tool's own requests through a dedicated `node:https` agent; `NODE_TLS_REJECT_UNAUTHORIZED` is never touched. Defaults to `true`. |
-| `AAP_TIMEOUT` | Request timeout in seconds. Defaults to 30. |
+| `AAP_TIMEOUT` | Request timeout in seconds, for each attempt and including the response body. Defaults to 30. |
 
 Each tool also accepts `url`, `username`, `token`, `timeout_seconds`, and `verify_ssl` arguments that override the environment for that call.
 
@@ -154,7 +154,19 @@ The script exits 0 with a skip message when `AAP_URL` plus credentials are absen
 
 ## How the tools handle evidence
 
-This section is reference for reviewing findings and bundles: how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+This section is reference for reviewing findings and bundles: how the tools retry failed requests, how unread, partial, or truncated data limits a verdict, how the tools page through the API and report incomplete listings, and how credentials are kept out of findings, bundles, and error text. You don't need it to set up or run the integration.
+
+### Retries
+
+A request that gets a 429, 500, 502, 503, or 504 answer, times out, or loses its connection is retried up to three times, so it makes at most four attempts.
+
+- Between attempts the client waits as long as the answer's `Retry-After` asks, in seconds or as an HTTP date. Without one, it waits 0.5, 1, then 2 seconds.
+- A `Retry-After` longer than 30 seconds is not waited out. The request fails at once and its error names the wait: `AAP request failed: /api/v2/hosts/ (429 Too Many Requests; the server asked to retry after 120 s, more than the 30 s limit)`.
+- Each attempt gets the full `AAP_TIMEOUT`, and the timer runs until the response body is read, so a body that stalls times out too.
+- When the retries run out, the error names the attempts and the last outcome, for example `AAP request failed after 4 attempts: /api/v2/hosts/ (503 Service Unavailable)`, `AAP request failed after 4 attempts: /api/v2/ping/ (timed out after 30000 ms)`, or `AAP request failed after 4 attempts: /api/v2/ping/ (network error: fetch failed)`.
+- Any other status, such as 401, 403, 404, or 501, is not retried, and neither is a 2xx whose body is not JSON.
+- The session login's `GET /api/login/` is retried like any read. Its `POST /api/login/` is retried on those statuses but never after a timeout or lost connection: such a login may still have opened a session, and AAP's `SESSIONS_PER_USER` limit expires the user's oldest session when another opens.
+- A list whose later page still fails after the retries is not collected at all. Its snapshot is the not-collected marker with the failing page's status and error, and every finding and counter that reads it treats it as unreadable, so the pages already read never stand in for the list.
 
 ### Bundle redaction
 
@@ -222,7 +234,7 @@ An object or array nested more than 32 containers below the file's root, or belo
 
 ### Error text
 
-Error strings are scrubbed at one choke point. Every failed request is raised as an `AnsibleApiError` carrying the HTTP status and the endpoint, and its message is passed through `redactErrorText` when the error is created.
+Error strings are scrubbed at one choke point. Every failed request is raised as an `AnsibleApiError` carrying the endpoint, plus the HTTP status when a response arrived (a timeout or network error has none), and its message is passed through `redactErrorText` when the error is created.
 
 The tool-level `errorMessage` helper runs the same pass. So no path from a response body, a login or token exchange, a network error, or a timeout to a finding, summary, `errors` array, access probe, `_errors.log`, or zip entry skips the pass.
 
@@ -236,7 +248,7 @@ The pass replaces:
 - AWS key-shaped strings.
 - The userinfo, query string, and fragment of any URL, wherever it sits in the message.
 
-A failed response whose body is not JSON (for example a proxy's 502 HTML page) is never quoted. The message carries `AAP request failed: <path> (502 Bad Gateway): non-JSON body (text/html, <n> bytes)`. A JSON error keeps only its structured `detail`.
+A failed response whose body is not JSON (for example a proxy's 502 HTML page) is never quoted. Once the retries run out, the message carries `AAP request failed after 4 attempts: <path> (502 Bad Gateway): non-JSON body (text/html, <n> bytes)`. A JSON error keeps only its structured `detail`.
 
 A `SyntaxError` reaching the error sink from any other path is recorded by name only (`SyntaxError: response could not be parsed as JSON; the parser's message is not recorded because it quotes the body`), because V8's parse message quotes a snippet of the rejected text.
 
@@ -313,6 +325,7 @@ As a result:
 Every fixed-text message the integration emits is held to the scrub by a test and survives it unchanged:
 
 - The parse and non-JSON notes.
+- The retry wordings: the attempt count and the over-limit `Retry-After` note.
 - The not-collected and `not attempted` markers.
 - The unreadable-view and downgrade wordings.
 - The session-login and manual-review prose.
