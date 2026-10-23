@@ -1188,6 +1188,28 @@ test("assessZendeskAuthentication warns on partially compliant security settings
   assert.match(findingById(passwordEndUsers, "ZD-21").summary, /zendesk_login=true under the recommended password security level/);
 });
 
+test("ZD-05 fails on a mobile app session timeout of 0 or more than three times the threshold, the same as the agent timeout", async () => {
+  const sessionFinding = async (overrides) => findingById(await assessZendeskAuthentication(healthyClient({
+    async getSecuritySettings() {
+      return healthySecuritySettings(overrides);
+    },
+  }), { now: () => NOW }), "ZD-05");
+
+  const neverExpires = await sessionFinding({ mobile_app_session_timeout: 0 });
+  assert.equal(neverExpires.status, "fail", neverExpires.summary);
+  assert.match(neverExpires.summary, /mobile_app_session_timeout=0, so mobile app sessions never expire from inactivity/);
+
+  const severe = await sessionFinding({ mobile_app_session_timeout: 1441 });
+  assert.equal(severe.status, "fail", severe.summary);
+  assert.match(severe.summary, /mobile_app_session_timeout=1441 minutes exceeds the 480-minute threshold/);
+
+  const atSevereThreshold = await sessionFinding({ mobile_app_session_timeout: 1440 });
+  assert.equal(atSevereThreshold.status, "warn", "three times the threshold exactly is a warning, not a failure");
+
+  const mobileOff = await sessionFinding({ mobile_app_access: false, mobile_app_session_timeout: 0 });
+  assert.equal(mobileOff.status, "pass", "the mobile timeout is not assessed while mobile app access is off");
+});
+
 test("assessZendeskAuthentication renders security-settings controls manual when the endpoint is forbidden or fields are absent", async () => {
   const forbiddenSecurity = await assessZendeskAuthentication(healthyClient({ getSecuritySettings: forbidden("/security_settings") }), { now: () => NOW });
   for (const id of ["ZD-01", "ZD-02", "ZD-03", "ZD-04", "ZD-05", "ZD-21"]) {
