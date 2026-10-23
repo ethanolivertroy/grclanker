@@ -32,6 +32,7 @@ Asset and vulnerability data arrive through asynchronous exports whose chunks ca
 
 - The tool only reads, except for the POST requests that start the asset and vulnerability exports.
 - Each export is polled every 2 seconds for up to 300 seconds, and only the first max_chunks available chunks are downloaded.
+- A throttled or failed request is retried before it counts as failed: HTTP 429 and 5xx answers get up to 4 more attempts, each waiting as long as Retry-After asks up to 30 seconds, and so does a GET that times out or fails before Tenable answers. The POST that starts an export is not sent again after a timeout or a network failure, because Tenable may already have started that export. A request that still fails names its method and path, the status, timeout, or network error, and the number of attempts, and a chunk that still fails leaves the export truncated.
 - Each platform's checks are assessed only when that platform's URL and key pair are configured. Checks for a platform that is not configured are reported as manual and do not change the other platform's results.
 - The export job lists cover only the previous 3 days, so the export automation check is a point-in-time signal, and report schedules are not exposed by the API.
 - Scanner records are kept without their linking key.
@@ -456,7 +457,7 @@ Malformed configuration: Reject malformed or ambiguous configuration before any 
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| Tenable Security Inspector | Not published | `Retry-After` | 429, 500-599 | Retry 429, every 5xx status, and network errors up to 4 times after the first attempt. A Retry-After header in seconds or as an HTTP date is honored up to 30 seconds; otherwise wait 500 ms doubled per attempt, capped at 15 seconds. Timed-out requests (30 seconds by default) are not retried. |
+| Tenable Security Inspector | Not published | `Retry-After` | 429, 500-599 | Retry 429 and every 5xx status up to 4 times after the first attempt, and retry a GET that times out (30 seconds by default) or fails before Tenable answers the same way, export status polls and chunk downloads included. The POST that starts an export is never sent again after a timeout or a network failure, since Tenable may already have started that export; a POST answered with 429 or a 5xx status is sent again like a GET. A Retry-After header in seconds or as an HTTP date measured against the client clock is honored, clamped to 30 seconds (an HTTP date already past waits 250 ms); otherwise wait 500 ms doubled per attempt, capped at 15 seconds. When the retries run out, or a POST drew no answer, the request fails with its method and path, the HTTP status, the timeout, or the network error, and the number of attempts; a chunk that still fails is a failed download and marks the export truncated. |
 
 ## Checks
 

@@ -32,6 +32,7 @@ import {
   resolveSecureOutputPath,
   resolveTenableConfiguration,
 } from "../dist/extensions/grc-tools/tenable.js";
+import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
 import { TENABLE_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
 import { TENABLE_SPEC } from "../dist/extensions/grc-tools/tenable.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -133,6 +134,16 @@ function sixWindows(value) {
 
 function jsonResponse(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+}
+
+// What fetch throws when the client's own per-request timer aborts the request.
+function tenableTimeout() {
+  return new DOMException("This operation was aborted", "AbortError");
+}
+
+// The "METHOD /path" a router matches a request on.
+function requestKey(url, init = {}) {
+  return `${(init.method ?? "GET").toUpperCase()} ${new URL(url).pathname}`;
 }
 
 function vmConfig(extra = {}) {
@@ -664,6 +675,291 @@ test("TenableApiClient runs the export workflow: request, poll status, download 
   assert.equal(capped.fetchedChunks, 1);
   assert.equal(capped.totalChunks, 3);
   assert.equal(capped.truncated, true);
+});
+
+test("TenableApiClient sends a read that timed out or drew no answer again with backoff, and names the endpoint, the reason, and the attempt count when every attempt fails", async () => {
+  let sent = 0;
+  const waits = [];
+  const recovering = createTenableClients(vmConfig(), {
+    fetchImpl: async () => {
+      sent += 1;
+      if (sent === 1) throw tenableTimeout();
+      if (sent === 2) throw new TypeError("fetch failed");
+      return jsonResponse({ scans: [{ id: 1, name: "ok" }] });
+    },
+    sleepImpl: async (ms) => { waits.push(ms); },
+  });
+  assert.equal((await recovering.vm.listScans()).length, 1);
+  assert.equal(sent, 3, "a timeout and a network failure are each followed by another request");
+  assert.deepEqual(waits, [500, 1000]);
+
+  for (const [name, failure, reason] of [
+    ["timeout", tenableTimeout, ": timed out after 30000ms"],
+    ["network failure", () => new TypeError("fetch failed"), " without an HTTP response: fetch failed"],
+  ]) {
+    const requests = [];
+    const delays = [];
+    const exhausted = createTenableClients(vmConfig(), {
+      fetchImpl: async (url, init) => {
+        requests.push(requestKey(url, init));
+        throw failure();
+      },
+      sleepImpl: async (ms) => { delays.push(ms); },
+    });
+    const thrown = await exhausted.vm.listScans().then(() => null, (error) => error);
+    assert.ok(thrown instanceof TenableApiError, name);
+    assert.equal(thrown.message, `Tenable request GET /scans failed after 5 attempts${reason}.`, name);
+    assert.equal(thrown.status, 0, name);
+    assert.equal(thrown.endpoint, "GET /scans", name);
+    assert.deepEqual(requests, Array(5).fill("GET /scans"), `${name}: the first request and four retries`);
+    assert.deepEqual(delays, [500, 1000, 2000, 4000], `${name}: the backoff doubles between attempts`);
+  }
+});
+
+test("TenableApiClient stops at once when the call is aborted during a retry wait, sending no further request", async () => {
+  const controller = new AbortController();
+  let sent = 0;
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async () => {
+      sent += 1;
+      throw tenableTimeout();
+    },
+    sleepImpl: () => {
+      controller.abort(new Error("operator cancelled"));
+      return new Promise(() => {});
+    },
+    signal: controller.signal,
+  });
+  await assert.rejects(clients.vm.listScans(), (error) => error instanceof ToolCallAbortedError);
+  assert.equal(sent, 1, "the timed-out read is not sent again after the abort");
+});
+
+test("TenableApiClient waits for Retry-After as seconds or as an HTTP date on the injected clock, capped at 30 seconds, and backs off when the header is unreadable", async () => {
+  const clock = Date.parse("2026-10-23T12:00:00Z");
+  const at = (offsetMs) => new Date(clock + offsetMs).toUTCString();
+  const sequence = [
+    { status: 503, headers: { "retry-after": "soon" } },
+    { status: 429, headers: { "retry-after": "7" } },
+    { status: 429, headers: { "retry-after": at(12_000) } },
+    { status: 503, headers: { "retry-after": "120" } },
+    { status: 503, headers: { "retry-after": at(-60_000) } },
+  ];
+  const waits = [];
+  let sent = 0;
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async () => {
+      const answer = sequence[sent++];
+      return answer ? jsonResponse({ error: "busy" }, answer.status, answer.headers) : jsonResponse({ scans: [{ id: 1, name: "ok" }] });
+    },
+    sleepImpl: async (ms) => { waits.push(ms); },
+    retryLimit: sequence.length,
+    now: () => clock,
+  });
+  assert.equal((await clients.vm.listScans()).length, 1);
+  assert.equal(sent, sequence.length + 1);
+  assert.deepEqual(waits, [
+    500, // an unreadable Retry-After falls back to the backoff for the first retry
+    7000,
+    12_000, // the HTTP date 12 seconds after the injected clock
+    30_000, // 120 seconds asked, capped at 30
+    250, // an HTTP date already past waits the 250 ms floor
+  ]);
+});
+
+test("TenableApiClient names the endpoint, the status, and the attempt count when a 429 or 5xx outlasts the retries, and a refusal that is never retried carries no attempt count", async () => {
+  for (const [name, respond, retryLimit, message, attempts] of [
+    ["429 under the default retry limit", () => jsonResponse({ error: "slow down" }, 429, { "retry-after": "1" }), undefined, "Tenable request GET /scans failed after 5 attempts (HTTP 429; slow down)", 5],
+    ["502 under a retry limit of 1", () => jsonResponse({ error: "down" }, 502), 1, "Tenable request GET /scans failed after 2 attempts (HTTP 502; down)", 2],
+    ["403", () => jsonResponse({ error: "forbidden" }, 403), undefined, "Tenable request GET /scans failed (HTTP 403; forbidden)", 1],
+  ]) {
+    let sent = 0;
+    const clients = createTenableClients(vmConfig(), {
+      fetchImpl: async () => {
+        sent += 1;
+        return respond();
+      },
+      sleepImpl: async () => {},
+      ...(retryLimit === undefined ? {} : { retryLimit }),
+    });
+    const thrown = await clients.vm.listScans().then(() => null, (error) => error);
+    assert.ok(thrown instanceof TenableApiError, name);
+    assert.equal(thrown.message, message, name);
+    assert.equal(sent, attempts, name);
+  }
+});
+
+test("an export request that timed out or drew no answer is sent once, since Tenable may already have started the export, and every check that reads the export is manual naming the request, the reason, and the attempt count", async () => {
+  const recording = (fetchImpl) => {
+    const sent = [];
+    const waits = [];
+    const clients = createTenableClients(vmConfig(), {
+      fetchImpl: async (url, init = {}) => {
+        sent.push(requestKey(url, init));
+        return fetchImpl(url, init);
+      },
+      sleepImpl: async (ms) => { waits.push(ms); },
+      exportPollMs: 0,
+      exportTimeoutMs: 5_000,
+    });
+    return { clients, sent, waits };
+  };
+  const exportRequests = (sent) => sent.filter((key) => key.startsWith("POST ")).sort();
+  const control = recording(routerFetch(healthyRoutes()));
+  await runAll(control.clients, { expectedAssetCount: 2 });
+  assert.ok(exportRequests(control.sent).includes("POST /assets/export") && exportRequests(control.sent).includes("POST /vulns/export"), "the control run requests both exports");
+
+  for (const [name, failure, reason] of [
+    ["timeout", tenableTimeout, ": timed out after 30000ms"],
+    ["network failure", () => new TypeError("fetch failed"), " without an HTTP response: fetch failed"],
+  ]) {
+    const routed = routerFetch(healthyRoutes());
+    const { clients, sent, waits } = recording(async (url, init) => {
+      if ((init.method ?? "GET").toUpperCase() === "POST") throw failure();
+      return routed(url, init);
+    });
+    const thrown = await clients.vm.exportAssets().then(() => null, (error) => error);
+    assert.ok(thrown instanceof TenableApiError, name);
+    assert.equal(thrown.message, `Tenable request POST /assets/export failed after 1 attempt${reason}; a POST that drew no answer is not sent again, since Tenable may already have acted on it.`, name);
+    assert.equal(thrown.status, 0, name);
+    assert.equal(thrown.endpoint, "POST /assets/export", name);
+    assert.deepEqual(sent, ["POST /assets/export"], `${name}: the export request is not sent again and no status is polled`);
+    assert.deepEqual(waits, [], `${name}: nothing is waited on`);
+
+    sent.length = 0;
+    const results = await runAll(clients, { expectedAssetCount: 2 });
+    assert.deepEqual(exportRequests(sent), exportRequests(control.sent), `${name}: each export the run reads is requested exactly once, as in the control run`);
+    for (const id of EXPORT_CAPPED) {
+      const item = byId(results, id);
+      const request = ["TENABLE-14", "TENABLE-15"].includes(id) ? "POST /vulns/export" : "POST /assets/export";
+      assert.equal(item.status, "manual", `${name}: ${id} is manual when the export request drew no answer: ${item.summary}`);
+      assert.ok(item.summary.includes(`Tenable request ${request} failed after 1 attempt${reason}`), `${name}: ${id} names the request, the reason, and the attempt count: ${item.summary}`);
+      assert.deepEqual(
+        { not_collected: item.evidence.not_collected, dataset_status: item.evidence.dataset_status, http_status: item.evidence.http_status, endpoint: item.evidence.endpoint },
+        { not_collected: true, dataset_status: "error", http_status: null, endpoint: request },
+        `${name}: ${id} evidence`,
+      );
+    }
+  }
+});
+
+test("an export request answered 429 or 503 is sent again after the wait, since Tenable answered without starting the export", async () => {
+  const routed = routerFetch(healthyRoutes());
+  const sent = [];
+  const waits = [];
+  let starts = 0;
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init = {}) => {
+      const key = requestKey(url, init);
+      sent.push(key);
+      if (key === "POST /assets/export") {
+        starts += 1;
+        if (starts === 1) return jsonResponse({ error: "too many requests" }, 429, { "retry-after": "3" });
+        if (starts === 2) return jsonResponse({ error: "unavailable" }, 503);
+      }
+      return routed(url, init);
+    },
+    sleepImpl: async (ms) => { waits.push(ms); },
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const result = await clients.vm.exportAssets();
+  assert.deepEqual({ status: result.status, records: result.records.length, truncated: result.truncated }, { status: "FINISHED", records: 2, truncated: false });
+  assert.deepEqual(sent.slice(0, 3), ["POST /assets/export", "POST /assets/export", "POST /assets/export"]);
+  assert.deepEqual(waits, [3000, 1000]);
+});
+
+test("an export status poll or chunk download that timed out or drew no answer is sent again, so one lost answer neither fails nor truncates the export", async () => {
+  const routed = routerFetch(healthyRoutes());
+  const pending = new Map([
+    ["GET /assets/export/asset-export-1/status", [tenableTimeout]],
+    ["GET /assets/export/asset-export-1/chunks/1", [() => new TypeError("fetch failed"), tenableTimeout]],
+  ]);
+  const sent = [];
+  const waits = [];
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init = {}) => {
+      const key = requestKey(url, init);
+      sent.push(key);
+      const failure = pending.get(key)?.shift();
+      if (failure) throw failure();
+      return routed(url, init);
+    },
+    sleepImpl: async (ms) => { waits.push(ms); },
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const result = await clients.vm.exportAssets();
+  assert.deepEqual(
+    { status: result.status, records: result.records.length, fetchedChunks: result.fetchedChunks, downloadFailures: result.downloadFailures, truncated: result.truncated, reason: result.reason },
+    { status: "FINISHED", records: 2, fetchedChunks: 1, downloadFailures: 0, truncated: false, reason: undefined },
+  );
+  assert.deepEqual(sent, [
+    "POST /assets/export",
+    "GET /assets/export/asset-export-1/status",
+    "GET /assets/export/asset-export-1/status",
+    "GET /assets/export/asset-export-1/chunks/1",
+    "GET /assets/export/asset-export-1/chunks/1",
+    "GET /assets/export/asset-export-1/chunks/1",
+  ]);
+  assert.deepEqual(waits, [500, 500, 1000], "the status poll waits once and the chunk download twice");
+});
+
+test("an export chunk that fails on every attempt leaves the export truncated, naming the chunk, the reason, and the attempt count, and no check that reads the export passes", async () => {
+  const chunkRoutes = () => threeChunkRoutes([healthyAssets(), [THIRD_ASSET], [THIRD_ASSET]], [healthyVulns(), [THIRD_VULN], [THIRD_VULN]]);
+  // Control: with every chunk answering, every check that reads the exports passes.
+  const controlVerdicts = verdictMap(await runAll(clientsFor(chunkRoutes()), { expectedAssetCount: 3 }));
+  for (const id of EXPORT_CAPPED) assert.equal(controlVerdicts.get(id), "pass", `${id} passes when every chunk answers`);
+
+  const lostChunks = new Set(["GET /assets/export/asset-export-1/chunks/2", "GET /vulns/export/vuln-export-1/chunks/2"]);
+  for (const [name, failure, reason, httpStatus] of [
+    ["timeout", () => { throw tenableTimeout(); }, ": timed out after 30000ms.", null],
+    ["network failure", () => { throw new TypeError("fetch failed"); }, " without an HTTP response: fetch failed.", null],
+    ["HTTP 503", () => jsonResponse({ error: "unavailable" }, 503), " (HTTP 503; unavailable)", 503],
+  ]) {
+    const routed = routerFetch(chunkRoutes());
+    const lost = [];
+    const clients = createTenableClients(vmConfig(), {
+      fetchImpl: async (url, init = {}) => {
+        const key = requestKey(url, init);
+        if (!lostChunks.has(key)) return routed(url, init);
+        lost.push(key);
+        return failure();
+      },
+      sleepImpl: async () => {},
+      exportPollMs: 0,
+      exportTimeoutMs: 5_000,
+    });
+    const result = await clients.vm.exportAssets();
+    assert.deepEqual(
+      { status: result.status, records: result.records.length, fetchedChunks: result.fetchedChunks, totalChunks: result.totalChunks, downloadFailures: result.downloadFailures, truncated: result.truncated, endpoint: result.endpoint, httpStatus: result.httpStatus },
+      { status: "FINISHED", records: 3, fetchedChunks: 2, totalChunks: 3, downloadFailures: 1, truncated: true, endpoint: "GET /assets/export/asset-export-1/chunks/2", httpStatus },
+      name,
+    );
+    const lostChunkText = `1 chunk downloads failed: Tenable request GET /assets/export/asset-export-1/chunks/2 failed after 5 attempts${reason}`;
+    assert.ok(result.reason.includes(lostChunkText), `${name}: ${result.reason}`);
+    assert.deepEqual(lost, Array(5).fill("GET /assets/export/asset-export-1/chunks/2"), `${name}: the chunk is requested once and retried four times`);
+
+    const results = await runAll(clients, { expectedAssetCount: 3 });
+    for (const id of EXPORT_CAPPED) {
+      const item = byId(results, id);
+      assert.ok(["warn", "manual"].includes(item.status), `${name}: ${id} never passes on a truncated export: ${item.status} ${item.summary}`);
+    }
+    const [, sensor, , vuln] = results;
+    assert.equal(sensor.summary.collection.asset_export.truncated, true, `${name}: the asset export is reported truncated`);
+    assert.equal(vuln.summary.collection.vuln_export.truncated, true, `${name}: the vulnerability export is reported truncated`);
+
+    const bundle = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-lost-chunk-")), { now: NOW, expectedAssetCount: 3 });
+    const files = readBundleFiles(bundle.outputDir);
+    const written = JSON.parse(files.get(join("core_data", "assets_export.json")));
+    assert.deepEqual(
+      { collected: written.collected, complete: written.complete, truncated: written.truncated, fetched_chunks: written.fetched_chunks, total_chunks: written.total_chunks, download_failures: written.download_failures, records: written.records.length },
+      { collected: true, complete: false, truncated: true, fetched_chunks: 2, total_chunks: 3, download_failures: 1, records: 3 },
+      `${name}: assets_export.json is a partial marker`,
+    );
+    assert.ok(files.get("_errors.log").includes(`asset_export dataset: partial view (3 of unknown records retrieved; ${lostChunkText}`), `${name}: ${files.get("_errors.log")}`);
+    const bundledFindings = JSON.parse(files.get(join("analysis", "findings.json")));
+    for (const id of EXPORT_CAPPED) assert.notEqual(bundledFindings.find((entry) => entry.id === id).status, "pass", `${name}: ${id} in the bundle`);
+  }
 });
 
 test("checkTenableAccess reports healthy when every surface is readable by an Administrator key", async () => {
@@ -2157,6 +2453,7 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, capp
     ["every read refused", clientsFor(routes, { status: 403 })],
     ["every read unavailable", clientsFor(routes, { status: 404 })],
     ["every read behind a proxy page", everyRoute(() => new Response("<html><body>502 Bad Gateway</body></html>", { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } }))],
+    ["every read timing out", everyRoute(() => { throw tenableTimeout(); })],
     ["every read an empty success", everyRoute(() => new Response("", { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }))],
     ["a page-capped walk", createTenableClients(vmConfig(), {
       fetchImpl: async (url, init) => (new URL(url).pathname === "/networks" ? cappedNetworks(url) : fallback(url, init)),
@@ -2240,7 +2537,9 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, capp
     /Tenable request GET \/users failed \(HTTP 404; forbidden\)/,
     // The error line of a dataset named for what it holds keeps its whole message.
     /"credentials dataset: Tenable request GET \/credentials failed \(HTTP 403; forbidden\)"/,
-    /"credentials dataset: Tenable request GET \/credentials failed \(HTTP 502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)\)"/,
+    /"credentials dataset: Tenable request GET \/credentials failed after 5 attempts \(HTTP 502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)\)"/,
+    /"credentials dataset: Tenable request GET \/credentials failed after 5 attempts: timed out after 30000ms\."/,
+    /"asset_export dataset: Tenable request POST \/assets\/export failed after 1 attempt: timed out after 30000ms; a POST that drew no answer is not sent again, since Tenable may already have acted on it\."/,
     /"networks dataset: partial view \(10000 of unknown records retrieved; the walk stopped at the 200-page cap\)\."/,
     // The role note names the Basic role, which is also a scheme word, and keeps its whole text.
     /"server_properties requires role Basic; GET \/server\/properties refused the API key with HTTP 403: Tenable request GET \/server\/properties failed \(HTTP 403; forbidden\)"/,

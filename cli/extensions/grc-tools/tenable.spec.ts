@@ -1502,7 +1502,7 @@ export const TENABLE_SPEC = buildBatchIntegrationSpec({
     retryHeaders: ["Retry-After"],
     retryableStatuses: [429],
     retryableStatusRanges: [{ from: 500, to: 599 }],
-    backoffPolicy: "Retry 429, every 5xx status, and network errors up to 4 times after the first attempt. A Retry-After header in seconds or as an HTTP date is honored up to 30 seconds; otherwise wait 500 ms doubled per attempt, capped at 15 seconds. Timed-out requests (30 seconds by default) are not retried.",
+    backoffPolicy: "Retry 429 and every 5xx status up to 4 times after the first attempt, and retry a GET that times out (30 seconds by default) or fails before Tenable answers the same way, export status polls and chunk downloads included. The POST that starts an export is never sent again after a timeout or a network failure, since Tenable may already have started that export; a POST answered with 429 or a 5xx status is sent again like a GET. A Retry-After header in seconds or as an HTTP date measured against the client clock is honored, clamped to 30 seconds (an HTTP date already past waits 250 ms); otherwise wait 500 ms doubled per attempt, capped at 15 seconds. When the retries run out, or a POST drew no answer, the request fails with its method and path, the HTTP status, the timeout, or the network error, and the number of attempts; a chunk that still fails is a failed download and marks the export truncated.",
   },
   runtimeBehavior: [],
   knownGaps: [

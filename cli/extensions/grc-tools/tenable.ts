@@ -1892,21 +1892,31 @@ function endpointLabel(method: string | undefined, path: string): string {
   return `${(method ?? "GET").toUpperCase()} ${path.startsWith("/") ? path : `/${path}`}`;
 }
 
-function retryDelayMs(response: Response, attempt: number): number {
+function retryDelayMs(response: Response, attempt: number, now: number): number {
   const retryAfter = response.headers.get("retry-after");
   if (retryAfter) {
     const seconds = Number(retryAfter);
     if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 30_000);
     const dateMs = Date.parse(retryAfter);
-    if (Number.isFinite(dateMs)) return Math.min(Math.max(dateMs - Date.now(), 250), 30_000);
+    if (Number.isFinite(dateMs)) return Math.min(Math.max(dateMs - now, 250), 30_000);
   }
+  return backoffMs(attempt);
+}
+
+function backoffMs(attempt: number): number {
   return Math.min(500 * 2 ** attempt, 15_000);
+}
+
+function attemptCount(attempts: number): string {
+  return `${attempts} attempt${attempts === 1 ? "" : "s"}`;
 }
 
 interface HttpClientOptions {
   fetchImpl?: FetchImpl;
   sleepImpl?: SleepImpl;
   retryLimit?: number;
+  /** The clock an HTTP-date Retry-After is measured against. */
+  now?: () => number;
   signal?: AbortSignal;
 }
 
@@ -1916,6 +1926,7 @@ abstract class TenableHttpClient {
   protected readonly fetchImpl: FetchImpl;
   protected readonly sleepImpl: SleepImpl;
   protected readonly retryLimit: number;
+  protected readonly now: () => number;
   protected readonly secrets: string[];
 
   constructor(baseUrl: string, timeoutMs: number, secrets: string[], options: HttpClientOptions = {}) {
@@ -1924,6 +1935,7 @@ abstract class TenableHttpClient {
     this.fetchImpl = abortableFetch(options.fetchImpl ?? fetch, options.signal);
     this.sleepImpl = abortableSleep(options.signal, options.sleepImpl);
     this.retryLimit = options.retryLimit ?? DEFAULT_RETRY_LIMIT;
+    this.now = options.now ?? Date.now;
     this.secrets = secrets;
   }
 
@@ -1972,6 +1984,9 @@ abstract class TenableHttpClient {
   protected async requestDocument(path: string, init: RequestInit = {}, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<TenableDocument> {
     const url = this.buildUrl(path, query);
     const endpoint = endpointLabel(init.method, path);
+    // A request that timed out or drew no answer may still have reached Tenable, so only a read is sent
+    // again: an export request sent twice could start a second export.
+    const resendUnanswered = (init.method ?? "GET").toUpperCase() === "GET";
     for (let attempt = 0; ; attempt += 1) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -1985,25 +2000,28 @@ abstract class TenableHttpClient {
       } catch (error) {
         clearTimeout(timer);
         if (error instanceof ToolCallAbortedError) throw error;
-        const message = this.scrub(error instanceof Error ? error.message : String(error));
-        const aborted = (error instanceof Error && error.name === "AbortError") || /abort/i.test(message);
-        if (aborted) throw this.fail(`Tenable request ${endpoint} timed out after ${this.timeoutMs}ms.`, 0, endpoint);
-        if (attempt < this.retryLimit) {
-          await this.sleepImpl(Math.min(500 * 2 ** attempt, 15_000));
+        if (resendUnanswered && attempt < this.retryLimit) {
+          await this.sleepImpl(backoffMs(attempt));
           continue;
         }
-        throw this.fail(`Tenable request ${endpoint} failed without an HTTP response: ${message}`, 0, endpoint);
+        const message = this.scrub(error instanceof Error ? error.message : String(error));
+        const aborted = (error instanceof Error && error.name === "AbortError") || /abort/i.test(message);
+        const failure = aborted ? `: timed out after ${this.timeoutMs}ms` : ` without an HTTP response: ${message.replace(/\.+$/, "")}`;
+        const notResent = resendUnanswered ? "" : "; a POST that drew no answer is not sent again, since Tenable may already have acted on it";
+        throw this.fail(`Tenable request ${endpoint} failed after ${attemptCount(attempt + 1)}${failure}${notResent}.`, 0, endpoint);
       }
       clearTimeout(timer);
 
-      if ((response.status === 429 || response.status >= 500) && attempt < this.retryLimit) {
-        await this.sleepImpl(retryDelayMs(response, attempt));
+      const retryable = response.status === 429 || response.status >= 500;
+      if (retryable && attempt < this.retryLimit) {
+        await this.sleepImpl(retryDelayMs(response, attempt, this.now()));
         continue;
       }
 
       const rawText = await response.text();
       if (!response.ok) {
-        throw this.fail(`Tenable request ${endpoint} failed (${describeErrorBody(response, rawText, (text) => this.scrub(text))})`, response.status, endpoint);
+        const attempts = retryable ? ` after ${attemptCount(attempt + 1)}` : "";
+        throw this.fail(`Tenable request ${endpoint} failed${attempts} (${describeErrorBody(response, rawText, (text) => this.scrub(text))})`, response.status, endpoint);
       }
       const body = rawText.length === 0 ? undefined : parseJsonBody(rawText);
       if (body === undefined) throw this.nonDocument({ value: undefined, response, rawText, endpoint }, { kind: "document" });

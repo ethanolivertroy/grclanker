@@ -12,6 +12,7 @@ Asset and vulnerability data arrive through asynchronous exports whose chunks ca
 
 - The tool only reads, except for the POST requests that start the asset and vulnerability exports.
 - Each export is polled every 2 seconds for up to 300 seconds, and only the first max_chunks available chunks are downloaded.
+- A throttled or failed request is retried before it counts as failed: HTTP 429 and 5xx answers get up to 4 more attempts, each waiting as long as Retry-After asks up to 30 seconds, and so does a GET that times out or fails before Tenable answers. The POST that starts an export is not sent again after a timeout or a network failure, because Tenable may already have started that export. A request that still fails names its method and path, the status, timeout, or network error, and the number of attempts, and a chunk that still fails leaves the export truncated.
 - Each platform's checks are assessed only when that platform's URL and key pair are configured. Checks for a platform that is not configured are reported as manual and do not change the other platform's results.
 - The export job lists cover only the previous 3 days, so the export automation check is a point-in-time signal, and report schedules are not exposed by the API.
 - Scanner records are kept without their linking key.
