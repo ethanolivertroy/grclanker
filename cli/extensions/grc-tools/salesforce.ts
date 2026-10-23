@@ -33,6 +33,7 @@ export const SALESFORCE_API_VERSION = "64.0";
 const DEFAULT_OUTPUT_DIR = "./export/salesforce";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
+const MAX_RETRY_WAIT_MS = 30_000;
 const DEFAULT_RECORD_LIMIT = 2000;
 const DEFAULT_LOGIN_HISTORY_DAYS = 30;
 const DEFAULT_AUDIT_TRAIL_DAYS = 90;
@@ -1209,6 +1210,25 @@ function escapeXml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** A Retry-After header in milliseconds, as delta-seconds or an HTTP-date measured against `now`. */
+function retryAfterMs(value: string | null, now: Date): number | undefined {
+  if (value === null) return undefined;
+  const seconds = asNumber(value);
+  if (seconds !== undefined) return Math.max(seconds, 0) * 1000;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : Math.max(date - now.getTime(), 0);
+}
+
+function afterAttempts(attempts: number): string {
+  return attempts > 1 ? ` after ${attempts} attempts` : "";
+}
+
+/** Why a retryable response was returned unretried: the server asked for a longer wait than the client allows. */
+function retryRefusal(attempts: number, waitMs: number): string {
+  const asked = `the server asked to retry after ${Math.ceil(waitMs / 1000)} s, more than the ${MAX_RETRY_WAIT_MS / 1000} s limit`;
+  return attempts > 1 ? `${afterAttempts(attempts)}, then stopped because ${asked}` : `, not retried because ${asked}`;
+}
+
 export class SalesforceApiClient {
   private readonly config: SalesforceResolvedConfig;
   private readonly fetchImpl: FetchImpl;
@@ -1260,7 +1280,7 @@ export class SalesforceApiClient {
     return redactSecrets(message, this.secrets());
   }
 
-  private async rawFetch(url: string, init: RequestInit): Promise<Response> {
+  private async rawFetch(url: string, init: RequestInit, attempts: number): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     const endpoint = new URL(url).pathname;
@@ -1269,41 +1289,43 @@ export class SalesforceApiClient {
     } catch (error) {
       rethrowIfAborted(error);
       if (error instanceof Error && error.name === "AbortError") {
-        throw new SalesforceApiError(`Salesforce request to ${endpoint} timed out after ${this.config.timeoutMs} ms`, { endpoint });
+        throw new SalesforceApiError(`Salesforce request to ${endpoint} timed out after ${this.config.timeoutMs} ms${attempts > 1 ? `, after ${attempts} attempts` : ""}`, { endpoint });
       }
       const message = error instanceof Error ? error.message : String(error);
-      throw new SalesforceApiError(this.redact(`Salesforce request to ${endpoint} failed: ${message}`), { endpoint });
+      throw new SalesforceApiError(this.redact(`Salesforce request to ${endpoint} failed${afterAttempts(attempts)}: ${message}`), { endpoint });
     } finally {
       clearTimeout(timeout);
     }
   }
 
-  private async fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
-    let attempt = 0;
-    for (;;) {
-      let response: Response | undefined;
-      let failure: SalesforceApiError | undefined;
+  /**
+   * Sends one Salesforce read (SOQL, REST, the token request, or a Metadata API readMetadata or
+   * listMetadata call), retrying a timeout, a transport failure, a 429, or a 5xx up to maxRetries times.
+   * Resolves with the final response and the note its failure message carries: the attempt count, or why
+   * retrying stopped when Retry-After asked for more than MAX_RETRY_WAIT_MS.
+   */
+  private async fetchWithRetry(url: string, init: RequestInit): Promise<{ response: Response; retryNote: string }> {
+    for (let attempt = 0; ; attempt += 1) {
+      let response: Response;
       try {
-        response = await this.rawFetch(url, init);
+        response = await this.rawFetch(url, init, attempt + 1);
       } catch (error) {
         rethrowIfAborted(error);
-        failure = error instanceof SalesforceApiError ? error : new SalesforceApiError(String(error));
+        if (attempt >= this.config.maxRetries) throw error instanceof SalesforceApiError ? error : new SalesforceApiError(String(error));
+        await this.sleep(Math.min(500 * 2 ** attempt, MAX_RETRY_WAIT_MS));
+        continue;
       }
-      const retryable = failure !== undefined || (response !== undefined && (response.status === 429 || response.status >= 500));
-      if (!retryable && response) return response;
-      if (attempt >= this.config.maxRetries) {
-        if (response) return response;
-        throw failure ?? new SalesforceApiError("Salesforce request failed.");
-      }
-      const retryAfter = asNumber(response?.headers.get("retry-after"));
-      await this.sleep(retryAfter !== undefined ? retryAfter * 1000 : 500 * 2 ** attempt);
-      attempt += 1;
+      const retryable = response.status === 429 || response.status >= 500;
+      if (!retryable || attempt >= this.config.maxRetries) return { response, retryNote: afterAttempts(attempt + 1) };
+      const waitMs = retryAfterMs(response.headers.get("retry-after"), this.now());
+      if (waitMs !== undefined && waitMs > MAX_RETRY_WAIT_MS) return { response, retryNote: retryRefusal(attempt + 1, waitMs) };
+      await this.sleep(waitMs ?? Math.min(500 * 2 ** attempt, MAX_RETRY_WAIT_MS));
     }
   }
 
   private async requestToken(form: Record<string, string>): Promise<{ accessToken: string; instanceUrl: string }> {
     const body = new URLSearchParams(form).toString();
-    const response = await this.fetchWithRetry(`${this.config.loginUrl}/services/oauth2/token`, {
+    const { response, retryNote } = await this.fetchWithRetry(`${this.config.loginUrl}/services/oauth2/token`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
       body,
@@ -1314,7 +1336,7 @@ export class SalesforceApiClient {
       const summary = salesforceErrorSummary(payload);
       const detail = summary.message ?? describeOpaqueBody(response, rawText, parsed ? "JSON body without a recognized error field" : "non-JSON body");
       throw new SalesforceApiError(
-        this.redact(`Salesforce token request failed (${response.status})${summary.errorCode ? ` ${summary.errorCode}` : ""}${detail ? `: ${detail}` : ""}`),
+        this.redact(`Salesforce token request failed (${response.status})${summary.errorCode ? ` ${summary.errorCode}` : ""}${retryNote}${detail ? `: ${detail}` : ""}`),
         { status: response.status, errorCode: summary.errorCode, endpoint: "/services/oauth2/token" },
       );
     }
@@ -1386,7 +1408,7 @@ export class SalesforceApiClient {
     if (refusal !== undefined) throw new SalesforceApiError(foreignUrlMessage(refusal));
     const url = new URL(pathOrUrl, session.instanceUrl);
     for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
-    const response = await this.fetchWithRetry(url.toString(), {
+    const { response, retryNote } = await this.fetchWithRetry(url.toString(), {
       method: "GET",
       headers: { authorization: `Bearer ${session.accessToken}`, accept: "application/json" },
     });
@@ -1398,7 +1420,7 @@ export class SalesforceApiClient {
       const summary = salesforceErrorSummary(payload);
       const detail = summary.message ?? describeOpaqueBody(response, rawText, parsed ? "JSON body without a recognized error field" : "non-JSON body");
       throw new SalesforceApiError(
-        this.redact(`Salesforce request ${url.pathname} failed (${response.status})${summary.errorCode ? ` ${summary.errorCode}` : ""}${detail ? `: ${detail}` : ""}`),
+        this.redact(`Salesforce request ${url.pathname} failed (${response.status})${summary.errorCode ? ` ${summary.errorCode}` : ""}${retryNote}${detail ? `: ${detail}` : ""}`),
         { status: response.status, errorCode: summary.errorCode, endpoint: url.pathname },
       );
     }
@@ -1499,7 +1521,7 @@ export class SalesforceApiClient {
       body,
       `</met:${operation}></soapenv:Body></soapenv:Envelope>`,
     ].join("");
-    const response = await this.fetchWithRetry(`${session.instanceUrl}/services/Soap/m/${this.config.apiVersion}`, {
+    const { response, retryNote } = await this.fetchWithRetry(`${session.instanceUrl}/services/Soap/m/${this.config.apiVersion}`, {
       method: "POST",
       headers: { "content-type": "text/xml; charset=UTF-8", soapaction: "\"\"" },
       body: envelope,
@@ -1516,7 +1538,7 @@ export class SalesforceApiClient {
       const faultString = asString(fault?.faultstring);
       const detail = faultString ?? describeOpaqueBody(response, rawText, envelopeBody === undefined ? "non-SOAP body" : "SOAP body without a fault string");
       throw new SalesforceApiError(
-        this.redact(`Salesforce Metadata API ${label} failed (${response.status})${faultCode ? ` ${faultCode}` : ""}${detail ? `: ${detail}` : ""}`),
+        this.redact(`Salesforce Metadata API ${label} failed (${response.status})${faultCode ? ` ${faultCode}` : ""}${retryNote}${detail ? `: ${detail}` : ""}`),
         { status: response.status, errorCode: faultCode, endpoint },
       );
     }

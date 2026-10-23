@@ -329,7 +329,7 @@ Credential refresh: POST /services/oauth2/token with the selected JWT bearer, re
 
 | Scope | Documented limit | Retry headers | Retryable statuses | Policy |
 |---|---|---|---|---|
-| Salesforce Security Inspector | Organization edition and license determine daily and concurrent API limits | `Sforce-Limit-Info`, `Retry-After` | 429, 500, 502, 503, 504 | Use bounded Retry-After and exponential retry; preserve REQUEST_LIMIT_EXCEEDED as unreadable evidence. |
+| Salesforce Security Inspector | Organization edition and license determine daily and concurrent API limits | `Retry-After` | 429, 500-599 | Retry 429, every 5xx status, request timeouts (30 seconds unless timeout_seconds or SF_TIMEOUT sets it), and network errors up to SF_MAX_RETRIES times after the first attempt (3 by default), on REST, Tooling, Metadata API readMetadata and listMetadata, and OAuth token requests alike. A Retry-After header in seconds or as an HTTP date is honored on any retryable response; a wait longer than 30 seconds is not taken, and the read fails at once with an error that names the requested wait. Otherwise wait 500 ms doubled per attempt, capped at 30 seconds. A tool-call abort is never retried. An exhausted read stays unreadable, and its error names the path, the last status, timeout, or network error, and the attempt count. A 403 REQUEST_LIMIT_EXCEEDED (the org's rolling 24-hour API limit) is not retried and stays unreadable evidence. |
 
 ## Checks
 

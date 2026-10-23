@@ -82,7 +82,7 @@ Other inputs:
 - `SF_LOGIN_URL`: Explicit login host. Otherwise `https://test.salesforce.com` is used when `SF_SANDBOX=true` or the instance URL is a sandbox host, and `https://login.salesforce.com` otherwise.
 - `SF_API_VERSION`: Defaults to `64.0`.
 - `SF_TIMEOUT` (default 30): Timeout in seconds, clamped to 1-300.
-- `SF_MAX_RETRIES` (default 3): Maximum retries, clamped to 0-8.
+- `SF_MAX_RETRIES` (default 3): Retries after the first attempt, clamped to 0-8.
 
 `SF_SECURITY_TOKEN` is needed for the username-password flow only when the login IP is not trusted.
 
@@ -234,6 +234,7 @@ Every finding is gated on the datasets it reads (the `Inputs` column of the [Con
   - Its summary names the dataset and the observed status ("... could not be verified because the TwoFactorMethodsInfo query was forbidden (403 ...)").
   - `manualEvidence` states what to collect.
   - A few unread datasets cap a `pass` at `warn` instead, and the summary says what was not checked. SF-04 reads the MFA requirement from `SecuritySettings` and from the Health Check MFA setting. An unread source caps it at `warn` while the other exposes a value. SF-04 is `manual` when neither does. An unread `PermissionSetAssignment` query caps SF-09 at `warn` only while no permission set grants an elevated permission. SF-09 becomes `manual` once one does. An unread `EventLogFile` query caps SF-15 at `warn`.
+- **Failed requests:** A 429, a 5xx, a timeout, or a network error is retried up to `SF_MAX_RETRIES` times on every request, including the token request and the Metadata API reads, with a wait of 500 ms doubled per attempt and capped at 30 seconds. A `Retry-After` of up to 30 seconds (in seconds or as an HTTP date) replaces that wait. A longer one is not waited out: the retries stop at once, and the error names the requested wait. When the request still fails, the dataset is errored and its error names the path (or the Metadata API call), the last status, timeout, or network error, and the attempt count ("... timed out after 30000 ms, after 4 attempts"). A failure on a later page leaves the whole dataset errored, never a shorter list.
 - **Truncated input:** The finding's summary carries "Only N of M ... records were read, so the verdict is downgraded", and a `pass` becomes `warn`. A SOQL result is `truncated`, with a known or unknown total, when any of these holds:
   - It stopped at `record_limit`.
   - It returned fewer rows than `totalSize`.

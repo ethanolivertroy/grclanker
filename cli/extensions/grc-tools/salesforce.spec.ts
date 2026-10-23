@@ -423,9 +423,10 @@ export const SALESFORCE_SPEC = buildBatchIntegrationSpec({
   }],
   rateLimit: {
     documentedLimit: "Organization edition and license determine daily and concurrent API limits",
-    retryHeaders: ["Sforce-Limit-Info", "Retry-After"],
-    retryableStatuses: [429, 500, 502, 503, 504],
-    backoffPolicy: "Use bounded Retry-After and exponential retry; preserve REQUEST_LIMIT_EXCEEDED as unreadable evidence.",
+    retryHeaders: ["Retry-After"],
+    retryableStatuses: [429],
+    retryableStatusRanges: [{ from: 500, to: 599 }],
+    backoffPolicy: "Retry 429, every 5xx status, request timeouts (30 seconds unless timeout_seconds or SF_TIMEOUT sets it), and network errors up to SF_MAX_RETRIES times after the first attempt (3 by default), on REST, Tooling, Metadata API readMetadata and listMetadata, and OAuth token requests alike. A Retry-After header in seconds or as an HTTP date is honored on any retryable response; a wait longer than 30 seconds is not taken, and the read fails at once with an error that names the requested wait. Otherwise wait 500 ms doubled per attempt, capped at 30 seconds. A tool-call abort is never retried. An exhausted read stays unreadable, and its error names the path, the last status, timeout, or network error, and the attempt count. A 403 REQUEST_LIMIT_EXCEEDED (the org's rolling 24-hour API limit) is not retried and stays unreadable evidence.",
   },
   runtimeBehavior: SALESFORCE_RUNTIME_BEHAVIOR,
   knownGaps: ["Interactive authorization code flow, geolocation baselines, and several policy surfaces are not read."],
