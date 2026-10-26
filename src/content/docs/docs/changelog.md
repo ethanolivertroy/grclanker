@@ -3,6 +3,15 @@ title: What's New
 description: "The grclanker changelog: what shipped in v0.1.3, v0.1.2, v0.1.1, v0.1.0, and v0.0.1."
 ---
 
+## Unreleased
+
+### Cursor Agent SDK
+
+- The [Cursor Agent SDK](/docs/getting-started/agent-sdk/) project moves to the public [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.3.0, up from `@cursor/bdk` 0.2.26. It still serves all 241 tools: 199 read-only and 42 approval-gated writers.
+- The npm scripts run the `agent-sdk` CLI instead of `bdk`. `agent-sdk:call` now runs `agent-sdk tool call`, the 0.3.0 name for the old `call` command, so `npm --prefix cli run agent-sdk:call -- <tool> --input <json>` works as before.
+- Sign in with `npx agent-sdk login` inside `cli/`. `CURSOR_API_KEY` works as before.
+- Links point to the public [Agent SDK docs](https://cursor.com/docs/agent-sdk).
+
 ## v0.1.3 (October 19, 2026)
 
 Adds an experimental, opt-in durable mode, moves the CLI to Pi 1.3.0 and the release bundles to Node.js 24.22.0, makes exports atomic, and fixes checks that could pass on incomplete evidence. The tool surface is unchanged. Install or upgrade with:

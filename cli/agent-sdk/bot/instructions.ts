@@ -1,4 +1,4 @@
-import { defineInstructions } from "@cursor/bdk";
+import { defineInstructions } from "@grok/agent-sdk";
 import { buildGrclankerInstructions } from "../lib/instructions.js";
 
 export default defineInstructions({ markdown: buildGrclankerInstructions() });

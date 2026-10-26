@@ -1,4 +1,4 @@
-import type { AgentConfig } from "@cursor/bdk";
+import type { AgentConfig } from "@grok/agent-sdk";
 
 export const AGENT_NAME = "grclanker";
 
@@ -9,7 +9,7 @@ export const AGENT_DESCRIPTION =
 export const MODEL_ENV_VAR = "GRCLANKER_AGENT_SDK_MODEL";
 
 /**
- * Root `defineAgent` config. Turns run on BDK's default local harness so the
+ * Root `defineAgent` config. Turns run on the Agent SDK's default local harness so the
  * in-process server tools apply; the model falls back to the Agent SDK default
  * unless `GRCLANKER_AGENT_SDK_MODEL` names a Cursor model id.
  */

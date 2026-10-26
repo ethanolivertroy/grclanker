@@ -13,7 +13,7 @@ export const defaultToolsDir = resolve(scriptDir, "../agent-sdk/bot/tools");
  */
 export function buildAgentSdkToolSource(toolName) {
   return [
-    'import { defineTool } from "@cursor/bdk/tools";',
+    'import { defineTool } from "@grok/agent-sdk/tools";',
     'import { grclankerToolConfig } from "../../lib/tools.js";',
     "",
     `export default defineTool(grclankerToolConfig(${JSON.stringify(toolName)}));`,
