@@ -13,23 +13,23 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const agentSdkDir = resolve(scriptDir, "../agent-sdk");
 const require = createRequire(import.meta.url);
 
-function resolveBdkBin() {
+function resolveAgentSdkBin() {
   try {
-    const packageJsonPath = require.resolve("@cursor/bdk/package.json");
+    const packageJsonPath = require.resolve("@grok/agent-sdk/package.json");
     const manifest = require(packageJsonPath);
-    return { version: manifest.version, bin: resolve(dirname(packageJsonPath), manifest.bin.bdk) };
+    return { version: manifest.version, bin: resolve(dirname(packageJsonPath), manifest.bin["agent-sdk"]) };
   } catch {
     return undefined;
   }
 }
 
 /**
- * Run a `bdk` command and return its stdout.
+ * Run an `agent-sdk` command and return its stdout.
  *
- * The child's stdout is a temp file, not a pipe: `bdk info --json`
- * writes with a bare `process.stdout.write` and then calls `process.exit`,
- * so with a pipe only the first 64 KiB survives and the full tool payload is
- * truncated mid-JSON. Writes to a file descriptor complete synchronously.
+ * The child's stdout is a temp file, not a pipe: releases before 0.3.0 wrote
+ * `info --json` with a bare `process.stdout.write` and then called
+ * `process.exit`, so a pipe kept only the first 64 KiB of the tool payload.
+ * Writes to a file descriptor complete synchronously on every release.
  */
 function runAgentSdk(bin, args) {
   const captureDir = mkdtempSync(join(tmpdir(), "grclanker-agent-sdk-smoke-"));
@@ -46,13 +46,13 @@ function runAgentSdk(bin, args) {
   }
 }
 
-const sdk = resolveBdkBin();
+const sdk = resolveAgentSdkBin();
 if (!sdk) {
-  console.log("Skipping Agent SDK discovery smoke: @cursor/bdk is not installed (run npm --prefix cli install).");
+  console.log("Skipping Agent SDK discovery smoke: @grok/agent-sdk is not installed (run npm --prefix cli install).");
   process.exit(0);
 }
 
-console.log(`Using @cursor/bdk ${sdk.version}`);
+console.log(`Using @grok/agent-sdk ${sdk.version}`);
 process.stdout.write(runAgentSdk(sdk.bin, ["validate"]));
 
 const info = JSON.parse(runAgentSdk(sdk.bin, ["info", "--json"]));

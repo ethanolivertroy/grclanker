@@ -1,11 +1,23 @@
 ---
 title: Cursor Agent SDK
-description: Run all 241 grclanker domain tools as a Cursor Agent SDK agent built on @cursor/bdk.
+description: Run all 241 grclanker domain tools as a Cursor Agent SDK agent built on @grok/agent-sdk.
 ---
 
-grclanker ships a Cursor Agent SDK project next to the Pi terminal CLI. The project lives in `cli/agent-sdk/` and adapts the bundled 241-tool domain registry instead of duplicating it.
+grclanker ships a [Cursor Agent SDK](https://cursor.com/docs/agent-sdk) project next to the Pi terminal CLI. The project lives in `cli/agent-sdk/` and adapts the bundled 241-tool domain registry instead of duplicating it.
 
-The project is built on [`@cursor/bdk`](https://www.npmjs.com/package/@cursor/bdk), Cursor's Bot Development Kit (BDK), the package behind the `bdk` CLI. BDK was published as `@cursor/july` with an `agent-sdk` CLI during its early alpha.
+The Agent SDK lets you define, test, and run agents as a folder of Markdown and TypeScript. grclanker's project is built on [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.3.0, the package behind the `agent-sdk` CLI. It was published as `@cursor/bdk` before the public release.
+
+## Quick start
+
+From a clone of the repo, on Node.js 22.19 or newer:
+
+```bash
+npm --prefix cli install
+npm --prefix cli run agent-sdk:validate
+npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-44228"}'
+```
+
+The last command runs one grclanker tool with no model turn and prints a JSON envelope with `"ok": true` and the matching Log4j entries from the CISA KEV feed. It needs network access but no Cursor credential.
 
 ## What the agent exposes
 
@@ -31,30 +43,24 @@ Each tool keeps the same behavior as in the CLI:
   - The FedRAMP lookups mirror the official catalog to `~/.grclanker/.state/fedramp/`. When the SDK marks a session as a dry run (`ctx.session.dryRun`), the adapter runs them with on-disk caching disabled, so they still return live data while the session leaves `~/.grclanker` (`GRCLANKER_HOME`) untouched.
   - The SDK host still writes its own session state under `.agent-serve/`.
 - The 42 writers set `needsApproval: true`.
-  - A model-initiated call to one of them parks until a person approves or denies it from the playground Approve / Deny buttons or `POST /v1/session/:sessionId/approvals/:callId`.
-  - The terminal `bdk chat` client shows the parked call but cannot resolve it, so use `agent-sdk:dev` and the playground for turns that export or generate files.
-  - Deterministic `bdk call` runs bypass the gate because the caller chose the tool and input.
+  - A model-initiated call to one of them parks until a person approves or denies it from the playground Approve / Deny buttons or `POST /v1/session/:sessionId/approvals/:callId`. Use `agent-sdk:dev` and the playground for turns that export or generate files.
+  - Deterministic `agent-sdk tool call` runs bypass the gate because the caller chose the tool and input.
 
 ## Run it
 
-The Agent SDK project runs from a source checkout. `@cursor/bdk` is a devDependency of the CLI package, so `npm --prefix cli install` provides `bdk`. The `agent-sdk:*` npm scripts keep their names and run `bdk`:
+The Agent SDK project runs from a source checkout. `@grok/agent-sdk` is a devDependency of the CLI package, so `npm --prefix cli install` provides the `agent-sdk` CLI. The npm scripts wrap it:
 
-```bash
-npm --prefix cli install
-npm --prefix cli run agent-sdk:validate
-npm --prefix cli run agent-sdk:info
-npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-44228"}'
-```
+| Script | Runs |
+|---|---|
+| `agent-sdk:validate` | `agent-sdk validate --dir agent-sdk` |
+| `agent-sdk:info` | `agent-sdk info --dir agent-sdk` |
+| `agent-sdk:call` | `agent-sdk tool call --dir agent-sdk` |
+| `agent-sdk:dev` | `agent-sdk dev agent-sdk --mode single` |
+| `agent-sdk:run` | `agent-sdk run --dir agent-sdk` |
 
-`validate`, `info`, and `call` need no Cursor credential. `call` runs a server tool deterministically with no model turn, which is the fastest way to confirm a tool works before blaming a prompt.
+`validate`, `info`, and `tool call` need no Cursor credential. `tool call` runs a server tool deterministically with no model turn, which is the fastest way to confirm a tool works before blaming a prompt.
 
-The `kevs_search` call above needs network access to the CISA KEV feed and prints a JSON envelope with `"ok": true` and the matching Log4j entries.
-
-Because `@cursor/bdk` is pinned (see [Limitations](#limitations)), every `bdk` command prints an "outdated" warning once a newer release is published. That warning is expected. Skip the `bdk update` it suggests, because the pin is deliberate.
-
-Every `bdk` command also prints `[bdk] GitHub auth: unavailable` unless a GitHub App or token is set. That line is about BDK's own GitHub integration, which this project does not use, so the tools still run. The `github_*` domain tools read their own credentials, as listed on the [GitHub](/docs/integrations/github/) page.
-
-Model turns need a Cursor credential. Sign in once with `npx bdk login` inside `cli/`, or export `CURSOR_API_KEY`, then serve the agent with the playground:
+Model turns need a Cursor credential. Sign in once with `npx agent-sdk login` inside `cli/`, or export `CURSOR_API_KEY`, then serve the agent with the playground:
 
 ```bash
 npm --prefix cli run agent-sdk:dev
@@ -64,19 +70,19 @@ npm --prefix cli run agent-sdk:run -- --message "Is BoringCrypto FIPS validated?
 
 The Agent SDK default model applies unless `GRCLANKER_AGENT_SDK_MODEL` names a Cursor model id, for example `GRCLANKER_AGENT_SDK_MODEL=composer-2.5`.
 
-Tool credentials work the same way as in the CLI: the cloud and SaaS tools read their environment variables from the `bdk` process.
+Tool credentials work the same way as in the CLI: the cloud and SaaS tools read their environment variables from the `agent-sdk` process.
+
+Commands that start a local host print a `[bdk] GitHub auth:` line on stderr. That line is about the Agent SDK's own GitHub integration, which this project does not use, so the tools run whether or not it finds a credential. The `github_*` domain tools read their own credentials, as listed on the [GitHub](/docs/integrations/github/) page.
 
 Session state, traces, and eval batches land in `cli/agent-sdk/.agent-serve/`, which is gitignored.
 
 ## Where exported files land
 
-Server tools run inside the `bdk` process. A relative `output_dir`, `workspace_dir`, or `zip_path` therefore resolves against that process's working directory (`cli/` when you use the npm scripts), not against the model's session workspace under `~/.cache/agent-serve/agent-sdk/`.
+Server tools run inside the `agent-sdk` process. A relative `output_dir`, `workspace_dir`, or `zip_path` therefore resolves against that process's working directory (`cli/` when you use the npm scripts), not against the model's session workspace, which the Agent SDK keeps in a per-project directory under `~/.cache`.
 
 The defaults are the same as in the CLI: exporters write under `./export/<domain>/` and the OSCAL tools use `./oscal-workspace/`. Both directories are gitignored.
 
 Every writer returns the absolute paths it created, and the runtime note tells the model to pass an absolute path when files must land in its workspace.
-
-Pipe `bdk info --json` to a file rather than another process (`npm --prefix cli run -s agent-sdk:info -- --json > /tmp/info.json`). The command writes its 241-tool payload with an unawaited stdout write, and a pipe truncates the output at 64 KiB. The `test:agent-sdk:validate` script captures it through a file descriptor for this reason.
 
 ## Keep the tool entries in sync
 
@@ -86,19 +92,24 @@ After adding or renaming a tool in `cli/extensions/grc-tools/`, regenerate the t
 npm --prefix cli run sync:agent-sdk-tools
 ```
 
-The Agent SDK derives tool names from filenames, so `cli/agent-sdk/bot/tools/` holds one generated entry per domain tool. The project uses BDK's `bot/` layout (see [Project layout](https://cursor.com/docs/bdk/reference/project-layout)).
+The Agent SDK derives tool names from filenames, so `cli/agent-sdk/bot/tools/` holds one generated entry per domain tool, in the `bot/` layout described in [Project layout](https://cursor.com/docs/agent-sdk/reference/project-layout).
 
 The sync compiles the registry without the generated entries (`cli/tsconfig.agent-sdk-sync.json`), rewrites every entry, and then runs the full build. That way, the sync still works when the existing entries no longer compile, for example right after a package rename.
 
 `npm --prefix cli run test:cli` covers the adapter with a mocked SDK (registration, schema conversion, argument bridging, result mapping, and every entry file) and fails when the generated entries drift.
 
-`npm --prefix cli run test:agent-sdk:validate` runs the real `bdk validate` and `bdk info --json` discovery and skips when `@cursor/bdk` is not installed.
+`npm --prefix cli run test:agent-sdk:validate` runs the real `agent-sdk validate` and `agent-sdk info --json` discovery and skips when `@grok/agent-sdk` is not installed.
 
 ## Limitations
 
-- Source checkout only: The release bundles do not include the Agent SDK project or `@cursor/bdk`, and `@grclanker/cli` is not published to npm.
-- `@cursor/bdk` is pre-1.0 and pinned to an exact version (`0.2.26`) in `cli/package.json`. Expect to bump it deliberately.
-- `zod` is a peer dependency of `@cursor/bdk` and a CLI devDependency.
-- BDK's "architecture v2" applies to agents deployed on Cursor hosting. This project only runs locally and is not deployed, so the v2 hosting changes do not affect it.
-- Turns run on the local Cursor harness, BDK's default runtime, so `bot/agent.ts` does not set `runtime`. In-process server tools only run on local turns.
-- Node 22.19 or newer, the CLI package's `engines` floor, and never Bun. `@cursor/bdk` itself accepts 22.13, but the grclanker tools it loads require 22.19.
+- Source checkout only: The release bundles do not include the Agent SDK project or `@grok/agent-sdk`, and `@grclanker/cli` is not published to npm.
+- `@grok/agent-sdk` is pinned to an exact version (`0.3.0`) in `cli/package.json`, and Dependabot proposes bumps in their own group. When a newer release is published, the CLI prints an "outdated" warning. Skip the `agent-sdk update` it suggests and bump the pin deliberately instead.
+- `zod` is a peer dependency of `@grok/agent-sdk` and a CLI devDependency.
+- The project runs locally and is not deployed to Cursor-managed hosting.
+- Turns run on the local Cursor harness, the Agent SDK's default runtime, so `bot/agent.ts` does not set `runtime`. In-process server tools only run on local turns.
+- Node 22.19 or newer, the CLI package's `engines` floor, and never Bun. `@grok/agent-sdk` itself accepts 22.13, but the grclanker tools it loads require 22.19.
+
+## Learn more
+
+- [Agent SDK docs](https://cursor.com/docs/agent-sdk), including the [CLI reference](https://cursor.com/docs/agent-sdk/reference/cli) and [tools reference](https://cursor.com/docs/agent-sdk/reference/tools)
+- [`@grok/agent-sdk` on npm](https://www.npmjs.com/package/@grok/agent-sdk)

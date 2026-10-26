@@ -170,11 +170,11 @@ The default backend is `host`, the local shell. `grclanker setup --compute <kind
 
 ## Cursor Agent SDK
 
-From a source checkout, the same 241 domain tools can run as a Cursor Agent SDK agent. The project is `cli/agent-sdk/`, an adapter over the bundled extension, built on [`@cursor/bdk`](https://www.npmjs.com/package/@cursor/bdk). It does not expose `bash`, `read`, `write`, `edit`, `ls`, `find`, or `grep`. The Cursor harness supplies its own shell and file tools.
+From a source checkout, the same 241 domain tools can run as a [Cursor Agent SDK](https://cursor.com/docs/agent-sdk) agent. The project is `cli/agent-sdk/`, an adapter over the bundled extension, built on [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.3.0. It does not expose `bash`, `read`, `write`, `edit`, `ls`, `find`, or `grep`. The Cursor harness supplies its own shell and file tools.
 
 199 tools declare `effect: "read"`. The other 42 write files (exports, generators, the Google Workspace operator evidence collector, and OSCAL workspace commands) and wait for a person to approve a model-initiated call.
 
-`@cursor/bdk` is a CLI devDependency. `npm --prefix cli ci` installs it:
+`@grok/agent-sdk` is a CLI devDependency. `npm --prefix cli ci` installs it and its `agent-sdk` CLI:
 
 ```bash
 npm --prefix cli run agent-sdk:validate
@@ -182,7 +182,7 @@ npm --prefix cli run agent-sdk:info
 npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-44228"}'
 ```
 
-`validate`, `info`, and `call` need no Cursor credential. Model turns (`agent-sdk:dev`, `agent-sdk:run`) need one: run `npx bdk login` inside `cli/`, or export `CURSOR_API_KEY`. Every `bdk` command starts with an "outdated" warning for the pinned version and a `[bdk] GitHub auth: unavailable` line. Both are expected, and neither stops the tools. See [Cursor Agent SDK](https://grclanker.com/docs/getting-started/agent-sdk/).
+`validate`, `info`, and `tool call` need no Cursor credential. Model turns (`agent-sdk:dev`, `agent-sdk:run`) need one: run `npx agent-sdk login` inside `cli/`, or export `CURSOR_API_KEY`. See [Cursor Agent SDK](https://grclanker.com/docs/getting-started/agent-sdk/).
 
 ## Flue
 

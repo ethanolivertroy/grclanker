@@ -52,18 +52,18 @@ updates:
     # The CLI is published, so "auto" would widen ranges; "increase" keeps exact pins exact.
     versioning-strategy: "increase"
     groups:
-      # BDK and Pi move together and get one deliberately reviewed PR.
+      # The Agent SDK and Pi move together and get one deliberately reviewed PR.
       cli-npm-agent-runtime:
         applies-to: "version-updates"
         patterns:
-          - "@cursor/bdk"
+          - "@grok/agent-sdk"
           - "@earendil-works/*"
       cli-npm-minor-patch:
         applies-to: "version-updates"
         patterns:
           - "*"
         exclude-patterns:
-          - "@cursor/bdk"
+          - "@grok/agent-sdk"
           - "@earendil-works/*"
         update-types:
           - "minor"
