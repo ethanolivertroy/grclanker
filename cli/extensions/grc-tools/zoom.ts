@@ -16,7 +16,7 @@ import {
 import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZOOM_AUTH_RESOLVER } from "./auth-resolver-contracts.js";

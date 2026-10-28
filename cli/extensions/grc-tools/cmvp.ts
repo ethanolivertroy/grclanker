@@ -5,7 +5,7 @@
  * (same data source as cmvp-tui). Enables searching validated, historical,
  * and in-process cryptographic modules for FIPS 140-2/140-3 compliance.
  */
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { cachedFetch, errorResult, formatTable, textResult } from "./shared.js";
 
 const DEFAULT_BASE = "https://ethanolivertroy.github.io/nist-cmvp-api/api";

@@ -7,7 +7,7 @@ import {
 } from "node:fs";
 import { chmod, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {

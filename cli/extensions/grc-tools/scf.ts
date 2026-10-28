@@ -4,7 +4,7 @@
  * Wraps the static JSON API at hackidle.github.io/scf-api and provides
  * practical GRC lookups for controls, crosswalks, and evidence requests.
  */
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { rethrowIfAborted } from "./abort.js";
 import { cachedFetch, errorResult, formatTable, textResult } from "./shared.js";
 

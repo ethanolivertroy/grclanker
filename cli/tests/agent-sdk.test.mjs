@@ -5,7 +5,7 @@ import { register } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 
 import { AGENT_DESCRIPTION, grclankerAgentConfig, MODEL_ENV_VAR } from "../dist/agent-sdk/lib/agent.js";
 import { classifyGrcToolEffect, hasWriteVerb, isGrcWriteTool, WRITE_VERBS } from "../dist/agent-sdk/lib/effects.js";
@@ -25,6 +25,7 @@ import {
   workflowSkillConfig,
 } from "../dist/agent-sdk/lib/skills.js";
 import { buildSdkToolConfig, executeGrcTool, grclankerToolConfig, prepareGrcToolArguments } from "../dist/agent-sdk/lib/tools.js";
+import { disableArgumentCoercion } from "../dist/extensions/grc-tools.js";
 import { clearFedrampCachesForTests } from "../dist/extensions/grc-tools/fedramp-source.js";
 import { clearGrcSharedCachesForTests, persistentCachesEnabled } from "../dist/extensions/grc-tools/shared.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -123,7 +124,7 @@ function fakeTool(overrides = {}) {
     },
     ...overrides,
   };
-  return { tool, calls };
+  return { tool: disableArgumentCoercion(tool), calls };
 }
 
 test("agent sdk registry exposes every domain tool and excludes compute backend tools", () => {
@@ -279,7 +280,7 @@ test("buildSdkToolConfig bridges prepareArguments, Pi argument validation, and t
     { toolCallId: "call_2", args: { query: "boringssl" } },
   ]);
 
-  // Pi validates TypeBox schemas without coercing primitives, so a string
+  // Registered domain tools opt out of Pi's argument coercion, so a string
   // where a number is declared is rejected before execute runs.
   const rejected = await config.execute({ query: "openssl", limit: "3" }, { toolCallId: "call_3" });
   assert.equal(rejected.isError, true);

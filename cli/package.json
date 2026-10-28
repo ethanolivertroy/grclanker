@@ -124,8 +124,8 @@
     "@earendil-works/pi-durable": "1.4.0",
     "@earendil-works/pi-tui": "1.4.0",
     "@flue/runtime": "^2.3.0",
-    "@sinclair/typebox": "^0.34.52",
     "archiver": "^8.0.0",
+    "typebox": "1.3.27",
     "valibot": "^1.5.0",
     "yaml": "^2.9.1"
   },

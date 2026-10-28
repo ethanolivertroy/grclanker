@@ -12,7 +12,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 const DEFAULT_WORKSPACE_DIR = "./oscal-workspace";

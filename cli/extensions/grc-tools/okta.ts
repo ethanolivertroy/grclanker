@@ -15,7 +15,7 @@ import {
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
 import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";

@@ -7,7 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { copyJson, isJsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";

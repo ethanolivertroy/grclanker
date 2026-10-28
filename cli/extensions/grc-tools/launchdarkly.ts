@@ -15,7 +15,7 @@ import {
 import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { DEFAULT_DATA_SCRUB_DEPTH, REDACTED, createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
