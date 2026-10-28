@@ -5,7 +5,7 @@ description: Run all 241 grclanker domain tools as a Cursor Agent SDK agent buil
 
 grclanker ships a [Cursor Agent SDK](https://cursor.com/docs/agent-sdk) project next to the Pi terminal CLI. The project lives in `cli/agent-sdk/` and adapts the bundled 241-tool domain registry instead of duplicating it.
 
-The Agent SDK lets you define, test, and run agents as a folder of Markdown and TypeScript. grclanker's project is built on [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.3.0, the package behind the `agent-sdk` CLI. It was published as `@cursor/bdk` before the public release.
+The Agent SDK lets you define, test, and run agents as a folder of Markdown and TypeScript. grclanker's project is built on [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.4.0, the package behind the `agent-sdk` CLI. It was published as `@cursor/bdk` before the public release.
 
 ## Quick start
 
@@ -98,12 +98,12 @@ The sync compiles the registry without the generated entries (`cli/tsconfig.agen
 
 `npm --prefix cli run test:cli` covers the adapter with a mocked SDK (registration, schema conversion, argument bridging, result mapping, and every entry file) and fails when the generated entries drift.
 
-`npm --prefix cli run test:agent-sdk:validate` runs the real `agent-sdk validate` and `agent-sdk info --json` discovery and skips when `@grok/agent-sdk` is not installed.
+`npm --prefix cli run test:agent-sdk:validate` checks the pinned SDK with real `agent-sdk validate` and `agent-sdk info --json` discovery, including every tool's effect and approval gate. It also previews and executes a local-only OSCAL check and verifies input-schema rejection without a model or provider request. It skips when `@grok/agent-sdk` is not installed.
 
 ## Limitations
 
 - Source checkout only: The release bundles do not include the Agent SDK project or `@grok/agent-sdk`, and `@grclanker/cli` is not published to npm.
-- `@grok/agent-sdk` is pinned to an exact version (`0.3.0`) in `cli/package.json`, and Dependabot proposes bumps in their own group. When a newer release is published, the CLI prints an "outdated" warning. Skip the `agent-sdk update` it suggests and bump the pin deliberately instead.
+- `@grok/agent-sdk` is pinned to an exact version (`0.4.0`) in `cli/package.json`, and Dependabot proposes bumps in their own group. When a newer release is published, the CLI prints an "outdated" warning. Skip the `agent-sdk update` it suggests and bump the pin deliberately instead.
 - `zod` is a peer dependency of `@grok/agent-sdk` and a CLI devDependency.
 - The project runs locally and is not deployed to Cursor-managed hosting.
 - Turns run on the local Cursor harness, the Agent SDK's default runtime, so `bot/agent.ts` does not set `runtime`. In-process server tools only run on local turns.
