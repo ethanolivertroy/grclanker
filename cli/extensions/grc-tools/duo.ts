@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
 import { DUO_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";

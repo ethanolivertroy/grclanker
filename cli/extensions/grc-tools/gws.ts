@@ -30,7 +30,7 @@ import {
 } from "node:fs";
 import { readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { GWS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";

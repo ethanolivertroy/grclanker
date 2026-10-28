@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 
@@ -160,6 +161,25 @@ test("built domain tool registry meets quality invariants", () => {
   const errors = lintDomainRegistry(domainTools);
 
   assert.deepEqual(errors, [], errors.join("\n"));
+});
+
+test("Pi rejects mistyped domain tool arguments instead of coercing them", () => {
+  const mistyped = { string: 7, integer: "7", number: "7", boolean: "true", array: "7" };
+  const domainTools = getRegisteredToolSummaries().filter((tool) => tool.kind === "domain");
+  let checked = 0;
+  for (const tool of domainTools) {
+    for (const [name, parameter] of Object.entries(tool.parameters.properties)) {
+      if (!Object.hasOwn(mistyped, parameter.type)) continue;
+      const value = mistyped[parameter.type];
+      assert.throws(
+        () => validateToolArguments(tool, { type: "toolCall", id: "probe", name: tool.name, arguments: { [name]: value } }),
+        (error) => error.message.includes(`  - ${name}: must be ${parameter.type}\n`),
+        `${tool.name}.${name}: ${JSON.stringify(value)} is coerced instead of rejected`,
+      );
+      checked += 1;
+    }
+  }
+  assert.ok(checked >= domainTools.length, `only ${checked} parameters checked`);
 });
 
 test("registry quality lint rejects a malformed synthetic registry", () => {

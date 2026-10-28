@@ -17,7 +17,7 @@ import { readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { connect as tlsConnect } from "node:tls";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, textResult } from "./shared.js";

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createVerify, generateKeyPairSync } from "node:crypto";
-import { Value } from "@sinclair/typebox/value";
+import { Value } from "typebox/value";
 import {
   chmodSync,
   existsSync,
