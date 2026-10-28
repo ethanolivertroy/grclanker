@@ -80,7 +80,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `client_id` | string | no | Falcon API client ID. Defaults to CS_CLIENT_ID (or FALCON_CLIENT_ID), then ~/.crowdstrike/config.json. |
 | `client_secret` | string | no | Falcon API client secret. Defaults to CS_CLIENT_SECRET (or FALCON_CLIENT_SECRET), then the config file. |
-| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then https://api.crowdstrike.com. |
+| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then `https://api.crowdstrike.com`. |
 | `cloud` | string | no | Falcon cloud alias: us-1, us-2, eu-1, us-gov-1, or us-gov-2. Defaults to CS_CLOUD. Ignored when base_url is set. |
 | `member_cid` | string | no | Optional child CID for Flight Control (MSSP) tenants. Defaults to CS_MEMBER_CID. Results cover that CID only. |
 | `config_file` | string | no | Optional JSON config file with client_id, client_secret, base_url, cloud, and member_cid. Defaults to CS_CONFIG_FILE or ~/.crowdstrike/config.json. |
@@ -92,7 +92,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `client_id` | string | no | Falcon API client ID. Defaults to CS_CLIENT_ID (or FALCON_CLIENT_ID), then ~/.crowdstrike/config.json. |
 | `client_secret` | string | no | Falcon API client secret. Defaults to CS_CLIENT_SECRET (or FALCON_CLIENT_SECRET), then the config file. |
-| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then https://api.crowdstrike.com. |
+| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then `https://api.crowdstrike.com`. |
 | `cloud` | string | no | Falcon cloud alias: us-1, us-2, eu-1, us-gov-1, or us-gov-2. Defaults to CS_CLOUD. Ignored when base_url is set. |
 | `member_cid` | string | no | Optional child CID for Flight Control (MSSP) tenants. Defaults to CS_MEMBER_CID. Results cover that CID only. |
 | `config_file` | string | no | Optional JSON config file with client_id, client_secret, base_url, cloud, and member_cid. Defaults to CS_CONFIG_FILE or ~/.crowdstrike/config.json. |
@@ -104,7 +104,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `client_id` | string | no | Falcon API client ID. Defaults to CS_CLIENT_ID (or FALCON_CLIENT_ID), then ~/.crowdstrike/config.json. |
 | `client_secret` | string | no | Falcon API client secret. Defaults to CS_CLIENT_SECRET (or FALCON_CLIENT_SECRET), then the config file. |
-| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then https://api.crowdstrike.com. |
+| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then `https://api.crowdstrike.com`. |
 | `cloud` | string | no | Falcon cloud alias: us-1, us-2, eu-1, us-gov-1, or us-gov-2. Defaults to CS_CLOUD. Ignored when base_url is set. |
 | `member_cid` | string | no | Optional child CID for Flight Control (MSSP) tenants. Defaults to CS_MEMBER_CID. Results cover that CID only. |
 | `config_file` | string | no | Optional JSON config file with client_id, client_secret, base_url, cloud, and member_cid. Defaults to CS_CONFIG_FILE or ~/.crowdstrike/config.json. |
@@ -121,7 +121,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `client_id` | string | no | Falcon API client ID. Defaults to CS_CLIENT_ID (or FALCON_CLIENT_ID), then ~/.crowdstrike/config.json. |
 | `client_secret` | string | no | Falcon API client secret. Defaults to CS_CLIENT_SECRET (or FALCON_CLIENT_SECRET), then the config file. |
-| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then https://api.crowdstrike.com. |
+| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then `https://api.crowdstrike.com`. |
 | `cloud` | string | no | Falcon cloud alias: us-1, us-2, eu-1, us-gov-1, or us-gov-2. Defaults to CS_CLOUD. Ignored when base_url is set. |
 | `member_cid` | string | no | Optional child CID for Flight Control (MSSP) tenants. Defaults to CS_MEMBER_CID. Results cover that CID only. |
 | `config_file` | string | no | Optional JSON config file with client_id, client_secret, base_url, cloud, and member_cid. Defaults to CS_CONFIG_FILE or ~/.crowdstrike/config.json. |
@@ -135,7 +135,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `client_id` | string | no | Falcon API client ID. Defaults to CS_CLIENT_ID (or FALCON_CLIENT_ID), then ~/.crowdstrike/config.json. |
 | `client_secret` | string | no | Falcon API client secret. Defaults to CS_CLIENT_SECRET (or FALCON_CLIENT_SECRET), then the config file. |
-| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then https://api.crowdstrike.com. |
+| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then `https://api.crowdstrike.com`. |
 | `cloud` | string | no | Falcon cloud alias: us-1, us-2, eu-1, us-gov-1, or us-gov-2. Defaults to CS_CLOUD. Ignored when base_url is set. |
 | `member_cid` | string | no | Optional child CID for Flight Control (MSSP) tenants. Defaults to CS_MEMBER_CID. Results cover that CID only. |
 | `config_file` | string | no | Optional JSON config file with client_id, client_secret, base_url, cloud, and member_cid. Defaults to CS_CONFIG_FILE or ~/.crowdstrike/config.json. |
@@ -150,7 +150,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `client_id` | string | no | Falcon API client ID. Defaults to CS_CLIENT_ID (or FALCON_CLIENT_ID), then ~/.crowdstrike/config.json. |
 | `client_secret` | string | no | Falcon API client secret. Defaults to CS_CLIENT_SECRET (or FALCON_CLIENT_SECRET), then the config file. |
-| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then https://api.crowdstrike.com. |
+| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then `https://api.crowdstrike.com`. |
 | `cloud` | string | no | Falcon cloud alias: us-1, us-2, eu-1, us-gov-1, or us-gov-2. Defaults to CS_CLOUD. Ignored when base_url is set. |
 | `member_cid` | string | no | Optional child CID for Flight Control (MSSP) tenants. Defaults to CS_MEMBER_CID. Results cover that CID only. |
 | `config_file` | string | no | Optional JSON config file with client_id, client_secret, base_url, cloud, and member_cid. Defaults to CS_CONFIG_FILE or ~/.crowdstrike/config.json. |
@@ -167,7 +167,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `client_id` | string | no | Falcon API client ID. Defaults to CS_CLIENT_ID (or FALCON_CLIENT_ID), then ~/.crowdstrike/config.json. |
 | `client_secret` | string | no | Falcon API client secret. Defaults to CS_CLIENT_SECRET (or FALCON_CLIENT_SECRET), then the config file. |
-| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then https://api.crowdstrike.com. |
+| `base_url` | string | no | Falcon API base URL. Defaults to CS_BASE_URL, then the cloud alias, then `https://api.crowdstrike.com`. |
 | `cloud` | string | no | Falcon cloud alias: us-1, us-2, eu-1, us-gov-1, or us-gov-2. Defaults to CS_CLOUD. Ignored when base_url is set. |
 | `member_cid` | string | no | Optional child CID for Flight Control (MSSP) tenants. Defaults to CS_MEMBER_CID. Results cover that CID only. |
 | `config_file` | string | no | Optional JSON config file with client_id, client_secret, base_url, cloud, and member_cid. Defaults to CS_CONFIG_FILE or ~/.crowdstrike/config.json. |
@@ -206,7 +206,7 @@ Environment variables: `CS_CONFIG_FILE`, `CS_CLIENT_ID`, `FALCON_CLIENT_ID`, `CS
 
 Configuration locations: ~/.crowdstrike/config.json, Explicit path from config_file or CS_CONFIG_FILE
 
-Credential and deployment variants: Named clouds us-1 (the default, https://api.crowdstrike.com), us-2, eu-1, us-gov-1, and us-gov-2, each with its own API host, Cloud aliases us1, us2, eu1, usgov1, usgov2, gov-1, gov, and laggar, matched case-insensitively with underscores read as hyphens, An explicit https base_url (the scheme may be omitted; http is rejected) replaces the cloud's API host, and a base_url equal to a named cloud's host reports that cloud, A Flight Control child CID (member_cid) is sent only in the token request, so the token and every read made with it cover that CID only
+Credential and deployment variants: Named clouds us-1 (the default, `https://api.crowdstrike.com`), us-2, eu-1, us-gov-1, and us-gov-2, each with its own API host, Cloud aliases us1, us2, eu1, usgov1, usgov2, gov-1, gov, and laggar, matched case-insensitively with underscores read as hyphens, An explicit https base_url (the scheme may be omitted; http is rejected) replaces the cloud's API host, and a base_url equal to a named cloud's host reports that cloud, A Flight Control child CID (member_cid) is sent only in the token request, so the token and every read made with it cover that CID only
 
 Configuration fields: `client_id`, `clientId`, `client_secret`, `clientSecret`, `cloud`, `region`, `base_url`, `baseUrl`, `member_cid`, `memberCid`, `timeout_seconds`
 

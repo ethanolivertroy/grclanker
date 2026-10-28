@@ -54,12 +54,12 @@ This specification requires [shared integration contract version 1.1](./integrat
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
 | `zia_cloud` | string | no | ZIA cloud name (zscaler, zscalerone, zscalertwo, zscalerthree, zscloud, zscalerbeta, zscalergov, zscalerten). Defaults to ZIA_CLOUD. |
-| `zia_base_url` | string | no | Explicit ZIA API base URL such as https://zsapi.zscalerthree.net/api/v1. Defaults to the cloud mapping. |
+| `zia_base_url` | string | no | Explicit ZIA API base URL such as `https://zsapi.zscalerthree.net/api/v1`. Defaults to the cloud mapping. |
 | `zia_api_key` | string | no | ZIA Cloud Service API key. Defaults to ZIA_API_KEY. |
 | `zia_username` | string | no | ZIA administrator login name. Defaults to ZIA_USERNAME. |
 | `zia_password` | string | no | ZIA administrator password. Defaults to ZIA_PASSWORD. |
 | `zpa_cloud` | string | no | ZPA cloud (PRODUCTION, ZPATWO, BETA, GOV, GOVUS, PREVIEW). Defaults to ZPA_CLOUD or PRODUCTION. |
-| `zpa_base_url` | string | no | Explicit ZPA base URL such as https://config.private.zscaler.com. Defaults to the cloud mapping. |
+| `zpa_base_url` | string | no | Explicit ZPA base URL such as `https://config.private.zscaler.com`. Defaults to the cloud mapping. |
 | `zpa_client_id` | string | no | ZPA API client ID. Defaults to ZPA_CLIENT_ID. |
 | `zpa_client_secret` | string | no | ZPA API client secret. Defaults to ZPA_CLIENT_SECRET. |
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
@@ -72,12 +72,12 @@ This specification requires [shared integration contract version 1.1](./integrat
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
 | `zia_cloud` | string | no | ZIA cloud name (zscaler, zscalerone, zscalertwo, zscalerthree, zscloud, zscalerbeta, zscalergov, zscalerten). Defaults to ZIA_CLOUD. |
-| `zia_base_url` | string | no | Explicit ZIA API base URL such as https://zsapi.zscalerthree.net/api/v1. Defaults to the cloud mapping. |
+| `zia_base_url` | string | no | Explicit ZIA API base URL such as `https://zsapi.zscalerthree.net/api/v1`. Defaults to the cloud mapping. |
 | `zia_api_key` | string | no | ZIA Cloud Service API key. Defaults to ZIA_API_KEY. |
 | `zia_username` | string | no | ZIA administrator login name. Defaults to ZIA_USERNAME. |
 | `zia_password` | string | no | ZIA administrator password. Defaults to ZIA_PASSWORD. |
 | `zpa_cloud` | string | no | ZPA cloud (PRODUCTION, ZPATWO, BETA, GOV, GOVUS, PREVIEW). Defaults to ZPA_CLOUD or PRODUCTION. |
-| `zpa_base_url` | string | no | Explicit ZPA base URL such as https://config.private.zscaler.com. Defaults to the cloud mapping. |
+| `zpa_base_url` | string | no | Explicit ZPA base URL such as `https://config.private.zscaler.com`. Defaults to the cloud mapping. |
 | `zpa_client_id` | string | no | ZPA API client ID. Defaults to ZPA_CLIENT_ID. |
 | `zpa_client_secret` | string | no | ZPA API client secret. Defaults to ZPA_CLIENT_SECRET. |
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
@@ -91,12 +91,12 @@ This specification requires [shared integration contract version 1.1](./integrat
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
 | `zia_cloud` | string | no | ZIA cloud name (zscaler, zscalerone, zscalertwo, zscalerthree, zscloud, zscalerbeta, zscalergov, zscalerten). Defaults to ZIA_CLOUD. |
-| `zia_base_url` | string | no | Explicit ZIA API base URL such as https://zsapi.zscalerthree.net/api/v1. Defaults to the cloud mapping. |
+| `zia_base_url` | string | no | Explicit ZIA API base URL such as `https://zsapi.zscalerthree.net/api/v1`. Defaults to the cloud mapping. |
 | `zia_api_key` | string | no | ZIA Cloud Service API key. Defaults to ZIA_API_KEY. |
 | `zia_username` | string | no | ZIA administrator login name. Defaults to ZIA_USERNAME. |
 | `zia_password` | string | no | ZIA administrator password. Defaults to ZIA_PASSWORD. |
 | `zpa_cloud` | string | no | ZPA cloud (PRODUCTION, ZPATWO, BETA, GOV, GOVUS, PREVIEW). Defaults to ZPA_CLOUD or PRODUCTION. |
-| `zpa_base_url` | string | no | Explicit ZPA base URL such as https://config.private.zscaler.com. Defaults to the cloud mapping. |
+| `zpa_base_url` | string | no | Explicit ZPA base URL such as `https://config.private.zscaler.com`. Defaults to the cloud mapping. |
 | `zpa_client_id` | string | no | ZPA API client ID. Defaults to ZPA_CLIENT_ID. |
 | `zpa_client_secret` | string | no | ZPA API client secret. Defaults to ZPA_CLIENT_SECRET. |
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
@@ -110,12 +110,12 @@ This specification requires [shared integration contract version 1.1](./integrat
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
 | `zia_cloud` | string | no | ZIA cloud name (zscaler, zscalerone, zscalertwo, zscalerthree, zscloud, zscalerbeta, zscalergov, zscalerten). Defaults to ZIA_CLOUD. |
-| `zia_base_url` | string | no | Explicit ZIA API base URL such as https://zsapi.zscalerthree.net/api/v1. Defaults to the cloud mapping. |
+| `zia_base_url` | string | no | Explicit ZIA API base URL such as `https://zsapi.zscalerthree.net/api/v1`. Defaults to the cloud mapping. |
 | `zia_api_key` | string | no | ZIA Cloud Service API key. Defaults to ZIA_API_KEY. |
 | `zia_username` | string | no | ZIA administrator login name. Defaults to ZIA_USERNAME. |
 | `zia_password` | string | no | ZIA administrator password. Defaults to ZIA_PASSWORD. |
 | `zpa_cloud` | string | no | ZPA cloud (PRODUCTION, ZPATWO, BETA, GOV, GOVUS, PREVIEW). Defaults to ZPA_CLOUD or PRODUCTION. |
-| `zpa_base_url` | string | no | Explicit ZPA base URL such as https://config.private.zscaler.com. Defaults to the cloud mapping. |
+| `zpa_base_url` | string | no | Explicit ZPA base URL such as `https://config.private.zscaler.com`. Defaults to the cloud mapping. |
 | `zpa_client_id` | string | no | ZPA API client ID. Defaults to ZPA_CLIENT_ID. |
 | `zpa_client_secret` | string | no | ZPA API client secret. Defaults to ZPA_CLIENT_SECRET. |
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |
@@ -131,12 +131,12 @@ This specification requires [shared integration contract version 1.1](./integrat
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
 | `zia_cloud` | string | no | ZIA cloud name (zscaler, zscalerone, zscalertwo, zscalerthree, zscloud, zscalerbeta, zscalergov, zscalerten). Defaults to ZIA_CLOUD. |
-| `zia_base_url` | string | no | Explicit ZIA API base URL such as https://zsapi.zscalerthree.net/api/v1. Defaults to the cloud mapping. |
+| `zia_base_url` | string | no | Explicit ZIA API base URL such as `https://zsapi.zscalerthree.net/api/v1`. Defaults to the cloud mapping. |
 | `zia_api_key` | string | no | ZIA Cloud Service API key. Defaults to ZIA_API_KEY. |
 | `zia_username` | string | no | ZIA administrator login name. Defaults to ZIA_USERNAME. |
 | `zia_password` | string | no | ZIA administrator password. Defaults to ZIA_PASSWORD. |
 | `zpa_cloud` | string | no | ZPA cloud (PRODUCTION, ZPATWO, BETA, GOV, GOVUS, PREVIEW). Defaults to ZPA_CLOUD or PRODUCTION. |
-| `zpa_base_url` | string | no | Explicit ZPA base URL such as https://config.private.zscaler.com. Defaults to the cloud mapping. |
+| `zpa_base_url` | string | no | Explicit ZPA base URL such as `https://config.private.zscaler.com`. Defaults to the cloud mapping. |
 | `zpa_client_id` | string | no | ZPA API client ID. Defaults to ZPA_CLIENT_ID. |
 | `zpa_client_secret` | string | no | ZPA API client secret. Defaults to ZPA_CLIENT_SECRET. |
 | `zpa_customer_id` | string | no | ZPA customer ID. Defaults to ZPA_CUSTOMER_ID. |

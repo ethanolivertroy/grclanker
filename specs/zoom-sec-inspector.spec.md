@@ -57,8 +57,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `token` | string | no | Pre-issued Zoom OAuth access token. Defaults to ZOOM_TOKEN. |
 | `client_id` | string | no | Zoom Server-to-Server OAuth client ID. Defaults to ZOOM_CLIENT_ID or the config file. |
 | `client_secret` | string | no | Zoom Server-to-Server OAuth client secret. Defaults to ZOOM_CLIENT_SECRET or the config file. |
-| `base_url` | string | no | Zoom REST API base URL. Defaults to https://api.zoom.us/v2. |
-| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to https://zoom.us or https://zoomgov.com based on base_url. |
+| `base_url` | string | no | Zoom REST API base URL. Defaults to `https://api.zoom.us/v2`. |
+| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to `https://zoom.us` or `https://zoomgov.com` based on base_url. |
 | `config_file` | string | no | JSON config file with account_id, client_id, client_secret, base_url. Defaults to ZOOM_CONFIG_FILE, ./.zoom.json, or ~/.zoom.json. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 
@@ -70,8 +70,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `token` | string | no | Pre-issued Zoom OAuth access token. Defaults to ZOOM_TOKEN. |
 | `client_id` | string | no | Zoom Server-to-Server OAuth client ID. Defaults to ZOOM_CLIENT_ID or the config file. |
 | `client_secret` | string | no | Zoom Server-to-Server OAuth client secret. Defaults to ZOOM_CLIENT_SECRET or the config file. |
-| `base_url` | string | no | Zoom REST API base URL. Defaults to https://api.zoom.us/v2. |
-| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to https://zoom.us or https://zoomgov.com based on base_url. |
+| `base_url` | string | no | Zoom REST API base URL. Defaults to `https://api.zoom.us/v2`. |
+| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to `https://zoom.us` or `https://zoomgov.com` based on base_url. |
 | `config_file` | string | no | JSON config file with account_id, client_id, client_secret, base_url. Defaults to ZOOM_CONFIG_FILE, ./.zoom.json, or ~/.zoom.json. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `user_limit` | number | no | Maximum users to enumerate before flagging a partial inventory. Defaults to 1000. |
@@ -86,8 +86,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `token` | string | no | Pre-issued Zoom OAuth access token. Defaults to ZOOM_TOKEN. |
 | `client_id` | string | no | Zoom Server-to-Server OAuth client ID. Defaults to ZOOM_CLIENT_ID or the config file. |
 | `client_secret` | string | no | Zoom Server-to-Server OAuth client secret. Defaults to ZOOM_CLIENT_SECRET or the config file. |
-| `base_url` | string | no | Zoom REST API base URL. Defaults to https://api.zoom.us/v2. |
-| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to https://zoom.us or https://zoomgov.com based on base_url. |
+| `base_url` | string | no | Zoom REST API base URL. Defaults to `https://api.zoom.us/v2`. |
+| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to `https://zoom.us` or `https://zoomgov.com` based on base_url. |
 | `config_file` | string | no | JSON config file with account_id, client_id, client_secret, base_url. Defaults to ZOOM_CONFIG_FILE, ./.zoom.json, or ~/.zoom.json. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `group_limit` | number | no | Maximum groups to inspect. Defaults to 50. |
@@ -102,8 +102,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `token` | string | no | Pre-issued Zoom OAuth access token. Defaults to ZOOM_TOKEN. |
 | `client_id` | string | no | Zoom Server-to-Server OAuth client ID. Defaults to ZOOM_CLIENT_ID or the config file. |
 | `client_secret` | string | no | Zoom Server-to-Server OAuth client secret. Defaults to ZOOM_CLIENT_SECRET or the config file. |
-| `base_url` | string | no | Zoom REST API base URL. Defaults to https://api.zoom.us/v2. |
-| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to https://zoom.us or https://zoomgov.com based on base_url. |
+| `base_url` | string | no | Zoom REST API base URL. Defaults to `https://api.zoom.us/v2`. |
+| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to `https://zoom.us` or `https://zoomgov.com` based on base_url. |
 | `config_file` | string | no | JSON config file with account_id, client_id, client_secret, base_url. Defaults to ZOOM_CONFIG_FILE, ./.zoom.json, or ~/.zoom.json. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `group_limit` | number | no | Maximum groups to inspect for override drift. Defaults to 50. |
@@ -116,8 +116,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `token` | string | no | Pre-issued Zoom OAuth access token. Defaults to ZOOM_TOKEN. |
 | `client_id` | string | no | Zoom Server-to-Server OAuth client ID. Defaults to ZOOM_CLIENT_ID or the config file. |
 | `client_secret` | string | no | Zoom Server-to-Server OAuth client secret. Defaults to ZOOM_CLIENT_SECRET or the config file. |
-| `base_url` | string | no | Zoom REST API base URL. Defaults to https://api.zoom.us/v2. |
-| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to https://zoom.us or https://zoomgov.com based on base_url. |
+| `base_url` | string | no | Zoom REST API base URL. Defaults to `https://api.zoom.us/v2`. |
+| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to `https://zoom.us` or `https://zoomgov.com` based on base_url. |
 | `config_file` | string | no | JSON config file with account_id, client_id, client_secret, base_url. Defaults to ZOOM_CONFIG_FILE, ./.zoom.json, or ~/.zoom.json. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `output_dir` | string | no | Output root. Defaults to ./export/zoom. |

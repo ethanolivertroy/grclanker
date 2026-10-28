@@ -82,9 +82,9 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
 | `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
-| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
+| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example `https://us.api.knowbe4.com`). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
-| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
+| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example `https://training.knowbe4.com/graphql`). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
 | `config_file` | string | no | Path to a YAML config file with api_token, region, and optional phisher_api_token. Defaults to KNOWBE4_CONFIG_FILE or ~/.knowbe4-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `redact_pii` | boolean | no | Replace user emails and names with stable pseudonyms in findings and exported data. Defaults to KNOWBE4_REDACT_PII or false. |
@@ -95,9 +95,9 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
 | `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
-| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
+| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example `https://us.api.knowbe4.com`). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
-| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
+| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example `https://training.knowbe4.com/graphql`). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
 | `config_file` | string | no | Path to a YAML config file with api_token, region, and optional phisher_api_token. Defaults to KNOWBE4_CONFIG_FILE or ~/.knowbe4-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `redact_pii` | boolean | no | Replace user emails and names with stable pseudonyms in findings and exported data. Defaults to KNOWBE4_REDACT_PII or false. |
@@ -118,9 +118,9 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
 | `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
-| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
+| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example `https://us.api.knowbe4.com`). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
-| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
+| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example `https://training.knowbe4.com/graphql`). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
 | `config_file` | string | no | Path to a YAML config file with api_token, region, and optional phisher_api_token. Defaults to KNOWBE4_CONFIG_FILE or ~/.knowbe4-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `redact_pii` | boolean | no | Replace user emails and names with stable pseudonyms in findings and exported data. Defaults to KNOWBE4_REDACT_PII or false. |
@@ -142,9 +142,9 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
 | `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
-| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
+| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example `https://us.api.knowbe4.com`). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
-| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
+| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example `https://training.knowbe4.com/graphql`). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
 | `config_file` | string | no | Path to a YAML config file with api_token, region, and optional phisher_api_token. Defaults to KNOWBE4_CONFIG_FILE or ~/.knowbe4-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `redact_pii` | boolean | no | Replace user emails and names with stable pseudonyms in findings and exported data. Defaults to KNOWBE4_REDACT_PII or false. |
@@ -162,9 +162,9 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
 | `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
-| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
+| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example `https://us.api.knowbe4.com`). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
-| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
+| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example `https://training.knowbe4.com/graphql`). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
 | `config_file` | string | no | Path to a YAML config file with api_token, region, and optional phisher_api_token. Defaults to KNOWBE4_CONFIG_FILE or ~/.knowbe4-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `redact_pii` | boolean | no | Replace user emails and names with stable pseudonyms in findings and exported data. Defaults to KNOWBE4_REDACT_PII or false. |
@@ -180,9 +180,9 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `api_token` | string | no | KnowBe4 Reporting API key. Defaults to KNOWBE4_API_TOKEN, then api_token in ~/.knowbe4-inspector/config.yaml. |
 | `region` | string or string or string or string or string | no | KnowBe4 hosting region that selects the API base URL: us, eu, ca, uk, or de. Defaults to KNOWBE4_REGION, then the config file, then us. |
-| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example https://us.api.knowbe4.com). Defaults to KNOWBE4_BASE_URL. |
+| `base_url` | string | no | Override for the Reporting API base URL (normally derived from region, for example `https://us.api.knowbe4.com`). Defaults to KNOWBE4_BASE_URL. |
 | `phisher_api_token` | string | no | Optional PhishER Product API key for GraphQL enrichment. Defaults to KNOWBE4_PHISHER_API_TOKEN, then phisher_api_token in the config file. |
-| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example https://training.knowbe4.com/graphql). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
+| `phisher_graphql_url` | string | no | Override for the PhishER GraphQL endpoint (normally derived from region, for example `https://training.knowbe4.com/graphql`). Defaults to KNOWBE4_PHISHER_GRAPHQL_URL. |
 | `config_file` | string | no | Path to a YAML config file with api_token, region, and optional phisher_api_token. Defaults to KNOWBE4_CONFIG_FILE or ~/.knowbe4-inspector/config.yaml. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `redact_pii` | boolean | no | Replace user emails and names with stable pseudonyms in findings and exported data. Defaults to KNOWBE4_REDACT_PII or false. |
@@ -231,7 +231,7 @@ Environment variables: `KNOWBE4_CONFIG_FILE`, `KNOWBE4_API_TOKEN`, `KNOWBE4_REGI
 
 Configuration locations: ~/.knowbe4-inspector/config.yaml, Explicit path from config_file or KNOWBE4_CONFIG_FILE
 
-Credential and deployment variants: Regions us (the default), eu, ca, uk, and de, matched after trimming and lowercasing; any other region is rejected, Each region's Reporting API host is https://{region}.api.knowbe4.com; its PhishER GraphQL URL is https://training.knowbe4.com/graphql for us and https://{region}.knowbe4.com/graphql otherwise, An explicit base_url or phisher_graphql_url replaces the region's URL, with any user information, query, fragment, and trailing slashes removed
+Credential and deployment variants: Regions us (the default), eu, ca, uk, and de, matched after trimming and lowercasing; any other region is rejected, Each region's Reporting API host is `https://{region}.api.knowbe4.com`; its PhishER GraphQL URL is `https://training.knowbe4.com/graphql` for us and `https://{region}.knowbe4.com/graphql` otherwise, An explicit base_url or phisher_graphql_url replaces the region's URL, with any user information, query, fragment, and trailing slashes removed
 
 Configuration fields: `api_token`, `region`, `base_url`, `phisher_api_token`, `phisher_graphql_url`, `timeout_seconds`, `redact_pii`
 
@@ -266,44 +266,44 @@ Malformed configuration: Reject malformed or ambiguous configuration before any 
 
 | Surface | Input | Exact value or rule | Required |
 |---|---|---|---|
-| `account` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `account` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `account` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `account` | response | A JSON object carrying at least one of name, type, domains, admins, subscription_level, subscription_end_date, number_of_seats, or current_risk_score; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is any other JSON. | yes |
-| `account_risk_score_history` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `account_risk_score_history` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `account_risk_score_history` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `account_risk_score_history` | response | A JSON array holding one organization risk score point per entry, an entry that is not a JSON object being dropped; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is JSON that is not an array. | yes |
 | `account_risk_score_history` | query:full | true | yes |
 | `account_risk_score_history` | query:page | The page number: 1 for the first page, then one more than the previous page's | yes |
 | `account_risk_score_history` | query:per_page | 500 | yes |
-| `users` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `users` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `users` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `users` | response | A JSON array holding one user per entry, an entry that is not a JSON object being dropped; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is JSON that is not an array. | yes |
 | `users` | query:status | active | yes |
 | `users` | query:page | The page number: 1 for the first page, then one more than the previous page's | yes |
 | `users` | query:per_page | 500, or 1 on the knowbe4_check_access probe | yes |
-| `groups` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `groups` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `groups` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `groups` | response | A JSON array holding one group per entry, an entry that is not a JSON object being dropped; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is JSON that is not an array. | yes |
 | `groups` | query:status | active | yes |
 | `groups` | query:page | The page number: 1 for the first page, then one more than the previous page's | yes |
 | `groups` | query:per_page | 500, or 1 on the knowbe4_check_access probe | yes |
-| `phishing_campaigns` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `phishing_campaigns` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `phishing_campaigns` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `phishing_campaigns` | response | A JSON array holding one phishing campaign per entry, an entry that is not a JSON object being dropped; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is JSON that is not an array. | yes |
 | `phishing_campaigns` | query:page | The page number: 1 for the first page, then one more than the previous page's | yes |
 | `phishing_campaigns` | query:per_page | 500, or 1 on the knowbe4_check_access probe | yes |
-| `security_tests` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `security_tests` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `security_tests` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `security_tests` | response | A JSON array holding one phishing security test per entry, an entry that is not a JSON object being dropped; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is JSON that is not an array. | yes |
 | `security_tests` | query:page | The page number: 1 for the first page, then one more than the previous page's | yes |
 | `security_tests` | query:per_page | 500, or 1 on the knowbe4_check_access probe | yes |
-| `security_test_recipients` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `security_test_recipients` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `security_test_recipients` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `security_test_recipients` | response | A JSON array holding one recipient per entry, an entry that is not a JSON object being dropped; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is JSON that is not an array. | yes |
 | `security_test_recipients` | path:pst_id | The sampled test's pst_id read as text | yes |
 | `security_test_recipients` | query:page | The page number: 1 for the first page, then one more than the previous page's | yes |
 | `security_test_recipients` | query:per_page | 500 | yes |
-| `phisher_messages` | client | Use the resolved PhishER GraphQL URL: phisher_graphql_url, else https://training.knowbe4.com/graphql for the us region and https://{region}.knowbe4.com/graphql for the others. | yes |
+| `phisher_messages` | client | Use the resolved PhishER GraphQL URL: phisher_graphql_url, else `https://training.knowbe4.com/graphql` for the us region and `https://{region}.knowbe4.com/graphql` for the others. | yes |
 | `phisher_messages` | headers | Accept: application/json; Authorization: Bearer {phisher_api_token}; Content-Type: application/json | yes |
 | `phisher_messages` | response | A JSON object carrying data or errors, whose data.phisherMessages may carry nodes, one reported message per entry (an entry that is not a JSON object being dropped), and pagination with page, pages, per, totalCount, and nextPageKey; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is any other JSON or a non-empty errors array. | yes |
 | `phisher_messages` | json-body:query | The phisherMessages query document, sorted by REPORTED_AT DESCENDING; the count-only document on the knowbe4_check_access count | yes |
@@ -311,12 +311,12 @@ Malformed configuration: Reject malformed or ambiguous configuration before any 
 | `phisher_messages` | json-body:variables.per | 200, or phisher_message_limit when that is smaller; On every read except the knowbe4_check_access count | yes |
 | `phisher_messages` | json-body:variables.page | The page number: 1 for the first page, then one more than the previous page's; On every read except the knowbe4_check_access count | yes |
 | `phisher_messages` | json-body:variables.nextPageKey | The previous page's pagination.nextPageKey; On a page after the first, when the previous page returned a nextPageKey | no |
-| `training_campaigns` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `training_campaigns` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `training_campaigns` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `training_campaigns` | response | A JSON array holding one training campaign per entry, an entry that is not a JSON object being dropped; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is JSON that is not an array. | yes |
 | `training_campaigns` | query:page | The page number: 1 for the first page, then one more than the previous page's | yes |
 | `training_campaigns` | query:per_page | 10, or 1 on the knowbe4_check_access probe | yes |
-| `training_enrollments` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `training_enrollments` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `training_enrollments` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `training_enrollments` | response | A JSON array holding one training enrollment per entry, an entry that is not a JSON object being dropped; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is JSON that is not an array. | yes |
 | `training_enrollments` | query:exclude_archived_users | true; On every read except the knowbe4_check_access probe | yes |
@@ -324,17 +324,17 @@ Malformed configuration: Reject malformed or ambiguous configuration before any 
 | `training_enrollments` | query:include_store_purchase_id | true; On every read except the knowbe4_check_access probe | yes |
 | `training_enrollments` | query:page | The page number: 1 for the first page, then one more than the previous page's | yes |
 | `training_enrollments` | query:per_page | 500, or 1 on the knowbe4_check_access probe | yes |
-| `store_purchases` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `store_purchases` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `store_purchases` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `store_purchases` | response | A JSON array holding one ModStore purchase per entry, an entry that is not a JSON object being dropped; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is JSON that is not an array. | yes |
 | `store_purchases` | query:page | The page number: 1 for the first page, then one more than the previous page's | yes |
 | `store_purchases` | query:per_page | 500, or 1 on the knowbe4_check_access probe | yes |
-| `training_policies` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `training_policies` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `training_policies` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `training_policies` | response | A JSON array holding one uploaded policy per entry, an entry that is not a JSON object being dropped; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is JSON that is not an array. | yes |
 | `training_policies` | query:page | The page number: 1 for the first page, then one more than the previous page's | yes |
 | `training_policies` | query:per_page | 500, or 1 on the knowbe4_check_access probe | yes |
-| `callback_security_tests` | client | Use the resolved Reporting API base URL: base_url, else the selected region's https://{region}.api.knowbe4.com. | yes |
+| `callback_security_tests` | client | Use the resolved Reporting API base URL: base_url, else the selected region's `https://{region}.api.knowbe4.com`. | yes |
 | `callback_security_tests` | headers | Accept: application/json; Authorization: Bearer {api_token} | yes |
 | `callback_security_tests` | response | A JSON array holding one callback phishing security test per entry, an entry that is not a JSON object being dropped; a status outside 200 through 299 after retries, an empty body, or a body that is not JSON is a refusal, as is JSON that is not an array. | yes |
 | `callback_security_tests` | query:page | The page number: 1 for the first page, then one more than the previous page's | yes |
