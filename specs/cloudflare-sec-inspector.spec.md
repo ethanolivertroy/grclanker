@@ -59,7 +59,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `api_key` | string | no | Legacy Cloudflare Global API Key. Defaults to CLOUDFLARE_API_KEY. |
 | `email` | string | no | Cloudflare account email for Global API Key auth. Defaults to CLOUDFLARE_EMAIL. |
 | `account_id` | string | no | Cloudflare account ID for account-scoped checks. Defaults to CLOUDFLARE_ACCOUNT_ID. |
-| `base_url` | string | no | Cloudflare API base URL. Defaults to https://api.cloudflare.com/client/v4. |
+| `base_url` | string | no | Cloudflare API base URL. Defaults to `https://api.cloudflare.com/client/v4`. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 
 #### `cloudflare_assess_identity`
@@ -70,7 +70,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `api_key` | string | no | Legacy Cloudflare Global API Key. Defaults to CLOUDFLARE_API_KEY. |
 | `email` | string | no | Cloudflare account email for Global API Key auth. Defaults to CLOUDFLARE_EMAIL. |
 | `account_id` | string | no | Cloudflare account ID for account-scoped checks. Defaults to CLOUDFLARE_ACCOUNT_ID. |
-| `base_url` | string | no | Cloudflare API base URL. Defaults to https://api.cloudflare.com/client/v4. |
+| `base_url` | string | no | Cloudflare API base URL. Defaults to `https://api.cloudflare.com/client/v4`. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `max_super_admins` | number | no | Maximum acceptable Super Administrator assignments before failing. Defaults to 2. |
 | `member_limit` | number | no | Maximum account members to inspect. Defaults to 200. |
@@ -85,7 +85,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `api_key` | string | no | Legacy Cloudflare Global API Key. Defaults to CLOUDFLARE_API_KEY. |
 | `email` | string | no | Cloudflare account email for Global API Key auth. Defaults to CLOUDFLARE_EMAIL. |
 | `account_id` | string | no | Cloudflare account ID for account-scoped checks. Defaults to CLOUDFLARE_ACCOUNT_ID. |
-| `base_url` | string | no | Cloudflare API base URL. Defaults to https://api.cloudflare.com/client/v4. |
+| `base_url` | string | no | Cloudflare API base URL. Defaults to `https://api.cloudflare.com/client/v4`. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `zone_limit` | number | no | Maximum zones to sample. Defaults to 20. |
 
@@ -97,7 +97,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `api_key` | string | no | Legacy Cloudflare Global API Key. Defaults to CLOUDFLARE_API_KEY. |
 | `email` | string | no | Cloudflare account email for Global API Key auth. Defaults to CLOUDFLARE_EMAIL. |
 | `account_id` | string | no | Cloudflare account ID for account-scoped checks. Defaults to CLOUDFLARE_ACCOUNT_ID. |
-| `base_url` | string | no | Cloudflare API base URL. Defaults to https://api.cloudflare.com/client/v4. |
+| `base_url` | string | no | Cloudflare API base URL. Defaults to `https://api.cloudflare.com/client/v4`. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `zone_limit` | number | no | Maximum zones to sample. Defaults to 20. |
 | `audit_limit` | number | no | Maximum audit log entries to inspect. Defaults to 200. |
@@ -110,7 +110,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `api_key` | string | no | Legacy Cloudflare Global API Key. Defaults to CLOUDFLARE_API_KEY. |
 | `email` | string | no | Cloudflare account email for Global API Key auth. Defaults to CLOUDFLARE_EMAIL. |
 | `account_id` | string | no | Cloudflare account ID for account-scoped checks. Defaults to CLOUDFLARE_ACCOUNT_ID. |
-| `base_url` | string | no | Cloudflare API base URL. Defaults to https://api.cloudflare.com/client/v4. |
+| `base_url` | string | no | Cloudflare API base URL. Defaults to `https://api.cloudflare.com/client/v4`. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `output_dir` | string | no | Output root. Defaults to ./export/cloudflare. |
 | `max_super_admins` | number | no | Maximum acceptable Super Administrator assignments before failing. Defaults to 2. |

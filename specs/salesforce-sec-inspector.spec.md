@@ -54,8 +54,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
-| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example `https://acme.my.salesforce.com`. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else `https://test.salesforce.com` for sandboxes or `https://login.salesforce.com`. |
 | `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
 | `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
 | `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
@@ -67,15 +67,15 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
 | `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
-| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `sandbox` | boolean | no | Force the sandbox login host `https://test.salesforce.com`. Defaults to SF_SANDBOX or detection from the instance URL. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 
 #### `salesforce_assess_platform_security`
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
-| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example `https://acme.my.salesforce.com`. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else `https://test.salesforce.com` for sandboxes or `https://login.salesforce.com`. |
 | `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
 | `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
 | `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
@@ -87,7 +87,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
 | `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
-| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `sandbox` | boolean | no | Force the sandbox login host `https://test.salesforce.com`. Defaults to SF_SANDBOX or detection from the instance URL. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `record_limit` | number | no | Maximum records to read per SOQL query before recording truncation. Defaults to 2000. |
 
@@ -95,8 +95,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
-| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example `https://acme.my.salesforce.com`. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else `https://test.salesforce.com` for sandboxes or `https://login.salesforce.com`. |
 | `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
 | `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
 | `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
@@ -108,7 +108,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
 | `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
-| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `sandbox` | boolean | no | Force the sandbox login host `https://test.salesforce.com`. Defaults to SF_SANDBOX or detection from the instance URL. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `record_limit` | number | no | Maximum records to read per SOQL query before recording truncation. Defaults to 2000. |
 | `max_admins` | number | no | Maximum acceptable administrator-class users or elevated assignees before failing. Defaults to 5. |
@@ -118,8 +118,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
-| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example `https://acme.my.salesforce.com`. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else `https://test.salesforce.com` for sandboxes or `https://login.salesforce.com`. |
 | `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
 | `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
 | `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
@@ -131,7 +131,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
 | `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
-| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `sandbox` | boolean | no | Force the sandbox login host `https://test.salesforce.com`. Defaults to SF_SANDBOX or detection from the instance URL. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `record_limit` | number | no | Maximum records to read per SOQL query before recording truncation. Defaults to 2000. |
 | `certificate_expiry_warning_days` | number | no | Warn when a certificate expires within this many days. Defaults to 30. |
@@ -140,8 +140,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
-| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example `https://acme.my.salesforce.com`. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else `https://test.salesforce.com` for sandboxes or `https://login.salesforce.com`. |
 | `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
 | `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
 | `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
@@ -153,7 +153,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
 | `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
-| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `sandbox` | boolean | no | Force the sandbox login host `https://test.salesforce.com`. Defaults to SF_SANDBOX or detection from the instance URL. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `record_limit` | number | no | Maximum records to read per SOQL query before recording truncation. Defaults to 2000. |
 | `login_history_days` | number | no | Login history lookback window in days. Defaults to 30. |
@@ -163,8 +163,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
-| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example `https://acme.my.salesforce.com`. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else `https://test.salesforce.com` for sandboxes or `https://login.salesforce.com`. |
 | `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
 | `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
 | `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
@@ -176,7 +176,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
 | `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
-| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `sandbox` | boolean | no | Force the sandbox login host `https://test.salesforce.com`. Defaults to SF_SANDBOX or detection from the instance URL. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `record_limit` | number | no | Maximum records to read per SOQL query before recording truncation. Defaults to 2000. |
 | `output_dir` | string | no | Output root. Defaults to ./export/salesforce. |

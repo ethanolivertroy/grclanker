@@ -56,7 +56,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example `https://api2.prismacloud.io`). Defaults to PRISMA_API_URL. |
 | `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
 | `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
 | `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |
@@ -71,7 +71,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example `https://api2.prismacloud.io`). Defaults to PRISMA_API_URL. |
 | `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
 | `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
 | `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |
@@ -88,7 +88,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example `https://api2.prismacloud.io`). Defaults to PRISMA_API_URL. |
 | `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
 | `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
 | `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |
@@ -103,7 +103,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example `https://api2.prismacloud.io`). Defaults to PRISMA_API_URL. |
 | `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
 | `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
 | `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |
@@ -118,7 +118,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example `https://api2.prismacloud.io`). Defaults to PRISMA_API_URL. |
 | `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
 | `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
 | `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |
@@ -134,7 +134,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example `https://api2.prismacloud.io`). Defaults to PRISMA_API_URL. |
 | `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
 | `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
 | `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |

@@ -31,12 +31,24 @@ const frameworkColumns = [
   ["ismap", "ISMAP"],
 ];
 
-function escapeCell(value) {
+function escapeCode(value) {
   return String(value).replaceAll("|", "\\|").replaceAll("\n", " ");
 }
 
+// Bare URLs in prose are API endpoints and defaults, not pages to visit, so
+// they render as code instead of being autolinked on GitHub and the site.
+const BARE_URL = /(?<!\]\(|<)\bhttps?:\/\/[\w{][^\s`()<>|'"]*?(?=[.,;:]?(?:[\s`()<>|'"]|$))/g;
+
+function codeUrls(text) {
+  return String(text).replace(BARE_URL, (url) => `\`${url}\``);
+}
+
+function escapeCell(value) {
+  return codeUrls(escapeCode(value));
+}
+
 function listCell(values) {
-  return values.length > 0 ? values.map((value) => `\`${escapeCell(value)}\``).join(", ") : "None";
+  return values.length > 0 ? values.map((value) => `\`${escapeCode(value)}\``).join(", ") : "None";
 }
 
 function bullets(values) {
@@ -69,7 +81,7 @@ function parameterRows(definition) {
     const type = Array.isArray(property.anyOf)
       ? property.anyOf.map((entry) => entry.type).filter(Boolean).join(" or ")
       : property.type ?? "value";
-    return `| \`${escapeCell(name)}\` | ${escapeCell(type)} | ${required.has(name) ? "yes" : "no"} | ${escapeCell(property.description ?? "")} |`;
+    return `| \`${escapeCode(name)}\` | ${escapeCell(type)} | ${required.has(name) ? "yes" : "no"} | ${escapeCell(property.description ?? "")} |`;
   });
 }
 
@@ -99,22 +111,22 @@ function renderAuthentication(spec) {
     "",
     "Supported modes:",
     "",
-    bullets(auth.modes),
+    bullets(auth.modes.map(codeUrls)),
     "",
     "Credential precedence, highest first:",
     "",
-    auth.credentialPrecedence.map((value, index) => `${index + 1}. ${value}`).join("\n"),
+    auth.credentialPrecedence.map((value, index) => `${index + 1}. ${codeUrls(value)}`).join("\n"),
     "",
     `Environment variables: ${listCell(auth.environmentVariables)}`,
     "",
-    `Configuration locations: ${auth.configLocations.join(", ") || "(none)"}`,
+    `Configuration locations: ${codeUrls(auth.configLocations.join(", ")) || "(none)"}`,
     "",
-    `Credential and deployment variants: ${auth.variants.join(", ")}`,
+    `Credential and deployment variants: ${codeUrls(auth.variants.join(", "))}`,
     "",
     `Configuration fields: ${listCell(auth.configFields)}`,
     "",
-    `Malformed configuration: ${auth.malformedConfigBehavior}`,
-    ...(auth.refreshRequest ? ["", `Credential refresh: ${auth.refreshRequest}`] : []),
+    `Malformed configuration: ${codeUrls(auth.malformedConfigBehavior)}`,
+    ...(auth.refreshRequest ? ["", `Credential refresh: ${codeUrls(auth.refreshRequest)}`] : []),
   ].join("\n");
 }
 
@@ -124,7 +136,7 @@ function renderPermissions(spec) {
     "",
     "| Kind | Permission, role, or plan | Unlocks | Notes |",
     "|---|---|---|---|",
-    ...spec.permissions.map((entry) => `| ${escapeCell(entry.kind)} | \`${escapeCell(entry.value)}\` | ${listCell(entry.unlocks)} | ${escapeCell(entry.notes ?? "")} |`),
+    ...spec.permissions.map((entry) => `| ${escapeCell(entry.kind)} | \`${escapeCode(entry.value)}\` | ${listCell(entry.unlocks)} | ${escapeCell(entry.notes ?? "")} |`),
   ].join("\n");
 }
 
@@ -136,7 +148,7 @@ function renderSurfaces(spec) {
     "|---|---|---|---|---|---|---|---|---|",
     ...spec.apiSurfaces.map((surface) => {
       const operation = surface.kind === "rest" ? `${surface.method} ${surface.path}` : surface.operation;
-      return `| \`${surface.id}\` | ${surface.kind === "rest" ? "HTTP" : "service operation"} | \`${escapeCell(operation)}\` | ${escapeCell(surface.sdkService ?? surface.baseService)} | ${surface.iamAction ? `\`${escapeCell(surface.iamAction)}\`` : "N/A"} | ${escapeCell(surface.intent)} | ${escapeCell(surface.projectionStage)} | ${listCell(surface.fieldsConsumed)} | [Official documentation](${surface.documentationUrl}) |`;
+      return `| \`${surface.id}\` | ${surface.kind === "rest" ? "HTTP" : "service operation"} | \`${escapeCode(operation)}\` | ${escapeCell(surface.sdkService ?? surface.baseService)} | ${surface.iamAction ? `\`${escapeCode(surface.iamAction)}\`` : "N/A"} | ${escapeCell(surface.intent)} | ${escapeCell(surface.projectionStage)} | ${listCell(surface.fieldsConsumed)} | [Official documentation](${surface.documentationUrl}) |`;
     }),
   ];
   const requestRows = spec.apiSurfaces.flatMap((surface) => {

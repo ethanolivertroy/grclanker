@@ -65,8 +65,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
 | `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
 | `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
-| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
-| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `base_url` | string | no | Box Content API base URL. Defaults to `https://api.box.com/2.0`. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to `https://api.box.com/oauth2/token`. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 
@@ -85,8 +85,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
 | `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
 | `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
-| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
-| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `base_url` | string | no | Box Content API base URL. Defaults to `https://api.box.com/2.0`. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to `https://api.box.com/oauth2/token`. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 | `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
@@ -111,8 +111,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
 | `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
 | `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
-| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
-| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `base_url` | string | no | Box Content API base URL. Defaults to `https://api.box.com/2.0`. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to `https://api.box.com/oauth2/token`. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 | `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
@@ -135,8 +135,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
 | `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
 | `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
-| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
-| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `base_url` | string | no | Box Content API base URL. Defaults to `https://api.box.com/2.0`. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to `https://api.box.com/oauth2/token`. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 | `list_limit` | number | no | Maximum records to inspect per paginated list (collaboration allowlist entries and exempt users, device pins, policies, and assignments). A list that hits the cap while Box reports more records is marked truncated and downgrades dependent findings to warn. Defaults to 500. |
@@ -156,8 +156,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
 | `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
 | `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
-| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
-| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `base_url` | string | no | Box Content API base URL. Defaults to `https://api.box.com/2.0`. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to `https://api.box.com/oauth2/token`. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 | `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
@@ -178,8 +178,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
 | `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
 | `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
-| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
-| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `base_url` | string | no | Box Content API base URL. Defaults to `https://api.box.com/2.0`. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to `https://api.box.com/oauth2/token`. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `max_retries` | number | no | Retries for 429 and 5xx responses, timeouts, and connection failures, with backoff. Defaults to 3. |
 | `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
@@ -218,7 +218,7 @@ Configuration fields: `auth_method`, `authMethod`, `auth_mode`, `jwt_config_path
 
 Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 
-Credential refresh: POST https://api.box.com/oauth2/token using the selected JWT, client_credentials, or refresh_token grant.
+Credential refresh: POST `https://api.box.com/oauth2/token` using the selected JWT, client_credentials, or refresh_token grant.
 
 ## Permissions
 
