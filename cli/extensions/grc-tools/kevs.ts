@@ -7,7 +7,7 @@
  *
  * Enables vulnerability prioritization with exploit intelligence.
  */
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { rethrowIfAborted } from "./abort.js";
 import { cachedFetch, errorResult, formatTable, textResult, throttledFetch } from "./shared.js";
 

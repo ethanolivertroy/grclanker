@@ -54,11 +54,11 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in https://{subdomain}.zendesk.com). Defaults to ZENDESK_SUBDOMAIN or the config file. |
+| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in `https://{subdomain}.zendesk.com`). Defaults to ZENDESK_SUBDOMAIN or the config file. |
 | `email` | string | no | Email of the admin or agent that owns the API token. Defaults to ZENDESK_EMAIL. |
 | `api_token` | string | no | Zendesk API token used with email as Basic auth ({email}/token:{api_token}). Defaults to ZENDESK_API_TOKEN. |
 | `oauth_token` | string | no | Zendesk OAuth access token (Bearer). Defaults to ZENDESK_OAUTH_TOKEN. Preferred over API tokens, which Zendesk is retiring. |
-| `base_url` | string | no | API base URL override. Defaults to https://{subdomain}.zendesk.com/api/v2. |
+| `base_url` | string | no | API base URL override. Defaults to `https://{subdomain}.zendesk.com/api/v2`. |
 | `config_file` | string | no | JSON config file with subdomain, email, api_token, or oauth_token keys. Defaults to ZENDESK_CONFIG_FILE or ~/.zendesk/config.json. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 
@@ -66,11 +66,11 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in https://{subdomain}.zendesk.com). Defaults to ZENDESK_SUBDOMAIN or the config file. |
+| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in `https://{subdomain}.zendesk.com`). Defaults to ZENDESK_SUBDOMAIN or the config file. |
 | `email` | string | no | Email of the admin or agent that owns the API token. Defaults to ZENDESK_EMAIL. |
 | `api_token` | string | no | Zendesk API token used with email as Basic auth ({email}/token:{api_token}). Defaults to ZENDESK_API_TOKEN. |
 | `oauth_token` | string | no | Zendesk OAuth access token (Bearer). Defaults to ZENDESK_OAUTH_TOKEN. Preferred over API tokens, which Zendesk is retiring. |
-| `base_url` | string | no | API base URL override. Defaults to https://{subdomain}.zendesk.com/api/v2. |
+| `base_url` | string | no | API base URL override. Defaults to `https://{subdomain}.zendesk.com/api/v2`. |
 | `config_file` | string | no | JSON config file with subdomain, email, api_token, or oauth_token keys. Defaults to ZENDESK_CONFIG_FILE or ~/.zendesk/config.json. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `admin_threshold` | number | no | Maximum acceptable number of admins before failing control 7. Defaults to 5. |
@@ -84,11 +84,11 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in https://{subdomain}.zendesk.com). Defaults to ZENDESK_SUBDOMAIN or the config file. |
+| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in `https://{subdomain}.zendesk.com`). Defaults to ZENDESK_SUBDOMAIN or the config file. |
 | `email` | string | no | Email of the admin or agent that owns the API token. Defaults to ZENDESK_EMAIL. |
 | `api_token` | string | no | Zendesk API token used with email as Basic auth ({email}/token:{api_token}). Defaults to ZENDESK_API_TOKEN. |
 | `oauth_token` | string | no | Zendesk OAuth access token (Bearer). Defaults to ZENDESK_OAUTH_TOKEN. Preferred over API tokens, which Zendesk is retiring. |
-| `base_url` | string | no | API base URL override. Defaults to https://{subdomain}.zendesk.com/api/v2. |
+| `base_url` | string | no | API base URL override. Defaults to `https://{subdomain}.zendesk.com/api/v2`. |
 | `config_file` | string | no | JSON config file with subdomain, email, api_token, or oauth_token keys. Defaults to ZENDESK_CONFIG_FILE or ~/.zendesk/config.json. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `admin_threshold` | number | no | Maximum acceptable number of admins before failing control 7. Defaults to 5. |
@@ -102,11 +102,11 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in https://{subdomain}.zendesk.com). Defaults to ZENDESK_SUBDOMAIN or the config file. |
+| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in `https://{subdomain}.zendesk.com`). Defaults to ZENDESK_SUBDOMAIN or the config file. |
 | `email` | string | no | Email of the admin or agent that owns the API token. Defaults to ZENDESK_EMAIL. |
 | `api_token` | string | no | Zendesk API token used with email as Basic auth ({email}/token:{api_token}). Defaults to ZENDESK_API_TOKEN. |
 | `oauth_token` | string | no | Zendesk OAuth access token (Bearer). Defaults to ZENDESK_OAUTH_TOKEN. Preferred over API tokens, which Zendesk is retiring. |
-| `base_url` | string | no | API base URL override. Defaults to https://{subdomain}.zendesk.com/api/v2. |
+| `base_url` | string | no | API base URL override. Defaults to `https://{subdomain}.zendesk.com/api/v2`. |
 | `config_file` | string | no | JSON config file with subdomain, email, api_token, or oauth_token keys. Defaults to ZENDESK_CONFIG_FILE or ~/.zendesk/config.json. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `admin_threshold` | number | no | Maximum acceptable number of admins before failing control 7. Defaults to 5. |
@@ -120,11 +120,11 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in https://{subdomain}.zendesk.com). Defaults to ZENDESK_SUBDOMAIN or the config file. |
+| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in `https://{subdomain}.zendesk.com`). Defaults to ZENDESK_SUBDOMAIN or the config file. |
 | `email` | string | no | Email of the admin or agent that owns the API token. Defaults to ZENDESK_EMAIL. |
 | `api_token` | string | no | Zendesk API token used with email as Basic auth ({email}/token:{api_token}). Defaults to ZENDESK_API_TOKEN. |
 | `oauth_token` | string | no | Zendesk OAuth access token (Bearer). Defaults to ZENDESK_OAUTH_TOKEN. Preferred over API tokens, which Zendesk is retiring. |
-| `base_url` | string | no | API base URL override. Defaults to https://{subdomain}.zendesk.com/api/v2. |
+| `base_url` | string | no | API base URL override. Defaults to `https://{subdomain}.zendesk.com/api/v2`. |
 | `config_file` | string | no | JSON config file with subdomain, email, api_token, or oauth_token keys. Defaults to ZENDESK_CONFIG_FILE or ~/.zendesk/config.json. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `admin_threshold` | number | no | Maximum acceptable number of admins before failing control 7. Defaults to 5. |
@@ -138,11 +138,11 @@ This specification requires [shared integration contract version 1.1](./integrat
 
 | Parameter | Kind | Required | Meaning |
 |---|---|---|---|
-| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in https://{subdomain}.zendesk.com). Defaults to ZENDESK_SUBDOMAIN or the config file. |
+| `subdomain` | string | no | Zendesk subdomain (the {subdomain} in `https://{subdomain}.zendesk.com`). Defaults to ZENDESK_SUBDOMAIN or the config file. |
 | `email` | string | no | Email of the admin or agent that owns the API token. Defaults to ZENDESK_EMAIL. |
 | `api_token` | string | no | Zendesk API token used with email as Basic auth ({email}/token:{api_token}). Defaults to ZENDESK_API_TOKEN. |
 | `oauth_token` | string | no | Zendesk OAuth access token (Bearer). Defaults to ZENDESK_OAUTH_TOKEN. Preferred over API tokens, which Zendesk is retiring. |
-| `base_url` | string | no | API base URL override. Defaults to https://{subdomain}.zendesk.com/api/v2. |
+| `base_url` | string | no | API base URL override. Defaults to `https://{subdomain}.zendesk.com/api/v2`. |
 | `config_file` | string | no | JSON config file with subdomain, email, api_token, or oauth_token keys. Defaults to ZENDESK_CONFIG_FILE or ~/.zendesk/config.json. |
 | `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 | `admin_threshold` | number | no | Maximum acceptable number of admins before failing control 7. Defaults to 5. |

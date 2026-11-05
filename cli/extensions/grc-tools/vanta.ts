@@ -23,7 +23,7 @@ import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
 import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";

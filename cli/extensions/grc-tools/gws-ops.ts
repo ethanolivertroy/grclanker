@@ -18,7 +18,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { projectActivitySnapshot, projectAlertSnapshot, redactKnownValues, redactSecrets, scrubText } from "./gws.js";
 import { errorResult, formatTable, textResult } from "./shared.js";

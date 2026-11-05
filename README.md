@@ -170,7 +170,7 @@ The default backend is `host`, the local shell. `grclanker setup --compute <kind
 
 ## Cursor Agent SDK
 
-From a source checkout, the same 241 domain tools can run as a [Cursor Agent SDK](https://cursor.com/docs/agent-sdk) agent. The project is `cli/agent-sdk/`, an adapter over the bundled extension, built on [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.3.0. It does not expose `bash`, `read`, `write`, `edit`, `ls`, `find`, or `grep`. The Cursor harness supplies its own shell and file tools.
+From a source checkout, the same 241 domain tools can run as a [Cursor Agent SDK](https://cursor.com/docs/agent-sdk) agent. The project is `cli/agent-sdk/`, an adapter over the bundled extension, built on [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.6.0. It does not expose `bash`, `read`, `write`, `edit`, `ls`, `find`, or `grep`. The Cursor harness supplies `shell` plus `Read`, `Write`, `StrReplace`, `Grep`, `Glob`, `LS`, and `Delete`. Turns that leave the model unset use `grok-4.7` with `reasoning_effort=high` and `fast=true`.
 
 199 tools declare `effect: "read"`. The other 42 write files (exports, generators, the Google Workspace operator evidence collector, and OSCAL workspace commands) and wait for a person to approve a model-initiated call.
 

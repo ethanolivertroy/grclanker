@@ -68,6 +68,13 @@ const discoveredTools = agent.tools.map((tool) => tool.name).sort();
 
 assert.equal(agent.name, "grclanker");
 assert.equal(agent.runtime, "local");
+assert.deepEqual(agent.model, {
+  id: "grok-4.7",
+  params: [
+    { id: "reasoning_effort", value: "high" },
+    { id: "fast", value: "true" },
+  ],
+});
 assert.deepEqual(agent.diagnostics ?? [], []);
 assert.deepEqual(discoveredTools, expectedTools);
 assert.ok(agent.tools.every((tool) => tool.execution === "server"));

@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { URLSearchParams, fileURLToPath, pathToFileURL } from "node:url";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import * as v from "valibot";
 import { init, setProvider, useModel, useSandbox, useSkill, useSubagent, useTool } from "@flue/runtime";
 import { sqlite, start } from "@flue/runtime/node";

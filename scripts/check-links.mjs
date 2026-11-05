@@ -44,6 +44,26 @@ const EXTERNAL_TIMEOUT_MS = 10000;
 const EXTERNAL_CONCURRENCY = 8;
 // Bot walls and rate limits, not proof that a page is gone.
 const BLOCKED_STATUSES = new Set([401, 403, 429, 999]);
+// Links that work in a browser but never in a cookie-less probe. --external
+// skips them instead of listing them as broken on every run.
+export const KNOWN_FALSE_POSITIVES = [
+  {
+    pattern: /^https:\/\/app\.swaggerhub\.com\/apis\/Veracode\//,
+    reason: 'SwaggerHub finishes a SmartBear cookie round-trip before serving the page; fetch keeps no cookies and ends on a 404',
+  },
+];
+
+export function knownFalsePositive(url, allowlist = KNOWN_FALSE_POSITIVES) {
+  return allowlist.find(({ pattern }) => pattern.test(url));
+}
+
+/** The --external report group for a probe result. */
+export function classifyExternal(url, result) {
+  if (BLOCKED_STATUSES.has(result.status)) return 'blocked';
+  if (result.error || result.status >= 400) return 'broken';
+  if (result.finalUrl !== url) return 'redirected';
+  return 'ok';
+}
 
 function walk(dir) {
   return readdirSync(dir).flatMap((name) => {
@@ -271,7 +291,8 @@ async function probe(url) {
 }
 
 async function reportExternal(urls) {
-  const queue = [...urls.keys()].sort();
+  const skipped = [...urls.keys()].filter((url) => knownFalsePositive(url));
+  const queue = [...urls.keys()].filter((url) => !knownFalsePositive(url)).sort();
   const results = new Map();
   const worker = async () => {
     while (queue.length > 0) {
@@ -284,20 +305,29 @@ async function reportExternal(urls) {
   const groups = { broken: [], blocked: [], redirected: [], ok: [] };
   for (const [url, result] of [...results].sort(([a], [b]) => a.localeCompare(b))) {
     const where = [...urls.get(url)].sort().join(', ');
-    if (BLOCKED_STATUSES.has(result.status)) {
-      groups.blocked.push(`${result.status} ${url}`);
-    } else if (result.error || result.status >= 400) {
-      groups.broken.push(`${result.error ?? result.status} ${url}\n      on ${where}`);
-    } else if (result.finalUrl !== url) {
-      groups.redirected.push(`${result.status} ${url} -> ${result.finalUrl}`);
-    } else {
-      groups.ok.push(url);
+    const group = classifyExternal(url, result);
+    switch (group) {
+      case 'blocked':
+        groups.blocked.push(`${result.status} ${url}`);
+        break;
+      case 'broken':
+        groups.broken.push(`${result.error ?? result.status} ${url}\n      on ${where}`);
+        break;
+      case 'redirected':
+        groups.redirected.push(`${result.status} ${url} -> ${result.finalUrl}`);
+        break;
+      case 'ok':
+        groups.ok.push(url);
+        break;
+      default:
+        throw new Error(`check-links: unknown external group ${group}`);
     }
   }
   console.log(
-    `\ncheck-links --external: ${results.size} URLs, ${groups.ok.length} ok, ` +
+    `\ncheck-links --external: ${results.size + skipped.length} URLs, ${groups.ok.length} ok, ` +
     `${groups.redirected.length} redirected, ${groups.blocked.length} blocked or rate-limited, ` +
-    `${groups.broken.length} broken or unreachable (reported, not failed)`,
+    `${groups.broken.length} broken or unreachable (reported, not failed), ` +
+    `${skipped.length} skipped as known false positives`,
   );
   for (const title of ['broken', 'blocked', 'redirected']) {
     if (groups[title].length === 0) continue;

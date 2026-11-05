@@ -22,7 +22,7 @@ import {
 import { readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { ToolCallAbortedError, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { evaluateBatchRuntimeCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";

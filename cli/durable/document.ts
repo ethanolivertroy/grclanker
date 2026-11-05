@@ -59,6 +59,7 @@ export const Assessment = defineDoc<AssessmentState>({
   history: "latest",
   fork: "current",
   initial: emptyAssessmentState,
+  checkpointWhen: () => false,
 });
 
 export interface ToolOutcome {

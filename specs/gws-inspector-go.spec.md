@@ -153,7 +153,7 @@ Configuration fields: `client_email`, `private_key`, `token_uri`
 
 Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 
-Credential refresh: POST https://oauth2.googleapis.com/token with a signed JWT bearer grant and delegated administrator subject.
+Credential refresh: POST `https://oauth2.googleapis.com/token` with a signed JWT bearer grant and delegated administrator subject.
 
 ## Permissions
 

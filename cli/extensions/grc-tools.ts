@@ -140,6 +140,21 @@ function rejectAbortedCalls(tool: ToolDefinition): ToolDefinition {
   };
 }
 
+const LEGACY_TYPEBOX_KIND = Symbol.for("TypeBox.Kind");
+
+/**
+ * Pi's tool argument validation coerces mistyped arguments ("7" to 7, 1.5 to
+ * 1, 42 to "42") unless the parameter schema is plain JSON Schema, without
+ * typebox's non-enumerable `~kind` markers, and carries the
+ * `Symbol.for("TypeBox.Kind")` marker of @sinclair/typebox 0.34 schemas.
+ * Domain tools reject mistyped arguments that their `prepareArguments` shim
+ * leaves in place, so they register their parameters in that form.
+ */
+export function disableArgumentCoercion(tool: ToolDefinition): ToolDefinition {
+  const parameters = JSON.parse(JSON.stringify(tool.parameters)) as ToolDefinition["parameters"];
+  return { ...tool, parameters: Object.assign(parameters, { [LEGACY_TYPEBOX_KIND]: "Object" }) };
+}
+
 function registerDomainTools(pi: ExtensionAPI): number {
   let count = 0;
   const counting = new Proxy(pi, {
@@ -147,7 +162,7 @@ function registerDomainTools(pi: ExtensionAPI): number {
       if (property === "registerTool") {
         return (tool: ToolDefinition) => {
           count += 1;
-          return target.registerTool(rejectAbortedCalls(tool));
+          return target.registerTool(rejectAbortedCalls(disableArgumentCoercion(tool)));
         };
       }
       const value = Reflect.get(target, property, target) as unknown;

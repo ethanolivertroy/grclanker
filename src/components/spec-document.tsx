@@ -2,7 +2,7 @@ import { createMarkdownRenderer, type MarkdownRendererOptions } from 'fumadocs-c
 import { getTableOfContents } from 'fumadocs-core/content/toc';
 import { rehypeCode, remarkGfm, remarkHeading } from 'fumadocs-core/mdx-plugins';
 import type { TOCItemType } from 'fumadocs-core/toc';
-import type { CSSProperties } from 'react';
+import type { ComponentProps, CSSProperties } from 'react';
 import { rehypeCodeOptions, siteRehypePlugins } from '../lib/markdown-options';
 import { githubUrl } from '../lib/site';
 import remarkSpecSource from '../lib/spec-markdown.mjs';
@@ -31,7 +31,10 @@ function StaticTable({ html, narrow, wide }: StaticTableProps) {
   return <div className="docs-table-scroll" style={heights} suppressHydrationWarning dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-const components = { ...mdxComponents, [STATIC_TABLE]: StaticTable };
+type MarkdownComponents = NonNullable<ComponentProps<typeof MarkdownServer>['components']>;
+
+// fumadocs looks components up by any tag name, but its type lists only HTML tags.
+const components = { ...mdxComponents, [STATIC_TABLE]: StaticTable } as MarkdownComponents;
 
 /** The sections a spec lists in its contents bar and beside its document. */
 export async function specSections(content: string): Promise<TOCItemType[]> {

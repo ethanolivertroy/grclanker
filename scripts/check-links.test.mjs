@@ -6,7 +6,15 @@ import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { checkSite, parseSrcset, parseTags, resolveTarget, SEARCH_INDEX } from './check-links.mjs';
+import {
+  checkSite,
+  classifyExternal,
+  knownFalsePositive,
+  parseSrcset,
+  parseTags,
+  resolveTarget,
+  SEARCH_INDEX,
+} from './check-links.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), 'check-links.mjs');
 const fixtures = [];
@@ -281,4 +289,36 @@ test('the CLI exits 1 on problems and 0 on a clean site', () => {
   const okRun = spawnSync(process.execPath, [script, minimal], { encoding: 'utf8' });
   assert.equal(okRun.status, 0, okRun.stderr);
   assert.match(okRun.stdout, /no broken internal links/);
+});
+
+test('external results group as blocked, broken, redirected, or ok', () => {
+  const url = 'https://example.com/a';
+  assert.equal(classifyExternal(url, { status: 403, finalUrl: url }), 'blocked');
+  assert.equal(classifyExternal(url, { status: 404, finalUrl: url }), 'broken');
+  assert.equal(classifyExternal(url, { error: 'ENOTFOUND' }), 'broken');
+  assert.equal(classifyExternal(url, { status: 200, finalUrl: 'https://example.com/b' }), 'redirected');
+  assert.equal(classifyExternal(url, { status: 200, finalUrl: url }), 'ok');
+});
+
+test('the Veracode SwaggerHub links are known false positives and nothing else is', () => {
+  assert.ok(knownFalsePositive('https://app.swaggerhub.com/apis/Veracode/veracode-identity_api/1.5'));
+  assert.equal(knownFalsePositive('https://app.swaggerhub.com/apis/OtherVendor/api/1.0'), undefined);
+  assert.equal(knownFalsePositive('https://api.veracode.com/'), undefined);
+});
+
+test('--external skips known false positives without probing them', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'check-links-'));
+  fixtures.push(dir);
+  mkdirSync(join(dir, 'docs'));
+  writeFileSync(
+    join(dir, 'docs', 'index.html'),
+    '<nav class="docs-sidebar-nav"><a href="/docs/">Docs</a></nav>' +
+      '<a href="https://app.swaggerhub.com/apis/Veracode/veracode-identity_api/1.5">API</a>',
+  );
+  mkdirSync(dirname(join(dir, SEARCH_INDEX)), { recursive: true });
+  writeFileSync(join(dir, SEARCH_INDEX), searchIndex([indexed('/docs/')]));
+  const run = spawnSync(process.execPath, [script, '--external', dir], { encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /1 URLs, 0 ok, .* 0 broken or unreachable \(reported, not failed\), 1 skipped as known false positives/);
+  assert.doesNotMatch(run.stdout, /broken:/);
 });

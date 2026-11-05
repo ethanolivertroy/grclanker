@@ -75,7 +75,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `access_key` | string | no | Tenable Vulnerability Management API access key. Defaults to TENABLE_ACCESS_KEY or the config file. |
 | `secret_key` | string | no | Tenable Vulnerability Management API secret key. Defaults to TENABLE_SECRET_KEY or the config file. |
-| `url` | string | no | Platform URL: https://cloud.tenable.com (default), https://fedcloud.tenable.com for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
+| `url` | string | no | Platform URL: `https://cloud.tenable.com` (default), `https://fedcloud.tenable.com` for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
 | `sc_url` | string | no | Optional Tenable Security Center URL assessed alongside the cloud tenant. Defaults to TENABLE_SC_URL. |
 | `sc_access_key` | string | no | Tenable Security Center API access key (x-apikey). Defaults to TENABLE_SC_ACCESS_KEY. |
 | `sc_secret_key` | string | no | Tenable Security Center API secret key (x-apikey). Defaults to TENABLE_SC_SECRET_KEY. |
@@ -88,7 +88,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `access_key` | string | no | Tenable Vulnerability Management API access key. Defaults to TENABLE_ACCESS_KEY or the config file. |
 | `secret_key` | string | no | Tenable Vulnerability Management API secret key. Defaults to TENABLE_SECRET_KEY or the config file. |
-| `url` | string | no | Platform URL: https://cloud.tenable.com (default), https://fedcloud.tenable.com for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
+| `url` | string | no | Platform URL: `https://cloud.tenable.com` (default), `https://fedcloud.tenable.com` for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
 | `sc_url` | string | no | Optional Tenable Security Center URL assessed alongside the cloud tenant. Defaults to TENABLE_SC_URL. |
 | `sc_access_key` | string | no | Tenable Security Center API access key (x-apikey). Defaults to TENABLE_SC_ACCESS_KEY. |
 | `sc_secret_key` | string | no | Tenable Security Center API secret key (x-apikey). Defaults to TENABLE_SC_SECRET_KEY. |
@@ -117,7 +117,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `access_key` | string | no | Tenable Vulnerability Management API access key. Defaults to TENABLE_ACCESS_KEY or the config file. |
 | `secret_key` | string | no | Tenable Vulnerability Management API secret key. Defaults to TENABLE_SECRET_KEY or the config file. |
-| `url` | string | no | Platform URL: https://cloud.tenable.com (default), https://fedcloud.tenable.com for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
+| `url` | string | no | Platform URL: `https://cloud.tenable.com` (default), `https://fedcloud.tenable.com` for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
 | `sc_url` | string | no | Optional Tenable Security Center URL assessed alongside the cloud tenant. Defaults to TENABLE_SC_URL. |
 | `sc_access_key` | string | no | Tenable Security Center API access key (x-apikey). Defaults to TENABLE_SC_ACCESS_KEY. |
 | `sc_secret_key` | string | no | Tenable Security Center API secret key (x-apikey). Defaults to TENABLE_SC_SECRET_KEY. |
@@ -146,7 +146,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `access_key` | string | no | Tenable Vulnerability Management API access key. Defaults to TENABLE_ACCESS_KEY or the config file. |
 | `secret_key` | string | no | Tenable Vulnerability Management API secret key. Defaults to TENABLE_SECRET_KEY or the config file. |
-| `url` | string | no | Platform URL: https://cloud.tenable.com (default), https://fedcloud.tenable.com for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
+| `url` | string | no | Platform URL: `https://cloud.tenable.com` (default), `https://fedcloud.tenable.com` for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
 | `sc_url` | string | no | Optional Tenable Security Center URL assessed alongside the cloud tenant. Defaults to TENABLE_SC_URL. |
 | `sc_access_key` | string | no | Tenable Security Center API access key (x-apikey). Defaults to TENABLE_SC_ACCESS_KEY. |
 | `sc_secret_key` | string | no | Tenable Security Center API secret key (x-apikey). Defaults to TENABLE_SC_SECRET_KEY. |
@@ -175,7 +175,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `access_key` | string | no | Tenable Vulnerability Management API access key. Defaults to TENABLE_ACCESS_KEY or the config file. |
 | `secret_key` | string | no | Tenable Vulnerability Management API secret key. Defaults to TENABLE_SECRET_KEY or the config file. |
-| `url` | string | no | Platform URL: https://cloud.tenable.com (default), https://fedcloud.tenable.com for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
+| `url` | string | no | Platform URL: `https://cloud.tenable.com` (default), `https://fedcloud.tenable.com` for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
 | `sc_url` | string | no | Optional Tenable Security Center URL assessed alongside the cloud tenant. Defaults to TENABLE_SC_URL. |
 | `sc_access_key` | string | no | Tenable Security Center API access key (x-apikey). Defaults to TENABLE_SC_ACCESS_KEY. |
 | `sc_secret_key` | string | no | Tenable Security Center API secret key (x-apikey). Defaults to TENABLE_SC_SECRET_KEY. |
@@ -204,7 +204,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `access_key` | string | no | Tenable Vulnerability Management API access key. Defaults to TENABLE_ACCESS_KEY or the config file. |
 | `secret_key` | string | no | Tenable Vulnerability Management API secret key. Defaults to TENABLE_SECRET_KEY or the config file. |
-| `url` | string | no | Platform URL: https://cloud.tenable.com (default), https://fedcloud.tenable.com for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
+| `url` | string | no | Platform URL: `https://cloud.tenable.com` (default), `https://fedcloud.tenable.com` for FedRAMP, or a Tenable Security Center host. Defaults to TENABLE_URL. |
 | `sc_url` | string | no | Optional Tenable Security Center URL assessed alongside the cloud tenant. Defaults to TENABLE_SC_URL. |
 | `sc_access_key` | string | no | Tenable Security Center API access key (x-apikey). Defaults to TENABLE_SC_ACCESS_KEY. |
 | `sc_secret_key` | string | no | Tenable Security Center API secret key (x-apikey). Defaults to TENABLE_SC_SECRET_KEY. |
