@@ -10,8 +10,9 @@ export const MODEL_ENV_VAR = "GRCLANKER_AGENT_SDK_MODEL";
 
 /**
  * Root `defineAgent` config. Turns run on the Agent SDK's default local harness so the
- * in-process server tools apply; the model falls back to the Agent SDK default
- * unless `GRCLANKER_AGENT_SDK_MODEL` names a Cursor model id.
+ * in-process server tools apply. Omitting `model` selects the SDK default
+ * (`grok-4.7` with `reasoning_effort=high` and `fast=true`) unless
+ * `GRCLANKER_AGENT_SDK_MODEL` names a Cursor model id.
  */
 export function grclankerAgentConfig(env: NodeJS.ProcessEnv = process.env): AgentConfig {
   const model = env[MODEL_ENV_VAR]?.trim();

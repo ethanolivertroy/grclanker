@@ -612,6 +612,8 @@ test("agent instructions compose SYSTEM.md with the Agent SDK runtime note", () 
   assert.match(markdown, /Delegate to the `auditor` subagent once evidence is gathered/);
   assert.match(markdown, /Delegate to the `verifier` subagent before reporting findings/);
   assert.match(markdown, /resolve relative paths against the working directory of the `agent-sdk` process/);
+  assert.match(markdown, /`Read`, `Write`, `StrReplace`, `Grep`, `Glob`, `LS`, and `Delete`/);
+  assert.match(markdown, /\{ status: "success", value: \{ content \} \}/);
 });
 
 test("workflow prompts and the bundled skill map onto skill configs", () => {
