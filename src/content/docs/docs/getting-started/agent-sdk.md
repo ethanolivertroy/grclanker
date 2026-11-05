@@ -98,7 +98,7 @@ The sync compiles the registry without the generated entries (`cli/tsconfig.agen
 
 `npm --prefix cli run test:cli` covers the adapter with a mocked SDK (registration, schema conversion, argument bridging, result mapping, and every entry file) and fails when the generated entries drift.
 
-`npm --prefix cli run test:agent-sdk:validate` runs the real `agent-sdk validate` and `agent-sdk info --json` discovery and skips when `@grok/agent-sdk` is not installed.
+`npm --prefix cli run test:agent-sdk:validate` checks the pinned SDK with real `agent-sdk validate` and `agent-sdk info --json` discovery, including every tool's effect and approval gate. It also previews and executes a local-only OSCAL check and verifies input-schema rejection without a model or provider request. It skips when `@grok/agent-sdk` is not installed.
 
 ## Limitations
 
