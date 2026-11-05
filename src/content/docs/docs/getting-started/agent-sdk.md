@@ -5,7 +5,7 @@ description: Run all 241 grclanker domain tools as a Cursor Agent SDK agent buil
 
 grclanker ships a [Cursor Agent SDK](https://cursor.com/docs/agent-sdk) project next to the Pi terminal CLI. The project lives in `cli/agent-sdk/` and adapts the bundled 241-tool domain registry instead of duplicating it.
 
-The Agent SDK lets you define, test, and run agents as a folder of Markdown and TypeScript. grclanker's project is built on [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.3.0, the package behind the `agent-sdk` CLI. It was published as `@cursor/bdk` before the public release.
+The Agent SDK lets you define, test, and run agents as a folder of Markdown and TypeScript. grclanker's project is built on [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.6.0, the package behind the `agent-sdk` CLI. It was published as `@cursor/bdk` before the public release.
 
 ## Quick start
 
@@ -29,7 +29,7 @@ The last command runs one grclanker tool with no model turn and prints a JSON en
 | `cli/skills/crypto-validation/SKILL.md` | Skill named `crypto-validation` |
 | `cli/.grclanker/agents/{auditor,verifier}.md` | Subagents named `auditor` and `verifier` |
 
-Pi's compute-backend tools (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) are not exposed. The Cursor harness supplies its own shell and file tools, so the `docker`, `sandbox-runtime`, and `parallels-vm` compute backends do not apply to this run mode.
+Pi's compute-backend tools (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) are not exposed. The Cursor harness supplies `shell` plus the native file tools `Read`, `Write`, `StrReplace`, `Grep`, `Glob`, `LS`, and `Delete`, so the `docker`, `sandbox-runtime`, and `parallels-vm` compute backends do not apply to this run mode. A successful file read is `{ status: "success", value: { content } }`.
 
 Each tool keeps the same behavior as in the CLI:
 
@@ -68,7 +68,7 @@ npm --prefix cli run agent-sdk:dev
 npm --prefix cli run agent-sdk:run -- --message "Is BoringCrypto FIPS validated?"
 ```
 
-The Agent SDK default model applies unless `GRCLANKER_AGENT_SDK_MODEL` names a Cursor model id, for example `GRCLANKER_AGENT_SDK_MODEL=composer-2.5`.
+Turns that leave the model unset use the Agent SDK default, `grok-4.7` with `reasoning_effort=high` and `fast=true`. Set `GRCLANKER_AGENT_SDK_MODEL` to a Cursor model id, for example `GRCLANKER_AGENT_SDK_MODEL=composer-2.5`, to override it.
 
 Tool credentials work the same way as in the CLI: the cloud and SaaS tools read their environment variables from the `agent-sdk` process.
 
@@ -103,7 +103,7 @@ The sync compiles the registry without the generated entries (`cli/tsconfig.agen
 ## Limitations
 
 - Source checkout only: The release bundles do not include the Agent SDK project or `@grok/agent-sdk`, and `@grclanker/cli` is not published to npm.
-- `@grok/agent-sdk` is pinned to an exact version (`0.3.0`) in `cli/package.json`, and Dependabot proposes bumps in their own group. When a newer release is published, the CLI prints an "outdated" warning. Skip the `agent-sdk update` it suggests and bump the pin deliberately instead.
+- `@grok/agent-sdk` is pinned to an exact version (`0.6.0`) in `cli/package.json`, and Dependabot proposes bumps in their own group. When a newer release is published, the CLI prints an "outdated" warning. Skip the `agent-sdk update` it suggests and bump the pin deliberately instead. `@grok/agent-sdk` 0.6.0 requires `@cursor/sdk` 1.3.0, which the CLI install pulls in.
 - `zod` is a peer dependency of `@grok/agent-sdk` and a CLI devDependency.
 - The project runs locally and is not deployed to Cursor-managed hosting.
 - Turns run on the local Cursor harness, the Agent SDK's default runtime, so `bot/agent.ts` does not set `runtime`. In-process server tools only run on local turns.
