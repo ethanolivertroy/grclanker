@@ -3,7 +3,7 @@ title: "Minimum Assessment Scope"
 description: "Official Consolidated Rules summary for the MAS FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
+> Generated from the official FedRAMP Consolidated Rules `2026.11.02.01`, last updated upstream on 2026-11-02. [Source details](#source)
 
 The Minimum Assessment Scope rules help providers define assessment boundaries narrowly enough to avoid unnecessary review of components that do not affect the offering's security. These rules still ensure the assessment includes the resources and connections needed to understand the offering's confidentiality, integrity, and availability.
 
@@ -63,7 +63,7 @@ Updates:
 
 Providers MUST include metadata (including metadata about federal customer data) in the Minimum Assessment Scope ONLY IF MAS-CSO-IIR (Identify Information Resources) APPLIES.
 
-Terms: `Federal Customer Data`, `Information Resource`, `Initial Incident Report (IIR)`
+Terms: `Federal Customer Data`, `Information Resource`, `Initial Incident Report (IIR)`, `Minimum Assessment Scope`
 
 Affects: Providers
 
@@ -93,7 +93,7 @@ Checklist items:
 
 Mapped Rev5 controls: `ra-3`
 
-Terms: `Cloud Service Offering`, `Federal Customer Data`, `Information Resource`, `Initial Incident Report (IIR)`, `Third-Party Information Resource`
+Terms: `Cloud Service Offering`, `Federal Customer Data`, `Information Resource`, `Initial Incident Report (IIR)`, `Minimum Assessment Scope`, `Third-Party Information Resource`
 
 Affects: Providers
 
@@ -104,6 +104,6 @@ Updates:
 ## Source
 
 - Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
-- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `0e98c7dfc99f`.
+- Consolidated Rules version: `2026.11.02.01` · upstream `last_updated`: `2026-11-02`.
 - Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

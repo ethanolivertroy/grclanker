@@ -3,7 +3,7 @@ title: "FedRAMP Processes"
 description: "Browse official Consolidated Rules process documents such as CDS, IVV, SCG, VDR, and CCM."
 ---
 
-> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
+> Generated from the official FedRAMP Consolidated Rules `2026.11.02.01`, last updated upstream on 2026-11-02. [Source details](#source)
 
 The FedRAMP Consolidated Rules for 2026 define 17 processes. Each line gives a process's short name and its requirement counts for 20x and Rev5.
 
@@ -28,6 +28,6 @@ The FedRAMP Consolidated Rules for 2026 define 17 processes. Each line gives a p
 ## Source
 
 - Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
-- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `0e98c7dfc99f`.
+- Consolidated Rules version: `2026.11.02.01` · upstream `last_updated`: `2026-11-02`.
 - Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

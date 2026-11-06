@@ -3,7 +3,7 @@ title: "Marketplace Listing"
 description: "Official Consolidated Rules summary for the MKT FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
+> Generated from the official FedRAMP Consolidated Rules `2026.11.02.01`, last updated upstream on 2026-11-02. [Source details](#source)
 
 The Marketplace Listing rules define how FedRAMP decides which cloud service offerings, assessors, and advisors may be listed in the FedRAMP Marketplace. These rules help agencies and other customers rely on the Marketplace as a consistent source of eligible services and supporting organizations, while requiring listed organizations to supply accurate, accessible, and machine-readable information.
 
@@ -81,7 +81,7 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 ### `MKT-CSO-PML` MUST: Provider Marketplace Listing Requests
 
-Providers MUST notify FedRAMP using the FedRAMP Marketplace Providing Listing Request Form to request a listing in the FedRAMP Marketplace.
+Providers MUST notify FedRAMP using the FedRAMP Marketplace Provider Listing Request Form to request a listing in the FedRAMP Marketplace.
 
 Notifications:
 - Notify FedRAMP via form: FedRAMP Marketplace Provider Listing Request Form (https://help.fedramp.gov/hc/en-us/requests/new?ticket_form_id=50939227168027)
@@ -90,7 +90,9 @@ Affects: Providers
 
 Note: FedRAMP does not accept applications for a FedRAMP Marketplace Listing via email!
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-31: Corrected the name of the form.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `MKT-FRP-SOF` MUST NOT: Scope of FedRAMP
 
@@ -184,6 +186,6 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 ## Source
 
 - Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
-- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `0e98c7dfc99f`.
+- Consolidated Rules version: `2026.11.02.01` · upstream `last_updated`: `2026-11-02`.
 - Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
