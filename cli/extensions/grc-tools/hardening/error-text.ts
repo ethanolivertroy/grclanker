@@ -25,12 +25,12 @@
  * header keeps its name and gets its own treatment. (2) A configured secret is removed whatever its
  * shape and in its encoded forms.
  *
- * The Flue redaction primitives in `cli/flue/redact.ts` own the credential key heuristic and the
+ * The shared redaction primitives in `cli/core/redact.ts` own the credential key heuristic and the
  * encoded forms of a configured secret. The quoted-value reader follows `credential-scrub.ts` so
  * both scrubbers agree.
  */
 import { Buffer } from "node:buffer";
-import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues } from "../../../flue/redact.js";
+import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues } from "../../../core/redact.js";
 
 /** The marker every scrub in this library writes; the Flue marker is folded into it so one message carries one marker. */
 export const REDACTED = "[REDACTED]";

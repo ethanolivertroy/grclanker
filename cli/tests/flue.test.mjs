@@ -61,7 +61,7 @@ import {
   scrubSensitiveValues,
   scrubbedFormsOf,
   withholdEchoedArguments,
-} from "../dist/flue/redact.js";
+} from "../dist/core/redact.js";
 import { formatFlueHelp, formatFlueRunOutcome, parseFlueRunArgs, runFlueCommand } from "../dist/flue/cli.js";
 import {
   asFlueProvider,

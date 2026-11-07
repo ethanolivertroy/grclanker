@@ -13,7 +13,7 @@ function readJson(path) {
 }
 
 test("every package.json declares Apache-2.0", () => {
-  for (const path of ["package.json", "cli/package.json", "cli/agent-sdk/package.json"]) {
+  for (const path of ["package.json", "cli/package.json", "cli/adapters/cursor-grok/package.json"]) {
     assert.equal(readJson(join(repoRoot, path)).license, "Apache-2.0", path);
   }
 });

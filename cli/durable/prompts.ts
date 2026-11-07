@@ -4,7 +4,7 @@
  * and the assessment state recorded so far in the conversation.
  */
 import { defineExtension, section, type Extension, type ToolRegistration } from "@earendil-works/pi-durable";
-import { readGrclankerSystemPrompt } from "../agent-sdk/lib/instructions.js";
+import { readGrclankerSystemPrompt } from "../core/instructions.js";
 import { Assessment, renderAssessmentSummary } from "./document.js";
 import { createDurableGrcTools } from "./tools.js";
 

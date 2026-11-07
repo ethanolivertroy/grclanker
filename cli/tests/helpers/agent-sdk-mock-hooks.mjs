@@ -1,7 +1,7 @@
 /**
  * Node module customization hooks that replace the `@grok/agent-sdk` entry
  * points with recording stubs, so the Agent SDK entry files under
- * `agent-sdk/bot/` can be loaded without the real framework or any
+ * `adapters/cursor-grok/bot/` can be loaded without the real framework or any
  * network access. Register from a test with:
  *
  *   register("./helpers/agent-sdk-mock-hooks.mjs", import.meta.url);

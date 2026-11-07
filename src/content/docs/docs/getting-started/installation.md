@@ -1,9 +1,11 @@
 ---
 title: Installation
-description: Install the grclanker release bundle, build the current main branch from source, or install only the skills.
+description: Install the Pi terminal release bundle, build grclanker from source, or install only the skills.
 ---
 
-There are two ways to install grclanker:
+This page installs grclanker's Pi terminal application. SDK hosts have their own complete setup guides on [Choose a Deployment](/docs/getting-started/deployment/); they use the shared source package with separate host configuration.
+
+There are two ways to install the terminal application:
 
 - **Release bundle.** The one-line installer fetches the newest GitHub release bundle, currently `v0.1.4`, with all 241 domain tools and its own Node.js runtime.
 - **Source checkout.** Build `main` yourself to run unreleased changes or to work on grclanker.
@@ -126,7 +128,7 @@ npm link
 
 Run `npm link` from the `cli/` directory. `npm --prefix cli link` does not work, because `--prefix` also redirects npm's global link directory into the checkout.
 
-To run only the [Cursor Agent SDK](/docs/getting-started/agent-sdk/) project from this checkout, stop after `npm --prefix cli ci`. Leave `npm --prefix cli run build`, `npm link`, the `grclanker` binary, `grclanker setup`, and Ollama unused. The repository-root site and docs build stay unused too. Node.js 22.19 or newer still applies. A model turn needs a Cursor credential. `validate` and `tool call` do not.
+To run only the [Cursor / Grok Agent SDK](/docs/getting-started/agent-sdk/) from this checkout, stop after `npm --prefix cli ci` and `npm --prefix cli run build`, then follow that guide. Leave `node cli/bin/grclanker.js`, `npm link`, `grclanker setup`, and Ollama unused. The repository-root site and docs build stay unused too. Node.js 22.19 or newer still applies. A model turn needs a Cursor credential. `cursor:validate` and `cursor:call` do not.
 
 If you would rather have the same self-contained layout as the release installer, build a bundle for your platform and install it from the checkout root:
 

@@ -1,6 +1,6 @@
 {
   "tests/abort-signals.test.mjs": 36.9,
-  "tests/agent-sdk.test.mjs": 5.7,
+  "tests/cursor-agent-sdk.test.mjs": 5.7,
   "tests/ansible.test.mjs": 15.6,
   "tests/atomic-output.test.mjs": 0.7,
   "tests/aws.test.mjs": 18.4,

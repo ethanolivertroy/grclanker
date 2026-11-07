@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { REDACTED_VALUE, scrubSensitiveValues } from "../../core/redact.js";
 import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
@@ -495,7 +495,7 @@ export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
  *    Basic credential the client sends, base64 of email/token:api_token) is removed whatever
  *    its shape and in every encoded form (JSON-escaped, URL-encoded, form-encoded,
  *    base64, base64url, re-flowed PEM lines), down to MIN_CONFIGURED_SECRET_LENGTH
- *    (cli/flue/redact.ts owns the forms). redactSecrets applies it at every client
+ *    (cli/core/redact.ts owns the forms). redactSecrets applies it at every client
  *    throw site; the tool boundary and the bundle writer apply it to the whole
  *    payload and every written file.
  *

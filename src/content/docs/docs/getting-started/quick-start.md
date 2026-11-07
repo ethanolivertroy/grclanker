@@ -1,11 +1,11 @@
 ---
 title: Quick Start
-description: The shortest path from install to a useful local grclanker session.
+description: The shortest path from install to a useful grclanker Pi terminal session.
 ---
 
-If you want the fast path, do this in order. For Windows notes, pinned versions, the source install, or skills-only installs, use the [Installation](/docs/getting-started/installation) page.
+This quick start runs the Pi terminal host. For a different agent host, use its complete guide on [Choose a Deployment](/docs/getting-started/deployment/). For Windows notes, pinned versions, the source install, or skills-only installs, use the [Installation](/docs/getting-started/installation) page.
 
-The steps below are the Pi terminal CLI. A source checkout that only runs the [Cursor Agent SDK](/docs/getting-started/agent-sdk/) leaves this page unused: no release installer, no `npm link`, no Ollama, and no `grclanker setup`. That path still installs the `cli/` tree on Node.js 22.19 or newer, and a model turn needs a Cursor credential.
+The steps below are the Pi terminal CLI. A source checkout that only runs the [Cursor / Grok Agent SDK](/docs/getting-started/agent-sdk/) leaves this page unused: no release installer, no `npm link`, no Ollama, and no `grclanker setup`. That path still installs and builds the `cli/` package on Node.js 22.19 or newer, and a model turn needs a Cursor credential.
 
 ## 1. Install
 
@@ -98,4 +98,4 @@ Read specs/aws-sec-inspector.spec.md, inspect the shipped AWS tools, and propose
 
 grclanker ships 35 integrations, and most have a spec under `specs/`. Use a spec to inspect coverage, plan a change, or seed an independent implementation.
 
-The Pi terminal CLI is the default path. A source checkout can also run the same domain tools through the [Cursor Agent SDK](/docs/getting-started/agent-sdk/), [Flue](/docs/getting-started/flue-runtime/), or the experimental [Durable Runtime](/docs/getting-started/durable-runtime/).
+The Pi terminal CLI is the default host. The [deployment chooser](/docs/getting-started/deployment/) also lists the OpenAI Agents SDK, Codex SDK, Cursor / Grok Agent SDK, Flue, and experimental Durable paths, each with its own configuration.

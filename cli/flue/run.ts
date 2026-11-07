@@ -20,7 +20,7 @@ import { sqlite as flueSqlite, start as flueStart, type Flue, type StartOptions 
 import { getGrclankerHome } from "../config/paths.js";
 import { Grclanker, prepareGrclankerAgent } from "./agent.js";
 import { flueConversationStreamPath, readPriorSensitiveValues } from "./history.js";
-import { collectSensitiveValues, redactSensitiveArguments, scrubSensitiveValues, withholdEchoedArguments } from "./redact.js";
+import { collectSensitiveValues, redactSensitiveArguments, scrubSensitiveValues, withholdEchoedArguments } from "../core/redact.js";
 import { collectGrclankerDomainTools } from "./tools.js";
 
 export const FLUE_AGENT_NAME = "grclanker";

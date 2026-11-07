@@ -3,7 +3,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { LiveState } from "@earendil-works/pi-durable";
-import { resolveCliRoot } from "../agent-sdk/lib/paths.js";
+import { resolveCliRoot } from "../core/paths.js";
 import { syncBundledAssets } from "../bootstrap/sync.js";
 import { getGrclankerAgentDir, getGrclankerSettingsPath } from "../config/paths.js";
 import { ConfigFileError } from "../extensions/grc-tools/hardening/config-file.js";
