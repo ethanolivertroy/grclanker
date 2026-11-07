@@ -38,6 +38,7 @@ export const docsSections: Array<{ title: string; items: DocsSectionEntry[] }> =
       { label: 'Codex SDK', slug: 'getting-started/codex-sdk' },
       { label: 'Cursor / Grok Agent SDK', slug: 'getting-started/agent-sdk' },
       { label: 'Claude Agent SDK', slug: 'getting-started/claude-agent-sdk' },
+      { label: 'Claude Code (MCP)', slug: 'getting-started/claude-code' },
       { label: 'Compute Backends', slug: 'getting-started/compute-backends' },
       { label: 'Flue Runtime', slug: 'getting-started/flue-runtime' },
       { label: 'Durable Runtime', slug: 'getting-started/durable-runtime' },

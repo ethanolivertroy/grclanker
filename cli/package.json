@@ -91,6 +91,8 @@
     "claude:install": "npm --prefix adapters/claude-agent-sdk ci",
     "claude:run": "npm --prefix adapters/claude-agent-sdk start --",
     "claude:check": "npm --prefix adapters/claude-agent-sdk run check",
+    "claude-code:install": "npm --prefix adapters/claude-code ci",
+    "claude-code:check": "npm --prefix adapters/claude-code run check",
     "test:unit": "node --test \"tests/*.test.mjs\"",
     "sync:tool-manifest": "node scripts/generate-tool-manifest.mjs",
     "check:tool-manifest": "node scripts/generate-tool-manifest.mjs --check",

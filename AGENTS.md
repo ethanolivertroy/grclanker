@@ -6,7 +6,7 @@
 - `src/`: Next.js marketing site and Fumadocs docs, exported as static files (`src/app`, `src/components`, `src/content/docs/docs`)
 - `cli/`: TypeScript CLI runtime, prompts, extensions, scripts, and tests
 - `cli/core/`: shared GRC tool registration, execution, schemas, workflows, and methodology
-- `cli/adapters/`: explicit OpenAI Agents, Claude Agent SDK, Cursor/Grok, and Codex SDK entrypoints; see `cli/README.md` for the code map
+- `cli/adapters/`: explicit OpenAI Agents, Claude Agent SDK, Claude Code MCP, Cursor/Grok, and Codex SDK entrypoints; see `cli/README.md` for the code map
 - `specs/`: product and tool build specs, usually one `*-spec.md` per integration
 
 Most contributor work lands in `cli/extensions/grc-tools/` for native tools, `cli/tests/` for regression coverage, and `cli/scripts/` for sync or live-smoke helpers.

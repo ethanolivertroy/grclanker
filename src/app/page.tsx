@@ -81,6 +81,12 @@ const deploymentCards = [
     description: 'Run the @grok/agent-sdk project with native GRC tools, workflow skills, and auditor and verifier personas.',
   },
   {
+    label: 'Claude Code',
+    status: 'Source · local MCP server',
+    href: '/docs/getting-started/claude-code/',
+    description: 'Add GRC tools, the grclanker role, and workflow slash commands to Claude Code with your own sign-in.',
+  },
+  {
     label: 'Claude Agent SDK',
     status: 'Source adapter',
     href: '/docs/getting-started/claude-agent-sdk/',

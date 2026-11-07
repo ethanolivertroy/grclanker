@@ -83,6 +83,7 @@ jobs:
             cli/package-lock.json
             cli/adapters/codex/package-lock.json
             cli/adapters/claude-agent-sdk/package-lock.json
+            cli/adapters/claude-code/package-lock.json
 
       - name: Install site dependencies
         run: npm ci
@@ -117,6 +118,14 @@ jobs:
 
       - name: Verify Claude Agent SDK and GRC MCP integration
         working-directory: cli/adapters/claude-agent-sdk
+        run: npm run check
+
+      - name: Install Claude Code MCP server dependencies
+        working-directory: cli/adapters/claude-code
+        run: npm ci
+
+      - name: Verify Claude Code MCP server
+        working-directory: cli/adapters/claude-code
         run: npm run check
 
       - name: Run leak probe
