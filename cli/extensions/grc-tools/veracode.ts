@@ -2058,24 +2058,33 @@ interface ScaWorkspaceSample {
   libraries: Surface<HalListResult>;
 }
 
-function scaUnavailableFinding(decisions: BatchVerdicts,
-  number: number, severity: VeracodeFinding["severity"], workspaces: Surface<HalListResult>, evidenceToCollect: string[]): VeracodeFinding | undefined {
+interface ScaWorkspaceIssue {
+  reason: string;
+  evidenceToCollect: string[];
+  evidence: JsonRecord;
+}
+
+function scaWorkspaceIssue(workspaces: Surface<HalListResult>, evidenceToCollect: string[]): ScaWorkspaceIssue | undefined {
   if (workspaces.status === "error") {
     const reason = isUnavailable(workspaces)
       ? `The SCA Agent API was not available to this credential (${workspaces.statusCode}); agent-based SCA may be unlicensed or the API user lacks a Workspace role, so the control is not applicable through the API.`
       : unreadableReason("SCA workspaces", workspaces);
-    return manualFinding(decisions, number, severity, reason, evidenceToCollect, { status_code: workspaces.statusCode ?? null });
+    return { reason, evidenceToCollect, evidence: { status_code: workspaces.statusCode ?? null } };
   }
   if (workspaces.value.items.length === 0) {
-    return manualFinding(decisions, number, severity, "The SCA Agent API returned zero workspaces, so there is no agent-based SCA inventory to evaluate; the empty inventory is treated as not applicable rather than compliant.", ["Confirm whether agent-based SCA is licensed and in use.", ...evidenceToCollect]);
+    return {
+      reason: "The SCA Agent API returned zero workspaces, so there is no agent-based SCA inventory to evaluate; the empty inventory is treated as not applicable rather than compliant.",
+      evidenceToCollect: ["Confirm whether agent-based SCA is licensed and in use.", ...evidenceToCollect],
+      evidence: {},
+    };
   }
   return undefined;
 }
 
 function evaluateScaCurrency(decisions: BatchVerdicts,
   workspaces: Surface<HalListResult>, samples: ScaWorkspaceSample[], cvssThreshold: number): VeracodeFinding {
-  const blocker = scaUnavailableFinding(decisions, 5, "high", workspaces, ["Export SCA vulnerability issues per workspace with CVSS scores."]);
-  if (blocker) return blocker;
+  const issue = scaWorkspaceIssue(workspaces, ["Export SCA vulnerability issues per workspace with CVSS scores."]);
+  if (issue) return manualFinding(decisions, 5, "high", issue.reason, issue.evidenceToCollect, issue.evidence);
   const list = (workspaces as { value: HalListResult }).value;
   const readable = samples.filter((sample) => sample.vulnerabilities.status === "ok");
   const unreadable = samples.filter((sample) => sample.vulnerabilities.status === "error");
@@ -2132,8 +2141,8 @@ function evaluateScaCurrency(decisions: BatchVerdicts,
 
 function evaluateScaLicenseRisk(decisions: BatchVerdicts,
   workspaces: Surface<HalListResult>, samples: ScaWorkspaceSample[]): VeracodeFinding {
-  const blocker = scaUnavailableFinding(decisions, 6, "medium", workspaces, ["Export SCA license issues per workspace with license risk ratings."]);
-  if (blocker) return blocker;
+  const issue = scaWorkspaceIssue(workspaces, ["Export SCA license issues per workspace with license risk ratings."]);
+  if (issue) return manualFinding(decisions, 6, "medium", issue.reason, issue.evidenceToCollect, issue.evidence);
   const list = (workspaces as { value: HalListResult }).value;
   const readable = samples.filter((sample) => sample.licenses.status === "ok");
   const unreadable = samples.filter((sample) => sample.licenses.status === "error");
@@ -2176,8 +2185,8 @@ async function evaluateScaWorkspaceCoverage(decisions: BatchVerdicts,
   client: ClientLike, snapshot: ApplicationSnapshot, workspaces: Surface<HalListResult>, maxApplications: number): Promise<{ finding: VeracodeFinding; raw: JsonRecord; errors: string[] }> {
   const blocker = applicationInventoryBlocker(decisions, 18, "medium", snapshot, ["Map each application with third-party dependencies to an SCA workspace or upload-and-scan SCA."]);
   if (blocker) return { finding: blocker, raw: { sca_projects_by_application: notAttempted("the application inventory was not readable, so no linked project list was requested.") }, errors: [] };
-  const scaBlocker = scaUnavailableFinding(decisions, 18, "medium", workspaces, ["Map each application to an SCA workspace or confirm upload-and-scan SCA is enabled."]);
-  const scaAgentNote = scaBlocker ? scaAgentUnavailableCause(workspaces) : undefined;
+  const scaIssue = scaWorkspaceIssue(workspaces, ["Map each application to an SCA workspace or confirm upload-and-scan SCA is enabled."]);
+  const scaAgentNote = scaIssue ? scaAgentUnavailableCause(workspaces) : undefined;
   const list = (snapshot.applications as { value: HalListResult }).value;
   const sampled = list.items.slice(0, maxApplications);
   const errors: string[] = [];
@@ -2195,7 +2204,7 @@ async function evaluateScaWorkspaceCoverage(decisions: BatchVerdicts,
       covered.push(applicationName(app));
       continue;
     }
-    if (scaBlocker) {
+    if (scaIssue) {
       // No linked project list is requested while the SCA Agent API is unreadable, so the application is unchecked, never uncovered.
       unchecked.push(applicationName(app));
       continue;
@@ -2235,24 +2244,25 @@ async function evaluateScaWorkspaceCoverage(decisions: BatchVerdicts,
   const evidence = {
     applications_sampled: sampled.length,
     covered_applications: covered.length,
-    uncovered_applications: scaBlocker ? null : uncovered.slice(0, 50),
+    uncovered_applications: scaIssue ? null : uncovered.slice(0, 50),
     unreadable_applications: unreadable.slice(0, 50),
     unreadable_linked_project_lists: unreadableLists.slice(0, 50),
     linked_project_lists_requested: listsRequested,
     unchecked_applications: unchecked.slice(0, 50),
     linked_projects_by_application: linkedProjectListsRead > 0 ? linkedProjectsByApplication : null,
-    sca_agent_api_available: !scaBlocker,
+    sca_agent_api_available: !scaIssue,
     sca_agent_api_status: workspaces.status === "error" ? workspaces.statusCode ?? null : null,
   };
   // The snapshot dataset is a marker, never {}, whenever no list was requested: the SCA Agent API was unreadable, or no sampled application needed one.
   const raw = {
-    sca_projects_by_application: scaBlocker
+    sca_projects_by_application: scaIssue
       ? notAttempted("the SCA Agent API was not readable, so no linked project list was requested.")
       : listsRequested === 0
         ? notAttempted("every sampled application has upload_and_scan_sca_enabled, so no linked project list was requested.")
         : rawProjects,
   };
-  if (scaBlocker && covered.length === 0) {
+  if (scaIssue && covered.length === 0) {
+    const scaBlocker = manualFinding(decisions, 18, "medium", scaIssue.reason, scaIssue.evidenceToCollect, scaIssue.evidence);
     return { finding: { ...scaBlocker, evidence: { ...scaBlocker.evidence, ...evidence } }, raw, errors };
   }
   if (unchecked.length > 0) {
