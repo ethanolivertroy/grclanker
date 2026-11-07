@@ -66,20 +66,27 @@ async function main() {
   const toolNames = args.toolNames
     ?? (process.env.GRCLANKER_TOOLS === undefined ? undefined : parseToolList(process.env.GRCLANKER_TOOLS));
   const terminal = stdin.isTTY && stderr.isTTY ? createInterface({ input: stdin, output: stderr }) : undefined;
+  // Concurrent write calls can ask at once, and readline does not queue
+  // questions; ask one at a time so each answer binds to the call shown.
+  let queue = Promise.resolve();
+  const approveWrite = ({ toolName, input }) => {
+    const answer = queue.then(async () => {
+      stderr.write(`Approval required: ${toolName} ${describeArguments(toolName, input)}\n`);
+      if (!terminal) {
+        stderr.write("No interactive terminal; write denied.\n");
+        return false;
+      }
+      return (await terminal.question("Approve this call? [y/N] ")).trim().toLowerCase() === "y";
+    });
+    queue = answer.catch(() => undefined);
+    return answer;
+  };
   try {
     const { options, model, readTools, approvalTools } = createGrclankerClaudeOptions({
       toolNames,
       model: args.model,
       persistSession: args.persistSession,
-      async approveWrite({ toolName, input }) {
-        stderr.write(`Approval required: ${toolName} ${describeArguments(toolName, input)}\n`);
-        if (!terminal) {
-          stderr.write("No interactive terminal; write denied.\n");
-          return false;
-        }
-        const answer = await terminal.question("Approve this call? [y/N] ");
-        return answer.trim().toLowerCase() === "y";
-      },
+      approveWrite,
     });
     if (args.check) {
       stdout.write(`${JSON.stringify({
