@@ -1,9 +1,13 @@
 ---
 title: Configuration
-description: Understand the grclanker runtime state, settings, and local model configuration files.
+description: Pi terminal CLI settings, and the variables the Cursor Agent SDK project reads.
 ---
 
-grclanker keeps its runtime state under:
+This page is the Pi terminal CLI: `grclanker`, `~/.grclanker/agent/settings.json`, and `grclanker setup`.
+
+The [Cursor Agent SDK](/docs/getting-started/agent-sdk/) project does not read `settings.json`, `models.json`, or the model `grclanker setup` saves. A fork that only runs that project skips `grclanker setup` and Ollama. Its model is `GRCLANKER_AGENT_SDK_MODEL`, or the Agent SDK default when that variable is unset, and a model turn needs a Cursor credential on the `agent-sdk` process. Of the variables below, that project reads `GRCLANKER_AGENT_SDK_MODEL`, `GRCLANKER_HOME`, `GRCLANKER_TRESTLE_BIN`, and `GRCLANKER_GWS_BIN`. The Flue, durable, and compute-backend rows belong to those other runtimes.
+
+The Pi terminal CLI keeps its runtime state under:
 
 ```text
 ~/.grclanker/agent
@@ -112,13 +116,13 @@ That sync is how the runtime keeps its branded deck, workflow rails, and bundled
 
 ## Changing modes
 
-Use the setup command instead of editing everything manually:
+`grclanker setup` moves the Pi terminal CLI between local-first and hosted mode. It does not configure the Cursor Agent SDK project. When you are running `grclanker`, use the setup command instead of editing `settings.json` by hand:
 
 ```bash
 grclanker setup
 ```
 
-That is the supported way to move between local-first and hosted mode in the current experimental release.
+That is the supported way to move the Pi terminal CLI between local-first and hosted mode in the current experimental release.
 
 If you need details on backend-specific fields or validation, use [Compute Backends](/docs/getting-started/compute-backends/).
 
@@ -132,13 +136,13 @@ These are the `GRCLANKER_*` variables grclanker reads:
 | `GRCLANKER_FLUE_MODEL` | `provider/model` for `grclanker flue run`. See [Flue Runtime](/docs/getting-started/flue-runtime/#configuration). |
 | `GRCLANKER_FLUE_SANDBOX` | `local` (default) or `none` for `grclanker flue run`. |
 | `GRCLANKER_DURABLE_MODEL` | `provider/model` for the experimental `grclanker durable` commands. See [Durable Runtime](/docs/getting-started/durable-runtime/#configuration). |
-| `GRCLANKER_AGENT_SDK_MODEL` | Cursor model id for the [Cursor Agent SDK](/docs/getting-started/agent-sdk/) project. Unset, turns use `grok-4.7` with `reasoning_effort=high` and `fast=true`. |
+| `GRCLANKER_AGENT_SDK_MODEL` | Cursor model id for the [Cursor Agent SDK](/docs/getting-started/agent-sdk/) project. That project does not read `settings.json`. Unset, turns use `grok-4.7` with `reasoning_effort=high` and `fast=true`. A model turn also needs a Cursor credential on the `agent-sdk` process. |
 | `GRCLANKER_TRESTLE_BIN` | Path to the `trestle` executable for the `oscal_*` tools (`TRESTLE_BIN` also works). |
 | `GRCLANKER_GWS_BIN` | Path to the `gws` executable for the `gws_ops_*` tools. |
 | `GRCLANKER_LIVE_BACKENDS` | Comma-separated backend kinds that `npm --prefix cli run test:compute-backends:live` should exercise. |
 | `GRCLANKER_VERSION` | Build-only. Version stamped on release bundles built with `npm --prefix cli run build:bundle` (default: the `cli/package.json` version). |
 | `GRCLANKER_NODE_VERSION` | Build-only. Node.js version that `npm --prefix cli run build:bundle` packages (default `24.22.0`). |
 
-grclanker sets `GRCLANKER_CODING_AGENT_DIR` and `GRCLANKER_COMPUTE_BACKEND` itself when it launches the embedded Pi runtime. It sets `GRCLANKER_COMPUTE_BACKEND_OVERRIDE` when you pass `--compute <kind>`. Leave them unset, and use `grclanker setup` or a per-run `--compute <kind>` instead.
+`GRCLANKER_CODING_AGENT_DIR`, `GRCLANKER_COMPUTE_BACKEND`, and `GRCLANKER_COMPUTE_BACKEND_OVERRIDE` belong to the Pi terminal CLI. grclanker sets the first two when it launches the embedded Pi runtime, and it sets the override when you pass `--compute <kind>`. Leave them unset. For that runtime, use `grclanker setup` or a per-run `--compute <kind>`.
 
 Provider and integration credentials use each vendor's own variable names (for example `ANTHROPIC_API_KEY`, `RUNPOD_API_KEY`, `MODAL_TOKEN_ID`). The integration and compute backend guides list them.

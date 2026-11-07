@@ -128,6 +128,8 @@ npm link
 
 Run `npm link` from the `cli/` directory. `npm --prefix cli link` does not work, because `--prefix` also redirects npm's global link directory into the checkout.
 
+To run only the [Cursor / Grok Agent SDK](/docs/getting-started/agent-sdk/) from this checkout, stop after `npm --prefix cli ci` and `npm --prefix cli run build`, then follow that guide. Leave `node cli/bin/grclanker.js`, `npm link`, `grclanker setup`, and Ollama unused. The repository-root site and docs build stay unused too. Node.js 22.19 or newer still applies. A model turn needs a Cursor credential. `cursor:validate` and `cursor:call` do not.
+
 If you would rather have the same self-contained layout as the release installer, build a bundle for your platform and install it from the checkout root:
 
 ```bash

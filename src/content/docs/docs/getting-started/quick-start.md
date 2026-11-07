@@ -5,6 +5,8 @@ description: The shortest path from install to a useful grclanker Pi terminal se
 
 This quick start runs the Pi terminal host. For a different agent host, use its complete guide on [Choose a Deployment](/docs/getting-started/deployment/). For Windows notes, pinned versions, the source install, or skills-only installs, use the [Installation](/docs/getting-started/installation) page.
 
+The steps below are the Pi terminal CLI. A source checkout that only runs the [Cursor / Grok Agent SDK](/docs/getting-started/agent-sdk/) leaves this page unused: no release installer, no `npm link`, no Ollama, and no `grclanker setup`. That path still installs and builds the `cli/` package on Node.js 22.19 or newer, and a model turn needs a Cursor credential.
+
 ## 1. Install
 
 ```bash

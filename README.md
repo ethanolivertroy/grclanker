@@ -57,6 +57,8 @@ grclanker tools
 
 `grclanker tools` should report `241 domain tools + 7 compute backend tools`. `npm link` has to run from inside `cli/`, where it puts the `cli/bin/grclanker.js` launcher on your `PATH`. `npm --prefix cli link` does not, because `--prefix` also redirects npm's global link directory into the checkout.
 
+That sequence builds and links the Pi terminal CLI. A fork that only runs the Cursor / Grok Agent SDK stops after `npm --prefix cli ci` and `npm --prefix cli run build`, then continues at [SDK adapters from source](#sdk-adapters-from-source). Leave `npm link`, the `grclanker` binary, `grclanker setup`, and Ollama unused. The marketing site and the docs build at the repository root (`npm install`, `npm run dev`, `npm run build`) stay unused too. Node.js 22.19 or newer still applies. A model turn needs a Cursor credential. `cursor:validate` and `cursor:call` do not.
+
 ## Pi terminal quick start
 
 The release installer links `grclanker` into `~/.local/bin`. A source checkout does the same with the `npm link` step above. The commands below use that name.
@@ -207,6 +209,8 @@ npm --prefix cli run codex:check
 ```
 
 These checks need no model credential. Codex requires Node.js 22.22 or newer and installs its additional SDK/MCP dependencies in its adapter directory. OpenAI and Cursor dependencies resolve from `cli/package.json`. The source package currently installs and builds these hosts together; separate configuration and run paths do not imply isolated dependency packages.
+
+A fork that only runs the Cursor / Grok adapter uses that shared install and the [Cursor / Grok guide](https://grclanker.com/docs/getting-started/agent-sdk/). It leaves the marketing site, the docs build, `npm link`, the `grclanker` binary, `grclanker setup`, and Ollama unused. Node.js 22.19 or newer still applies. A model turn needs a Cursor credential before it starts. `cursor:validate` and `cursor:call` do not. On that path the harness `shell` is unsandboxed, and the `auditor` and `verifier` `Allowed:` lines are prompt text. The guide states both.
 
 Use `openai-agents:run`, `codex:run`, or `cursor:run` with the credentials and tool selection documented in that host's guide. Cursor's `cursor:dev` starts its playground. The older `agent-sdk:*` scripts remain compatibility aliases for the Cursor adapter; new instructions use `cursor:*`.
 

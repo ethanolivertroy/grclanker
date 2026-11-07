@@ -13,7 +13,7 @@ Host-specific SDK code and generated definitions live in this adapter. Shared to
 
 ## Prerequisites
 
-- Node.js **22.19 or newer**, npm, and Git. Use Node, not Bun.
+- Node.js **22.19 or newer**, npm, and Git. Use Node, not Bun. `@grok/agent-sdk` itself accepts 22.13. The grclanker tools it loads use the CLI package's 22.19 floor. The site package at the repository root asks for 22.22, and that floor applies when you build the site.
 - A source checkout of grclanker. Release binaries do not include this project, and `@grclanker/cli` is not published to npm.
 - A Cursor credential for model turns. The installation and local tool check below need no model credential.
 - Network access to Cursor for model turns and to each data source you use. Cloud and SaaS assessments also need that source's credentials.
@@ -34,6 +34,18 @@ npm --prefix cli run cursor:info
 ```
 
 Keep development dependencies installed: they contain the pinned SDK and its `zod` peer dependency. A successful validation prints `has no diagnostics`. Discovery lists the agent's tools, five skills, and two subagents.
+
+`npm --prefix cli ci` installs the shared `cli/` package the adapter loads, including `@grok/agent-sdk` and the native tools. `cli/adapters/cursor-grok/package.json` has no dependencies, so install from `cli/`. The install runs `cli/scripts/patch-embedded-pi.mjs`, which rebrands the embedded Pi package, and the install fails if that step fails. The `cursor:*` scripts do not launch `grclanker`.
+
+### What this path leaves unused
+
+- The repository-root site and its docs build (`npm install` and `npm run build` at the repo root)
+- `npm link` and the `grclanker` binary
+- `grclanker setup`, Ollama, and `~/.grclanker/agent/settings.json`
+
+[Configuration](/docs/getting-started/configuration/) describes that settings file for the Pi terminal CLI. This adapter does not read it, and `grclanker setup` does not select this agent's model. Set `GRCLANKER_AGENT_SDK_MODEL` to a Cursor model id when you want one other than the default below.
+
+A model turn needs a Cursor credential before it starts. The checks on this page do not. The authentication steps below sign in. The SDK also accepts `CURSOR_API_KEY_FILE` and `CURSOR_SERVICE_ACCOUNT_KEY`. `npx --no-install agent-sdk whoami`, run from `cli/`, reports whether a credential is present.
 
 Check one real tool without a model, credentials, or an external API:
 
@@ -162,7 +174,13 @@ These are the actual source files, not files you need to create after installing
 
 Ask for the relevant workflow in ordinary language, such as “use the audit skill to map this evidence to SOC 2.” The auditor maps gathered evidence to controls; the verifier checks claims against sources. Terminal slash commands are not registered in this harness.
 
-The Cursor harness supplies `shell`, `Read`, `Write`, `StrReplace`, `Grep`, `Glob`, `LS`, and `Delete`. The domain adapter's approval gates apply to its domain tools; configure and isolate the harness separately for its built-in shell and file access. The CLI's `docker`, `sandbox-runtime`, and `parallels-vm` compute-backend settings do not configure this harness.
+The Cursor harness supplies `shell`, `Read`, `Write`, `StrReplace`, `Grep`, `Glob`, `LS`, and `Delete`. The domain adapter's approval gates apply to its domain tools. The CLI's `docker`, `sandbox-runtime`, and `parallels-vm` compute-backend settings do not configure this harness.
+
+`bot/agent.ts` leaves the harness sandbox off and does not set a built-in tool allowlist. `shell` runs with the `agent-sdk` process environment, including any tenant credentials that process holds, and shell commands auto-approve. The approval gate on the 42 domain writers does not cover `shell`, `Write`, `StrReplace`, or `Delete`.
+
+`auditor` and `verifier` inherit that same surface. The `Allowed:` lines in their persona files are instructions for the model. This runtime does not filter their tools. The Flue runtime mounts only the tools those lines name.
+
+The workflow skills are the shared prompt files with an empty subject, so the conversation supplies the subject.
 
 ## Files, state, and self-hosting
 
