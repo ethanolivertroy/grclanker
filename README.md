@@ -4,6 +4,18 @@ grclanker is an experimental open source AI GRC CLI built on [Pi](https://github
 
 macOS and Linux are the platforms with release bundles. Windows support is best effort. Linux musl hosts, including Alpine, have no bundle. Use a source checkout there.
 
+grclanker's goal is a GRC engineering assistant: scope assessments, gather evidence, map controls, prioritize organizational risks, and recommend remediation. Vendor integrations provide the evidence for that work. Choose your host below; each guide stands on its own with installation, authentication, code, and a first run.
+
+| Deployment | Availability | Self-contained guide |
+| --- | --- | --- |
+| Pi terminal CLI | Release bundle or source; local or hosted models | [Pi](https://grclanker.com/docs/getting-started/pi-runtime/) |
+| OpenAI Agents SDK | TypeScript adapter and runner from source | [OpenAI Agents SDK](https://grclanker.com/docs/getting-started/openai-agents-sdk/) |
+| Codex SDK | Source example with selected GRC tools over local MCP | [Codex SDK](https://grclanker.com/docs/getting-started/codex-sdk/) |
+| Cursor / Grok Agent SDK | Source project using `@grok/agent-sdk`; local harness | [Cursor / Grok](https://grclanker.com/docs/getting-started/agent-sdk/) |
+| Claude Agent SDK | Planned; no adapter yet | [Claude plan](https://grclanker.com/docs/getting-started/claude-agent-sdk/) |
+
+OpenAI Agents SDK and Codex SDK are different hosts. Cursor currently distributes its Agent SDK as `@grok/agent-sdk`, so Cursor and Grok share one SDK guide. All SDK paths use native GRC implementations through provider-neutral code; they do not require the Pi terminal setup or another SDK's guide. See [Choose a Deployment](https://grclanker.com/docs/getting-started/deployment/) for the runtime boundaries and current product scope.
+
 ## Install
 
 On macOS or Linux:

@@ -1,15 +1,9 @@
-import { readCliAsset } from "./paths.js";
+import { readCliAsset } from "../../runtime/paths.js";
+import { buildGrclankerInstructions as buildRuntimeInstructions } from "../../runtime/instructions.js";
 
-/** The bundled Pi `SYSTEM.md`, shared by every runtime that hosts the grclanker agent. */
-export function readGrclankerSystemPrompt(): string {
-  return readCliAsset(".grclanker", "SYSTEM.md").trimEnd();
-}
+export { readGrclankerSystemPrompt } from "../../runtime/instructions.js";
 
-/**
- * The always-on system prompt: the bundled Pi `SYSTEM.md` followed by a short
- * note describing how the tool surface differs under the Cursor Agent SDK.
- */
+/** Add the Cursor/Grok-specific runtime note to the shared GRC methodology. */
 export function buildGrclankerInstructions(): string {
-  const runtimeNote = readCliAsset("agent-sdk", "prompts", "runtime.md").trim();
-  return `${readGrclankerSystemPrompt()}\n\n${runtimeNote}\n`;
+  return buildRuntimeInstructions(readCliAsset("agent-sdk", "prompts", "runtime.md"));
 }

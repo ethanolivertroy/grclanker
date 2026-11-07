@@ -7,7 +7,7 @@ import { githubUrl } from '../../lib/site';
 export const metadata = pageMetadata({
   title: 'About: grclanker',
   description:
-    'What grclanker ships today: an open source compliance agent with 241 domain tools, 35 vendor integrations, and Pi, Cursor Agent SDK, Flue, and experimental durable runtime paths.',
+    'An open source GRC engineering assistant with 241 domain tools, 35 vendor integrations, and independent Pi, OpenAI Agents SDK, Codex SDK, and Cursor / Grok deployment paths.',
   path: '/about/',
 });
 
@@ -69,16 +69,22 @@ export default function AboutPage() {
                 </p>
 
                 <p>
-                  The same prompts, personas, and domain tools run in the Pi terminal CLI, the Cursor Agent SDK project, and
-                  the Flue Framework adapter. The Pi path supports local-first models or an explicitly configured hosted
-                  provider. The experimental, opt-in durable runtime runs the agent with only the domain tools, and it can
-                  resume a run that crashed or was stopped.
+                  Choose the Pi terminal CLI, OpenAI Agents SDK, Codex SDK, or Cursor / Grok Agent SDK. Each has a{' '}
+                  <Link href="/docs/getting-started/deployment/" className="text-blue underline underline-offset-2">self-contained deployment guide</Link>.
+                  {' '}The GRC tools and instructions share provider-neutral code. Each host supplies its own agent loop
+                  and authentication. Claude Agent SDK is planned; Flue and the experimental durable runtime remain available.
                 </p>
 
                 <p>
                   The project exists because compliance evidence is scattered across vendor dashboards, government feeds,
                   and spreadsheets. grclanker gathers that evidence, maps it to controls, and packages the result for
                   review.
+                </p>
+
+                <p>
+                  The goal is a full GRC engineer assistant for governance, organizational risk, and compliance. Today
+                  it helps scope assessments, map evidence to controls, prioritize findings, and recommend remediation.
+                  Persistent risk registers, policy lifecycle management, and continuous monitoring remain future work.
                 </p>
 
                 <p>

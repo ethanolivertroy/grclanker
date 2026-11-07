@@ -32,8 +32,13 @@ export const docsSections: Array<{ title: string; items: DocsSectionEntry[] }> =
   {
     title: 'Runtimes',
     items: [
+      { label: 'Choose a Deployment', slug: 'getting-started/deployment' },
+      { label: 'Pi Terminal CLI', slug: 'getting-started/pi-runtime' },
+      { label: 'OpenAI Agents SDK', slug: 'getting-started/openai-agents-sdk' },
+      { label: 'Codex SDK', slug: 'getting-started/codex-sdk' },
+      { label: 'Cursor / Grok Agent SDK', slug: 'getting-started/agent-sdk' },
+      { label: 'Claude Agent SDK (Planned)', slug: 'getting-started/claude-agent-sdk' },
       { label: 'Compute Backends', slug: 'getting-started/compute-backends' },
-      { label: 'Cursor Agent SDK', slug: 'getting-started/agent-sdk' },
       { label: 'Flue Runtime', slug: 'getting-started/flue-runtime' },
       { label: 'Durable Runtime', slug: 'getting-started/durable-runtime' },
     ],
