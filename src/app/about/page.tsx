@@ -7,7 +7,7 @@ import { githubUrl } from '../../lib/site';
 export const metadata = pageMetadata({
   title: 'About: grclanker',
   description:
-    'An open source GRC engineering assistant with 241 domain tools, 35 vendor integrations, and independent Pi, OpenAI Agents SDK, Codex SDK, and Cursor / Grok deployment paths.',
+    'An open source GRC engineering assistant with 241 domain tools, 35 vendor integrations, and independent Pi, Claude Code, OpenAI Agents SDK, Claude API, Claude Agent SDK, Codex SDK, and Cursor / Grok deployment paths.',
   path: '/about/',
 });
 
@@ -69,10 +69,10 @@ export default function AboutPage() {
                 </p>
 
                 <p>
-                  Choose the Pi terminal CLI, OpenAI Agents SDK, Codex SDK, or Cursor / Grok Agent SDK. Each has a{' '}
+                  Choose the Pi terminal CLI, Claude Code, OpenAI Agents SDK, the Claude API tool runner, Claude Agent SDK, Codex SDK, or Cursor / Grok Agent SDK. Each has a{' '}
                   <Link href="/docs/getting-started/deployment/" className="text-blue underline underline-offset-2">self-contained deployment guide</Link>.
                   {' '}The GRC tools and instructions share provider-neutral code. Each host supplies its own agent loop
-                  and authentication. Claude Agent SDK is planned; Flue and the experimental durable runtime remain available.
+                  and authentication. Flue and the experimental durable runtime remain available.
                 </p>
 
                 <p>

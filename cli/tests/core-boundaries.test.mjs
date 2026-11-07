@@ -22,7 +22,7 @@ test("shared core discovers and executes GRC tools with all agent hosts blocked"
       registerHooks({
         resolve(specifier, context, nextResolve) {
           if (/^@earendil-works\\/(?:pi-coding-agent|pi-tui|pi-durable|pi-ai)(?:$|\\/)/.test(specifier)
-            || /^@(?:grok\\/agent-sdk|cursor\\/(?:bdk|sdk)|openai\\/(?:agents|codex-sdk)|anthropic-ai\\/claude-agent-sdk|flue\\/runtime)(?:$|\\/)/.test(specifier)) {
+            || /^@(?:grok\\/agent-sdk|cursor\\/(?:bdk|sdk)|openai\\/(?:agents|codex-sdk)|anthropic-ai\\/(?:claude-agent-sdk|sdk)|flue\\/runtime)(?:$|\\/)/.test(specifier)) {
             throw new Error("Agent host must not load: " + specifier);
           }
           const resolved = nextResolve(specifier, context);

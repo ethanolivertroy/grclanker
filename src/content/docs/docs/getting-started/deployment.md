@@ -1,6 +1,6 @@
 ---
 title: Choose a Deployment
-description: Choose a Pi, OpenAI Agents SDK, Codex SDK, or Cursor / Grok Agent SDK host with its own setup for your GRC engineering assistant.
+description: Choose a Pi, Claude Code, OpenAI Agents SDK, Claude API, Claude Agent SDK, Codex SDK, or Cursor / Grok Agent SDK host with its own setup for your GRC engineering assistant.
 ---
 
 grclanker combines a GRC engineering role, evidence-driven workflows, and 241 domain tools across 35 vendor integrations. Choose the runtime that fits where you want your agent to work. Each guide includes its own prerequisites, installation, authentication, code, first run, and operating limits; no SDK guide requires another SDK guide.
@@ -13,11 +13,25 @@ grclanker combines a GRC engineering role, evidence-driven workflows, and 241 do
 | OpenAI Agents SDK | Available from source | You want to embed GRC tools in your own TypeScript agent using OpenAI's agent loop. | [OpenAI Agents SDK](/docs/getting-started/openai-agents-sdk/) |
 | Codex SDK | Available from source; selected read tools | You want Codex to act as a GRC engineer with an explicit set of GRC tools through a local MCP server. | [Codex SDK](/docs/getting-started/codex-sdk/) |
 | Cursor / Grok Agent SDK | Available from source, local harness | You want an agent project with native SDK tools, skills, and personas in the Cursor/Grok harness. | [Cursor / Grok Agent SDK](/docs/getting-started/agent-sdk/) |
-| Claude Agent SDK | Planned; no grclanker adapter yet | You want to track the future Claude deployment path. | [Claude Agent SDK plan](/docs/getting-started/claude-agent-sdk/) |
+| Claude Code (MCP) | Available from source; local MCP server | You already use Claude Code, including with a Claude subscription, and want GRC tools, role, and workflows in it. | [Claude Code (MCP)](/docs/getting-started/claude-code/) |
+| Claude API tool runner | Available from source | You want a lightweight TypeScript agent on Anthropic's API SDK tool runner, with selected GRC tools and no Claude Code executable. | [Claude API Tool Runner](/docs/getting-started/claude-api/) |
+| Claude Agent SDK | Available from source | You want Claude's agent loop with selected GRC tools over in-process MCP, reviewer subagents, and per-call approval for writes. | [Claude Agent SDK](/docs/getting-started/claude-agent-sdk/) |
 
-OpenAI Agents SDK and Codex SDK are separate integrations with separate agent loops. Cursor's current Agent SDK is distributed as `@grok/agent-sdk`, formerly `@cursor/bdk`: Cursor and Grok refer to the same SDK path here. This does not establish compatibility with the separate xAI API SDK. See the [OpenAI Agents SDK overview](https://developers.openai.com/api/docs/guides/agents/sdk), [Codex SDK documentation](https://developers.openai.com/codex/sdk), and [Cursor Agent SDK documentation](https://cursor.com/docs/agent-sdk).
+### Which Claude path?
 
-The release installer runs Pi. The OpenAI, Codex, and Cursor/Grok guides use a source checkout; installing the release does not install those SDK projects. SDK credentials authenticate the model or harness. Vendor credentials separately authorize the GRC tools to inspect your organization.
+| Path | Claude authentication | Agent loop | Choose it when |
+| --- | --- | --- | --- |
+| [Claude Code (MCP)](/docs/getting-started/claude-code/) | Your Claude Code sign-in, including a Claude subscription | Claude Code itself; grclanker adds a local MCP server | You work in Claude Code and want GRC tools, the role, and workflow slash commands there |
+| [Claude API tool runner](/docs/getting-started/claude-api/) | Anthropic API key | `@anthropic-ai/sdk` tool runner in your Node process | You are embedding a GRC agent in your own application and want the lightest dependency |
+| [Claude Agent SDK](/docs/getting-started/claude-agent-sdk/) | Anthropic API key, or Bedrock, Vertex AI, or Foundry settings | Bundled Claude Code executable, with its built-in tools removed | You want the Claude Code agent loop, subagents, and session resume inside your application |
+
+Anthropic does not allow third-party products such as grclanker to offer claude.ai login or subscription limits through the Agent SDK, so both SDK paths use API authentication. The Claude Code path runs inside your own Claude Code session.
+
+### Other SDKs
+
+OpenAI Agents SDK and Codex SDK are separate integrations with separate agent loops. Cursor's current Agent SDK is distributed as `@grok/agent-sdk`, formerly `@cursor/bdk`: Cursor and Grok refer to the same SDK path here. This does not establish compatibility with the separate xAI API SDK. See the [OpenAI Agents SDK overview](https://developers.openai.com/api/docs/guides/agents/sdk), [Codex SDK documentation](https://developers.openai.com/codex/sdk), [Claude Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview), and [Cursor Agent SDK documentation](https://cursor.com/docs/agent-sdk).
+
+The release installer runs Pi. The OpenAI, Codex, Claude API, Claude Agent SDK, Claude Code, and Cursor/Grok guides use a source checkout; installing the release does not install those SDK projects. SDK credentials authenticate the model or harness. Vendor credentials separately authorize the GRC tools to inspect your organization.
 
 Existing [Flue](/docs/getting-started/flue-runtime/) and experimental [durable](/docs/getting-started/durable-runtime/) runners remain additional deployment options.
 
@@ -46,12 +60,15 @@ The code separates shared GRC behavior from each agent host:
 | `cli/pi/` | Pi terminal, setup wizard, sessions, and compute backends |
 | `cli/adapters/openai-agents/` | OpenAI Agents SDK tools, agents, approvals, and runner |
 | `cli/adapters/codex/` | Codex SDK worker and local GRC MCP server |
+| `cli/adapters/claude-api/` | Claude API tool runner tools, reviewers, approvals, and runner |
+| `cli/adapters/claude-code/` | Local MCP server adding GRC tools, role, and workflow prompts to Claude Code |
+| `cli/adapters/claude-agent-sdk/` | Claude Agent SDK options, in-process GRC MCP server, approvals, and runner |
 | `cli/adapters/cursor-grok/` | Cursor/Grok project, SDK tool definitions, skills, and subagents |
 
 Shared instructions and assets live in `cli/.grclanker/`, `cli/prompts/`, and `cli/skills/`. The SDK adapters consume the core and native tools; they do not import one another.
 
 Each host supplies its own model loop, authentication, sessions, file and shell access, and approval controls. Pi compute backend settings do not configure the other hosts. The individual guides explain tool selection, write permissions, output locations, and deployment for their own host.
 
-Source dependency installation and the TypeScript build are currently shared in `cli/package.json`. Choosing an SDK gives you separate setup and configuration, not an independently packaged installation. Codex also installs dependencies from its own adapter manifest and still needs the common build. Keep the source layout and required assets together when deploying; copying an adapter directory alone is insufficient. The repository's [`cli/README.md`](https://github.com/ethanolivertroy/grclanker/blob/main/cli/README.md) maps the code and canonical commands for contributors.
+Source dependency installation and the TypeScript build are currently shared in `cli/package.json`. Choosing an SDK gives you separate setup and configuration, not an independently packaged installation. Codex, Claude Agent SDK, and Claude Code also install dependencies from their own adapter manifests and still need the common build. Keep the source layout and required assets together when deploying; copying an adapter directory alone is insufficient. The repository's [`cli/README.md`](https://github.com/ethanolivertroy/grclanker/blob/main/cli/README.md) maps the code and canonical commands for contributors.
 
 The [tool catalog](/docs/tools/catalog/) and vendor integration references are optional extensions once your selected path is running. They are not prerequisites from a different SDK path.
