@@ -15,8 +15,8 @@ The runtime lives in `cli/durable/` and is additive. The interactive CLI, the Cu
 
 | grclanker asset | Pi Durable surface |
 | --- | --- |
-| 241 native domain tools, from the registry in `cli/agent-sdk/lib/registry.ts` | Durable tools with the same names, descriptions, parameter schemas, and argument repair |
-| Each tool's effect class in `cli/agent-sdk/lib/effects.ts` | Its replay policy: the 199 read-only tools are replay-safe, and the 42 tools that can write are not. A tool the classifier cannot place counts as a writer |
+| 241 native domain tools, from the registry in `cli/core/registry.ts` | Durable tools with the same names, descriptions, parameter schemas, and argument repair |
+| Each tool's effect class in `cli/core/effects.ts` | Its replay policy: the 199 read-only tools are replay-safe, and the 42 tools that can write are not. A tool the classifier cannot place counts as a writer |
 | `cli/.grclanker/SYSTEM.md` | A system prompt section, followed by a short note on this runtime |
 | Tool details | Strict JSON: `NaN` and infinities become `null`, bigints become strings, cycles become `"[Circular]"`, and `undefined` values are dropped |
 | Findings, call outcomes, and exports in tool details | An assessment document stored with the conversation and summarized into the system prompt |

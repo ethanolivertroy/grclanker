@@ -19,7 +19,7 @@ import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { Type } from "typebox";
-import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { REDACTED_VALUE, scrubSensitiveValues } from "../../core/redact.js";
 import { abortableFetch, abortableSleep, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import {
@@ -489,7 +489,7 @@ export const REDACTION_MARKER = "[REDACTED]";
  *    API key, the keygen password, and the key keygen returns) is removed whatever
  *    its shape and in every encoded form (JSON-escaped, URL-encoded, form-encoded,
  *    base64, base64url, re-flowed PEM lines), down to MIN_CONFIGURED_SECRET_LENGTH
- *    (cli/flue/redact.ts owns the forms). redactSecrets applies it at every client
+ *    (cli/core/redact.ts owns the forms). redactSecrets applies it at every client
  *    throw site; the tool boundary and the bundle writer apply it to the whole
  *    payload and every written file.
  *

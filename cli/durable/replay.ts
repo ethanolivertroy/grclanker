@@ -6,7 +6,7 @@
  * tools a dry run may execute for real are exactly the ones that may replay,
  * and anything with a write verb in its name never does.
  */
-import { classifyGrcToolEffect } from "../runtime/effects.js";
+import { classifyGrcToolEffect } from "../core/effects.js";
 
 export type DurableReplayPolicy = "safe" | "unsafe";
 

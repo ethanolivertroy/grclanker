@@ -15,7 +15,7 @@ import {
   materializeInitialPrompt,
   serializeInitialPrompt,
 } from "../dist/pi/prompt-envelope.js";
-import { renderWorkflowPrompt } from "../dist/pi/workflow-prompt.js";
+import { renderWorkflowPrompt } from "../dist/core/workflow-prompt.js";
 
 const cliRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workflows = ["assess", "audit", "investigate", "validate"];

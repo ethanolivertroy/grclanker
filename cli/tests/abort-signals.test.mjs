@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { collectRegisteredGrcTools, getRegisteredGrcTool } from "../dist/agent-sdk/lib/registry.js";
+import { collectRegisteredGrcTools, getRegisteredGrcTool } from "../dist/core/registry.js";
 import { abortableFetch, abortableSleep, ToolCallAbortedError, unlessAborted } from "../dist/extensions/grc-tools/abort.js";
 import { createTlsOptOutFetch } from "../dist/extensions/grc-tools/ansible.js";
 import { collectGwsOperatorEvidenceBundle } from "../dist/extensions/grc-tools/gws-ops.js";

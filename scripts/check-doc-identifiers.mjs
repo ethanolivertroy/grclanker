@@ -3,7 +3,7 @@
 // variables that the code defines.
 //
 // A tool name is a word that joins a DOMAIN_GROUPS prefix from
-// cli/pi/tool-catalog.ts to a verb that a registered tool name uses, such as
+// cli/core/tool-catalog.ts to a verb that a registered tool name uses, such as
 // `aws_check_access` or `kevs_recent`. It must appear as a string literal in
 // cli/extensions. Globs like `aws_assess_*` and file names like
 // `aws_check_access.json` are not tool names.
@@ -24,7 +24,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const DOCS_DIR = 'src/content/docs/docs';
 const README = 'README.md';
-const TOOL_CATALOG = 'cli/pi/tool-catalog.ts';
+const TOOL_CATALOG = 'cli/core/tool-catalog.ts';
 const TOOL_SOURCES = 'cli/extensions';
 const CODE_DIR = 'cli';
 const INSTALLER_DIR = 'public';

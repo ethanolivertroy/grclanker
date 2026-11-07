@@ -13,9 +13,9 @@ import {
   createOpenAIGrcTool,
   DEFAULT_OPENAI_GRC_TOOLS,
   MAX_OPENAI_GRC_TOOLS,
-} from "../dist/openai-agents/agent.js";
-import { collectRegisteredGrcTools } from "../dist/runtime/registry.js";
-import { isGrcWriteTool } from "../dist/runtime/effects.js";
+} from "../dist/adapters/openai-agents/agent.js";
+import { collectRegisteredGrcTools } from "../dist/core/registry.js";
+import { isGrcWriteTool } from "../dist/core/effects.js";
 
 function fixture(name, execute) {
   return {
@@ -36,7 +36,7 @@ test("OpenAI agent defaults to public-data tools and includes independent workfl
   ]);
   assert.match(agent.instructions, /Evidence over opinion/);
   assert.match(agent.instructions, /OpenAI Agents SDK runtime/);
-  assert.doesNotMatch(agent.instructions, /Cursor Agent SDK|agent-sdk\/prompts/);
+  assert.doesNotMatch(agent.instructions, /Cursor Agent SDK|(?:agent-sdk|cursor-grok)\/prompts/);
   assert.equal(agent.modelSettings.parallelToolCalls, false);
 });
 
@@ -182,18 +182,18 @@ test("OpenAI deployments reject unknown tools and oversized selections", () => {
 });
 
 test("OpenAI adapter has no Cursor project imports and --check requires no credentials", () => {
-  for (const filename of readdirSync(new URL("../openai-agents/", import.meta.url))) {
+  for (const filename of readdirSync(new URL("../adapters/openai-agents/", import.meta.url))) {
     if (!filename.endsWith(".ts")) continue;
-    const source = readFileSync(new URL(`../openai-agents/${filename}`, import.meta.url), "utf8");
-    assert.doesNotMatch(source, /from ["'][^"']*(?:agent-sdk|@grok|@cursor)/);
+    const source = readFileSync(new URL(`../adapters/openai-agents/${filename}`, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /from ["'][^"']*(?:agent-sdk|cursor-grok|@grok|@cursor)/);
   }
-  const output = execFileSync(process.execPath, ["dist/openai-agents/cli.js", "--check"], {
+  const output = execFileSync(process.execPath, ["dist/adapters/openai-agents/cli.js", "--check"], {
     cwd: new URL("../", import.meta.url),
     env: { ...process.env, OPENAI_API_KEY: "" },
     encoding: "utf8",
   });
   assert.equal(JSON.parse(output).name, "grclanker");
-  const withoutKey = execFileSync(process.execPath, ["dist/openai-agents/cli.js", "--list-tools"], {
+  const withoutKey = execFileSync(process.execPath, ["dist/adapters/openai-agents/cli.js", "--list-tools"], {
     cwd: new URL("../", import.meta.url),
     env: { ...process.env, OPENAI_API_KEY: "" },
     encoding: "utf8",
@@ -231,7 +231,7 @@ test("the real noninteractive CLI rejects writers and never displays credential 
       await once(server, "listening");
       try {
         const { stdout, stderr } = await execFileAsync(process.execPath, [
-          "dist/openai-agents/cli.js", "--tools", "github_export_audit_bundle", "Export a GitHub evidence bundle",
+          "dist/adapters/openai-agents/cli.js", "--tools", "github_export_audit_bundle", "Export a GitHub evidence bundle",
         ], {
           cwd: new URL("../", import.meta.url),
           env: { ...process.env, OPENAI_API_KEY: "synthetic-local-test-key", OPENAI_BASE_URL: `http://127.0.0.1:${server.address().port}/v1` },

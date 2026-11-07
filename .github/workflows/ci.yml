@@ -81,7 +81,7 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             cli/package-lock.json
-            cli/examples/codex-sdk/package-lock.json
+            cli/adapters/codex/package-lock.json
 
       - name: Install site dependencies
         run: npm ci
@@ -96,14 +96,14 @@ jobs:
 
       - name: Validate Agent SDK registry
         working-directory: cli
-        run: npm run test:agent-sdk:validate
+        run: npm run test:cursor:validate
 
       - name: Install Codex SDK example dependencies
-        working-directory: cli/examples/codex-sdk
+        working-directory: cli/adapters/codex
         run: npm ci
 
       - name: Verify Codex SDK and GRC MCP integration
-        working-directory: cli/examples/codex-sdk
+        working-directory: cli/adapters/codex
         run: npm run check
 
       - name: Run leak probe

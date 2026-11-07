@@ -8,7 +8,7 @@
  */
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { collectSensitiveValues } from "./redact.js";
+import { collectSensitiveValues } from "../core/redact.js";
 
 const BATCHES_TABLE = "flue_conversation_stream_batches";
 const CHUNKS_TABLE = "flue_conversation_stream_batch_chunks";

@@ -5,6 +5,8 @@ description: Install, configure, and run grclanker as a GRC engineering assistan
 
 Use this path for an interactive GRC engineering assistant on your machine. grclanker embeds Pi and supplies its GRC tools, personas, and workflow prompts. You can use a local model or a hosted model. This guide includes the complete setup for this runtime.
 
+In source, `cli/pi/` owns the terminal, setup, sessions, and compute backends; `cli/index.ts` launches it. The host embeds Pi 1.4. Native GRC implementations remain in `cli/extensions/grc-tools/`, with shared domain registration and tool handling in `cli/core/`. Source dependencies and the TypeScript build are shared with SDK adapters in `cli/package.json`. The Pi release bundle is the self-contained terminal installation described below.
+
 ## Install
 
 On macOS or Linux, run:

@@ -11,6 +11,6 @@
     "declaration": true,
     "sourceMap": true
   },
-  "include": ["*.ts", "pi/**/*", "extensions/**/*", "bootstrap/**/*", "config/**/*", "runtime/**/*", "openai-agents/**/*", "agent-sdk/**/*", "flue/**/*", "durable/**/*"],
+  "include": ["*.ts", "pi/**/*", "extensions/**/*", "bootstrap/**/*", "config/**/*", "core/**/*", "adapters/openai-agents/**/*", "adapters/cursor-grok/**/*", "flue/**/*", "durable/**/*"],
   "exclude": ["node_modules", "dist"]
 }

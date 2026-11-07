@@ -1,13 +1,15 @@
 ---
 title: Cursor / Grok Agent SDK
-description: Install, configure, and run grclanker as an independent Cursor / Grok Agent SDK GRC engineer agent.
+description: Install, configure, and run grclanker's Cursor / Grok Agent SDK adapter as a GRC engineer agent.
 ---
 
 Run a grclanker GRC engineer agent with the [Cursor Agent SDK](https://cursor.com/docs/agent-sdk). This guide contains the complete source-install, authentication, configuration, code, and local deployment steps for this path. You do not need to install or run the Pi terminal app, Codex, or another agent SDK.
 
 **Cursor / Grok names:** Cursor's Agent SDK currently ships as [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk), formerly `@cursor/bdk`. These names refer to the same SDK path here. Choosing a Grok model in this harness uses this deployment; a separate xAI API integration is not included.
 
-The project lives in `cli/agent-sdk/`. It loads grclanker's native GRC tools, system instructions, workflow skills, and auditor/verifier personas. Use it to gather security evidence, assess controls, investigate findings, and prepare reviewable compliance artifacts. Broader autonomous governance and risk management remain product goals; the installed tools and their evidence determine what the agent can substantiate today.
+The project lives in `cli/adapters/cursor-grok/`. It loads grclanker's native GRC tools, system instructions, workflow skills, and auditor/verifier personas. Use it to gather security evidence, assess controls, investigate findings, and prepare reviewable compliance artifacts. Broader autonomous governance and risk management remain product goals; the installed tools and their evidence determine what the agent can substantiate today.
+
+Host-specific SDK code and generated definitions live in this adapter. Shared tool handling and methodology loading live in `cli/core/`, and native implementations remain in `cli/extensions/grc-tools/`. Source dependencies and the TypeScript build are shared in `cli/package.json`; the adapter is not separately packaged. You configure and run this host without another adapter's model setup or credentials.
 
 ## Prerequisites
 
@@ -18,6 +20,8 @@ The project lives in `cli/agent-sdk/`. It loads grclanker's native GRC tools, sy
 
 Commands below use a POSIX shell and start at the repository root unless a step explicitly changes directory. The SDK is pinned to **`@grok/agent-sdk` 0.6.0** in `cli/package.json`; no global installation is needed.
 
+The npm scripts use `cursor:*` to identify this adapter. Older `agent-sdk:*` scripts remain compatibility aliases. Cursor's executable is still named `agent-sdk`, and `GRCLANKER_AGENT_SDK_MODEL` remains this adapter's model override.
+
 ## Install and verify
 
 ```bash
@@ -25,8 +29,8 @@ git clone https://github.com/ethanolivertroy/grclanker.git
 cd grclanker
 npm --prefix cli ci
 npm --prefix cli run build
-npm --prefix cli run agent-sdk:validate
-npm --prefix cli run agent-sdk:info
+npm --prefix cli run cursor:validate
+npm --prefix cli run cursor:info
 ```
 
 Keep development dependencies installed: they contain the pinned SDK and its `zod` peer dependency. A successful validation prints `has no diagnostics`. Discovery lists the agent's tools, five skills, and two subagents.
@@ -34,7 +38,7 @@ Keep development dependencies installed: they contain the pinned SDK and its `zo
 Check one real tool without a model, credentials, or an external API:
 
 ```bash
-npm --prefix cli run agent-sdk:call -- oscal_check_trestle \
+npm --prefix cli run cursor:call -- oscal_check_trestle \
   --input '{"workspace_dir":"."}' --json
 ```
 
@@ -43,7 +47,7 @@ Expect `"ok": true`, `"isError": false`, and a workspace/Trestle status report. 
 To check a public data source as well:
 
 ```bash
-npm --prefix cli run agent-sdk:call -- kevs_search \
+npm --prefix cli run cursor:call -- kevs_search \
   --input '{"query":"CVE-2021-44228"}' --json
 ```
 
@@ -64,7 +68,7 @@ Complete the browser sign-in before continuing. For an unattended process, suppl
 Run a single read-only turn:
 
 ```bash
-npm --prefix cli run agent-sdk:run -- \
+npm --prefix cli run cursor:run -- \
   --message "Use kevs_search to check CVE-2021-44228. Cite the tool evidence and explain the remediation priority."
 ```
 
@@ -72,7 +76,7 @@ With no `--url`, `run` starts its own temporary local host. The model's answer a
 
 ```bash
 GRCLANKER_AGENT_SDK_MODEL=composer-2.5 \
-  npm --prefix cli run agent-sdk:run -- \
+  npm --prefix cli run cursor:run -- \
   --message "Use kevs_search to check CVE-2021-44228 and summarize the evidence."
 ```
 
@@ -81,13 +85,13 @@ GRCLANKER_AGENT_SDK_MODEL=composer-2.5 \
 Start a persistent local host in terminal 1:
 
 ```bash
-npm --prefix cli run agent-sdk:dev
+npm --prefix cli run cursor:dev
 ```
 
 Open the playground URL printed by the SDK, normally `http://127.0.0.1:3000/playground`. In terminal 2, from the same repository root, send a turn to that host:
 
 ```bash
-npm --prefix cli run agent-sdk:run -- \
+npm --prefix cli run cursor:run -- \
   --url http://127.0.0.1:3000 \
   --message "Assess the available evidence, identify gaps, and propose the next GRC engineering actions."
 ```
@@ -106,8 +110,8 @@ Data-source credentials belong to the host process that runs the tools. As one c
 export GITHUB_ORG="your-organization"
 export GITHUB_TOKEN="<your-read-only-github-token>"
 
-npm --prefix cli run agent-sdk:call -- github_check_access --input '{}' --json
-npm --prefix cli run agent-sdk:dev
+npm --prefix cli run cursor:call -- github_check_access --input '{}' --json
+npm --prefix cli run cursor:dev
 ```
 
 Replace both placeholders. For the full assessment, the principal needs organization-owner visibility with read access to organization administration, members, webhooks, Actions, repositories, and repository administration. Authorize the PAT for SSO if the organization requires it. Keep the token in your shell or secret manager; do not put it in a prompt or commit it.
@@ -128,7 +132,7 @@ Other cloud and SaaS families use their own host environment credentials and `<p
 
 ## The agent code
 
-The source checkout already includes the complete agent. Its entry point, `cli/agent-sdk/bot/agent.ts`, is:
+The source checkout already includes the complete agent. Its entry point, `cli/adapters/cursor-grok/bot/agent.ts`, is:
 
 ```ts
 import { defineAgent } from "@grok/agent-sdk";
@@ -137,7 +141,7 @@ import { grclankerAgentConfig } from "../lib/agent.js";
 export default defineAgent(grclankerAgentConfig());
 ```
 
-The configuration names the GRC agent and reads `GRCLANKER_AGENT_SDK_MODEL`. Each domain tool has its own generated definition, for example `cli/agent-sdk/bot/tools/kevs_search.ts`:
+The configuration names the GRC agent and reads `GRCLANKER_AGENT_SDK_MODEL`. Each domain tool has its own generated definition, for example `cli/adapters/cursor-grok/bot/tools/kevs_search.ts`:
 
 ```ts
 import { defineTool } from "@grok/agent-sdk/tools";
@@ -151,7 +155,7 @@ These are the actual source files, not files you need to create after installing
 | Included asset | Agent SDK surface |
 |---|---|
 | Native domain tools in `cli/extensions/grc-tools/` | Server tools under their native names |
-| `cli/.grclanker/SYSTEM.md` and `cli/agent-sdk/prompts/runtime.md` | Always-on GRC instructions and runtime guidance |
+| `cli/.grclanker/SYSTEM.md` and `cli/adapters/cursor-grok/prompts/runtime.md` | Always-on GRC instructions and runtime guidance |
 | `cli/prompts/{investigate,audit,assess,validate}.md` | Skills named `investigate`, `audit`, `assess`, and `validate` |
 | `cli/skills/crypto-validation/SKILL.md` | Skill named `crypto-validation` |
 | `cli/.grclanker/agents/{auditor,verifier}.md` | Subagents named `auditor` and `verifier` |
@@ -164,20 +168,20 @@ The Cursor harness supplies `shell`, `Read`, `Write`, `StrReplace`, `Grep`, `Glo
 
 Server tools execute in the SDK host process. Relative `output_dir`, `workspace_dir`, and `zip_path` arguments resolve against its working directory: **`cli/` when using the npm scripts above**. They do not resolve against the model's separate session workspace. Pass an absolute path to place artifacts in a specific workspace, and use the absolute paths returned by the tool.
 
-Default exports go under `cli/export/<domain>/` and OSCAL workspaces under `cli/oscal-workspace/`. The SDK's state, traces, and eval batches go under `cli/agent-sdk/.agent-serve/`. These local directories are gitignored. Treat reports and traces as organization evidence and control access to them.
+Default exports go under `cli/export/<domain>/` and OSCAL workspaces under `cli/oscal-workspace/`. The SDK's state, traces, and eval batches go under `cli/adapters/cursor-grok/.agent-serve/`. These local directories are gitignored. Treat reports and traces as organization evidence and control access to them.
 
-For local development, `agent-sdk:dev` is sufficient. To run the existing source checkout as a persistent service on your own machine, install/build as above, provide the Cursor and integration credentials to the service, and run from `cli/`:
+For local development, `cursor:dev` is sufficient. To run the existing source checkout as a persistent service on your own machine, install/build as above, provide the Cursor and integration credentials to the service, and run from `cli/`:
 
 ```bash
 cd cli
-npx --no-install agent-sdk serve --dir agent-sdk --mode single \
+npx --no-install agent-sdk serve --dir adapters/cursor-grok --mode single \
   --host 127.0.0.1 --port 3000 \
   --state-root /var/lib/grclanker-agent-sdk
 ```
 
 Create that state directory with write access for the service account first. Keep loopback access or place an authenticated TLS proxy in front of the service. The SDK also supports a `--bearer-token` option; supply its value through your service's secret handling when exposing HTTP routes. Persist the state root and the artifact directories that your organization needs to retain.
 
-**Cursor-managed hosting is not configured or validated for this grclanker project.** Its current adapter uses in-process server tools on the local harness and source/assets from the parent `cli/` package. Copying `cli/agent-sdk/` alone or running a generic managed-hosting deploy command is not a complete deployment of these tools.
+**Cursor-managed hosting is not configured or validated for this grclanker project.** Its current adapter uses in-process server tools on the local harness and source/assets from the parent `cli/` package. Copying `cli/adapters/cursor-grok/` alone or running a generic managed-hosting deploy command is not a complete deployment of these tools.
 
 ## Validate changes and troubleshoot
 
@@ -185,13 +189,13 @@ After changing adapter code, run:
 
 ```bash
 npm --prefix cli run build
-npm --prefix cli run test:agent-sdk:validate
+npm --prefix cli run test:cursor:validate
 ```
 
 The smoke test checks the pinned SDK's real discovery, tool effects and approval flags, plus a local OSCAL tool call and invalid-input rejection without a model or provider request. After adding or renaming native tools, regenerate their SDK definitions with:
 
 ```bash
-npm --prefix cli run sync:agent-sdk-tools
+npm --prefix cli run sync:cursor-tools
 ```
 
 | Symptom | Action |
