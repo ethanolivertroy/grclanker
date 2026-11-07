@@ -299,6 +299,7 @@ export function copyApp(stageAppDir, target, runCommand = run) {
   const entries = [
     ".grclanker",
     "bin",
+    "core",
     "dist",
     "extensions",
     "prompts",
@@ -501,7 +502,6 @@ function main() {
   console.log(`Archive timestamp (SOURCE_DATE_EPOCH): ${epoch}`);
 
   run("npm", ["run", "build"]);
-  run("node", [join(companionDir, "scripts", "patch-embedded-pi.mjs")]);
 
   const artifacts = [];
   for (const targetId of targetIds) {

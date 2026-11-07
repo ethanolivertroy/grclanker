@@ -1,3 +1,9 @@
+import type { FrameworkKey } from "./spec-model.js";
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
+import { propertyNameSegments } from "./security/credential-keys.js";
+import { ensurePrivateDir, resolveSecureOutputPath, createSecureTextWriter, countFilesRecursively } from "./secure-output.js";
+export { resolveSecureOutputPath };
+import { createPemCredentialScrubber } from "./security/pem-scrubber.js";
 /**
  * Tenable security inspector tools for grclanker.
  *
@@ -5,33 +11,29 @@
  * or fedcloud.tenable.com) with optional Tenable Security Center equivalents. The only
  * POST calls are the documented asset and vulnerability export requests.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-} from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { join, resolve } from "node:path";
+
 import { Type } from "typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
-import { REDACTED_VALUE, scrubSensitiveValues } from "../../core/redact.js";
+
 import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { BatchVerdicts, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, mapWithConcurrency, textResult } from "./shared.js";
-import type { FrameworkKey } from "./spec-model.js";
+
 import { TENABLE_SPEC } from "./tenable.spec.js";
 import { createZipArchive } from "./zip-archive.js";
 
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
 type JsonRecord = Record<string, unknown>;
+
+import { resolveTenableRunPlan, TENABLE_ASSESSMENT_DEFAULTS, type TenableAssessmentOptions, type TenableRunPlan } from "./tenable-run-plan.js";
+export type { TenableAssessmentOptions, TenableRunPlan } from "./tenable-run-plan.js";
 
 const DEFAULT_OUTPUT_DIR = "./export/tenable";
 const DEFAULT_CLOUD_URL = "https://cloud.tenable.com";
@@ -42,20 +44,9 @@ const ATTEMPT_CAP_TIMEOUTS = 20;
 const DEFAULT_RETRY_LIMIT = 4;
 const DEFAULT_EXPORT_TIMEOUT_MS = 300_000;
 const DEFAULT_EXPORT_POLL_MS = 2_000;
-const DEFAULT_MAX_CHUNKS = 50;
+const DEFAULT_MAX_CHUNKS = TENABLE_ASSESSMENT_DEFAULTS.maxChunks;
 const DEFAULT_PAGE_LIMIT = 1000;
 const DEFAULT_MAX_PAGES = 200;
-const DEFAULT_STALE_SCAN_DAYS = 30;
-const DEFAULT_STALE_ASSET_DAYS = 30;
-const DEFAULT_AGENT_OFFLINE_DAYS = 7;
-const DEFAULT_PLUGIN_STALE_HOURS = 24;
-const DEFAULT_INACTIVE_USER_DAYS = 90;
-const DEFAULT_MAX_ADMINS = 5;
-const DEFAULT_CREDENTIAL_THRESHOLD = 0.8;
-const DEFAULT_TAGGED_THRESHOLD = 0.9;
-const DEFAULT_AUDIT_LOOKBACK_DAYS = 30;
-const DEFAULT_VULN_LOOKBACK_DAYS = 90;
-const DEFAULT_SLA_DAYS = { critical: 15, high: 30, medium: 90, low: 180 };
 const DAY_MS = 86_400_000;
 const ADMINISTRATOR_PERMISSION = 64;
 const EXPORT_JOB_WINDOW_DAYS = 3;
@@ -151,26 +142,6 @@ export interface TenableAuditBundleResult {
   fileCount: number;
   findingCount: number;
   errorCount: number;
-}
-
-export interface TenableAssessmentOptions {
-  now?: number;
-  staleScanDays?: number;
-  staleAssetDays?: number;
-  agentOfflineDays?: number;
-  pluginStaleHours?: number;
-  inactiveUserDays?: number;
-  maxAdmins?: number;
-  credentialThreshold?: number;
-  taggedThreshold?: number;
-  auditLookbackDays?: number;
-  vulnLookbackDays?: number;
-  slaCriticalDays?: number;
-  slaHighDays?: number;
-  slaMediumDays?: number;
-  slaLowDays?: number;
-  expectedAssetCount?: number;
-  maxChunks?: number;
 }
 
 type CheckAccessArgs = {
@@ -429,998 +400,8 @@ const REDACTED = CREDENTIAL_REDACTION_MARKER;
  * public PEM blocks (certificates, public keys, CSRs) kept as evidence. Every rule
  * is unanchored and idempotent.
  */
-export const MIN_CONFIGURED_SECRET_LENGTH = 4;
-export const LONG_TOKEN_MIN_LENGTH = 16;
-
-// Which PEM blocks a scrub removes: every block in error text, where a block is never
-// evidence; only non-public blocks in data values, where a certificate is.
-type PemScope = "all" | "private";
-
-const PEM_BLOCK_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----[\s\S]*?-----END [A-Z0-9 ]+-----/g;
-// A block whose END was cut off (a truncated message) runs to the end of the text.
-const PEM_OPEN_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----(?:(?!-----END )[\s\S])*$/;
-// Labels of PEM blocks that carry public material only; every other label (PRIVATE KEY,
-// ENCRYPTED PRIVATE KEY, RSA/EC/DSA/OPENSSH PRIVATE KEY, PGP PRIVATE KEY BLOCK) is a secret.
-const PUBLIC_PEM_LABELS = new Set(["CERTIFICATE", "TRUSTED CERTIFICATE", "X509 CRL", "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST", "PUBLIC KEY", "RSA PUBLIC KEY", "PKCS7", "CMS"]);
-// Any scheme-prefixed URL: the userinfo is dropped; its query and fragment pairs are
-// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay. The
-// userinfo ends where the authority does, at "/", "?", or "#", so an "@" inside a query or
-// fragment (https://h?e=a@x.com&token=..., https://h#f@x.com) is never read as userinfo: the
-// host stays "h", and the query is left to the pair rule and the origin reducer instead of
-// being carried on as if it were the host.
-const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
-const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s\/?#@"'<>\\]+@/i;
-// A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
-// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, a
-// backslash (no token carries one; the escape after it, \" or \n inside a JSON string, is
-// kept so the string still parses and the text after it is still read), or the "," that
-// ends a URL inside a sentence. A ";" is part of the value, as URLSearchParams reads it
-// (?token=hunter2;restofsecret is one value and loses the whole of it); the ";" that ends a
-// pair belongs to the cookie and key-list header lines, which are read before this rule, so
-// a cookie pair whose name holds "&" or "#" goes with its cookie.
-// A quote with a value character on both sides (O'hunter2) is content of the value.
-const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>,\\]+(?:["'](?![:)}\]])[^&#\s"'<>,\\]+)*)/g;
-// A credential-bearing header line: the whole value goes, whatever its shape. The name and
-// separator are matched here (the name may be quoted as a JSON member name, with its quotes
-// escaped to any depth: "Cookie": ..., \"Cookie\": ..., \\\"Cookie\\\": ...) and the value
-// is consumed by headerValueEnd, which carries a quoted value through its closing quote at
-// the same depth, so Cookie: sid="value" loses value and quotes together instead of
-// stopping at the first quote, and ends an unquoted value before the next header on a
-// compound line, so the next header keeps its name. A value that already opens with a
-// marker is left alone so the rule is idempotent. The name starts where no word character
-// precedes it, or right after a JSON string escape left in place by one stringify (\n, \r,
-// \t, \b, \f, \v, \0, \uXXXX, \xHH): "request failed\nX-SecurityCenter: value" is a header
-// line inside a JSON string, and the escape letter is not part of the name that follows it.
-const HEADER_LINE_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv0]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}))(authorization|proxy-authorization|cookie|set-cookie|x-cookie|x-api-key|x-apikeys?|api-key|apikey|x-securitycenter|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)((?:\\*["'])?\s*:\s*)/gi;
-// The escape letters that can sit between a backslash and the key or header name after it.
-const ESCAPE_LETTER_PATTERN = /^(?:[nrtbfv0]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})/;
-// Inside a header value a quote opens a quoted segment only where a value can start: at the
-// start of the value or after "=", ":", ",", ";", "(", or whitespace. A quote with a token
-// character on both sides (sid=O'hunter2, my'pref=value, my"pref=value) is content of the
-// value, since RFC 6265 lets a cookie name or value carry an apostrophe. A quote anywhere
-// else, at the end of a token, is the quote that closes the text the header line was quoted
-// in.
-const HEADER_VALUE_OPENER_PATTERN = /[=:,;(\s]/;
-// What follows a quote that opens or closes something: whitespace, a delimiter, a closing
-// bracket, a tag, another quote, or an escape. Any other character continues the token.
-const QUOTE_BOUNDARY_PATTERN = /[\s,;:)}\]<>"'\\]/;
-const HEADER_VALUE_TERMINATOR_PATTERN = /[\r\n<>]/;
-// The "Name:" token of the next header after ";" or "," on a compound line (the name may be
-// quoted, as in a JSON object, with the quotes escaped to any depth, and may hold dots, as
-// X.Api.Key does when a proxy rewrites hyphens); a colon followed by "//" is a URL scheme,
-// not a header. The token is looked for within FOLLOWING_HEADER_LOOKAHEAD characters of the
-// separator.
-const FOLLOWING_HEADER_PATTERN = /^\s*(?:\\*["'])?[A-Za-z][A-Za-z0-9.-]*(?:\\*["'])?\s*:(?!\/\/)/;
-const FOLLOWING_HEADER_LOOKAHEAD = 96;
-// Header classes. An Authorization or Proxy-Authorization value opens with the scheme word
-// its credentials follow (Bearer, Basic, Digest, and the rest of AUTH_SCHEME_WORDS, in any
-// casing): the word stays as spelled and the one token (or one quoted string) after it
-// goes, so the operator still reads which scheme was replayed and prose after the token
-// stays; a parameter list after the scheme (Digest username=..., realm=...) goes whole, as
-// does a value that opens with anything else (a scheme word the list does not know, such
-// as GenieKey, SharedKey, or Bot, a bare token, a digit), to the end of the line: an
-// unknown first word may be a scheme with its credentials after it, so nothing after it
-// is trusted. A cookie header, or Tenable's X-ApiKeys (accessKey=...; secretKey=...), is
-// a list of pairs and goes whole. Every other header (X-Api-Key, X-Auth-Token,
-// X-Vault-Token, ...) carries one token: an unquoted value ends at the first whitespace,
-// so a JSON fragment or prose after it on the same line ({"status":"denied"}, "rejected")
-// is still read; a value that opens with a listed scheme word (X-Auth-Token: Bearer <v>)
-// is the word and the token after it together, and both go under the one marker, as the
-// scheme word is part of the value under any key but Authorization; a quoted value ends
-// at its closing quote whatever it holds.
-const AUTHORIZATION_HEADERS = new Set(["authorization", "proxy-authorization"]);
-const LIST_VALUE_HEADERS = new Set(["cookie", "set-cookie", "x-cookie", "x-apikeys", "x-apikey"]);
-const AUTH_SCHEME_WORDS = new Set([
-  "basic", "bearer", "digest", "hoba", "mutual", "negotiate", "oauth", "scram-sha-1", "scram-sha-256", "vapid", "dpop", "gnap",
-  "privatetoken", "concealed", "ntlm", "token", "ssws", "apikey", "api-key", "splunk", "snowflake", "aws4-hmac-sha256",
-]);
-const AUTH_SCHEME_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)(?:\s+|$)/;
-// A header value the header rule already treated, as the pair rules then see it: the scheme
-// word and, after whitespace and an optional quote, the marker.
-const REDACTED_SCHEME_VALUE_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)\s+((?:\\*["'])?)\[REDACTED\]/;
-const AUTH_PARAM_LIST_PATTERN = /^[A-Za-z][A-Za-z0-9_-]*=/;
-// A scheme and its credentials: the value is removed whatever its shape, except the
-// prose words that follow a scheme name in a sentence ("Basic authentication is
-// required", "Bearer token") and a Titlecase word, which makes the scheme name an
-// adjective in a title ("Basic Network Scan", "Bearer Token", "Token Hygiene"): a Basic
-// credential is base64 and a bearer token or API key carries digits, symbols, or token
-// casing, so neither is ever one capitalized word of letters. "Token", "OAuth", "Splunk",
-// and "Snowflake" are also nouns of this module's own prose and of product names ("Token
-// hygiene", "OAuth clients", "Splunk index", "Snowflake account"), so after them any plain
-// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. An auth-param name before
-// "=" (Bearer realm="api", Digest qop="auth") is the challenge's grammar, not a credential;
-// the quoted value after it is judged by the attribute rule under its own name. A
-// parameter list that carries credentials is read whole by the parameter-list rule first.
-const SCHEME_WORD_SOURCE = "Bearer|Basic|Digest|Token|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256";
-const SCHEME_VALUE_PATTERN = new RegExp(String.raw`\b(${SCHEME_WORD_SOURCE})\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})`, "gi");
-const NOUN_SCHEME_WORDS = new Set(["token", "oauth", "splunk", "snowflake"]);
-const AUTH_PARAM_PATTERN = /^([A-Za-z][A-Za-z0-9_-]*)=$/;
-const AUTH_PARAM_NAMES = new Set([
-  "realm", "error", "error_description", "error_uri", "scope", "charset", "nonce", "opaque", "qop", "algorithm", "stale", "domain",
-  "uri", "response", "cnonce", "nc", "username", "credential", "signedheaders", "signature", "oauth_consumer_key", "oauth_token",
-  "oauth_signature_method", "oauth_signature", "oauth_timestamp", "oauth_nonce", "oauth_version", "oauth_callback", "oauth_verifier",
-]);
-// A scheme word followed by a parameter list (name=value, name2=value2, ...) is the value of
-// an Authorization header wherever it appears, with the header name in front of it or
-// without one (Snowflake Token="<value>", Token token="<value>", nonce="...", Digest
-// username="...", realm="...", nonce="...", response="...", OAuth oauth_token="..."): the
-// word stays and the whole list goes, as it does under the header name. A list made only
-// of the parameters a challenge carries (the realm, the Bearer error fields, the Basic
-// charset, the Digest challenge fields: Bearer realm="api", error="invalid_token", a
-// WWW-Authenticate value) is a challenge and stays for the per-parameter rules; a list with
-// any other parameter (Token, token, key, username, uri, response, oauth_token, ...) is the
-// credential side of its scheme. The list is read by readAuthParameterList.
-const CHALLENGE_PARAM_NAMES = new Set(["realm", "error", "error_description", "error_uri", "scope", "charset", "domain", "nonce", "opaque", "stale", "algorithm", "qop", "userhash"]);
-// The parameters that carry the proof of a credential: the Digest response, a signature
-// (oauth_signature, signature, sig), or a MAC. A proof's value goes whatever its shape, in
-// a list after a scheme word or in one without a scheme word.
-const PROOF_PARAM_NAMES = new Set(["response", "signature", "oauth_signature", "mac", "sig"]);
-// A parameter list without a scheme word (realm="api", nonce="n", response="<proof>": the
-// value of a www_authenticate field, or a credential echoed without its scheme word) is an
-// auth parameter list when it holds two or more parameters and one of them, other than a
-// proof, is a known auth parameter (a challenge parameter, or username, uri, nc, cnonce, an
-// oauth_* parameter). In such a list, or in the list after a scheme word, a proof goes and a
-// challenge parameter keeps its value: the nonce of a challenge is public, so a proof-free
-// challenge (Digest realm="api", qop="auth", nonce="n") keeps every value, while a list
-// that carries a proof is not a challenge, whatever parameters open it. Any other parameter
-// (username, oauth_token) is judged under its own name, and a lone name=value pair is no
-// list. A list opens at a name that no word character precedes.
-const AUTH_PARAMETER_LIST_OPENER_PATTERN = /(?<![A-Za-z0-9_.:-])[A-Za-z][A-Za-z0-9_-]*=/g;
-const SCHEME_LED_LIST_PATTERN = new RegExp(String.raw`\b(?:${SCHEME_WORD_SOURCE})\s+$`, "i");
-const SCHEME_PARAMETER_LIST_PATTERN = new RegExp(String.raw`\b(${SCHEME_WORD_SOURCE})\s+(?=[A-Za-z][A-Za-z0-9_-]*=)`, "gi");
-const AUTH_PARAM_ITEM_PATTERN = /([A-Za-z][A-Za-z0-9_-]*)=/y;
-const AUTH_PARAM_BARE_VALUE_PATTERN = /[^\s,"'\\<>]+/y;
-const AUTH_PARAM_SEPARATOR_PATTERN = /\s*,\s*/y;
-const PLAIN_WORD_PATTERN = /^[a-z]+$/;
-const TITLE_WORD_PATTERN = /^[A-Z][a-z]{1,19}$/;
-const SCHEME_PROSE_WORDS = new Set([
-  "authentication", "authorization", "auth", "token", "tokens", "credential", "credentials", "scheme", "schemes", "header", "headers",
-  "realm", "challenge", "access", "mode", "method", "login", "flow", "grant", "type", "string", "value", "values", "user", "users",
-  "account", "client", "clients", "error", "request", "requests", "response", "with", "without", "and", "or", "is", "was", "are",
-  "not", "the", "this", "that", "these", "those", "to", "in", "for", "from", "on", "of", "by", "as", "at", "if", "then", "but", "so",
-  "than", "when", "where", "over", "via", "per", "only", "still", "also", "use", "used", "using", "required", "requires", "failed",
-  "rejected", "expired", "invalid", "missing", "unsupported", "supported", "unauthorized", "forbidden", "denied", "allowed", "enabled",
-  "disabled", "preferred", "deprecated", "retired", "retiring", "must", "should", "can", "cannot", "could", "will", "would", "may",
-  "has", "have", "does", "did", "do", "be", "been",
-]);
-// "key":"value" and key="value" carriers keep the whole quoted value together so a
-// value with spaces is removed as one; the unquoted pair rule below takes the rest.
-// Keys may start with "_" (_upstream_session, _token), so a key begins wherever no key
-// character precedes it rather than at a word boundary.
-const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"(\s*:\s*)"((?!\[REDACTED\])[^"\r\n]+)"/g;
-// The same pair inside a JSON text that was itself stringified into a string value, so its
-// quotes arrive behind a run of backslashes (\" one level down, \\\" two levels down): the
-// run is captured and the pair's four quotes must all carry it, so the value ends at the
-// quote of its own depth.
-const JSON_ESCAPED_PAIR_PATTERN = /(\\+)"([A-Za-z_][A-Za-z0-9_.-]{0,63})\1"(\s*:\s*)\1"((?!\[REDACTED\])(?:(?!\1")[^\r\n])+?)\1"/g;
-// A quoted attribute or pair value: the quote may be escaped to any depth, and the value
-// ends at the quote of its own depth.
-// A quote with a value character on both sides (O'hunter2) is content of the value.
-const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(\\*["'])((?!\[REDACTED\])(?:[^"'\r\n]|["'](?=[^\s"'\r\n<>;,&:)}\]\\]))+)\2/g;
-// An unquoted pair: key=value runs to the next delimiter, key: value (a header or
-// YAML-style line) to the end of the line, where a brace or bracket ends it so a JSON
-// structure after a credential-named key (compact "password":{...}, "auth":null}) is
-// never taken for a value. The key and the value may be quoted with the quotes escaped to
-// any depth; a value never runs into the escaped quote that closes it. A key starts where
-// no word character precedes it: after the "--" of a command-line flag (--password=v), the
-// "-D" of a Java system property (-Dpassword=v, where the D is read as part of the key and
-// the credential word is still its tail), a "/" path separator, or a "." (the tail of a
-// dotted name is scanned only when no key match started earlier on the name); or right
-// after a \0 escape, whose digit cannot start a key (the letter escapes, \n and the rest,
-// are read as part of the key and removed by keyAfterEscape).
-const ASSIGNMENT_KEY_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\0))((?:\\*["'])?)([A-Za-z_][A-Za-z0-9_.-]{0,63})((?:\\*["'])?\s*([:=])\s*(?:\\*["'])?)/g;
-// The escape one stringify leaves for a control character: \n, \r, \t, \b, \f, \v, \0, or a
-// \uXXXX or \xHH code of a control (U+0000 to U+001F, U+007F, and the line and paragraph
-// separators U+2028 and U+2029). An escape of a printable character (\u00e9) is content.
-const ESCAPED_CONTROL_SOURCE = String.raw`\\(?:[nrtbfv0]|u(?:00[01][0-9a-fA-F]|007[fF]|202[89])|x(?:[01][0-9a-fA-F]|7[fF]))`;
-// A credential name after "--" with its value as the next argument (psql --password value):
-// the flag starts where no word character or "-" precedes it (at the start of a quoted
-// command line too), its name may open with a letter or an underscore (a cookie name such as
-// _zendesk_session is a credential name too), and the value is the one token after it, never
-// another flag, ending where an unquoted pair value does.
-const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z_][A-Za-z0-9_.-]{0,63})([ \t]+)((?!\[REDACTED\])(?!-)(?:(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&])+)`, "g");
-// After a credential-named path segment and ":" (kv/password: value) the value is at most
-// one token. A singular label (password, token, key) takes that token whatever its shape
-// and whatever follows it (/etc/app/password: <value> was rejected); a plural label names a
-// collection (/api/v1/api-tokens: request failed with 403), so prose after the token means
-// there was no value, while a lone token after a plural label is one.
-const PROSE_CONTINUATION_PATTERN = /^[ \t]+[A-Za-z]/;
-// A key whose last word is a plural credential word, in the segment split (api-tokens, keys,
-// oauth_tokens) or concatenated (apikeys, sshkeys).
-const PLURAL_CREDENTIAL_LABEL_PATTERN = /(?:token|secret|key|cookie|password|credential|passphrase|signature|session)s$/;
-// The "-D" of a Java system property (java -Dkey=value) is not part of the key.
-const JAVA_PROPERTY_PREFIX_PATTERN = /(?:^|\s)-$/;
-// A delimited (key=value) value ends at whitespace or a control character, raw or left
-// escaped by one stringify (\n, \r, \t, \b, \f, \v, \0, \u0009 and the other \u00XX control
-// codes, \x09), as an unquoted header token does, so a pair or header chained after the
-// escape (api_key=<v>\tpassword: <v>) is read on its own and loses its own value. A key:
-// value line ends at a line break only, raw or escaped (\n, \r, \u000a, \u000d), as the raw
-// line does, so the header or pair on the next escaped line is read on its own.
-// A quote with a value character on both sides (O'hunter2, my'pref) is content of the value;
-// a quote at the end of a token, or an escaped quote, ends it, as does a value's first quote.
-const DELIMITED_VALUE_PATTERN = new RegExp(String.raw`(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&]|["'](?=[^\s"'<>;,&:)}\]\\]))+`, "y");
-const LINE_VALUE_PATTERN = /(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\r\n<>"',;{}[\]]|["'](?=[^\s\r\n<>"',;{}[\]:)\\]))*(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\s\r\n<>"',;{}[\]]/y;
-const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])(?:[^\s"'<>\\]|["'](?=[^\s"'<>\\,;:)}\]]))+/gi;
-// A URL whose slashes arrive escaped by a stringify (https:\/\/user:secret@host\/path): the
-// userinfo goes as it does from a bare URL and ends at the same "/", "?", or "#"; the query
-// pairs are read by the pair rule.
-const SLASH_ESCAPED_URL_USERINFO_PATTERN = /\b([a-z][a-z0-9+.-]*:\\\/\\\/)[^\s\/?#@"'<>\\]+@/gi;
-// A key naming a webhook URL: the incoming webhooks of Slack, Discord, Teams, and PagerDuty
-// carry their token in the path or query, so under webhook, webhook_url, webhookUrl, or
-// WEBHOOK_URL a URL value keeps its scheme and host only, whatever the host. webhook_count,
-// webhook_id, and webhook_name are not URL-valued and stay; a webhook key whose value is not
-// a URL (a name, an id) stays too.
-const WEBHOOK_URL_TAIL_WORDS = new Set(["url", "uri", "endpoint", "address", "link"]);
-const URL_VALUE_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/\S+$/i;
-const WEBHOOK_VALUE_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/iy;
-const URL_ORIGIN_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@]*@)?([^/?#]*)/i;
-const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
-const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
-const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
-// Vendor token prefixes that name a credential on their own, on both sides: GitHub (ghp_,
-// gho_, ghu_, ghs_, ghr_, github_pat_), Stripe (sk_live_, sk_test_, rk_live_, rk_test_), and
-// Slack (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-, xoxe-, xoxo-).
-const GITHUB_TOKEN_PATTERN = /\b(?:gh[oprsu]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})/g;
-const STRIPE_KEY_PATTERN = /\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}/g;
-const SLACK_TOKEN_PATTERN = /\bxox[abeoprs]-[A-Za-z0-9-]{10,}/g;
-const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
-const TOKEN_VALUE_PATTERN = /^[A-Za-z0-9+_-]{16,}={0,2}$/;
-const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
-const DIGITS_ONLY_PATTERN = /^\d+$/;
-const DIGIT_GROUP_PATTERN = /\d+/g;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// Below this many letters a segment's casing is not judged: eBay, iOS, McD are names.
-const MIN_LETTERS_FOR_CASING = 6;
-// A segment this long that is not name-shaped makes the whole run a token on its own.
-const MIN_TOKEN_SEGMENT_LENGTH = 8;
-// A carrier is named by its last word: api_key, access_token, client_secret, X-PAN-KEY,
-// _upstream_session, oauth_signature, Set-Cookie, password1. A key whose last word names
-// something else (credentialID, keyId, tokenCount, auth_mode, credentials_file,
-// passwordPolicy, password_complexity_by_device, credential-enforcement) is not one, nor is
-// a max/min bound; a session id (session_id, PHPSESSID, JSESSIONID) is, whatever its tail.
-const CREDENTIAL_KEY_WORDS = new Set([
-  "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase", "passcode", "phash",
-  "apikey", "authorization", "credential", "credentials", "key", "keys", "cookie", "cookies", "sid", "sig", "signature",
-  "auth", "nonce", "sas", "community", "authpwd", "privpwd", "pin", "otp", "totp", "jwt", "assertion", "bearer", "hmac",
-  "session", "sessid", "kubeconfig", "dsn", "pem", "ikey", "skey",
-]);
-// Concatenated spellings the segment split cannot see (authtoken, sharedsecret, privatekey).
-const CREDENTIAL_KEY_SUFFIX_PATTERN = /(?:token|secret|passw(?:or)?d|passphrase|passcode|phash|authorization|credential|signature|nonce|community|assertion|session|sessid|authpwd|privpwd|(?:api|private|secret|access|signing|encryption|master|shared|account|client|service|session|license|ssh|hmac)keys?)$/;
-// A key whose last word names the form of a value (password_hash, token_value,
-// authorization_header, secret_plain) carries a credential when an earlier word names one.
-const CREDENTIAL_VALUE_FORM_WORDS = new Set(["value", "values", "plain", "plaintext", "data", "string", "text", "header", "raw", "encrypted", "hash", "digest", "blob", "content"]);
-const SESSION_ID_PATTERN = /sess(?:ion)?[_.-]?id$/i;
-const BOUND_KEY_SEGMENTS = new Set(["max", "min"]);
-const EXTRA_CREDENTIAL_KEYS = new Set(["x-pan-key", "x-redlock-auth", "proxy-authorization", "x-amz-signature", "x-amz-credential", "x-amz-security-token", "oauth_signature", "oauth_token", "oauth_verifier"]);
-// "pass" names a credential in a query string or an = assignment (user=a&pass=b), while a
-// "pass" count or verdict in a key: value pair is this module's own vocabulary.
-const ASSIGNMENT_ONLY_CREDENTIAL_WORDS = new Set(["pass"]);
-// JSON structure and literals after a key are never a credential value.
-const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
-// A bare integer under a plural credential word ("api_keys": 1, keys=3, secrets: 0) is
-// a count, this module's own summary vocabulary, not a credential; the digits end at
-// whitespace, raw or left escaped by a stringify (keys: 3\tcookies: 0), or at the end.
-const PLURAL_CREDENTIAL_WORDS = new Set(["tokens", "secrets", "keys", "cookies", "passwords", "credentials"]);
-const COUNT_VALUE_PATTERN = new RegExp(String.raw`^\d+(?:\s|${ESCAPED_CONTROL_SOURCE}|$)`);
-const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
-// "code" names a credential only behind one of these words (registration_code,
-// activation_code, authorization_code, recovery_code); status_code, error_code, and
-// country_code stay evidence.
-const CREDENTIAL_CODE_QUALIFIERS = new Set(["registration", "activation", "linking", "auth", "authorization", "access", "verification", "recovery", "backup", "security", "mfa", "otp", "pairing", "enrollment", "license"]);
-// A secret id or token id is the bearer credential itself (a Vault AppRole secret_id, an
-// API token_id, roleSecretId), unlike client_id, tenant_id, key_id, or access_key_id, which
-// name a public identifier; secret_id_ttl, secret_id_accessor, and token_accessor end in a
-// setting word and stay. The qualifier is tested by its tail so -Dsecret_id is read too.
-const BEARER_ID_QUALIFIER_PATTERN = /(?:secret|token)$/;
-
-function propertyNameSegments(name: string): string[] {
-  return name
-    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((segment) => segment.length > 0);
-}
-
-function credentialKeyWord(segment: string): boolean {
-  return CREDENTIAL_KEY_WORDS.has(segment) || CREDENTIAL_KEY_SUFFIX_PATTERN.test(segment);
-}
-
-// The words of a key with trailing digits removed from each (password1, key2).
-function keyWords(key: string): string[] {
-  return propertyNameSegments(key).map((segment) => segment.replace(/\d+$/, "")).filter((segment) => segment.length > 0);
-}
-
-/** True when a name in a query string, header, attribute, or name-value pair carries a credential. */
-export function isCredentialKey(key: string): boolean {
-  if (SESSION_ID_PATTERN.test(key) || EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
-  const words = keyWords(key);
-  const last = words[words.length - 1];
-  if (last === undefined || BOUND_KEY_SEGMENTS.has(words[0])) return false;
-  if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
-  if (last === "code" || last === "codes") return words.length > 1 && CREDENTIAL_CODE_QUALIFIERS.has(words[words.length - 2]);
-  if (last === "id") return words.length > 1 && BEARER_ID_QUALIFIER_PATTERN.test(words[words.length - 2]);
-  // A connection string (connection_string, connectionString, DB_CONNECTION_STRING) embeds
-  // the password of the account it connects as.
-  if (last === "string" && words[words.length - 2] === "connection") return true;
-  if (credentialKeyWord(last)) return true;
-  return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
-}
-
-/** True when a key names a webhook URL whose path and query carry the webhook's token. */
-function isWebhookUrlKey(key: string): boolean {
-  const words = keyWords(key);
-  const last = words[words.length - 1];
-  if (last === "webhook") return true;
-  return last !== undefined && WEBHOOK_URL_TAIL_WORDS.has(last) && words[words.length - 2] === "webhook";
-}
-
-// The URL under a webhook key with its userinfo, path, query, and fragment replaced: the
-// scheme and host stay, so the destination is still read.
-function redactedWebhookUrl(url: string): string {
-  const origin = URL_ORIGIN_PATTERN.exec(url);
-  return `${origin ? `${origin[1]}${origin[2]}` : ""}/${REDACTED}`;
-}
-
-// True for a value that opens with a bare integer under a plural credential word: a count,
-// not a carrier (the rest of a key: value line is rescanned for pairs of its own).
-function isCountValue(key: string, value: string): boolean {
-  if (!COUNT_VALUE_PATTERN.test(value)) return false;
-  const words = keyWords(key);
-  return words.length > 0 && PLURAL_CREDENTIAL_WORDS.has(words[words.length - 1]);
-}
-
-// True for a key whose last word is a plural credential word (api-tokens, keys, apikeys): a
-// collection, so as a path label it is a pair only when a lone token follows.
-function isPluralCredentialKey(key: string): boolean {
-  const words = keyWords(key);
-  const last = words[words.length - 1];
-  return last !== undefined && (PLURAL_CREDENTIAL_WORDS.has(last) || PLURAL_CREDENTIAL_LABEL_PATTERN.test(last));
-}
-
-/** isCredentialKey plus the words that name a credential only in a query string or = assignment. */
-function isCredentialAssignmentKey(key: string): boolean {
-  if (isCredentialKey(key)) return true;
-  const words = keyWords(key);
-  return words.length > 0 && ASSIGNMENT_ONLY_CREDENTIAL_WORDS.has(words[words.length - 1]);
-}
-
-// Token-shaped casing: the case changes more often than once every three letters
-// (bPxRfiCYcanaryKEY); words, acronyms, camelCase, and PascalCase change case at word
-// boundaries only (AWSLambdaBasicExecutionRole).
-function hasTokenCasing(letters: string): boolean {
-  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
-  let changes = 0;
-  for (let index = 1; index < letters.length; index += 1) {
-    const previousLower = letters[index - 1] >= "a" && letters[index - 1] <= "z";
-    const currentLower = letters[index] >= "a" && letters[index] <= "z";
-    if (previousLower !== currentLower) changes += 1;
-  }
-  return changes * 3 > letters.length;
-}
-
-// A "-" or "_" separated segment shaped like part of a name: empty, digits alone, or letters
-// with at most one digit group (west2, sha256, vsys1, ethernet1) whose casing is not token-shaped.
-function isNameSegment(segment: string): boolean {
-  if (segment.length === 0 || DIGITS_ONLY_PATTERN.test(segment)) return true;
-  const digitGroups = segment.match(DIGIT_GROUP_PATTERN) ?? [];
-  if (digitGroups.length > 1) return false;
-  return !hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, ""));
-}
-
-// A run is a token when it carries base64 symbols ("+" anywhere; "=" padding only where the
-// run is base64-shaped: a multiple of four characters with no "-" or "_", so "key=" left
-// in front of a marker is never padding and the rule stays idempotent), or when a
-// segment of MIN_TOKEN_SEGMENT_LENGTH or more is not name-shaped, or when at least half
-// of its segments are not. One short random-looking segment beside several names (the
-// six-character mkdtemp suffix of a temp path, a build id) does not make a token.
-function looksLikeToken(run: string): boolean {
-  const padding = /=+$/.exec(run)?.[0] ?? "";
-  const body = run.slice(0, run.length - padding.length);
-  if (UPPERCASE_CODE_PATTERN.test(body) || DIGITS_ONLY_PATTERN.test(body) || UUID_PATTERN.test(body)) return false;
-  if (body.includes("+")) return true;
-  if (padding.length > 0) return run.length % 4 === 0 && !/[-_]/.test(body);
-  const segments = body.split(/[-_]/).filter((segment) => segment.length > 0);
-  const tokenSegments = segments.filter((segment) => !isNameSegment(segment));
-  if (tokenSegments.length === 0) return false;
-  return tokenSegments.some((segment) => segment.length >= MIN_TOKEN_SEGMENT_LENGTH) || tokenSegments.length * 2 >= segments.length;
-}
-
-// A whole query value that is one token-shaped run (no path, dot, or percent escape inside).
-function isTokenShapedValue(value: string): boolean {
-  return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
-}
-
-// The word after a scheme name is prose when it is a Titlecase word, an auth-param name
-// before its "=", a plain lowercase word from the list above, or, after a noun scheme
-// word (Token, OAuth, Splunk, Snowflake), any plain lowercase word too short to be a real
-// token.
-function isSchemeProse(scheme: string, value: string): boolean {
-  if (TITLE_WORD_PATTERN.test(value)) return true;
-  const authParam = AUTH_PARAM_PATTERN.exec(value);
-  if (authParam) return AUTH_PARAM_NAMES.has(authParam[1].toLowerCase());
-  if (!PLAIN_WORD_PATTERN.test(value)) return false;
-  if (SCHEME_PROSE_WORDS.has(value)) return true;
-  return NOUN_SCHEME_WORDS.has(scheme.toLowerCase()) && value.length < LONG_TOKEN_MIN_LENGTH;
-}
-
-function isPublicPemLabel(label: string): boolean {
-  return PUBLIC_PEM_LABELS.has(label.trim());
-}
-
-function scrubPem(text: string, scope: PemScope): string {
-  const keeps = (label: string): boolean => {
-    switch (scope) {
-      case "all":
-        return false;
-      case "private":
-        return isPublicPemLabel(label);
-      default: {
-        const exhaustive: never = scope;
-        return exhaustive;
-      }
-    }
-  };
-  return text
-    .replace(PEM_BLOCK_PATTERN, (match, label: string) => (keeps(label) ? match : CREDENTIAL_REDACTION_MARKER))
-    .replace(PEM_OPEN_PATTERN, (match, label: string) => (keeps(label) ? match : CREDENTIAL_REDACTION_MARKER));
-}
-
-function scrubUrlUserinfo(url: string): string {
-  return url.replace(URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`);
-}
-
-// The run of backslashes at index.
-function backslashRun(text: string, index: number): number {
-  let run = 0;
-  while (text[index + run] === "\\") run += 1;
-  return run;
-}
-
-// The quote token at index: a bare quote, or a quote behind the odd run of backslashes that
-// JSON escaping puts before it at some nesting depth (\" one level down, \\\" two levels
-// down, and so on). An even run escapes backslashes and leaves the quote bare, so it is no
-// token here; the caller steps over the run and reads the quote on its own.
-function quoteTokenAt(text: string, index: number): string | undefined {
-  const run = backslashRun(text, index);
-  const quote = text[index + run];
-  if ((quote !== '"' && quote !== "'") || (run > 0 && run % 2 === 0)) return undefined;
-  return text.slice(index, index + run + 1);
-}
-
-// True when the quote token at index sits inside a token, a value character before it and
-// another after it, so it is content of the value and neither opens nor closes a segment.
-function midTokenQuoteAt(text: string, index: number, tokenLength: number): boolean {
-  const before = text[index - 1];
-  const after = text[index + tokenLength];
-  if (before === undefined || after === undefined) return false;
-  if (HEADER_VALUE_OPENER_PATTERN.test(before) || before === '"' || before === "'" || before === "\\") return false;
-  return !QUOTE_BOUNDARY_PATTERN.test(after);
-}
-
-// True when the quote token at index, though a value could start there, is followed by
-// nothing a quoted value starts with (whitespace, a delimiter, a bracket, a tag, or the
-// end of the text): it is the quote closing the enclosing text, as after a base64 value
-// that ends in "=" (Basic dXNlcjpwYXNz=","code":401), not one opening a segment.
-function closingQuoteAfterOpener(text: string, index: number, tokenLength: number): boolean {
-  const after = text[index + tokenLength];
-  return after === undefined || /[\s,;:)}\]<>]/.test(after);
-}
-
-// The first line end or HTML tag at or after start, or the end of the text.
-function lineEndFrom(text: string, start: number): number {
-  const terminator = HEADER_VALUE_TERMINATOR_PATTERN.exec(text.slice(start));
-  return terminator ? start + terminator.index : text.length;
-}
-
-// The control characters the one-letter escapes stand for.
-const CONTROL_ESCAPE_LETTERS = new Map<string, number>([["n", 0x0a], ["r", 0x0d], ["t", 0x09], ["b", 0x08], ["f", 0x0c], ["v", 0x0b], ["0", 0x00]]);
-
-// True for the code of a control character: U+0000 to U+001F, U+007F, or the line and
-// paragraph separators U+2028 and U+2029.
-function isControlCode(code: number): boolean {
-  return code <= 0x1f || code === 0x7f || code === 0x2028 || code === 0x2029;
-}
-
-// The code of the control character an escape at index stands for (\n, \r, \t, \b, \f, \v,
-// \0, \uXXXX, or \xHH behind an odd run of backslashes, as one stringify leaves it), or -1
-// when the text at index is no such escape: an even run escapes backslashes, and the escape
-// of a printable character (\u00e9) is content.
-function escapedControlCodeAt(text: string, index: number): number {
-  const run = backslashRun(text, index);
-  if (run === 0 || run % 2 === 0) return -1;
-  const letter = text[index + run];
-  if (letter === undefined) return -1;
-  const simple = CONTROL_ESCAPE_LETTERS.get(letter);
-  if (simple !== undefined) return simple;
-  const digits = letter === "u" ? 4 : letter === "x" ? 2 : 0;
-  if (digits === 0) return -1;
-  const hex = text.slice(index + run + 1, index + run + 1 + digits);
-  if (hex.length !== digits || !/^[0-9a-f]+$/i.test(hex)) return -1;
-  const code = parseInt(hex, 16);
-  return isControlCode(code) ? code : -1;
-}
-
-// True at a line break left escaped by one stringify (\n, \r, \u000a, \u000d, \x0a, \x0d): a
-// line end for an unquoted header value, as the raw character is.
-function escapedLineBreakAt(text: string, index: number): boolean {
-  const code = escapedControlCodeAt(text, index);
-  return code === 0x0a || code === 0x0d;
-}
-
-// Where the unquoted token that starts at start ends: at the first whitespace or raw control
-// character, at a control the stringify left escaped (\t, \u0009, \f, \b, and a line break
-// among them), or at limit. A token never carries a control, so the pair or header chained
-// after the escape is read on its own.
-function unquotedTokenEnd(text: string, start: number, limit: number): number {
-  let index = start;
-  while (index < limit) {
-    const char = text[index];
-    if (/\s/.test(char) || isControlCode(char.charCodeAt(0))) break;
-    if (char === "\\") {
-      if (escapedControlCodeAt(text, index) !== -1) break;
-      index += backslashRun(text, index);
-      continue;
-    }
-    index += 1;
-  }
-  return index;
-}
-
-// The key without the escape letter in front of it: after an escaping backslash the letter
-// belongs to the escape (\napi_key is a newline and then api_key), not to the key. Only the
-// credential test uses the result; the text itself is left as it arrived.
-function keyAfterEscape(text: string, keyStart: number, key: string): string {
-  let run = 0;
-  while (keyStart - 1 - run >= 0 && text[keyStart - 1 - run] === "\\") run += 1;
-  if (run % 2 === 0) return key;
-  const letter = ESCAPE_LETTER_PATTERN.exec(key);
-  return letter ? key.slice(letter[0].length) : key;
-}
-
-// The index of the token that closes a quoted segment opened with token, before limit, or
-// -1. A token inside a token (sid="O'hunter2") is content of the segment, as is a token at a
-// deeper depth (more backslashes); a token nearer the surface closes the text the segment
-// sits in, so the segment is unterminated.
-function closingQuoteIndex(text: string, from: number, token: string, limit: number): number {
-  let index = from;
-  while (index < limit) {
-    const candidate = quoteTokenAt(text, index);
-    if (candidate === undefined) {
-      index += text[index] === "\\" ? backslashRun(text, index) : 1;
-      continue;
-    }
-    if (midTokenQuoteAt(text, index, candidate.length)) {
-      index += candidate.length;
-      continue;
-    }
-    if (candidate === token) return index;
-    if (candidate.length < token.length) return -1;
-    index += candidate.length;
-  }
-  return -1;
-}
-
-// Where the value of a header line that starts at start ends. A value that opens with a
-// quote token ends at the token that closes it on the same line, whatever it carries (a
-// "; Name:" inside a quoted cookie is content); when nothing closes it, the quote is content
-// and the value ends as an unquoted one does. An unquoted value ends at the end of the line,
-// at an HTML tag, at the ";" or "," before the "Name:" token of the next header on a
-// compound line (on "Cookie: sid=value; X-ApiKeys: value" the next header keeps its name
-// and gets its own carrier treatment, and a Content-Type or Date after a cookie keeps its
-// name and value), at a line break left escaped inside a JSON string (\n, \r, \u000a), or
-// at the quote that closes the text the line sits in. Inside an unquoted value a quote
-// where a value can start opens a quoted segment carried through its closing token; a
-// quote inside a token (sid=O'hunter2, my'pref=value) is content; a quote at the end of a
-// token, or one after "=" that only a delimiter or the end follows (sid=abc==",), closes
-// the enclosing text. Trailing whitespace is not part of the value.
-function headerValueEnd(text: string, start: number): number {
-  const limit = lineEndFrom(text, start);
-  const opening = quoteTokenAt(text, start);
-  if (opening !== undefined) {
-    const close = closingQuoteIndex(text, start + opening.length, opening, limit);
-    if (close !== -1) return close + opening.length;
-  }
-  let index = opening === undefined ? start : start + opening.length;
-  while (index < limit) {
-    const char = text[index];
-    if ((char === ";" || char === ",") && FOLLOWING_HEADER_PATTERN.test(text.slice(index + 1, index + 1 + FOLLOWING_HEADER_LOOKAHEAD))) break;
-    if (char === "\\" && escapedLineBreakAt(text, index)) break;
-    const token = quoteTokenAt(text, index);
-    if (token === undefined) {
-      index += char === "\\" ? backslashRun(text, index) : 1;
-      continue;
-    }
-    if (!HEADER_VALUE_OPENER_PATTERN.test(text[index - 1])) {
-      if (!midTokenQuoteAt(text, index, token.length)) break;
-      index += token.length;
-      continue;
-    }
-    if (closingQuoteAfterOpener(text, index, token.length)) break;
-    const close = closingQuoteIndex(text, index + token.length, token, limit);
-    index = close === -1 ? index + token.length : close + token.length;
-  }
-  while (index > start && /\s/.test(text[index - 1])) index -= 1;
-  return index;
-}
-
-// The quote token a header value is wrapped in as a whole (bare or escaped to any depth), or
-// "" when it is not one quoted string.
-function enclosingQuote(value: string): string {
-  const token = quoteTokenAt(value, 0);
-  return token !== undefined && value.length >= token.length * 2 && value.endsWith(token) ? token : "";
-}
-
-// True for an Authorization pair whose value reads "Bearer [REDACTED]" or the like: the header
-// rule already treated it, and the pair rules leave the scheme word standing. Under any other
-// credential-named key the scheme word is part of the value and goes with it.
-function keepsSchemeWord(key: string, value: string): boolean {
-  if (!AUTHORIZATION_HEADERS.has(key.toLowerCase())) return false;
-  const scheme = REDACTED_SCHEME_VALUE_PATTERN.exec(value);
-  return scheme !== null && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase());
-}
-
-// The listed scheme word a header value opens with, when a token follows it, or undefined:
-// for a bare scheme word, a word the list does not know, or a value that opens with anything
-// but a word.
-function leadingSchemeWord(value: string): RegExpExecArray | undefined {
-  const scheme = AUTH_SCHEME_PATTERN.exec(value);
-  if (!scheme || scheme[0].length === value.length || !AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) return undefined;
-  return scheme;
-}
-
-// Where the credentials after a scheme word end, credentialsStart being the index after the
-// word and the whitespace behind it: a parameter list (username=..., realm=...) runs to end,
-// a quoted string to the quote that closes it (or to end when nothing does), and a bare
-// token to its first whitespace or escaped control.
-function schemeCredentialsEnd(text: string, credentialsStart: number, end: number): number {
-  const credentials = text.slice(credentialsStart, end);
-  if (AUTH_PARAM_LIST_PATTERN.test(credentials)) return end;
-  const quote = quoteTokenAt(credentials, 0);
-  if (quote !== undefined) {
-    const close = closingQuoteIndex(text, credentialsStart + quote.length, quote, end);
-    return close === -1 ? end : close + quote.length;
-  }
-  return unquotedTokenEnd(text, credentialsStart, end);
-}
-
-// Where the value of a single-token header ends: an unquoted value at its first whitespace
-// or escaped control, a quoted one where headerValueEnd put it. A value that opens with a
-// listed scheme word and a token (X-Auth-Token: Bearer <token>) is the word and the
-// credentials after it, as it would be under Authorization, so the token is never left
-// standing after the marker.
-function singleTokenEnd(text: string, start: number, end: number): number {
-  const value = text.slice(start, end);
-  if (enclosingQuote(value) !== "") return end;
-  const scheme = leadingSchemeWord(value);
-  if (scheme !== undefined) return schemeCredentialsEnd(text, start + scheme[0].length, end);
-  return unquotedTokenEnd(text, start, end);
-}
-
-// Where an Authorization value ends: after the listed scheme word and the one token (or one
-// quoted string) of credentials that follows it, so prose after the token on a free-text
-// line stays; a parameter list after the scheme (Digest username=..., realm=...) goes to the
-// end of the line, as does a value quoted as a whole, a bare scheme word, and a value that
-// opens with anything but a listed scheme word (GenieKey <token>, SharedKey account:<sig>,
-// a bare token): the first word may be a scheme the list does not know, with its credentials
-// after it, so the whole line goes.
-function authorizationValueEnd(text: string, start: number, end: number): number {
-  const value = text.slice(start, end);
-  if (enclosingQuote(value) !== "") return end;
-  const scheme = leadingSchemeWord(value);
-  if (scheme === undefined) return end;
-  return schemeCredentialsEnd(text, start + scheme[0].length, end);
-}
-
-// The replacement for a header value, or undefined when nothing is left to remove: the value
-// already opens with the marker (bare, inside its quotes, or after its scheme word), or an
-// Authorization value is a bare scheme word with no credentials after it. An Authorization
-// value keeps its scheme word as spelled; the credentials after it go whole, inside their own
-// quotes when they were quoted (Bearer "value" becomes Bearer "[REDACTED]"). A value that is
-// one quoted string keeps its quotes around the replacement so quoted text stays quoted.
-function redactedHeaderValue(header: string, value: string): string | undefined {
-  const quote = enclosingQuote(value);
-  const inner = quote === "" ? value : value.slice(quote.length, value.length - quote.length);
-  if (inner.startsWith(CREDENTIAL_REDACTION_MARKER)) return undefined;
-  if (AUTHORIZATION_HEADERS.has(header)) {
-    const scheme = AUTH_SCHEME_PATTERN.exec(inner);
-    if (scheme && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) {
-      const credentials = inner.slice(scheme[0].length);
-      if (credentials.length === 0) return undefined;
-      const credentialQuote = enclosingQuote(credentials);
-      if (credentials.slice(credentialQuote.length).startsWith(CREDENTIAL_REDACTION_MARKER)) return undefined;
-      return `${quote}${scheme[1]} ${credentialQuote}${CREDENTIAL_REDACTION_MARKER}${credentialQuote}${quote}`;
-    }
-  }
-  return `${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`;
-}
-
-// Every credential-bearing header line loses its credentials whatever their shape, by the
-// header's class: an Authorization value keeps its listed scheme word and loses the token
-// after it (or its whole parameter list), or goes whole when it opens with anything else; a
-// cookie or key list goes whole; and a single-token header loses its first token, or the
-// listed scheme word and the token after it when it opens with one. On a compound line each
-// header is its own line: the value of one ends before the name of the next, which is then
-// matched and treated on its own.
-function scrubHeaderLines(text: string): string {
-  HEADER_LINE_PATTERN.lastIndex = 0;
-  let out = "";
-  let last = 0;
-  let match: RegExpExecArray | null;
-  while ((match = HEADER_LINE_PATTERN.exec(text)) !== null) {
-    const header = match[1].toLowerCase();
-    const start = match.index + match[0].length;
-    const lineEnd = headerValueEnd(text, start);
-    const end = LIST_VALUE_HEADERS.has(header) ? lineEnd : AUTHORIZATION_HEADERS.has(header) ? authorizationValueEnd(text, start, lineEnd) : singleTokenEnd(text, start, lineEnd);
-    const value = text.slice(start, end);
-    if (value.length === 0) continue;
-    const replacement = redactedHeaderValue(header, value);
-    if (replacement === undefined) continue;
-    out += `${text.slice(last, start)}${replacement}`;
-    last = end;
-    HEADER_LINE_PATTERN.lastIndex = end;
-  }
-  return last === 0 ? text : `${out}${text.slice(last)}`;
-}
-
-// The key and separator are matched on their own and the value is consumed only when the
-// key names a credential, so the value of an ordinary pair is rescanned and a credential
-// pair nested inside it (data=token=...) is still caught. A value the scheme rule already
-// reduced to "<scheme> [REDACTED]" keeps its scheme word under an Authorization key and loses
-// it under any other credential key, where the scheme word was the start of the value. A
-// colon-terminated key that ends a path segment is a label whose value is at most one token:
-// a singular label (/etc/app/password: <value> was rejected) takes that token whatever its
-// shape and whatever follows, and a plural label (/api/v1/api-tokens: request failed) takes
-// it only when no prose continues after it, since prose means there was no value at all; an
-// escaped slash (\/) before the key is a line break, not a path.
-function replaceCredentialAssignments(text: string): string {
-  const fates = authParameterFates(text);
-  ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
-  let out = "";
-  let last = 0;
-  let match: RegExpExecArray | null;
-  while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
-    const [whole, openingQuote, key, separator, operator] = match;
-    if (operator === "=" && fates.get(match.index + openingQuote.length) === "challenge") continue;
-    const spelledName = keyAfterEscape(text, match.index + openingQuote.length, key);
-    const name = openingQuote === "" && spelledName.startsWith("D") && JAVA_PROPERTY_PREFIX_PATTERN.test(text.slice(Math.max(0, match.index - 2), match.index)) ? spelledName.slice(1) : spelledName;
-    const valueStart = match.index + whole.length;
-    if (isWebhookUrlKey(name)) {
-      WEBHOOK_VALUE_PATTERN.lastIndex = valueStart;
-      const url = WEBHOOK_VALUE_PATTERN.exec(text)?.[0];
-      if (url === undefined) continue;
-      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedWebhookUrl(url)}`;
-      last = valueStart + url.length;
-      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
-      continue;
-    }
-    if (!(operator === "=" ? isCredentialAssignmentKey(name) : isCredentialKey(name))) continue;
-    const redactedScheme = REDACTED_SCHEME_VALUE_PATTERN.exec(text.slice(valueStart));
-    if (redactedScheme !== null && AUTH_SCHEME_WORDS.has(redactedScheme[1].toLowerCase())) {
-      if (AUTHORIZATION_HEADERS.has(name.toLowerCase())) continue;
-      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedScheme[2]}${CREDENTIAL_REDACTION_MARKER}`;
-      last = valueStart + redactedScheme[0].length;
-      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
-      continue;
-    }
-    const pathLabel = operator === ":" && text[match.index - 1] === "/" && text[match.index - 2] !== "\\";
-    const valuePattern = operator === ":" && !pathLabel ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
-    valuePattern.lastIndex = valueStart;
-    const value = valuePattern.exec(text)?.[0];
-    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(name, value)) continue;
-    if (pathLabel && isPluralCredentialKey(name) && PROSE_CONTINUATION_PATTERN.test(text.slice(valueStart + value.length))) continue;
-    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${CREDENTIAL_REDACTION_MARKER}`;
-    last = valueStart + value.length;
-    ASSIGNMENT_KEY_PATTERN.lastIndex = last;
-  }
-  return last === 0 ? text : `${out}${text.slice(last)}`;
-}
-
-// A credential-named flag with its value as the next argument loses that argument.
-function replaceFlagValues(text: string): string {
-  return text.replace(FLAG_VALUE_PATTERN, (match, flag: string, space: string) => (isCredentialKey(flag) ? `--${flag}${space}${CREDENTIAL_REDACTION_MARKER}` : match));
-}
-
-// Where a quoted parameter value that opens at valueStart with the quote token ends: after
-// the token that closes it; at a shallower token, which closes the text the list sits in,
-// so the value was cut off and nothing of it stays; or at limit when nothing closes it. A
-// token inside a token (O'hunter2) is content of the value.
-function quotedParameterValueEnd(text: string, valueStart: number, quote: string, limit: number): number {
-  let index = valueStart + quote.length;
-  while (index < limit) {
-    const candidate = quoteTokenAt(text, index);
-    if (candidate === undefined) {
-      index += text[index] === "\\" ? backslashRun(text, index) : 1;
-      continue;
-    }
-    if (midTokenQuoteAt(text, index, candidate.length)) {
-      index += candidate.length;
-      continue;
-    }
-    if (candidate === quote) return index + candidate.length;
-    if (candidate.length < quote.length) return index;
-    index += candidate.length;
-  }
-  return limit;
-}
-
-// One parameter of a list: its name as spelled (without an escape letter glued to its
-// front), where the name starts, and where its value starts and ends; the quote token that
-// opens a quoted value, or undefined for a bare one.
-interface AuthParameter {
-  name: string;
-  nameStart: number;
-  valueStart: number;
-  valueEnd: number;
-  quote: string | undefined;
-}
-
-// What a parameter of an auth parameter list is: a proof (its value goes), a challenge
-// parameter (its value stays), or another parameter (judged under its own name).
-type AuthParameterFate = "proof" | "challenge" | "other";
-
-// The parameter list that opens at start (name=value, name2=value2, ...): its parameters
-// and where it ends. A quoted value (bare or escaped to any depth) runs to the quote that
-// closes it, or to the end of the text it sits in when nothing does (a cut-off value keeps
-// no part of itself), an unquoted value is one token, and the list ends before a "," that
-// no further parameter follows, so prose after the list stays. Undefined when no parameter
-// opens at start (nothing after the "=").
-function readAuthParameterList(text: string, start: number): { end: number; items: AuthParameter[] } | undefined {
-  const limit = lineEndFrom(text, start);
-  const items: AuthParameter[] = [];
-  let index = start;
-  while (index < limit) {
-    AUTH_PARAM_ITEM_PATTERN.lastIndex = index;
-    const item = AUTH_PARAM_ITEM_PATTERN.exec(text);
-    if (item === null) break;
-    const valueStart = index + item[0].length;
-    const quote = quoteTokenAt(text, valueStart);
-    let valueEnd: number;
-    if (quote !== undefined) {
-      valueEnd = quotedParameterValueEnd(text, valueStart, quote, limit);
-    } else {
-      AUTH_PARAM_BARE_VALUE_PATTERN.lastIndex = valueStart;
-      const bare = AUTH_PARAM_BARE_VALUE_PATTERN.exec(text);
-      if (bare === null) break;
-      valueEnd = valueStart + bare[0].length;
-    }
-    items.push({ name: keyAfterEscape(text, index, item[1]), nameStart: index, valueStart, valueEnd, quote });
-    AUTH_PARAM_SEPARATOR_PATTERN.lastIndex = valueEnd;
-    const separator = AUTH_PARAM_SEPARATOR_PATTERN.exec(text);
-    if (separator === null || separator[0].length === 0) break;
-    index = valueEnd + separator[0].length;
-  }
-  const lastItem = items[items.length - 1];
-  return lastItem === undefined ? undefined : { end: lastItem.valueEnd, items };
-}
-
-function authParameterFate(name: string): AuthParameterFate {
-  const lower = name.toLowerCase();
-  if (PROOF_PARAM_NAMES.has(lower)) return "proof";
-  return CHALLENGE_PARAM_NAMES.has(lower) ? "challenge" : "other";
-}
-
-// A known auth parameter other than a proof: one of them makes a list without a scheme
-// word an auth parameter list.
-function isAuthParameterAnchor(name: string): boolean {
-  const lower = name.toLowerCase();
-  return (AUTH_PARAM_NAMES.has(lower) || CHALLENGE_PARAM_NAMES.has(lower)) && !PROOF_PARAM_NAMES.has(lower);
-}
-
-// The fate of every parameter of every auth parameter list in text, by where its name
-// starts: the list after a scheme word, whatever it holds (a credential list after a scheme
-// word has already gone whole when this runs), and a list without one that holds two or
-// more parameters, one of them an anchor. A parameter outside such a list has no entry.
-function authParameterFates(text: string): Map<number, AuthParameterFate> {
-  const fates = new Map<number, AuthParameterFate>();
-  AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = 0;
-  let opener: RegExpExecArray | null;
-  while ((opener = AUTH_PARAMETER_LIST_OPENER_PATTERN.exec(text)) !== null) {
-    const list = readAuthParameterList(text, opener.index);
-    if (list === undefined) continue;
-    const schemeLed = SCHEME_LED_LIST_PATTERN.test(text.slice(Math.max(0, opener.index - 32), opener.index));
-    if (schemeLed || (list.items.length > 1 && list.items.some((item) => isAuthParameterAnchor(item.name)))) {
-      for (const item of list.items) fates.set(item.nameStart, authParameterFate(item.name));
-    }
-    AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = list.end;
-  }
-  return fates;
-}
-
-// A scheme word and the credential parameter list after it lose the list and keep the
-// word, header name in front or none; a challenge's parameter list stays.
-function replaceSchemeParameterLists(text: string): string {
-  SCHEME_PARAMETER_LIST_PATTERN.lastIndex = 0;
-  let out = "";
-  let last = 0;
-  let match: RegExpExecArray | null;
-  while ((match = SCHEME_PARAMETER_LIST_PATTERN.exec(text)) !== null) {
-    const list = readAuthParameterList(text, match.index + match[0].length);
-    if (list === undefined || !list.items.some((item) => !CHALLENGE_PARAM_NAMES.has(item.name.toLowerCase()))) continue;
-    out += `${text.slice(last, match.index)}${match[1]} ${CREDENTIAL_REDACTION_MARKER}`;
-    last = list.end;
-    SCHEME_PARAMETER_LIST_PATTERN.lastIndex = last;
-  }
-  return last === 0 ? text : `${out}${text.slice(last)}`;
-}
-
-// Every proof parameter of an auth parameter list loses its value, quoted (the quote token
-// of its own depth stays, and a cut-off value gets no closing quote it never had) or bare;
-// the parameters beside it are left as they are.
-function replaceAuthParameterProofs(text: string): string {
-  const proofs = [...authParameterFates(text).entries()].filter(([, fate]) => fate === "proof").map(([nameStart]) => nameStart);
-  if (proofs.length === 0) return text;
-  let out = "";
-  let last = 0;
-  for (const nameStart of proofs) {
-    const list = readAuthParameterList(text, nameStart);
-    const item = list?.items[0];
-    if (item === undefined || item.nameStart !== nameStart) continue;
-    const quote = item.quote ?? "";
-    const closed = quote !== "" && item.valueEnd - quote.length > item.valueStart && text.startsWith(quote, item.valueEnd - quote.length);
-    const value = text.slice(item.valueStart + quote.length, closed ? item.valueEnd - quote.length : item.valueEnd);
-    if (value.length === 0 || value === CREDENTIAL_REDACTION_MARKER) continue;
-    out += `${text.slice(last, item.valueStart)}${quote}${CREDENTIAL_REDACTION_MARKER}${closed ? quote : ""}`;
-    last = item.valueEnd;
-  }
-  return last === 0 ? text : `${out}${text.slice(last)}`;
-}
-
-// The rule for a quoted attribute or pair value under a key: redacted under a credential
-// key (or reduced to its origin under a webhook key), the match otherwise.
-type QuotedValueRule = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string) => string;
-
-// Every key="value" attribute, at any escape depth, under the quoted-value rule; a challenge
-// parameter inside an auth parameter list (the nonce of Digest realm="api", nonce="n")
-// keeps its value whatever its name says.
-function replaceQuotedAttributes(text: string, quotedValue: QuotedValueRule): string {
-  const fates = authParameterFates(text);
-  return text.replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string, value: string, offset: number) =>
-    (fates.get(offset) === "challenge" ? match : quotedValue(keyAfterEscape(text, offset, key), value, () => `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`, (url) => `${key}=${quote}${url}${quote}`, match)));
-}
-
-/** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
-// Header lines go first: a recognised header line takes its whole value, so the URL and
-// query rules never split a cookie pair whose name holds "&" or "#" off its cookie. The
-// parameter-list rule runs before the scheme rule, so a credential list after a scheme
-// word goes whole instead of losing its first "name=" and keeping the quoted value, and the
-// proof rule right after it, so a proof in a list without a scheme word goes before the
-// per-parameter rules read the list.
-function scrubCarriers(text: string, pemScope: PemScope): string {
-  const quotedValue = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string): string => {
-    if (isWebhookUrlKey(key) && URL_VALUE_PATTERN.test(value)) return webhook(redactedWebhookUrl(value));
-    return isCredentialKey(key) && !isCountValue(key, value) && !keepsSchemeWord(key, value) ? redacted() : match;
-  };
-  const carriers = scrubHeaderLines(scrubPem(text, pemScope))
-    .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}`)
-    .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
-    .replace(SLASH_ESCAPED_URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`)
-    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match));
-  const pairs = replaceAuthParameterProofs(replaceSchemeParameterLists(carriers))
-    .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${CREDENTIAL_REDACTION_MARKER}`))
-    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => quotedValue(key, value, () => `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"`, (url) => `"${key}"${separator}"${url}"`, match))
-    .replace(JSON_ESCAPED_PAIR_PATTERN, (match, run: string, key: string, separator: string, value: string) => quotedValue(key, value, () => `${run}"${key}${run}"${separator}${run}"${CREDENTIAL_REDACTION_MARKER}${run}"`, (url) => `${run}"${key}${run}"${separator}${run}"${url}${run}"`, match));
-  const scrubbed = replaceQuotedAttributes(pairs, quotedValue);
-  return replaceCredentialAssignments(replaceFlagValues(scrubbed))
-    .replace(JWT_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(PANOS_API_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(AWS_ACCESS_KEY_ID_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(GITHUB_TOKEN_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(STRIPE_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(SLACK_TOKEN_PATTERN, CREDENTIAL_REDACTION_MARKER);
-}
-
-/** The general scrub for error text: every carrier rule, every PEM block, and the long-token rule. Idempotent. */
-export function redactErrorText(text: string): string {
-  return scrubCarriers(text, "all").replace(LONG_TOKEN_RUN_PATTERN, (run) => (looksLikeToken(run) ? CREDENTIAL_REDACTION_MARKER : run));
-}
-
-/** Guard 2 on its own: every configured secret in every encoded form, for whole payloads and bundle files where the general scrub would remove evidence. */
-export function redactConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
-  const values = secrets.filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
-  if (values.length === 0) return text;
-  return scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(CREDENTIAL_REDACTION_MARKER);
-}
+const { MIN_CONFIGURED_SECRET_LENGTH, LONG_TOKEN_MIN_LENGTH, URL_VALUE_PATTERN, SESSION_ID_PATTERN, isCredentialKey, isWebhookUrlKey, redactedWebhookUrl, scrubCarriers, redactErrorText, redactConfiguredSecrets } = createPemCredentialScrubber();
+export { MIN_CONFIGURED_SECRET_LENGTH, LONG_TOKEN_MIN_LENGTH, isCredentialKey, redactErrorText, redactConfiguredSecrets };
 
 /**
  * Every string inside a tool result or other plain value, with the configured secrets
@@ -1686,52 +667,9 @@ function percent(value: number): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
-
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
-  if (
-    relativeTarget === ".."
-    || relativeTarget.startsWith(`..${join("/")}`)
-    || relativeTarget.startsWith("..")
-  ) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
-
-  const pathSegments = relativeTarget.split(/[\\/]+/).filter(Boolean);
-  let currentPath = realBase;
-  for (const segment of pathSegments) {
-    currentPath = join(currentPath, segment);
-    if (!existsSync(currentPath)) break;
-    if (lstatSync(currentPath).isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked parent directory: ${currentPath}`);
-    }
-  }
-
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  if (lstatSync(realpathSync(parent)).isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
-  return resolvedTarget;
-}
 
 /** Writes one bundle file with the configured secrets removed from its text in every encoded form (guard 2). */
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string, secrets: ReadonlyArray<string | undefined> = []): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, redactConfiguredSecrets(content, secrets), { encoding: "utf8", mode: 0o600 });
-}
+const writeSecureTextFile = createSecureTextWriter(redactConfiguredSecrets);
 
 /** Writes one JSON bundle file; the configured secrets are removed value by value before serialization so the file stays valid JSON. */
 async function writeSecureJsonFile(rootDir: string, relativePathname: string, value: unknown, secrets: ReadonlyArray<string | undefined>): Promise<void> {
@@ -1739,15 +677,6 @@ async function writeSecureJsonFile(rootDir: string, relativePathname: string, va
   await writeSecureTextFile(rootDir, relativePathname, serializeJson(sealValue(plain, secrets)));
 }
 
-async function countFilesRecursively(rootDir: string): Promise<number> {
-  let total = 0;
-  for (const entry of await readdir(rootDir, { withFileTypes: true })) {
-    const pathname = join(rootDir, entry.name);
-    if (entry.isDirectory()) total += await countFilesRecursively(pathname);
-    else if (entry.isFile()) total += 1;
-  }
-  return total;
-}
 
 const ERRNO_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
 
@@ -2549,11 +1478,11 @@ export class TenableApiClient extends TenableHttpClient {
     };
   }
 
-  async exportAssets(maxChunks = DEFAULT_MAX_CHUNKS): Promise<TenableExportResult> {
+  async exportAssets(maxChunks: number = DEFAULT_MAX_CHUNKS): Promise<TenableExportResult> {
     return this.runExport("assets", { chunk_size: OWN_ASSET_EXPORT_CHUNK_SIZE }, maxChunks);
   }
 
-  async exportVulnerabilities(sinceUnixSeconds: number, maxChunks = DEFAULT_MAX_CHUNKS): Promise<TenableExportResult> {
+  async exportVulnerabilities(sinceUnixSeconds: number, maxChunks: number = DEFAULT_MAX_CHUNKS): Promise<TenableExportResult> {
     return this.runExport("vulns", {
       num_assets: OWN_VULN_EXPORT_NUM_ASSETS,
       include_plugin_output: false,
@@ -2949,18 +1878,16 @@ function collectionSummary(datasets: Record<string, TenableDataset<unknown>>): J
   return Object.fromEntries(Object.entries(datasets).map(([name, dataset]) => [name, collectionStatusOf(dataset)]));
 }
 
-const TENABLE_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
 
-function recordTenableDecisionFacts(control: number, facts: Readonly<Record<string, unknown>>, idSuffix = ""): void {
+function recordTenableDecisionFacts(decisions: BatchVerdicts,
+  control: number, facts: Readonly<Record<string, unknown>>, idSuffix = ""): void {
   const id = `TENABLE-${String(control).padStart(2, "0")}${idSuffix}`;
-  const store = TENABLE_DECISION_CONTEXT.getStore();
-  if (!store) throw new Error(`${id} decision facts were recorded outside a Tenable assessment`);
-  store.set(id, facts);
+  decisions.record(id, facts);
 }
 
 function finding(
+  decisions: BatchVerdicts,
   control: number,
-  status: TenableFindingStatus,
   severity: TenableSeverity,
   summary: string,
   evidence: JsonRecord = {},
@@ -2970,7 +1897,7 @@ function finding(
     id: `TENABLE-${String(control).padStart(2, "0")}${idSuffix}`,
     title: CONTROL_TITLES[control] + (idSuffix ? " (Tenable Security Center)" : ""),
     severity,
-    status,
+    status: decisions.status(`TENABLE-${String(control).padStart(2, "0")}${idSuffix}`) as TenableFindingStatus,
     summary,
     evidence,
     mappings: CONTROL_MAPPINGS[control],
@@ -3004,13 +1931,14 @@ function describeUnread(dataset: TenableDataset<unknown>): string {
  * that is not configured is described without naming any endpoint, because no
  * request was made; otherwise the summary names the request that failed.
  */
-function unreadableFinding(control: number, severity: TenableSeverity, dataset: TenableDataset<unknown>, manualEvidence: string, idSuffix = ""): TenableFinding {
+function unreadableFinding(decisions: BatchVerdicts,
+  control: number, severity: TenableSeverity, dataset: TenableDataset<unknown>, manualEvidence: string, idSuffix = ""): TenableFinding {
   const summary = dataset.status === "not_configured"
     ? `Not applicable: ${describeUnread(dataset)}, so this control was not assessed. A human must collect ${manualEvidence}.`
     : `Unknown: ${dataset.endpoint} could not be read because ${describeUnread(dataset)}. A human must collect ${manualEvidence}.`;
   // The evidence states the absence in the positive form (not_collected: true): a false
   // leaf appearing under a denied read is the shape an empty or disabled setting takes.
-  return finding(control, "manual", severity, summary, {
+  return finding(decisions, control, severity, summary, {
     not_collected: true,
     endpoint: dataset.endpoint,
     dataset_status: dataset.status,
@@ -3030,10 +1958,7 @@ function partialNote(dataset: TenableDataset<unknown>): string {
 
 // A pass never survives a capped, stuck, or unreadable inventory it depends on, nor an
 // export whose chunks carried records that could not be evaluated.
-function capForPartial(status: TenableFindingStatus, dataset: TenableDataset<unknown>): TenableFindingStatus {
-  if (status === "pass" && (dataset.status !== "ok" || dataset.truncated || unevaluableRecordsOf(dataset) > 0)) return "warn";
-  return status;
-}
+
 
 // The partial-view statement of a truncated inventory appears on every branch, not only
 // the pass branch the author appended it to: a fail or warn read from a capped or stuck
@@ -3061,10 +1986,7 @@ function capForUnreadable(status: TenableFindingStatus, ...datasets: Array<Tenab
 // The corollary extended to truncation: a pass does not survive a secondary inventory
 // that was unreadable or truncated, since its unread remainder may hold what the pass
 // ruled out.
-function capForIncomplete(status: TenableFindingStatus, ...datasets: Array<TenableDataset<unknown>>): TenableFindingStatus {
-  if (status === "pass" && datasets.some((dataset) => dataset.status !== "ok" || dataset.truncated === true)) return "warn";
-  return status;
-}
+
 
 function readInFull(dataset: TenableDataset<unknown>): boolean {
   return dataset.status === "ok" && dataset.truncated !== true && unevaluableRecordsOf(dataset) === 0;
@@ -3336,31 +2258,38 @@ async function collectPolicyDetails(clients: TenableClients, scans: TenableDatas
 }
 
 export async function collectTenableScanProgramData(clients: TenableClients, options: TenableAssessmentOptions = {}): Promise<TenableScanProgramData> {
-  const now = options.now ?? Date.now();
-  const maxChunks = clampInteger(options.maxChunks, DEFAULT_MAX_CHUNKS, 1, 1000);
+  return collectScanProgramForRun(clients, resolveTenableRunPlan(options));
+}
+
+interface TenableSharedReads {
+  users: Promise<TenableDataset<JsonRecord[]>>;
+  assetExport: Promise<TenableDataset<TenableExportResult>>;
+}
+
+async function collectScanProgramForRun(clients: TenableClients, plan: TenableRunPlan, shared?: TenableSharedReads): Promise<TenableScanProgramData> {
   const [scans, policies, templates, exclusions, targetGroups, users, assetExport, scScans, scScanResults] = await Promise.all([
     vmList(clients, "GET /scans", (client) => client.listScans()),
     vmList(clients, "GET /policies", (client) => client.listPolicies()),
     vmList(clients, "GET /editor/scan/templates", (client) => client.listScanTemplates()),
     vmPaginated(clients, "GET /exclusions", (client) => client.listExclusions()),
     vmList(clients, "GET /target-groups", (client) => client.listTargetGroups()),
-    vmList(clients, "GET /users", (client) => client.listUsers()),
-    vmExport(clients, "POST /assets/export", (client) => client.exportAssets(maxChunks)),
+    shared?.users ?? vmList(clients, "GET /users", (client) => client.listUsers()),
+    shared?.assetExport ?? vmExport(clients, "POST /assets/export", (client) => client.exportAssets(plan.maxChunks)),
     scDataset(clients, "GET /rest/scan", (client) => client.listScans()),
-    scDataset(clients, "GET /rest/scanResult", (client) => client.listScanResults(Math.floor((now - DEFAULT_STALE_SCAN_DAYS * DAY_MS) / 1000))),
+    scDataset(clients, "GET /rest/scanResult", (client) => client.listScanResults(plan.scanResultsSinceUnix)),
   ]);
   const policyDetails = await collectPolicyDetails(clients, scans);
   return { scans, policies, policyDetails, templates, exclusions, targetGroups, users, assetExport, scScans, scScanResults };
 }
 
 export function assessTenableScanProgram(data: TenableScanProgramData, options: TenableAssessmentOptions = {}): TenableAssessmentResult {
-  return runBatchVerdictContext(TENABLE_DECISION_CONTEXT, TENABLE_SPEC, () => assessTenableScanProgramWithDecisionContext(data, options));
+  const plan = resolveTenableRunPlan(options);
+  return assessTenableScanProgramWithPlan(data, plan);
 }
 
-function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramData, options: TenableAssessmentOptions): TenableAssessmentResult {
-  const now = options.now ?? Date.now();
-  const staleScanDays = clampInteger(options.staleScanDays, DEFAULT_STALE_SCAN_DAYS, 1, 365);
-  const credentialThreshold = clampNumber(options.credentialThreshold, DEFAULT_CREDENTIAL_THRESHOLD, 0, 1);
+function assessTenableScanProgramWithPlan(data: TenableScanProgramData, plan: TenableRunPlan): TenableAssessmentResult {
+  const decisions = new BatchVerdicts(TENABLE_SPEC);
+  const { now, staleScanDays, credentialThreshold } = plan;
   const callerIsAdministrator = detectAdministrator(data.users);
   const findings: TenableFinding[] = [];
 
@@ -3373,10 +2302,10 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
     templatesById.get(asString(item.wizard_uuid) ?? "") ?? templatesById.get(asString(item.template_uuid) ?? "");
 
   if (data.scans.status !== "ok") {
-    for (const control of [1, 2, 17]) recordTenableDecisionFacts(control, { scans_readable: false });
-    findings.push(unreadableFinding(1, "high", data.scans, "the scan template list, port ranges, plugin families, and safe-check settings from the Tenable UI"));
-    findings.push(unreadableFinding(2, "high", data.scans, "the scan schedule list and last run dates from the Tenable UI"));
-    findings.push(unreadableFinding(17, "medium", data.scans, "the list of scheduled compliance audit scans (CIS, DISA STIG, PCI) from the Tenable UI"));
+    for (const control of [1, 2, 17]) recordTenableDecisionFacts(decisions, control, { scans_readable: false });
+    findings.push(unreadableFinding(decisions, 1, "high", data.scans, "the scan template list, port ranges, plugin families, and safe-check settings from the Tenable UI"));
+    findings.push(unreadableFinding(decisions, 2, "high", data.scans, "the scan schedule list and last run dates from the Tenable UI"));
+    findings.push(unreadableFinding(decisions, 17, "medium", data.scans, "the list of scheduled compliance audit scans (CIS, DISA STIG, PCI) from the Tenable UI"));
   } else {
     const scans = data.scans.data;
     const templateNames = new Map<string, number>();
@@ -3416,7 +2345,7 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
       { dataset: data.policies, consequence: "policy names are unknown" },
     ];
     const templateNote = unreadableNote(policySecondaries);
-    recordTenableDecisionFacts(1, {
+    recordTenableDecisionFacts(decisions, 1, {
       scans_readable: true,
       scan_count: scans.length,
       discovery_scan_count: discoveryOnly,
@@ -3459,7 +2388,7 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
       policySummary = `All ${evaluations.length} scan policies referenced by the ${scans.length} visible scans enable safe checks (safe_checks=yes), scan the default or full port range, and keep more than half of their plugin families enabled, per ${POLICY_DETAILS_ENDPOINT}.${scansWithoutPolicy.length > 0 ? ` ${scansWithoutPolicy.length} scans expose no policy_id and were not evaluated.` : ""}${templateNote}${nonAdminNote(callerIsAdministrator)}`;
       if (scansWithoutPolicy.length > 0 && policyStatus === "pass") policyStatus = "warn";
     }
-    findings.push(finding(1, policyStatus, "high", policySummary, {
+    findings.push(finding(decisions, 1, "high", policySummary, {
       scan_count: scans.length,
       scan_types: scanTypes,
       policy_count: countOrNull(data.policies),
@@ -3492,7 +2421,7 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
       return lastLaunch !== undefined && daysBetween(now, lastLaunch) > staleScanDays;
     });
     const neverRun = recurring.filter((scan) => asString(scan.status) === "empty" || parseTimestampMs(scan.last_modification_date) === undefined);
-    recordTenableDecisionFacts(2, {
+    recordTenableDecisionFacts(decisions, 2, {
       scans_readable: true,
       scan_count: scans.length,
       enabled_recurring_scan_count: recurring.length,
@@ -3501,25 +2430,25 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
       never_run_or_undated_recurring_scan_count: neverRun.length,
       caller_is_administrator: callerIsAdministrator === true,
     });
-    let scheduleStatus: TenableFindingStatus;
+
     let scheduleSummary: string;
     if (scans.length === 0) {
-      scheduleStatus = "fail";
+
       scheduleSummary = `No scans are visible, so no recurring scan schedule exists; emptiness fails this control.${nonAdminNote(callerIsAdministrator)}`;
     } else if (recurring.length === 0) {
-      scheduleStatus = "fail";
+
       scheduleSummary = `${scans.length} scans are visible but none has an enabled recurring schedule (enabled=true with non-null rrules).`;
     } else if (stale.length > 0) {
-      scheduleStatus = "fail";
+
       scheduleSummary = `${stale.length} of ${recurring.length} enabled recurring scans last launched more than ${staleScanDays} days ago.`;
     } else if (neverRun.length > 0) {
-      scheduleStatus = "warn";
+
       scheduleSummary = `${recurring.length} enabled recurring scans exist, but ${neverRun.length} have never run or expose no launch date, so they are not counted as fresh.`;
     } else {
-      scheduleStatus = capForNonAdmin("pass", callerIsAdministrator);
+
       scheduleSummary = `All ${recurring.length} enabled recurring scans launched within the last ${staleScanDays} days.${nonAdminNote(callerIsAdministrator)}`;
     }
-    findings.push(finding(2, scheduleStatus, "high", scheduleSummary, {
+    findings.push(finding(decisions, 2, "high", scheduleSummary, {
       scan_count: scans.length,
       enabled_recurring_scans: recurring.length,
       disabled_recurring_scans: disabledRecurring.length,
@@ -3530,15 +2459,15 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
     }));
 
     if (data.templates.status !== "ok") {
-      recordTenableDecisionFacts(17, { scans_readable: true, templates_readable: false });
-      findings.push(unreadableFinding(17, "medium", data.templates, "the list of scheduled compliance audit scans (CIS, DISA STIG, PCI) from the Tenable UI"));
+      recordTenableDecisionFacts(decisions, 17, { scans_readable: true, templates_readable: false });
+      findings.push(unreadableFinding(decisions, 17, "medium", data.templates, "the list of scheduled compliance audit scans (CIS, DISA STIG, PCI) from the Tenable UI"));
     } else {
       const complianceScans = scans.filter((scan) => {
         const template = templateFor(scan);
         return Boolean(template && templateLooksCompliance(template));
       });
       const activeCompliance = complianceScans.filter((scan) => scanIsEnabled(scan) && scanIsRecurring(scan));
-      recordTenableDecisionFacts(17, {
+      recordTenableDecisionFacts(decisions, 17, {
         scans_readable: true,
         templates_readable: true,
         scan_count: scans.length,
@@ -3546,8 +2475,7 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
         caller_is_administrator: callerIsAdministrator === true,
       });
       findings.push(finding(
-        17,
-        scans.length === 0 ? "fail" : activeCompliance.length > 0 ? capForNonAdmin("pass", callerIsAdministrator) : "fail",
+        decisions, 17,
         "medium",
         scans.length === 0
           ? "No scans are visible, so no compliance audit scan is configured; emptiness fails this control."
@@ -3564,8 +2492,8 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
   }
 
   if (data.assetExport.status !== "ok") {
-    recordTenableDecisionFacts(4, { asset_export_readable: false });
-    findings.push(unreadableFinding(4, "high", data.assetExport, "the credentialed scan ratio from the Tenable asset inventory (Last Authenticated Scan filter)"));
+    recordTenableDecisionFacts(decisions, 4, { asset_export_readable: false });
+    findings.push(unreadableFinding(decisions, 4, "high", data.assetExport, "the credentialed scan ratio from the Tenable asset inventory (Last Authenticated Scan filter)"));
   } else {
     const assets = data.assetExport.data.records;
     const credentialed = assets.filter((asset) => asString(asset.last_authentication_scan_status) === "Success" || asBoolean(asset.has_agent) === true);
@@ -3575,26 +2503,26 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
       return asBoolean(asset.has_agent) !== true && (status === undefined || status === "N/A");
     });
     const coverage = ratio(credentialed.length, assets.length);
-    recordTenableDecisionFacts(4, {
+    recordTenableDecisionFacts(decisions, 4, {
       asset_export_readable: true,
       asset_count: assets.length,
       credentialed_coverage_ratio: coverage,
       credential_threshold: credentialThreshold,
       asset_export_complete: readInFull(data.assetExport),
     });
-    let status: TenableFindingStatus;
+
     let summary: string;
     if (assets.length === 0) {
-      status = "manual";
+
       summary = "The asset export finished but returned zero assets, so the credentialed scan ratio cannot be computed; verify the key's asset visibility (All Assets Can View) and that scans have run.";
     } else if (coverage < credentialThreshold) {
-      status = "fail";
+
       summary = `${percent(coverage)} of ${assets.length} exported assets had a successful credentialed or agent scan, below the ${percent(credentialThreshold)} threshold.`;
     } else {
-      status = capForPartial("pass", data.assetExport);
+
       summary = `${percent(coverage)} of ${assets.length} exported assets had a successful credentialed or agent scan (threshold ${percent(credentialThreshold)}).${partialNote(data.assetExport)}`;
     }
-    findings.push(finding(4, status, "high", summary, {
+    findings.push(finding(decisions, 4, "high", summary, {
       asset_count: assets.length,
       credentialed_or_agent_assets: credentialed.length,
       authentication_failures: failures.length,
@@ -3608,14 +2536,14 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
   }
 
   if (data.exclusions.status !== "ok") {
-    recordTenableDecisionFacts(13, { exclusions_readable: false });
-    findings.push(unreadableFinding(13, "medium", data.exclusions, "the scan exclusion list with schedules, targets, and justifications from Settings > Exclusions"));
+    recordTenableDecisionFacts(decisions, 13, { exclusions_readable: false });
+    findings.push(unreadableFinding(decisions, 13, "medium", data.exclusions, "the scan exclusion list with schedules, targets, and justifications from Settings > Exclusions"));
   } else {
     const exclusions = data.exclusions.data;
     const permanent = exclusions.filter((item) => asBoolean(asObject(item.schedule)?.enabled) !== true);
     const undocumented = exclusions.filter((item) => !asString(item.description));
     const broad = exclusions.filter((item) => exclusionIsBroad(asString(item.members)));
-    recordTenableDecisionFacts(13, {
+    recordTenableDecisionFacts(decisions, 13, {
       exclusions_readable: true,
       exclusions_complete: !data.exclusions.truncated,
       permanent_exclusion_count: permanent.length,
@@ -3624,8 +2552,7 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
     });
     const issues = new Set([...permanent, ...undocumented, ...broad].map((item) => asString(item.name) ?? asString(item.id) ?? "exclusion"));
     findings.push(withPartialView(finding(
-      13,
-      exclusions.length === 0 ? capForPartial("pass", data.exclusions) : issues.size === 0 ? capForPartial("pass", data.exclusions) : permanent.length > 0 || broad.length > 0 ? "fail" : "warn",
+      decisions, 13,
       "medium",
       exclusions.length === 0
         ? data.exclusions.truncated
@@ -3649,8 +2576,8 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
   }
 
   if (data.targetGroups.status !== "ok") {
-    recordTenableDecisionFacts(20, { target_groups_readable: false });
-    findings.push(unreadableFinding(20, "low", data.targetGroups, "the legacy target group list (deprecated feature) or confirmation that tags replaced target groups"));
+    recordTenableDecisionFacts(decisions, 20, { target_groups_readable: false });
+    findings.push(unreadableFinding(decisions, 20, "low", data.targetGroups, "the legacy target group list (deprecated feature) or confirmation that tags replaced target groups"));
   } else {
     const groups = data.targetGroups.data;
     const stale = groups.filter((group) => {
@@ -3665,7 +2592,7 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
     }
     const overlapping = [...memberIndex.entries()].filter(([, owners]) => owners.length > 1);
     const modifiedTimes = groups.map((group) => parseTimestampMs(group.last_modification_date));
-    recordTenableDecisionFacts(20, {
+    recordTenableDecisionFacts(decisions, 20, {
       target_groups_readable: true,
       target_group_age_days: modifiedTimes.flatMap((modified) => modified === undefined ? [] : [daysBetween(now, modified)]),
       undated_target_group_count: modifiedTimes.filter((modified) => modified === undefined).length,
@@ -3673,8 +2600,7 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
       caller_is_administrator: callerIsAdministrator === true,
     });
     findings.push(finding(
-      20,
-      groups.length === 0 ? capForNonAdmin("pass", callerIsAdministrator) : stale.length === 0 && overlapping.length === 0 ? capForNonAdmin("pass", callerIsAdministrator) : "warn",
+      decisions, 20,
       "low",
       groups.length === 0
         ? `No legacy target groups are visible (${data.targetGroups.endpoint} returned an empty list); target groups were deprecated in February 2022 in favor of tags, so emptiness is compliant.${nonAdminNote(callerIsAdministrator)}`
@@ -3689,7 +2615,7 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
     ));
   }
 
-  findings.push(assessSecurityCenterSchedule(data.scScans, data.scScanResults, now, staleScanDays));
+  findings.push(assessSecurityCenterSchedule(decisions, data.scScans, data.scScanResults, now, staleScanDays));
 
   const errors = [
     ...datasetErrors("scans", data.scans),
@@ -3734,10 +2660,11 @@ function assessTenableScanProgramWithDecisionContext(data: TenableScanProgramDat
   };
 }
 
-function assessSecurityCenterSchedule(scans: TenableDataset<JsonRecord[]>, results: TenableDataset<JsonRecord[]>, now: number, staleScanDays: number): TenableFinding {
+function assessSecurityCenterSchedule(decisions: BatchVerdicts,
+  scans: TenableDataset<JsonRecord[]>, results: TenableDataset<JsonRecord[]>, now: number, staleScanDays: number): TenableFinding {
   if (scans.status !== "ok") {
-    recordTenableDecisionFacts(2, { sc_scans_readable: false }, "-SC");
-    return unreadableFinding(2, "high", scans, "the Security Center scan schedule list and recent scan results", "-SC");
+    recordTenableDecisionFacts(decisions, 2, { sc_scans_readable: false }, "-SC");
+    return unreadableFinding(decisions, 2, "high", scans, "the Security Center scan schedule list and recent scan results", "-SC");
   }
   const scheduled = scans.data.filter((scan) => asString(asObject(scan.schedule)?.type) === "ical");
   const completed = results.status === "ok"
@@ -3746,7 +2673,7 @@ function assessSecurityCenterSchedule(scans: TenableDataset<JsonRecord[]>, resul
         return /completed/i.test(asString(result.status) ?? "") && finishedAt !== undefined && daysBetween(now, finishedAt) <= staleScanDays;
       })
     : [];
-  recordTenableDecisionFacts(2, {
+  recordTenableDecisionFacts(decisions, 2, {
     sc_scans_readable: true,
     sc_scan_count: scans.data.length,
     sc_recurring_scan_count: scheduled.length,
@@ -3759,25 +2686,25 @@ function assessSecurityCenterSchedule(scans: TenableDataset<JsonRecord[]>, resul
       : [],
     stale_scan_days: staleScanDays,
   }, "-SC");
-  let status: TenableFindingStatus;
+
   let summary: string;
   if (scans.data.length === 0) {
-    status = "fail";
+
     summary = "Security Center returned zero scans for this API key, so no recurring schedule exists; emptiness fails this control.";
   } else if (scheduled.length === 0) {
-    status = "fail";
+
     summary = `${scans.data.length} Security Center scans are visible but none uses an ical (recurring) schedule.`;
   } else if (results.status !== "ok") {
-    status = "manual";
+
     summary = `${scheduled.length} recurring Security Center scans exist but ${describeUnread(results)}, so recent completion cannot be confirmed.`;
   } else if (completed.length === 0) {
-    status = "fail";
+
     summary = `${scheduled.length} recurring Security Center scans exist but no scan result completed in the last ${staleScanDays} days.`;
   } else {
-    status = "pass";
+
     summary = `${scheduled.length} recurring Security Center scans exist and ${completed.length} scan results completed in the last ${staleScanDays} days.`;
   }
-  return finding(2, status, "high", summary, {
+  return finding(decisions, 2, "high", summary, {
     sc_scan_count: scans.data.length,
     sc_recurring_scans: scheduled.length,
     sc_completed_results_in_window: results.status === "ok" ? completed.length : null,
@@ -3800,7 +2727,10 @@ export interface TenableSensorCoverageData {
 }
 
 export async function collectTenableSensorCoverageData(clients: TenableClients, options: TenableAssessmentOptions = {}): Promise<TenableSensorCoverageData> {
-  const maxChunks = clampInteger(options.maxChunks, DEFAULT_MAX_CHUNKS, 1, 1000);
+  return collectSensorCoverageForRun(clients, resolveTenableRunPlan(options));
+}
+
+async function collectSensorCoverageForRun(clients: TenableClients, plan: TenableRunPlan, shared?: TenableSharedReads): Promise<TenableSensorCoverageData> {
   const [serverProperties, scanners, agents, agentGroups, networks, tagCategories, tagValues, assetExport, users, scScanners, scFeed] = await Promise.all([
     vmObject(clients, "GET /server/properties", (client) => client.getServerProperties()),
     vmList(clients, "GET /scanners", (client) => client.listScanners()),
@@ -3809,8 +2739,8 @@ export async function collectTenableSensorCoverageData(clients: TenableClients, 
     vmPaginated(clients, "GET /networks", (client) => client.listNetworks()),
     vmPaginated(clients, "GET /tags/categories", (client) => client.listTagCategories()),
     vmPaginated(clients, "GET /tags/values", (client) => client.listTagValues()),
-    vmExport(clients, "POST /assets/export", (client) => client.exportAssets(maxChunks)),
-    vmList(clients, "GET /users", (client) => client.listUsers()),
+    shared?.assetExport ?? vmExport(clients, "POST /assets/export", (client) => client.exportAssets(plan.maxChunks)),
+    shared?.users ?? vmList(clients, "GET /users", (client) => client.listUsers()),
     scDataset(clients, "GET /rest/scanner", (client) => client.listScanners()),
     scObject(clients, "GET /rest/feed", (client) => client.getFeed()),
   ]);
@@ -3832,24 +2762,22 @@ function newestVersion(versions: string[]): string | undefined {
 }
 
 export function assessTenableSensorCoverage(data: TenableSensorCoverageData, options: TenableAssessmentOptions = {}): TenableAssessmentResult {
-  return runBatchVerdictContext(TENABLE_DECISION_CONTEXT, TENABLE_SPEC, () => assessTenableSensorCoverageWithDecisionContext(data, options));
+  const plan = resolveTenableRunPlan(options);
+  return assessTenableSensorCoverageWithPlan(data, plan);
 }
 
-function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCoverageData, options: TenableAssessmentOptions): TenableAssessmentResult {
-  const now = options.now ?? Date.now();
-  const staleAssetDays = clampInteger(options.staleAssetDays, DEFAULT_STALE_ASSET_DAYS, 1, 365);
-  const agentOfflineDays = clampInteger(options.agentOfflineDays, DEFAULT_AGENT_OFFLINE_DAYS, 1, 365);
-  const pluginStaleHours = clampInteger(options.pluginStaleHours, DEFAULT_PLUGIN_STALE_HOURS, 1, 24 * 30);
-  const taggedThreshold = clampNumber(options.taggedThreshold, DEFAULT_TAGGED_THRESHOLD, 0, 1);
+function assessTenableSensorCoverageWithPlan(data: TenableSensorCoverageData, plan: TenableRunPlan): TenableAssessmentResult {
+  const decisions = new BatchVerdicts(TENABLE_SPEC);
+  const { now, staleAssetDays, agentOfflineDays, pluginStaleHours, taggedThreshold } = plan;
   const callerIsAdministrator = detectAdministrator(data.users);
   const findings: TenableFinding[] = [];
   const assets = data.assetExport.status === "ok" ? data.assetExport.data.records : [];
 
   if (data.assetExport.status !== "ok") {
-    recordTenableDecisionFacts(3, { asset_export_readable: false });
-    recordTenableDecisionFacts(16, { asset_export_readable: false });
-    findings.push(unreadableFinding(3, "high", data.assetExport, "the asset inventory per network and the expected network ranges"));
-    findings.push(unreadableFinding(16, "medium", data.assetExport, "the asset tag coverage report from the Tenable UI"));
+    recordTenableDecisionFacts(decisions, 3, { asset_export_readable: false });
+    recordTenableDecisionFacts(decisions, 16, { asset_export_readable: false });
+    findings.push(unreadableFinding(decisions, 3, "high", data.assetExport, "the asset inventory per network and the expected network ranges"));
+    findings.push(unreadableFinding(decisions, 16, "medium", data.assetExport, "the asset tag coverage report from the Tenable UI"));
   } else {
     const fresh = assets.filter((asset) => {
       const lastSeen = parseTimestampMs(asset.last_seen);
@@ -3865,8 +2793,8 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
     const emptyNetworks = data.networks.status === "ok"
       ? data.networks.data.filter((network) => !perNetwork.has(asString(network.name) ?? "") && !perNetwork.has(asString(network.uuid) ?? "")).map((network) => asString(network.name) ?? asString(network.uuid) ?? "network")
       : [];
-    const expected = options.expectedAssetCount;
-    recordTenableDecisionFacts(3, {
+    const expected = plan.expectedAssetCount;
+    recordTenableDecisionFacts(decisions, 3, {
       asset_export_readable: true,
       asset_count: assets.length,
       expected_asset_coverage_ratio: expected !== undefined && expected > 0 ? ratio(fresh.length, expected) : null,
@@ -3882,20 +2810,20 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
           ? ` ${emptyNetworks.length} of the ${data.networks.data.length} network objects retrieved have no assets; the network inventory was truncated (${data.networks.seen ?? "an unknown number"} of ${data.networks.total ?? "unknown"} records), so they are not named until it is read to completion.`
           : ` Networks without assets: ${emptyNetworks.slice(0, 10).join(", ")}.`
       : ` ${describeUnread(data.networks)}, so networks without assets are unknown.`;
-    let status: TenableFindingStatus;
+
     let summary: string;
     if (assets.length === 0) {
-      status = "fail";
+
       summary = "The asset export finished with zero assets, so no asset inventory exists to compare against expected ranges; emptiness fails this control.";
     } else if (expected !== undefined && expected > 0) {
       const coverage = ratio(fresh.length, expected);
-      status = coverage >= 0.95 ? capForIncomplete(capForPartial("pass", data.assetExport), data.networks) : "fail";
+
       summary = `${fresh.length} assets seen within ${staleAssetDays} days against an expected population of ${expected} (${percent(coverage)} coverage).${undated.length > 0 ? ` ${undated.length} assets have no last_seen date and were not counted.` : ""}${partialNote(data.assetExport)}${partialNote(data.networks)}${unreadableNote([{ dataset: data.networks, consequence: "networks without assets are unknown" }])}`;
     } else {
-      status = "manual";
+
       summary = `${assets.length} assets exported (${fresh.length} seen within ${staleAssetDays} days, ${stale} stale, ${undated.length} without last_seen). The API does not know the expected network ranges; pass expected_asset_count or compare the per-network counts in the evidence against the authoritative inventory.${networkNote}`;
     }
-    findings.push(finding(3, status, "high", summary, {
+    findings.push(finding(decisions, 3, "high", summary, {
       asset_count: assets.length,
       fresh_assets: fresh.length,
       stale_assets: stale,
@@ -3912,7 +2840,7 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
     const tagged = assets.filter((asset) => asRecords(asset.tags).length > 0);
     const categories = data.tagCategories.status === "ok" ? data.tagCategories.data.map((item) => asString(item.name) ?? "category") : [];
     const taggedRatio = ratio(tagged.length, assets.length);
-    recordTenableDecisionFacts(16, {
+    recordTenableDecisionFacts(decisions, 16, {
       asset_export_readable: true,
       tag_categories_readable: data.tagCategories.status === "ok",
       asset_count: assets.length,
@@ -3923,29 +2851,29 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
       asset_export_complete: readInFull(data.assetExport),
       tag_values_complete: readInFull(data.tagValues),
     });
-    let tagStatus: TenableFindingStatus;
+
     let tagSummary: string;
     if (data.tagCategories.status !== "ok") {
-      tagStatus = "manual";
+
       tagSummary = `${describeUnread(data.tagCategories)}; a human must confirm the tag taxonomy for compliance scope, business unit, and environment.`;
     } else if (assets.length === 0) {
-      tagStatus = "manual";
+
       tagSummary = "Zero assets were exported, so tag coverage cannot be measured.";
     } else if (categories.length === 0 && data.tagCategories.truncated) {
       // Zero delivered records under a truncated walk is an unread taxonomy, not an absent one.
-      tagStatus = "warn";
+
       tagSummary = `${data.tagCategories.endpoint} delivered zero tag categories although pagination.total reports ${data.tagCategories.total ?? "an unknown count"}, so the tag taxonomy was not reviewed.${partialNote(data.tagCategories)}`;
     } else if (categories.length === 0) {
-      tagStatus = "fail";
+
       tagSummary = "No tag categories are defined, so assets are not classified for compliance scope, business unit, or environment.";
     } else if (taggedRatio < taggedThreshold) {
-      tagStatus = "fail";
+
       tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag, below the ${percent(taggedThreshold)} threshold (${categories.length} categories defined).`;
     } else {
-      tagStatus = capForIncomplete(capForPartial("pass", data.assetExport), data.tagCategories, data.tagValues);
+
       tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag across ${categories.length} categories. Confirm the categories cover compliance scope, business unit, and environment.${partialNote(data.assetExport)}${partialNote(data.tagCategories)}${partialNote(data.tagValues)}${unreadableNote([{ dataset: data.tagValues, consequence: "the tag value population is unknown" }])}`;
     }
-    findings.push(finding(16, tagStatus, "medium", tagSummary, {
+    findings.push(finding(decisions, 16, "medium", tagSummary, {
       asset_count: assets.length,
       tagged_assets: tagged.length,
       tagged_ratio: taggedRatio,
@@ -3961,10 +2889,10 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
 
   const licensedAgents = asNumber(asObject(asObject(data.serverProperties.data)?.license)?.agents);
   if (data.agents.status !== "ok") {
-    recordTenableDecisionFacts(5, { agents_readable: false });
-    recordTenableDecisionFacts(6, { agents_readable: false });
-    findings.push(unreadableFinding(5, "high", data.agents, "the agent inventory with status, last connect, and version from Sensors > Agents"));
-    findings.push(unreadableFinding(6, "medium", data.agents, "the agent group membership report from Sensors > Agents"));
+    recordTenableDecisionFacts(decisions, 5, { agents_readable: false });
+    recordTenableDecisionFacts(decisions, 6, { agents_readable: false });
+    findings.push(unreadableFinding(decisions, 5, "high", data.agents, "the agent inventory with status, last connect, and version from Sensors > Agents"));
+    findings.push(unreadableFinding(decisions, 6, "medium", data.agents, "the agent group membership report from Sensors > Agents"));
   } else {
     const agents = data.agents.data;
     const offline = agents.filter((agent) => asString(agent.status) === "off");
@@ -3979,7 +2907,7 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
       return version !== undefined && compareVersions(version, newest) < 0 && (version.split(".")[0] !== newest.split(".")[0] || Number(version.split(".")[1] ?? 0) < Number(newest.split(".")[1] ?? 0));
     }) : [];
     const unhealthy = new Set([...offline, ...staleConnect].map((agent) => asString(agent.uuid) ?? asString(agent.id) ?? asString(agent.name) ?? "agent"));
-    recordTenableDecisionFacts(5, {
+    recordTenableDecisionFacts(decisions, 5, {
       agents_readable: true,
       agent_count: agents.length,
       unhealthy_agent_ratio: ratio(unhealthy.size, agents.length),
@@ -3988,24 +2916,24 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
       agents_complete: readInFull(data.agents),
       server_properties_readable: data.serverProperties.status === "ok",
     });
-    let status: TenableFindingStatus;
+
     let summary: string;
     if (agents.length === 0) {
-      status = "manual";
+
       summary = licensedAgents === 0
         ? "Unlicensed: the license reports zero agents and no agents are linked, so agent deployment does not apply to this tenant."
         : `No agents are linked (pagination.total ${data.agents.total ?? "unknown"}). Confirm whether agent deployment is in scope; emptiness cannot pass this control.`;
     } else if (ratio(unhealthy.size, agents.length) > 0.1) {
-      status = "fail";
+
       summary = `${unhealthy.size} of ${agents.length} agents are offline or have not connected in ${agentOfflineDays} days (more than 10%).`;
     } else if (undated.length > 0 || outdated.length > 0 || data.agents.truncated) {
-      status = "warn";
+
       summary = `${agents.length} agents inventoried; ${unhealthy.size} offline or stale, ${undated.length} without last_connect (not counted as healthy), ${outdated.length} below the newest linked version ${newest ?? "unknown"}.${partialNote(data.agents)}`;
     } else {
-      status = capForUnreadable("pass", data.serverProperties);
+
       summary = `All ${agents.length} agents connected within ${agentOfflineDays} days and run version ${newest ?? "unknown"}; ${unhealthy.size} offline.${unreadableNote([{ dataset: data.serverProperties, consequence: "the licensed agent count (license.agents) is unknown" }])}`;
     }
-    findings.push(withPartialView(finding(5, status, "high", summary, {
+    findings.push(withPartialView(finding(decisions, 5, "high", summary, {
       agent_count: boundedCount(agents.length, data.agents),
       pagination_total: data.agents.total ?? null,
       licensed_agents: licensedAgents ?? null,
@@ -4021,7 +2949,7 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
 
     const ungrouped = agents.filter((agent) => asRecords(agent.groups).length === 0);
     const groupCount = data.agentGroups.status === "ok" ? data.agentGroups.data.length : null;
-    recordTenableDecisionFacts(6, {
+    recordTenableDecisionFacts(decisions, 6, {
       agents_readable: true,
       agent_count: agents.length,
       agent_groups_readable: data.agentGroups.status === "ok",
@@ -4030,25 +2958,25 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
       ungrouped_agent_count: ungrouped.length,
       agents_complete: readInFull(data.agents),
     });
-    let groupStatus: TenableFindingStatus;
+
     let groupSummary: string;
     if (agents.length === 0) {
-      groupStatus = "manual";
+
       groupSummary = "No agents are linked, so there is no agent group organization to evaluate.";
     } else if (data.agentGroups.status !== "ok") {
-      groupStatus = "manual";
+
       groupSummary = `${describeUnread(data.agentGroups)}; ${ungrouped.length} of ${agents.length} agents report no group membership.`;
     } else if (groupCount === 0 || ratio(ungrouped.length, agents.length) > 0.1) {
-      groupStatus = "fail";
+
       groupSummary = `${ungrouped.length} of ${agents.length} agents belong to no agent group (${groupCount} groups defined).`;
     } else if (ungrouped.length > 0 || data.agents.truncated) {
-      groupStatus = "warn";
+
       groupSummary = `${ungrouped.length} of ${agents.length} agents are ungrouped across ${groupCount} groups.${partialNote(data.agents)}`;
     } else {
-      groupStatus = "pass";
+
       groupSummary = `All ${agents.length} agents belong to at least one of ${groupCount} agent groups. Confirm the groups mirror network segments or business units.`;
     }
-    findings.push(withPartialView(finding(6, groupStatus, "medium", groupSummary, {
+    findings.push(withPartialView(finding(decisions, 6, "medium", groupSummary, {
       agent_count: boundedCount(agents.length, data.agents),
       agent_group_count: groupCount,
       ungrouped_agents_count: boundedCount(ungrouped.length, data.agents),
@@ -4060,14 +2988,14 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
 
   const linkedScanners = data.scanners.data.filter((scanner) => asString(scanner.type) !== "local" && asBoolean(scanner.pool) !== true && asBoolean(scanner.group) !== true);
   if (data.scanners.status !== "ok") {
-    recordTenableDecisionFacts(7, { scanners_readable: false });
-    findings.push(unreadableFinding(7, "high", data.scanners, "the linked scanner list with status, last connect, and Nessus version from Sensors > Nessus Scanners"));
+    recordTenableDecisionFacts(decisions, 7, { scanners_readable: false });
+    findings.push(unreadableFinding(decisions, 7, "high", data.scanners, "the linked scanner list with status, last connect, and Nessus version from Sensors > Nessus Scanners"));
   } else if (data.scanners.data.length === 0) {
-    recordTenableDecisionFacts(7, { scanners_readable: true, scanner_count: 0, linked_scanner_count: 0 });
-    findings.push(finding(7, "manual", "high", `${data.scanners.endpoint} returned zero scanners; even cloud scanners were not visible, so the key cannot see sensors. Collect the scanner inventory from Sensors > Nessus Scanners.`, { scanner_count: 0 }));
+    recordTenableDecisionFacts(decisions, 7, { scanners_readable: true, scanner_count: 0, linked_scanner_count: 0 });
+    findings.push(finding(decisions, 7, "high", `${data.scanners.endpoint} returned zero scanners; even cloud scanners were not visible, so the key cannot see sensors. Collect the scanner inventory from Sensors > Nessus Scanners.`, { scanner_count: 0 }));
   } else if (linkedScanners.length === 0) {
-    recordTenableDecisionFacts(7, { scanners_readable: true, scanner_count: data.scanners.data.length, linked_scanner_count: 0 });
-    findings.push(finding(7, "manual", "high", `Not applicable to linked appliances: ${data.scanners.data.length} scanner entries are visible but all are Tenable-managed cloud scanners or groups. Confirm the tenant intentionally relies only on cloud scanners.`, {
+    recordTenableDecisionFacts(decisions, 7, { scanners_readable: true, scanner_count: data.scanners.data.length, linked_scanner_count: 0 });
+    findings.push(finding(decisions, 7, "high", `Not applicable to linked appliances: ${data.scanners.data.length} scanner entries are visible but all are Tenable-managed cloud scanners or groups. Confirm the tenant intentionally relies only on cloud scanners.`, {
       scanner_count: data.scanners.data.length,
       cloud_scanners: data.scanners.data.map((scanner) => asString(scanner.name)).slice(0, 50),
     }));
@@ -4085,7 +3013,7 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
       return version !== undefined && compareVersions(version, newest) < 0;
     }) : [];
     const unhealthy = new Set([...unlinked, ...off, ...staleConnect].map((scanner) => asString(scanner.name) ?? asString(scanner.id) ?? "scanner"));
-    recordTenableDecisionFacts(7, {
+    recordTenableDecisionFacts(decisions, 7, {
       scanners_readable: true,
       scanner_count: data.scanners.data.length,
       linked_scanner_count: linkedScanners.length,
@@ -4098,8 +3026,7 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
       scanner_list_truncated: data.scanners.truncated === true,
     });
     findings.push(withPartialView(finding(
-      7,
-      unhealthy.size > 0 ? "fail" : undated.length > 0 || outdated.length > 0 ? "warn" : capForNonAdmin(capForPartial("pass", data.scanners), callerIsAdministrator),
+      decisions, 7,
       "high",
       unhealthy.size > 0
         ? `${unhealthy.size} of ${linkedScanners.length} linked scanners are unlinked, off, or have not connected in 24 hours: ${[...unhealthy].slice(0, 10).join(", ")}.`
@@ -4121,8 +3048,8 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
   }
 
   if (data.serverProperties.status !== "ok") {
-    recordTenableDecisionFacts(8, { server_properties_readable: false });
-    findings.push(unreadableFinding(8, "high", data.serverProperties, "the current plugin set date from Settings > About and each scanner's plugin set"));
+    recordTenableDecisionFacts(decisions, 8, { server_properties_readable: false });
+    findings.push(unreadableFinding(decisions, 8, "high", data.serverProperties, "the current plugin set date from Settings > About and each scanner's plugin set"));
   } else {
     const serverPluginMs = parsePluginSetMs(data.serverProperties.data.plugin_set) ?? parsePluginSetMs(data.serverProperties.data.loaded_plugin_set);
     const datedScanners = data.scanners.data.filter((scanner) => parsePluginSetMs(scanner.loaded_plugin_set) !== undefined);
@@ -4136,7 +3063,7 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
       return stamp !== undefined && now - stamp > pluginStaleHours * 3_600_000 && asString(agent.status) === "on";
     }) : [];
     const serverFresh = serverPluginMs !== undefined && now - serverPluginMs <= pluginStaleHours * 3_600_000;
-    recordTenableDecisionFacts(8, {
+    recordTenableDecisionFacts(decisions, 8, {
       server_properties_readable: true,
       server_plugin_set_age_hours: serverPluginMs === undefined ? null : hoursSince(now, serverPluginMs),
       plugin_stale_hours: pluginStaleHours,
@@ -4152,37 +3079,37 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
       }) : [],
       agents_complete: readInFull(data.agents),
     });
-    let status: TenableFindingStatus;
+
     let summary: string;
     if (serverPluginMs === undefined) {
-      status = "manual";
+
       summary = `${data.serverProperties.endpoint} did not expose a parseable plugin_set, so plugin currency cannot be confirmed; collect the plugin set date from Settings > About.`;
     } else if (!serverFresh || staleScanners.length > 0) {
       // A stale container plugin set fails on its own; when the scanner list was not read,
       // the scanner clause names the unread read instead of counting zero of zero entries.
-      status = "fail";
+
       const scannerClause = data.scanners.status !== "ok"
         ? `${describeUnread(data.scanners)}, so scanner plugin sets are unverified`
         : `${staleScanners.length} of ${datedScanners.length} scanner entries exposing loaded_plugin_set load a set older than ${pluginStaleHours} hours${staleScanners.length > 0 ? ` (${staleScanners.map((scanner) => asString(scanner.name) ?? asString(scanner.id)).slice(0, 10).join(", ")})` : ""}`;
       summary = `The container plugin set ${asString(data.serverProperties.data.plugin_set) ?? "unknown"} is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old${serverFresh ? "" : ` (older than ${pluginStaleHours} hours)`} and ${scannerClause}.`;
     } else if (data.scanners.status !== "ok") {
-      status = "manual";
+
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but ${describeUnread(data.scanners)}, so no scanner plugin set could be evaluated; collect each scanner's plugin set from Settings > Sensors.`;
     } else if (datedScanners.length === 0) {
-      status = "manual";
+
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but ${data.scanners.data.length === 0 ? `${data.scanners.endpoint} returned zero scanners` : `none of the ${data.scanners.data.length} scanner entries exposes a parseable loaded_plugin_set (${undatedScanners.length} scanner instances without one, the rest are cloud scanner pools or groups)`}, so per-scanner plugin currency is not applicable or unverifiable and cannot pass; confirm scanner plugin sets in Settings > Sensors.`;
     } else if (undatedScanners.length > 0 || staleAgents.length > 0) {
-      status = "warn";
+
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and ${datedScanners.length} scanner entries load a fresh plugin set, but ${undatedScanners.length} scanner instances expose no parseable plugin set (not counted as current) and ${staleAgents.length} online agents load a plugin set older than ${pluginStaleHours} hours.`;
     } else if (data.agents.status !== "ok") {
       // Agent plugin currency is a verdict input; an unreadable agent list cannot pass.
-      status = "warn";
+
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${datedScanners.length} scanner entries exposing loaded_plugin_set load a set newer than ${pluginStaleHours} hours, but ${describeUnread(data.agents)}, so agent plugin currency is unknown and the verdict is capped at warn.`;
     } else {
-      status = capForPartial("pass", data.agents);
+
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${datedScanners.length} scanner entries exposing loaded_plugin_set (${linkedScanners.length} linked appliances) load a set newer than ${pluginStaleHours} hours.${partialNote(data.agents)}`;
     }
-    findings.push(withPartialView(finding(8, status, "high", summary, {
+    findings.push(withPartialView(finding(decisions, 8, "high", summary, {
       plugin_set: asString(data.serverProperties.data.plugin_set) ?? null,
       plugin_set_age_hours: serverPluginMs === undefined ? null : Math.round((now - serverPluginMs) / 3_600_000),
       scanner_entries: countOrNull(data.scanners),
@@ -4197,13 +3124,13 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
   }
 
   if (data.networks.status !== "ok") {
-    recordTenableDecisionFacts(9, { networks_readable: false });
-    findings.push(unreadableFinding(9, "medium", data.networks, "the network object list with assigned scanners from Settings > Sensors > Networks"));
+    recordTenableDecisionFacts(decisions, 9, { networks_readable: false });
+    findings.push(unreadableFinding(decisions, 9, "medium", data.networks, "the network object list with assigned scanners from Settings > Sensors > Networks"));
   } else {
     const networks = data.networks.data;
     const withoutScanners = networks.filter((network) => asNumber(network.scanner_count) === 0);
     const unknownCount = networks.filter((network) => asNumber(network.scanner_count) === undefined);
-    recordTenableDecisionFacts(9, {
+    recordTenableDecisionFacts(decisions, 9, {
       networks_readable: true,
       network_count: networks.length,
       zero_scanner_network_count: withoutScanners.length,
@@ -4211,8 +3138,7 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
       networks_complete: readInFull(data.networks),
     });
     findings.push(withPartialView(finding(
-      9,
-      networks.length === 0 ? "manual" : withoutScanners.length > 0 ? "fail" : unknownCount.length > 0 ? "warn" : capForPartial("pass", data.networks),
+      decisions, 9,
       "medium",
       networks.length === 0
         ? `${data.networks.endpoint} returned zero network objects; the default network should always exist, so the view is incomplete. Collect the network list from Settings > Sensors > Networks.`
@@ -4232,7 +3158,7 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
     ), data.networks));
   }
 
-  findings.push(assessSecurityCenterScanners(data.scScanners, data.scFeed, now, pluginStaleHours));
+  findings.push(assessSecurityCenterScanners(decisions, data.scScanners, data.scFeed, now, pluginStaleHours));
 
   const errors = [
     ...datasetErrors("server_properties", data.serverProperties),
@@ -4280,10 +3206,11 @@ function assessTenableSensorCoverageWithDecisionContext(data: TenableSensorCover
   };
 }
 
-function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, feed: TenableDataset<JsonRecord>, now: number, pluginStaleHours: number): TenableFinding {
+function assessSecurityCenterScanners(decisions: BatchVerdicts,
+  scanners: TenableDataset<JsonRecord[]>, feed: TenableDataset<JsonRecord>, now: number, pluginStaleHours: number): TenableFinding {
   if (scanners.status !== "ok") {
-    recordTenableDecisionFacts(7, { sc_scanners_readable: false }, "-SC");
-    return unreadableFinding(7, "high", scanners, "the Security Center scanner list with status, version, plugin set, and last check-in", "-SC");
+    recordTenableDecisionFacts(decisions, 7, { sc_scanners_readable: false }, "-SC");
+    return unreadableFinding(decisions, 7, "high", scanners, "the Security Center scanner list with status, version, plugin set, and last check-in", "-SC");
   }
   const enabled = scanners.data.filter((scanner) => asBoolean(scanner.enabled) !== false);
   const unhealthy = enabled.filter((scanner) => asString(scanner.status) !== "1");
@@ -4298,7 +3225,7 @@ function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, fe
   });
   const feedActive = asObject(feed.data.active);
   const feedStale = feed.status === "ok" ? asBoolean(feedActive?.stale) : undefined;
-  recordTenableDecisionFacts(7, {
+  recordTenableDecisionFacts(decisions, 7, {
     sc_scanners_readable: true,
     sc_scanner_count: scanners.data.length,
     sc_unhealthy_scanner_count: unhealthy.length,
@@ -4312,22 +3239,22 @@ function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, fe
     sc_undated_scanner_count: undated.length,
     sc_feed_readable: feed.status === "ok",
   }, "-SC");
-  let status: TenableFindingStatus;
+
   let summary: string;
   if (scanners.data.length === 0) {
-    status = "manual";
+
     summary = "Security Center returned zero scanners for this API key (organization users only see agent-capable scanners); collect the scanner list as an administrator.";
   } else if (unhealthy.length > 0 || staleCheckin.length > 0 || stalePlugins.length > 0 || feedStale === true) {
-    status = "fail";
+
     summary = `${unhealthy.length} of ${enabled.length} enabled Security Center scanners report a non-working status, ${staleCheckin.length} have not checked in for 24 hours, ${stalePlugins.length} load a plugin set older than ${pluginStaleHours} hours${feedStale === true ? ", and the active plugin feed is marked stale" : ""}.`;
   } else if (undated.length > 0 || feed.status !== "ok") {
-    status = "warn";
+
     summary = `${enabled.length} enabled Security Center scanners report a working status; ${undated.length} expose no lastCheckinTime${feed.status !== "ok" ? ` and ${describeUnread(feed)}` : ""}.`;
   } else {
-    status = "pass";
+
     summary = `All ${enabled.length} enabled Security Center scanners report status 1, checked in within 24 hours, load a plugin set newer than ${pluginStaleHours} hours, and the active plugin feed is not stale.`;
   }
-  return withPartialView(finding(7, status, "high", summary, {
+  return withPartialView(finding(decisions, 7, "high", summary, {
     sc_scanner_count: scanners.data.length,
     sc_enabled_scanners: enabled.length,
     sc_unhealthy: unhealthy.map((scanner) => `${asString(scanner.name)} (status ${asString(scanner.status)})`).slice(0, 50),
@@ -4351,17 +3278,18 @@ export interface TenableAccessControlData {
 }
 
 export async function collectTenableAccessControlData(clients: TenableClients, options: TenableAssessmentOptions = {}): Promise<TenableAccessControlData> {
-  const now = options.now ?? Date.now();
-  const lookbackDays = clampInteger(options.auditLookbackDays, DEFAULT_AUDIT_LOOKBACK_DAYS, 1, 365);
-  const sinceIso = new Date(now - lookbackDays * DAY_MS).toISOString();
+  return collectAccessControlForRun(clients, resolveTenableRunPlan(options));
+}
+
+async function collectAccessControlForRun(clients: TenableClients, plan: TenableRunPlan, shared?: TenableSharedReads): Promise<TenableAccessControlData> {
   const [users, groups, roles, permissions, accessGroups, credentials, auditLog, scUsers] = await Promise.all([
-    vmList(clients, "GET /users", (client) => client.listUsers()),
+    shared?.users ?? vmList(clients, "GET /users", (client) => client.listUsers()),
     vmList(clients, "GET /groups", (client) => client.listGroups()),
     vmList(clients, "GET /access-control/v1/roles", (client) => client.listRoles()),
     vmList(clients, "GET /api/v3/access-control/permissions", (client) => client.listPermissions()),
     vmPaginated(clients, "GET /v2/access-groups", (client) => client.listAccessGroups()),
     vmPaginated(clients, "GET /credentials", (client) => client.listCredentials()),
-    vmPaginated(clients, "GET /audit-log/v1/events", (client) => client.listAuditLogEvents(sinceIso)),
+    vmPaginated(clients, "GET /audit-log/v1/events", (client) => client.listAuditLogEvents(plan.auditSinceIso)),
     scDataset(clients, "GET /rest/user", (client) => client.listUsers()),
   ]);
   return { users, groups, roles, permissions, accessGroups, credentials, auditLog, scUsers };
@@ -4397,26 +3325,25 @@ function userHasStrongAuth(user: JsonRecord): boolean {
 }
 
 export function assessTenableAccessControl(data: TenableAccessControlData, options: TenableAssessmentOptions = {}): TenableAssessmentResult {
-  return runBatchVerdictContext(TENABLE_DECISION_CONTEXT, TENABLE_SPEC, () => assessTenableAccessControlWithDecisionContext(data, options));
+  const plan = resolveTenableRunPlan(options);
+  return assessTenableAccessControlWithPlan(data, plan);
 }
 
-function assessTenableAccessControlWithDecisionContext(data: TenableAccessControlData, options: TenableAssessmentOptions): TenableAssessmentResult {
-  const now = options.now ?? Date.now();
-  const inactiveDays = clampInteger(options.inactiveUserDays, DEFAULT_INACTIVE_USER_DAYS, 1, 3650);
-  const maxAdmins = clampInteger(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 10000);
-  const lookbackDays = clampInteger(options.auditLookbackDays, DEFAULT_AUDIT_LOOKBACK_DAYS, 1, 365);
+function assessTenableAccessControlWithPlan(data: TenableAccessControlData, plan: TenableRunPlan): TenableAssessmentResult {
+  const decisions = new BatchVerdicts(TENABLE_SPEC);
+  const { now, inactiveUserDays: inactiveDays, maxAdmins, auditLookbackDays: lookbackDays } = plan;
   const callerIsAdministrator = detectAdministrator(data.users);
   const findings: TenableFinding[] = [];
 
   if (data.users.status !== "ok") {
-    recordTenableDecisionFacts(10, { users_readable: false });
-    findings.push(unreadableFinding(10, "high", data.users, "the user list with roles, last login, MFA, and enabled state from Settings > Access Control > Users"));
+    recordTenableDecisionFacts(decisions, 10, { users_readable: false });
+    findings.push(unreadableFinding(decisions, 10, "high", data.users, "the user list with roles, last login, MFA, and enabled state from Settings > Access Control > Users"));
   } else if (data.users.data.length === 0) {
-    recordTenableDecisionFacts(10, { users_readable: true, user_count: 0 });
-    findings.push(finding(10, "manual", "high", `${data.users.endpoint} returned zero users, which cannot be a complete view because the calling user must exist; collect the user list from Settings > Access Control > Users.`, { user_count: 0 }));
+    recordTenableDecisionFacts(decisions, 10, { users_readable: true, user_count: 0 });
+    findings.push(finding(decisions, 10, "high", `${data.users.endpoint} returned zero users, which cannot be a complete view because the calling user must exist; collect the user list from Settings > Access Control > Users.`, { user_count: 0 }));
   } else if (callerIsAdministrator !== true) {
-    recordTenableDecisionFacts(10, { users_readable: true, user_count: data.users.data.length, caller_is_administrator: false });
-    findings.push(finding(10, "manual", "high", `Partial view: ${data.users.endpoint} returned ${data.users.data.length} users but only uuid, id, username, and email are exposed because the API key does not hold the Administrator [64] role. Role, last login, MFA, and enabled attributes require an Administrator key.`, {
+    recordTenableDecisionFacts(decisions, 10, { users_readable: true, user_count: data.users.data.length, caller_is_administrator: false });
+    findings.push(finding(decisions, 10, "high", `Partial view: ${data.users.endpoint} returned ${data.users.data.length} users but only uuid, id, username, and email are exposed because the API key does not hold the Administrator [64] role. Role, last login, MFA, and enabled attributes require an Administrator key.`, {
       user_count: data.users.data.length,
       caller_is_administrator: false,
     }));
@@ -4437,7 +3364,7 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
       return lastAccess !== undefined && daysBetween(now, lastAccess) > inactiveDays;
     });
     const missingEnabledFlag = users.filter((user) => asBoolean(user.enabled) === undefined);
-    recordTenableDecisionFacts(10, {
+    recordTenableDecisionFacts(decisions, 10, {
       users_readable: true,
       user_count: users.length,
       caller_is_administrator: true,
@@ -4454,22 +3381,22 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
       users_without_enabled_flag_count: missingEnabledFlag.length,
       roles_readable: data.roles.status === "ok",
     });
-    let status: TenableFindingStatus;
+
     let summary: string;
     if (adminsWithoutStrongAuth.length > 0 || inactive.length > 0 || admins.length > maxAdmins) {
-      status = "fail";
+
       summary = `${admins.length} enabled Administrator accounts (threshold ${maxAdmins}); ${adminsWithoutStrongAuth.length} UI-permitted administrators lack SAML-only or two-factor enforcement; ${inactive.length} enabled users have not logged in for ${inactiveDays} days.`;
     } else if (enabledUsers.length === 0) {
-      status = "manual";
+
       summary = `${data.users.endpoint} returned ${users.length} users but none has enabled=true (${missingEnabledFlag.length} expose no enabled flag), so no enabled population exists to verify and the calling user itself is unaccounted for; collect the user list with enabled state, role, and MFA from Settings > Access Control > Users.`;
     } else if (neverLoggedIn.length > 0 || staleApiKeys.length > 0 || lockedOut.length > 0 || repeatedFailures.length > 0 || missingEnabledFlag.length > 0) {
-      status = "warn";
+
       summary = `${admins.length} administrators all enforce SAML or two-factor and no enabled user is inactive past ${inactiveDays} days, but ${neverLoggedIn.length} enabled users have never logged in (not counted as active), ${staleApiKeys.length} have API keys unused for ${inactiveDays} days, ${lockedOut.length} are locked out, ${repeatedFailures.length} show 5 or more failed logins, and ${missingEnabledFlag.length} expose no enabled flag (not counted as enabled).`;
     } else {
-      status = capForUnreadable("pass", data.roles);
+
       summary = `${enabledUsers.length} enabled users, ${admins.length} administrators (threshold ${maxAdmins}) all enforcing SAML-only or two-factor authentication, none inactive past ${inactiveDays} days.${unreadableNote([{ dataset: data.roles, consequence: "custom roles are unknown" }])}`;
     }
-    findings.push(finding(10, status, "high", summary, {
+    findings.push(finding(decisions, 10, "high", summary, {
       user_count: users.length,
       enabled_users: enabledUsers.length,
       users_without_enabled_flag: missingEnabledFlag.length,
@@ -4492,11 +3419,11 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
   }
 
   if (data.permissions.status !== "ok") {
-    recordTenableDecisionFacts(11, { permissions_readable: false });
-    findings.push(unreadableFinding(11, "high", data.permissions, "the access control permission list (Settings > Access Control > Permissions) and any legacy access groups"));
+    recordTenableDecisionFacts(decisions, 11, { permissions_readable: false });
+    findings.push(unreadableFinding(decisions, 11, "high", data.permissions, "the access control permission list (Settings > Access Control > Permissions) and any legacy access groups"));
   } else if (data.permissions.data.length === 0) {
-    recordTenableDecisionFacts(11, { permissions_readable: true, permission_count: 0 });
-    findings.push(finding(11, "manual", "high", `${data.permissions.endpoint} returned zero permissions, but Tenable always generates administrator permissions, so the view is incomplete; collect the permission list from Settings > Access Control > Permissions.`, { permission_count: boundedCount(0, data.permissions) }));
+    recordTenableDecisionFacts(decisions, 11, { permissions_readable: true, permission_count: 0 });
+    findings.push(finding(decisions, 11, "high", `${data.permissions.endpoint} returned zero permissions, but Tenable always generates administrator permissions, so the view is incomplete; collect the permission list from Settings > Access Control > Permissions.`, { permission_count: boundedCount(0, data.permissions) }));
   } else {
     const permissions = data.permissions.data;
     const broad = permissions.filter((permission) => {
@@ -4509,7 +3436,7 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
       return allUsers && allObjects && writeActions;
     });
     const legacyAccessGroups = data.accessGroups.status === "ok" ? data.accessGroups.data.filter((group) => asBoolean(group.all_assets) !== true) : [];
-    recordTenableDecisionFacts(11, {
+    recordTenableDecisionFacts(decisions, 11, {
       permissions_readable: true,
       permission_count: permissions.length,
       broad_permission_count: broad.length,
@@ -4519,8 +3446,7 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
       caller_is_administrator: callerIsAdministrator === true,
     });
     findings.push(finding(
-      11,
-      broad.length > 0 ? "fail" : legacyAccessGroups.length > 0 || data.accessGroups.status !== "ok" ? "warn" : capForNonAdmin(capForUnreadable(capForPartial("pass", data.accessGroups), data.groups), callerIsAdministrator),
+      decisions, 11,
       "high",
       broad.length > 0
         ? `${broad.length} of ${permissions.length} permissions grant every user (AllUsers or the tenant-wide All Users group ${ALL_USERS_GROUP_UUID}) write-style actions (CanEdit, CanScan, or CanUse) on all assets, objects, or tags: ${broad.map((permission) => asString(permission.name)).slice(0, 10).join(", ")}. Narrow these to specific groups and tags.`
@@ -4542,11 +3468,11 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
   }
 
   if (data.credentials.status !== "ok") {
-    recordTenableDecisionFacts(12, { credentials_readable: false });
-    findings.push(unreadableFinding(12, "medium", data.credentials, "the managed credential inventory with types, owners, and last use from Settings > Credentials"));
+    recordTenableDecisionFacts(decisions, 12, { credentials_readable: false });
+    findings.push(unreadableFinding(decisions, 12, "medium", data.credentials, "the managed credential inventory with types, owners, and last use from Settings > Credentials"));
   } else if (data.credentials.data.length === 0) {
-    recordTenableDecisionFacts(12, { credentials_readable: true, credential_count: 0 });
-    findings.push(finding(12, "manual", "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total ${data.credentials.total ?? "not reported"}).${data.credentials.truncated ? " The walk was truncated before any record arrived, so the credential list was not reviewed." : ""} Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: boundedCount(0, data.credentials), pagination_total: data.credentials.total ?? null, inventory_truncated: data.credentials.truncated }));
+    recordTenableDecisionFacts(decisions, 12, { credentials_readable: true, credential_count: 0 });
+    findings.push(finding(decisions, 12, "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total ${data.credentials.total ?? "not reported"}).${data.credentials.truncated ? " The walk was truncated before any record arrived, so the credential list was not reviewed." : ""} Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: boundedCount(0, data.credentials), pagination_total: data.credentials.total ?? null, inventory_truncated: data.credentials.truncated }));
   } else {
     const credentials = data.credentials.data;
     const unused = credentials.filter((credential) => asNumber(asObject(credential.last_used_by)?.id) === undefined);
@@ -4555,7 +3481,7 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
       return created !== undefined && daysBetween(now, created) > 365;
     });
     const undated = credentials.filter((credential) => parseTimestampMs(credential.created_date) === undefined);
-    recordTenableDecisionFacts(12, {
+    recordTenableDecisionFacts(decisions, 12, {
       credentials_readable: true,
       credential_count: credentials.length,
       unused_credential_count: unused.length,
@@ -4569,8 +3495,7 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
       types.set(type, (types.get(type) ?? 0) + 1);
     }
     findings.push(withPartialView(finding(
-      12,
-      unused.length > 0 || old.length > 0 ? "warn" : undated.length > 0 ? "warn" : capForPartial("pass", data.credentials),
+      decisions, 12,
       "medium",
       unused.length > 0 || old.length > 0
         ? `${credentials.length} managed credentials: ${unused.length} have never been used in a scan, ${old.length} were created over a year ago (the API exposes created_date but no rotation date, so confirm rotation manually).`
@@ -4591,8 +3516,8 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
   }
 
   if (data.auditLog.status !== "ok") {
-    recordTenableDecisionFacts(18, { audit_log_readable: false });
-    findings.push(unreadableFinding(18, "medium", data.auditLog, `the activity log for the last ${lookbackDays} days from Settings > Activity Logs (Administrator role required)`));
+    recordTenableDecisionFacts(decisions, 18, { audit_log_readable: false });
+    findings.push(unreadableFinding(decisions, 18, "medium", data.auditLog, `the activity log for the last ${lookbackDays} days from Settings > Activity Logs (Administrator role required)`));
   } else {
     const events = data.auditLog.data;
     const deletes = events.filter((event) => asString(event.crud) === "d");
@@ -4600,28 +3525,28 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
     const exclusionOrPolicy = events.filter((event) => /exclusion|policy|template/i.test(asString(event.action) ?? "") && asString(event.crud) !== "r");
     const failures = events.filter((event) => asBoolean(event.is_failure) === true);
     const sensitive = new Set([...deletes, ...privilege, ...exclusionOrPolicy].map((event) => asString(event.id) ?? JSON.stringify(event)));
-    recordTenableDecisionFacts(18, {
+    recordTenableDecisionFacts(decisions, 18, {
       audit_log_readable: true,
       audit_event_count: events.length,
       audit_events_complete: readInFull(data.auditLog),
       sensitive_audit_event_count: sensitive.size,
     });
-    let status: TenableFindingStatus;
+
     let summary: string;
     if (events.length === 0) {
-      status = "warn";
+
       summary = `The activity log returned zero events for the last ${lookbackDays} days (pagination.total ${data.auditLog.total ?? "not reported"}); an active tenant should record logins and API calls, so confirm logging and the date filter.`;
     } else if (data.auditLog.truncated) {
-      status = "warn";
+
       summary = `Only ${events.length} of ${data.auditLog.total ?? "unknown"} activity log events were retrieved for the last ${lookbackDays} days, so the review is partial; ${sensitive.size} sensitive events were seen.`;
     } else if (sensitive.size > 0) {
-      status = "warn";
+
       summary = `${events.length} activity log events were retrieved for the last ${lookbackDays} days; ${sensitive.size} sensitive events (${deletes.length} deletions, ${privilege.length} user or permission changes, ${exclusionOrPolicy.length} exclusion or template changes) need reviewer sign-off.`;
     } else {
-      status = "pass";
+
       summary = `${events.length} activity log events were retrieved completely for the last ${lookbackDays} days with no deletions, privilege changes, or exclusion changes; ${failures.length} failed actions recorded.`;
     }
-    findings.push(finding(18, status, "medium", summary, {
+    findings.push(finding(decisions, 18, "medium", summary, {
       event_count: boundedCount(events.length, data.auditLog),
       pagination_total: data.auditLog.total ?? null,
       inventory_truncated: data.auditLog.truncated,
@@ -4640,7 +3565,7 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
     }));
   }
 
-  findings.push(assessSecurityCenterUsers(data.scUsers, now, inactiveDays));
+  findings.push(assessSecurityCenterUsers(decisions, data.scUsers, now, inactiveDays));
 
   const errors = [
     ...datasetErrors("users", data.users),
@@ -4680,10 +3605,11 @@ function assessTenableAccessControlWithDecisionContext(data: TenableAccessContro
   };
 }
 
-function assessSecurityCenterUsers(users: TenableDataset<JsonRecord[]>, now: number, inactiveDays: number): TenableFinding {
+function assessSecurityCenterUsers(decisions: BatchVerdicts,
+  users: TenableDataset<JsonRecord[]>, now: number, inactiveDays: number): TenableFinding {
   if (users.status !== "ok") {
-    recordTenableDecisionFacts(10, { sc_users_readable: false }, "-SC");
-    return unreadableFinding(10, "high", users, "the Security Center user list with roles, last login, and lock state", "-SC");
+    recordTenableDecisionFacts(decisions, 10, { sc_users_readable: false }, "-SC");
+    return unreadableFinding(decisions, 10, "high", users, "the Security Center user list with roles, last login, and lock state", "-SC");
   }
   const active = users.data.filter((user) => asString(user.status) === "0");
   const admins = active.filter((user) => asString(asObject(user.role)?.id) === "1" || /administrator/i.test(asString(asObject(user.role)?.name) ?? ""));
@@ -4693,7 +3619,7 @@ function assessSecurityCenterUsers(users: TenableDataset<JsonRecord[]>, now: num
   });
   const neverLoggedIn = active.filter((user) => parseTimestampMs(user.lastLogin) === undefined);
   const locked = active.filter((user) => asBoolean(user.locked) === true);
-  recordTenableDecisionFacts(10, {
+  recordTenableDecisionFacts(decisions, 10, {
     sc_users_readable: true,
     sc_user_count: users.data.length,
     sc_active_user_last_login_age_days: daysSinceEach(now, active, "lastLogin"),
@@ -4701,22 +3627,22 @@ function assessSecurityCenterUsers(users: TenableDataset<JsonRecord[]>, now: num
     sc_never_logged_in_user_count: neverLoggedIn.length,
     sc_locked_user_count: locked.length,
   }, "-SC");
-  let status: TenableFindingStatus;
+
   let summary: string;
   if (users.data.length === 0) {
-    status = "manual";
+
     summary = "Security Center returned zero users for this API key, which cannot be complete because the calling user exists; collect the user list as an administrator.";
   } else if (inactive.length > 0) {
-    status = "fail";
+
     summary = `${inactive.length} of ${active.length} active Security Center users have not logged in for ${inactiveDays} days; ${admins.length} hold the Administrator role.`;
   } else if (neverLoggedIn.length > 0 || locked.length > 0) {
-    status = "warn";
+
     summary = `${active.length} active Security Center users; ${neverLoggedIn.length} have never logged in (not counted as active) and ${locked.length} are locked; ${admins.length} hold the Administrator role.`;
   } else {
-    status = "pass";
+
     summary = `All ${active.length} active Security Center users logged in within ${inactiveDays} days; ${admins.length} hold the Administrator role.`;
   }
-  return finding(10, status, "high", summary, {
+  return finding(decisions, 10, "high", summary, {
     sc_user_count: users.data.length,
     sc_active_users: active.length,
     sc_administrators: admins.map((user) => asString(user.username)).slice(0, 50),
@@ -4735,47 +3661,51 @@ export interface TenableVulnerabilityData {
 }
 
 export async function collectTenableVulnerabilityData(clients: TenableClients, options: TenableAssessmentOptions = {}): Promise<TenableVulnerabilityData> {
-  const now = options.now ?? Date.now();
-  const lookbackDays = clampInteger(options.vulnLookbackDays, DEFAULT_VULN_LOOKBACK_DAYS, 1, 730);
-  const maxChunks = clampInteger(options.maxChunks, DEFAULT_MAX_CHUNKS, 1, 1000);
+  return collectVulnerabilityForRun(clients, resolveTenableRunPlan(options));
+}
+
+type TenableExportJobSnapshot = Pick<TenableVulnerabilityData, "vulnExportJobs" | "assetExportJobs">;
+
+async function collectVulnerabilityForRun(clients: TenableClients, plan: TenableRunPlan, shared?: TenableSharedReads, jobs?: TenableExportJobSnapshot): Promise<TenableVulnerabilityData> {
   const [vulnExportJobs, assetExportJobs, users] = await Promise.all([
-    vmList(clients, "GET /vulns/export/status", (client) => client.listVulnExportJobs()),
-    vmList(clients, "GET /assets/export/status", (client) => client.listAssetExportJobs()),
-    vmList(clients, "GET /users", (client) => client.listUsers()),
+    jobs?.vulnExportJobs ?? vmList(clients, "GET /vulns/export/status", (client) => client.listVulnExportJobs()),
+    jobs?.assetExportJobs ?? vmList(clients, "GET /assets/export/status", (client) => client.listAssetExportJobs()),
+    shared?.users ?? vmList(clients, "GET /users", (client) => client.listUsers()),
   ]);
   const [vulnExport, assetExport] = await Promise.all([
-    vmExport(clients, "POST /vulns/export", (client) => client.exportVulnerabilities(Math.floor((now - lookbackDays * DAY_MS) / 1000), maxChunks)),
-    vmExport(clients, "POST /assets/export", (client) => client.exportAssets(maxChunks)),
+    vmExport(clients, "POST /vulns/export", (client) => client.exportVulnerabilities(plan.vulnerabilitiesSinceUnix, plan.maxChunks)),
+    shared?.assetExport ?? vmExport(clients, "POST /assets/export", (client) => client.exportAssets(plan.maxChunks)),
   ]);
   return { vulnExport, assetExport, vulnExportJobs, assetExportJobs, users };
 }
 
 export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityData, options: TenableAssessmentOptions = {}): TenableAssessmentResult {
-  return runBatchVerdictContext(TENABLE_DECISION_CONTEXT, TENABLE_SPEC, () => assessTenableVulnerabilityManagementWithDecisionContext(data, options));
+  const plan = resolveTenableRunPlan(options);
+  return assessTenableVulnerabilityManagementWithPlan(data, plan);
 }
 
-function assessTenableVulnerabilityManagementWithDecisionContext(data: TenableVulnerabilityData, options: TenableAssessmentOptions): TenableAssessmentResult {
-  const now = options.now ?? Date.now();
+function assessTenableVulnerabilityManagementWithPlan(data: TenableVulnerabilityData, plan: TenableRunPlan): TenableAssessmentResult {
+  const decisions = new BatchVerdicts(TENABLE_SPEC);
+  const { now, vulnLookbackDays: lookbackDays } = plan;
   const sla = {
-    critical: clampInteger(options.slaCriticalDays, DEFAULT_SLA_DAYS.critical, 1, 3650),
-    high: clampInteger(options.slaHighDays, DEFAULT_SLA_DAYS.high, 1, 3650),
-    medium: clampInteger(options.slaMediumDays, DEFAULT_SLA_DAYS.medium, 1, 3650),
-    low: clampInteger(options.slaLowDays, DEFAULT_SLA_DAYS.low, 1, 3650),
+    critical: plan.slaCriticalDays,
+    high: plan.slaHighDays,
+    medium: plan.slaMediumDays,
+    low: plan.slaLowDays,
   };
-  const lookbackDays = clampInteger(options.vulnLookbackDays, DEFAULT_VULN_LOOKBACK_DAYS, 1, 730);
   const findings: TenableFinding[] = [];
   const callerIsAdministrator = detectAdministrator(data.users);
   const assetCount = data.assetExport.status === "ok" ? data.assetExport.data.records.length : undefined;
   // A pass over the two exports never survives a partial asset population, a vulnerability
   // export some of whose records could not be evaluated, or a non-administrator caller.
-  const capPopulation = (status: TenableFindingStatus): TenableFindingStatus => capForNonAdmin(capForPartial(capForPartial(status, data.assetExport), data.vulnExport), callerIsAdministrator);
+
   const populationNote = `${partialNote(data.assetExport)}${unevaluableRecordsNote(data.vulnExport, CAPPED_AT_WARN)}${nonAdminNote(callerIsAdministrator)}`;
 
   if (data.vulnExport.status !== "ok") {
-    recordTenableDecisionFacts(14, { vuln_export_readable: false });
-    recordTenableDecisionFacts(15, { vuln_export_readable: false });
-    findings.push(unreadableFinding(14, "high", data.vulnExport, "the VPR distribution of open findings from Findings > Vulnerabilities"));
-    findings.push(unreadableFinding(15, "high", data.vulnExport, "the open finding age by severity and remediation times from Findings > Vulnerabilities"));
+    recordTenableDecisionFacts(decisions, 14, { vuln_export_readable: false });
+    recordTenableDecisionFacts(decisions, 15, { vuln_export_readable: false });
+    findings.push(unreadableFinding(decisions, 14, "high", data.vulnExport, "the VPR distribution of open findings from Findings > Vulnerabilities"));
+    findings.push(unreadableFinding(decisions, 15, "high", data.vulnExport, "the open finding age by severity and remediation times from Findings > Vulnerabilities"));
   } else {
     const records = data.vulnExport.data.records;
     const open = records.filter((record) => ["OPEN", "REOPENED"].includes(asString(record.state)?.toUpperCase() ?? ""));
@@ -4789,7 +3719,7 @@ function assessTenableVulnerabilityManagementWithDecisionContext(data: TenableVu
     const rated = open.filter((record) => ["low", "medium", "high", "critical"].includes(asString(record.severity)?.toLowerCase() ?? ""));
     const vprCoverage = ratio(scored.length, rated.length);
     const unevaluableVulnRecords = unevaluableRecordsOf(data.vulnExport);
-    recordTenableDecisionFacts(14, assetCount === undefined
+    recordTenableDecisionFacts(decisions, 14, assetCount === undefined
       ? { vuln_export_readable: true, asset_export_readable: false }
       : {
         vuln_export_readable: true,
@@ -4802,28 +3732,28 @@ function assessTenableVulnerabilityManagementWithDecisionContext(data: TenableVu
         asset_export_complete: readInFull(data.assetExport),
         caller_is_administrator: callerIsAdministrator === true,
       });
-    let vprStatus: TenableFindingStatus;
+
     let vprSummary: string;
     if (assetCount === undefined) {
-      vprStatus = "manual";
+
       vprSummary = `The vulnerability export finished with ${open.length} open findings but ${describeUnread(data.assetExport)}, so the asset population cannot be validated.`;
     } else if (assetCount === 0) {
-      vprStatus = "manual";
+
       vprSummary = "The asset export returned zero assets, so an empty vulnerability set does not demonstrate VPR-based prioritization.";
     } else if (open.length === 0) {
-      vprStatus = "manual";
+
       vprSummary = `No open findings were exported for the last ${lookbackDays} days across ${assetCount} assets, so VPR usage cannot be evaluated; confirm scans are producing findings.${unevaluableRecordsNote(data.vulnExport)}`;
     } else if (data.vulnExport.truncated) {
-      vprStatus = "warn";
+
       vprSummary = `Partial export: ${data.vulnExport.data.fetchedChunks ?? "unknown"} of ${data.vulnExport.data.totalChunks ?? "unknown"} chunks were downloaded (${data.vulnExport.error ?? "partial"}), covering ${open.length} open findings; ${percent(vprCoverage)} of rated findings carry a VPR score.`;
     } else if (vprCoverage < 0.5) {
-      vprStatus = "warn";
+
       vprSummary = `Only ${percent(vprCoverage)} of ${rated.length} rated open findings carry a VPR score, so VPR-based prioritization has limited coverage.`;
     } else {
-      vprStatus = capPopulation("pass");
+
       vprSummary = `${percent(vprCoverage)} of ${rated.length} rated open findings carry a VPR score across ${assetCount} assets; ${vprCritical.length} findings have VPR 9 or higher and ${vprHigh.length} are VPR 7 to 8.9. Confirm remediation workflows sort by VPR.${populationNote}`;
     }
-    findings.push(finding(14, vprStatus, "high", vprSummary, {
+    findings.push(finding(decisions, 14, "high", vprSummary, {
       exported_records: records.length,
       open_findings: open.length,
       fixed_findings_in_window: fixed.length,
@@ -4857,7 +3787,7 @@ function assessTenableVulnerabilityManagementWithDecisionContext(data: TenableVu
     const overdueTotal = overdue.critical + overdue.high + overdue.medium + overdue.low;
     const openAgeDays = (severity: keyof typeof sla): number[] =>
       daysSinceEach(now, open.filter((record) => asString(record.severity)?.toLowerCase() === severity), "first_found");
-    recordTenableDecisionFacts(15, assetCount === undefined
+    recordTenableDecisionFacts(decisions, 15, assetCount === undefined
       ? { vuln_export_readable: true, asset_export_readable: false }
       : {
         vuln_export_readable: true,
@@ -4877,30 +3807,30 @@ function assessTenableVulnerabilityManagementWithDecisionContext(data: TenableVu
         asset_export_complete: readInFull(data.assetExport),
         caller_is_administrator: callerIsAdministrator === true,
       });
-    let slaStatus: TenableFindingStatus;
+
     let slaSummary: string;
     if (assetCount === undefined || assetCount === 0) {
-      slaStatus = "manual";
+
       slaSummary = assetCount === 0
         ? "The asset export returned zero assets, so zero overdue findings does not demonstrate SLA compliance."
         : `${describeUnread(data.assetExport)}, so the finding population cannot be validated.`;
     } else if (data.vulnExport.truncated) {
-      slaStatus = "warn";
+
       slaSummary = `Partial export (${data.vulnExport.data.fetchedChunks ?? "unknown"} of ${data.vulnExport.data.totalChunks ?? "unknown"} chunks; ${data.vulnExport.error ?? "partial"}): ${overdueTotal} of ${open.length} retrieved open findings exceed their SLA, but unseen chunks may contain more.`;
     } else if (overdue.critical > 0 || overdue.high > 0) {
-      slaStatus = "fail";
+
       slaSummary = `${overdue.critical} critical findings exceed ${sla.critical} days and ${overdue.high} high findings exceed ${sla.high} days (${overdue.medium} medium and ${overdue.low} low also overdue) out of ${open.length} open findings.`;
     } else if (overdue.medium > 0 || overdue.low > 0 || undated > 0) {
-      slaStatus = "warn";
+
       slaSummary = `No critical or high findings exceed SLA, but ${overdue.medium} medium and ${overdue.low} low findings are overdue and ${undated} open findings have no first_found date (not counted as compliant).`;
     } else if (open.length === 0) {
-      slaStatus = capPopulation("pass");
+
       slaSummary = `Zero open findings were exported for the last ${lookbackDays} days from an export that FINISHED completely, against an asset export of ${assetCount} assets.${populationNote}`;
     } else {
-      slaStatus = capPopulation("pass");
+
       slaSummary = `All ${open.length} open findings are within SLA (critical ${sla.critical}d, high ${sla.high}d, medium ${sla.medium}d, low ${sla.low}d) across ${assetCount} assets${mttrDays !== null ? `; mean time to remediate over ${fixTimes.length} fixed findings is ${mttrDays} days` : ""}.${populationNote}`;
     }
-    findings.push(finding(15, slaStatus, "high", slaSummary, {
+    findings.push(finding(decisions, 15, "high", slaSummary, {
       open_by_severity: openBySeverity,
       overdue_by_severity: overdue,
       undated_open_findings: undated,
@@ -4916,10 +3846,10 @@ function assessTenableVulnerabilityManagementWithDecisionContext(data: TenableVu
 
   if (data.vulnExportJobs.status !== "ok" && data.assetExportJobs.status !== "ok") {
     const manualEvidence = "evidence of scheduled exports or report schedules from the Tenable UI (Reports) and integration logs";
-    recordTenableDecisionFacts(19, { vuln_export_jobs_readable: false, asset_export_jobs_readable: false });
+    recordTenableDecisionFacts(decisions, 19, { vuln_export_jobs_readable: false, asset_export_jobs_readable: false });
     findings.push(data.vulnExportJobs.status === "not_configured"
-      ? unreadableFinding(19, "medium", data.vulnExportJobs, manualEvidence)
-      : finding(19, "manual", "medium", `Unknown: the export job lists could not be read because ${describeUnread(data.vulnExportJobs)} and ${describeUnread(data.assetExportJobs)}. A human must collect ${manualEvidence}.`, {
+      ? unreadableFinding(decisions, 19, "medium", data.vulnExportJobs, manualEvidence)
+      : finding(decisions, 19, "medium", `Unknown: the export job lists could not be read because ${describeUnread(data.vulnExportJobs)} and ${describeUnread(data.assetExportJobs)}. A human must collect ${manualEvidence}.`, {
         not_collected: true,
         vuln_export_jobs: collectionStatusOf(data.vulnExportJobs),
         asset_export_jobs: collectionStatusOf(data.assetExportJobs),
@@ -4941,26 +3871,26 @@ function assessTenableVulnerabilityManagementWithDecisionContext(data: TenableVu
     const externalDays = new Set(externalJobs.map((job) => new Date(parseTimestampMs(job.created) ?? 0).toISOString().slice(0, 10)));
     const limitation = `The export job lists include completed jobs only from the previous ${EXPORT_JOB_WINDOW_DAYS} days, so this is a point-in-time signal of export activity, and report schedules are not exposed by the API, so they need a manual check in Reports.`;
     const unreadJobLists = unreadableNote([{ dataset: data.vulnExportJobs, consequence: "vulnerability export jobs are unobserved" }, { dataset: data.assetExportJobs, consequence: "asset export jobs are unobserved" }]);
-    recordTenableDecisionFacts(19, {
+    recordTenableDecisionFacts(decisions, 19, {
       vuln_export_jobs_readable: data.vulnExportJobs.status === "ok",
       asset_export_jobs_readable: data.assetExportJobs.status === "ok",
       external_export_job_count: externalJobs.length,
       external_export_job_day_count: externalDays.size,
       caller_is_administrator: callerIsAdministrator === true,
     });
-    let status: TenableFindingStatus;
+
     let summary: string;
     if (externalDays.size >= 2) {
-      status = capForNonAdmin(capForUnreadable("pass", data.vulnExportJobs, data.assetExportJobs), callerIsAdministrator);
+
       summary = `${externalJobs.length} export jobs not created by this tool ran on ${externalDays.size} distinct days within the last ${EXPORT_JOB_WINDOW_DAYS} days, indicating recurring automated exports. ${limitation}${unreadJobLists}${nonAdminNote(callerIsAdministrator)}`;
     } else if (externalJobs.length > 0) {
-      status = "warn";
+
       summary = `${externalJobs.length} export jobs not created by this tool ran within the last ${EXPORT_JOB_WINDOW_DAYS} days, all on one day, so recurring automation is not demonstrated. ${limitation}${unreadJobLists}`;
     } else {
-      status = "manual";
+
       summary = `No export jobs other than this tool's own runs (${ownUuids.size} from this assessment and ${ownShaped.length} matching this tool's export shape) appear within the last ${EXPORT_JOB_WINDOW_DAYS} days, so automated exports are not evident in the observable window; a human must collect the integration or report schedule that distributes results. ${limitation}${unreadJobLists}`;
     }
-    findings.push(finding(19, status, "medium", summary, {
+    findings.push(finding(decisions, 19, "medium", summary, {
       external_export_jobs_in_window: externalJobs.length,
       external_export_days: [...externalDays].sort(),
       window_days: EXPORT_JOB_WINDOW_DAYS,
@@ -5058,9 +3988,26 @@ function describeSurfaceFailure(surface: TenableAccessSurface): string {
 }
 
 export async function checkTenableAccess(clients: TenableClients): Promise<TenableAccessCheckResult> {
+  return checkTenableAccessForRun(clients);
+}
+
+async function checkTenableAccessForRun(clients: TenableClients, sharedUsers?: TenableDataset<JsonRecord[]>): Promise<TenableAccessCheckResult> {
   const vm = clients.vm;
   const sc = clients.securityCenter;
-  const usersProbe = await probeSurface("users", "GET /users", "Basic (full attributes need Administrator)", vm ? () => vm.listUsers() : undefined, listCount);
+  const usersProbe = sharedUsers
+    ? {
+      surface: {
+        name: "users",
+        endpoint: sharedUsers.endpoint,
+        requiredRole: "Basic (full attributes need Administrator)",
+        status: ({ ok: "readable", forbidden: "forbidden", error: "not_readable", not_configured: "not_configured" } as const)[sharedUsers.status],
+        count: sharedUsers.status === "ok" ? sharedUsers.data.length : null,
+        httpStatus: sharedUsers.httpStatus,
+        ...(sharedUsers.status !== "ok" ? { error: sharedUsers.error } : {}),
+      },
+      value: sharedUsers.status === "ok" ? sharedUsers.data : undefined,
+    }
+    : await probeSurface("users", "GET /users", "Basic (full attributes need Administrator)", vm ? () => vm.listUsers() : undefined, listCount);
   const users = usersProbe.surface.status === "readable" ? asRecords(usersProbe.value) : [];
   const callerIsAdministrator = users.length > 0 ? users.some((user) => asNumber(user.permissions) !== undefined) : null;
 
@@ -5335,6 +4282,48 @@ function buildQuickReference(): string {
   ].join("\n");
 }
 
+export interface TenableAuditSnapshot {
+  plan: TenableRunPlan;
+  shared: { users: TenableDataset<JsonRecord[]>; assetExport: TenableDataset<TenableExportResult> };
+  access: TenableAccessCheckResult;
+  scanProgram: TenableScanProgramData;
+  sensorCoverage: TenableSensorCoverageData;
+  accessControl: TenableAccessControlData;
+  vulnerabilityManagement: TenableVulnerabilityData;
+}
+
+/** All categories and the exported raw evidence consume the same tenant observations. */
+export async function collectTenableAuditSnapshot(clients: TenableClients, options: TenableAssessmentOptions = {}): Promise<TenableAuditSnapshot> {
+  const plan = resolveTenableRunPlan(options);
+  // Inventory existing jobs before this run creates either export, so the automation
+  // control can distinguish existing jobs from evidence generated by this run.
+  const [users, vulnExportJobs, assetExportJobs] = await Promise.all([
+    vmList(clients, "GET /users", (client) => client.listUsers()),
+    vmList(clients, "GET /vulns/export/status", (client) => client.listVulnExportJobs()),
+    vmList(clients, "GET /assets/export/status", (client) => client.listAssetExportJobs()),
+  ]);
+  const shared: TenableSharedReads = {
+    users: Promise.resolve(users),
+    assetExport: vmExport(clients, "POST /assets/export", (client) => client.exportAssets(plan.maxChunks)),
+  };
+  const [scanProgram, sensorCoverage, accessControl, vulnerabilityManagement, access] = await Promise.all([
+    collectScanProgramForRun(clients, plan, shared),
+    collectSensorCoverageForRun(clients, plan, shared),
+    collectAccessControlForRun(clients, plan, shared),
+    collectVulnerabilityForRun(clients, plan, shared, { vulnExportJobs, assetExportJobs }),
+    checkTenableAccessForRun(clients, users),
+  ]);
+  return {
+    plan,
+    shared: { users, assetExport: await shared.assetExport },
+    access,
+    scanProgram,
+    sensorCoverage,
+    accessControl,
+    vulnerabilityManagement,
+  };
+}
+
 export async function exportTenableAuditBundle(
   clients: TenableClients,
   outputRoot: string,
@@ -5343,16 +4332,13 @@ export async function exportTenableAuditBundle(
   const config = clients.config;
   // Guard 2 for every written file: the configured keys in every encoded form.
   const secrets = configuredTenableSecrets(config);
-  const access = await checkTenableAccess(clients);
-  const scanProgramData = await collectTenableScanProgramData(clients, options);
-  const sensorData = await collectTenableSensorCoverageData(clients, options);
-  const accessData = await collectTenableAccessControlData(clients, options);
-  const vulnData = await collectTenableVulnerabilityData(clients, options);
+  const snapshot = await collectTenableAuditSnapshot(clients, options);
+  const { plan, access, scanProgram: scanProgramData, sensorCoverage: sensorData, accessControl: accessData, vulnerabilityManagement: vulnData } = snapshot;
   const assessments = [
-    assessTenableScanProgram(scanProgramData, options),
-    assessTenableSensorCoverage(sensorData, options),
-    assessTenableAccessControl(accessData, options),
-    assessTenableVulnerabilityManagement(vulnData, options),
+    assessTenableScanProgramWithPlan(scanProgramData, plan),
+    assessTenableSensorCoverageWithPlan(sensorData, plan),
+    assessTenableAccessControlWithPlan(accessData, plan),
+    assessTenableVulnerabilityManagementWithPlan(vulnData, plan),
   ];
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = assessments.flatMap((assessment) => assessment.errors);
@@ -5382,7 +4368,7 @@ export async function exportTenableAuditBundle(
       ["core_data/scan_templates.json", collectedOrMarker(scanProgramData.templates)],
       ["core_data/exclusions.json", collectedOrMarker(scanProgramData.exclusions)],
       ["core_data/target_groups.json", collectedOrMarker(scanProgramData.targetGroups)],
-      ["core_data/assets_export.json", collectedOrMarker(sensorData.assetExport, exportRecords)],
+      ["core_data/assets_export.json", collectedOrMarker(snapshot.shared.assetExport, exportRecords)],
       ["core_data/server_properties.json", collectedOrMarker(sensorData.serverProperties)],
       ["core_data/scanners.json", collectedOrMarker(sensorData.scanners)],
       ["core_data/agents.json", collectedOrMarker(sensorData.agents)],
@@ -5390,7 +4376,7 @@ export async function exportTenableAuditBundle(
       ["core_data/networks.json", collectedOrMarker(sensorData.networks)],
       ["core_data/tag_categories.json", collectedOrMarker(sensorData.tagCategories)],
       ["core_data/tag_values.json", collectedOrMarker(sensorData.tagValues)],
-      ["core_data/users.json", collectedOrMarker(accessData.users)],
+      ["core_data/users.json", collectedOrMarker(snapshot.shared.users)],
       ["core_data/groups.json", collectedOrMarker(accessData.groups)],
       ["core_data/roles.json", collectedOrMarker(accessData.roles)],
       ["core_data/permissions.json", collectedOrMarker(accessData.permissions)],
@@ -5418,7 +4404,7 @@ export async function exportTenableAuditBundle(
     }
     await writeSecureJsonFile(staged.dir, "analysis/findings.json", redactCredentialProperties(findings), secrets);
     await writeSecureJsonFile(staged.dir, "metadata.json", {
-      generated_at: new Date().toISOString(),
+      generated_at: new Date(plan.now).toISOString(),
       platform: access.platform,
       source_chain: config.sourceChain,
       caller_is_administrator: access.callerIsAdministrator,
@@ -5590,7 +4576,7 @@ async function runAssessment(kind: AssessmentKind, clients: TenableClients, opti
   }
 }
 
-function registerAssessmentTool(pi: ExtensionAPI, kind: AssessmentKind, name: string, label: string, description: string): void {
+function registerAssessmentTool(pi: GrcToolRegistrar, kind: AssessmentKind, name: string, label: string, description: string): void {
   pi.registerTool({
     name,
     label,
@@ -5606,7 +4592,7 @@ function registerAssessmentTool(pi: ExtensionAPI, kind: AssessmentKind, name: st
   });
 }
 
-export function registerTenableTools(pi: any): void {
+export function registerTenableTools(pi: GrcToolRegistrar): void {
   pi = withIntegrationToolContracts(pi, TENABLE_SPEC);
   pi.registerTool({
     name: "tenable_check_access",

@@ -12,15 +12,7 @@ import {
   scrubError,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/hardening/error-text.js";
-import {
-  coreDataValue,
-  gatedPrincipals,
-  notCollected,
-  notRequested,
-  notRequestedDataset,
-  seenVersusTotal,
-  unreadableDataset,
-} from "../dist/extensions/grc-tools/hardening/collection-status.js";
+import { collectionError, unavailableCollection, skippedCollection } from "../dist/extensions/grc-tools/hardening/collection-status.js";
 import { describePagination } from "../dist/extensions/grc-tools/hardening/pagination.js";
 import { NextLinkError, nextLinkStop, originOf, resolveSameOriginUrl } from "../dist/extensions/grc-tools/hardening/next-link.js";
 
@@ -251,8 +243,8 @@ test("every pagination note survives the scrub", () => {
       if (outcome.note !== undefined) assertSurvivesScrub(outcome.note, `${stop.kind} ${seen}/${total}`);
     }
   }
-  assertSurvivesScrub(seenVersusTotal(40, 120), "seen of total");
-  assertSurvivesScrub(seenVersusTotal(40, null), "seen, total unknown");
+  assertSurvivesScrub("seen 40 of 120", "seen of total");
+  assertSurvivesScrub("40 seen, total unknown", "seen, total unknown");
 });
 
 /** Configured origins in the shapes the integrations use: vendor hosts, tenant subdomains, ports, and IP literals. */
@@ -351,38 +343,37 @@ test("marker error text survives the scrub for every inventory label, including 
     const endpoint = `/v1/${label.replace(/ /g, "-").toLowerCase()}`;
     const parentLine = describeFailedResponse({ method: "GET", endpoint, status: 403, statusText: "Forbidden", contentType: "text/html", body: "<html>denied</html>" });
     assertSurvivesScrub(parentLine, `${label} parent line`);
-    assertSurvivesScrub(notCollected(parentLine, 403, endpoint).error, `${label} not collected`);
-    assertSurvivesScrub(notRequested(label, parentLine).error, `${label} not requested with parent error`);
-    assertSurvivesScrub(notRequested(label).error, `${label} not requested`);
-    assertSurvivesScrub(coreDataValue(notRequestedDataset(label, parentLine)).error, `${label} not requested dataset`);
-    assertSurvivesScrub(coreDataValue(unreadableDataset(parentLine, { status: 403, endpoint })).error, `${label} unreadable dataset`);
+    const unavailable = unavailableCollection(label, parentLine, { status: 403, endpoint });
+    assertSurvivesScrub(collectionError(unavailable), `${label} unavailable collection`);
+    assertSurvivesScrub(collectionError(skippedCollection(label, `${label} was not readable (${parentLine})`, unavailable.key)), `${label} skipped with parent error`);
+    assertSurvivesScrub(collectionError(skippedCollection(label, `${label} was not readable`)), `${label} skipped`);
 
     const notes = [
-      `${label}: ${seenVersusTotal(40, 120)}`,
-      `${label}: ${seenVersusTotal(40, null)}`,
+      `${label}: seen 40 of 120`,
+      `${label}: 40 seen, total unknown`,
       `${label}: unreadable (${parentLine})`,
       `${label}: not collected`,
       `${label}: truncated`,
     ];
-    const gated = gatedPrincipals({ admins_without_mfa: ["alice"], admin_count: 1 }, false, notes);
+    const withheldText = notes.join("; ");
     // The caller's notes, not the library's. A safe label is written without the colon or with a plain word before it.
     const withoutColon = notes.map((note) => note.replace(`${label}: `, `${label} `));
-    assertSurvivesScrub(gatedPrincipals({ admin_count: 1 }, false, withoutColon).principals_withheld, `${label} principals_withheld without a colon`);
-    assertSurvivesScrub(gatedPrincipals({ admin_count: 1 }, false, notes.map((note) => note.replace(`${label}: `, `${label} inventory: `))).principals_withheld, `${label} principals_withheld with a compound label`);
+    assertSurvivesScrub(withoutColon.join("; "), `${label} principals_withheld without a colon`);
+    assertSurvivesScrub(notes.map((note) => note.replace(`${label}: `, `${label} inventory: `)).join("; "), `${label} principals_withheld with a compound label`);
     if (PAIR_KEY_LABELS.includes(label)) {
       // A credential pair word before a colon loses whatever follows it.
-      assert.equal(scrubErrorText(gated.principals_withheld), notes.map((note) => note.replace(/^credentials: \S+/, `credentials: ${REDACTED}`)).join("; "), `${label} principals_withheld with a colon`);
+      assert.equal(scrubErrorText(withheldText), notes.map((note) => note.replace(/^credentials: \S+/, `credentials: ${REDACTED}`)).join("; "), `${label} principals_withheld with a colon`);
       continue;
     }
     if (GENERIC_KEY_LABELS.includes(label)) {
       // A label the Flue heuristic classifies loses a bare word after the colon and keeps a value that continues as prose.
-      assert.equal(scrubErrorText(gated.principals_withheld), notes.map((note) => (note.endsWith(": truncated") ? `${label}: ${REDACTED}` : note)).join("; "), `${label} principals_withheld with a colon`);
-      assert.equal(scrubDataText(gated.principals_withheld), scrubErrorText(gated.principals_withheld), `${label} principals_withheld: both scrubs agree`);
+      assert.equal(scrubErrorText(withheldText), notes.map((note) => (note.endsWith(": truncated") ? `${label}: ${REDACTED}` : note)).join("; "), `${label} principals_withheld with a colon`);
+      assert.equal(scrubDataText(withheldText), scrubErrorText(withheldText), `${label} principals_withheld: both scrubs agree`);
       continue;
     }
-    assertSurvivesScrub(gated.principals_withheld, `${label} principals_withheld`);
+    assertSurvivesScrub(withheldText, `${label} principals_withheld`);
   }
-  assertSurvivesScrub(notCollected(line).error, "not collected without status");
+  assertSurvivesScrub(collectionError(unavailableCollection("roles", line)), "not collected without status");
 });
 
 test("the prose-continuation phrases the generic pair rule exempts survive the scrub, and a bare word after such a key does not", () => {

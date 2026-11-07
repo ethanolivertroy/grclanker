@@ -827,10 +827,55 @@ test("verdict rule 8: re-running the export allocates a new directory and zip", 
   assert.match(second.zipPath, /-audit-bundle-2\.zip$/);
 });
 
+test("malformed 2xx JSON is unreadable evidence for each Cloudflare result decoder", async (t) => {
+  const malformed = [
+    ["missing result", { success: true }],
+    ["null document", null],
+    ["array document", []],
+    ["wrong result type", { success: true, result: "untrusted-value" }],
+    ["missing success", { result: [] }],
+    ["non-object list member", { success: true, result: [null] }],
+  ];
+  for (const [label, payload] of malformed) {
+    await t.test(label, async () => {
+      const fetchImpl = async () => new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+      const client = cloudflareClient(sampleConfig(), { fetchImpl });
+      for (const load of [() => client.listZones(), () => client.listZoneRulesets("zone-1"), () => client.listPageRules("zone-1"), () => client.getDnssec("zone-1")]) {
+        await assert.rejects(load, (error) => error instanceof CloudflareApiError && error.status === 200 && /invalid API document/.test(error.message));
+      }
+      const access = await checkCloudflareAccess(client);
+      const zones = access.surfaces.find((surface) => surface.name === "zones");
+      assert.equal(zones.status, "not_readable");
+      assert.equal(zones.count, null);
+      const assessment = await assessCloudflareZoneSecurity(client);
+      assert.equal(byId(assessment, "CF-ZONE-01").status, "manual");
+      assert.ok(assessment.errors.some((error) => /invalid API document/.test(error)));
+    });
+  }
+});
+
+test("malformed Cloudflare object results do not claim an observed missing WAF; valid empty lists and documented 404 remain distinct", async () => {
+  const client = cloudflareClient(sampleConfig(), {
+    fetchImpl: async (url) => new Response(JSON.stringify(new URL(url).pathname.endsWith("/zones")
+      ? { success: true, result: [{ id: "zone-1", name: "review.example" }] }
+      : { success: true }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  const assessment = await assessCloudflareZoneSecurity(client);
+  assert.equal(byId(assessment, "CF-ZONE-01").status, "manual");
+  assert.match(byId(assessment, "CF-ZONE-01").summary, /invalid API document/);
+  assert.doesNotMatch(byId(assessment, "CF-ZONE-01").summary, /No http_request_firewall_managed entry point ruleset exists/);
+  const empty = cloudflareClient(sampleConfig(), { fetchImpl: async () => new Response(JSON.stringify({ success: true, result: [] }), { status: 200 }) });
+  assert.deepEqual(await empty.listZones(), { items: [], totalCount: 0, truncated: false });
+  const absent = cloudflareClient(sampleConfig(), { fetchImpl: async () => new Response("", { status: 404 }) });
+  assert.equal(await absent.getZoneEntrypointRuleset("zone-1", CLOUDFLARE_RULESET_PHASES.firewallManaged), null);
+  assert.deepEqual(await absent.listUserTokens(), { items: [], totalCount: 0, truncated: false });
+});
+
 test("schema fidelity: client requests documented paths, phases, setting ids, and query parameters", async () => {
   const { calls, fetchImpl } = fakeFetch((url) => {
     if (url.pathname.includes("/settings/")) return { payload: { success: true, result: { id: url.pathname.split("/").pop(), value: "on" } } };
     if (url.pathname.endsWith("/entrypoint")) return { payload: { success: true, result: { id: "rs", rules: [] } } };
+    if (/(?:\/settings|\/subscription|\/gateway|\/bot_management|\/dnssec|\/tokens\/(?:tok-1|verify))$/.test(url.pathname)) return { payload: { success: true, result: {} } };
     return { payload: { success: true, result: [] } };
   });
   const client = cloudflareClient(sampleConfig(), { fetchImpl, now: () => new Date("2026-09-21T00:00:00Z") });

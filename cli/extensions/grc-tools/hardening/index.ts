@@ -42,28 +42,20 @@ export {
 export type { ConfigFileErrorDetails, ConfigFileFailureKind, ConfigFileOptions, ConfigFileResult, ParserPosition } from "./config-file.js";
 
 export {
-  coreDataValue,
-  countIfReadable,
-  datasetMarker,
-  datasetState,
-  datasetStatus,
-  derived,
-  derivedFlag,
-  gatedPrincipals,
-  ifComplete,
-  ifRead,
-  isAbsenceValue,
-  isComplete,
-  isReadable,
-  notCollected,
-  notRequested,
-  notRequestedDataset,
-  readDataset,
+  collectionComplete,
+  collectionError,
+  collectionReadable,
+  collectionValueOr,
+  completeCollection,
+  mapCollection,
+  observedValue,
+  partialCollection,
+  populationValue,
   seenVersusTotal,
-  unreadableDataset,
-  withoutAbsenceClaims,
+  skippedCollection,
+  unavailableCollection,
 } from "./collection-status.js";
-export type { Dataset, DatasetState, DatasetStatus, NotCollectedMarker, ReadDatasetDetails, UnreadDatasetDetails } from "./collection-status.js";
+export type { CollectionDetails, CollectionOutcome, CollectionState, ReadCollection } from "./collection-status.js";
 
 export { describePagination } from "./pagination.js";
 export type { PaginationOutcome, PaginationStop, PaginationStopKind } from "./pagination.js";

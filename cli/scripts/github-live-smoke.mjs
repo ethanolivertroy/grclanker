@@ -1,3 +1,4 @@
+import { resolveLiveSmokeConfiguration } from "./live-smoke-config.mjs";
 import {
   GitHubAuditorClient,
   assessGitHubActionsSecurity,
@@ -18,16 +19,6 @@ function log(message) {
   process.stdout.write(`${message}\n`);
 }
 
-function hasConfigHints() {
-  const hasPat = Boolean(process.env.GITHUB_TOKEN?.trim() || process.env.GH_TOKEN?.trim());
-  const hasApp = Boolean(
-    process.env.GITHUB_APP_ID?.trim()
-    && (process.env.GITHUB_APP_PRIVATE_KEY?.trim() || process.env.GITHUB_APP_PRIVATE_KEY_PATH?.trim())
-    && process.env.GITHUB_APP_INSTALLATION_ID?.trim(),
-  );
-  const hasOrg = Boolean(process.env.GITHUB_ORG?.trim() || process.env.GH_ORG?.trim());
-  return hasOrg && (hasPat || hasApp);
-}
 
 function describeSummary(summary) {
   return `Pass ${summary.Pass}, Partial ${summary.Partial}, Fail ${summary.Fail}, Manual ${summary.Manual}, Info ${summary.Info}`;
@@ -57,14 +48,9 @@ const ASSESSMENTS = [
 ];
 
 try {
-  if (!hasConfigHints()) {
-    log(
-      "Skipping live GitHub smoke test: set GITHUB_ORG and either GITHUB_TOKEN / GH_TOKEN or the GitHub App env vars to run against a real organization.",
-    );
-    process.exit(0);
-  }
-
-  const config = await resolveGitHubConfiguration();
+  const authentication = await resolveLiveSmokeConfiguration("GitHub", () => resolveGitHubConfiguration());
+  if (authentication.kind === "unconfigured") process.exit(0);
+  const config = authentication.config;
   const client = new GitHubAuditorClient(config);
   const access = await runGitHubAccessCheck(client, config);
 

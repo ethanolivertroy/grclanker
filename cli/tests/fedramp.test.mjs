@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -22,6 +23,7 @@ import {
   resolveFedrampKsi,
   resolveFedrampProcess,
   resolveFedrampRequirement,
+  resolveFedrampSubject,
   searchFedrampCatalog,
 } from "../dist/extensions/grc-tools/fedramp-source.js";
 import { buildFedrampDocsSnapshot } from "../dist/extensions/grc-tools/fedramp-docs.js";
@@ -45,6 +47,8 @@ import {
   registerFedrampTools,
 } from "../dist/extensions/grc-tools/fedramp.js";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { renderAdsPublicSite } from "../dist/extensions/grc-tools/fedramp/ads-site.js";
+import { renderAdsStarterBundle } from "../dist/extensions/grc-tools/fedramp/ads-starter.js";
 
 function jsonResponse(payload) {
   return new Response(JSON.stringify(payload), {
@@ -1012,6 +1016,37 @@ test("readiness helper links KSI indicators back to their process obligations", 
   assert.match(brief.text, /Linked process:\s+Certification Data Sharing \[CDS\]/);
 });
 
+test("readiness and artifact plans share one resolved subject for processes, indicators, and domains", () => {
+  const catalog = normalizeFedrampConsolidatedRules(consolidatedRulesFixture);
+  const loaded = { catalog, provenance: { repo: "rules", path: "fixture.json", branch: "main", blobSha: "fixture", version: "test", upstreamLastUpdated: "2026-07-02" }, cacheStatus: "live" };
+  for (const query of ["ADS", catalog.ksiIndicators[0].id, catalog.ksiDomains[0].id]) {
+    const resolved = resolveFedrampSubject(catalog, query);
+    const brief = buildFedrampReadinessBrief(loaded, { query, audience: "provider", applies_to: "20x" });
+    const plan = buildFedrampArtifactPlan(loaded, { query, audience: "provider", applies_to: "20x" });
+    assert.equal(brief.kind, resolved.kind);
+    assert.equal(plan.kind, resolved.kind);
+    assert.deepEqual(brief.subject, resolved.subject);
+    assert.deepEqual(plan.subject, resolved.subject);
+    assert.deepEqual(brief.linkedProcesses, plan.linkedProcesses);
+    assert.deepEqual(brief.linkedIndicators, plan.linkedIndicators);
+  }
+});
+
+test("FedRAMP subject resolution preserves ambiguous process errors instead of choosing a KSI fallback", () => {
+  const catalog = normalizeFedrampConsolidatedRules(consolidatedRulesFixture);
+  const process = catalog.processes[0];
+  catalog.processes = [{ ...process, id: "ONE", name: "Shared process one" }, { ...process, id: "TWO", name: "Shared process two" }];
+  catalog.ksiDomains = [{ ...catalog.ksiDomains[0], name: "Shared process" }];
+  assert.throws(() => resolveFedrampSubject(catalog, "Shared process"), /FedRAMP process query .* matched multiple items/);
+});
+
+test("a readiness computation failure retains its original cause after a process is resolved", () => {
+  const catalog = normalizeFedrampConsolidatedRules(consolidatedRulesFixture);
+  const failure = new Error("source data could not be read");
+  Object.defineProperty(catalog, "requirements", { get() { throw failure; } });
+  assert.throws(() => buildFedrampReadinessBrief({ catalog }, { query: "CDS" }), (error) => error === failure);
+});
+
 test("artifact and workstream inference stays grounded in official requirement language", () => {
   const catalog = normalizeFedrampConsolidatedRules(consolidatedRulesFixture);
   const requirements = catalog.requirements;
@@ -1109,6 +1144,42 @@ test("CDS package planner groups artifacts into package layers", () => {
   assert.match(plan.text, /Public trust-center layer:/);
   assert.match(plan.text, /Controlled authorization-data layer:/);
   assert.match(plan.text, /Recommended rollout:/);
+});
+
+test("ADS presentation consumes a completed plan and provenance without a catalog and preserves generated scaffold bytes", () => {
+  const source = {
+    provenance: {
+      repo: "rules",
+      path: "fedramp-consolidated-rules.json",
+      branch: "main",
+      blobSha: "abcdef1234567890abcdef1234567890abcdef12",
+      version: "2026.07.02.02",
+      upstreamLastUpdated: "2026-07-02",
+    },
+    cacheStatus: "live",
+    notes: [],
+  };
+  const loaded = { ...source, catalog: normalizeFedrampConsolidatedRules(consolidatedRulesFixture) };
+  const args = {
+    audience: "trust-center",
+    applies_to: "20x",
+    provider_name: "Acme & Partners",
+    offering_name: "Cloud <Platform>",
+    primary_domain: "https://trust.example.test/",
+    support_email: "security@example.test",
+  };
+  const plan = buildFedrampAdsPackagePlan(loaded, args);
+  const site = renderAdsPublicSite(source, plan, args);
+  const starter = renderAdsStarterBundle(source, plan);
+  assert.equal(site.plan, plan);
+  assert.equal(starter.plan, plan);
+  assert.deepEqual(site, buildFedrampAdsSite(loaded, args));
+  assert.deepEqual(starter, buildFedrampAdsStarterBundle(loaded, args));
+  // Captured before presentation was extracted: paths, ordering, HTML escaping,
+  // machine-readable contracts, and every asset's exact bytes stay compatible.
+  const digest = (files) => createHash("sha256").update(JSON.stringify(files)).digest("hex");
+  assert.equal(digest(site.files), "a370ce6a5b2b14922df72adb687c96fe2d976552f26fe46680a5314b34ef83f8");
+  assert.equal(digest(starter.files), "62e38b6ff2bb8df6de0458c3937f5cc7fac83ae194d48f4e9500f880f136c8db");
 });
 
 test("CDS starter bundle builder includes trust-center and feed templates", () => {

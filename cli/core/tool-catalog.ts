@@ -1,4 +1,4 @@
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { GrcToolDefinition as ToolDefinition } from "./tool-definition.js";
 import { collectDomainToolDefinitions } from "./domain-tools.js";
 
 export interface RegisteredToolSummary {
@@ -68,6 +68,8 @@ const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["zoom_", "Zoom"],
   ["zscaler_", "Zscaler"],
 ];
+
+export const TOOL_PREFIXES = DOMAIN_GROUPS.map(([prefix]) => prefix);
 
 export function resolveToolGroup(name: string): { group: string; kind: RegisteredToolSummary["kind"] } {
   if (COMPUTE_TOOL_NAMES.has(name)) {
@@ -151,7 +153,7 @@ function getParameterSummaries(parameters: unknown): RegisteredToolParameter[] {
   });
 }
 
-export function summarizeToolDefinitions(tools: ToolDefinition[]): RegisteredToolSummary[] {
+export function summarizeToolDefinitions(tools: readonly Pick<ToolDefinition, "name" | "label" | "description" | "parameters">[]): RegisteredToolSummary[] {
   return tools.map((tool) => {
     const { group, kind } = resolveToolGroup(tool.name);
     return {

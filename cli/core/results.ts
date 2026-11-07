@@ -14,7 +14,8 @@ function toSdkContent(content: GrcToolContent): GrcToolContent {
       return { type: "image", data: content.data, mimeType: content.mimeType };
     default: {
       const exhaustive: never = content;
-      throw new Error(`Unsupported grclanker tool content: ${JSON.stringify(exhaustive)}`);
+      void exhaustive;
+      throw new Error("Unsupported native tool content block.");
     }
   }
 }
@@ -25,9 +26,8 @@ function toSdkContent(content: GrcToolContent): GrcToolContent {
  * `isError` is carried over when set.
  */
 export function toSdkToolResult(result: GrcToolResult): GrcToolEnvelope {
-  const content = Array.isArray(result.content)
-    ? result.content.map(toSdkContent)
-    : [{ type: "text" as const, text: JSON.stringify(result) }];
+  if (!Array.isArray(result?.content)) return errorEnvelope("The native tool returned invalid content.");
+  const content = result.content.map(toSdkContent);
   const envelope: GrcToolEnvelope = { content };
   if (result.isError === true) {
     envelope.isError = true;

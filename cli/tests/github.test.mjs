@@ -2623,6 +2623,69 @@ function createForbiddenClient() {
   return Object.fromEntries(Object.keys(createCompliantClient()).map((name) => [name, async () => { throw new ForbiddenError(); }]));
 }
 
+test("one GitHub audit run shares root evidence across categories even when later reads would change", async () => {
+  const outputRoot = createTempBase("grclanker-github-snapshot-");
+  const client = createCompliantClient();
+  const calls = new Map();
+  const sharedMethods = ["getOrganization", "listRepositories", "listHooks", "listInstallations", "listCredentialAuthorizations"];
+  for (const method of sharedMethods) {
+    const load = client[method];
+    client[method] = async (...args) => {
+      const count = (calls.get(method) ?? 0) + 1;
+      calls.set(method, count);
+      // A repeated read would observe a changed tenant. Sharing only successful records after
+      // collection is insufficient: the read itself must belong to this run exactly once.
+      if (count > 1) return method === "getOrganization" ? { login: "changed-org" } : [];
+      return load(...args);
+    };
+  }
+  try {
+    const result = await exportGitHubAuditBundle(client, SELF_CHECK_CONFIG, outputRoot);
+    const read = (category) => JSON.parse(readFileSync(join(result.outputDir, "core_data", `${category}.json`), "utf8"));
+    const access = read("org_access");
+    const protection = read("repo_protection");
+    const security = read("code_security");
+    const integrations = read("integrations");
+    assert.deepEqual(Object.fromEntries(calls), Object.fromEntries(sharedMethods.map((method) => [method, 1])));
+    for (const category of [protection, security, integrations]) assert.deepEqual(category.org, access.org);
+    assert.deepEqual(security.repositories, protection.repositories);
+    assert.deepEqual(integrations.repositories, protection.repositories);
+    assert.deepEqual(integrations.hooks, access.hooks);
+    assert.deepEqual(integrations.appInstallations, access.appInstallations);
+    assert.deepEqual(integrations.credentialAuthorizations, access.credentialAuthorizations);
+    assert.ok(protection.repositories.data.length > 0);
+  } finally {
+    fs.rmSync(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test("a failed GitHub root is shared without retrying it in another audit category", async () => {
+  const outputRoot = createTempBase("grclanker-github-snapshot-denied-");
+  const client = createCompliantClient();
+  let repositoryReads = 0;
+  let dependentReads = 0;
+  client.listRepositories = async () => {
+    repositoryReads += 1;
+    if (repositoryReads === 1) throw new ForbiddenError();
+    return SELF_CHECK_REPOS;
+  };
+  for (const method of ["listRepoRulesets", "getBranchProtection", "listBranchRules", "listRepoHooks", "listDeployKeys"]) {
+    client[method] = async () => { dependentReads += 1; return []; };
+  }
+  try {
+    const result = await exportGitHubAuditBundle(client, SELF_CHECK_CONFIG, outputRoot);
+    const roots = ["repo_protection", "code_security", "integrations"].map((category) =>
+      JSON.parse(readFileSync(join(result.outputDir, "core_data", `${category}.json`), "utf8")).repositories);
+    assert.equal(repositoryReads, 1);
+    assert.equal(dependentReads, 0, "no repository children can run after the shared inventory failed");
+    assert.ok(roots[0].error);
+    assert.deepEqual(roots[1], roots[0]);
+    assert.deepEqual(roots[2], roots[0]);
+  } finally {
+    fs.rmSync(outputRoot, { recursive: true, force: true });
+  }
+});
+
 function createEmptyClient() {
   return {
     ...createCompliantClient(),

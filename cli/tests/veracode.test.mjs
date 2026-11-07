@@ -28,6 +28,7 @@ import {
 } from "../dist/extensions/grc-tools/veracode.js";
 import { VERACODE_AUTH_RESOLVER } from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
 import { VERACODE_SPEC } from "../dist/extensions/grc-tools/veracode.spec.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
@@ -1084,6 +1085,45 @@ test("assessVeracodeFindingsHygiene counts false positives from FP annotations a
   const fpEvidence = withFp.findings.find((item) => item.id === "VERACODE-16").evidence;
   assert.equal(fpEvidence.applications_exceeding[0].rate_percent, 50);
   assert.equal(fpEvidence.per_application[0].fp_approved_findings, 1);
+});
+
+test("SCA workspace availability is collected before each check is evaluated once", async () => {
+  const workspaceStates = [
+    { name: "available", available: true, load: undefined },
+    { name: "refused", available: false, async load() { throw forbidden("/srcclr/v3/workspaces"); } },
+    { name: "empty", available: false, async load() { return list([]); } },
+  ];
+  for (const workspaceState of workspaceStates) {
+    for (const coverage of ["none", "mixed", "all"]) {
+      const fixture = healthyFixture();
+      fixture.applications.forEach((app, index) => {
+        app.profile.upload_and_scan_sca_enabled = coverage === "all" || coverage === "mixed" && index === 0;
+      });
+      const uploadCovered = fixture.applications.filter((app) => app.profile.upload_and_scan_sca_enabled).length;
+      let projectRequests = 0;
+      const client = mockClient(fixture, {
+        ...(workspaceState.load ? { listScaWorkspaces: workspaceState.load } : {}),
+        async getScaApplicationProjects() {
+          projectRequests += 1;
+          return fixture.scaProjects;
+        },
+      });
+      const label = `${workspaceState.name} workspaces, ${coverage} upload-and-scan coverage`;
+      const { result, captures } = await captureBatchDecisionFacts(() => assessVeracodeScaPosture(client));
+      const evaluations = captures.flatMap((capture) => [...capture.checks]);
+      assert.equal(evaluations.length, 3, `${label}: only final findings evaluate policy`);
+      assert.deepEqual(evaluations.map(([id]) => id).sort(), ["VERACODE-05", "VERACODE-06", "VERACODE-18"], `${label}: each check evaluates once`);
+      const facts = evaluations.find(([id]) => id === "VERACODE-18")[1];
+      const covered = workspaceState.available ? fixture.applications.length : uploadCovered;
+      const unchecked = workspaceState.available ? 0 : fixture.applications.length - uploadCovered;
+      assert.equal(facts.sca_covered_application_count, covered, `${label}: evaluation sees the complete coverage facts`);
+      assert.equal(facts.sca_unchecked_application_count, unchecked, `${label}: evaluation sees the unqueried population`);
+      assert.equal(facts.linked_project_reads_complete, unchecked === 0, label);
+      const finding = result.findings.find((item) => item.id === "VERACODE-18");
+      assert.equal(finding.status, unchecked === 0 ? "pass" : covered === 0 ? "manual" : "warn", label);
+      assert.equal(projectRequests, workspaceState.available ? fixture.applications.length - uploadCovered : 0, `${label}: unavailable workspaces never trigger linked-project requests`);
+    }
+  }
 });
 
 test("assessVeracodeScaPosture fails on high CVSS and HIGH risk licenses and treats unlicensed SCA as manual", async () => {

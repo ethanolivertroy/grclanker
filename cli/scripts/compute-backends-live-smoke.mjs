@@ -30,7 +30,7 @@ const requested = process.env.GRCLANKER_LIVE_BACKENDS
 
 // Readiness comes from the same detection `env list` and `env doctor` use, so a backend missing a
 // mandatory local tool (for runpod-pod: ssh, scp, and git) is skipped here too.
-const candidates = selectLiveSmokeCandidates(detectComputeBackendStatuses(), requested);
+const candidates = selectLiveSmokeCandidates(await detectComputeBackendStatuses(), requested);
 
 if (candidates.length === 0) {
   log(

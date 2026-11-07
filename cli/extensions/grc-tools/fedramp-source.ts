@@ -1489,14 +1489,41 @@ function resolveUniqueMatch<T>(
 
   const resultSet = exact.length > 0 ? exact : partial.length > 0 ? partial : tokenMatches;
   if (resultSet.length === 0) {
-    throw new Error(`No FedRAMP ${label} matched "${query}".`);
+    throw new FedrampLookupError("not_found", `No FedRAMP ${label} matched "${query}".`);
   }
 
   const examples = resultSet
     .slice(0, 5)
     .map((value) => candidates(value)[0] ?? "(unknown)")
     .join("; ");
-  throw new Error(`FedRAMP ${label} query "${query}" matched multiple items. Narrow it down. Examples: ${examples}`);
+  throw new FedrampLookupError("ambiguous", `FedRAMP ${label} query "${query}" matched multiple items. Narrow it down. Examples: ${examples}`);
+}
+
+export class FedrampLookupError extends Error {
+  constructor(readonly kind: "not_found" | "ambiguous", message: string) {
+    super(message);
+    this.name = "FedrampLookupError";
+  }
+}
+
+export type FedrampSubject =
+  | { kind: "process"; subject: FedrampProcessRecord }
+  | { kind: "ksi-indicator"; subject: FedrampKsiIndicatorRecord }
+  | { kind: "ksi-domain"; subject: FedrampKsiDomainRecord };
+
+/** Only a missing process lookup permits KSI lookup; ambiguous queries and data errors retain their cause. */
+export function resolveFedrampSubject(catalog: FedrampCatalog, query: string): FedrampSubject {
+  let process: FedrampProcessRecord;
+  try {
+    process = resolveFedrampProcess(catalog, query);
+  } catch (error) {
+    if (!(error instanceof FedrampLookupError) || error.kind !== "not_found") throw error;
+    const ksi = resolveFedrampKsi(catalog, query);
+    return ksi.kind === "indicator"
+      ? { kind: "ksi-indicator", subject: ksi.indicator }
+      : { kind: "ksi-domain", subject: ksi.domain };
+  }
+  return { kind: "process", subject: process };
 }
 
 export function resolveFedrampProcess(catalog: FedrampCatalog, query: string): FedrampProcessRecord {

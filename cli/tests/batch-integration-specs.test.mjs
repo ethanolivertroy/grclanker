@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   evaluateBatchCheckVerdict,
-  materializeBatchCheckVerdict,
+  BatchVerdicts,
 } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import {
   BOX_AUTH_RESOLVER,
@@ -746,7 +746,7 @@ test("Okta Info is an explicit evidence outcome and cannot be selected by a lega
     insecure_active_count: 0,
   };
   assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-INTEG-001", emptyOrigins), "info");
-  assert.equal(materializeBatchCheckVerdict(OKTA_SPEC, "OKTA-INTEG-001", emptyOrigins), "Info");
+  assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-INTEG-001", emptyOrigins), "info");
   assert.throws(
     () => evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-INTEG-001", { ...emptyOrigins, manualLabel: "Manual" }),
     /OKTA-INTEG-001 received undeclared decision input/,
@@ -812,7 +812,7 @@ test("all batch rules reject null, missing, denied, or unreadable evidence", () 
   }
 });
 
-test("Okta executable rules ignore legacy status and use complete counts with ordered precedence", () => {
+test("Okta executable rules derive status from facts and use complete counts with ordered precedence", () => {
   const phishingFacts = {
     readable: true,
     complete: true,
@@ -821,12 +821,12 @@ test("Okta executable rules ignore legacy status and use complete counts with or
     phishing_resistant_count: 1,
     strong_count: 1,
   };
-  assert.equal(materializeBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-001", phishingFacts), "Pass");
-  assert.equal(materializeBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-001", {
+  assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-001", phishingFacts), "pass");
+  assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-001", {
     ...phishingFacts,
     phishing_resistant_count: 0,
     strong_count: 0,
-  }), "Fail");
+  }), "fail");
   assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-006", {
     readable: true,
     complete: false,
@@ -849,7 +849,7 @@ test("Okta executable rules ignore legacy status and use complete counts with or
   }), "pass");
 });
 
-test("Duo executable rules ignore legacy status and use complete evidence with ordered precedence", () => {
+test("Duo executable rules derive status from facts and use complete evidence with ordered precedence", () => {
   const base = {
     readable: true,
     complete: true,
@@ -859,11 +859,11 @@ test("Duo executable rules ignore legacy status and use complete evidence with o
     bypass_user_count: 0,
     unenrolled_user_count: 0,
   };
-  assert.equal(materializeBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", base), "Pass");
-  assert.equal(materializeBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", {
+  assert.equal(evaluateBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", base), "pass");
+  assert.equal(evaluateBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", {
     ...base,
     bypass_user_count: 1,
-  }), "Fail", "mutating primitive evidence changes the verdict");
+  }), "fail", "mutating primitive evidence changes the verdict");
   assert.equal(evaluateBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", {
     ...base,
     complete: false,
@@ -875,18 +875,18 @@ test("Duo executable rules ignore legacy status and use complete evidence with o
   }), "warn", "a 26-user incomplete inventory cannot pass based on a 25-item rendering sample");
 });
 
-test("GWS executable rules ignore legacy status and use complete evidence with ordered precedence", () => {
+test("GWS executable rules derive status from facts and use complete evidence with ordered precedence", () => {
   const base = {
     readable: true,
     complete: true,
     active_user_count: 100,
     two_step_required_user_count: 98,
   };
-  assert.equal(materializeBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", base), "Pass");
-  assert.equal(materializeBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", {
+  assert.equal(evaluateBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", base), "pass");
+  assert.equal(evaluateBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", {
     ...base,
     two_step_required_user_count: 84,
-  }), "Fail", "mutating primitive directory counts changes the verdict");
+  }), "fail", "mutating primitive directory counts changes the verdict");
   assert.equal(evaluateBatchCheckVerdict(GWS_SPEC, "GWS-MON-002", {
     readable: true,
     complete: false,
@@ -901,8 +901,7 @@ test("GWS executable rules ignore legacy status and use complete evidence with o
   }), "warn", "complete source cardinality, not a capped 25-item sample, controls pass");
 });
 
-test("Box executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
-  const legacyStatus = "pass";
+test("Box executable rules derive status from facts and preserve boundaries, precedence, and complete counts", () => {
   const passwordFacts = {
     settings_readable: true,
     unused_setting_count: 0,
@@ -916,7 +915,6 @@ test("Box executable rules ignore legacy status and preserve boundaries, precede
     ...passwordFacts,
     minimum_length: 7,
   }), "fail", "mutating password evidence changes the verdict while the legacy status is held constant");
-  assert.equal(legacyStatus, "pass");
 
   const inactivityFacts = {
     users_readable: true,
@@ -955,7 +953,7 @@ test("Box executable rules ignore legacy status and preserve boundaries, precede
   }), "warn", "the complete 26-user inventory, not a 25-item evidence sample, controls the result");
 });
 
-test("Slack executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
+test("Slack executable rules derive status from facts and preserve boundaries, precedence, and complete counts", () => {
   const legacyStatus = "pass";
   const uploadFacts = {
     preferences_readable: true,
@@ -993,7 +991,7 @@ test("Slack executable rules ignore legacy status and preserve boundaries, prece
   }), "warn", "the complete 26-user collector state, not a 25-item rendering sample, prevents pass");
 });
 
-test("Zoom executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
+test("Zoom executable rules derive status from facts and preserve boundaries, precedence, and complete counts", () => {
   const legacyStatus = "pass";
   const meetingFacts = {
     settings_readable: true,
@@ -1042,7 +1040,7 @@ test("Zoom executable rules ignore legacy status and preserve boundaries, preced
   }), "warn", "the complete 26-user collector state, not a 25-item evidence sample, prevents pass");
 });
 
-test("Zendesk executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
+test("Zendesk executable rules derive status from facts and preserve boundaries, precedence, and complete counts", () => {
   const legacyStatus = "pass";
   const sessionFacts = {
     credential_is_admin: true,
@@ -1095,7 +1093,7 @@ test("Zendesk executable rules ignore legacy status and preserve boundaries, pre
   }), "fail", "the complete 26-admin inventory, not a 25-item evidence sample, controls the result");
 });
 
-test("Salesforce executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
+test("Salesforce executable rules derive status from facts and preserve boundaries, precedence, and complete counts", () => {
   const legacyStatus = "pass";
   const passwordFacts = {
     settings_readable: true,
@@ -1146,7 +1144,7 @@ test("Salesforce executable rules ignore legacy status and preserve boundaries, 
   }), "fail", "the complete 26-admin inventory, not a 25-item evidence sample, controls the result");
 });
 
-test("ServiceNow executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
+test("ServiceNow executable rules derive status from facts and preserve boundaries, precedence, and complete counts", () => {
   const legacyStatus = "pass";
   const accessFacts = {
     readable: true,
@@ -1158,11 +1156,11 @@ test("ServiceNow executable rules ignore legacy status and preserve boundaries, 
     stale_admin_count: 0,
     warning_count: 0,
   };
-  assert.equal(materializeBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", accessFacts, legacyStatus), "Pass");
-  assert.equal(materializeBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", {
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", accessFacts), "pass");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", {
     ...accessFacts,
     admin_count: 6,
-  }, legacyStatus), "Fail", "mutating raw administrator evidence changes the verdict while the legacy status is held constant");
+  }), "fail", "mutating raw administrator evidence changes the verdict");
   assert.equal(legacyStatus, "pass");
   assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", {
     ...accessFacts,
@@ -1417,4 +1415,20 @@ test("all batch check IDs belong to registered owning tools", () => {
       assert.equal(checkContract(spec, check.id).id, check.id);
     }
   }
+});
+
+
+test("explicit assessment verdicts isolate runs and reject evidence changes after rendering", () => {
+  const id = "SNOW-04";
+  const facts = { readable: true, complete: true, user_count: 100, admin_assignment_count: 5, admin_count: 5, max_admins: 5, stale_admin_count: 0, warning_count: 0 };
+  const first = new BatchVerdicts(SERVICENOW_SPEC);
+  const second = new BatchVerdicts(SERVICENOW_SPEC);
+  first.record(id, facts);
+  second.record(id, { ...facts, admin_count: 6 });
+  assert.equal(first.status(id), "pass");
+  assert.equal(second.status(id), "fail");
+  assert.equal(first.status(id), "pass", "another assessment cannot mutate this run's decision facts");
+  assert.throws(() => first.record(id, { admin_count: 6 }), /collect every decision fact before rendering/);
+  assert.equal(first.status(id), "pass", "a rendered decision keeps its collected evidence snapshot");
+  assert.throws(() => new BatchVerdicts(SERVICENOW_SPEC).status(id), /has no collected decision facts/);
 });

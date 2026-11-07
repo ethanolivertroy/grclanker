@@ -1,10 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import {
-  getRegisteredToolSummaries,
-  groupRegisteredTools,
-} from "../dist/pi/tool-catalog.js";
+import { readToolManifest } from "../../scripts/lib/tool-manifest.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "../..");
@@ -22,7 +19,7 @@ function toolPurpose(tool) {
   return sentence.trim().replace(/\.$/, "");
 }
 
-export function buildToolCatalogMarkdown(tools = getRegisteredToolSummaries()) {
+export function buildToolCatalogMarkdown(tools = readToolManifest(repoRoot).tools) {
   const domainCount = tools.filter((tool) => tool.kind === "domain").length;
   const computeCount = tools.filter((tool) => tool.kind === "compute").length;
   const lines = [
@@ -37,7 +34,13 @@ export function buildToolCatalogMarkdown(tools = getRegisteredToolSummaries()) {
     "",
   ];
 
-  const groups = groupRegisteredTools(tools);
+  const grouped = new Map();
+  for (const tool of tools) {
+    const group = grouped.get(tool.group) ?? { group: tool.group, kind: tool.kind, tools: [] };
+    group.tools.push(tool);
+    grouped.set(tool.group, group);
+  }
+  const groups = [...grouped.values()].sort((left, right) => left.group.localeCompare(right.group));
   const orderedGroups = [
     ...groups.filter((group) => group.kind === "domain"),
     ...groups.filter((group) => group.kind === "compute"),

@@ -1,3 +1,4 @@
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
 /**
  * CISA Known Exploited Vulnerabilities (KEV) and EPSS tools.
  *
@@ -325,7 +326,7 @@ function epssScoreDates(
   return dates;
 }
 
-export function registerKevsTools(pi: any): void {
+export function registerKevsTools(pi: GrcToolRegistrar): void {
   pi.registerTool({
     name: "kevs_search",
     label: "Search Known Exploited Vulnerabilities",

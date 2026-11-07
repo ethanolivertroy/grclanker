@@ -21,6 +21,7 @@ import { executeComputeAwareGrep } from "../pi/search-tools.js";
 import { readGrclankerSettings } from "../pi/settings.js";
 import { initialPromptInputResult } from "../pi/prompt-envelope.js";
 import { registerDomainTools } from "../core/domain-tools.js";
+import { toPiToolDefinition } from "../pi/tool-adapter.js";
 import { formatGrclankerStatus, installGrclankerHeader } from "./grc-tools/header.js";
 
 function resolveCliVersion(currentDir: string): string {
@@ -176,7 +177,7 @@ export default function grcTools(pi: ExtensionAPI): void {
     return { systemPrompt: `${event.systemPrompt.trimEnd()}\n\n${note}` };
   });
 
-  const domainToolCount = registerDomainTools(pi);
+  const domainToolCount = registerDomainTools({ registerTool(tool) { pi.registerTool(toPiToolDefinition(tool)); } });
 
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;

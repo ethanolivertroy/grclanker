@@ -1,3 +1,6 @@
+import { resolveLexicalOutputPath as resolveSecureOutputPath, writeSecureTextFile, countFilesRecursively as countFiles } from "./secure-output.js";
+export { resolveSecureOutputPath };
+import { createSnapshotCredentialScrubber } from "./security/snapshot-scrubber.js";
 /**
  * Duo GRC assessment tools.
  *
@@ -6,22 +9,15 @@
  * read-only and Admin API–first so GRC engineers can assess a tenant with one
  * audit principal.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, createHmac } from "node:crypto";
-import {
-  chmodSync,
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  realpathSync,
-} from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+
+
+import { resolve } from "node:path";
 import { Type } from "typebox";
 import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError } from "./abort.js";
 import { writeBundleAtomically } from "./atomic-output.js";
 import { DUO_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { BatchVerdicts, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { DUO_SPEC } from "./duo.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -1150,704 +1146,8 @@ function describeNonJsonBody(response: Response, text: string): string | undefin
   return `non-JSON body (${contentType}, ${Buffer.byteLength(text, "utf8")} bytes)`;
 }
 
-const REDACTED_ERROR_VALUE = "[REDACTED]";
-const CONFIGURED_SECRETS = new Set<string>();
-const MIN_CONFIGURED_SECRET_LENGTH = 4;
-
-/**
- * The forms a configured secret can take inside an error string: plain, JSON-escaped, URL-encoded, base64,
- * and base64url (rule 9 scrub boundary: a configured secret is removed whatever its shape, in every form).
- */
-function configuredSecretForms(value: string): string[] {
-  const forms = new Set<string>([
-    value,
-    JSON.stringify(value).slice(1, -1),
-    encodeURIComponent(value),
-    Buffer.from(value, "utf8").toString("base64"),
-    Buffer.from(value, "utf8").toString("base64url"),
-  ]);
-  return [...forms].filter((form) => form.length >= MIN_CONFIGURED_SECRET_LENGTH);
-}
-
-/** Secrets the running client was configured with or obtained; every recorded error string is scrubbed of them in every form. */
-function registerConfiguredSecrets(...values: Array<string | undefined>): void {
-  for (const value of values) {
-    if (!value || value.length < MIN_CONFIGURED_SECRET_LENGTH) continue;
-    for (const form of configuredSecretForms(value)) CONFIGURED_SECRETS.add(form);
-  }
-}
-
-function escapeErrorRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** Replaces every configured secret form wherever it appears; a form under eight characters only where it stands as a whole token. */
-function scrubConfiguredSecrets(text: string): string {
-  let scrubbed = text;
-  for (const secret of [...CONFIGURED_SECRETS].sort((left, right) => right.length - left.length)) {
-    scrubbed = secret.length >= 8
-      ? scrubbed.split(secret).join(REDACTED_ERROR_VALUE)
-      : scrubbed.replace(new RegExp(`(?<![A-Za-z0-9])${escapeErrorRegExp(secret)}(?![A-Za-z0-9])`, "g"), REDACTED_ERROR_VALUE);
-  }
-  return scrubbed;
-}
-
-// The words that name a credential. A key ends in one of them; isCredentialNamedKey below decides how the word may
-// be attached to the rest of the key. `skey` and `ikey` are Duo's secret key and integration key (DUO_SKEY, DUO_IKEY),
-// both configured secrets of that integration; there is no bare `key`, so KmsKeyId, ssh_key_name, and the like stay
-// identifiers. The compound words (`session_token`, `client_secret`, `secret_access_key`, `secret_key`,
-// `connection_string`, `ssh_key_data`) are the members an SDK response or a credential store carries, so they count
-// in their PascalCase form too (`SessionToken`, `ClientSecret`, `SecretAccessKey`, `SecretKey`), where a PascalCase
-// error code that merely ends in `Token` (`ExpiredToken`) does not; see isCredentialNamedKey. The bearer ids are the
-// one override to the identifier suffix: a key ending in
-// `secret_id` (a Vault AppRole secret id) or `token_id` (a token id is the token), or in a session id (`session_id`,
-// `sid`, `sessid`, `jsessionid`, `PHPSESSID`), authenticates rather than identifies, so it is a credential key
-// despite ending in `id` and its value goes whatever its shape, UUID included, while `client_id`, `tenant_id`,
-// `access_key_id`, `key_id`, and `secret_name` keep theirs unless the value's own shape goes. A URL-valued webhook
-// key (`webhook`, `webhook_url`) carries its token in the path, so the whole value goes; `webhook_count` is a count.
-const ERROR_CREDENTIAL_WORDS =
-  "token|secret[_.-]?id|token[_.-]?id|session[_.-]?token|access[_.-]?token|refresh[_.-]?token|id[_.-]?token|client[_.-]?secret|api[_.-]?secret|secret[_.-]?access[_.-]?key|secret[_.-]?key|secret|passw(?:or)?d|pwd|passphrase|api[_.-]?key|apikey|auth[_.-]?key|auth[_.-]?email|session(?:[_.-]?id)?|sessid|sid|cookie|csrftoken|authorization|auth|signature|sig|nonce|credentials?|access[_.-]?key|private[_.-]?key|ssh[_.-]?key[_.-]?data|skey|ikey|assertion|connection[_.-]?string|webhook(?:[_.-]?url)?";
-const ERROR_CREDENTIAL_KEY_PATTERN = `[A-Za-z0-9_.-]*(?:${ERROR_CREDENTIAL_WORDS})`;
-
-/**
- * Where a key may start: after a character that cannot be part of a key, or after a JSON escape (`\n`, `\t`,
- * `\u000a`) inside a serialized message, where the character before the key is the escape's last letter and
- * `\b` sees no boundary. Never right after a backslash, so the escape letter is not
- * read as the first letter of the key (`\nExpiredToken:` is the error code, not a key `nExpiredToken`).
- */
-const KEY_BOUNDARY_PATTERN = String.raw`(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))`;
-/** Where a header name or a scheme word may start: the same boundaries, allowing a `.` or `-` before the name. */
-const NAME_BOUNDARY_PATTERN = String.raw`(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))`;
-
-/**
- * The authorization scheme words, matched in any casing: the HTTP schemes, Okta's
- * SSWS, the Splunk and Snowflake header schemes, and SigV4. Under a credential-named key only an Authorization
- * header treats the word as a scheme in front of the value; under any other key the word is the value.
- */
-const ERROR_SCHEME_WORDS = "Bearer|Basic|Digest|Negotiate|NTLM|OAuth|SSWS|Token|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256";
-const ERROR_SCHEME_PATTERN = `(?:${ERROR_SCHEME_WORDS})`;
-/**
- * key=value and key: value pairs whose key ends in a credential word, wherever the key stands: after a flag
- * prefix `--`, `-D`, a path segment `kv/`, a parenthesis, or a comma. The value runs to
- * whitespace, a quote, `&`, `;`, `,`, a closing bracket, an angle bracket, or a backslash (the compound-line
- * rule), so a pair inside a query string, a header list, a JSON fragment, or a parenthesis keeps the text after
- * it; a marker inside the value (a URL whose query was already removed) is part of it. A value that is already
- * the marker is not a value, so a second pass over a scrubbed message changes nothing; scrubCredentialPairs
- * decides whether the key names a credential.
- */
-const ERROR_CREDENTIAL_PAIR_PATTERN = new RegExp(
-  `${KEY_BOUNDARY_PATTERN}(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\\\*["'])?\\s*[=:]\\s*["']?)((?:${ERROR_SCHEME_PATTERN}\\s+)?(?!\\[REDACTED\\])(?:\\[REDACTED\\]|[^\\s"'&;,<>)\\]}\\\\])+)`,
-  "gi",
-);
-/** `--name value` in a CLI's stderr: the next token is the value. */
-const FLAG_CARRIER_PATTERN = new RegExp(`(?<![A-Za-z0-9_.-])--(${ERROR_CREDENTIAL_KEY_PATTERN})(\\s+)(?![-\\[])([^\\s"'&;,<>)\\]}\\\\]+)`, "gi");
-const TRAILING_PUNCTUATION_PATTERN = /[.!?:)]+$/;
-
-/**
- * A quoted value: the opening quote with the backslashes that escape it at its serialization depth (none when the
- * message is plain, one when it was serialized once, three when twice), the value up to the close quote at the
- * same depth (an escaped quote inside the value, `\"` inside `"..."`, is part of the value, as is a deeper
- * quote), and that close quote. Both patterns below place it after two capturing groups, so the backslashes are
- * group 4, the quote character group 5, the value group 6, and the close quote group 7.
- */
-const ERROR_QUOTED_VALUE_PATTERN = String.raw`(?<!\\)((\\*)(["']))((?:(?!(?<!\\)\4\5)[^\n])+)((?<!\\)\4\5)`;
-/**
- * A quoted credential value: `X-Api-Key: "value"`, `Cookie: sid='value'`, `Authorization: Bearer "value"`,
- * `\"X-Auth-Key\":\"value\"`: with or without spaces, single or double quotes, plain or JSON-escaped. The quotes
- * delimit the carrier, so the quoted value is removed whole whatever its shape; the pair rule above stops at the
- * opening quote and would judge a short or name-shaped value ("key", "prod-key") as prose. The header name, the
- * separator, the scheme, and the quotes stay so the message remains diagnosable.
- */
-const ERROR_QUOTED_CREDENTIAL_PATTERN = new RegExp(
-  String.raw`${KEY_BOUNDARY_PATTERN}(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\*["'])?\s*[=:]\s*(?:${ERROR_SCHEME_PATTERN}\s*)?)${ERROR_QUOTED_VALUE_PATTERN}`,
-  "gi",
-);
-// A scheme word that is itself quoted (`"Token":"..."`, a JSON key) or ends a compound key (`"x-api-key":`,
-// `"settings.token":`) is a pair the rule above already handled.
-const ERROR_QUOTED_SCHEME_PATTERN = new RegExp(String.raw`(?<!["'\\./-])\b(${ERROR_SCHEME_PATTERN})(\s*)${ERROR_QUOTED_VALUE_PATTERN}`, "gi");
-const QUOTED_VALUE_REPLACEMENT = `$1$2$3${REDACTED_ERROR_VALUE}$7`;
-/**
- * A quoted phrase that is a scheme word and one value (`"Bearer prod-token"`, `\"Token prod-key\"`, `'Basic abc'`):
- * the quotes delimit a header value, so the quoted name-shaped bearer goes whatever its shape, where the same
- * phrase bare in prose (`sent as Bearer prod-token`) is
- * judged by the scheme rule's shape test. A quoted phrase of several words after the scheme is prose and stays.
- */
-const ERROR_QUOTED_SCHEME_PHRASE_PATTERN = new RegExp(
-  String.raw`(?<!\\)((\\*)(["']))(${ERROR_SCHEME_PATTERN})(\s+)((?:(?!(?<!\\)\2\3)[^\s"'\\])+)((?<!\\)\2\3)`,
-  "gi",
-);
-const QUOTED_SCHEME_PHRASE_REPLACEMENT = `$1$4$5${REDACTED_ERROR_VALUE}$7`;
-
-const CREDENTIAL_KEY_WORD_PATTERN = new RegExp(`(?:${ERROR_CREDENTIAL_WORDS})$`, "i");
-// Credential words that end too many ordinary words to count when glued to a lowercase prefix (`oauth`, `ssid`).
-const WEAK_CREDENTIAL_WORD_PATTERN = /^(?:auth|sid|sig)$/i;
-const PAIR_VALUE_SCHEME_PATTERN = new RegExp(`^${ERROR_SCHEME_PATTERN}\\s+`, "i");
-const BARE_SCHEME_WORD_PATTERN = new RegExp(`^${ERROR_SCHEME_PATTERN}$`, "i");
-/** The keys whose value is `<scheme> <credential>`: Authorization and Proxy-Authorization. */
-const AUTHORIZATION_KEY_PATTERN = /authorization$/i;
-const SCHEME_PARAMETER_PATTERN = /^([A-Za-z][A-Za-z0-9_-]*)=(?!=)/;
-
-/**
- * Whether the value after a scheme word is a `name=value` parameter list (SigV4 `Credential=...`, `realm="api"`,
- * `OAuth oauth_consumer_key=...`) rather than one bearer credential: the name is shaped like a name segment by
- * segment (`oauth_consumer_key`, `x-amz-date`), and the `=` is followed by more text, or by the quote that opens
- * the parameter's value where the caller's value stopped (`uri="/dir"`, `Session="v"`: `quoteFollows`), or the
- * whole is not base64-length (`realm=` is a parameter; `cGFzc3dvcmQ=` is padding).
- */
-function isSchemeParameterList(value: string, quoteFollows = false): boolean {
-  const parameter = SCHEME_PARAMETER_PATTERN.exec(value);
-  if (parameter === null || !isParameterName(parameter[1])) return false;
-  return parameter[0].length < value.length || quoteFollows || value.length % 4 !== 0;
-}
-
-/** A parameter name: `-` or `_` separated segments that are each shaped like part of a name (see isNameSegment). */
-function isParameterName(name: string): boolean {
-  return name.split(/[-_]/).every((segment) => isNameSegment(segment));
-}
-
-/** Whether a quote, plain or behind the backslashes of its JSON escape, stands at `index` in `text`. */
-function quoteOpensAt(text: string, index: number): boolean {
-  let cursor = index;
-  while (text[cursor] === "\\") cursor += 1;
-  return text[cursor] === '"' || text[cursor] === "'";
-}
-
-/**
- * Whether a key names a credential. It does when it is a credential word
- * (`password`, `Token`, `skey`, `SessionToken`), sets one off with `_`, `-`, or `.` (`DB_PASSWORD`,
- * `AZURE_CLIENT_SECRET`, `x-api-key`, `Proxy-Authorization`), or is a lowerCamelCase, lowercase, or uppercase
- * compound ending in one (`accessToken`, `clientSecret`, `dbpassword`, `ACCESSTOKEN`). A PascalCase identifier
- * that merely ends in the word (`InvalidAuthenticationToken`, `ExpiredToken`) is an error code or a type name,
- * and the text after its colon is prose. A key that names an identifier (`AWS_ACCESS_KEY_ID`, `AZURE_TENANT_ID`,
- * `CLOUDFLARE_EMAIL`) never ends in a credential word, so its value is judged by its own shape alone; the bearer
- * ids (`secret_id`, `token_id`, and the session ids, see ERROR_CREDENTIAL_WORDS) are credential words, so that
- * suffix test never reaches them.
- */
-function isCredentialNamedKey(key: string): boolean {
-  const word = CREDENTIAL_KEY_WORD_PATTERN.exec(key)?.[0];
-  if (word === undefined) return false;
-  const prefix = key.slice(0, key.length - word.length);
-  if (prefix.length === 0 || /[_.-]$/.test(prefix)) return true;
-  if (/^[A-Z]/.test(prefix) && /[a-z]/.test(prefix)) return false;
-  return !WEAK_CREDENTIAL_WORD_PATTERN.test(word);
-}
-
-/**
- * The value of a pair whose key names a credential is the credential and is removed whatever its shape and
- * length: `password=letmein`, `DB_PASSWORD=Sunshine`, `AZURE_CLIENT_SECRET: abc12`,
- * and `DUO_SKEY=p@ss` go the way `{"password":"letmein"}` already did. The key, the separator, and the sentence
- * punctuation after the value stay. Under an Authorization header a scheme word in front of the value stays
- * too, a scheme word standing alone ("sent as Authorization: Bearer") names the scheme and carries nothing, and
- * a parameter list after the scheme (SigV4 `Credential=..., SignedHeaders=..., Signature=...`) is judged pair by
- * pair so the region and the request scope stay (scrubAuthorizationParameters has already removed every
- * parameter value that is a proof, so this pass sees markers and the kept parameters). Under any other
- * credential key the scheme word is the value (`sslPassword=splunk rejected`,
- * `db_password: token`), and the prose after it stays. A `--name value` flag is a pair whose separator is the space.
- */
-function scrubCredentialPairs(text: string): string {
-  const scrubbed = text.replace(ERROR_CREDENTIAL_PAIR_PATTERN, (match: string, key: string, separator: string, value: string, offset: number) => {
-    if (!isCredentialNamedKey(key)) return match;
-    const scheme = PAIR_VALUE_SCHEME_PATTERN.exec(value)?.[0] ?? "";
-    const authorization = AUTHORIZATION_KEY_PATTERN.test(key);
-    if (scheme.length > 0 && !authorization) {
-      const word = scheme.trimEnd();
-      return `${key}${separator}${REDACTED_ERROR_VALUE}${value.slice(word.length)}`;
-    }
-    const core = value.slice(scheme.length).replace(TRAILING_PUNCTUATION_PATTERN, "");
-    if (core.length === 0) return match;
-    const tail = value.slice(scheme.length + core.length);
-    if (authorization) {
-      if (BARE_SCHEME_WORD_PATTERN.test(core)) return match;
-      if (isSchemeParameterList(core, quoteOpensAt(text, offset + match.length - tail.length))) {
-        return `${key}${separator}${scheme}${scrubCredentialPairs(core)}${tail}`;
-      }
-    }
-    return `${key}${separator}${scheme}${REDACTED_ERROR_VALUE}${tail}`;
-  });
-  return scrubbed.replace(FLAG_CARRIER_PATTERN, (match: string, key: string, space: string) =>
-    isCredentialNamedKey(key) ? `--${key}${space}${REDACTED_ERROR_VALUE}` : match,
-  );
-}
-
-/**
- * Header carriers whose value is free form: Cookie and Set-Cookie (session values with their attributes) and
- * Cloudflare's legacy X-Auth-Key / X-Auth-Email pair (the global API key and its account). The
- * value is removed whatever its shape. Where it ends follows the compound-line rule shared by every scrubber:
- * a quoted value (a plain or JSON-escaped quote) ends at its closing quote, so a closed value that holds `; Name:`
- * is one value and the quotes stay around the marker; an unquoted value, or a quoted one that is never closed,
- * ends at the `;` or `,` that introduces the next `Name:` header token on the line (a name may hold dots,
- * `X.Api.Key:`), at a `<` or `>` (the header quoted inside markup), at a `"` that closes the JSON string and
- * container that carried the line (`"}`, `"]`), at a JSON-escaped line break (`\n`, `\r`, `\u000a`, `\u000d` as
- * backslash text, the end of the line inside a serialized message), or at the end of the line, so the next
- * header keeps its name and gets its own carrier treatment. A value that is already the marker is left alone,
- * so a second pass over a scrubbed message leaves the text after the marker as it is.
- *
- * The header name counts as a carrier at a line start, after any character that is not part of a name, and
- * after a JSON escape: inside a serialized message the character before `Cookie`
- * is the escape's last letter (`\nCookie`, `\u000aCookie`), a word character to `\b`, and a boundary that
- * relied on `\b` left the free-form removal to the pair rule, which stops at the first `;` and judges every
- * later cookie pair on its own name and shape. After `--`, `.`, or `/` (plain or JSON-escaped) the name is a
- * flag, a property, or a path segment (`--x-auth-key=value -h db`, `-Dspring.datasource.x-auth-key=value`,
- * `kv/x-auth-key=value see log`), a pair whose value ends at the next space, so the pair rule takes it and the
- * text after the value stays.
- */
-const HEADER_CARRIER_PATTERN = new RegExp(`(?:(?<![A-Za-z0-9_./-])|(?<=\\\\[nrtbfv])|(?<=\\\\u[0-9A-Fa-f]{4}))(set-cookie|cookie|x-auth-key|x-auth-email)(\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])`, "gi");
-const HEADER_CARRIER_QUOTE_PATTERN = /^(\\*)(["'])/;
-const NEXT_HEADER_TOKEN_PATTERN = /[;,]\s*[A-Za-z][A-Za-z0-9.-]*\s*:/;
-const MARKUP_OR_JSON_CLOSE_PATTERN = /[<>]|"(?=\s*[}\]])/;
-const ESCAPED_LINE_BREAK_PATTERN = /\\(?:[nr]|u000[aAdD])/;
-
-/** The first occurrence of `quote` in `line` at or after `from` that is not escaped by a backslash before it, or -1. */
-function closingQuoteIndex(line: string, quote: string, from: number): number {
-  for (let index = line.indexOf(quote, from); index !== -1; index = line.indexOf(quote, index + 1)) {
-    if (index === 0 || line[index - 1] !== "\\") return index;
-  }
-  return -1;
-}
-
-/** The end of a free-form header value that starts at `start`, and the quote (plain or escaped) that encloses a closed quoted value. */
-function headerCarrierValueEnd(text: string, start: number): { end: number; quote?: string } {
-  const newline = text.indexOf("\n", start);
-  const line = text.slice(start, newline === -1 ? text.length : newline);
-  const opening = HEADER_CARRIER_QUOTE_PATTERN.exec(line);
-  if (opening) {
-    const close = closingQuoteIndex(line, opening[0], opening[0].length);
-    if (close !== -1) return { end: start + close + opening[0].length, quote: opening[0] };
-  }
-  // An unterminated quote is part of the value; the stops are searched after it.
-  const skip = opening ? opening[0].length : 0;
-  const rest = line.slice(skip);
-  const stops = [MARKUP_OR_JSON_CLOSE_PATTERN.exec(rest)?.index, NEXT_HEADER_TOKEN_PATTERN.exec(rest)?.index, ESCAPED_LINE_BREAK_PATTERN.exec(rest)?.index].filter(
-    (index): index is number => index !== undefined,
-  );
-  return { end: start + skip + (stops.length > 0 ? Math.min(...stops) : rest.length) };
-}
-
-function scrubHeaderCarriers(text: string): string {
-  let scrubbed = "";
-  let cursor = 0;
-  for (const match of text.matchAll(HEADER_CARRIER_PATTERN)) {
-    // A carrier name inside a value already consumed (`Cookie: "a; X-Auth-Key: b"`) is part of that value.
-    if (match.index < cursor) continue;
-    const valueStart = match.index + match[0].length;
-    const { end, quote } = headerCarrierValueEnd(text, valueStart);
-    if (end === valueStart) continue;
-    scrubbed += text.slice(cursor, valueStart) + (quote === undefined ? REDACTED_ERROR_VALUE : `${quote}${REDACTED_ERROR_VALUE}${quote}`);
-    cursor = end;
-  }
-  return scrubbed + text.slice(cursor);
-}
-
-/**
- * An Authorization or Proxy-Authorization header (any prefix the key rule accepts, any casing, plain or after a
- * JSON escape) whose value is a scheme word and a parameter list:
- * `Authorization: Snowflake Token="..."`, `Authorization: Digest username="...", realm="...", nonce="...",
- * uri="...", response="..."`, `Authorization: OAuth oauth_token="..."`, any `<Scheme> <name>="..."` shape. The
- * match ends after the space that follows the scheme word, where the first parameter's name starts, and
- * scrubSchemeParameterList walks the list. A header value quoted whole (`Authorization: "Digest ..."`, a JSON
- * header object) is not this shape: the quoted-value rule below removes it whole.
- */
-const AUTHORIZATION_PARAMETERS_PATTERN = new RegExp(
-  String.raw`${KEY_BOUNDARY_PATTERN}([A-Za-z0-9_.-]*authorization)((?:\\*["'])?\s*[=:]\s*)(${ERROR_SCHEME_PATTERN})(\s+)(?=[A-Za-z])`,
-  "gi",
-);
-/**
- * The parameters whose value describes the exchange rather than proves it, so they stay: Digest's `realm`,
- * `username`, `uri`, `qop`, `nc`, `algorithm`, `charset`, and `userhash` (RFC 7616), OAuth 1.0's consumer key (a
- * client identifier), signature method, timestamp, version, and callback (RFC 5849), and SigV4's `Credential`
- * (the access key id in front of the request scope, judged by the vendor prefix rule and the pair rule as before)
- * and `SignedHeaders`. Every other parameter is the proof or an opaque blob (`response`, `nonce`, `cnonce`,
- * `opaque`, `oauth_token`, `oauth_signature`, `oauth_nonce`, `Token`, `Session`, `value`) and its value becomes
- * the marker, quoted at any serialization depth or bare.
- */
-const KEPT_SCHEME_PARAMETER_PATTERN =
-  /^(?:realm|username|uri|qop|nc|algorithm|charset|userhash|oauth_consumer_key|oauth_signature_method|oauth_timestamp|oauth_version|oauth_callback|credential|signedheaders)$/i;
-/**
- * The parameters whose name says the value is a proof wherever the list stands: Digest's `response`, a
- * `signature` or `sig`, OAuth 1.0's `oauth_signature`, and the MAC
- * scheme's `mac`. In a challenge (see CHALLENGE_PARAMETERS_PATTERN) only these go; under an Authorization header
- * every parameter that is not kept goes, so this list never widens what that header gives up.
- */
-const PROOF_SCHEME_PARAMETER_PATTERN = /^(?:response|signature|oauth_signature|mac|sig)$/i;
-const REALM_PARAMETER_PATTERN = /^realm$/i;
-/** Which values a parameter list gives up: every proof under an Authorization header, only the proof-named parameters in a challenge. */
-type SchemeParameterListKind = "authorization" | "challenge";
-const SCHEME_PARAMETER_NAME_PATTERN = /([A-Za-z][A-Za-z0-9_-]*)=(?!=)/y;
-const SCHEME_PARAMETER_BARE_VALUE_PATTERN = /(?:\[REDACTED\]|[^\s"'&;,<>)\]}\\])+/y;
-const SCHEME_PARAMETER_SEPARATOR_PATTERN = /\s*,\s*/y;
-
-/**
- * Where the parameter value that starts at `start` ends, and the quote (plain or JSON-escaped) that encloses a
- * quoted value: a quoted value runs to its closing quote at the same depth on the same line (an escaped quote
- * inside it is part of it), a bare value ends where the pair rule's value ends. An unterminated quote or an
- * empty bare value is not a parameter value, so the list ends before it.
- */
-function schemeParameterValueEnd(text: string, start: number): { end: number; quote?: string } | undefined {
-  const newline = text.indexOf("\n", start);
-  const line = text.slice(start, newline === -1 ? text.length : newline);
-  const opening = HEADER_CARRIER_QUOTE_PATTERN.exec(line);
-  if (opening) {
-    const close = closingQuoteIndex(line, opening[0], opening[0].length);
-    return close === -1 ? undefined : { end: start + close + opening[0].length, quote: opening[0] };
-  }
-  SCHEME_PARAMETER_BARE_VALUE_PATTERN.lastIndex = start;
-  const bare = SCHEME_PARAMETER_BARE_VALUE_PATTERN.exec(text);
-  return bare === null ? undefined : { end: start + bare[0].length };
-}
-
-/**
- * Walks the `name=value` parameter list that starts at `start`, the parameters separated by commas (RFC 7235),
- * each name shaped like a name (a base64 value with its padding, `cGFzc3dvcmQ=`, is no parameter). Under an
- * Authorization header a kept parameter passes whole and every other value becomes the marker; in a challenge
- * only a proof-named value does. The marker stands inside the value's own quotes, an empty value stays empty,
- * and a value that is already the marker is left as it is, so a second pass changes nothing. The list ends
- * before the first text that is not a parameter (prose, a `)`, the close of the JSON string that carried the
- * line, the `;` inside SigV4's `SignedHeaders=host;x-amz-date`), which the caller keeps; a separator with no
- * parameter after it is not consumed. Returns the end of the list, its scrubbed text, and whether a `realm`
- * parameter was among the parameters walked.
- */
-function scrubSchemeParameterList(text: string, start: number, kind: SchemeParameterListKind): { end: number; replacement: string; realm: boolean } {
-  let end = start;
-  let replacement = "";
-  let pending = "";
-  let cursor = start;
-  let realm = false;
-  for (;;) {
-    SCHEME_PARAMETER_NAME_PATTERN.lastIndex = cursor;
-    const name = SCHEME_PARAMETER_NAME_PATTERN.exec(text);
-    if (name === null || !isParameterName(name[1])) break;
-    const valueStart = cursor + name[0].length;
-    const value = schemeParameterValueEnd(text, valueStart);
-    if (value === undefined) break;
-    const quote = value.quote ?? "";
-    const content = text.slice(valueStart + quote.length, value.end - quote.length);
-    const kept =
-      content.length === 0 || (kind === "authorization" ? KEPT_SCHEME_PARAMETER_PATTERN.test(name[1]) : !PROOF_SCHEME_PARAMETER_PATTERN.test(name[1]));
-    if (REALM_PARAMETER_PATTERN.test(name[1])) realm = true;
-    replacement += `${pending}${name[0]}${quote}${kept ? content : REDACTED_ERROR_VALUE}${quote}`;
-    end = cursor = value.end;
-    SCHEME_PARAMETER_SEPARATOR_PATTERN.lastIndex = cursor;
-    const separator = SCHEME_PARAMETER_SEPARATOR_PATTERN.exec(text);
-    if (separator === null) break;
-    pending = separator[0];
-    cursor += separator[0].length;
-  }
-  return { end, replacement, realm };
-}
-
-/**
- * Removes the proofs from every Authorization parameter list in the text (see AUTHORIZATION_PARAMETERS_PATTERN),
- * the header name, the scheme word, the parameter names, the kept parameters, their quotes, and the text after
- * the list staying. Runs before the quoted-value and scheme rules, which then see the marker where a proof
- * stood; a header name inside a list already walked (`Authorization: Digest opaque="Authorization: ..."`) is part
- * of that value.
- */
-function scrubAuthorizationParameters(text: string): string {
-  let scrubbed = "";
-  let cursor = 0;
-  for (const match of text.matchAll(AUTHORIZATION_PARAMETERS_PATTERN)) {
-    if (match.index < cursor || !isCredentialNamedKey(match[1])) continue;
-    const listStart = match.index + match[0].length;
-    const { end, replacement } = scrubSchemeParameterList(text, listStart, "authorization");
-    if (end === listStart) continue;
-    scrubbed += text.slice(cursor, listStart) + replacement;
-    cursor = end;
-  }
-  return scrubbed + text.slice(cursor);
-}
-
-/**
- * Where a parameter list that is not under an Authorization key may start: after a scheme word and its
- * whitespace when a parameter follows (a WWW-Authenticate or
- * Proxy-Authenticate challenge, `Digest realm="api", nonce="n", response="..."` in prose or in a JSON string, any
- * casing), or at a `realm` parameter or a proof-named parameter standing on its own (`realm="api", nonce="n",
- * response="..."` as a data value, `response="...", realm="api"`). A list shaped like a challenge is not exempt
- * from the proof rule because the challenge names it: scrubChallengeParameters removes the proof-named values and
- * keeps the rest, where a list under an Authorization key has already given up every proof.
- */
-const CHALLENGE_PARAMETERS_PATTERN = new RegExp(
-  String.raw`(${NAME_BOUNDARY_PATTERN}(?:${ERROR_SCHEME_PATTERN})\s+)(?=[A-Za-z][A-Za-z0-9_-]*=(?!=))|${KEY_BOUNDARY_PATTERN}(?=(?:realm|response|signature|oauth_signature|mac|sig)=(?!=))`,
-  "gi",
-);
-
-/**
- * Removes the proof-named values (see PROOF_SCHEME_PARAMETER_PATTERN) from every challenge-shaped parameter list in
- * the text: the list after a scheme word, whatever its parameters, and a bare list that holds a `realm` parameter,
- * before or after the proof. The scheme word, the parameter names, the other parameters (`realm`, `qop`,
- * `algorithm`, `opaque`, `error`, `error_description`), their quotes, and the text after the list stay, so
- * `WWW-Authenticate: Bearer realm="api"` and `Digest realm="api", qop="auth"` pass unchanged. A bare list with no
- * `realm` and no scheme word is data (`response="ok", status="done"`, `mac=aa:bb:cc:dd:ee:ff response=200`), as is
- * a `response` or `mac` field outside a parameter list (`"response": 403`). A list under an Authorization key has
- * already been walked by scrubAuthorizationParameters and holds markers where its proofs stood, which this pass
- * leaves as they are; a parameter name inside a value already walked is part of that value.
- */
-function scrubChallengeParameters(text: string): string {
-  let scrubbed = "";
-  let cursor = 0;
-  for (const match of text.matchAll(CHALLENGE_PARAMETERS_PATTERN)) {
-    if (match.index < cursor) continue;
-    const scheme: string | undefined = match[1];
-    const listStart = match.index + match[0].length;
-    const { end, replacement, realm } = scrubSchemeParameterList(text, listStart, "challenge");
-    if (end === listStart || (scheme === undefined && !realm)) continue;
-    scrubbed += text.slice(cursor, listStart) + replacement;
-    cursor = end;
-  }
-  return scrubbed + text.slice(cursor);
-}
-
-/**
- * Whether the token after a bare scheme word in prose is a credential: long, or carrying a digit or a base64
- * symbol (padding included), or changing case inside the word, so prose such as "Basic authentication" and
- * "Bearer token is missing" stays. A `name=value` parameter list after the scheme (`Bearer realm="api"`, SigV4
- * `Credential=...`, `OAuth oauth_consumer_key=...`), its first value quoted (`quoteFollows`) or bare, is judged
- * parameter by parameter by scrubAuthorizationParameters, scrubChallengeParameters, and the pair rule, not as one
- * bearer value.
- */
-function looksLikeSchemeCredential(value: string, quoteFollows = false): boolean {
-  if (isSchemeParameterList(value, quoteFollows)) return false;
-  return value.length >= 16 || /[\d+/=]/.test(value) || /[a-z][A-Z]/.test(value);
-}
-
-type QuotedCredentialReplacement = (
-  match: string,
-  key: string,
-  separator: string,
-  opening: string,
-  backslashes: string,
-  quote: string,
-  content: string,
-  closing: string,
-) => string;
-type SchemeCredentialReplacement = (match: string, scheme: string, value: string, offset: number, text: string) => string;
-type TextRule = readonly [RegExp, string | QuotedCredentialReplacement | SchemeCredentialReplacement];
-
-function applyTextRule(text: string, [pattern, replacement]: TextRule): string {
-  return typeof replacement === "string" ? text.replace(pattern, replacement) : text.replace(pattern, replacement);
-}
-
-/**
- * Carrier rules: a value is removed because of what carries it (a quoted header or pair value, an authorization
- * scheme, a vendor token prefix, a JWT or PEM shape), not because of its own shape. The free-form header carriers
- * (Cookie, Set-Cookie, X-Auth-Key, X-Auth-Email) run first in scrubHeaderCarriers, the Authorization parameter
- * lists in scrubAuthorizationParameters, and the challenge proofs in scrubChallengeParameters, so these only ever
- * see the marker.
- */
-const CARRIER_TEXT_PATTERNS: ReadonlyArray<TextRule> = [
-  // Quoted header and pair values first, whatever their shape, so the scheme and pair rules see the marker. Under
-  // an Authorization header a scheme word that opens the quoted value stays (`Authorization: "Bearer [REDACTED]"`).
-  [
-    ERROR_QUOTED_CREDENTIAL_PATTERN,
-    (_match: string, key: string, separator: string, opening: string, _backslashes: string, _quote: string, content: string, closing: string) => {
-      const scheme = AUTHORIZATION_KEY_PATTERN.test(key) ? PAIR_VALUE_SCHEME_PATTERN.exec(content)?.[0] ?? "" : "";
-      return `${key}${separator}${opening}${scheme}${REDACTED_ERROR_VALUE}${closing}`;
-    },
-  ],
-  [ERROR_QUOTED_SCHEME_PATTERN, QUOTED_VALUE_REPLACEMENT],
-  [ERROR_QUOTED_SCHEME_PHRASE_PATTERN, QUOTED_SCHEME_PHRASE_REPLACEMENT],
-  // Authorization scheme values wherever they appear (headers, cookies, HTML, JSON messages), in any casing of
-  // the scheme word; looksLikeSchemeCredential keeps prose and parameter lists (a first parameter whose quoted
-  // value follows the match included).
-  [
-    new RegExp(String.raw`${NAME_BOUNDARY_PATTERN}(${ERROR_SCHEME_PATTERN})\s+([A-Za-z0-9\-._~+/=:]{6,})`, "gi"),
-    (match: string, scheme: string, value: string, offset: number, text: string) =>
-      looksLikeSchemeCredential(value, quoteOpensAt(text, offset + match.length)) ? `${scheme} ${REDACTED_ERROR_VALUE}` : match,
-  ],
-  // Vendor token prefixes name the token type: AWS access key ids (long-term `AKIA`, temporary `ASIA`) and STS
-  // bearer and context-specific credentials (`ABIA`, `ACCA`), Stripe secret and restricted keys, GitHub tokens,
-  // Slack tokens. The prefix is the carrier, so these go from snapshots too (AWS evidence carries its access key
-  // ids masked); the AWS unique ids of resources (roles, users, groups, policies) are bare shapes below.
-  [/\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
-  [/\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/g, REDACTED_ERROR_VALUE],
-  [/\b(?:gh[oprsu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g, REDACTED_ERROR_VALUE],
-  [/\bxox[abeoprs]-[A-Za-z0-9-]{10,}/g, REDACTED_ERROR_VALUE],
-  // JWT-shaped strings.
-  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED_ERROR_VALUE],
-  // PEM blocks, whole or cut off.
-  [/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g, REDACTED_ERROR_VALUE],
-];
-
-/** Bare-shape rules: a value is removed for its own shape, wherever it stands. Error text only; a snapshot keeps its identifiers. */
-const BARE_SHAPE_PATTERNS: ReadonlyArray<TextRule> = [
-  // AWS unique ids of roles, users, groups, managed policies, policy versions, and public keys: opaque
-  // identifiers in error text, resource names in a snapshot (an assumed-role principal is `AROA...:session`).
-  [/\b(?:AROA|AIDA|AGPA|ANPA|ANVA|APKA)[A-Z0-9]{16}\b/g, REDACTED_ERROR_VALUE],
-  // 40-character secret access keys, long secret-shaped blobs, and hex digests.
-  [/(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g, REDACTED_ERROR_VALUE],
-  // Long blobs must carry a digit so camelCase identifiers survive.
-  [/(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2}(?![A-Za-z0-9+_=-])/g, REDACTED_ERROR_VALUE],
-  [/\b[a-f0-9]{32,}\b/gi, REDACTED_ERROR_VALUE],
-];
-
-/**
- * URL userinfo, query, and fragment anywhere in the string, not only when the string starts with a URL: any
- * scheme (`https://`, `proxy://`), plain or with its slashes JSON-escaped (`https:\/\/`),
- * after a JSON escape as after any other boundary. The scheme, host, and path stay; the userinfo goes and the
- * query and the fragment each become the marker. The userinfo ends at the first `/`, `?`, or `#` as at
- * whitespace, so an `@` inside a query or a fragment is not a userinfo boundary when the
- * authority before it is a host: `https://h?e=a@x.com&token=v` is host `h` with a query, which becomes the
- * marker whole. When that authority is not `host[:port]` (`svc:secret`, a password read up to a raw `?` or `#`
- * inside it) and an `@` follows in the run, the run up to that `@` is userinfo after all (scrubUrlMatch).
- */
-const ERROR_URL_PATTERN = new RegExp(
-  String.raw`(?:(?<![A-Za-z0-9+.\\-])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))([A-Za-z][A-Za-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/?#@"'<>\\]+@)?((?:[^\s?#"'<>\\]|\\\/)+)(\?(?:[^\s#"'<>\\]|\\\/)*)?(#(?:[^\s"'<>\\]|\\\/)*)?`,
-  "g",
-);
-/** A URL authority that is `host[:port]`: a name or address, or a bracketed IPv6 address, with at most a numeric port. */
-const HOST_AND_PORT_PATTERN = /^(?:\[[^\]\s]*\]|[^:\[\]@\\]+)(?::\d*)?$/;
-/** The first path separator of a host-and-path run, plain or JSON-escaped. */
-const PATH_START_PATTERN = /\\?\//;
-
-/**
- * Renders one URL match: the userinfo is gone (the pattern never captures it) and the query and the fragment
- * are the marker. An authority that is not `host[:port]` followed by an `@` later in the run is a userinfo
- * whose password carried a raw `?` or `#`, so everything up to that `@` goes and the URL after it is rendered
- * on its own; with a valid authority the `@` belongs to the query or the fragment.
- */
-function scrubUrlMatch(_match: string, scheme: string, hostPath: string, query?: string, fragment?: string): string {
-  const pathStart = hostPath.search(PATH_START_PATTERN);
-  const tail = `${query ?? ""}${fragment ?? ""}`;
-  const at = tail.indexOf("@");
-  if (pathStart === -1 && at !== -1 && !HOST_AND_PORT_PATTERN.test(hostPath)) {
-    return `${scheme}${tail.slice(at + 1)}`.replace(ERROR_URL_PATTERN, scrubUrlMatch);
-  }
-  return `${scheme}${hostPath}${query ? `?${REDACTED_ERROR_VALUE}` : ""}${fragment ? `#${REDACTED_ERROR_VALUE}` : ""}`;
-}
-
-/**
- * Rule 9 scrub boundary for bare values. A run of 16 or more token characters is removed when it is shaped
- * like a token (base64 symbols, digits scattered through its letters, or casing that breaks into one- and
- * two-letter camelCase pieces) and kept when it is shaped like a name: "-" or "_" separated segments that are
- * each letters in any casing, digits alone, or letters with one digit group (`prod-us-east-2026`,
- * `AWSLambdaBasicExecutionRole`, `sha256`), an uppercase code, or a canonical UUID. "/", ".", ":", "@", and
- * whitespace end a run, so path segments, hostnames, ARNs, and emails are judged piece by piece. Opaque
- * identifiers whose shape is a token's are removed from error text as well; they travel in structured fields.
- */
-// Trailing "=" is base64 padding only when a delimiter follows it; before a marker (`API_KEY=[REDACTED]`), a quote
-// (`AWS_SECRET_ACCESS_KEY='[REDACTED]'`, `signature_method='ccg'`), an escape, or a path
-// (`AWS_SHARED_CREDENTIALS_FILE=/home/audit/.aws/credentials`) it is the pair's separator, so the key keeps its name.
-const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&[/"'\\<]))?/g;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
-const MIN_LETTERS_FOR_CASING = 6;
-
-const CAMEL_WORD_PATTERN = /[A-Z]+(?![a-z])|[A-Z]?[a-z]+/g;
-const MAX_SHORT_WORD_LENGTH = 2;
-
-/**
- * Token-shaped casing. Split at camelCase boundaries, a name is words and acronyms of three letters or more
- * (`GetAccessKeyLastUsed`, `AWSLambdaBasicExecutionRole`, `getHTTPSUrl`), while a random run breaks into
- * one- and two-letter pieces (`bPxRfiCYcanaryKEYqm`: b, Px, C, KE). Two or more such pieces making up at
- * least a third of the words is the token signal; one short word (`GetEbsEncryptionByDefault`) is a name.
- */
-function hasTokenCasing(letters: string): boolean {
-  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
-  const words = letters.match(CAMEL_WORD_PATTERN) ?? [];
-  const shortWords = words.filter((word) => word.length <= MAX_SHORT_WORD_LENGTH).length;
-  return shortWords >= 2 && shortWords * 3 >= words.length;
-}
-
-/** A "-" or "_" separated segment shaped like part of a name: empty, digits alone, or letters with at most one digit group and no token casing. */
-function isNameSegment(segment: string): boolean {
-  if (segment.length === 0 || /^\d+$/.test(segment)) return true;
-  if (!/^[A-Za-z0-9]+$/.test(segment)) return false;
-  if ((segment.match(/\d+/g) ?? []).length > 1) return false;
-  return !hasTokenCasing(segment.replace(/\d+/g, ""));
-}
-
-function looksLikeToken(run: string): boolean {
-  if (UUID_PATTERN.test(run) || UPPERCASE_CODE_PATTERN.test(run)) return false;
-  if (/[+=]/.test(run)) return true;
-  return run.split(/[-_]/).some((segment) => !isNameSegment(segment));
-}
-
-function scrubLongTokens(text: string): string {
-  return text.replace(LONG_TOKEN_RUN_PATTERN, (run: string) => (looksLikeToken(run) ? REDACTED_ERROR_VALUE : run));
-}
-
-/**
- * Rule 9 sink for error text. Every error string passes through here before it is recorded in a
- * dataset, access probe, finding, summary, tool result, or bundle file, so no path can carry a
- * credential echoed by an upstream error body, a transport error, or a URL into the audit output.
- */
-export function redactErrorText(text: string): string {
-  let scrubbed = scrubCarriers(text);
-  for (const rule of BARE_SHAPE_PATTERNS) scrubbed = applyTextRule(scrubbed, rule);
-  scrubbed = scrubCredentialPairs(scrubbed);
-  return scrubLongTokens(scrubbed);
-}
-
-/** The carrier passes shared by error text and snapshot strings: configured secrets, URL userinfo, query, and fragment, header carriers, Authorization parameter lists, challenge proofs, quoted values, schemes, vendor token prefixes, JWT and PEM shapes. */
-function scrubCarriers(text: string): string {
-  let scrubbed = scrubConfiguredSecrets(text);
-  scrubbed = scrubbed.replace(ERROR_URL_PATTERN, scrubUrlMatch);
-  scrubbed = scrubHeaderCarriers(scrubbed);
-  scrubbed = scrubAuthorizationParameters(scrubbed);
-  scrubbed = scrubChallengeParameters(scrubbed);
-  for (const rule of CARRIER_TEXT_PATTERNS) scrubbed = applyTextRule(scrubbed, rule);
-  return scrubbed;
-}
-
-/**
- * Rule 9 data-side scrub for a string kept in a snapshot: the carrier rules of
- * redactErrorText (the configured secrets in every encoded form, URL userinfo, query, and fragment strings, the free-form
- * header carriers, the proofs in Authorization parameter lists and in challenges, quoted header and pair values,
- * authorization schemes, vendor token prefixes, JWT and PEM shapes, and credential-named pairs) without its
- * bare-shape rules, so a value is removed for what carries it and an identifier, a digest, or a key id that is
- * data stays data.
- */
-export function redactCarrierText(text: string): string {
-  return scrubCredentialPairs(scrubCarriers(text));
-}
-
-/** Nesting past which an object or array in a snapshot is replaced by the marker; the value handed to the walker is depth 1. */
-const SNAPSHOT_DEPTH_CAP = 32;
-/**
- * Field names whose value in API data is a secret whatever its shape. Exact names, not the suffix rule of the error
- * text pair rule: a snapshot's own keys name collections about credentials (`tokens`, `credentials`,
- * `passwordCredentials`, `webauthncredentials`, `hardtoken`) that carry metadata, and those stay. The URL-valued
- * webhook keys are here because the token travels in the URL's path.
- */
-const SNAPSHOT_SECRET_KEY_PATTERN =
-  /^(?:secret[_-]?key|skey|secret|client[_-]?secret|api[_-]?secret|password|passwd|passphrase|private[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|secret[_-]?access[_-]?key|assertion|connection[_-]?string|authorization|cookie|set-cookie|x-auth-key|api[_-]?key|x-api-key|webhook(?:[_-]?url)?)$/i;
-/**
- * The bearer-id override for snapshot keys: a key ending in
- * `secret_id` or `token_id`, any prefix, casing, and separator (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`,
- * `roleSecretId`, `token_id`, `tokenId`), holds a Vault AppRole secret id or a token id, which authenticates rather
- * than identifies, so its value is the marker whatever its shape; an `_id` key that identifies (`client_id`,
- * `tenant_id`, `key_id`, `user_id`) is data and stays.
- */
-const SNAPSHOT_BEARER_ID_KEY_PATTERN = /(?:secret|token)[_-]?id$/i;
-
-/** The snapshot walk behind scrubSnapshotValue and the integration's own data walkers: one key rule, one string rule, one cap. */
-function scrubSnapshotTree(value: unknown, isSecretKey: (key: string) => boolean, depth: number): unknown {
-  if (typeof value === "string") return redactCarrierText(value);
-  if (value === null || typeof value !== "object") return value;
-  if (value instanceof Date) return value;
-  if (depth > SNAPSHOT_DEPTH_CAP) return REDACTED_ERROR_VALUE;
-  if (Array.isArray(value)) return value.map((entry) => scrubSnapshotTree(entry, isSecretKey, depth + 1));
-  const output: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value)) {
-    output[key] = isSecretKey(key) ? snapshotMarkerFor(entry) : scrubSnapshotTree(entry, isSecretKey, depth + 1);
-  }
-  return output;
-}
-
-/** An absent or empty secret stays as it is (it reports that nothing was set); anything else is the marker. */
-function snapshotMarkerFor(entry: unknown): unknown {
-  return entry === undefined || entry === null || entry === "" ? entry : REDACTED_ERROR_VALUE;
-}
-
-/**
- * Rule 9 walk over a value about to be written to a bundle file or returned as data. Every string at every depth
- * goes through redactCarrierText, so a carrier inside a benign-keyed string
- * (`detail: "Authorization: Bearer ..."`) is scrubbed in place with its siblings kept; a value under a secret
- * field name is the marker; an object or array nested past SNAPSHOT_DEPTH_CAP is the marker, so the depth of a
- * server-supplied tree bounds the work and nothing deeper than the cap is copied.
- */
-export function scrubSnapshotValue(value: unknown): unknown {
-  return scrubSnapshotTree(value, (key) => SNAPSHOT_SECRET_KEY_PATTERN.test(key) || SNAPSHOT_BEARER_ID_KEY_PATTERN.test(key), 1);
-}
+const { registerConfiguredSecrets, redactErrorText, scrubSnapshotTree, scrubSnapshotValue, redactCarrierText } = createSnapshotCredentialScrubber();
+export { redactErrorText, redactCarrierText, scrubSnapshotValue };
 
 /**
  * A parser's message quotes the text it could not parse (V8: `Unexpected token '<', "<html>..." is not valid
@@ -1914,7 +1214,7 @@ function hasNextOffset(metadata: JsonRecord): boolean {
   return metadata.next_offset !== undefined && metadata.next_offset !== null;
 }
 
-const REDACTED_VALUE = "[REDACTED]";
+
 /** Integrations v3 records carry secret_key (masked to its last four characters on list, but credential-shaped). */
 const INTEGRATION_SECRET_FIELDS = /^(secret_key|secretkey|skey)$/i;
 /** Retrieve Bypass Codes documents that the code value is omitted; strip it anyway in case a tenant returns it. */
@@ -2608,12 +1908,10 @@ export async function collectDuoMonitoringData(
   };
 }
 
-const DUO_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
 
-function recordDuoDecisionFacts(id: DuoCheckId, facts: Readonly<Record<string, unknown>>): void {
-  const store = DUO_DECISION_CONTEXT.getStore();
-  if (!store) throw new Error(`${id} decision facts were recorded outside a Duo assessment`);
-  store.set(id, facts);
+function recordDuoDecisionFacts(decisions: BatchVerdicts,
+  id: DuoCheckId, facts: Readonly<Record<string, unknown>>): void {
+  decisions.record(id, facts);
 }
 
 function completeDuoDatasets(...datasets: Array<CollectedDataset<unknown> | undefined>): boolean {
@@ -2621,14 +1919,15 @@ function completeDuoDatasets(...datasets: Array<CollectedDataset<unknown> | unde
 }
 
 function buildFinding(
+  decisions: BatchVerdicts,
   id: DuoCheckId,
-  status: DuoFindingStatus,
   summary: string,
   evidence: string[],
   recommendation: string,
   options?: { severity?: DuoSeverity; manualNote?: string },
 ): DuoFinding {
   const definition = DUO_CHECKS[id];
+  const status = ({ pass: "Pass", warn: "Partial", fail: "Fail", manual: "Manual", info: "Info" } as const)[decisions.status(id)];
   return {
     id: definition.id,
     title: definition.title,
@@ -2903,11 +2202,6 @@ function inventoryNote(dataset: CollectedDataset<unknown[]>, capSize?: number): 
   return undefined;
 }
 
-const STATUS_RANK: Record<DuoFindingStatus, number> = { Pass: 0, Info: 1, Partial: 2, Manual: 3, Fail: 4 };
-
-function capStatus(status: DuoFindingStatus, cap: DuoFindingStatus): DuoFindingStatus {
-  return STATUS_RANK[status] < STATUS_RANK[cap] ? cap : status;
-}
 
 function withInventoryCap(
   finding: DuoFinding,
@@ -2918,7 +2212,6 @@ function withInventoryCap(
   if (!note) return finding;
   return {
     ...finding,
-    status: finding.status === "Manual" ? "Manual" : capStatus(finding.status, "Partial"),
     evidence: [...finding.evidence, note],
     manualNote: `${finding.manualNote ? `${finding.manualNote} ` : ""}Follow metadata.next_offset to completion before relying on this verdict.`,
   };
@@ -3010,7 +2303,8 @@ function percentage(numerator: number, denominator: number): number {
   return Math.round((numerator / denominator) * 1000) / 10;
 }
 
-function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
+function assessUserPopulation(decisions: BatchVerdicts,
+  data: DuoAuthenticationData): DuoFinding[] {
   const findings: DuoFinding[] = [];
   const users = data.users.data;
   const usersEvidence = unavailableEvidence(
@@ -3028,7 +2322,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       readable: !data.users.error,
       complete: completeDuoDatasets(data.users),
     };
-    recordDuoDecisionFacts("DUO-AUTH-008", {
+    recordDuoDecisionFacts(decisions, "DUO-AUTH-008", {
       ...unavailableFacts,
       user_count: users.length,
       known_enrollment_count: 0,
@@ -3036,22 +2330,22 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       bypass_user_count: 0,
       unenrolled_user_count: 0,
     });
-    recordDuoDecisionFacts("DUO-AUTH-009", {
+    recordDuoDecisionFacts(decisions, "DUO-AUTH-009", {
       ...unavailableFacts,
       access_user_count: 0,
       inactive_user_count: 0,
       undated_user_count: 0,
     });
-    recordDuoDecisionFacts("DUO-AUTH-010", {
+    recordDuoDecisionFacts(decisions, "DUO-AUTH-010", {
       ...unavailableFacts,
       enrolled_user_count: 0,
       webauthn_user_count: 0,
       deprecated_u2f_user_count: 0,
     });
     findings.push(
-      buildFinding("DUO-AUTH-008", "Manual", reason, usersEvidence, "Grant the audit principal Grant resource - Read and confirm the tenant has enrolled users."),
-      buildFinding("DUO-AUTH-009", "Manual", reason, usersEvidence, "Review user last-login activity in the Duo Admin Panel Users page."),
-      buildFinding("DUO-AUTH-010", "Manual", reason, usersEvidence, "Review WebAuthn registrations per user in the Duo Admin Panel."),
+      buildFinding(decisions, "DUO-AUTH-008", reason, usersEvidence, "Grant the audit principal Grant resource - Read and confirm the tenant has enrolled users."),
+      buildFinding(decisions, "DUO-AUTH-009", reason, usersEvidence, "Review user last-login activity in the Duo Admin Panel Users page."),
+      buildFinding(decisions, "DUO-AUTH-010", reason, usersEvidence, "Review WebAuthn registrations per user in the Duo Admin Panel."),
     );
   } else {
     const statusCounts = users.reduce<Record<string, number>>((counts, user) => {
@@ -3074,7 +2368,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       ...bypassUsers.slice(0, 10).map((user) => `bypass_user=${userLabel(user)}`),
       ...unenrolledUsers.slice(0, 10).map((user) => `not_enrolled_user=${userLabel(user)}`),
     ];
-    recordDuoDecisionFacts("DUO-AUTH-008", {
+    recordDuoDecisionFacts(decisions, "DUO-AUTH-008", {
       readable: true,
       complete: completeDuoDatasets(data.users),
       user_count: users.length,
@@ -3087,8 +2381,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
     if (enrollmentKnown.length === 0) {
       findings.push(
         buildFinding(
-          "DUO-AUTH-008",
-          "Manual",
+          decisions, "DUO-AUTH-008",
           "No active user exposed the documented is_enrolled flag or authenticator lists, so enrollment could not be measured.",
           enrollmentEvidence,
           "Confirm the audit principal reads full user objects (is_enrolled, phones, tokens, u2f_tokens, webauthncredentials).",
@@ -3098,8 +2391,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       findings.push(
         withInventoryCap(
           buildFinding(
-            "DUO-AUTH-008",
-            "Pass",
+            decisions, "DUO-AUTH-008",
             "Every active user is enrolled and no user is in bypass status.",
             enrollmentEvidence,
             "Keep enrollment completeness at 100 percent and treat bypass status as a time-boxed exception.",
@@ -3111,8 +2403,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       findings.push(
         withInventoryCap(
           buildFinding(
-            "DUO-AUTH-008",
-            "Partial",
+            decisions, "DUO-AUTH-008",
             `Enrollment is at ${enrollmentPercent} percent with no bypass users, but some active users still have no authenticator.`,
             enrollmentEvidence,
             "Drive the remaining users through enrollment or disable accounts that no longer need access.",
@@ -3124,8 +2415,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       findings.push(
         withInventoryCap(
           buildFinding(
-            "DUO-AUTH-008",
-            "Fail",
+            decisions, "DUO-AUTH-008",
             `Enrollment is incomplete: ${bypassUsers.length} bypass user(s) and ${unenrolledUsers.length} unenrolled active user(s).`,
             enrollmentEvidence,
             "Remove bypass status from standing accounts and enforce enrollment for every active user.",
@@ -3148,7 +2438,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       ...inactiveUsers.slice(0, 10).map((user) => `inactive_user=${userLabel(user)} last_login_age_days=${daysSince(user.last_login)}`),
       ...undatedUsers.slice(0, 10).map((user) => `undated_user=${userLabel(user)} last_login=null`),
     ];
-    recordDuoDecisionFacts("DUO-AUTH-009", {
+    recordDuoDecisionFacts(decisions, "DUO-AUTH-009", {
       readable: true,
       complete: completeDuoDatasets(data.users),
       access_user_count: accessUsers.length,
@@ -3158,8 +2448,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
     if (accessUsers.length === 0) {
       findings.push(
         buildFinding(
-          "DUO-AUTH-009",
-          "Manual",
+          decisions, "DUO-AUTH-009",
           "No users are in active or bypass status, so inactivity review has no population to assess.",
           inactiveEvidence,
           "Confirm the user population and re-run once active users exist.",
@@ -3169,8 +2458,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       findings.push(
         withInventoryCap(
           buildFinding(
-            "DUO-AUTH-009",
-            "Pass",
+            decisions, "DUO-AUTH-009",
             `No active user has been inactive for more than ${INACTIVE_USER_DAYS} days.`,
             inactiveEvidence,
             "Keep periodic access reviews in place and disable users who stop authenticating.",
@@ -3182,8 +2470,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       findings.push(
         withInventoryCap(
           buildFinding(
-            "DUO-AUTH-009",
-            "Partial",
+            decisions, "DUO-AUTH-009",
             `${undatedUsers.length} active user(s) have never logged in (last_login=null) and cannot be counted as active.`,
             inactiveEvidence,
             "Review users who have never authenticated and remove access that was never used.",
@@ -3195,8 +2482,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       findings.push(
         withInventoryCap(
           buildFinding(
-            "DUO-AUTH-009",
-            inactiveShare > 10 ? "Fail" : "Partial",
+            decisions, "DUO-AUTH-009",
             `${inactiveUsers.length} active user(s) (${inactiveShare} percent) have not authenticated in ${INACTIVE_USER_DAYS}+ days.`,
             inactiveEvidence,
             "Disable or remove users who have not authenticated in 90 days and document any exceptions.",
@@ -3224,7 +2510,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
         : `webauthn_credentials_total=${credentialInventory.length} uv_capable=${uvCapable}`,
       ...(credentialNote ? [`webauthn_credentials_${credentialNote}`] : []),
     ];
-    recordDuoDecisionFacts("DUO-AUTH-010", {
+    recordDuoDecisionFacts(decisions, "DUO-AUTH-010", {
       readable: true,
       complete: completeDuoDatasets(data.users),
       enrolled_user_count: enrolledUsers.length,
@@ -3236,8 +2522,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
     if (enrolledUsers.length === 0) {
       findings.push(
         buildFinding(
-          "DUO-AUTH-010",
-          "Manual",
+          decisions, "DUO-AUTH-010",
           "No enrolled users were available to measure WebAuthn adoption.",
           adoptionEvidence,
           "Confirm enrollment first, then measure phishing-resistant credential adoption.",
@@ -3247,8 +2532,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       findings.push(
         withInventoryCap(
           buildFinding(
-            "DUO-AUTH-010",
-            "Pass",
+            decisions, "DUO-AUTH-010",
             `${adoptionPercent} percent of enrolled users have a WebAuthn credential and no deprecated U2F tokens remain.`,
             adoptionEvidence,
             "Keep WebAuthn as the default enrollment path and retire remaining non-phishing-resistant authenticators.",
@@ -3260,8 +2544,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       findings.push(
         withInventoryCap(
           buildFinding(
-            "DUO-AUTH-010",
-            "Partial",
+            decisions, "DUO-AUTH-010",
             `${adoptionPercent} percent of enrolled users have a WebAuthn credential and no deprecated U2F tokens remain, but the WebAuthn credential inventory ${credentialGap}. Adoption could not be confirmed against that inventory, so the verdict is capped at Partial.`,
             adoptionEvidence,
             `Rerun once ${DUO_ENDPOINTS.webauthnCredentials} can be read in full (it requires ${DUO_PERMISSIONS.readResource}), and keep WebAuthn as the default enrollment path.`,
@@ -3273,8 +2556,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       findings.push(
         withInventoryCap(
           buildFinding(
-            "DUO-AUTH-010",
-            "Partial",
+            decisions, "DUO-AUTH-010",
             `${adoptionPercent} percent of enrolled users have a WebAuthn credential${u2fUsers.length > 0 ? ` and ${u2fUsers.length} still hold deprecated U2F tokens` : ""}.${credentialGap ? ` The WebAuthn credential inventory ${credentialGap}.` : ""}`,
             adoptionEvidence,
             "Expand WebAuthn enrollment toward full coverage and migrate U2F tokens to WebAuthn.",
@@ -3286,8 +2568,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       findings.push(
         withInventoryCap(
           buildFinding(
-            "DUO-AUTH-010",
-            "Fail",
+            decisions, "DUO-AUTH-010",
             `No enrolled user has a WebAuthn credential.${credentialGap ? ` The WebAuthn credential inventory ${credentialGap}.` : ""}`,
             adoptionEvidence,
             "Enable WebAuthn in the authentication methods policy and run an enrollment campaign for security keys or platform authenticators.",
@@ -3311,11 +2592,10 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       return false;
     }
   }).length;
-  recordDuoDecisionFacts("DUO-AUTH-011", {});
+  recordDuoDecisionFacts(decisions, "DUO-AUTH-011", {});
   findings.push(
     buildFinding(
-      "DUO-AUTH-011",
-      "Manual",
+      decisions, "DUO-AUTH-011",
       "Offline access limits are not exposed by the Admin API; the Policy Section Data reference documents no offline access section, so configuration must be verified in the Admin Panel.",
       offline?.error
         ? unavailableEvidence(
@@ -3341,11 +2621,10 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
   return findings;
 }
 
-export function assessDuoAuthentication(
-  data: DuoAuthenticationData,
-  config: DuoResolvedConfig,
-): DuoAssessmentResult {
-  return runBatchVerdictContext(DUO_DECISION_CONTEXT, DUO_SPEC, () => {
+
+export function assessDuoAuthentication(data: DuoAuthenticationData,
+  config: DuoResolvedConfig): DuoAssessmentResult {
+  const decisions = new BatchVerdicts(DUO_SPEC);
   const findings: DuoFinding[] = [];
   const globalPolicy = getGlobalPolicyRecord(data);
   const policyUnavailable = Object.keys(getPolicySections(globalPolicy)).length === 0;
@@ -3380,15 +2659,14 @@ export function assessDuoAuthentication(
     : `admin_allowed_auth_methods.webauthn_enabled=${getBooleanish(adminMethods, "webauthn_enabled") ?? false}`;
 
   const userAuthBehavior = asString(asRecord(getPolicySections(globalPolicy).authentication_policy).user_auth_behavior)?.toLowerCase();
-  recordDuoDecisionFacts("DUO-AUTH-007", {
+  recordDuoDecisionFacts(decisions, "DUO-AUTH-007", {
     policy_readable: !policyUnavailable,
     user_auth_behavior: userAuthBehavior,
   });
   if (policyUnavailable) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-007",
-        "Manual",
+        decisions, "DUO-AUTH-007",
         "Global MFA enforcement mode could not be read because the global policy was unavailable.",
         policyEvidence,
         "Grant the audit principal Grant resource - Read and confirm authentication_policy.user_auth_behavior=enforce in the Global Policy.",
@@ -3397,8 +2675,7 @@ export function assessDuoAuthentication(
   } else if (userAuthBehavior === undefined) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-007",
-        "Manual",
+        decisions, "DUO-AUTH-007",
         "The global policy payload did not include the authentication_policy section.",
         ["sections.authentication_policy.user_auth_behavior was absent from the Global Policy response."],
         "Confirm in the Duo Admin Panel that the Global Policy Authentication Policy is set to enforce 2FA.",
@@ -3407,8 +2684,7 @@ export function assessDuoAuthentication(
   } else if (userAuthBehavior === "enforce") {
     findings.push(
       buildFinding(
-        "DUO-AUTH-007",
-        "Pass",
+        decisions, "DUO-AUTH-007",
         "The global policy enforces two-factor authentication for all users.",
         ["authentication_policy.user_auth_behavior=enforce"],
         "Keep the Global Policy authentication behavior on enforce and review any custom policy that overrides it.",
@@ -3417,8 +2693,7 @@ export function assessDuoAuthentication(
   } else if (userAuthBehavior === "bypass") {
     findings.push(
       buildFinding(
-        "DUO-AUTH-007",
-        "Fail",
+        decisions, "DUO-AUTH-007",
         "The global policy bypasses two-factor authentication and enrollment.",
         ["authentication_policy.user_auth_behavior=bypass"],
         "Set the Global Policy authentication behavior to enforce so primary credentials alone never grant access.",
@@ -3427,8 +2702,7 @@ export function assessDuoAuthentication(
   } else {
     findings.push(
       buildFinding(
-        "DUO-AUTH-007",
-        "Partial",
+        decisions, "DUO-AUTH-007",
         `The global policy authentication behavior is ${userAuthBehavior}, which denies all authentication rather than enforcing MFA.`,
         [`authentication_policy.user_auth_behavior=${userAuthBehavior}`],
         "Confirm the deny posture is intentional (for example a maintenance freeze) and return the Global Policy to enforce afterwards.",
@@ -3436,7 +2710,7 @@ export function assessDuoAuthentication(
     );
   }
 
-  recordDuoDecisionFacts("DUO-AUTH-001", {
+  recordDuoDecisionFacts(decisions, "DUO-AUTH-001", {
     policy_readable: !policyUnavailable,
     has_webauthn: hasWebAuthn,
     allows_push: allowsPush,
@@ -3446,8 +2720,7 @@ export function assessDuoAuthentication(
   if (policyUnavailable) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-001",
-        "Manual",
+        decisions, "DUO-AUTH-001",
         "Phishing-resistant factor posture could not be read because the global policy was unavailable.",
         policyEvidence,
         "Grant the audit principal Grant resource - Read and confirm WebAuthn or Verified Duo Push in authentication_methods.",
@@ -3456,8 +2729,7 @@ export function assessDuoAuthentication(
   } else if (hasWebAuthn || (allowsPush && requireVerifiedPush)) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-001",
-        "Pass",
+        decisions, "DUO-AUTH-001",
         "The global authentication policy includes phishing-resistant factors.",
         [...strongFactorEvidence, adminMethodsEvidence],
         "Keep WebAuthn and Verified Duo Push coverage in policy and enrollment guidance.",
@@ -3466,8 +2738,7 @@ export function assessDuoAuthentication(
   } else if (allowsPush || strongFactorEvidence.length > 0) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-001",
-        "Partial",
+        decisions, "DUO-AUTH-001",
         "Duo Push or administrator hardening exists, but phishing-resistant coverage is incomplete or not enforced globally.",
         [
           ...(strongFactorEvidence.length > 0 ? strongFactorEvidence : ["No explicit WebAuthn or Verified Duo Push requirement found in the global policy."]),
@@ -3479,8 +2750,7 @@ export function assessDuoAuthentication(
   } else {
     findings.push(
       buildFinding(
-        "DUO-AUTH-001",
-        "Fail",
+        decisions, "DUO-AUTH-001",
         "The global policy does not show phishing-resistant factors.",
         ["No WebAuthn or Verified Duo Push requirement was detected in the collected policy data.", adminMethodsEvidence],
         "Enable WebAuthn or Verified Duo Push in Duo authentication methods before relying on the tenant for higher-assurance workflows.",
@@ -3494,7 +2764,7 @@ export function assessDuoAuthentication(
     `authentication_methods.blocked_auth_list=${telephony.blocked.join(",") || (telephony.blockedExposed ? "empty" : "absent")}`,
     "Admin API rule: a method not in blocked_auth_list is allowed even when it is not in allowed_auth_list.",
   ];
-  recordDuoDecisionFacts("DUO-AUTH-002", {
+  recordDuoDecisionFacts(decisions, "DUO-AUTH-002", {
     policy_readable: !policyUnavailable,
     allowed_list_exposed: telephony.allowedExposed,
     blocked_list_exposed: telephony.blockedExposed,
@@ -3504,8 +2774,7 @@ export function assessDuoAuthentication(
   if (policyUnavailable) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-002",
-        "Manual",
+        decisions, "DUO-AUTH-002",
         "Authentication method restrictions could not be read because the global policy was unavailable.",
         policyEvidence,
         "Grant the audit principal Grant resource - Read and confirm sms and phonecall appear in authentication_methods.blocked_auth_list.",
@@ -3514,8 +2783,7 @@ export function assessDuoAuthentication(
   } else if (!telephony.allowedExposed && !telephony.blockedExposed) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-002",
-        "Manual",
+        decisions, "DUO-AUTH-002",
         "The global policy did not expose authentication_methods.allowed_auth_list or blocked_auth_list.",
         methodListEvidence,
         "Review the Authentication Methods policy section manually and verify SMS and phone callback are blocked.",
@@ -3524,8 +2792,7 @@ export function assessDuoAuthentication(
   } else if (telephony.explicitlyAllowedTelephony.length > 0) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-002",
-        telephony.blockedTelephony.length === 0 ? "Fail" : "Partial",
+        decisions, "DUO-AUTH-002",
         `Telephony factors are explicitly allowed in the global policy: ${telephony.explicitlyAllowedTelephony.join(", ")}.`,
         [...methodListEvidence, `permitted_telephony_methods=${telephony.permittedTelephony.join(",")}`],
         "Remove sms and phonecall from allowed_auth_list and add them to blocked_auth_list, reserving telephony for tightly governed exceptions.",
@@ -3534,8 +2801,7 @@ export function assessDuoAuthentication(
   } else if (!telephony.blockedExposed) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-002",
-        "Manual",
+        decisions, "DUO-AUTH-002",
         "The global policy did not expose authentication_methods.blocked_auth_list, so sms and phonecall cannot be confirmed blocked.",
         methodListEvidence,
         "Confirm in the Authentication Methods policy section that SMS and phone callback are blocked; a method absent from the allow-list is still permitted unless blocked.",
@@ -3544,8 +2810,7 @@ export function assessDuoAuthentication(
   } else if (telephony.permittedTelephony.length === 0) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-002",
-        "Pass",
+        decisions, "DUO-AUTH-002",
         "SMS and phone callback are blocked by the global policy.",
         [...methodListEvidence, `blocked_telephony_methods=${telephony.blockedTelephony.join(",")}`],
         "Keep sms and phonecall in blocked_auth_list unless you have a documented break-glass exception.",
@@ -3554,8 +2819,7 @@ export function assessDuoAuthentication(
   } else {
     findings.push(
       buildFinding(
-        "DUO-AUTH-002",
-        telephony.blockedTelephony.length === 0 ? "Fail" : "Partial",
+        decisions, "DUO-AUTH-002",
         `Telephony factors remain permitted because they are not in blocked_auth_list: ${telephony.permittedTelephony.join(", ")}.`,
         [
           ...methodListEvidence,
@@ -3568,14 +2832,13 @@ export function assessDuoAuthentication(
   }
 
   const newUserBehavior = asString(asRecord(getPolicySections(globalPolicy).new_user).new_user_behavior)?.toLowerCase();
-  recordDuoDecisionFacts("DUO-AUTH-003", {
+  recordDuoDecisionFacts(decisions, "DUO-AUTH-003", {
     new_user_behavior: newUserBehavior,
   });
   if (!newUserBehavior) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-003",
-        "Manual",
+        decisions, "DUO-AUTH-003",
         "New user policy could not be resolved from the collected policy data.",
         policyUnavailable ? policyEvidence : ["The global policy did not include a new_user.new_user_behavior value."],
         "Confirm that new users must enroll before accessing protected applications.",
@@ -3584,8 +2847,7 @@ export function assessDuoAuthentication(
   } else if (newUserBehavior === "enroll") {
     findings.push(
       buildFinding(
-        "DUO-AUTH-003",
-        "Pass",
+        decisions, "DUO-AUTH-003",
         "New users are required to enroll before access.",
         [`new_user_behavior=${newUserBehavior}`],
         "Keep enrollment-required behavior in place for new users.",
@@ -3594,8 +2856,7 @@ export function assessDuoAuthentication(
   } else {
     findings.push(
       buildFinding(
-        "DUO-AUTH-003",
-        newUserBehavior === "no-mfa" ? "Fail" : "Partial",
+        decisions, "DUO-AUTH-003",
         `New user policy is set to ${newUserBehavior}.`,
         [`new_user_behavior=${newUserBehavior}`],
         "Set the Duo New User policy to enroll users instead of allowing access without MFA.",
@@ -3604,15 +2865,14 @@ export function assessDuoAuthentication(
   }
 
   const rememberedDays = rememberedDeviceWindowDays(globalPolicy);
-  recordDuoDecisionFacts("DUO-AUTH-004", {
+  recordDuoDecisionFacts(decisions, "DUO-AUTH-004", {
     policy_readable: !policyUnavailable,
     remembered_device_days: rememberedDays,
   });
   if (policyUnavailable) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-004",
-        "Manual",
+        decisions, "DUO-AUTH-004",
         "Remembered device posture could not be read because the global policy was unavailable.",
         policyEvidence,
         "Grant the audit principal Grant resource - Read and review remembered_devices.browser_apps in the Global Policy.",
@@ -3621,8 +2881,7 @@ export function assessDuoAuthentication(
   } else if (rememberedDays === null) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-004",
-        "Manual",
+        decisions, "DUO-AUTH-004",
         "Remembered device duration could not be interpreted.",
         ["The Remembered Devices policy exists, but the effective duration could not be normalized."],
         "Review remembered device settings and cap the window to a justifiable interval for the scoped risk.",
@@ -3631,8 +2890,7 @@ export function assessDuoAuthentication(
   } else if (rememberedDays === 0) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-004",
-        "Pass",
+        decisions, "DUO-AUTH-004",
         "Remembered devices are disabled.",
         ["remembered_devices.browser_apps.enabled=false"],
         "Keep remembered devices disabled for higher-assurance applications unless there is a documented exception.",
@@ -3641,8 +2899,7 @@ export function assessDuoAuthentication(
   } else if (rememberedDays <= 14) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-004",
-        "Pass",
+        decisions, "DUO-AUTH-004",
         `Remembered devices are enabled for ${rememberedDays} day(s).`,
         [`remembered_device_window_days=${rememberedDays}`],
         "Revisit the remembered-device window if risk tolerance changes.",
@@ -3651,8 +2908,7 @@ export function assessDuoAuthentication(
   } else if (rememberedDays <= 30) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-004",
-        "Partial",
+        decisions, "DUO-AUTH-004",
         `Remembered devices persist for ${rememberedDays} day(s).`,
         [`remembered_device_window_days=${rememberedDays}`],
         "Consider shortening remembered-device duration for high-sensitivity applications or administrator flows.",
@@ -3661,8 +2917,7 @@ export function assessDuoAuthentication(
   } else {
     findings.push(
       buildFinding(
-        "DUO-AUTH-004",
-        "Fail",
+        decisions, "DUO-AUTH-004",
         `Remembered devices persist for ${rememberedDays} day(s).`,
         [`remembered_device_window_days=${rememberedDays}`],
         "Shorten or disable remembered devices so the cached MFA window stays aligned with regulated access expectations.",
@@ -3689,15 +2944,14 @@ export function assessDuoAuthentication(
     getBooleanish(screenLock, "require_screen_lock") ? "screen_lock.require_screen_lock=true" : undefined,
     getBooleanish(diskEncryption, "require_encryption") ? "full_disk_encryption.require_encryption=true" : undefined,
   ].filter((item): item is string => Boolean(item));
-  recordDuoDecisionFacts("DUO-AUTH-005", {
+  recordDuoDecisionFacts(decisions, "DUO-AUTH-005", {
     policy_readable: !policyUnavailable,
     trusted_endpoint_checking: trustedChecking,
   });
   if (policyUnavailable) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-005",
-        "Manual",
+        decisions, "DUO-AUTH-005",
         "Trusted endpoint posture could not be read because the global policy was unavailable.",
         policyEvidence,
         "Grant the audit principal Grant resource - Read and review trusted_endpoints.trusted_endpoint_checking in the Global Policy.",
@@ -3706,8 +2960,7 @@ export function assessDuoAuthentication(
   } else if (trustedChecking === "require-trusted") {
     findings.push(
       buildFinding(
-        "DUO-AUTH-005",
-        "Pass",
+        decisions, "DUO-AUTH-005",
         "Trusted endpoints are required by policy.",
         healthEvidence,
         "Keep trusted endpoint and device health checks aligned with platform coverage and operational reality.",
@@ -3716,8 +2969,7 @@ export function assessDuoAuthentication(
   } else if (trustedChecking === "allow-all") {
     findings.push(
       buildFinding(
-        "DUO-AUTH-005",
-        "Partial",
+        decisions, "DUO-AUTH-005",
         "Trusted endpoints are evaluated but not required.",
         healthEvidence.length > 0 ? healthEvidence : ["trusted_endpoint_checking=allow-all"],
         "Move the policy to require-trusted where managed device coverage supports it.",
@@ -3726,8 +2978,7 @@ export function assessDuoAuthentication(
   } else {
     findings.push(
       buildFinding(
-        "DUO-AUTH-005",
-        "Fail",
+        decisions, "DUO-AUTH-005",
         "Trusted endpoint requirements are not configured.",
         healthEvidence.length > 0 ? healthEvidence : ["trusted_endpoint_checking is not configured."],
         "Configure trusted endpoints and the supporting device-health controls before treating device trust as enforced.",
@@ -3761,7 +3012,7 @@ export function assessDuoAuthentication(
     ),
   ];
   const flaggedBypassCodes = bypassReview.stale.length + bypassReview.unlimited.length;
-  recordDuoDecisionFacts("DUO-AUTH-006", {
+  recordDuoDecisionFacts(decisions, "DUO-AUTH-006", {
     readable: !data.bypassCodes.error,
     complete: completeDuoDatasets(data.bypassCodes),
     settings_readable: !data.settings.error,
@@ -3775,8 +3026,7 @@ export function assessDuoAuthentication(
   if (data.bypassCodes.error) {
     findings.push(
       buildFinding(
-        "DUO-AUTH-006",
-        "Manual",
+        decisions, "DUO-AUTH-006",
         "Bypass code inventory could not be collected.",
         unavailableEvidence(
           DUO_ENDPOINTS.bypassCodes,
@@ -3791,8 +3041,7 @@ export function assessDuoAuthentication(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-AUTH-006",
-          settingsReadFailure ? "Partial" : "Pass",
+          decisions, "DUO-AUTH-006",
           settingsReadFailure
             ? `No active bypass codes were returned, but help desk issuance limits could not be read: ${settingsReadFailure}. The zero-code verdict is capped at Partial.`
             : "No active bypass codes were returned.",
@@ -3808,8 +3057,7 @@ export function assessDuoAuthentication(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-AUTH-006",
-          "Fail",
+          decisions, "DUO-AUTH-006",
           flaggedBypassCodes > 0
             ? `${bypassReview.stale.length} bypass code(s) are older than 24 hours and ${bypassReview.unlimited.length} have unlimited uses or no expiration.`
             : "Bypass codes are active while help desk issuance has no expiration limit.",
@@ -3823,8 +3071,7 @@ export function assessDuoAuthentication(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-AUTH-006",
-          "Partial",
+          decisions, "DUO-AUTH-006",
           `${bypassReview.undated} bypass code(s) have no created timestamp, so their age cannot be confirmed (Partial, not Pass).`,
           bypassEvidence,
           "Review the undated bypass codes in the Duo Admin Panel and revoke any older than 24 hours.",
@@ -3836,8 +3083,7 @@ export function assessDuoAuthentication(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-AUTH-006",
-          "Partial",
+          decisions, "DUO-AUTH-006",
           bypassCount === bypassReview.expired
             ? `${bypassCount} bypass code(s) were returned but every one has passed its expiration timestamp (Partial until they are deleted).`
             : `${bypassCount - bypassReview.expired} active bypass code(s) were created within 24 hours and carry a reuse limit and expiration.`,
@@ -3849,7 +3095,7 @@ export function assessDuoAuthentication(
     );
   }
 
-  findings.push(...assessUserPopulation(data));
+  findings.push(...assessUserPopulation(decisions, data));
 
   const snapshotSummary = {
     users: readCount(data.users),
@@ -3866,14 +3112,12 @@ export function assessDuoAuthentication(
     snapshotSummary,
     text: buildAssessmentText("Duo authentication assessment", getOrganizationName(config), findings, snapshotSummary),
   };
-  });
-}
+  }
 
-export function assessDuoAdminAccess(
-  data: DuoAdminAccessData,
-  config: DuoResolvedConfig,
-): DuoAssessmentResult {
-  return runBatchVerdictContext(DUO_DECISION_CONTEXT, DUO_SPEC, () => {
+
+export function assessDuoAdminAccess(data: DuoAdminAccessData,
+  config: DuoResolvedConfig): DuoAssessmentResult {
+  const decisions = new BatchVerdicts(DUO_SPEC);
   const findings: DuoFinding[] = [];
   const admins = data.admins.data;
   const activeAdmins = admins.filter((admin) => (asString(admin.status)?.toLowerCase() ?? "active") !== "disabled");
@@ -3889,7 +3133,7 @@ export function assessDuoAdminAccess(
     data.admins.error,
     "Export the Administrators list from the Duo Admin Panel with role, status, and last login.",
   );
-  recordDuoDecisionFacts("DUO-ADMIN-001", {
+  recordDuoDecisionFacts(decisions, "DUO-ADMIN-001", {
     readable: !data.admins.error,
     complete: completeDuoDatasets(data.admins),
     admin_count: admins.length,
@@ -3899,8 +3143,7 @@ export function assessDuoAdminAccess(
   if (admins.length === 0) {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-001",
-        "Manual",
+        decisions, "DUO-ADMIN-001",
         data.admins.error
           ? "Administrator inventory could not be collected."
           : "The administrator inventory was empty, which cannot be true for a live tenant, so the result is Manual rather than Pass.",
@@ -3912,8 +3155,7 @@ export function assessDuoAdminAccess(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-ADMIN-001",
-          "Pass",
+          decisions, "DUO-ADMIN-001",
           "Owner-level access is concentrated in a small number of admins.",
           [`admins=${admins.length}`, `active_admins=${activeAdmins.length}`, `owners=${ownerCount}`],
           "Keep Owner-role assignments limited and review them periodically.",
@@ -3924,8 +3166,7 @@ export function assessDuoAdminAccess(
   } else if (ownerCount <= Math.max(3, Math.ceil(admins.length / 2))) {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-001",
-        "Partial",
+        decisions, "DUO-ADMIN-001",
         "Owner-level access is broader than ideal.",
         [`admins=${admins.length}`, `owners=${ownerCount}`],
         "Reduce Owner assignments and shift routine work to narrower administrative roles.",
@@ -3934,8 +3175,7 @@ export function assessDuoAdminAccess(
   } else {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-001",
-        "Fail",
+        decisions, "DUO-ADMIN-001",
         "Owner-level access is over-distributed across the administrator population.",
         [`admins=${admins.length}`, `owners=${ownerCount}`],
         "Constrain Owner access to the minimum practical set of operators and use narrower roles for everything else.",
@@ -3948,7 +3188,7 @@ export function assessDuoAdminAccess(
   const webauthnEnabled = getBooleanish(allowed, "webauthn_enabled");
   const smsEnabled = getBooleanish(allowed, "sms_enabled");
   const voiceEnabled = getBooleanish(allowed, "voice_enabled");
-  recordDuoDecisionFacts("DUO-ADMIN-002", {
+  recordDuoDecisionFacts(decisions, "DUO-ADMIN-002", {
     readable: !data.allowedAdminAuthMethods.error && Object.keys(allowed).length > 0,
     verified_push_enabled: verifiedPushEnabled,
     webauthn_enabled: webauthnEnabled,
@@ -3958,8 +3198,7 @@ export function assessDuoAdminAccess(
   if (data.allowedAdminAuthMethods.error || Object.keys(allowed).length === 0) {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-002",
-        "Manual",
+        decisions, "DUO-ADMIN-002",
         "Administrator authentication methods could not be collected.",
         unavailableEvidence(
           DUO_ENDPOINTS.adminAllowedAuthMethods,
@@ -3973,8 +3212,7 @@ export function assessDuoAdminAccess(
   } else if (verifiedPushEnabled || webauthnEnabled) {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-002",
-        smsEnabled || voiceEnabled ? "Partial" : "Pass",
+        decisions, "DUO-ADMIN-002",
         "Administrator login supports stronger MFA factors.",
         [
           `verified_push_enabled=${verifiedPushEnabled ?? false}`,
@@ -3988,8 +3226,7 @@ export function assessDuoAdminAccess(
   } else {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-002",
-        "Fail",
+        decisions, "DUO-ADMIN-002",
         "Administrator login does not show phishing-resistant factors.",
         [
           `verified_push_enabled=${verifiedPushEnabled ?? false}`,
@@ -4010,7 +3247,7 @@ export function assessDuoAdminAccess(
   );
   const helpdeskBypass = asString(settings.helpdesk_bypass)?.toLowerCase();
   const helpdeskBypassExpiration = asNumber(settings.helpdesk_bypass_expiration);
-  recordDuoDecisionFacts("DUO-ADMIN-003", {
+  recordDuoDecisionFacts(decisions, "DUO-ADMIN-003", {
     readable: !settingsUnavailable,
     helpdesk_bypass: helpdeskBypass,
     helpdesk_bypass_expiration: helpdeskBypassExpiration,
@@ -4018,8 +3255,7 @@ export function assessDuoAdminAccess(
   if (settingsUnavailable) {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-003",
-        "Manual",
+        decisions, "DUO-ADMIN-003",
         "Help desk bypass settings could not be collected.",
         settingsEvidence,
         "Grant the audit principal Grant settings so helpdesk_bypass can be verified.",
@@ -4028,8 +3264,7 @@ export function assessDuoAdminAccess(
   } else if (helpdeskBypass === "deny") {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-003",
-        "Pass",
+        decisions, "DUO-ADMIN-003",
         "Help desk administrators cannot mint bypass codes.",
         ["helpdesk_bypass=deny"],
         "Keep help desk bypass issuance disabled unless there is a documented operational need.",
@@ -4038,8 +3273,7 @@ export function assessDuoAdminAccess(
   } else if (helpdeskBypass === "limit" && (helpdeskBypassExpiration ?? 0) > 0) {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-003",
-        "Partial",
+        decisions, "DUO-ADMIN-003",
         "Help desk bypass creation is allowed, but Duo enforces a fixed expiration.",
         [
           `helpdesk_bypass=limit`,
@@ -4051,8 +3285,7 @@ export function assessDuoAdminAccess(
   } else {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-003",
-        "Fail",
+        decisions, "DUO-ADMIN-003",
         "Help desk bypass creation is too permissive.",
         [
           `helpdesk_bypass=${helpdeskBypass ?? "unknown"}`,
@@ -4070,7 +3303,7 @@ export function assessDuoAdminAccess(
     ...staleAdmins.slice(0, 10).map((admin) => `${asString(admin.email) ?? asString(admin.name) ?? "unknown-admin"} last_login_age_days=${daysSince(admin.last_login) ?? "unknown"}`),
     ...undatedAdmins.slice(0, 10).map((admin) => `${asString(admin.email) ?? asString(admin.name) ?? "unknown-admin"} last_login=null`),
   ];
-  recordDuoDecisionFacts("DUO-ADMIN-004", {
+  recordDuoDecisionFacts(decisions, "DUO-ADMIN-004", {
     readable: !data.admins.error,
     complete: completeDuoDatasets(data.admins),
     admin_count: admins.length,
@@ -4081,8 +3314,7 @@ export function assessDuoAdminAccess(
   if (admins.length === 0) {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-004",
-        "Manual",
+        decisions, "DUO-ADMIN-004",
         "Stale administrator review could not be completed.",
         adminsEvidence,
         "Review privileged account activity directly in the Duo admin console.",
@@ -4092,8 +3324,7 @@ export function assessDuoAdminAccess(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-ADMIN-004",
-          "Pass",
+          decisions, "DUO-ADMIN-004",
           "No privileged administrators were obviously stale based on available login timestamps.",
           staleEvidence,
           "Keep periodic access reviews in place for privileged administrators.",
@@ -4105,8 +3336,7 @@ export function assessDuoAdminAccess(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-ADMIN-004",
-          "Partial",
+          decisions, "DUO-ADMIN-004",
           `${undatedAdmins.length} administrator(s) have never logged in (last_login=null) and cannot be counted as active.`,
           staleEvidence,
           "Review administrators who have never logged in and remove accounts that were never activated or used.",
@@ -4118,8 +3348,7 @@ export function assessDuoAdminAccess(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-ADMIN-004",
-          staleAdmins.length >= Math.max(1, Math.ceil(activeAdmins.length / 3)) ? "Fail" : "Partial",
+          decisions, "DUO-ADMIN-004",
           "Some privileged administrators appear stale.",
           staleEvidence,
           "Review stale privileged accounts and remove or re-justify access for administrators who no longer need it.",
@@ -4138,15 +3367,14 @@ export function assessDuoAdminAccess(
     `lockout_expire_duration=${settings.lockout_expire_duration ?? "null"}`,
     `unenrolled_user_lockout_threshold=${unenrolledLockoutDays ?? "null"}`,
   ];
-  recordDuoDecisionFacts("DUO-ADMIN-005", {
+  recordDuoDecisionFacts(decisions, "DUO-ADMIN-005", {
     readable: !settingsUnavailable,
     lockout_threshold: lockoutThresholdNumber,
   });
   if (settingsUnavailable) {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-005",
-        "Manual",
+        decisions, "DUO-ADMIN-005",
         "User lockout settings could not be collected.",
         settingsEvidence,
         "Grant the audit principal Grant settings so lockout_threshold can be verified.",
@@ -4155,8 +3383,7 @@ export function assessDuoAdminAccess(
   } else if (lockoutThresholdNumber === undefined) {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-005",
-        "Manual",
+        decisions, "DUO-ADMIN-005",
         "The settings payload did not include a numeric lockout_threshold.",
         lockoutEvidence,
         "Confirm the Lockout and Fraud settings in the Duo Admin Panel.",
@@ -4165,8 +3392,7 @@ export function assessDuoAdminAccess(
   } else if (lockoutThresholdNumber <= 0) {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-005",
-        "Fail",
+        decisions, "DUO-ADMIN-005",
         "Failed-attempt lockout is not configured.",
         lockoutEvidence,
         `Set lockout_threshold to ${LOCKOUT_THRESHOLD_MAX} or fewer consecutive failed attempts.`,
@@ -4175,8 +3401,7 @@ export function assessDuoAdminAccess(
   } else if (lockoutThresholdNumber <= LOCKOUT_THRESHOLD_MAX) {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-005",
-        "Pass",
+        decisions, "DUO-ADMIN-005",
         `Users are locked out after ${lockoutThresholdNumber} consecutive failed attempts.`,
         [
           ...lockoutEvidence,
@@ -4190,8 +3415,7 @@ export function assessDuoAdminAccess(
   } else {
     findings.push(
       buildFinding(
-        "DUO-ADMIN-005",
-        "Partial",
+        decisions, "DUO-ADMIN-005",
         `Lockout is enabled but only after ${lockoutThresholdNumber} consecutive failed attempts.`,
         lockoutEvidence,
         `Lower lockout_threshold to ${LOCKOUT_THRESHOLD_MAX} or fewer consecutive failed attempts.`,
@@ -4218,8 +3442,7 @@ export function assessDuoAdminAccess(
     snapshotSummary,
     text: buildAssessmentText("Duo admin-access assessment", getOrganizationName(config), findings, snapshotSummary),
   };
-  });
-}
+  }
 
 function integrationLabel(integration: JsonRecord): string {
   return asString(integration.name) ?? asString(integration.integration_key) ?? "unknown-integration";
@@ -4230,9 +3453,10 @@ function isCriticalIntegration(integration: JsonRecord): boolean {
   return sensitivity === "critical" || sensitivity === "high" || listStrings(integration.compliance_requirements).length > 0;
 }
 
-function assessCriticalApplications(data: DuoIntegrationData, integrationsEvidence: string[]): DuoFinding {
+function assessCriticalApplications(decisions: BatchVerdicts,
+  data: DuoIntegrationData, integrationsEvidence: string[]): DuoFinding {
   if (data.integrations.error) {
-    recordDuoDecisionFacts("DUO-INTEGRATIONS-005", {
+    recordDuoDecisionFacts(decisions, "DUO-INTEGRATIONS-005", {
       readable: false,
       complete: false,
       protected_integration_count: 0,
@@ -4240,8 +3464,7 @@ function assessCriticalApplications(data: DuoIntegrationData, integrationsEviden
       tagged_without_policy_count: 0,
     });
     return buildFinding(
-      "DUO-INTEGRATIONS-005",
-      "Manual",
+      decisions, "DUO-INTEGRATIONS-005",
       "Critical application coverage could not be assessed because the integration inventory was unavailable.",
       integrationsEvidence,
       "Grant the audit principal Grant resource - Read and tag critical applications with a sensitivity level in the Duo Admin Panel.",
@@ -4251,7 +3474,7 @@ function assessCriticalApplications(data: DuoIntegrationData, integrationsEviden
   const protectedIntegrations = data.integrations.data.filter(integrationIsProtected);
   const tagged = protectedIntegrations.filter(isCriticalIntegration);
   const taggedWithoutPolicy = tagged.filter((integration) => !policyKey(integration));
-  recordDuoDecisionFacts("DUO-INTEGRATIONS-005", {
+  recordDuoDecisionFacts(decisions, "DUO-INTEGRATIONS-005", {
     readable: true,
     complete: completeDuoDatasets(data.integrations),
     protected_integration_count: protectedIntegrations.length,
@@ -4269,8 +3492,7 @@ function assessCriticalApplications(data: DuoIntegrationData, integrationsEviden
 
   if (protectedIntegrations.length === 0) {
     return buildFinding(
-      "DUO-INTEGRATIONS-005",
-      "Manual",
+      decisions, "DUO-INTEGRATIONS-005",
       "No protected integrations were returned, so critical application coverage cannot be compared against the tenant inventory.",
       evidence,
       "Confirm the application inventory in the Duo Admin Panel and compare it with the organization's critical application list.",
@@ -4278,8 +3500,7 @@ function assessCriticalApplications(data: DuoIntegrationData, integrationsEviden
   }
   if (tagged.length === 0) {
     return buildFinding(
-      "DUO-INTEGRATIONS-005",
-      "Manual",
+      decisions, "DUO-INTEGRATIONS-005",
       "No integration carries a Critical or High sensitivity_level or any compliance_requirements, so critical applications cannot be identified from the API.",
       [...evidence, "sensitivity_level and compliance_requirements are read-only fields set in the Duo Admin Panel."],
       "Tag critical applications with a sensitivity level and compliance requirements in the Duo Admin Panel, then compare against the organization's critical application list.",
@@ -4288,8 +3509,7 @@ function assessCriticalApplications(data: DuoIntegrationData, integrationsEviden
   if (taggedWithoutPolicy.length === 0) {
     return withInventoryCap(
       buildFinding(
-        "DUO-INTEGRATIONS-005",
-        "Pass",
+        decisions, "DUO-INTEGRATIONS-005",
         "Every Critical, High, or regulated application has an explicit Duo policy attached.",
         evidence,
         "Keep sensitivity tagging current and compare the Duo inventory against the organization's critical application list during access reviews.",
@@ -4299,8 +3519,7 @@ function assessCriticalApplications(data: DuoIntegrationData, integrationsEviden
   }
   return withInventoryCap(
     buildFinding(
-      "DUO-INTEGRATIONS-005",
-      taggedWithoutPolicy.length === tagged.length ? "Fail" : "Partial",
+      decisions, "DUO-INTEGRATIONS-005",
       `${taggedWithoutPolicy.length} Critical, High, or regulated application(s) rely on the global policy only.`,
       evidence,
       "Attach an explicit policy to every critical application so its MFA, device, and network requirements are reviewable.",
@@ -4313,12 +3532,13 @@ function osList(value: unknown): string[] {
   return listStrings(value).map((item) => item.toLowerCase());
 }
 
-function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
+function assessDeviceHealthDepth(decisions: BatchVerdicts,
+  data: DuoIntegrationData): DuoFinding {
   const globalPolicy = getGlobalPolicyRecord(data);
   const sections = getPolicySections(globalPolicy);
   const edition = asString(asRecord(data.infoSummary?.data).edition) ?? "unknown";
   if (Object.keys(sections).length === 0) {
-    recordDuoDecisionFacts("DUO-INTEGRATIONS-006", {
+    recordDuoDecisionFacts(decisions, "DUO-INTEGRATIONS-006", {
       policy_readable: false,
       edition_sections_present: false,
       duo_desktop_platform_count: 0,
@@ -4330,8 +3550,7 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
       restricted_os_count: 0,
     });
     return buildFinding(
-      "DUO-INTEGRATIONS-006",
-      "Manual",
+      decisions, "DUO-INTEGRATIONS-006",
       "Device health requirements could not be read because the global policy was unavailable.",
       unavailableEvidence(
         DUO_ENDPOINTS.globalPolicy,
@@ -4354,7 +3573,7 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
   const hasEditionSections = [healthSource, sections.operating_systems, sections.full_disk_encryption, sections.screen_lock].some(Boolean);
 
   if (!hasEditionSections) {
-    recordDuoDecisionFacts("DUO-INTEGRATIONS-006", {
+    recordDuoDecisionFacts(decisions, "DUO-INTEGRATIONS-006", {
       policy_readable: true,
       edition_sections_present: false,
       duo_desktop_platform_count: 0,
@@ -4366,8 +3585,7 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
       restricted_os_count: 0,
     });
     return buildFinding(
-      "DUO-INTEGRATIONS-006",
-      "Manual",
+      decisions, "DUO-INTEGRATIONS-006",
       `The global policy exposes no device health sections; health_checks, duo_desktop, operating_systems, full_disk_encryption, and screen_lock require Duo Advantage or Premier (edition reported: ${edition}).`,
       [`edition=${edition}`, "Policy Section Data marks these sections as Premier and Advantage edition features."],
       "Confirm the tenant edition and, if eligible, configure device health requirements in the Global Policy.",
@@ -4403,7 +3621,7 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
     restrictedOs.length > 0,
   ];
   const satisfied = checks.filter(Boolean).length;
-  recordDuoDecisionFacts("DUO-INTEGRATIONS-006", {
+  recordDuoDecisionFacts(decisions, "DUO-INTEGRATIONS-006", {
     policy_readable: true,
     edition_sections_present: true,
     duo_desktop_platform_count: requiresDuoDesktop.length,
@@ -4417,8 +3635,7 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
 
   if (satisfied === checks.length) {
     return buildFinding(
-      "DUO-INTEGRATIONS-006",
-      "Pass",
+      decisions, "DUO-INTEGRATIONS-006",
       "Device health policy requires Duo Desktop with encryption, firewall, system password or screen lock, and operating system version restrictions.",
       evidence,
       "Keep device health requirements aligned with the managed fleet and review remediation notes for blocked users.",
@@ -4426,16 +3643,14 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
   }
   if (satisfied === 0) {
     return buildFinding(
-      "DUO-INTEGRATIONS-006",
-      "Fail",
+      decisions, "DUO-INTEGRATIONS-006",
       "Device health sections are present but no health requirement is enforced.",
       evidence,
       "Require Duo Desktop and enable encryption, firewall, system password, and OS version checks for managed platforms.",
     );
   }
   return buildFinding(
-    "DUO-INTEGRATIONS-006",
-    "Partial",
+    decisions, "DUO-INTEGRATIONS-006",
     `${satisfied} of ${checks.length} device health requirement groups are enforced.`,
     evidence,
     "Extend device health enforcement to encryption, firewall, system password or screen lock, and OS version restrictions.",
@@ -4449,12 +3664,13 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
  * so it is reported as evidence only and never decides the verdict.
  */
 function assessSelfServicePortal(
+  decisions: BatchVerdicts,
   data: DuoIntegrationData,
   protectedIntegrations: JsonRecord[],
   integrationsEvidence: string[],
 ): DuoFinding {
   if (data.integrations.error) {
-    recordDuoDecisionFacts("DUO-INTEGRATIONS-003", {
+    recordDuoDecisionFacts(decisions, "DUO-INTEGRATIONS-003", {
       readable: false,
       complete: false,
       protected_integration_count: 0,
@@ -4462,8 +3678,7 @@ function assessSelfServicePortal(
       self_service_enabled_count: 0,
     });
     return buildFinding(
-      "DUO-INTEGRATIONS-003",
-      "Manual",
+      decisions, "DUO-INTEGRATIONS-003",
       "Self-service device management posture could not be collected because the integration inventory was unavailable.",
       integrationsEvidence,
       "Grant the audit principal Grant resource - Read so self_service_allowed can be read for every application.",
@@ -4472,7 +3687,7 @@ function assessSelfServicePortal(
   const legacyFlag = getBooleanish(asRecord(data.settings.data), "global_ssp_policy_enforced");
   const legacyEvidence = `global_ssp_policy_enforced=${legacyFlag ?? "unknown"} (legacy Retrieve Settings parameter, defaults to true, not used for the verdict)`;
   if (protectedIntegrations.length === 0) {
-    recordDuoDecisionFacts("DUO-INTEGRATIONS-003", {
+    recordDuoDecisionFacts(decisions, "DUO-INTEGRATIONS-003", {
       readable: true,
       complete: completeDuoDatasets(data.integrations),
       protected_integration_count: 0,
@@ -4480,8 +3695,7 @@ function assessSelfServicePortal(
       self_service_enabled_count: 0,
     });
     return buildFinding(
-      "DUO-INTEGRATIONS-003",
-      "Partial",
+      decisions, "DUO-INTEGRATIONS-003",
       "No active protected integrations were returned, so self-service device management cannot be judged (Partial, not Pass).",
       ["protected_integrations=0", legacyEvidence],
       "Confirm the application inventory in the Duo Admin Panel before concluding that no application allows self-service device changes.",
@@ -4490,7 +3704,7 @@ function assessSelfServicePortal(
 
   const withField = protectedIntegrations.filter((integration) => getBooleanish(integration, "self_service_allowed") !== undefined);
   const enabled = withField.filter((integration) => getBooleanish(integration, "self_service_allowed") === true);
-  recordDuoDecisionFacts("DUO-INTEGRATIONS-003", {
+  recordDuoDecisionFacts(decisions, "DUO-INTEGRATIONS-003", {
     readable: true,
     complete: completeDuoDatasets(data.integrations),
     protected_integration_count: protectedIntegrations.length,
@@ -4510,8 +3724,7 @@ function assessSelfServicePortal(
 
   if (withField.length === 0) {
     return buildFinding(
-      "DUO-INTEGRATIONS-003",
-      "Manual",
+      decisions, "DUO-INTEGRATIONS-003",
       "No protected integration exposed self_service_allowed, so device self-service posture requires manual review.",
       [
         `endpoint=${DUO_ENDPOINTS.integrations}`,
@@ -4525,8 +3738,7 @@ function assessSelfServicePortal(
   if (enabled.length === 0) {
     return withInventoryCap(
       buildFinding(
-        "DUO-INTEGRATIONS-003",
-        "Pass",
+        decisions, "DUO-INTEGRATIONS-003",
         "No protected integration allows users to add or remove authentication devices from the prompt.",
         evidence,
         "Keep self-service disabled or bound to an approval workflow when applications are added.",
@@ -4536,8 +3748,7 @@ function assessSelfServicePortal(
   }
   return withInventoryCap(
     buildFinding(
-      "DUO-INTEGRATIONS-003",
-      enabled.length === withField.length ? "Fail" : "Partial",
+      decisions, "DUO-INTEGRATIONS-003",
       `${enabled.length} of ${withField.length} protected integration(s) let users manage authentication devices without administrator approval.`,
       evidence,
       "Disable self_service_allowed where administrator approval is required, or document the approval and policy controls that govern self-service device changes.",
@@ -4546,11 +3757,10 @@ function assessSelfServicePortal(
   );
 }
 
-export function assessDuoIntegrations(
-  data: DuoIntegrationData,
-  config: DuoResolvedConfig,
-): DuoAssessmentResult {
-  return runBatchVerdictContext(DUO_DECISION_CONTEXT, DUO_SPEC, () => {
+
+export function assessDuoIntegrations(data: DuoIntegrationData,
+  config: DuoResolvedConfig): DuoAssessmentResult {
+  const decisions = new BatchVerdicts(DUO_SPEC);
   const findings: DuoFinding[] = [];
   const integrations = activeIntegrations(data.integrations.data);
   const policyAttachedCount = integrations.filter((integration) => Boolean(policyKey(integration))).length;
@@ -4577,19 +3787,19 @@ export function assessDuoIntegrations(
   );
   const integrationsReadable = !data.integrations.error;
   const integrationsComplete = completeDuoDatasets(data.integrations);
-  recordDuoDecisionFacts("DUO-INTEGRATIONS-001", {
+  recordDuoDecisionFacts(decisions, "DUO-INTEGRATIONS-001", {
     readable: integrationsReadable,
     complete: integrationsComplete,
     protected_integration_count: integrations.length,
     policy_attached_count: policyAttachedCount,
   });
-  recordDuoDecisionFacts("DUO-INTEGRATIONS-002", {
+  recordDuoDecisionFacts(decisions, "DUO-INTEGRATIONS-002", {
     readable: integrationsReadable,
     complete: integrationsComplete,
     applicable_integration_count: universalPromptApplicable.length,
     universal_prompt_count: universalPromptCount,
   });
-  recordDuoDecisionFacts("DUO-INTEGRATIONS-004", {
+  recordDuoDecisionFacts(decisions, "DUO-INTEGRATIONS-004", {
     readable: integrationsReadable,
     complete: integrationsComplete,
     admin_api_count: adminApiIntegrations.length,
@@ -4599,8 +3809,7 @@ export function assessDuoIntegrations(
   if (integrations.length === 0) {
     findings.push(
       buildFinding(
-        "DUO-INTEGRATIONS-001",
-        data.integrations.error ? "Manual" : "Partial",
+        decisions, "DUO-INTEGRATIONS-001",
         data.integrations.error
           ? "Direct integration inventory could not be collected."
           : "No active protected integrations were returned (Partial, not Pass: an empty inventory cannot demonstrate policy coverage).",
@@ -4612,8 +3821,7 @@ export function assessDuoIntegrations(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-INTEGRATIONS-001",
-          "Pass",
+          decisions, "DUO-INTEGRATIONS-001",
           "All active protected integrations expose an explicit policy attachment.",
           [`protected_integrations=${integrations.length}`, `with_policy_key=${policyAttachedCount}`],
           "Keep custom policy attachment visible for high-value applications instead of relying only on the global policy.",
@@ -4624,8 +3832,7 @@ export function assessDuoIntegrations(
   } else if (policyAttachedCount > 0) {
     findings.push(
       buildFinding(
-        "DUO-INTEGRATIONS-001",
-        "Partial",
+        decisions, "DUO-INTEGRATIONS-001",
         "Some active integrations expose explicit policy attachments, but others appear to rely only on broader defaults.",
         [`protected_integrations=${integrations.length}`, `with_policy_key=${policyAttachedCount}`],
         "Review integrations without a policy_key and confirm they still inherit the intended control posture.",
@@ -4634,8 +3841,7 @@ export function assessDuoIntegrations(
   } else {
     findings.push(
       buildFinding(
-        "DUO-INTEGRATIONS-001",
-        "Fail",
+        decisions, "DUO-INTEGRATIONS-001",
         "Active protected integrations do not expose explicit policy attachments.",
         [`protected_integrations=${integrations.length}`, `with_policy_key=${policyAttachedCount}`],
         "Attach explicit Duo policies to protected integrations so exception handling and control inheritance are reviewable.",
@@ -4646,8 +3852,7 @@ export function assessDuoIntegrations(
   if (data.integrations.error) {
     findings.push(
       buildFinding(
-        "DUO-INTEGRATIONS-002",
-        "Manual",
+        decisions, "DUO-INTEGRATIONS-002",
         "Universal Prompt adoption could not be determined because the integration inventory was unavailable.",
         integrationsEvidence,
         "Grant the audit principal Grant resource - Read so prompt_v4_enabled and frameless_auth_prompt_enabled can be read per application.",
@@ -4656,8 +3861,7 @@ export function assessDuoIntegrations(
   } else if (universalPromptApplicable.length === 0) {
     findings.push(
       buildFinding(
-        "DUO-INTEGRATIONS-002",
-        "Manual",
+        decisions, "DUO-INTEGRATIONS-002",
         "Universal Prompt adoption could not be determined from the collected integration payloads.",
         [
           `integrations_returned=${data.integrations.data.length}`,
@@ -4670,8 +3874,7 @@ export function assessDuoIntegrations(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-INTEGRATIONS-002",
-          "Pass",
+          decisions, "DUO-INTEGRATIONS-002",
           "All inspected integrations that expose prompt posture are on Universal Prompt.",
           [`universal_prompt_integrations=${universalPromptCount}`, `prompt_applicable=${universalPromptApplicable.length}`],
           "Keep Universal Prompt adoption at full coverage as new integrations are added.",
@@ -4682,8 +3885,7 @@ export function assessDuoIntegrations(
   } else {
     findings.push(
       buildFinding(
-        "DUO-INTEGRATIONS-002",
-        universalPromptCount === 0 ? "Fail" : "Partial",
+        decisions, "DUO-INTEGRATIONS-002",
         "Universal Prompt adoption is incomplete.",
         [`universal_prompt_integrations=${universalPromptCount}`, `prompt_applicable=${universalPromptApplicable.length}`],
         "Migrate the remaining applications to Universal Prompt so authentication posture stays current and consistent.",
@@ -4691,13 +3893,12 @@ export function assessDuoIntegrations(
     );
   }
 
-  findings.push(assessSelfServicePortal(data, integrations, integrationsEvidence));
+  findings.push(assessSelfServicePortal(decisions, data, integrations, integrationsEvidence));
 
   if (data.integrations.error) {
     findings.push(
       buildFinding(
-        "DUO-INTEGRATIONS-004",
-        "Manual",
+        decisions, "DUO-INTEGRATIONS-004",
         "Admin API integration permissions could not be collected.",
         integrationsEvidence,
         "Grant the audit principal Grant resource - Read so Admin API application permissions can be reviewed.",
@@ -4706,8 +3907,7 @@ export function assessDuoIntegrations(
   } else if (adminApiIntegrations.length === 0) {
     findings.push(
       buildFinding(
-        "DUO-INTEGRATIONS-004",
-        "Partial",
+        decisions, "DUO-INTEGRATIONS-004",
         "No Admin API integrations were returned even though this audit runs through one, so the inventory is not authoritative.",
         ["adminapi_integrations=0", `integrations_returned=${data.integrations.data.length}`],
         "Review Admin API applications directly in the Duo Admin Panel and confirm the audit principal can list them.",
@@ -4717,8 +3917,7 @@ export function assessDuoIntegrations(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-INTEGRATIONS-004",
-          "Pass",
+          decisions, "DUO-INTEGRATIONS-004",
           "Admin API integrations appear read-oriented in the returned inventory.",
           [
             `adminapi_integrations=${adminApiIntegrations.length}`,
@@ -4732,8 +3931,7 @@ export function assessDuoIntegrations(
   } else {
     findings.push(
       buildFinding(
-        "DUO-INTEGRATIONS-004",
-        overPrivilegedAdminApis.length === adminApiIntegrations.length ? "Fail" : "Partial",
+        decisions, "DUO-INTEGRATIONS-004",
         "Some Admin API integrations have broader write or permission-management scope.",
         overPrivilegedAdminApis.slice(0, 10).map((integration) => `${asString(integration.name) ?? asString(integration.integration_key) ?? "unknown-adminapi"} has elevated Admin API permissions.`),
         "Review Admin API applications and reduce them to read-only scope unless mutation rights are explicitly required and governed.",
@@ -4741,8 +3939,8 @@ export function assessDuoIntegrations(
     );
   }
 
-  findings.push(assessCriticalApplications(data, integrationsEvidence));
-  findings.push(assessDeviceHealthDepth(data));
+  findings.push(assessCriticalApplications(decisions, data, integrationsEvidence));
+  findings.push(assessDeviceHealthDepth(decisions, data));
 
   const integrationsUnread = Boolean(data.integrations.error);
   const snapshotSummary = {
@@ -4760,8 +3958,7 @@ export function assessDuoIntegrations(
     snapshotSummary,
     text: buildAssessmentText("Duo integration assessment", getOrganizationName(config), findings, snapshotSummary),
   };
-  });
-}
+  }
 
 interface TravelAnomaly {
   user: string;
@@ -4808,7 +4005,8 @@ function detectImpossibleTravel(events: JsonRecord[]): { anomalies: TravelAnomal
   return { anomalies, locatedEvents };
 }
 
-function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResolvedConfig): DuoFinding {
+function assessAuthenticationAnomalies(decisions: BatchVerdicts,
+  data: DuoMonitoringData, config: DuoResolvedConfig): DuoFinding {
   const attempts = data.authenticationAttempts;
   const edition = asString(asRecord(data.infoSummary.data).edition) ?? "unknown";
   const counts = asRecord(asRecord(attempts?.data).authentication_attempts);
@@ -4822,7 +4020,7 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
     ? { anomalies: [] as TravelAnomaly[], locatedEvents: 0 }
     : detectImpossibleTravel(data.authenticationLogs.data);
   const { anomalies, locatedEvents } = travel;
-  recordDuoDecisionFacts("DUO-MON-005", {
+  recordDuoDecisionFacts(decisions, "DUO-MON-005", {
     attempts_readable: Boolean(attempts) && !attempts?.error,
     logs_readable: !data.authenticationLogs.error,
     counts_present: Object.keys(counts).length > 0,
@@ -4836,8 +4034,7 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
   });
   if (!attempts || attempts.error) {
     return buildFinding(
-      "DUO-MON-005",
-      "Manual",
+      decisions, "DUO-MON-005",
       "Authentication attempt statistics could not be collected.",
       unavailableEvidence(
         DUO_ENDPOINTS.authenticationAttempts,
@@ -4850,8 +4047,7 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
   }
   if (data.authenticationLogs.error) {
     return buildFinding(
-      "DUO-MON-005",
-      "Manual",
+      decisions, "DUO-MON-005",
       "Authentication logs could not be collected, so travel anomalies cannot be evaluated.",
       unavailableEvidence(
         DUO_ENDPOINTS.authenticationLogs,
@@ -4880,8 +4076,7 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
 
   if (Object.keys(counts).length === 0) {
     return buildFinding(
-      "DUO-MON-005",
-      "Manual",
+      decisions, "DUO-MON-005",
       "The authentication attempts report did not include the documented authentication_attempts counts.",
       evidence,
       "Review the Authentication Summary report in the Duo Admin Panel.",
@@ -4889,8 +4084,7 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
   }
   if (total === 0 && data.authenticationLogs.data.length === 0) {
     return buildFinding(
-      "DUO-MON-005",
-      "Partial",
+      decisions, "DUO-MON-005",
       "No authentication attempts or events were recorded in the lookback window, so anomaly review has no data (Partial, not Pass).",
       evidence,
       "Confirm the lookback window covers real usage and that authentication telemetry is retained.",
@@ -4898,8 +4092,7 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
   }
   if (anomalies.length > 0) {
     return buildFinding(
-      "DUO-MON-005",
-      "Fail",
+      decisions, "DUO-MON-005",
       `${anomalies.length} successful authentication pair(s) show a country change within ${IMPOSSIBLE_TRAVEL_WINDOW_MS / 60000} minutes.`,
       evidence,
       "Investigate the flagged users for credential compromise or shared accounts and enable User Location or Trust Monitor policies.",
@@ -4907,8 +4100,7 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
   }
   if (locatedEvents === 0) {
     return buildFinding(
-      "DUO-MON-005",
-      "Manual",
+      decisions, "DUO-MON-005",
       `No authentication event exposed access_device.location, which the Admin API documents for Duo Premier and Duo Advantage plans (edition reported: ${edition}); travel analysis requires manual review.`,
       evidence,
       "Confirm the tenant edition, then review authentication locations in the Duo Admin Panel or upgrade to an edition with access device location.",
@@ -4917,8 +4109,7 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
   }
   if (fraud > 0 || failureShare > 20) {
     return buildFinding(
-      "DUO-MON-005",
-      "Partial",
+      decisions, "DUO-MON-005",
       fraud > 0
         ? `${fraud} authentication attempt(s) were reported as fraud in the lookback window.`
         : `${failureShare} percent of authentication attempts were denied in the lookback window.`,
@@ -4927,19 +4118,17 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
     );
   }
   return buildFinding(
-    "DUO-MON-005",
-    "Pass",
+    decisions, "DUO-MON-005",
     "No fraud reports, elevated denial rates, or impossible travel pairs were found in the lookback window.",
     evidence,
     "Keep reviewing authentication summaries and location changes as part of routine monitoring.",
   );
 }
 
-export function assessDuoMonitoring(
-  data: DuoMonitoringData,
-  config: DuoResolvedConfig,
-): DuoAssessmentResult {
-  return runBatchVerdictContext(DUO_DECISION_CONTEXT, DUO_SPEC, () => {
+
+export function assessDuoMonitoring(data: DuoMonitoringData,
+  config: DuoResolvedConfig): DuoAssessmentResult {
+  const decisions = new BatchVerdicts(DUO_SPEC);
   const findings: DuoFinding[] = [];
   const authLogs = data.authenticationLogs.data;
   const telephonyLogs = data.telephonyLogs.data;
@@ -4956,7 +4145,7 @@ export function assessDuoMonitoring(
     const result = `${asString(event.result) ?? ""} ${asString(event.reason) ?? ""}`.toLowerCase();
     return result.includes("fraud");
   }).length;
-  recordDuoDecisionFacts("DUO-MON-001", {
+  recordDuoDecisionFacts(decisions, "DUO-MON-001", {
     readable: !data.authenticationLogs.error,
     complete: completeDuoDatasets(data.authenticationLogs),
     event_count: authLogs.length,
@@ -4966,8 +4155,7 @@ export function assessDuoMonitoring(
   if (data.authenticationLogs.error) {
     findings.push(
       buildFinding(
-        "DUO-MON-001",
-        "Manual",
+        decisions, "DUO-MON-001",
         "Authentication logs could not be collected.",
         unavailableEvidence(
           DUO_ENDPOINTS.authenticationLogs,
@@ -4981,8 +4169,7 @@ export function assessDuoMonitoring(
   } else if (authLogs.length === 0) {
     findings.push(
       buildFinding(
-        "DUO-MON-001",
-        "Partial",
+        decisions, "DUO-MON-001",
         "Authentication log collection succeeded but returned no events in the requested lookback window.",
         [`lookback_days=${config.lookbackDays}`],
         "Confirm the lookback window is appropriate and that authentication telemetry is retained for audit review.",
@@ -4992,8 +4179,7 @@ export function assessDuoMonitoring(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-MON-001",
-          "Partial",
+          decisions, "DUO-MON-001",
           "Authentication telemetry is available and shows events worth review.",
           [
             `auth_logs_collected=${authLogs.length}`,
@@ -5011,8 +4197,7 @@ export function assessDuoMonitoring(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-MON-001",
-          "Pass",
+          decisions, "DUO-MON-001",
           "Authentication telemetry is available and does not show obvious weak-factor reliance in the sampled window.",
           [`auth_logs_collected=${authLogs.length}`],
           "Keep the authentication log workflow in place and expand the lookback window when performing deeper investigations.",
@@ -5023,7 +4208,7 @@ export function assessDuoMonitoring(
     );
   }
 
-  recordDuoDecisionFacts("DUO-MON-002", {
+  recordDuoDecisionFacts(decisions, "DUO-MON-002", {
     readable: !data.trustMonitorEvents.error,
     complete: completeDuoDatasets(data.trustMonitorEvents),
     event_count: trustMonitorEvents.length,
@@ -5031,8 +4216,7 @@ export function assessDuoMonitoring(
   if (data.trustMonitorEvents.error) {
     findings.push(
       buildFinding(
-        "DUO-MON-002",
-        "Manual",
+        decisions, "DUO-MON-002",
         "Trust Monitor events could not be collected.",
         unavailableEvidence(
           DUO_ENDPOINTS.trustMonitorEvents,
@@ -5049,8 +4233,7 @@ export function assessDuoMonitoring(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-MON-002",
-          trustMonitorEvents.length > 0 ? "Pass" : "Partial",
+          decisions, "DUO-MON-002",
           trustMonitorEvents.length > 0
             ? "Trust Monitor surfaced recent events for review."
             : "No Trust Monitor events were returned in the requested lookback window.",
@@ -5072,7 +4255,7 @@ export function assessDuoMonitoring(
     const type = asString(event.type)?.toLowerCase() ?? "";
     return type === "sms" || type === "phone";
   }).length;
-  recordDuoDecisionFacts("DUO-MON-003", {
+  recordDuoDecisionFacts(decisions, "DUO-MON-003", {
     readable: !data.telephonyLogs.error && !data.infoSummary.error,
     complete: completeDuoDatasets(data.telephonyLogs, data.infoSummary),
     credits_remaining: creditsRemaining,
@@ -5081,8 +4264,7 @@ export function assessDuoMonitoring(
   if (data.telephonyLogs.error || data.infoSummary.error) {
     findings.push(
       buildFinding(
-        "DUO-MON-003",
-        "Manual",
+        decisions, "DUO-MON-003",
         "Telephony monitoring could not be fully assessed.",
         [
           ...(data.infoSummary.error
@@ -5108,8 +4290,7 @@ export function assessDuoMonitoring(
   } else if (creditsRemaining === undefined) {
     findings.push(
       buildFinding(
-        "DUO-MON-003",
-        "Manual",
+        decisions, "DUO-MON-003",
         "Remaining telephony credits could not be read, so telephony capacity cannot be confirmed (unknown credits never support Pass).",
         [
           `endpoint=${DUO_ENDPOINTS.infoSummary}`,
@@ -5126,8 +4307,7 @@ export function assessDuoMonitoring(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-MON-003",
-          "Fail",
+          decisions, "DUO-MON-003",
           "Telephony-backed MFA usage is active while available credits are low.",
           [`telephony_logs=${telephonyLogs.length}`, `telephony_factor_events=${smsOrPhoneLogs}`, `telephony_credits_remaining=${creditsRemaining}`],
           "Reduce telephony reliance and replenish credits before low balance creates an authentication bottleneck.",
@@ -5140,8 +4320,7 @@ export function assessDuoMonitoring(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-MON-003",
-          "Partial",
+          decisions, "DUO-MON-003",
           "Telephony capacity needs periodic review.",
           [`telephony_logs=${telephonyLogs.length}`, `telephony_factor_events=${smsOrPhoneLogs}`, `telephony_credits_remaining=${creditsRemaining}`],
           "Keep telephony credits monitored and continue moving users away from SMS and phone callback factors.",
@@ -5154,8 +4333,7 @@ export function assessDuoMonitoring(
     findings.push(
       withInventoryCap(
         buildFinding(
-          "DUO-MON-003",
-          "Pass",
+          decisions, "DUO-MON-003",
           "Telephony capacity looks healthy in the sampled window.",
           [`telephony_logs=${telephonyLogs.length}`, `telephony_credits_remaining=${creditsRemaining}`],
           "Continue monitoring telephony usage so low credits or weak-factor fallback do not become a surprise.",
@@ -5166,7 +4344,7 @@ export function assessDuoMonitoring(
     );
   }
 
-  findings.push(withInventoryCap(assessAuthenticationAnomalies(data, config), data.authenticationLogs, MAX_LOG_RECORDS));
+  findings.push(withInventoryCap(assessAuthenticationAnomalies(decisions, data, config), data.authenticationLogs, MAX_LOG_RECORDS));
 
   const settings = asRecord(data.settings.data);
   const notificationSignals = [
@@ -5174,15 +4352,14 @@ export function assessDuoMonitoring(
     getBooleanish(settings, "push_activity_notification_enabled"),
     getBooleanish(settings, "email_activity_notification_enabled"),
   ].filter((value): value is boolean => value !== undefined);
-  recordDuoDecisionFacts("DUO-MON-004", {
+  recordDuoDecisionFacts(decisions, "DUO-MON-004", {
     readable: !data.settings.error && Object.keys(settings).length > 0,
     enabled_notification_count: notificationSignals.filter(Boolean).length,
   });
   if (data.settings.error || Object.keys(settings).length === 0) {
     findings.push(
       buildFinding(
-        "DUO-MON-004",
-        "Manual",
+        decisions, "DUO-MON-004",
         "Notification settings could not be collected.",
         unavailableEvidence(
           DUO_ENDPOINTS.settings,
@@ -5196,8 +4373,7 @@ export function assessDuoMonitoring(
   } else if (notificationSignals.some(Boolean)) {
     findings.push(
       buildFinding(
-        "DUO-MON-004",
-        "Pass",
+        decisions, "DUO-MON-004",
         "Duo account notifications are enabled for at least one operator-facing path.",
         [
           `fraud_email_enabled=${getBooleanish(settings, "fraud_email_enabled") ?? false}`,
@@ -5210,8 +4386,7 @@ export function assessDuoMonitoring(
   } else {
     findings.push(
       buildFinding(
-        "DUO-MON-004",
-        "Partial",
+        decisions, "DUO-MON-004",
         "No operator-facing Duo account notification toggle was clearly enabled.",
         [
           `fraud_email_enabled=${getBooleanish(settings, "fraud_email_enabled") ?? "unknown"}`,
@@ -5237,8 +4412,7 @@ export function assessDuoMonitoring(
     snapshotSummary,
     text: buildAssessmentText("Duo monitoring assessment", getOrganizationName(config), findings, snapshotSummary),
   };
-  });
-}
+  }
 
 function buildConfigNotes(config: DuoResolvedConfig): string[] {
   return [
@@ -5435,41 +4609,6 @@ function buildUnifiedMatrix(findings: DuoFinding[]): string {
   ].join("\n");
 }
 
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  const root = resolve(baseDir);
-  const rootExisted = existsSync(root);
-  mkdirSync(root, { recursive: true, mode: 0o700 });
-  if (!rootExisted) chmodSync(root, 0o700);
-  const rootReal = realpathSync(root);
-  const destination = resolve(root, targetDir);
-
-  let current = destination;
-  while (current !== root && current !== dirname(current)) {
-    if (existsSync(current) && lstatSync(current).isSymbolicLink()) {
-      throw new Error(`Refusing to write through symlinked output path: ${current}`);
-    }
-    current = dirname(current);
-  }
-
-  const parent = dirname(destination);
-  const parentRelative = relative(root, parent);
-  if (parentRelative.startsWith("..") || isAbsolute(parentRelative)) {
-    throw new Error(`Refusing to write outside output root: ${destination}`);
-  }
-  let currentParent = root;
-  for (const segment of parentRelative.split(sep).filter(Boolean)) {
-    currentParent = join(currentParent, segment);
-    if (!existsSync(currentParent)) {
-      mkdirSync(currentParent, { mode: 0o700 });
-      chmodSync(currentParent, 0o700);
-    }
-  }
-  const parentReal = realpathSync(parent);
-  if (relative(rootReal, parentReal).startsWith("..")) {
-    throw new Error(`Refusing to write outside output root: ${destination}`);
-  }
-  return destination;
-}
 
 function sanitizeSegment(value: string): string {
   return value
@@ -5488,36 +4627,13 @@ function uniqueNameCandidates(preferredName: string): string[] {
 
 /** Every JSON file the bundle writes goes through the snapshot walk first (rule 9 at every depth, with the cap). */
 async function writeJson(rootDir: string, relativePathname: string, value: unknown): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  await writeFile(destination, `${JSON.stringify(scrubSnapshotValue(value), null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await chmod(destination, 0o600);
+  await writeSecureTextFile(rootDir, relativePathname, `${JSON.stringify(scrubSnapshotValue(value), null, 2)}\n`);
 }
 
 async function writeText(rootDir: string, relativePathname: string, value: string): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  await writeFile(destination, `${value.trimEnd()}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await chmod(destination, 0o600);
+  await writeSecureTextFile(rootDir, relativePathname, `${value.trimEnd()}\n`);
 }
 
-async function countFiles(rootDir: string): Promise<number> {
-  const entries = await readdir(rootDir, { withFileTypes: true });
-  let count = 0;
-  for (const entry of entries) {
-    const full = join(rootDir, entry.name);
-    if (entry.isDirectory()) {
-      count += await countFiles(full);
-    } else if (entry.isFile()) {
-      count += 1;
-    }
-  }
-  return count;
-}
 
 const FRAMEWORK_REPORTS: Array<{ key: FrameworkKey; path: string; title: string }> = [
   { key: "fedramp", path: "compliance/fedramp/fedramp_compliance_report.md", title: "FedRAMP / NIST 800-53 Compliance Report" },

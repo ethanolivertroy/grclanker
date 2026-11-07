@@ -98,6 +98,10 @@ jobs:
         working-directory: cli
         run: npm run test:cursor:validate
 
+      - name: Check generated tool manifest
+        working-directory: cli
+        run: npm run check:tool-manifest
+
       - name: Install Codex SDK example dependencies
         working-directory: cli/adapters/codex
         run: npm ci

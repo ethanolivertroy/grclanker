@@ -1,6 +1,4 @@
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolveLiveSmokeConfiguration } from "./live-smoke-config.mjs";
 
 import {
   ServicenowApiClient,
@@ -13,26 +11,11 @@ function log(message) {
   process.stdout.write(`${message}\n`);
 }
 
-function hasConfigHints() {
-  return (
-    Boolean(process.env.SERVICENOW_INSTANCE?.trim())
-    || Boolean(process.env.SERVICENOW_URL?.trim())
-    || Boolean(process.env.SERVICENOW_INSTANCE_URL?.trim())
-    || Boolean(process.env.SERVICENOW_CONFIG_FILE?.trim())
-    || existsSync(resolve(process.cwd(), ".servicenow.yaml"))
-    || existsSync(join(homedir(), ".servicenow-sec-inspector", "config.yaml"))
-  );
-}
 
 try {
-  if (!hasConfigHints()) {
-    log(
-      "Skipping live ServiceNow smoke test: set SERVICENOW_INSTANCE, SERVICENOW_URL, or SERVICENOW_INSTANCE_URL plus credentials (SERVICENOW_USERNAME and SERVICENOW_PASSWORD, SERVICENOW_CLIENT_ID and SERVICENOW_CLIENT_SECRET, or SERVICENOW_ACCESS_TOKEN or SERVICENOW_TOKEN), or configure SERVICENOW_CONFIG_FILE, .servicenow.yaml, or ~/.servicenow-sec-inspector/config.yaml to run against a real instance.",
-    );
-    process.exit(0);
-  }
-
-  const config = resolveServicenowConfiguration();
+  const authentication = await resolveLiveSmokeConfiguration("ServiceNow", () => resolveServicenowConfiguration());
+  if (authentication.kind === "unconfigured") process.exit(0);
+  const config = authentication.config;
   const client = new ServicenowApiClient(config);
   const access = await checkServicenowAccess(client);
 

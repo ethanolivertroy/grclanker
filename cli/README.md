@@ -26,6 +26,7 @@ Each host has its own model loop, credentials, configuration, session behavior, 
 cli/
   core/                     Shared domain registry, schemas, validation, results,
                             effects, redaction, instructions, and asset loading
+  tool-manifest.json        Generated host-neutral tool and environment inventory
   extensions/grc-tools/     Native cloud, SaaS, framework, and public-data tools
   extensions/grc-tools.ts   Pi extension combining domain and compute tools
   pi/                       Pi terminal, setup, and compute backend implementation
@@ -43,6 +44,10 @@ cli/
 
 Compiled TypeScript mirrors those directories under `dist/`: shared code is in `dist/core/`, and the TypeScript SDK adapters are in `dist/adapters/`. The Codex `.mjs` worker runs directly from `adapters/codex/` and imports the built core. Tool implementations stay in one place; adapters translate their schemas, results, and host approval behavior rather than duplicating connectors.
 
+Native integrations implement `GrcToolDefinition` from `core/tool-definition.ts`: a schema, an optional argument preparation function, and `execute(callId, args, signal)`. They register through `GrcToolRegistrar`; no agent SDK or terminal context is part of this contract. The common executor validates prepared arguments strictly and redacts errors. Hosts convert the returned content and metadata for their own SDK. Pi's schema compatibility marker is applied only in `pi/tool-adapter.ts`.
+
+Shared credential scrubbers live in `extensions/grc-tools/security/`; each integration creates its own instance so remembered secrets stay isolated. Bundle writers enforce output containment and reject symlink roots through `secure-output.ts` and `atomic-output.ts`. Change these shared policies with their cross-vendor regression tests.
+
 To inspect or call shared tools without an agent loop:
 
 ```bash
@@ -59,6 +64,8 @@ Calls require a JSON object on stdin. File-writing tools are denied unless the c
 - Change a host's model, sessions, approvals, or SDK translation in its own adapter folder or `pi/`.
 - Change shared GRC role, workflows, and personas in `.grclanker/`, `prompts/`, and `skills/`.
 
-After adding a native tool, run `npm --prefix cli run sync:cursor-tools` to update the Cursor/Grok project's generated tool definitions. OpenAI and Codex select tools from the shared registry. The old `agent-sdk:*` and `sync:agent-sdk-tools` script names remain compatibility aliases for Cursor/Grok; new instructions use `cursor:*` and `sync:cursor-tools`.
+After adding a native tool, run `npm --prefix cli run sync:cursor-tools` to update the Cursor/Grok project's generated tool definitions, then `npm --prefix cli run sync:tool-manifest`. The checked-in manifest supplies website search, documentation identifier checks, and catalog generation without loading an agent host. OpenAI and Codex select tools from the shared registry. The old `agent-sdk:*` and `sync:agent-sdk-tools` script names remain compatibility aliases for Cursor/Grok; new instructions use `cursor:*` and `sync:cursor-tools`.
 
 Run `npm --prefix cli run test:cli` for the CLI regression suite, `npm --prefix cli run test:cursor:validate` for the pinned Cursor SDK's discovery/execution smoke test, and `npm --prefix cli run codex:check` for the Codex SDK/MCP offline check after installing its dependencies. These checks do not establish live model or tenant access.
+
+`npm --prefix cli run verify` builds once, runs the unit suite and SDK validation, and checks generated specs and the manifest. Individual validation commands use the existing build. A build compiles into a staging directory and publishes it only after compilation succeeds, preserving the last runnable build on failure.

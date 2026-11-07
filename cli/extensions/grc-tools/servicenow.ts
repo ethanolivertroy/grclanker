@@ -1,3 +1,7 @@
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
+import { MissingAuthenticationError } from "./auth-errors.js";
+import { ensurePrivateDir, resolveSecureOutputPath, writeSecureTextFile, countFilesRecursively } from "./secure-output.js";
+export { resolveSecureOutputPath };
 /**
  * ServiceNow instance security inspector for grclanker.
  *
@@ -6,24 +10,22 @@
  * is evidence-gated: unreadable, forbidden, ACL-filtered, truncated, or empty
  * inventories never produce a pass on their own.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-} from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { Type } from "typebox";
 import { YAMLError, parse as parseYaml } from "yaml";
 import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SERVICENOW_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { BatchVerdicts, hydrateBatchFrameworkMappings, withIntegrationToolContracts  } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import {
+  collectionError, collectionReadable, completeCollection, mapCollection, observedValue, populationValue,
+  partialCollection, skippedCollection, unavailableCollection,
+  type CollectionOutcome,
+} from "./hardening/collection-status.js";
 import {
   SERVICENOW_BASELINE_HARDENING_PROPERTIES,
   SERVICENOW_INSTANCE_SECURITY_PROPERTIES,
@@ -201,25 +203,35 @@ export interface ServicenowResolvedConfig {
   sourceChain: string[];
 }
 
-export interface TableSnapshot {
-  table: string;
-  query?: string;
+interface TableRead {
   rows: JsonRecord[];
   total?: number;
-  pages: number;
   truncated: boolean;
-  /** Why pagination stopped before the inventory was exhausted; set whenever truncated is true. */
   truncationReason?: string;
-  /** True when rows came back without an X-Total-Count header, so the population size is unproven. */
   totalUnknown?: boolean;
-  partial: boolean;
-  error?: string;
-  statusCode?: number;
-  unavailable?: string;
-  /** Path of the Table API request that was issued for this snapshot; absent when no request was made. */
-  endpoint?: string;
-  /** Set when no request was issued at all, with the reason; the flags and counts on such a snapshot are placeholders. */
-  skipped?: string;
+}
+
+/** Failed and skipped requests have no row list or population flags. */
+export type TableSnapshot = CollectionOutcome<TableRead> & {
+  table: string;
+  query?: string;
+  /** Count of answered pages, retained if a later request failed. */
+  pages: number;
+  /** A documented Invalid table response from an optional plugin's table. */
+  missingTableReason?: string;
+};
+
+/** Observations remain absent for unread inventories; evaluations gate on their sources. */
+function observedRows(snapshot: TableSnapshot): JsonRecord[] | null {
+  return collectionReadable(snapshot) ? snapshot.value.rows : null;
+}
+
+function tableRead(snapshot: TableSnapshot): TableRead | undefined {
+  return collectionReadable(snapshot) ? snapshot.value : undefined;
+}
+
+function tableError(snapshot: TableSnapshot): string | undefined {
+  return collectionError(snapshot);
 }
 
 export interface CountResult {
@@ -247,22 +259,29 @@ export interface NotCollectedMarker {
   pages?: number;
 }
 
-/** True when a Table API request was issued and answered with rows (possibly none); false for denied, errored, unavailable, or skipped reads. */
-function tableCollected(snapshot: TableSnapshot): boolean {
-  return !snapshot.error && !snapshot.unavailable && !snapshot.skipped;
-}
-
-export function tableCoreData(snapshot: TableSnapshot): TableSnapshot | NotCollectedMarker {
-  if (tableCollected(snapshot)) return snapshot;
-  const reason = snapshot.error
-    ?? (snapshot.skipped ? `not requested: ${snapshot.skipped}` : `table unavailable: ${snapshot.unavailable}`);
+export function tableCoreData(snapshot: TableSnapshot): JsonRecord | NotCollectedMarker {
+  if (collectionReadable(snapshot)) {
+    const value = snapshot.value;
+    return {
+      table: snapshot.table,
+      query: snapshot.query,
+      rows: value.rows,
+      total: value.total,
+      pages: snapshot.pages,
+      truncated: value.truncated,
+      ...(value.truncationReason ? { truncationReason: value.truncationReason } : {}),
+      ...(value.totalUnknown ? { totalUnknown: true } : {}),
+      partial: snapshot.state === "partial",
+      endpoint: snapshot.endpoint ?? undefined,
+    };
+  }
   return {
     collected: false,
     table: snapshot.table,
     query: snapshot.query ?? null,
-    status: snapshot.statusCode ?? null,
-    endpoint: snapshot.endpoint ?? null,
-    error: reason,
+    status: snapshot.status,
+    endpoint: snapshot.endpoint,
+    error: snapshot.missingTableReason ? `table unavailable: ${snapshot.missingTableReason}` : tableError(snapshot)!,
     ...(snapshot.pages > 0 ? { pages: snapshot.pages } : {}),
   };
 }
@@ -779,68 +798,13 @@ function truncateList<T>(items: T[], max = 25): T[] {
   return items.slice(0, max);
 }
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
 
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
-  if (
-    relativeTarget === ".."
-    || relativeTarget.startsWith(`..${join("/")}`)
-    || relativeTarget.startsWith("..")
-  ) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
 
-  const pathSegments = relativeTarget.split(/[\\/]+/).filter(Boolean);
-  let currentPath = realBase;
-  for (const segment of pathSegments) {
-    currentPath = join(currentPath, segment);
-    if (!existsSync(currentPath)) break;
-    const currentStat = lstatSync(currentPath);
-    if (currentStat.isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked parent directory: ${currentPath}`);
-    }
-  }
 
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  const realParent = realpathSync(parent);
-  if (lstatSync(realParent).isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
 
-  return resolvedTarget;
-}
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
 
-async function countFilesRecursively(rootDir: string): Promise<number> {
-  let total = 0;
-  const entries = await readdir(rootDir, { withFileTypes: true });
-  for (const entry of entries) {
-    const pathname = join(rootDir, entry.name);
-    if (entry.isDirectory()) {
-      total += await countFilesRecursively(pathname);
-    } else if (entry.isFile()) {
-      total += 1;
-    }
-  }
-  return total;
-}
+
 
 function parseAuthMode(value: string | undefined): ServicenowAuthMode | undefined {
   const normalized = value?.trim().toLowerCase();
@@ -936,7 +900,7 @@ function inferAuthMode(overlay: ConfigOverlay): ServicenowAuthMode {
   if (overlay.accessToken) return "oauth";
   if (overlay.clientId && overlay.clientSecret) return "oauth";
   if (overlay.username && overlay.password) return "basic";
-  throw new Error(
+  throw new MissingAuthenticationError(
     "ServiceNow credentials are required. Set SERVICENOW_USERNAME plus SERVICENOW_PASSWORD for basic auth, SERVICENOW_CLIENT_ID plus SERVICENOW_CLIENT_SECRET (optionally with username and password for the password grant) for OAuth, or SERVICENOW_ACCESS_TOKEN for a pre-issued bearer token.",
   );
 }
@@ -980,7 +944,7 @@ export function resolveServicenowConfiguration(
 
   const rawUrl = overlay.instanceUrl ?? (overlay.instanceName ? `https://${overlay.instanceName}.service-now.com` : undefined);
   if (!rawUrl) {
-    throw new Error("SERVICENOW_URL or SERVICENOW_INSTANCE (or an instance_url / instance argument) is required.");
+    throw new MissingAuthenticationError("SERVICENOW_URL or SERVICENOW_INSTANCE (or an instance_url / instance argument) is required.");
   }
   const instanceUrl = normalizeBaseUrl(rawUrl);
   const instanceName = overlay.instanceName ?? new URL(instanceUrl).hostname.split(".")[0];
@@ -989,12 +953,12 @@ export function resolveServicenowConfiguration(
   switch (authMode) {
     case "basic":
       if (!overlay.username || !overlay.password) {
-        throw new Error("ServiceNow basic auth requires SERVICENOW_USERNAME and SERVICENOW_PASSWORD.");
+        throw new MissingAuthenticationError("ServiceNow basic auth requires SERVICENOW_USERNAME and SERVICENOW_PASSWORD.");
       }
       break;
     case "oauth":
       if (!overlay.accessToken && (!overlay.clientId || !overlay.clientSecret)) {
-        throw new Error("ServiceNow OAuth requires SERVICENOW_CLIENT_ID and SERVICENOW_CLIENT_SECRET (or SERVICENOW_ACCESS_TOKEN).");
+        throw new MissingAuthenticationError("ServiceNow OAuth requires SERVICENOW_CLIENT_ID and SERVICENOW_CLIENT_SECRET (or SERVICENOW_ACCESS_TOKEN).");
       }
       break;
     case "mtls":
@@ -1197,7 +1161,7 @@ export interface ServicenowTableQuery {
  */
 async function readTable(client: Pick<ServicenowReadClient, "queryTable">, table: string, options: ServicenowTableQuery = {}): Promise<TableSnapshot> {
   const snapshot = await client.queryTable(table, options);
-  return { ...snapshot, rows: scrubDataStrings(snapshot.rows) };
+  return { ...snapshot, ...mapCollection(snapshot, (value) => ({ ...value, rows: scrubDataStrings(value.rows) })) };
 }
 
 export interface ServicenowReadClient {
@@ -1446,6 +1410,7 @@ export class ServicenowApiClient implements ServicenowReadClient {
     const rows: JsonRecord[] = [];
     let total: number | undefined;
     let pages = 0;
+    let responseStatus: number | null = null;
     let truncationReason: string | undefined;
     let currentOffset = 0;
     const visitedUrls = new Set<string>();
@@ -1462,8 +1427,12 @@ export class ServicenowApiClient implements ServicenowReadClient {
     try {
       while (url) {
         visitedUrls.add(url);
-        const { payload, headers } = await this.requestJson(url);
+        const { payload, headers, status } = await this.requestJson(url);
+        responseStatus = status;
         pages += 1;
+        if (!Array.isArray(payload.result) || payload.result.some((row) => asObject(row) === undefined)) {
+          throw new Error("ServiceNow Table API response did not include an array of record objects.");
+        }
         const pageRows = projectRows(asRecordArray(payload.result), options.fields);
         rows.push(...pageRows);
         const count = asNumber(headers.get("x-total-count"));
@@ -1503,37 +1472,31 @@ export class ServicenowApiClient implements ServicenowReadClient {
       }
     } catch (error) {
       rethrowIfAborted(error);
-      // The in-memory flags on a failed read are placeholders; every rendered surface (core_data,
-      // evidence, summaries) reads them through tableCoreData or snapshotEvidence, which render null.
       return {
+        ...unavailableCollection<TableRead>(table, this.redact(errorMessage(error)), {
+          status: error instanceof ServicenowApiError ? error.status : responseStatus,
+          endpoint,
+        }),
         table,
         query: options.query,
-        rows: [],
-        total,
         pages,
-        truncated: false,
-        partial: false,
-        error: this.redact(errorMessage(error)),
-        statusCode: error instanceof ServicenowApiError ? error.status : undefined,
-        endpoint,
       };
     }
 
     const truncated = truncationReason !== undefined;
     const totalUnknown = total === undefined && rows.length > 0;
-    return {
-      table,
-      query: options.query,
-      rows,
-      total,
-      pages,
-      truncated,
+    const value: TableRead = {
+      rows, total, truncated,
       ...(truncationReason ? { truncationReason } : {}),
       ...(totalUnknown ? { totalUnknown } : {}),
-      partial: truncated || totalUnknown || (total !== undefined && total > rows.length),
-      endpoint,
     };
+    const partial = truncated || total === undefined || total > rows.length;
+    const outcome = partial
+      ? partialCollection(table, value, truncationReason ?? (total === undefined ? "population total unknown" : "ACL-filtered or hidden rows"), { endpoint })
+      : completeCollection(table, value, { endpoint });
+    return { ...outcome, table, query: options.query, pages };
   }
+
 
   async countRecords(table: string, query?: string): Promise<CountResult> {
     const endpoint = `/api/now/stats/${encodeURIComponent(table)}`;
@@ -1558,55 +1521,38 @@ export class ServicenowApiClient implements ServicenowReadClient {
   }
 }
 
-function snapshotIssue(snapshot: TableSnapshot): string | undefined {
-  if (snapshot.error) {
-    if (snapshot.skipped) {
-      return `${snapshot.table} was not requested (${snapshot.skipped})`;
-    }
-    if (snapshot.statusCode === 401 || snapshot.statusCode === 403) {
-      return `${snapshot.table} read was forbidden (${snapshot.statusCode})`;
-    }
-    return `${snapshot.table} read failed (${snapshot.error})`;
+function snapshotIssue(snapshot: TableSnapshot, inputs: readonly TableSnapshot[] = []): string | undefined {
+  if (snapshot.missingTableReason || collectionReadable(snapshot)) return undefined;
+  if (snapshot.state === "skipped") {
+    // The child query is unnecessary when its actual parent supplied no ids. Keep the child
+    // skipped in evidence; only the observed parent can justify evaluating this branch.
+    const parent = inputs.find((input) => input.key === snapshot.dependency);
+    if (parent && collectionReadable(parent) && parent.value.rows.length === 0) return undefined;
+    return `${snapshot.table} was not requested (${snapshot.reason})`;
   }
-  return undefined;
+  if (snapshot.status === 401 || snapshot.status === 403) return `${snapshot.table} read was forbidden (${snapshot.status})`;
+  return `${snapshot.table} read failed (${snapshot.error})`;
 }
 
-/**
- * Tables that belong to an inactive plugin do not exist on the instance and the
- * Table API answers 400 Invalid table. That is a documented state, not a read
- * failure, so the snapshot is marked unavailable and left readable for gating.
- */
+/** A missing optional-plugin table remains unavailable, with its documented cause retained. */
 function normalizeMissingTable(snapshot: TableSnapshot, reason: string): TableSnapshot {
-  if (snapshot.statusCode === 400 && /invalid table/i.test(snapshot.error ?? "")) {
-    // The observed status code and message are kept so the core_data marker names what the API answered.
-    return { ...snapshot, rows: [], error: undefined, truncated: false, partial: false, unavailable: `${reason} (${snapshot.error})` };
-  }
-  return snapshot;
+  return snapshot.state === "unavailable" && snapshot.status === 400 && /invalid table/i.test(snapshot.error)
+    ? { ...snapshot, missingTableReason: `${reason} (${snapshot.error})` }
+    : snapshot;
 }
 
 function snapshotPartialNote(snapshot: TableSnapshot): string | undefined {
-  if (snapshot.error) return undefined;
-  if (snapshot.truncated) {
-    return `${snapshot.table} was truncated at ${snapshot.rows.length} of ${snapshot.total ?? "unknown"} rows (${snapshot.truncationReason ?? "record limit reached"})`;
-  }
-  if (snapshot.total !== undefined && snapshot.total > snapshot.rows.length) {
-    return `${snapshot.table} returned ${snapshot.rows.length} of ${snapshot.total} rows (ACL-filtered or hidden rows)`;
-  }
-  if (visibilityUnproven(snapshot)) {
-    return `${snapshot.table} returned 0 rows without an X-Total-Count header (visibility unproven)`;
-  }
-  if (snapshot.totalUnknown) {
-    return `${snapshot.table} returned ${snapshot.rows.length} rows without an X-Total-Count header (total unknown)`;
-  }
+  if (!collectionReadable(snapshot)) return undefined;
+  const value = snapshot.value;
+  if (value.truncated) return `${snapshot.table} was truncated at ${value.rows.length} of ${value.total ?? "unknown"} rows (${value.truncationReason ?? "record limit reached"})`;
+  if (value.total !== undefined && value.total > value.rows.length) return `${snapshot.table} returned ${value.rows.length} of ${value.total} rows (ACL-filtered or hidden rows)`;
+  if (visibilityUnproven(snapshot)) return `${snapshot.table} returned 0 rows without an X-Total-Count header (visibility unproven)`;
+  if (value.totalUnknown) return `${snapshot.table} returned ${value.rows.length} rows without an X-Total-Count header (total unknown)`;
   return undefined;
 }
 
-/**
- * A response with no rows and no X-Total-Count header cannot be told apart
- * from an ACL-filtered read, so it never supports a pass on its own.
- */
 function visibilityUnproven(snapshot: TableSnapshot): boolean {
-  return !snapshot.error && !snapshot.unavailable && snapshot.pages > 0 && snapshot.rows.length === 0 && snapshot.total === undefined;
+  return collectionReadable(snapshot) && snapshot.pages > 0 && snapshot.value.rows.length === 0 && snapshot.value.total === undefined;
 }
 
 function snapshotErrors(label: string, snapshot: TableSnapshot): string[] {
@@ -1625,11 +1571,12 @@ function countErrors(label: string, count: CountResult): string[] {
 type TableState = "complete" | "partial" | "unread" | "unavailable" | "not_requested";
 
 function tableState(snapshot: TableSnapshot): TableState {
-  if (snapshot.skipped) return "not_requested";
-  if (snapshot.error) return "unread";
-  if (snapshot.unavailable) return "unavailable";
-  if (snapshot.partial || visibilityUnproven(snapshot)) return "partial";
-  return "complete";
+  if (snapshot.missingTableReason) return "unavailable";
+  switch (snapshot.state) {
+    case "skipped": return "not_requested";
+    case "unavailable": return "unread";
+    default: return snapshot.state;
+  }
 }
 
 /**
@@ -1641,15 +1588,15 @@ function describeTable(snapshot: TableSnapshot): string {
   const state = tableState(snapshot);
   switch (state) {
     case "unread":
-      return `${snapshot.table} read: unread (${snapshot.error})`;
+      return `${snapshot.table} read: unread (${tableError(snapshot)})`;
     case "not_requested":
-      return `${snapshot.table} read: not requested (${snapshot.skipped})`;
+      return `${snapshot.table} read: not requested (${snapshot.state === "skipped" ? snapshot.reason : ""})`;
     case "unavailable":
-      return `${snapshot.table} read: unavailable (${snapshot.unavailable})`;
+      return `${snapshot.table} read: unavailable (${snapshot.missingTableReason})`;
     case "partial":
       return `${snapshot.table} read: partial (${snapshotPartialNote(snapshot) ?? "visible rows are not the full population"})`;
     case "complete":
-      return `${snapshot.table} read: complete (${snapshot.rows.length} row${snapshot.rows.length === 1 ? "" : "s"}${snapshot.total !== undefined ? ` of ${snapshot.total}` : ""})`;
+      return `${snapshot.table} read: complete (${visibleRows(snapshot)} row${visibleRows(snapshot) === 1 ? "" : "s"}${tableRead(snapshot)?.total !== undefined ? ` of ${tableRead(snapshot)?.total}` : ""})`;
     default: {
       const exhaustive: never = state;
       throw new Error(`Unhandled table state ${String(exhaustive)}`);
@@ -1667,40 +1614,12 @@ function tablesComplete(snapshots: TableSnapshot[]): boolean {
   return snapshots.every((snapshot) => tableState(snapshot) === "complete");
 }
 
-function tablesReadable(snapshots: TableSnapshot[]): boolean {
-  return snapshots.every((snapshot) => !snapshot.error);
-}
-
-function isAbsenceValue(value: unknown): boolean {
-  if (value === 0) return true;
-  if (Array.isArray(value)) return value.length === 0;
-  if (value !== null && typeof value === "object") return Object.keys(value as object).length === 0;
-  return false;
-}
-
-/**
- * A count, list, or map derived from one or more table reads. It renders null when any source was not
- * read, and null when a source is partial or unavailable and the value would assert absence (0, [], {}),
- * because a partly read inventory cannot prove that nothing exists.
- */
-function derived<T>(value: T, ...snapshots: TableSnapshot[]): T | null {
-  if (!tablesReadable(snapshots)) return null;
-  if (!tablesComplete(snapshots) && isAbsenceValue(value)) return null;
-  return value;
-}
-
-function derivedFlag(value: boolean, ...snapshots: TableSnapshot[]): boolean | null {
-  if (!tablesReadable(snapshots)) return null;
-  if (!value && !tablesComplete(snapshots)) return null;
-  return value;
-}
-
 function visibleRows(snapshot: TableSnapshot): number | null {
-  return tableCollected(snapshot) ? snapshot.rows.length : null;
+  return observedRows(snapshot)?.length ?? null;
 }
 
 function totalRows(snapshot: TableSnapshot): number | null {
-  return tableCollected(snapshot) ? snapshot.total ?? null : null;
+  return tableRead(snapshot)?.total ?? null;
 }
 
 function countValue(count: CountResult): number | null {
@@ -1708,7 +1627,7 @@ function countValue(count: CountResult): number | null {
 }
 
 function principalCount(value: number, ...snapshots: TableSnapshot[]): number | null {
-  return tablesComplete(snapshots) ? value : null;
+  return populationValue(value, ...snapshots);
 }
 
 /**
@@ -1717,31 +1636,33 @@ function principalCount(value: number, ...snapshots: TableSnapshot[]): number | 
  * consumer cannot mistake a placeholder `truncated: false` or `visible_rows: 0` for an observation.
  */
 function snapshotEvidence(snapshot: TableSnapshot): JsonRecord {
-  const listed = tableCollected(snapshot);
+  const value = tableRead(snapshot);
   return {
     table: snapshot.table,
     query: snapshot.query ?? null,
     state: tableState(snapshot),
-    visible_rows: listed ? snapshot.rows.length : null,
-    total_rows: listed ? snapshot.total ?? null : null,
-    // Pages read before a failure are an observation; zero pages on a read that was not answered is not.
-    pages: listed || snapshot.pages > 0 ? snapshot.pages : null,
-    truncated: listed ? snapshot.truncated : null,
-    truncation_reason: snapshot.truncationReason ?? null,
-    total_unknown: listed ? snapshot.totalUnknown ?? false : null,
-    partial: listed ? snapshot.partial : null,
-    error: snapshot.error ?? null,
-    status_code: snapshot.statusCode ?? null,
-    endpoint: snapshot.endpoint ?? null,
-    unavailable: snapshot.unavailable ?? null,
-    skipped: snapshot.skipped ?? null,
+    visible_rows: value?.rows.length ?? null,
+    total_rows: value?.total ?? null,
+    pages: value || snapshot.pages > 0 ? snapshot.pages : null,
+    truncated: value?.truncated ?? null,
+    truncation_reason: value?.truncationReason ?? null,
+    total_unknown: value ? value.totalUnknown ?? false : null,
+    partial: value ? snapshot.state === "partial" : null,
+    error: snapshot.missingTableReason ? null : tableError(snapshot) ?? null,
+    status_code: snapshot.status,
+    endpoint: snapshot.endpoint,
+    unavailable: snapshot.missingTableReason ?? null,
+    skipped: snapshot.state === "skipped" ? snapshot.reason : null,
   };
 }
 
 interface Evaluation {
   status: ServicenowFindingStatus;
   summary: string;
+  /** Claims about the full input population; unavailable or partial inputs render each value null. */
   evidence?: JsonRecord;
+  /** Domain-projected observations with their own explicit source requirements. */
+  observations?: JsonRecord;
   manualEvidence?: string;
   /**
    * Lists that name principals (users, accounts, integrations) as holding or lacking a property, and
@@ -1751,29 +1672,17 @@ interface Evaluation {
   principals?: Record<string, unknown[] | number>;
   /** Thresholds and options echoed into evidence verbatim; they describe the run, not the tenant, so they are never gated. */
   parameters?: JsonRecord;
-  /**
-   * A fail that rests on the absence of a row among the visible rows (no policy row, no provider row).
-   * Under a partial read the absence is provable only against the rows that were not read, so the
-   * verdict renders manual instead of fail; a complete empty read still fails.
-   */
-  absenceClaim?: boolean;
 }
 
-function withoutAbsenceClaims(evidence: JsonRecord | undefined, complete: boolean): JsonRecord {
-  if (!evidence) return {};
-  if (complete) return evidence;
-  return Object.fromEntries(Object.entries(evidence).map(([key, value]) => [key, isAbsenceValue(value) ? null : value]));
-}
-
-function gatedPrincipals(principals: Record<string, unknown[] | number> | undefined, complete: boolean, partialNotes: string[]): JsonRecord {
+function gatedPrincipals(principals: Record<string, unknown[] | number> | undefined, inputs: TableSnapshot[], partialNotes: string[]): JsonRecord {
   if (!principals) return {};
   const gated: JsonRecord = {};
-  for (const [key, value] of Object.entries(principals)) gated[key] = complete ? value : null;
-  gated.principals_withheld = complete ? null : partialNotes.join("; ");
+  for (const [key, value] of Object.entries(principals)) gated[key] = populationValue(value, ...inputs);
+  gated.principals_withheld = tablesComplete(inputs) ? null : partialNotes.join("; ");
   return gated;
 }
 
-function finding(controlNumber: number, evaluation: Evaluation): ServicenowFinding {
+function finding(decisions: BatchVerdicts, controlNumber: number, evaluation: Evaluation): ServicenowFinding {
   const definition = SERVICENOW_CONTROLS[controlNumber];
   const id = findingId(controlNumber);
   return {
@@ -1781,7 +1690,7 @@ function finding(controlNumber: number, evaluation: Evaluation): ServicenowFindi
     control: controlNumber,
     title: definition.title,
     severity: definition.severity,
-    status: evaluation.status,
+    status: decisions.status(findingId(controlNumber)) as ServicenowFindingStatus,
     summary: evaluation.summary,
     evidence: evaluation.evidence,
     mappings: mappingsForControl(controlNumber),
@@ -1789,17 +1698,15 @@ function finding(controlNumber: number, evaluation: Evaluation): ServicenowFindi
   };
 }
 
-const SERVICENOW_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
 
-function recordServicenowDecisionFacts(controlNumber: number, facts: Readonly<Record<string, unknown>>): void {
+
+function recordServicenowDecisionFacts(decisions: BatchVerdicts, controlNumber: number, facts: Readonly<Record<string, unknown>>): void {
   const id = findingId(controlNumber);
-  const store = SERVICENOW_DECISION_CONTEXT.getStore();
-  if (!store) throw new Error(`${id} decision facts were recorded outside a ServiceNow assessment`);
-  store.set(id, facts);
+  decisions.record(id, facts);
 }
 
 function decisionInputsReadable(inputs: TableSnapshot[]): boolean {
-  return inputs.every((snapshot) => snapshotIssue(snapshot) === undefined);
+  return inputs.every((snapshot) => snapshotIssue(snapshot, inputs) === undefined);
 }
 
 function decisionInputsComplete(inputs: TableSnapshot[]): boolean {
@@ -1812,15 +1719,15 @@ function decisionInputsComplete(inputs: TableSnapshot[]): boolean {
  * input prevents pass and is reported with seen and total counts.
  */
 function gatedFinding(
-  controlNumber: number,
+  decisions: BatchVerdicts, controlNumber: number,
   inputs: TableSnapshot[],
   manualEvidence: string,
   evaluate: () => Evaluation,
 ): ServicenowFinding {
-  const issues = inputs.map(snapshotIssue).filter((item): item is string => Boolean(item));
+  const issues = inputs.map((snapshot) => snapshotIssue(snapshot, inputs)).filter((item): item is string => Boolean(item));
   const inputEvidence: JsonRecord = { inputs: inputs.map(snapshotEvidence) };
   if (issues.length > 0) {
-    return finding(controlNumber, {
+    return finding(decisions, controlNumber, {
       status: "manual",
       summary: `Verdict unknown: ${issues.join("; ")}. Collect the evidence manually.`,
       evidence: inputEvidence,
@@ -1834,36 +1741,29 @@ function gatedFinding(
   const evidence = {
     ...inputEvidence,
     ...(evaluation.parameters ?? {}),
-    ...withoutAbsenceClaims(evaluation.evidence, complete),
-    ...gatedPrincipals(evaluation.principals, complete, partialNotes),
+    ...Object.fromEntries(Object.entries(evaluation.evidence ?? {}).map(([key, value]) => [key, populationValue(value, ...inputs)])),
+    ...(evaluation.observations ?? {}),
+    ...gatedPrincipals(evaluation.principals, inputs, partialNotes),
   };
   if (complete) {
-    return finding(controlNumber, { ...evaluation, evidence, manualEvidence: evaluation.manualEvidence ?? (evaluation.status === "manual" ? manualEvidence : undefined) });
+    return finding(decisions, controlNumber, { ...evaluation, evidence, manualEvidence: evaluation.manualEvidence ?? (evaluation.status === "manual" ? manualEvidence : undefined) });
   }
 
   const partialSummary = `Partial view: ${partialNotes.join("; ")}.`;
   switch (evaluation.status) {
     case "pass":
-      return finding(controlNumber, {
+      return finding(decisions, controlNumber, {
         status: "warn",
         summary: `${evaluation.summary} ${partialSummary} The verdict is downgraded because the visible rows are not the full population.`,
         evidence,
         manualEvidence,
       });
     case "fail":
-      if (evaluation.absenceClaim) {
-        return finding(controlNumber, {
-          status: "manual",
-          summary: `${evaluation.summary} ${partialSummary} The absence this verdict rests on cannot be asserted for the rows that were not read, so the verdict is manual (unknown).`,
-          evidence,
-          manualEvidence,
-        });
-      }
-      return finding(controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence });
+      return finding(decisions, controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence });
     case "warn":
-      return finding(controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence });
+      return finding(decisions, controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence });
     case "manual":
-      return finding(controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence, manualEvidence: evaluation.manualEvidence ?? manualEvidence });
+      return finding(decisions, controlNumber, { ...evaluation, summary: `${evaluation.summary} ${partialSummary}`, evidence, manualEvidence: evaluation.manualEvidence ?? manualEvidence });
     default: {
       const exhaustive: never = evaluation.status;
       throw new Error(`Unhandled finding status: ${String(exhaustive)}`);
@@ -1878,7 +1778,7 @@ interface PropertyReading {
 }
 
 function readProperty(snapshot: TableSnapshot, name: string): PropertyReading {
-  const row = snapshot.rows.find((item) => asString(item.name) === name);
+  const row = (observedRows(snapshot) ?? []).find((item) => asString(item.name) === name);
   if (!row) return { name, exists: false };
   return { name, exists: true, value: asString(row.value) ?? "" };
 }
@@ -2124,7 +2024,8 @@ function findPolicyFlag(policy: JsonRecord, pattern: RegExp): boolean | undefine
   return undefined;
 }
 
-function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowIdentityData): ServicenowAssessmentResult {
+export function assessServicenowIdentityAccessData(data: ServicenowIdentityData): ServicenowAssessmentResult {
+  const decisions = new BatchVerdicts(SERVICENOW_SPEC);
   const errors = [
     ...snapshotErrors("users", data.users),
     ...snapshotErrors("privileged role assignments", data.privilegedAssignments),
@@ -2139,8 +2040,8 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
     ...snapshotErrors("multi-factor criteria", data.mfaCriteria),
   ];
 
-  const users = data.users.rows;
-  const assignments = data.privilegedAssignments.rows;
+  const users = (observedRows(data.users) ?? []);
+  const assignments = (observedRows(data.privilegedAssignments) ?? []);
   const elevatedAssignments = assignments.filter((row) => ELEVATED_ROLE_NAMES.includes(rowString(row, "role.name") ?? ""));
   const elevatedUserIds = new Set(elevatedAssignments.map((row) => rowString(row, "user")).filter((item): item is string => Boolean(item)));
   const elevatedUserNames = [...new Set(elevatedAssignments.map(userLabel))];
@@ -2157,17 +2058,17 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
 
   const roleInputs = [data.roleInheritance];
   const roleVisibilityProof = data.roleInheritanceTotal.count;
-  recordServicenowDecisionFacts(3, {
+  recordServicenowDecisionFacts(decisions, 3, {
     readable: decisionInputsReadable(roleInputs),
     complete: decisionInputsComplete(roleInputs),
     role_aggregate_readable: !data.roleInheritanceTotal.error && roleVisibilityProof !== undefined,
     role_aggregate_count: roleVisibilityProof,
     role_pages: data.roleInheritance.pages,
-    role_total_known: data.roleInheritance.total !== undefined,
-    inheriting_count: data.roleInheritance.rows.length,
+    role_total_known: tableRead(data.roleInheritance)?.total !== undefined,
+    inheriting_count: (observedRows(data.roleInheritance) ?? []).length,
   });
-  const roleHierarchy = gatedFinding(3, [data.roleInheritance], "Navigate to User Administration > Roles, open admin and security_admin, and review the Contained By related list; justify every role that inherits admin or security_admin.", () => {
-    const inheriting = data.roleInheritance.rows.map((row) => ({
+  const roleHierarchy = gatedFinding(decisions, 3, [data.roleInheritance], "Navigate to User Administration > Roles, open admin and security_admin, and review the Contained By related list; justify every role that inherits admin or security_admin.", () => {
+    const inheriting = (observedRows(data.roleInheritance) ?? []).map((row) => ({
       role: rowString(row, "role.name") ?? rowString(row, "role") ?? "unknown",
       contains: rowString(row, "contains.name") ?? rowString(row, "contains") ?? "unknown",
     }));
@@ -2176,27 +2077,27 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
       return {
         status: "manual",
         summary: `The sys_user_role_contains inventory could not be proven visible (aggregate count ${visibilityProof ?? "unavailable"}${data.roleInheritanceTotal.error ? `, ${data.roleInheritanceTotal.error}` : ""}), so an empty admin-inheritance result cannot be trusted.`,
-        evidence: { inheriting_roles: truncateList(inheriting), role_contains_total: visibilityProof ?? null },
+        observations: { inheriting_roles: populationValue(truncateList(inheriting), data.roleInheritance), role_contains_total: visibilityProof ?? null },
       };
     }
     if (visibilityUnproven(data.roleInheritance)) {
       return {
         status: "manual",
         summary: `The admin-inheritance query returned no rows and no X-Total-Count header, so the empty result cannot be distinguished from ACL-filtered rows even though sys_user_role_contains holds ${visibilityProof} rows in aggregate.`,
-        evidence: { inheriting_roles: [], role_contains_total: visibilityProof, x_total_count_present: false },
+        observations: { inheriting_roles: populationValue([], data.roleInheritance), role_contains_total: visibilityProof, x_total_count_present: false },
       };
     }
     if (inheriting.length === 0) {
       return {
         status: "pass",
         summary: `No role inherits admin or security_admin across ${visibilityProof} role containment rows.`,
-        evidence: { inheriting_roles: [], role_contains_total: visibilityProof },
+        observations: { inheriting_roles: populationValue([], data.roleInheritance), role_contains_total: visibilityProof },
       };
     }
     return {
       status: "warn",
       summary: `${inheriting.length} role containment rows grant admin or security_admin through inheritance (${truncateList(inheriting.map((item) => item.role), 10).join(", ")}); confirm each follows least privilege.`,
-      evidence: { inheriting_roles: truncateList(inheriting), role_contains_total: visibilityProof },
+      observations: { inheriting_roles: populationValue(truncateList(inheriting), data.roleInheritance), role_contains_total: visibilityProof },
     };
   });
 
@@ -2220,7 +2121,7 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
     elevatedUserIds.has(rowString(user, "sys_id") ?? "")
     && !parseServicenowDate(user.last_login_time));
   const decisionLockedOut = users.filter((user) => rowBoolean(user, "locked_out") === true);
-  recordServicenowDecisionFacts(4, {
+  recordServicenowDecisionFacts(decisions, 4, {
     readable: decisionInputsReadable(userAccessInputs),
     complete: decisionInputsComplete(userAccessInputs),
     user_count: users.length,
@@ -2234,19 +2135,19 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
       + multiPrivilegedUsers.length
       + decisionLockedOut.length,
   });
-  const userAccessReview = gatedFinding(4, [data.users, data.privilegedAssignments], `Export User Administration > Users filtered on Active = true with Last login time, and User Administration > Roles > admin > Users; review accounts with no login in ${data.inactiveDays} days and every admin assignment.`, () => {
+  const userAccessReview = gatedFinding(decisions, 4, [data.users, data.privilegedAssignments], `Export User Administration > Users filtered on Active = true with Last login time, and User Administration > Roles > admin > Users; review accounts with no login in ${data.inactiveDays} days and every admin assignment.`, () => {
     if (users.length === 0) {
       return {
         status: "manual",
         summary: "No active users were visible although the authenticated account itself is active, so sys_user is being filtered; the access review cannot be performed from this credential.",
-        evidence: { active_users: 0 },
+        observations: { active_users: observedValue(0, data.users) },
       };
     }
     if (elevatedAssignments.length === 0) {
       return {
         status: "manual",
         summary: `No admin or security_admin role assignments were visible for ${users.length} active users; every instance has at least one admin, so sys_user_has_role is being filtered.`,
-        evidence: { active_users: users.length, admin_assignments: 0 },
+        observations: { active_users: observedValue(users.length, data.users), admin_assignments: populationValue(0, data.privilegedAssignments) },
       };
     }
     const stale: string[] = [];
@@ -2267,7 +2168,7 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
     const adminsWithoutLoginDate = users.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? "") && !parseServicenowDate(user.last_login_time)).map(userLabel);
     const lockedOut = users.filter((user) => rowBoolean(user, "locked_out") === true);
     const lockedOutAdmins = lockedOut.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? "")).map(userLabel);
-    const evidence: JsonRecord = { active_users: users.length };
+    const evidence: JsonRecord = { active_users: observedValue(users.length, data.users) };
     const parameters: JsonRecord = { max_admins: data.maxAdmins, inactive_days: data.inactiveDays };
     const principals: Evaluation["principals"] = {
       admin_users: elevatedUserIds.size,
@@ -2293,7 +2194,7 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
         summary: complete
           ? `${elevatedUserIds.size} active users hold admin or security_admin (threshold ${data.maxAdmins}); ${staleAdmins.length} admins have not logged in for ${data.inactiveDays}+ days; ${stale.length} active users are inactive; ${neverLoggedIn.length} have no last login date and are not counted as active; ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins).`
           : `Among the visible rows, ${staleAdmins.length > 0 ? `an admin or security_admin holder has not logged in for ${data.inactiveDays}+ days` : `more than ${data.maxAdmins} active users hold admin or security_admin`}; ${withheld}.`,
-        evidence,
+        observations: evidence,
         parameters,
         principals,
       };
@@ -2304,7 +2205,7 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
         summary: complete
           ? `${elevatedUserIds.size} admin users are within the threshold of ${data.maxAdmins}, but ${stale.length} active users are inactive for ${data.inactiveDays}+ days, ${neverLoggedIn.length} have no last login date (reported separately, never counted as active), ${lockedOut.length} active accounts are locked out (${lockedOutAdmins.length} admins; review or deactivate them), and ${multiPrivilegedUsers.length} users hold multiple privileged roles.`
           : `Among the visible rows, accounts that are inactive for ${data.inactiveDays}+ days, have no last login date, are locked out, or hold multiple privileged roles were observed; ${withheld}.`,
-        evidence,
+        observations: evidence,
         parameters,
         principals,
       };
@@ -2314,7 +2215,7 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
       summary: complete
         ? `${users.length} active users reviewed: ${elevatedUserIds.size} admins within the threshold of ${data.maxAdmins}, no user inactive for ${data.inactiveDays}+ days, every active user has a last login date, no active account is locked out, and no user stacks multiple privileged roles.`
         : `No inactive, never-logged-in, locked-out, or multi-privileged account was observed among the visible rows and the visible admin holders are within the threshold of ${data.maxAdmins}, but the user inventory was not fully read, so the population is unknown.`,
-      evidence,
+      observations: evidence,
       parameters,
       principals,
     };
@@ -2322,13 +2223,13 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
 
   const passwordInputs = [data.properties, data.passwordPolicies];
   const decisionEnablement = readProperty(data.properties, "glide.enable.password_policy");
-  const decisionPolicies = data.passwordPolicies.rows.map((policy) => ({
+  const decisionPolicies = (observedRows(data.passwordPolicies) ?? []).map((policy) => ({
     minLength: findPolicyNumber(policy, /min.*(length|len)/i),
     upper: findPolicyFlag(policy, /upper/i),
     lower: findPolicyFlag(policy, /lower/i),
     digit: findPolicyFlag(policy, /digit|numer/i),
   }));
-  recordServicenowDecisionFacts(6, {
+  recordServicenowDecisionFacts(decisions, 6, {
     readable: decisionInputsReadable(passwordInputs),
     complete: decisionInputsComplete(passwordInputs),
     password_policy_property_value: decisionEnablement.exists ? asBoolean(decisionEnablement.value) : undefined,
@@ -2339,29 +2240,47 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
       && (policy.minLength < data.minPasswordLength || policy.upper === false || policy.lower === false || policy.digit === false)).length,
     password_policy_property_present: decisionEnablement.exists,
   });
-  const passwordPolicy = gatedFinding(6, [data.properties, data.passwordPolicies], `Open Password Policy > Password Policies > Default and Password Policy > Properties; record minimum length (expected ${data.minPasswordLength}+), character class requirements, and glide.enable.password_policy.`, () => {
+  const passwordManualEvidence = `Open Password Policy > Password Policies > Default and Password Policy > Properties; record minimum length (expected ${data.minPasswordLength}+), character class requirements, and glide.enable.password_policy.`;
+  const passwordPopulationUnknown = decisionPolicies.length === 0
+    && decisionInputsReadable(passwordInputs)
+    && !decisionInputsComplete(passwordInputs)
+    && !(decisionEnablement.exists && asBoolean(decisionEnablement.value) === false);
+  const passwordPolicy = passwordPopulationUnknown
+    ? finding(decisions, 6, {
+      status: "manual",
+      summary: `No password_policy rows are visible; the baseline Default policy should exist, so either the policy was removed or the credential cannot read it. Partial view: ${passwordInputs.map(snapshotPartialNote).filter(Boolean).join("; ")}. The absence this verdict rests on cannot be asserted for the rows that were not read, so the verdict is manual (unknown).`,
+      evidence: {
+        inputs: passwordInputs.map(snapshotEvidence),
+        glide_enable_password_policy: decisionEnablement.exists ? decisionEnablement.value : null,
+        glide_apply_password_policy_on_login: readProperty(data.properties, "glide.apply.password_policy.on_login").value ?? null,
+        glide_login_no_blank_password: readProperty(data.properties, "glide.login.no_blank_password").value ?? null,
+        policy_count: populationValue(0, data.passwordPolicies),
+        min_password_length_threshold: data.minPasswordLength,
+      },
+      manualEvidence: passwordManualEvidence,
+    })
+    : gatedFinding(decisions, 6, passwordInputs, passwordManualEvidence, () => {
     const enablement = readProperty(data.properties, "glide.enable.password_policy");
     const applyOnLogin = readProperty(data.properties, "glide.apply.password_policy.on_login");
     const noBlank = readProperty(data.properties, "glide.login.no_blank_password");
-    const policies = data.passwordPolicies.rows;
+    const policies = (observedRows(data.passwordPolicies) ?? []);
+    const parameters = { min_password_length_threshold: data.minPasswordLength };
     const evidence: JsonRecord = {
       glide_enable_password_policy: enablement.exists ? enablement.value : null,
       glide_apply_password_policy_on_login: applyOnLogin.exists ? applyOnLogin.value : null,
       glide_login_no_blank_password: noBlank.exists ? noBlank.value : null,
       policy_count: policies.length,
-      min_password_length_threshold: data.minPasswordLength,
     };
     if (enablement.exists && asBoolean(enablement.value) === false) {
-      return { status: "fail", summary: "glide.enable.password_policy is set to false, so the password_policy table is not enforced.", evidence };
+      return { status: "fail", summary: "glide.enable.password_policy is set to false, so the password_policy table is not enforced.", evidence, parameters };
     }
     if (policies.length === 0) {
-      // A complete empty read fails; a truncated, ACL-filtered, or visibility-unproven zero-row read is an
-      // absence claim over the unread rows and renders manual (gatedFinding).
+      // The incomplete zero-row population was handled above; a complete empty inventory fails.
       return {
         status: "fail",
         summary: "No password_policy rows are visible; the baseline Default policy should exist, so either the policy was removed or the credential cannot read it.",
         evidence,
-        absenceClaim: true,
+        parameters,
       };
     }
     const evaluated = policies.map((policy) => ({
@@ -2381,6 +2300,7 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
         status: "manual",
         summary: `${policies.length} password_policy rows are visible but none exposed a recognizable minimum length column; review the policy form manually.`,
         evidence,
+        parameters,
       };
     }
     const weak = evaluated.filter((item) => item.min_length !== undefined && (item.min_length < data.minPasswordLength || item.upper === false || item.lower === false || item.digit === false));
@@ -2389,6 +2309,7 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
         status: "fail",
         summary: `${weak.length}/${evaluated.length} password policies fall below the threshold (minimum length ${data.minPasswordLength}, upper, lower, digit required): ${weak.map((item) => `${item.name} (min ${item.min_length ?? "?"})`).join(", ")}.`,
         evidence,
+        parameters,
       };
     }
     if (!enablement.exists) {
@@ -2396,12 +2317,14 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
         status: "warn",
         summary: `All ${evaluated.length} visible password policies meet the threshold, but glide.enable.password_policy has no sys_properties row; ServiceNow documents it as automatically true, yet the row was not observed so enforcement is not assumed.`,
         evidence,
+        parameters,
       };
     }
     return {
       status: "pass",
       summary: `glide.enable.password_policy is true and all ${evaluated.length} password policies meet the threshold (minimum length ${data.minPasswordLength}, upper, lower, and digit required).`,
       evidence,
+      parameters,
     };
   });
 
@@ -2410,14 +2333,14 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
   const decisionEmailOtp = readProperty(data.properties, "glide.authenticate.multifactor.email.otp.enabled");
   const decisionAdmins = users.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? ""));
   const decisionAdminsWithoutFlag = decisionAdmins.filter((user) => rowBoolean(user, "enable_multifactor_authn") !== true);
-  const decisionCriteria = data.mfaCriteria.rows.map((row) => ({
+  const decisionCriteria = (observedRows(data.mfaCriteria) ?? []).map((row) => ({
     name: rowString(row, "name") ?? rowString(row, "sys_id") ?? "criteria",
     active: rowBoolean(row, "active") ?? null,
     roles: criteriaRoleNames(row),
   }));
   const decisionActiveRoleCriteria = decisionCriteria.filter((item) => /role/i.test(item.name) && item.active === true);
   const decisionEnforcedRoles = new Set(decisionActiveRoleCriteria.flatMap((item) => item.roles));
-  recordServicenowDecisionFacts(7, {
+  recordServicenowDecisionFacts(decisions, 7, {
     readable: decisionInputsReadable(mfaInputs),
     complete: decisionInputsComplete(mfaInputs),
     properties_complete: tablesComplete([data.properties]),
@@ -2431,12 +2354,12 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
     admins_without_mfa_flag_count: decisionAdminsWithoutFlag.length,
     email_otp_property_value: decisionEmailOtp.exists ? asBoolean(decisionEmailOtp.value) : undefined,
   });
-  const mfa = gatedFinding(7, [data.properties, data.users, data.privilegedAssignments, data.mfaCriteria], `Open Multi-factor Authentication > Multi-factor Criteria (${MFA_CRITERIA_TABLE}) and confirm the Role-based multi-factor authentication record is Active with admin and security_admin in its Multi-factor Roles list; open System Properties for glide.authenticate.multifactor and glide.authenticate.multifactor.email.otp.enabled; confirm every admin user carries enable_multifactor_authn or is covered by an MFA authentication policy.`, () => {
+  const mfa = gatedFinding(decisions, 7, [data.properties, data.users, data.privilegedAssignments, data.mfaCriteria], `Open Multi-factor Authentication > Multi-factor Criteria (${MFA_CRITERIA_TABLE}) and confirm the Role-based multi-factor authentication record is Active with admin and security_admin in its Multi-factor Roles list; open System Properties for glide.authenticate.multifactor and glide.authenticate.multifactor.email.otp.enabled; confirm every admin user carries enable_multifactor_authn or is covered by an MFA authentication policy.`, () => {
     const enabled = readProperty(data.properties, "glide.authenticate.multifactor");
     const emailOtp = readProperty(data.properties, "glide.authenticate.multifactor.email.otp.enabled");
     const admins = users.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? ""));
     const adminsWithoutFlag = admins.filter((user) => rowBoolean(user, "enable_multifactor_authn") !== true).map(userLabel);
-    const criteria = data.mfaCriteria.rows.map((row) => ({
+    const criteria = (observedRows(data.mfaCriteria) ?? []).map((row) => ({
       name: rowString(row, "name") ?? rowString(row, "sys_id") ?? "criteria",
       active: rowBoolean(row, "active") ?? null,
       roles: criteriaRoleNames(row),
@@ -2555,11 +2478,11 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
   });
 
   const ssoInputs = [data.ssoProviders, data.ldapServers, data.properties, data.certificates];
-  const decisionActiveSso = data.ssoProviders.rows.filter((row) => rowBoolean(row, "active") === true);
-  const decisionActiveLdap = data.ldapServers.rows.filter((row) => rowBoolean(row, "active") === true);
+  const decisionActiveSso = (observedRows(data.ssoProviders) ?? []).filter((row) => rowBoolean(row, "active") === true);
+  const decisionActiveLdap = (observedRows(data.ldapServers) ?? []).filter((row) => rowBoolean(row, "active") === true);
   const decisionMultisso = readProperty(data.properties, "glide.authenticate.multisso.enabled");
   const decisionRedirect = readProperty(data.properties, "glide.authenticate.sso.redirect.idp");
-  const decisionCertificates = data.certificates.rows.filter((row) => rowBoolean(row, "active") !== false);
+  const decisionCertificates = (observedRows(data.certificates) ?? []).filter((row) => rowBoolean(row, "active") !== false);
   let decisionExpiredCertificates = 0;
   let decisionCertificateConcerns = 0;
   for (const certificate of decisionCertificates) {
@@ -2574,7 +2497,7 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
   }
   if (decisionActiveSso.length > 0 && asBoolean(decisionMultisso.value) !== true) decisionCertificateConcerns += 1;
   if (decisionActiveSso.length > 0 && (!decisionRedirect.exists || !decisionRedirect.value)) decisionCertificateConcerns += 1;
-  recordServicenowDecisionFacts(8, {
+  recordServicenowDecisionFacts(decisions, 8, {
     readable: decisionInputsReadable(ssoInputs),
     complete: decisionInputsComplete(ssoInputs),
     providers_complete: tablesComplete([data.ssoProviders, data.ldapServers]),
@@ -2582,12 +2505,12 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
     expired_certificate_count: decisionExpiredCertificates,
     concern_count: decisionCertificateConcerns,
   });
-  const sso = gatedFinding(8, [data.ssoProviders, data.ldapServers, data.properties, data.certificates], "Open Multi-Provider SSO > Identity Providers and System LDAP > LDAP Servers; record active providers, certificate expiration dates, glide.authenticate.multisso.enabled, and the default redirect IdP.", () => {
-    const activeSso = data.ssoProviders.rows.filter((row) => rowBoolean(row, "active") === true);
-    const activeLdap = data.ldapServers.rows.filter((row) => rowBoolean(row, "active") === true);
+  const sso = gatedFinding(decisions, 8, [data.ssoProviders, data.ldapServers, data.properties, data.certificates], "Open Multi-Provider SSO > Identity Providers and System LDAP > LDAP Servers; record active providers, certificate expiration dates, glide.authenticate.multisso.enabled, and the default redirect IdP.", () => {
+    const activeSso = (observedRows(data.ssoProviders) ?? []).filter((row) => rowBoolean(row, "active") === true);
+    const activeLdap = (observedRows(data.ldapServers) ?? []).filter((row) => rowBoolean(row, "active") === true);
     const multisso = readProperty(data.properties, "glide.authenticate.multisso.enabled");
     const redirect = readProperty(data.properties, "glide.authenticate.sso.redirect.idp");
-    const activeCertificates = data.certificates.rows.filter((row) => rowBoolean(row, "active") !== false);
+    const activeCertificates = (observedRows(data.certificates) ?? []).filter((row) => rowBoolean(row, "active") !== false);
     const expiring: string[] = [];
     const expired: string[] = [];
     const undated: string[] = [];
@@ -2654,19 +2577,19 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
   const decisionAdminIntegrations = assignments.filter((row) =>
     assignmentIsIntegration(row) && ELEVATED_ROLE_NAMES.includes(rowString(row, "role.name") ?? ""));
   const decisionPrivilegedIntegrations = assignments.filter(assignmentIsIntegration);
-  recordServicenowDecisionFacts(14, {
+  recordServicenowDecisionFacts(decisions, 14, {
     readable: decisionInputsReadable(integrationInputs),
     complete: decisionInputsComplete(integrationInputs),
     integration_user_count: decisionIntegrationUsers.length,
     admin_integration_count: decisionAdminIntegrations.length,
     privileged_assignment_count: decisionPrivilegedIntegrations.length,
   });
-  const integrationUsers = gatedFinding(14, [data.users, data.privilegedAssignments, data.oauthEntities], "List User Administration > Users with Web service access only = true or Internal Integration User = true, and System OAuth > Application Registry; confirm each integration account holds only the roles its integration needs and none hold admin.", () => {
+  const integrationUsers = gatedFinding(decisions, 14, [data.users, data.privilegedAssignments, data.oauthEntities], "List User Administration > Users with Web service access only = true or Internal Integration User = true, and System OAuth > Application Registry; confirm each integration account holds only the roles its integration needs and none hold admin.", () => {
     const integration = users.filter(isIntegrationUser);
     const integrationWithAdmin = assignments.filter((row) => assignmentIsIntegration(row) && ELEVATED_ROLE_NAMES.includes(rowString(row, "role.name") ?? "")).map(userLabel);
     const integrationWithPrivilege = assignments.filter(assignmentIsIntegration).map((row) => `${userLabel(row)}:${rowString(row, "role.name") ?? "role"}`);
     const evidence: JsonRecord = {
-      oauth_entities: data.oauthEntities.rows.length,
+      oauth_entities: (observedRows(data.oauthEntities) ?? []).length,
     };
     const principals: Evaluation["principals"] = {
       integration_users: integration.length,
@@ -2690,7 +2613,7 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
     if (integration.length === 0) {
       return {
         status: "manual",
-        summary: `No active user is flagged web_service_access_only or internal_integration_user although ${data.oauthEntities.rows.length} OAuth application registry entries exist; integrations may be running under interactive accounts, which cannot be told apart through the API.`,
+        summary: `No active user is flagged web_service_access_only or internal_integration_user although ${(observedRows(data.oauthEntities) ?? []).length} OAuth application registry entries exist; integrations may be running under interactive accounts, which cannot be told apart through the API.`,
         evidence,
         principals,
       };
@@ -2724,9 +2647,9 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
       active_users_total: totalRows(data.users),
       admin_users: principalCount(elevatedUserIds.size, data.users, data.privilegedAssignments),
       privileged_assignments_visible: visibleRows(data.privilegedAssignments),
-      roles_inheriting_admin: derived(data.roleInheritance.rows.length, data.roleInheritance),
-      active_sso_providers: derived(data.ssoProviders.rows.filter((row) => rowBoolean(row, "active") === true).length, data.ssoProviders),
-      active_ldap_servers: derived(data.ldapServers.rows.filter((row) => rowBoolean(row, "active") === true).length, data.ldapServers),
+      roles_inheriting_admin: populationValue((observedRows(data.roleInheritance) ?? []).length, data.roleInheritance),
+      active_sso_providers: populationValue((observedRows(data.ssoProviders) ?? []).filter((row) => rowBoolean(row, "active") === true).length, data.ssoProviders),
+      active_ldap_servers: populationValue((observedRows(data.ldapServers) ?? []).filter((row) => rowBoolean(row, "active") === true).length, data.ldapServers),
       inventories: {
         users: describeTable(data.users),
         privileged_assignments: describeTable(data.privilegedAssignments),
@@ -2747,9 +2670,7 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
   };
 }
 
-export function assessServicenowIdentityAccessData(data: ServicenowIdentityData): ServicenowAssessmentResult {
-  return runBatchVerdictContext(SERVICENOW_DECISION_CONTEXT, SERVICENOW_SPEC, () => assessServicenowIdentityAccessDataWithDecisionContext(data));
-}
+
 
 export async function assessServicenowIdentityAccess(
   client: Pick<ServicenowReadClient, "queryTable" | "countRecords" | "getNow">,
@@ -2830,7 +2751,8 @@ function classifyEmailConnectionSecurity(row: JsonRecord): EmailAccountSecurity 
   return { name, connection_security: null, level: "unknown", source: "not_returned" };
 }
 
-function assessServicenowPlatformHardeningDataWithDecisionContext(data: ServicenowHardeningData): ServicenowAssessmentResult {
+export function assessServicenowPlatformHardeningData(data: ServicenowHardeningData): ServicenowAssessmentResult {
+  const decisions = new BatchVerdicts(SERVICENOW_SPEC);
   const errors = [
     ...snapshotErrors("hardening properties", data.properties),
     ...snapshotErrors("debug properties", data.debugProperties),
@@ -2842,20 +2764,20 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
 
   const instanceSecurityInputs = [data.properties];
   const instanceSecurityChecks = checkProperties(data.properties, INSTANCE_SECURITY_PROPERTIES);
-  recordServicenowDecisionFacts(1, {
+  recordServicenowDecisionFacts(decisions, 1, {
     readable: decisionInputsReadable(instanceSecurityInputs),
     complete: decisionInputsComplete(instanceSecurityInputs),
     unexpected_value_count: instanceSecurityChecks.filter((item) => item.compliant === false).length,
     absent_count: instanceSecurityChecks.filter((item) => !item.exists).length,
   });
-  const instanceSecurity = gatedFinding(1, [data.properties], "Open System Properties > Security (or the Instance Security Center hardening view) and record glide.security.use_csrf_token, glide.security.csrf.strict.validation.mode, glide.security.file.mime_type.validation, glide.security.diag_txns_acl, and glide.security.strict.user_image_upload.", () =>
+  const instanceSecurity = gatedFinding(decisions, 1, [data.properties], "Open System Properties > Security (or the Instance Security Center hardening view) and record glide.security.use_csrf_token, glide.security.csrf.strict.validation.mode, glide.security.file.mime_type.validation, glide.security.diag_txns_acl, and glide.security.strict.user_image_upload.", () =>
     propertyVerdict(checkProperties(data.properties, INSTANCE_SECURITY_PROPERTIES), "instance security"));
 
   const sessionInputs = [data.properties];
   const decisionTimeout = readProperty(data.properties, "glide.ui.session_timeout");
   const decisionRotate = readProperty(data.properties, "glide.ui.rotate_sessions");
   const decisionTimeoutMinutes = asNumber(decisionTimeout.value);
-  recordServicenowDecisionFacts(5, {
+  recordServicenowDecisionFacts(decisions, 5, {
     readable: decisionInputsReadable(sessionInputs),
     complete: decisionInputsComplete(sessionInputs),
     timeout_present: decisionTimeout.exists,
@@ -2863,15 +2785,15 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
     max_timeout_minutes: data.maxSessionTimeoutMinutes,
     rotate_sessions_value: decisionRotate.exists ? asBoolean(decisionRotate.value) : undefined,
   });
-  const session = gatedFinding(5, [data.properties], `Open System Properties > UI Properties and record glide.ui.session_timeout (expected ${data.maxSessionTimeoutMinutes} minutes or less), glide.ui.rotate_sessions, and glide.ui.user_cookie.max_life_span_in_days.`, () => {
+  const session = gatedFinding(decisions, 5, [data.properties], `Open System Properties > UI Properties and record glide.ui.session_timeout (expected ${data.maxSessionTimeoutMinutes} minutes or less), glide.ui.rotate_sessions, and glide.ui.user_cookie.max_life_span_in_days.`, () => {
     const timeout = readProperty(data.properties, "glide.ui.session_timeout");
     const rotate = readProperty(data.properties, "glide.ui.rotate_sessions");
     const cookieLife = readProperty(data.properties, "glide.ui.user_cookie.max_life_span_in_days");
     const timeoutMinutes = asNumber(timeout.value);
+    const parameters = { max_session_timeout_minutes: data.maxSessionTimeoutMinutes };
     const evidence: JsonRecord = {
       session_timeout_minutes: timeoutMinutes ?? null,
       session_timeout_present: timeout.exists,
-      max_session_timeout_minutes: data.maxSessionTimeoutMinutes,
       rotate_sessions: rotate.exists ? rotate.value : null,
       user_cookie_max_life_span_days: cookieLife.exists ? cookieLife.value : null,
     };
@@ -2880,6 +2802,7 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
         status: "fail",
         summary: `glide.ui.session_timeout is ${timeout.value}, which exceeds the ${data.maxSessionTimeoutMinutes} minute threshold or is not a positive number.`,
         evidence,
+        parameters,
       };
     }
     if (!timeout.exists) {
@@ -2887,6 +2810,7 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
         status: "warn",
         summary: `glide.ui.session_timeout has no sys_properties row; ServiceNow documents a fallback of 30 minutes, but the value is not observed and is not assumed. Set it explicitly to ${data.maxSessionTimeoutMinutes} minutes or less.`,
         evidence,
+        parameters,
       };
     }
     if (rotate.exists && asBoolean(rotate.value) === false) {
@@ -2894,27 +2818,29 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
         status: "warn",
         summary: `glide.ui.session_timeout is ${timeoutMinutes} minutes, within the threshold, but glide.ui.rotate_sessions is false.`,
         evidence,
+        parameters,
       };
     }
     return {
       status: "pass",
       summary: `glide.ui.session_timeout is ${timeoutMinutes} minutes, within the ${data.maxSessionTimeoutMinutes} minute threshold${rotate.exists ? `, and glide.ui.rotate_sessions is ${rotate.value}` : ""}.`,
       evidence,
+      parameters,
     };
   });
 
   const scriptInputs = [data.properties, data.evalScripts];
   const scriptChecks = checkProperties(data.properties, SCRIPT_RESTRICTION_PROPERTIES);
-  recordServicenowDecisionFacts(12, {
+  recordServicenowDecisionFacts(decisions, 12, {
     readable: decisionInputsReadable(scriptInputs),
     complete: decisionInputsComplete(scriptInputs),
     unexpected_value_count: scriptChecks.filter((item) => item.compliant === false).length,
     absent_count: scriptChecks.filter((item) => !item.exists).length,
-    eval_rule_count: data.evalScripts.rows.length,
+    eval_rule_count: (observedRows(data.evalScripts) ?? []).length,
   });
-  const scripts = gatedFinding(12, [data.properties, data.evalScripts], "Open System Properties > Security and record glide.script.use.sandbox, glide.script.allow.ajaxevaluate, glide.script.secure.ajaxgliderecord, and glide.script.ccsi.ispublic; search System Definition > Business Rules for eval( usage.", () => {
+  const scripts = gatedFinding(decisions, 12, [data.properties, data.evalScripts], "Open System Properties > Security and record glide.script.use.sandbox, glide.script.allow.ajaxevaluate, glide.script.secure.ajaxgliderecord, and glide.script.ccsi.ispublic; search System Definition > Business Rules for eval( usage.", () => {
     const verdict = propertyVerdict(checkProperties(data.properties, SCRIPT_RESTRICTION_PROPERTIES), "script restriction");
-    const evalRules = data.evalScripts.rows.map((row) => `${rowString(row, "name") ?? rowString(row, "sys_id") ?? "rule"} (${rowString(row, "collection") ?? "table"})`);
+    const evalRules = (observedRows(data.evalScripts) ?? []).map((row) => `${rowString(row, "name") ?? rowString(row, "sys_id") ?? "rule"} (${rowString(row, "collection") ?? "table"})`);
     const evidence = { ...(verdict.evidence ?? {}), business_rules_using_eval: truncateList(evalRules), business_rules_using_eval_count: evalRules.length };
     if (evalRules.length > 0) {
       return {
@@ -2928,29 +2854,29 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
 
   const hardeningInputs = [data.properties];
   const hardeningChecks = checkProperties(data.properties, HARDENING_PROPERTIES);
-  recordServicenowDecisionFacts(13, {
+  recordServicenowDecisionFacts(decisions, 13, {
     readable: decisionInputsReadable(hardeningInputs),
     complete: decisionInputsComplete(hardeningInputs),
     unexpected_value_count: hardeningChecks.filter((item) => item.compliant === false).length,
     absent_count: hardeningChecks.filter((item) => !item.exists).length,
   });
-  const hardening = gatedFinding(13, [data.properties], "Open System Properties > Security and the Instance Security Center hardening view; record the strict update, strict action, HTML escaping, sanitizer, code tag, X-Frame-Options, and cookie properties.", () =>
+  const hardening = gatedFinding(decisions, 13, [data.properties], "Open System Properties > Security and the Instance Security Center hardening view; record the strict update, strict action, HTML escaping, sanitizer, code tag, X-Frame-Options, and cookie properties.", () =>
     propertyVerdict(checkProperties(data.properties, HARDENING_PROPERTIES), "hardening"));
 
   const debugInputs = [data.properties, data.debugProperties];
-  recordServicenowDecisionFacts(16, {
+  recordServicenowDecisionFacts(decisions, 16, {
     readable: decisionInputsReadable(debugInputs),
     complete: decisionInputsComplete(debugInputs),
-    enabled_debug_count: data.debugProperties.rows.length,
-    hardening_property_count: data.properties.rows.length,
+    enabled_debug_count: (observedRows(data.debugProperties) ?? []).length,
+    hardening_property_count: (observedRows(data.properties) ?? []).length,
   });
-  const debug = gatedFinding(16, [data.properties, data.debugProperties], "Filter System Properties on name contains debug and confirm every debug property is false, then confirm no session debug is enabled for shared accounts.", () => {
-    const enabledDebug = data.debugProperties.rows.map((row) => rowString(row, "name") ?? "property");
-    const evidence: JsonRecord = { enabled_debug_properties: truncateList(enabledDebug), hardening_properties_visible: data.properties.rows.length };
+  const debug = gatedFinding(decisions, 16, [data.properties, data.debugProperties], "Filter System Properties on name contains debug and confirm every debug property is false, then confirm no session debug is enabled for shared accounts.", () => {
+    const enabledDebug = (observedRows(data.debugProperties) ?? []).map((row) => rowString(row, "name") ?? "property");
+    const evidence: JsonRecord = { enabled_debug_properties: truncateList(enabledDebug), hardening_properties_visible: (observedRows(data.properties) ?? []).length };
     if (enabledDebug.length > 0) {
       return { status: "fail", summary: `${enabledDebug.length} debug properties are enabled: ${truncateList(enabledDebug, 10).join(", ")}.`, evidence };
     }
-    if (data.properties.rows.length === 0) {
+    if ((observedRows(data.properties) ?? []).length === 0) {
       return {
         status: "manual",
         summary: "No debug property is enabled, but the companion hardening property read returned zero rows, so sys_properties visibility is not proven and the empty result cannot be trusted.",
@@ -2959,18 +2885,18 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
     }
     return {
       status: "pass",
-      summary: `No sys_properties row whose name contains debug is set to true (sys_properties visibility proven by ${data.properties.rows.length} readable hardening rows).`,
+      summary: `No sys_properties row whose name contains debug is set to true (sys_properties visibility proven by ${(observedRows(data.properties) ?? []).length} readable hardening rows).`,
       evidence,
     };
   });
 
   const ipInputs = [data.properties, data.ipAccessRules, data.ipAuthenticatorPlugin];
   const decisionStrict = readProperty(data.properties, "glide.ip.authenticate.strict");
-  const decisionPluginRow = data.ipAuthenticatorPlugin.rows.find((row) =>
-    rowString(row, "source") === IP_AUTHENTICATOR_PLUGIN) ?? data.ipAuthenticatorPlugin.rows[0];
+  const decisionPluginRow = (observedRows(data.ipAuthenticatorPlugin) ?? []).find((row) =>
+    rowString(row, "source") === IP_AUTHENTICATOR_PLUGIN) ?? (observedRows(data.ipAuthenticatorPlugin) ?? [])[0];
   const decisionPluginState = decisionPluginRow ? pluginActive(decisionPluginRow) : undefined;
-  const decisionActiveRules = data.ipAccessRules.rows.filter((row) => rowBoolean(row, "active") !== false);
-  recordServicenowDecisionFacts(17, {
+  const decisionActiveRules = (observedRows(data.ipAccessRules) ?? []).filter((row) => rowBoolean(row, "active") !== false);
+  recordServicenowDecisionFacts(decisions, 17, {
     readable: decisionInputsReadable(ipInputs),
     complete: decisionInputsComplete(ipInputs),
     plugin_present: decisionPluginRow !== undefined,
@@ -2978,53 +2904,53 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
     plugin_active_value: decisionPluginState,
     active_rule_count: decisionActiveRules.length,
     rule_inventory_complete: tablesComplete([data.ipAccessRules]),
-    table_readable: data.ipAccessRules.unavailable === undefined,
+    table_readable: data.ipAccessRules.missingTableReason === undefined,
     strict_property_value: decisionStrict.exists ? asBoolean(decisionStrict.value) : undefined,
   });
-  const ipAccess = gatedFinding(17, [data.properties, data.ipAccessRules, data.ipAuthenticatorPlugin], `Open System Definition > Plugins and confirm IP Range Based Authentication (${IP_AUTHENTICATOR_PLUGIN}) is active, then open System Security > IP Address Access Control and record the active allow and deny rules (type, direction, range) plus glide.ip.authenticate.strict.`, () => {
+  const ipAccess = gatedFinding(decisions, 17, [data.properties, data.ipAccessRules, data.ipAuthenticatorPlugin], `Open System Definition > Plugins and confirm IP Range Based Authentication (${IP_AUTHENTICATOR_PLUGIN}) is active, then open System Security > IP Address Access Control and record the active allow and deny rules (type, direction, range) plus glide.ip.authenticate.strict.`, () => {
     const strict = readProperty(data.properties, "glide.ip.authenticate.strict");
-    const pluginRow = data.ipAuthenticatorPlugin.rows.find((row) => rowString(row, "source") === IP_AUTHENTICATOR_PLUGIN) ?? data.ipAuthenticatorPlugin.rows[0];
+    const pluginRow = (observedRows(data.ipAuthenticatorPlugin) ?? []).find((row) => rowString(row, "source") === IP_AUTHENTICATOR_PLUGIN) ?? (observedRows(data.ipAuthenticatorPlugin) ?? [])[0];
     const pluginState = pluginRow ? pluginActive(pluginRow) : undefined;
-    const tableUnavailable = data.ipAccessRules.unavailable;
-    const rules = data.ipAccessRules.rows;
+    const tableUnavailable = data.ipAccessRules.missingTableReason;
+    const rules = (observedRows(data.ipAccessRules) ?? []);
     const activeRules = rules.filter((row) => rowBoolean(row, "active") !== false);
     const evidence: JsonRecord = {
       ip_authenticator_plugin: IP_AUTHENTICATOR_PLUGIN,
-      ip_authenticator_plugin_present: Boolean(pluginRow),
-      ip_authenticator_plugin_active: pluginState ?? null,
+      ip_authenticator_plugin_present: pluginRow ? observedValue(true, data.ipAuthenticatorPlugin) : populationValue(false, data.ipAuthenticatorPlugin),
+      ip_authenticator_plugin_active: observedValue(pluginState ?? null, data.ipAuthenticatorPlugin),
       ip_access_table_available: !tableUnavailable,
-      ip_access_rules: rules.length,
-      active_ip_access_rules: activeRules.length,
-      active_rules: truncateList(activeRules.map((row) => `${rowString(row, "type") ?? "type"} ${rowString(row, "direction") ?? "direction"} ${rowString(row, "range_start") ?? "?"}-${rowString(row, "range_end") ?? "?"}`)),
-      glide_ip_authenticate_strict: strict.exists ? strict.value : null,
+      ip_access_rules: populationValue(rules.length, data.ipAccessRules),
+      active_ip_access_rules: populationValue(activeRules.length, data.ipAccessRules),
+      active_rules: populationValue(truncateList(activeRules.map((row) => `${rowString(row, "type") ?? "type"} ${rowString(row, "direction") ?? "direction"} ${rowString(row, "range_start") ?? "?"}-${rowString(row, "range_end") ?? "?"}`)), data.ipAccessRules),
+      glide_ip_authenticate_strict: observedValue(strict.exists ? strict.value : null, data.properties),
     };
     if (pluginState !== true) {
       if (!pluginRow && activeRules.length > 0) {
         return {
           status: "warn",
           summary: `${activeRules.length} active ${IP_ACCESS_TABLE} rules exist, but ${IP_AUTHENTICATOR_PLUGIN} was not visible in sys_plugins, so plugin activation could not be confirmed from this credential.`,
-          evidence,
+          observations: evidence,
         };
       }
       if (!pluginRow && !tablesComplete([data.ipAuthenticatorPlugin])) {
         return {
           status: "manual",
           summary: `${IP_AUTHENTICATOR_PLUGIN} was not among the visible sys_plugins rows and that read was partial, so plugin activation cannot be asserted either way.`,
-          evidence,
+          observations: evidence,
         };
       }
       const pluginDescription = pluginRow ? `is ${rowString(pluginRow, "active") ?? "not active"} in sys_plugins` : "has no row in sys_plugins";
       return {
         status: "fail",
         summary: `IP Range Based Authentication (${IP_AUTHENTICATOR_PLUGIN}) ${pluginDescription}${tableUnavailable ? ` and the ${IP_ACCESS_TABLE} table does not exist` : ` and ${activeRules.length} active ${IP_ACCESS_TABLE} rules are visible`}; administrative access is not restricted by source network.`,
-        evidence,
+        observations: evidence,
       };
     }
     if (tableUnavailable) {
       return {
         status: "manual",
         summary: `${IP_AUTHENTICATOR_PLUGIN} is active but the ${IP_ACCESS_TABLE} table was reported as invalid (${tableUnavailable}); review IP Address Access Control manually.`,
-        evidence,
+        observations: evidence,
       };
     }
     if (activeRules.length === 0) {
@@ -3032,35 +2958,35 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
         return {
           status: "manual",
           summary: `${IP_AUTHENTICATOR_PLUGIN} is active and none of the visible ${IP_ACCESS_TABLE} rows is active, but that read was partial, so the absence of an active rule cannot be asserted.`,
-          evidence,
+          observations: evidence,
         };
       }
       return {
         status: "fail",
         summary: `${IP_AUTHENTICATOR_PLUGIN} is active but no active IP Address Access Control rule exists (${IP_ACCESS_TABLE} has ${rules.length} rows, none active), so administrative access is not restricted by source network.`,
-        evidence,
+        observations: evidence,
       };
     }
     if (!strict.exists || asBoolean(strict.value) !== true) {
       return {
         status: "warn",
         summary: `${IP_AUTHENTICATOR_PLUGIN} is active with ${activeRules.length} active ${IP_ACCESS_TABLE} rules, but glide.ip.authenticate.strict is ${strict.exists ? strict.value : "absent"}; strict enforcement is not confirmed.`,
-        evidence,
+        observations: evidence,
       };
     }
     return {
       status: "pass",
       summary: `${IP_AUTHENTICATOR_PLUGIN} is active, ${activeRules.length} active ${IP_ACCESS_TABLE} rules restrict access by source network, and glide.ip.authenticate.strict is true.`,
-      evidence,
+      observations: evidence,
     };
   });
 
   const emailInputs = [data.properties, data.emailAccounts];
   const decisionSmtpAuth = readProperty(data.properties, "glide.smtp.auth");
-  const decisionSmtpAccounts = data.emailAccounts.rows.filter((row) =>
+  const decisionSmtpAccounts = (observedRows(data.emailAccounts) ?? []).filter((row) =>
     /smtp/i.test(rowString(row, "type") ?? "") && rowBoolean(row, "active") !== false);
   const decisionClassifiedAccounts = decisionSmtpAccounts.map(classifyEmailConnectionSecurity);
-  recordServicenowDecisionFacts(18, {
+  recordServicenowDecisionFacts(decisions, 18, {
     readable: decisionInputsReadable(emailInputs),
     smtp_account_count: decisionSmtpAccounts.length,
     insecure_count: decisionClassifiedAccounts.filter((item) => item.level === "none").length,
@@ -3068,10 +2994,10 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
     unverified_count: decisionClassifiedAccounts.filter((item) => item.level === "unknown").length,
     starttls_count: decisionClassifiedAccounts.filter((item) => item.level === "starttls").length,
   });
-  const email = gatedFinding(18, [data.properties, data.emailAccounts], "Open System Mailboxes > Administration > Email Accounts and record the Connection Security choice (SSL/TLS expected) on each active SMTP account; open Email Properties for glide.smtp.auth; record DKIM signing configuration and notification security headers.", () => {
+  const email = gatedFinding(decisions, 18, [data.properties, data.emailAccounts], "Open System Mailboxes > Administration > Email Accounts and record the Connection Security choice (SSL/TLS expected) on each active SMTP account; open Email Properties for glide.smtp.auth; record DKIM signing configuration and notification security headers.", () => {
     const smtpAuth = readProperty(data.properties, "glide.smtp.auth");
     const smtpAuthDisabled = smtpAuth.exists && asBoolean(smtpAuth.value) === false;
-    const smtpAccounts = data.emailAccounts.rows.filter((row) => /smtp/i.test(rowString(row, "type") ?? "") && rowBoolean(row, "active") !== false);
+    const smtpAccounts = (observedRows(data.emailAccounts) ?? []).filter((row) => /smtp/i.test(rowString(row, "type") ?? "") && rowBoolean(row, "active") !== false);
     const classified = smtpAccounts.map(classifyEmailConnectionSecurity);
     const byLevel = (level: EmailConnectionSecurity) => classified.filter((item) => item.level === level);
     const insecure = byLevel("none");
@@ -3131,10 +3057,10 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
     summary: {
       hardening_properties_visible: visibleRows(data.properties),
       hardening_properties_expected: HARDENING_PROPERTY_QUERY_NAMES.length,
-      enabled_debug_properties: derived(data.debugProperties.rows.length, data.debugProperties),
-      business_rules_using_eval: derived(data.evalScripts.rows.length, data.evalScripts),
-      active_ip_access_rules: derived(data.ipAccessRules.rows.filter((row) => rowBoolean(row, "active") !== false).length, data.ipAccessRules),
-      ip_authenticator_plugin_active: derivedFlag(data.ipAuthenticatorPlugin.rows.some((row) => pluginActive(row) === true), data.ipAuthenticatorPlugin),
+      enabled_debug_properties: populationValue((observedRows(data.debugProperties) ?? []).length, data.debugProperties),
+      business_rules_using_eval: populationValue((observedRows(data.evalScripts) ?? []).length, data.evalScripts),
+      active_ip_access_rules: populationValue((observedRows(data.ipAccessRules) ?? []).filter((row) => rowBoolean(row, "active") !== false).length, data.ipAccessRules),
+      ip_authenticator_plugin_active: populationValue((observedRows(data.ipAuthenticatorPlugin) ?? []).some((row) => pluginActive(row) === true), data.ipAuthenticatorPlugin),
       inventories: {
         properties: describeTable(data.properties),
         debug_properties: describeTable(data.debugProperties),
@@ -3150,9 +3076,7 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
   };
 }
 
-export function assessServicenowPlatformHardeningData(data: ServicenowHardeningData): ServicenowAssessmentResult {
-  return runBatchVerdictContext(SERVICENOW_DECISION_CONTEXT, SERVICENOW_SPEC, () => assessServicenowPlatformHardeningDataWithDecisionContext(data));
-}
+
 
 export async function assessServicenowPlatformHardening(
   client: Pick<ServicenowReadClient, "queryTable">,
@@ -3199,26 +3123,21 @@ export async function collectServicenowAccessControlData(
 ): Promise<ServicenowAccessControlData> {
   const recordLimit = clampNumber(options.recordLimit, DEFAULT_RECORD_LIMIT, 1, 500_000);
   const rawAcls = await readTable(client, "sys_security_acl", { query: buildSensitiveAclQuery(), fields: ACL_FIELDS, limit: recordLimit });
-  const acls: TableSnapshot = { ...rawAcls, rows: rawAcls.rows.map(projectAclRow) };
-  const aclIds = acls.rows.map((row) => rowString(row, "sys_id")).filter((item): item is string => Boolean(item));
-  // The role lookup is keyed on the ACL ids that were read. Without ids no request is issued, and the
-  // placeholder snapshot says so instead of borrowing the status code of the sys_security_acl read.
-  const skippedRoles = (reason: string, failed: boolean): TableSnapshot => ({
+  const acls: TableSnapshot = { ...rawAcls, ...mapCollection(rawAcls, (value) => ({ ...value, rows: value.rows.map(projectAclRow) })) };
+  const aclIds = (observedRows(acls) ?? []).map((row) => rowString(row, "sys_id")).filter((item): item is string => Boolean(item));
+  // A missing dependency carries its identity, never a fabricated empty row list.
+  const skippedRoles = (reason: string): TableSnapshot => ({
+    ...skippedCollection<TableRead>("sys_security_acl_role", reason, acls.key),
     table: "sys_security_acl_role",
     query: "sys_security_aclIN",
-    rows: [],
     pages: 0,
-    truncated: false,
-    partial: false,
-    skipped: reason,
-    ...(failed ? { error: `not requested: ${reason}` } : {}),
   });
   const [aclRoles, aclTotal, publicPages] = await Promise.all([
     aclIds.length > 0
       ? readTable(client, "sys_security_acl_role", { query: `sys_security_aclIN${aclIds.join(",")}`, fields: ACL_ROLE_FIELDS, limit: recordLimit })
-      : Promise.resolve(acls.error
-        ? skippedRoles(`the ${acls.table} read failed, so there were no ACL ids to look up`, true)
-        : skippedRoles(`the ${acls.table} read returned no rows, so there were no ACL ids to look up`, false)),
+      : Promise.resolve(!collectionReadable(acls)
+        ? skippedRoles(`the ${acls.table} read failed, so there were no ACL ids to look up`)
+        : skippedRoles(`the ${acls.table} read returned no rows, so there were no ACL ids to look up`)),
     client.countRecords("sys_security_acl", "active=true^type=record"),
     readTable(client, "sys_public", { query: "active=true", fields: ["sys_id", "page", "active", "sys_updated_on"], limit: recordLimit }),
   ]);
@@ -3229,7 +3148,8 @@ function aclLabel(row: JsonRecord): string {
   return `${rowString(row, "name") ?? "acl"}:${rowString(row, "operation") ?? "op"}`;
 }
 
-function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAccessControlData): ServicenowAssessmentResult {
+export function assessServicenowAccessControlData(data: ServicenowAccessControlData): ServicenowAssessmentResult {
+  const decisions = new BatchVerdicts(SERVICENOW_SPEC);
   const errors = [
     ...snapshotErrors("acls", data.acls),
     ...snapshotErrors("acl roles", data.aclRoles),
@@ -3238,7 +3158,7 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
   ];
 
   const rolesByAcl = new Map<string, string[]>();
-  for (const row of data.aclRoles.rows) {
+  for (const row of (observedRows(data.aclRoles) ?? [])) {
     const acl = rowString(row, "sys_security_acl");
     const role = rowString(row, "sys_user_role.name") ?? rowString(row, "sys_user_role");
     if (!acl || !role) continue;
@@ -3251,12 +3171,12 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
     const hasScript = rowBoolean(row, "has_script") ?? Boolean(rowString(row, "script"));
     return { label: aclLabel(row), name: rowString(row, "name") ?? "", operation: rowString(row, "operation") ?? "", roles, unrestricted: roles.length === 0 && !hasCondition && !hasScript, admin_overrides: rowBoolean(row, "admin_overrides") };
   };
-  const described = data.acls.rows.map(describeAcl);
+  const described = (observedRows(data.acls) ?? []).map(describeAcl);
   const wildcard = described.filter((item) => item.name === "*" || item.name.startsWith("*."));
   const unrestricted = described.filter((item) => item.unrestricted);
 
   const completenessInputs = [data.acls, data.aclRoles, data.publicPages];
-  recordServicenowDecisionFacts(2, {
+  recordServicenowDecisionFacts(decisions, 2, {
     readable: decisionInputsReadable(completenessInputs),
     complete: decisionInputsComplete(completenessInputs),
     acl_aggregate_readable: !data.aclTotal.error && data.aclTotal.count !== undefined,
@@ -3264,25 +3184,25 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
     visible_acl_count: described.length,
     unrestricted_count: unrestricted.length,
     wildcard_count: wildcard.length,
-    public_page_count: data.publicPages.rows.length,
+    public_page_count: (observedRows(data.publicPages) ?? []).length,
   });
-  const completeness = gatedFinding(2, [data.acls, data.aclRoles, data.publicPages], "Open System Security > Access Control (ACL), filter Active = true and Type = record; review wildcard (*) rules and rules with no role, condition, or script. Open System Definition > Public Pages and justify each active page.", () => {
-    const publicPages = data.publicPages.rows.map((row) => rowString(row, "page") ?? rowString(row, "sys_id") ?? "page");
+  const completeness = gatedFinding(decisions, 2, [data.acls, data.aclRoles, data.publicPages], "Open System Security > Access Control (ACL), filter Active = true and Type = record; review wildcard (*) rules and rules with no role, condition, or script. Open System Definition > Public Pages and justify each active page.", () => {
+    const publicPages = (observedRows(data.publicPages) ?? []).map((row) => rowString(row, "page") ?? rowString(row, "sys_id") ?? "page");
     const proven = data.aclTotal.count;
     const evidence: JsonRecord = {
-      record_acl_total: proven ?? null,
-      sensitive_acls_visible: described.length,
-      wildcard_acls: truncateList(wildcard.map((item) => item.label)),
-      unrestricted_acls: truncateList(unrestricted.map((item) => item.label)),
-      unrestricted_acl_count: unrestricted.length,
-      public_pages: truncateList(publicPages),
-      public_page_count: publicPages.length,
+      record_acl_total: countValue(data.aclTotal),
+      sensitive_acls_visible: observedValue(described.length, data.acls),
+      wildcard_acls: populationValue(truncateList(wildcard.map((item) => item.label)), data.acls),
+      unrestricted_acls: populationValue(truncateList(unrestricted.map((item) => item.label)), data.acls, data.aclRoles),
+      unrestricted_acl_count: populationValue(unrestricted.length, data.acls, data.aclRoles),
+      public_pages: populationValue(truncateList(publicPages), data.publicPages),
+      public_page_count: populationValue(publicPages.length, data.publicPages),
     };
     if (data.aclTotal.error || proven === undefined || proven === 0) {
       return {
         status: "manual",
         summary: `The sys_security_acl inventory could not be proven visible (aggregate count ${proven ?? "unavailable"}${data.aclTotal.error ? `, ${data.aclTotal.error}` : ""}); every instance ships thousands of ACLs, so the visible rows cannot be trusted.`,
-        evidence,
+        observations: evidence,
       };
     }
     if (described.length === 0) {
@@ -3295,7 +3215,7 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
       return {
         status: "manual",
         summary: `${proven} active record ACLs exist but none of the sensitive-table or wildcard ACLs were visible to this credential, so completeness cannot be judged${visiblePages ? `; ${publicPages.length} active public pages (${truncateList(publicPages, 8).join(", ")}) were visible and need justification` : ""}.`,
-        evidence: {
+        observations: {
           ...evidence,
           wildcard_acls: null,
           unrestricted_acls: null,
@@ -3309,20 +3229,20 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
       return {
         status: "fail",
         summary: `${unrestricted.length} active record ACLs on sensitive or wildcard tables have no role, condition, or script and therefore grant unrestricted access: ${truncateList(unrestricted.map((item) => item.label), 10).join(", ")}.`,
-        evidence,
+        observations: evidence,
       };
     }
     if (wildcard.length > 0 || publicPages.length > 0) {
       return {
         status: "warn",
         summary: `${proven} active record ACLs exist; ${wildcard.length} wildcard ACLs and ${publicPages.length} active public pages (${truncateList(publicPages, 8).join(", ")}) need justification.`,
-        evidence,
+        observations: evidence,
       };
     }
     return {
       status: "pass",
       summary: `${proven} active record ACLs exist; ${described.length} ACLs on sensitive tables were reviewed, none is unrestricted, no wildcard ACL is active, and no public page is active.`,
-      evidence,
+      observations: evidence,
     };
   });
 
@@ -3335,7 +3255,7 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
       missingOperationCount: ["read", "write", "delete"].filter((operation) => !operations.has(operation)).length,
     };
   });
-  recordServicenowDecisionFacts(11, {
+  recordServicenowDecisionFacts(decisions, 11, {
     readable: decisionInputsReadable(tableLevelInputs),
     complete: tablesComplete(tableLevelInputs),
     acl_aggregate_readable: !data.aclTotal.error && data.aclTotal.count !== undefined,
@@ -3343,7 +3263,7 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
     uncovered_table_count: decisionCoverage.filter((item) => item.aclCount === 0).length,
     operation_gap_count: decisionCoverage.filter((item) => item.aclCount > 0 && item.missingOperationCount > 0).length,
   });
-  const tableLevel = gatedFinding(11, [data.acls, data.aclRoles], `Open System Security > Access Control (ACL) and confirm read, write, and delete record ACLs with roles exist for ${SENSITIVE_ACL_TABLES.join(", ")}.`, () => {
+  const tableLevel = gatedFinding(decisions, 11, [data.acls, data.aclRoles], `Open System Security > Access Control (ACL) and confirm read, write, and delete record ACLs with roles exist for ${SENSITIVE_ACL_TABLES.join(", ")}.`, () => {
     const proven = data.aclTotal.count;
     // Per-table "no ACL" and "missing operation" claims are absence claims; on a partial ACL read they render null.
     const complete = tablesComplete([data.acls, data.aclRoles]);
@@ -3361,17 +3281,17 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
     });
     const coverageEvidence = coverage.map((item) => ({
       table: item.table,
-      acls: complete || item.acls > 0 ? item.acls : null,
-      operations: complete || item.operations.length > 0 ? item.operations : null,
-      missing_operations: complete ? item.missing_operations : null,
-      role_protected_acls: complete || item.role_protected_acls > 0 ? item.role_protected_acls : null,
+      acls: populationValue(item.acls, data.acls),
+      operations: populationValue(item.operations, data.acls),
+      missing_operations: populationValue(item.missing_operations, data.acls),
+      role_protected_acls: populationValue(item.role_protected_acls, data.acls, data.aclRoles),
     }));
     const evidence: JsonRecord = { record_acl_total: proven ?? null, sensitive_table_coverage: coverageEvidence };
     if (data.aclTotal.error || proven === undefined || proven === 0) {
       return {
         status: "manual",
         summary: `The sys_security_acl inventory could not be proven visible (aggregate count ${proven ?? "unavailable"}), so table-level coverage cannot be judged.`,
-        evidence,
+        observations: evidence,
       };
     }
     const uncovered = coverage.filter((item) => item.acls === 0);
@@ -3381,27 +3301,27 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
       return {
         status: "manual",
         summary: "Some sensitive tables showed no active record ACL, or no explicit read, write, or delete rule, among the visible sys_security_acl rows, but that read was partial, so the unread rows could hold them; table names and counts are withheld and coverage cannot be judged.",
-        evidence,
+        observations: evidence,
       };
     }
     if (uncovered.length > 0) {
       return {
         status: "fail",
         summary: `${uncovered.length} sensitive tables have no visible active record ACL: ${uncovered.map((item) => item.table).join(", ")}.`,
-        evidence,
+        observations: evidence,
       };
     }
     if (gaps.length > 0) {
       return {
         status: "warn",
         summary: `All ${coverage.length} sensitive tables have record ACLs, but ${gaps.length} lack an explicit read, write, or delete rule: ${gaps.map((item) => `${item.table} (missing ${item.missing_operations.join("/")})`).join(", ")}.`,
-        evidence,
+        observations: evidence,
       };
     }
     return {
       status: "pass",
       summary: `All ${coverage.length} sensitive tables have active read, write, and delete record ACLs.`,
-      evidence,
+      observations: evidence,
     };
   });
 
@@ -3412,9 +3332,9 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
     summary: {
       record_acl_total: countValue(data.aclTotal),
       sensitive_acls_visible: visibleRows(data.acls),
-      wildcard_acls: derived(wildcard.length, data.acls),
-      unrestricted_acls: derived(unrestricted.length, data.acls, data.aclRoles),
-      public_pages: derived(data.publicPages.rows.length, data.publicPages),
+      wildcard_acls: populationValue(wildcard.length, data.acls),
+      unrestricted_acls: populationValue(unrestricted.length, data.acls, data.aclRoles),
+      public_pages: populationValue((observedRows(data.publicPages) ?? []).length, data.publicPages),
       inventories: {
         acls: describeTable(data.acls),
         acl_roles: describeTable(data.aclRoles),
@@ -3428,9 +3348,7 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
   };
 }
 
-export function assessServicenowAccessControlData(data: ServicenowAccessControlData): ServicenowAssessmentResult {
-  return runBatchVerdictContext(SERVICENOW_DECISION_CONTEXT, SERVICENOW_SPEC, () => assessServicenowAccessControlDataWithDecisionContext(data));
-}
+
 
 export async function assessServicenowAccessControl(
   client: Pick<ServicenowReadClient, "queryTable" | "countRecords">,
@@ -3503,7 +3421,8 @@ function pluginActive(row: JsonRecord): boolean | undefined {
   return undefined;
 }
 
-function assessServicenowOperationsGovernanceDataWithDecisionContext(data: ServicenowOperationsData): ServicenowAssessmentResult {
+export function assessServicenowOperationsGovernanceData(data: ServicenowOperationsData): ServicenowAssessmentResult {
+  const decisions = new BatchVerdicts(SERVICENOW_SPEC);
   const errors = [
     ...snapshotErrors("encryption contexts", data.encryptionContexts),
     ...snapshotErrors("cryptographic modules", data.cryptoModules),
@@ -3519,48 +3438,48 @@ function assessServicenowOperationsGovernanceDataWithDecisionContext(data: Servi
     ...snapshotErrors("plugins", data.plugins),
   ];
 
-  recordServicenowDecisionFacts(9, {});
-  const encryption = gatedFinding(9, [data.encryptionContexts, data.cryptoModules, data.encryptedFields], `Open Key Management Framework > Cryptographic Modules (${CRYPTO_MODULE_TABLE}), System Security > Field Encryption > Encryption Contexts (legacy), and System Definition > Dictionary filtered on Type = Encrypted Text; confirm every field holding regulated data is encrypted, and record whether Column Level Encryption Enterprise, Cloud Encryption, or Edge Encryption is licensed.`, () => {
-    const contexts = data.encryptionContexts.rows.map((row) => rowString(row, "name") ?? rowString(row, "sys_id") ?? "context");
-    const modules = data.cryptoModules.rows.map((row) => rowString(row, "name") ?? rowString(row, "module_name") ?? rowString(row, "sys_id") ?? "module");
-    const fields = data.encryptedFields.rows.map((row) => `${rowString(row, "name") ?? "table"}.${rowString(row, "element") ?? "field"}`);
+  recordServicenowDecisionFacts(decisions, 9, {});
+  const encryption = gatedFinding(decisions, 9, [data.encryptionContexts, data.cryptoModules, data.encryptedFields], `Open Key Management Framework > Cryptographic Modules (${CRYPTO_MODULE_TABLE}), System Security > Field Encryption > Encryption Contexts (legacy), and System Definition > Dictionary filtered on Type = Encrypted Text; confirm every field holding regulated data is encrypted, and record whether Column Level Encryption Enterprise, Cloud Encryption, or Edge Encryption is licensed.`, () => {
+    const contexts = (observedRows(data.encryptionContexts) ?? []).map((row) => rowString(row, "name") ?? rowString(row, "sys_id") ?? "context");
+    const modules = (observedRows(data.cryptoModules) ?? []).map((row) => rowString(row, "name") ?? rowString(row, "module_name") ?? rowString(row, "sys_id") ?? "module");
+    const fields = (observedRows(data.encryptedFields) ?? []).map((row) => `${rowString(row, "name") ?? "table"}.${rowString(row, "element") ?? "field"}`);
     const evidence: JsonRecord = {
-      crypto_modules: truncateList(modules),
-      crypto_module_count: modules.length,
-      legacy_encryption_contexts: truncateList(contexts),
-      legacy_encryption_context_count: contexts.length,
-      legacy_context_table_available: !data.encryptionContexts.unavailable,
-      encrypted_fields: truncateList(fields),
-      encrypted_field_count: fields.length,
+      crypto_modules: populationValue(truncateList(modules), data.cryptoModules),
+      crypto_module_count: populationValue(modules.length, data.cryptoModules),
+      legacy_encryption_contexts: populationValue(truncateList(contexts), data.encryptionContexts),
+      legacy_encryption_context_count: populationValue(contexts.length, data.encryptionContexts),
+      legacy_context_table_available: !data.encryptionContexts.missingTableReason,
+      encrypted_fields: populationValue(truncateList(fields), data.encryptedFields),
+      encrypted_field_count: populationValue(fields.length, data.encryptedFields),
     };
     if (contexts.length === 0 && modules.length === 0 && fields.length === 0) {
       return {
         status: "manual",
-        summary: `No KMF cryptographic modules, legacy encryption contexts${data.encryptionContexts.unavailable ? ` (${LEGACY_ENCRYPTION_CONTEXT_TABLE} is not present)` : ""}, or encrypted dictionary fields exist; column-level encryption is not in use. Confirm whether sensitive fields require encryption and whether an encryption module (CLE Enterprise, Cloud Encryption, Edge Encryption) is licensed and scoped for this instance.`,
-        evidence,
+        summary: `No KMF cryptographic modules, legacy encryption contexts${data.encryptionContexts.missingTableReason ? ` (${LEGACY_ENCRYPTION_CONTEXT_TABLE} is not present)` : ""}, or encrypted dictionary fields exist; column-level encryption is not in use. Confirm whether sensitive fields require encryption and whether an encryption module (CLE Enterprise, Cloud Encryption, Edge Encryption) is licensed and scoped for this instance.`,
+        observations: evidence,
       };
     }
     return {
       status: "manual",
       summary: `${modules.length} KMF cryptographic modules, ${contexts.length} legacy encryption contexts, and ${fields.length} encrypted dictionary fields are configured; the API cannot determine whether every sensitive field is covered, so coverage must be confirmed against the data classification inventory.`,
-      evidence,
+      observations: evidence,
     };
   });
 
   const auditInputs = [data.auditDictionary];
-  const decisionAuditRows = new Map(data.auditDictionary.rows.map((row) => [rowString(row, "name") ?? "", row]));
+  const decisionAuditRows = new Map((observedRows(data.auditDictionary) ?? []).map((row) => [rowString(row, "name") ?? "", row]));
   const decisionMissingAuditRows = AUDITED_CRITICAL_TABLES.filter((table) => !decisionAuditRows.has(table));
   const decisionUnaudited = AUDITED_CRITICAL_TABLES.filter((table) =>
     decisionAuditRows.has(table) && rowBoolean(decisionAuditRows.get(table) ?? {}, "audit") !== true);
-  recordServicenowDecisionFacts(10, {
+  recordServicenowDecisionFacts(decisions, 10, {
     readable: decisionInputsReadable(auditInputs),
     unaudited_count: decisionUnaudited.length,
     missing_dictionary_count: decisionMissingAuditRows.length,
     recent_audit_count_known: data.recentAuditCount.count !== undefined,
     recent_audit_count: data.recentAuditCount.count,
   });
-  const audit = gatedFinding(10, [data.auditDictionary], `Open System Definition > Dictionary, filter Type = Collection, and confirm Audit is checked for ${AUDITED_CRITICAL_TABLES.join(", ")}; open System Archiving or Table Rotation to record the sys_audit retention period.`, () => {
-    const rowsByTable = new Map(data.auditDictionary.rows.map((row) => [rowString(row, "name") ?? "", row]));
+  const audit = gatedFinding(decisions, 10, [data.auditDictionary], `Open System Definition > Dictionary, filter Type = Collection, and confirm Audit is checked for ${AUDITED_CRITICAL_TABLES.join(", ")}; open System Archiving or Table Rotation to record the sys_audit retention period.`, () => {
+    const rowsByTable = new Map((observedRows(data.auditDictionary) ?? []).map((row) => [rowString(row, "name") ?? "", row]));
     const missing = AUDITED_CRITICAL_TABLES.filter((table) => !rowsByTable.has(table));
     const unaudited = AUDITED_CRITICAL_TABLES.filter((table) => rowsByTable.has(table) && rowBoolean(rowsByTable.get(table) ?? {}, "audit") !== true);
     const audited = AUDITED_CRITICAL_TABLES.filter((table) => rowBoolean(rowsByTable.get(table) ?? {}, "audit") === true);
@@ -3602,20 +3521,20 @@ function assessServicenowOperationsGovernanceDataWithDecisionContext(data: Servi
   });
 
   const updateSetInputs = [data.updateSetsInProgress, data.sensitiveUpdateXml];
-  recordServicenowDecisionFacts(15, {
+  recordServicenowDecisionFacts(decisions, 15, {
     readable: decisionInputsReadable(updateSetInputs),
     complete: decisionInputsComplete(updateSetInputs),
     update_set_aggregate_readable: !data.updateSetTotal.error && data.updateSetTotal.count !== undefined,
     update_set_aggregate_count: data.updateSetTotal.count,
-    in_progress_row_count: data.updateSetsInProgress.rows.length,
+    in_progress_row_count: (observedRows(data.updateSetsInProgress) ?? []).length,
     in_progress_pages: data.updateSetsInProgress.pages,
-    in_progress_total_known: data.updateSetsInProgress.total !== undefined,
-    in_progress_count: data.updateSetsInProgress.rows.length,
-    sensitive_change_count: data.sensitiveUpdateXml.rows.length,
+    in_progress_total_known: tableRead(data.updateSetsInProgress)?.total !== undefined,
+    in_progress_count: (observedRows(data.updateSetsInProgress) ?? []).length,
+    sensitive_change_count: (observedRows(data.sensitiveUpdateXml) ?? []).length,
   });
-  const updateSets = gatedFinding(15, [data.updateSetsInProgress, data.sensitiveUpdateXml], "Open System Update Sets > Local Update Sets filtered on State = In progress and review Customer Updates for ACL, role, script, and property changes; confirm each has a change record.", () => {
-    const inProgress = data.updateSetsInProgress.rows.map((row) => rowString(row, "name") ?? rowString(row, "sys_id") ?? "update set");
-    const sensitive = data.sensitiveUpdateXml.rows.map((row) => `${rowString(row, "update_set.name") ?? rowString(row, "update_set") ?? "set"}: ${rowString(row, "type") ?? "type"} ${rowString(row, "target_name") ?? rowString(row, "name") ?? ""}`.trim());
+  const updateSets = gatedFinding(decisions, 15, [data.updateSetsInProgress, data.sensitiveUpdateXml], "Open System Update Sets > Local Update Sets filtered on State = In progress and review Customer Updates for ACL, role, script, and property changes; confirm each has a change record.", () => {
+    const inProgress = (observedRows(data.updateSetsInProgress) ?? []).map((row) => rowString(row, "name") ?? rowString(row, "sys_id") ?? "update set");
+    const sensitive = (observedRows(data.sensitiveUpdateXml) ?? []).map((row) => `${rowString(row, "update_set.name") ?? rowString(row, "update_set") ?? "set"}: ${rowString(row, "type") ?? "type"} ${rowString(row, "target_name") ?? rowString(row, "name") ?? ""}`.trim());
     const proven = data.updateSetTotal.count;
     const evidence: JsonRecord = {
       update_set_total: proven ?? null,
@@ -3660,16 +3579,16 @@ function assessServicenowOperationsGovernanceDataWithDecisionContext(data: Servi
   });
 
   const midServerInputs = [data.midServers, data.properties];
-  const decisionMidServers = data.midServers.rows;
+  const decisionMidServers = (observedRows(data.midServers) ?? []);
   const decisionVersionOverride = readProperty(data.properties, "mid.version.override");
-  recordServicenowDecisionFacts(19, {
+  recordServicenowDecisionFacts(decisions, 19, {
     readable: decisionInputsReadable(midServerInputs),
     server_count: decisionMidServers.length,
     not_validated_count: decisionMidServers.filter((row) => rowBoolean(row, "validated") !== true).length,
     version_override_present: decisionVersionOverride.exists && Boolean(decisionVersionOverride.value),
   });
-  const midServer = gatedFinding(19, [data.midServers, data.properties], "Open MID Server > Servers and record Validated, Status, Version, mutual authentication (client certificate) configuration, and the allowed host list in config.xml; record mid.version.override in System Properties.", () => {
-    const servers = data.midServers.rows;
+  const midServer = gatedFinding(decisions, 19, [data.midServers, data.properties], "Open MID Server > Servers and record Validated, Status, Version, mutual authentication (client certificate) configuration, and the allowed host list in config.xml; record mid.version.override in System Properties.", () => {
+    const servers = (observedRows(data.midServers) ?? []);
     const override = readProperty(data.properties, "mid.version.override");
     const notValidated = servers.filter((row) => rowBoolean(row, "validated") !== true).map((row) => rowString(row, "name") ?? "mid");
     const notUp = servers.filter((row) => !/^up$/i.test(rowString(row, "status") ?? "")).map((row) => rowString(row, "name") ?? "mid");
@@ -3710,31 +3629,31 @@ function assessServicenowOperationsGovernanceDataWithDecisionContext(data: Servi
   });
 
   const pluginInputs = [data.plugins];
-  const decisionPluginRows = data.plugins.rows;
+  const decisionPluginRows = (observedRows(data.plugins) ?? []);
   const decisionPluginsComplete = tablesComplete(pluginInputs);
   const decisionRequiredPlugins = REQUIRED_SECURITY_PLUGINS.map((definition) => {
     const match = decisionPluginRows.find((row) => definition.pattern.test(rowString(row, "name") ?? ""));
     return { present: match !== undefined, active: match ? pluginActive(match) : undefined };
   });
-  recordServicenowDecisionFacts(20, {
+  recordServicenowDecisionFacts(decisions, 20, {
     readable: decisionInputsReadable(pluginInputs),
     complete: decisionPluginsComplete,
     plugin_count: decisionPluginRows.length,
     visible_required_plugin_inactive_count: decisionRequiredPlugins.filter((item) => item.present && item.active !== true).length,
     missing_required_count: decisionRequiredPlugins.filter((item) => !item.present).length,
   });
-  const plugins = gatedFinding(20, [data.plugins], "Open System Definition > Plugins; confirm High Security Settings, Contextual Security: Role Management V2, and Security Jump Start are active, record Instance Security Center, Security Incident Response, GRC, and Vulnerability Response status, and review every other active plugin for necessity.", () => {
-    const rows = data.plugins.rows;
+  const plugins = gatedFinding(decisions, 20, [data.plugins], "Open System Definition > Plugins; confirm High Security Settings, Contextual Security: Role Management V2, and Security Jump Start are active, record Instance Security Center, Security Incident Response, GRC, and Vulnerability Response status, and review every other active plugin for necessity.", () => {
+    const rows = (observedRows(data.plugins) ?? []);
     // A plugin absent from a partial sys_plugins read may sit among the unread rows, so its presence is unknown rather than false.
     const complete = tablesComplete([data.plugins]);
     const evaluate = (definition: { key: string; pattern: RegExp; label: string }) => {
       const match = rows.find((row) => definition.pattern.test(rowString(row, "name") ?? ""));
-      return { key: definition.key, label: definition.label, present: match ? true : complete ? false : null, active: match ? pluginActive(match) ?? null : null };
+      return { key: definition.key, label: definition.label, present: match ? observedValue(true, data.plugins) : populationValue(false, data.plugins), active: match ? observedValue(pluginActive(match) ?? null, data.plugins) : null };
     };
     const required = REQUIRED_SECURITY_PLUGINS.map(evaluate);
     const optional = OPTIONAL_SECURITY_PLUGINS.map(evaluate);
     const evidence: JsonRecord = {
-      plugins_visible: rows.length,
+      plugins_visible: observedValue(rows.length, data.plugins),
       required_security_plugins: required,
       optional_security_plugins: optional,
       unnecessary_plugin_review_via_api: false,
@@ -3743,7 +3662,7 @@ function assessServicenowOperationsGovernanceDataWithDecisionContext(data: Servi
       return {
         status: "manual",
         summary: "No plugin rows are visible in sys_plugins; every instance has hundreds of plugins, so the credential cannot read the inventory.",
-        evidence,
+        observations: evidence,
       };
     }
     const inactiveRequired = required.filter((item) => item.active !== true);
@@ -3752,27 +3671,27 @@ function assessServicenowOperationsGovernanceDataWithDecisionContext(data: Servi
       return {
         status: "fail",
         summary: `${observedInactive.length} baseline security plugins are present but not active: ${observedInactive.map((item) => item.label).join(", ")}.`,
-        evidence,
+        observations: evidence,
       };
     }
     if (inactiveRequired.length > 0 && !complete) {
       return {
         status: "manual",
         summary: `${inactiveRequired.length} baseline security plugins were not among the visible sys_plugins rows and that read was partial, so the unread rows could hold them; their status is unknown.`,
-        evidence,
+        observations: evidence,
       };
     }
     if (inactiveRequired.length > 0) {
       return {
         status: "fail",
         summary: `${inactiveRequired.length} baseline security plugins are not active: ${inactiveRequired.map((item) => item.label).join(", ")}.`,
-        evidence,
+        observations: evidence,
       };
     }
     return {
       status: "manual",
       summary: `${rows.length} plugins inventoried and all ${required.length} baseline security plugins are active; ${optional.filter((item) => item.active === true).length}/${optional.length} optional security products are active. Necessity of the remaining active plugins must be reviewed manually.`,
-      evidence,
+      observations: evidence,
     };
   });
 
@@ -3781,12 +3700,12 @@ function assessServicenowOperationsGovernanceDataWithDecisionContext(data: Servi
     area: "operations_governance",
     title: "ServiceNow operations governance",
     summary: {
-      encryption_contexts: derived(data.encryptionContexts.rows.length, data.encryptionContexts),
-      crypto_modules: derived(data.cryptoModules.rows.length, data.cryptoModules),
-      encrypted_fields: derived(data.encryptedFields.rows.length, data.encryptedFields),
+      encryption_contexts: populationValue((observedRows(data.encryptionContexts) ?? []).length, data.encryptionContexts),
+      crypto_modules: populationValue((observedRows(data.cryptoModules) ?? []).length, data.cryptoModules),
+      encrypted_fields: populationValue((observedRows(data.encryptedFields) ?? []).length, data.encryptedFields),
       audit_rows_last_7_days: countValue(data.recentAuditCount),
-      update_sets_in_progress: derived(data.updateSetsInProgress.rows.length, data.updateSetsInProgress),
-      mid_servers: derived(data.midServers.rows.length, data.midServers),
+      update_sets_in_progress: populationValue((observedRows(data.updateSetsInProgress) ?? []).length, data.updateSetsInProgress),
+      mid_servers: populationValue((observedRows(data.midServers) ?? []).length, data.midServers),
       plugins_visible: visibleRows(data.plugins),
       inventories: {
         encryption_contexts: describeTable(data.encryptionContexts),
@@ -3809,9 +3728,7 @@ function assessServicenowOperationsGovernanceDataWithDecisionContext(data: Servi
   };
 }
 
-export function assessServicenowOperationsGovernanceData(data: ServicenowOperationsData): ServicenowAssessmentResult {
-  return runBatchVerdictContext(SERVICENOW_DECISION_CONTEXT, SERVICENOW_SPEC, () => assessServicenowOperationsGovernanceDataWithDecisionContext(data));
-}
+
 
 export async function assessServicenowOperationsGovernance(
   client: Pick<ServicenowReadClient, "queryTable" | "countRecords">,
@@ -3852,7 +3769,11 @@ const ACCESS_SURFACES: Array<{ name: string; table: string }> = [
 
 const CORE_ACCESS_SURFACES = new Set(["users", "user_roles", "roles", "system_properties", "acls", "acl_roles", "audit", "update_sets", "dictionary"]);
 
-type ServicenowRequestOutcome = Pick<TableSnapshot, "statusCode" | "error">;
+type ServicenowRequestOutcome = { statusCode?: number; error?: string };
+
+function requestOutcome(snapshot: TableSnapshot): ServicenowRequestOutcome {
+  return { statusCode: snapshot.status ?? undefined, error: tableError(snapshot) };
+}
 
 async function probeSurface(
   client: Pick<ServicenowReadClient, "queryTable" | "countRecords">,
@@ -3863,19 +3784,20 @@ async function probeSurface(
     readTable(client, surface.table, { fields: ["sys_id"], limit: 1, pageSize: 1 }),
     client.countRecords(surface.table),
   ]);
-  if (isRejectedCredentials(snapshot) && isRejectedCredentials(count)) rejections.set(surface.name, [snapshot, count]);
-  const total = count.count ?? snapshot.total;
-  if (snapshot.error) {
+  const outcome = requestOutcome(snapshot);
+  if (isRejectedCredentials(outcome) && isRejectedCredentials(count)) rejections.set(surface.name, [outcome, count]);
+  const total = count.count ?? tableRead(snapshot)?.total;
+  if (!collectionReadable(snapshot)) {
     return {
       name: surface.name,
       table: surface.table,
-      status: snapshot.statusCode === 401 || snapshot.statusCode === 403 ? "forbidden" : "not_readable",
+      status: snapshot.status === 401 || snapshot.status === 403 ? "forbidden" : "not_readable",
       ...(total !== undefined ? { total } : {}),
-      ...(snapshot.statusCode !== undefined ? { http_status: snapshot.statusCode } : {}),
-      error: count.error ? `${snapshot.error}; aggregate count also failed (${count.error})` : snapshot.error,
+      ...(snapshot.status !== null ? { http_status: snapshot.status } : {}),
+      error: count.error ? `${tableError(snapshot)}; aggregate count also failed (${count.error})` : tableError(snapshot),
     };
   }
-  if (snapshot.rows.length === 0 && total !== undefined && total > 0) {
+  if ((observedRows(snapshot) ?? []).length === 0 && total !== undefined && total > 0) {
     return {
       name: surface.name,
       table: surface.table,
@@ -3885,7 +3807,7 @@ async function probeSurface(
       error: `aggregate count ${total} but no rows returned; ACLs hide the rows`,
     };
   }
-  return { name: surface.name, table: surface.table, status: "readable", visible: snapshot.rows.length, total };
+  return { name: surface.name, table: surface.table, status: "readable", visible: (observedRows(snapshot) ?? []).length, total };
 }
 
 export async function checkServicenowAccess(
@@ -3893,17 +3815,17 @@ export async function checkServicenowAccess(
 ): Promise<ServicenowAccessCheckResult> {
   const config = client.getResolvedConfig();
   const whoami = await readTable(client, "sys_user", { query: "sys_id=javascript:gs.getUserID()", fields: ["user_name", "name"], limit: 1, pageSize: 1 });
-  const identity = whoami.rows[0] ? rowString(whoami.rows[0], "user_name") ?? rowString(whoami.rows[0], "name") : undefined;
+  const identity = (observedRows(whoami) ?? [])[0] ? rowString((observedRows(whoami) ?? [])[0], "user_name") ?? rowString((observedRows(whoami) ?? [])[0], "name") : undefined;
   const rejections = new Map<string, ServicenowRequestOutcome[]>();
   const probed = await Promise.all(ACCESS_SURFACES.map((surface) => probeSurface(client, surface, rejections)));
-  const rejected = isRejectedCredentials(whoami) && probed.every((surface) => rejections.has(surface.name));
+  const rejected = isRejectedCredentials(requestOutcome(whoami)) && probed.every((surface) => rejections.has(surface.name));
   // A rejected credential is refused on every table whatever the account's roles, so its denials name no missing role.
   const surfaces = rejected ? probed.map((surface): ServicenowAccessSurface => ({ ...surface, status: "unauthorized" })) : probed;
   const readable = surfaces.filter((surface) => surface.status === "readable");
   const coreReadable = readable.filter((surface) => CORE_ACCESS_SURFACES.has(surface.name)).length;
   const status: ServicenowAccessCheckResult["status"] = rejected ? "failed" : coreReadable === CORE_ACCESS_SURFACES.size ? "healthy" : "limited";
   const degraded = surfaces.filter((surface) => surface.status !== "readable");
-  const credential = rejectedCredential(config, [whoami, ...probed.flatMap((surface) => rejections.get(surface.name) ?? [])]);
+  const credential = rejectedCredential(config, [requestOutcome(whoami), ...probed.flatMap((surface) => rejections.get(surface.name) ?? [])]);
 
   return {
     status,
@@ -3912,7 +3834,7 @@ export async function checkServicenowAccess(
     identity,
     surfaces,
     notes: [
-      `Instance ${config.instanceUrl} via ${config.authMode} auth${identity ? ` as ${identity}` : whoami.error ? ` (identity lookup failed: ${whoami.error})` : ""}.`,
+      `Instance ${config.instanceUrl} via ${config.authMode} auth${identity ? ` as ${identity}` : tableError(whoami) ? ` (identity lookup failed: ${tableError(whoami)})` : ""}.`,
       `${readable.length}/${surfaces.length} audit tables are readable; ${coreReadable}/${CORE_ACCESS_SURFACES.size} core tables are readable.`,
       ...(rejected
         ? [`Permissions were not checked because ServiceNow rejected the ${credential.kind}; the denied probes do not mean permissions are missing.`]
@@ -4432,7 +4354,7 @@ function runTool<TArgs extends AuthArgs>(
   };
 }
 
-export function registerServicenowTools(pi: any): void {
+export function registerServicenowTools(pi: GrcToolRegistrar): void {
   pi = withIntegrationToolContracts(pi, SERVICENOW_SPEC);
   pi.registerTool({
     name: "servicenow_check_access",

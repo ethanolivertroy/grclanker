@@ -21,7 +21,7 @@ test("shared core discovers and executes GRC tools with all agent hosts blocked"
       import { pathToFileURL } from "node:url";
       registerHooks({
         resolve(specifier, context, nextResolve) {
-          if (/^@earendil-works\\/(?:pi-coding-agent|pi-tui|pi-durable)(?:$|\\/)/.test(specifier)
+          if (/^@earendil-works\\/(?:pi-coding-agent|pi-tui|pi-durable|pi-ai)(?:$|\\/)/.test(specifier)
             || /^@(?:grok\\/agent-sdk|cursor\\/(?:bdk|sdk)|openai\\/(?:agents|codex-sdk)|anthropic-ai\\/claude-agent-sdk|flue\\/runtime)(?:$|\\/)/.test(specifier)) {
             throw new Error("Agent host must not load: " + specifier);
           }
@@ -72,7 +72,7 @@ test("Pi adds only its compute tools to the same domain definitions exposed by c
   assert.deepEqual(pi.filter((tool) => computeNames.has(tool.name)).map((tool) => tool.name).sort(), [...computeNames].sort());
   assert.equal(pi.length, core.length + computeNames.size);
   assert.deepEqual(
-    pi.filter((tool) => !computeNames.has(tool.name)).map((tool) => ({ name: tool.name, parameters: tool.parameters })),
-    core.map((tool) => ({ name: tool.name, parameters: tool.parameters })),
+    pi.filter((tool) => !computeNames.has(tool.name)).map((tool) => ({ name: tool.name, parameters: JSON.parse(JSON.stringify(tool.parameters)) })),
+    core.map((tool) => ({ name: tool.name, parameters: JSON.parse(JSON.stringify(tool.parameters)) })),
   );
 });

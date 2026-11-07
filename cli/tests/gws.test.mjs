@@ -68,9 +68,17 @@ function dataset(data, error) {
 
 async function captureGwsFacts(checkId, callback) {
   const { result, captures } = await captureBatchDecisionFacts(callback);
-  assert.equal(captures.length, 1);
-  assert.equal(captures[0].integration, GWS_SPEC.identity.slug);
-  const facts = captures[0].checks.get(checkId);
+  assert.equal(captures.length, result.findings.length, "each finding evaluates its own facts once");
+  const checks = new Map();
+  for (const capture of captures) {
+    assert.equal(capture.integration, GWS_SPEC.identity.slug);
+    assert.equal(capture.checks.size, 1);
+    const [[id, facts]] = capture.checks;
+    assert.equal(checks.has(id), false, `${id}: no duplicate evaluation`);
+    checks.set(id, facts);
+  }
+  assert.deepEqual([...checks.keys()].sort(), result.findings.map((finding) => finding.id).sort());
+  const facts = checks.get(checkId);
   assert.ok(facts, `${checkId}: captured runtime facts`);
   return { result, facts };
 }

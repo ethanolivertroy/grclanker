@@ -28,7 +28,7 @@ import { readGrclankerSettings } from "./settings.js";
 export async function runComputeDoctor(): Promise<void> {
   const settings = readGrclankerSettings(getGrclankerSettingsPath());
   const preferredBackend = resolveComputeBackend(settings);
-  const statuses = detectComputeBackendStatuses();
+  const statuses = await detectComputeBackendStatuses();
 
   console.log("\ngrclanker env doctor\n");
   console.log(`Preferred compute backend: ${getComputeBackendLabel(preferredBackend)} (${preferredBackend})`);

@@ -3,7 +3,7 @@ import { isGrcWriteTool } from "../../core/effects.js";
 import { buildGrclankerInstructions } from "../../core/instructions.js";
 import { personaAgentConfig, PERSONA_NAMES } from "../../core/personas.js";
 import { getRegisteredGrcTool, type RegisteredGrcTool } from "../../core/registry.js";
-import { errorEnvelope } from "../../core/results.js";
+import { errorEnvelope, toSdkToolResult } from "../../core/results.js";
 import { toJsonSchema } from "../../core/schema.js";
 import { bundledSkillConfig, WORKFLOW_NAMES, workflowSkillConfig, type WorkflowName } from "../../core/skills.js";
 import { executeGrcTool } from "../../core/tools.js";
@@ -55,10 +55,10 @@ export function createOpenAIGrcTool(nativeTool: RegisteredGrcTool) {
       if (!input || typeof input !== "object" || Array.isArray(input)) {
         return errorEnvelope("Expected a JSON object for the tool arguments.");
       }
-      return executeGrcTool(nativeTool, input as Record<string, unknown>, {
+      return toSdkToolResult(await executeGrcTool(nativeTool, input as Record<string, unknown>, {
         toolCallId: details?.toolCall?.callId,
         signal: details?.signal,
-      });
+      }));
     },
   });
 }

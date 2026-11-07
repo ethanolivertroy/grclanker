@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
 
 export type IntegrationKind = "security-inspector" | "operator-bridge" | "runtime-architecture";
 export type ApiSurfaceKind = "rest" | "sdk";
@@ -288,7 +288,7 @@ export interface IntegrationSpecContract {
   tools: readonly PublishedToolContract[];
 }
 
-type RegisteredToolDefinition = Parameters<ExtensionAPI["registerTool"]>[0];
+type RegisteredToolDefinition = Parameters<GrcToolRegistrar["registerTool"]>[0];
 
 const GRC_TOOL_CONTRACT = Symbol.for("grclanker.grc-tool-contract");
 
@@ -315,15 +315,15 @@ export function grcToolContract(definition: RegisteredToolDefinition): ToolContr
   return (definition as DefinedGrcTool)[GRC_TOOL_CONTRACT];
 }
 
-export function collectDefinedGrcTools(register: (pi: ExtensionAPI) => void): CollectedGrcTool[] {
+export function collectDefinedGrcTools(register: (tools: GrcToolRegistrar) => void): CollectedGrcTool[] {
   const tools: CollectedGrcTool[] = [];
-  const pi = {
+  const registrar: GrcToolRegistrar = {
     registerTool(definition: RegisteredToolDefinition) {
       const contract = grcToolContract(definition);
       if (contract) tools.push({ definition, contract });
     },
-  } as ExtensionAPI;
-  register(pi);
+  };
+  register(registrar);
   return tools;
 }
 

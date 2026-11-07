@@ -1,4 +1,5 @@
-import { readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
+import { commitFileTransaction, recoverFileTransaction } from "../core/atomic-files.ts";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -14,6 +15,7 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 export const repoRoot = resolve(scriptDir, "../..");
 export const sharedContractPath = resolve(repoRoot, "specs/integration-contract.md");
 export const llmsPath = resolve(repoRoot, "public/llms.txt");
+const snapshotJournalPath = resolve(repoRoot, "cli/.cache/integration-specs-transaction.json");
 const generatedMarker = "<!-- generated integration spec -->";
 const llmsCatalogStart = "<!-- generated integration registry start -->";
 const llmsCatalogEnd = "<!-- generated integration registry end -->";
@@ -585,6 +587,7 @@ export function renderLlmsCatalog(llms) {
 }
 
 export async function renderAllIntegrationSpecs() {
+  await recoverFileTransaction(snapshotJournalPath);
   const outputs = new Map([[sharedContractPath, renderSharedContract()]]);
   for (const entry of PUBLISHED_INTEGRATION_SPECS) {
     const narrativePath = resolve(repoRoot, entry.narrativePath);
@@ -603,8 +606,7 @@ export async function renderAllIntegrationSpecs() {
   return outputs;
 }
 
-async function generatedSpecPaths() {
-  const specsDir = resolve(repoRoot, "specs");
+async function generatedSpecPaths(specsDir = resolve(repoRoot, "specs")) {
   const names = await readdir(specsDir);
   const paths = names.filter((name) => name.endsWith(".spec.md")).map((name) => resolve(specsDir, name));
   const generated = [];
@@ -628,14 +630,25 @@ export async function checkIntegrationSpecs() {
   return [...new Set(stale)].sort();
 }
 
+/** Publish all generated contracts, their catalog, and stale deletions as one recoverable set. */
+export async function writeIntegrationSpecSnapshot(outputs, {
+  specsDir = resolve(repoRoot, "specs"),
+  journalPath = snapshotJournalPath,
+  beforeCommit,
+} = {}) {
+  await recoverFileTransaction(journalPath);
+  const expectedGenerated = new Set([...outputs.keys()].filter((path) => path.endsWith(".spec.md")));
+  const replacements = [...outputs].map(([path, data]) => ({ path, data }));
+  for (const path of await generatedSpecPaths(specsDir)) {
+    if (!expectedGenerated.has(path)) replacements.push({ path, data: null });
+  }
+  await commitFileTransaction(replacements, { journalPath, beforeCommit });
+  return [...outputs.keys()];
+}
+
 export async function writeIntegrationSpecs() {
   const outputs = await renderAllIntegrationSpecs();
-  for (const [path, content] of outputs) await writeFile(path, content, "utf8");
-  const expectedGenerated = new Set([...outputs.keys()].filter((path) => path.endsWith(".spec.md")));
-  for (const path of await generatedSpecPaths()) {
-    if (!expectedGenerated.has(path)) await rm(path);
-  }
-  return [...outputs.keys()];
+  return writeIntegrationSpecSnapshot(outputs);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -43,10 +43,9 @@ test("the four constructor points the audit named are present under one import",
   assert.equal(typeof index.readJsonConfig, "function");
   assert.equal(typeof index.readConfigText, "function");
   assert.ok(new index.ConfigFileError({ kind: "read", path: "/p" }) instanceof Error);
-  assert.equal(typeof index.coreDataValue, "function");
-  assert.equal(typeof index.derived, "function");
-  assert.equal(typeof index.countIfReadable, "function");
-  assert.equal(typeof index.gatedPrincipals, "function");
+  for (const name of ["completeCollection", "partialCollection", "unavailableCollection", "skippedCollection", "observedValue", "populationValue"]) {
+    assert.equal(typeof index[name], "function");
+  }
   assert.equal(typeof index.describePagination, "function");
   assert.equal(typeof index.resolveSameOriginUrl, "function");
 });

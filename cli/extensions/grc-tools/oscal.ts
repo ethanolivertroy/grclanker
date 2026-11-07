@@ -1,3 +1,4 @@
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
 /**
  * OSCAL + compliance-trestle helpers for grclanker.
  *
@@ -1037,7 +1038,7 @@ export async function assembleOscalSsp(
   };
 }
 
-export function registerOscalTools(pi: any): void {
+export function registerOscalTools(pi: GrcToolRegistrar): void {
   pi.registerTool({
     name: "oscal_check_trestle",
     label: "Check OSCAL trestle setup",

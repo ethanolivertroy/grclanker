@@ -3,30 +3,35 @@ import { catppuccinFrappe } from './monaco-theme';
 
 interface MountMonacoViewerOptions {
   container: HTMLElement;
-  skeleton: HTMLElement;
-  fallbackPre: HTMLElement;
   source: string;
-  initialWrap: boolean;
+  signal: AbortSignal;
 }
 
 export interface MonacoViewerController {
-  setWrap: (enabled: boolean) => void;
-  setMap: (enabled: boolean) => void;
+  setOptions: (options: { wrap: boolean; map: boolean }) => void;
+  layout: () => void;
+  focus: () => void;
   dispose: () => void;
 }
 
 export async function mountMonacoViewer({
   container,
-  skeleton,
-  fallbackPre,
   source,
-  initialWrap,
+  signal,
 }: MountMonacoViewerOptions): Promise<MonacoViewerController> {
-  const timeout = new Promise<never>((_, reject) => {
-    window.setTimeout(() => reject(new Error('timeout')), 8000);
+  signal.throwIfAborted();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let abortLoad: (() => void) | undefined;
+  const unavailable = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('Editor loading timed out')), 8000);
+    abortLoad = () => reject(signal.reason);
+    signal.addEventListener('abort', abortLoad, { once: true });
   });
-
-  const monaco = await Promise.race([loader.init(), timeout]);
+  const monaco = await Promise.race([loader.init(), unavailable]).finally(() => {
+    clearTimeout(timer);
+    if (abortLoad) signal.removeEventListener('abort', abortLoad);
+  });
+  signal.throwIfAborted();
   monaco.editor.defineTheme('catppuccin-frappe', catppuccinFrappe);
 
   const isMobile = window.innerWidth < 768;
@@ -37,7 +42,7 @@ export async function mountMonacoViewer({
     theme: 'catppuccin-frappe',
     readOnly: true,
     automaticLayout: true,
-    wordWrap: initialWrap ? 'on' : 'off',
+    wordWrap: 'on',
     lineNumbers: 'on',
     lineNumbersMinChars: isMobile ? 3 : 4,
     folding: !isMobile,
@@ -85,22 +90,13 @@ export async function mountMonacoViewer({
   sizeContainer();
   window.addEventListener('resize', sizeContainer);
 
-  const fallbackHadFocus = fallbackPre.contains(document.activeElement);
-  skeleton.hidden = true;
-  fallbackPre.style.display = 'none';
-  container.style.display = 'block';
-  editor.setScrollTop(0);
-  editor.setPosition({ lineNumber: 1, column: 1 });
-  if (fallbackHadFocus) editor.focus();
-
   return {
-    setWrap(enabled: boolean) {
-      editor.updateOptions({ wordWrap: enabled ? 'on' : 'off' });
-      window.setTimeout(sizeContainer, 50);
+    setOptions({ wrap, map }) {
+      editor.updateOptions({ wordWrap: wrap ? 'on' : 'off', minimap: { enabled: map } });
+      sizeContainer();
     },
-    setMap(enabled: boolean) {
-      editor.updateOptions({ minimap: { enabled } });
-    },
+    layout: sizeContainer,
+    focus: () => editor.focus(),
     dispose() {
       window.removeEventListener('resize', sizeContainer);
       editor.dispose();

@@ -1,9 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
-import { linkSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync } from "node:fs";
 import { chmod, link, lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { markOutputCommitted } from "./abort.js";
+import { assertOutputDirectory, resolveSecureOutputPath } from "./secure-output.js";
 
 /**
  * Where a bundle lands: the directory that receives it and the names to try in order. The first
@@ -12,8 +13,8 @@ import { markOutputCommitted } from "./abort.js";
 export interface BundleTarget {
   root: string;
   /**
-   * Creates `root` with the caller's own checks, in place of a plain recursive mkdir, and returns the
-   * path the bundle lands under, such as the root's real path.
+   * Optional destination preparation. Shared directory and containment validation
+   * always runs before and after this hook.
    */
   createRoot?: (root: string) => string;
   names: Iterable<string>;
@@ -347,9 +348,11 @@ export async function writeBundleAtomically(
   write: (staged: StagedBundle) => Promise<void>,
 ): Promise<CommittedBundle> {
   options.signal?.throwIfAborted();
+  assertOutputDirectory(options.root);
   const created = claimNewDirectories(options.root);
   try {
     const root = options.createRoot ? options.createRoot(options.root) : options.root;
+    assertOutputDirectory(root);
     return await stageAndCommit(root, options, write);
   } finally {
     releaseNewDirectories(created);
@@ -368,6 +371,11 @@ async function stageAndCommit(
   const nextFreeName = (): string | undefined => {
     for (let step = candidates.next(); !step.done; step = candidates.next()) {
       assertBundleName(step.value);
+      resolveSecureOutputPath(root, step.value);
+      // A dangling archive link reserves a name; it is never followed or replaced.
+      const archivePath = join(root, `${step.value}.zip`);
+      if (zip && lstatSync(archivePath, { throwIfNoEntry: false })?.isSymbolicLink() && !existsSync(archivePath)) continue;
+      if (zip) resolveSecureOutputPath(root, `${step.value}.zip`);
       checkName?.(step.value);
       if (!claimedTargets.has(join(root, step.value)) && !takenOnDisk(step.value)) return step.value;
     }
@@ -380,6 +388,7 @@ async function stageAndCommit(
   );
 
   await mkdir(root, { recursive: true, mode: 0o700 });
+  assertOutputDirectory(root);
   await sweepAbandonedStaging(root);
   let name = nextFreeName();
   if (name === undefined) throw exhausted();

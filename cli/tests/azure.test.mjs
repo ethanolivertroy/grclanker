@@ -38,6 +38,8 @@ import {
 } from "../dist/extensions/grc-tools/azure.js";
 import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { AZURE_COMPLETENESS_SOURCES, AZURE_SPEC } from "../dist/extensions/grc-tools/azure.spec.js";
+import { checkContract, evaluateCheckVerdict } from "../dist/extensions/grc-tools/spec-model.js";
+import { MissingAuthenticationError } from "../dist/extensions/grc-tools/auth-errors.js";
 import {
   CANARY,
   CANARY_URL,
@@ -226,6 +228,31 @@ function statusesById(result) {
 }
 
 const ALWAYS_MANUAL = new Set(["AZURE-MON-07", "AZURE-DP-02", "AZURE-DP-07"]);
+
+test("Azure missing authentication is typed separately from invalid configuration", () => {
+  for (const input of [{}, { tenant_id: "tenant" }, { tenant_id: "tenant", subscription_id: "subscription" }]) {
+    assert.throws(() => resolveAzureConfiguration(input, {}, () => undefined), MissingAuthenticationError);
+  }
+  assert.throws(() => resolveAzureConfiguration({}, { AZURE_AUTHORITY_HOST: "https://unsupported.example" }, () => undefined), (error) => error instanceof Error && !(error instanceof MissingAuthenticationError));
+});
+
+test("Azure findings use canonical verdict rules and preserve control mappings across readable and denied inventories", async () => {
+  const assessors = [assessAzureIdentity, assessAzureMonitoring, assessAzureSubscriptionGuardrails, assessAzureDataProtection, assessAzureNetworkAndPolicy];
+  for (const [label, client] of [["compliant", compliantClient()], ["denied", forbiddenClient()], ["empty", clientWith()]]) {
+    const { result, captures } = await captureBatchDecisionFacts(() => Promise.all(assessors.map((assess) => assess(client))));
+    const facts = new Map(captures.filter((capture) => capture.integration === AZURE_SPEC.identity.slug).flatMap((capture) => [...capture.checks]));
+    const findings = result.flatMap((assessment) => assessment.findings);
+    assert.equal(findings.length, AZURE_SPEC.checks.length, label);
+    for (const finding of findings) {
+      assert.ok(facts.has(finding.id), `${label}:${finding.id} captured decision inputs`);
+      assert.equal(finding.status, evaluateCheckVerdict(checkContract(AZURE_SPEC, finding.id), facts.get(finding.id)), `${label}:${finding.id} status`);
+      const mapping = azureModule.AZURE_CONTROL_MAPPINGS[finding.control];
+      assert.deepEqual(finding.mappings, azureModule.AZURE_FRAMEWORKS
+        .filter((framework) => mapping[framework.key] !== "n/a")
+        .map((framework) => `${framework.label} ${mapping[framework.key]}`), `${label}:${finding.id} mappings`);
+    }
+  }
+});
 
 test("resolveAzureConfiguration prefers explicit args over environment defaults", () => {
   const resolved = resolveAzureConfiguration(

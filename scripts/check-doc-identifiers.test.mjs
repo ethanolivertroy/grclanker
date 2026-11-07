@@ -23,26 +23,21 @@ after(() => {
   for (const dir of fixtures) rmSync(dir, { recursive: true, force: true });
 });
 
-const catalog = `const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
-  ["demo_", "Demo"],
-  ["demo_ops_", "Demo Operator"],
-];
-`;
-
-const extension = `pi.registerTool({ name: "demo_check_access", label: "Check" });
-pi.registerTool({ name: \`demo_assess_posture\` });
-registerAssessment(pi, "demo_assess_identity");
-pi.registerTool({ name: 'demo_ops_review_tokens' });
-const config = { region: "demo_region" };
-const token = process.env.DEMO_API_TOKEN ?? process.env["DEMO_TOKEN"];
-`;
+const manifest = {
+  schemaVersion: 1,
+  toolPrefixes: ['demo_', 'demo_ops_'],
+  tools: ['demo_check_access', 'demo_assess_posture', 'demo_assess_identity', 'demo_ops_review_tokens'].map((name) => ({
+    name, label: name, description: 'Demo tool', group: 'Demo', kind: 'domain', effect: 'read', parameters: { type: 'object' },
+  })),
+  environmentVariables: ['DEMO_API_TOKEN', 'DEMO_TOKEN', 'DEMO_SMOKE_REGIONS', 'GRCLANKER_INSTALL_DIR'],
+};
 
 function repo(files = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'check-doc-identifiers-'));
   fixtures.push(dir);
   const all = {
-    'cli/core/tool-catalog.ts': catalog,
-    'cli/extensions/demo.ts': extension,
+    'cli/tool-manifest.json': JSON.stringify(manifest),
+    'cli/extensions/demo.ts': 'const unregistered = "demo_assess_unregistered";\n',
     'cli/scripts/demo-live-smoke.mjs': 'const regions = process.env.DEMO_SMOKE_REGIONS;\n',
     'cli/tests/demo.test.mjs': 'const ghost = "demo_assess_ghost";\nprocess.env.DEMO_TEST_ONLY = "1";\n',
     'cli/dist/extensions/demo.js': 'const stale = "demo_assess_stale";\nprocess.env.DEMO_DIST_ONLY;\n',
@@ -63,14 +58,13 @@ const pattern = toolNamePattern(['demo_', 'demo_ops_'], ['check', 'assess', 'rev
 const toolNames = (markdown) => findToolNames(markdown, pattern).map(({ name }) => name);
 const envNames = (markdown) => findEnvNames(markdown).map(({ name }) => name);
 
-test('tool names come from string literals in cli/extensions and verbs from registered names', () => {
+test('tool names come only from the neutral manifest, independent of source text or adapter entries', () => {
   const code = readCodeIdentifiers(repo());
   assert.deepEqual([...code.toolNames].sort(), [
     'demo_assess_identity',
     'demo_assess_posture',
     'demo_check_access',
     'demo_ops_review_tokens',
-    'demo_region',
   ]);
   assert.deepEqual(findToolNames('`demo_check_access` `demo_assess_x` `demo_ops_review_y` `demo_region_x`', code.toolPattern).map(({ name }) => name), [
     'demo_check_access',
@@ -79,7 +73,7 @@ test('tool names come from string literals in cli/extensions and verbs from regi
   ]);
 });
 
-test('environment variable names come from the code under cli/ and the installers, never tests or builds', () => {
+test('environment variable names come only from the neutral manifest', () => {
   const { envNames: names } = readCodeIdentifiers(repo());
   for (const name of ['DEMO_API_TOKEN', 'DEMO_TOKEN', 'DEMO_SMOKE_REGIONS', 'GRCLANKER_INSTALL_DIR']) {
     assert.ok(names.has(name), name);
@@ -87,9 +81,10 @@ test('environment variable names come from the code under cli/ and the installer
   for (const name of ['DEMO_TEST_ONLY', 'DEMO_DIST_ONLY', 'DEMO_LLMS_ONLY']) assert.ok(!names.has(name), name);
 });
 
-test('a tool catalog without DOMAIN_GROUPS fails instead of checking nothing', () => {
-  assert.throws(() => readCodeIdentifiers(repo({ 'cli/core/tool-catalog.ts': 'export const GROUPS = [];\n' })), /DOMAIN_GROUPS/);
-  assert.throws(() => readCodeIdentifiers(repo({ 'cli/extensions/demo.ts': 'const x = 1;\n' })), /registered tool names/);
+test('missing or invalid neutral catalogs fail instead of checking nothing', () => {
+  assert.throws(() => readCodeIdentifiers(repo({ 'cli/tool-manifest.json': '{' })), /tool-manifest/);
+  assert.throws(() => readCodeIdentifiers(repo({ 'cli/tool-manifest.json': JSON.stringify({ ...manifest, toolPrefixes: [] }) })), /no tool inventory/);
+  assert.throws(() => readCodeIdentifiers(repo({ 'cli/tool-manifest.json': JSON.stringify({ ...manifest, tools: [] }) })), /no tool inventory/);
 });
 
 test('a tool name is a prefix and a verb, with or without more words', () => {
@@ -268,9 +263,9 @@ test('checkDocs reports names the code does not define with their file and line'
   });
   const { problems, stats } = checkDocs({ repoDir: dir });
   assert.deepEqual(problems, [
-    'src/content/docs/docs/integrations/demo.md:3: no tool named `demo_assess_ghost` in cli/extensions',
-    'src/content/docs/docs/integrations/demo.md:8: environment variable `DEMO_TEST_ONLY` is not in cli/ or the public/install* installers',
-    'src/content/docs/docs/integrations/demo.md:11: environment variable `DEMO_TYPO` is not in cli/ or the public/install* installers',
+    'src/content/docs/docs/integrations/demo.md:3: no tool named `demo_assess_ghost` in cli/tool-manifest.json',
+    'src/content/docs/docs/integrations/demo.md:8: environment variable `DEMO_TEST_ONLY` is not in cli/tool-manifest.json',
+    'src/content/docs/docs/integrations/demo.md:11: environment variable `DEMO_TYPO` is not in cli/tool-manifest.json',
   ]);
   assert.deepEqual(stats, { files: 3, tools: 2, env: 5 });
 });
@@ -279,7 +274,7 @@ test('the script exits non-zero and lists each problem', () => {
   const dir = repo({ 'README.md': 'Run `demo_check_acces`.\n' });
   const result = spawnSync(process.execPath, [script, dir], { encoding: 'utf8' });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /README\.md:1: no tool named `demo_check_acces` in cli\/extensions/);
+  assert.match(result.stderr, /README\.md:1: no tool named `demo_check_acces` in cli\/tool-manifest\.json/);
 
   const clean = spawnSync(process.execPath, [script, repo()], { encoding: 'utf8' });
   assert.equal(clean.status, 0, clean.stderr);

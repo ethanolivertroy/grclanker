@@ -1,3 +1,6 @@
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
+import { ensurePrivateDir, resolveSecureOutputPath, writeSecureTextFile, countFilesRecursively } from "./secure-output.js";
+export { resolveSecureOutputPath };
 /**
  * GCP GRC assessment tools.
  *
@@ -7,19 +10,14 @@
  */
 import { execFileSync } from "node:child_process";
 import { createSign } from "node:crypto";
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-} from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { Type } from "typebox";
 import { abortableFetch, resolveWithCommands, rethrowIfAborted, type CommandLookup } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
+import { MissingAuthenticationError } from "./auth-errors.js";
 import {
   evaluateBatchRuntimeCheckVerdict,
   hydrateBatchFrameworkMappings,
@@ -681,64 +679,13 @@ function redactSecrets(value: unknown): unknown {
   return output;
 }
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
 
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
-  if (
-    relativeTarget === ".."
-    || relativeTarget.startsWith(`..${join("/")}`)
-    || relativeTarget.startsWith("..")
-  ) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
 
-  const pathSegments = relativeTarget.split(/[\\/]+/).filter(Boolean);
-  let currentPath = realBase;
-  for (const segment of pathSegments) {
-    currentPath = join(currentPath, segment);
-    if (!existsSync(currentPath)) break;
-    const currentStat = lstatSync(currentPath);
-    if (currentStat.isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked parent directory: ${currentPath}`);
-    }
-  }
 
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  const realParent = realpathSync(parent);
-  if (lstatSync(realParent).isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
-  return resolvedTarget;
-}
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
 
-async function countFilesRecursively(pathname: string): Promise<number> {
-  const entries = await readdir(pathname, { withFileTypes: true });
-  let count = 0;
-  for (const entry of entries) {
-    const fullPath = join(pathname, entry.name);
-    if (entry.isDirectory()) count += await countFilesRecursively(fullPath);
-    else count += 1;
-  }
-  return count;
-}
+
+
 
 function defaultCommandRunner(command: string, args: string[]): string | undefined {
   try {
@@ -1036,7 +983,7 @@ function* gcpConfigurationSteps(
   }
 
   if (!accessToken && !credentials) {
-    throw new Error(
+    throw new MissingAuthenticationError(
       "Unable to resolve GCP credentials from arguments, GCP_ACCESS_TOKEN, GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, the ADC file, or gcloud auth print-access-token.",
     );
   }
@@ -4424,7 +4371,7 @@ function runTool<TArgs>(
   };
 }
 
-export function registerGcpTools(pi: any): void {
+export function registerGcpTools(pi: GrcToolRegistrar): void {
   pi = withIntegrationToolContracts(pi, GCP_SPEC);
   pi.registerTool({
     name: "gcp_check_access",

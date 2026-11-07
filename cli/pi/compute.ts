@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { cpus, totalmem } from "node:os";
 import {
@@ -77,6 +77,15 @@ export type ComputeToolLookup = (command: string) => boolean;
 
 export type ComputeDetectionOptions = {
   toolExists?: ComputeToolLookup;
+  /** Whole-backend inspection deadline, also applied to each subprocess. */
+  timeoutMs?: number;
+  probe?: (executable: string, args: string[], timeoutMs: number) => Promise<boolean>;
+};
+
+type BackendReadiness = Pick<ComputeBackendStatus, "available" | "detail">;
+type InspectionContext = {
+  toolExists: (command: string) => Promise<boolean>;
+  probe: (executable: string, args: string[]) => Promise<boolean>;
 };
 
 type ComputeBackendMetadata = {
@@ -87,6 +96,7 @@ type ComputeBackendMetadata = {
   credentialEnv: readonly string[];
   /** Executables checked by `env list`, `env doctor`, the configuration issues, and the live smoke selector. */
   requiredTools: readonly ComputeToolRequirement[];
+  inspect: (context: InspectionContext) => Promise<BackendReadiness>;
 };
 
 // runpod-pod stages the git index (`git ls-files`) into a private copy, uploads it with scp, and
@@ -103,6 +113,7 @@ const MODAL_REQUIRED_TOOLS: readonly ComputeToolRequirement[] = [
 
 const COMPUTE_BACKEND_OPTIONS: Record<ComputeBackendKind, ComputeBackendMetadata> = {
   host: {
+    inspect: async () => ({ available: true, detail: "Built-in local execution is always available." }),
     label: "Host",
     summary: "run directly in the current shell on this machine",
     bucket: "host",
@@ -111,6 +122,7 @@ const COMPUTE_BACKEND_OPTIONS: Record<ComputeBackendKind, ComputeBackendMetadata
     requiredTools: [],
   },
   "sandbox-runtime": {
+    inspect: inspectSandboxRuntime,
     label: "sandbox-runtime",
     summary: "wrap tool execution in a local filesystem/network sandbox",
     bucket: "sandboxed",
@@ -119,6 +131,7 @@ const COMPUTE_BACKEND_OPTIONS: Record<ComputeBackendKind, ComputeBackendMetadata
     requiredTools: [],
   },
   docker: {
+    inspect: inspectDocker,
     label: "Docker",
     summary: "run work inside an isolated local container",
     bucket: "sandboxed",
@@ -127,6 +140,7 @@ const COMPUTE_BACKEND_OPTIONS: Record<ComputeBackendKind, ComputeBackendMetadata
     requiredTools: [],
   },
   "parallels-vm": {
+    inspect: inspectParallels,
     label: "Parallels VM",
     summary: "run work inside a disposable Parallels sandbox deployed from a template or stopped base VM",
     bucket: "sandboxed",
@@ -135,6 +149,7 @@ const COMPUTE_BACKEND_OPTIONS: Record<ComputeBackendKind, ComputeBackendMetadata
     requiredTools: [],
   },
   modal: {
+    inspect: (context) => inspectRemoteBackend("modal", context),
     label: "Modal",
     summary: "run one-shot commands in a Modal container through the modal CLI, optionally with GPUs",
     bucket: "gpu-burst",
@@ -143,6 +158,7 @@ const COMPUTE_BACKEND_OPTIONS: Record<ComputeBackendKind, ComputeBackendMetadata
     requiredTools: MODAL_REQUIRED_TOOLS,
   },
   "runpod-pod": {
+    inspect: (context) => inspectRemoteBackend("runpod-pod", context),
     label: "RunPod Pod",
     summary: "run commands over SSH inside a persistent RunPod pod you already own",
     bucket: "persistent-remote",
@@ -151,6 +167,7 @@ const COMPUTE_BACKEND_OPTIONS: Record<ComputeBackendKind, ComputeBackendMetadata
     requiredTools: RUNPOD_POD_REQUIRED_TOOLS,
   },
   "runpod-serverless": {
+    inspect: (context) => inspectRemoteBackend("runpod-serverless", context),
     label: "RunPod Serverless",
     summary: "dispatch stateless jobs to a RunPod serverless endpoint running the grclanker worker contract",
     bucket: "gpu-burst",
@@ -159,6 +176,7 @@ const COMPUTE_BACKEND_OPTIONS: Record<ComputeBackendKind, ComputeBackendMetadata
     requiredTools: [],
   },
   "cloudflare-sandbox": {
+    inspect: inspectUnavailableBackend,
     label: "Cloudflare Sandbox",
     summary: "remote CPU-only sandbox embedded in a Cloudflare Worker (not yet available)",
     bucket: "sandboxed",
@@ -167,6 +185,7 @@ const COMPUTE_BACKEND_OPTIONS: Record<ComputeBackendKind, ComputeBackendMetadata
     requiredTools: [],
   },
   "vercel-sandbox": {
+    inspect: inspectUnavailableBackend,
     label: "Vercel Sandbox",
     summary: "remote CPU-only sandbox on Vercel (not yet available)",
     bucket: "sandboxed",
@@ -325,7 +344,7 @@ export function getComputeBackendCredentialState(kind: ComputeBackendKind): Comp
 
 function binaryExists(command: string): boolean {
   const locator = process.platform === "win32" ? "where" : "which";
-  const result = spawnSync(locator, [command], { stdio: "ignore" });
+  const result = spawnSync(locator, [command], { stdio: "ignore", timeout: 2_000, killSignal: "SIGKILL" });
   return result.status === 0;
 }
 
@@ -350,13 +369,6 @@ function normalizeWorkspacePath(value: unknown, fallback: string): string {
   const normalized = normalizeOptionalString(value)?.replace(/\\/g, "/").replace(/\/+$/, "");
   if (!normalized) return fallback;
   return normalized.startsWith("/") ? normalized : `/${normalized}`;
-}
-
-// Only called once the docker binary was found, so an injected lookup that reports it absent
-// keeps `docker info` from ever being spawned.
-function dockerDaemonReachable(): boolean {
-  const result = spawnSync("docker", ["info"], { stdio: "ignore" });
-  return result.status === 0;
 }
 
 function parseJson<T>(value: string): T | undefined {
@@ -389,9 +401,11 @@ export function getComputeBackendChoices(): Array<{
   label: string;
   summary: string;
 }> {
-  return (Object.entries(COMPUTE_BACKEND_OPTIONS) as Array<
-    [ComputeBackendKind, { label: string; summary: string }]
-  >).map(([kind, metadata]) => ({ kind, ...metadata }));
+  return COMPUTE_BACKEND_KINDS.map((kind) => ({
+    kind,
+    label: COMPUTE_BACKEND_OPTIONS[kind].label,
+    summary: COMPUTE_BACKEND_OPTIONS[kind].summary,
+  }));
 }
 
 export function normalizeComputeBackend(value: unknown): ComputeBackendKind {
@@ -748,88 +762,94 @@ function describeToolReadiness(kind: ComputeBackendKind, missing: readonly Compu
   return missing.map((requirement) => `Install \`${requirement.tool}\` to use this backend; ${requirement.reason}.`).join(" ");
 }
 
-function detectRemoteBackendStatus(kind: ComputeBackendKind, toolExists: ComputeToolLookup): ComputeBackendStatus {
-  const metadata = COMPUTE_BACKEND_OPTIONS[kind];
-  if (metadata.shipState === "stub") {
-    return {
-      kind,
-      label: metadata.label,
-      summary: metadata.summary,
-      available: false,
-      detail: "Not yet available: the adapter fails fast until a documented lifecycle surface is wired in.",
-    };
-  }
+function runInspectionProbe(executable: string, args: string[], timeoutMs: number): Promise<boolean> {
+  return new Promise((resolveProbe) => {
+    const child = spawn(executable, args, { stdio: "ignore" });
+    const timer = setTimeout(() => { child.kill("SIGKILL"); resolveProbe(false); }, timeoutMs);
+    child.once("error", () => { clearTimeout(timer); resolveProbe(false); });
+    child.once("close", (code) => { clearTimeout(timer); resolveProbe(code === 0); });
+  });
+}
 
-  const credentials = getComputeBackendCredentialState(kind);
-  const missing = findMissingComputeTools(kind, toolExists);
-  const detail = [credentials.detail, describeToolReadiness(kind, missing)].filter(Boolean).join(" ");
+async function inspectUnavailableBackend(): Promise<BackendReadiness> {
+  return { available: false, detail: "Not yet available: the adapter fails fast until a documented lifecycle surface is wired in." };
+}
+
+async function inspectSandboxRuntime(): Promise<BackendReadiness> {
+  const supported = process.platform === "darwin" || process.platform === "linux";
+  const installed = sandboxRuntimeInstalled();
   return {
-    kind,
-    label: metadata.label,
-    summary: metadata.summary,
-    available: credentials.ok && missing.length === 0,
-    detail,
+    available: supported && installed,
+    detail: !supported ? "sandbox-runtime backends require a macOS or Linux host."
+      : installed ? "Found `@anthropic-ai/sandbox-runtime` in the local runtime."
+      : "Install `@anthropic-ai/sandbox-runtime` to use this backend.",
   };
 }
 
-export function detectComputeBackendStatuses(options: ComputeDetectionOptions = {}): ComputeBackendStatus[] {
-  const toolExists = options.toolExists ?? binaryExists;
-  const sandboxInstalled = sandboxRuntimeInstalled();
-  const dockerInstalled = toolExists("docker");
-  const dockerReady = dockerInstalled && dockerDaemonReachable();
-  const parallelsInstalled = process.platform === "darwin" && toolExists("prlctl");
-
-  const statuses: ComputeBackendStatus[] = [
-    {
-      kind: "host",
-      label: getComputeBackendLabel("host"),
-      summary: COMPUTE_BACKEND_OPTIONS.host.summary,
-      available: true,
-      detail: "Built-in local execution is always available.",
-    },
-    {
-      kind: "sandbox-runtime",
-      label: getComputeBackendLabel("sandbox-runtime"),
-      summary: COMPUTE_BACKEND_OPTIONS["sandbox-runtime"].summary,
-      available: (process.platform === "darwin" || process.platform === "linux") && sandboxInstalled,
-      detail: process.platform !== "darwin" && process.platform !== "linux"
-        ? "sandbox-runtime backends require a macOS or Linux host."
-        : sandboxInstalled
-          ? "Found `@anthropic-ai/sandbox-runtime` in the local runtime."
-          : "Install `@anthropic-ai/sandbox-runtime` to use this backend.",
-    },
-    {
-      kind: "docker",
-      label: getComputeBackendLabel("docker"),
-      summary: COMPUTE_BACKEND_OPTIONS.docker.summary,
-      available: dockerReady,
-      detail: !dockerInstalled
-        ? "Install Docker Desktop or Docker Engine to use this backend."
-        : dockerReady
-          ? "Found `docker` on PATH and the Docker daemon is reachable."
-          : "Found `docker` on PATH, but the Docker daemon is not reachable.",
-    },
-    {
-      kind: "parallels-vm",
-      label: getComputeBackendLabel("parallels-vm"),
-      summary: COMPUTE_BACKEND_OPTIONS["parallels-vm"].summary,
-      available: parallelsInstalled,
-      detail: process.platform !== "darwin"
-        ? "Parallels VM backends require a macOS host."
-        : parallelsInstalled
-          ? "Found `prlctl` on PATH."
-          : "Install Parallels Desktop and ensure `prlctl` is available.",
-    },
-    detectRemoteBackendStatus("modal", toolExists),
-    detectRemoteBackendStatus("runpod-pod", toolExists),
-    detectRemoteBackendStatus("runpod-serverless", toolExists),
-    detectRemoteBackendStatus("cloudflare-sandbox", toolExists),
-    detectRemoteBackendStatus("vercel-sandbox", toolExists),
-  ];
-
-  return statuses;
+async function inspectDocker(context: InspectionContext): Promise<BackendReadiness> {
+  const installed = await context.toolExists("docker");
+  const available = installed && await context.probe("docker", ["info"]);
+  return {
+    available,
+    detail: !installed ? "Install Docker Desktop or Docker Engine to use this backend."
+      : available ? "Found `docker` on PATH and the Docker daemon is reachable."
+      : "Found `docker` on PATH, but the Docker daemon is not reachable.",
+  };
 }
 
-export function isComputeBackendAvailable(kind: ComputeBackendKind): boolean {
-  return detectComputeBackendStatuses().find((status) => status.kind === kind)?.available ?? false;
+async function inspectParallels(context: InspectionContext): Promise<BackendReadiness> {
+  const supported = process.platform === "darwin";
+  const available = supported && await context.toolExists("prlctl");
+  return {
+    available,
+    detail: !supported ? "Parallels VM backends require a macOS host."
+      : available ? "Found `prlctl` on PATH."
+      : "Install Parallels Desktop and ensure `prlctl` is available.",
+  };
+}
+
+async function inspectRemoteBackend(kind: ComputeBackendKind, context: InspectionContext): Promise<BackendReadiness> {
+  const credentials = getComputeBackendCredentialState(kind);
+  const required = COMPUTE_BACKEND_OPTIONS[kind].requiredTools;
+  const present = await Promise.all(required.map((requirement) => context.toolExists(requirement.tool)));
+  const missing = required.filter((_requirement, index) => !present[index]);
+  return {
+    available: credentials.ok && missing.length === 0,
+    detail: [credentials.detail, describeToolReadiness(kind, missing)].filter(Boolean).join(" "),
+  };
+}
+
+/** Inspect exactly one descriptor; unrelated providers and executables are never probed. */
+export async function inspectComputeBackend(kind: ComputeBackendKind, options: ComputeDetectionOptions = {}): Promise<ComputeBackendStatus> {
+  const descriptor = COMPUTE_BACKEND_OPTIONS[kind];
+  const timeoutMs = options.timeoutMs ?? 2_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Compute inspection timeout must be positive.");
+  const runProbe = options.probe ?? runInspectionProbe;
+  const context: InspectionContext = {
+    probe: (executable, args) => runProbe(executable, args, timeoutMs),
+    toolExists: options.toolExists
+      ? async (command) => options.toolExists!(command)
+      : (command) => runProbe(process.platform === "win32" ? "where" : "which", [command], timeoutMs),
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const readiness = await Promise.race([
+      descriptor.inspect(context),
+      new Promise<BackendReadiness>((resolveTimeout) => {
+        timer = setTimeout(() => resolveTimeout({ available: false, detail: `Inspection timed out after ${timeoutMs}ms.` }), timeoutMs);
+      }),
+    ]);
+    return { kind, label: descriptor.label, summary: descriptor.summary, ...readiness };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Independent inspections share no global probe sequence and finish within their own deadlines. */
+export async function detectComputeBackendStatuses(options: ComputeDetectionOptions = {}): Promise<ComputeBackendStatus[]> {
+  return Promise.all(COMPUTE_BACKEND_KINDS.map((kind) => inspectComputeBackend(kind, options)));
+}
+
+export async function isComputeBackendAvailable(kind: ComputeBackendKind, options: ComputeDetectionOptions = {}): Promise<boolean> {
+  return (await inspectComputeBackend(kind, options)).available;
 }
