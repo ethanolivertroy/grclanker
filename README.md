@@ -13,6 +13,7 @@ grclanker's goal is a GRC engineering assistant: scope assessments, gather evide
 | Codex SDK | Source adapter with selected read tools over local MCP | [Codex SDK](https://grclanker.com/docs/getting-started/codex-sdk/) |
 | Cursor / Grok Agent SDK | Source project using `@grok/agent-sdk`; local harness | [Cursor / Grok](https://grclanker.com/docs/getting-started/agent-sdk/) |
 | Claude Code (MCP) | Local MCP server for Claude Code; uses your Claude Code sign-in | [Claude Code](https://grclanker.com/docs/getting-started/claude-code/) |
+| Claude API tool runner | TypeScript adapter on `@anthropic-ai/sdk`'s tool runner from source | [Claude API](https://grclanker.com/docs/getting-started/claude-api/) |
 | Claude Agent SDK | Source adapter with selected tools over in-process MCP and write approval | [Claude Agent SDK](https://grclanker.com/docs/getting-started/claude-agent-sdk/) |
 
 OpenAI Agents SDK and Codex SDK are different hosts. Cursor currently distributes its Agent SDK as `@grok/agent-sdk`, so Cursor and Grok share one SDK guide. Each host has its own setup, model credentials, and execution controls. Source adapters share native tool implementations and the CLI dependency installation/build; they are not independently packaged products. See [Choose a Deployment](https://grclanker.com/docs/getting-started/deployment/) for operating boundaries and [cli/README.md](cli/README.md) for the code map.
@@ -189,6 +190,7 @@ The adapters live together under `cli/adapters/`. Each uses the shared GRC core 
 | --- | --- | --- |
 | OpenAI Agents SDK | [`cli/adapters/openai-agents/`](cli/adapters/openai-agents/) | [OpenAI guide](https://grclanker.com/docs/getting-started/openai-agents-sdk/): TypeScript agent, selected tools, and write approvals |
 | Codex SDK | [`cli/adapters/codex/`](cli/adapters/codex/) | [Codex guide](https://grclanker.com/docs/getting-started/codex-sdk/): worker with selected read tools over local MCP |
+| Claude API tool runner | [`cli/adapters/claude-api/`](cli/adapters/claude-api/) | [Claude API guide](https://grclanker.com/docs/getting-started/claude-api/): tool runner agent, selected tools, reviewers, and write approvals |
 | Claude Code (MCP) | [`cli/adapters/claude-code/`](cli/adapters/claude-code/) | [Claude Code guide](https://grclanker.com/docs/getting-started/claude-code/): local MCP server with GRC tools, role, and workflow prompts |
 | Claude Agent SDK | [`cli/adapters/claude-agent-sdk/`](cli/adapters/claude-agent-sdk/) | [Claude guide](https://grclanker.com/docs/getting-started/claude-agent-sdk/): selected tools over in-process MCP, reviewer subagents, and write approvals |
 | Cursor / Grok Agent SDK | [`cli/adapters/cursor-grok/`](cli/adapters/cursor-grok/) | [Cursor / Grok guide](https://grclanker.com/docs/getting-started/agent-sdk/): generated SDK project, skills, personas, and local playground |
@@ -204,6 +206,7 @@ Then use the check for your chosen adapter:
 
 ```bash
 npm --prefix cli run openai-agents:check
+npm --prefix cli run claude-api:check
 npm --prefix cli run cursor:validate
 npm --prefix cli run codex:install
 npm --prefix cli run codex:check
@@ -213,9 +216,9 @@ npm --prefix cli run claude-code:install
 npm --prefix cli run claude-code:check
 ```
 
-These checks need no model credential. Codex requires Node.js 22.22 or newer and installs its additional SDK/MCP dependencies in its adapter directory. The Claude Agent SDK adapter does the same, because the SDK bundles a platform-specific Claude Code executable. The Claude Code MCP server installs only the MCP SDK in its directory; register it with `claude mcp add` as its guide shows. OpenAI and Cursor dependencies resolve from `cli/package.json`. The source package currently installs and builds these hosts together; separate configuration and run paths do not imply isolated dependency packages.
+These checks need no model credential. Codex requires Node.js 22.22 or newer and installs its additional SDK/MCP dependencies in its adapter directory. The Claude Agent SDK adapter does the same, because the SDK bundles a platform-specific Claude Code executable. The Claude Code MCP server installs only the MCP SDK in its directory; register it with `claude mcp add` as its guide shows. OpenAI, Claude API, and Cursor dependencies resolve from `cli/package.json`. The source package currently installs and builds these hosts together; separate configuration and run paths do not imply isolated dependency packages.
 
-Use `openai-agents:run`, `codex:run`, `claude:run`, or `cursor:run` with the credentials and tool selection documented in that host's guide. Cursor's `cursor:dev` starts its playground. The older `agent-sdk:*` scripts remain compatibility aliases for the Cursor adapter; new instructions use `cursor:*`.
+Use `openai-agents:run`, `claude-api:run`, `codex:run`, `claude:run`, or `cursor:run` with the credentials and tool selection documented in that host's guide. Cursor's `cursor:dev` starts its playground. The older `agent-sdk:*` scripts remain compatibility aliases for the Cursor adapter; new instructions use `cursor:*`.
 
 ## Flue
 

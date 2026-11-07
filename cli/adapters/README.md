@@ -6,6 +6,7 @@ Choose the adapter for the agent host you want. Each directory documents its own
 | --- | --- | --- | --- |
 | [OpenAI Agents SDK](openai-agents/README.md) | `@openai/agents` in your Node process | `openai-agents/cli.ts`, or exported factory in `agent.ts` | `npm --prefix cli run openai-agents:check` |
 | [Codex SDK](codex/README.md) | `@openai/codex-sdk` subprocess, with GRC tools over local MCP | `codex/main.mjs` and `mcp-server.mjs` | `npm --prefix cli run codex:install`, then `npm --prefix cli run codex:check` |
+| [Claude API tool runner](claude-api/README.md) | `@anthropic-ai/sdk` tool runner in your Node process | `claude-api/cli.ts`, or exported factory in `agent.ts` | `npm --prefix cli run claude-api:check` |
 | [Claude Code (MCP)](claude-code/README.md) | Claude Code itself, with your Claude Code sign-in; GRC tools over a local stdio MCP server | `claude-code/mcp-server.mjs`, registered with `claude mcp add` | `npm --prefix cli run claude-code:install`, then `npm --prefix cli run claude-code:check` |
 | [Claude Agent SDK](claude-agent-sdk/README.md) | `@anthropic-ai/claude-agent-sdk` with its bundled Claude Code executable, GRC tools over in-process MCP | `claude-agent-sdk/main.mjs`, or exported options in `agent.mjs` | `npm --prefix cli run claude:install`, then `npm --prefix cli run claude:check` |
 | [Cursor / Grok Agent SDK](cursor-grok/README.md) | `@grok/agent-sdk` local harness | `cursor-grok/bot/agent.ts` | `npm --prefix cli run cursor:validate` |

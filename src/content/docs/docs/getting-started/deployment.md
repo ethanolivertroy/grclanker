@@ -14,11 +14,12 @@ grclanker combines a GRC engineering role, evidence-driven workflows, and 241 do
 | Codex SDK | Available from source; selected read tools | You want Codex to act as a GRC engineer with an explicit set of GRC tools through a local MCP server. | [Codex SDK](/docs/getting-started/codex-sdk/) |
 | Cursor / Grok Agent SDK | Available from source, local harness | You want an agent project with native SDK tools, skills, and personas in the Cursor/Grok harness. | [Cursor / Grok Agent SDK](/docs/getting-started/agent-sdk/) |
 | Claude Code (MCP) | Available from source; local MCP server | You already use Claude Code, including with a Claude subscription, and want GRC tools, role, and workflows in it. | [Claude Code (MCP)](/docs/getting-started/claude-code/) |
+| Claude API tool runner | Available from source | You want a lightweight TypeScript agent on Anthropic's API SDK tool runner, with selected GRC tools and no Claude Code executable. | [Claude API Tool Runner](/docs/getting-started/claude-api/) |
 | Claude Agent SDK | Available from source | You want Claude's agent loop with selected GRC tools over in-process MCP, reviewer subagents, and per-call approval for writes. | [Claude Agent SDK](/docs/getting-started/claude-agent-sdk/) |
 
 OpenAI Agents SDK and Codex SDK are separate integrations with separate agent loops. Cursor's current Agent SDK is distributed as `@grok/agent-sdk`, formerly `@cursor/bdk`: Cursor and Grok refer to the same SDK path here. This does not establish compatibility with the separate xAI API SDK. See the [OpenAI Agents SDK overview](https://developers.openai.com/api/docs/guides/agents/sdk), [Codex SDK documentation](https://developers.openai.com/codex/sdk), [Claude Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview), and [Cursor Agent SDK documentation](https://cursor.com/docs/agent-sdk).
 
-The release installer runs Pi. The OpenAI, Codex, Claude Agent SDK, Claude Code, and Cursor/Grok guides use a source checkout; installing the release does not install those SDK projects. SDK credentials authenticate the model or harness. Vendor credentials separately authorize the GRC tools to inspect your organization.
+The release installer runs Pi. The OpenAI, Codex, Claude API, Claude Agent SDK, Claude Code, and Cursor/Grok guides use a source checkout; installing the release does not install those SDK projects. SDK credentials authenticate the model or harness. Vendor credentials separately authorize the GRC tools to inspect your organization.
 
 Existing [Flue](/docs/getting-started/flue-runtime/) and experimental [durable](/docs/getting-started/durable-runtime/) runners remain additional deployment options.
 
@@ -47,6 +48,7 @@ The code separates shared GRC behavior from each agent host:
 | `cli/pi/` | Pi terminal, setup wizard, sessions, and compute backends |
 | `cli/adapters/openai-agents/` | OpenAI Agents SDK tools, agents, approvals, and runner |
 | `cli/adapters/codex/` | Codex SDK worker and local GRC MCP server |
+| `cli/adapters/claude-api/` | Claude API tool runner tools, reviewers, approvals, and runner |
 | `cli/adapters/claude-code/` | Local MCP server adding GRC tools, role, and workflow prompts to Claude Code |
 | `cli/adapters/claude-agent-sdk/` | Claude Agent SDK options, in-process GRC MCP server, approvals, and runner |
 | `cli/adapters/cursor-grok/` | Cursor/Grok project, SDK tool definitions, skills, and subagents |

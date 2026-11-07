@@ -5,7 +5,7 @@ description: Run a GRC engineering assistant with the Claude Agent SDK, grclanke
 
 The grclanker Claude Agent SDK adapter pairs Anthropic's agent loop with the GRC engineer instructions, workflow prompts, an explicitly chosen set of domain tools, and auditor and verifier subagents. It lives in `cli/adapters/claude-agent-sdk/` and imports the provider-neutral `cli/core/` bridge; it does not depend on another provider's adapter.
 
-To use grclanker inside Claude Code with your own Claude Code sign-in, including a Claude subscription, use the [Claude Code (MCP)](/docs/getting-started/claude-code/) path instead; it needs no API key.
+To use grclanker inside Claude Code with your own Claude Code sign-in, including a Claude subscription, use the [Claude Code (MCP)](/docs/getting-started/claude-code/) path instead; it needs no API key. For a lighter API-key agent without the Claude Code executable, see the [Claude API tool runner](/docs/getting-started/claude-api/).
 
 The [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) (`@anthropic-ai/claude-agent-sdk`, pinned to 0.3.305) runs its loop through a bundled Claude Code executable. grclanker removes Claude Code's built-in shell, file, web, and editing tools and serves the selected GRC tools from an MCP server inside your Node process.
 

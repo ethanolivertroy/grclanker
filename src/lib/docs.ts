@@ -39,6 +39,7 @@ export const docsSections: Array<{ title: string; items: DocsSectionEntry[] }> =
       { label: 'Cursor / Grok Agent SDK', slug: 'getting-started/agent-sdk' },
       { label: 'Claude Agent SDK', slug: 'getting-started/claude-agent-sdk' },
       { label: 'Claude Code (MCP)', slug: 'getting-started/claude-code' },
+      { label: 'Claude API Tool Runner', slug: 'getting-started/claude-api' },
       { label: 'Compute Backends', slug: 'getting-started/compute-backends' },
       { label: 'Flue Runtime', slug: 'getting-started/flue-runtime' },
       { label: 'Durable Runtime', slug: 'getting-started/durable-runtime' },

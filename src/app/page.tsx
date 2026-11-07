@@ -81,6 +81,12 @@ const deploymentCards = [
     description: 'Run the @grok/agent-sdk project with native GRC tools, workflow skills, and auditor and verifier personas.',
   },
   {
+    label: 'Claude API Tool Runner',
+    status: 'Source adapter',
+    href: '/docs/getting-started/claude-api/',
+    description: 'Build a TypeScript GRC agent on the Anthropic API SDK tool runner, with selected native tools and human approvals.',
+  },
+  {
     label: 'Claude Code',
     status: 'Source · local MCP server',
     href: '/docs/getting-started/claude-code/',

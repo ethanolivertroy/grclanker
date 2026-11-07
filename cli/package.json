@@ -37,6 +37,8 @@
     "agent-sdk:call": "npm run cursor:call --",
     "openai-agents:run": "node dist/adapters/openai-agents/cli.js",
     "openai-agents:check": "node dist/adapters/openai-agents/cli.js --check",
+    "claude-api:run": "node dist/adapters/claude-api/cli.js",
+    "claude-api:check": "node dist/adapters/claude-api/cli.js --check",
     "postinstall": "node scripts/patch-embedded-pi.mjs --root .",
     "brand:embedded-pi": "node scripts/patch-embedded-pi.mjs",
     "build:bundle": "node scripts/build-native-bundle.mjs",
@@ -124,6 +126,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.81",
+    "@anthropic-ai/sdk": "1.2.0",
     "@aws-sdk/client-accessanalyzer": "^3.1156.0",
     "@aws-sdk/client-account": "^3.1156.0",
     "@aws-sdk/client-auditmanager": "^3.1156.0",
