@@ -91,7 +91,7 @@ import {
 import { normalizeGrclankerSettings, readGrclankerSettings } from "../dist/pi/settings.js";
 import { quoteForBash } from "../dist/pi/shell.js";
 import { extractInitialPrompt } from "../dist/pi/prompt-envelope.js";
-import { readWorkflowPrompt } from "../dist/pi/workflow-prompt.js";
+import { readWorkflowPrompt } from "../dist/core/workflow-prompt.js";
 
 const RUNPOD_POD_JSON = JSON.stringify({
   id: "pod42",

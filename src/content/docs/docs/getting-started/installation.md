@@ -1,9 +1,11 @@
 ---
 title: Installation
-description: Install the grclanker release bundle, build the current main branch from source, or install only the skills.
+description: Install the Pi terminal release bundle, build grclanker from source, or install only the skills.
 ---
 
-There are two ways to install grclanker:
+This page installs grclanker's Pi terminal application. SDK hosts have their own complete setup guides on [Choose a Deployment](/docs/getting-started/deployment/); they use the shared source package with separate host configuration.
+
+There are two ways to install the terminal application:
 
 - **Release bundle.** The one-line installer fetches the newest GitHub release bundle, currently `v0.1.4`, with all 241 domain tools and its own Node.js runtime.
 - **Source checkout.** Build `main` yourself to run unreleased changes or to work on grclanker.

@@ -23,9 +23,9 @@ const sitePages = [
 // the sections that use their other words.
 const identifiersOnlySections = ['/docs/integrations/', '/docs/fedramp/'];
 
-// `sync:agent-sdk-tools` writes one file per registered tool, named after it.
+// `sync:cursor-tools` writes one file per registered tool, named after it.
 const toolNames = new Set(
-  readdirSync(join(process.cwd(), 'cli/agent-sdk/bot/tools')).map((file) => file.replace(/\.ts$/, '')),
+  readdirSync(join(process.cwd(), 'cli/adapters/cursor-grok/bot/tools')).map((file) => file.replace(/\.ts$/, '')),
 );
 
 // A hit shows its sidebar section above the page title. That is what tells a

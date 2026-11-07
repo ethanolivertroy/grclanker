@@ -3,9 +3,11 @@ title: OpenAI Agents SDK
 description: Build and run a GRC engineer assistant with the OpenAI Agents SDK, grclanker's native tools, workflows, and evidence reviewers.
 ---
 
-Run grclanker inside the **OpenAI Agents SDK for TypeScript** using the adapter in `cli/openai-agents/`. This page includes installation, credentials, runnable code, tool selection, approval behavior, and deployment instructions. It does not require another runtime's guide or configuration.
+Run grclanker inside the **OpenAI Agents SDK for TypeScript** using the adapter in `cli/adapters/openai-agents/`. This page includes installation, credentials, runnable code, tool selection, approval behavior, and deployment instructions. It does not require another runtime's guide or configuration.
 
-The adapter uses `@openai/agents` **0.21.0** and the provider-neutral GRC registry in `cli/runtime/`. It loads the same GRC methodology, native tools, workflow prompts, cryptographic validation skill, and auditor/verifier personas as the project. It has no dependency on the Cursor/Grok adapter. The [OpenAI Agents SDK](https://developers.openai.com/api/docs/guides/agents/sdk) runs the model and tool loop in your Node process.
+The adapter uses `@openai/agents` **0.21.0** and the provider-neutral GRC registry in `cli/core/`. Native tools live in `cli/extensions/grc-tools/`; shared instructions, workflow prompts, skills, and personas live in `cli/.grclanker/`, `cli/prompts/`, and `cli/skills/`. The [OpenAI Agents SDK](https://developers.openai.com/api/docs/guides/agents/sdk) runs the model and tool loop in your Node process.
+
+This host has its own agent configuration, credentials, approvals, and runner. It does not import or require another adapter's setup. Source dependencies and the TypeScript build are shared in `cli/package.json`, so the adapter is not an independently packaged installation. Its `agent.ts` and `cli.ts` compile to `cli/dist/adapters/openai-agents/`.
 
 ## Prerequisites
 
@@ -80,7 +82,7 @@ After the installation above, save this complete example as `cli/openai-example.
 
 ```javascript
 import { Runner } from "@openai/agents";
-import { createGrclankerOpenAIAgent } from "./dist/openai-agents/agent.js";
+import { createGrclankerOpenAIAgent } from "./dist/adapters/openai-agents/agent.js";
 
 const agent = createGrclankerOpenAIAgent({
   model: "gpt-5.4",
@@ -144,7 +146,7 @@ In an embedded application, inspect `result.interruptions`, resolve each with `r
 
 ## Deploy on your infrastructure
 
-Build the checkout in CI with the install and build commands above. Run `node cli/dist/openai-agents/cli.js` from the repository root for a one-shot job, or call the exported factory from your Node service. Preserve the `cli/package.json`, installed production dependencies, built `cli/dist/`, and bundled assets under `cli/.grclanker/`, `cli/prompts/`, and `cli/skills/`; the adapter resolves its instructions from those assets.
+Build the checkout in CI with the install and build commands above. Run `node cli/dist/adapters/openai-agents/cli.js` from the repository root for a one-shot job, or call the exported factory from your Node service. Preserve the `cli/package.json`, installed production dependencies, built `cli/dist/`, and bundled assets under `cli/.grclanker/`, `cli/prompts/`, and `cli/skills/`; the adapter resolves its instructions from those assets.
 
 Inject `OPENAI_API_KEY` and the selected tenant credentials at runtime. Provide network access to the model and the selected tools' APIs. Mount a persistent output directory if evidence must survive a job. Public lookups can cache reference data under `~/.grclanker/.state/`; set `GRCLANKER_HOME` when you need a dedicated state directory.
 
@@ -154,7 +156,7 @@ The shipped CLI is a local process and one-shot runner, not a hosted website, sc
 
 | Symptom | Action |
 |---|---|
-| `Cannot find module` under `dist/openai-agents` | Run `npm --prefix cli ci` and `npm --prefix cli run build` from the checkout |
+| `Cannot find module` under `dist/adapters/openai-agents` | Run `npm --prefix cli ci` and `npm --prefix cli run build` from the checkout |
 | Missing `OPENAI_API_KEY`, or provider 401 | Inject a valid OpenAI API key into the agent process; local agent construction does not test authentication |
 | Model is unavailable | Choose a model your API project can access with `--model` |
 | Agent cannot call an organization tool | Add its exact name to `--tools` and inject that vendor's credentials into the process |

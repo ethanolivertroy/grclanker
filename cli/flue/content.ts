@@ -14,7 +14,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, extname, resolve } from "node:path";
 import { defineSkill, type SkillDefinition } from "@flue/runtime";
 import { parse as parseYaml } from "yaml";
-import { renderWorkflowPrompt } from "../pi/workflow-prompt.js";
+import { renderWorkflowPrompt } from "../core/workflow-prompt.js";
 
 export interface GrclankerSubagentRole {
   name: string;

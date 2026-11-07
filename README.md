@@ -1,6 +1,6 @@
 # grclanker
 
-grclanker is an experimental open source AI GRC CLI built on [Pi](https://github.com/earendil-works/pi) 1.3 (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.3.0). The current release is [`v0.1.4`](https://github.com/ethanolivertroy/grclanker/releases/tag/v0.1.4). It is early: minor versions can break before 1.0.
+grclanker is an experimental open source GRC engineering assistant with native tools for evidence collection, control assessments, and risk analysis. Its default terminal host embeds [Pi](https://github.com/earendil-works/pi) 1.4 (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.4.0); source adapters support other agent hosts. The current release is [`v0.1.4`](https://github.com/ethanolivertroy/grclanker/releases/tag/v0.1.4). It is early: minor versions can break before 1.0.
 
 macOS and Linux are the platforms with release bundles. Windows support is best effort. Linux musl hosts, including Alpine, have no bundle. Use a source checkout there.
 
@@ -10,13 +10,13 @@ grclanker's goal is a GRC engineering assistant: scope assessments, gather evide
 | --- | --- | --- |
 | Pi terminal CLI | Release bundle or source; local or hosted models | [Pi](https://grclanker.com/docs/getting-started/pi-runtime/) |
 | OpenAI Agents SDK | TypeScript adapter and runner from source | [OpenAI Agents SDK](https://grclanker.com/docs/getting-started/openai-agents-sdk/) |
-| Codex SDK | Source example with selected GRC tools over local MCP | [Codex SDK](https://grclanker.com/docs/getting-started/codex-sdk/) |
+| Codex SDK | Source adapter with selected read tools over local MCP | [Codex SDK](https://grclanker.com/docs/getting-started/codex-sdk/) |
 | Cursor / Grok Agent SDK | Source project using `@grok/agent-sdk`; local harness | [Cursor / Grok](https://grclanker.com/docs/getting-started/agent-sdk/) |
 | Claude Agent SDK | Planned; no adapter yet | [Claude plan](https://grclanker.com/docs/getting-started/claude-agent-sdk/) |
 
-OpenAI Agents SDK and Codex SDK are different hosts. Cursor currently distributes its Agent SDK as `@grok/agent-sdk`, so Cursor and Grok share one SDK guide. All SDK paths use native GRC implementations through provider-neutral code; they do not require the Pi terminal setup or another SDK's guide. See [Choose a Deployment](https://grclanker.com/docs/getting-started/deployment/) for the runtime boundaries and current product scope.
+OpenAI Agents SDK and Codex SDK are different hosts. Cursor currently distributes its Agent SDK as `@grok/agent-sdk`, so Cursor and Grok share one SDK guide. Each host has its own setup, model credentials, and execution controls. Source adapters share native tool implementations and the CLI dependency installation/build; they are not independently packaged products. See [Choose a Deployment](https://grclanker.com/docs/getting-started/deployment/) for operating boundaries and [cli/README.md](cli/README.md) for the code map.
 
-## Install
+## Install the Pi terminal CLI
 
 On macOS or Linux:
 
@@ -40,7 +40,7 @@ An official GitHub download or a `GRCLANKER_RELEASE_BASE_URL` install checks the
 
 `@grclanker/cli` is not on npm. `npm install -g @grclanker/cli` and `bun install -g @grclanker/cli` fail.
 
-### From source
+### Pi terminal CLI from source
 
 A checkout of `main` runs changes that are not in the release bundle yet. You need git, npm, and Node.js 22.19 or newer, the `engines` floor in `cli/package.json`.
 
@@ -57,7 +57,7 @@ grclanker tools
 
 `grclanker tools` should report `241 domain tools + 7 compute backend tools`. `npm link` has to run from inside `cli/`, where it puts the `cli/bin/grclanker.js` launcher on your `PATH`. `npm --prefix cli link` does not, because `--prefix` also redirects npm's global link directory into the checkout.
 
-## Quick start
+## Pi terminal quick start
 
 The release installer links `grclanker` into `~/.local/bin`. A source checkout does the same with the `npm link` step above. The commands below use that name.
 
@@ -161,9 +161,9 @@ These five families are the other 29 domain tools. They are not tenant integrati
 
 212 platform tools and 29 reference tools are the 241 domain tools.
 
-## Compute backends
+## Pi compute backends
 
-The default backend is `host`, the local shell. `grclanker setup --compute <kind>` saves a preference. For one run, put `--compute <kind>` on a workflow command, a quoted prompt, `env smoke-test`, or `env exec`. Examples: `grclanker investigate --compute docker` and `grclanker env smoke-test --compute host`. `grclanker --compute docker` is an unknown command. `env doctor` and `env list` ignore the flag.
+These settings configure the Pi terminal host. The default backend is `host`, the local shell. `grclanker setup --compute <kind>` saves a preference. For one run, put `--compute <kind>` on a workflow command, a quoted prompt, `env smoke-test`, or `env exec`. Examples: `grclanker investigate --compute docker` and `grclanker env smoke-test --compute host`. `grclanker --compute docker` is an unknown command. `env doctor` and `env list` ignore the flag.
 
 | Kind | State | What runs there |
 | --- | --- | --- |
@@ -180,21 +180,35 @@ The default backend is `host`, the local shell. `grclanker setup --compute <kind
 
 `grclanker env list` shows which kinds this machine can run. `env doctor` checks the saved backend. `env smoke-test` checks file tools and backend-native search. The [compute backends](https://grclanker.com/docs/getting-started/compute-backends/) page is the full matrix.
 
-## Cursor Agent SDK
+## SDK adapters from source
 
-From a source checkout, the same 241 domain tools can run as a [Cursor Agent SDK](https://cursor.com/docs/agent-sdk) agent. The project is `cli/agent-sdk/`, an adapter over the bundled extension, built on [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.6.0. It does not expose `bash`, `read`, `write`, `edit`, `ls`, `find`, or `grep`. The Cursor harness supplies `shell` plus `Read`, `Write`, `StrReplace`, `Grep`, `Glob`, `LS`, and `Delete`. Turns that leave the model unset use `grok-4.7` with `reasoning_effort=high` and `fast=true`.
+The adapters live together under `cli/adapters/`. Each uses the shared GRC core in `cli/core/` and native tool implementations in `cli/extensions/grc-tools/`; none starts another adapter's agent loop. The default terminal host remains in `cli/pi/`.
 
-199 tools declare `effect: "read"`. The other 42 write files (exports, generators, the Google Workspace operator evidence collector, and OSCAL workspace commands) and wait for a person to approve a model-initiated call.
+| Host | Source | Complete setup |
+| --- | --- | --- |
+| OpenAI Agents SDK | [`cli/adapters/openai-agents/`](cli/adapters/openai-agents/) | [OpenAI guide](https://grclanker.com/docs/getting-started/openai-agents-sdk/): TypeScript agent, selected tools, and write approvals |
+| Codex SDK | [`cli/adapters/codex/`](cli/adapters/codex/) | [Codex guide](https://grclanker.com/docs/getting-started/codex-sdk/): worker with selected read tools over local MCP |
+| Cursor / Grok Agent SDK | [`cli/adapters/cursor-grok/`](cli/adapters/cursor-grok/) | [Cursor / Grok guide](https://grclanker.com/docs/getting-started/agent-sdk/): generated SDK project, skills, personas, and local playground |
 
-`@grok/agent-sdk` is a CLI devDependency. `npm --prefix cli ci` installs it and its `agent-sdk` CLI:
+From the checkout root, install and build the shared source package:
 
 ```bash
-npm --prefix cli run agent-sdk:validate
-npm --prefix cli run agent-sdk:info
-npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-44228"}'
+npm --prefix cli ci
+npm --prefix cli run build
 ```
 
-`validate`, `info`, and `tool call` need no Cursor credential. Model turns (`agent-sdk:dev`, `agent-sdk:run`) need one: run `npx agent-sdk login` inside `cli/`, or export `CURSOR_API_KEY`. See [Cursor Agent SDK](https://grclanker.com/docs/getting-started/agent-sdk/).
+Then use the check for your chosen adapter:
+
+```bash
+npm --prefix cli run openai-agents:check
+npm --prefix cli run cursor:validate
+npm --prefix cli run codex:install
+npm --prefix cli run codex:check
+```
+
+These checks need no model credential. Codex requires Node.js 22.22 or newer and installs its additional SDK/MCP dependencies in its adapter directory. OpenAI and Cursor dependencies resolve from `cli/package.json`. The source package currently installs and builds these hosts together; separate configuration and run paths do not imply isolated dependency packages.
+
+Use `openai-agents:run`, `codex:run`, or `cursor:run` with the credentials and tool selection documented in that host's guide. Cursor's `cursor:dev` starts its playground. The older `agent-sdk:*` scripts remain compatibility aliases for the Cursor adapter; new instructions use `cursor:*`.
 
 ## Flue
 

@@ -12,7 +12,7 @@ import {
   scrubDataText,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/hardening/error-text.js";
-import { isSensitiveArgumentKey } from "../dist/flue/redact.js";
+import { isSensitiveArgumentKey } from "../dist/core/redact.js";
 import { leakedCanaryWindow } from "./helpers/error-canaries.mjs";
 import { assertUrlUserinfoBoundaryRows } from "./helpers/redaction-table.mjs";
 

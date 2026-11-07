@@ -14,9 +14,9 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { CURRENT_SQLITE_SCHEMA_VERSION } from "@earendil-works/pi-durable/storage/sqlite";
 
-import { classifyGrcToolEffect, hasWriteVerb, WRITE_VERBS } from "../dist/agent-sdk/lib/effects.js";
-import { readGrclankerSystemPrompt } from "../dist/agent-sdk/lib/instructions.js";
-import { collectRegisteredGrcTools, getRegisteredGrcTool } from "../dist/agent-sdk/lib/registry.js";
+import { classifyGrcToolEffect, hasWriteVerb, WRITE_VERBS } from "../dist/core/effects.js";
+import { readGrclankerSystemPrompt } from "../dist/core/instructions.js";
+import { collectRegisteredGrcTools, getRegisteredGrcTool } from "../dist/core/registry.js";
 import {
   DURABLE_EXPERIMENTAL_BANNER,
   exitCodeForDurableOutcome,

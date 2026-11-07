@@ -18,7 +18,7 @@ import {
 import { resolveComputeBackend, type ComputeBackendKind } from "./compute.js";
 import { serializeInitialPrompt, type InitialPromptPayload } from "./prompt-envelope.js";
 import { ensureCliConfigured, runComputeSetup, runSetupWizard } from "./setup.js";
-import { readWorkflowPrompt } from "./workflow-prompt.js";
+import { readWorkflowPrompt } from "../core/workflow-prompt.js";
 
 function resolveExtensionEntrypoint(appRoot: string): string {
   const compiledPath = resolve(appRoot, "dist", "extensions", "grc-tools.js");

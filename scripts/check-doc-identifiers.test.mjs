@@ -41,7 +41,7 @@ function repo(files = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'check-doc-identifiers-'));
   fixtures.push(dir);
   const all = {
-    'cli/pi/tool-catalog.ts': catalog,
+    'cli/core/tool-catalog.ts': catalog,
     'cli/extensions/demo.ts': extension,
     'cli/scripts/demo-live-smoke.mjs': 'const regions = process.env.DEMO_SMOKE_REGIONS;\n',
     'cli/tests/demo.test.mjs': 'const ghost = "demo_assess_ghost";\nprocess.env.DEMO_TEST_ONLY = "1";\n',
@@ -88,7 +88,7 @@ test('environment variable names come from the code under cli/ and the installer
 });
 
 test('a tool catalog without DOMAIN_GROUPS fails instead of checking nothing', () => {
-  assert.throws(() => readCodeIdentifiers(repo({ 'cli/pi/tool-catalog.ts': 'export const GROUPS = [];\n' })), /DOMAIN_GROUPS/);
+  assert.throws(() => readCodeIdentifiers(repo({ 'cli/core/tool-catalog.ts': 'export const GROUPS = [];\n' })), /DOMAIN_GROUPS/);
   assert.throws(() => readCodeIdentifiers(repo({ 'cli/extensions/demo.ts': 'const x = 1;\n' })), /registered tool names/);
 });
 

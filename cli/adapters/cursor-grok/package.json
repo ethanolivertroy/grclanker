@@ -1,0 +1,8 @@
+{
+  "name": "grclanker-cursor-agent",
+  "version": "0.1.4",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "Cursor / Grok Agent SDK adapter for grclanker GRC tools, workflow prompts, and personas. Shared implementations live in cli/core; dependencies resolve from @grclanker/cli."
+}

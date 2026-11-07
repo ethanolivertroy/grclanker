@@ -1,8 +1,8 @@
 /**
- * Bridge grclanker's native Pi tools into Flue `ToolDefinition`s.
+ * Bridge grclanker's shared GRC tools into Flue `ToolDefinition`s.
  *
- * The Pi tools stay untouched; this module collects them from the same
- * registration path `grclanker tools` uses, converts their TypeBox parameter
+ * Domain tools stay shared; this module collects them directly from core
+ * without initializing Pi's terminal extension, converts their TypeBox parameter
  * schemas to Valibot at the boundary, and adapts the Pi `execute()` contract
  * to Flue's `run()` envelope.
  */
@@ -12,8 +12,8 @@ import type {
   ToolDefinition as PiToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { defineTool, type ToolDefinition as FlueToolDefinition } from "@flue/runtime";
-import { collectRegisteredToolDefinitions, resolveToolGroup } from "../pi/tool-catalog.js";
-import { redactSensitiveArguments, redactToolErrorText } from "./redact.js";
+import { collectDomainToolDefinitions } from "../core/domain-tools.js";
+import { redactSensitiveArguments, redactToolErrorText } from "../core/redact.js";
 import { jsonSchemaToToolInput } from "./schema.js";
 
 /** The subset of a Pi tool definition the bridge relies on. */
@@ -116,7 +116,7 @@ export function toFlueTool(tool: PiBridgeableTool): FlueToolDefinition {
 
 /** Every grclanker domain tool (compute-backend wrappers are Pi-specific and excluded). */
 export function collectGrclankerDomainTools(): PiToolDefinition[] {
-  return collectRegisteredToolDefinitions().filter((tool) => resolveToolGroup(tool.name).kind !== "compute");
+  return collectDomainToolDefinitions();
 }
 
 export function createGrclankerFlueTools(tools: PiBridgeableTool[] = collectGrclankerDomainTools()): FlueToolDefinition[] {

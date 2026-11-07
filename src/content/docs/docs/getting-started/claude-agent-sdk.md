@@ -7,7 +7,7 @@ description: Status and intended scope for a future standalone grclanker integra
 
 ## Intended deployment
 
-The [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) embeds Anthropic's agent loop in an application you operate. A future grclanker integration should pair that loop with the GRC engineer instructions, workflow prompts, and an explicitly chosen set of domain tools from the provider-neutral `cli/runtime/` bridge.
+The [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) embeds Anthropic's agent loop in an application you operate. A future grclanker integration should pair that loop with the GRC engineer instructions, workflow prompts, and an explicitly chosen set of domain tools from the provider-neutral `cli/core/` bridge.
 
 The aim is an assistant that scopes governance and compliance work, gathers security evidence from authorized systems, maps findings to controls, prioritizes organizational risk, and helps draft remediation and compliance artifacts. It should distinguish verified evidence from recommendations and missing information.
 

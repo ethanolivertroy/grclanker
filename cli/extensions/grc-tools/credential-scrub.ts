@@ -35,7 +35,7 @@
  * way it would in an error message; and the whole subtree under a credential-shaped key is replaced, arrays and
  * nested objects included, so `tokens: ["..."]` and `credentials: { value }` cannot keep what their key names.
  */
-import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues } from "../../flue/redact.js";
+import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues } from "../../core/redact.js";
 
 /** The marker every scrub writes; the Flue marker is folded into it so one message carries one marker. */
 export const REDACTED = "[REDACTED]";
