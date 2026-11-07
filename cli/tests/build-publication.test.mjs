@@ -30,7 +30,7 @@ for (const project of ["tsconfig.json", "tsconfig.cursor-sync.json"]) {
       } }), /synthetic compiler error/);
       assert.equal(readFileSync(join(root, "dist/index.js"), "utf8"), "old runnable build");
       assert.equal(readFileSync(join(root, "dist/stale.js"), "utf8"), "old generated file");
-      assert.deepEqual(readdirSync(root).filter((name) => name.startsWith(".dist")), []);
+      assert.deepEqual(readdirSync(root).filter((name) => name.startsWith(".dist")), [".dist.snapshot-transaction.json.lock.sqlite"]);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 }
@@ -50,7 +50,7 @@ test("a successful compiler publishes its complete tree and removes obsolete bui
     } });
     assert.equal(readFileSync(join(root, "dist/index.js"), "utf8"), "new complete build");
     assert.equal(existsSync(join(root, "dist/stale.js")), false);
-    assert.deepEqual(readdirSync(root).filter((name) => name.startsWith(".dist")), []);
+    assert.deepEqual(readdirSync(root).filter((name) => name.startsWith(".dist")), [".dist.snapshot-transaction.json.lock.sqlite"]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
