@@ -23,13 +23,13 @@ test('homepage workflow states match the shipped prompts', () => {
 });
 
 test('deployment choices list every source integration', () => {
-  for (const label of ['Pi Terminal CLI', 'OpenAI Agents SDK', 'Codex SDK', 'Cursor / Grok Agent SDK', 'Claude Agent SDK']) {
+  for (const label of ['Pi Terminal CLI', 'OpenAI Agents SDK', 'Codex SDK', 'Cursor / Grok Agent SDK', 'Claude Code', 'Claude API Tool Runner', 'Claude Agent SDK']) {
     assert.ok(home.includes(`label: '${label}'`), label);
   }
   assert.doesNotMatch(home, /status: 'Planned'/);
-  assert.match(home, /Source integrations add OpenAI Agents SDK, Codex SDK, Claude Agent SDK, and Cursor \/ Grok Agent SDK/);
+  assert.match(home, /Source integrations add Claude Code, OpenAI Agents SDK, the Claude API tool runner, Claude Agent SDK, Codex SDK, and Cursor \/ Grok Agent SDK/);
   assert.match(home, /including Flue and the experimental durable runtime/);
-  assert.match(about, /Codex SDK, Claude Agent SDK, or Cursor \/ Grok Agent SDK/);
+  assert.match(about, /Claude Code, OpenAI Agents SDK, the Claude API tool runner, Claude Agent SDK, Codex SDK, or Cursor \/ Grok Agent SDK/);
   assert.doesNotMatch(`${home}\n${about}`, /Claude Agent SDK is planned/);
 });
 

@@ -5,7 +5,7 @@ description: Install grclanker, choose a runtime, and use 241 domain tools with 
 
 `grclanker` is an experimental open source GRC engineering assistant. It combines evidence gathering, framework mapping, risk prioritization, and remediation guidance with 241 domain tools and 35 vendor integrations.
 
-Start by [choosing a deployment](/docs/getting-started/deployment/): the Pi terminal CLI, OpenAI Agents SDK, Codex SDK, or Cursor / Grok Agent SDK. Each has a separate, self-contained guide. Claude Agent SDK is planned. Flue and the experimental durable runtime are also available.
+Start by [choosing a deployment](/docs/getting-started/deployment/): the Pi terminal CLI, Claude Code, the OpenAI Agents SDK, the Claude API tool runner, the Claude Agent SDK, the Codex SDK, or the Cursor / Grok Agent SDK. Each has a separate, self-contained guide. Flue and the experimental durable runtime are also available.
 
 For the terminal CLI, follow the complete [Pi guide](/docs/getting-started/pi-runtime/), or [install grclanker](/docs/getting-started/installation/), run `grclanker setup`, and follow the [Quick Start](/docs/getting-started/quick-start/).
 
@@ -27,7 +27,7 @@ Each integration guide describes its authentication, collected surfaces, finding
 
 The current tool families share hardening for credential-aware error scrubbing, fixed-shape config errors, incomplete collection markers, and pagination status.
 
-Runtime adapters validate schemas at their boundaries. The OpenAI adapter and Codex example expose selected read tools by default; the OpenAI adapter also supports human approval for writers. The Cursor / Grok Agent SDK marks 199 tools as read-only and approval-gates 42 writers. Flue redacts credential-shaped activity log arguments and documents its persistence risks.
+Runtime adapters validate schemas at their boundaries. The OpenAI, Claude API, Claude Agent SDK, Claude Code, and Codex paths expose selected read tools by default; the OpenAI, Claude API, and Claude Agent SDK adapters ask a human to approve each writer, and Claude Code exposes writers only with `--allow-writes` and then asks through its own permission prompt. The Cursor / Grok Agent SDK marks 199 tools as read-only and approval-gates 42 writers. Flue redacts credential-shaped activity log arguments and documents its persistence risks.
 
 Evidence exporters allocate a new bundle path on each rerun instead of overwriting a prior export. Each integration guide documents its export layout and sensitive-data handling. Review it before handling tenant data.
 

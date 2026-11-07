@@ -16,7 +16,7 @@ grclanker's goal is a GRC engineering assistant: scope assessments, gather evide
 | Claude API tool runner | TypeScript adapter on `@anthropic-ai/sdk`'s tool runner from source | [Claude API](https://grclanker.com/docs/getting-started/claude-api/) |
 | Claude Agent SDK | Source adapter with selected tools over in-process MCP and write approval | [Claude Agent SDK](https://grclanker.com/docs/getting-started/claude-agent-sdk/) |
 
-OpenAI Agents SDK and Codex SDK are different hosts. Cursor currently distributes its Agent SDK as `@grok/agent-sdk`, so Cursor and Grok share one SDK guide. Each host has its own setup, model credentials, and execution controls. Source adapters share native tool implementations and the CLI dependency installation/build; they are not independently packaged products. See [Choose a Deployment](https://grclanker.com/docs/getting-started/deployment/) for operating boundaries and [cli/README.md](cli/README.md) for the code map.
+Claude Code (MCP) runs inside your own Claude Code session, including with a Claude subscription; the Claude API tool runner and Claude Agent SDK paths use API authentication. OpenAI Agents SDK and Codex SDK are different hosts. Cursor currently distributes its Agent SDK as `@grok/agent-sdk`, so Cursor and Grok share one SDK guide. Each host has its own setup, model credentials, and execution controls. Source adapters share native tool implementations and the CLI dependency installation/build; they are not independently packaged products. See [Choose a Deployment](https://grclanker.com/docs/getting-started/deployment/) for operating boundaries and [cli/README.md](cli/README.md) for the code map.
 
 ## Install the Pi terminal CLI
 

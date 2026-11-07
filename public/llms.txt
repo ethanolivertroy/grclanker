@@ -1,6 +1,6 @@
 # grclanker
 
-> Open source GRC engineering assistant with a Pi terminal host and source adapters for OpenAI Agents SDK, Codex SDK, Claude Agent SDK, and Cursor / Grok Agent SDK. Native tools assess SaaS, cloud, and security platforms and map the evidence to compliance frameworks. Every shipped vendor integration except Vanta has a repository spec, a language-neutral contract for the APIs, authentication, checks, framework mappings, and outputs. The compute backends spec is included.
+> Open source GRC engineering assistant with a Pi terminal host and source adapters for Claude Code (local MCP server), OpenAI Agents SDK, the Claude API tool runner, Claude Agent SDK, Codex SDK, and Cursor / Grok Agent SDK. Native tools assess SaaS, cloud, and security platforms and map the evidence to compliance frameworks. Every shipped vendor integration except Vanta has a repository spec, a language-neutral contract for the APIs, authentication, checks, framework mappings, and outputs. The compute backends spec is included.
 
 Use a spec to inspect, extend, or reimplement an integration. Specs document design and intended behavior; the [tool catalog](https://grclanker.com/docs/tools/catalog/) lists the tools the CLI actually registers.
 
