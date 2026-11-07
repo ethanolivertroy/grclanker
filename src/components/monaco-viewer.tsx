@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { mountMonacoViewer, type MonacoViewerController } from '../lib/monaco-viewer';
+import { mountMonacoViewer } from '../lib/monaco-viewer';
+import { createMonacoSession } from '../lib/monaco-session.mjs';
 import { useCopy } from '../lib/use-copy';
 
 type EditorStatus = 'idle' | 'loading' | 'ready' | 'unavailable';
@@ -21,58 +22,54 @@ const skeletonWidths = ['w-3/4', 'w-1/2', 'w-5/6', 'w-2/3', 'w-4/5', 'w-1/3', 'w
  */
 export function MonacoViewer({ content }: { content: string }) {
   const [status, setStatus] = useState<EditorStatus>('idle');
+  const [requested, setRequested] = useState(false);
   const [wrap, setWrap] = useState(true);
   const [map, setMap] = useState(false);
   const { copied, copy } = useCopy('Spec markdown copied to clipboard');
   const containerRef = useRef<HTMLDivElement>(null);
-  const skeletonRef = useRef<HTMLDivElement>(null);
   const fallbackRef = useRef<HTMLPreElement>(null);
   const loadButtonRef = useRef<HTMLButtonElement>(null);
-  const controllerRef = useRef<MonacoViewerController | null>(null);
-  const mountedRef = useRef(false);
-
-  async function loadEditor() {
-    const container = containerRef.current;
-    const skeleton = skeletonRef.current;
-    const fallbackPre = fallbackRef.current;
-    if (!container || !skeleton || !fallbackPre) return;
-
-    setStatus('loading');
-    // The button disables itself, so keep keyboard focus on the content.
-    if (document.activeElement === loadButtonRef.current) fallbackPre.focus({ preventScroll: true });
-    try {
-      const controller = await mountMonacoViewer({ container, skeleton, fallbackPre, source: content, initialWrap: wrap });
-      if (!mountedRef.current) {
-        controller.dispose();
-        return;
-      }
-      controllerRef.current = controller;
-      setStatus('ready');
-    } catch {
-      if (mountedRef.current) setStatus('unavailable');
-    }
-  }
+  const sessionRef = useRef<ReturnType<typeof createMonacoSession> | null>(null);
+  const focusAfterLoad = useRef(false);
 
   useEffect(() => {
-    mountedRef.current = true;
-    const timer = window.matchMedia('(min-width: 768px)').matches ? window.setTimeout(loadEditor, 0) : undefined;
-    return () => {
-      mountedRef.current = false;
-      window.clearTimeout(timer);
-      controllerRef.current?.dispose();
-      controllerRef.current = null;
-    };
-    // Reads `content` once; the spec page keys this component by slug.
+    if (window.matchMedia('(min-width: 768px)').matches) setRequested(true);
   }, []);
 
-  function toggleWrap() {
-    setWrap(!wrap);
-    controllerRef.current?.setWrap(!wrap);
-  }
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!requested || !container) return;
+    setStatus('loading');
+    const session = createMonacoSession({
+      options: { wrap, map },
+      mount: (signal) => mountMonacoViewer({ container, source: content, signal }),
+      onReady() {
+        focusAfterLoad.current = fallbackRef.current?.contains(document.activeElement) ?? false;
+        setStatus('ready');
+      },
+      onError: () => setStatus('unavailable'),
+    });
+    sessionRef.current = session;
+    return () => {
+      session.dispose();
+      sessionRef.current = null;
+    };
+    // Options are synchronized separately, including changes during loading.
+  }, [content, requested]);
 
-  function toggleMap() {
-    setMap(!map);
-    controllerRef.current?.setMap(!map);
+  useEffect(() => {
+    sessionRef.current?.updateOptions({ wrap, map });
+  }, [wrap, map]);
+
+  useEffect(() => {
+    if (status !== 'ready') return;
+    sessionRef.current?.layout();
+    if (focusAfterLoad.current) sessionRef.current?.focus();
+  }, [status]);
+
+  function requestEditor() {
+    if (document.activeElement === loadButtonRef.current) fallbackRef.current?.focus({ preventScroll: true });
+    setRequested(true);
   }
 
   return (
@@ -92,7 +89,7 @@ export function MonacoViewer({ content }: { content: string }) {
             className={wrap ? 'toolbar-btn active' : 'toolbar-btn'}
             title="Toggle word wrap"
             aria-pressed={wrap}
-            onClick={toggleWrap}
+            onClick={() => setWrap((value) => !value)}
           >
             WRAP
           </button>
@@ -102,7 +99,7 @@ export function MonacoViewer({ content }: { content: string }) {
             className={status === 'ready' ? 'toolbar-btn' : 'toolbar-btn active'}
             title="Load enhanced editor"
             disabled={status !== 'idle'}
-            onClick={loadEditor}
+            onClick={requestEditor}
           >
             {loadLabels[status]}
           </button>
@@ -112,7 +109,7 @@ export function MonacoViewer({ content }: { content: string }) {
             title="Toggle minimap"
             aria-pressed={map}
             disabled={status !== 'ready'}
-            onClick={toggleMap}
+            onClick={() => setMap((value) => !value)}
           >
             MAP
           </button>
@@ -123,17 +120,17 @@ export function MonacoViewer({ content }: { content: string }) {
         Mobile stays in plain markdown first. Load the editor only when you need line numbers or the minimap.
       </div>
 
-      <div ref={skeletonRef} className="monaco-skeleton" hidden={status !== 'loading'}>
+      <div className="monaco-skeleton" hidden={status !== 'loading'}>
         {skeletonWidths.map((width, index) => (
           <div key={index} className={`skeleton-line ${width}`} />
         ))}
       </div>
 
-      {/* mountMonacoViewer reveals this container and hides the fallback once the editor is ready. */}
-      <div ref={containerRef} id="monaco-container" style={{ display: 'none' }} />
+      <div ref={containerRef} id="monaco-container" hidden={status !== 'ready'} />
 
       <pre
         ref={fallbackRef}
+        hidden={status === 'ready'}
         className={wrap ? 'fallback-pre fallback-pre-wrap' : 'fallback-pre fallback-pre-nowrap'}
         role="region"
         aria-label="Raw markdown"

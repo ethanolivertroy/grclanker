@@ -1,3 +1,7 @@
+import { MissingAuthenticationError } from "./auth-errors.js";
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
+import { ensurePrivateDir, resolveSecureOutputPath, writeSecureTextFile, countFilesRecursively } from "./secure-output.js";
+export { resolveSecureOutputPath };
 /**
  * Box enterprise security inspector tools for grclanker.
  *
@@ -5,24 +9,17 @@
  * specs/box-sec-inspector.spec.md: identity and access, sharing and
  * collaboration, data governance, and Shield plus monitoring posture.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
 import { createPrivateKey, createSign, randomBytes } from "node:crypto";
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-} from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
+import { readFileSync, realpathSync } from "node:fs";
+
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { Type } from "typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { ToolCallAbortedError, abortableFetch, abortableSleep, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { BOX_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { BatchVerdicts, hydrateBatchFrameworkMappings, withIntegrationToolContracts  } from "./batch-spec-builder.js";
 import { BOX_SPEC } from "./box.spec.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -602,68 +599,13 @@ function base64Url(input: Buffer | string): string {
   return Buffer.from(input).toString("base64").replace(/=+$/g, "").replace(/\+/g, "-").replace(/\//g, "_");
 }
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
 
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
-  if (
-    relativeTarget === ".."
-    || relativeTarget.startsWith(`..${join("/")}`)
-    || relativeTarget.startsWith("..")
-  ) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
 
-  const pathSegments = relativeTarget.split(/[\\/]+/).filter(Boolean);
-  let currentPath = realBase;
-  for (const segment of pathSegments) {
-    currentPath = join(currentPath, segment);
-    if (!existsSync(currentPath)) break;
-    const currentStat = lstatSync(currentPath);
-    if (currentStat.isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked parent directory: ${currentPath}`);
-    }
-  }
 
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  const realParent = realpathSync(parent);
-  if (lstatSync(realParent).isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
 
-  return resolvedTarget;
-}
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
 
-async function countFilesRecursively(rootDir: string): Promise<number> {
-  let total = 0;
-  const entries = await readdir(rootDir, { withFileTypes: true });
-  for (const entry of entries) {
-    const pathname = join(rootDir, entry.name);
-    if (entry.isDirectory()) {
-      total += await countFilesRecursively(pathname);
-    } else if (entry.isFile()) {
-      total += 1;
-    }
-  }
-  return total;
-}
+
 
 function parseAuthMode(value: string | undefined): BoxAuthMode | undefined {
   const normalized = value?.trim().toLowerCase();
@@ -862,7 +804,7 @@ function inferAuthMode(overlay: ConfigOverlay): BoxAuthMode {
   if (overlay.accessToken || overlay.refreshToken) return "oauth";
   if (overlay.jwtConfigPath) return "jwt";
   if (overlay.clientId && overlay.clientSecret && (overlay.enterpriseId || overlay.subjectId)) return "ccg";
-  throw new Error(
+  throw new MissingAuthenticationError(
     "Box credentials are required. Set BOX_JWT_CONFIG_PATH for JWT, BOX_CLIENT_ID plus BOX_CLIENT_SECRET plus BOX_ENTERPRISE_ID for Client Credentials Grant, or BOX_ACCESS_TOKEN for OAuth 2.0.",
   );
 }
@@ -906,7 +848,7 @@ export function resolveBoxConfiguration(
   let jwt: BoxJwtCredentials | undefined;
   if (authMode === "jwt") {
     if (!merged.jwtConfigPath) {
-      throw new Error("Box JWT auth requires BOX_JWT_CONFIG_PATH or a jwt_config_path argument.");
+      throw new MissingAuthenticationError("Box JWT auth requires BOX_JWT_CONFIG_PATH or a jwt_config_path argument.");
     }
     const jwtFile = readJwtConfigFile(resolve(cwd, merged.jwtConfigPath));
     sourceChain.push("jwt-config-file");
@@ -936,10 +878,10 @@ export function resolveBoxConfiguration(
     case "jwt":
     case "ccg": {
       if (!merged.clientId || !merged.clientSecret) {
-        throw new Error(`Box ${authMode.toUpperCase()} auth requires a client ID and client secret (BOX_CLIENT_ID and BOX_CLIENT_SECRET).`);
+        throw new MissingAuthenticationError(`Box ${authMode.toUpperCase()} auth requires a client ID and client secret (BOX_CLIENT_ID and BOX_CLIENT_SECRET).`);
       }
       if (!subjectId) {
-        throw new Error(
+        throw new MissingAuthenticationError(
           subjectType === "enterprise"
             ? `Box ${authMode.toUpperCase()} auth requires BOX_ENTERPRISE_ID (or enterpriseID in the JWT config file).`
             : "Box user-subject auth requires BOX_SUBJECT_ID.",
@@ -949,7 +891,7 @@ export function resolveBoxConfiguration(
     }
     case "oauth": {
       if (!merged.accessToken && !(merged.refreshToken && merged.clientId && merged.clientSecret)) {
-        throw new Error("Box OAuth 2.0 auth requires BOX_ACCESS_TOKEN, or BOX_REFRESH_TOKEN with BOX_CLIENT_ID and BOX_CLIENT_SECRET.");
+        throw new MissingAuthenticationError("Box OAuth 2.0 auth requires BOX_ACCESS_TOKEN, or BOX_REFRESH_TOKEN with BOX_CLIENT_ID and BOX_CLIENT_SECRET.");
       }
       break;
     }
@@ -1121,7 +1063,6 @@ function capForUnreadableInventories(item: BoxFinding, inventories: Array<Unread
     .join("; ");
   return {
     ...item,
-    status: "warn",
     summary: `${item.summary} The verdict is capped at warn because ${described}.`,
     evidence,
     manualEvidence: item.manualEvidence ?? manualEvidence,
@@ -2110,12 +2051,12 @@ function datasetTruncations(label: string, dataset: CollectedDataset<unknown>, l
 }
 
 function finding(
-  controlNumber: number,
-  status: BoxFindingStatus,
+  decisions: BatchVerdicts, controlNumber: number,
   summary: string,
   evidence?: JsonRecord,
   manualEvidence?: string,
 ): BoxFinding {
+  const status = decisions.status(findingId(controlNumber)) as BoxFindingStatus;
   const definition = BOX_CONTROLS[controlNumber];
   const id = findingId(controlNumber);
   return {
@@ -2131,13 +2072,10 @@ function finding(
   };
 }
 
-const BOX_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
 
-function recordBoxDecisionFacts(controlNumber: number, facts: Readonly<Record<string, unknown>>): void {
-  const id = findingId(controlNumber);
-  const store = BOX_DECISION_CONTEXT.getStore();
-  if (!store) throw new Error(`${id} decision facts were recorded outside a Box assessment`);
-  store.set(id, facts);
+
+function recordBoxDecisionFacts(decisions: BatchVerdicts, controlNumber: number, facts: Readonly<Record<string, unknown>>): void {
+  decisions.record(findingId(controlNumber), facts);
 }
 
 function completeBoxDatasets(...datasets: Array<CollectedDataset<unknown> | undefined>): boolean {
@@ -2450,7 +2388,8 @@ export async function collectBoxIdentityData(
 }
 
 export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxIdentityOptions = {}): BoxAssessmentResult {
-  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
+  const decisions = new BatchVerdicts(BOX_SPEC);
+
   const maxAdmins = clampNumber(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 10_000);
   const minPasswordLength = clampNumber(options.minPasswordLength, DEFAULT_MIN_PASSWORD_LENGTH, 4, 128);
   const maxSessionHours = clampNumber(options.maxSessionHours, DEFAULT_MAX_SESSION_HOURS, 1, 24 * 365);
@@ -2494,7 +2433,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     ...settingsEvidence(userSettingsReadable, ssoSettings, ssoUnused),
   };
   const ssoManualEvidence = "Admin Console > Enterprise Settings > User Settings > Configure Single Sign On (SSO): confirm SSO is set to Required, not Enabled (optional) or Test mode, and record the identity provider.";
-  recordBoxDecisionFacts(1, {
+  recordBoxDecisionFacts(decisions, 1, {
     settings_readable: userSettingsReadable,
     unused_setting_count: Object.keys(ssoUnused).length,
     sso_required: ssoRequired,
@@ -2502,16 +2441,16 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   });
   findings.push(
     !userSettingsReadable
-      ? finding(1, "manual", `Enterprise SSO configuration could not be read because ${categoryUnreadableReason(data.configuration, "user_settings")}.`, { ...ssoEvidence, config_error: data.configuration.error ?? null }, ssoManualEvidence)
+      ? finding(decisions, 1, `Enterprise SSO configuration could not be read because ${categoryUnreadableReason(data.configuration, "user_settings")}.`, { ...ssoEvidence, config_error: data.configuration.error ?? null }, ssoManualEvidence)
       : hasUnusedSettings(ssoUnused)
-        ? finding(1, "warn", unusedSettingsSummary(ssoUnused, "SSO cannot be treated as enforced"), ssoEvidence, ssoManualEvidence)
+        ? finding(decisions, 1, unusedSettingsSummary(ssoUnused, "SSO cannot be treated as enforced"), ssoEvidence, ssoManualEvidence)
         : ssoRequired === true && ssoTesting !== true
-        ? finding(1, "pass", "Enterprise settings expose SSO as required for all users and not in testing mode.", ssoEvidence)
+        ? finding(decisions, 1, "Enterprise settings expose SSO as required for all users and not in testing mode.", ssoEvidence)
         : ssoRequired === true
-          ? finding(1, "warn", "SSO is marked required but the enterprise is still in SSO testing mode, so users can bypass the identity provider.", ssoEvidence)
+          ? finding(decisions, 1, "SSO is marked required but the enterprise is still in SSO testing mode, so users can bypass the identity provider.", ssoEvidence)
           : ssoRequired === false
-            ? finding(1, "fail", "Enterprise settings report SSO as not required, so Box passwords remain a valid sign-in path.", ssoEvidence)
-            : finding(1, "warn", "Enterprise user settings were readable but did not expose is_enterprise_sso_required, so SSO enforcement cannot be confirmed from the API.", ssoEvidence, ssoManualEvidence),
+            ? finding(decisions, 1, "Enterprise settings report SSO as not required, so Box passwords remain a valid sign-in path.", ssoEvidence)
+            : finding(decisions, 1, "Enterprise user settings were readable but did not expose is_enterprise_sso_required, so SSO enforcement cannot be confirmed from the API.", ssoEvidence, ssoManualEvidence),
   );
 
   const mfaSettings = configSettings(configuration, "security", ["is_multi_factor_auth_required", "multi_factor_auth_type"]);
@@ -2532,7 +2471,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     ...inventoryEvidence,
   };
   const adminMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all managed users, and open each admin and co-admin user record to confirm the 'Exempt from 2-step verification' option is not set.";
-  recordBoxDecisionFacts(2, {
+  recordBoxDecisionFacts(decisions, 2, {
     settings_readable: securityReadable,
     users_readable: usersReadable,
     unused_setting_count: Object.keys(mfaUnused).length,
@@ -2545,24 +2484,24 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   });
   findings.push(
     !securityReadable && !usersReadable
-      ? adminMfaUnreadableFinding(data)
+      ? adminMfaUnreadableFinding(decisions, data)
       : !usersReadable
-        ? finding(2, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}, so admin and co-admin exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}.`, { ...adminMfaEvidence, users_error: data.users.error ?? null }, adminMfaManualEvidence)
+        ? finding(decisions, 2, `Enterprise users could not be listed because ${unreadableReason(data.users)}, so admin and co-admin exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}.`, { ...adminMfaEvidence, users_error: data.users.error ?? null }, adminMfaManualEvidence)
         : !securityReadable
-          ? finding(2, "manual", `Enterprise MFA settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}; ${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are flagged exempt from login verification.`, adminMfaEvidence, adminMfaManualEvidence)
+          ? finding(decisions, 2, `Enterprise MFA settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}; ${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are flagged exempt from login verification.`, adminMfaEvidence, adminMfaManualEvidence)
           : hasUnusedSettings(mfaUnused)
-            ? finding(2, "warn", unusedSettingsSummary(mfaUnused, `enterprise MFA cannot be treated as enforced for the ${privileged.length} admin or co-admin accounts (${exemptPrivileged.length} flagged exempt from login verification)`), adminMfaEvidence, adminMfaManualEvidence)
+            ? finding(decisions, 2, unusedSettingsSummary(mfaUnused, `enterprise MFA cannot be treated as enforced for the ${privileged.length} admin or co-admin accounts (${exemptPrivileged.length} flagged exempt from login verification)`), adminMfaEvidence, adminMfaManualEvidence)
             : mfaRequired === true
             ? exemptPrivileged.length > 0
-              ? finding(2, "fail", `${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are exempt from login verification even though enterprise MFA is required.`, adminMfaEvidence)
+              ? finding(decisions, 2, `${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are exempt from login verification even though enterprise MFA is required.`, adminMfaEvidence)
               : inventoryGap
-                ? finding(2, "warn", `Multi-factor authentication is required for managed users${mfaType ? ` (${mfaType})` : ""}, but admin exemptions could not be assessed because ${inventoryGap}.`, adminMfaEvidence, inventoryManualEvidence)
-                : finding(2, "pass", `Multi-factor authentication is required for managed users${mfaType ? ` (${mfaType})` : ""} and none of the ${privileged.length} admin or co-admin accounts are exempt from login verification.`, adminMfaEvidence)
+                ? finding(decisions, 2, `Multi-factor authentication is required for managed users${mfaType ? ` (${mfaType})` : ""}, but admin exemptions could not be assessed because ${inventoryGap}.`, adminMfaEvidence, inventoryManualEvidence)
+                : finding(decisions, 2, `Multi-factor authentication is required for managed users${mfaType ? ` (${mfaType})` : ""} and none of the ${privileged.length} admin or co-admin accounts are exempt from login verification.`, adminMfaEvidence)
             : mfaRequired === undefined
-              ? finding(2, "warn", `Enterprise security settings were readable but did not expose is_multi_factor_auth_required, so admin MFA enforcement cannot be confirmed from the API; ${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are flagged exempt from login verification.`, adminMfaEvidence, adminMfaManualEvidence)
+              ? finding(decisions, 2, `Enterprise security settings were readable but did not expose is_multi_factor_auth_required, so admin MFA enforcement cannot be confirmed from the API; ${exemptPrivileged.length}/${privileged.length} admin or co-admin accounts are flagged exempt from login verification.`, adminMfaEvidence, adminMfaManualEvidence)
               : ssoRequired === true
-                ? finding(2, "warn", "Box-native MFA is not required; admin MFA depends entirely on the identity provider enforced through required SSO.", adminMfaEvidence, "Confirm the SSO identity provider enforces phishing-resistant MFA for every Box admin and co-admin.")
-                : finding(2, "fail", `Multi-factor authentication is not required for managed users, leaving ${privileged.length} admin or co-admin accounts without an enforced second factor.`, adminMfaEvidence),
+                ? finding(decisions, 2, "Box-native MFA is not required; admin MFA depends entirely on the identity provider enforced through required SSO.", adminMfaEvidence, "Confirm the SSO identity provider enforces phishing-resistant MFA for every Box admin and co-admin.")
+                : finding(decisions, 2, `Multi-factor authentication is not required for managed users, leaving ${privileged.length} admin or co-admin accounts without an enforced second factor.`, adminMfaEvidence),
   );
 
   const userMfaEvidence = {
@@ -2575,7 +2514,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     ...inventoryEvidence,
   };
   const userMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all users, including external collaborators.";
-  recordBoxDecisionFacts(3, {
+  recordBoxDecisionFacts(decisions, 3, {
     settings_readable: securityReadable,
     users_readable: usersReadable,
     unused_setting_count: Object.keys(mfaUnused).length,
@@ -2588,24 +2527,24 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   });
   findings.push(
     !securityReadable && !usersReadable
-      ? finding(3, "manual", `Neither enterprise MFA settings (${categoryUnreadableReason(data.configuration, "security")}) nor enterprise users (${unreadableReason(data.users)}) could be read.`, { ...userMfaEvidence, users_error: data.users.error ?? null }, userMfaManualEvidence)
+      ? finding(decisions, 3, `Neither enterprise MFA settings (${categoryUnreadableReason(data.configuration, "security")}) nor enterprise users (${unreadableReason(data.users)}) could be read.`, { ...userMfaEvidence, users_error: data.users.error ?? null }, userMfaManualEvidence)
       : !usersReadable
-        ? finding(3, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}, so per-user exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}.`, { ...userMfaEvidence, users_error: data.users.error ?? null }, userMfaManualEvidence)
+        ? finding(decisions, 3, `Enterprise users could not be listed because ${unreadableReason(data.users)}, so per-user exemptions from login verification cannot be verified; enterprise MFA is ${mfaState}.`, { ...userMfaEvidence, users_error: data.users.error ?? null }, userMfaManualEvidence)
         : !securityReadable
-          ? finding(3, "manual", `Enterprise MFA settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, userMfaEvidence, userMfaManualEvidence)
+          ? finding(decisions, 3, `Enterprise MFA settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, userMfaEvidence, userMfaManualEvidence)
           : hasUnusedSettings(mfaUnused)
-            ? finding(3, "warn", unusedSettingsSummary(mfaUnused, `enterprise MFA cannot be treated as enforced for the sampled ${users.length} users (${exemptUsers.length} flagged exempt from login verification)`), userMfaEvidence, userMfaManualEvidence)
+            ? finding(decisions, 3, unusedSettingsSummary(mfaUnused, `enterprise MFA cannot be treated as enforced for the sampled ${users.length} users (${exemptUsers.length} flagged exempt from login verification)`), userMfaEvidence, userMfaManualEvidence)
             : mfaRequired === true
             ? exemptUsers.length > 0
-              ? finding(3, "warn", `Multi-factor authentication is required enterprise-wide, but ${exemptUsers.length}/${users.length} sampled users are exempt from login verification.`, userMfaEvidence)
+              ? finding(decisions, 3, `Multi-factor authentication is required enterprise-wide, but ${exemptUsers.length}/${users.length} sampled users are exempt from login verification.`, userMfaEvidence)
               : inventoryGap
-                ? finding(3, "warn", `Multi-factor authentication is required for all managed users${mfaType ? ` (${mfaType})` : ""}, but per-user exemptions could not be assessed because ${inventoryGap}.`, userMfaEvidence, inventoryManualEvidence)
-                : finding(3, "pass", `Multi-factor authentication is required for all managed users${mfaType ? ` (${mfaType})` : ""} with no exempt accounts in the sampled ${users.length} users.`, userMfaEvidence)
+                ? finding(decisions, 3, `Multi-factor authentication is required for all managed users${mfaType ? ` (${mfaType})` : ""}, but per-user exemptions could not be assessed because ${inventoryGap}.`, userMfaEvidence, inventoryManualEvidence)
+                : finding(decisions, 3, `Multi-factor authentication is required for all managed users${mfaType ? ` (${mfaType})` : ""} with no exempt accounts in the sampled ${users.length} users.`, userMfaEvidence)
             : mfaRequired === undefined
-              ? finding(3, "warn", "Enterprise security settings were readable but did not expose is_multi_factor_auth_required, so MFA enforcement cannot be confirmed from the API.", userMfaEvidence, userMfaManualEvidence)
+              ? finding(decisions, 3, "Enterprise security settings were readable but did not expose is_multi_factor_auth_required, so MFA enforcement cannot be confirmed from the API.", userMfaEvidence, userMfaManualEvidence)
               : ssoRequired === true
-                ? finding(3, "warn", "Box-native MFA is not required for all users; MFA coverage depends on the identity provider enforced through required SSO.", userMfaEvidence, "Confirm the SSO identity provider enforces MFA for every Box user population, including service and app users that sign in with passwords.")
-                : finding(3, "fail", `Multi-factor authentication is not required enterprise-wide and ${ssoRequired === false ? "SSO is not required, so password-only sign-in is possible" : "SSO enforcement could not be read, so password-only sign-in may be possible"}.`, userMfaEvidence),
+                ? finding(decisions, 3, "Box-native MFA is not required for all users; MFA coverage depends on the identity provider enforced through required SSO.", userMfaEvidence, "Confirm the SSO identity provider enforces MFA for every Box user population, including service and app users that sign in with passwords.")
+                : finding(decisions, 3, `Multi-factor authentication is not required enterprise-wide and ${ssoRequired === false ? "SSO is not required, so password-only sign-in is possible" : "SSO enforcement could not be read, so password-only sign-in may be possible"}.`, userMfaEvidence),
   );
 
   const adminRoleChanges = events.filter((event) => eventType(event) === "CHANGE_ADMIN_ROLE");
@@ -2620,7 +2559,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     admin_role_change_events: observedCount([data.events], adminRoleChanges.length),
     ...inventoryEvidence,
   };
-  recordBoxDecisionFacts(17, {
+  recordBoxDecisionFacts(decisions, 17, {
     users_readable: usersReadable,
     users_truncated: usersTruncated,
     user_count: users.length,
@@ -2630,15 +2569,15 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   });
   findings.push(
     !usersReadable
-      ? finding(17, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}.`, { users_error: data.users.error ?? null }, "Admin Console > Users & Groups: filter by Admin and Co-Admin roles, export the list, and confirm each assignment is justified.")
+      ? finding(decisions, 17, `Enterprise users could not be listed because ${unreadableReason(data.users)}.`, { users_error: data.users.error ?? null }, "Admin Console > Users & Groups: filter by Admin and Co-Admin roles, export the list, and confirm each assignment is justified.")
       : privileged.length > maxAdmins
-        ? finding(17, "warn", `${privileged.length} admin or co-admin accounts exceed the configured threshold of ${maxAdmins}.`, adminCountEvidence)
+        ? finding(decisions, 17, `${privileged.length} admin or co-admin accounts exceed the configured threshold of ${maxAdmins}.`, adminCountEvidence)
         : inventoryGap
-          ? finding(17, "warn", `Admin and co-admin counts could not be assessed because ${inventoryGap}.`, adminCountEvidence, inventoryManualEvidence)
-          : finding(17, "pass", `${admins.length} admin and ${coAdmins.length} co-admin accounts fall within the configured threshold of ${maxAdmins}.`, adminCountEvidence),
+          ? finding(decisions, 17, `Admin and co-admin counts could not be assessed because ${inventoryGap}.`, adminCountEvidence, inventoryManualEvidence)
+          : finding(decisions, 17, `${admins.length} admin and ${coAdmins.length} co-admin accounts fall within the configured threshold of ${maxAdmins}.`, adminCountEvidence),
   );
 
-  recordBoxDecisionFacts(18, {
+  recordBoxDecisionFacts(decisions, 18, {
     users_readable: usersReadable,
     users_truncated: usersTruncated,
     user_count: users.length,
@@ -2647,12 +2586,12 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   });
   findings.push(
     !usersReadable
-      ? finding(18, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}.`, undefined, "Admin Console > Users & Groups: open each co-admin and review the co-admin permission set under Edit User Access Permissions.")
+      ? finding(decisions, 18, `Enterprise users could not be listed because ${unreadableReason(data.users)}.`, undefined, "Admin Console > Users & Groups: open each co-admin and review the co-admin permission set under Edit User Access Permissions.")
       : coAdmins.length > 0
-        ? finding(18, "manual", `${coAdmins.length} co-admin accounts exist${usersTruncated ? " among the users read" : ""}; the Box API does not expose individual co-admin permission sets, so scoping must be confirmed in the Admin Console.`, { ...coAdminEvidence, ...inventoryEvidence }, "Admin Console > Users & Groups > (each co-admin) > Edit User Access Permissions: confirm each co-admin has only the permission categories they need (for example Users and Groups, Reports, Content) and no co-admin holds the full set equivalent to a primary admin.")
+        ? finding(decisions, 18, `${coAdmins.length} co-admin accounts exist${usersTruncated ? " among the users read" : ""}; the Box API does not expose individual co-admin permission sets, so scoping must be confirmed in the Admin Console.`, { ...coAdminEvidence, ...inventoryEvidence }, "Admin Console > Users & Groups > (each co-admin) > Edit User Access Permissions: confirm each co-admin has only the permission categories they need (for example Users and Groups, Reports, Content) and no co-admin holds the full set equivalent to a primary admin.")
         : inventoryGap
-          ? finding(18, "warn", `Co-admin permission scoping could not be assessed because ${inventoryGap}.`, { ...coAdminEvidence, ...inventoryEvidence }, inventoryManualEvidence)
-          : finding(18, "pass", "No co-admin accounts exist, so there are no delegated permission sets to scope.", { ...coAdminEvidence, ...inventoryEvidence }),
+          ? finding(decisions, 18, `Co-admin permission scoping could not be assessed because ${inventoryGap}.`, { ...coAdminEvidence, ...inventoryEvidence }, inventoryManualEvidence)
+          : finding(decisions, 18, "No co-admin accounts exist, so there are no delegated permission sets to scope.", { ...coAdminEvidence, ...inventoryEvidence }),
   );
 
   const passwordMinLength = configNumber(configuration, "security", "password_min_length");
@@ -2688,7 +2627,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   };
   const passwordManualEvidence = "Admin Console > Enterprise Settings > Security > Password Requirements: record minimum length, character class rules, weak password prevention, reset frequency, and reuse limits.";
   const complexityCount = [passwordUppercase, passwordNumeric, passwordSpecial].filter((value) => (value ?? 0) > 0).length;
-  recordBoxDecisionFacts(21, {
+  recordBoxDecisionFacts(decisions, 21, {
     settings_readable: securityReadable,
     unused_setting_count: Object.keys(passwordUnused).length,
     minimum_length: passwordMinLength,
@@ -2698,16 +2637,16 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   });
   findings.push(
     !securityReadable
-      ? finding(21, "manual", `Enterprise password settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, passwordManualEvidence)
+      ? finding(decisions, 21, `Enterprise password settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, passwordManualEvidence)
       : hasUnusedSettings(passwordUnused)
-        ? finding(21, "warn", unusedSettingsSummary(passwordUnused, "the enterprise password policy cannot be treated as enforced"), passwordEvidence, passwordManualEvidence)
+        ? finding(decisions, 21, unusedSettingsSummary(passwordUnused, "the enterprise password policy cannot be treated as enforced"), passwordEvidence, passwordManualEvidence)
         : passwordMinLength === undefined
-          ? finding(21, "warn", "Enterprise password settings were readable but did not expose a minimum password length.", passwordEvidence, passwordManualEvidence)
+          ? finding(decisions, 21, "Enterprise password settings were readable but did not expose a minimum password length.", passwordEvidence, passwordManualEvidence)
         : passwordMinLength >= minPasswordLength && weakPasswordPrevention === true && complexityCount >= 2
-          ? finding(21, "pass", `Passwords require at least ${passwordMinLength} characters with ${complexityCount} character-class rules and weak password prevention enabled.`, passwordEvidence)
+          ? finding(decisions, 21, `Passwords require at least ${passwordMinLength} characters with ${complexityCount} character-class rules and weak password prevention enabled.`, passwordEvidence)
           : passwordMinLength >= 8
-            ? finding(21, "warn", `Passwords require ${passwordMinLength} characters, below the ${minPasswordLength}-character target or missing complexity or weak password prevention controls.`, passwordEvidence)
-            : finding(21, "fail", `Passwords require only ${passwordMinLength} characters, below the 8-character minimum baseline.`, passwordEvidence),
+            ? finding(decisions, 21, `Passwords require ${passwordMinLength} characters, below the ${minPasswordLength}-character target or missing complexity or weak password prevention controls.`, passwordEvidence)
+            : finding(decisions, 21, `Passwords require only ${passwordMinLength} characters, below the 8-character minimum baseline.`, passwordEvidence),
   );
 
   const sessionDuration = configString(configuration, "security", "session_duration");
@@ -2726,7 +2665,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     max_session_hours: maxSessionHours,
   };
   const sessionManualEvidence = "Admin Console > Enterprise Settings > Security > Session Duration: record the inactivity timeout and any custom group durations.";
-  recordBoxDecisionFacts(22, {
+  recordBoxDecisionFacts(decisions, 22, {
     settings_readable: securityReadable,
     unused_setting_count: Object.keys(sessionUnused).length,
     session_duration_value: sessionDuration,
@@ -2738,30 +2677,29 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   });
   findings.push(
     !securityReadable
-      ? finding(22, "manual", `Enterprise session settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, sessionManualEvidence)
+      ? finding(decisions, 22, `Enterprise session settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, sessionManualEvidence)
       : hasUnusedSettings(sessionUnused)
-        ? finding(22, "warn", unusedSettingsSummary(sessionUnused, "the session duration cannot be treated as enforced"), sessionEvidence, sessionManualEvidence)
+        ? finding(decisions, 22, unusedSettingsSummary(sessionUnused, "the session duration cannot be treated as enforced"), sessionEvidence, sessionManualEvidence)
         : sessionDuration === undefined
-          ? finding(22, "warn", "Enterprise session settings were readable but did not expose a session duration value.", sessionEvidence, sessionManualEvidence)
+          ? finding(decisions, 22, "Enterprise session settings were readable but did not expose a session duration value.", sessionEvidence, sessionManualEvidence)
           : sessionHours === undefined
-            ? finding(22, "warn", `Session duration "${sessionDuration}" ${describeUninterpretableDuration(sessionDuration)}, so it cannot be compared against the ${maxSessionHours}-hour threshold.`, sessionEvidence, `${sessionManualEvidence} Confirm the unit behind the raw value "${sessionDuration}" and whether it is at or below ${maxSessionHours} hours.`)
+            ? finding(decisions, 22, `Session duration "${sessionDuration}" ${describeUninterpretableDuration(sessionDuration)}, so it cannot be compared against the ${maxSessionHours}-hour threshold.`, sessionEvidence, `${sessionManualEvidence} Confirm the unit behind the raw value "${sessionDuration}" and whether it is at or below ${maxSessionHours} hours.`)
             : sessionHours > maxSessionHours
-              ? finding(22, "fail", `Session duration ${sessionDuration} exceeds the ${maxSessionHours}-hour threshold.`, sessionEvidence)
+              ? finding(decisions, 22, `Session duration ${sessionDuration} exceeds the ${maxSessionHours}-hour threshold.`, sessionEvidence)
               : customSessionEnabled !== true
-                ? finding(22, "pass", `Session duration is ${sessionDuration}, within the ${maxSessionHours}-hour threshold.`, sessionEvidence)
+                ? finding(decisions, 22, `Session duration is ${sessionDuration}, within the ${maxSessionHours}-hour threshold.`, sessionEvidence)
                 : customSessionHours === undefined
-                  ? finding(22, "warn", `Session duration is ${sessionDuration}, but the custom group duration "${customSessionValue ?? "unset"}" ${describeUninterpretableDuration(customSessionValue)}, so it cannot be compared against the ${maxSessionHours}-hour threshold.`, sessionEvidence, sessionManualEvidence)
+                  ? finding(decisions, 22, `Session duration is ${sessionDuration}, but the custom group duration "${customSessionValue ?? "unset"}" ${describeUninterpretableDuration(customSessionValue)}, so it cannot be compared against the ${maxSessionHours}-hour threshold.`, sessionEvidence, sessionManualEvidence)
                   : customSessionHours <= maxSessionHours
-                    ? finding(22, "pass", `Session duration is ${sessionDuration} and the custom group duration is ${customSessionValue}, both within the ${maxSessionHours}-hour threshold.`, sessionEvidence)
-                    : finding(22, "fail", `Session duration ${sessionDuration} is within the threshold, but the custom group duration ${customSessionValue} exceeds ${maxSessionHours} hours.`, sessionEvidence),
+                    ? finding(decisions, 22, `Session duration is ${sessionDuration} and the custom group duration is ${customSessionValue}, both within the ${maxSessionHours}-hour threshold.`, sessionEvidence)
+                    : finding(decisions, 22, `Session duration ${sessionDuration} is within the threshold, but the custom group duration ${customSessionValue} exceeds ${maxSessionHours} hours.`, sessionEvidence),
   );
 
   const ipLists = data.shieldLists.data.filter((list) => shieldListContentType(list) === "ip");
-  recordBoxDecisionFacts(23, {});
+  recordBoxDecisionFacts(decisions, 23, {});
   findings.push(
     finding(
-      23,
-      "manual",
+      decisions, 23,
       ipLists.length > 0
         ? `${ipLists.length} Shield IP lists exist, but the Box API does not expose whether IP restrictions are enforced for enterprise sign-in or access policies.`
         : data.shieldLists.error
@@ -2808,7 +2746,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     ...inventoryEvidence,
   };
   const inactivityManualEvidence = `Admin Console > Reports > User Activity (or the Users report with last login): identify users with no login in the last ${data.lookbackDays} days and confirm deactivation decisions.`;
-  recordBoxDecisionFacts(24, {
+  recordBoxDecisionFacts(decisions, 24, {
     users_readable: usersReadable,
     events_readable: eventsReadable,
     users_truncated: usersTruncated,
@@ -2820,18 +2758,18 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   });
   findings.push(
     !usersReadable || !eventsReadable
-      ? finding(24, "manual", `Inactive users could not be derived because ${!usersReadable ? `users were unreadable (${unreadableReason(data.users)})` : `enterprise events were unreadable (${unreadableReason(data.events)})`}.`, { lookback_days: data.lookbackDays }, inactivityManualEvidence)
+      ? finding(decisions, 24, `Inactive users could not be derived because ${!usersReadable ? `users were unreadable (${unreadableReason(data.users)})` : `enterprise events were unreadable (${unreadableReason(data.events)})`}.`, { lookback_days: data.lookbackDays }, inactivityManualEvidence)
       : inventoryGap
-        ? finding(24, "warn", `Inactive users could not be assessed because ${inventoryGap}.`, inactivityEvidence, inventoryManualEvidence)
+        ? finding(decisions, 24, `Inactive users could not be assessed because ${inventoryGap}.`, inactivityEvidence, inventoryManualEvidence)
         : activeUsers.length === 0
-          ? finding(24, "warn", `None of the ${users.length} sampled users are active managed users (only deactivated or platform-only app users were returned), so there was no activity to assess.`, inactivityEvidence, inactivityManualEvidence)
+          ? finding(decisions, 24, `None of the ${users.length} sampled users are active managed users (only deactivated or platform-only app users were returned), so there was no activity to assess.`, inactivityEvidence, inactivityManualEvidence)
           : eventsTruncated
-            ? finding(24, "warn", `The event collection ${truncationClause(data.events, events.length, "events", "Box reported more events (a next_stream_position remained)")}, so ${inactiveCandidates.length}/${activeUsers.length} active users without observed activity is an upper bound; raise event_limit or confirm in the Admin Console.`, inactivityEvidence, inactivityManualEvidence)
+            ? finding(decisions, 24, `The event collection ${truncationClause(data.events, events.length, "events", "Box reported more events (a next_stream_position remained)")}, so ${inactiveCandidates.length}/${activeUsers.length} active users without observed activity is an upper bound; raise event_limit or confirm in the Admin Console.`, inactivityEvidence, inactivityManualEvidence)
             : inactiveCandidates.length === 0
-              ? finding(24, "pass", `All ${activeUsers.length} active users showed successful login or content activity events within the last ${data.lookbackDays} days.`, inactivityEvidence)
+              ? finding(decisions, 24, `All ${activeUsers.length} active users showed successful login or content activity events within the last ${data.lookbackDays} days.`, inactivityEvidence)
               : inactiveRatio > 0.25
-                ? finding(24, "fail", `${inactiveCandidates.length}/${activeUsers.length} active users had no successful login or content activity in the last ${data.lookbackDays} days${inactiveWithFailedLogins.length > 0 ? ` (${inactiveWithFailedLogins.length} of them only recorded failed logins)` : ""}.`, inactivityEvidence)
-                : finding(24, "warn", `${inactiveCandidates.length}/${activeUsers.length} active users had no successful login or content activity in the last ${data.lookbackDays} days${inactiveWithFailedLogins.length > 0 ? ` (${inactiveWithFailedLogins.length} of them only recorded failed logins)` : ""}.`, inactivityEvidence),
+                ? finding(decisions, 24, `${inactiveCandidates.length}/${activeUsers.length} active users had no successful login or content activity in the last ${data.lookbackDays} days${inactiveWithFailedLogins.length > 0 ? ` (${inactiveWithFailedLogins.length} of them only recorded failed logins)` : ""}.`, inactivityEvidence)
+                : finding(decisions, 24, `${inactiveCandidates.length}/${activeUsers.length} active users had no successful login or content activity in the last ${data.lookbackDays} days${inactiveWithFailedLogins.length > 0 ? ` (${inactiveWithFailedLogins.length} of them only recorded failed logins)` : ""}.`, inactivityEvidence),
   );
 
   return {
@@ -2866,13 +2804,12 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
       ...datasetTruncations("enterprise_events", data.events, "event_limit"),
     ],
   };
-  });
+
 }
 
-function adminMfaUnreadableFinding(data: BoxIdentityData): BoxFinding {
+function adminMfaUnreadableFinding(decisions: BatchVerdicts, data: BoxIdentityData): BoxFinding {
   return finding(
-    2,
-    "manual",
+    decisions, 2,
     `Neither enterprise MFA settings (${categoryUnreadableReason(data.configuration, "security")}) nor enterprise users (${unreadableReason(data.users)}) could be read.`,
     { config_error: data.configuration.error ?? null, users_error: data.users.error ?? null },
     "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required, then review each admin and co-admin for the 'Exempt from 2-step verification' option.",
@@ -2915,7 +2852,8 @@ export async function collectBoxSharingData(
 }
 
 export function assessBoxSharingCollaborationData(data: BoxSharingData, options: BoxSharingOptions = {}): BoxAssessmentResult {
-  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
+  const decisions = new BatchVerdicts(BOX_SPEC);
+
   const staleDays = clampNumber(options.staleAllowlistDays, DEFAULT_STALE_ALLOWLIST_DAYS, 1, 3650);
   const configuration = data.configuration.error ? undefined : data.configuration.data;
   const configReadable = categoryReadable(data.configuration, "content_and_sharing");
@@ -2948,7 +2886,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   const allowlistUnreadable = unreadableInventory("collaboration_allowlist_entries", data.allowlistEntries, "the permitted external domains were not checked");
   const exemptTargetsUnreadable = unreadableInventory("collaboration_allowlist_exempt_targets", data.exemptTargets, "users exempt from the domain restriction were not checked");
   const collaborationConfigUnreadable = unreadableInventory("enterprise_configuration (content_and_sharing)", data.configuration, "the external collaboration mode that decides whether an empty allowlist is compliant was not checked");
-  recordBoxDecisionFacts(4, {
+  recordBoxDecisionFacts(decisions, 4, {
     settings_readable: configReadable,
     allowlist_readable: allowlistReadable,
     unused_setting_count: Object.keys(externalUnused).length,
@@ -2958,25 +2896,25 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   findings.push(capForUnreadableInventories(
     !configReadable
       ? allowlistReadable && entries.length > 0
-        ? finding(4, "warn", `${entries.length} collaboration allowlist domains exist, but the enterprise external collaboration mode could not be read (${configUnreadableReason}).`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: confirm external collaboration is limited to allowlisted domains or disabled.")
-        : finding(4, "manual", `External collaboration settings could not be read because ${configUnreadableReason}.`, externalEvidence, externalManualEvidence)
+        ? finding(decisions, 4, `${entries.length} collaboration allowlist domains exist, but the enterprise external collaboration mode could not be read (${configUnreadableReason}).`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration: confirm external collaboration is limited to allowlisted domains or disabled.")
+        : finding(decisions, 4, `External collaboration settings could not be read because ${configUnreadableReason}.`, externalEvidence, externalManualEvidence)
       : hasUnusedSettings(externalUnused)
-        ? finding(4, "warn", unusedSettingsSummary(externalUnused, `the external collaboration mode cannot be treated as enforced (${countOrUnread(data.allowlistEntries, entries.length)} allowlist entries visible)`), externalEvidence, externalManualEvidence)
+        ? finding(decisions, 4, unusedSettingsSummary(externalUnused, `the external collaboration mode cannot be treated as enforced (${countOrUnread(data.allowlistEntries, entries.length)} allowlist entries visible)`), externalEvidence, externalManualEvidence)
         : externalStatus === "limit_collaboration_to_users_within_enterprise"
-        ? finding(4, "pass", "External collaboration is limited to users within the enterprise.", externalEvidence)
+        ? finding(decisions, 4, "External collaboration is limited to users within the enterprise.", externalEvidence)
         : externalStatus === "limit_collaboration_to_allowlisted_domains"
           ? !allowlistReadable
-            ? finding(4, "warn", `External collaboration is limited to allowlisted domains, but the ${describeInventory("collaboration allowlist", data.allowlistEntries)} could not be read because ${unreadableReason(data.allowlistEntries)}, so the permitted domains were not checked.`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and confirm each entry is a business partner.")
+            ? finding(decisions, 4, `External collaboration is limited to allowlisted domains, but the ${describeInventory("collaboration allowlist", data.allowlistEntries)} could not be read because ${unreadableReason(data.allowlistEntries)}, so the permitted domains were not checked.`, externalEvidence, "Admin Console > Enterprise Settings > Content & Sharing > Collaboration > Allowlisted domains: export the domain list and confirm each entry is a business partner.")
             // The pass rests on the enterprise setting; a listing that stopped short keeps it and states the stop, while an
             // empty page from a listing that stopped proves nothing about whether the allowlist is populated.
             : entries.length > 0
-              ? finding(4, "pass", `External collaboration is limited to allowlisted domains (${entries.length} domain entries visible${entriesTruncated ? `; ${entriesTruncationNote}, so the entry count is a lower bound; ${entriesRemedy}` : ""}).`, externalEvidence)
+              ? finding(decisions, 4, `External collaboration is limited to allowlisted domains (${entries.length} domain entries visible${entriesTruncated ? `; ${entriesTruncationNote}, so the entry count is a lower bound; ${entriesRemedy}` : ""}).`, externalEvidence)
               : entriesTruncated
-                ? finding(4, "warn", `External collaboration is limited to allowlisted domains, but the collaboration allowlist listing returned no entries before it stopped (${data.allowlistEntries.truncation?.reason ?? "the listing stopped at its cap"}), so whether the allowlist is populated is unknown; ${entriesRemedy}.`, externalEvidence, externalManualEvidence)
-                : finding(4, "warn", "External collaboration is limited to allowlisted domains, but the allowlist is empty, which may block all external work or indicate an incomplete rollout.", externalEvidence)
+                ? finding(decisions, 4, `External collaboration is limited to allowlisted domains, but the collaboration allowlist listing returned no entries before it stopped (${data.allowlistEntries.truncation?.reason ?? "the listing stopped at its cap"}), so whether the allowlist is populated is unknown; ${entriesRemedy}.`, externalEvidence, externalManualEvidence)
+                : finding(decisions, 4, "External collaboration is limited to allowlisted domains, but the allowlist is empty, which may block all external work or indicate an incomplete rollout.", externalEvidence)
           : externalStatus === "enable_external_collaboration"
-            ? finding(4, "fail", "External collaboration is enabled for any domain without an allowlist restriction.", externalEvidence)
-            : finding(4, "warn", `External collaboration status "${externalStatus ?? "unknown"}" was not recognized; confirm the setting manually.`, externalEvidence),
+            ? finding(decisions, 4, "External collaboration is enabled for any domain without an allowlist restriction.", externalEvidence)
+            : finding(decisions, 4, `External collaboration status "${externalStatus ?? "unknown"}" was not recognized; confirm the setting manually.`, externalEvidence),
     [allowlistUnreadable],
     externalManualEvidence,
   ));
@@ -3018,7 +2956,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     ...(undatedEntries.length > 0 ? [`${undatedEntries.length} allowlist entries have a missing or unparseable created_at (a documented CollaborationAllowlistEntry field), so their age cannot be assessed`] : []),
     ...(exemptTargets.length > 0 ? [`${exemptTargets.length} users are exempt from domain restrictions`] : []),
   ];
-  recordBoxDecisionFacts(5, {
+  recordBoxDecisionFacts(decisions, 5, {
     allowlist_readable: allowlistReadable,
     config_readable: !data.configuration.error,
     exempt_targets_readable: !data.exemptTargets.error,
@@ -3032,17 +2970,17 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   });
   findings.push(capForUnreadableInventories(
     !allowlistReadable
-      ? finding(5, "manual", `The collaboration allowlist could not be read because ${unreadableReason(data.allowlistEntries)}.`, allowlistEvidence, allowlistManualEvidence)
+      ? finding(decisions, 5, `The collaboration allowlist could not be read because ${unreadableReason(data.allowlistEntries)}.`, allowlistEvidence, allowlistManualEvidence)
       : publicDomainEntries.length > 0
-        ? finding(5, "fail", `${publicDomainEntries.length} allowlisted domains are public consumer email providers, which effectively allow anyone to collaborate.`, allowlistEvidence)
+        ? finding(decisions, 5, `${publicDomainEntries.length} allowlisted domains are public consumer email providers, which effectively allow anyone to collaborate.`, allowlistEvidence)
         : allowlistTruncated
-          ? finding(5, "warn", `With ${entries.length} entries and ${countOrUnread(data.exemptTargets, exemptTargets.length)} exempt users retrieved, ${allowlistStopNotes}, so unreviewed public, stale, or exempt entries may remain; ${allowlistStopRemedies}.`, allowlistEvidence, allowlistManualEvidence)
+          ? finding(decisions, 5, `With ${entries.length} entries and ${countOrUnread(data.exemptTargets, exemptTargets.length)} exempt users retrieved, ${allowlistStopNotes}, so unreviewed public, stale, or exempt entries may remain; ${allowlistStopRemedies}.`, allowlistEvidence, allowlistManualEvidence)
         : entries.length === 0
-          ? finding(5, externalStatus === "limit_collaboration_to_allowlisted_domains" ? "warn" : "pass", entries.length === 0 && externalStatus === "limit_collaboration_to_allowlisted_domains" ? "The allowlist is empty while collaboration is limited to allowlisted domains." : "No collaboration allowlist entries exist to audit.", allowlistEvidence)
+          ? finding(decisions, 5, entries.length === 0 && externalStatus === "limit_collaboration_to_allowlisted_domains" ? "The allowlist is empty while collaboration is limited to allowlisted domains." : "No collaboration allowlist entries exist to audit.", allowlistEvidence)
           : allowlistReviewReasons.length > 0
-            ? finding(5, "warn", `${allowlistReviewReasons.join("; ")}; review them for continued need.`, allowlistEvidence, "Confirm with content owners that each stale, undated, or exempt entry still has an active business relationship, and record the creation date of any undated entry from the Admin Console export.")
+            ? finding(decisions, 5, `${allowlistReviewReasons.join("; ")}; review them for continued need.`, allowlistEvidence, "Confirm with content owners that each stale, undated, or exempt entry still has an active business relationship, and record the creation date of any undated entry from the Admin Console export.")
             // The absence of exemptions is stated only from an exempt-target listing that was read; otherwise it is unread.
-            : finding(5, "pass", `${entries.length} allowlist entries are dated, recent, non-public domains${isRead(data.exemptTargets) ? " with no user exemptions" : "; the user exemption list is unread"}.`, allowlistEvidence),
+            : finding(decisions, 5, `${entries.length} allowlist entries are dated, recent, non-public domains${isRead(data.exemptTargets) ? " with no user exemptions" : "; the user exemption list is unread"}.`, allowlistEvidence),
     [exemptTargetsUnreadable, collaborationConfigUnreadable],
     allowlistManualEvidence,
   ));
@@ -3058,7 +2996,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     ...settingsEvidence(configReadable, linkSettings, linkUnused),
   };
   const linkManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: record the default link access level and whether open (public) links are permitted.";
-  recordBoxDecisionFacts(6, {
+  recordBoxDecisionFacts(decisions, 6, {
     settings_readable: configReadable,
     unused_setting_count: Object.keys(linkUnused).length,
     shared_link_default_access: sharedLinkDefault,
@@ -3066,16 +3004,16 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   });
   findings.push(
     !configReadable
-      ? finding(6, "manual", `Shared link settings could not be read because ${configUnreadableReason}.`, undefined, linkManualEvidence)
+      ? finding(decisions, 6, `Shared link settings could not be read because ${configUnreadableReason}.`, undefined, linkManualEvidence)
       : hasUnusedSettings(linkUnused)
-        ? finding(6, "warn", unusedSettingsSummary(linkUnused, "the shared link access policy cannot be treated as enforced"), linkEvidence, linkManualEvidence)
+        ? finding(decisions, 6, unusedSettingsSummary(linkUnused, "the shared link access policy cannot be treated as enforced"), linkEvidence, linkManualEvidence)
         : accessLevelIsOpen(sharedLinkDefault)
-        ? finding(6, "fail", `The default shared link access level "${sharedLinkDefault}" creates public links.`, linkEvidence)
+        ? finding(decisions, 6, `The default shared link access level "${sharedLinkDefault}" creates public links.`, linkEvidence)
         : accessLevelIsRestricted(sharedLinkDefault)
           ? accessLevelIsOpen(sharedLinkAllowed)
-            ? finding(6, "warn", `Shared links default to "${sharedLinkDefault}", but open links remain available to users through "${sharedLinkAllowed}".`, linkEvidence)
-            : finding(6, "pass", `Shared links default to "${sharedLinkDefault}" and open links are not offered by the enterprise setting "${sharedLinkAllowed ?? "unset"}".`, linkEvidence)
-          : finding(6, "warn", `Shared link default access "${sharedLinkDefault ?? "unset"}" was not recognized; confirm it is People in this company or more restrictive.`, linkEvidence),
+            ? finding(decisions, 6, `Shared links default to "${sharedLinkDefault}", but open links remain available to users through "${sharedLinkAllowed}".`, linkEvidence)
+            : finding(decisions, 6, `Shared links default to "${sharedLinkDefault}" and open links are not offered by the enterprise setting "${sharedLinkAllowed ?? "unset"}".`, linkEvidence)
+          : finding(decisions, 6, `Shared link default access "${sharedLinkDefault ?? "unset"}" was not recognized; confirm it is People in this company or more restrictive.`, linkEvidence),
   );
 
   const expirationEnabled = configBool(configuration, "content_and_sharing", "is_shared_links_expiration_enabled");
@@ -3099,7 +3037,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     ...settingsEvidence(configReadable, expirationSettings, unusedSettings(expirationSettings)),
   };
   const expirationManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: confirm automatic expiration is enabled and record the day count.";
-  recordBoxDecisionFacts(7, {
+  recordBoxDecisionFacts(decisions, 7, {
     settings_readable: configReadable,
     unused_setting_count: Object.keys(expirationUnused).length,
     expiration_enabled: expirationEnabled,
@@ -3107,23 +3045,22 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   });
   findings.push(
     !configReadable
-      ? finding(7, "manual", `Shared link expiration settings could not be read because ${configUnreadableReason}.`, undefined, expirationManualEvidence)
+      ? finding(decisions, 7, `Shared link expiration settings could not be read because ${configUnreadableReason}.`, undefined, expirationManualEvidence)
       : hasUnusedSettings(expirationUnused)
-        ? finding(7, "warn", unusedSettingsSummary(expirationUnused, "shared link expiration cannot be treated as enforced"), expirationEvidence, expirationManualEvidence)
+        ? finding(decisions, 7, unusedSettingsSummary(expirationUnused, "shared link expiration cannot be treated as enforced"), expirationEvidence, expirationManualEvidence)
         : expirationEnabled === true
-        ? finding(7, "pass", `Shared links expire automatically after ${expirationDays ?? "a configured number of"} days.`, expirationEvidence)
+        ? finding(decisions, 7, `Shared links expire automatically after ${expirationDays ?? "a configured number of"} days.`, expirationEvidence)
         : publicExpirationEnabled === true
-          ? finding(7, "warn", `Only public shared links expire automatically (${publicExpirationDays ?? "configured"} days); company and collaborator links have no mandatory expiration.`, expirationEvidence)
+          ? finding(decisions, 7, `Only public shared links expire automatically (${publicExpirationDays ?? "configured"} days); company and collaborator links have no mandatory expiration.`, expirationEvidence)
           : expirationEnabled === false
-            ? finding(7, "fail", "Shared links do not have a mandatory expiration configured.", expirationEvidence)
-            : finding(7, "warn", "Enterprise settings did not expose is_shared_links_expiration_enabled, so shared link expiration cannot be confirmed from the API.", expirationEvidence, expirationManualEvidence),
+            ? finding(decisions, 7, "Shared links do not have a mandatory expiration configured.", expirationEvidence)
+            : finding(decisions, 7, "Enterprise settings did not expose is_shared_links_expiration_enabled, so shared link expiration cannot be confirmed from the API.", expirationEvidence, expirationManualEvidence),
   );
 
-  recordBoxDecisionFacts(8, {});
+  recordBoxDecisionFacts(decisions, 8, {});
   findings.push(
     finding(
-      8,
-      "manual",
+      decisions, 8,
       configReadable
         ? "The enterprise configuration API does not expose whether passwords are required for open shared links."
         : `Shared link settings could not be read (${configUnreadableReason}) and the API does not expose shared link password requirements.`,
@@ -3145,30 +3082,29 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     ...settingsEvidence(configReadable, watermarkSettings, watermarkUnused),
   };
   const watermarkManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Watermarking: confirm watermarking is enabled and which folders or classifications apply it.";
-  recordBoxDecisionFacts(9, {
+  recordBoxDecisionFacts(decisions, 9, {
     settings_readable: configReadable,
     unused_setting_count: Object.keys(watermarkUnused).length,
     watermarking_enabled: watermarkingEnabled,
   });
   findings.push(
     !configReadable
-      ? finding(9, "manual", `Watermarking settings could not be read because ${configUnreadableReason}.`, undefined, watermarkManualEvidence)
+      ? finding(decisions, 9, `Watermarking settings could not be read because ${configUnreadableReason}.`, undefined, watermarkManualEvidence)
       : hasUnusedSettings(watermarkUnused)
-        ? finding(9, "warn", unusedSettingsSummary(watermarkUnused, "watermarking cannot be treated as an enforced enterprise feature"), watermarkEvidence, watermarkManualEvidence)
+        ? finding(decisions, 9, unusedSettingsSummary(watermarkUnused, "watermarking cannot be treated as an enforced enterprise feature"), watermarkEvidence, watermarkManualEvidence)
         : watermarkingEnabled === true
-        ? finding(9, "pass", "Watermarking is enabled as an enterprise feature; confirm sensitive folders and classifications apply it.", watermarkEvidence, "Spot check sensitive folders for the watermark setting and confirm classification policies apply watermarks where required.")
+        ? finding(decisions, 9, "Watermarking is enabled as an enterprise feature; confirm sensitive folders and classifications apply it.", watermarkEvidence, "Spot check sensitive folders for the watermark setting and confirm classification policies apply watermarks where required.")
         : watermarkingEnabled === false
-          ? finding(9, "fail", "Watermarking is not enabled as an enterprise feature.", watermarkEvidence)
-          : finding(9, "warn", "Enterprise settings did not expose the watermarking feature flag.", watermarkEvidence),
+          ? finding(decisions, 9, "Watermarking is not enabled as an enterprise feature.", watermarkEvidence)
+          : finding(decisions, 9, "Enterprise settings did not expose the watermarking feature flag.", watermarkEvidence),
   );
 
   const appEvents = events.filter((event) => /^(ENTERPRISE_APP_AUTHORIZATION_UPDATE|APPLICATION_CREATED|APPLICATION_PUBLIC_KEY_ADDED)$/.test(eventType(event)));
   const integrationLists = data.shieldLists.data.filter((list) => shieldListContentType(list) === "integration");
-  recordBoxDecisionFacts(19, {});
+  recordBoxDecisionFacts(decisions, 19, {});
   findings.push(
     finding(
-      19,
-      "manual",
+      decisions, 19,
       `${sampledCountText(data.events, appEvents.length)} app authorization or creation events occurred in the last ${data.lookbackDays} days and ${countOrUnread(data.shieldLists, integrationLists.length)} Shield integration lists exist; the Box API does not expose the app approval policy itself.`,
       {
         app_events: sampledValue(data.events, countEventTypes(appEvents)),
@@ -3188,18 +3124,18 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     external_terms: whenRead(data.termsOfServices, externalTerms.map((terms) => ({ id: asString(terms.id), status: asString(terms.status) }))),
     terms_accept_events: observedCount([data.events], events.filter((event) => eventType(event) === "TERMS_OF_SERVICE_ACCEPT").length),
   };
-  recordBoxDecisionFacts(20, {
+  recordBoxDecisionFacts(decisions, 20, {
     terms_readable: !data.termsOfServices.error,
     enabled_managed_term_count: enabledManaged.length,
   });
   findings.push(
     data.termsOfServices.error
-      ? finding(20, "manual", `Terms of service could not be read because ${unreadableReason(data.termsOfServices)}.`, tosEvidence, "Admin Console > Enterprise Settings > Custom Setup > Custom Terms of Service: confirm terms are enabled for managed users and record the last modification date.")
+      ? finding(decisions, 20, `Terms of service could not be read because ${unreadableReason(data.termsOfServices)}.`, tosEvidence, "Admin Console > Enterprise Settings > Custom Setup > Custom Terms of Service: confirm terms are enabled for managed users and record the last modification date.")
       : enabledManaged.length > 0
-        ? finding(20, "pass", `Custom terms of service are enabled for managed users${externalTerms.some((terms) => asString(terms.status) === "enabled") ? " and external users" : ""}.`, tosEvidence)
+        ? finding(decisions, 20, `Custom terms of service are enabled for managed users${externalTerms.some((terms) => asString(terms.status) === "enabled") ? " and external users" : ""}.`, tosEvidence)
         : managedTerms.length > 0
-          ? finding(20, "fail", "Custom terms of service exist for managed users but are disabled.", tosEvidence)
-          : finding(20, "fail", "No custom terms of service are configured for managed users.", tosEvidence),
+          ? finding(decisions, 20, "Custom terms of service exist for managed users but are disabled.", tosEvidence)
+          : finding(decisions, 20, "No custom terms of service are configured for managed users.", tosEvidence),
   );
 
   return {
@@ -3238,7 +3174,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
       ...datasetTruncations("enterprise_events", data.events, "event_limit"),
     ],
   };
-  });
+
 }
 
 export async function assessBoxSharingCollaboration(
@@ -3359,7 +3295,8 @@ function classificationOptions(template: JsonRecord): string[] {
 }
 
 export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessmentResult {
-  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
+  const decisions = new BatchVerdicts(BOX_SPEC);
+
   const configuration = data.configuration.error ? undefined : data.configuration.data;
   const findings: BoxFinding[] = [];
 
@@ -3374,19 +3311,19 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
     is_box_sync_restricted_for_new_users: configBool(configuration, "user_settings", "is_box_sync_restricted_for_new_users") ?? null,
   };
   const deviceManualEvidence = "Admin Console > Enterprise Settings > Device Trust: record whether device pinning is enforced for Box Drive, Box Sync, and mobile apps, and export the pinned device list.";
-  recordBoxDecisionFacts(10, {
+  recordBoxDecisionFacts(decisions, 10, {
     readable: !data.devicePinners.error,
     complete: completeBoxDatasets(data.devicePinners),
     pin_count: pins.length,
   });
   findings.push(
     data.devicePinners.error
-      ? finding(10, "manual", `Device pins could not be read because ${unreadableReason(data.devicePinners)}.`, deviceEvidence, deviceManualEvidence)
+      ? finding(decisions, 10, `Device pins could not be read because ${unreadableReason(data.devicePinners)}.`, deviceEvidence, deviceManualEvidence)
       : pins.length === 0
         ? pinsTruncated
-          ? finding(10, "manual", `The device pin listing returned no pins before it stopped (${data.devicePinners.truncation?.reason ?? "the listing stopped at its cap"}), so whether device pinning is in use is unknown; ${truncationRemedy(data.devicePinners, "list_limit")}.`, deviceEvidence, deviceManualEvidence)
-          : finding(10, "warn", "No device pins exist, which indicates device pinning is not enforced for desktop or mobile clients.", deviceEvidence, "Admin Console > Enterprise Settings > Device Trust: confirm whether device pinning and device trust checks are intentionally disabled.")
-        : finding(10, "manual", `${pins.length} device pins are registered${pinsTruncated ? ` (a lower bound: ${listingTruncationNote("device pin", data.devicePinners)}; ${truncationRemedy(data.devicePinners, "list_limit")})` : ""}; the Box API does not expose the device trust policy that decides whether unpinned devices are blocked.`, deviceEvidence, "Admin Console > Enterprise Settings > Device Trust: confirm device pinning is required, record per-user device limits, and review the pinned device inventory for stale entries."),
+          ? finding(decisions, 10, `The device pin listing returned no pins before it stopped (${data.devicePinners.truncation?.reason ?? "the listing stopped at its cap"}), so whether device pinning is in use is unknown; ${truncationRemedy(data.devicePinners, "list_limit")}.`, deviceEvidence, deviceManualEvidence)
+          : finding(decisions, 10, "No device pins exist, which indicates device pinning is not enforced for desktop or mobile clients.", deviceEvidence, "Admin Console > Enterprise Settings > Device Trust: confirm whether device pinning and device trust checks are intentionally disabled.")
+        : finding(decisions, 10, `${pins.length} device pins are registered${pinsTruncated ? ` (a lower bound: ${listingTruncationNote("device pin", data.devicePinners)}; ${truncationRemedy(data.devicePinners, "list_limit")})` : ""}; the Box API does not expose the device trust policy that decides whether unpinned devices are blocked.`, deviceEvidence, "Admin Console > Enterprise Settings > Device Trust: confirm device pinning is required, record per-user device limits, and review the pinned device inventory for stale entries."),
   );
 
   const templates = data.metadataTemplates.data;
@@ -3399,16 +3336,16 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
     metadata_templates_truncated: whenRead(data.metadataTemplates, data.metadataTemplates.truncated === true),
     classification_error: data.classificationTemplate.error ?? null,
   };
-  recordBoxDecisionFacts(11, {
+  recordBoxDecisionFacts(decisions, 11, {
     readable: classificationReadable,
     classification_count: classifications.length,
   });
   findings.push(
     data.classificationTemplate.error && data.classificationTemplate.statusCode !== 404
-      ? finding(11, "manual", `The classification template could not be read because ${unreadableReason(data.classificationTemplate)}.`, classificationEvidence, "Admin Console > Enterprise Settings > Classification: record the defined labels and confirm sensitive folders carry a classification.")
+      ? finding(decisions, 11, `The classification template could not be read because ${unreadableReason(data.classificationTemplate)}.`, classificationEvidence, "Admin Console > Enterprise Settings > Classification: record the defined labels and confirm sensitive folders carry a classification.")
       : classifications.length > 0
-        ? finding(11, "pass", `${classifications.length} classification labels are defined (${classifications.join(", ")}); label application to sensitive content still needs a sampled folder review.`, classificationEvidence, "Sample sensitive folders and confirm they carry the expected classification label and downstream Shield or sharing policies.")
-        : finding(11, "fail", "No classification labels are defined for the enterprise.", classificationEvidence),
+        ? finding(decisions, 11, `${classifications.length} classification labels are defined (${classifications.join(", ")}); label application to sensitive content still needs a sampled folder review.`, classificationEvidence, "Sample sensitive folders and confirm they carry the expected classification label and downstream Shield or sharing policies.")
+        : finding(decisions, 11, "No classification labels are defined for the enterprise.", classificationEvidence),
   );
 
   const retentionPolicies = data.retentionPolicies.data;
@@ -3437,7 +3374,7 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   // pass, while the total behind the stop is unknown; the counts it states are lower bounds carried with the exit.
   const retentionTruncationNote = listingTruncationNote("retention policy", data.retentionPolicies);
   const retentionRemedy = truncationRemedy(data.retentionPolicies, "list_limit");
-  recordBoxDecisionFacts(12, {
+  recordBoxDecisionFacts(decisions, 12, {
     policies_readable: !data.retentionPolicies.error,
     assignments_readable: !data.retentionAssignments.error,
     complete: !retentionTruncated,
@@ -3446,18 +3383,18 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   });
   findings.push(capForUnreadableInventories(
     data.retentionPolicies.error
-      ? finding(12, "manual", `Retention policies could not be read because ${unreadableReason(data.retentionPolicies)}; this endpoint requires Box Governance and the manage_data_retention scope.`, retentionEvidence, retentionManualEvidence)
+      ? finding(decisions, 12, `Retention policies could not be read because ${unreadableReason(data.retentionPolicies)}; this endpoint requires Box Governance and the manage_data_retention scope.`, retentionEvidence, retentionManualEvidence)
       : retentionTruncated && retentionPolicies.length === 0
-        ? finding(12, "warn", `The retention policy listing returned no policies before it stopped (${data.retentionPolicies.truncation?.reason ?? "the listing stopped at its cap"}), so whether active retention policies exist is unknown; ${retentionRemedy}.`, retentionEvidence, retentionManualEvidence)
+        ? finding(decisions, 12, `The retention policy listing returned no policies before it stopped (${data.retentionPolicies.truncation?.reason ?? "the listing stopped at its cap"}), so whether active retention policies exist is unknown; ${retentionRemedy}.`, retentionEvidence, retentionManualEvidence)
         : assignedRetention.length > 0
           ? retentionTruncated
-            ? finding(12, "warn", `${assignedRetention.length}/${activeRetention.length} active retention policies have assignments among the ${retentionPolicies.length} policies read, but ${retentionTruncationNote}; the total number of policies is unknown and the policies beyond the stop were not assessed, so the assignment coverage holds only for the policies read and both counts are lower bounds; ${retentionRemedy}.`, retentionEvidence, retentionManualEvidence)
-            : finding(12, "pass", `${assignedRetention.length}/${activeRetention.length} active retention policies have assignments.`, retentionEvidence)
+            ? finding(decisions, 12, `${assignedRetention.length}/${activeRetention.length} active retention policies have assignments among the ${retentionPolicies.length} policies read, but ${retentionTruncationNote}; the total number of policies is unknown and the policies beyond the stop were not assessed, so the assignment coverage holds only for the policies read and both counts are lower bounds; ${retentionRemedy}.`, retentionEvidence, retentionManualEvidence)
+            : finding(decisions, 12, `${assignedRetention.length}/${activeRetention.length} active retention policies have assignments.`, retentionEvidence)
           : activeRetention.length > 0
-            ? finding(12, "warn", `${activeRetention.length} active retention policies exist but none have visible assignments${retentionTruncated ? `; ${retentionTruncationNote}, so assigned policies may remain unread; ${retentionRemedy}` : ""}.`, retentionEvidence)
+            ? finding(decisions, 12, `${activeRetention.length} active retention policies exist but none have visible assignments${retentionTruncated ? `; ${retentionTruncationNote}, so assigned policies may remain unread; ${retentionRemedy}` : ""}.`, retentionEvidence)
             : retentionTruncated
-              ? finding(12, "warn", `None of the ${retentionPolicies.length} retention policies read is active, but ${retentionTruncationNote}, so active policies may remain unread; ${retentionRemedy}.`, retentionEvidence, retentionManualEvidence)
-              : finding(12, "fail", "No active retention policies exist.", retentionEvidence),
+              ? finding(decisions, 12, `None of the ${retentionPolicies.length} retention policies read is active, but ${retentionTruncationNote}, so active policies may remain unread; ${retentionRemedy}.`, retentionEvidence, retentionManualEvidence)
+              : finding(decisions, 12, "No active retention policies exist.", retentionEvidence),
     [unreadableInventory("retention_policy_assignments", data.retentionAssignments, "the folders and metadata each policy is assigned to were not checked (only the policy's own assignment_counts were read)")],
     retentionManualEvidence,
   ));
@@ -3480,7 +3417,7 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   const holdManualEvidence = "Admin Console > Governance > Legal Holds: record each policy, its custodians or folders, and confirm the legal team's hold process is documented.";
   const holdTruncationNote = listingTruncationNote("legal hold policy", data.legalHoldPolicies);
   const holdRemedy = truncationRemedy(data.legalHoldPolicies, "list_limit");
-  recordBoxDecisionFacts(13, {
+  recordBoxDecisionFacts(decisions, 13, {
     policies_readable: !data.legalHoldPolicies.error,
     assignments_readable: !data.legalHoldAssignments.error,
     complete: !holdsTruncated,
@@ -3488,18 +3425,18 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   });
   findings.push(capForUnreadableInventories(
     data.legalHoldPolicies.error
-      ? finding(13, "manual", `Legal hold policies could not be read because ${unreadableReason(data.legalHoldPolicies)}; this endpoint requires Box Governance and the manage_legal_holds scope.`, holdEvidence, holdManualEvidence)
+      ? finding(decisions, 13, `Legal hold policies could not be read because ${unreadableReason(data.legalHoldPolicies)}; this endpoint requires Box Governance and the manage_legal_holds scope.`, holdEvidence, holdManualEvidence)
       : holdsTruncated && legalHolds.length === 0
-        ? finding(13, "warn", `The legal hold policy listing returned no policies before it stopped (${data.legalHoldPolicies.truncation?.reason ?? "the listing stopped at its cap"}), so whether legal hold policies exist is unknown; ${holdRemedy}.`, holdEvidence, holdManualEvidence)
+        ? finding(decisions, 13, `The legal hold policy listing returned no policies before it stopped (${data.legalHoldPolicies.truncation?.reason ?? "the listing stopped at its cap"}), so whether legal hold policies exist is unknown; ${holdRemedy}.`, holdEvidence, holdManualEvidence)
         : assignedHolds.length > 0
           ? holdsTruncated
-            ? finding(13, "warn", `${assignedHolds.length}/${activeHolds.length} active legal hold policies have custodian or content assignments among the ${legalHolds.length} policies read, but ${holdTruncationNote}; the total number of policies is unknown and the policies beyond the stop were not assessed, so the assignment coverage holds only for the policies read and both counts are lower bounds; ${holdRemedy}.`, holdEvidence, holdManualEvidence)
-            : finding(13, "pass", `${assignedHolds.length}/${activeHolds.length} active legal hold policies have custodian or content assignments.`, holdEvidence)
+            ? finding(decisions, 13, `${assignedHolds.length}/${activeHolds.length} active legal hold policies have custodian or content assignments among the ${legalHolds.length} policies read, but ${holdTruncationNote}; the total number of policies is unknown and the policies beyond the stop were not assessed, so the assignment coverage holds only for the policies read and both counts are lower bounds; ${holdRemedy}.`, holdEvidence, holdManualEvidence)
+            : finding(decisions, 13, `${assignedHolds.length}/${activeHolds.length} active legal hold policies have custodian or content assignments.`, holdEvidence)
           : activeHolds.length > 0
-            ? finding(13, "warn", `${activeHolds.length} active legal hold policies exist without visible assignments${holdsTruncated ? `; ${holdTruncationNote}, so assigned holds may remain unread; ${holdRemedy}` : ""}.`, holdEvidence)
+            ? finding(decisions, 13, `${activeHolds.length} active legal hold policies exist without visible assignments${holdsTruncated ? `; ${holdTruncationNote}, so assigned holds may remain unread; ${holdRemedy}` : ""}.`, holdEvidence)
             : holdsTruncated
-              ? finding(13, "warn", `None of the ${legalHolds.length} legal hold policies read is active, but ${holdTruncationNote}, so active holds may remain unread; ${holdRemedy}.`, holdEvidence, holdManualEvidence)
-              : finding(13, "warn", "No legal hold policies exist; confirm a documented process exists to create holds when litigation is anticipated.", holdEvidence, "Obtain the legal team's hold procedure and confirm Box Governance is licensed so holds can be applied when required."),
+              ? finding(decisions, 13, `None of the ${legalHolds.length} legal hold policies read is active, but ${holdTruncationNote}, so active holds may remain unread; ${holdRemedy}.`, holdEvidence, holdManualEvidence)
+              : finding(decisions, 13, "No legal hold policies exist; confirm a documented process exists to create holds when litigation is anticipated.", holdEvidence, "Obtain the legal team's hold procedure and confirm Box Governance is licensed so holds can be applied when required."),
     [unreadableInventory("legal_hold_policy_assignments", data.legalHoldAssignments, "the custodians and content each hold covers were not checked (only the policy's own assignment_counts were read)")],
     holdManualEvidence,
   ));
@@ -3539,7 +3476,7 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
       ...datasetTruncations("legal_hold_policy_assignments", data.legalHoldAssignments, "list_limit"),
     ],
   };
-  });
+
 }
 
 function countEventTypesBy(items: JsonRecord[], keyOf: (item: JsonRecord) => string): Record<string, number> {
@@ -3581,7 +3518,8 @@ export async function collectBoxShieldData(
 }
 
 export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmentResult {
-  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
+  const decisions = new BatchVerdicts(BOX_SPEC);
+
   const configuration = data.configuration.error ? undefined : data.configuration.data;
   const shieldReadable = categoryReadable(data.configuration, "shield");
   const shieldUnreadableReason = categoryUnreadableReason(data.configuration, "shield");
@@ -3600,16 +3538,16 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     sampled_events: whenRead(data.events, events.length),
     events_truncated: whenRead(data.events, data.events.truncated === true),
   };
-  recordBoxDecisionFacts(14, {
+  recordBoxDecisionFacts(decisions, 14, {
     settings_readable: shieldReadable,
     shield_rule_count: shieldRules.length,
   });
   findings.push(
     !shieldReadable
-      ? finding(14, "manual", `Shield rule configuration could not be read because ${shieldUnreadableReason}; Box Shield licensing and the manage_enterprise_properties scope are required.`, ruleEvidence, "Admin Console > Shield > Access Policies and Threat Detection Rules: record each policy, its scope (classification, user, group), and the enabled anomaly detectors.")
+      ? finding(decisions, 14, `Shield rule configuration could not be read because ${shieldUnreadableReason}; Box Shield licensing and the manage_enterprise_properties scope are required.`, ruleEvidence, "Admin Console > Shield > Access Policies and Threat Detection Rules: record each policy, its scope (classification, user, group), and the enabled anomaly detectors.")
       : shieldRules.length > 0
-        ? finding(14, "pass", `${shieldRules.length} Shield rules are configured across ${Object.keys(ruleCategories).length} categories.`, ruleEvidence)
-        : finding(14, "fail", "No Shield smart access or threat detection rules are configured.", ruleEvidence),
+        ? finding(decisions, 14, `${shieldRules.length} Shield rules are configured across ${Object.keys(ruleCategories).length} categories.`, ruleEvidence)
+        : finding(decisions, 14, "No Shield smart access or threat detection rules are configured.", ruleEvidence),
   );
 
   const barriers = data.barriers.data;
@@ -3636,27 +3574,27 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   const enabledWithSegments = enabledBarriers.filter((barrier) => (childList(data.barrierSegments.data, asString(barrier.id))?.length ?? 0) > 0);
   const segmentTruncationNote = `the segment listing ${truncationClause(data.barrierSegments, datasetRecordCount(data.barrierSegments.data) ?? 0, "segments", "Box reported more segments (a next_marker remained)")}`;
   const barrierManualEvidence = "Admin Console > Shield > Information Barriers: record each barrier, its segments, and the restrictions between segments, or confirm barriers are not required for this enterprise.";
-  recordBoxDecisionFacts(15, {
+  recordBoxDecisionFacts(decisions, 15, {
     barriers_readable: !data.barriers.error,
     segments_readable: !data.barrierSegments.error,
     enabled_with_segments_count: enabledWithSegments.length,
   });
   findings.push(capForUnreadableInventories(
     data.barriers.error
-      ? finding(15, "manual", `Shield information barriers could not be read because ${unreadableReason(data.barriers)}.`, barrierEvidence, barrierManualEvidence)
+      ? finding(decisions, 15, `Shield information barriers could not be read because ${unreadableReason(data.barriers)}.`, barrierEvidence, barrierManualEvidence)
       // The pass rests on a segment existing behind an enabled barrier; a segment listing that stopped short keeps it
       // and states the stop, since the segments read are real and the counts are lower bounds.
       : enabledWithSegments.length > 0
-        ? finding(15, "pass", `${enabledWithSegments.length} enabled information barriers have segments defined${segmentsTruncated ? `; ${segmentTruncationNote}, so the segment counts are lower bounds; review the remainder in the Admin Console` : ""}.`, barrierEvidence)
+        ? finding(decisions, 15, `${enabledWithSegments.length} enabled information barriers have segments defined${segmentsTruncated ? `; ${segmentTruncationNote}, so the segment counts are lower bounds; review the remainder in the Admin Console` : ""}.`, barrierEvidence)
         : enabledBarriers.length > 0
           // "No segments" is asserted only from segment reads that completed; a denied segment read leaves them unread,
           // and a listing that stopped before any segment was read leaves whether segments exist unknown.
-          ? finding(15, "warn", `${enabledBarriers.length} information barriers are enabled but ${!isRead(data.barrierSegments) ? "their segments could not be read" : segmentsTruncated ? `their segment listing returned no segments before it stopped (${data.barrierSegments.truncation?.reason ?? "the listing stopped at its cap"}), so whether they have segments is unknown` : "have no visible segments"}.`, barrierEvidence, segmentsTruncated ? barrierManualEvidence : undefined)
+          ? finding(decisions, 15, `${enabledBarriers.length} information barriers are enabled but ${!isRead(data.barrierSegments) ? "their segments could not be read" : segmentsTruncated ? `their segment listing returned no segments before it stopped (${data.barrierSegments.truncation?.reason ?? "the listing stopped at its cap"}), so whether they have segments is unknown` : "have no visible segments"}.`, barrierEvidence, segmentsTruncated ? barrierManualEvidence : undefined)
           : barriers.length > 0
-            ? finding(15, "warn", `${barriers.length} information barriers exist but none are enabled${barriersTruncated ? ` among the barriers read; ${listingTruncationNote("information barrier", data.barriers)}, so enabled barriers may remain unread` : ""}.`, barrierEvidence)
+            ? finding(decisions, 15, `${barriers.length} information barriers exist but none are enabled${barriersTruncated ? ` among the barriers read; ${listingTruncationNote("information barrier", data.barriers)}, so enabled barriers may remain unread` : ""}.`, barrierEvidence)
             : barriersTruncated
-              ? finding(15, "warn", `The information barrier listing returned no barriers before it stopped (${data.barriers.truncation?.reason ?? "the listing stopped at its cap"}), so whether barriers are configured is unknown; review the remainder in the Admin Console.`, barrierEvidence, barrierManualEvidence)
-              : finding(15, "warn", "No information barriers are configured; confirm segregation between groups is not required.", barrierEvidence, "Document whether regulatory or conflict-of-interest requirements call for information barriers between business units."),
+              ? finding(decisions, 15, `The information barrier listing returned no barriers before it stopped (${data.barriers.truncation?.reason ?? "the listing stopped at its cap"}), so whether barriers are configured is unknown; review the remainder in the Admin Console.`, barrierEvidence, barrierManualEvidence)
+              : finding(decisions, 15, "No information barriers are configured; confirm segregation between groups is not required.", barrierEvidence, "Document whether regulatory or conflict-of-interest requirements call for information barriers between business units."),
     [unreadableInventory("shield_information_barrier_segments", data.barrierSegments, "the segments behind the enabled barriers were not checked")],
     barrierManualEvidence,
   ));
@@ -3670,16 +3608,16 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     siem_consumption_verified: false,
   };
   const streamManualEvidence = "Admin Console > Reports and Box Shield > SIEM integrations, or the Events API consumer configuration: record which SIEM or log pipeline polls the enterprise event stream (service account and stream_position checkpoint), confirm it is receiving events, and record how alerting is configured.";
-  recordBoxDecisionFacts(16, {
+  recordBoxDecisionFacts(decisions, 16, {
     events_readable: eventsReadable,
     event_count: events.length,
   });
   findings.push(
     !eventsReadable
-      ? finding(16, "manual", `The enterprise event stream could not be read because ${unreadableReason(data.events)}; the admin_logs stream requires an admin or co-admin with report permissions or the manage_enterprise_properties scope.`, streamEvidence, streamManualEvidence)
+      ? finding(decisions, 16, `The enterprise event stream could not be read because ${unreadableReason(data.events)}; the admin_logs stream requires an admin or co-admin with report permissions or the manage_enterprise_properties scope.`, streamEvidence, streamManualEvidence)
       : events.length > 0
-        ? finding(16, "pass", `Verified only that the enterprise admin_logs event stream is active and readable (${events.length} monitoring events in the last ${data.lookbackDays} days); the Box API does not expose whether a SIEM consumes the stream, so SIEM consumption still requires the manual evidence listed.`, streamEvidence, streamManualEvidence)
-        : finding(16, "warn", `The enterprise event stream is readable but returned no monitoring events in the last ${data.lookbackDays} days, and the Box API does not expose whether a SIEM consumes the stream.`, streamEvidence, streamManualEvidence),
+        ? finding(decisions, 16, `Verified only that the enterprise admin_logs event stream is active and readable (${events.length} monitoring events in the last ${data.lookbackDays} days); the Box API does not expose whether a SIEM consumes the stream, so SIEM consumption still requires the manual evidence listed.`, streamEvidence, streamManualEvidence)
+        : finding(decisions, 16, `The enterprise event stream is readable but returned no monitoring events in the last ${data.lookbackDays} days, and the Box API does not expose whether a SIEM consumes the stream.`, streamEvidence, streamManualEvidence),
   );
 
   const anomalyEvents = events.filter((event) => /^(SHIELD_ALERT|CONTENT_WORKFLOW_ABNORMAL_DOWNLOAD_ACTIVITY|SHIELD_DOWNLOAD_BLOCKED|SHIELD_SHARED_LINK_ACCESS_BLOCKED|FILE_MARKED_MALICIOUS)$/.test(eventType(event)));
@@ -3698,7 +3636,7 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   const monitoringManualEvidence = "Admin Console > Shield > Threat Detection: confirm anomalous download, session, and location detection rules are enabled and alerts route to the security team.";
   const shieldConfigUnreadable = unreadableInventory("enterprise_configuration (shield)", data.configuration, "the configured Shield anomaly detection rules were not checked");
   const monitoringEventsUnreadable = unreadableInventory("enterprise_events", data.events, "Shield alert and block events were not checked");
-  recordBoxDecisionFacts(25, {
+  recordBoxDecisionFacts(decisions, 25, {
     shield_settings_readable: shieldReadable,
     configuration_readable: !data.configuration.error,
     events_readable: eventsReadable,
@@ -3709,18 +3647,18 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   });
   findings.push(capForUnreadableInventories(
     !eventsReadable && !shieldReadable
-      ? finding(25, "manual", "Neither enterprise events nor Shield rules could be read, so content access monitoring cannot be confirmed from the API.", monitoringEvidence, monitoringManualEvidence)
+      ? finding(decisions, 25, "Neither enterprise events nor Shield rules could be read, so content access monitoring cannot be confirmed from the API.", monitoringEvidence, monitoringManualEvidence)
       : anomalyRules.length > 0 || anomalyEvents.length > 0
-        ? finding(25, "pass", `${shieldReadable ? String(anomalyRules.length) : "unread"} Shield anomaly detection rules and ${sampledCountText(data.events, anomalyEvents.length)} Shield alert or block events show content access monitoring is active.`, monitoringEvidence)
+        ? finding(decisions, 25, `${shieldReadable ? String(anomalyRules.length) : "unread"} Shield anomaly detection rules and ${sampledCountText(data.events, anomalyEvents.length)} Shield alert or block events show content access monitoring is active.`, monitoringEvidence)
         : !shieldReadable
-          ? finding(25, "warn", `Shield rule configuration could not be read because ${shieldUnreadableReason}, and no Shield alert or block events were observed among ${accessEvents.length} download and preview events; detection may depend on external analytics.`, monitoringEvidence, monitoringManualEvidence)
+          ? finding(decisions, 25, `Shield rule configuration could not be read because ${shieldUnreadableReason}, and no Shield alert or block events were observed among ${accessEvents.length} download and preview events; detection may depend on external analytics.`, monitoringEvidence, monitoringManualEvidence)
           : !eventsReadable
-            ? finding(25, "warn", `No Shield anomaly detection rules exist and the enterprise event stream could not be read (${unreadableReason(data.events)}), so content access monitoring cannot be confirmed from the API.`, monitoringEvidence, monitoringManualEvidence)
+            ? finding(decisions, 25, `No Shield anomaly detection rules exist and the enterprise event stream could not be read (${unreadableReason(data.events)}), so content access monitoring cannot be confirmed from the API.`, monitoringEvidence, monitoringManualEvidence)
             : accessEvents.length > 0
-              ? finding(25, "warn", `${accessEvents.length} download and preview events are recorded, but no Shield anomaly rules or alerts were observed, so detection depends on external analytics.`, monitoringEvidence, "Confirm the SIEM applies anomaly detection to Box download and preview events, or enable Shield threat detection rules.")
+              ? finding(decisions, 25, `${accessEvents.length} download and preview events are recorded, but no Shield anomaly rules or alerts were observed, so detection depends on external analytics.`, monitoringEvidence, "Confirm the SIEM applies anomaly detection to Box download and preview events, or enable Shield threat detection rules.")
               : data.events.truncated
-                ? finding(25, "warn", `No Shield anomaly detection rules exist and no Shield alerts appeared in the ${events.length} sampled events, but the event collection ${truncationClause(data.events, events.length, "events", "Box reported more events")}, so alerts may exist beyond the sample; ${truncationRemedy(data.events, "event_limit")}.`, monitoringEvidence, monitoringManualEvidence)
-                : finding(25, "fail", "No Shield anomaly detection rules exist and no content access events were observed in the sampled window.", monitoringEvidence),
+                ? finding(decisions, 25, `No Shield anomaly detection rules exist and no Shield alerts appeared in the ${events.length} sampled events, but the event collection ${truncationClause(data.events, events.length, "events", "Box reported more events")}, so alerts may exist beyond the sample; ${truncationRemedy(data.events, "event_limit")}.`, monitoringEvidence, monitoringManualEvidence)
+                : finding(decisions, 25, "No Shield anomaly detection rules exist and no content access events were observed in the sampled window.", monitoringEvidence),
     [shieldConfigUnreadable, monitoringEventsUnreadable],
     monitoringManualEvidence,
   ));
@@ -3754,7 +3692,7 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
       ...datasetTruncations("enterprise_events", data.events, "event_limit"),
     ],
   };
-  });
+
 }
 
 export async function assessBoxShieldMonitoring(
@@ -4504,7 +4442,7 @@ function runTool<TArgs extends AuthArgs>(
   })();
 }
 
-export function registerBoxTools(pi: any): void {
+export function registerBoxTools(pi: GrcToolRegistrar): void {
   pi = withIntegrationToolContracts(pi, BOX_SPEC);
   pi.registerTool({
     name: "box_check_access",

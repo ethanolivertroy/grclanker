@@ -101,11 +101,9 @@ const BASELINE_DOMAIN_TOOL_COUNT = 219;
 const DOMAIN_TOOL_COUNT = getRegisteredToolSummaries().filter((tool) => tool.kind === "domain").length;
 assert.ok(DOMAIN_TOOL_COUNT >= BASELINE_DOMAIN_TOOL_COUNT, `registry shrank below ${BASELINE_DOMAIN_TOOL_COUNT} tools`);
 
-// The Pi CLI's own argument validation (pi-ai 1.x, the copy the CLI runs),
-// used as the oracle the adapter is compared against.
-const { validateToolArguments: piCliValidate } = await import(
-  pathToFileURL(resolve(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-ai"))), "utils/validation.js")).href
-);
+// All hosts now share strict native validation; Flue's separate SDK gate is
+// still exercised below with the dependency copy actually used by Flue.
+const { prepareGrcToolArguments } = await import("../dist/core/arguments.js");
 
 function createRecordingHooks() {
   const calls = { models: [], tools: [], skills: [], subagents: [], sandboxes: [] };
@@ -119,7 +117,7 @@ function createRecordingHooks() {
   return { hooks, calls };
 }
 
-function createFakePiTool(overrides = {}) {
+function createFakeGrcTool(overrides = {}) {
   const executions = [];
   const tool = {
     name: "kevs_probe",
@@ -253,7 +251,7 @@ test("schema conversion handles strict objects, enums, nullables, and unknown co
 });
 
 test("tool input schemas run prepareArguments before validation and still render the declared schema", () => {
-  const { tool } = createFakePiTool();
+  const { tool } = createFakeGrcTool();
   const withShim = jsonSchemaToToolInput(tool.parameters, tool.name, tool.prepareArguments);
   const withoutShim = jsonSchemaToToolInput(tool.parameters, tool.name);
 
@@ -281,16 +279,10 @@ test("tool input schemas run prepareArguments before validation and still render
   assert.match(thrown.issues[0].message, /kevs_probe could not normalize its arguments: shim exploded/);
 });
 
-/** The Pi CLI's tool loop: `prepareArguments` (a throw becomes an error result), then pi-ai's `validateToolArguments`. */
-function piVerdict(tool, raw) {
-  let prepared;
+/** The common native boundary: prepare once, normalize optional nulls, and validate strictly. */
+function nativeVerdict(tool, raw) {
   try {
-    prepared = tool.prepareArguments ? tool.prepareArguments(structuredClone(raw)) : raw;
-  } catch {
-    return { ok: false, threw: true };
-  }
-  try {
-    const args = piCliValidate({ name: tool.name, parameters: tool.parameters }, { id: "probe", name: tool.name, arguments: prepared });
+    const args = prepareGrcToolArguments(tool, "probe", structuredClone(raw));
     return { ok: true, args: JSON.parse(JSON.stringify(args)) };
   } catch {
     return { ok: false };
@@ -405,7 +397,7 @@ test("string patterns render for the model and are enforced by Flue's gate, with
   assert.equal(v.safeParse(flueTool.input, { code: "ABC-1", note: "x" }).success, false);
 });
 
-test("the adapter stage accepts and normalizes arguments exactly like the Pi CLI loop for every domain tool", () => {
+test("the adapter stage accepts and normalizes arguments like the shared native boundary for every domain tool", () => {
   const piTools = collectGrclankerDomainTools();
   const flueTools = new Map(createGrclankerFlueTools(piTools).map((tool) => [tool.name, tool]));
   const mismatches = [];
@@ -436,7 +428,7 @@ test("the adapter stage accepts and normalizes arguments exactly like the Pi CLI
       compared += 1;
       // The adapter stage on its own must equal the Pi CLI's loop on the same payload.
       const direct = adapterVerdict(flueTool, input);
-      const pi = piVerdict(piTool, input);
+      const pi = nativeVerdict(piTool, input);
       if (!(pi.ok === direct.ok && (!pi.ok || canonical(pi.args) === canonical(direct.args)))) {
         mismatches.push({ stage: "adapter", tool: piTool.name, input, pi, flue: direct });
       }
@@ -450,7 +442,7 @@ test("the adapter stage accepts and normalizes arguments exactly like the Pi CLI
         continue;
       }
       const runtime = adapterVerdict(flueTool, gate.args);
-      const piOnGated = piVerdict(piTool, gate.args);
+      const piOnGated = nativeVerdict(piTool, gate.args);
       if (!(piOnGated.ok === runtime.ok && (!piOnGated.ok || canonical(piOnGated.args) === canonical(runtime.args)))) {
         mismatches.push({ stage: "runtime", tool: piTool.name, input, gated: gate.args, pi: piOnGated, flue: runtime });
       }
@@ -463,7 +455,7 @@ test("the adapter stage accepts and normalizes arguments exactly like the Pi CLI
 
   assert.ok(compared > 10000, `expected a broad probe matrix, compared ${compared}`);
   assert.ok(gated > 0 && gated < compared / 2, `the gate should reject a minority of probes (rejected ${gated} of ${compared})`);
-  assert.deepEqual(mismatches.slice(0, 10), [], `${mismatches.length} verdicts differ between the Pi CLI and the adapter`);
+  assert.deepEqual(mismatches.slice(0, 10), [], `${mismatches.length} verdicts differ between shared native validation and the adapter`);
   assert.ok(lenient > 0, "the gate's coercion admits some payloads the Pi CLI rejects");
   assert.deepEqual(lenientWithoutCoercion, [], "Flue is more permissive than the Pi CLI only where the gate coerced a value");
   assert.deepEqual(
@@ -495,7 +487,7 @@ test("Flue preserves AWS optional list defaults through its gate and adapter", (
   }
 });
 
-test("reviewer probe cases: the gate is the only difference from the Pi CLI, in both directions", () => {
+test("reviewer probe cases: the gate is the only difference from shared native validation, in both directions", () => {
   const piTools = collectGrclankerDomainTools();
   const flueTools = new Map(createGrclankerFlueTools(piTools).map((tool) => [tool.name, tool]));
   // `pi` is the Pi CLI verdict on the raw payload. For Flue, `pass` means accepted with the
@@ -533,7 +525,7 @@ test("reviewer probe cases: the gate is the only difference from the Pi CLI, in 
 
   for (const [name, input, piExpected, flueExpected] of cases) {
     const label = `${name} ${JSON.stringify(input)}`;
-    const pi = piVerdict(piTools.find((tool) => tool.name === name), input);
+    const pi = nativeVerdict(piTools.find((tool) => tool.name === name), input);
     const flue = flueVerdict(flueTools.get(name), input);
     assert.equal(pi.ok, piExpected === "accept", `${label}: Pi CLI verdict`);
     switch (flueExpected) {
@@ -592,7 +584,7 @@ test("every grclanker domain tool bridges into a Flue tool definition", () => {
 });
 
 test("bridged tools validate through the shim, execute once, and return Flue envelopes", async () => {
-  const { tool, executions } = createFakePiTool();
+  const { tool, executions } = createFakeGrcTool();
   const flueTool = toFlueTool(tool);
   const signal = new AbortController().signal;
 
@@ -605,10 +597,10 @@ test("bridged tools validate through the shim, execute once, and return Flue env
   assert.equal(executions.length, 1);
   assert.equal(executions[0].toolCallId, "call-42");
   assert.equal(executions[0].signal, signal);
-  assert.equal(executions[0].params, data, "run hands the validated arguments to execute without re-normalizing");
+  assert.deepEqual(executions[0].params, data, "the shared executor validates a copy without repeating the shim");
 
   const terminating = toFlueTool(
-    createFakePiTool({
+    createFakeGrcTool({
       async execute() {
         return { content: [{ type: "text", text: "done" }], details: {}, terminate: true };
       },
@@ -617,7 +609,7 @@ test("bridged tools validate through the shim, execute once, and return Flue env
   assert.deepEqual(await terminating.run(fakeRunContext({ query: "x" })), { output: "done", terminate: true });
 
   const failing = toFlueTool(
-    createFakePiTool({
+    createFakeGrcTool({
       async execute() {
         return { content: [{ type: "text", text: "kevs_probe requires a query." }], details: { tool: "kevs_probe" }, isError: true };
       },
@@ -650,7 +642,7 @@ test("bridged tool errors withhold echoed arguments and credentials before the m
   });
 
   const failing = toFlueTool(
-    createFakePiTool({
+    createFakeGrcTool({
       parameters,
       prepareArguments: undefined,
       async execute(_toolCallId, args) {
@@ -679,7 +671,7 @@ test("bridged tool errors withhold echoed arguments and credentials before the m
   });
 
   const throwing = toFlueTool(
-    createFakePiTool({
+    createFakeGrcTool({
       parameters,
       prepareArguments: undefined,
       async execute() {
@@ -689,12 +681,12 @@ test("bridged tool errors withhold echoed arguments and credentials before the m
   );
   await assert.rejects(throwing.run(fakeRunContext({ api_token: credential, query })), (error) => {
     assert.ok(error instanceof GrclankerToolError);
-    assert.equal(error.message, `upstream said ${REDACTED_VALUE} for ${query}`);
+    assert.equal(error.message, `kevs_probe failed: upstream said ${REDACTED_VALUE} for ${query}`);
     return true;
   });
 
   const aborting = toFlueTool(
-    createFakePiTool({
+    createFakeGrcTool({
       async execute() {
         const error = new Error("The operation was aborted");
         error.name = "AbortError";
@@ -1786,8 +1778,8 @@ test("the agent runs end-to-end on the real Flue runtime with a faux model (no l
     await importFluePiAi();
   const faux = fauxProvider({ models: [{ id: "grc-test" }] });
   const content = loadGrclankerAgentContent(cliRoot);
-  const probe = createFakePiTool();
-  const failing = createFakePiTool({
+  const probe = createFakeGrcTool();
+  const failing = createFakeGrcTool({
     name: "kevs_failing_probe",
     description: "Always fails.",
     async execute() {
@@ -1892,7 +1884,7 @@ test("prior sensitive values are read back from a real Flue conversation file", 
   const { fauxProvider, fauxAssistantMessage, fauxToolCall } = await importFluePiAi();
   const faux = fauxProvider({ models: [{ id: "grc-test" }] });
   const secret = "cfut_stored_turn_SECRET_token";
-  const probe = createFakePiTool({
+  const probe = createFakeGrcTool({
     name: "vault_probe",
     parameters: Type.Object({
       api_token: Type.String({ description: "API token." }),

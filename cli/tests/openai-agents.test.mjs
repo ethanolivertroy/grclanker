@@ -87,7 +87,7 @@ test("OpenAI runner executes a read tool with normalized native arguments and su
       };
     }),
     parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Number()) }),
-    prepareArguments: (input) => ({ query: input.q, limit: input.limit }),
+    prepareArguments: (input) => ({ query: input.q, limit: input.limit === undefined ? undefined : Number(input.limit) }),
   };
   const model = new ScriptedModel([
     [functionCall(nativeTool.name, { q: "tenant", limit: "2" }, { callId: "read-1" })],

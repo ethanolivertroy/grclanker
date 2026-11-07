@@ -1,25 +1,37 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { recoverDirectorySnapshot, replaceDirectoryAtomically } from "../core/atomic-files.ts";
 
-import { buildFedrampDocsSnapshot } from "../extensions/grc-tools/fedramp-docs.js";
-import { fetchFedrampDocsSources } from "../extensions/grc-tools/fedramp-source.js";
-
-async function writeGeneratedFiles(
+/** Replace the generated tree only after every file has been staged successfully. */
+export async function writeGeneratedFiles(
   baseDir: string,
-  files: ReturnType<typeof buildFedrampDocsSnapshot>,
+  files: readonly { path: string; content: string }[],
+  options: Parameters<typeof replaceDirectoryAtomically>[2] = {},
 ) {
-  await rm(baseDir, { recursive: true, force: true });
-  for (const file of files) {
-    const targetPath = resolve(baseDir, file.path.replace(/^fedramp\//, ""));
-    await mkdir(dirname(targetPath), { recursive: true });
-    await writeFile(targetPath, file.content, "utf8");
-  }
+  if (!files.length) throw new Error("Refusing to publish an empty FedRAMP documentation snapshot.");
+  await replaceDirectoryAtomically(baseDir, async (staging) => {
+    const paths = new Set<string>();
+    for (const file of files) {
+      const targetPath = resolve(staging, file.path.replace(/^fedramp\//, ""));
+      const within = relative(staging, targetPath);
+      if (!file.path.startsWith("fedramp/") || !within || within.startsWith("..") || isAbsolute(within)) {
+        throw new Error(`Invalid generated FedRAMP path: ${file.path}`);
+      }
+      if (paths.has(targetPath)) throw new Error(`Duplicate generated FedRAMP path: ${file.path}`);
+      paths.add(targetPath);
+      await mkdir(dirname(targetPath), { recursive: true });
+      await writeFile(targetPath, file.content, "utf8");
+    }
+  }, options);
 }
 
 async function main() {
   const repoRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
   const targetDir = resolve(repoRoot, "src/content/docs/docs/fedramp");
+  await recoverDirectorySnapshot(targetDir);
+  const { buildFedrampDocsSnapshot } = await import("../extensions/grc-tools/fedramp-docs.js");
+  const { fetchFedrampDocsSources } = await import("../extensions/grc-tools/fedramp-source.js");
 
   const { catalog, primary, secondary } = await fetchFedrampDocsSources();
   const files = buildFedrampDocsSnapshot(catalog, { primary, secondary });
@@ -36,9 +48,9 @@ async function main() {
   );
 }
 
-try {
-  await main();
-} catch (error) {
-  process.stderr.write(`FedRAMP sync failed: ${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error: unknown) => {
+    process.stderr.write(`FedRAMP sync failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
 }

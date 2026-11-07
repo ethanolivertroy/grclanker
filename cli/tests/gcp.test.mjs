@@ -49,6 +49,7 @@ import { CLOUD_RETRYABLE_STATUSES, cloudRetryPolicy } from "../dist/extensions/g
 import { GCP_COMPLETENESS_SOURCES, GCP_SPEC } from "../dist/extensions/grc-tools/gcp.spec.js";
 import * as specModel from "../dist/extensions/grc-tools/spec-model.js";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { MissingAuthenticationError } from "../dist/extensions/grc-tools/auth-errors.js";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 /** Retry waits resolve at once, so a test that serves retryable failures does not spend the real backoff. */
@@ -242,6 +243,17 @@ function gcpFactsByCheck(captures) {
   }
   return facts;
 }
+
+test("GCP missing authentication is typed only after canonical credential discovery is exhausted", () => {
+  const commands = [];
+  assert.throws(() => resolveGcpConfiguration({ project_id: "review-project" }, {}, (command, args) => {
+    commands.push([command, args]);
+    return undefined;
+  }, () => undefined), (error) => error instanceof MissingAuthenticationError && error.message === "Unable to resolve GCP credentials from arguments, GCP_ACCESS_TOKEN, GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, the ADC file, or gcloud auth print-access-token.");
+  assert.deepEqual(commands, [["gcloud", ["auth", "print-access-token"]]]);
+  assert.throws(() => resolveGcpConfiguration({ credentials_file: "invalid.json", project_id: "review-project" }, {}, () => undefined, () => '{"type":"unsupported"}'), (error) => !(error instanceof MissingAuthenticationError));
+  assert.throws(() => resolveGcpConfiguration({ access_token: "present-token" }, {}, () => undefined, () => undefined), (error) => !(error instanceof MissingAuthenticationError) && /scope the GCP audit/.test(error.message));
+});
 
 test("resolveGcpConfiguration prefers explicit args and accepts the GCP_ORG_ID alias", () => {
   const resolved = resolveGcpConfiguration(

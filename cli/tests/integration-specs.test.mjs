@@ -41,7 +41,7 @@ import {
   validateDecisionInputs,
 } from "../scripts/generate-integration-specs.mjs";
 
-const expectedDatasetStates = ["complete", "truncated", "unreadable", "not_requested"];
+const expectedDatasetStates = ["complete", "partial", "unavailable", "skipped"];
 const expectedCollectionStates = ["complete", "truncated", "unreadable", "denied", "not_requested", "not_configured"];
 const expectedPaginationStops = [
   "exhausted",

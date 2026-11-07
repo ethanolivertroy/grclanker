@@ -1,3 +1,5 @@
+import { ensurePrivateDir, resolveSecureOutputPath, writeSecureTextFile, countFilesRecursively } from "./secure-output.js";
+export { resolveSecureOutputPath };
 /**
  * Qualys security inspector tools for grclanker.
  *
@@ -6,22 +8,16 @@
  * VM/PC API (XML), the Asset Management and Tagging, Cloud Agent, and
  * Administration APIs (QPS 2.0, JSON), and the WAS API (QPS 3.0, JSON).
  */
-import { AsyncLocalStorage } from "node:async_hooks";
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  realpathSync,
-} from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
+
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { join, resolve } from "node:path";
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
 import { Type } from "typebox";
 import { abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { QUALYS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, evaluateBatchRuntimeCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { NextLinkError, readConfigText, resolveSameOriginUrl } from "./hardening/index.js";
 import { QUALYS_RAW_DATA_ALLOWLISTS, QUALYS_SPEC, type FieldAllowlist, type FieldRule } from "./qualys.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1979,14 +1975,9 @@ export function resolveViewScope(config: QualysResolvedConfig, users: Collected,
   return unverifiedScope(`API user ${config.username} was not returned by the user search (Managers and Super Users are hidden from it), so role scope was not verified.`);
 }
 
-const QUALYS_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
 
-function recordQualysDecisionFacts(control: number, facts: Readonly<Record<string, unknown>>): void {
-  const id = `QUALYS-C${String(control).padStart(2, "0")}`;
-  const store = QUALYS_DECISION_CONTEXT.getStore();
-  if (!store) throw new Error(`${id} decision facts were recorded outside a Qualys assessment`);
-  store.set(id, facts);
-}
+
+
 
 function finding(
   control: number,
@@ -2021,17 +2012,15 @@ interface VerdictInput {
 }
 
 function guardedFinding(input: VerdictInput): QualysFinding {
-  recordQualysDecisionFacts(input.control, input.facts);
   const unreadable = input.sources.filter((source) => source.error);
   const truncated = input.sources.filter((source) => !source.error && source.truncated);
   const buckets = Object.entries(input.unknownBuckets ?? {}).filter(([, count]) => count > 0);
   const unknownTotal = buckets.reduce((total, [, count]) => total + count, 0);
   const notes: string[] = [];
-  let status = input.status;
+  const status = evaluateBatchRuntimeCheckVerdict(QUALYS_SPEC, `QUALYS-C${String(input.control).padStart(2, "0")}`, input.facts) as QualysFindingStatus;
 
   if (unreadable.length > 0) {
     const causes = unreadable.map((source) => `${source.name}${source.moduleUnavailable ? " (module unlicensed or role not permitted)" : ""}: ${shortenMessage(source.error ?? "", 120)}`);
-    if (status !== "fail") status = "manual";
     notes.push(`${status === "fail" ? "Additional evidence was not readable" : "Required evidence was not readable"}: ${causes.join("; ")}.`);
   }
   // A call blocked by an unreadable upstream is disclosed with the read it would have made; a call skipped because
@@ -2041,15 +2030,12 @@ function guardedFinding(input: VerdictInput): QualysFinding {
     notes.push(`Not collected: ${blocked.map((source) => `${sourceLabel(source)} ${source.notCollected?.reason ?? ""}`).join("; ")}.`);
   }
   if (truncated.length > 0) {
-    if (status === "pass") status = "warn";
     notes.push(`Partial view: ${truncated.map((source) => `${source.name} ${source.truncationReason} (${source.data.length} seen${source.cap ? ` of cap ${source.cap}` : ""})`).join("; ")}.`);
   }
   if (unknownTotal > 0) {
-    if (status === "pass") status = "warn";
     notes.push(`${unknownTotal} records lack the date or flag needed to count as compliant (${buckets.map(([name, count]) => `${name}: ${count}`).join(", ")}) and were not counted as compliant.`);
   }
   if (input.scope.partial) {
-    if (status === "pass") status = "warn";
     notes.push(`Partial view: ${input.scope.note}`);
   }
 
@@ -2279,16 +2265,11 @@ export function rawDataSurfaceNames(): string[] {
   return Object.keys(QUALYS_RAW_DATA_ALLOWLISTS);
 }
 
+
+
 export async function assessQualysScanCoverage(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
-): Promise<QualysAssessmentResult> {
-  return runBatchVerdictContext(QUALYS_DECISION_CONTEXT, QUALYS_SPEC, () => assessQualysScanCoverageWithDecisionContext(client, options));
-}
-
-async function assessQualysScanCoverageWithDecisionContext(
-  client: QualysDataClient,
-  options: QualysAssessmentOptions,
 ): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
@@ -2696,16 +2677,11 @@ function agentHasActivationKey(agent: JsonRecord): boolean {
   return Boolean(key && (asString(key.activationId) ?? asString(key.title) ?? asString(key.id)));
 }
 
+
+
 export async function assessQualysAssetInventory(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
-): Promise<QualysAssessmentResult> {
-  return runBatchVerdictContext(QUALYS_DECISION_CONTEXT, QUALYS_SPEC, () => assessQualysAssetInventoryWithDecisionContext(client, options));
-}
-
-async function assessQualysAssetInventoryWithDecisionContext(
-  client: QualysDataClient,
-  options: QualysAssessmentOptions,
 ): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
@@ -3087,20 +3063,11 @@ function policyIsAssigned(policy: JsonRecord): boolean {
 const NETWORK_DEVICE_OS_PATTERN = /cisco|nx-os|ios[- ]?xe|junos|juniper|palo alto|pan-os|fortinet|fortios|fortigate|arista|big-ip|f5 |check ?point|gaia|router|switch|firewall|screenos|brocade|huawei/i;
 const NETWORK_AUTH_TYPE_PATTERN = /snmp|cisco|checkpoint|check_point|palo|fortinet|juniper|arista|network|f5|huawei|brocade/i;
 
+
+
 export async function assessQualysVulnerabilityManagement(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
-): Promise<QualysAssessmentResult> {
-  return runBatchVerdictContext(
-    QUALYS_DECISION_CONTEXT,
-    QUALYS_SPEC,
-    () => assessQualysVulnerabilityManagementWithDecisionContext(client, options),
-  );
-}
-
-async function assessQualysVulnerabilityManagementWithDecisionContext(
-  client: QualysDataClient,
-  options: QualysAssessmentOptions,
 ): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
@@ -3614,16 +3581,11 @@ function classifyWebAppScans(webApps: JsonRecord[], recentScans: JsonRecord[], h
 
 const SENSITIVE_ACTIVITY_PATTERN = /user|delete|remove|policy|exclu|schedule|option profile|permission|role|password/i;
 
+
+
 export async function assessQualysAdministration(
   client: QualysDataClient,
   options: QualysAssessmentOptions = {},
-): Promise<QualysAssessmentResult> {
-  return runBatchVerdictContext(QUALYS_DECISION_CONTEXT, QUALYS_SPEC, () => assessQualysAdministrationWithDecisionContext(client, options));
-}
-
-async function assessQualysAdministrationWithDecisionContext(
-  client: QualysDataClient,
-  options: QualysAssessmentOptions,
 ): Promise<QualysAssessmentResult> {
   const config = client.getResolvedConfig();
   const settings = resolveAssessmentOptions(config, options);
@@ -4243,41 +4205,9 @@ function safeDirName(value: string): string {
   return normalized || "qualys";
 }
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
 
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
-  if (relativeTarget === ".." || relativeTarget.startsWith(`..${join("/")}`) || relativeTarget.startsWith("..")) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
 
-  const pathSegments = relativeTarget.split(/[\\/]+/).filter(Boolean);
-  let currentPath = realBase;
-  for (const segment of pathSegments) {
-    currentPath = join(currentPath, segment);
-    if (!existsSync(currentPath)) break;
-    if (lstatSync(currentPath).isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked parent directory: ${currentPath}`);
-    }
-  }
 
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  if (lstatSync(realpathSync(parent)).isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
-  return resolvedTarget;
-}
 
 const MAX_BUNDLE_SUFFIX = 99;
 
@@ -4285,21 +4215,9 @@ export function bundleZipPath(outputDir: string): string {
   return `${outputDir}.zip`;
 }
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
 
-async function countFilesRecursively(rootDir: string): Promise<number> {
-  let total = 0;
-  for (const entry of await readdir(rootDir, { withFileTypes: true })) {
-    const pathname = join(rootDir, entry.name);
-    if (entry.isDirectory()) total += await countFilesRecursively(pathname);
-    else if (entry.isFile()) total += 1;
-  }
-  return total;
-}
+
+
 
 export async function exportQualysAuditBundle(
   client: QualysDataClient & Partial<Pick<QualysApiClient, "lastRateLimit">>,
@@ -4460,7 +4378,7 @@ const assessParams = {
 };
 
 function registerAssessmentTool(
-  pi: ExtensionAPI,
+  pi: GrcToolRegistrar,
   name: string,
   label: string,
   description: string,
@@ -4490,7 +4408,7 @@ function registerAssessmentTool(
   });
 }
 
-export function registerQualysTools(pi: any): void {
+export function registerQualysTools(pi: GrcToolRegistrar): void {
   pi = withIntegrationToolContracts(pi, QUALYS_SPEC);
   pi.registerTool({
     name: "qualys_check_access",

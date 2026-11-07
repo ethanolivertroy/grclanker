@@ -434,7 +434,7 @@ test("a truncated archive is refused before the previous install moves", () => {
   }
 });
 
-test("a failed extraction puts the previous install back", () => {
+test("a failed extraction leaves the previous install active", () => {
   const name = "grclanker-1.0.0-linux-x64.tar.gz";
   const stage = stageCheckout([name], { packageVersion: "1.0.0" });
   // tar lists a 300-character name, but filesystems cap names at 255 bytes, so extraction fails partway.
@@ -446,7 +446,7 @@ test("a failed extraction puts the previous install back", () => {
   try {
     const { result } = runStagedInstall(stage);
     assert.notEqual(result.status, 0, result.stdout);
-    assert.match(result.stderr, /Could not extract grclanker-1\.0\.0-linux-x64\.tar\.gz, so the previous install was restored/);
+    assert.match(result.stderr, /Could not extract grclanker-1\.0\.0-linux-x64\.tar\.gz; the previous install was left unchanged/);
     assert.equal(readFileSync(resolve(installDir, "grclanker"), "utf8"), "previous\n");
     // A failed run keeps an earlier aside, which may be the only complete copy.
     assert.deepEqual(readdirSync(stage.root).filter((entry) => entry.startsWith("install.")), ["install.old-0badc0de"]);
@@ -807,7 +807,7 @@ function runPwshInstall(root, env, pwshArgs = ["-File", resolve(root, "public", 
   });
 }
 
-function stagePwshCheckout(names, { packageVersion = "9.9.9", sums = null, entries = { "ok.txt": "ok\n" } } = {}) {
+function stagePwshCheckout(names, { packageVersion = "9.9.9", sums = null, entries = { "ok.txt": "ok\n", "grclanker.cmd": "@echo off\n", "node/node.exe": "synthetic runtime\n", "app/bin/grclanker.js": "console.log('fixture');\n" } } = {}) {
   const root = mkdtempSync(join(tmpdir(), "grclanker-release-ps-"));
   const releaseDir = resolve(root, "cli", "release");
   mkdirSync(releaseDir, { recursive: true });
@@ -897,6 +897,7 @@ test("PowerShell refuses zip entries that escape the install directory", { skip:
 test("PowerShell verifies the bundle, then replaces the install with its full layout", { skip: !hasPwsh }, () => {
   const name = "grclanker-1.0.0-win32-x64.zip";
   const entries = {
+    "grclanker.cmd": "@echo off\n",
     "app/bin/grclanker.js": "console.log('grclanker');\n",
     "app/node_modules/pkg/lib/index.js": "module.exports = 'na\u00efve \u2603';\n",
     "app/empty/": "",
@@ -925,14 +926,14 @@ test("PowerShell verifies the bundle, then replaces the install with its full la
     assert.equal(existsSync(resolve(installDir, "app", "stale.js")), false);
     assert.deepEqual(readdirSync(stage.root).filter((name) => name.startsWith("install.")), []);
     const launcher = readFileSync(resolve(stage.root, "bin", "grclanker.cmd"), "utf8");
-    assert.ok(launcher.includes(`set "GRCLANKER_INSTALL_DIR=${installDir}"`), launcher);
+    assert.ok(launcher.includes(".install.v"), launcher);
     assert.ok(launcher.includes(String.raw`"%GRCLANKER_INSTALL_DIR%\node\node.exe" "%GRCLANKER_INSTALL_DIR%\app\bin\grclanker.js" %*`), launcher);
   } finally {
     rmSync(stage.root, { recursive: true, force: true });
   }
 });
 
-test("PowerShell puts the previous install back when extraction fails", { skip: !hasPwsh }, () => {
+test("PowerShell leaves the previous install active when extraction fails", { skip: !hasPwsh }, () => {
   // The file named app passes the entry check, then blocks the app/ directory the next entry needs.
   const stage = stagePwshCheckout(["grclanker-1.0.0-win32-x64.zip"], {
     packageVersion: "1.0.0",
@@ -947,7 +948,7 @@ test("PowerShell puts the previous install back when extraction fails", { skip: 
     const result = runPwshInstall(stage.root);
     assert.notEqual(result.status, 0, result.stdout);
     assert.doesNotMatch(result.stdout, /Installed bundle into/);
-    assert.match(result.stdout, /Extraction failed, so the previous install was restored/);
+    assert.match(`${result.stdout}\n${result.stderr}`, /Extraction failed; the previous install was left unchanged/);
     assert.equal(readFileSync(previousLauncher, "utf8"), "console.log('previous');\n");
     // A failed run keeps an earlier aside, which may be the only complete copy.
     assert.deepEqual(readdirSync(stage.root).filter((name) => name.startsWith("install.")), ["install.old-0badc0de"]);
@@ -981,18 +982,20 @@ test("PowerShell removes asides an interrupted earlier run left behind", { skip:
   }
 });
 
-test("PowerShell resolves a relative install directory from its location, not the process directory", { skip: !hasPwsh }, () => {
+test("PowerShell resolves relative install and bin directories from its location, not the process directory", { skip: !hasPwsh }, () => {
   const stage = stagePwshCheckout(["grclanker-1.0.0-win32-x64.zip"], { packageVersion: "1.0.0" });
   const elsewhere = resolve(stage.root, "elsewhere");
   mkdirSync(elsewhere);
   try {
-    const result = runPwshInstall(stage.root, { GRCLANKER_INSTALL_DIR: "relative-install" }, [
+    const result = runPwshInstall(stage.root, { GRCLANKER_INSTALL_DIR: "relative-install", GRCLANKER_BIN_DIR: "relative-bin" }, [
       "-Command",
       `Set-Location -LiteralPath '${elsewhere}'; & '${resolve(stage.root, "public", "install.ps1")}'`,
     ]);
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     assert.equal(readFileSync(resolve(elsewhere, "relative-install", "ok.txt"), "utf8"), "ok\n");
     assert.equal(existsSync(resolve(stage.root, "relative-install")), false);
+    assert.ok(existsSync(resolve(elsewhere, "relative-bin", "grclanker.cmd")));
+    assert.equal(existsSync(resolve(stage.root, "relative-bin")), false);
   } finally {
     rmSync(stage.root, { recursive: true, force: true });
   }
@@ -1003,7 +1006,7 @@ test("PowerShell refuses a release base URL whose checksum file is missing", { s
   mkdirSync(resolve(root, "public"), { recursive: true });
   copyFileSync(resolve(REPO_ROOT, "public", "install.ps1"), resolve(root, "public", "install.ps1"));
   const zipPath = resolve(root, "grclanker-1.2.3-win32-x64.zip");
-  writeZip(zipPath, { "ok.txt": "ok\n" });
+  writeZip(zipPath, { "ok.txt": "ok\n", "grclanker.cmd": "@echo off\n", "node/node.exe": "synthetic runtime\n", "app/bin/grclanker.js": "console.log('fixture');\n" });
   const zipBytes = readFileSync(zipPath);
   const server = http.createServer((request, response) => {
     if (request.url === "/grclanker-1.2.3-win32-x64.zip") {
@@ -1052,8 +1055,9 @@ test("the PowerShell installer fails closed and checks zip entries before expand
   const verify = contents.indexOf("$verified = Verify-Checksum -ArchivePath $ArchivePath");
   const check = contents.indexOf("Assert-ZipEntriesSafe -ArchivePath $ArchivePath");
   const expand = contents.indexOf("Expand-Bundle -ArchivePath $ArchivePath");
-  const setAside = contents.indexOf("Move-Item -LiteralPath $InstallPath -Destination $PreviousInstall");
-  assert.ok(verify > 0 && check > verify && setAside > check && expand > setAside);
+  const validate = contents.indexOf('foreach ($Required in @("grclanker.cmd"');
+  const activate = contents.indexOf("[System.IO.File]::Replace($LauncherTemp, $BinPath");
+  assert.ok(verify > 0 && check > verify && expand > check && validate > expand && activate > validate);
   assert.match(contents, /Refusing to extract unsafe archive entry/);
   assert.match(contents, /\^\[A-Za-z\]:/);
   assert.match(contents, /Could not fetch SHA256SUMS\.txt/);

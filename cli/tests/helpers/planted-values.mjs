@@ -1,3 +1,4 @@
+import { canaryWindows } from "./canary-windows.mjs";
 /**
  * Planted credentials and the fragment-window leak assertion (round 7, fragment windows).
  *
@@ -19,12 +20,7 @@ export const PLANTED_VALUE_SHAPE = /^[A-Za-z0-9]+$/;
  * deduplicated, longest first so a failure names the longest surviving fragment.
  */
 export function fragmentWindows(value, min = FRAGMENT_WINDOW_MIN, max = FRAGMENT_WINDOW_MAX) {
-  if (value.length <= min) return [value];
-  const windows = new Set();
-  for (let length = Math.min(max, value.length); length >= min; length -= 1) {
-    for (let index = 0; index + length <= value.length; index += 1) windows.add(value.slice(index, index + length));
-  }
-  return [...windows];
+  return canaryWindows(value, { min, max, descending: true });
 }
 
 /** The 6-character windows only, for the self-checks (distinctness and absence from legitimate text). */

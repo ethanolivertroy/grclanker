@@ -1,3 +1,4 @@
+import { canaryWindows as sharedWindows, leakedCanaryWindow as sharedLeak } from "./canary-windows.mjs";
 /**
  * Canary fixtures for the rule 9 error-string class: a failing surface answers with a non-JSON
  * body (a proxy's 502 HTML page) that carries credential-shaped values, or with a JSON error whose
@@ -73,13 +74,7 @@ export const CANARY_WINDOW_MAX = 24;
 
 /** Every substring of the value whose length lies in [minLength, maxLength], clamped to the value's length. */
 export function canaryWindows(value, minLength = CANARY_WINDOW_MIN, maxLength = CANARY_WINDOW_MAX) {
-  const shortest = Math.min(minLength, value.length);
-  const longest = Math.min(maxLength, value.length);
-  const windows = [];
-  for (let length = shortest; length <= longest; length += 1) {
-    for (let start = 0; start + length <= value.length; start += 1) windows.push(value.slice(start, start + length));
-  }
-  return windows;
+  return sharedWindows(value, { min: minLength, max: maxLength });
 }
 
 /**
@@ -89,13 +84,7 @@ export function canaryWindows(value, minLength = CANARY_WINDOW_MIN, maxLength = 
  * minLength pass is the exhaustive test and the longer lengths only refine the report.
  */
 export function leakedCanaryWindow(text, value, minLength = CANARY_WINDOW_MIN, maxLength = CANARY_WINDOW_MAX) {
-  const shortest = Math.min(minLength, value.length);
-  if (!canaryWindows(value, shortest, shortest).some((window) => text.includes(window))) return undefined;
-  for (let length = Math.min(maxLength, value.length); length > shortest; length -= 1) {
-    const window = canaryWindows(value, length, length).find((candidate) => text.includes(candidate));
-    if (window) return window;
-  }
-  return canaryWindows(value, shortest, shortest).find((window) => text.includes(window));
+  return sharedLeak(text, value, { min: minLength, max: maxLength });
 }
 
 function textOf(value) {

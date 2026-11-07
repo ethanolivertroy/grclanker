@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { resolveLiveSmokeConfiguration } from "./live-smoke-config.mjs";
 
 import {
   GcpAuditorClient,
@@ -8,7 +8,6 @@ import {
   assessGcpNetworkSecurity,
   assessGcpOrgGuardrails,
   checkGcpAccess,
-  defaultAdcPath,
   resolveGcpConfiguration,
 } from "../dist/extensions/grc-tools/gcp.js";
 
@@ -16,21 +15,6 @@ function log(message) {
   process.stdout.write(`${message}\n`);
 }
 
-function hasCredentialHints() {
-  return (
-    Boolean(process.env.GCP_ACCESS_TOKEN?.trim())
-    || Boolean(process.env.GOOGLE_OAUTH_ACCESS_TOKEN?.trim())
-    || Boolean(process.env.GOOGLE_ACCESS_TOKEN?.trim())
-    || Boolean(process.env.GCP_CREDENTIALS_FILE?.trim())
-    || Boolean(process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim())
-    || Boolean(process.env.GCP_ORGANIZATION_ID?.trim())
-    || Boolean(process.env.GCP_ORG_ID?.trim())
-    || Boolean(process.env.GCP_PROJECT_ID?.trim())
-    || Boolean(process.env.GOOGLE_CLOUD_PROJECT?.trim())
-    || Boolean(process.env.GCLOUD_PROJECT?.trim())
-    || existsSync(defaultAdcPath())
-  );
-}
 
 function countStatuses(findings) {
   const counts = { pass: 0, warn: 0, fail: 0, manual: 0 };
@@ -48,14 +32,9 @@ function logAssessment(result) {
 }
 
 try {
-  if (!hasCredentialHints()) {
-    log(
-      "Skipping live GCP smoke test: set GCP_ORGANIZATION_ID (or GCP_ORG_ID) or GCP_PROJECT_ID (or GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT) plus GCP_ACCESS_TOKEN (or GOOGLE_OAUTH_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN), GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, or an ADC file to run against a real organization.",
-    );
-    process.exit(0);
-  }
-
-  const config = resolveGcpConfiguration();
+  const authentication = await resolveLiveSmokeConfiguration("GCP", () => resolveGcpConfiguration());
+  if (authentication.kind === "unconfigured") process.exit(0);
+  const config = authentication.config;
   const client = new GcpAuditorClient(config);
   const access = await checkGcpAccess(client);
 

@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { commitFileTransactionSync, type FileTransactionOptions } from "../core/atomic-files.js";
 import { spawnSync } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 import {
@@ -21,6 +21,7 @@ import {
   type GrclankerSettings,
   readGrclankerSettings,
   readModelsConfig,
+  configurationJournalPath,
   resolveSkillDiscoveryMode,
   type SkillDiscoveryMode,
   writeGrclankerSettings,
@@ -160,9 +161,6 @@ function isConfigured(settings: GrclankerSettings): boolean {
   );
 }
 
-function writeModelsConfig(path: string, config: Record<string, unknown>): void {
-  writeFileSync(path, JSON.stringify(config, null, 2) + "\n", "utf8");
-}
 
 function unwrapPrompt<T>(value: T | typeof CANCEL_SYMBOL): T {
   if (isCancel(value)) {
@@ -458,7 +456,7 @@ async function promptHostedModel(
 }
 
 async function promptComputeBackend(fallback: ComputeBackendKind): Promise<ComputeBackendKind> {
-  const statuses = detectComputeBackendStatuses();
+  const statuses = await detectComputeBackendStatuses();
 
   console.log("Choose a default compute backend.");
   console.log("Pick where grclanker should run bash, file, and search tools by default.");
@@ -481,7 +479,7 @@ async function promptComputeBackend(fallback: ComputeBackendKind): Promise<Compu
       maxItems: 8,
     }));
 
-    if (selected !== "host" && !isComputeBackendAvailable(selected)) {
+    if (selected !== "host" && !await isComputeBackendAvailable(selected)) {
       const saveAnyway = await promptYesNo(
         `${selected} is not detected on this machine. Save it as the preferred backend anyway?`,
         false,
@@ -493,11 +491,13 @@ async function promptComputeBackend(fallback: ComputeBackendKind): Promise<Compu
   }
 }
 
-function listAvailableDockerImages(): string[] {
-  if (!isComputeBackendAvailable("docker")) return [];
+async function listAvailableDockerImages(): Promise<string[]> {
+  if (!await isComputeBackendAvailable("docker")) return [];
 
   const result = spawnSync("docker", ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"], {
     encoding: "utf8",
+    timeout: 2_000,
+    killSignal: "SIGKILL",
   });
 
   if (result.status !== 0) return [];
@@ -511,7 +511,7 @@ function listAvailableDockerImages(): string[] {
 
 async function promptDockerImage(settings: GrclankerSettings): Promise<string> {
   const currentImage = resolveDockerImage(settings) || DEFAULT_DOCKER_IMAGE;
-  const installedImages = listAvailableDockerImages();
+  const installedImages = await listAvailableDockerImages();
   const imageOptions = uniqueStrings([
     currentImage,
     DEFAULT_DOCKER_IMAGE,
@@ -780,6 +780,7 @@ export function saveLocalSetup(
   baseUrl: string,
   modelId: string,
   computeSettings: Partial<GrclankerSettings>,
+  persistence: Pick<FileTransactionOptions, "beforeCommit"> = {},
 ): void {
   const modelsConfig = readModelsConfig(modelsPath);
   const providers =
@@ -798,8 +799,10 @@ export function saveLocalSetup(
     defaultModel: modelId,
     ...computeSettings,
   };
-  writeModelsConfig(modelsPath, nextModels);
-  writeGrclankerSettings(settingsPath, settings);
+  commitFileTransactionSync([
+    { path: modelsPath, data: JSON.stringify(nextModels, null, 2) + "\n", mode: 0o600 },
+    { path: settingsPath, data: JSON.stringify(settings, null, 2) + "\n", mode: 0o600 },
+  ], { journalPath: configurationJournalPath(settingsPath), ...persistence });
 }
 
 function saveHostedSetup(
@@ -850,7 +853,7 @@ export async function runComputeSetup(computeBackend: ComputeBackendKind): Promi
   writeGrclankerSettings(settingsPath, next);
   console.log(`Preferred compute backend: ${computeBackend} (${getRoutingBucket(computeBackend)} bucket).`);
   console.log(`Compute profile: ${next.computeProfile}.`);
-  if (computeBackend !== "host" && !isComputeBackendAvailable(computeBackend)) {
+  if (computeBackend !== "host" && !await isComputeBackendAvailable(computeBackend)) {
     console.log(`warning: ${computeBackend} is not detected on this machine yet.`);
   }
   for (const issue of getComputeBackendConfigurationIssues(next, computeBackend)) {
@@ -880,6 +883,42 @@ function nonInteractiveSetupHint(): string {
   return `Without a terminal, add the model settings to ${getGrclankerSettingsPath()} yourself: ${CONFIGURATION_DOCS_URL}`;
 }
 
+/** Model selection finishes before the shared compute/skills/commit pipeline begins. */
+export type ModelChoice =
+  | { mode: "local"; baseUrl: string; modelId: string }
+  | { mode: "hosted"; provider: keyof typeof HOSTED_DEFAULTS; modelId: string };
+
+async function promptModelChoice(settings: GrclankerSettings): Promise<ModelChoice> {
+  if (await promptMode(settings) === "hosted") {
+    const provider = await promptHostedProvider(settings);
+    return { mode: "hosted", provider, modelId: await promptHostedModel(provider, settings) };
+  }
+  const configuredBaseUrl = settings.providerKind === LOCAL_PROVIDER && isNonEmptyString(settings.providerBaseUrl)
+    ? normalizeBaseUrl(settings.providerBaseUrl)
+    : LOCAL_BASE_URL;
+  const baseUrl = normalizeBaseUrl(await promptWithDefault("Local endpoint", configuredBaseUrl));
+  const reachableModelIds = await fetchReachableModelIds(baseUrl, LOCAL_MODEL);
+  const installedLocalModels = filterLocalModels(reachableModelIds);
+  let suggestedModel = choosePreferredLocalModel(installedLocalModels)
+    ?? (settings.providerKind === LOCAL_PROVIDER && isNonEmptyString(settings.defaultModel) ? settings.defaultModel : LOCAL_MODEL);
+  while (true) {
+    const modelId = await promptLocalModel(suggestedModel, installedLocalModels);
+    if (isInstalledModel(reachableModelIds, modelId)) return { mode: "local", baseUrl, modelId };
+    const fallbackModel = choosePreferredLocalModel(installedLocalModels);
+    console.log(`\nReached ${baseUrl}, but ${modelId} is not installed locally.\n`);
+    if (fallbackModel && fallbackModel !== modelId) {
+      if (await promptYesNo(`Use installed local model ${fallbackModel} instead?`, true)) {
+        return { mode: "local", baseUrl, modelId: fallbackModel };
+      }
+      suggestedModel = fallbackModel;
+    }
+    console.log("Install another local model or enter a different one:");
+    console.log(`  ollama pull ${modelId}`);
+    console.log(`Installed local models: ${installedLocalModels.length > 0 ? installedLocalModels.join(", ") : "none"}`);
+    console.log("");
+  }
+}
+
 export async function runSetupWizard(force = true): Promise<void> {
   const settingsPath = getGrclankerSettingsPath();
   const modelsPath = getGrclankerModelsPath();
@@ -905,106 +944,7 @@ export async function runSetupWizard(force = true): Promise<void> {
     console.log("Recommended local-first path: Ollama + Gemma 4.\n");
     console.log("This wizard now covers model choice, compute backend, and skill visibility.\n");
 
-    const mode = await promptMode(settings);
-
-    if (mode === "local") {
-      const configuredBaseUrl = settings.providerKind === LOCAL_PROVIDER && isNonEmptyString(settings.providerBaseUrl)
-        ? normalizeBaseUrl(settings.providerBaseUrl)
-        : LOCAL_BASE_URL;
-      const baseUrl = normalizeBaseUrl(
-        await promptWithDefault("Local endpoint", configuredBaseUrl),
-      );
-      const reachableModelIds = await fetchReachableModelIds(baseUrl, LOCAL_MODEL);
-      const installedLocalModels = filterLocalModels(reachableModelIds);
-      let suggestedModel = choosePreferredLocalModel(installedLocalModels)
-        ?? (settings.providerKind === LOCAL_PROVIDER && isNonEmptyString(settings.defaultModel)
-          ? settings.defaultModel
-          : LOCAL_MODEL);
-
-      while (true) {
-        const modelId = await promptLocalModel(suggestedModel, installedLocalModels);
-        if (isInstalledModel(reachableModelIds, modelId)) {
-          const shouldConfigureCompute = await promptAdvancedComputeSetup(settings);
-          const computeBackend = shouldConfigureCompute
-            ? await promptComputeBackend(currentComputeBackend)
-            : currentComputeBackend;
-          const computeSettings = shouldConfigureCompute
-            ? await promptComputeBackendSettings(settings, computeBackend)
-            : { computeBackend };
-          const skillDiscoveryMode = await promptSkillDiscoveryMode(settings);
-
-          saveLocalSetup(settingsPath, modelsPath, settings, baseUrl, modelId, {
-            ...computeSettings,
-            skillDiscoveryMode,
-          });
-          console.log("");
-          console.log(`Pinned local runtime to ${LOCAL_PROVIDER}/${modelId}.`);
-          console.log(`Preferred compute backend: ${computeBackend}.`);
-          console.log(`Skill visibility: ${describeSkillDiscoveryMode(skillDiscoveryMode)}`);
-          if (!shouldConfigureCompute) {
-            console.log("Skipped advanced compute setup. Re-run setup later if you want Docker or Parallels.");
-          }
-          console.log("grclanker will stay on that local model until you rerun setup.");
-          console.log(LOCAL_CONTEXT_HINT);
-          outro("Saved local-first setup.");
-          return;
-        }
-
-        const fallbackModel = choosePreferredLocalModel(installedLocalModels);
-        console.log(`\nReached ${baseUrl}, but ${modelId} is not installed locally.\n`);
-
-        if (fallbackModel && fallbackModel !== modelId) {
-          const useFallback = await promptYesNo(
-            `Use installed local model ${fallbackModel} instead?`,
-            true,
-          );
-          if (useFallback) {
-            const shouldConfigureCompute = await promptAdvancedComputeSetup(settings);
-            const computeBackend = shouldConfigureCompute
-              ? await promptComputeBackend(currentComputeBackend)
-              : currentComputeBackend;
-            const computeSettings = shouldConfigureCompute
-              ? await promptComputeBackendSettings(settings, computeBackend)
-              : { computeBackend };
-            const skillDiscoveryMode = await promptSkillDiscoveryMode(settings);
-
-            saveLocalSetup(
-              settingsPath,
-              modelsPath,
-              settings,
-              baseUrl,
-              fallbackModel,
-              {
-                ...computeSettings,
-                skillDiscoveryMode,
-              },
-            );
-            console.log("");
-            console.log(`Pinned local runtime to ${LOCAL_PROVIDER}/${fallbackModel}.`);
-            console.log(`Preferred compute backend: ${computeBackend}.`);
-            console.log(`Skill visibility: ${describeSkillDiscoveryMode(skillDiscoveryMode)}`);
-            if (!shouldConfigureCompute) {
-              console.log("Skipped advanced compute setup. Re-run setup later if you want Docker or Parallels.");
-            }
-            console.log("grclanker will stay on that local model until you rerun setup.");
-            console.log(LOCAL_CONTEXT_HINT);
-            outro("Saved local-first setup.");
-            return;
-          }
-          suggestedModel = fallbackModel;
-        }
-
-        console.log("Install another local model or enter a different one:");
-        console.log(`  ollama pull ${modelId}`);
-        console.log(
-          `Installed local models: ${installedLocalModels.length > 0 ? installedLocalModels.join(", ") : "none"}`,
-        );
-        console.log("");
-      }
-    }
-
-    const provider = await promptHostedProvider(settings);
-    const modelId = await promptHostedModel(provider, settings);
+    const choice = await promptModelChoice(settings);
     const shouldConfigureCompute = await promptAdvancedComputeSetup(settings);
     const computeBackend = shouldConfigureCompute
       ? await promptComputeBackend(currentComputeBackend)
@@ -1013,21 +953,28 @@ export async function runSetupWizard(force = true): Promise<void> {
       ? await promptComputeBackendSettings(settings, computeBackend)
       : { computeBackend };
     const skillDiscoveryMode = await promptSkillDiscoveryMode(settings);
+    const sharedSettings = { ...computeSettings, skillDiscoveryMode };
 
-    saveHostedSetup(settingsPath, settings, provider, modelId, {
-      ...computeSettings,
-      skillDiscoveryMode,
-    });
+    if (choice.mode === "local") {
+      saveLocalSetup(settingsPath, modelsPath, settings, choice.baseUrl, choice.modelId, sharedSettings);
+    } else {
+      saveHostedSetup(settingsPath, settings, choice.provider, choice.modelId, sharedSettings);
+    }
     console.log("");
+    if (choice.mode === "local") console.log(`Pinned local runtime to ${LOCAL_PROVIDER}/${choice.modelId}.`);
     console.log(`Preferred compute backend: ${computeBackend}.`);
     console.log(`Skill visibility: ${describeSkillDiscoveryMode(skillDiscoveryMode)}`);
     if (!shouldConfigureCompute) {
       console.log("Skipped advanced compute setup. Re-run setup later if you want Docker or Parallels.");
     }
-    console.log(
-      `grclanker reads the API key from ${HOSTED_API_KEY_ENV[provider]}, or from a key saved with /login inside grclanker.`,
-    );
-    outro("Saved hosted setup.");
+    if (choice.mode === "local") {
+      console.log("grclanker will stay on that local model until you rerun setup.");
+      console.log(LOCAL_CONTEXT_HINT);
+      outro("Saved local-first setup.");
+    } else {
+      console.log(`grclanker reads the API key from ${HOSTED_API_KEY_ENV[choice.provider]}, or from a key saved with /login inside grclanker.`);
+      outro("Saved hosted setup.");
+    }
   } catch (error) {
     if (error instanceof SetupCancelledError) {
       cancel("Setup cancelled.");

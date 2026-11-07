@@ -430,6 +430,7 @@ if ($AssetUrlOverride) {
 
 $TempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("grclanker-install-" + [System.Guid]::NewGuid().ToString("N"))
 $ArchivePath = Join-Path $TempRoot $AssetName
+$BinDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BinDir)
 $BinPath = Join-Path $BinDir "grclanker.cmd"
 
 New-Item -ItemType Directory -Force -Path $TempRoot | Out-Null
@@ -456,61 +457,113 @@ try {
   # Reject a hostile archive before replacing anything already installed.
   Assert-ZipEntriesSafe -ArchivePath $ArchivePath
 
-  # Move the previous install aside so a failed extraction can put it back.
+  # Every version is complete before either public pointer changes. Junctions
+  # need no Windows symlink privilege; the command shim switches with File.Replace.
+  $InstallRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InstallDir).TrimEnd([char[]]"\/")
+  $Parent = Split-Path -Parent $InstallRoot
+  $Leaf = Split-Path -Leaf $InstallRoot
+  # Short version paths preserve the path budget of Windows PowerShell 5.1.
+  $Versions = Join-Path $Parent ("." + $Leaf + ".v")
+  New-Item -ItemType Directory -Force -Path $Versions | Out-Null
+  $Candidate = Join-Path $Versions ([System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+  New-Item -ItemType Directory -Path $Candidate | Out-Null
+  $Alias = "$Candidate.alias"
   $PreviousInstall = $null
-  if (Test-Path -LiteralPath $InstallDir) {
-    $InstallPath = (Resolve-Path -LiteralPath $InstallDir).ProviderPath.TrimEnd([char[]]"\/")
-    # A short suffix keeps the deepest bundle paths under the 260-character Windows limit.
-    # A leftover with the same name would make Move-Item move the install inside it, so pick an unused name.
-    do {
-      $PreviousInstall = "$InstallPath.old-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8)
-    } while (Test-Path -LiteralPath $PreviousInstall)
-    Move-Item -LiteralPath $InstallPath -Destination $PreviousInstall
-  }
-
-  $Extracted = $false
+  $PreviousMoved = $false
+  $PreviousVersion = $null
+  $RootChanged = $false
+  $LauncherChanged = $false
+  $Committed = $false
+  $Restored = $false
+  New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+  $LauncherTemp = Join-Path $BinDir (".grclanker.activate-" + [System.Guid]::NewGuid().ToString("N"))
+  $LauncherBackup = "$LauncherTemp.previous"
+  $HadLauncher = [System.IO.File]::Exists($BinPath)
   try {
-    # .NET resolves a relative path against the process directory, not the PowerShell location.
-    $InstallRoot = (New-Item -ItemType Directory -Force -Path $InstallDir).FullName
-    Expand-Bundle -ArchivePath $ArchivePath -DestinationPath $InstallRoot
-    $Extracted = $true
-  } finally {
-    if ($PreviousInstall -and -not $Extracted) {
-      try {
-        if (Test-Path -LiteralPath $InstallPath) {
-          Remove-Item -Recurse -Force -LiteralPath $InstallPath
-        }
-        Move-Item -LiteralPath $PreviousInstall -Destination $InstallPath
-        Write-Warn "Extraction failed, so the previous install was restored."
-      } catch {
-        Write-Warn "Could not restore the previous install from ${PreviousInstall}: $($_.Exception.Message)"
+    try {
+      Expand-Bundle -ArchivePath $ArchivePath -DestinationPath $Candidate
+    } catch {
+      throw "Extraction failed; the previous install was left unchanged. $($_.Exception.Message)"
+    }
+    foreach ($Required in @("grclanker.cmd", "node/node.exe", "app/bin/grclanker.js")) {
+      if (-not (Test-Path -LiteralPath (Join-Path $Candidate $Required) -PathType Leaf)) {
+        throw "Bundle validation failed: missing $Required. The previous install was left unchanged."
       }
     }
+    $WindowsHost = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
+    if ($WindowsHost) {
+      & (Join-Path $Candidate "node/node.exe") (Join-Path $Candidate "app/bin/grclanker.js") --help | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw "Bundle validation failed; the previous install was left unchanged." }
+    }
+    $LinkType = if ($WindowsHost) { "Junction" } else { "SymbolicLink" }
+    New-Item -ItemType $LinkType -Path $Alias -Value $Candidate | Out-Null
+    $LauncherShim = @(
+      "@echo off",
+      "setlocal",
+      "set ""GRCLANKER_INSTALL_DIR=$Candidate""",
+      """%GRCLANKER_INSTALL_DIR%\node\node.exe"" ""%GRCLANKER_INSTALL_DIR%\app\bin\grclanker.js"" %*",
+      ""
+    ) -join "`r`n"
+    [System.IO.File]::WriteAllText($LauncherTemp, $LauncherShim, [System.Text.Encoding]::ASCII)
+    if ($HadLauncher) {
+      [System.IO.File]::Replace($LauncherTemp, $BinPath, $LauncherBackup)
+    } else {
+      [System.IO.File]::Move($LauncherTemp, $BinPath)
+    }
+    $LauncherChanged = $true
+    if (Test-Path -LiteralPath $InstallRoot) {
+      $PreviousVersion = (Get-Item -Force -LiteralPath $InstallRoot).Target
+      $PreviousInstall = Join-Path $Parent ("." + $Leaf + ".previous-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+      Move-Item -LiteralPath $InstallRoot -Destination $PreviousInstall
+      $PreviousMoved = $true
+    }
+    Move-Item -LiteralPath $Alias -Destination $InstallRoot
+    $RootChanged = $true
+    $Committed = $true
+  } finally {
+    if (-not $Committed) {
+      $Restored = $false
+      try {
+        if ($RootChanged) { [System.IO.Directory]::Delete($InstallRoot) }
+        if ($PreviousMoved) { Move-Item -LiteralPath $PreviousInstall -Destination $InstallRoot }
+        if ($LauncherChanged) {
+          if ($HadLauncher) {
+            [System.IO.File]::Replace($LauncherBackup, $BinPath, [NullString]::Value)
+          } else { [System.IO.File]::Delete($BinPath) }
+        }
+        $Restored = $true
+      } catch {
+        Write-Warn "Activation rollback failed; complete versions remain in $Versions. $($_.Exception.Message)"
+      }
+      if ($Restored) {
+        if (Get-Item -Force -LiteralPath $Alias -ErrorAction SilentlyContinue) { [System.IO.Directory]::Delete($Alias) }
+        Remove-Item -Recurse -Force -LiteralPath $Candidate
+      }
+    }
+    if (Test-Path -LiteralPath $Alias) { [System.IO.Directory]::Delete($Alias) }
+    if (Test-Path -LiteralPath $LauncherTemp) { Remove-Item -Force -LiteralPath $LauncherTemp }
+    if (($Committed -or $Restored) -and (Test-Path -LiteralPath $LauncherBackup)) { Remove-Item -Force -LiteralPath $LauncherBackup }
   }
-  Write-Ok "Installed bundle into $InstallDir"
-
-  # The new install is complete, so this run's aside can go, along with any an
-  # interrupted earlier run left behind. Windows names ignore case, but the
-  # installer only generates lowercase suffixes.
-  $InstallRoot = $InstallRoot.TrimEnd([char[]]"\/")
-  $AsideName = "^(?i:" + [regex]::Escape((Split-Path -Leaf $InstallRoot)) + ")\.old-[0-9a-f]{8}$"
-  foreach ($Aside in @(Get-ChildItem -LiteralPath (Split-Path -Parent $InstallRoot) -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -cmatch $AsideName })) {
+  if ($PreviousInstall) {
     try {
-      Remove-Item -Recurse -Force -LiteralPath $Aside.FullName
-    } catch {
-      Write-Warn "Could not remove the previous install at $($Aside.FullName): $($_.Exception.Message)"
+      $Previous = Get-Item -Force -LiteralPath $PreviousInstall
+      if ($Previous.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { [System.IO.Directory]::Delete($PreviousInstall) }
+      else { Remove-Item -Recurse -Force -LiteralPath $PreviousInstall }
+    } catch { Write-Warn "Could not remove previous install at $PreviousInstall" }
+  }
+  # Retain the current and previous immutable version; remove only installer-owned trees.
+  foreach ($Old in @(Get-ChildItem -LiteralPath $Versions -Directory | Where-Object { $_.Name -cmatch '^[0-9a-f]{8}$' })) {
+    if ($Old.FullName -ne $Candidate -and $Old.FullName -ne $PreviousVersion) {
+      try { Remove-Item -Recurse -Force -LiteralPath $Old.FullName }
+      catch { Write-Warn "Could not remove previous version at $($Old.FullName)" }
     }
   }
-
-  New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-  $LauncherShim = @(
-    "@echo off",
-    "setlocal",
-    "set ""GRCLANKER_INSTALL_DIR=$InstallDir""",
-    """%GRCLANKER_INSTALL_DIR%\node\node.exe"" ""%GRCLANKER_INSTALL_DIR%\app\bin\grclanker.js"" %*",
-    ""
-  ) -join "`r`n"
-  Set-Content -Path $BinPath -Value $LauncherShim -Encoding Ascii
+  $AsideName = "^(?i:" + [regex]::Escape($Leaf) + ")\.old-[0-9a-f]{8}$"
+  foreach ($Aside in @(Get-ChildItem -LiteralPath $Parent -Force | Where-Object { $_.Name -cmatch $AsideName })) {
+    try { Remove-Item -Recurse -Force -LiteralPath $Aside.FullName }
+    catch { Write-Warn "Could not remove previous install at $($Aside.FullName)" }
+  }
+  Write-Ok "Installed bundle into $InstallDir"
   Write-Ok "Installed launcher into $BinPath"
 
   if (-not (($env:Path -split ";") -contains $BinDir)) {

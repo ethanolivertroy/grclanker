@@ -94,7 +94,7 @@ export function extractComputeFlag(args: string[]): { compute?: ComputeBackendKi
 
 export function buildComputeBackendList(
   settings: GrclankerSettings,
-  statuses: ComputeBackendStatus[] = detectComputeBackendStatuses(),
+  statuses: ComputeBackendStatus[],
   options: ComputeDetectionOptions = {},
 ): ComputeBackendListEntry[] {
   const preferred = resolveComputeBackend(settings);
@@ -170,7 +170,7 @@ export function formatComputeBackendList(
 
 export async function runComputeList(rawArgs: string[]): Promise<void> {
   const settings = readGrclankerSettings(getGrclankerSettingsPath());
-  const entries = buildComputeBackendList(settings);
+  const entries = buildComputeBackendList(settings, await detectComputeBackendStatuses());
   if (rawArgs.includes("--json")) {
     console.log(JSON.stringify(entries, null, 2));
     return;

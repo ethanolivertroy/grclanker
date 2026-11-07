@@ -4,7 +4,7 @@ import {
   MIN_CONFIGURED_SECRET_LENGTH,
   REDACTED,
 } from "../credential-scrub.js";
-import type { DatasetState } from "./collection-status.js";
+import type { CollectionState } from "./collection-status.js";
 import type { PaginationStopKind } from "./pagination.js";
 
 export const SHARED_INTEGRATION_CONTRACT_VERSION = "1.1";
@@ -18,11 +18,11 @@ export const SHARED_COLLECTION_STATES = [
   "not_configured",
 ] as const;
 
-export const SHARED_DATASET_STATES: readonly DatasetState[] = [
+export const SHARED_DATASET_STATES: readonly CollectionState[] = [
   "complete",
-  "truncated",
-  "unreadable",
-  "not_requested",
+  "partial",
+  "unavailable",
+  "skipped",
 ];
 
 export const SHARED_PAGINATION_STOP_KINDS: readonly PaginationStopKind[] = [

@@ -1,3 +1,5 @@
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
+import { ensurePrivateDir, resolveSecureOutputPath, writeSecureTextFile, countFilesRecursively } from "./secure-output.js";
 /**
  * Google Workspace CLI operator bridge for read-only GRC investigation.
  *
@@ -15,9 +17,9 @@
  * by parse_service_and_version in crates/google-workspace-cli/src/main.rs.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+
+import { join } from "node:path";
 import { Type } from "typebox";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { projectActivitySnapshot, projectAlertSnapshot, redactKnownValues, redactSecrets, scrubText } from "./gws.js";
@@ -860,74 +862,13 @@ function safeDirName(value: string): string {
   return cleaned || "gws-ops";
 }
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const rawStat = lstatSync(pathname);
-  if (rawStat.isSymbolicLink()) {
-    throw new Error(`Refusing to use symlink path: ${pathname}`);
-  }
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
 
-function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
 
-  if (
-    relativeTarget === ".."
-    || relativeTarget.startsWith(`..${join("/")}`)
-    || relativeTarget.startsWith("..")
-  ) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
 
-  const pathSegments = relativeTarget.split(/[\\/]+/).filter(Boolean);
-  let currentPath = realBase;
-  for (const segment of pathSegments) {
-    currentPath = join(currentPath, segment);
-    if (!existsSync(currentPath)) break;
-    const stat = lstatSync(currentPath);
-    if (stat.isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked parent directory: ${currentPath}`);
-    }
-  }
 
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  const realParent = realpathSync(parent);
-  const stat = lstatSync(realParent);
-  if (stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
 
-  return resolvedTarget;
-}
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
 
-async function countFilesRecursively(pathname: string): Promise<number> {
-  const entries = await readdir(pathname, { withFileTypes: true });
-  let count = 0;
-  for (const entry of entries) {
-    const fullPath = join(pathname, entry.name);
-    if (entry.isDirectory()) {
-      count += await countFilesRecursively(fullPath);
-    } else {
-      count += 1;
-    }
-  }
-  return count;
-}
 
 function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
@@ -1353,7 +1294,8 @@ function renderToolError(prefix: string, error: unknown, tool: string) {
   );
 }
 
-function normalizeBaseArgs(args: Record<string, unknown>): GwsOpsBaseArgs {
+function normalizeBaseArgs(input: unknown): GwsOpsBaseArgs {
+  const args = asRecord(input);
   return {
     gwsBin: asString(args.gws_bin),
     configDir: asString(args.config_dir),
@@ -1361,7 +1303,8 @@ function normalizeBaseArgs(args: Record<string, unknown>): GwsOpsBaseArgs {
   };
 }
 
-function normalizeActivityArgs(args: Record<string, unknown>): GwsOpsActivityArgs {
+function normalizeActivityArgs(input: unknown): GwsOpsActivityArgs {
+  const args = asRecord(input);
   return {
     ...normalizeBaseArgs(args),
     lookback_days: normalizeLookbackDays(args.lookback_days),
@@ -1369,7 +1312,8 @@ function normalizeActivityArgs(args: Record<string, unknown>): GwsOpsActivityArg
   };
 }
 
-function normalizeAlertArgs(args: Record<string, unknown>): GwsOpsAlertArgs {
+function normalizeAlertArgs(input: unknown): GwsOpsAlertArgs {
+  const args = asRecord(input);
   return {
     ...normalizeBaseArgs(args),
     max_results: normalizeMaxResults(args.max_results),
@@ -1377,7 +1321,8 @@ function normalizeAlertArgs(args: Record<string, unknown>): GwsOpsAlertArgs {
   };
 }
 
-function normalizeBundleArgs(args: Record<string, unknown>): GwsOpsBundleArgs {
+function normalizeBundleArgs(input: unknown): GwsOpsBundleArgs {
+  const args = asRecord(input);
   return {
     ...normalizeActivityArgs(args),
     filter: asString(args.filter),
@@ -1430,7 +1375,7 @@ function renderBundleResult(
   );
 }
 
-export function registerGwsOperatorTools(pi: any): void {
+export function registerGwsOperatorTools(pi: GrcToolRegistrar): void {
   const baseParams = {
     gws_bin: Type.Optional(
       Type.String({

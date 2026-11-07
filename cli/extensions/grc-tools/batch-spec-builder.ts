@@ -29,7 +29,7 @@ import {
   toolContract,
 } from "./spec-model.js";
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
 
 const FRAMEWORK_KEYS: readonly FrameworkKey[] = [
   "fedramp",
@@ -884,42 +884,42 @@ export function evaluateBatchRuntimeCheckVerdict(
   return evaluateCheckVerdict(check, declaredFacts);
 }
 
-export function assertBatchCheckVerdict<T extends string>(
-  spec: IntegrationSpecContract,
-  checkId: string,
-  rawFacts: Readonly<Record<string, unknown>>,
-  expectedStatus: T,
-): T {
-  const normalizedExpected = ({
-    Pass: "pass",
-    Partial: "warn",
-    Fail: "fail",
-    Manual: "manual",
-    Info: "info",
-  } as Record<string, EvaluatedFindingStatus>)[expectedStatus]
-    ?? expectedStatus.toLowerCase() as EvaluatedFindingStatus;
-  const evaluated = evaluateBatchCheckVerdict(spec, checkId, rawFacts);
-  if (evaluated !== normalizedExpected) {
-    throw new Error(`${checkId} runtime status ${expectedStatus} disagrees with evidence contract (${evaluated})`);
+/** Explicit per-assessment facts. Status has one owner: the integration's executable check rules. */
+export class BatchVerdicts {
+  private readonly facts = new Map<string, Readonly<Record<string, unknown>>>();
+  private readonly evaluated = new Map<string, EvaluatedFindingStatus>();
+
+  constructor(private readonly spec: IntegrationSpecContract) {}
+
+  record(checkId: string, facts: Readonly<Record<string, unknown>>): void {
+    if (this.evaluated.has(checkId)) {
+      throw new Error(`${checkId} was already evaluated; collect every decision fact before rendering a finding`);
+    }
+    this.facts.set(checkId, { ...this.facts.get(checkId), ...facts });
   }
-  return expectedStatus;
+
+  factsFor(checkId: string): Readonly<Record<string, unknown>> {
+    const facts = this.facts.get(checkId);
+    if (facts === undefined) throw new Error(`${checkId} has no collected decision facts`);
+    return facts;
+  }
+
+  status(checkId: string): EvaluatedFindingStatus {
+    const cached = this.evaluated.get(checkId);
+    if (cached !== undefined) return cached;
+    const status = evaluateBatchRuntimeCheckVerdict(this.spec, checkId, this.factsFor(checkId));
+    this.evaluated.set(checkId, status);
+    return status;
+  }
 }
 
-interface BatchVerdictContextStorage {
-  run<T>(
-    store: Map<string, Readonly<Record<string, unknown>>>,
-    callback: () => T,
-  ): T;
-}
 
-interface BatchVerdictFinding {
-  id: string;
-  status: string;
-}
 
-interface BatchVerdictResult {
-  findings: readonly BatchVerdictFinding[];
-}
+
+
+
+
+
 
 export interface CapturedBatchDecisionFacts {
   integration: string;
@@ -953,75 +953,16 @@ export function observeBatchDecisionFacts(observer: (capture: CapturedBatchDecis
   };
 }
 
-function assertBatchResultVerdicts<T>(
-  spec: IntegrationSpecContract,
-  factsByCheck: ReadonlyMap<string, Readonly<Record<string, unknown>>>,
-  result: T,
-): T {
-  const candidate = result as Partial<BatchVerdictResult> | null;
-  if (!candidate || !Array.isArray(candidate.findings)) {
-    throw new Error(`${spec.identity.slug} assessment did not return a findings array`);
-  }
-  recordBatchDecisionFacts({
-    integration: spec.identity.slug,
-    checks: new Map(factsByCheck),
-  });
-  for (const finding of candidate.findings) {
-    const facts = factsByCheck.get(finding.id);
-    if (!facts) throw new Error(`${finding.id} has no runtime decision facts`);
-    assertBatchCheckVerdict(spec, finding.id, facts, finding.status);
-  }
-  return result;
-}
 
-/**
- * Runs one assessment with an isolated fact store, then verifies the final
- * findings after all legacy partial/truncation decorators have been applied.
- * The assessment result is returned unchanged.
- */
-export function runBatchVerdictContext<T>(
-  storage: BatchVerdictContextStorage,
-  spec: IntegrationSpecContract,
-  callback: () => T,
-): T {
-  const factsByCheck = new Map<string, Readonly<Record<string, unknown>>>();
-  return storage.run(factsByCheck, () => {
-    const result = callback();
-    if (
-      typeof result === "object"
-      && result !== null
-      && "then" in result
-      && typeof result.then === "function"
-    ) {
-      return result.then((resolved: unknown) =>
-        assertBatchResultVerdicts(spec, factsByCheck, resolved)) as T;
-    }
-    return assertBatchResultVerdicts(spec, factsByCheck, result);
-  });
-}
 
-export function materializeBatchCheckVerdict(
-  spec: IntegrationSpecContract,
-  checkId: string,
-  rawFacts: Readonly<Record<string, unknown>>,
-): "Pass" | "Partial" | "Fail" | "Manual" | "Info" {
-  const evaluated = evaluateBatchCheckVerdict(spec, checkId, rawFacts);
-  return ({
-    pass: "Pass",
-    warn: "Partial",
-    fail: "Fail",
-    manual: "Manual",
-    info: "Info",
-  } as const)[evaluated];
-}
 
-export function withIntegrationToolContracts(pi: ExtensionAPI, spec: IntegrationSpecContract): ExtensionAPI {
-  return new Proxy(pi, {
-    get(target, property, receiver) {
-      if (property !== "registerTool") return Reflect.get(target, property, receiver);
-      return (definition: Parameters<ExtensionAPI["registerTool"]>[0]) => {
-        target.registerTool(defineGrcTool(definition, toolContract(spec, definition.name)));
-      };
+
+
+
+export function withIntegrationToolContracts(registrar: GrcToolRegistrar, spec: IntegrationSpecContract): GrcToolRegistrar {
+  return {
+    registerTool(definition) {
+      registrar.registerTool(defineGrcTool(definition, toolContract(spec, definition.name)));
     },
-  });
+  };
 }

@@ -682,7 +682,7 @@ test("runpod-pod readiness requires git next to ssh and scp on every surface", a
     // live smoke selector all report the backend as not ready and name git.
     const noGit = lookupFor(["ssh", "scp"]);
     assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: noGit.toolExists }), [GIT_ISSUE]);
-    const statuses = detectComputeBackendStatuses({ toolExists: noGit.toolExists });
+    const statuses = await detectComputeBackendStatuses({ toolExists: noGit.toolExists });
     const pod = statuses.find((status) => status.kind === "runpod-pod");
     assert.equal(pod.available, false);
     assert.equal(pod.detail, "Found RUNPOD_API_KEY, RUNPOD_POD_ID in the environment. Install `git` to use this backend; git is required to stage tracked files (runpod-pod uploads the git index of the workspace).");
@@ -698,14 +698,14 @@ test("runpod-pod readiness requires git next to ssh and scp on every surface", a
     assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: lookupFor(["scp", "git"]).toolExists }), [SSH_ISSUE]);
     assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: lookupFor(["ssh", "git"]).toolExists }), [SCP_ISSUE]);
     assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: lookupFor([]).toolExists }), [SSH_ISSUE, SCP_ISSUE, GIT_ISSUE]);
-    const nothing = detectComputeBackendStatuses({ toolExists: lookupFor([]).toolExists }).find((status) => status.kind === "runpod-pod");
+    const nothing = (await detectComputeBackendStatuses({ toolExists: lookupFor([]).toolExists })).find((status) => status.kind === "runpod-pod");
     assert.equal(nothing.available, false);
     assert.match(nothing.detail, /Install `ssh` to use this backend; .* Install `scp` to use this backend; .* Install `git` to use this backend; git is required to stage tracked files/);
 
     // All three present: ready as before, and the smoke selector picks it.
     const all = lookupFor(["ssh", "scp", "git"]);
     assert.deepEqual(getComputeBackendConfigurationIssues(settings, "runpod-pod", { toolExists: all.toolExists }), []);
-    const readyStatuses = detectComputeBackendStatuses({ toolExists: all.toolExists });
+    const readyStatuses = await detectComputeBackendStatuses({ toolExists: all.toolExists });
     const readyPod = readyStatuses.find((status) => status.kind === "runpod-pod");
     assert.equal(readyPod.available, true);
     assert.equal(readyPod.detail, "Found RUNPOD_API_KEY, RUNPOD_POD_ID in the environment. Found `ssh`, `scp`, `git` on PATH.");
@@ -714,8 +714,8 @@ test("runpod-pod readiness requires git next to ssh and scp on every surface", a
     assert.deepEqual(selectLiveSmokeCandidates(readyStatuses, ["runpod-pod", "modal"]).map((status) => status.kind), ["runpod-pod"], "modal has no credentials here");
 
     // Tools present but credentials missing is still not ready (unchanged behavior).
-    await withEnv({ RUNPOD_POD_ID: undefined }, () => {
-      const noPod = detectComputeBackendStatuses({ toolExists: all.toolExists }).find((status) => status.kind === "runpod-pod");
+    await withEnv({ RUNPOD_POD_ID: undefined }, async () => {
+      const noPod = (await detectComputeBackendStatuses({ toolExists: all.toolExists })).find((status) => status.kind === "runpod-pod");
       assert.equal(noPod.available, false);
       assert.match(noPod.detail, /^Set RUNPOD_POD_ID to use this backend\. Found `ssh`, `scp`, `git` on PATH\.$/);
     });

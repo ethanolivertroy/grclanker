@@ -15,11 +15,13 @@ import {
   ServicenowApiClient,
   ServicenowApiError,
   assessServicenowAccessControl,
+  assessServicenowAccessControlData,
   assessServicenowIdentityAccess,
   assessServicenowOperationsGovernance,
   assessServicenowPlatformHardening,
   buildSensitiveAclQuery,
   checkServicenowAccess,
+  collectServicenowAccessControlData,
   exportServicenowAuditBundle,
   listServicenowControls,
   mappingsForControl,
@@ -32,9 +34,11 @@ import {
   registerServicenowTools,
   resolveSecureOutputPath,
   resolveServicenowConfiguration,
+  tableCoreData,
 } from "../dist/extensions/grc-tools/servicenow.js";
 import { SERVICENOW_SPEC } from "../dist/extensions/grc-tools/servicenow.spec.js";
 import { ToolCallAbortedError } from "../dist/extensions/grc-tools/abort.js";
+import { MissingAuthenticationError } from "../dist/extensions/grc-tools/auth-errors.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertBundlePathsMatchSpec, assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
@@ -64,6 +68,16 @@ const STALE_LOGIN = "2026-01-05 08:15:00";
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
+
+test("ServiceNow missing authentication is typed separately from invalid configuration", () => {
+  const directory = createTempBase("grclanker-snow-missing-auth-");
+  const options = { cwd: directory, homeDir: directory };
+  for (const input of [{}, { instance: "acme" }, { instance: "acme", auth_method: "basic", username: "audit" }, { instance: "acme", auth_method: "oauth", client_id: "audit" }]) {
+    assert.throws(() => resolveServicenowConfiguration(input, {}, options), MissingAuthenticationError);
+  }
+  assert.throws(() => resolveServicenowConfiguration({ instance: "acme", config_file: "missing.yaml" }, {}, options), (error) => error instanceof Error && !(error instanceof MissingAuthenticationError));
+  assert.throws(() => resolveServicenowConfiguration({ instance: "acme", auth_method: "mtls" }, {}, options), (error) => error instanceof Error && !(error instanceof MissingAuthenticationError));
+});
 
 /** The configured basic-auth password: a planted credential, so random-looking (see the planted-values self-check). */
 const SAMPLE_PASSWORD = "Ka4pnBxqUxmU8PgZhf";
@@ -479,9 +493,9 @@ function findingsById(result) {
 
 async function captureServicenowFacts(checkId, callback) {
   const { result, captures } = await captureBatchDecisionFacts(callback);
-  assert.equal(captures.length, 1);
-  assert.equal(captures[0].integration, SERVICENOW_SPEC.identity.slug);
-  const facts = captures[0].checks.get(checkId);
+  assert.ok(captures.length > 0);
+  assert.ok(captures.every((capture) => capture.integration === SERVICENOW_SPEC.identity.slug));
+  const facts = captures.flatMap((capture) => [...capture.checks]).find(([id]) => id === checkId)?.[1];
   assert.ok(facts, `${checkId}: captured runtime facts`);
   return { result, facts };
 }
@@ -602,11 +616,11 @@ test("ServicenowApiClient shapes Table API queries with basic auth and follows L
 
   const snapshot = await client.queryTable("sys_user", { query: "active=true", fields: ["sys_id", "user_name"], limit: 100 });
 
-  assert.equal(snapshot.rows.length, 5);
-  assert.equal(snapshot.total, 5);
+  assert.equal(snapshot.value.rows.length, 5);
+  assert.equal(snapshot.value.total, 5);
   assert.equal(snapshot.pages, 3);
-  assert.equal(snapshot.truncated, false);
-  assert.equal(snapshot.partial, false);
+  assert.equal(snapshot.value.truncated, false);
+  assert.equal((snapshot.state === "partial"), false);
   assert.equal(snapshot.error, undefined);
   assert.deepEqual(calls.map((call) => call.url.searchParams.get("sysparm_offset")), ["0", "2", "4"]);
   const first = calls[0].url;
@@ -622,6 +636,51 @@ test("ServicenowApiClient shapes Table API queries with basic auth and follows L
   }
 });
 
+test("Table API collection outcomes distinguish observed emptiness, uncertain visibility, denied reads, and skipped dependencies", async () => {
+  const complete = await createClient(fixtureFetch(healthyFixture()).fetchImpl).queryTable("ldap_server_config");
+  assert.equal(complete.state, "complete");
+  assert.deepEqual(complete.value.rows, []);
+  assert.equal(complete.value.total, 0);
+  assert.deepEqual(tableCoreData(complete).rows, []);
+
+  const uncertain = await createClient(fixtureFetch(healthyFixture(), { omitTotalCount: true }).fetchImpl).queryTable("ldap_server_config");
+  assert.equal(uncertain.state, "partial");
+  assert.deepEqual(uncertain.value.rows, []);
+  assert.equal(uncertain.value.total, undefined);
+
+  const data = await collectServicenowAccessControlData(createClient(fixtureFetch(healthyFixture(), { forbiddenTables: ["sys_security_acl"] }).fetchImpl));
+  assert.equal(data.acls.state, "unavailable");
+  assert.equal(data.aclRoles.state, "skipped");
+  assert.equal(data.aclRoles.dependency, data.acls.key);
+  for (const outcome of [data.acls, data.aclRoles]) {
+    for (const key of ["value", "rows", "total", "truncated", "partial"]) assert.equal(key in outcome, false, `${outcome.state}: ${key} is absent`);
+    const marker = tableCoreData(outcome);
+    assert.equal(marker.collected, false);
+    assert.equal("rows" in marker, false);
+  }
+
+  const hidden = healthyFixture();
+  hidden.tables.sys_security_acl = [];
+  hidden.counts = { ...hidden.counts, sys_security_acl: 24 };
+  const emptyParent = await collectServicenowAccessControlData(createClient(fixtureFetch(hidden).fetchImpl));
+  const renamed = { ...emptyParent, acls: { ...emptyParent.acls, table: "renamed parent" } };
+  const findings = (value) => assessServicenowAccessControlData(value).findings.find((finding) => finding.id === "SNOW-02");
+  assert.match(findings(renamed).summary, /^24 active record ACLs exist but none/);
+  const unrelated = { ...renamed, aclRoles: { ...renamed.aclRoles, dependency: Symbol(renamed.acls.label) } };
+  assert.match(findings(unrelated).summary, /^Verdict unknown: .* was not requested/);
+});
+
+test("Table API malformed successful responses are unavailable rather than observed empty inventories", async () => {
+  for (const body of [{}, { result: null }, { result: {} }, { result: [null] }, { result: ["unexpected"] }]) {
+    const outcome = await createClient(async () => jsonResponse(body, { headers: { "X-Total-Count": "0" } })).queryTable("sys_user");
+    assert.equal(outcome.state, "unavailable");
+    assert.equal(outcome.status, 200);
+    assert.equal("value" in outcome, false);
+    assert.equal("rows" in tableCoreData(outcome), false);
+    assert.match(outcome.error, /did not include an array of record objects/);
+  }
+});
+
 test("ServicenowApiClient records truncation when the record limit stops pagination", async () => {
   const fixture = healthyFixture();
   fixture.tables.sys_user = Array.from({ length: 6 }, (_, index) => user(`u-${index}`, `user${index}`));
@@ -630,20 +689,20 @@ test("ServicenowApiClient records truncation when the record limit stops paginat
 
   const snapshot = await client.queryTable("sys_user", { limit: 4 });
 
-  assert.equal(snapshot.rows.length, 4);
-  assert.equal(snapshot.total, 6);
-  assert.equal(snapshot.truncated, true);
-  assert.equal(snapshot.partial, true);
+  assert.equal(snapshot.value.rows.length, 4);
+  assert.equal(snapshot.value.total, 6);
+  assert.equal(snapshot.value.truncated, true);
+  assert.equal((snapshot.state === "partial"), true);
   assert.equal(calls.length, 2);
 });
 
 test("ServicenowApiClient flags ACL-hidden rows when X-Total-Count exceeds the returned rows", async () => {
   const { fetchImpl } = fixtureFetch(healthyFixture(), { inflateTotal: 7 });
   const snapshot = await createClient(fetchImpl).queryTable("sys_user_role");
-  assert.equal(snapshot.rows.length, 2);
-  assert.equal(snapshot.total, 9);
-  assert.equal(snapshot.truncated, false);
-  assert.equal(snapshot.partial, true);
+  assert.equal(snapshot.value.rows.length, 2);
+  assert.equal(snapshot.value.total, 9);
+  assert.equal(snapshot.value.truncated, false);
+  assert.equal((snapshot.state === "partial"), true);
 });
 
 test("ServicenowApiClient reads Aggregate API counts and captures count failures", async () => {
@@ -677,7 +736,7 @@ test("ServicenowApiClient exchanges OAuth client credentials at /oauth_token.do 
   const client = createClient(fetchImpl, { authMode: "oauth", username: undefined, password: undefined, clientId: "client-id", clientSecret: "client-secret" });
 
   const snapshot = await client.queryTable("sys_user_role");
-  assert.equal(snapshot.rows.length, 2);
+  assert.equal(snapshot.value.rows.length, 2);
   assert.equal(tokenCalls.length, 1);
   assert.equal(tokenCalls[0].init.method, "POST");
   const body = new URLSearchParams(tokenCalls[0].init.body);
@@ -724,7 +783,7 @@ test("ServicenowApiClient retries 429 and 5xx responses with backoff and honors 
   const snapshot = await createClient(fetchImpl, {}, sleeps).queryTable("sys_user_role");
 
   assert.equal(snapshot.error, undefined);
-  assert.equal(snapshot.rows.length, 2);
+  assert.equal(snapshot.value.rows.length, 2);
   assert.deepEqual(sleeps, [2000, 1000]);
 });
 
@@ -738,8 +797,9 @@ test("ServicenowApiClient gives up after max retries and reports the failing sta
   const snapshot = await createClient(fetchImpl, { maxRetries: 2 }, sleeps).queryTable("sys_user");
   assert.equal(attempts, 3);
   assert.equal(sleeps.length, 2);
-  assert.equal(snapshot.statusCode, 500);
-  assert.equal(snapshot.rows.length, 0);
+  assert.equal(snapshot.status, 500);
+  assert.equal(snapshot.state, "unavailable");
+  assert.equal("value" in snapshot, false);
   assert.match(snapshot.error, /500/);
 });
 
@@ -769,7 +829,7 @@ test("ServicenowApiClient retries a timeout, a transport failure, and a 503 whos
   const snapshot = await createClient(fetchImpl, {}, sleeps).queryTable("sys_user_role");
 
   assert.equal(snapshot.error, undefined);
-  assert.equal(snapshot.rows.length, 2);
+  assert.equal(snapshot.value.rows.length, 2);
   assert.equal(requests, 4);
   assert.deepEqual(sleeps, [500, 1000, 7000], "exponential backoff after the timeout and the transport failure, then the HTTP-date measured against the injected clock");
 });
@@ -814,7 +874,7 @@ test("ServicenowApiClient retries the OAuth token request on a 5xx, a timeout, a
   const snapshot = await client.queryTable("sys_user_role");
 
   assert.equal(snapshot.error, undefined);
-  assert.equal(snapshot.rows.length, 2);
+  assert.equal(snapshot.value.rows.length, 2);
   assert.equal(tokenRequests, 4);
   assert.deepEqual(sleeps, [500, 1000, 2000]);
   assert.equal(inner.calls.at(-1).init.headers.get("authorization"), "Bearer retried-grant-token");
@@ -854,7 +914,8 @@ test("ServicenowApiClient fails closed after four attempts with the endpoint pat
     const snapshot = await client.queryTable("sys_user", query);
     assert.equal(requests, 4, `${scenario.label}: one request and three retries`);
     assert.equal(sleeps.length, 3, scenario.label);
-    assert.deepEqual(snapshot.rows, [], scenario.label);
+    assert.equal(snapshot.state, "unavailable", scenario.label);
+    assert.equal("value" in snapshot, false, scenario.label);
     assert.match(snapshot.error, scenario.expected, `${scenario.label}: ${snapshot.error}`);
     assert.equal(snapshot.error.includes("sysparm_query") || snapshot.error.includes("alice.admin"), false, `${scenario.label}: no query value in ${snapshot.error}`);
     assertFragmentsAbsent(assert, snapshot.error, planted, `${scenario.label} error`);
@@ -1720,13 +1781,13 @@ test("ServicenowApiClient projects rows to the requested fields even when the se
   const { fetchImpl, calls } = fixtureFetch(fixture);
 
   const projected = await createClient(fetchImpl).queryTable("sys_user", { fields: ["sys_id", "user_name"] });
-  assert.equal(projected.rows.length, 4);
-  for (const row of projected.rows) assert.deepEqual(Object.keys(row).sort(), ["sys_id", "user_name"]);
+  assert.equal(projected.value.rows.length, 4);
+  for (const row of projected.value.rows) assert.deepEqual(Object.keys(row).sort(), ["sys_id", "user_name"]);
   assert.equal(calls[0].url.searchParams.get("sysparm_fields"), "sys_id,user_name");
   assert.equal(JSON.stringify(projected).includes(FAKE_SNOW_SECRETS.passwordHash), false);
 
   const dotted = await createClient(fetchImpl).queryTable("sys_user_has_role", { fields: ["sys_id", "user.user_name", "role.name"] });
-  assert.deepEqual(Object.keys(dotted.rows[0]).sort(), ["role.name", "sys_id", "user.user_name"], "dot-walked columns are kept under their dotted key");
+  assert.deepEqual(Object.keys(dotted.value.rows[0]).sort(), ["role.name", "sys_id", "user.user_name"], "dot-walked columns are kept under their dotted key");
 
   assert.deepEqual(projectRows([{ a: 1, b: 2 }], ["a"]), [{ a: 1 }]);
   assert.deepEqual(projectRows([{ a: 1, b: 2 }], undefined), [{ a: 1, b: 2 }], "no fields list means the caller asked for whole rows");
@@ -1803,7 +1864,7 @@ test("ServicenowApiClient describes non-JSON error bodies by shape and logs only
   const gatewayPage = `<html><body>502 upstream; request headers: authorization: Basic ${FAKE_SNOW_SECRETS.secretToken1}</body></html>`;
   const gatewayFetch = async () => new Response(gatewayPage, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html" } });
   const snapshot = await createClient(gatewayFetch, { maxRetries: 0 }).queryTable("sys_user", { query: "active=true", fields: ["sys_id"] });
-  assert.equal(snapshot.statusCode, 502);
+  assert.equal(snapshot.status, 502);
   assert.match(snapshot.error, /502 Bad Gateway\) for \/api\/now\/table\/sys_user: non-JSON body \(text\/html, \d+ bytes\)$/);
   assertFragmentsAbsent(assert, snapshot.error, [FAKE_SNOW_SECRETS.secretToken1], "502 HTML error string");
   assert.equal(snapshot.error.includes("<html>"), false);
@@ -1889,12 +1950,12 @@ test("ServicenowApiClient reports an empty page that still carries a Link rel=ne
   });
 
   const snapshot = await createClient(fetchImpl, { pageSize: 2 }).queryTable("sys_user", { query: "active=true", fields: ["sys_id", "user_name", "last_login_time"], limit: 100 });
-  assert.equal(snapshot.rows.length, 2);
+  assert.equal(snapshot.value.rows.length, 2);
   assert.equal(snapshot.pages, 2);
-  assert.equal(snapshot.total, undefined);
-  assert.equal(snapshot.truncated, true);
-  assert.equal(snapshot.partial, true);
-  assert.equal(snapshot.truncationReason, "empty page returned with a Link rel=next");
+  assert.equal(snapshot.value.total, undefined);
+  assert.equal(snapshot.value.truncated, true);
+  assert.equal((snapshot.state === "partial"), true);
+  assert.equal(snapshot.value.truncationReason, "empty page returned with a Link rel=next");
 
   const review = findingsById(await assessServicenowIdentityAccess(createClient(fetchImpl, { pageSize: 2 }))).get("SNOW-04");
   assert.equal(review.status, "warn");
@@ -1914,10 +1975,10 @@ test("ServicenowApiClient stops on a Link rel=next whose offset does not advance
 
   const snapshot = await createClient(fetchImpl, { pageSize: 2 }).queryTable("sys_user", { fields: ["sys_id", "user_name"], limit: 100 });
   assert.equal(userCalls, 1, "the stuck cursor is not re-read");
-  assert.equal(snapshot.rows.length, 2);
-  assert.equal(snapshot.total, 6);
-  assert.equal(snapshot.truncated, true);
-  assert.equal(snapshot.truncationReason, "Link rel=next offset did not advance");
+  assert.equal(snapshot.value.rows.length, 2);
+  assert.equal(snapshot.value.total, 6);
+  assert.equal(snapshot.value.truncated, true);
+  assert.equal(snapshot.value.truncationReason, "Link rel=next offset did not advance");
 
   const result = await assessServicenowIdentityAccess(createClient(fetchImpl, { pageSize: 2 }));
   const review = findingsById(result).get("SNOW-04");
@@ -1947,10 +2008,10 @@ test("ServicenowApiClient never follows a Link rel=next that points at another o
   const snapshot = await createClient(fetchImpl, { pageSize: 2 }).queryTable("sys_user", { fields: ["sys_id", "user_name"], limit: 100 });
   assert.deepEqual([...hosts], ["dev12345.service-now.com"], "the only host requested is the configured instance");
   assert.equal(snapshot.pages, 1);
-  assert.equal(snapshot.rows.length, 2);
-  assert.equal(snapshot.truncated, true);
+  assert.equal(snapshot.value.rows.length, 2);
+  assert.equal(snapshot.value.truncated, true);
   const foreignReason = "Link rel=next pointed at another origin, https://collector.attacker.example, than the configured instance https://dev12345.service-now.com; not followed";
-  assert.equal(snapshot.truncationReason, foreignReason);
+  assert.equal(snapshot.value.truncationReason, foreignReason);
   assert.equal(snapshot.error, undefined, "a foreign link is a truncation, not a read failure");
 
   const result = await assessServicenowIdentityAccess(createClient(fetchImpl, { pageSize: 2 }));
@@ -2013,9 +2074,9 @@ test("reviewer B round 4 verdict CodeRabbit (a) residue: ServicenowApiClient ref
       };
       const snapshot = await createClient(fetchImpl, { maxRetries: 0 }).queryTable(table, { limit: 100 });
       assert.equal(snapshot.pages, 1, `${label} ${table}: the link is not fetched`);
-      assert.equal(snapshot.truncated, true, `${label} ${table}`);
+      assert.equal(snapshot.value.truncated, true, `${label} ${table}`);
       assert.equal(snapshot.error, undefined, `${label} ${table}: a refused link is a truncation, not a read failure`);
-      assert.equal(snapshot.truncationReason, `Link rel=next ${clause}; not followed`, `${label} ${table}`);
+      assert.equal(snapshot.value.truncationReason, `Link rel=next ${clause}; not followed`, `${label} ${table}`);
       for (const url of requested) {
         assert.equal(new URL(url).origin, configured, `${label} ${table}: every request stays on the configured origin`);
         assertNoFragment(url, `${label} ${table} request URL`);
@@ -2046,11 +2107,11 @@ test("reviewer B round 4 verdict CodeRabbit (a) residue: ServicenowApiClient ref
 test("ServicenowApiClient marks a non-empty read without X-Total-Count as total unknown so dependent findings cannot pass (rule 10)", async () => {
   const { fetchImpl } = fixtureFetch(healthyFixture(), { omitTotalCount: true });
   const snapshot = await createClient(fetchImpl).queryTable("sys_user", { query: "active=true", fields: ["sys_id", "user_name"] });
-  assert.equal(snapshot.rows.length, 4);
-  assert.equal(snapshot.total, undefined);
-  assert.equal(snapshot.totalUnknown, true);
-  assert.equal(snapshot.truncated, false);
-  assert.equal(snapshot.partial, true);
+  assert.equal(snapshot.value.rows.length, 4);
+  assert.equal(snapshot.value.total, undefined);
+  assert.equal(snapshot.value.totalUnknown, true);
+  assert.equal(snapshot.value.truncated, false);
+  assert.equal((snapshot.state === "partial"), true);
 
   const results = await runAllAssessments(createClient(fetchImpl));
   for (const [label, result] of Object.entries(results)) {
@@ -2504,6 +2565,30 @@ test("collection status: a partially visible user directory keeps seen and total
   assertMentionsMatchRequests([run.analysis, run.accessCheck, run.payloads, run.errors, run.executive], run.requests, "partial users");
 });
 
+test("ServiceNow evidence uses the declared observation or population basis regardless of the value shape", async () => {
+  const fixture = healthyFixture();
+  const partial = fixtureFetch(fixture, { inflateTotals: { sys_security_acl: 60, sys_plugins: 40, ldap_server_config: 5, password_policy: 5, sys_properties: 100 } });
+  const client = createClient(partial.fetchImpl);
+  const access = await assessServicenowAccessControl(client);
+  const tableLevel = findingsById(access).get("SNOW-11");
+  assert.ok(tableLevel.evidence.inputs[0].visible_rows > 0, "the answered partial read retains its observed count");
+  assert.ok(tableLevel.evidence.sensitive_table_coverage.every((row) => row.acls === null), "positive full-population counts remain unknown under a partial read");
+
+  fixture.tables.sys_plugins = fixture.tables.sys_plugins.map((row) => /Security Jump Start/.test(row.name) ? { ...row, active: "inactive" } : row);
+  const operations = await assessServicenowOperationsGovernance(client);
+  const plugin = findingsById(operations).get("SNOW-20").evidence.required_security_plugins.find((row) => /Security Jump Start/.test(row.label));
+  assert.equal(plugin.present, true, "an observed record stays present under a partial read");
+  assert.equal(plugin.active, false, "an observed inactive setting stays false under a partial read");
+
+  const identity = await assessServicenowIdentityAccess(client);
+  assert.equal(identity.summary.active_ldap_servers, null, "an incomplete empty inventory does not prove a zero population");
+  assert.equal(findingsById(identity).get("SNOW-06").evidence.min_password_length_threshold, 12, "run parameters remain known under a partial read");
+  const hardening = await assessServicenowPlatformHardening(client);
+  assert.equal(findingsById(hardening).get("SNOW-05").evidence.max_session_timeout_minutes, 60);
+  const complete = await assessServicenowIdentityAccess(createClient(fixtureFetch(healthyFixture()).fetchImpl));
+  assert.equal(complete.summary.active_ldap_servers, 0, "a complete empty inventory does prove a zero population");
+});
+
 test("review round item 13: absence-driven fails on a partial ACL, plugin, or property read cap at manual and name nothing they did not see", async () => {
   const withoutAcls = healthyFixture();
   withoutAcls.tables.sys_security_acl = withoutAcls.tables.sys_security_acl.filter((row) => row.name !== "sys_audit" && row.name !== "syslog");
@@ -2700,7 +2785,7 @@ test("addendum 4: an OAuth token endpoint that answers with a 502 HTML page or a
   const { fetchImpl } = fixtureFetch(healthyFixture(), { oauthToken: SNOW_CANARY.accessToken, fail: { table: "sys_user", flavor: "json" } });
   const client = new ServicenowApiClient(sampleConfig(oauth), { fetchImpl, sleep: async () => {}, now: () => FIXED_NOW });
   const snapshot = await client.queryTable("sys_user", { fields: ["sys_id"] });
-  assert.equal(snapshot.statusCode, 403);
+  assert.equal(snapshot.status, 403);
   assertSnowCanariesAbsent(snapshot.error, "post-exchange error");
   assertFragmentsAbsent(assert, client.redact(`Authorization: Bearer ${SNOW_CANARY.accessToken}; client_secret=${SNOW_CANARY.clientSecret}; ${SNOW_CANARY_URL}`), [SNOW_CANARY.accessToken, SNOW_CANARY.clientSecret, SNOW_CANARY.urlToken], "client.redact over the obtained bearer, the client secret, and the canary URL");
   assert.equal(redactSecrets(`header Bearer ${SNOW_CANARY.bearer}, cookie JSESSIONID=${SNOW_CANARY.session}, at https://u:p@example.com/a?sid=1#frag`, []), "header Bearer [REDACTED], cookie JSESSIONID=[REDACTED], at https://[REDACTED]@example.com/a?[REDACTED]#[REDACTED]");
@@ -3049,7 +3134,7 @@ test("CodeRabbit (#62, second review) item 1: a refresh token configured through
     };
     const client = new ServicenowApiClient(resolved, { fetchImpl, sleep: async () => {} });
     const snapshot = await client.queryTable("sys_user_role");
-    assert.equal(snapshot.rows.length, 2, label);
+    assert.equal(snapshot.value.rows.length, 2, label);
     assert.equal(tokenCalls.length, 1, `${label}: one exchange`);
     const body = new URLSearchParams(tokenCalls[0].init.body);
     assert.equal(body.get("grant_type"), "refresh_token", `${label}: the first exchange is the refresh_token grant`);

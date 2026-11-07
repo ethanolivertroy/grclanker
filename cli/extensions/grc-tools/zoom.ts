@@ -1,3 +1,6 @@
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
+import { ensurePrivateDir, resolveSecureOutputPath, writeSecureTextFile, countFilesRecursively } from "./secure-output.js";
+export { resolveSecureOutputPath };
 /**
  * Zoom organization audit tools for grclanker.
  *
@@ -6,21 +9,15 @@
  * response field read here is traceable to the public Zoom API reference
  * (developers.zoom.us); the ZOOM_DOCS constant records the page per endpoint.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  realpathSync,
-} from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
+
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { Type } from "typebox";
 import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZOOM_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { BatchVerdicts, hydrateBatchFrameworkMappings, withIntegrationToolContracts  } from "./batch-spec-builder.js";
 import { ConfigFileError, readJsonConfig, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { ZOOM_SPEC } from "./zoom.spec.js";
@@ -633,68 +630,13 @@ function getNestedValue(value: unknown, path: string[]): unknown {
   return current;
 }
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
 
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
-  if (
-    relativeTarget === ".."
-    || relativeTarget.startsWith(`..${join("/")}`)
-    || relativeTarget.startsWith("..")
-  ) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
 
-  const pathSegments = relativeTarget.split(/[\\/]+/).filter(Boolean);
-  let currentPath = realBase;
-  for (const segment of pathSegments) {
-    currentPath = join(currentPath, segment);
-    if (!existsSync(currentPath)) break;
-    const currentStat = lstatSync(currentPath);
-    if (currentStat.isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked parent directory: ${currentPath}`);
-    }
-  }
 
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  const realParent = realpathSync(parent);
-  if (lstatSync(realParent).isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
 
-  return resolvedTarget;
-}
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
 
-async function countFilesRecursively(rootDir: string): Promise<number> {
-  let total = 0;
-  const entries = await readdir(rootDir, { withFileTypes: true });
-  for (const entry of entries) {
-    const pathname = join(rootDir, entry.name);
-    if (entry.isDirectory()) {
-      total += await countFilesRecursively(pathname);
-    } else if (entry.isFile()) {
-      total += 1;
-    }
-  }
-  return total;
-}
+
 
 function encodeBasicAuth(clientId: string, clientSecret: string): string {
   return Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
@@ -1632,22 +1574,20 @@ function controlMappings(controls: number[]): string[] {
 }
 
 function finding(
-  id: string,
+  decisions: BatchVerdicts, id: string,
   title: string,
   severity: ZoomFinding["severity"],
   controls: number[],
-  status: ZoomFindingStatus,
   summary: string,
   evidence?: JsonRecord,
 ): ZoomFinding {
+  const status = decisions.status(id) as ZoomFindingStatus;
   return { id, title, severity, status, summary, controls, evidence, mappings: controlMappings(controls) };
 }
 
-const ZOOM_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
-function recordZoomDecisionFacts(id: string, facts: Readonly<Record<string, unknown>>): void {
-  const store = ZOOM_DECISION_CONTEXT.getStore();
-  if (!store) throw new Error(`${id} decision facts were recorded outside a Zoom assessment`);
-  store.set(id, facts);
+
+function recordZoomDecisionFacts(decisions: BatchVerdicts, id: string, facts: Readonly<Record<string, unknown>>): void {
+  decisions.record(id, facts);
 }
 
 interface SettingRead {
@@ -1722,7 +1662,8 @@ export function assessZoomIdentityFromSnapshot(
   snapshot: ZoomSnapshot,
   options: ZoomIdentityOptions = {},
 ): ZoomAssessmentResult {
-  return runBatchVerdictContext(ZOOM_DECISION_CONTEXT, ZOOM_SPEC, () => {
+  const decisions = new BatchVerdicts(ZOOM_SPEC);
+
   const maxAdmins = clampNumber(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 5000);
   const maxInactivity = clampNumber(options.maxSessionInactivityMinutes, DEFAULT_MAX_SESSION_INACTIVITY_MINUTES, 1, 100000);
   const findings: ZoomFinding[] = [];
@@ -1750,28 +1691,23 @@ export function assessZoomIdentityFromSnapshot(
     undocumented_login_codes: undocumentedCodes,
     login_type_codes: Object.fromEntries(Object.entries(LOGIN_TYPE_CATALOG).map(([code, entry]) => [code, `${entry.label} [${entry.category}]`])),
   };
-  recordZoomDecisionFacts("ZOOM-ID-01", { readable: snapshot.users.status === "ok", complete: !usersPartial, count: userRecords.length, bad_count: nonSsoUsers.length, unknown_count: unknownLoginUsers.length });
-  recordZoomDecisionFacts("ZOOM-ID-05", { readable: snapshot.users.status === "ok", complete: !usersPartial, count: userRecords.length, bad_count: socialUsers.length + passwordUsers.length, unknown_count: unknownLoginUsers.length + otherDocumentedUsers.length + undocumentedUsers.length });
+  recordZoomDecisionFacts(decisions, "ZOOM-ID-01", { readable: snapshot.users.status === "ok", complete: !usersPartial, count: userRecords.length, bad_count: nonSsoUsers.length, unknown_count: unknownLoginUsers.length });
+  recordZoomDecisionFacts(decisions, "ZOOM-ID-05", { readable: snapshot.users.status === "ok", complete: !usersPartial, count: userRecords.length, bad_count: socialUsers.length + passwordUsers.length, unknown_count: unknownLoginUsers.length + otherDocumentedUsers.length + undocumentedUsers.length });
 
   if (snapshot.users.status !== "ok") {
-    findings.push(finding("ZOOM-ID-01", "SSO enforcement for all users", "critical", [5], "manual", manualForSurface(snapshot.users, "the user list with sign-in methods"), userEvidence));
-    findings.push(finding("ZOOM-ID-05", "Personal and social sign-in methods blocked", "high", [16], "manual", manualForSurface(snapshot.users, "the user list with sign-in methods"), userEvidence));
+    findings.push(finding(decisions, "ZOOM-ID-01", "SSO enforcement for all users", "critical", [5], manualForSurface(snapshot.users, "the user list with sign-in methods"), userEvidence));
+    findings.push(finding(decisions, "ZOOM-ID-05", "Personal and social sign-in methods blocked", "high", [16], manualForSurface(snapshot.users, "the user list with sign-in methods"), userEvidence));
   } else if (userRecords.length === 0) {
     const summary = "Manual: GET /users returned no active users, so sign-in methods cannot be judged; an empty inventory is treated as manual because a paid account always has at least the owner. Confirm the app scope (user:read:list_users:admin) and the account scope.";
-    findings.push(finding("ZOOM-ID-01", "SSO enforcement for all users", "critical", [5], "manual", summary, userEvidence));
-    findings.push(finding("ZOOM-ID-05", "Personal and social sign-in methods blocked", "high", [16], "manual", summary, userEvidence));
+    findings.push(finding(decisions, "ZOOM-ID-01", "SSO enforcement for all users", "critical", [5], summary, userEvidence));
+    findings.push(finding(decisions, "ZOOM-ID-05", "Personal and social sign-in methods blocked", "high", [16], summary, userEvidence));
   } else {
-    const ssoStatus: ZoomFindingStatus = nonSsoUsers.length > 0
-      ? "fail"
-      : usersPartial || unknownLoginUsers.length > 0
-        ? "warn"
-        : "pass";
+
     findings.push(finding(
-      "ZOOM-ID-01",
+      decisions, "ZOOM-ID-01",
       "SSO enforcement for all users",
       "critical",
       [5],
-      ssoStatus,
       nonSsoUsers.length > 0
         ? `${nonSsoUsers.length}/${userRecords.length} active users expose a login_types code other than 101 (SSO).`
         : usersPartial
@@ -1782,11 +1718,7 @@ export function assessZoomIdentityFromSnapshot(
       userEvidence,
     ));
     const unjudgedSignIns = otherDocumentedUsers.length > 0 || undocumentedUsers.length > 0;
-    const signInStatus: ZoomFindingStatus = socialUsers.length > 0 || passwordUsers.length > 0
-      ? "fail"
-      : usersPartial || unknownLoginUsers.length > 0 || unjudgedSignIns
-        ? "warn"
-        : "pass";
+
     const unjudgedNote = [
       otherDocumentedUsers.length > 0
         ? `${otherDocumentedUsers.length} users expose codes that are documented but neither SSO nor a personal or social provider (${loginCodesByCategory("other").map((code) => `${code} ${LOGIN_TYPE_CATALOG[code].label}`).join(", ")}).`
@@ -1797,11 +1729,10 @@ export function assessZoomIdentityFromSnapshot(
       unjudgedSignIns ? "They are reported separately and cannot count as blocked." : "",
     ].filter(Boolean).join(" ");
     findings.push(finding(
-      "ZOOM-ID-05",
+      decisions, "ZOOM-ID-05",
       "Personal and social sign-in methods blocked",
       "high",
       [16],
-      signInStatus,
       socialUsers.length > 0 || passwordUsers.length > 0
         ? `${socialUsers.length} users use third-party OAuth sign-in (codes ${loginCodesByCategory("social").join(", ")}) and ${passwordUsers.length} use Zoom-held passwords (codes ${loginCodesByCategory("password").join(", ")}).`
         : usersPartial
@@ -1830,7 +1761,7 @@ export function assessZoomIdentityFromSnapshot(
   const rolesUnreadable = snapshot.roles.status !== "ok";
   const uncoveredAdminRoles = adminRoles.filter((role) => !twoFactorRoles.includes(asString(role.id) ?? ""));
   const twoFactorMode = asString(twoFactor.value);
-  recordZoomDecisionFacts("ZOOM-ID-02", {
+  recordZoomDecisionFacts(decisions, "ZOOM-ID-02", {
     settings_readable: !securitySurface,
     setting_present: twoFactor.present,
     setting_value: twoFactorMode,
@@ -1853,20 +1784,19 @@ export function assessZoomIdentityFromSnapshot(
       }),
   };
   if (securitySurface) {
-    findings.push(finding("ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "manual", manualForSurface(securitySurface, "the Security > Sign in with Two-Factor Authentication setting"), twoFactorEvidence));
+    findings.push(finding(decisions, "ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], manualForSurface(securitySurface, "the Security > Sign in with Two-Factor Authentication setting"), twoFactorEvidence));
   } else if (!twoFactor.present) {
-    findings.push(finding("ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "manual", manualForAbsentKey(twoFactor.path, ZOOM_DOCS.accountSettings, "the two-factor authentication setting"), twoFactorEvidence));
+    findings.push(finding(decisions, "ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], manualForAbsentKey(twoFactor.path, ZOOM_DOCS.accountSettings, "the two-factor authentication setting"), twoFactorEvidence));
   } else {
     const mode = asString(twoFactor.value);
     switch (mode) {
       case "all": {
         const allSummary = "security.sign_in_with_two_factor_auth is `all`: two-factor authentication is required for every user, including admins.";
         findings.push(finding(
-          "ZOOM-ID-02",
+          decisions, "ZOOM-ID-02",
           "Two-factor authentication for admins",
           "critical",
           [6],
-          rolesUnreadable || roles.truncated ? "warn" : "pass",
           rolesUnreadable
             ? `${allSummary} The admin role inventory (GET /roles) that evidences which roles this covers was unreadable: GET ${surfaceCause(snapshot.roles)}. Confirm the admin roles manually.`
             : roles.truncated
@@ -1878,17 +1808,16 @@ export function assessZoomIdentityFromSnapshot(
       }
       case "role": {
         if (snapshot.roles.status !== "ok") {
-          findings.push(finding("ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "manual", `security.sign_in_with_two_factor_auth is \`role\`, but ${surfaceCause(snapshot.roles)}, so admin role coverage cannot be confirmed. Compare the 2FA role list with the admin roles manually.`, twoFactorEvidence));
+          findings.push(finding(decisions, "ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], `security.sign_in_with_two_factor_auth is \`role\`, but ${surfaceCause(snapshot.roles)}, so admin role coverage cannot be confirmed. Compare the 2FA role list with the admin roles manually.`, twoFactorEvidence));
         } else if (adminRoles.length === 0) {
-          findings.push(finding("ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "manual", "security.sign_in_with_two_factor_auth is `role`, but GET /roles returned no admin or owner roles to compare against; confirm the role list manually.", twoFactorEvidence));
+          findings.push(finding(decisions, "ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "security.sign_in_with_two_factor_auth is `role`, but GET /roles returned no admin or owner roles to compare against; confirm the role list manually.", twoFactorEvidence));
         } else {
           const uncovered = adminRoles.filter((role) => !twoFactorRoles.includes(asString(role.id) ?? ""));
           findings.push(finding(
-            "ZOOM-ID-02",
+            decisions, "ZOOM-ID-02",
             "Two-factor authentication for admins",
             "critical",
             [6],
-            uncovered.length > 0 ? "fail" : roles.truncated ? "warn" : "pass",
             uncovered.length > 0
               ? `security.sign_in_with_two_factor_auth is \`role\` but ${uncovered.length}/${adminRoles.length} admin or owner roles are missing from sign_in_with_two_factor_auth_roles.`
               : roles.truncated
@@ -1900,13 +1829,13 @@ export function assessZoomIdentityFromSnapshot(
         break;
       }
       case "group":
-        findings.push(finding("ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "warn", "security.sign_in_with_two_factor_auth is `group`: 2FA applies to selected groups only, and group membership of admins is not exposed by this API, so admin coverage is unproven.", twoFactorEvidence));
+        findings.push(finding(decisions, "ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "security.sign_in_with_two_factor_auth is `group`: 2FA applies to selected groups only, and group membership of admins is not exposed by this API, so admin coverage is unproven.", twoFactorEvidence));
         break;
       case "none":
-        findings.push(finding("ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "fail", "security.sign_in_with_two_factor_auth is `none`: two-factor authentication is not required for any user.", twoFactorEvidence));
+        findings.push(finding(decisions, "ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "security.sign_in_with_two_factor_auth is `none`: two-factor authentication is not required for any user.", twoFactorEvidence));
         break;
       default:
-        findings.push(finding("ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], "manual", `security.sign_in_with_two_factor_auth returned an undocumented value (${String(twoFactor.value)}); documented values are all, group, role, none.`, twoFactorEvidence));
+        findings.push(finding(decisions, "ZOOM-ID-02", "Two-factor authentication for admins", "critical", [6], `security.sign_in_with_two_factor_auth returned an undocumented value (${String(twoFactor.value)}); documented values are all, group, role, none.`, twoFactorEvidence));
     }
   }
 
@@ -1918,21 +1847,12 @@ export function assessZoomIdentityFromSnapshot(
     managed_domains: domainRecords.map((domain) => ({ domain: asString(domain.domain) ?? null, status: asString(domain.status) ?? null })),
     total_records: domains.total ?? null,
   };
-  recordZoomDecisionFacts("ZOOM-ID-03", { readable: snapshot.managedDomains.status === "ok", complete: !domains.truncated, count: domainRecords.length, bad_count: otherDomains.length });
+  recordZoomDecisionFacts(decisions, "ZOOM-ID-03", { readable: snapshot.managedDomains.status === "ok", complete: !domains.truncated, count: domainRecords.length, bad_count: otherDomains.length });
   findings.push(finding(
-    "ZOOM-ID-03",
+    decisions, "ZOOM-ID-03",
     "Managed domains verified",
     "high",
     [14],
-    snapshot.managedDomains.status !== "ok"
-      ? "manual"
-      : domainRecords.length === 0
-        ? "manual"
-        : otherDomains.length > 0
-          ? "fail"
-          : domains.truncated
-            ? "warn"
-            : "pass",
     snapshot.managedDomains.status !== "ok"
       ? manualForSurface(snapshot.managedDomains, "the Associated Domains list (requires the master account option)")
       : domainRecords.length === 0
@@ -1970,7 +1890,7 @@ export function assessZoomIdentityFromSnapshot(
     member_lists_truncated: memberTruncated,
     member_lists_denied: memberDenied,
   };
-  recordZoomDecisionFacts("ZOOM-ID-04", {
+  recordZoomDecisionFacts(decisions, "ZOOM-ID-04", {
     roles_readable: snapshot.roles.status === "ok",
     admin_role_count: adminRoles.length,
     member_read_denied: memberDenied,
@@ -1979,21 +1899,10 @@ export function assessZoomIdentityFromSnapshot(
     max_admins: maxAdmins,
   });
   findings.push(finding(
-    "ZOOM-ID-04",
+    decisions, "ZOOM-ID-04",
     "Administrative privilege concentration",
     "medium",
     [6],
-    snapshot.roles.status !== "ok"
-      ? "manual"
-      : adminRoles.length === 0
-        ? "manual"
-        : memberDenied
-          ? "manual"
-          : memberTruncated || roles.truncated
-            ? "warn"
-            : adminIds.size <= maxAdmins
-              ? "pass"
-              : "warn",
     snapshot.roles.status !== "ok"
       ? manualForSurface(snapshot.roles, "the role list and admin role membership")
       : adminRoles.length === 0
@@ -2021,7 +1930,7 @@ export function assessZoomIdentityFromSnapshot(
     max_session_inactivity_minutes: maxInactivity,
   };
   const timeoutDisabled = (minutes: number | undefined) => minutes === undefined || minutes <= 0;
-  recordZoomDecisionFacts("ZOOM-ID-06", {
+  recordZoomDecisionFacts(decisions, "ZOOM-ID-06", {
     settings_readable: !securitySurface,
     client_setting_present: clientTimeout.present,
     web_setting_present: webTimeout.present,
@@ -2029,21 +1938,12 @@ export function assessZoomIdentityFromSnapshot(
     web_minutes: webMinutes,
     max_minutes: maxInactivity,
   });
-  recordZoomDecisionFacts("ZOOM-ID-07", {});
+  recordZoomDecisionFacts(decisions, "ZOOM-ID-07", {});
   findings.push(finding(
-    "ZOOM-ID-06",
+    decisions, "ZOOM-ID-06",
     "Session inactivity timeout enforced",
     "medium",
     [17],
-    securitySurface
-      ? "manual"
-      : !clientTimeout.present && !webTimeout.present
-        ? "manual"
-        : timeoutDisabled(clientMinutes) || timeoutDisabled(webMinutes)
-          ? "fail"
-          : (clientMinutes ?? 0) > maxInactivity || (webMinutes ?? 0) > maxInactivity
-            ? "warn"
-            : "pass",
     securitySurface
       ? manualForSurface(securitySurface, "the Security > Sign in again after a period of inactivity settings")
       : !clientTimeout.present && !webTimeout.present
@@ -2057,11 +1957,10 @@ export function assessZoomIdentityFromSnapshot(
   ));
 
   findings.push(finding(
-    "ZOOM-ID-07",
+    decisions, "ZOOM-ID-07",
     "Vanity URL configured and secured",
     "low",
     [13],
-    "manual",
     `Manual: the account settings reference (${ZOOM_DOCS.accountSettings}) exposes no account vanity URL field; only per-user personal meeting room URLs are documented (vanity_url on ${ZOOM_DOCS.user}). Review the account profile vanity URL in the admin portal.`,
     { documented_alternative: "GET /users/{userId} vanity_url (personal meeting room URL, not the account vanity URL)" },
   ));
@@ -2086,7 +1985,7 @@ export function assessZoomIdentityFromSnapshot(
     findings,
     errors: surfaceErrors([snapshot.users, snapshot.roles, ...adminMemberSurfaces, snapshot.managedDomains, ...snapshot.settings.settingsSurfaces]),
   };
-  });
+
 }
 
 /**
@@ -2095,7 +1994,7 @@ export function assessZoomIdentityFromSnapshot(
  * no enum, so the match is case-insensitive on those example values and any
  * other string is reported as unrecognized rather than compliant.
  */
-function disclaimerVerdict(bundle: ZoomSettingsBundle): { status: ZoomFindingStatus; summary: string; evidence: JsonRecord } {
+function describeRecordingDisclaimer(bundle: ZoomSettingsBundle): { summary: string; evidence: JsonRecord } {
   const disclaimer = readSetting(bundle, "recording.recording_notification_for_zoom_client.disclaimer_to_participants");
   const askHost = readSetting(bundle, "recording.recording_notification_for_zoom_client.ask_host_to_confirm");
   const legacy = readSetting(bundle, "recording.recording_disclaimer");
@@ -2109,26 +2008,27 @@ function disclaimerVerdict(bundle: ZoomSettingsBundle): { status: ZoomFindingSta
   const option = asString(disclaimer.value);
   if (option) {
     if (/all participants/i.test(option)) {
-      return { status: "pass", summary: `recording_notification_for_zoom_client.disclaimer_to_participants is \`${option}\` (documented example value), so every participant sees the recording disclaimer.${askHost.value === true ? " Hosts must confirm before recording starts." : ""}`, evidence };
+      return { summary: `recording_notification_for_zoom_client.disclaimer_to_participants is \`${option}\` (documented example value), so every participant sees the recording disclaimer.${askHost.value === true ? " Hosts must confirm before recording starts." : ""}`, evidence };
     }
     if (/guest only/i.test(option)) {
-      return { status: "warn", summary: `recording_notification_for_zoom_client.disclaimer_to_participants is \`${option}\`: only guests see the disclaimer, internal participants do not.`, evidence };
+      return { summary: `recording_notification_for_zoom_client.disclaimer_to_participants is \`${option}\`: only guests see the disclaimer, internal participants do not.`, evidence };
     }
-    return { status: "warn", summary: `recording_notification_for_zoom_client.disclaimer_to_participants is \`${option}\`, which is not one of the documented example option names (All participants, Guest only); confirm it is not the off option.`, evidence };
+    return { summary: `recording_notification_for_zoom_client.disclaimer_to_participants is \`${option}\`, which is not one of the documented example option names (All participants, Guest only); confirm it is not the off option.`, evidence };
   }
   if (legacy.present) {
     return legacy.value === true
-      ? { status: "pass", summary: "recording.recording_disclaimer (deprecated but documented) is true and the replacement field was not returned; participants see a disclaimer before recording starts.", evidence }
-      : { status: "fail", summary: "recording.recording_disclaimer is false and the replacement recording_notification_for_zoom_client.disclaimer_to_participants was not returned.", evidence };
+      ? { summary: "recording.recording_disclaimer (deprecated but documented) is true and the replacement field was not returned; participants see a disclaimer before recording starts.", evidence }
+      : { summary: "recording.recording_disclaimer is false and the replacement recording_notification_for_zoom_client.disclaimer_to_participants was not returned.", evidence };
   }
-  return { status: "manual", summary: manualForAbsentKey("recording.recording_notification_for_zoom_client.disclaimer_to_participants", ZOOM_DOCS.accountSettings, "the Recording notifications setting"), evidence };
+  return { summary: manualForAbsentKey("recording.recording_notification_for_zoom_client.disclaimer_to_participants", ZOOM_DOCS.accountSettings, "the Recording notifications setting"), evidence };
 }
 
 export function assessZoomCollaborationGovernanceFromSnapshot(
   snapshot: ZoomSnapshot,
   options: ZoomCollaborationOptions = {},
 ): ZoomAssessmentResult {
-  return runBatchVerdictContext(ZOOM_DECISION_CONTEXT, ZOOM_SPEC, () => {
+  const decisions = new BatchVerdicts(ZOOM_SPEC);
+
   const maxRetention = clampNumber(options.maxRecordingRetentionDays, DEFAULT_MAX_RECORDING_RETENTION_DAYS, 1, 3650);
   const bundle = snapshot.settings;
   const settingsSurface = settingsUnreadable(bundle);
@@ -2137,21 +2037,12 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
   const trusted = listSurfaceState(snapshot.trustedDomains);
   const trustedNames = trusted.items.map((item) => asString(item) ?? asString(asObject(item)?.domain)).filter((item): item is string => Boolean(item));
   const wildcardDomains = trustedNames.filter((name) => name.includes("*") || name === "");
-  recordZoomDecisionFacts("ZOOM-COLLAB-01", { readable: snapshot.trustedDomains.status === "ok", complete: !trusted.truncated, count: trustedNames.length, bad_count: wildcardDomains.length });
+  recordZoomDecisionFacts(decisions, "ZOOM-COLLAB-01", { readable: snapshot.trustedDomains.status === "ok", complete: !trusted.truncated, count: trustedNames.length, bad_count: wildcardDomains.length });
   findings.push(finding(
-    "ZOOM-COLLAB-01",
+    decisions, "ZOOM-COLLAB-01",
     "Trusted domain restrictions",
     "high",
     [12],
-    snapshot.trustedDomains.status !== "ok"
-      ? "manual"
-      : trustedNames.length === 0
-        ? "manual"
-        : wildcardDomains.length > 0
-          ? "fail"
-          : trusted.truncated
-            ? "warn"
-            : "pass",
     snapshot.trustedDomains.status !== "ok"
       ? manualForSurface(snapshot.trustedDomains, "the trusted domains list")
       : trustedNames.length === 0
@@ -2167,7 +2058,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
   const fileTransfer = readSetting(bundle, "in_meeting.file_transfer");
   const fileTransferLocked = readLock(bundle, "in_meeting.file_transfer");
   const fileTransferGroups = groupOverrideState(snapshot, groupsRelaxing(snapshot, "in_meeting.file_transfer", false));
-  recordZoomDecisionFacts("ZOOM-COLLAB-02", {
+  recordZoomDecisionFacts(decisions, "ZOOM-COLLAB-02", {
     settings_readable: !settingsSurface,
     setting_present: fileTransfer.present,
     setting_value: fileTransfer.value,
@@ -2175,19 +2066,10 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
     ...fileTransferGroups.decisionFacts,
   });
   findings.push(finding(
-    "ZOOM-COLLAB-02",
+    decisions, "ZOOM-COLLAB-02",
     "In-meeting file transfer restricted",
     "high",
     [9],
-    settingsSurface
-      ? "manual"
-      : !fileTransfer.present
-        ? "manual"
-        : fileTransfer.value === true
-          ? "fail"
-          : fileTransferLocked === true && !fileTransferGroups.demote
-            ? "pass"
-            : "warn",
     settingsSurface
       ? manualForSurface(settingsSurface, "the In Meeting (Basic) > Send files via meeting chat setting")
       : !fileTransfer.present
@@ -2212,7 +2094,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
     max_recording_retention_days: maxRetention,
     ...retentionGroups.evidence,
   };
-  recordZoomDecisionFacts("ZOOM-COLLAB-03", {
+  recordZoomDecisionFacts(decisions, "ZOOM-COLLAB-03", {
     settings_readable: !settingsSurface,
     cloud_recording_present: cloudRecording.present,
     cloud_recording_value: cloudRecording.value,
@@ -2224,25 +2106,10 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
     ...retentionGroups.decisionFacts,
   });
   findings.push(finding(
-    "ZOOM-COLLAB-03",
+    decisions, "ZOOM-COLLAB-03",
     "Cloud recording auto-delete retention",
     "high",
     [10, 11],
-    settingsSurface
-      ? "manual"
-      : !cloudRecording.present && !autoDelete.present
-        ? "manual"
-        : cloudRecording.value === false
-          ? "manual"
-          : autoDelete.value !== true
-            ? "fail"
-            : retentionDays === undefined
-              ? "warn"
-              : retentionDays > maxRetention
-                ? "warn"
-                : autoDeleteLocked === true && !retentionGroups.demote
-                  ? "pass"
-                  : "warn",
     settingsSurface
       ? manualForSurface(settingsSurface, "the Recording > Auto delete cloud recordings setting")
       : !cloudRecording.present && !autoDelete.present
@@ -2269,7 +2136,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
   const phonePolicies = [autoCall, adHoc];
   const phoneUnlocked = phonePolicies.filter((policy) => policy && asBoolean(policy.locked) !== true);
   const phoneMissingEnable = phonePolicies.filter((policy) => policy && asBoolean(policy.enable) === undefined);
-  recordZoomDecisionFacts("ZOOM-COLLAB-04", {
+  recordZoomDecisionFacts(decisions, "ZOOM-COLLAB-04", {
     phone_readable: phone.status === "ok",
     auto_call_present: Boolean(autoCall),
     ad_hoc_present: Boolean(adHoc),
@@ -2279,19 +2146,10 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
     ad_hoc_lock: adHoc ? asBoolean(adHoc.locked) : undefined,
   });
   findings.push(finding(
-    "ZOOM-COLLAB-04",
+    decisions, "ZOOM-COLLAB-04",
     "Zoom Phone recording policies enforced",
     "medium",
     [19],
-    phone.status !== "ok"
-      ? "manual"
-      : !autoCall || !adHoc
-        ? "manual"
-        : phoneMissingEnable.length > 0
-          ? "manual"
-          : phoneUnlocked.length > 0
-            ? "warn"
-            : "pass",
     phone.status !== "ok"
       ? `Manual: ${surfaceCause(phone)}. Zoom Phone requires a Business or Enterprise account with a Zoom Phone license; confirm whether Phone is licensed and review its recording policies in the admin portal.`
       : !autoCall || !adHoc
@@ -2320,21 +2178,12 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
     newest_entry: newestLog > 0 ? new Date(newestLog).toISOString() : null,
     category_types: [...new Set(logRecords.map((log) => asString(log.category_type)).filter(Boolean))].slice(0, 20),
   };
-  recordZoomDecisionFacts("ZOOM-COLLAB-05", { readable: snapshot.operationLogs.status === "ok", complete: !logs.truncated, count: logRecords.length, bad_count: undatedLogs.length });
+  recordZoomDecisionFacts(decisions, "ZOOM-COLLAB-05", { readable: snapshot.operationLogs.status === "ok", complete: !logs.truncated, count: logRecords.length, bad_count: undatedLogs.length });
   findings.push(finding(
-    "ZOOM-COLLAB-05",
+    decisions, "ZOOM-COLLAB-05",
     "Admin operation logs readable and recent",
     "medium",
     [24],
-    snapshot.operationLogs.status !== "ok"
-      ? "manual"
-      : logRecords.length === 0
-        ? "warn"
-        : logs.truncated
-          ? "warn"
-          : undatedLogs.length > 0
-            ? "warn"
-            : "pass",
     snapshot.operationLogs.status !== "ok"
       ? manualForSurface(snapshot.operationLogs, "the Admin Activity Logs report (requires report:read:operation_logs:admin)")
       : logRecords.length === 0
@@ -2352,21 +2201,12 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
   const sharedGroups = imRecords.filter((group) => asString(group.type) === "shared");
   const unknownTypeGroups = imRecords.filter((group) => !["normal", "shared", "restricted"].includes(asString(group.type) ?? ""));
   const crossAccountSearch = imRecords.filter((group) => asBoolean(group.search_by_ma_account) === true);
-  recordZoomDecisionFacts("ZOOM-COLLAB-06", { readable: snapshot.imGroups.status === "ok", complete: !imGroups.truncated, count: imRecords.length, bad_count: sharedGroups.length + unknownTypeGroups.length + crossAccountSearch.length });
+  recordZoomDecisionFacts(decisions, "ZOOM-COLLAB-06", { readable: snapshot.imGroups.status === "ok", complete: !imGroups.truncated, count: imRecords.length, bad_count: sharedGroups.length + unknownTypeGroups.length + crossAccountSearch.length });
   findings.push(finding(
-    "ZOOM-COLLAB-06",
+    decisions, "ZOOM-COLLAB-06",
     "IM group restrictions enforced",
     "medium",
     [15],
-    snapshot.imGroups.status !== "ok"
-      ? "manual"
-      : imRecords.length === 0
-        ? "manual"
-        : imGroups.truncated
-          ? "warn"
-          : sharedGroups.length > 0 || unknownTypeGroups.length > 0 || crossAccountSearch.length > 0
-            ? "warn"
-            : "pass",
     snapshot.imGroups.status !== "ok"
       ? manualForSurface(snapshot.imGroups, "the IM directory groups (requires contact_group:read:list_groups:admin)")
       : imRecords.length === 0
@@ -2411,7 +2251,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
       restricted(asObject(getNestedValue(policy.settings.data, ["chat", "allow_users_to_add_contacts"]))) === false
       || restricted(asObject(getNestedValue(policy.settings.data, ["chat", "allow_users_to_chat_with_others"]))) === false)
     .map((policy) => policy.name));
-  recordZoomDecisionFacts("ZOOM-COLLAB-07", {
+  recordZoomDecisionFacts(decisions, "ZOOM-COLLAB-07", {
     settings_readable: !settingsSurface,
     add_policy_present: Boolean(addContacts),
     add_policy_enabled: addContacts ? asBoolean(addContacts.enable) : undefined,
@@ -2423,21 +2263,12 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
     chat_policy_lock: chatLocked,
     ...contactsGroups.decisionFacts,
   });
-  recordZoomDecisionFacts("ZOOM-COLLAB-08", {});
+  recordZoomDecisionFacts(decisions, "ZOOM-COLLAB-08", {});
   findings.push(finding(
-    "ZOOM-COLLAB-07",
+    decisions, "ZOOM-COLLAB-07",
     "External contacts restricted",
     "medium",
     [12],
-    settingsSurface
-      ? "manual"
-      : !addContacts || !chatWithOthers
-        ? "manual"
-        : addRestricted === undefined || chatRestricted === undefined
-          ? "manual"
-          : addRestricted && chatRestricted
-            ? (contactsLocked && !contactsGroups.demote ? "pass" : "warn")
-            : "fail",
     settingsSurface
       ? manualForSurface(settingsSurface, "the Team Chat > Allow users to add contacts and chat with others settings")
       : !addContacts || !chatWithOthers
@@ -2451,11 +2282,10 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
   ));
 
   findings.push(finding(
-    "ZOOM-COLLAB-08",
+    decisions, "ZOOM-COLLAB-08",
     "Chat encryption enabled",
     "medium",
     [8],
-    "manual",
     `Manual: the account settings reference (${ZOOM_DOCS.accountSettings}) documents no account-level Team Chat encryption setting under the chat object; encryption indicators exist only as per-message metadata in the Team Chat API. Confirm Advanced Chat Encryption in the admin portal.`,
     { chat_settings_present: readSetting(bundle, "chat").present },
   ));
@@ -2478,7 +2308,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
     findings,
     errors: surfaceErrors([...bundle.settingsSurfaces, ...bundle.lockSurfaces, snapshot.groups, ...groupPolicySurfaces(snapshot), snapshot.trustedDomains, snapshot.imGroups, snapshot.operationLogs, snapshot.phoneSettings]),
   };
-  });
+
 }
 
 function groupsRelaxing(snapshot: ZoomSnapshot, path: string, compliantValue: unknown): string[] {
@@ -2514,7 +2344,7 @@ function unreadableGroupLabel(entry: { group: string; surface: ZoomSurface<JsonR
 }
 
 function booleanControl(
-  snapshot: ZoomSnapshot,
+  decisions: BatchVerdicts, snapshot: ZoomSnapshot,
   id: string,
   title: string,
   severity: ZoomFinding["severity"],
@@ -2536,7 +2366,7 @@ function booleanControl(
     ...groups.evidence,
     ...extraEvidence,
   };
-  recordZoomDecisionFacts(id, {
+  recordZoomDecisionFacts(decisions, id, {
     settings_readable: !surface,
     setting_present: setting.present,
     setting_value: setting.value,
@@ -2544,17 +2374,17 @@ function booleanControl(
     ...groups.decisionFacts,
   });
   if (surface) {
-    return finding(id, title, severity, controls, "manual", manualForSurface(surface, labels.evidenceToCollect), evidence);
+    return finding(decisions, id, title, severity, controls, manualForSurface(surface, labels.evidenceToCollect), evidence);
   }
   if (!setting.present) {
-    return finding(id, title, severity, controls, "manual", manualForAbsentKey(path, ZOOM_DOCS.accountSettings, labels.evidenceToCollect), evidence);
+    return finding(decisions, id, title, severity, controls, manualForAbsentKey(path, ZOOM_DOCS.accountSettings, labels.evidenceToCollect), evidence);
   }
   if (setting.value !== compliantValue) {
-    return finding(id, title, severity, controls, "fail", `${path} is ${String(setting.value)}: ${labels.nonCompliant}`, evidence);
+    return finding(decisions, id, title, severity, controls, `${path} is ${String(setting.value)}: ${labels.nonCompliant}`, evidence);
   }
-  const status: ZoomFindingStatus = locked === true && !groups.demote ? "pass" : "warn";
+
   const summary = [`${path} is ${String(compliantValue)}: ${labels.compliant}`, lockNote(locked, path, bundle), groups.note].filter(Boolean).join(" ");
-  return finding(id, title, severity, controls, status, summary, evidence);
+  return finding(decisions, id, title, severity, controls, summary, evidence);
 }
 
 function groupInventoryTruncated(snapshot: ZoomSnapshot): boolean {
@@ -2614,12 +2444,13 @@ export function assessZoomMeetingSecurityFromSnapshot(
   snapshot: ZoomSnapshot,
   _options: ZoomMeetingSecurityOptions = {},
 ): ZoomAssessmentResult {
-  return runBatchVerdictContext(ZOOM_DECISION_CONTEXT, ZOOM_SPEC, () => {
+  const decisions = new BatchVerdicts(ZOOM_SPEC);
+
   const bundle = snapshot.settings;
   const findings: ZoomFinding[] = [];
 
   const passwordFinding = booleanControl(
-    snapshot,
+    decisions, snapshot,
     "ZOOM-MTG-01",
     "Meeting password enforcement and account lock",
     "critical",
@@ -2636,7 +2467,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
   findings.push(passwordFinding);
 
   findings.push(booleanControl(
-    snapshot,
+    decisions, snapshot,
     "ZOOM-MTG-02",
     "Waiting room enabled by default",
     "critical",
@@ -2668,7 +2499,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
     ...shareGroups.evidence,
   };
   const sharingValue = asString(whoCanShare.value);
-  recordZoomDecisionFacts("ZOOM-MTG-03", {
+  recordZoomDecisionFacts(decisions, "ZOOM-MTG-03", {
     settings_readable: !screenSurface,
     screen_setting_present: screenSharing.present,
     screen_setting_value: screenSharing.value,
@@ -2678,23 +2509,10 @@ export function assessZoomMeetingSecurityFromSnapshot(
     ...shareGroups.decisionFacts,
   });
   findings.push(finding(
-    "ZOOM-MTG-03",
+    decisions, "ZOOM-MTG-03",
     "Screen sharing restricted to host only",
     "high",
     [3],
-    screenSurface
-      ? "manual"
-      : !screenSharing.present
-        ? "manual"
-        : screenSharing.value === false
-          ? sharePass
-          : !whoCanShare.present
-            ? "manual"
-            : asString(whoCanShare.value) === "host"
-              ? sharePass
-              : asString(whoCanShare.value) === "all"
-                ? "fail"
-                : "manual",
     screenSurface
       ? manualForSurface(screenSurface, "the In Meeting (Basic) > Screen sharing setting")
       : !screenSharing.present
@@ -2712,7 +2530,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
   ));
 
   findings.push(booleanControl(
-    snapshot,
+    decisions, snapshot,
     "ZOOM-MTG-04",
     "Local recording disabled",
     "high",
@@ -2735,7 +2553,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
     ...groupsRelaxing(snapshot, "meeting_security.end_to_end_encrypted_meetings", true),
     ...groupsRelaxing(snapshot, "meeting_security.encryption_type", "e2ee"),
   ])]);
-  recordZoomDecisionFacts("ZOOM-MTG-05", {
+  recordZoomDecisionFacts(decisions, "ZOOM-MTG-05", {
     settings_readable: !e2eeSurface,
     e2ee_setting_present: e2ee.present,
     e2ee_setting_value: e2ee.value,
@@ -2744,19 +2562,10 @@ export function assessZoomMeetingSecurityFromSnapshot(
     ...e2eeGroups.decisionFacts,
   });
   findings.push(finding(
-    "ZOOM-MTG-05",
+    decisions, "ZOOM-MTG-05",
     "End-to-end encryption available and default",
     "high",
     [7],
-    e2eeSurface
-      ? "manual"
-      : !e2ee.present
-        ? "manual"
-        : e2ee.value !== true
-          ? "fail"
-          : asString(encryptionType.value) === "e2ee"
-            ? (e2eeLocked === true && !e2eeGroups.demote ? "pass" : "warn")
-            : "warn",
     e2eeSurface
       ? manualForSurface(e2eeSurface, "the Security > Allow use of end-to-end encryption setting (option=meeting_security)")
       : !e2ee.present
@@ -2770,7 +2579,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
   ));
 
   findings.push(booleanControl(
-    snapshot,
+    decisions, snapshot,
     "ZOOM-MTG-06",
     "Embed password in join link disabled",
     "medium",
@@ -2807,7 +2616,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
     ...pmiGroups.evidence,
   };
   const pmiCompliant = personalMeeting.value === false || (pmiScheduled.value === false && pmiInstant.value === false);
-  recordZoomDecisionFacts("ZOOM-MTG-07", {
+  recordZoomDecisionFacts(decisions, "ZOOM-MTG-07", {
     settings_readable: !pmiSurface,
     personal_meeting_value: personalMeeting.value,
     scheduled_setting_present: pmiScheduled.present,
@@ -2819,19 +2628,10 @@ export function assessZoomMeetingSecurityFromSnapshot(
     ...pmiGroups.decisionFacts,
   });
   findings.push(finding(
-    "ZOOM-MTG-07",
+    decisions, "ZOOM-MTG-07",
     "Personal Meeting ID usage restricted",
     "medium",
     [25],
-    pmiSurface
-      ? "manual"
-      : personalMeeting.value !== false && (!pmiScheduled.present || !pmiInstant.present)
-        ? "manual"
-        : !pmiCompliant
-          ? "fail"
-          : pmiLocked && !pmiGroups.demote
-            ? "pass"
-            : "warn",
     pmiSurface
       ? manualForSurface(pmiSurface, "the Schedule Meeting > Personal Meeting ID settings")
       : personalMeeting.value !== false && (!pmiScheduled.present || !pmiInstant.present)
@@ -2849,7 +2649,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
   ));
 
   findings.push(booleanControl(
-    snapshot,
+    decisions, snapshot,
     "ZOOM-MTG-08",
     "Only authenticated users can join meetings",
     "high",
@@ -2872,7 +2672,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
   const regionSurface = settingsUnreadable(bundle);
   const regionsLocked = readLock(bundle, "in_meeting.custom_data_center_regions");
   const regionGroups = groupOverrideState(snapshot, groupsRelaxing(snapshot, "in_meeting.custom_data_center_regions", true));
-  recordZoomDecisionFacts("ZOOM-MTG-09", {
+  recordZoomDecisionFacts(decisions, "ZOOM-MTG-09", {
     settings_readable: !regionSurface,
     setting_present: customRegions.present,
     setting_value: customRegions.value,
@@ -2881,21 +2681,10 @@ export function assessZoomMeetingSecurityFromSnapshot(
     ...regionGroups.decisionFacts,
   });
   findings.push(finding(
-    "ZOOM-MTG-09",
+    decisions, "ZOOM-MTG-09",
     "Data routing control enabled",
     "critical",
     [18],
-    regionSurface
-      ? "manual"
-      : !customRegions.present
-        ? "manual"
-        : customRegions.value !== true
-          ? "fail"
-          : regionList.length === 0
-            ? "warn"
-            : regionsLocked === true && !regionGroups.demote
-              ? "pass"
-              : "warn",
     regionSurface
       ? manualForSurface(regionSurface, "the In Meeting (Advanced) > Select data center regions setting")
       : !customRegions.present
@@ -2910,8 +2699,8 @@ export function assessZoomMeetingSecurityFromSnapshot(
 
   const disclaimerSurface = settingsUnreadable(bundle);
   const disclaimer = disclaimerSurface
-    ? { status: "manual" as ZoomFindingStatus, summary: manualForSurface(disclaimerSurface, "the Recording > Recording notifications setting"), evidence: {} }
-    : disclaimerVerdict(bundle);
+    ? { summary: manualForSurface(disclaimerSurface, "the Recording > Recording notifications setting"), evidence: {} }
+    : describeRecordingDisclaimer(bundle);
   const disclaimerGroupsRelaxing = snapshot.groupPolicies
     .filter((policy) => policy.settings.status === "ok")
     .filter((policy) => {
@@ -2920,10 +2709,10 @@ export function assessZoomMeetingSecurityFromSnapshot(
     })
     .map((policy) => policy.name);
   const disclaimerGroups = groupOverrideState(snapshot, disclaimerGroupsRelaxing);
-  const disclaimerStatus: ZoomFindingStatus = disclaimer.status === "pass" && disclaimerGroups.demote ? "warn" : disclaimer.status;
+
   const disclaimerOption = asString(readSetting(bundle, "recording.recording_notification_for_zoom_client.disclaimer_to_participants").value);
   const disclaimerLegacy = readSetting(bundle, "recording.recording_disclaimer");
-  recordZoomDecisionFacts("ZOOM-MTG-10", {
+  recordZoomDecisionFacts(decisions, "ZOOM-MTG-10", {
     settings_readable: !disclaimerSurface,
     disclaimer_option: disclaimerOption,
     legacy_setting_present: disclaimerLegacy.present,
@@ -2931,11 +2720,10 @@ export function assessZoomMeetingSecurityFromSnapshot(
     ...disclaimerGroups.decisionFacts,
   });
   findings.push(finding(
-    "ZOOM-MTG-10",
+    decisions, "ZOOM-MTG-10",
     "Recording consent disclaimer shown to participants",
     "high",
     [4],
-    disclaimerStatus,
     [disclaimer.summary, disclaimerGroups.note].filter(Boolean).join(" "),
     { ...disclaimer.evidence, ...disclaimerGroups.evidence },
   ));
@@ -2959,7 +2747,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
     findings,
     errors: surfaceErrors([...bundle.settingsSurfaces, ...bundle.lockSurfaces, snapshot.groups, ...groupPolicySurfaces(snapshot)]),
   };
-  });
+
 }
 
 export type ZoomAccessCheckOptions = Pick<ZoomCollectionOptions, "now">;
@@ -3561,7 +3349,7 @@ const collaborationParams = {
   max_recording_retention_days: Type.Optional(Type.Number({ description: "Maximum acceptable cloud recording retention in days before warning. Defaults to 120.", default: 120 })),
 };
 
-export function registerZoomTools(pi: any): void {
+export function registerZoomTools(pi: GrcToolRegistrar): void {
   pi = withIntegrationToolContracts(pi, ZOOM_SPEC);
   pi.registerTool({
     name: "zoom_check_access",

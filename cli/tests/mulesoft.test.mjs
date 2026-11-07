@@ -2030,6 +2030,27 @@ function partialIdentityClient() {
   });
 }
 
+test("MuleSoft aggregate reads retain partial coverage from either their parent or their children", async () => {
+  const childPartial = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listRoleGroupRoles() {
+      return truncatedPage([{ role_id: "organization-admin", name: "Organization Administrator" }], 20);
+    },
+  }));
+  assert.match(childPartial.summary.inventories.role_group_roles, /^partial \(/);
+  assert.match(childPartial.summary.inventories.role_group_roles, /20 total/);
+  for (const id of ["MULESOFT-IAM-03", "MULESOFT-IAM-04"]) assert.notEqual(statusOf(childPartial, id), "pass");
+
+  const parentPartial = await assessMulesoftIdentityAccess(healthyIdentityClient({
+    async listRoleGroups() {
+      return truncatedPage([{ role_group_id: "rg-admin", name: "Organization Administrators", editable: false }], 40);
+    },
+  }));
+  assert.match(parentPartial.summary.inventories.role_group_roles, /^partial \(/);
+  assert.match(parentPartial.summary.inventories.role_group_users, /^partial \(/);
+  assert.match(parentPartial.summary.inventories.role_group_roles, /40 total/);
+  assert.notEqual(statusOf(parentPartial, "MULESOFT-IAM-03"), "pass");
+});
+
 function partialApiGatewayClient() {
   return healthyApiGatewayClient({
     getResolvedConfig: () => sampleConfig({ environmentFilter: ["Sandbox"] }),
@@ -3834,9 +3855,10 @@ test("round 2 SEND BACK 4: under a listLoadBalancers denial the certificate prob
   // The assessment result: the snapshot is a marker, RT-16 is manual through the denied parent, and no probe ran.
   const runtime = await assessMulesoftRuntimeInfrastructure(denied);
   const snapshotMarker = assertNotCollectedMarker(runtime.snapshots.load_balancer_certificates, "load_balancer_certificates", "snapshots.load_balancer_certificates");
-  assert.equal(snapshotMarker.status, 403);
+  assert.equal(snapshotMarker.status, null, "an unrequested child has no observed HTTP status; its parent refusal stays in the reason");
+  assert.equal(snapshotMarker.endpoint, null);
   assert.match(snapshotMarker.error, /^not requested: the load_balancers read failed \(Anypoint request failed \(403 Forbidden\) for .*loadbalancers.*\), so there were no load_balancers to scope the load_balancer_certificates read$/);
-  assertNotCollectedMarker(runtime.snapshots.load_balancers, "load_balancers", "snapshots.load_balancers");
+  assert.equal(assertNotCollectedMarker(runtime.snapshots.load_balancers, "load_balancers", "snapshots.load_balancers").status, 403);
   assert.equal(statusOf(runtime, "MULESOFT-RT-16"), "manual");
   assert.match(findingById(runtime, "MULESOFT-RT-16").summary, /^Could not evaluate: load_balancers could not be read, the credential lacks permission \(HTTP 403\)/);
   assert.equal(findingById(runtime, "MULESOFT-RT-16").evidence.certificates, undefined, "no certificate list is claimed for a list that was never read");

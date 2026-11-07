@@ -1,3 +1,7 @@
+import { writeSecureFile } from "./secure-output.js";
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
+import { ensurePrivateDir, resolveSecureOutputPath } from "./secure-output.js";
+export { ensurePrivateDir, resolveSecureOutputPath };
 /**
  * Vanta auditor tools for grclanker.
  *
@@ -10,15 +14,8 @@
  * intentionally separate from the later Manage Vanta surface.
  */
 import { createHash } from "node:crypto";
-import {
-  createWriteStream,
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  realpathSync,
-  chmodSync,
-} from "node:fs";
-import { chmod, readdir, rm, writeFile } from "node:fs/promises";
+import { createWriteStream, existsSync, lstatSync } from "node:fs";
+import { chmod, readdir, rm } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -443,59 +440,11 @@ export function sanitizeFilename(name: string): string {
   return result;
 }
 
-export function ensurePrivateDir(path: string): void {
-  if (existsSync(path)) {
-    const info = lstatSync(path);
-    if (info.isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked directory: ${path}`);
-    }
-    if (!info.isDirectory()) {
-      throw new Error(`Path is not a directory: ${path}`);
-    }
-  }
 
-  mkdirSync(path, { recursive: true, mode: 0o700 });
 
-  const info = lstatSync(path);
-  if (info.isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked directory: ${path}`);
-  }
-  if (!info.isDirectory()) {
-    throw new Error(`Path is not a directory: ${path}`);
-  }
 
-  chmodSync(path, 0o700);
-}
 
-export function resolveSecureOutputPath(baseDir: string, destPath: string): string {
-  const resolvedBase = realpathSync(resolve(baseDir));
-  const absoluteDest = resolve(destPath);
 
-  if (existsSync(absoluteDest)) {
-    const info = lstatSync(absoluteDest);
-    if (info.isSymbolicLink()) {
-      throw new Error(`Refusing to write through symlink: ${absoluteDest}`);
-    }
-  }
-
-  const resolvedDestDir = realpathSync(resolve(dirname(absoluteDest)));
-  const resolvedDest = join(resolvedDestDir, basename(absoluteDest));
-  const relPath = relative(resolvedBase, resolvedDest);
-  if (relPath.startsWith("..") || relPath === "" && resolvedDest !== resolvedBase) {
-    throw new Error("Invalid output path: path traversal detected");
-  }
-  if (relative(resolvedBase, resolvedDest).startsWith("..")) {
-    throw new Error("Invalid output path: path traversal detected");
-  }
-
-  return resolvedDest;
-}
-
-async function writeSecureFile(baseDir: string, destPath: string, data: string | Buffer): Promise<void> {
-  const resolvedPath = resolveSecureOutputPath(baseDir, destPath);
-  await writeFile(resolvedPath, data, { mode: 0o600 });
-  await chmod(resolvedPath, 0o600);
-}
 
 function normalizeHostname(host: string): string {
   return host.toLowerCase().replace(/\.$/, "");
@@ -1430,7 +1379,7 @@ function buildExportText(audit: VantaAudit, result: VantaExportResult): string {
   return lines.join("\n");
 }
 
-export function registerVantaTools(pi: any): void {
+export function registerVantaTools(pi: GrcToolRegistrar): void {
   pi.registerTool({
     name: "vanta_check_access",
     label: "Check Vanta auditor access",

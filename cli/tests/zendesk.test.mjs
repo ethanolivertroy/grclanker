@@ -1,3 +1,4 @@
+import { CANARY_WINDOW_MIN as LEAK_WINDOW_MIN, secretForms, shortestCanaryWindows as sixWindows, assertNoCanaryWindow, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -70,59 +71,8 @@ const FIXTURE_API_TOKEN = "fixture-teal-harbor-2026";
 // The composed Basic credential the client sends for the fixture configuration.
 const FIXTURE_BASIC_CREDENTIAL = Buffer.from(`auditor@example.com/token:${FIXTURE_API_TOKEN}`).toString("base64");
 
-// The forms a configured secret can be echoed in: as is, JSON-escaped, URL-encoded, base64, base64url.
-function secretForms(value) {
-  return [...new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value), Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")])];
-}
-
-// The window rule (addendum 8): every leak assertion against a planted credential checks
-// the whole value and every window of it from LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters,
-// so a partial echo (the 10-character window JSON.parse quotes, a token cut by a length cap,
-// the head of a base64 form split by a marker) cannot pass. The planted values are alphanumeric
-// and random-looking, and the fixture self-check below proves that no 6-character window of
-// any of them occurs in the fixtures' legitimate text, so every failure is a real leak.
-const LEAK_WINDOW_MIN = 6;
-const LEAK_WINDOW_MAX = 24;
-const leakWindowCache = new Map();
-
-// The whole value plus every window of LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters, longest
-// first so a failure names the largest fragment that survived, and the shortest windows on
-// their own: a longer window contains its own first LEAK_WINDOW_MIN characters, so every
-// window is absent exactly when the whole value and every shortest window are.
-function leakWindows(canary) {
-  let entry = leakWindowCache.get(canary);
-  if (entry === undefined) {
-    const all = [canary];
-    for (let size = Math.min(LEAK_WINDOW_MAX, canary.length - 1); size >= LEAK_WINDOW_MIN; size -= 1) {
-      for (let index = 0; index + size <= canary.length; index += 1) all.push(canary.slice(index, index + size));
-    }
-    const shortest = Math.min(LEAK_WINDOW_MIN, canary.length);
-    entry = { all: [...new Set(all)], probes: [...new Set(all.filter((window) => window.length === shortest))] };
-    leakWindowCache.set(canary, entry);
-  }
-  return entry;
-}
-
-// Neither the canary nor any window of it from 6 to 24 characters may survive in the text.
-function assertNoWindow(text, canary, label) {
-  const { all, probes } = leakWindows(canary);
-  if (!probes.some((probe) => text.includes(probe))) return;
-  const leaked = all.find((window) => text.includes(window));
-  assert.fail(leaked === canary ? `${label}: ${canary} leaked` : `${label}: window ${leaked} of ${canary} leaked`);
-}
-
-// Every bundle file or zip entry against every planted secret: the shared whole-value scan, then every window.
-function assertNoSecretWindows(contents, secrets, label) {
-  assertSecretsAbsent(assert, contents, secrets, label);
-  for (const [name, text] of contents) {
-    for (const secret of secrets) assertNoWindow(text, secret, `${label} ${name}`);
-  }
-}
-
-// The 6-character windows of a planted value (the value itself when shorter), for the fixture self-check.
-function sixWindows(value) {
-  return leakWindows(value).probes;
-}
+const assertNoWindow = (text, canary, label) => assertNoCanaryWindow(assert, text, canary, label);
+const assertNoSecretWindows = (contents, secrets, label) => assertCanaryWindowsAbsent(assert, contents, secrets, label);
 
 function sampleConfig(overrides = {}) {
   return {

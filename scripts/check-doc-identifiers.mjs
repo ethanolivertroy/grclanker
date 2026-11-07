@@ -2,11 +2,9 @@
 // Checks that the docs and the README name only tools and environment
 // variables that the code defines.
 //
-// A tool name is a word that joins a DOMAIN_GROUPS prefix from
-// cli/core/tool-catalog.ts to a verb that a registered tool name uses, such as
-// `aws_check_access` or `kevs_recent`. It must appear as a string literal in
-// cli/extensions. Globs like `aws_assess_*` and file names like
-// `aws_check_access.json` are not tool names.
+// Tool names and environment variables come from the checked-in neutral catalog.
+// The shared generator validates that catalog against registered implementations.
+// Globs and file names such as aws_check_access.json are not tool references.
 //
 // An environment variable is checked only where a page sets or lists one:
 // `export` lines, assignments in front of a grclanker, npm, npx, node, bash,
@@ -21,19 +19,11 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readToolManifest, TOOL_MANIFEST_PATH } from './lib/tool-manifest.mjs';
 
 const DOCS_DIR = 'src/content/docs/docs';
 const README = 'README.md';
-const TOOL_CATALOG = 'cli/core/tool-catalog.ts';
-const TOOL_SOURCES = 'cli/extensions';
-const CODE_DIR = 'cli';
-const INSTALLER_DIR = 'public';
-
-const CODE_FILE = /\.[cm]?[jt]s$/;
 const SKIPPED_DIRS = new Set(['node_modules', 'dist', 'tests']);
-const SNAKE_LITERAL = /(["'`])([a-z][a-z0-9_]*)\1/g;
-const TOOL_NAME_PROPERTY = /\bname:\s*(["'`])([a-z][a-z0-9_]*)\1/g;
-const ENV_WORD = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g;
 const ENV_NAME = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/;
 
 const FENCE = /^\s*(`{3,}|~{3,})(.*)$/;
@@ -69,8 +59,6 @@ function walk(dir, keep) {
   });
 }
 
-const codeFiles = (dir) => walk(dir, (name) => CODE_FILE.test(name) && !name.includes('.test.'));
-
 export function docFiles(repoDir) {
   return [join(repoDir, README), ...walk(join(repoDir, DOCS_DIR), (name) => /\.mdx?$/.test(name))];
 }
@@ -96,33 +84,12 @@ export function toolNamePattern(prefixes, verbs) {
 }
 
 export function readCodeIdentifiers(repoDir) {
-  const catalog = readFileSync(join(repoDir, TOOL_CATALOG), 'utf8');
-  const groups = catalog.match(/\bDOMAIN_GROUPS\b[^=]*=\s*\[([\s\S]*?)\n\];/);
-  const prefixes = groups ? [...groups[1].matchAll(/\[\s*["']([a-z0-9_]+_)["']\s*,/g)].map(([, prefix]) => prefix) : [];
-  if (prefixes.length === 0) throw new Error(`no DOMAIN_GROUPS prefixes found in ${TOOL_CATALOG}`);
-
-  const toolNames = new Set();
-  const verbs = new Set();
-  for (const file of codeFiles(join(repoDir, TOOL_SOURCES))) {
-    const source = readFileSync(file, 'utf8');
-    for (const [, , literal] of source.matchAll(SNAKE_LITERAL)) {
-      if (longestPrefix(literal, prefixes)) toolNames.add(literal);
-    }
-    for (const [, , name] of source.matchAll(TOOL_NAME_PROPERTY)) {
-      const prefix = longestPrefix(name, prefixes);
-      if (prefix) verbs.add(name.slice(prefix.length).split('_')[0]);
-    }
-  }
-  verbs.delete('');
-  if (verbs.size === 0) throw new Error(`no registered tool names found in ${TOOL_SOURCES}`);
-
-  const installers = walk(join(repoDir, INSTALLER_DIR), (name) => name.startsWith('install'));
-  const envNames = new Set();
-  for (const file of [...codeFiles(join(repoDir, CODE_DIR)), ...installers]) {
-    for (const [name] of readFileSync(file, 'utf8').matchAll(ENV_WORD)) envNames.add(name);
-  }
-
-  return { toolNames, envNames, toolPattern: toolNamePattern(prefixes, verbs) };
+  const manifest = readToolManifest(repoDir);
+  const tools = manifest.tools.filter((tool) => tool.kind === 'domain');
+  const toolNames = new Set(tools.map((tool) => tool.name));
+  const prefixes = manifest.toolPrefixes;
+  const verbs = new Set(tools.map((tool) => tool.name.slice(longestPrefix(tool.name, prefixes).length).split('_')[0]));
+  return { toolNames, envNames: new Set(manifest.environmentVariables), toolPattern: toolNamePattern(prefixes, verbs) };
 }
 
 export function findToolNames(markdown, toolPattern) {
@@ -286,12 +253,12 @@ export function checkDocs({ repoDir, files = docFiles(repoDir) }) {
     const where = relative(repoDir, file);
     for (const { name, line } of findToolNames(markdown, code.toolPattern)) {
       tools.add(name);
-      if (!code.toolNames.has(name)) problems.push(`${where}:${line}: no tool named \`${name}\` in ${TOOL_SOURCES}`);
+      if (!code.toolNames.has(name)) problems.push(`${where}:${line}: no tool named \`${name}\` in ${TOOL_MANIFEST_PATH}`);
     }
     for (const { name, line } of findEnvNames(markdown)) {
       env.add(name);
       if (!code.envNames.has(name)) {
-        problems.push(`${where}:${line}: environment variable \`${name}\` is not in ${CODE_DIR}/ or the ${INSTALLER_DIR}/install* installers`);
+        problems.push(`${where}:${line}: environment variable \`${name}\` is not in ${TOOL_MANIFEST_PATH}`);
       }
     }
   }

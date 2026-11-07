@@ -694,7 +694,7 @@ test("the tool adapter keeps the registry tool's name, schema, and argument repa
   const tool = toDurableTool(native);
   assert.equal(tool.name, native.name);
   assert.equal(tool.description, native.description);
-  assert.equal(tool.parameters, parameters);
+  assert.deepEqual(JSON.parse(JSON.stringify(tool.parameters)), JSON.parse(JSON.stringify(parameters)));
   assert.equal(tool.replay, "safe");
 
   const input = { ids: "U1" };
@@ -730,9 +730,16 @@ test("tool results become durable results with strict-JSON details", () => {
   });
 
   assert.deepEqual(toDurableToolResult(tool, {}, { content: [] }), { output: [] });
-  assert.deepEqual(toDurableToolResult(tool, {}, { summary: "no content array" }), {
-    output: [{ type: "text", text: '{"summary":"no content array"}' }],
+  assert.deepEqual(toDurableToolResult(tool, {}, { summary: "no content array", details: { token: SECRET } }), {
+    output: [{ type: "text", text: "The native tool returned invalid content." }],
+    isError: true,
   });
+});
+
+test("unsupported durable content never echoes unknown payloads into thrown errors", () => {
+  assert.throws(() => toDurableToolResult({ name: READ_TOOL, parameters: Type.Object({}) }, {}, {
+    content: [{ type: "unknown", payload: SECRET }],
+  }), (error) => error.message === "Unsupported native tool content block." && !error.message.includes(SECRET));
 });
 
 test("error results and thrown errors lose credential values before they reach the session", () => {

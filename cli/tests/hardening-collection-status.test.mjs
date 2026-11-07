@@ -1,151 +1,63 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { completeCollection, partialCollection, unavailableCollection, skippedCollection, collectionReadable, collectionComplete, collectionError, mapCollection, observedValue, populationValue } from "../dist/extensions/grc-tools/hardening/collection-status.js";
+const complete = completeCollection("users", [{ id: "u1" }], { status: 200, endpoint: "/users" });
+const empty = completeCollection("groups", []);
+const partial = partialCollection("users", [{ id: "u1" }], "page cap reached", { status: 206, endpoint: "/users?page=2" });
+const unavailable = unavailableCollection("roles", "403 Forbidden", { status: 403, endpoint: "/roles" });
+const skipped = skippedCollection("memberships", "roles were unavailable", unavailable.key);
 
-import {
-  coreDataValue,
-  countIfReadable,
-  datasetMarker,
-  datasetState,
-  datasetStatus,
-  derived,
-  derivedFlag,
-  gatedPrincipals,
-  ifComplete,
-  ifRead,
-  isAbsenceValue,
-  isComplete,
-  isReadable,
-  notCollected,
-  notRequested,
-  notRequestedDataset,
-  readDataset,
-  seenVersusTotal,
-  unreadableDataset,
-  withoutAbsenceClaims,
-} from "../dist/extensions/grc-tools/hardening/collection-status.js";
-
-const complete = readDataset([{ id: "u1" }, { id: "u2" }], { total: 2, status: 200, endpoint: "/v1/users" });
-const emptyComplete = readDataset([], { total: 0, status: 200, endpoint: "/v1/groups" });
-const truncated = readDataset([{ id: "u1" }], { truncated: true, total: 40, status: 200, endpoint: "/v1/users?limit=1" });
-const unreadable = unreadableDataset("GET /v1/roles failed with 403 Forbidden: non-JSON body (text/html, 512 bytes)", { status: 403, endpoint: "/v1/roles" });
-const notIssued = notRequestedDataset("roles", unreadable.error);
-
-test("dataset constructors produce exactly one state each", () => {
-  assert.equal(datasetState(complete), "complete");
-  assert.equal(datasetState(emptyComplete), "complete");
-  assert.equal(datasetState(truncated), "truncated");
-  assert.equal(datasetState(unreadable), "unreadable");
-  assert.equal(datasetState(notIssued), "not_requested");
-
-  assert.deepEqual(complete, { items: [{ id: "u1" }, { id: "u2" }], complete: true, truncated: false, total: 2, status: 200, endpoint: "/v1/users", error: null });
-  assert.deepEqual(readDataset([]), { items: [], complete: true, truncated: false, total: null, status: null, endpoint: null, error: null });
-  assert.deepEqual(unreadable, { items: [], complete: false, truncated: false, total: null, status: 403, endpoint: "/v1/roles", error: unreadable.error });
-  assert.deepEqual(notIssued, {
-    items: [],
-    complete: false,
-    truncated: false,
-    total: null,
-    status: null,
-    endpoint: null,
-    error: null,
-    notRequested: `Not requested: roles was not readable (${unreadable.error})`,
-  });
-  assert.equal(notRequestedDataset("roles").notRequested, "Not requested: roles was not readable");
-
-  assert.equal(isReadable(complete) && isReadable(truncated) && isReadable(emptyComplete), true);
-  assert.equal(isReadable(unreadable) || isReadable(notIssued), false);
-  assert.equal(isComplete(complete) && isComplete(emptyComplete), true);
-  assert.equal(isComplete(truncated) || isComplete(unreadable) || isComplete(notIssued), false);
-
-  const handRolledPartial = { items: [{ id: "x" }], complete: false, truncated: false, total: null, status: 200, endpoint: "/x", error: null };
-  assert.equal(datasetState(handRolledPartial), "truncated", "a read that is not complete is partial even without the flag");
+test("explicit outcomes distinguish partial, unreadable, skipped, and genuinely empty inventories", () => {
+  assert.equal(complete.state, "complete");
+  assert.equal(empty.state, "complete");
+  assert.equal(partial.state, "partial");
+  assert.equal(partial.reason, "page cap reached");
+  assert.equal(unavailable.state, "unavailable");
+  assert.equal(skipped.state, "skipped");
+  assert.equal(skipped.dependency, unavailable.key);
+  for (const outcome of [unavailable, skipped]) {
+    assert.equal("value" in outcome, false, "unread data must not become a placeholder empty list");
+    assert.equal(collectionReadable(outcome), false);
+    assert.equal(collectionComplete(outcome), false);
+  }
+  assert.equal(collectionReadable(partial), true);
+  assert.equal(collectionComplete(partial), false);
+  assert.equal(collectionComplete(empty), true);
+  assert.equal(collectionError(unavailable), "403 Forbidden");
+  assert.match(collectionError(skipped), /roles were unavailable/);
+  assert.equal(collectionError(complete), undefined);
 });
 
-test("core_data renders a readable dataset as its list and an unread one as a marker", () => {
-  assert.deepEqual(coreDataValue(complete), complete.items);
-  assert.deepEqual(coreDataValue(emptyComplete), [], "a readable empty inventory keeps its list shape");
-  assert.deepEqual(coreDataValue(truncated), truncated.items);
-  assert.deepEqual(coreDataValue(unreadable), { collected: false, status: 403, endpoint: "/v1/roles", error: unreadable.error });
-  assert.deepEqual(coreDataValue(notIssued), { collected: false, status: null, endpoint: null, error: notIssued.notRequested });
-
-  assert.equal(datasetMarker(complete), undefined);
-  assert.equal(datasetMarker(truncated), undefined);
-  assert.deepEqual(datasetMarker(unreadable), notCollected(unreadable.error, 403, "/v1/roles"));
-  assert.deepEqual(datasetMarker(notIssued), notRequested("roles", unreadable.error));
-  assert.deepEqual(notCollected("denied"), { collected: false, status: null, endpoint: null, error: "denied" });
-  assert.deepEqual(notRequested("users"), { collected: false, status: null, endpoint: null, error: "Not requested: users was not readable" });
-  assert.deepEqual(notRequested("users", null), notRequested("users"));
+test("projection preserves dependency identity and cannot fabricate data for an unavailable collection", () => {
+  assert.notEqual(completeCollection("users", []).key, complete.key);
+  const projected = mapCollection(partial, (users) => users.map((user) => user.id));
+  assert.equal(projected.key, partial.key);
+  assert.equal(projected.state, "partial");
+  assert.equal(projected.reason, partial.reason);
+  assert.equal(projected.status, 206);
+  assert.equal(projected.endpoint, "/users?page=2");
+  assert.deepEqual(projected.value, ["u1"]);
+  for (const outcome of [unavailable, skipped]) assert.equal(mapCollection(outcome, () => assert.fail("unread data must not be projected")), outcome);
 });
 
-test("datasetStatus reports counts and totals only for answered reads", () => {
-  assert.deepEqual(datasetStatus(complete), { state: "complete", count: 2, total: 2, truncated: false, status: 200, endpoint: "/v1/users", error: null });
-  assert.deepEqual(datasetStatus(emptyComplete), { state: "complete", count: 0, total: 0, truncated: false, status: 200, endpoint: "/v1/groups", error: null });
-  assert.deepEqual(datasetStatus(truncated), { state: "truncated", count: 1, total: 40, truncated: true, status: 200, endpoint: "/v1/users?limit=1", error: null });
-  assert.deepEqual(datasetStatus(unreadable), { state: "unreadable", count: null, total: null, truncated: null, status: 403, endpoint: "/v1/roles", error: unreadable.error });
-  assert.deepEqual(datasetStatus(notIssued), { state: "not_requested", count: null, total: null, truncated: null, status: null, endpoint: null, error: notIssued.notRequested });
+test("observations under partial reads remain sightings, including zero seen records and observed flags", () => {
+  for (const value of [0, 1, false, true, [], ["u1"], {}, { count: 1 }]) assert.equal(observedValue(value, partial), value);
+  assert.equal(observedValue(5, complete, unavailable), null);
+  assert.equal(observedValue(5, skipped), null);
 });
 
-test("derived values render null under an unread source and null for absence claims under a partial source", () => {
-  assert.equal(derived(2, complete), 2);
-  assert.equal(derived(0, complete), 0, "a complete read proves a zero");
-  assert.deepEqual(derived([], emptyComplete), []);
-  assert.equal(derived(1, truncated), 1, "a positive sighting under a partial read stands");
-  assert.equal(derived(0, truncated), null, "a partial read cannot prove a zero");
-  assert.equal(derived([], truncated), null);
-  assert.deepEqual(derived({}, truncated), null);
-  assert.deepEqual(derived({ a: 1 }, truncated), { a: 1 });
-  assert.equal(derived(5, unreadable), null);
-  assert.equal(derived(5, notIssued), null);
-  assert.equal(derived(5, complete, unreadable), null, "one unread source nulls the whole derivation");
-  assert.equal(derived(0, complete, truncated), null);
-  assert.equal(derived(3, complete, truncated), 3);
-  assert.equal(derived(7), 7, "no sources means nothing withheld");
-
-  assert.equal(derivedFlag(true, truncated), true);
-  assert.equal(derivedFlag(false, truncated), null);
-  assert.equal(derivedFlag(false, complete), false);
-  assert.equal(derivedFlag(true, unreadable), null);
-  assert.equal(derivedFlag(false, complete, notIssued), null);
-
-  assert.equal(countIfReadable(0, emptyComplete), 0);
-  assert.equal(countIfReadable(1, truncated), 1, "a count of what was seen is a fact about the read");
-  assert.equal(countIfReadable(0, unreadable), null);
-  assert.equal(countIfReadable(4, complete, notIssued), null);
-
-  assert.equal(ifRead(truncated, "seen"), "seen");
-  assert.equal(ifRead(unreadable, "seen"), null);
-  assert.equal(ifComplete("all", complete, emptyComplete), "all");
-  assert.equal(ifComplete("all", complete, truncated), null);
+test("population claims require every dependency to be complete regardless of the JavaScript value shape", () => {
+  for (const value of [0, 1, false, true, [], ["u1"], {}, { count: 1 }]) {
+    assert.equal(populationValue(value, partial), null);
+    assert.equal(populationValue(value, complete, unavailable), null);
+    assert.equal(populationValue(value, skipped), null);
+    assert.equal(populationValue(value, complete, empty), value);
+  }
 });
 
-test("isAbsenceValue names the values that claim nothing exists", () => {
-  for (const value of [0, [], {}]) assert.equal(isAbsenceValue(value), true);
-  for (const value of [1, -1, [0], { a: null }, "", null, undefined, false, "0"]) assert.equal(isAbsenceValue(value), false, `${JSON.stringify(value)} is not an absence claim`);
-});
-
-test("seenVersusTotal phrases progress for known and unknown totals", () => {
-  assert.equal(seenVersusTotal(40, 120), "seen 40 of 120");
-  assert.equal(seenVersusTotal(0, 0), "seen 0 of 0");
-  assert.equal(seenVersusTotal(40, null), "40 seen, total unknown");
-  assert.equal(seenVersusTotal(40, undefined), "40 seen, total unknown");
-});
-
-test("withoutAbsenceClaims nulls absence values under a partial read and passes a complete one through", () => {
-  const evidence = { admins: 0, groups: [], policies: {}, users: 3, names: ["a"], enabled: false, note: "x" };
-  assert.deepEqual(withoutAbsenceClaims(evidence, true), evidence);
-  assert.deepEqual(withoutAbsenceClaims(evidence, false), { admins: null, groups: null, policies: null, users: 3, names: ["a"], enabled: false, note: "x" });
-  assert.deepEqual(withoutAbsenceClaims(undefined, false), {});
-  assert.deepEqual(withoutAbsenceClaims(undefined, true), {});
-});
-
-test("gatedPrincipals emits named principals only for a complete read", () => {
-  const principals = { admins_without_mfa: ["alice", "bob"], admin_count: 2, stale_accounts: [] };
-  assert.deepEqual(gatedPrincipals(principals, true, []), { ...principals, principals_withheld: null });
-  assert.deepEqual(gatedPrincipals(principals, false, ["users: seen 40 of 120", "roles: not collected"]), {
-    admins_without_mfa: null,
-    admin_count: null,
-    stale_accounts: null,
-    principals_withheld: "users: seen 40 of 120; roles: not collected",
-  });
-  assert.deepEqual(gatedPrincipals(undefined, false, ["users: seen 40 of 120"]), {});
+test("security evidence distinguishes a spotted inactive account from an exhaustive list", () => {
+  assert.deepEqual(observedValue(["u1"], partial), ["u1"]);
+  assert.equal(populationValue(["u1"], partial), null);
+  assert.equal(populationValue(0, empty), 0, "a complete empty inventory proves absence");
+  assert.equal(populationValue(false, partial), null, "a negative security claim needs complete evidence");
 });

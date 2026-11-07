@@ -12,10 +12,11 @@ import { awaitWithContext } from "@earendil-works/chord/context";
 import type { TSchema } from "@earendil-works/pi-ai";
 import { defineTool, type ToolExecutionResult, type ToolRegistration } from "@earendil-works/pi-durable";
 import { collectRegisteredGrcTools, type GrcToolResult, type RegisteredGrcTool } from "../core/registry.js";
-import { redactSensitiveArguments, redactToolErrorText } from "../core/redact.js";
+import { redactToolErrorDetails, redactToolErrorText } from "../core/redact.js";
 import { Assessment, recordToolOutcome } from "./document.js";
 import { toStrictJson } from "./json.js";
 import { durableReplayPolicy } from "./replay.js";
+import { disableArgumentCoercion } from "../pi/schema.js";
 
 type DurableToolOutput = NonNullable<ToolExecutionResult["output"]>;
 
@@ -30,9 +31,6 @@ function describeError(error: unknown): string {
 }
 
 function toDurableOutput(result: GrcToolResult): DurableToolOutput {
-  if (!Array.isArray(result?.content)) {
-    return [{ type: "text", text: JSON.stringify(toStrictJson(result) ?? null) }];
-  }
   return result.content.map((block) => {
     switch (block.type) {
       case "text":
@@ -41,7 +39,8 @@ function toDurableOutput(result: GrcToolResult): DurableToolOutput {
         return { type: "image", data: block.data, mimeType: block.mimeType };
       default: {
         const exhaustive: never = block;
-        throw new Error(`Unsupported grclanker tool content: ${JSON.stringify(exhaustive)}`);
+        void exhaustive;
+        throw new Error("Unsupported native tool content block.");
       }
     }
   });
@@ -53,6 +52,9 @@ export function toDurableToolResult(
   args: unknown,
   result: GrcToolResult,
 ): ToolExecutionResult {
+  if (!Array.isArray(result?.content)) {
+    return { output: [{ type: "text", text: "The native tool returned invalid content." }], isError: true };
+  }
   const isError = result?.isError === true;
   let output = toDurableOutput(result);
   let details: JsonValue | undefined = toStrictJson(result?.details);
@@ -62,7 +64,7 @@ export function toDurableToolResult(
       block.type === "text" ? { ...block, text: redactToolErrorText(block.text, args, tool.parameters) } : block,
     );
     if (output.length === 0) output = [{ type: "text", text: `${tool.name} failed without a message.` }];
-    details = toStrictJson(redactSensitiveArguments(details, tool.parameters));
+    details = toStrictJson(redactToolErrorDetails(details, args, tool.parameters));
   }
 
   return {
@@ -111,7 +113,7 @@ export function toDurableTool(tool: DurableBridgeableTool): ToolRegistration {
   return defineTool({
     name: tool.name,
     description: tool.description,
-    parameters: tool.parameters as unknown as TSchema,
+    parameters: disableArgumentCoercion({ parameters: tool.parameters }).parameters as unknown as TSchema,
     replay,
     // The Harness may run the repair again on retry and requires it not to mutate its input.
     ...(prepareArguments ? { prepareArguments: (args: unknown) => prepareArguments(structuredClone(args)) } : {}),

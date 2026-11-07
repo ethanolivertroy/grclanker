@@ -1,5 +1,4 @@
-import { readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { readToolManifest } from '../../scripts/lib/tool-manifest.mjs';
 import type { AdvancedIndex } from 'fumadocs-core/search/server';
 import { getDocHref } from './docs';
 import { identifierContents } from './search-identifiers.mjs';
@@ -23,10 +22,8 @@ const sitePages = [
 // the sections that use their other words.
 const identifiersOnlySections = ['/docs/integrations/', '/docs/fedramp/'];
 
-// `sync:cursor-tools` writes one file per registered tool, named after it.
-const toolNames = new Set(
-  readdirSync(join(process.cwd(), 'cli/adapters/cursor-grok/bot/tools')).map((file) => file.replace(/\.ts$/, '')),
-);
+// All website tooling uses the same neutral catalog, independent of SDK adapter output.
+const toolNames = new Set(readToolManifest().tools.filter((tool) => tool.kind === 'domain').map((tool) => tool.name));
 
 // A hit shows its sidebar section above the page title. That is what tells a
 // FedRAMP KSI domain such as "Incident Response" apart from the guides.

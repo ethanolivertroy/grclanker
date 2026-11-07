@@ -1,35 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-
-export interface SpecMeta {
-  slug: string;
-  name: string;
-  vendor: string;
-  category: string;
-  language: string;
-  status: string;
-  version: string;
-  source_repo: string;
-  source_pr?: string;
-  contributor?: string;
-  contributor_url?: string;
-  last_updated: string;
-}
-
-export function parseFrontmatter(raw: string): { meta: SpecMeta; content: string } {
-  const normalized = raw.replace(/\r\n/g, '\n');
-  const match = normalized.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
-  if (!match) throw new Error('Invalid frontmatter');
-  const meta: Record<string, string> = {};
-  match[1].split('\n').forEach(line => {
-    const colonIdx = line.indexOf(':');
-    if (colonIdx === -1) return;
-    const key = line.slice(0, colonIdx).trim();
-    const val = line.slice(colonIdx + 1).trim().replace(/^["']|["']$/g, '');
-    if (key) meta[key] = val;
-  });
-  return { meta: meta as unknown as SpecMeta, content: match[2] };
-}
+import { parseDocument } from 'yaml';
+import { z } from 'zod';
 
 export interface SpecCategoryGroup {
   label: string;
@@ -49,7 +21,7 @@ export const categoryLabels: Record<string, string> = {
 
 /**
  * Category names that generated specs carry from the CLI registry, mapped to the catalog group each belongs to.
- * The catalog leaves out a spec whose category is neither a group key nor listed here.
+ * Unknown categories fail at the metadata boundary instead of hiding a spec.
  */
 export const categoryAliases: Record<string, string> = {
   'application-security': 'vulnerability-application-security',
@@ -70,11 +42,43 @@ export const categoryAliases: Record<string, string> = {
 
 /** The catalog group key for a spec's frontmatter category. */
 export function getCategoryKey(category: string) {
-  return categoryAliases[category] ?? category;
+  const key = categoryAliases[category] ?? category;
+  if (!Object.hasOwn(categoryLabels, key)) throw new Error(`Unknown spec category: ${category}`);
+  return key;
 }
 
 export function getCategoryLabel(category: string) {
-  return categoryLabels[getCategoryKey(category)] ?? category;
+  return categoryLabels[getCategoryKey(category)];
+}
+
+const nonempty = z.string().trim().min(1);
+const httpUrl = z.url().refine((value) => /^https?:\/\//.test(value), 'Expected an HTTP(S) URL');
+
+export const specMetadataSchema = z.object({
+  slug: nonempty.regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  name: nonempty,
+  vendor: nonempty,
+  category: nonempty.refine((value) => Object.hasOwn(categoryLabels, categoryAliases[value] ?? value), 'Unknown spec category'),
+  language: nonempty,
+  status: z.enum(['generated', 'implemented', 'spec-only']),
+  version: nonempty,
+  source_repo: httpUrl,
+  source_pr: httpUrl.optional(),
+  contributor: nonempty.optional(),
+  contributor_url: httpUrl.optional(),
+  last_updated: z.iso.date(),
+});
+
+export type SpecMeta = z.infer<typeof specMetadataSchema>;
+export interface SpecDocument { meta: SpecMeta; content: string }
+
+/** Parse real YAML, including generator-escaped strings, then validate the metadata contract. */
+export function parseFrontmatter(raw: string): SpecDocument {
+  const match = raw.replace(/\r\n/g, '\n').match(/^---\n([\s\S]*?)\n---(?:\n|$)([\s\S]*)$/);
+  if (!match) throw new Error('Invalid spec frontmatter');
+  const document = parseDocument(match[1], { uniqueKeys: true });
+  if (document.errors.length) throw new Error(`Invalid spec YAML: ${document.errors[0].message}`);
+  return { meta: specMetadataSchema.parse(document.toJS({ maxAliasCount: 0 })), content: match[2] };
 }
 
 export const RAW_BASE = 'https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs';
@@ -93,19 +97,37 @@ export function getSpecGuideSlug(slug: string) {
 
 const specsDir = join(process.cwd(), 'specs');
 
-export function readSpecs(): Array<{ meta: SpecMeta; content: string }> {
-  return readdirSync(specsDir)
-    .filter((file) => file.endsWith('.spec.md'))
-    .map((file) => parseFrontmatter(readFileSync(join(specsDir, file), 'utf8')))
-    .sort((a, b) => a.meta.name.localeCompare(b.meta.name));
+/** Load and validate the complete collection before exposing routes or metadata. */
+export function loadSpecCatalog(directory: string) {
+  const bySlug = new Map<string, SpecDocument>();
+  for (const file of readdirSync(directory).filter((name) => name.endsWith('.spec.md'))) {
+    let spec: SpecDocument;
+    try {
+      spec = parseFrontmatter(readFileSync(join(directory, file), 'utf8'));
+    } catch (error) {
+      throw new Error(`${file}: ${error instanceof Error ? error.message : 'Invalid spec metadata'}`, { cause: error });
+    }
+    if (bySlug.has(spec.meta.slug)) throw new Error(`${file}: duplicate spec slug ${spec.meta.slug}`);
+    if (file !== `${spec.meta.slug}.spec.md`) throw new Error(`${file}: filename does not match spec slug ${spec.meta.slug}`);
+    bySlug.set(spec.meta.slug, spec);
+  }
+  const specs = [...bySlug.values()].sort((a, b) => a.meta.name.localeCompare(b.meta.name));
+  return { specs, metadata: specs.map((spec) => spec.meta), bySlug };
+}
+
+let catalog: ReturnType<typeof loadSpecCatalog> | undefined;
+const getCatalog = () => (catalog ??= loadSpecCatalog(specsDir));
+
+export function readSpecs(): SpecDocument[] {
+  return getCatalog().specs.slice();
 }
 
 export function loadSpecs(): SpecMeta[] {
-  return readSpecs().map((spec) => spec.meta);
+  return getCatalog().metadata.slice();
 }
 
 export function getSpec(slug: string) {
-  return readSpecs().find((spec) => spec.meta.slug === slug);
+  return getCatalog().bySlug.get(slug);
 }
 
 export function groupSpecsByCategory(specs: SpecMeta[] = loadSpecs()): Record<string, SpecCategoryGroup> {
@@ -116,7 +138,7 @@ export function groupSpecsByCategory(specs: SpecMeta[] = loadSpecs()): Record<st
   });
 
   specs.forEach((spec) => {
-    categories[getCategoryKey(spec.category)]?.specs.push(spec);
+    categories[getCategoryKey(spec.category)].specs.push(spec);
   });
 
   return categories;

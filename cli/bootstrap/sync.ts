@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { getBootstrapStatePath } from "../config/paths.js";
+import { commitFileTransactionSync, recoverFileTransactionSync, type FileReplacement, type FileTransactionOptions } from "../core/atomic-files.js";
 
 type BootstrapRecord = {
   lastAppliedSourceHash: string;
@@ -37,11 +38,6 @@ function readBootstrapState(path: string): BootstrapState {
   } catch {
     return { version: 1, files: {} };
   }
-}
-
-function writeBootstrapState(path: string, state: BootstrapState): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(state, null, 2) + "\n", "utf8");
 }
 
 function listFiles(root: string): string[] {
@@ -82,6 +78,7 @@ function syncManagedFiles(
   scope: string,
   state: BootstrapState,
   result: BootstrapSyncResult,
+  replacements: FileReplacement[],
 ): void {
   const sourcePaths = new Set(listFiles(sourceRoot).map((sourcePath) => relative(sourceRoot, sourcePath)));
 
@@ -99,8 +96,7 @@ function syncManagedFiles(
       continue;
     }
 
-    rmSync(targetPath, { force: true });
-    removeEmptyParentDirectories(targetPath, targetRoot);
+    replacements.push({ path: targetPath, data: null });
     delete state.files[scopedKey];
     delete state.files[key];
   }
@@ -113,10 +109,8 @@ function syncManagedFiles(
     const scopedKey = `${scope}:${key}`;
     const previous = state.files[scopedKey] ?? state.files[key];
 
-    mkdirSync(dirname(targetPath), { recursive: true });
-
     if (!existsSync(targetPath)) {
-      writeFileSync(targetPath, sourceData);
+      replacements.push({ path: targetPath, data: sourceData });
       state.files[scopedKey] = {
         lastAppliedSourceHash: sourceHash,
         lastAppliedTargetHash: sourceHash,
@@ -143,7 +137,7 @@ function syncManagedFiles(
       continue;
     }
 
-    writeFileSync(targetPath, sourceData);
+    replacements.push({ path: targetPath, data: sourceData });
     state.files[scopedKey] = {
       lastAppliedSourceHash: sourceHash,
       lastAppliedTargetHash: sourceHash,
@@ -153,15 +147,29 @@ function syncManagedFiles(
   }
 }
 
-export function syncBundledAssets(appRoot: string, agentDir: string): BootstrapSyncResult {
+export function syncBundledAssets(
+  appRoot: string,
+  agentDir: string,
+  persistence: Pick<FileTransactionOptions, "beforeCommit"> = {},
+): BootstrapSyncResult {
   const statePath = getBootstrapStatePath();
+  const journalPath = `${statePath}.transaction.json`;
+  recoverFileTransactionSync(journalPath);
   const state = readBootstrapState(statePath);
   const result: BootstrapSyncResult = { copied: [], updated: [], skipped: [] };
+  const replacements: FileReplacement[] = [];
 
-  syncManagedFiles(resolve(appRoot, ".grclanker", "themes"), resolve(agentDir, "themes"), "themes", state, result);
-  syncManagedFiles(resolve(appRoot, ".grclanker", "agents"), resolve(agentDir, "agents"), "agents", state, result);
-  syncManagedFiles(resolve(appRoot, "skills"), resolve(agentDir, "skills"), "skills", state, result);
+  syncManagedFiles(resolve(appRoot, ".grclanker", "themes"), resolve(agentDir, "themes"), "themes", state, result, replacements);
+  syncManagedFiles(resolve(appRoot, ".grclanker", "agents"), resolve(agentDir, "agents"), "agents", state, result, replacements);
+  syncManagedFiles(resolve(appRoot, "skills"), resolve(agentDir, "skills"), "skills", state, result, replacements);
 
-  writeBootstrapState(statePath, state);
+  const serialized = JSON.stringify(state, null, 2) + "\n";
+  if (!existsSync(statePath) || readFileSync(statePath, "utf8") !== serialized) {
+    replacements.push({ path: statePath, data: serialized, mode: 0o600 });
+  }
+  if (replacements.length > 0) commitFileTransactionSync(replacements, { journalPath, ...persistence });
+  for (const replacement of replacements) {
+    if (replacement.data === null) removeEmptyParentDirectories(replacement.path, agentDir);
+  }
   return result;
 }
