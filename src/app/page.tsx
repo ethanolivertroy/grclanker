@@ -10,7 +10,7 @@ import { loadSpecs } from '../lib/specs';
 export const metadata = pageMetadata({
   title: 'grclanker: Put a Clanker on Your Compliance',
   description:
-    '241 domain tools across 35 vendor integrations and CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL, with Pi, Cursor Agent SDK, Flue, and experimental durable runtime paths.',
+    'A GRC engineering assistant with 241 domain tools and independent Pi, OpenAI Agents SDK, Codex SDK, and Cursor / Grok deployment guides. Claude Agent SDK is planned.',
   path: '/',
 });
 
@@ -55,6 +55,39 @@ const workflowCards = [
   },
 ];
 
+const deploymentCards = [
+  {
+    label: 'Pi Terminal CLI',
+    status: 'Release bundle or source',
+    href: '/docs/getting-started/pi-runtime/',
+    description: 'An interactive GRC engineer in your terminal, with local or hosted models and selectable compute backends.',
+  },
+  {
+    label: 'OpenAI Agents SDK',
+    status: 'Source adapter',
+    href: '/docs/getting-started/openai-agents-sdk/',
+    description: 'Build a TypeScript GRC agent with the OpenAI agent loop, selected native tools, and human approvals.',
+  },
+  {
+    label: 'Codex SDK',
+    status: 'Source example',
+    href: '/docs/getting-started/codex-sdk/',
+    description: 'Give Codex your GRC role and an explicit set of evidence tools through a local MCP server.',
+  },
+  {
+    label: 'Cursor / Grok Agent SDK',
+    status: 'Source project · local harness',
+    href: '/docs/getting-started/agent-sdk/',
+    description: 'Run the @grok/agent-sdk project with native GRC tools, workflow skills, and auditor and verifier personas.',
+  },
+  {
+    label: 'Claude Agent SDK',
+    status: 'Planned',
+    href: '/docs/getting-started/claude-agent-sdk/',
+    description: 'Track the intended Claude integration and the requirements for a supported standalone guide.',
+  },
+];
+
 function releaseFacts(integrationSpecCount: number) {
   return [
     {
@@ -63,9 +96,9 @@ function releaseFacts(integrationSpecCount: number) {
         'Native checks, assessments, and evidence exports cover 35 vendor integrations, plus CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools. The v0.1.4 release bundle carries all of them.',
     },
     {
-      label: 'Four runtime paths',
+      label: 'Release and source runtimes',
       detail:
-        'Use the Pi terminal CLI, run the same agent from source with the Cursor Agent SDK, use the bundled Flue runner and official Flue CLI, or opt in to the experimental durable runtime, which can resume a crashed or stopped run.',
+        'The release includes Pi, Flue, and the experimental durable runtime. Source integrations add OpenAI Agents SDK, Codex SDK, and Cursor / Grok Agent SDK. Claude Agent SDK is planned.',
     },
     {
       label: 'Hardened evidence',
@@ -150,8 +183,8 @@ export default function HomePage() {
                 Put a clanker on it.
               </h1>
               <p className="mx-auto mt-5 max-w-2xl text-base md:text-lg text-subtext1 leading-relaxed italic hero-copy-lede">
-                241 domain tools. 35 vendor integrations. Pi, Cursor Agent SDK, Flue, and experimental durable runtime
-                paths.
+                Your GRC engineering assistant. 241 domain tools. 35 vendor integrations. Choose Pi, OpenAI Agents SDK,
+                Codex SDK, or Cursor / Grok Agent SDK.
               </p>
             </div>
 
@@ -159,8 +192,8 @@ export default function HomePage() {
               <HeroInstall />
 
               <div className="hero-action-row">
-                <Link href="/docs/getting-started/installation/" className="hero-primary-link">
-                  Get Started
+                <Link href="/docs/getting-started/deployment/" className="hero-primary-link">
+                  Choose Your Deployment
                 </Link>
                 <a href={githubUrl} target="_blank" rel="noopener" className="hero-secondary-link">
                   GitHub
@@ -204,6 +237,32 @@ export default function HomePage() {
 
       <div className="max-w-content mx-auto px-6 pt-5 pb-8 md:pt-7 md:pb-10 space-y-8">
         <HeroBrandRail />
+
+        <section className="viewscreen rounded-xl scanlines relative overflow-hidden" aria-labelledby="deployment-heading">
+          <div className="relative z-10 p-5 md:p-6">
+            <h2 id="deployment-heading" className="font-semibold text-sm tracking-widest uppercase text-blue">
+              Choose Your GRC Engineer
+            </h2>
+            <p className="text-subtext0 text-sm mt-2 leading-relaxed">
+              Each deployment has its own complete guide, from installation to your first assessment. Connect your
+              evidence sources, map findings to controls, and prioritize the work your organization needs next.
+            </p>
+            <div className="workflow-grid">
+              {deploymentCards.map((item) => (
+                <Link key={item.href} href={item.href} className="workflow-row group focus-visible:outline-2 focus-visible:outline-blue">
+                  <div className="font-mono text-sm text-sapphire group-hover:underline">{item.label}</div>
+                  <div className="text-xs text-subtext1 mt-1">{item.status}</div>
+                  <div className="text-subtext0 text-sm mt-2 leading-relaxed">{item.description}</div>
+                </Link>
+              ))}
+            </div>
+            <p className="text-subtext0 text-sm mt-4">
+              Cursor and Grok use the same SDK package.{' '}
+              <Link href="/docs/getting-started/deployment/" className="text-blue underline underline-offset-2">Compare all runtimes</Link>,
+              including Flue and the experimental durable runtime.
+            </p>
+          </div>
+        </section>
 
         <section className="viewscreen rounded-xl scanlines relative overflow-hidden hero-briefing">
           <div className="relative z-10 p-5 md:p-6">

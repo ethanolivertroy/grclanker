@@ -1,0 +1,17 @@
+{
+  "name": "grclanker-codex-sdk-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "scripts": {
+    "start": "node main.mjs",
+    "check": "node check.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@openai/codex-sdk": "0.167.0"
+  }
+}

@@ -52,6 +52,12 @@ All specs are available as raw markdown. Point your agent at any URL below.
 ## Docs
 
 - [Documentation](https://grclanker.com/docs/): Installation, runtimes, integration guides, workflows, and FedRAMP reference
+- [Choose a deployment](https://grclanker.com/docs/getting-started/deployment/): Independent GRC engineer deployment paths and availability
+- [Pi terminal CLI](https://grclanker.com/docs/getting-started/pi-runtime/): Complete terminal setup with local or hosted models
+- [OpenAI Agents SDK](https://grclanker.com/docs/getting-started/openai-agents-sdk/): Standalone TypeScript adapter, credentials, tools, approvals, and runner
+- [Codex SDK](https://grclanker.com/docs/getting-started/codex-sdk/): Standalone Codex example with selected GRC tools over local MCP
+- [Cursor / Grok Agent SDK](https://grclanker.com/docs/getting-started/agent-sdk/): Complete local @grok/agent-sdk project setup
+- [Claude Agent SDK plan](https://grclanker.com/docs/getting-started/claude-agent-sdk/): Planned integration; no shipped adapter
 - [Tool catalog](https://grclanker.com/docs/tools/catalog/): Native tools the CLI registers, grouped by domain
 - [Using specs as inputs](https://grclanker.com/docs/specs/using-specs-as-inputs/): How to inspect, extend, or reimplement an integration from its spec
 
