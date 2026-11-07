@@ -45,6 +45,8 @@ grclanker tools
 
 `grclanker tools` should report `241 domain tools + 7 compute backend tools`. `npm link` has to run from inside `cli/`, where it puts the `cli/bin/grclanker.js` launcher on your `PATH`. `npm --prefix cli link` does not, because `--prefix` also redirects npm's global link directory into the checkout.
 
+That sequence builds and links the Pi terminal CLI. A fork that only runs the Cursor Agent SDK project stops after `npm --prefix cli ci`. That install is the `cli/` tree the agent loads. Leave `npm --prefix cli run build`, `npm link`, the `grclanker` binary, `grclanker setup`, and Ollama unused. The marketing site and the docs build at the repository root (`npm install`, `npm run dev`, `npm run build`) are unused on that path too. Continue at [Cursor Agent SDK](#cursor-agent-sdk). Node.js 22.19 or newer still applies. A model turn needs a Cursor credential. `validate` and `tool call` do not.
+
 ## Quick start
 
 The release installer links `grclanker` into `~/.local/bin`. A source checkout does the same with the `npm link` step above. The commands below use that name.
@@ -170,19 +172,22 @@ The default backend is `host`, the local shell. `grclanker setup --compute <kind
 
 ## Cursor Agent SDK
 
-From a source checkout, the same 241 domain tools can run as a [Cursor Agent SDK](https://cursor.com/docs/agent-sdk) agent. The project is `cli/agent-sdk/`, an adapter over the bundled extension, built on [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.6.0. It does not expose `bash`, `read`, `write`, `edit`, `ls`, `find`, or `grep`. The Cursor harness supplies `shell` plus `Read`, `Write`, `StrReplace`, `Grep`, `Glob`, `LS`, and `Delete`. Turns that leave the model unset use `grok-4.7` with `reasoning_effort=high` and `fast=true`.
-
-199 tools declare `effect: "read"`. The other 42 write files (exports, generators, the Google Workspace operator evidence collector, and OSCAL workspace commands) and wait for a person to approve a model-initiated call.
-
-`@grok/agent-sdk` is a CLI devDependency. `npm --prefix cli ci` installs it and its `agent-sdk` CLI:
+From a source checkout, the same 241 domain tools can run as a [Cursor Agent SDK](https://cursor.com/docs/agent-sdk) agent, with the site, the docs build, `npm link`, the `grclanker` binary, `grclanker setup`, and Ollama left unused. The project is `cli/agent-sdk/`, an adapter over the bundled extension, built on [`@grok/agent-sdk`](https://www.npmjs.com/package/@grok/agent-sdk) 0.6.0. The tools live in the `cli/` package. `cli/agent-sdk/package.json` has no dependencies, so install from `cli/`:
 
 ```bash
+npm --prefix cli ci
 npm --prefix cli run agent-sdk:validate
 npm --prefix cli run agent-sdk:info
 npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-44228"}'
 ```
 
-`validate`, `info`, and `tool call` need no Cursor credential. Model turns (`agent-sdk:dev`, `agent-sdk:run`) need one: run `npx agent-sdk login` inside `cli/`, or export `CURSOR_API_KEY`. See [Cursor Agent SDK](https://grclanker.com/docs/getting-started/agent-sdk/).
+`npm --prefix cli ci` installs that tree, including Pi, because the adapter loads the extension from there. The install's postinstall rebrands the embedded Pi package, and the install fails if that step fails. The Agent SDK scripts do not launch `grclanker`. `validate`, `info`, and `tool call` need no prior `npm --prefix cli run build` and no Cursor credential. The 29 reference tools (CMVP, KEV/EPSS, SCF, FedRAMP, and OSCAL) need no tenant. The 212 platform tools need the same credentials as the CLI.
+
+Model turns (`agent-sdk:dev`, `agent-sdk:run`) need a Cursor credential before they start. Run `npx agent-sdk login` inside `cli/`, or set `CURSOR_API_KEY` on the `agent-sdk` process. `npx agent-sdk whoami` reports whether a credential is present. Turns that leave the model unset use `grok-4.7` with `reasoning_effort=high` and `fast=true`.
+
+The project does not expose `bash`, `read`, `write`, `edit`, `ls`, `find`, or `grep`. The Cursor harness supplies `shell` plus `Read`, `Write`, `StrReplace`, `Grep`, `Glob`, `LS`, and `Delete`. `shell` is unsandboxed and inherits the process environment. The `Allowed:` lines for `auditor` and `verifier` are prompt text on this path. See [Cursor Agent SDK](https://grclanker.com/docs/getting-started/agent-sdk/).
+
+199 tools declare `effect: "read"`. The other 42 write files (exports, generators, the Google Workspace operator evidence collector, and OSCAL workspace commands) and wait for a person to approve a model-initiated call.
 
 ## Flue
 

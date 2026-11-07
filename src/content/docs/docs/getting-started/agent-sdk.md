@@ -9,15 +9,29 @@ The Agent SDK lets you define, test, and run agents as a folder of Markdown and 
 
 ## Quick start
 
-From a clone of the repo, on Node.js 22.19 or newer:
+This path runs from a clone of the repo and uses the `cli/` package. Node.js 22.19 or newer, never Bun. `@grok/agent-sdk` itself accepts 22.13. The grclanker tools it loads use the CLI package's 22.19 floor. The site package at the repository root asks for 22.22, and that floor applies when you build the site.
 
 ```bash
+git clone https://github.com/ethanolivertroy/grclanker.git
+cd grclanker
 npm --prefix cli install
 npm --prefix cli run agent-sdk:validate
 npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-44228"}'
 ```
 
-The last command runs one grclanker tool with no model turn and prints a JSON envelope with `"ok": true` and the matching Log4j entries from the CISA KEV feed. It needs network access but no Cursor credential.
+`npm --prefix cli install` installs the `cli/` tree: `@grok/agent-sdk`, the tool implementations under `cli/extensions/grc-tools/`, and the prompts and personas the adapter reads. Install from `cli/`. `cli/agent-sdk/package.json` has no dependencies, so an install inside that directory does not provide the `agent-sdk` CLI or the tools. The install runs `cli/scripts/patch-embedded-pi.mjs`, which rebrands the embedded Pi package. The Agent SDK scripts do not launch `grclanker`. The install fails if that patch fails.
+
+`validate` and `tool call` need no prior `npm --prefix cli run build`. The SDK loads the TypeScript sources. The last command runs one grclanker tool with no model turn and prints a JSON envelope with `"ok": true` and the matching Log4j entries from the CISA KEV feed. It needs network access. A Cursor credential is optional for that command.
+
+### What this path leaves unused
+
+- The repository-root site and its docs build (`npm install` and `npm run build` at the repo root)
+- `npm --prefix cli run build`, `npm link`, and the `grclanker` binary
+- `grclanker setup`, Ollama, and `~/.grclanker/agent/settings.json`
+
+[Configuration](/docs/getting-started/configuration/) describes that settings file for the Pi terminal CLI. The Agent SDK project does not read it, and `grclanker setup` does not select this agent's model. Set `GRCLANKER_AGENT_SDK_MODEL` to a Cursor model id when you want one other than the default below.
+
+A model turn needs a Cursor credential before it starts. Sign in once with `npx agent-sdk login` inside `cli/`, or set `CURSOR_API_KEY` on the `agent-sdk` process. `npx agent-sdk whoami` reports whether a credential is present. The SDK also accepts `CURSOR_API_KEY_FILE` and `CURSOR_SERVICE_ACCOUNT_KEY`.
 
 ## What the agent exposes
 
@@ -30,6 +44,12 @@ The last command runs one grclanker tool with no model turn and prints a JSON en
 | `cli/.grclanker/agents/{auditor,verifier}.md` | Subagents named `auditor` and `verifier` |
 
 Pi's compute-backend tools (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) are not exposed. The Cursor harness supplies `shell` plus the native file tools `Read`, `Write`, `StrReplace`, `Grep`, `Glob`, `LS`, and `Delete`, so the `docker`, `sandbox-runtime`, and `parallels-vm` compute backends do not apply to this run mode. A successful file read is `{ status: "success", value: { content } }`.
+
+`bot/agent.ts` leaves the harness sandbox off and does not set a built-in tool allowlist. `shell` runs with the `agent-sdk` process environment, including any tenant credentials that process holds, and shell commands auto-approve. The approval gate on the 42 domain writers does not cover `shell`, `Write`, `StrReplace`, or `Delete`.
+
+`auditor` and `verifier` inherit that same surface. The `Allowed:` lines in their persona files are instructions for the model. This runtime does not filter their tools. The Flue runtime mounts only the tools those lines name.
+
+The four workflow skills are the Pi prompt files with an empty subject, so the conversation supplies the subject. Slash commands such as `/investigate` are not available here. Load the matching skill.
 
 Each tool keeps the same behavior as in the CLI:
 
@@ -60,7 +80,7 @@ The Agent SDK project runs from a source checkout. `@grok/agent-sdk` is a devDep
 
 `validate`, `info`, and `tool call` need no Cursor credential. `tool call` runs a server tool deterministically with no model turn, which is the fastest way to confirm a tool works before blaming a prompt.
 
-Model turns need a Cursor credential. Sign in once with `npx agent-sdk login` inside `cli/`, or export `CURSOR_API_KEY`, then serve the agent with the playground:
+Model turns need the Cursor credential from the quick start, then serve the agent with the playground:
 
 ```bash
 npm --prefix cli run agent-sdk:dev
@@ -70,9 +90,9 @@ npm --prefix cli run agent-sdk:run -- --message "Is BoringCrypto FIPS validated?
 
 Turns that leave the model unset use the Agent SDK default, `grok-4.7` with `reasoning_effort=high` and `fast=true`. Set `GRCLANKER_AGENT_SDK_MODEL` to a Cursor model id, for example `GRCLANKER_AGENT_SDK_MODEL=composer-2.5`, to override it.
 
-Tool credentials work the same way as in the CLI: the cloud and SaaS tools read their environment variables from the `agent-sdk` process.
+Tool credentials work the same way as in the CLI. The 29 reference tools (CMVP, KEV/EPSS, SCF, FedRAMP, and OSCAL) need no tenant. The 212 platform tools read the same environment variables, config files, and local CLIs as the terminal CLI, including `~/.aws`, `az`, `gcloud`, and an OCI config. Each integration page lists its own names. `gws_ops_*` needs the `gws` binary (`GRCLANKER_GWS_BIN`). OSCAL commands other than `oscal_check_trestle` need `compliance-trestle` (`GRCLANKER_TRESTLE_BIN` or `TRESTLE_BIN`). A missing credential or binary comes back as a tool result with `isError: true`, and `agent-sdk tool call` then exits 1. The JSON envelope still carries the message.
 
-Commands that start a local host print a `[bdk] GitHub auth:` line on stderr. That line is about the Agent SDK's own GitHub integration, which this project does not use, so the tools run whether or not it finds a credential. The `github_*` domain tools read their own credentials, as listed on the [GitHub](/docs/integrations/github/) page.
+Commands that start a local host, and `agent-sdk tool call`, print a `[bdk] GitHub auth:` line on stderr. That line is about the Agent SDK's own GitHub integration, which this project does not use. The tools run whether or not it finds a credential. When the line tells you to run `gh auth login`, that login does not configure the `github_*` domain tools. Those tools read their own credentials, as listed on the [GitHub](/docs/integrations/github/) page.
 
 Session state, traces, and eval batches land in `cli/agent-sdk/.agent-serve/`, which is gitignored.
 
