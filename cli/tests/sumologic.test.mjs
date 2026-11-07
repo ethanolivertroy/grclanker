@@ -1,3 +1,6 @@
+import { canaryWindows as windowsOf, windowsForCanaries as leakWindows, assertNoCanaryWindow, assertFixtureFreeOfCanaryWindows as assertSharedFixture } from "./helpers/canary-windows.mjs";
+const assertNoWindowOf = (text, secret, label) => assertNoCanaryWindow(assert, text, secret, label);
+const assertFixtureFreeOfCanaryWindows = (text, canaries, label) => assertSharedFixture(assert, text, canaries, label);
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -299,37 +302,15 @@ const LIBRARY_ERROR_WORDING = [
 ];
 
 /** Every substring of a planted credential at lengths 6 through 24 (sliding windows), so a partial echo such as a JSON.parse window or a truncated token cannot pass a leak assertion. */
-function windowsOf(value, { min = 6, max = 24 } = {}) {
-  const windows = new Set();
-  for (let size = Math.min(min, value.length); size <= Math.min(max, value.length); size += 1) {
-    for (let index = 0; index + size <= value.length; index += 1) windows.add(value.slice(index, index + size));
-  }
-  return [...windows];
-}
 
 /** The window set of every planted secret, for bundle, zip, and payload scans through assertSecretsAbsent. */
-function leakWindows(secrets) {
-  return [...new Set(secrets.flatMap((secret) => windowsOf(secret)))];
-}
 
-function assertNoWindowOf(text, secret, label) {
-  for (const window of windowsOf(secret)) assert.ok(!text.includes(window), `${label} carries a window (${window}) of the planted credential: ${text.slice(0, 300)}`);
-}
 
 /**
  * Fixture self-check: the legitimate values of a fixture (everything it serves
  * with the planted canaries themselves removed, longest first) contain no
  * 6-character window of any canary, so a window hit in an output can only be a leak.
  */
-function assertFixtureFreeOfCanaryWindows(legitimateText, canaries, label) {
-  let legitimate = legitimateText;
-  for (const canary of [...canaries].sort((a, b) => b.length - a.length)) legitimate = legitimate.split(canary).join("");
-  for (const canary of canaries) {
-    for (const window of windowsOf(canary, { min: 6, max: 6 })) {
-      assert.ok(!legitimate.includes(window), `${label}: legitimate fixture text contains the window ${window} of canary ${canary}`);
-    }
-  }
-}
 
 function assertConfigErrorText(text, { path, code, line, column, canaries }, label) {
   for (const canary of canaries) assertNoWindowOf(text, canary, `${label} (${canary})`);

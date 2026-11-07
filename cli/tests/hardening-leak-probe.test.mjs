@@ -16,7 +16,7 @@ import {
 } from "../dist/extensions/grc-tools/hardening/error-text.js";
 import { NextLinkError, nextLinkStop, resolveSameOriginUrl } from "../dist/extensions/grc-tools/hardening/next-link.js";
 import { describePagination } from "../dist/extensions/grc-tools/hardening/pagination.js";
-import { datasetState, derived, gatedPrincipals, isComplete, isReadable, readDataset, seenVersusTotal, unreadableDataset } from "../dist/extensions/grc-tools/hardening/collection-status.js";
+import { completeCollection, partialCollection, unavailableCollection, collectionReadable, collectionComplete, collectionError, populationValue } from "../dist/extensions/grc-tools/hardening/collection-status.js";
 import {
   BEARER_ID_KEYS,
   FIXED_PASSWORDS,
@@ -67,53 +67,55 @@ const ROLES = Object.freeze([
 const MODEL_INVENTORIES = Object.freeze(["users", "roles"]);
 
 function datasetFor(records, inventory, target, mode, endpoint) {
-  if (inventory !== target || mode === "baseline") return readDataset([...records], { total: records.length, status: 200, endpoint });
+  const value = { items: [...records], total: records.length };
+  if (inventory !== target || mode === "baseline") return completeCollection(target, value, { status: 200, endpoint });
   switch (mode) {
-    case "zero-rows-truncated":
-      return readDataset([], { truncated: true, total: records.length, status: 200, endpoint });
-    case "capped":
-      return readDataset(records.slice(0, 1), { truncated: true, total: records.length, status: 200, endpoint });
-    case "denied":
-      return unreadableDataset(scrubErrorText(`GET ${endpoint} failed with 403 Forbidden: JSON body without a documented message field (42 bytes)`), { status: 403, endpoint });
-    default:
-      throw new Error(`unknown mode ${mode}`);
+    case "zero-rows-truncated": return partialCollection(target, { ...value, items: [] }, "page cap reached", { status: 200, endpoint });
+    case "capped": return partialCollection(target, { ...value, items: records.slice(0, 1) }, "page cap reached", { status: 200, endpoint });
+    case "denied": return unavailableCollection(target, scrubErrorText(`GET ${endpoint} failed with 403 Forbidden: JSON body without a documented message field (42 bytes)`), { status: 403, endpoint });
+    default: throw new Error(`unknown mode ${mode}`);
   }
 }
 
-function summaryOf(dataset) {
+function summaryOf(outcome) {
+  const rows = collectionReadable(outcome) ? outcome.value.items : [];
   return {
-    state: datasetState(dataset),
-    count: derived(dataset.items.length, dataset),
-    seen: isReadable(dataset) && !isComplete(dataset) ? seenVersusTotal(dataset.items.length, dataset.total) : null,
-    status: dataset.status,
-    error: dataset.error,
+    state: outcome.state,
+    count: populationValue(rows.length, outcome),
+    seen: collectionReadable(outcome) && !collectionComplete(outcome) ? `seen ${rows.length} of ${outcome.value.total}` : null,
+    status: outcome.status,
+    error: collectionError(outcome) ?? null,
   };
 }
 
-/** A collector built on the collection-status helpers: the shape every integration's findings must take under a partial read. */
+/** These security counts and exhaustive principal lists are population claims, not merely sightings. */
 function modelTruncationRunner({ inventory, mode }) {
   const users = datasetFor(USERS, inventory, "users", mode, "/api/v2/users");
   const roles = datasetFor(ROLES, inventory, "roles", mode, "/api/v2/roles");
-  const withoutMfa = users.items.filter((user) => !user.mfa);
-  const admins = roles.items.filter((role) => role.role === "admin");
+  const userRows = collectionReadable(users) ? users.value.items : [];
+  const roleRows = collectionReadable(roles) ? roles.value.items : [];
+  const withoutMfa = userRows.filter((user) => !user.mfa);
+  const admins = roleRows.filter((role) => role.role === "admin");
   const findings = [
     {
       id: "USERS-MFA",
-      status: isComplete(users) ? (withoutMfa.length === 0 ? "pass" : "fail") : "not_evaluated",
-      summary: isComplete(users) ? `${withoutMfa.length} of ${users.items.length} users lack MFA` : `users inventory ${datasetState(users)}: ${users.error ?? seenVersusTotal(users.items.length, users.total)}`,
+      status: collectionComplete(users) ? (withoutMfa.length === 0 ? "pass" : "fail") : "not_evaluated",
+      summary: collectionComplete(users) ? `${withoutMfa.length} of ${userRows.length} users lack MFA` : `users inventory ${users.state}: ${collectionError(users) ?? summaryOf(users).seen}`,
       evidence: {
-        users_total: derived(users.items.length, users),
-        without_mfa: derived(withoutMfa.length, users),
-        ...gatedPrincipals({ users_without_mfa: withoutMfa.map((user) => user.name) }, isComplete(users), [`users ${datasetState(users)}`]),
+        users_total: populationValue(userRows.length, users),
+        without_mfa: populationValue(withoutMfa.length, users),
+        users_without_mfa: populationValue(withoutMfa.map((user) => user.name), users),
+        principals_withheld: collectionComplete(users) ? null : `users ${users.state}`,
       },
     },
     {
       id: "ROLES-ADMIN",
-      status: isComplete(roles) ? (admins.length <= 1 ? "pass" : "fail") : "not_evaluated",
-      summary: isComplete(roles) ? `${admins.length} admin role holders` : `roles inventory ${datasetState(roles)}: ${roles.error ?? seenVersusTotal(roles.items.length, roles.total)}`,
+      status: collectionComplete(roles) ? (admins.length <= 1 ? "pass" : "fail") : "not_evaluated",
+      summary: collectionComplete(roles) ? `${admins.length} admin role holders` : `roles inventory ${roles.state}: ${collectionError(roles) ?? summaryOf(roles).seen}`,
       evidence: {
-        admins: derived(admins.length, roles),
-        ...gatedPrincipals({ admin_principals: admins.map((role) => role.name) }, isComplete(roles), [`roles ${datasetState(roles)}`]),
+        admins: populationValue(admins.length, roles),
+        admin_principals: populationValue(admins.map((role) => role.name), roles),
+        principals_withheld: collectionComplete(roles) ? null : `roles ${roles.state}`,
       },
     },
     { id: "STATIC-01", status: "pass", summary: "the static control reads no inventory", evidence: {} },
@@ -127,14 +129,14 @@ function modelTruncationRunner({ inventory, mode }) {
 function flawedTruncationRunner({ inventory, mode }) {
   const users = datasetFor(USERS, inventory, "users", mode, "/api/v2/users");
   const roles = datasetFor(ROLES, inventory, "roles", mode, "/api/v2/roles");
-  const withoutMfa = users.items.filter((user) => !user.mfa);
-  const admins = roles.items.filter((role) => role.role === "admin");
+  const withoutMfa = (users.value?.items ?? []).filter((user) => !user.mfa);
+  const admins = (roles.value?.items ?? []).filter((role) => role.role === "admin");
   const findings = [
-    { id: "USERS-MFA", status: withoutMfa.length === 0 ? "pass" : "fail", summary: `${withoutMfa.length} users lack MFA`, evidence: { users_total: users.items.length, users_without_mfa: withoutMfa.map((user) => user.name) } },
-    { id: "USERS-COUNT", status: users.items.length >= 3 ? "pass" : "fail", summary: `${users.items.length} users`, evidence: { complete: users.items.length >= 3 } },
+    { id: "USERS-MFA", status: withoutMfa.length === 0 ? "pass" : "fail", summary: `${withoutMfa.length} users lack MFA`, evidence: { users_total: (users.value?.items ?? []).length, users_without_mfa: withoutMfa.map((user) => user.name) } },
+    { id: "USERS-COUNT", status: (users.value?.items ?? []).length >= 3 ? "pass" : "fail", summary: `${(users.value?.items ?? []).length} users`, evidence: { complete: (users.value?.items ?? []).length >= 3 } },
     { id: "ROLES-ADMIN", status: admins.length <= 1 ? "pass" : "fail", summary: `admins: ${admins.map((role) => role.name).join(", ")}`, evidence: { admins: admins.length } },
   ];
-  const summaries = { users: { count: users.items.length }, roles: { count: roles.items.length } };
+  const summaries = { users: { count: (users.value?.items ?? []).length }, roles: { count: (roles.value?.items ?? []).length } };
   const principals = inventory === "users" ? USERS.map((user) => user.name) : inventory === "roles" ? ROLES.map((role) => role.name) : [];
   return { findings, summaries, principals };
 }

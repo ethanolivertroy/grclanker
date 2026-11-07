@@ -1,3 +1,7 @@
+import { MissingAuthenticationError } from "./auth-errors.js";
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
+import { ensurePrivateDir, resolveSecureOutputPath, writeSecureTextFile } from "./secure-output.js";
+export { resolveSecureOutputPath };
 /**
  * GitHub GRC assessment tools.
  *
@@ -7,15 +11,10 @@
  * with either a PAT or a GitHub App installation token.
  */
 import { createPrivateKey, sign as signData, type KeyObject } from "node:crypto";
-import {
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-} from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
+import { readFileSync, realpathSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { STATUS_CODES } from "node:http";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { Type } from "typebox";
 import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted, unlessAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
@@ -351,6 +350,15 @@ interface GitHubIntegrationsData {
   repositories: CollectedDataset<JsonRecord[]>;
   repoHooks: CollectedDataset<Record<string, GitHubRepoListEntry>>;
   deployKeys: CollectedDataset<Record<string, GitHubRepoListEntry>>;
+}
+
+/** Shared reads belong to an audit run, so every category sees the same evidence and failures. */
+interface GitHubSharedAuditData {
+  org: CollectedDataset<JsonRecord | null>;
+  repositories: CollectedDataset<JsonRecord[]>;
+  hooks: CollectedDataset<JsonRecord[]>;
+  appInstallations: CollectedDataset<JsonRecord[]>;
+  credentialAuthorizations: CollectedDataset<JsonRecord[]>;
 }
 
 interface GitHubAuditBundleResult {
@@ -1627,36 +1635,36 @@ export async function resolveGitHubConfiguration(
 
   const organization = overlay.organization ? normalizeOrganization(overlay.organization) : undefined;
   if (!organization) {
-    throw new Error(
+    throw new MissingAuthenticationError(
       "GitHub organization is required. Set GITHUB_ORG or pass organization explicitly.",
     );
   }
 
   if (!authMode) {
-    throw new Error(
+    throw new MissingAuthenticationError(
       "GitHub auth is required. Set GITHUB_TOKEN / GH_TOKEN for PAT mode, or provide GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY(_PATH), and GITHUB_APP_INSTALLATION_ID for app mode.",
     );
   }
 
   if (authMode === "pat" && !overlay.apiToken) {
-    throw new Error(
+    throw new MissingAuthenticationError(
       "GitHub PAT auth requires an API token. Set GITHUB_TOKEN / GH_TOKEN or pass api_token explicitly.",
     );
   }
 
   if (authMode === "app") {
     if (!overlay.appId) {
-      throw new Error(
+      throw new MissingAuthenticationError(
         "GitHub App auth requires app_id. Set GITHUB_APP_ID or pass app_id explicitly.",
       );
     }
     if (!overlay.appPrivateKey) {
-      throw new Error(
+      throw new MissingAuthenticationError(
         "GitHub App auth requires a PEM private key. Set GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH, or pass app_private_key / app_private_key_path explicitly.",
       );
     }
     if (!overlay.installationId) {
-      throw new Error(
+      throw new MissingAuthenticationError(
         "GitHub App auth requires installation_id. Set GITHUB_APP_INSTALLATION_ID or pass installation_id explicitly.",
       );
     }
@@ -2840,44 +2848,11 @@ function buildExecutiveSummary(
   ].filter(Boolean).join("\n");
 }
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
 
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
-  if (
-    relativeTarget === ".."
-    || relativeTarget.startsWith(`..${join("/")}`)
-    || relativeTarget.startsWith("..")
-  ) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
 
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  const realParent = realpathSync(parent);
-  const stat = lstatSync(realParent);
-  if (stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
 
-  return resolvedTarget;
-}
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
+
 
 // Text documents (the error log, the executive summary, the compliance reports) take the second
 // scrub layer on their whole body; JSON documents take it per string through serializeJson.
@@ -3166,19 +3141,20 @@ export async function collectGitHubOrgAccessData(
     | "getEnterpriseIdentitySnapshot"
   >,
   config: GitHubResolvedConfig,
+  shared?: GitHubSharedAuditData,
 ): Promise<GitHubOrgAccessData> {
   return {
-    org: await collectDataset<JsonRecord | null>(null, () => client.getOrganization()),
+    org: shared?.org ?? await collectDataset<JsonRecord | null>(null, () => client.getOrganization()),
     members: await collectDataset<JsonRecord[]>([], () => client.listMembers("all")),
     adminMembers: await collectDataset<JsonRecord[]>([], () => client.listMembers("admin")),
     twoFactorDisabledMembers: await collectDataset<JsonRecord[]>([], () => client.listTwoFactorDisabledMembers()),
     outsideCollaborators: await collectDataset<JsonRecord[]>([], () => client.listOutsideCollaborators()),
     invitations: await collectDataset<JsonRecord[]>([], () => client.listInvitations()),
     organizationRoles: await collectDataset<JsonRecord[]>([], () => client.listOrganizationRoles()),
-    credentialAuthorizations: await collectDataset<JsonRecord[]>([], () => client.listCredentialAuthorizations()),
+    credentialAuthorizations: shared?.credentialAuthorizations ?? await collectDataset<JsonRecord[]>([], () => client.listCredentialAuthorizations()),
     auditLog: await collectDataset<GitHubAuditLogSnapshot>(emptyAuditLogSnapshot(config.lookbackDays), () => client.listAuditLog(config.lookbackDays)),
-    hooks: await collectDataset<JsonRecord[]>([], () => client.listHooks()),
-    appInstallations: await collectDataset<JsonRecord[]>([], () => client.listInstallations()),
+    hooks: shared?.hooks ?? await collectDataset<JsonRecord[]>([], () => client.listHooks()),
+    appInstallations: shared?.appInstallations ?? await collectDataset<JsonRecord[]>([], () => client.listInstallations()),
     samlIdentity: await collectDataset<GitHubSamlIdentitySnapshot | null>(null, () => client.getSamlIdentitySnapshot()),
     ipAllowList: await collectDataset<GitHubIpAllowListSnapshot | null>(null, () => client.getIpAllowListSnapshot()),
     enterpriseIdentity: await collectDataset<GitHubEnterpriseIdentitySnapshot | null>(null, () => client.getEnterpriseIdentitySnapshot()),
@@ -3735,9 +3711,10 @@ export async function collectGitHubRepoProtectionData(
     | "getBranchProtection"
     | "listBranchRules"
   >,
+  shared?: GitHubSharedAuditData,
 ): Promise<GitHubRepoProtectionData> {
-  const org = await collectDataset<JsonRecord | null>(null, () => client.getOrganization());
-  const repositories = await collectDataset<JsonRecord[]>([], () => client.listRepositories());
+  const org = shared?.org ?? await collectDataset<JsonRecord | null>(null, () => client.getOrganization());
+  const repositories = shared?.repositories ?? await collectDataset<JsonRecord[]>([], () => client.listRepositories());
   const orgRulesets = await collectDataset<JsonRecord[]>([], () => client.listOrgRulesets());
 
   const eligibleRepos = repositories.data.filter((repo) => !isArchivedRepo(repo));
@@ -3823,10 +3800,11 @@ export async function collectGitHubCodeSecurityData(
     | "listCodeSecurityConfigurations"
     | "listCodeSecurityDefaultConfigurations"
   >,
+  shared?: GitHubSharedAuditData,
 ): Promise<GitHubCodeSecurityData> {
   return {
-    org: await collectDataset<JsonRecord | null>(null, () => client.getOrganization()),
-    repositories: await collectDataset<JsonRecord[]>([], () => client.listRepositories()),
+    org: shared?.org ?? await collectDataset<JsonRecord | null>(null, () => client.getOrganization()),
+    repositories: shared?.repositories ?? await collectDataset<JsonRecord[]>([], () => client.listRepositories()),
     codeSecurityConfigurations: await collectDataset<JsonRecord[]>([], () => client.listCodeSecurityConfigurations()),
     codeSecurityDefaults: await collectDataset<JsonRecord[]>([], () => client.listCodeSecurityDefaultConfigurations()),
   };
@@ -3861,12 +3839,13 @@ export async function collectGitHubIntegrationsData(
     | "listRepoHooks"
     | "listDeployKeys"
   >,
+  shared?: GitHubSharedAuditData,
 ): Promise<GitHubIntegrationsData> {
-  const org = await collectDataset<JsonRecord | null>(null, () => client.getOrganization());
-  const hooks = await collectDataset<JsonRecord[]>([], () => client.listHooks());
-  const appInstallations = await collectDataset<JsonRecord[]>([], () => client.listInstallations());
-  const credentialAuthorizations = await collectDataset<JsonRecord[]>([], () => client.listCredentialAuthorizations());
-  const repositories = await collectDataset<JsonRecord[]>([], () => client.listRepositories());
+  const org = shared?.org ?? await collectDataset<JsonRecord | null>(null, () => client.getOrganization());
+  const hooks = shared?.hooks ?? await collectDataset<JsonRecord[]>([], () => client.listHooks());
+  const appInstallations = shared?.appInstallations ?? await collectDataset<JsonRecord[]>([], () => client.listInstallations());
+  const credentialAuthorizations = shared?.credentialAuthorizations ?? await collectDataset<JsonRecord[]>([], () => client.listCredentialAuthorizations());
+  const repositories = shared?.repositories ?? await collectDataset<JsonRecord[]>([], () => client.listRepositories());
   const eligibleRepos = repositories.data.filter((repo) => !isArchivedRepo(repo));
   const repoHooks = await collectDataset<Record<string, GitHubRepoListEntry>>({}, () =>
     collectPerRepo(eligibleRepos, (owner, name) => client.listRepoHooks(owner, name)));
@@ -5485,11 +5464,28 @@ export async function exportGitHubAuditBundle(
   outputRoot: string,
   options: { signal?: AbortSignal } = {},
 ): Promise<GitHubAuditBundleResult> {
-  const orgAccess = await collectGitHubOrgAccessData(client, config);
-  const repoProtection = await collectGitHubRepoProtectionData(client);
+  // These five independent requests are the roots of the collection graph. In particular, do not
+  // list repositories again inside each category: a changed population would make one bundle
+  // describe several different inventories, and a failed root must have the same meaning everywhere.
+  const [org, repositories, hooks, appInstallations, credentialAuthorizations] = await Promise.all([
+    collectDataset<JsonRecord | null>(null, () => client.getOrganization()),
+    collectDataset<JsonRecord[]>([], () => client.listRepositories()),
+    collectDataset<JsonRecord[]>([], () => client.listHooks()),
+    collectDataset<JsonRecord[]>([], () => client.listInstallations()),
+    collectDataset<JsonRecord[]>([], () => client.listCredentialAuthorizations()),
+  ]);
+  const shared: GitHubSharedAuditData = { org, repositories, hooks, appInstallations, credentialAuthorizations };
+  // Keep the independent category work bounded to two branches. Per-repository branches already
+  // cap their own fan-out at six requests, and the remaining categories have no repository fan-out.
+  const [orgAccess, repoProtection] = await Promise.all([
+    collectGitHubOrgAccessData(client, config, shared),
+    collectGitHubRepoProtectionData(client, shared),
+  ]);
   const actions = await collectGitHubActionsData(client);
-  const codeSecurity = await collectGitHubCodeSecurityData(client);
-  const integrations = await collectGitHubIntegrationsData(client);
+  const [codeSecurity, integrations] = await Promise.all([
+    collectGitHubCodeSecurityData(client, shared),
+    collectGitHubIntegrationsData(client, shared),
+  ]);
 
   const assessments = [
     assessGitHubOrgAccess(orgAccess, config),
@@ -5575,7 +5571,7 @@ export async function exportGitHubAuditBundle(
   };
 }
 
-export function registerGitHubTools(pi: any): void {
+export function registerGitHubTools(pi: GrcToolRegistrar): void {
   const authParams = {
     organization: Type.Optional(
       Type.String({

@@ -1,3 +1,7 @@
+import { completeCollection, partialCollection, unavailableCollection, skippedCollection, collectionReadable, collectionComplete, collectionError, collectionValueOr, type CollectionOutcome, type ReadCollection } from "./hardening/collection-status.js";
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
+import { ensurePrivateDir, resolveSecureOutputPath, writeSecureTextFile, countFilesRecursively } from "./secure-output.js";
+export { resolveSecureOutputPath };
 /**
  * MuleSoft Anypoint Platform security inspector tools for grclanker.
  *
@@ -6,16 +10,10 @@
  * Endpoint paths follow the public Anypoint Platform API specifications
  * published on Anypoint Exchange.
  */
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-} from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 import { Type } from "typebox";
 import { abortableFetch, abortableSleep, rethrowIfAborted, ToolCallAbortedError, unlessAborted } from "./abort.js";
@@ -901,68 +899,15 @@ function safeDirName(value: string): string {
   return normalized || "mulesoft";
 }
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
 
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
-  if (
-    relativeTarget === ".."
-    || relativeTarget.startsWith(`..${join("/")}`)
-    || relativeTarget.startsWith("..")
-  ) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
 
-  const pathSegments = relativeTarget.split(/[\\/]+/).filter(Boolean);
-  let currentPath = realBase;
-  for (const segment of pathSegments) {
-    currentPath = join(currentPath, segment);
-    if (!existsSync(currentPath)) break;
-    if (lstatSync(currentPath).isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked parent directory: ${currentPath}`);
-    }
-  }
 
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  if (lstatSync(realpathSync(parent)).isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
-
-  return resolvedTarget;
-}
 
 const MAX_AUDIT_DIR_SUFFIX = 50;
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
 
-async function countFilesRecursively(rootDir: string): Promise<number> {
-  let total = 0;
-  const entries = await readdir(rootDir, { withFileTypes: true });
-  for (const entry of entries) {
-    const pathname = join(rootDir, entry.name);
-    if (entry.isDirectory()) {
-      total += await countFilesRecursively(pathname);
-    } else if (entry.isFile()) {
-      total += 1;
-    }
-  }
-  return total;
-}
+
+
 
 /** A TOML line the simple reader cannot accept; it records the line number only, never the line. */
 export class MulesoftTomlSyntaxError extends Error {
@@ -1966,23 +1911,7 @@ type AccessClient = IdentityClient & ApiGatewayClient & RuntimeClient & AuditCli
 
 export type MulesoftBundleClient = AccessClient;
 
-interface Collected<T> {
-  /**
-   * The source name, with the scope of a per-item read in parentheses (`secret_groups (Production)`).
-   * A `name:scope` shape would put a credential-named label such as `secret_groups` before a colon,
-   * which the redaction pass reads as a credential pair and eats along with the scope.
-   */
-  label: string;
-  value: T;
-  error?: string;
-  httpStatus?: number;
-  /** Path of the request that failed; absent when the read succeeded or no request was made. */
-  endpoint?: string;
-  /** Set when the read was never requested because its parent list failed; names the parent and its failure. */
-  skipped?: string;
-  /** Label of the parent source whose failure caused the skip. */
-  skippedParent?: string;
-}
+type Collected<T> = CollectionOutcome<T>;
 
 /**
  * Written to core_data (and into each category's snapshots) in place of a dataset that was denied,
@@ -2005,19 +1934,15 @@ export interface PartiallyCollectedSnapshot {
   items: unknown;
 }
 
-function sourceCollected(source: Collected<unknown>): boolean {
-  return !source.error && !source.skipped;
-}
+function sourceCollected<T>(source: Collected<T>): source is ReadCollection<T> { return collectionReadable(source); }
 
-function sourceFailure(source: Collected<unknown>): string {
-  return source.error ?? `not requested: ${source.skipped}`;
-}
+function sourceFailure(source: Collected<unknown>): string { return collectionError(source) ?? "not collected"; }
 
 function notCollectedMarker(source: Collected<unknown>): NotCollectedMarker {
   return {
     collected: false,
     dataset: source.label,
-    status: source.httpStatus ?? null,
+    status: source.status ?? null,
     endpoint: source.endpoint ?? null,
     error: sourceFailure(source),
   };
@@ -2039,7 +1964,7 @@ export function snapshotOf(source: Collected<unknown>, value: unknown, reads: Ar
     dataset: source.label,
     failed_reads: failedReads.map((read) => ({
       read: read.label,
-      status: read.httpStatus ?? null,
+      status: read.status ?? null,
       endpoint: read.endpoint ?? null,
       error: sourceFailure(read),
     })),
@@ -2066,13 +1991,7 @@ interface Verdict {
   status: MulesoftFindingStatus;
   summary: string;
   evidence?: JsonRecord;
-  /**
-   * A fail that rests on the absence of an item among the visible items of a truncated page (zero
-   * providers before the page was cut). The absence is provable only against the items that were not
-   * read, so `evaluate` renders the verdict manual and its absence-valued evidence (0, [], {}) null; the
-   * compute sets it only when the list itself was truncated, so a complete empty read still fails.
-   */
-  absenceClaim?: boolean;
+
 }
 
 interface EvaluationInputs {
@@ -2081,43 +2000,35 @@ interface EvaluationInputs {
   partial?: Array<string | undefined>;
 }
 
-async function collect<T>(label: string, fallback: T, load: () => Promise<T>, errors: string[]): Promise<Collected<T>> {
-  try {
-    return { label, value: scrubDataStrings(await load()) };
-  } catch (error) {
+async function collect<T>(label: string, load: () => Promise<T>, errors: string[]): Promise<Collected<T>> {
+  try { return completeCollection(label, scrubDataStrings(await load())); }
+  catch (error) {
     rethrowIfAborted(error);
     const message = errorMessage(error);
     errors.push(`${label}: ${message}`);
-    return {
-      label,
-      value: fallback,
-      error: message,
-      httpStatus: error instanceof MulesoftApiError ? error.status : undefined,
-      endpoint: error instanceof MulesoftApiError ? error.endpoint : undefined,
-    };
+    return unavailableCollection(label, message, { status: error instanceof MulesoftApiError ? error.status : undefined, endpoint: error instanceof MulesoftApiError ? error.endpoint : undefined });
   }
 }
 
 /** A read that was never requested because the list it depends on failed; the reason names that parent. */
-function skippedSource<T>(label: string, parent: Collected<unknown>, fallback: T): Collected<T> {
-  const reason = parent.error
+function skippedSource<T>(label: string, parent: Collected<unknown>): Collected<T> {
+  const reason = parent.state === "unavailable"
     ? `the ${parent.label} read failed (${parent.error}), so there were no ${parent.label} to scope the ${label} read`
-    : `the ${parent.label} read was not requested (${parent.skipped}), so there were no ${parent.label} to scope the ${label} read`;
-  return { label, value: fallback, skipped: reason, skippedParent: parent.label, httpStatus: parent.httpStatus };
+    : `the ${parent.label} read was not requested (${parent.state === "skipped" ? parent.reason : "not collected"}), so there were no ${parent.label} to scope the ${label} read`;
+  return skippedCollection(label, reason, parent.key);
 }
 
 async function collectPage(label: string, load: () => Promise<MulesoftListResult>, errors: string[]): Promise<Collected<MulesoftPage>> {
-  const collected = await collect<MulesoftListResult>(label, [], load, errors);
-  return { ...collected, value: toPage(collected.value) };
+  const result = await collect<MulesoftListResult>(label, load, errors);
+  if (!collectionReadable(result)) return result;
+  const page = toPage(result.value);
+  const details = { key: result.key, status: result.status, endpoint: result.endpoint };
+  return page.truncated ? partialCollection(label, page, truncationNote(label, page) ?? "inventory incomplete", details) : completeCollection(label, page, details);
 }
 
-function readySource(label: string): Collected<undefined> {
-  return { label, value: undefined };
-}
+function readySource(label: string): Collected<undefined> { return completeCollection(label, undefined); }
 
-function failedSource(label: string, error: string): Collected<undefined> {
-  return { label, value: undefined, error };
-}
+function failedSource<T = never>(label: string, error: string): Collected<T> { return unavailableCollection(label, error); }
 
 /**
  * Combine per-item reads into one source. When the parent list the reads depend on was not collected,
@@ -2126,64 +2037,34 @@ function failedSource(label: string, error: string): Collected<undefined> {
  */
 function mergeSources(label: string, sources: Array<Collected<unknown>>, parent?: Collected<unknown>): Collected<undefined> {
   if (parent && !sourceCollected(parent)) {
-    if (sources.length === 0) return skippedSource(label, parent, undefined);
-    // Some parents were read and their children requested; the children of the unread parents were not.
-    return {
-      label,
-      value: undefined,
-      error: `${label} reads were requested only for the ${parent.label} that were read (${sourceFailure(parent)})`,
-      httpStatus: parent.httpStatus,
-      endpoint: parent.endpoint,
-      skippedParent: parent.label,
-    };
+    if (sources.length === 0) return skippedSource(label, parent);
+    return unavailableCollection(label, `${label} reads were requested only for the ${parent.label} that were read (${sourceFailure(parent)})`, { status: parent.status, endpoint: parent.endpoint, dependency: parent.key });
   }
   const failed = sources.filter((source) => !sourceCollected(source));
-  if (failed.length === 0) return readySource(label);
+  if (failed.length === 0) {
+    const partial = [parent, ...sources].filter((source): source is ReadCollection<unknown> & { state: "partial"; reason: string } => source?.state === "partial");
+    return partial.length > 0
+      ? partialCollection(label, undefined, partial.map((source) => source.reason).join("; "))
+      : readySource(label);
+  }
   const detail = failed.slice(0, 3).map((source) => `${source.label}: ${sourceFailure(source)}`).join("; ");
-  return {
-    label,
-    value: undefined,
-    error: `${failed.length} of ${sources.length} reads failed (${detail}${failed.length > 3 ? "; ..." : ""})`,
-    httpStatus: failed[0].httpStatus,
-    endpoint: failed[0].endpoint,
-  };
+  return unavailableCollection(label, `${failed.length} of ${sources.length} reads failed (${detail}${failed.length > 3 ? "; ..." : ""})`, { status: failed[0].status, endpoint: failed[0].endpoint });
 }
 
 function describeFailure(source: Collected<unknown>): string {
-  if (source.skipped) return `${source.label} was not requested because ${source.skipped}`;
-  const status = source.httpStatus;
-  const cause = status === 401 || status === 403
-    ? `the credential lacks permission (HTTP ${status})`
-    : status === 404
-      ? "the endpoint is unavailable on this control plane or plan (HTTP 404)"
-      : "the read errored";
-  return `${source.label} could not be read, ${cause}: ${source.error}`;
+  if (source.state === "skipped") return `${source.label} was not requested because ${source.reason}`;
+  const status = source.status;
+  const cause = status === 401 || status === 403 ? `the credential lacks permission (HTTP ${status})` : status === 404 ? "the endpoint is unavailable on this control plane or plan (HTTP 404)" : "the read errored";
+  return `${source.label} could not be read, ${cause}: ${collectionError(source)}`;
 }
 
 function verdict(status: MulesoftFindingStatus, summary: string, evidence?: JsonRecord): Verdict {
   return { status, summary, evidence };
 }
 
-/** A fail resting on the absence of an item among the visible items of a truncated page; `evaluate` renders it manual. */
-function absenceVerdict(summary: string, evidence?: JsonRecord): Verdict {
-  return { status: "fail", summary, evidence, absenceClaim: true };
-}
-
-function isAbsenceValue(value: unknown): boolean {
-  if (value === 0) return true;
-  if (Array.isArray(value)) return value.length === 0;
-  if (value !== null && typeof value === "object") return Object.keys(value as object).length === 0;
-  return false;
-}
-
-/** Under a partial view, evidence values that assert absence (0, [], {}) render null because the unread items could hold the item. */
-function withoutAbsenceClaims(evidence: JsonRecord): JsonRecord {
-  return Object.fromEntries(Object.entries(evidence).map(([key, value]) => [key, isAbsenceValue(value) ? null : value]));
-}
-
 /** A count of the items of a paged list, unknown (null) unless the list was read to completion. */
 function completeCount(value: number, source: Collected<MulesoftPage>): number | null {
-  return sourceCollected(source) && !source.value.truncated ? value : null;
+  return collectionComplete(source) ? value : null;
 }
 
 function evaluate(
@@ -2195,11 +2076,13 @@ function evaluate(
   const failures = [...inputs.primary, ...(inputs.secondary ?? [])].filter((source) => !sourceCollected(source));
   // A read skipped because its parent failed is reported through the parent when both feed this finding.
   const cascaded = (source: Collected<unknown>): boolean =>
-    source.skippedParent !== undefined && failures.some((failure) => failure.label === source.skippedParent);
+    source.dependency !== undefined && failures.some((failure) => failure.key === source.dependency);
   const primaryFailures = inputs.primary.filter((source) => !sourceCollected(source) && !cascaded(source));
   const secondaryFailures = (inputs.secondary ?? []).filter((source) => !sourceCollected(source) && !cascaded(source));
   const unreadableSources = [...primaryFailures, ...secondaryFailures].map(describeFailure);
-  const partialView = (inputs.partial ?? []).filter((note): note is string => Boolean(note));
+  const providedNotes = (inputs.partial ?? []).filter((note): note is string => Boolean(note));
+  const partialSources = [...inputs.primary, ...(inputs.secondary ?? [])].filter((source) => source.state === "partial");
+  const partialView = providedNotes.length > 0 ? providedNotes : partialSources.map((source) => source.reason);
 
   if (primaryFailures.length > 0) {
     // A list that was never read has no partial view to report; null says so where [] would claim a complete empty read.
@@ -2212,20 +2095,9 @@ function evaluate(
   }
 
   const result = compute();
-  // A fail resting on an absence among the visible items is a claim about the unread items under a partial view.
-  const absenceUnderPartialView = result.status === "fail" && result.absenceClaim === true && partialView.length > 0;
-  const evidence: JsonRecord = absenceUnderPartialView ? withoutAbsenceClaims(result.evidence ?? {}) : { ...(result.evidence ?? {}) };
+  const evidence: JsonRecord = { ...(result.evidence ?? {}) };
   if (unreadableSources.length > 0) evidence.unreadable_sources = unreadableSources;
   if (partialView.length > 0) evidence.partial_view = partialView;
-
-  if (absenceUnderPartialView) {
-    return finding(
-      number,
-      "manual",
-      `${result.summary} Partial view: ${partialView.join("; ")}. The absence this verdict rests on cannot be asserted for the items that were not read, so the verdict is manual (unknown). ${evidenceToCollect}`,
-      evidence,
-    );
-  }
 
   if (secondaryFailures.length > 0) {
     const causes = secondaryFailures.map(describeFailure).join("; ");
@@ -2306,14 +2178,14 @@ async function sampleEnvironments(
 ): Promise<EnvironmentSample> {
   const config = client.getResolvedConfig();
   const source = await collectPage("environments", () => client.listEnvironments(), errors);
-  const all = source.value.items;
+  const all = collectionValueOr(source, toPage([])).items;
   const matching = all.filter((environment) => matchesEnvironmentFilter(environment, config.environmentFilter));
   const excludedByFilter = all.filter((environment) => !matching.includes(environment));
   const sorted = [...matching].sort((left, right) => Number(isProductionEnvironment(right)) - Number(isProductionEnvironment(left)));
   const sampled = sorted.slice(0, limit);
   const excludedByLimit = sorted.slice(limit);
   const partialNotes: string[] = [];
-  const inventoryTruncation = truncationNote("environment", source.value);
+  const inventoryTruncation = truncationNote("environment", collectionValueOr(source, toPage([])));
   if (inventoryTruncation) {
     partialNotes.push(`the ${inventoryTruncation}, so unseen environments (which may include production) were not sampled`);
   }
@@ -2406,13 +2278,13 @@ function businessGroupScopeNote(hierarchy: JsonRecord): string | undefined {
 
 // Root scope is only established by isRoot=true on a readable hierarchy; a failed read or a missing flag leaves the scope unknown.
 function organizationScopeNote(hierarchy: Collected<JsonRecord>): string | undefined {
-  if (hierarchy.error) {
+  if (collectionError(hierarchy)) {
     return `${describeFailure(hierarchy)}, so it is unknown whether this organization is a business group with root settings and sibling groups outside the view`;
   }
-  if (asBoolean(hierarchy.value.isRoot) === undefined) {
+  if (asBoolean(collectionValueOr(hierarchy, {}).isRoot) === undefined) {
     return "the organization hierarchy did not expose isRoot, so it is unknown whether this organization is a business group with root settings and sibling groups outside the view";
   }
-  return businessGroupScopeNote(hierarchy.value);
+  return businessGroupScopeNote(collectionValueOr(hierarchy, {}));
 }
 
 interface OrganizationScope {
@@ -2424,7 +2296,7 @@ async function collectOrganizationScope(
   client: Pick<MulesoftApiClient, "getOrganizationHierarchy">,
   errors: string[],
 ): Promise<OrganizationScope> {
-  const source = await collect<JsonRecord>("organization_hierarchy", {}, () => client.getOrganizationHierarchy(), errors);
+  const source = await collect<JsonRecord>("organization_hierarchy", () => client.getOrganizationHierarchy(), errors);
   return { source, note: organizationScopeNote(source) };
 }
 
@@ -2440,10 +2312,10 @@ export async function assessMulesoftIdentityAccess(
   const maxConnectedAppScopes = clampNumber(options.maxConnectedAppScopes, DEFAULT_MAX_CONNECTED_APP_SCOPES, 1, 500);
   const staleDays = clampNumber(options.staleConnectedAppDays, DEFAULT_STALE_CONNECTED_APP_DAYS, 1, 3650);
 
-  const organization = await collect<JsonRecord>("organization", {}, () => client.getOrganization(), errors);
-  const hierarchy = await collect<JsonRecord>("organization_hierarchy", {}, () => client.getOrganizationHierarchy(), errors);
+  const organization = await collect<JsonRecord>("organization", () => client.getOrganization(), errors);
+  const hierarchy = await collect<JsonRecord>("organization_hierarchy", () => client.getOrganizationHierarchy(), errors);
   const identityProviders = await collectPage("identity_providers", () => client.listIdentityProviders(), errors);
-  const identityProviderSettings = await collect<JsonRecord>("identity_provider_settings", {}, () => client.getIdentityProviderSettings(), errors);
+  const identityProviderSettings = await collect<JsonRecord>("identity_provider_settings", () => client.getIdentityProviderSettings(), errors);
   const members = await collectPage("members", () => client.listMembers(userLimit), errors);
   const mfaExemptUsers = await collectPage("mfa_exempt_users", () => client.listMfaExemptUsers(userLimit), errors);
   const roleGroups = await collectPage("role_groups", () => client.listRoleGroups(), errors);
@@ -2451,15 +2323,15 @@ export async function assessMulesoftIdentityAccess(
   const connectedApps = await collectPage("connected_applications", () => client.listConnectedApplications(), errors);
 
   const roleGroupDetails: Array<{ roleGroup: JsonRecord; roles: Collected<MulesoftPage>; users?: Collected<MulesoftPage> }> = [];
-  for (const roleGroup of roleGroups.value.items) {
+  for (const roleGroup of collectionValueOr(roleGroups, toPage([])).items) {
     const id = roleGroupId(roleGroup);
     const name = roleGroupName(roleGroup);
     if (!id) {
-      roleGroupDetails.push({ roleGroup, roles: { ...failedSource(`role_group_roles (${name})`, "role group has no id"), value: toPage([]) } });
+      roleGroupDetails.push({ roleGroup, roles: failedSource(`role_group_roles (${name})`, "role group has no id") });
       continue;
     }
     const roles = await collectPage(`role_group_roles (${name})`, () => client.listRoleGroupRoles(id), errors);
-    const users = isOrgAdminRoleGroup(roleGroup, roles.value.items)
+    const users = isOrgAdminRoleGroup(roleGroup, collectionValueOr(roles, toPage([])).items)
       ? await collectPage(`role_group_users (${name})`, () => client.listRoleGroupUsers(id), errors)
       : undefined;
     roleGroupDetails.push({ roleGroup, roles, users });
@@ -2468,54 +2340,54 @@ export async function assessMulesoftIdentityAccess(
   const adminUsersSource = mergeSources("role_group_users", roleGroupDetails.flatMap((detail) => (detail.users ? [detail.users] : [])), roleGroups);
 
   const connectedAppScopes: Array<{ app: JsonRecord; scopes: Collected<MulesoftPage> }> = [];
-  for (const app of connectedApps.value.items) {
+  for (const app of collectionValueOr(connectedApps, toPage([])).items) {
     const clientId = asString(app.client_id);
     const name = connectedAppName(app);
     const scopes = clientId
       ? await collectPage(`connected_app_scopes (${name})`, () => client.listConnectedApplicationScopes(clientId), errors)
-      : { ...failedSource(`connected_app_scopes (${name})`, "connected app has no client_id"), value: toPage([]) };
+      : failedSource(`connected_app_scopes (${name})`, "connected app has no client_id");
     connectedAppScopes.push({ app, scopes });
   }
   const scopesSource = mergeSources("connected_app_scopes", connectedAppScopes.map((item) => item.scopes), connectedApps);
 
-  const providers = identityProviders.value.items;
+  const providers = collectionValueOr(identityProviders, toPage([])).items;
   const providerSummaries = providers.map((provider) => ({
     name: asString(provider.name) ?? asString(provider.provider_id) ?? "identity provider",
     type: providerType(provider),
     disabled: providerIsDisabled(provider),
   }));
   const activeProviders = providers.filter((provider) => !providerIsDisabled(provider));
-  const allowNewNonSsoUsers = asBoolean(identityProviderSettings.value.allow_new_non_sso_users);
-  const isFederated = asBoolean(organization.value.isFederated) ?? asBoolean(hierarchy.value.isFederated);
+  const allowNewNonSsoUsers = asBoolean(collectionValueOr(identityProviderSettings, {}).allow_new_non_sso_users);
+  const isFederated = asBoolean(collectionValueOr(organization, {}).isFederated) ?? asBoolean(collectionValueOr(hierarchy, {}).isFederated);
   const scopeNote = organizationScopeNote(hierarchy);
 
-  const exemptReturned = mfaExemptUsers.value.items;
+  const exemptReturned = collectionValueOr(mfaExemptUsers, toPage([])).items;
   const exemptFlagged = exemptReturned.filter((user) => asBoolean(user.mfaVerificationExcluded) === true);
   const exemptUnflagged = exemptReturned.filter((user) => asBoolean(user.mfaVerificationExcluded) !== true);
 
-  const roleGroupItems = roleGroups.value.items;
-  const adminGroups = roleGroupDetails.filter((detail) => isOrgAdminRoleGroup(detail.roleGroup, detail.roles.value.items));
+  const roleGroupItems = collectionValueOr(roleGroups, toPage([])).items;
+  const adminGroups = roleGroupDetails.filter((detail) => isOrgAdminRoleGroup(detail.roleGroup, collectionValueOr(detail.roles, toPage([])).items));
   const adminUsers = new Map<string, string>();
   for (const detail of adminGroups) {
-    for (const user of detail.users?.value.items ?? []) {
+    for (const user of (detail.users === undefined ? [] : collectionValueOr(detail.users, toPage([])).items)) {
       const id = asString(user.id) ?? memberLabel(user);
       adminUsers.set(id, memberLabel(user));
     }
   }
-  const adminUsersTruncated = adminGroups.some((detail) => detail.users?.value.truncated === true);
+  const adminUsersTruncated = adminGroups.some((detail) => detail.users?.state === "partial");
 
   const overPrivilegedGroups = roleGroupDetails
-    .filter((detail) => !isBuiltInAdminGroup(detail.roleGroup) && detail.roles.value.items.some((role) => ORG_ADMIN_ROLE_PATTERN.test(roleName(role))))
+    .filter((detail) => !isBuiltInAdminGroup(detail.roleGroup) && collectionValueOr(detail.roles, toPage([])).items.some((role) => ORG_ADMIN_ROLE_PATTERN.test(roleName(role))))
     .map((detail) => roleGroupName(detail.roleGroup));
   const broadGroups = roleGroupDetails
-    .filter((detail) => detail.roles.value.items.length > maxRolesPerGroup)
-    .map((detail) => ({ role_group: roleGroupName(detail.roleGroup), roles: detail.roles.value.items.length }));
+    .filter((detail) => collectionValueOr(detail.roles, toPage([])).items.length > maxRolesPerGroup)
+    .map((detail) => ({ role_group: roleGroupName(detail.roleGroup), roles: collectionValueOr(detail.roles, toPage([])).items.length }));
   const truncatedRoleGroups = roleGroupDetails
-    .filter((detail) => detail.roles.value.truncated)
+    .filter((detail) => collectionValueOr(detail.roles, toPage([])).truncated)
     .map((detail) => roleGroupName(detail.roleGroup));
 
   const allAssignments = roleGroupDetails.flatMap((detail) =>
-    detail.roles.value.items.map((role) => ({ roleGroup: roleGroupName(detail.roleGroup), role })),
+    collectionValueOr(detail.roles, toPage([])).items.map((role) => ({ roleGroup: roleGroupName(detail.roleGroup), role })),
   );
   const environmentScopedAssignments = allAssignments.filter((item) => assignmentEnvironmentId(item.role) !== undefined);
   const orgWideEnvironmentRoles = allAssignments.filter((item) =>
@@ -2524,7 +2396,7 @@ export async function assessMulesoftIdentityAccess(
     && !ORG_ADMIN_ROLE_PATTERN.test(roleName(item.role)),
   );
 
-  const environmentItems = environments.value.items;
+  const environmentItems = collectionValueOr(environments, toPage([])).items;
   const productionEnvironments = environmentItems.filter(isProductionEnvironment);
   const sandboxEnvironments = environmentItems.filter((environment) => !isProductionEnvironment(environment));
   const untypedEnvironments = environmentItems.filter((environment) => !hasEnvironmentType(environment));
@@ -2534,11 +2406,11 @@ export async function assessMulesoftIdentityAccess(
     return (PRODUCTION_NAME_PATTERN.test(name) && !production) || (NON_PRODUCTION_NAME_PATTERN.test(name) && production);
   });
 
-  const connectedAppItems = connectedApps.value.items;
+  const connectedAppItems = collectionValueOr(connectedApps, toPage([])).items;
   const scopedApps = connectedAppScopes.map((item) => ({
     name: connectedAppName(item.app),
     service: isServiceConnectedApp(item.app),
-    scopes: connectedAppScopeNames(item.app, item.scopes.value.items),
+    scopes: connectedAppScopeNames(item.app, collectionValueOr(item.scopes, toPage([])).items),
   }));
   const adminScoped = scopedApps.filter((item) => item.scopes.some((scope) => ADMIN_SCOPE_PATTERN.test(scope)));
   const adminScopedApps = adminScoped.filter((item) => item.service).map((item) => item.name);
@@ -2546,7 +2418,7 @@ export async function assessMulesoftIdentityAccess(
   const broadScopedApps = scopedApps
     .filter((item) => item.scopes.length > maxConnectedAppScopes)
     .map((item) => ({ app: item.name, scopes: item.scopes.length }));
-  const truncatedScopeApps = connectedAppScopes.filter((item) => item.scopes.value.truncated).map((item) => connectedAppName(item.app));
+  const truncatedScopeApps = connectedAppScopes.filter((item) => collectionValueOr(item.scopes, toPage([])).truncated).map((item) => connectedAppName(item.app));
 
   const now = Date.now();
   const staleThreshold = now - staleDays * DAY_MS;
@@ -2555,14 +2427,21 @@ export async function assessMulesoftIdentityAccess(
   const staleApps = appsWithUsageDate.filter((app) => (connectedAppLastUsed(app) as Date).getTime() < staleThreshold);
   const disabledApps = connectedAppItems.filter((app) => asBoolean(app.enabled) === false);
 
-  const subOrganizations = asRecordArray(hierarchy.value.subOrganizations);
-  const canCreateSubOrgs = asBoolean(getNestedValue(organization.value, ["entitlements", "createSubOrgs"]));
-  const isRoot = asBoolean(hierarchy.value.isRoot);
+  const subOrganizations = asRecordArray(collectionValueOr(hierarchy, {}).subOrganizations);
+  const canCreateSubOrgs = asBoolean(getNestedValue(collectionValueOr(organization, {}), ["entitlements", "createSubOrgs"]));
+  const isRoot = asBoolean(collectionValueOr(hierarchy, {}).isRoot);
 
+  const identityProviderPartialView = [scopeNote, truncationNote("identity provider", collectionValueOr(identityProviders, toPage([])))].filter((note): note is string => Boolean(note));
+  const unknownIdentityProviderPopulation = identityProviders.state === "partial" && providers.length === 0 && sourceCollected(organization);
   const findings: MulesoftFinding[] = [
-    evaluate(
+    unknownIdentityProviderPopulation
+      ? finding(1, "manual",
+        `No external identity provider was among the visible providers (the identityProviders read was truncated before any provider was visible), so whether one is configured cannot be confirmed or ruled out from the visible items. Partial view: ${identityProviderPartialView.join("; ")}. The absence this verdict rests on cannot be asserted for the items that were not read, so the verdict is manual (unknown). Export Access Management > Identity Providers (type and status) and the organization SSO settings as evidence.`,
+        { identity_providers: null, active_identity_providers: null, is_federated: isFederated ?? null, allow_new_non_sso_users: allowNewNonSsoUsers ?? null, partial_view: identityProviderPartialView,
+          ...(!sourceCollected(identityProviderSettings) ? { unreadable_sources: [describeFailure(identityProviderSettings)] } : {}) })
+      : evaluate(
       1,
-      { primary: [identityProviders, organization], secondary: [identityProviderSettings], partial: [scopeNote, truncationNote("identity provider", identityProviders.value)] },
+      { primary: [identityProviders, organization], secondary: [identityProviderSettings], partial: [scopeNote, truncationNote("identity provider", collectionValueOr(identityProviders, toPage([])))] },
       "Export Access Management > Identity Providers (type and status) and the organization SSO settings as evidence.",
       () => {
         const evidence = {
@@ -2572,11 +2451,6 @@ export async function assessMulesoftIdentityAccess(
           allow_new_non_sso_users: allowNewNonSsoUsers ?? null,
         };
         if (providers.length === 0) {
-          // A truncated page with zero visible providers is an absence claim over the unread providers and renders
-          // manual (evaluate); a complete empty read fails, whatever the business-group scope of the credential.
-          if (identityProviders.value.truncated) {
-            return absenceVerdict("No external identity provider was among the visible providers (the identityProviders read was truncated before any provider was visible), so whether one is configured cannot be confirmed or ruled out from the visible items.", evidence);
-          }
           return verdict("fail", "No external identity provider is configured (the identityProviders read succeeded and returned zero providers); users authenticate with Anypoint Platform passwords. Zero providers is treated as fail.", evidence);
         }
         if (activeProviders.length === 0) {
@@ -2598,14 +2472,14 @@ export async function assessMulesoftIdentityAccess(
       2,
       {
         primary: [mfaExemptUsers],
-        partial: [truncationNote("MFA-exempt users", mfaExemptUsers.value), truncationNote("members", members.value), scopeNote],
+        partial: [truncationNote("MFA-exempt users", collectionValueOr(mfaExemptUsers, toPage([]))), truncationNote("members", collectionValueOr(members, toPage([]))), scopeNote],
       },
       "Capture the Access Management > Organization > multi-factor authentication setting, or the external identity provider MFA policy, as evidence.",
       () => {
         const evidence = {
           mfa_exempt_users: sample(exemptFlagged.map(memberLabel)),
           users_returned_without_flag: sample(exemptUnflagged.map(memberLabel)),
-          members_sampled: derived(members.value.items.length, members),
+          members_sampled: derived(collectionValueOr(members, toPage([])).items.length, members),
           is_federated: isFederated ?? null,
         };
         if (exemptFlagged.length > 0) {
@@ -2622,7 +2496,7 @@ export async function assessMulesoftIdentityAccess(
       {
         primary: [roleGroups, roleGroupRolesSource, adminUsersSource],
         partial: [
-          truncationNote("role groups", roleGroups.value),
+          truncationNote("role groups", collectionValueOr(roleGroups, toPage([]))),
           truncatedRoleGroups.length > 0 ? `role assignments truncated for ${truncatedRoleGroups.join(", ")}` : undefined,
           adminUsersTruncated ? `admin role group membership truncated at ${adminUsers.size} users` : undefined,
           scopeNote,
@@ -2635,7 +2509,7 @@ export async function assessMulesoftIdentityAccess(
           admin_users: sample([...adminUsers.values()]),
           admin_user_count: adminUsers.size,
           max_admins: maxAdmins,
-          members_sampled: derived(members.value.items.length, members),
+          members_sampled: derived(collectionValueOr(members, toPage([])).items.length, members),
         };
         if (roleGroupItems.length === 0) {
           return verdict("manual", "Zero role groups were returned even though the read succeeded; every organization has a built-in Organization Administrators group, so the credential sees a scoped-down view. Zero role groups is treated as manual.", evidence);
@@ -2654,7 +2528,7 @@ export async function assessMulesoftIdentityAccess(
       {
         primary: [roleGroups, roleGroupRolesSource],
         partial: [
-          truncationNote("role groups", roleGroups.value),
+          truncationNote("role groups", collectionValueOr(roleGroups, toPage([]))),
           truncatedRoleGroups.length > 0 ? `role assignments truncated for ${truncatedRoleGroups.join(", ")}` : undefined,
           scopeNote,
         ],
@@ -2684,7 +2558,7 @@ export async function assessMulesoftIdentityAccess(
       {
         primary: [roleGroups, roleGroupRolesSource],
         partial: [
-          truncationNote("role groups", roleGroups.value),
+          truncationNote("role groups", collectionValueOr(roleGroups, toPage([]))),
           truncatedRoleGroups.length > 0 ? `role assignments truncated for ${truncatedRoleGroups.join(", ")}` : undefined,
           scopeNote,
         ],
@@ -2713,7 +2587,7 @@ export async function assessMulesoftIdentityAccess(
     ),
     evaluate(
       6,
-      { primary: [environments], partial: [truncationNote("environment", environments.value), scopeNote] },
+      { primary: [environments], partial: [truncationNote("environment", collectionValueOr(environments, toPage([]))), scopeNote] },
       "Export Access Management > Environments with each environment's type and confirm production workloads do not share a sandbox environment.",
       () => {
         const evidence = {
@@ -2742,7 +2616,7 @@ export async function assessMulesoftIdentityAccess(
       {
         primary: [connectedApps, scopesSource],
         partial: [
-          truncationNote("connected apps", connectedApps.value),
+          truncationNote("connected apps", collectionValueOr(connectedApps, toPage([]))),
           truncatedScopeApps.length > 0 ? `scope lists truncated for ${truncatedScopeApps.join(", ")}` : undefined,
           scopeNote,
         ],
@@ -2751,7 +2625,7 @@ export async function assessMulesoftIdentityAccess(
       () => {
         const evidence = {
           connected_apps: connectedAppItems.length,
-          connected_apps_total: connectedApps.value.total ?? connectedAppItems.length,
+          connected_apps_total: collectionValueOr(connectedApps, toPage([])).total ?? connectedAppItems.length,
           managed_apps_included: true,
           service_apps: scopedApps.filter((item) => item.service).length,
           admin_scoped_apps: sample(adminScopedApps),
@@ -2776,12 +2650,12 @@ export async function assessMulesoftIdentityAccess(
     ),
     evaluate(
       19,
-      { primary: [connectedApps], partial: [truncationNote("connected apps", connectedApps.value), scopeNote] },
+      { primary: [connectedApps], partial: [truncationNote("connected apps", collectionValueOr(connectedApps, toPage([]))), scopeNote] },
       "Export the connected apps list with last-used timestamps from Access Management > Connected Apps and confirm each app is still required.",
       () => {
         const evidence = {
           connected_apps: connectedAppItems.length,
-          connected_apps_total: connectedApps.value.total ?? connectedAppItems.length,
+          connected_apps_total: collectionValueOr(connectedApps, toPage([])).total ?? connectedAppItems.length,
           managed_apps_included: true,
           apps_with_usage_data: appsWithUsageDate.length,
           apps_without_usage_date: sample(appsWithoutUsageDate.map(connectedAppName)),
@@ -2836,11 +2710,11 @@ export async function assessMulesoftIdentityAccess(
       organization_id: config.organizationId,
       identity_providers: completeCount(providers.length, identityProviders),
       identity_providers_seen: derived(providers.length, identityProviders),
-      identity_providers_total: derived(identityProviders.value.total ?? null, identityProviders),
-      identity_providers_truncated: derived(identityProviders.value.truncated, identityProviders),
-      members_sampled: derived(members.value.items.length, members),
-      members_total: derived(members.value.total ?? null, members),
-      members_truncated: derived(members.value.truncated, members),
+      identity_providers_total: derived(collectionValueOr(identityProviders, toPage([])).total ?? null, identityProviders),
+      identity_providers_truncated: derived(collectionValueOr(identityProviders, toPage([])).truncated, identityProviders),
+      members_sampled: derived(collectionValueOr(members, toPage([])).items.length, members),
+      members_total: derived(collectionValueOr(members, toPage([])).total ?? null, members),
+      members_truncated: derived(collectionValueOr(members, toPage([])).truncated, members),
       mfa_exempt_users: derived(exemptFlagged.length, mfaExemptUsers),
       organization_admins: derived(adminUsers.size, roleGroups, roleGroupRolesSource, adminUsersSource),
       role_groups: derived(roleGroupItems.length, roleGroups),
@@ -2853,22 +2727,22 @@ export async function assessMulesoftIdentityAccess(
     },
     findings,
     snapshots: {
-      organization: snapshotOf(organization, organization.value),
-      organization_hierarchy: snapshotOf(hierarchy, hierarchy.value),
+      organization: snapshotOf(organization, collectionValueOr(organization, {})),
+      organization_hierarchy: snapshotOf(hierarchy, collectionValueOr(hierarchy, {})),
       identity_providers: snapshotOf(identityProviders, providers),
-      identity_provider_settings: snapshotOf(identityProviderSettings, identityProviderSettings.value),
-      members: snapshotOf(members, members.value.items),
+      identity_provider_settings: snapshotOf(identityProviderSettings, collectionValueOr(identityProviderSettings, {})),
+      members: snapshotOf(members, collectionValueOr(members, toPage([])).items),
       mfa_exempt_users: snapshotOf(mfaExemptUsers, exemptReturned),
       role_groups: snapshotOf(roleGroups, roleGroupDetails.map((detail) => ({
         role_group: detail.roleGroup,
-        roles: sourceCollected(detail.roles) ? detail.roles.value.items : notCollectedMarker(detail.roles),
-        roles_truncated: derived(detail.roles.value.truncated, detail.roles),
-        users: detail.users === undefined ? null : sourceCollected(detail.users) ? detail.users.value.items : notCollectedMarker(detail.users),
+        roles: sourceCollected(detail.roles) ? collectionValueOr(detail.roles, toPage([])).items : notCollectedMarker(detail.roles),
+        roles_truncated: derived(collectionValueOr(detail.roles, toPage([])).truncated, detail.roles),
+        users: detail.users === undefined ? null : sourceCollected(detail.users) ? collectionValueOr(detail.users, toPage([])).items : notCollectedMarker(detail.users),
       }))),
       environments: snapshotOf(environments, environmentItems),
       connected_applications: snapshotOf(connectedApps, connectedAppScopes.map((item) => ({
         ...item.app,
-        scopes: sourceCollected(item.scopes) ? item.scopes.value.items : notCollectedMarker(item.scopes),
+        scopes: sourceCollected(item.scopes) ? collectionValueOr(item.scopes, toPage([])).items : notCollectedMarker(item.scopes),
       }))),
     },
     errors,
@@ -2881,15 +2755,11 @@ function describeSources(...sources: Array<Collected<unknown>>): Record<string, 
 }
 
 function describeSource(source: Collected<unknown>): string {
-  if (source.skipped) return `not requested (${source.skipped})`;
-  if (source.error) return `unread (${source.error})`;
-  if (isPage(source.value)) {
-    return source.value.truncated
-      ? `partial (${source.value.items.length} of ${pageTotalLabel(source.value)})`
-      : `complete (${source.value.items.length} item${source.value.items.length === 1 ? "" : "s"})`;
-  }
-  if (Array.isArray(source.value)) return `complete (${source.value.length} item${source.value.length === 1 ? "" : "s"})`;
-  return "complete";
+  if (source.state === "skipped") return `not requested (${source.reason})`;
+  if (source.state === "unavailable") return `unread (${source.error})`;
+  if (isPage(source.value)) return source.state === "partial" ? `partial (${source.value.items.length} of ${source.value.total ?? "an unknown"} total)` : `complete (${source.value.items.length} items)`;
+  if (source.state === "partial") return `partial (${source.reason})`;
+  return Array.isArray(source.value) ? `complete (${source.value.length} items)` : "complete";
 }
 
 function policyAssetId(policy: JsonRecord): string {
@@ -2966,7 +2836,7 @@ function policyCoverageVerdict(
 ): Verdict {
   const production = records.filter((record) => isProductionEnvironment(record.environment));
   const nonProduction = records.filter((record) => !isProductionEnvironment(record.environment));
-  const coverage = (record: ApiRecord) => policyCoverage(record.policies.value, pattern);
+  const coverage = (record: ApiRecord) => policyCoverage(collectionValueOr(record.policies, []), pattern);
   const productionMissing = production.filter((record) => coverage(record) === "missing");
   const productionUnknown = production.filter((record) => coverage(record) === "unknown_state");
   const nonProductionMissing = nonProduction.filter((record) => coverage(record) === "missing");
@@ -3015,7 +2885,7 @@ export async function assessMulesoftApiGateway(
     const environmentId = asString(environment.id);
     const label = environmentLabel(environment);
     if (!environmentId) {
-      apiSources.push({ ...failedSource(`api_manager_apis (${label})`, "environment has no id"), value: toPage([]) });
+      apiSources.push(failedSource(`api_manager_apis (${label})`, "environment has no id"));
       continue;
     }
     const remaining = apiLimit - apiRecords.length;
@@ -3025,13 +2895,13 @@ export async function assessMulesoftApiGateway(
     }
     const apis = await collectPage(`api_manager_apis (${label})`, () => client.listManagedApis(environmentId, remaining), errors);
     apiSources.push(apis);
-    const note = truncationNote(`${label} API instance`, apis.value);
+    const note = truncationNote(`${label} API instance`, collectionValueOr(apis, toPage([])));
     if (note) apiPartialNotes.push(note);
-    for (const api of apis.value.items) {
+    for (const api of collectionValueOr(apis, toPage([])).items) {
       const apiId = asString(api.id);
       const policies: Collected<JsonRecord[]> = apiId
-        ? await collect<JsonRecord[]>(`api_policies (${apiLabel(api)})`, [], () => client.listApiPolicies(environmentId, apiId), errors)
-        : { label: `api_policies (${apiLabel(api)})`, value: [], error: "API instance has no id" };
+        ? await collect<JsonRecord[]>(`api_policies (${apiLabel(api)})`, () => client.listApiPolicies(environmentId, apiId), errors)
+        : unavailableCollection(`api_policies (${apiLabel(api)})`, "API instance has no id");
       apiRecords.push({ environment, api, policies });
     }
   }
@@ -3039,14 +2909,14 @@ export async function assessMulesoftApiGateway(
   const policiesSource = mergeSources("api_policies", apiRecords.map((record) => record.policies), apisSource);
 
   const exchangeAssets = await collectPage("exchange_assets", () => client.listExchangeAssets(), errors);
-  const organizationAssets = exchangeAssets.value.items.filter((asset) => {
+  const organizationAssets = collectionValueOr(exchangeAssets, toPage([])).items.filter((asset) => {
     const owner = asString(asset.organizationId);
     return owner === undefined || owner === config.organizationId;
   });
 
   const productionApis = apiRecords.filter((record) => isProductionEnvironment(record.environment));
-  const productionWithoutAuth = productionApis.filter((record) => policyCoverage(record.policies.value, AUTHENTICATION_POLICY_PATTERN) === "missing");
-  const productionWithoutRateLimit = productionApis.filter((record) => policyCoverage(record.policies.value, RATE_LIMIT_POLICY_PATTERN) === "missing");
+  const productionWithoutAuth = productionApis.filter((record) => policyCoverage(collectionValueOr(record.policies, []), AUTHENTICATION_POLICY_PATTERN) === "missing");
+  const productionWithoutRateLimit = productionApis.filter((record) => policyCoverage(collectionValueOr(record.policies, []), RATE_LIMIT_POLICY_PATTERN) === "missing");
   const activeContracts = apiRecords.reduce((total, record) => total + (asNumber(record.api.activeContractsCount) ?? 0), 0);
 
   const publicAssets = organizationAssets.filter((asset) => asBoolean(asset.isPublic) === true);
@@ -3110,7 +2980,7 @@ export async function assessMulesoftApiGateway(
     ),
     evaluate(
       20,
-      { primary: [exchangeAssets], partial: [truncationNote("Exchange asset", exchangeAssets.value), scope.note] },
+      { primary: [exchangeAssets], partial: [truncationNote("Exchange asset", collectionValueOr(exchangeAssets, toPage([]))), scope.note] },
       "Export the API Governance conformance report and the Exchange publishing settings that require review before publication.",
       () => {
         const evidence = {
@@ -3154,8 +3024,8 @@ export async function assessMulesoftApiGateway(
         environment: environmentLabel(record.environment),
         environment_id: asString(record.environment.id),
         api: record.api,
-        policies: sourceCollected(record.policies) ? record.policies.value.map(projectApiPolicy) : notCollectedMarker(record.policies),
-        policies_error: record.policies.error ?? null,
+        policies: sourceCollected(record.policies) ? collectionValueOr(record.policies, []).map(projectApiPolicy) : notCollectedMarker(record.policies),
+        policies_error: collectionError(record.policies) ?? null,
       })), apiSources),
       exchange_assets: snapshotOf(exchangeAssets, organizationAssets),
     },
@@ -3402,12 +3272,12 @@ export async function assessMulesoftRuntimeInfrastructure(
     const environmentId = asString(environment.id);
     const label = environmentLabel(environment);
     if (!environmentId) {
-      applicationSources.push({ label: `cloudhub_applications (${label})`, value: [], error: "environment has no id" });
+      applicationSources.push(unavailableCollection(`cloudhub_applications (${label})`, "environment has no id"));
       continue;
     }
-    const environmentApplications = await collect<JsonRecord[]>(`cloudhub_applications (${label})`, [], () => client.listCloudhubApplications(environmentId), errors);
+    const environmentApplications = await collect<JsonRecord[]>(`cloudhub_applications (${label})`, () => client.listCloudhubApplications(environmentId), errors);
     applicationSources.push(environmentApplications);
-    for (const application of environmentApplications.value) {
+    for (const application of collectionValueOr(environmentApplications, [])) {
       if (applications.length >= applicationLimit) {
         applicationsDropped += 1;
         continue;
@@ -3415,31 +3285,31 @@ export async function assessMulesoftRuntimeInfrastructure(
       applications.push({ environment, application });
     }
 
-    const environmentServers = await collect<JsonRecord[]>(`hybrid_servers (${label})`, [], () => client.listHybridServers(environmentId), errors);
+    const environmentServers = await collect<JsonRecord[]>(`hybrid_servers (${label})`, () => client.listHybridServers(environmentId), errors);
     serverSources.push(environmentServers);
-    servers.push(...environmentServers.value.map((server) => ({ environment, server })));
+    servers.push(...collectionValueOr(environmentServers, []).map((server) => ({ environment, server })));
 
-    const regions = await collect<JsonRecord[]>(`mq_regions (${label})`, [], () => client.listMqRegions(environmentId), errors);
+    const regions = await collect<JsonRecord[]>(`mq_regions (${label})`, () => client.listMqRegions(environmentId), errors);
     mqRegionSources.push(regions);
-    for (const region of regions.value) {
+    for (const region of collectionValueOr(regions, [])) {
       const regionId = asString(region.regionId) ?? asString(region.id);
       if (!regionId) {
-        mqQueueSources.push({ label: `mq_queues (${label})`, value: [], error: "MQ region has no id" });
+        mqQueueSources.push(unavailableCollection(`mq_queues (${label})`, "MQ region has no id"));
         continue;
       }
-      const queues = await collect<JsonRecord[]>(`mq_queues (${label}, ${regionId})`, [], () => client.listMqQueues(environmentId, regionId), errors);
+      const queues = await collect<JsonRecord[]>(`mq_queues (${label}, ${regionId})`, () => client.listMqQueues(environmentId, regionId), errors);
       mqQueueSources.push(queues);
-      mqInventory.push({ environment: label, region: regionId, queues: queues.value });
+      mqInventory.push({ environment: label, region: regionId, queues: collectionValueOr(queues, []) });
     }
-    if (regions.value.length > 0) {
-      const clients = await collect<JsonRecord[]>(`mq_clients (${label})`, [], () => client.listMqClients(environmentId), errors);
+    if (collectionValueOr(regions, []).length > 0) {
+      const clients = await collect<JsonRecord[]>(`mq_clients (${label})`, () => client.listMqClients(environmentId), errors);
       mqClientSources.push(clients);
-      mqClients.push({ environment: label, clients: clients.value });
+      mqClients.push({ environment: label, clients: collectionValueOr(clients, []) });
     }
 
-    const secretGroups = await collect<JsonRecord[]>(`secret_groups (${label})`, [], () => client.listSecretGroups(environmentId), errors);
+    const secretGroups = await collect<JsonRecord[]>(`secret_groups (${label})`, () => client.listSecretGroups(environmentId), errors);
     secretGroupSources.push(secretGroups);
-    secretGroupsByEnvironment.push({ environment, secretGroups: secretGroups.value });
+    secretGroupsByEnvironment.push({ environment, secretGroups: collectionValueOr(secretGroups, []) });
   }
   const applicationsSource = mergeSources("cloudhub_applications", applicationSources, environments.source);
   const serversSource = mergeSources("hybrid_servers", serverSources, environments.source);
@@ -3449,24 +3319,24 @@ export async function assessMulesoftRuntimeInfrastructure(
   const secretGroupsSource = mergeSources("secret_groups", secretGroupSources, environments.source);
 
   const vpcSummaries = await collectPage("vpcs", () => client.listVpcs(DEFAULT_VPC_LIMIT), errors);
-  const vpcPage = capPage(vpcSummaries.value, DEFAULT_VPC_LIMIT);
+  const vpcPage = capPage(collectionValueOr(vpcSummaries, toPage([])), DEFAULT_VPC_LIMIT);
   const vpcDetails: Array<Collected<JsonRecord>> = [];
   const vpcs: JsonRecord[] = [];
   for (const vpc of vpcPage.items) {
     const vpcId = asString(vpc.id);
     const vpcName = asString(vpc.name) ?? vpcId ?? "vpc";
     const detail: Collected<JsonRecord> = vpcId
-      ? await collect<JsonRecord>(`vpc (${vpcName})`, {}, () => client.getVpc(vpcId), errors)
-      : { label: `vpc (${vpcName})`, value: {}, error: "VPC has no id" };
+      ? await collect<JsonRecord>(`vpc (${vpcName})`, () => client.getVpc(vpcId), errors)
+      : unavailableCollection(`vpc (${vpcName})`, "VPC has no id");
     vpcDetails.push(detail);
-    vpcs.push({ ...vpc, ...detail.value });
+    vpcs.push({ ...vpc, ...collectionValueOr(detail, {}) });
   }
   const vpcDetailsSource = mergeSources("vpc_details", vpcDetails, vpcSummaries);
   const vpcPartialNote = truncationNote("VPC", vpcPage);
   const vpcsWithoutRules = vpcs.filter((vpc) => !Array.isArray(vpc.firewallRules));
 
   const loadBalancerSource = await collectPage("load_balancers", () => client.listLoadBalancers(DEFAULT_LOAD_BALANCER_LIMIT), errors);
-  const loadBalancerPage = capPage(loadBalancerSource.value, DEFAULT_LOAD_BALANCER_LIMIT);
+  const loadBalancerPage = capPage(collectionValueOr(loadBalancerSource, toPage([])), DEFAULT_LOAD_BALANCER_LIMIT);
   const loadBalancerDetails: Array<Collected<JsonRecord>> = [];
   const loadBalancers: JsonRecord[] = [];
   for (const summary of loadBalancerPage.items) {
@@ -3476,21 +3346,21 @@ export async function assessMulesoftRuntimeInfrastructure(
       loadBalancers.push(summary);
       continue;
     }
-    const detail = await collect<JsonRecord>(`load_balancer (${loadBalancerLabel(summary)})`, {}, () => client.getLoadBalancer(vpcId, loadBalancerId), errors);
+    const detail = await collect<JsonRecord>(`load_balancer (${loadBalancerLabel(summary)})`, () => client.getLoadBalancer(vpcId, loadBalancerId), errors);
     loadBalancerDetails.push(detail);
-    loadBalancers.push({ ...summary, ...detail.value });
+    loadBalancers.push({ ...summary, ...collectionValueOr(detail, {}) });
   }
   const loadBalancerDetailsSource = mergeSources("load_balancer_details", loadBalancerDetails, loadBalancerSource);
   const loadBalancerPartialNote = truncationNote("load balancer", loadBalancerPage);
   // Certificate probes read sslEndpoints from the merged record, so a failed detail read leaves endpoints unprobed.
-  const loadBalancerDetailNote = loadBalancerDetailsSource.error
+  const loadBalancerDetailNote = collectionError(loadBalancerDetailsSource)
     ? `${describeFailure(loadBalancerDetailsSource)}, so SSL endpoints carried only by the detail record were not probed`
     : undefined;
   // The probes are scoped by the load balancer list: when that list was not read, no probe was requested,
   // and the certificates snapshot is a not-requested marker naming the parent rather than an empty list.
   const certificateSource: Collected<undefined> = sourceCollected(loadBalancerSource)
     ? readySource("load_balancer_certificates")
-    : skippedSource("load_balancer_certificates", loadBalancerSource, undefined);
+    : skippedSource("load_balancer_certificates", loadBalancerSource);
   const certificateProbes: CertificateProbeRecord[] = [];
   for (const loadBalancer of loadBalancers) {
     const host = asString(loadBalancer.domain);
@@ -4014,8 +3884,8 @@ function summarizeAuditRetention(entries: JsonRecord[], now: number): AuditReten
 }
 
 function auditRetentionNote(retention: AuditRetentionSummary, source: Collected<JsonRecord[]>): string {
-  if (source.error) {
-    return ` Retention settings could not be read (${source.error}); confirm the audit log retention period in Access Management > Settings of the root organization.`;
+  if (!sourceCollected(source)) {
+    return ` Retention settings could not be read (${sourceFailure(source)}); confirm the audit log retention period in Access Management > Settings of the root organization.`;
   }
   if (retention.currentPeriodDays === null) {
     return " Retention settings returned no retention period; confirm it in Access Management > Settings of the root organization.";
@@ -4048,23 +3918,23 @@ export async function assessMulesoftAuditMonitoring(
   const now = Date.now();
 
   const scope = await collectOrganizationScope(client, errors);
-  const platforms = await collect<JsonRecord[]>("audit_platforms", [], () => client.listAuditPlatforms(), errors);
-  const retentionSettings = await collect<JsonRecord[]>("audit_retention_settings", [], () => client.getAuditRetentionSettings(), errors);
-  const retention = summarizeAuditRetention(retentionSettings.value, now);
+  const platforms = await collect<JsonRecord[]>("audit_platforms", () => client.listAuditPlatforms(), errors);
+  const retentionSettings = await collect<JsonRecord[]>("audit_retention_settings", () => client.getAuditRetentionSettings(), errors);
+  const retention = summarizeAuditRetention(collectionValueOr(retentionSettings, []), now);
   const startDate = new Date(now - lookbackHours * 60 * 60 * 1000).toISOString();
   const endDate = new Date(now).toISOString();
-  const recentQuery = await collect<JsonRecord>("audit_query", {}, () => client.queryAuditLogs({ startDate, endDate, limit: AUDIT_QUERY_PAGE_LIMIT }), errors);
-  const recentEntries = extractCollection(recentQuery.value);
-  const recentTotal = asNumber(recentQuery.value.total);
-  const fallbackRequested = !recentQuery.error && recentEntries.length === 0;
+  const recentQuery = await collect<JsonRecord>("audit_query", () => client.queryAuditLogs({ startDate, endDate, limit: AUDIT_QUERY_PAGE_LIMIT }), errors);
+  const recentEntries = extractCollection(collectionValueOr(recentQuery, {}));
+  const recentTotal = asNumber(collectionValueOr(recentQuery, {}).total);
+  const fallbackRequested = !collectionError(recentQuery) && recentEntries.length === 0;
   const fallbackQuery: Collected<JsonRecord> = fallbackRequested
-    ? await collect<JsonRecord>("audit_query_fallback", {}, () => client.queryAuditLogs({
+    ? await collect<JsonRecord>("audit_query_fallback", () => client.queryAuditLogs({
       startDate: new Date(now - AUDIT_FALLBACK_LOOKBACK_DAYS * DAY_MS).toISOString(),
       endDate,
       limit: 1,
     }), errors)
-    : { label: "audit_query_fallback", value: {} };
-  const fallbackEntries = extractCollection(fallbackQuery.value);
+    : skippedCollection("audit_query_fallback", "the recent query already returned records or was unavailable, so no wider lookback was requested", recentQuery.key);
+  const fallbackEntries = extractCollection(collectionValueOr(fallbackQuery, {}));
 
   const environments = await sampleEnvironments(client, environmentLimit, errors);
   const environmentPartialNotes = [...environments.partialNotes, scope.note];
@@ -4074,7 +3944,7 @@ export async function assessMulesoftAuditMonitoring(
     const environmentId = asString(environment.id);
     const label = environmentLabel(environment);
     if (!environmentId) {
-      const missing = { label: `alerts (${label})`, value: [] as JsonRecord[], error: "environment has no id" };
+      const missing = unavailableCollection(`alerts (${label})`, "environment has no id");
       alertCoverage.push({
         environment: label,
         cloudhubAlerts: missing,
@@ -4087,13 +3957,13 @@ export async function assessMulesoftAuditMonitoring(
       });
       continue;
     }
-    const cloudhubAlerts = await collect<JsonRecord[]>(`cloudhub_alerts (${label})`, [], () => client.listCloudhubAlerts(environmentId), errors);
-    const hybridAlerts = await collect<JsonRecord[]>(`hybrid_alerts (${label})`, [], () => client.listHybridAlerts(environmentId), errors);
-    const applications = await collect<JsonRecord[]>(`cloudhub_applications (${label})`, [], () => client.listCloudhubApplications(environmentId), errors);
-    const allAlerts = [...cloudhubAlerts.value, ...hybridAlerts.value];
+    const cloudhubAlerts = await collect<JsonRecord[]>(`cloudhub_alerts (${label})`, () => client.listCloudhubAlerts(environmentId), errors);
+    const hybridAlerts = await collect<JsonRecord[]>(`hybrid_alerts (${label})`, () => client.listHybridAlerts(environmentId), errors);
+    const applications = await collect<JsonRecord[]>(`cloudhub_applications (${label})`, () => client.listCloudhubApplications(environmentId), errors);
+    const allAlerts = [...collectionValueOr(cloudhubAlerts, []), ...collectionValueOr(hybridAlerts, [])];
     const enabledAlerts = allAlerts.filter((alert) => alertState(alert) === "enabled");
     const unknownStateAlerts = allAlerts.filter((alert) => alertState(alert) === "unknown");
-    const domains = applications.value.map(applicationLabel);
+    const domains = collectionValueOr(applications, []).map(applicationLabel);
     const uncoveredApplications = domains.filter((domain) =>
       !enabledAlerts.some((alert) => alertCoversApplication(alert, domain))
       && !unknownStateAlerts.some((alert) => alertCoversApplication(alert, domain)));
@@ -4119,14 +3989,14 @@ export async function assessMulesoftAuditMonitoring(
   const environmentsWithOnlyUnknownAlerts = alertCoverage.filter((item) => item.enabledAlerts.length === 0 && item.unknownStateAlerts.length > 0);
   const uncoveredApplications = alertCoverage.flatMap((item) => item.uncoveredApplications.map((domain) => `${item.environment}: ${domain}`));
   const unknownCoverageApplications = alertCoverage.flatMap((item) => item.unknownCoverageApplications.map((domain) => `${item.environment}: ${domain}`));
-  const totalProductionApplications = alertCoverage.reduce((total, item) => total + item.applications.value.length, 0);
+  const totalProductionApplications = alertCoverage.reduce((total, item) => total + collectionValueOr(item.applications, []).length, 0);
   const totalEnabledAlerts = alertCoverage.reduce((total, item) => total + item.enabledAlerts.length, 0);
   const totalUnknownStateAlerts = alertCoverage.reduce((total, item) => total + item.unknownStateAlerts.length, 0);
 
   const findings: MulesoftFinding[] = [
     evaluate(
       17,
-      { primary: [recentQuery, fallbackQuery], partial: [scope.note] },
+      { primary: fallbackRequested ? [recentQuery, fallbackQuery] : [recentQuery], partial: [scope.note] },
       "Export Access Management > Audit Log for the review period, or grant the credential the Audit Log Viewer permission and rerun.",
       () => {
         const entriesInWindow = recentTotal ?? recentEntries.length;
@@ -4136,21 +4006,21 @@ export async function assessMulesoftAuditMonitoring(
           entries_fetched: recentEntries.length,
           entries_in_fallback_window: fallbackRequested ? fallbackEntries.length : null,
           fallback_lookback_days: AUDIT_FALLBACK_LOOKBACK_DAYS,
-          platforms: derived(platforms.value.map((platform) => asString(platform.name) ?? asString(platform.label) ?? "platform"), platforms),
-          platforms_error: platforms.error ?? null,
+          platforms: derived(collectionValueOr(platforms, []).map((platform) => asString(platform.name) ?? asString(platform.label) ?? "platform"), platforms),
+          platforms_error: collectionError(platforms) ?? null,
           retention_period_days: retention.currentPeriodDays,
           retention_scheduled_change: derived(retention.scheduledChange, retentionSettings),
           retention_entries: derived(retention.entries, retentionSettings),
-          retention_settings_error: retentionSettings.error ?? null,
+          retention_settings_error: collectionError(retentionSettings) ?? null,
           retention_settings_source: "GET /audit/v2/organizations/{orgId}/retentionSettings; evidence only, the verdict does not depend on it",
           recent_entries: sample(recentEntries.map(auditEntrySummary), 10),
         };
         const retentionNote = auditRetentionNote(retention, retentionSettings);
         if (recentEntries.length > 0) {
           const fetchedNote = entriesInWindow > recentEntries.length ? ` (${recentEntries.length} fetched)` : "";
-          const platformsNote = platforms.error
+          const platformsNote = collectionError(platforms)
             ? `; the audit platform list is unknown because ${describeFailure(platforms)}.`
-            : ` across ${platforms.value.length} platform(s).`;
+            : ` across ${collectionValueOr(platforms, []).length} platform(s).`;
           return verdict("pass", `${entriesInWindow} audit log entr${entriesInWindow === 1 ? "y" : "ies"} recorded within the last ${lookbackHours} hours${fetchedNote}${platformsNote}${retentionNote}`, evidence);
         }
         if (fallbackEntries.length > 0) {
@@ -4167,11 +4037,11 @@ export async function assessMulesoftAuditMonitoring(
         const evidence = {
           production_environments: alertCoverage.map((item) => ({
             environment: item.environment,
-            cloudhub_alerts: derived(item.cloudhubAlerts.value.length, item.cloudhubAlerts),
-            runtime_manager_alerts: derived(item.hybridAlerts.value.length, item.hybridAlerts),
+            cloudhub_alerts: derived(collectionValueOr(item.cloudhubAlerts, []).length, item.cloudhubAlerts),
+            runtime_manager_alerts: derived(collectionValueOr(item.hybridAlerts, []).length, item.hybridAlerts),
             enabled_alerts: derived(item.enabledAlerts.length, item.cloudhubAlerts, item.hybridAlerts),
             unknown_state_alerts: derived(item.unknownStateAlerts.length, item.cloudhubAlerts, item.hybridAlerts),
-            applications: derived(item.applications.value.length, item.applications),
+            applications: derived(collectionValueOr(item.applications, []).length, item.applications),
             uncovered_applications: derived(sample(item.uncoveredApplications), item.applications, item.cloudhubAlerts, item.hybridAlerts),
             unknown_coverage_applications: derived(sample(item.unknownCoverageApplications), item.applications, item.cloudhubAlerts, item.hybridAlerts),
           })),
@@ -4206,13 +4076,13 @@ export async function assessMulesoftAuditMonitoring(
     title: "MuleSoft audit logging and monitoring posture",
     summary: {
       organization_id: config.organizationId,
-      audit_platforms: derived(platforms.value.length, platforms),
+      audit_platforms: derived(collectionValueOr(platforms, []).length, platforms),
       audit_entries_in_window: derived(recentTotal ?? recentEntries.length, recentQuery),
       audit_lookback_hours: lookbackHours,
       audit_retention_period_days: derived(retention.currentPeriodDays, retentionSettings),
       environments_visible: derived(environments.all.length, environments.source),
-      environments_total: derived(environments.source.value.total ?? null, environments.source),
-      environments_truncated: derived(environments.source.value.truncated, environments.source),
+      environments_total: derived(collectionValueOr(environments.source, toPage([])).total ?? null, environments.source),
+      environments_truncated: derived(collectionValueOr(environments.source, toPage([])).truncated, environments.source),
       production_environments: derived(productionEnvironments.length, environments.source),
       production_applications: derived(totalProductionApplications, environments.source, applicationsSource),
       enabled_alerts: derived(totalEnabledAlerts, environments.source, alertsSource),
@@ -4223,13 +4093,13 @@ export async function assessMulesoftAuditMonitoring(
     },
     findings,
     snapshots: {
-      audit_platforms: snapshotOf(platforms, platforms.value),
-      audit_retention_settings: snapshotOf(retentionSettings, retentionSettings.value),
+      audit_platforms: snapshotOf(platforms, collectionValueOr(platforms, [])),
+      audit_retention_settings: snapshotOf(retentionSettings, collectionValueOr(retentionSettings, [])),
       audit_log_recent: snapshotOf(recentQuery, recentEntries.map(auditEntrySummary)),
       alerts: snapshotOf(alertsSource, alertCoverage.map((item) => ({
         environment: item.environment,
-        cloudhub_alerts: sourceCollected(item.cloudhubAlerts) ? item.cloudhubAlerts.value : notCollectedMarker(item.cloudhubAlerts),
-        runtime_manager_alerts: sourceCollected(item.hybridAlerts) ? item.hybridAlerts.value : notCollectedMarker(item.hybridAlerts),
+        cloudhub_alerts: sourceCollected(item.cloudhubAlerts) ? collectionValueOr(item.cloudhubAlerts, []) : notCollectedMarker(item.cloudhubAlerts),
+        runtime_manager_alerts: sourceCollected(item.hybridAlerts) ? collectionValueOr(item.hybridAlerts, []) : notCollectedMarker(item.hybridAlerts),
       })), alertReads),
     },
     errors,
@@ -4937,7 +4807,7 @@ const auditParams = {
   audit_lookback_hours: Type.Optional(Type.Number({ description: "Audit log lookback window in hours. Defaults to 24.", default: 24 })),
 };
 
-export function registerMulesoftTools(pi: any): void {
+export function registerMulesoftTools(pi: GrcToolRegistrar): void {
   pi.registerTool({
     name: "mulesoft_check_access",
     label: "Check MuleSoft Anypoint audit access",

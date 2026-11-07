@@ -282,3 +282,14 @@ export function withholdEchoedArguments(errorText: string): string {
 export function redactToolErrorText(errorText: string, input: unknown, schema?: unknown): string {
   return scrubSensitiveValues(withholdEchoedArguments(errorText), collectSensitiveValues(input, schema));
 }
+
+/** Error metadata needs the same credential-echo protection as visible error text. */
+export function redactToolErrorDetails(value: unknown, input: unknown, schema?: unknown): unknown {
+  function scrub(entry: unknown): unknown {
+    if (typeof entry === "string") return redactToolErrorText(entry, input, schema);
+    if (Array.isArray(entry)) return entry.map(scrub);
+    if (isPlainObject(entry)) return Object.fromEntries(Object.entries(entry).map(([key, item]) => [key, scrub(item)]));
+    return entry;
+  }
+  return scrub(redactSensitiveArguments(value, schema));
+}

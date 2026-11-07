@@ -1,3 +1,4 @@
+import { canaryWindows } from "./canary-windows.mjs";
 /**
  * Canary fixtures and the fragment assertion for the shared hardening helper tests (rule 9).
  *
@@ -219,12 +220,7 @@ export const LEGITIMATE_VALUES = Object.freeze([
 
 /** Every substring of `canary` whose length lies in the range, longest first so a failure names the largest echo. */
 export function fragmentsOf(canary, { minLength = FRAGMENT_LENGTHS.minLength, maxLength = FRAGMENT_LENGTHS.maxLength } = {}) {
-  const fragments = [];
-  const longest = Math.min(maxLength, canary.length);
-  for (let length = longest; length >= minLength; length -= 1) {
-    for (let index = 0; index + length <= canary.length; index += 1) fragments.push(canary.slice(index, index + length));
-  }
-  return fragments;
+  return canaryWindows(canary, { min: minLength, max: maxLength, descending: true });
 }
 
 /** True when `text` carries any window of `canary` at the given length; the positive controls use it to prove the library echoed the value. */

@@ -3,6 +3,7 @@ import type { ToolContext, ToolExecuteResult } from "@grok/agent-sdk/tools";
 import { classifyGrcToolEffect, type GrcToolEffect, isGrcWriteTool } from "../../../core/effects.js";
 import { getRegisteredGrcTool, type RegisteredGrcTool } from "../../../core/registry.js";
 import { executeGrcTool } from "../../../core/tools.js";
+import { toSdkToolResult } from "../../../core/results.js";
 import { toJsonSchema } from "../../../core/schema.js";
 
 export interface GrcToolExecutionContext {
@@ -25,8 +26,8 @@ export function buildSdkToolConfig(tool: RegisteredGrcTool): GrclankerSdkToolCon
     inputSchema: toJsonSchema(tool.parameters),
     effect: classifyGrcToolEffect(tool.name),
     needsApproval: isGrcWriteTool(tool.name),
-    execute: (input, ctx) =>
-      executeGrcTool(tool, input, { toolCallId: ctx.toolCallId, dryRun: ctx.session?.dryRun === true }),
+    execute: async (input, ctx) =>
+      toSdkToolResult(await executeGrcTool(tool, input, { toolCallId: ctx.toolCallId, dryRun: ctx.session?.dryRun === true })),
   };
 }
 

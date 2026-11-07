@@ -1,3 +1,7 @@
+import { NON_CREDENTIAL_KEY_QUALIFIERS, propertyNameSegments } from "./security/credential-keys.js";
+import { createPemCredentialScrubber } from "./security/pem-scrubber.js";
+import { ensurePrivateDir, resolveSecureOutputPath, createSecureTextWriter, countFilesRecursively } from "./secure-output.js";
+export { resolveSecureOutputPath };
 /**
  * Zendesk security inspector tools for grclanker.
  *
@@ -6,24 +10,17 @@
  * reference cannot verify are emitted as manual findings that name the
  * Admin Center evidence a reviewer must collect.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-} from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { join, relative, resolve } from "node:path";
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
 import { Type } from "typebox";
-import { REDACTED_VALUE, scrubSensitiveValues } from "../../core/redact.js";
+
 import { abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { BatchVerdicts, evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts  } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { ZENDESK_SPEC } from "./zendesk.spec.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -514,988 +511,8 @@ export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
  * public PEM blocks (certificates, public keys, CSRs) kept as evidence. Every rule
  * is unanchored and idempotent.
  */
-export const MIN_CONFIGURED_SECRET_LENGTH = 4;
-export const LONG_TOKEN_MIN_LENGTH = 16;
-
-// Which PEM blocks a scrub removes: every block in error text, where a block is never
-// evidence; only non-public blocks in data values, where a certificate is.
-type PemScope = "all" | "private";
-
-const PEM_BLOCK_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----[\s\S]*?-----END [A-Z0-9 ]+-----/g;
-// A block whose END was cut off (a truncated message) runs to the end of the text.
-const PEM_OPEN_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----(?:(?!-----END )[\s\S])*$/;
-// Labels of PEM blocks that carry public material only; every other label (PRIVATE KEY,
-// ENCRYPTED PRIVATE KEY, RSA/EC/DSA/OPENSSH PRIVATE KEY, PGP PRIVATE KEY BLOCK) is a secret.
-const PUBLIC_PEM_LABELS = new Set(["CERTIFICATE", "TRUSTED CERTIFICATE", "X509 CRL", "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST", "PUBLIC KEY", "RSA PUBLIC KEY", "PKCS7", "CMS"]);
-// Any scheme-prefixed URL: the userinfo is dropped; its query and fragment pairs are
-// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay. The
-// userinfo ends where the authority does, at "/", "?", or "#", so an "@" inside a query or
-// fragment (https://h?e=a@x.com&token=..., https://h#f@x.com) is never read as userinfo: the
-// host stays "h", and the query is left to the pair rule and the origin reducer instead of
-// being carried on as if it were the host.
-const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
-const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s\/?#@"'<>\\]+@/i;
-// A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
-// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, a
-// backslash (no token carries one; the escape after it, \" or \n inside a JSON string, is
-// kept so the string still parses and the text after it is still read), or the "," that
-// ends a URL inside a sentence. A ";" is part of the value, as URLSearchParams reads it
-// (?token=hunter2;restofsecret is one value and loses the whole of it); the ";" that ends a
-// pair belongs to the cookie and key-list header lines, which are read before this rule, so
-// a cookie pair whose name holds "&" or "#" goes with its cookie.
-// A quote with a value character on both sides (O'hunter2) is content of the value.
-const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>,\\]+(?:["'](?![:)}\]])[^&#\s"'<>,\\]+)*)/g;
-// A credential-bearing header line: the whole value goes, whatever its shape. The name and
-// separator are matched here (the name may be quoted as a JSON member name, with its quotes
-// escaped to any depth: "Cookie": ..., \"Cookie\": ..., \\\"Cookie\\\": ...) and the value
-// is consumed by headerValueEnd, which carries a quoted value through its closing quote at
-// the same depth, so Cookie: sid="value" loses value and quotes together instead of
-// stopping at the first quote, and ends an unquoted value before the next header on a
-// compound line, so the next header keeps its name. A value that already opens with a
-// marker is left alone so the rule is idempotent. The name starts where no word character
-// precedes it, or right after a JSON string escape left in place by one stringify (\n, \r,
-// \t, \b, \f, \v, \0, \uXXXX, \xHH): "request failed\nX-SecurityCenter: value" is a header
-// line inside a JSON string, and the escape letter is not part of the name that follows it.
-const HEADER_LINE_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv0]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}))(authorization|proxy-authorization|cookie|set-cookie|x-cookie|x-api-key|x-apikeys?|api-key|apikey|x-securitycenter|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)((?:\\*["'])?\s*:\s*)/gi;
-// The escape letters that can sit between a backslash and the key or header name after it.
-const ESCAPE_LETTER_PATTERN = /^(?:[nrtbfv0]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})/;
-// Inside a header value a quote opens a quoted segment only where a value can start: at the
-// start of the value or after "=", ":", ",", ";", "(", or whitespace. A quote with a token
-// character on both sides (sid=O'hunter2, my'pref=value, my"pref=value) is content of the
-// value, since RFC 6265 lets a cookie name or value carry an apostrophe. A quote anywhere
-// else, at the end of a token, is the quote that closes the text the header line was quoted
-// in.
-const HEADER_VALUE_OPENER_PATTERN = /[=:,;(\s]/;
-// What follows a quote that opens or closes something: whitespace, a delimiter, a closing
-// bracket, a tag, another quote, or an escape. Any other character continues the token.
-const QUOTE_BOUNDARY_PATTERN = /[\s,;:)}\]<>"'\\]/;
-const HEADER_VALUE_TERMINATOR_PATTERN = /[\r\n<>]/;
-// The "Name:" token of the next header after ";" or "," on a compound line (the name may be
-// quoted, as in a JSON object, with the quotes escaped to any depth, and may hold dots, as
-// X.Api.Key does when a proxy rewrites hyphens); a colon followed by "//" is a URL scheme,
-// not a header. The token is looked for within FOLLOWING_HEADER_LOOKAHEAD characters of the
-// separator.
-const FOLLOWING_HEADER_PATTERN = /^\s*(?:\\*["'])?[A-Za-z][A-Za-z0-9.-]*(?:\\*["'])?\s*:(?!\/\/)/;
-const FOLLOWING_HEADER_LOOKAHEAD = 96;
-// Header classes. An Authorization or Proxy-Authorization value opens with the scheme word
-// its credentials follow (Bearer, Basic, Digest, and the rest of AUTH_SCHEME_WORDS, in any
-// casing): the word stays as spelled and the one token (or one quoted string) after it
-// goes, so the operator still reads which scheme was replayed and prose after the token
-// stays; a parameter list after the scheme (Digest username=..., realm=...) goes whole, as
-// does a value that opens with anything else (a scheme word the list does not know, such
-// as GenieKey, SharedKey, or Bot, a bare token, a digit), to the end of the line: an
-// unknown first word may be a scheme with its credentials after it, so nothing after it
-// is trusted. A cookie header, or Tenable's X-ApiKeys (accessKey=...; secretKey=...), is
-// a list of pairs and goes whole. Every other header (X-Api-Key, X-Auth-Token,
-// X-Vault-Token, ...) carries one token: an unquoted value ends at the first whitespace,
-// so a JSON fragment or prose after it on the same line ({"status":"denied"}, "rejected")
-// is still read; a value that opens with a listed scheme word (X-Auth-Token: Bearer <v>)
-// is the word and the token after it together, and both go under the one marker, as the
-// scheme word is part of the value under any key but Authorization; a quoted value ends
-// at its closing quote whatever it holds.
-const AUTHORIZATION_HEADERS = new Set(["authorization", "proxy-authorization"]);
-const LIST_VALUE_HEADERS = new Set(["cookie", "set-cookie", "x-cookie", "x-apikeys", "x-apikey"]);
-const AUTH_SCHEME_WORDS = new Set([
-  "basic", "bearer", "digest", "hoba", "mutual", "negotiate", "oauth", "scram-sha-1", "scram-sha-256", "vapid", "dpop", "gnap",
-  "privatetoken", "concealed", "ntlm", "token", "ssws", "apikey", "api-key", "splunk", "snowflake", "aws4-hmac-sha256",
-]);
-const AUTH_SCHEME_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)(?:\s+|$)/;
-// A header value the header rule already treated, as the pair rules then see it: the scheme
-// word and, after whitespace and an optional quote, the marker.
-const REDACTED_SCHEME_VALUE_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)\s+((?:\\*["'])?)\[REDACTED\]/;
-const AUTH_PARAM_LIST_PATTERN = /^[A-Za-z][A-Za-z0-9_-]*=/;
-// A scheme and its credentials: the value is removed whatever its shape, except the
-// prose words that follow a scheme name in a sentence ("Basic authentication is
-// required", "Bearer token") and a Titlecase word, which makes the scheme name an
-// adjective in a title ("Basic Network Scan", "Bearer Token", "Token Hygiene"): a Basic
-// credential is base64 and a bearer token or API key carries digits, symbols, or token
-// casing, so neither is ever one capitalized word of letters. "Token", "OAuth", "Splunk",
-// and "Snowflake" are also nouns of this module's own prose and of product names ("Token
-// hygiene", "OAuth clients", "Splunk index", "Snowflake account"), so after them any plain
-// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. An auth-param name before
-// "=" (Bearer realm="api", Digest qop="auth") is the challenge's grammar, not a credential;
-// the quoted value after it is judged by the attribute rule under its own name. A
-// parameter list that carries credentials is read whole by the parameter-list rule first.
-const SCHEME_WORD_SOURCE = "Bearer|Basic|Digest|Token|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256";
-const SCHEME_VALUE_PATTERN = new RegExp(String.raw`\b(${SCHEME_WORD_SOURCE})\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})`, "gi");
-const NOUN_SCHEME_WORDS = new Set(["token", "oauth", "splunk", "snowflake"]);
-const AUTH_PARAM_PATTERN = /^([A-Za-z][A-Za-z0-9_-]*)=$/;
-const AUTH_PARAM_NAMES = new Set([
-  "realm", "error", "error_description", "error_uri", "scope", "charset", "nonce", "opaque", "qop", "algorithm", "stale", "domain",
-  "uri", "response", "cnonce", "nc", "username", "credential", "signedheaders", "signature", "oauth_consumer_key", "oauth_token",
-  "oauth_signature_method", "oauth_signature", "oauth_timestamp", "oauth_nonce", "oauth_version", "oauth_callback", "oauth_verifier",
-]);
-// A scheme word followed by a parameter list (name=value, name2=value2, ...) is the value of
-// an Authorization header wherever it appears, with the header name in front of it or
-// without one (Snowflake Token="<value>", Token token="<value>", nonce="...", Digest
-// username="...", realm="...", nonce="...", response="...", OAuth oauth_token="..."): the
-// word stays and the whole list goes, as it does under the header name. A list made only
-// of the parameters a challenge carries (the realm, the Bearer error fields, the Basic
-// charset, the Digest challenge fields: Bearer realm="api", error="invalid_token", a
-// WWW-Authenticate value) is a challenge and stays for the per-parameter rules; a list with
-// any other parameter (Token, token, key, username, uri, response, oauth_token, ...) is the
-// credential side of its scheme. The list is read by readAuthParameterList.
-const CHALLENGE_PARAM_NAMES = new Set(["realm", "error", "error_description", "error_uri", "scope", "charset", "domain", "nonce", "opaque", "stale", "algorithm", "qop", "userhash"]);
-// The parameters that carry the proof of a credential: the Digest response, a signature
-// (oauth_signature, signature, sig), or a MAC. A proof's value goes whatever its shape, in
-// a list after a scheme word or in one without a scheme word.
-const PROOF_PARAM_NAMES = new Set(["response", "signature", "oauth_signature", "mac", "sig"]);
-// A parameter list without a scheme word (realm="api", nonce="n", response="<proof>": the
-// value of a www_authenticate field, or a credential echoed without its scheme word) is an
-// auth parameter list when it holds two or more parameters and one of them, other than a
-// proof, is a known auth parameter (a challenge parameter, or username, uri, nc, cnonce, an
-// oauth_* parameter). In such a list, or in the list after a scheme word, a proof goes and a
-// challenge parameter keeps its value: the nonce of a challenge is public, so a proof-free
-// challenge (Digest realm="api", qop="auth", nonce="n") keeps every value, while a list
-// that carries a proof is not a challenge, whatever parameters open it. Any other parameter
-// (username, oauth_token) is judged under its own name, and a lone name=value pair is no
-// list. A list opens at a name that no word character precedes.
-const AUTH_PARAMETER_LIST_OPENER_PATTERN = /(?<![A-Za-z0-9_.:-])[A-Za-z][A-Za-z0-9_-]*=/g;
-const SCHEME_LED_LIST_PATTERN = new RegExp(String.raw`\b(?:${SCHEME_WORD_SOURCE})\s+$`, "i");
-const SCHEME_PARAMETER_LIST_PATTERN = new RegExp(String.raw`\b(${SCHEME_WORD_SOURCE})\s+(?=[A-Za-z][A-Za-z0-9_-]*=)`, "gi");
-const AUTH_PARAM_ITEM_PATTERN = /([A-Za-z][A-Za-z0-9_-]*)=/y;
-const AUTH_PARAM_BARE_VALUE_PATTERN = /[^\s,"'\\<>]+/y;
-const AUTH_PARAM_SEPARATOR_PATTERN = /\s*,\s*/y;
-const PLAIN_WORD_PATTERN = /^[a-z]+$/;
-const TITLE_WORD_PATTERN = /^[A-Z][a-z]{1,19}$/;
-const SCHEME_PROSE_WORDS = new Set([
-  "authentication", "authorization", "auth", "token", "tokens", "credential", "credentials", "scheme", "schemes", "header", "headers",
-  "realm", "challenge", "access", "mode", "method", "login", "flow", "grant", "type", "string", "value", "values", "user", "users",
-  "account", "client", "clients", "error", "request", "requests", "response", "with", "without", "and", "or", "is", "was", "are",
-  "not", "the", "this", "that", "these", "those", "to", "in", "for", "from", "on", "of", "by", "as", "at", "if", "then", "but", "so",
-  "than", "when", "where", "over", "via", "per", "only", "still", "also", "use", "used", "using", "required", "requires", "failed",
-  "rejected", "expired", "invalid", "missing", "unsupported", "supported", "unauthorized", "forbidden", "denied", "allowed", "enabled",
-  "disabled", "preferred", "deprecated", "retired", "retiring", "must", "should", "can", "cannot", "could", "will", "would", "may",
-  "has", "have", "does", "did", "do", "be", "been",
-]);
-// "key":"value" and key="value" carriers keep the whole quoted value together so a
-// value with spaces is removed as one; the unquoted pair rule below takes the rest.
-// Keys may start with "_" (_upstream_session, _token), so a key begins wherever no key
-// character precedes it rather than at a word boundary.
-const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"(\s*:\s*)"((?!\[REDACTED\])[^"\r\n]+)"/g;
-// The same pair inside a JSON text that was itself stringified into a string value, so its
-// quotes arrive behind a run of backslashes (\" one level down, \\\" two levels down): the
-// run is captured and the pair's four quotes must all carry it, so the value ends at the
-// quote of its own depth.
-const JSON_ESCAPED_PAIR_PATTERN = /(\\+)"([A-Za-z_][A-Za-z0-9_.-]{0,63})\1"(\s*:\s*)\1"((?!\[REDACTED\])(?:(?!\1")[^\r\n])+?)\1"/g;
-// A quoted attribute or pair value: the quote may be escaped to any depth, and the value
-// ends at the quote of its own depth.
-// A quote with a value character on both sides (O'hunter2) is content of the value.
-const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(\\*["'])((?!\[REDACTED\])(?:[^"'\r\n]|["'](?=[^\s"'\r\n<>;,&:)}\]\\]))+)\2/g;
-// An unquoted pair: key=value runs to the next delimiter, key: value (a header or
-// YAML-style line) to the end of the line, where a brace or bracket ends it so a JSON
-// structure after a credential-named key (compact "password":{...}, "auth":null}) is
-// never taken for a value. The key and the value may be quoted with the quotes escaped to
-// any depth; a value never runs into the escaped quote that closes it. A key starts where
-// no word character precedes it: after the "--" of a command-line flag (--password=v), the
-// "-D" of a Java system property (-Dpassword=v, where the D is read as part of the key and
-// the credential word is still its tail), a "/" path separator, or a "." (the tail of a
-// dotted name is scanned only when no key match started earlier on the name); or right
-// after a \0 escape, whose digit cannot start a key (the letter escapes, \n and the rest,
-// are read as part of the key and removed by keyAfterEscape).
-const ASSIGNMENT_KEY_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\0))((?:\\*["'])?)([A-Za-z_][A-Za-z0-9_.-]{0,63})((?:\\*["'])?\s*([:=])\s*(?:\\*["'])?)/g;
-// The escape one stringify leaves for a control character: \n, \r, \t, \b, \f, \v, \0, or a
-// \uXXXX or \xHH code of a control (U+0000 to U+001F, U+007F, and the line and paragraph
-// separators U+2028 and U+2029). An escape of a printable character (\u00e9) is content.
-const ESCAPED_CONTROL_SOURCE = String.raw`\\(?:[nrtbfv0]|u(?:00[01][0-9a-fA-F]|007[fF]|202[89])|x(?:[01][0-9a-fA-F]|7[fF]))`;
-// A credential name after "--" with its value as the next argument (psql --password value):
-// the flag starts where no word character or "-" precedes it (at the start of a quoted
-// command line too), its name may open with a letter or an underscore (a cookie name such as
-// _zendesk_session is a credential name too), and the value is the one token after it, never
-// another flag, ending where an unquoted pair value does.
-const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z_][A-Za-z0-9_.-]{0,63})([ \t]+)((?!\[REDACTED\])(?!-)(?:(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&])+)`, "g");
-// After a credential-named path segment and ":" (kv/password: value) the value is at most
-// one token. A singular label (password, token, key) takes that token whatever its shape
-// and whatever follows it (/etc/app/password: <value> was rejected); a plural label names a
-// collection (/api/v1/api-tokens: request failed with 403), so prose after the token means
-// there was no value, while a lone token after a plural label is one.
-const PROSE_CONTINUATION_PATTERN = /^[ \t]+[A-Za-z]/;
-// A key whose last word is a plural credential word, in the segment split (api-tokens, keys,
-// oauth_tokens) or concatenated (apikeys, sshkeys).
-const PLURAL_CREDENTIAL_LABEL_PATTERN = /(?:token|secret|key|cookie|password|credential|passphrase|signature|session)s$/;
-// The "-D" of a Java system property (java -Dkey=value) is not part of the key.
-const JAVA_PROPERTY_PREFIX_PATTERN = /(?:^|\s)-$/;
-// A delimited (key=value) value ends at whitespace or a control character, raw or left
-// escaped by one stringify (\n, \r, \t, \b, \f, \v, \0, \u0009 and the other \u00XX control
-// codes, \x09), as an unquoted header token does, so a pair or header chained after the
-// escape (api_key=<v>\tpassword: <v>) is read on its own and loses its own value. A key:
-// value line ends at a line break only, raw or escaped (\n, \r, \u000a, \u000d), as the raw
-// line does, so the header or pair on the next escaped line is read on its own.
-// A quote with a value character on both sides (O'hunter2, my'pref) is content of the value;
-// a quote at the end of a token, or an escaped quote, ends it, as does a value's first quote.
-const DELIMITED_VALUE_PATTERN = new RegExp(String.raw`(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&]|["'](?=[^\s"'<>;,&:)}\]\\]))+`, "y");
-const LINE_VALUE_PATTERN = /(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\r\n<>"',;{}[\]]|["'](?=[^\s\r\n<>"',;{}[\]:)\\]))*(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\s\r\n<>"',;{}[\]]/y;
-const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])(?:[^\s"'<>\\]|["'](?=[^\s"'<>\\,;:)}\]]))+/gi;
-// A URL whose slashes arrive escaped by a stringify (https:\/\/user:secret@host\/path): the
-// userinfo goes as it does from a bare URL and ends at the same "/", "?", or "#"; the query
-// pairs are read by the pair rule.
-const SLASH_ESCAPED_URL_USERINFO_PATTERN = /\b([a-z][a-z0-9+.-]*:\\\/\\\/)[^\s\/?#@"'<>\\]+@/gi;
-// A key naming a webhook URL: the incoming webhooks of Slack, Discord, Teams, and PagerDuty
-// carry their token in the path or query, so under webhook, webhook_url, webhookUrl, or
-// WEBHOOK_URL a URL value keeps its scheme and host only, whatever the host. webhook_count,
-// webhook_id, and webhook_name are not URL-valued and stay; a webhook key whose value is not
-// a URL (a name, an id) stays too.
-const WEBHOOK_URL_TAIL_WORDS = new Set(["url", "uri", "endpoint", "address", "link"]);
-const URL_VALUE_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/\S+$/i;
-const WEBHOOK_VALUE_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/iy;
-const URL_ORIGIN_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@]*@)?([^/?#]*)/i;
-const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
-const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
-const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
-// Vendor token prefixes that name a credential on their own, on both sides: GitHub (ghp_,
-// gho_, ghu_, ghs_, ghr_, github_pat_), Stripe (sk_live_, sk_test_, rk_live_, rk_test_), and
-// Slack (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-, xoxe-, xoxo-).
-const GITHUB_TOKEN_PATTERN = /\b(?:gh[oprsu]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})/g;
-const STRIPE_KEY_PATTERN = /\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}/g;
-const SLACK_TOKEN_PATTERN = /\bxox[abeoprs]-[A-Za-z0-9-]{10,}/g;
-const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
-const TOKEN_VALUE_PATTERN = /^[A-Za-z0-9+_-]{16,}={0,2}$/;
-const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
-const DIGITS_ONLY_PATTERN = /^\d+$/;
-const DIGIT_GROUP_PATTERN = /\d+/g;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// Below this many letters a segment's casing is not judged: eBay, iOS, McD are names.
-const MIN_LETTERS_FOR_CASING = 6;
-// A segment this long that is not name-shaped makes the whole run a token on its own.
-const MIN_TOKEN_SEGMENT_LENGTH = 8;
-// A carrier is named by its last word: api_key, access_token, client_secret, X-PAN-KEY,
-// _upstream_session, oauth_signature, Set-Cookie, password1. A key whose last word names
-// something else (credentialID, keyId, tokenCount, auth_mode, credentials_file,
-// passwordPolicy, password_complexity_by_device, credential-enforcement) is not one, nor is
-// a max/min bound; a session id (session_id, PHPSESSID, JSESSIONID) is, whatever its tail.
-const CREDENTIAL_KEY_WORDS = new Set([
-  "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase", "passcode", "phash",
-  "apikey", "authorization", "credential", "credentials", "key", "keys", "cookie", "cookies", "sid", "sig", "signature",
-  "auth", "nonce", "sas", "community", "authpwd", "privpwd", "pin", "otp", "totp", "jwt", "assertion", "bearer", "hmac",
-  "session", "sessid", "kubeconfig", "dsn", "pem", "ikey", "skey",
-]);
-// Concatenated spellings the segment split cannot see (authtoken, sharedsecret, privatekey).
-const CREDENTIAL_KEY_SUFFIX_PATTERN = /(?:token|secret|passw(?:or)?d|passphrase|passcode|phash|authorization|credential|signature|nonce|community|assertion|session|sessid|authpwd|privpwd|(?:api|private|secret|access|signing|encryption|master|shared|account|client|service|session|license|ssh|hmac)keys?)$/;
-// A key whose last word names the form of a value (password_hash, token_value,
-// authorization_header, secret_plain) carries a credential when an earlier word names one.
-const CREDENTIAL_VALUE_FORM_WORDS = new Set(["value", "values", "plain", "plaintext", "data", "string", "text", "header", "raw", "encrypted", "hash", "digest", "blob", "content"]);
-const SESSION_ID_PATTERN = /sess(?:ion)?[_.-]?id$/i;
-const BOUND_KEY_SEGMENTS = new Set(["max", "min"]);
-const EXTRA_CREDENTIAL_KEYS = new Set(["x-pan-key", "x-redlock-auth", "proxy-authorization", "x-amz-signature", "x-amz-credential", "x-amz-security-token", "oauth_signature", "oauth_token", "oauth_verifier"]);
-// "pass" names a credential in a query string or an = assignment (user=a&pass=b), while a
-// "pass" count or verdict in a key: value pair is this module's own vocabulary.
-const ASSIGNMENT_ONLY_CREDENTIAL_WORDS = new Set(["pass"]);
-// JSON structure and literals after a key are never a credential value.
-const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
-// A bare integer under a plural credential word ("oauth_tokens": 1, keys=3, secrets: 0) is
-// a count, this module's own summary vocabulary, not a credential; the digits end at
-// whitespace, raw or left escaped by a stringify (keys: 3\tcookies: 0), or at the end.
-const PLURAL_CREDENTIAL_WORDS = new Set(["tokens", "secrets", "keys", "cookies", "passwords", "credentials"]);
-const COUNT_VALUE_PATTERN = new RegExp(String.raw`^\d+(?:\s|${ESCAPED_CONTROL_SOURCE}|$)`);
-// "code" names a credential only behind one of these words (registration_code,
-// activation_code, authorization_code, recovery_code); status_code, error_code, and
-// country_code stay evidence.
-const CREDENTIAL_CODE_QUALIFIERS = new Set(["registration", "activation", "linking", "auth", "authorization", "access", "verification", "recovery", "backup", "security", "mfa", "otp", "pairing", "enrollment", "license"]);
-// A secret id or token id is the bearer credential itself (a Vault AppRole secret_id, an
-// API token_id, roleSecretId), unlike client_id, tenant_id, key_id, or access_key_id, which
-// name a public identifier; secret_id_ttl, secret_id_accessor, and token_accessor end in a
-// setting word and stay. The qualifier is tested by its tail so -Dsecret_id is read too.
-const BEARER_ID_QUALIFIER_PATTERN = /(?:secret|token)$/;
-
-function credentialKeyWord(segment: string): boolean {
-  return CREDENTIAL_KEY_WORDS.has(segment) || CREDENTIAL_KEY_SUFFIX_PATTERN.test(segment);
-}
-
-// The words of a key with trailing digits removed from each (password1, key2).
-function keyWords(key: string): string[] {
-  return propertyNameSegments(key).map((segment) => segment.replace(/\d+$/, "")).filter((segment) => segment.length > 0);
-}
-
-/** True when a name in a query string, header, attribute, or name-value pair carries a credential. */
-export function isCredentialKey(key: string): boolean {
-  if (SESSION_ID_PATTERN.test(key) || EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
-  const words = keyWords(key);
-  const last = words[words.length - 1];
-  if (last === undefined || BOUND_KEY_SEGMENTS.has(words[0])) return false;
-  if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
-  if (last === "code" || last === "codes") return words.length > 1 && CREDENTIAL_CODE_QUALIFIERS.has(words[words.length - 2]);
-  if (last === "id") return words.length > 1 && BEARER_ID_QUALIFIER_PATTERN.test(words[words.length - 2]);
-  // A connection string (connection_string, connectionString, DB_CONNECTION_STRING) embeds
-  // the password of the account it connects as.
-  if (last === "string" && words[words.length - 2] === "connection") return true;
-  if (credentialKeyWord(last)) return true;
-  return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
-}
-
-/** True when a key names a webhook URL whose path and query carry the webhook's token. */
-function isWebhookUrlKey(key: string): boolean {
-  const words = keyWords(key);
-  const last = words[words.length - 1];
-  if (last === "webhook") return true;
-  return last !== undefined && WEBHOOK_URL_TAIL_WORDS.has(last) && words[words.length - 2] === "webhook";
-}
-
-// The URL under a webhook key with its userinfo, path, query, and fragment replaced: the
-// scheme and host stay, so the destination is still read.
-function redactedWebhookUrl(url: string): string {
-  const origin = URL_ORIGIN_PATTERN.exec(url);
-  return `${origin ? `${origin[1]}${origin[2]}` : ""}/${CREDENTIAL_REDACTION_MARKER}`;
-}
-
-// True for a value that opens with a bare integer under a plural credential word: a count,
-// not a carrier (the rest of a key: value line is rescanned for pairs of its own).
-function isCountValue(key: string, value: string): boolean {
-  if (!COUNT_VALUE_PATTERN.test(value)) return false;
-  const words = keyWords(key);
-  return words.length > 0 && PLURAL_CREDENTIAL_WORDS.has(words[words.length - 1]);
-}
-
-// True for a key whose last word is a plural credential word (api-tokens, keys, apikeys): a
-// collection, so as a path label it is a pair only when a lone token follows.
-function isPluralCredentialKey(key: string): boolean {
-  const words = keyWords(key);
-  const last = words[words.length - 1];
-  return last !== undefined && (PLURAL_CREDENTIAL_WORDS.has(last) || PLURAL_CREDENTIAL_LABEL_PATTERN.test(last));
-}
-
-/** isCredentialKey plus the words that name a credential only in a query string or = assignment. */
-function isCredentialAssignmentKey(key: string): boolean {
-  if (isCredentialKey(key)) return true;
-  const words = keyWords(key);
-  return words.length > 0 && ASSIGNMENT_ONLY_CREDENTIAL_WORDS.has(words[words.length - 1]);
-}
-
-// Token-shaped casing: the case changes more often than once every three letters
-// (bPxRfiCYcanaryKEY); words, acronyms, camelCase, and PascalCase change case at word
-// boundaries only (AWSLambdaBasicExecutionRole).
-function hasTokenCasing(letters: string): boolean {
-  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
-  let changes = 0;
-  for (let index = 1; index < letters.length; index += 1) {
-    const previousLower = letters[index - 1] >= "a" && letters[index - 1] <= "z";
-    const currentLower = letters[index] >= "a" && letters[index] <= "z";
-    if (previousLower !== currentLower) changes += 1;
-  }
-  return changes * 3 > letters.length;
-}
-
-// A "-" or "_" separated segment shaped like part of a name: empty, digits alone, or letters
-// with at most one digit group (west2, sha256, vsys1, ethernet1) whose casing is not token-shaped.
-function isNameSegment(segment: string): boolean {
-  if (segment.length === 0 || DIGITS_ONLY_PATTERN.test(segment)) return true;
-  const digitGroups = segment.match(DIGIT_GROUP_PATTERN) ?? [];
-  if (digitGroups.length > 1) return false;
-  return !hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, ""));
-}
-
-// A run is a token when it carries base64 symbols ("+" anywhere; "=" padding only where the
-// run is base64-shaped: a multiple of four characters with no "-" or "_", so "key=" left
-// in front of a marker is never padding and the rule stays idempotent), or when a
-// segment of MIN_TOKEN_SEGMENT_LENGTH or more is not name-shaped, or when at least half
-// of its segments are not. One short random-looking segment beside several names (the
-// six-character mkdtemp suffix of a temp path, a build id) does not make a token.
-function looksLikeToken(run: string): boolean {
-  const padding = /=+$/.exec(run)?.[0] ?? "";
-  const body = run.slice(0, run.length - padding.length);
-  if (UPPERCASE_CODE_PATTERN.test(body) || DIGITS_ONLY_PATTERN.test(body) || UUID_PATTERN.test(body)) return false;
-  if (body.includes("+")) return true;
-  if (padding.length > 0) return run.length % 4 === 0 && !/[-_]/.test(body);
-  const segments = body.split(/[-_]/).filter((segment) => segment.length > 0);
-  const tokenSegments = segments.filter((segment) => !isNameSegment(segment));
-  if (tokenSegments.length === 0) return false;
-  return tokenSegments.some((segment) => segment.length >= MIN_TOKEN_SEGMENT_LENGTH) || tokenSegments.length * 2 >= segments.length;
-}
-
-// A whole query value that is one token-shaped run (no path, dot, or percent escape inside).
-function isTokenShapedValue(value: string): boolean {
-  return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
-}
-
-// The word after a scheme name is prose when it is a Titlecase word, an auth-param name
-// before its "=", a plain lowercase word from the list above, or, after a noun scheme
-// word (Token, OAuth, Splunk, Snowflake), any plain lowercase word too short to be a real
-// token.
-function isSchemeProse(scheme: string, value: string): boolean {
-  if (TITLE_WORD_PATTERN.test(value)) return true;
-  const authParam = AUTH_PARAM_PATTERN.exec(value);
-  if (authParam) return AUTH_PARAM_NAMES.has(authParam[1].toLowerCase());
-  if (!PLAIN_WORD_PATTERN.test(value)) return false;
-  if (SCHEME_PROSE_WORDS.has(value)) return true;
-  return NOUN_SCHEME_WORDS.has(scheme.toLowerCase()) && value.length < LONG_TOKEN_MIN_LENGTH;
-}
-
-function isPublicPemLabel(label: string): boolean {
-  return PUBLIC_PEM_LABELS.has(label.trim());
-}
-
-function scrubPem(text: string, scope: PemScope): string {
-  const keeps = (label: string): boolean => {
-    switch (scope) {
-      case "all":
-        return false;
-      case "private":
-        return isPublicPemLabel(label);
-      default: {
-        const exhaustive: never = scope;
-        return exhaustive;
-      }
-    }
-  };
-  return text
-    .replace(PEM_BLOCK_PATTERN, (match, label: string) => (keeps(label) ? match : CREDENTIAL_REDACTION_MARKER))
-    .replace(PEM_OPEN_PATTERN, (match, label: string) => (keeps(label) ? match : CREDENTIAL_REDACTION_MARKER));
-}
-
-function scrubUrlUserinfo(url: string): string {
-  return url.replace(URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`);
-}
-
-// The run of backslashes at index.
-function backslashRun(text: string, index: number): number {
-  let run = 0;
-  while (text[index + run] === "\\") run += 1;
-  return run;
-}
-
-// The quote token at index: a bare quote, or a quote behind the odd run of backslashes that
-// JSON escaping puts before it at some nesting depth (\" one level down, \\\" two levels
-// down, and so on). An even run escapes backslashes and leaves the quote bare, so it is no
-// token here; the caller steps over the run and reads the quote on its own.
-function quoteTokenAt(text: string, index: number): string | undefined {
-  const run = backslashRun(text, index);
-  const quote = text[index + run];
-  if ((quote !== '"' && quote !== "'") || (run > 0 && run % 2 === 0)) return undefined;
-  return text.slice(index, index + run + 1);
-}
-
-// True when the quote token at index sits inside a token, a value character before it and
-// another after it, so it is content of the value and neither opens nor closes a segment.
-function midTokenQuoteAt(text: string, index: number, tokenLength: number): boolean {
-  const before = text[index - 1];
-  const after = text[index + tokenLength];
-  if (before === undefined || after === undefined) return false;
-  if (HEADER_VALUE_OPENER_PATTERN.test(before) || before === '"' || before === "'" || before === "\\") return false;
-  return !QUOTE_BOUNDARY_PATTERN.test(after);
-}
-
-// True when the quote token at index, though a value could start there, is followed by
-// nothing a quoted value starts with (whitespace, a delimiter, a bracket, a tag, or the
-// end of the text): it is the quote closing the enclosing text, as after a base64 value
-// that ends in "=" (Basic dXNlcjpwYXNz=","code":401), not one opening a segment.
-function closingQuoteAfterOpener(text: string, index: number, tokenLength: number): boolean {
-  const after = text[index + tokenLength];
-  return after === undefined || /[\s,;:)}\]<>]/.test(after);
-}
-
-// The first line end or HTML tag at or after start, or the end of the text.
-function lineEndFrom(text: string, start: number): number {
-  const terminator = HEADER_VALUE_TERMINATOR_PATTERN.exec(text.slice(start));
-  return terminator ? start + terminator.index : text.length;
-}
-
-// The control characters the one-letter escapes stand for.
-const CONTROL_ESCAPE_LETTERS = new Map<string, number>([["n", 0x0a], ["r", 0x0d], ["t", 0x09], ["b", 0x08], ["f", 0x0c], ["v", 0x0b], ["0", 0x00]]);
-
-// True for the code of a control character: U+0000 to U+001F, U+007F, or the line and
-// paragraph separators U+2028 and U+2029.
-function isControlCode(code: number): boolean {
-  return code <= 0x1f || code === 0x7f || code === 0x2028 || code === 0x2029;
-}
-
-// The code of the control character an escape at index stands for (\n, \r, \t, \b, \f, \v,
-// \0, \uXXXX, or \xHH behind an odd run of backslashes, as one stringify leaves it), or -1
-// when the text at index is no such escape: an even run escapes backslashes, and the escape
-// of a printable character (\u00e9) is content.
-function escapedControlCodeAt(text: string, index: number): number {
-  const run = backslashRun(text, index);
-  if (run === 0 || run % 2 === 0) return -1;
-  const letter = text[index + run];
-  if (letter === undefined) return -1;
-  const simple = CONTROL_ESCAPE_LETTERS.get(letter);
-  if (simple !== undefined) return simple;
-  const digits = letter === "u" ? 4 : letter === "x" ? 2 : 0;
-  if (digits === 0) return -1;
-  const hex = text.slice(index + run + 1, index + run + 1 + digits);
-  if (hex.length !== digits || !/^[0-9a-f]+$/i.test(hex)) return -1;
-  const code = parseInt(hex, 16);
-  return isControlCode(code) ? code : -1;
-}
-
-// True at a line break left escaped by one stringify (\n, \r, \u000a, \u000d, \x0a, \x0d): a
-// line end for an unquoted header value, as the raw character is.
-function escapedLineBreakAt(text: string, index: number): boolean {
-  const code = escapedControlCodeAt(text, index);
-  return code === 0x0a || code === 0x0d;
-}
-
-// Where the unquoted token that starts at start ends: at the first whitespace or raw control
-// character, at a control the stringify left escaped (\t, \u0009, \f, \b, and a line break
-// among them), or at limit. A token never carries a control, so the pair or header chained
-// after the escape is read on its own.
-function unquotedTokenEnd(text: string, start: number, limit: number): number {
-  let index = start;
-  while (index < limit) {
-    const char = text[index];
-    if (/\s/.test(char) || isControlCode(char.charCodeAt(0))) break;
-    if (char === "\\") {
-      if (escapedControlCodeAt(text, index) !== -1) break;
-      index += backslashRun(text, index);
-      continue;
-    }
-    index += 1;
-  }
-  return index;
-}
-
-// The key without the escape letter in front of it: after an escaping backslash the letter
-// belongs to the escape (\napi_key is a newline and then api_key), not to the key. Only the
-// credential test uses the result; the text itself is left as it arrived.
-function keyAfterEscape(text: string, keyStart: number, key: string): string {
-  let run = 0;
-  while (keyStart - 1 - run >= 0 && text[keyStart - 1 - run] === "\\") run += 1;
-  if (run % 2 === 0) return key;
-  const letter = ESCAPE_LETTER_PATTERN.exec(key);
-  return letter ? key.slice(letter[0].length) : key;
-}
-
-// The index of the token that closes a quoted segment opened with token, before limit, or
-// -1. A token inside a token (sid="O'hunter2") is content of the segment, as is a token at a
-// deeper depth (more backslashes); a token nearer the surface closes the text the segment
-// sits in, so the segment is unterminated.
-function closingQuoteIndex(text: string, from: number, token: string, limit: number): number {
-  let index = from;
-  while (index < limit) {
-    const candidate = quoteTokenAt(text, index);
-    if (candidate === undefined) {
-      index += text[index] === "\\" ? backslashRun(text, index) : 1;
-      continue;
-    }
-    if (midTokenQuoteAt(text, index, candidate.length)) {
-      index += candidate.length;
-      continue;
-    }
-    if (candidate === token) return index;
-    if (candidate.length < token.length) return -1;
-    index += candidate.length;
-  }
-  return -1;
-}
-
-// Where the value of a header line that starts at start ends. A value that opens with a
-// quote token ends at the token that closes it on the same line, whatever it carries (a
-// "; Name:" inside a quoted cookie is content); when nothing closes it, the quote is content
-// and the value ends as an unquoted one does. An unquoted value ends at the end of the line,
-// at an HTML tag, at the ";" or "," before the "Name:" token of the next header on a
-// compound line (on "Cookie: sid=value; X-Api-Key: value" the next header keeps its name
-// and gets its own carrier treatment, and a Content-Type or Date after a cookie keeps its
-// name and value), at a line break left escaped inside a JSON string (\n, \r, \u000a), or
-// at the quote that closes the text the line sits in. Inside an unquoted value a quote
-// where a value can start opens a quoted segment carried through its closing token; a
-// quote inside a token (sid=O'hunter2, my'pref=value) is content; a quote at the end of a
-// token, or one after "=" that only a delimiter or the end follows (sid=abc==",), closes
-// the enclosing text. Trailing whitespace is not part of the value.
-function headerValueEnd(text: string, start: number): number {
-  const limit = lineEndFrom(text, start);
-  const opening = quoteTokenAt(text, start);
-  if (opening !== undefined) {
-    const close = closingQuoteIndex(text, start + opening.length, opening, limit);
-    if (close !== -1) return close + opening.length;
-  }
-  let index = opening === undefined ? start : start + opening.length;
-  while (index < limit) {
-    const char = text[index];
-    if ((char === ";" || char === ",") && FOLLOWING_HEADER_PATTERN.test(text.slice(index + 1, index + 1 + FOLLOWING_HEADER_LOOKAHEAD))) break;
-    if (char === "\\" && escapedLineBreakAt(text, index)) break;
-    const token = quoteTokenAt(text, index);
-    if (token === undefined) {
-      index += char === "\\" ? backslashRun(text, index) : 1;
-      continue;
-    }
-    if (!HEADER_VALUE_OPENER_PATTERN.test(text[index - 1])) {
-      if (!midTokenQuoteAt(text, index, token.length)) break;
-      index += token.length;
-      continue;
-    }
-    if (closingQuoteAfterOpener(text, index, token.length)) break;
-    const close = closingQuoteIndex(text, index + token.length, token, limit);
-    index = close === -1 ? index + token.length : close + token.length;
-  }
-  while (index > start && /\s/.test(text[index - 1])) index -= 1;
-  return index;
-}
-
-// The quote token a header value is wrapped in as a whole (bare or escaped to any depth), or
-// "" when it is not one quoted string.
-function enclosingQuote(value: string): string {
-  const token = quoteTokenAt(value, 0);
-  return token !== undefined && value.length >= token.length * 2 && value.endsWith(token) ? token : "";
-}
-
-// True for an Authorization pair whose value reads "Bearer [REDACTED]" or the like: the header
-// rule already treated it, and the pair rules leave the scheme word standing. Under any other
-// credential-named key the scheme word is part of the value and goes with it.
-function keepsSchemeWord(key: string, value: string): boolean {
-  if (!AUTHORIZATION_HEADERS.has(key.toLowerCase())) return false;
-  const scheme = REDACTED_SCHEME_VALUE_PATTERN.exec(value);
-  return scheme !== null && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase());
-}
-
-// The listed scheme word a header value opens with, when a token follows it, or undefined:
-// for a bare scheme word, a word the list does not know, or a value that opens with anything
-// but a word.
-function leadingSchemeWord(value: string): RegExpExecArray | undefined {
-  const scheme = AUTH_SCHEME_PATTERN.exec(value);
-  if (!scheme || scheme[0].length === value.length || !AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) return undefined;
-  return scheme;
-}
-
-// Where the credentials after a scheme word end, credentialsStart being the index after the
-// word and the whitespace behind it: a parameter list (username=..., realm=...) runs to end,
-// a quoted string to the quote that closes it (or to end when nothing does), and a bare
-// token to its first whitespace or escaped control.
-function schemeCredentialsEnd(text: string, credentialsStart: number, end: number): number {
-  const credentials = text.slice(credentialsStart, end);
-  if (AUTH_PARAM_LIST_PATTERN.test(credentials)) return end;
-  const quote = quoteTokenAt(credentials, 0);
-  if (quote !== undefined) {
-    const close = closingQuoteIndex(text, credentialsStart + quote.length, quote, end);
-    return close === -1 ? end : close + quote.length;
-  }
-  return unquotedTokenEnd(text, credentialsStart, end);
-}
-
-// Where the value of a single-token header ends: an unquoted value at its first whitespace
-// or escaped control, a quoted one where headerValueEnd put it. A value that opens with a
-// listed scheme word and a token (X-Auth-Token: Bearer <token>) is the word and the
-// credentials after it, as it would be under Authorization, so the token is never left
-// standing after the marker.
-function singleTokenEnd(text: string, start: number, end: number): number {
-  const value = text.slice(start, end);
-  if (enclosingQuote(value) !== "") return end;
-  const scheme = leadingSchemeWord(value);
-  if (scheme !== undefined) return schemeCredentialsEnd(text, start + scheme[0].length, end);
-  return unquotedTokenEnd(text, start, end);
-}
-
-// Where an Authorization value ends: after the listed scheme word and the one token (or one
-// quoted string) of credentials that follows it, so prose after the token on a free-text
-// line stays; a parameter list after the scheme (Digest username=..., realm=...) goes to the
-// end of the line, as does a value quoted as a whole, a bare scheme word, and a value that
-// opens with anything but a listed scheme word (GenieKey <token>, SharedKey account:<sig>,
-// a bare token): the first word may be a scheme the list does not know, with its credentials
-// after it, so the whole line goes.
-function authorizationValueEnd(text: string, start: number, end: number): number {
-  const value = text.slice(start, end);
-  if (enclosingQuote(value) !== "") return end;
-  const scheme = leadingSchemeWord(value);
-  if (scheme === undefined) return end;
-  return schemeCredentialsEnd(text, start + scheme[0].length, end);
-}
-
-// The replacement for a header value, or undefined when nothing is left to remove: the value
-// already opens with the marker (bare, inside its quotes, or after its scheme word), or an
-// Authorization value is a bare scheme word with no credentials after it. An Authorization
-// value keeps its scheme word as spelled; the credentials after it go whole, inside their own
-// quotes when they were quoted (Bearer "value" becomes Bearer "[REDACTED]"). A value that is
-// one quoted string keeps its quotes around the replacement so quoted text stays quoted.
-function redactedHeaderValue(header: string, value: string): string | undefined {
-  const quote = enclosingQuote(value);
-  const inner = quote === "" ? value : value.slice(quote.length, value.length - quote.length);
-  if (inner.startsWith(CREDENTIAL_REDACTION_MARKER)) return undefined;
-  if (AUTHORIZATION_HEADERS.has(header)) {
-    const scheme = AUTH_SCHEME_PATTERN.exec(inner);
-    if (scheme && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) {
-      const credentials = inner.slice(scheme[0].length);
-      if (credentials.length === 0) return undefined;
-      const credentialQuote = enclosingQuote(credentials);
-      if (credentials.slice(credentialQuote.length).startsWith(CREDENTIAL_REDACTION_MARKER)) return undefined;
-      return `${quote}${scheme[1]} ${credentialQuote}${CREDENTIAL_REDACTION_MARKER}${credentialQuote}${quote}`;
-    }
-  }
-  return `${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`;
-}
-
-// Every credential-bearing header line loses its credentials whatever their shape, by the
-// header's class: an Authorization value keeps its listed scheme word and loses the token
-// after it (or its whole parameter list), or goes whole when it opens with anything else; a
-// cookie or key list goes whole; and a single-token header loses its first token, or the
-// listed scheme word and the token after it when it opens with one. On a compound line each
-// header is its own line: the value of one ends before the name of the next, which is then
-// matched and treated on its own.
-function scrubHeaderLines(text: string): string {
-  HEADER_LINE_PATTERN.lastIndex = 0;
-  let out = "";
-  let last = 0;
-  let match: RegExpExecArray | null;
-  while ((match = HEADER_LINE_PATTERN.exec(text)) !== null) {
-    const header = match[1].toLowerCase();
-    const start = match.index + match[0].length;
-    const lineEnd = headerValueEnd(text, start);
-    const end = LIST_VALUE_HEADERS.has(header) ? lineEnd : AUTHORIZATION_HEADERS.has(header) ? authorizationValueEnd(text, start, lineEnd) : singleTokenEnd(text, start, lineEnd);
-    const value = text.slice(start, end);
-    if (value.length === 0) continue;
-    const replacement = redactedHeaderValue(header, value);
-    if (replacement === undefined) continue;
-    out += `${text.slice(last, start)}${replacement}`;
-    last = end;
-    HEADER_LINE_PATTERN.lastIndex = end;
-  }
-  return last === 0 ? text : `${out}${text.slice(last)}`;
-}
-
-// The key and separator are matched on their own and the value is consumed only when the
-// key names a credential, so the value of an ordinary pair is rescanned and a credential
-// pair nested inside it (data=token=...) is still caught. A value the scheme rule already
-// reduced to "<scheme> [REDACTED]" keeps its scheme word under an Authorization key and loses
-// it under any other credential key, where the scheme word was the start of the value. A
-// colon-terminated key that ends a path segment is a label whose value is at most one token:
-// a singular label (/etc/app/password: <value> was rejected) takes that token whatever its
-// shape and whatever follows, and a plural label (/api/v1/api-tokens: request failed) takes
-// it only when no prose continues after it, since prose means there was no value at all; an
-// escaped slash (\/) before the key is a line break, not a path.
-function replaceCredentialAssignments(text: string): string {
-  const fates = authParameterFates(text);
-  ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
-  let out = "";
-  let last = 0;
-  let match: RegExpExecArray | null;
-  while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
-    const [whole, openingQuote, key, separator, operator] = match;
-    if (operator === "=" && fates.get(match.index + openingQuote.length) === "challenge") continue;
-    const spelledName = keyAfterEscape(text, match.index + openingQuote.length, key);
-    const name = openingQuote === "" && spelledName.startsWith("D") && JAVA_PROPERTY_PREFIX_PATTERN.test(text.slice(Math.max(0, match.index - 2), match.index)) ? spelledName.slice(1) : spelledName;
-    const valueStart = match.index + whole.length;
-    if (isWebhookUrlKey(name)) {
-      WEBHOOK_VALUE_PATTERN.lastIndex = valueStart;
-      const url = WEBHOOK_VALUE_PATTERN.exec(text)?.[0];
-      if (url === undefined) continue;
-      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedWebhookUrl(url)}`;
-      last = valueStart + url.length;
-      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
-      continue;
-    }
-    if (!(operator === "=" ? isCredentialAssignmentKey(name) : isCredentialKey(name))) continue;
-    const redactedScheme = REDACTED_SCHEME_VALUE_PATTERN.exec(text.slice(valueStart));
-    if (redactedScheme !== null && AUTH_SCHEME_WORDS.has(redactedScheme[1].toLowerCase())) {
-      if (AUTHORIZATION_HEADERS.has(name.toLowerCase())) continue;
-      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedScheme[2]}${CREDENTIAL_REDACTION_MARKER}`;
-      last = valueStart + redactedScheme[0].length;
-      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
-      continue;
-    }
-    const pathLabel = operator === ":" && text[match.index - 1] === "/" && text[match.index - 2] !== "\\";
-    const valuePattern = operator === ":" && !pathLabel ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
-    valuePattern.lastIndex = valueStart;
-    const value = valuePattern.exec(text)?.[0];
-    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(name, value)) continue;
-    if (pathLabel && isPluralCredentialKey(name) && PROSE_CONTINUATION_PATTERN.test(text.slice(valueStart + value.length))) continue;
-    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${CREDENTIAL_REDACTION_MARKER}`;
-    last = valueStart + value.length;
-    ASSIGNMENT_KEY_PATTERN.lastIndex = last;
-  }
-  return last === 0 ? text : `${out}${text.slice(last)}`;
-}
-
-// A credential-named flag with its value as the next argument loses that argument.
-function replaceFlagValues(text: string): string {
-  return text.replace(FLAG_VALUE_PATTERN, (match, flag: string, space: string) => (isCredentialKey(flag) ? `--${flag}${space}${CREDENTIAL_REDACTION_MARKER}` : match));
-}
-
-// Where a quoted parameter value that opens at valueStart with the quote token ends: after
-// the token that closes it; at a shallower token, which closes the text the list sits in,
-// so the value was cut off and nothing of it stays; or at limit when nothing closes it. A
-// token inside a token (O'hunter2) is content of the value.
-function quotedParameterValueEnd(text: string, valueStart: number, quote: string, limit: number): number {
-  let index = valueStart + quote.length;
-  while (index < limit) {
-    const candidate = quoteTokenAt(text, index);
-    if (candidate === undefined) {
-      index += text[index] === "\\" ? backslashRun(text, index) : 1;
-      continue;
-    }
-    if (midTokenQuoteAt(text, index, candidate.length)) {
-      index += candidate.length;
-      continue;
-    }
-    if (candidate === quote) return index + candidate.length;
-    if (candidate.length < quote.length) return index;
-    index += candidate.length;
-  }
-  return limit;
-}
-
-// One parameter of a list: its name as spelled (without an escape letter glued to its
-// front), where the name starts, and where its value starts and ends; the quote token that
-// opens a quoted value, or undefined for a bare one.
-interface AuthParameter {
-  name: string;
-  nameStart: number;
-  valueStart: number;
-  valueEnd: number;
-  quote: string | undefined;
-}
-
-// What a parameter of an auth parameter list is: a proof (its value goes), a challenge
-// parameter (its value stays), or another parameter (judged under its own name).
-type AuthParameterFate = "proof" | "challenge" | "other";
-
-// The parameter list that opens at start (name=value, name2=value2, ...): its parameters
-// and where it ends. A quoted value (bare or escaped to any depth) runs to the quote that
-// closes it, or to the end of the text it sits in when nothing does (a cut-off value keeps
-// no part of itself), an unquoted value is one token, and the list ends before a "," that
-// no further parameter follows, so prose after the list stays. Undefined when no parameter
-// opens at start (nothing after the "=").
-function readAuthParameterList(text: string, start: number): { end: number; items: AuthParameter[] } | undefined {
-  const limit = lineEndFrom(text, start);
-  const items: AuthParameter[] = [];
-  let index = start;
-  while (index < limit) {
-    AUTH_PARAM_ITEM_PATTERN.lastIndex = index;
-    const item = AUTH_PARAM_ITEM_PATTERN.exec(text);
-    if (item === null) break;
-    const valueStart = index + item[0].length;
-    const quote = quoteTokenAt(text, valueStart);
-    let valueEnd: number;
-    if (quote !== undefined) {
-      valueEnd = quotedParameterValueEnd(text, valueStart, quote, limit);
-    } else {
-      AUTH_PARAM_BARE_VALUE_PATTERN.lastIndex = valueStart;
-      const bare = AUTH_PARAM_BARE_VALUE_PATTERN.exec(text);
-      if (bare === null) break;
-      valueEnd = valueStart + bare[0].length;
-    }
-    items.push({ name: keyAfterEscape(text, index, item[1]), nameStart: index, valueStart, valueEnd, quote });
-    AUTH_PARAM_SEPARATOR_PATTERN.lastIndex = valueEnd;
-    const separator = AUTH_PARAM_SEPARATOR_PATTERN.exec(text);
-    if (separator === null || separator[0].length === 0) break;
-    index = valueEnd + separator[0].length;
-  }
-  const lastItem = items[items.length - 1];
-  return lastItem === undefined ? undefined : { end: lastItem.valueEnd, items };
-}
-
-function authParameterFate(name: string): AuthParameterFate {
-  const lower = name.toLowerCase();
-  if (PROOF_PARAM_NAMES.has(lower)) return "proof";
-  return CHALLENGE_PARAM_NAMES.has(lower) ? "challenge" : "other";
-}
-
-// A known auth parameter other than a proof: one of them makes a list without a scheme
-// word an auth parameter list.
-function isAuthParameterAnchor(name: string): boolean {
-  const lower = name.toLowerCase();
-  return (AUTH_PARAM_NAMES.has(lower) || CHALLENGE_PARAM_NAMES.has(lower)) && !PROOF_PARAM_NAMES.has(lower);
-}
-
-// The fate of every parameter of every auth parameter list in text, by where its name
-// starts: the list after a scheme word, whatever it holds (a credential list after a scheme
-// word has already gone whole when this runs), and a list without one that holds two or
-// more parameters, one of them an anchor. A parameter outside such a list has no entry.
-function authParameterFates(text: string): Map<number, AuthParameterFate> {
-  const fates = new Map<number, AuthParameterFate>();
-  AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = 0;
-  let opener: RegExpExecArray | null;
-  while ((opener = AUTH_PARAMETER_LIST_OPENER_PATTERN.exec(text)) !== null) {
-    const list = readAuthParameterList(text, opener.index);
-    if (list === undefined) continue;
-    const schemeLed = SCHEME_LED_LIST_PATTERN.test(text.slice(Math.max(0, opener.index - 32), opener.index));
-    if (schemeLed || (list.items.length > 1 && list.items.some((item) => isAuthParameterAnchor(item.name)))) {
-      for (const item of list.items) fates.set(item.nameStart, authParameterFate(item.name));
-    }
-    AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = list.end;
-  }
-  return fates;
-}
-
-// A scheme word and the credential parameter list after it lose the list and keep the
-// word, header name in front or none; a challenge's parameter list stays.
-function replaceSchemeParameterLists(text: string): string {
-  SCHEME_PARAMETER_LIST_PATTERN.lastIndex = 0;
-  let out = "";
-  let last = 0;
-  let match: RegExpExecArray | null;
-  while ((match = SCHEME_PARAMETER_LIST_PATTERN.exec(text)) !== null) {
-    const list = readAuthParameterList(text, match.index + match[0].length);
-    if (list === undefined || !list.items.some((item) => !CHALLENGE_PARAM_NAMES.has(item.name.toLowerCase()))) continue;
-    out += `${text.slice(last, match.index)}${match[1]} ${CREDENTIAL_REDACTION_MARKER}`;
-    last = list.end;
-    SCHEME_PARAMETER_LIST_PATTERN.lastIndex = last;
-  }
-  return last === 0 ? text : `${out}${text.slice(last)}`;
-}
-
-// Every proof parameter of an auth parameter list loses its value, quoted (the quote token
-// of its own depth stays, and a cut-off value gets no closing quote it never had) or bare;
-// the parameters beside it are left as they are.
-function replaceAuthParameterProofs(text: string): string {
-  const proofs = [...authParameterFates(text).entries()].filter(([, fate]) => fate === "proof").map(([nameStart]) => nameStart);
-  if (proofs.length === 0) return text;
-  let out = "";
-  let last = 0;
-  for (const nameStart of proofs) {
-    const list = readAuthParameterList(text, nameStart);
-    const item = list?.items[0];
-    if (item === undefined || item.nameStart !== nameStart) continue;
-    const quote = item.quote ?? "";
-    const closed = quote !== "" && item.valueEnd - quote.length > item.valueStart && text.startsWith(quote, item.valueEnd - quote.length);
-    const value = text.slice(item.valueStart + quote.length, closed ? item.valueEnd - quote.length : item.valueEnd);
-    if (value.length === 0 || value === CREDENTIAL_REDACTION_MARKER) continue;
-    out += `${text.slice(last, item.valueStart)}${quote}${CREDENTIAL_REDACTION_MARKER}${closed ? quote : ""}`;
-    last = item.valueEnd;
-  }
-  return last === 0 ? text : `${out}${text.slice(last)}`;
-}
-
-// The rule for a quoted attribute or pair value under a key: redacted under a credential
-// key (or reduced to its origin under a webhook key), the match otherwise.
-type QuotedValueRule = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string) => string;
-
-// Every key="value" attribute, at any escape depth, under the quoted-value rule; a challenge
-// parameter inside an auth parameter list (the nonce of Digest realm="api", nonce="n")
-// keeps its value whatever its name says.
-function replaceQuotedAttributes(text: string, quotedValue: QuotedValueRule): string {
-  const fates = authParameterFates(text);
-  return text.replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string, value: string, offset: number) =>
-    (fates.get(offset) === "challenge" ? match : quotedValue(keyAfterEscape(text, offset, key), value, () => `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`, (url) => `${key}=${quote}${url}${quote}`, match)));
-}
-
-/** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
-// Header lines go first: a recognised header line takes its whole value, so the URL and
-// query rules never split a cookie pair whose name holds "&" or "#" off its cookie. The
-// parameter-list rule runs before the scheme rule, so a credential list after a scheme
-// word goes whole instead of losing its first "name=" and keeping the quoted value, and the
-// proof rule right after it, so a proof in a list without a scheme word goes before the
-// per-parameter rules read the list.
-function scrubCarriers(text: string, pemScope: PemScope): string {
-  const quotedValue = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string): string => {
-    if (isWebhookUrlKey(key) && URL_VALUE_PATTERN.test(value)) return webhook(redactedWebhookUrl(value));
-    return isCredentialKey(key) && !isCountValue(key, value) && !keepsSchemeWord(key, value) ? redacted() : match;
-  };
-  const carriers = scrubHeaderLines(scrubPem(text, pemScope))
-    .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}`)
-    .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
-    .replace(SLASH_ESCAPED_URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`)
-    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match));
-  const pairs = replaceAuthParameterProofs(replaceSchemeParameterLists(carriers))
-    .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${CREDENTIAL_REDACTION_MARKER}`))
-    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => quotedValue(key, value, () => `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"`, (url) => `"${key}"${separator}"${url}"`, match))
-    .replace(JSON_ESCAPED_PAIR_PATTERN, (match, run: string, key: string, separator: string, value: string) => quotedValue(key, value, () => `${run}"${key}${run}"${separator}${run}"${CREDENTIAL_REDACTION_MARKER}${run}"`, (url) => `${run}"${key}${run}"${separator}${run}"${url}${run}"`, match));
-  const scrubbed = replaceQuotedAttributes(pairs, quotedValue);
-  return replaceCredentialAssignments(replaceFlagValues(scrubbed))
-    .replace(JWT_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(PANOS_API_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(AWS_ACCESS_KEY_ID_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(GITHUB_TOKEN_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(STRIPE_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(SLACK_TOKEN_PATTERN, CREDENTIAL_REDACTION_MARKER);
-}
-
-/** The general scrub for error text: every carrier rule, every PEM block, and the long-token rule. Idempotent. */
-export function redactErrorText(text: string): string {
-  return scrubCarriers(text, "all").replace(LONG_TOKEN_RUN_PATTERN, (run) => (looksLikeToken(run) ? CREDENTIAL_REDACTION_MARKER : run));
-}
-
-/** Guard 2 on its own: every configured secret in every encoded form, for whole payloads and bundle files where the general scrub would remove evidence. */
-export function redactConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
-  const values = secrets.filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
-  if (values.length === 0) return text;
-  return scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(CREDENTIAL_REDACTION_MARKER);
-}
+const { MIN_CONFIGURED_SECRET_LENGTH, LONG_TOKEN_MIN_LENGTH, URL_VALUE_PATTERN, isCredentialKey, isWebhookUrlKey, redactedWebhookUrl, scrubCarriers, redactErrorText, redactConfiguredSecrets } = createPemCredentialScrubber();
+export { MIN_CONFIGURED_SECRET_LENGTH, LONG_TOKEN_MIN_LENGTH, isCredentialKey, redactErrorText, redactConfiguredSecrets };
 
 /**
  * Every string inside a tool result or other plain value, with the configured secrets
@@ -1607,7 +624,7 @@ function originOf(url: URL): string {
 // object keeps its numeric fields (they sit under password_length and similar
 // names, not under password itself).
 const CREDENTIAL_LAST_SEGMENTS = new Set(["token", "secret", "password", "passwd", "pwd", "passphrase", "apikey", "authorization"]);
-const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
+
 // Containers whose every string value is a credential apart from the name that
 // labels it: webhook authentication.data (basic_auth password, bearer_token
 // token, api_key value, with username and name kept) and header maps such as
@@ -1636,14 +653,7 @@ export function redactCredentialValueText(text: string): string {
   return scrubCarriers(text, "private");
 }
 
-function propertyNameSegments(name: string): string[] {
-  return name
-    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((segment) => segment.length > 0);
-}
+
 
 export function isCredentialPropertyName(name: string): boolean {
   const segments = propertyNameSegments(name);
@@ -2416,13 +1426,13 @@ function snapshotErrors(entries: Array<[string, ZendeskSnapshot<unknown>]>): str
 }
 
 function finding(
-  control: number,
+  decisions: BatchVerdicts, control: number,
   title: string,
   severity: ZendeskFinding["severity"],
-  status: ZendeskFindingStatus,
   summary: string,
   evidence?: JsonRecord,
 ): ZendeskFinding {
+  const status = decisions.status(`ZD-${String(control).padStart(2, "0")}`) as ZendeskFindingStatus;
   const id = `ZD-${String(control).padStart(2, "0")}`;
   return {
     id,
@@ -2436,24 +1446,21 @@ function finding(
   };
 }
 
-const ZENDESK_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
 
-function recordZendeskDecisionFacts(control: number, facts: Readonly<Record<string, unknown>>): void {
-  const id = `ZD-${String(control).padStart(2, "0")}`;
-  const store = ZENDESK_DECISION_CONTEXT.getStore();
-  if (!store) throw new Error(`${id} decision facts were recorded outside a Zendesk assessment`);
-  store.set(id, facts);
+
+function recordZendeskDecisionFacts(decisions: BatchVerdicts, control: number, facts: Readonly<Record<string, unknown>>): void {
+  decisions.record(`ZD-${String(control).padStart(2, "0")}`, facts);
 }
 
 function manualFinding(
-  control: number,
+  decisions: BatchVerdicts, control: number,
   title: string,
   severity: ZendeskFinding["severity"],
   cause: string,
   evidenceInstruction: string,
   evidence?: JsonRecord,
 ): ZendeskFinding {
-  return finding(control, title, severity, "manual", `${cause} Manual evidence: ${evidenceInstruction}`, evidence);
+  return finding(decisions, control, title, severity, `${cause} Manual evidence: ${evidenceInstruction}`, evidence);
 }
 
 function listSnapshotItems(snap: ZendeskSnapshot<ZendeskListResult>): JsonRecord[] {
@@ -2550,7 +1557,6 @@ function capForIncomplete(item: ZendeskFinding, secondaries: Array<[string, Zend
   ];
   return {
     ...item,
-    status: "warn",
     summary: `${item.summary} ${causes.join(" ")}`,
     evidence: {
       ...(item.evidence ?? {}),
@@ -2820,30 +1826,34 @@ function roleCeilingReason(currentUser: ZendeskSnapshot<JsonRecord>): string | u
     : `the current user lookup (/users/me) failed (${currentUser.error ?? currentUser.status}), so the credential's role could not be confirmed`;
 }
 
-function finalizeFindings(findings: ZendeskFinding[], currentUser: ZendeskSnapshot<JsonRecord>): ZendeskFinding[] {
-  const reason = roleCeilingReason(currentUser);
-  const factsByCheck = ZENDESK_DECISION_CONTEXT.getStore();
-  if (!factsByCheck) throw new Error("Zendesk findings were finalized outside an assessment");
-  const credentialIsAdmin = reason === undefined;
-  for (const item of findings) {
-    const facts = factsByCheck.get(item.id);
-    if (!facts) throw new Error(`${item.id} has no runtime decision facts`);
-    const check = ZENDESK_SPEC.checks.find((candidate) => candidate.id === item.id);
-    factsByCheck.set(item.id, check?.evidenceFields.includes("credential_is_admin")
-      ? { ...facts, credential_is_admin: credentialIsAdmin }
-      : facts);
+function createZendeskVerdicts(currentUser: ZendeskSnapshot<JsonRecord>): BatchVerdicts {
+  const decisions = new BatchVerdicts(ZENDESK_SPEC);
+  const credentialIsAdmin = roleCeilingReason(currentUser) === undefined;
+  for (const check of ZENDESK_SPEC.checks) {
+    if (check.evidenceFields.includes("credential_is_admin")) {
+      decisions.record(check.id, { credential_is_admin: credentialIsAdmin });
+    }
   }
-  const capped = reason
-    ? findings.map((item): ZendeskFinding => item.status === "pass"
-      ? {
+  return decisions;
+}
+
+function finalizeFindings(decisions: BatchVerdicts, findings: ZendeskFinding[], currentUser: ZendeskSnapshot<JsonRecord>): ZendeskFinding[] {
+  const reason = roleCeilingReason(currentUser);
+  const explained = reason
+    ? findings.map((item): ZendeskFinding => {
+      // The counterfactual adds an explanation only; the executable check owns status.
+      const cappedByRole = item.status === "warn"
+        && evaluateBatchCheckVerdict(ZENDESK_SPEC, item.id, {
+          ...decisions.factsFor(item.id), credential_is_admin: true,
+        }) === "pass";
+      return cappedByRole ? {
         ...item,
-        status: "warn",
         summary: `${item.summary} Verdict capped at warn because ${reason}.`,
         evidence: { ...(item.evidence ?? {}), verdict_capped_by_role: asString(currentUser.data?.role) ?? null },
-      }
-      : item)
+      } : item;
+    })
     : findings;
-  return [...capped].sort((left, right) => left.control - right.control);
+  return [...explained].sort((left, right) => left.control - right.control);
 }
 
 function ssoMethods(auth: JsonRecord): string[] {
@@ -2869,13 +1879,13 @@ function authenticationEvidence(auth: JsonRecord): JsonRecord {
   };
 }
 
-function assessSsoEnforcement(securitySnap: ZendeskSnapshot<JsonRecord>, agentAuth: JsonRecord, adminCenterAuth: string): ZendeskFinding {
+function assessSsoEnforcement(decisions: BatchVerdicts, securitySnap: ZendeskSnapshot<JsonRecord>, agentAuth: JsonRecord, adminCenterAuth: string): ZendeskFinding {
   const title = "SSO enforcement enabled";
   const instruction = `capture ${adminCenterAuth} showing single sign-on enabled and Zendesk password sign-in disabled for team members.`;
   const enforceSso = asBoolean(agentAuth.enforce_sso);
   const zendeskLogin = asBoolean(agentAuth.zendesk_login);
   const methods = ssoMethods(agentAuth);
-  recordZendeskDecisionFacts(1, {
+  recordZendeskDecisionFacts(decisions, 1, {
     readable: securitySnap.status === "ok",
     fields_present: enforceSso !== undefined && zendeskLogin !== undefined,
     enforce_sso: enforceSso,
@@ -2883,7 +1893,7 @@ function assessSsoEnforcement(securitySnap: ZendeskSnapshot<JsonRecord>, agentAu
     sso_method_count: methods.length,
   });
   if (securitySnap.status !== "ok") {
-    return manualFinding(1, title, "critical", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
+    return manualFinding(decisions, 1, title, "critical", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
   }
   const bypassName = asString(agentAuth.remote_bypass_name) ?? (asNumber(agentAuth.remote_bypass) === 1 ? "owner" : asNumber(agentAuth.remote_bypass) === 2 ? "admins" : "unknown");
   const evidence: JsonRecord = {
@@ -2893,7 +1903,7 @@ function assessSsoEnforcement(securitySnap: ZendeskSnapshot<JsonRecord>, agentAu
     two_factor_enforce: asBoolean(agentAuth.two_factor_enforce) ?? null,
   };
   if (enforceSso === undefined || zendeskLogin === undefined) {
-    return manualFinding(1, title, "critical", "security_settings.authentication.agent did not include enforce_sso and zendesk_login.", instruction, evidence);
+    return manualFinding(decisions, 1, title, "critical", "security_settings.authentication.agent did not include enforce_sso and zendesk_login.", instruction, evidence);
   }
   const redirectNote = methods.length > 1
     ? (asBoolean(agentAuth.sso_auto_redirect) === true
@@ -2901,20 +1911,20 @@ function assessSsoEnforcement(securitySnap: ZendeskSnapshot<JsonRecord>, agentAu
       : " sso_auto_redirect=false, so team members choose among the active SSO methods.")
     : "";
   if (enforceSso && zendeskLogin === false && methods.length > 0) {
-    return finding(1, title, "critical", "pass", `authentication.agent.enforce_sso=true and zendesk_login=false: team members must sign in through ${methods.join(", ")}. One-time SSO bypass links are limited to ${bypassName} (remote_bypass).${redirectNote}`, evidence);
+    return finding(decisions, 1, title, "critical", `authentication.agent.enforce_sso=true and zendesk_login=false: team members must sign in through ${methods.join(", ")}. One-time SSO bypass links are limited to ${bypassName} (remote_bypass).${redirectNote}`, evidence);
   }
   if (enforceSso) {
-    return finding(1, title, "critical", "warn", methods.length === 0
+    return finding(decisions, 1, title, "critical", methods.length === 0
       ? "authentication.agent.enforce_sso=true but no SSO method (remote_login, google_login, office_365_login) is enabled for team members; confirm how team members sign in."
       : `authentication.agent.enforce_sso=true but zendesk_login=true, so email and password sign-in still appears enabled alongside ${methods.join(", ")}.${redirectNote}`, evidence);
   }
-  return finding(1, title, "critical", "fail", methods.length > 0
+  return finding(decisions, 1, title, "critical", methods.length > 0
     ? `authentication.agent.enforce_sso=false: ${methods.join(", ")} ${methods.length === 1 ? "is" : "are"} enabled but not enforced, so team members can still sign in with a Zendesk password (zendesk_login=${zendeskLogin}).`
     : `authentication.agent.enforce_sso=false and no SSO method is enabled; team members sign in with Zendesk passwords only (zendesk_login=${zendeskLogin}).`, evidence);
 }
 
 function assessAgentTwoFactor(
-  securitySnap: ZendeskSnapshot<JsonRecord>,
+  decisions: BatchVerdicts, securitySnap: ZendeskSnapshot<JsonRecord>,
   agentAuth: JsonRecord,
   teamSnap: ZendeskSnapshot<ZendeskListResult>,
   teamMembers: JsonRecord[],
@@ -2926,7 +1936,7 @@ function assessAgentTwoFactor(
   const enforceSso = securitySnap.status === "ok" ? asBoolean(agentAuth.enforce_sso) : undefined;
   const withoutTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === false);
   const unknownTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === undefined);
-  recordZendeskDecisionFacts(2, {
+  recordZendeskDecisionFacts(decisions, 2, {
     team_readable: teamSnap.status === "ok",
     team_count: teamMembers.length,
     security_readable: securitySnap.status === "ok",
@@ -2941,10 +1951,10 @@ function assessAgentTwoFactor(
     ? `security_settings.authentication.agent.two_factor_enforce=${enforce ?? "absent"}.`
     : snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap);
   if (teamSnap.status !== "ok") {
-    return manualFinding(2, title, "critical", `${snapshotCause("Team member list (/users?role[]=agent&role[]=admin)", teamSnap)} ${enforcementText}`, `export the team member list from Admin Center > People > Team > Team members and ${requirementInstruction}`, { two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
+    return manualFinding(decisions, 2, title, "critical", `${snapshotCause("Team member list (/users?role[]=agent&role[]=admin)", teamSnap)} ${enforcementText}`, `export the team member list from Admin Center > People > Team > Team members and ${requirementInstruction}`, { two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
   }
   if (teamMembers.length === 0) {
-    return manualFinding(2, title, "critical", `Zero active agents or admins were visible although every Zendesk account has at least one admin, so the credential sees only a partial population.${truncationNote("team member", teamSnap)} ${enforcementText}`, `use an admin credential and ${requirementInstruction}`, { seen_team_members: countOrNull(0, teamSnap), inventory_truncated: truncationOrNull(teamSnap), two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
+    return manualFinding(decisions, 2, title, "critical", `Zero active agents or admins were visible although every Zendesk account has at least one admin, so the credential sees only a partial population.${truncationNote("team member", teamSnap)} ${enforcementText}`, `use an admin credential and ${requirementInstruction}`, { seen_team_members: countOrNull(0, teamSnap), inventory_truncated: truncationOrNull(teamSnap), two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
   }
   const truncated = isTruncated(teamSnap);
   const enrolled = teamMembers.length - withoutTwoFactor.length - unknownTwoFactor.length;
@@ -2963,22 +1973,22 @@ function assessAgentTwoFactor(
   const atLeast = truncated ? "at least " : "";
   if (securitySnap.status !== "ok") {
     return withoutTwoFactor.length > 0
-      ? finding(2, title, "critical", "fail", `${withoutTwoFactor.length}/${teamMembers.length} active team members report two_factor_auth_enabled=false. ${enforcementText}${truncationNote("team member", teamSnap)}`, evidence)
-      : manualFinding(2, title, "critical", `${perUser}, but the account-level requirement could not be verified: ${enforcementText}`, requirementInstruction, evidence);
+      ? finding(decisions, 2, title, "critical", `${withoutTwoFactor.length}/${teamMembers.length} active team members report two_factor_auth_enabled=false. ${enforcementText}${truncationNote("team member", teamSnap)}`, evidence)
+      : manualFinding(decisions, 2, title, "critical", `${perUser}, but the account-level requirement could not be verified: ${enforcementText}`, requirementInstruction, evidence);
   }
   if (enforce === undefined) {
-    return manualFinding(2, title, "critical", `${perUser}, but security_settings.authentication.agent.two_factor_enforce was absent from the response.`, requirementInstruction, evidence);
+    return manualFinding(decisions, 2, title, "critical", `${perUser}, but security_settings.authentication.agent.two_factor_enforce was absent from the response.`, requirementInstruction, evidence);
   }
   if (!enforce) {
     if (enforceSso === true) {
-      return manualFinding(2, title, "critical", `two_factor_enforce=false while enforce_sso=true, so Zendesk-native 2FA is not required and multi-factor authentication depends on the identity provider (${perUser}).`, "capture the identity provider's MFA policy that covers every Zendesk team member.", evidence);
+      return manualFinding(decisions, 2, title, "critical", `two_factor_enforce=false while enforce_sso=true, so Zendesk-native 2FA is not required and multi-factor authentication depends on the identity provider (${perUser}).`, "capture the identity provider's MFA policy that covers every Zendesk team member.", evidence);
     }
-    return finding(2, title, "critical", "fail", `security_settings.authentication.agent.two_factor_enforce=false: the account does not require 2FA, so per-user enrollment is optional even though ${perUser}${withoutTwoFactor.length > 0 ? ` and ${withoutTwoFactor.length} report it disabled` : ""}.${truncationNote("team member", teamSnap)}`, evidence);
+    return finding(decisions, 2, title, "critical", `security_settings.authentication.agent.two_factor_enforce=false: the account does not require 2FA, so per-user enrollment is optional even though ${perUser}${withoutTwoFactor.length > 0 ? ` and ${withoutTwoFactor.length} report it disabled` : ""}.${truncationNote("team member", teamSnap)}`, evidence);
   }
   if (withoutTwoFactor.length > 0 || unknownTwoFactor.length > 0 || truncated) {
-    return finding(2, title, "critical", "warn", `two_factor_enforce=true, but ${atLeast}${withoutTwoFactor.length} team members report two_factor_auth_enabled=false (not yet enrolled) and ${atLeast}${unknownTwoFactor.length} did not expose the flag (${perUser}).${truncationNote("team member", teamSnap)}`, evidence);
+    return finding(decisions, 2, title, "critical", `two_factor_enforce=true, but ${atLeast}${withoutTwoFactor.length} team members report two_factor_auth_enabled=false (not yet enrolled) and ${atLeast}${unknownTwoFactor.length} did not expose the flag (${perUser}).${truncationNote("team member", teamSnap)}`, evidence);
   }
-  return finding(2, title, "critical", "pass", `security_settings.authentication.agent.two_factor_enforce=true and all ${teamMembers.length} active team members report two_factor_auth_enabled=true; the inventory was read to completion.`, evidence);
+  return finding(decisions, 2, title, "critical", `security_settings.authentication.agent.two_factor_enforce=true and all ${teamMembers.length} active team members report two_factor_auth_enabled=true; the inventory was read to completion.`, evidence);
 }
 
 function customPasswordGaps(password: JsonRecord): string[] {
@@ -2996,18 +2006,18 @@ function customPasswordGaps(password: JsonRecord): string[] {
   return gaps;
 }
 
-function assessPasswordPolicy(securitySnap: ZendeskSnapshot<JsonRecord>, agentAuth: JsonRecord, agentPassword: JsonRecord): ZendeskFinding {
+function assessPasswordPolicy(decisions: BatchVerdicts, securitySnap: ZendeskSnapshot<JsonRecord>, agentAuth: JsonRecord, agentPassword: JsonRecord): ZendeskFinding {
   const title = "Password policy meets complexity requirements";
   const instruction = "capture Admin Center > Account > Security > Team member authentication > Password level (Recommended, High, Medium, Low, or Custom) and the custom policy details.";
   const policyName = asString(agentAuth.security_policy_name)?.toLowerCase();
   const customGaps = policyName === "custom" ? customPasswordGaps(agentPassword) : [];
-  recordZendeskDecisionFacts(3, {
+  recordZendeskDecisionFacts(decisions, 3, {
     readable: securitySnap.status === "ok",
     security_policy_name: policyName,
     custom_gap_count: customGaps.length,
   });
   if (securitySnap.status !== "ok") {
-    return manualFinding(3, title, "high", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
+    return manualFinding(decisions, 3, title, "high", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
   }
   const evidence: JsonRecord = {
     ...authenticationEvidence(agentAuth),
@@ -3023,40 +2033,40 @@ function assessPasswordPolicy(securitySnap: ZendeskSnapshot<JsonRecord>, agentAu
     },
   };
   if (!policyName) {
-    return manualFinding(3, title, "high", "security_settings.authentication.agent.security_policy_name was absent from the response.", instruction, evidence);
+    return manualFinding(decisions, 3, title, "high", "security_settings.authentication.agent.security_policy_name was absent from the response.", instruction, evidence);
   }
   const ssoNote = asBoolean(agentAuth.enforce_sso) === true && asBoolean(agentAuth.zendesk_login) === false
     ? " SSO is enforced, so this policy governs only bypass and recovery sign-ins."
     : "";
   const label = `authentication.agent.security_policy_name=${policyName} (security_policy_id ${asNumber(agentAuth.security_policy_id) ?? "absent"})`;
   if (policyName === "recommended") {
-    return finding(3, title, "high", "pass", `${label}, the level Zendesk documents as its strongest preset.${ssoNote}`, evidence);
+    return finding(decisions, 3, title, "high", `${label}, the level Zendesk documents as its strongest preset.${ssoNote}`, evidence);
   }
   if (policyName === "custom") {
     const gaps = customGaps;
     return gaps.length === 0
-      ? finding(3, title, "high", "pass", `${label} and the documented policy fields meet the baseline (12+ characters, numbers and special characters, mixed case, lockout after at most 10 failed attempts, email local part disallowed, history of at least 5 or unlimited).${ssoNote}`, evidence)
-      : finding(3, title, "high", "warn", `${label} but ${gaps.length} policy fields fall short of the baseline: ${gaps.join("; ")}.${ssoNote}`, evidence);
+      ? finding(decisions, 3, title, "high", `${label} and the documented policy fields meet the baseline (12+ characters, numbers and special characters, mixed case, lockout after at most 10 failed attempts, email local part disallowed, history of at least 5 or unlimited).${ssoNote}`, evidence)
+      : finding(decisions, 3, title, "high", `${label} but ${gaps.length} policy fields fall short of the baseline: ${gaps.join("; ")}.${ssoNote}`, evidence);
   }
   if (policyName === "high") {
-    return finding(3, title, "high", "warn", `${label}; Zendesk documents High as having lower requirements than Recommended, so confirm it satisfies the password length your frameworks require (PCI-DSS 8.3.6 expects 12 characters).${ssoNote}`, evidence);
+    return finding(decisions, 3, title, "high", `${label}; Zendesk documents High as having lower requirements than Recommended, so confirm it satisfies the password length your frameworks require (PCI-DSS 8.3.6 expects 12 characters).${ssoNote}`, evidence);
   }
-  return finding(3, title, "high", "fail", `${label}, below Zendesk's recommended preset; raise it to Recommended or a custom policy that meets the baseline.${ssoNote}`, evidence);
+  return finding(decisions, 3, title, "high", `${label}, below Zendesk's recommended preset; raise it to Recommended or a custom policy that meets the baseline.${ssoNote}`, evidence);
 }
 
-function assessIpRestrictions(securitySnap: ZendeskSnapshot<JsonRecord>, ipSettings: JsonRecord): ZendeskFinding {
+function assessIpRestrictions(decisions: BatchVerdicts, securitySnap: ZendeskSnapshot<JsonRecord>, ipSettings: JsonRecord): ZendeskFinding {
   const title = "IP restrictions configured for agent access";
   const instruction = "capture Admin Center > Account > Security > Advanced > IP restrictions showing the allowed ranges and whether customers are exempt.";
   const enabled = asBoolean(ipSettings.ip_restriction_enabled);
   const ranges = (asString(ipSettings.ip_ranges) ?? "").split(/\s+/).filter(Boolean);
-  recordZendeskDecisionFacts(4, {
+  recordZendeskDecisionFacts(decisions, 4, {
     readable: securitySnap.status === "ok",
     enabled_present: enabled !== undefined,
     enabled,
     range_count: ranges.length,
   });
   if (securitySnap.status !== "ok") {
-    return manualFinding(4, title, "high", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
+    return manualFinding(decisions, 4, title, "high", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
   }
   const agentsOnly = asBoolean(ipSettings.enable_agent_ip_restrictions);
   const evidence: JsonRecord = {
@@ -3066,27 +2076,27 @@ function assessIpRestrictions(securitySnap: ZendeskSnapshot<JsonRecord>, ipSetti
     enable_agent_ip_restrictions: agentsOnly ?? null,
   };
   if (enabled === undefined) {
-    return manualFinding(4, title, "high", "security_settings.ip.ip_restriction_enabled was absent from the response.", instruction, evidence);
+    return manualFinding(decisions, 4, title, "high", "security_settings.ip.ip_restriction_enabled was absent from the response.", instruction, evidence);
   }
   if (enabled && ranges.length > 0) {
     const scope = agentsOnly === true
       ? "restrictions apply to team members only and customers are exempt (enable_agent_ip_restrictions=true)"
       : "restrictions apply to team members and end users (enable_agent_ip_restrictions=false)";
-    return finding(4, title, "high", "pass", `security_settings.ip.ip_restriction_enabled=true with ${ranges.length} allowed IP range(s); ${scope}.`, evidence);
+    return finding(decisions, 4, title, "high", `security_settings.ip.ip_restriction_enabled=true with ${ranges.length} allowed IP range(s); ${scope}.`, evidence);
   }
   if (enabled) {
-    return finding(4, title, "high", "warn", "security_settings.ip.ip_restriction_enabled=true but ip_ranges is empty, so no allowlist is applied.", evidence);
+    return finding(decisions, 4, title, "high", "security_settings.ip.ip_restriction_enabled=true but ip_ranges is empty, so no allowlist is applied.", evidence);
   }
-  return finding(4, title, "high", "fail", "security_settings.ip.ip_restriction_enabled=false: team members can sign in from any network. If agents work from unmanaged networks, document the compensating control (for example SSO with device or conditional access policies).", evidence);
+  return finding(decisions, 4, title, "high", "security_settings.ip.ip_restriction_enabled=false: team members can sign in from any network. If agents work from unmanaged networks, document the compensating control (for example SSO with device or conditional access policies).", evidence);
 }
 
-function assessSessionTimeout(securitySnap: ZendeskSnapshot<JsonRecord>, security: JsonRecord, thresholdMinutes: number): ZendeskFinding {
+function assessSessionTimeout(decisions: BatchVerdicts, securitySnap: ZendeskSnapshot<JsonRecord>, security: JsonRecord, thresholdMinutes: number): ZendeskFinding {
   const title = "Session timeout configured and reasonable";
   const instruction = "capture Admin Center > Account > Security > Advanced > Authentication showing the team member, end user, and mobile app session expiration values.";
   const agentTimeout = asNumber(security.agent_session_timeout);
   const mobileAccess = asBoolean(security.mobile_app_access);
   const mobileTimeout = asNumber(security.mobile_app_session_timeout);
-  recordZendeskDecisionFacts(5, {
+  recordZendeskDecisionFacts(decisions, 5, {
     readable: securitySnap.status === "ok",
     agent_session_timeout: agentTimeout,
     mobile_app_access: mobileAccess,
@@ -3095,7 +2105,7 @@ function assessSessionTimeout(securitySnap: ZendeskSnapshot<JsonRecord>, securit
     severe_threshold_minutes: thresholdMinutes * 3,
   });
   if (securitySnap.status !== "ok") {
-    return manualFinding(5, title, "medium", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
+    return manualFinding(decisions, 5, title, "medium", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
   }
   const endUserTimeout = asNumber(security.end_user_session_timeout);
   const maxDurationEnabled = asBoolean(security.maximum_session_duration_enabled);
@@ -3110,7 +2120,7 @@ function assessSessionTimeout(securitySnap: ZendeskSnapshot<JsonRecord>, securit
     threshold_minutes: thresholdMinutes,
   };
   if (agentTimeout === undefined) {
-    return manualFinding(5, title, "medium", "security_settings.agent_session_timeout was absent from the response.", instruction, evidence);
+    return manualFinding(decisions, 5, title, "medium", "security_settings.agent_session_timeout was absent from the response.", instruction, evidence);
   }
   const issues: string[] = [];
   if (agentTimeout <= 0) issues.push("agent_session_timeout=0, so team member sessions never expire from inactivity");
@@ -3125,15 +2135,15 @@ function assessSessionTimeout(securitySnap: ZendeskSnapshot<JsonRecord>, securit
   const endUserNote = endUserTimeout !== undefined ? ` End user sessions expire after ${endUserTimeout} minutes of inactivity.` : "";
   if (issues.length === 0) {
     const mobileNote = mobileAccess !== false && mobileTimeout !== undefined ? ` and mobile_app_session_timeout=${mobileTimeout} minutes` : "";
-    return finding(5, title, "medium", "pass", `security_settings.agent_session_timeout=${agentTimeout} minutes${mobileNote} of inactivity are within the ${thresholdMinutes}-minute threshold.${maxNote}${endUserNote}`, evidence);
+    return finding(decisions, 5, title, "medium", `security_settings.agent_session_timeout=${agentTimeout} minutes${mobileNote} of inactivity are within the ${thresholdMinutes}-minute threshold.${maxNote}${endUserNote}`, evidence);
   }
-  const isSevere = (timeout: number) => timeout <= 0 || timeout > thresholdMinutes * 3;
-  const severe = isSevere(agentTimeout) || (mobileAccess !== false && mobileTimeout !== undefined && isSevere(mobileTimeout));
-  return finding(5, title, "medium", severe ? "fail" : "warn", `${issues.join("; ")}.${maxNote}${endUserNote}`, evidence);
+
+
+  return finding(decisions, 5, title, "medium", `${issues.join("; ")}.${maxNote}${endUserNote}`, evidence);
 }
 
 function assessEndUserAuthentication(
-  securitySnap: ZendeskSnapshot<JsonRecord>,
+  decisions: BatchVerdicts, securitySnap: ZendeskSnapshot<JsonRecord>,
   endUserAuth: JsonRecord,
   settingsSnap: ZendeskSnapshot<JsonRecord>,
   apiSettings: JsonRecord,
@@ -3152,7 +2162,7 @@ function assessEndUserAuthentication(
   const enforceSso = asBoolean(endUserAuth.enforce_sso);
   const methods = ssoMethods(endUserAuth);
   const policyName = asString(endUserAuth.security_policy_name)?.toLowerCase();
-  recordZendeskDecisionFacts(21, {
+  recordZendeskDecisionFacts(decisions, 21, {
     security_readable: securitySnap.status === "ok",
     fields_present: zendeskLogin !== undefined && enforceSso !== undefined,
     enforce_sso: enforceSso,
@@ -3162,7 +2172,7 @@ function assessEndUserAuthentication(
     account_settings_complete: settingsSnap.status === "ok",
   });
   if (securitySnap.status !== "ok") {
-    return manualFinding(21, title, "high", `${snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap)}${apiNote}`, `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, baseEvidence);
+    return manualFinding(decisions, 21, title, "high", `${snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap)}${apiNote}`, `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, baseEvidence);
   }
   const evidence: JsonRecord = {
     ...authenticationEvidence(endUserAuth),
@@ -3170,34 +2180,35 @@ function assessEndUserAuthentication(
     ...baseEvidence,
   };
   if (zendeskLogin === undefined || enforceSso === undefined) {
-    return manualFinding(21, title, "high", "security_settings.authentication.end_user did not include zendesk_login and enforce_sso.", `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, evidence);
+    return manualFinding(decisions, 21, title, "high", "security_settings.authentication.end_user did not include zendesk_login and enforce_sso.", `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, evidence);
   }
   const manualPortion = ` The anonymous submission setting is a separate manual check: ${anonymousInstruction}`;
   if (enforceSso && methods.length > 0) {
-    return cap(finding(21, title, "high", "pass", `authentication.end_user.enforce_sso=true: end users must sign in through ${methods.join(", ")} and Zendesk password sign-in is disabled.${apiNote}${manualPortion}`, evidence));
+    return cap(finding(decisions, 21, title, "high", `authentication.end_user.enforce_sso=true: end users must sign in through ${methods.join(", ")} and Zendesk password sign-in is disabled.${apiNote}${manualPortion}`, evidence));
   }
   if (enforceSso) {
-    return finding(21, title, "high", "warn", `authentication.end_user.enforce_sso=true but no SSO method is enabled for end users; confirm how end users sign in.${apiNote}${manualPortion}`, evidence);
+    return finding(decisions, 21, title, "high", `authentication.end_user.enforce_sso=true but no SSO method is enabled for end users; confirm how end users sign in.${apiNote}${manualPortion}`, evidence);
   }
   if (zendeskLogin) {
     const social = methods.length > 0 ? ` Additional sign-in methods: ${methods.join(", ")}.` : "";
     return policyName === "recommended" || policyName === "high"
-      ? cap(finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=true under the ${policyName} password security level, so end users authenticate with Zendesk credentials.${social}${apiNote}${manualPortion}`, evidence))
-      : finding(21, title, "high", "warn", `authentication.end_user.zendesk_login=true under the ${policyName ?? "unknown"} password security level; raise the end user password level to Recommended or High.${social}${apiNote}${manualPortion}`, evidence);
+      ? cap(finding(decisions, 21, title, "high", `authentication.end_user.zendesk_login=true under the ${policyName} password security level, so end users authenticate with Zendesk credentials.${social}${apiNote}${manualPortion}`, evidence))
+      : finding(decisions, 21, title, "high", `authentication.end_user.zendesk_login=true under the ${policyName ?? "unknown"} password security level; raise the end user password level to Recommended or High.${social}${apiNote}${manualPortion}`, evidence);
   }
   if (methods.length > 0) {
-    return cap(finding(21, title, "high", "pass", `authentication.end_user.zendesk_login=false and end users authenticate only through ${methods.join(", ")}.${apiNote}${manualPortion}`, evidence));
+    return cap(finding(decisions, 21, title, "high", `authentication.end_user.zendesk_login=false and end users authenticate only through ${methods.join(", ")}.${apiNote}${manualPortion}`, evidence));
   }
-  return finding(21, title, "high", "fail", `authentication.end_user.zendesk_login=false, enforce_sso=false, and no SSO method is enabled, so end users have no way to sign in and every end user interaction is anonymous.${apiNote}${manualPortion}`, evidence);
+  return finding(decisions, 21, title, "high", `authentication.end_user.zendesk_login=false, enforce_sso=false, and no SSO method is enabled, so end users have no way to sign in and every end user interaction is anonymous.${apiNote}${manualPortion}`, evidence);
 }
 
-async function assessZendeskAuthenticationWithDecisionContext(
+export async function assessZendeskAuthentication(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
   const config = client.getResolvedConfig();
   const resolved = resolveOptions(options);
   const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const decisions = createZendeskVerdicts(currentUserSnap);
   const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
   const securitySnap = await snapshot("getSecuritySettings", () => client.getSecuritySettings());
   const teamSnap = await snapshot("listTeamMembers", () => client.listTeamMembers(resolved.maxItems));
@@ -3212,15 +2223,15 @@ async function assessZendeskAuthenticationWithDecisionContext(
   const adminCenterAuth = "Admin Center > Account > Security > Team member authentication (and End user authentication)";
 
   const findings: ZendeskFinding[] = [
-    assessSsoEnforcement(securitySnap, agentAuth, adminCenterAuth),
-    assessAgentTwoFactor(securitySnap, agentAuth, teamSnap, teamMembers, adminCenterAuth),
-    assessPasswordPolicy(securitySnap, agentAuth, agentPassword),
-    assessIpRestrictions(securitySnap, ipSettings),
-    assessSessionTimeout(securitySnap, security, resolved.sessionTimeoutMinutes),
-    assessEndUserAuthentication(securitySnap, endUserAuth, settingsSnap, apiSettings),
+    assessSsoEnforcement(decisions, securitySnap, agentAuth, adminCenterAuth),
+    assessAgentTwoFactor(decisions, securitySnap, agentAuth, teamSnap, teamMembers, adminCenterAuth),
+    assessPasswordPolicy(decisions, securitySnap, agentAuth, agentPassword),
+    assessIpRestrictions(decisions, securitySnap, ipSettings),
+    assessSessionTimeout(decisions, securitySnap, security, resolved.sessionTimeoutMinutes),
+    assessEndUserAuthentication(decisions, securitySnap, endUserAuth, settingsSnap, apiSettings),
   ];
 
-  const finalFindings = finalizeFindings(findings, currentUserSnap);
+  const finalFindings = finalizeFindings(decisions, findings, currentUserSnap);
   const entries: Array<[string, ZendeskSnapshot<unknown>]> = [
     ["current_user", currentUserSnap],
     ["account_settings", settingsSnap],
@@ -3243,12 +2254,7 @@ async function assessZendeskAuthenticationWithDecisionContext(
   };
 }
 
-export async function assessZendeskAuthentication(
-  client: ZendeskReadClient,
-  options: ZendeskAssessmentOptions = {},
-): Promise<ZendeskAssessmentResult> {
-  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskAuthenticationWithDecisionContext(client, options));
-}
+
 
 interface ApiTokenEventSummary {
   created: number;
@@ -3295,7 +2301,7 @@ function summarizeApiTokenEvents(events: JsonRecord[], staleDays: number, now: D
 }
 
 function assessApiTokens(
-  settingsSnap: ZendeskSnapshot<JsonRecord>,
+  decisions: BatchVerdicts, settingsSnap: ZendeskSnapshot<JsonRecord>,
   tokenLogsSnap: ZendeskSnapshot<ZendeskListResult>,
   config: ZendeskResolvedConfig,
   staleDays: number,
@@ -3307,7 +2313,7 @@ function assessApiTokens(
   const apiTokenAccess = asBoolean(asObject(settingsSnap.data?.api)?.api_token_access);
   const events = listSnapshotItems(tokenLogsSnap);
   const summary = summarizeApiTokenEvents(events, staleDays, now);
-  recordZendeskDecisionFacts(13, {
+  recordZendeskDecisionFacts(decisions, 13, {
     settings_readable: settingsSnap.status === "ok",
     api_token_access: apiTokenAccess,
     token_history_readable: tokenLogsSnap.status === "ok",
@@ -3333,17 +2339,17 @@ function assessApiTokens(
     ? `The audit log (filter[source_type]=apitoken) recorded ${summary.created} token creation and ${summary.destroyed} deletion events, leaving ${summary.outstanding.length} outstanding token(s).${truncationNote("token event", tokenLogsSnap)}`
     : snapshotCause(tokenLogSource, tokenLogsSnap);
   if (settingsSnap.status !== "ok") {
-    return manualFinding(13, title, "high", `${snapshotCause("Account settings", settingsSnap)} ${auditText}`, instruction, evidence);
+    return manualFinding(decisions, 13, title, "high", `${snapshotCause("Account settings", settingsSnap)} ${auditText}`, instruction, evidence);
   }
   if (apiTokenAccess === false) {
     return capForIncomplete(
-      finding(13, title, "high", "pass", `settings.api.api_token_access=false, so API tokens cannot be used to authenticate to this account. ${auditText}`, evidence),
+      finding(decisions, 13, title, "high", `settings.api.api_token_access=false, so API tokens cannot be used to authenticate to this account. ${auditText}`, evidence),
       [[tokenLogSource, tokenLogsSnap]],
     );
   }
   const accessText = `settings.api.api_token_access=${apiTokenAccess === true ? "true" : "absent"}, so API tokens can authenticate to this account.`;
   if (tokenLogsSnap.status !== "ok") {
-    return manualFinding(13, title, "high", `${accessText} ${auditText} ${retirement}`, instruction, evidence);
+    return manualFinding(decisions, 13, title, "high", `${accessText} ${auditText} ${retirement}`, instruction, evidence);
   }
   if (summary.outstanding.length === 0) {
     const caveat = config.authMode === "api_token"
@@ -3351,10 +2357,10 @@ function assessApiTokens(
       : isTruncated(tokenLogsSnap)
         ? " Older tokens may be missing from the unread remainder of the history."
         : " The audit log records events rather than an inventory, so confirm the token list in Admin Center.";
-    return finding(13, title, "high", "warn", `${accessText} ${auditText}${caveat} ${retirement}`, evidence);
+    return finding(decisions, 13, title, "high", `${accessText} ${auditText}${caveat} ${retirement}`, evidence);
   }
   return manualFinding(
-    13,
+    decisions, 13,
     title,
     "high",
     `${accessText} ${auditText} ${summary.outstandingOverStale} were created more than ${staleDays} days ago and ${summary.outstandingUndated} have no creation date. ${retirement}`,
@@ -3363,7 +2369,7 @@ function assessApiTokens(
   );
 }
 
-async function assessZendeskAccessControlWithDecisionContext(
+export async function assessZendeskAccessControl(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
@@ -3371,6 +2377,7 @@ async function assessZendeskAccessControlWithDecisionContext(
   const resolved = resolveOptions(options);
   const now = resolved.now();
   const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const decisions = createZendeskVerdicts(currentUserSnap);
   const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
   const teamSnap = await snapshot("listTeamMembers", () => client.listTeamMembers(resolved.maxItems));
   const rolesSnap = await snapshot("listCustomRoles", () => client.listCustomRoles());
@@ -3393,7 +2400,7 @@ async function assessZendeskAccessControlWithDecisionContext(
   const groups = listSnapshotItems(groupsSnap).filter((group) => asBoolean(group.deleted) !== true);
   const memberships = listSnapshotItems(membershipsSnap);
 
-  recordZendeskDecisionFacts(6, {
+  recordZendeskDecisionFacts(decisions, 6, {
     team_readable: teamSnap.status === "ok",
     team_count: teamMembers.length,
     roles_readable: rolesSnap.status === "ok",
@@ -3403,7 +2410,7 @@ async function assessZendeskAccessControlWithDecisionContext(
     agent_count: agents.length,
     unrestricted_agent_count: unrestrictedAgents.length,
   });
-  recordZendeskDecisionFacts(7, {
+  recordZendeskDecisionFacts(decisions, 7, {
     team_readable: teamSnap.status === "ok",
     admin_count: admins.length,
     admin_threshold: resolved.adminThreshold,
@@ -3411,7 +2418,7 @@ async function assessZendeskAccessControlWithDecisionContext(
     undated_admin_count: adminLoginBuckets.undated.length,
     complete: !isTruncated(teamSnap),
   });
-  recordZendeskDecisionFacts(8, {
+  recordZendeskDecisionFacts(decisions, 8, {
     groups_readable: groupsSnap.status === "ok",
     memberships_readable: membershipsSnap.status === "ok",
     group_count: groups.length,
@@ -3421,9 +2428,9 @@ async function assessZendeskAccessControlWithDecisionContext(
 
   const leastPrivilegeTitle = "Agent roles follow least privilege";
   if (teamSnap.status !== "ok") {
-    findings.push(manualFinding(6, leastPrivilegeTitle, "critical", snapshotCause("Team member list", teamSnap), "export Admin Center > People > Team > Team members with role assignments and Admin Center > People > Team > Roles."));
+    findings.push(manualFinding(decisions, 6, leastPrivilegeTitle, "critical", snapshotCause("Team member list", teamSnap), "export Admin Center > People > Team > Team members with role assignments and Admin Center > People > Team > Roles."));
   } else if (teamMembers.length === 0) {
-    findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `Zero active team members were visible, which indicates a partial view of the account.${truncationNote("team member", teamSnap)}`, "use an admin credential and export the team member and role lists from Admin Center.", { seen_team_members: countOrNull(0, teamSnap), inventory_truncated: truncationOrNull(teamSnap) }));
+    findings.push(manualFinding(decisions, 6, leastPrivilegeTitle, "critical", `Zero active team members were visible, which indicates a partial view of the account.${truncationNote("team member", teamSnap)}`, "use an admin credential and export the team member and role lists from Admin Center.", { seen_team_members: countOrNull(0, teamSnap), inventory_truncated: truncationOrNull(teamSnap) }));
   } else {
     const evidence: JsonRecord = {
       seen_team_members: teamMembers.length,
@@ -3439,21 +2446,21 @@ async function assessZendeskAccessControlWithDecisionContext(
     // The roles are named only when the role inventory was read to completion.
     const adminEquivalentText = isTruncated(rolesSnap) ? "" : ` (${adminEquivalent.map((role) => `${role.name}: ${role.reasons.join(", ")}`).join("; ")})`;
     if (rolesSnap.status !== "ok") {
-      findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `${snapshotCause("Custom roles (/custom_roles, Enterprise plan)", rolesSnap)} Built-in roles seen: ${admins.length} admins, ${agents.length} agents (${unrestrictedAgents.length} unrestricted).${truncationNote("team member", teamSnap)}`, "capture Admin Center > People > Team > Roles and confirm agents are assigned the least-privileged built-in or custom role.", evidence));
+      findings.push(manualFinding(decisions, 6, leastPrivilegeTitle, "critical", `${snapshotCause("Custom roles (/custom_roles, Enterprise plan)", rolesSnap)} Built-in roles seen: ${admins.length} admins, ${agents.length} agents (${unrestrictedAgents.length} unrestricted).${truncationNote("team member", teamSnap)}`, "capture Admin Center > People > Team > Roles and confirm agents are assigned the least-privileged built-in or custom role.", evidence));
     } else if (adminEquivalent.some((role) => role.members > 0)) {
-      findings.push(finding(6, leastPrivilegeTitle, "critical", "fail", `${adminEquivalent.filter((role) => role.members > 0).length} custom roles grant admin-equivalent permissions${adminEquivalentText}.${truncationNote("team member", teamSnap)}${truncationNote("custom role", rolesSnap)}`, evidence));
+      findings.push(finding(decisions, 6, leastPrivilegeTitle, "critical", `${adminEquivalent.filter((role) => role.members > 0).length} custom roles grant admin-equivalent permissions${adminEquivalentText}.${truncationNote("team member", teamSnap)}${truncationNote("custom role", rolesSnap)}`, evidence));
     } else if (isTruncated(teamSnap) || isTruncated(rolesSnap) || adminEquivalent.length > 0 || (agents.length > 0 && unrestrictedAgents.length === agents.length)) {
-      findings.push(finding(6, leastPrivilegeTitle, "critical", "warn", `${customRoles.length} custom roles reviewed; ${adminEquivalent.length} admin-equivalent roles have no members; ${unrestrictedAgents.length}/${agents.length} agents are unrestricted.${truncationNote("team member", teamSnap)}${truncationNote("custom role", rolesSnap)} Review whether unrestricted agents need account-wide ticket access.`, evidence));
+      findings.push(finding(decisions, 6, leastPrivilegeTitle, "critical", `${customRoles.length} custom roles reviewed; ${adminEquivalent.length} admin-equivalent roles have no members; ${unrestrictedAgents.length}/${agents.length} agents are unrestricted.${truncationNote("team member", teamSnap)}${truncationNote("custom role", rolesSnap)} Review whether unrestricted agents need account-wide ticket access.`, evidence));
     } else {
-      findings.push(finding(6, leastPrivilegeTitle, "critical", "pass", `${teamMembers.length} team members (${admins.length} admins, ${agents.length} agents, ${unrestrictedAgents.length} unrestricted) and ${customRoles.length} custom roles were read to completion with no admin-equivalent custom roles.`, evidence));
+      findings.push(finding(decisions, 6, leastPrivilegeTitle, "critical", `${teamMembers.length} team members (${admins.length} admins, ${agents.length} agents, ${unrestrictedAgents.length} unrestricted) and ${customRoles.length} custom roles were read to completion with no admin-equivalent custom roles.`, evidence));
     }
   }
 
   const adminTitle = "No excessive admin accounts";
   if (teamSnap.status !== "ok") {
-    findings.push(manualFinding(7, adminTitle, "high", snapshotCause("Team member list", teamSnap), "export the admin list from Admin Center > People > Team > Team members filtered to the Administrator role."));
+    findings.push(manualFinding(decisions, 7, adminTitle, "high", snapshotCause("Team member list", teamSnap), "export the admin list from Admin Center > People > Team > Team members filtered to the Administrator role."));
   } else if (admins.length === 0) {
-    findings.push(manualFinding(7, adminTitle, "high", `Zero admins were visible although every account has at least one admin (account owner), so the inventory is partial.${truncationNote("team member", teamSnap)}`, "use an admin credential and export the Administrator list from Admin Center.", { seen_admins: countOrNull(0, teamSnap), seen_team_members: countOrNull(teamMembers.length, teamSnap), inventory_truncated: truncationOrNull(teamSnap) }));
+    findings.push(manualFinding(decisions, 7, adminTitle, "high", `Zero admins were visible although every account has at least one admin (account owner), so the inventory is partial.${truncationNote("team member", teamSnap)}`, "use an admin credential and export the Administrator list from Admin Center.", { seen_admins: countOrNull(0, teamSnap), seen_team_members: countOrNull(teamMembers.length, teamSnap), inventory_truncated: truncationOrNull(teamSnap) }));
   } else {
     const loginBuckets = adminLoginBuckets;
     const evidence: JsonRecord = {
@@ -3467,19 +2474,19 @@ async function assessZendeskAccessControlWithDecisionContext(
       inventory_truncated: truncationOrNull(teamSnap),
     };
     if (admins.length > resolved.adminThreshold) {
-      findings.push(finding(7, adminTitle, "high", "fail", `${admins.length} active admins exceed the threshold of ${resolved.adminThreshold}.${truncationNote("team member", teamSnap)}`, evidence));
+      findings.push(finding(decisions, 7, adminTitle, "high", `${admins.length} active admins exceed the threshold of ${resolved.adminThreshold}.${truncationNote("team member", teamSnap)}`, evidence));
     } else if (isTruncated(teamSnap) || loginBuckets.stale.length > 0 || loginBuckets.undated.length > 0) {
-      findings.push(finding(7, adminTitle, "high", "warn", `${admins.length} active admins are within the threshold of ${resolved.adminThreshold}, but ${loginBuckets.stale.length} have not signed in for more than ${resolved.staleDays} days and ${loginBuckets.undated.length} have no last_login_at value.${truncationNote("team member", teamSnap)}`, evidence));
+      findings.push(finding(decisions, 7, adminTitle, "high", `${admins.length} active admins are within the threshold of ${resolved.adminThreshold}, but ${loginBuckets.stale.length} have not signed in for more than ${resolved.staleDays} days and ${loginBuckets.undated.length} have no last_login_at value.${truncationNote("team member", teamSnap)}`, evidence));
     } else {
-      findings.push(finding(7, adminTitle, "high", "pass", `${admins.length} active admins are within the threshold of ${resolved.adminThreshold}; all signed in within ${resolved.staleDays} days and the inventory was read to completion.`, evidence));
+      findings.push(finding(decisions, 7, adminTitle, "high", `${admins.length} active admins are within the threshold of ${resolved.adminThreshold}; all signed in within ${resolved.staleDays} days and the inventory was read to completion.`, evidence));
     }
   }
 
   const groupsTitle = "Group-based access controls configured";
   if (groupsSnap.status !== "ok" || membershipsSnap.status !== "ok") {
-    findings.push(manualFinding(8, groupsTitle, "medium", `${snapshotCause("Groups", groupsSnap)} ${snapshotCause("Group memberships", membershipsSnap)}`, "capture Admin Center > People > Team > Groups with member counts."));
+    findings.push(manualFinding(decisions, 8, groupsTitle, "medium", `${snapshotCause("Groups", groupsSnap)} ${snapshotCause("Group memberships", membershipsSnap)}`, "capture Admin Center > People > Team > Groups with member counts."));
   } else if (groups.length === 0) {
-    findings.push(manualFinding(8, groupsTitle, "medium", `Zero groups were visible although every account has a default group, so the inventory is partial.${truncationNote("group", groupsSnap)}`, "use an admin credential and capture Admin Center > People > Team > Groups.", { seen_groups: countOrNull(0, groupsSnap), inventory_truncated: truncationOrNull(groupsSnap, membershipsSnap) }));
+    findings.push(manualFinding(decisions, 8, groupsTitle, "medium", `Zero groups were visible although every account has a default group, so the inventory is partial.${truncationNote("group", groupsSnap)}`, "use an admin credential and capture Admin Center > People > Team > Groups.", { seen_groups: countOrNull(0, groupsSnap), inventory_truncated: truncationOrNull(groupsSnap, membershipsSnap) }));
   } else {
     const privateGroups = groups.filter((group) => asBoolean(group.is_public) === false);
     const evidence: JsonRecord = {
@@ -3490,15 +2497,15 @@ async function assessZendeskAccessControlWithDecisionContext(
       inventory_truncated: truncationOrNull(groupsSnap, membershipsSnap),
     };
     if (groups.length === 1 || memberships.length === 0) {
-      findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} group(s) and ${memberships.length} memberships were visible, so ticket access is not segmented by group.${truncationNote("group", groupsSnap)}${truncationNote("group membership", membershipsSnap)}`, evidence));
+      findings.push(finding(decisions, 8, groupsTitle, "medium", `${groups.length} group(s) and ${memberships.length} memberships were visible, so ticket access is not segmented by group.${truncationNote("group", groupsSnap)}${truncationNote("group membership", membershipsSnap)}`, evidence));
     } else if (isTruncated(groupsSnap) || isTruncated(membershipsSnap)) {
-      findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} groups and ${memberships.length} memberships were seen but the inventory was truncated, so segmentation could not be fully confirmed.${truncationNote("group", groupsSnap)}${truncationNote("group membership", membershipsSnap)}`, evidence));
+      findings.push(finding(decisions, 8, groupsTitle, "medium", `${groups.length} groups and ${memberships.length} memberships were seen but the inventory was truncated, so segmentation could not be fully confirmed.${truncationNote("group", groupsSnap)}${truncationNote("group membership", membershipsSnap)}`, evidence));
     } else {
-      findings.push(finding(8, groupsTitle, "medium", "pass", `${groups.length} groups (${privateGroups.length} private) with ${memberships.length} memberships were read to completion, showing group-based segmentation is configured.`, evidence));
+      findings.push(finding(decisions, 8, groupsTitle, "medium", `${groups.length} groups (${privateGroups.length} private) with ${memberships.length} memberships were read to completion, showing group-based segmentation is configured.`, evidence));
     }
   }
 
-  findings.push(assessApiTokens(settingsSnap, tokenLogsSnap, config, resolved.staleDays, now));
+  findings.push(assessApiTokens(decisions, settingsSnap, tokenLogsSnap, config, resolved.staleDays, now));
 
   const oauthTitle = "OAuth application permissions are scoped";
   const clients = listSnapshotItems(clientsSnap);
@@ -3509,7 +2516,7 @@ async function assessZendeskAccessControlWithDecisionContext(
   const privilegedTokens = tokens.filter((token) => asArray(token.scopes).some((scope) => /write|impersonate/i.test(asString(scope) ?? "")));
   const nonExpiringTokens = tokens.filter((token) => !asString(token.expires_at));
   const usage = partitionByDate(tokens, "used_at", resolved.staleDays, now);
-  recordZendeskDecisionFacts(14, {
+  recordZendeskDecisionFacts(decisions, 14, {
     clients_readable: clientsSnap.status === "ok",
     clients_complete: clientsSnap.status === "ok" && !isTruncated(clientsSnap),
     client_count: clients.length,
@@ -3525,7 +2532,7 @@ async function assessZendeskAccessControlWithDecisionContext(
     undated_token_count: usage.undated.length,
   });
   if (clientsSnap.status !== "ok") {
-    findings.push(manualFinding(14, oauthTitle, "high", snapshotCause("OAuth clients (/oauth/clients, admin only)", clientsSnap), "capture Admin Center > Apps and integrations > APIs > OAuth clients with each client's scopes, kind, and redirect URLs."));
+    findings.push(manualFinding(decisions, 14, oauthTitle, "high", snapshotCause("OAuth clients (/oauth/clients, admin only)", clientsSnap), "capture Admin Center > Apps and integrations > APIs > OAuth clients with each client's scopes, kind, and redirect URLs."));
   } else {
     const tokenSource = "OAuth tokens (/oauth/tokens?all=true, admin only)";
     const clientLabel = (item: JsonRecord): string => asString(item.name) ?? asString(item.identifier) ?? "client";
@@ -3546,25 +2553,25 @@ async function assessZendeskAccessControlWithDecisionContext(
       inventory_truncated: truncationOrNull(clientsSnap, tokensSnap),
     };
     if (unscoped.length > 0 || insecureRedirects.length > 0) {
-      findings.push(finding(14, oauthTitle, "high", "fail", `${unscoped.length}/${clients.length} OAuth clients have no scope restriction and ${insecureRedirects.length} use http:// redirect URIs.${truncationNote("OAuth client", clientsSnap)}`, evidence));
+      findings.push(finding(decisions, 14, oauthTitle, "high", `${unscoped.length}/${clients.length} OAuth clients have no scope restriction and ${insecureRedirects.length} use http:// redirect URIs.${truncationNote("OAuth client", clientsSnap)}`, evidence));
     } else if (clients.length === 0) {
       if (tokensSnap.status !== "ok") {
-        findings.push(finding(14, oauthTitle, "high", "warn", `The OAuth client endpoint was readable and returned zero clients, but the token inventory could not be read, so tokens issued to global or hidden clients cannot be ruled out: ${snapshotCause(tokenSource, tokensSnap)}`, evidence));
+        findings.push(finding(decisions, 14, oauthTitle, "high", `The OAuth client endpoint was readable and returned zero clients, but the token inventory could not be read, so tokens issued to global or hidden clients cannot be ruled out: ${snapshotCause(tokenSource, tokensSnap)}`, evidence));
       } else if (tokens.length > 0) {
-        findings.push(finding(14, oauthTitle, "high", "warn", `Zero OAuth clients were returned but ${tokens.length} OAuth tokens exist (global clients or partial view); review token ownership.${truncationNote("OAuth token", tokensSnap)}`, evidence));
+        findings.push(finding(decisions, 14, oauthTitle, "high", `Zero OAuth clients were returned but ${tokens.length} OAuth tokens exist (global clients or partial view); review token ownership.${truncationNote("OAuth token", tokensSnap)}`, evidence));
       } else if (isTruncated(clientsSnap) || isTruncated(tokensSnap)) {
-        findings.push(finding(14, oauthTitle, "high", "warn", `Zero OAuth clients and zero tokens were seen, but an inventory was truncated before completion.${truncationNote("OAuth client", clientsSnap)}${truncationNote("OAuth token", tokensSnap)}`, evidence));
+        findings.push(finding(decisions, 14, oauthTitle, "high", `Zero OAuth clients and zero tokens were seen, but an inventory was truncated before completion.${truncationNote("OAuth client", clientsSnap)}${truncationNote("OAuth token", tokensSnap)}`, evidence));
       } else {
-        findings.push(finding(14, oauthTitle, "high", "pass", "The OAuth client and token endpoints were readable and returned zero clients and zero tokens, so no third-party OAuth applications are registered on this account.", evidence));
+        findings.push(finding(decisions, 14, oauthTitle, "high", "The OAuth client and token endpoints were readable and returned zero clients and zero tokens, so no third-party OAuth applications are registered on this account.", evidence));
       }
     } else if (publicClients.length > 0 || privilegedTokens.length > 0 || nonExpiringTokens.length > 0 || usage.stale.length > 0 || usage.undated.length > 0 || isTruncated(clientsSnap) || isTruncated(tokensSnap) || tokensSnap.status !== "ok") {
-      findings.push(finding(14, oauthTitle, "high", "warn", `${clients.length} OAuth clients all declare allowed scopes; review ${publicClients.length} public clients${tokensSnap.status === "ok" ? `, ${privilegedTokens.length} tokens with write or impersonate scope, ${nonExpiringTokens.length} non-expiring tokens, ${usage.stale.length} tokens unused for more than ${resolved.staleDays} days, and ${usage.undated.length} tokens with no used_at value` : ""}.${tokensSnap.status !== "ok" ? ` Token hygiene could not be reviewed: ${snapshotCause(tokenSource, tokensSnap)}` : ""}${truncationNote("OAuth client", clientsSnap)}${truncationNote("OAuth token", tokensSnap)}`, evidence));
+      findings.push(finding(decisions, 14, oauthTitle, "high", `${clients.length} OAuth clients all declare allowed scopes; review ${publicClients.length} public clients${tokensSnap.status === "ok" ? `, ${privilegedTokens.length} tokens with write or impersonate scope, ${nonExpiringTokens.length} non-expiring tokens, ${usage.stale.length} tokens unused for more than ${resolved.staleDays} days, and ${usage.undated.length} tokens with no used_at value` : ""}.${tokensSnap.status !== "ok" ? ` Token hygiene could not be reviewed: ${snapshotCause(tokenSource, tokensSnap)}` : ""}${truncationNote("OAuth client", clientsSnap)}${truncationNote("OAuth token", tokensSnap)}`, evidence));
     } else {
-      findings.push(finding(14, oauthTitle, "high", "pass", `${clients.length} OAuth clients all declare allowed scopes and https redirect URIs; ${tokens.length} tokens were read to completion with expiries and recent usage.`, evidence));
+      findings.push(finding(decisions, 14, oauthTitle, "high", `${clients.length} OAuth clients all declare allowed scopes and https redirect URIs; ${tokens.length} tokens were read to completion with expiries and recent usage.`, evidence));
     }
   }
 
-  const finalFindings = finalizeFindings(findings, currentUserSnap);
+  const finalFindings = finalizeFindings(decisions, findings, currentUserSnap);
   const entries: Array<[string, ZendeskSnapshot<unknown>]> = [
     ["current_user", currentUserSnap],
     ["account_settings", settingsSnap],
@@ -3597,12 +2604,7 @@ async function assessZendeskAccessControlWithDecisionContext(
   };
 }
 
-export async function assessZendeskAccessControl(
-  client: ZendeskReadClient,
-  options: ZendeskAssessmentOptions = {},
-): Promise<ZendeskAssessmentResult> {
-  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskAccessControlWithDecisionContext(client, options));
-}
+
 
 function describeConditions(list: unknown): string[] {
   return asRecordArray(list).map((condition) => {
@@ -3632,7 +2634,7 @@ function scheduleHasConditions(schedule: JsonRecord): boolean {
 }
 
 function assessDeletionPolicies(
-  deletionSnap: ZendeskSnapshot<ZendeskListResult>,
+  decisions: BatchVerdicts, deletionSnap: ZendeskSnapshot<ZendeskListResult>,
   settingsSnap: ZendeskSnapshot<JsonRecord>,
   tickets: JsonRecord,
   rolesSnap: ZendeskSnapshot<ZendeskListResult>,
@@ -3663,7 +2665,7 @@ function assessDeletionPolicies(
   const active = schedules.filter((schedule) => asBoolean(schedule.active) === true);
   const activeByObject = Object.fromEntries(DELETION_SCHEDULE_OBJECTS.map((object) => [object, active.filter((schedule) => asString(schedule.object) === object).length]));
   const activeWithoutConditions = active.filter((schedule) => !scheduleHasConditions(schedule)).length;
-  recordZendeskDecisionFacts(12, {
+  recordZendeskDecisionFacts(decisions, 12, {
     readable: deletionSnap.status === "ok",
     complete: deletionSnap.status === "ok" && !isTruncated(deletionSnap),
     schedule_count: schedules.length,
@@ -3673,7 +2675,7 @@ function assessDeletionPolicies(
     secondary_complete: settingsSnap.status === "ok" && rolesSnap.status === "ok" && !isTruncated(rolesSnap),
   });
   if (deletionSnap.status !== "ok") {
-    return manualFinding(12, title, "high", `${snapshotCause("Deletion schedules (/deletion_schedules, admin only)", deletionSnap)}${context}`, instruction, baseEvidence);
+    return manualFinding(decisions, 12, title, "high", `${snapshotCause("Deletion schedules (/deletion_schedules, admin only)", deletionSnap)}${context}`, instruction, baseEvidence);
   }
   const otherActive = active.filter((schedule) => !DELETION_SCHEDULE_OBJECTS.includes(asString(schedule.object) ?? "")).length;
   const defaults = schedules.filter((schedule) => asBoolean(schedule.default) === true).length;
@@ -3691,13 +2693,13 @@ function assessDeletionPolicies(
   // read to completion; a truncated read may have stopped before the schedules.
   if (schedules.length === 0) {
     return isTruncated(deletionSnap)
-      ? finding(12, title, "high", "warn", `Zero deletion schedules were seen but the inventory was truncated before completion, so whether an automated retention or deletion policy is configured could not be determined.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence)
-      : finding(12, title, "high", "fail", `The deletion schedules endpoint was readable and returned zero schedules, so no automated retention or deletion policy is configured.${context}`, evidence);
+      ? finding(decisions, 12, title, "high", `Zero deletion schedules were seen but the inventory was truncated before completion, so whether an automated retention or deletion policy is configured could not be determined.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence)
+      : finding(decisions, 12, title, "high", `The deletion schedules endpoint was readable and returned zero schedules, so no automated retention or deletion policy is configured.${context}`, evidence);
   }
   if (active.length === 0) {
     return isTruncated(deletionSnap)
-      ? finding(12, title, "high", "warn", `${schedules.length} deletion schedule(s) were seen and none is active, but the inventory was truncated before completion.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence)
-      : finding(12, title, "high", "fail", `${schedules.length} deletion schedule(s) exist but none is active.${context}`, evidence);
+      ? finding(decisions, 12, title, "high", `${schedules.length} deletion schedule(s) were seen and none is active, but the inventory was truncated before completion.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence)
+      : finding(decisions, 12, title, "high", `${schedules.length} deletion schedule(s) exist but none is active.${context}`, evidence);
   }
   const byObjectText = Object.entries(activeByObject).filter(([, count]) => count > 0).map(([object, count]) => `${count} for ${object}`).concat(otherActive > 0 ? [`${otherActive} for custom objects`] : []).join(", ");
   const ticketSchedules = activeByObject["zen:ticket"] ?? 0;
@@ -3707,12 +2709,12 @@ function assessDeletionPolicies(
       ...(activeWithoutConditions > 0 ? [`${activeWithoutConditions} active schedule(s) have no conditions`] : []),
       ...(isTruncated(deletionSnap) ? ["the schedule inventory was truncated"] : []),
     ];
-    return finding(12, title, "high", "warn", `${active.length} active deletion schedule(s) (${byObjectText}; ${defaults} default) but ${gaps.join(" and ")}.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence);
+    return finding(decisions, 12, title, "high", `${active.length} active deletion schedule(s) (${byObjectText}; ${defaults} default) but ${gaps.join(" and ")}.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence);
   }
-  return cap(finding(12, title, "high", "pass", `${active.length} active deletion schedule(s) read to completion (${byObjectText}; ${defaults} default); ticket retention is enforced by ${ticketSchedules} conditioned schedule(s).${context}`, evidence));
+  return cap(finding(decisions, 12, title, "high", `${active.length} active deletion schedule(s) read to completion (${byObjectText}; ${defaults} default); ticket retention is enforced by ${ticketSchedules} conditioned schedule(s).${context}`, evidence));
 }
 
-async function assessZendeskDataProtectionWithDecisionContext(
+export async function assessZendeskDataProtection(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
@@ -3720,6 +2722,7 @@ async function assessZendeskDataProtectionWithDecisionContext(
   const resolved = resolveOptions(options);
   const now = resolved.now();
   const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const decisions = createZendeskVerdicts(currentUserSnap);
   const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
   const auditSnap = await snapshot("listRecentAuditLogs", () => client.listRecentAuditLogs(DEFAULT_AUDIT_LOG_SAMPLE));
   const oldestSnap: ZendeskSnapshot<JsonRecord | undefined> = auditSnap.status === "ok"
@@ -3740,16 +2743,16 @@ async function assessZendeskDataProtectionWithDecisionContext(
   // the cap. The sample is cut short when paging stopped before it filled (a stalled cursor
   // or a refused next link), and only then is the read incomplete for this finding.
   const sampleCutShort = isTruncated(auditSnap) && auditEntries.length < DEFAULT_AUDIT_LOG_SAMPLE;
-  recordZendeskDecisionFacts(9, {
+  recordZendeskDecisionFacts(decisions, 9, {
     readable: auditSnap.status === "ok",
     entry_count: auditEntries.length,
     truncated: isTruncated(auditSnap),
     sample_size: DEFAULT_AUDIT_LOG_SAMPLE,
   });
   if (auditSnap.status !== "ok") {
-    findings.push(manualFinding(9, auditTitle, "high", `${snapshotCause("Audit logs (/audit_logs, Enterprise plan and admin role)", auditSnap)} This is a plan or permission limitation, not a pass.`, "capture Admin Center > Account > Audit log showing recent entries, or record that the plan does not include the audit log.", { audit_log_status: auditSnap.status }));
+    findings.push(manualFinding(decisions, 9, auditTitle, "high", `${snapshotCause("Audit logs (/audit_logs, Enterprise plan and admin role)", auditSnap)} This is a plan or permission limitation, not a pass.`, "capture Admin Center > Account > Audit log showing recent entries, or record that the plan does not include the audit log.", { audit_log_status: auditSnap.status }));
   } else if (auditEntries.length === 0) {
-    findings.push(manualFinding(9, auditTitle, "high", sampleCutShort
+    findings.push(manualFinding(decisions, 9, auditTitle, "high", sampleCutShort
       ? `The audit log endpoint was readable but the read stopped before any entry arrived (${truncationReasonOf(auditSnap)}), so whether entries are being recorded could not be determined.`
       : "The audit log endpoint was readable but returned zero entries, which is unexpected for an active account.", "open Admin Center > Account > Audit log and confirm entries are being recorded.", { audit_log_entries: countOrNull(0, auditSnap), sample_size: DEFAULT_AUDIT_LOG_SAMPLE, sample_cut_short: sampleCutShort }));
   } else {
@@ -3762,42 +2765,42 @@ async function assessZendeskDataProtectionWithDecisionContext(
       actions_seen: sampleCutShort ? null : [...new Set(auditEntries.map((entry) => asString(entry.action)).filter(Boolean))],
     };
     findings.push(sampleCutShort
-      ? finding(9, auditTitle, "high", "warn", `The audit log is readable, but the ${DEFAULT_AUDIT_LOG_SAMPLE}-entry sample was cut short after ${auditEntries.length} entries (${truncationReasonOf(auditSnap)}), so the sampled window could not be confirmed; newest entry ${newest ? newest.toISOString() : "has no created_at"}.`, evidence)
-      : finding(9, auditTitle, "high", "pass", `The audit log is readable with ${auditEntries.length} recent entries sampled; newest entry ${newest ? newest.toISOString() : "has no created_at"}.`, evidence));
+      ? finding(decisions, 9, auditTitle, "high", `The audit log is readable, but the ${DEFAULT_AUDIT_LOG_SAMPLE}-entry sample was cut short after ${auditEntries.length} entries (${truncationReasonOf(auditSnap)}), so the sampled window could not be confirmed; newest entry ${newest ? newest.toISOString() : "has no created_at"}.`, evidence)
+      : finding(decisions, 9, auditTitle, "high", `The audit log is readable with ${auditEntries.length} recent entries sampled; newest entry ${newest ? newest.toISOString() : "has no created_at"}.`, evidence));
   }
 
   const retentionTitle = "Audit log retention meets compliance requirements";
   const oldest = oldestSnap.data;
   const oldestAge = oldest ? ageInDays(oldest.created_at, now) : undefined;
-  recordZendeskDecisionFacts(10, {
+  recordZendeskDecisionFacts(decisions, 10, {
     readable: oldestSnap.status === "ok",
     dateable: oldest !== undefined && oldestAge !== undefined,
     oldest_age_days: oldestAge,
     required_retention_days: resolved.retentionDays,
   });
   if (oldestSnap.status !== "ok") {
-    findings.push(manualFinding(10, retentionTitle, "medium", snapshotCause("Audit logs (oldest record lookup)", oldestSnap), "record the audit log retention statement from Zendesk documentation (records are kept indefinitely on Enterprise) and capture the oldest visible entry in Admin Center > Account > Audit log."));
+    findings.push(manualFinding(decisions, 10, retentionTitle, "medium", snapshotCause("Audit logs (oldest record lookup)", oldestSnap), "record the audit log retention statement from Zendesk documentation (records are kept indefinitely on Enterprise) and capture the oldest visible entry in Admin Center > Account > Audit log."));
   } else {
     const evidence: JsonRecord = { oldest_entry: asString(oldest?.created_at) ?? null, oldest_entry_age_days: oldestAge ?? null, required_retention_days: resolved.retentionDays };
     if (!oldest || oldestAge === undefined) {
-      findings.push(manualFinding(10, retentionTitle, "medium", "The oldest audit log entry could not be dated (missing created_at or empty log).", "capture the oldest entry in Admin Center > Account > Audit log.", evidence));
+      findings.push(manualFinding(decisions, 10, retentionTitle, "medium", "The oldest audit log entry could not be dated (missing created_at or empty log).", "capture the oldest entry in Admin Center > Account > Audit log.", evidence));
     } else if (oldestAge >= resolved.retentionDays) {
-      findings.push(finding(10, retentionTitle, "medium", "pass", `The oldest audit log entry is ${oldestAge} days old, meeting the ${resolved.retentionDays}-day retention requirement (Zendesk documents indefinite audit log retention).`, evidence));
+      findings.push(finding(decisions, 10, retentionTitle, "medium", `The oldest audit log entry is ${oldestAge} days old, meeting the ${resolved.retentionDays}-day retention requirement (Zendesk documents indefinite audit log retention).`, evidence));
     } else {
-      findings.push(finding(10, retentionTitle, "medium", "warn", `The oldest audit log entry is ${oldestAge} days old, less than the ${resolved.retentionDays}-day requirement; this is expected if the account or audit log is younger than the requirement, so confirm the account age.`, evidence));
+      findings.push(finding(decisions, 10, retentionTitle, "medium", `The oldest audit log entry is ${oldestAge} days old, less than the ${resolved.retentionDays}-day requirement; this is expected if the account or audit log is younger than the requirement, so confirm the account age.`, evidence));
     }
   }
 
-  recordZendeskDecisionFacts(11, {});
-  findings.push(manualFinding(11, "HIPAA compliance mode enabled (if applicable)", "critical", "Neither the published Account Settings reference nor the Security Settings reference exposes a HIPAA or Advanced Data Privacy and Protection field.", "capture Admin Center > Account > Security > Advanced showing the HIPAA-enabled configuration (or the executed BAA) if the account processes PHI; otherwise record not applicable.", { settings_readable: settingsSnap.status === "ok" }));
+  recordZendeskDecisionFacts(decisions, 11, {});
+  findings.push(manualFinding(decisions, 11, "HIPAA compliance mode enabled (if applicable)", "critical", "Neither the published Account Settings reference nor the Security Settings reference exposes a HIPAA or Advanced Data Privacy and Protection field.", "capture Admin Center > Account > Security > Advanced showing the HIPAA-enabled configuration (or the executed BAA) if the account processes PHI; otherwise record not applicable.", { settings_readable: settingsSnap.status === "ok" }));
 
-  findings.push(assessDeletionPolicies(deletionSnap, settingsSnap, tickets, rolesSnap));
+  findings.push(assessDeletionPolicies(decisions, deletionSnap, settingsSnap, tickets, rolesSnap));
 
   const cdnTitle = "CDN security (attachment hosting) configured";
   const privateAttachments = asBoolean(tickets.private_attachments);
   const cdnHosts = asRecordArray(asObject(settings.cdn)?.hosts).map((host) => asString(host.url)).filter((url): url is string => Boolean(url));
   const insecureCdnHosts = cdnHosts.filter((url) => urlScheme(url) !== "https");
-  recordZendeskDecisionFacts(18, {
+  recordZendeskDecisionFacts(decisions, 18, {
     readable: settingsSnap.status === "ok",
     flag_present: privateAttachments !== undefined,
     private_attachments: privateAttachments,
@@ -3805,22 +2808,22 @@ async function assessZendeskDataProtectionWithDecisionContext(
   });
   const cdnEvidence: JsonRecord = { private_attachments: privateAttachments ?? null, cdn_hosts: cdnHosts, insecure_cdn_hosts: insecureCdnHosts };
   if (settingsSnap.status !== "ok") {
-    findings.push(manualFinding(18, cdnTitle, "medium", snapshotCause("Account settings", settingsSnap), "capture Admin Center > Objects and rules > Tickets > Settings > Attachments showing 'Require authentication to download'."));
+    findings.push(manualFinding(decisions, 18, cdnTitle, "medium", snapshotCause("Account settings", settingsSnap), "capture Admin Center > Objects and rules > Tickets > Settings > Attachments showing 'Require authentication to download'."));
   } else if (privateAttachments === true && insecureCdnHosts.length === 0) {
-    findings.push(finding(18, cdnTitle, "medium", "pass", `settings.tickets.private_attachments=true, so users must sign in to download attachments${cdnHosts.length > 0 ? ` and all ${cdnHosts.length} CDN hosts use https` : ""}.`, cdnEvidence));
+    findings.push(finding(decisions, 18, cdnTitle, "medium", `settings.tickets.private_attachments=true, so users must sign in to download attachments${cdnHosts.length > 0 ? ` and all ${cdnHosts.length} CDN hosts use https` : ""}.`, cdnEvidence));
   } else if (privateAttachments === true) {
-    findings.push(finding(18, cdnTitle, "medium", "warn", `Attachments require authentication, but ${insecureCdnHosts.length} CDN hosts do not use https.`, cdnEvidence));
+    findings.push(finding(decisions, 18, cdnTitle, "medium", `Attachments require authentication, but ${insecureCdnHosts.length} CDN hosts do not use https.`, cdnEvidence));
   } else if (privateAttachments === false) {
-    findings.push(finding(18, cdnTitle, "medium", "fail", "settings.tickets.private_attachments=false, so attachment links can be downloaded without signing in.", cdnEvidence));
+    findings.push(finding(decisions, 18, cdnTitle, "medium", "settings.tickets.private_attachments=false, so attachment links can be downloaded without signing in.", cdnEvidence));
   } else {
-    findings.push(manualFinding(18, cdnTitle, "medium", "settings.tickets.private_attachments was absent from the response.", "capture Admin Center > Objects and rules > Tickets > Settings > Attachments.", cdnEvidence));
+    findings.push(manualFinding(decisions, 18, cdnTitle, "medium", "settings.tickets.private_attachments was absent from the response.", "capture Admin Center > Objects and rules > Tickets > Settings > Attachments.", cdnEvidence));
   }
 
   const attachmentTitle = "File attachment restrictions configured";
   const attachmentSize = asNumber(limits.attachment_size);
-  recordZendeskDecisionFacts(19, {});
+  recordZendeskDecisionFacts(decisions, 19, {});
   findings.push(manualFinding(
-    19,
+    decisions, 19,
     attachmentTitle,
     "medium",
     settingsSnap.status === "ok"
@@ -3833,14 +2836,14 @@ async function assessZendeskDataProtectionWithDecisionContext(
   const suspendedTitle = "Suspended ticket handling automated";
   const suspended = listSnapshotItems(suspendedSnap);
   const buckets = partitionByDate(suspended, "created_at", resolved.suspendedTicketAgeDays, now);
-  recordZendeskDecisionFacts(20, {
+  recordZendeskDecisionFacts(decisions, 20, {
     readable: suspendedSnap.status === "ok",
     complete: suspendedSnap.status === "ok" && !isTruncated(suspendedSnap),
     stale_count: buckets.stale.length,
     undated_count: buckets.undated.length,
   });
   if (suspendedSnap.status !== "ok") {
-    findings.push(manualFinding(20, suspendedTitle, "low", snapshotCause("Suspended tickets (/suspended_tickets, admin or manage_suspended_tickets permission)", suspendedSnap), "capture the Suspended tickets view in Support showing the queue size and oldest item, and the automation that recovers or deletes them."));
+    findings.push(manualFinding(decisions, 20, suspendedTitle, "low", snapshotCause("Suspended tickets (/suspended_tickets, admin or manage_suspended_tickets permission)", suspendedSnap), "capture the Suspended tickets view in Support showing the queue size and oldest item, and the automation that recovers or deletes them."));
   } else {
     const evidence: JsonRecord = {
       seen_suspended_tickets: countOrNull(suspended.length, suspendedSnap),
@@ -3851,19 +2854,19 @@ async function assessZendeskDataProtectionWithDecisionContext(
       inventory_truncated: truncationOrNull(suspendedSnap),
     };
     if (suspended.length === 0 && isTruncated(suspendedSnap)) {
-      findings.push(finding(20, suspendedTitle, "low", "warn", `Zero suspended tickets were seen but the queue read was truncated before completion.${truncationNote("suspended ticket", suspendedSnap)}`, evidence));
+      findings.push(finding(decisions, 20, suspendedTitle, "low", `Zero suspended tickets were seen but the queue read was truncated before completion.${truncationNote("suspended ticket", suspendedSnap)}`, evidence));
     } else if (suspended.length === 0) {
-      findings.push(finding(20, suspendedTitle, "low", "pass", "The suspended ticket endpoint was readable and the queue is empty (0 suspended tickets).", evidence));
+      findings.push(finding(decisions, 20, suspendedTitle, "low", "The suspended ticket endpoint was readable and the queue is empty (0 suspended tickets).", evidence));
     } else if (buckets.stale.length > 0 || isTruncated(suspendedSnap)) {
-      findings.push(finding(20, suspendedTitle, "low", "warn", `${suspended.length} suspended tickets are queued and ${buckets.stale.length} are older than ${resolved.suspendedTicketAgeDays} days (${buckets.undated.length} undated).${truncationNote("suspended ticket", suspendedSnap)}`, evidence));
+      findings.push(finding(decisions, 20, suspendedTitle, "low", `${suspended.length} suspended tickets are queued and ${buckets.stale.length} are older than ${resolved.suspendedTicketAgeDays} days (${buckets.undated.length} undated).${truncationNote("suspended ticket", suspendedSnap)}`, evidence));
     } else if (buckets.undated.length > 0) {
-      findings.push(finding(20, suspendedTitle, "low", "warn", `${suspended.length} suspended tickets are queued; ${buckets.undated.length} have no created_at and cannot be aged.`, evidence));
+      findings.push(finding(decisions, 20, suspendedTitle, "low", `${suspended.length} suspended tickets are queued; ${buckets.undated.length} have no created_at and cannot be aged.`, evidence));
     } else {
-      findings.push(finding(20, suspendedTitle, "low", "pass", `${suspended.length} suspended tickets are queued and all are newer than ${resolved.suspendedTicketAgeDays} days.`, evidence));
+      findings.push(finding(decisions, 20, suspendedTitle, "low", `${suspended.length} suspended tickets are queued and all are newer than ${resolved.suspendedTicketAgeDays} days.`, evidence));
     }
   }
 
-  const finalFindings = finalizeFindings(findings, currentUserSnap);
+  const finalFindings = finalizeFindings(decisions, findings, currentUserSnap);
   const entries: Array<[string, ZendeskSnapshot<unknown>]> = [
     ["current_user", currentUserSnap],
     ["account_settings", settingsSnap],
@@ -3894,14 +2897,9 @@ async function assessZendeskDataProtectionWithDecisionContext(
   };
 }
 
-export async function assessZendeskDataProtection(
-  client: ZendeskReadClient,
-  options: ZendeskAssessmentOptions = {},
-): Promise<ZendeskAssessmentResult> {
-  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskDataProtectionWithDecisionContext(client, options));
-}
 
-async function assessZendeskIntegrationsWithDecisionContext(
+
+export async function assessZendeskIntegrations(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
@@ -3909,6 +2907,7 @@ async function assessZendeskIntegrationsWithDecisionContext(
   const resolved = resolveOptions(options);
   const settingsSnap = await snapshot("getAccountSettings", () => client.getAccountSettings());
   const currentUserSnap = await snapshot("getCurrentUser", () => client.getCurrentUser());
+  const decisions = createZendeskVerdicts(currentUserSnap);
   const installationsSnap = await snapshot("listAppInstallations", () => client.listAppInstallations());
   const ownedSnap = await snapshot("listOwnedApps", () => client.listOwnedApps());
   const brandsSnap = await snapshot("listBrands", () => client.listBrands(resolved.maxItems));
@@ -3925,7 +2924,7 @@ async function assessZendeskIntegrationsWithDecisionContext(
   const installationName = (item: JsonRecord): string => asString(asObject(item.settings)?.title) ?? asString(asObject(item.settings)?.name) ?? `app ${asString(item.app_id) ?? "unknown"}`;
   const marketplace = installations.filter((item) => !ownedIds.has(asString(item.app_id) ?? ""));
   const enabled = marketplace.filter((item) => asBoolean(item.enabled) !== false);
-  recordZendeskDecisionFacts(15, {
+  recordZendeskDecisionFacts(decisions, 15, {
     installations_readable: installationsSnap.status === "ok",
     installations_complete: installationsSnap.status === "ok" && !isTruncated(installationsSnap),
     installation_count: installations.length,
@@ -3934,7 +2933,7 @@ async function assessZendeskIntegrationsWithDecisionContext(
 
   const marketplaceTitle = "Marketplace apps reviewed for permissions";
   if (installationsSnap.status !== "ok") {
-    findings.push(manualFinding(15, marketplaceTitle, "medium", snapshotCause("App installations (/apps/installations)", installationsSnap), "capture Admin Center > Apps and integrations > Zendesk Support apps > Currently installed with each app's permissions and role or group restrictions."));
+    findings.push(manualFinding(decisions, 15, marketplaceTitle, "medium", snapshotCause("App installations (/apps/installations)", installationsSnap), "capture Admin Center > Apps and integrations > Zendesk Support apps > Currently installed with each app's permissions and role or group restrictions."));
   } else {
     // Marketplace apps are the installations not matched to an owned app, so the split
     // rests on both inventories: it is not asserted while either is incomplete.
@@ -3952,27 +2951,27 @@ async function assessZendeskIntegrationsWithDecisionContext(
         ? `, but the owned app inventory was truncated after ${ownedApps.length} items (${truncationReasonOf(ownedSnap)}), so the split between private and marketplace apps is not asserted`
         : "";
     if (installations.length === 0 && isTruncated(installationsSnap)) {
-      findings.push(finding(15, marketplaceTitle, "medium", "warn", `Zero installed apps were seen but the installation inventory was truncated before completion.${truncationNote("app installation", installationsSnap)}`, evidence));
+      findings.push(finding(decisions, 15, marketplaceTitle, "medium", `Zero installed apps were seen but the installation inventory was truncated before completion.${truncationNote("app installation", installationsSnap)}`, evidence));
     } else if (installations.length === 0) {
       findings.push(capForIncomplete(
-        finding(15, marketplaceTitle, "medium", "pass", "The app installation endpoint was readable and returned zero installed apps, so there are no marketplace apps to review.", evidence),
+        finding(decisions, 15, marketplaceTitle, "medium", "The app installation endpoint was readable and returned zero installed apps, so there are no marketplace apps to review.", evidence),
         [["Owned apps (/apps/owned, used to separate private apps from marketplace apps)", ownedSnap]],
       ));
     } else {
-      findings.push(manualFinding(15, marketplaceTitle, "medium", `${marketplace.length} marketplace app installations (${enabled.length} enabled) were inventoried among ${installations.length} installed apps${ownedNote}; app permission reviews cannot be verified through the API.${truncationNote("app installation", installationsSnap)}`, "record the reviewer, date, and outcome of the permission review for each installed app in Admin Center > Apps and integrations > Zendesk Support apps.", evidence));
+      findings.push(manualFinding(decisions, 15, marketplaceTitle, "medium", `${marketplace.length} marketplace app installations (${enabled.length} enabled) were inventoried among ${installations.length} installed apps${ownedNote}; app permission reviews cannot be verified through the API.${truncationNote("app installation", installationsSnap)}`, "record the reviewer, date, and outcome of the permission review for each installed app in Admin Center > Apps and integrations > Zendesk Support apps.", evidence));
     }
   }
 
   const customAppTitle = "Private/custom apps have appropriate scope";
   const retired = ownedApps.filter((app) => asBoolean(app.deprecated) === true || asBoolean(app.obsolete) === true);
-  recordZendeskDecisionFacts(16, {
+  recordZendeskDecisionFacts(decisions, 16, {
     readable: ownedSnap.status === "ok",
     complete: ownedSnap.status === "ok" && !isTruncated(ownedSnap),
     owned_app_count: ownedApps.length,
     retired_count: retired.length,
   });
   if (ownedSnap.status !== "ok") {
-    findings.push(manualFinding(16, customAppTitle, "medium", snapshotCause("Owned apps (/apps/owned, admin or manage apps permission)", ownedSnap), "capture the private apps list in Admin Center > Apps and integrations > Zendesk Support apps > Private apps with their manifests."));
+    findings.push(manualFinding(decisions, 16, customAppTitle, "medium", snapshotCause("Owned apps (/apps/owned, admin or manage apps permission)", ownedSnap), "capture the private apps list in Admin Center > Apps and integrations > Zendesk Support apps > Private apps with their manifests."));
   } else {
     const evidence: JsonRecord = {
       owned_apps: countOrNull(ownedApps.length, ownedSnap),
@@ -3982,31 +2981,31 @@ async function assessZendeskIntegrationsWithDecisionContext(
       apps: detailOrNull(ownedApps.slice(0, 50).map((app) => ({ name: asString(app.name) ?? null, visibility: asString(app.visibility) ?? null, framework_version: asString(app.framework_version) ?? null, parameters: asArray(app.parameters).length })), ownedSnap),
     };
     if (ownedApps.length === 0 && isTruncated(ownedSnap)) {
-      findings.push(finding(16, customAppTitle, "medium", "warn", `Zero owned apps were seen but the inventory was truncated before completion.${truncationNote("owned app", ownedSnap)}`, evidence));
+      findings.push(finding(decisions, 16, customAppTitle, "medium", `Zero owned apps were seen but the inventory was truncated before completion.${truncationNote("owned app", ownedSnap)}`, evidence));
     } else if (ownedApps.length === 0) {
-      findings.push(finding(16, customAppTitle, "medium", "pass", "The owned apps endpoint was readable and returned zero private or custom apps.", evidence));
+      findings.push(finding(decisions, 16, customAppTitle, "medium", "The owned apps endpoint was readable and returned zero private or custom apps.", evidence));
     } else if (retired.length > 0) {
-      findings.push(finding(16, customAppTitle, "medium", "warn", `${retired.length}/${ownedApps.length} owned apps are deprecated or obsolete and should be removed or updated; scope review of the remaining apps is manual.${truncationNote("owned app", ownedSnap)}`, evidence));
+      findings.push(finding(decisions, 16, customAppTitle, "medium", `${retired.length}/${ownedApps.length} owned apps are deprecated or obsolete and should be removed or updated; scope review of the remaining apps is manual.${truncationNote("owned app", ownedSnap)}`, evidence));
     } else {
-      findings.push(manualFinding(16, customAppTitle, "medium", `${ownedApps.length} private or custom apps were inventoried; requested locations and secure parameters must be reviewed against the manifest.${truncationNote("owned app", ownedSnap)}`, "record the scope review for each private app (manifest locations, secure parameters, external domains).", evidence));
+      findings.push(manualFinding(decisions, 16, customAppTitle, "medium", `${ownedApps.length} private or custom apps were inventoried; requested locations and secure parameters must be reviewed against the manifest.${truncationNote("owned app", ownedSnap)}`, "record the scope review for each private app (manifest locations, secure parameters, external domains).", evidence));
     }
   }
 
   const sandboxTitle = "Sandbox environment used for testing";
   const sandbox = asBoolean(asObject(settingsSnap.data?.active_features)?.sandbox);
-  recordZendeskDecisionFacts(17, {
+  recordZendeskDecisionFacts(decisions, 17, {
     readable: settingsSnap.status === "ok",
     flag_present: sandbox !== undefined,
     sandbox_enabled: sandbox,
   });
   if (settingsSnap.status !== "ok") {
-    findings.push(manualFinding(17, sandboxTitle, "low", snapshotCause("Account settings", settingsSnap), "capture Admin Center > Account > Sandbox showing the provisioned sandbox."));
+    findings.push(manualFinding(decisions, 17, sandboxTitle, "low", snapshotCause("Account settings", settingsSnap), "capture Admin Center > Account > Sandbox showing the provisioned sandbox."));
   } else if (sandbox === true) {
-    findings.push(finding(17, sandboxTitle, "low", "pass", "settings.active_features.sandbox=true, so a sandbox is provisioned for testing changes before production.", { sandbox: true }));
+    findings.push(finding(decisions, 17, sandboxTitle, "low", "settings.active_features.sandbox=true, so a sandbox is provisioned for testing changes before production.", { sandbox: true }));
   } else if (sandbox === false) {
-    findings.push(finding(17, sandboxTitle, "low", "warn", "settings.active_features.sandbox=false; no sandbox is provisioned. Confirm whether the plan includes a sandbox and whether configuration changes are tested elsewhere.", { sandbox: false }));
+    findings.push(finding(decisions, 17, sandboxTitle, "low", "settings.active_features.sandbox=false; no sandbox is provisioned. Confirm whether the plan includes a sandbox and whether configuration changes are tested elsewhere.", { sandbox: false }));
   } else {
-    findings.push(manualFinding(17, sandboxTitle, "low", "settings.active_features.sandbox was absent from the response.", "capture Admin Center > Account > Sandbox.", { sandbox: null }));
+    findings.push(manualFinding(decisions, 17, sandboxTitle, "low", "settings.active_features.sandbox was absent from the response.", "capture Admin Center > Account > Sandbox.", { sandbox: null }));
   }
 
   const brandTitle = "Brand security settings consistent across brands";
@@ -4014,7 +3013,7 @@ async function assessZendeskIntegrationsWithDecisionContext(
   const brands = listSnapshotItems(brandsSnap).filter((brand) => asBoolean(brand.is_deleted) !== true);
   const activeBrands = brands.filter((brand) => asBoolean(brand.active) !== false);
   const states = [...new Set(activeBrands.map((brand) => asString(brand.help_center_state) ?? "unknown"))];
-  recordZendeskDecisionFacts(22, {
+  recordZendeskDecisionFacts(decisions, 22, {
     readable: brandsSnap.status === "ok",
     brand_count: brands.length,
     admin_view: currentRole === "admin",
@@ -4022,7 +3021,7 @@ async function assessZendeskIntegrationsWithDecisionContext(
     inconsistent_state_count: states.length > 1 || states.includes("unknown") ? 1 : 0,
   });
   if (brandsSnap.status !== "ok") {
-    findings.push(manualFinding(22, brandTitle, "medium", snapshotCause("Brands (/brands)", brandsSnap), "capture Admin Center > Account > Brand management showing each brand's help center state and host mapping."));
+    findings.push(manualFinding(decisions, 22, brandTitle, "medium", snapshotCause("Brands (/brands)", brandsSnap), "capture Admin Center > Account > Brand management showing each brand's help center state and host mapping."));
   } else {
     const evidence: JsonRecord = {
       brands: countOrNull(brands.length, brandsSnap),
@@ -4033,16 +3032,16 @@ async function assessZendeskIntegrationsWithDecisionContext(
       inventory_truncated: truncationOrNull(brandsSnap),
     };
     if (brands.length === 0) {
-      findings.push(manualFinding(22, brandTitle, "medium", `Zero brands were visible although every account has a default brand, so the view is partial.${truncationNote("brand", brandsSnap)}`, "use an admin credential and capture Admin Center > Account > Brand management.", evidence));
+      findings.push(manualFinding(decisions, 22, brandTitle, "medium", `Zero brands were visible although every account has a default brand, so the view is partial.${truncationNote("brand", brandsSnap)}`, "use an admin credential and capture Admin Center > Account > Brand management.", evidence));
     } else if (currentRole !== "admin") {
       const credential = currentRole === undefined ? "a credential whose role could not be read, which may list only the brands the agent belongs to" : `a non-admin credential (role ${currentRole}), which only lists brands the agent belongs to`;
-      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were visible to ${credential}, so cross-brand consistency cannot be confirmed.${truncationNote("brand", brandsSnap)}`, evidence));
+      findings.push(finding(decisions, 22, brandTitle, "medium", `${brands.length} brands were visible to ${credential}, so cross-brand consistency cannot be confirmed.${truncationNote("brand", brandsSnap)}`, evidence));
     } else if (isTruncated(brandsSnap)) {
-      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were seen but the inventory was truncated, so cross-brand consistency cannot be confirmed.${truncationNote("brand", brandsSnap)}`, evidence));
+      findings.push(finding(decisions, 22, brandTitle, "medium", `${brands.length} brands were seen but the inventory was truncated, so cross-brand consistency cannot be confirmed.${truncationNote("brand", brandsSnap)}`, evidence));
     } else if (states.length > 1 || states.includes("unknown")) {
-      findings.push(finding(22, brandTitle, "medium", "warn", `${activeBrands.length} active brands expose mixed help center states (${states.join(", ")}); confirm each public or restricted help center is intentional.`, evidence));
+      findings.push(finding(decisions, 22, brandTitle, "medium", `${activeBrands.length} active brands expose mixed help center states (${states.join(", ")}); confirm each public or restricted help center is intentional.`, evidence));
     } else {
-      findings.push(finding(22, brandTitle, "medium", "pass", `${activeBrands.length} active brand(s) were read to completion by an admin and share the same help center state (${states[0] ?? "none"}).`, evidence));
+      findings.push(finding(decisions, 22, brandTitle, "medium", `${activeBrands.length} active brand(s) were read to completion by an admin and share the same help center state (${states[0] ?? "none"}).`, evidence));
     }
   }
 
@@ -4050,14 +3049,14 @@ async function assessZendeskIntegrationsWithDecisionContext(
   const agreements = listSnapshotItems(sharingSnap);
   const active = agreements.filter((item) => ["accepted", "pending"].includes(asString(item.status) ?? ""));
   const broken = agreements.filter((item) => ["failed", "ssl_error", "configuration_error"].includes(asString(item.status) ?? ""));
-  recordZendeskDecisionFacts(23, {
+  recordZendeskDecisionFacts(decisions, 23, {
     readable: sharingSnap.status === "ok",
     complete: sharingSnap.status === "ok" && !isTruncated(sharingSnap),
     agreement_count: agreements.length,
     broken_count: broken.length,
   });
   if (sharingSnap.status !== "ok") {
-    findings.push(manualFinding(23, sharingTitle, "medium", snapshotCause("Sharing agreements (/sharing_agreements)", sharingSnap), "capture Admin Center > Objects and rules > Tickets > Ticket sharing showing every agreement and its status."));
+    findings.push(manualFinding(decisions, 23, sharingTitle, "medium", snapshotCause("Sharing agreements (/sharing_agreements)", sharingSnap), "capture Admin Center > Objects and rules > Tickets > Ticket sharing showing every agreement and its status."));
   } else {
     const evidence: JsonRecord = {
       sharing_agreements: countOrNull(agreements.length, sharingSnap),
@@ -4069,13 +3068,13 @@ async function assessZendeskIntegrationsWithDecisionContext(
     // Remote accounts are named only when the agreement inventory was read to completion.
     const remoteAccounts = isTruncated(sharingSnap) ? "" : ` (${active.map((item) => asString(item.remote_subdomain) ?? asString(item.partner_name) ?? asString(item.name) ?? "unnamed").join(", ")})`;
     if (agreements.length === 0 && isTruncated(sharingSnap)) {
-      findings.push(finding(23, sharingTitle, "medium", "warn", `Zero sharing agreements were seen but the inventory was truncated before completion.${truncationNote("sharing agreement", sharingSnap)}`, evidence));
+      findings.push(finding(decisions, 23, sharingTitle, "medium", `Zero sharing agreements were seen but the inventory was truncated before completion.${truncationNote("sharing agreement", sharingSnap)}`, evidence));
     } else if (agreements.length === 0) {
-      findings.push(finding(23, sharingTitle, "medium", "pass", "The sharing agreement endpoint was readable and returned zero agreements, so tickets are not shared with external Zendesk accounts.", evidence));
+      findings.push(finding(decisions, 23, sharingTitle, "medium", "The sharing agreement endpoint was readable and returned zero agreements, so tickets are not shared with external Zendesk accounts.", evidence));
     } else if (broken.length > 0) {
-      findings.push(finding(23, sharingTitle, "medium", "warn", `${broken.length}/${agreements.length} sharing agreements are in a failed, ssl_error, or configuration_error state and ${active.length} are active; review each remote account.${truncationNote("sharing agreement", sharingSnap)}`, evidence));
+      findings.push(finding(decisions, 23, sharingTitle, "medium", `${broken.length}/${agreements.length} sharing agreements are in a failed, ssl_error, or configuration_error state and ${active.length} are active; review each remote account.${truncationNote("sharing agreement", sharingSnap)}`, evidence));
     } else {
-      findings.push(manualFinding(23, sharingTitle, "medium", `${active.length}/${agreements.length} sharing agreements are accepted or pending with external accounts${remoteAccounts}.${truncationNote("sharing agreement", sharingSnap)}`, "record the business justification and data handling agreement for each remote account.", evidence));
+      findings.push(manualFinding(decisions, 23, sharingTitle, "medium", `${active.length}/${agreements.length} sharing agreements are accepted or pending with external accounts${remoteAccounts}.${truncationNote("sharing agreement", sharingSnap)}`, "record the business justification and data handling agreement for each remote account.", evidence));
     }
   }
 
@@ -4088,14 +3087,14 @@ async function assessZendeskIntegrationsWithDecisionContext(
   const activeWebhooks = webhooks.filter((hook) => asString(hook.status) === "active");
   const insecureWebhooks = activeWebhooks.filter((hook) => urlScheme(hook.endpoint) !== "https");
   const unauthenticatedWebhooks = activeWebhooks.filter((hook) => !asObject(hook.authentication) && !asObject(hook.signing_secret));
-  recordZendeskDecisionFacts(24, {
+  recordZendeskDecisionFacts(decisions, 24, {
     any_readable: targetsSnap.status === "ok" || webhooksSnap.status === "ok",
     complete: targetsSnap.status === "ok" && webhooksSnap.status === "ok" && !isTruncated(targetsSnap) && !isTruncated(webhooksSnap),
     insecure_count: insecureTargets.length + insecureWebhooks.length,
     unauthenticated_webhook_count: unauthenticatedWebhooks.length,
   });
   if (targetsSnap.status !== "ok" && webhooksSnap.status !== "ok") {
-    findings.push(manualFinding(24, httpsTitle, "high", `${snapshotCause("Targets", targetsSnap)} ${snapshotCause("Webhooks", webhooksSnap)}`, "capture Admin Center > Apps and integrations > Webhooks and Targets showing every destination URL and authentication method."));
+    findings.push(manualFinding(decisions, 24, httpsTitle, "high", `${snapshotCause("Targets", targetsSnap)} ${snapshotCause("Webhooks", webhooksSnap)}`, "capture Admin Center > Apps and integrations > Webhooks and Targets showing every destination URL and authentication method."));
   } else {
     const destinationsTruncated = isTruncated(targetsSnap) || isTruncated(webhooksSnap);
     const truncationNotes = `${truncationNote("target", targetsSnap)}${truncationNote("webhook", webhooksSnap)}`;
@@ -4117,19 +3116,19 @@ async function assessZendeskIntegrationsWithDecisionContext(
       inventory_truncated: truncationOrNull(targetsSnap, webhooksSnap),
     };
     if (insecureTargets.length > 0 || insecureWebhooks.length > 0) {
-      findings.push(finding(24, httpsTitle, "high", "fail", `${targetText} and ${webhookText} deliver to non-https endpoints.${truncationNotes}`, evidence));
+      findings.push(finding(decisions, 24, httpsTitle, "high", `${targetText} and ${webhookText} deliver to non-https endpoints.${truncationNotes}`, evidence));
     } else if (targetsSnap.status !== "ok" || webhooksSnap.status !== "ok" || destinationsTruncated || unauthenticatedWebhooks.length > 0) {
-      findings.push(finding(24, httpsTitle, "high", "warn", `All seen destinations use https, but ${webhooksSnap.status === "ok" ? `${unauthenticatedWebhooks.length} active webhooks have no authentication or signing secret visible` : "webhook authentication could not be reviewed"}${targetsSnap.status !== "ok" ? `, and ${snapshotCause("targets", targetsSnap).toLowerCase()}` : ""}${webhooksSnap.status !== "ok" ? `, and ${snapshotCause("webhooks", webhooksSnap).toLowerCase()}` : ""}${destinationsTruncated ? ", and an inventory was truncated" : ""}.${truncationNotes}`, evidence));
+      findings.push(finding(decisions, 24, httpsTitle, "high", `All seen destinations use https, but ${webhooksSnap.status === "ok" ? `${unauthenticatedWebhooks.length} active webhooks have no authentication or signing secret visible` : "webhook authentication could not be reviewed"}${targetsSnap.status !== "ok" ? `, and ${snapshotCause("targets", targetsSnap).toLowerCase()}` : ""}${webhooksSnap.status !== "ok" ? `, and ${snapshotCause("webhooks", webhooksSnap).toLowerCase()}` : ""}${destinationsTruncated ? ", and an inventory was truncated" : ""}.${truncationNotes}`, evidence));
     } else if (activeTargets.length === 0 && activeWebhooks.length === 0) {
-      findings.push(finding(24, httpsTitle, "high", "pass", "Both the targets and webhooks endpoints were readable and returned zero active destinations (0 targets, 0 webhooks), so there are no external notification endpoints to secure; emptiness is compliant for this control.", evidence));
+      findings.push(finding(decisions, 24, httpsTitle, "high", "Both the targets and webhooks endpoints were readable and returned zero active destinations (0 targets, 0 webhooks), so there are no external notification endpoints to secure; emptiness is compliant for this control.", evidence));
     } else {
-      findings.push(finding(24, httpsTitle, "high", "pass", `${activeTargets.length} active targets (${urlTargets.length} URL-based) and ${activeWebhooks.length} active webhooks were read to completion; every destination uses https and every webhook carries authentication.`, evidence));
+      findings.push(finding(decisions, 24, httpsTitle, "high", `${activeTargets.length} active targets (${urlTargets.length} URL-based) and ${activeWebhooks.length} active webhooks were read to completion; every destination uses https and every webhook carries authentication.`, evidence));
     }
   }
 
   const exfilTitle = "Triggers/automations do not send data to external URLs";
   if (triggersSnap.status !== "ok" || automationsSnap.status !== "ok") {
-    recordZendeskDecisionFacts(25, {
+    recordZendeskDecisionFacts(decisions, 25, {
       rules_readable: false,
       rule_count: 0,
       rules_complete: false,
@@ -4137,7 +3136,7 @@ async function assessZendeskIntegrationsWithDecisionContext(
       external_action_count: 0,
       destination_sources_complete: false,
     });
-    findings.push(manualFinding(25, exfilTitle, "high", `${snapshotCause("Triggers", triggersSnap)} ${snapshotCause("Automations", automationsSnap)}`, "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action."));
+    findings.push(manualFinding(decisions, 25, exfilTitle, "high", `${snapshotCause("Triggers", triggersSnap)} ${snapshotCause("Automations", automationsSnap)}`, "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action."));
   } else {
     const rules = [
       ...listSnapshotItems(triggersSnap).map((rule) => ({ kind: "trigger", rule })),
@@ -4164,7 +3163,7 @@ async function assessZendeskIntegrationsWithDecisionContext(
     const insecure = external.filter((item) => urlScheme(item.destination) === "http");
     const unresolved = external.filter((item) => item.unresolved);
     const truncated = isTruncated(triggersSnap) || isTruncated(automationsSnap);
-    recordZendeskDecisionFacts(25, {
+    recordZendeskDecisionFacts(decisions, 25, {
       rules_readable: true,
       rule_count: rules.length,
       rules_complete: !truncated,
@@ -4200,22 +3199,22 @@ async function assessZendeskIntegrationsWithDecisionContext(
     };
     const ruleTruncationNotes = `${truncationNote("trigger", triggersSnap)}${truncationNote("automation", automationsSnap)}`;
     if (insecure.length > 0) {
-      findings.push(finding(25, exfilTitle, "high", "fail", `${insecure.length}/${external.length} external notification actions deliver ticket data to http:// destinations.${unresolvedNote}${ruleTruncationNotes}`, evidence));
+      findings.push(finding(decisions, 25, exfilTitle, "high", `${insecure.length}/${external.length} external notification actions deliver ticket data to http:// destinations.${unresolvedNote}${ruleTruncationNotes}`, evidence));
     } else if (rules.length === 0) {
-      findings.push(manualFinding(25, exfilTitle, "high", `Zero active triggers or automations were visible although Zendesk accounts ship with default triggers, so the view is partial.${ruleTruncationNotes}`, "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action.", evidence));
+      findings.push(manualFinding(decisions, 25, exfilTitle, "high", `Zero active triggers or automations were visible although Zendesk accounts ship with default triggers, so the view is partial.${ruleTruncationNotes}`, "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action.", evidence));
     } else if (external.length > 0) {
-      findings.push(finding(25, exfilTitle, "high", "warn", `${external.length} active rule actions send ticket data to external destinations${destinationHosts}; confirm each destination is an approved processor.${unresolvedNote}${ruleTruncationNotes}`, evidence));
+      findings.push(finding(decisions, 25, exfilTitle, "high", `${external.length} active rule actions send ticket data to external destinations${destinationHosts}; confirm each destination is an approved processor.${unresolvedNote}${ruleTruncationNotes}`, evidence));
     } else if (truncated) {
-      findings.push(finding(25, exfilTitle, "high", "warn", `No external notification actions were found in the seen rules, but the trigger or automation inventory was truncated, so the full population was not reviewed.${ruleTruncationNotes}`, evidence));
+      findings.push(finding(decisions, 25, exfilTitle, "high", `No external notification actions were found in the seen rules, but the trigger or automation inventory was truncated, so the full population was not reviewed.${ruleTruncationNotes}`, evidence));
     } else {
       findings.push(capForIncomplete(
-        finding(25, exfilTitle, "high", "pass", `${rules.length} active triggers and automations were read to completion and none notify external targets, webhooks, or sharing agreements.`, evidence),
+        finding(decisions, 25, exfilTitle, "high", `${rules.length} active triggers and automations were read to completion and none notify external targets, webhooks, or sharing agreements.`, evidence),
         destinationSources,
       ));
     }
   }
 
-  const finalFindings = finalizeFindings(findings, currentUserSnap);
+  const finalFindings = finalizeFindings(decisions, findings, currentUserSnap);
   const entries: Array<[string, ZendeskSnapshot<unknown>]> = [
     ["current_user", currentUserSnap],
     ["account_settings", settingsSnap],
@@ -4248,55 +3247,14 @@ async function assessZendeskIntegrationsWithDecisionContext(
   };
 }
 
-export async function assessZendeskIntegrations(
-  client: ZendeskReadClient,
-  options: ZendeskAssessmentOptions = {},
-): Promise<ZendeskAssessmentResult> {
-  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskIntegrationsWithDecisionContext(client, options));
-}
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
 
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
-  if (relativeTarget === ".." || relativeTarget.startsWith(`..${join("/")}`) || relativeTarget.startsWith("..")) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
 
-  const pathSegments = relativeTarget.split(/[\\/]+/).filter(Boolean);
-  let currentPath = realBase;
-  for (const segment of pathSegments) {
-    currentPath = join(currentPath, segment);
-    if (!existsSync(currentPath)) break;
-    if (lstatSync(currentPath).isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked parent directory: ${currentPath}`);
-    }
-  }
 
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  if (lstatSync(realpathSync(parent)).isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
-  return resolvedTarget;
-}
+
 
 /** Writes one bundle file; every configured secret is removed from the content first, in every encoded form (guard 2). */
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string, secrets: ReadonlyArray<string | undefined> = []): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, redactConfiguredSecrets(content, secrets), { encoding: "utf8", mode: 0o600 });
-}
+const writeSecureTextFile = createSecureTextWriter(redactConfiguredSecrets);
 
 /** Writes one JSON bundle file; the configured secrets are removed value by value before serialization so the file stays valid JSON. */
 async function writeSecureJsonFile(rootDir: string, relativePathname: string, value: unknown, secrets: ReadonlyArray<string | undefined>): Promise<void> {
@@ -4304,15 +3262,7 @@ async function writeSecureJsonFile(rootDir: string, relativePathname: string, va
   await writeSecureTextFile(rootDir, relativePathname, serializeJson(sealValue(plain, secrets)));
 }
 
-async function countFilesRecursively(rootDir: string): Promise<number> {
-  let total = 0;
-  for (const entry of await readdir(rootDir, { withFileTypes: true })) {
-    const pathname = join(rootDir, entry.name);
-    if (entry.isDirectory()) total += await countFilesRecursively(pathname);
-    else if (entry.isFile()) total += 1;
-  }
-  return total;
-}
+
 
 function formatAccessCheckText(result: ZendeskAccessCheckResult): string {
   const rows = result.surfaces.map((surface) => [
@@ -4621,7 +3571,7 @@ const assessParams = {
 };
 
 function registerAssessmentTool(
-  pi: ExtensionAPI,
+  pi: GrcToolRegistrar,
   name: string,
   label: string,
   description: string,
@@ -4642,7 +3592,7 @@ function registerAssessmentTool(
   });
 }
 
-export function registerZendeskTools(pi: any): void {
+export function registerZendeskTools(pi: GrcToolRegistrar): void {
   pi = withIntegrationToolContracts(pi, ZENDESK_SPEC);
   pi.registerTool({
     name: "zendesk_check_access",

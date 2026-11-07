@@ -21,15 +21,52 @@ export const CANARY_WINDOW_MAX = 24;
 export const CANARY_SHAPE = /^[A-Za-z0-9]{6,}$/;
 
 /** Every distinct substring of `canary` at lengths `min` through `max` (capped at the canary's own length). */
-export function canaryWindows(canary, { min = CANARY_WINDOW_MIN, max = CANARY_WINDOW_MAX } = {}) {
+export function canaryWindows(canary, { min = CANARY_WINDOW_MIN, max = CANARY_WINDOW_MAX, descending = false } = {}) {
   const windows = new Set();
+  const shortest = Math.min(min, canary.length);
   const longest = Math.min(max, canary.length);
-  for (let length = min; length <= longest; length += 1) {
+  for (let length = shortest; length <= longest; length += 1) {
     for (let index = 0; index + length <= canary.length; index += 1) {
       windows.add(canary.slice(index, index + length));
     }
   }
-  return [...windows];
+  return descending ? [...windows].sort((left, right) => right.length - left.length) : [...windows];
+}
+
+/** Return the longest surviving fragment; a shortest-width scan is sufficient to rule out every longer one. */
+export function leakedCanaryWindow(text, value, { min = CANARY_WINDOW_MIN, max = CANARY_WINDOW_MAX } = {}) {
+  if (typeof text !== "string" || typeof value !== "string" || value.length === 0) return undefined;
+  if (!canaryWindows(value, { min, max: min }).some((window) => text.includes(window))) return undefined;
+  return canaryWindows(value, { min, max, descending: true }).find((window) => text.includes(window));
+}
+
+/** Encodings a configured credential can take when echoed by a transport. */
+export function secretForms(value) {
+  return [...new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value), Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")])];
+}
+
+export function shortestCanaryWindows(value, min = CANARY_WINDOW_MIN) {
+  return canaryWindows(value, { min, max: min });
+}
+
+export function windowsForCanaries(canaries) {
+  return [...new Set(canaries.flatMap((canary) => canaryWindows(canary)))];
+}
+
+/** Single-credential form used by vendor suites; it uses the same oracle as bundle checks. */
+export function assertNoCanaryWindow(assert, text, canary, label) {
+  assertCanaryWindowsAbsent(assert, text, [canary], label);
+}
+
+/** Exclude deliberately planted values before checking that fixture text cannot cause a false positive. */
+export function assertFixtureFreeOfCanaryWindows(assert, legitimateText, canaries, label) {
+  let legitimate = legitimateText;
+  for (const canary of [...canaries].sort((a, b) => b.length - a.length)) legitimate = legitimate.split(canary).join("");
+  for (const canary of canaries) {
+    for (const window of shortestCanaryWindows(canary)) {
+      assert.ok(!legitimate.includes(window), `${label}: legitimate fixture text contains the window ${window} of canary ${canary}`);
+    }
+  }
 }
 
 /** Normalizes a string, a Map of name to text, an array of [name, text] pairs, or an object to [name, text] pairs. */

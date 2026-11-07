@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
 import { registerAwsTools } from "./aws.js";
 import { AWS_SPEC } from "./aws.spec.js";
 import { registerAzureTools } from "./azure.js";
@@ -49,7 +49,7 @@ export interface PublishedIntegrationSpec {
   contract: IntegrationSpecContract;
   narrativePath: string;
   outputPath: string;
-  registerTools: (pi: ExtensionAPI) => void;
+  registerTools: (pi: GrcToolRegistrar) => void;
 }
 
 export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = [

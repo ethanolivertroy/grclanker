@@ -1,3 +1,5 @@
+import { assertNoCanaryWindow } from "./helpers/canary-windows.mjs";
+const assertNoWindowOf = (text, secret, label) => assertNoCanaryWindow(assert, text, secret, label);
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -1374,12 +1376,6 @@ const REJECTED_CANARIES = [
 ];
 const REJECTION_EXTRAS = `Bearer ${REJECTED_BEARER} refused; session=${REJECTED_SESSION}, api_key=${REJECTED_API_KEY}; sign in at https://idbroker.webex.com/idb/oauth2/v1/authorize?token=${REJECTED_URL_TOKEN}`;
 
-function assertNoWindowOf(text, secret, label) {
-  for (let start = 0; start + 8 <= secret.length; start += 1) {
-    const window = secret.slice(start, start + 8);
-    assert.ok(!text.includes(window), `${label} carries ${JSON.stringify(window)} of a planted value`);
-  }
-}
 
 /** A 401 whose documented message fields echo the credentials the request carried beside a bearer token, a session pair, an API key pair, and a tokenised URL. */
 function rejectedApiResponse(sent) {

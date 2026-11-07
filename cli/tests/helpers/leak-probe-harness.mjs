@@ -1,3 +1,4 @@
+import { canaryWindows, leakedCanaryWindow } from "./canary-windows.mjs";
 /**
  * Shared leak-probe harness for the batch 1 hardening PRs.
  *
@@ -342,10 +343,7 @@ function isTokenShaped(value) {
 
 /** Every distinct substring of `value` at `length` characters (the whole value when it is shorter). */
 export function windowsOf(value, length = WINDOW_MIN) {
-  if (value.length <= length) return [value];
-  const windows = new Set();
-  for (let index = 0; index + length <= value.length; index += 1) windows.add(value.slice(index, index + length));
-  return [...windows];
+  return canaryWindows(value, { min: length, max: length });
 }
 
 /**
@@ -354,15 +352,7 @@ export function windowsOf(value, length = WINDOW_MIN) {
  * windows decide and the longest is found only for the report.
  */
 export function leakedWindow(text, planted) {
-  if (typeof text !== "string" || typeof planted !== "string" || planted.length === 0) return undefined;
-  if (planted.length <= WINDOW_MIN) return text.includes(planted) ? planted : undefined;
-  const shortest = windowsOf(planted, WINDOW_MIN).find((window) => text.includes(window));
-  if (shortest === undefined) return undefined;
-  for (let length = Math.min(WINDOW_MAX, planted.length); length > WINDOW_MIN; length -= 1) {
-    const found = windowsOf(planted, length).find((window) => text.includes(window));
-    if (found !== undefined) return found;
-  }
-  return shortest;
+  return leakedCanaryWindow(text, planted, { min: WINDOW_MIN, max: WINDOW_MAX });
 }
 
 function collidingWindow(value, fixtureText) {

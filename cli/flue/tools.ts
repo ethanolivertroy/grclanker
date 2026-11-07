@@ -3,34 +3,25 @@
  *
  * Domain tools stay shared; this module collects them directly from core
  * without initializing Pi's terminal extension, converts their TypeBox parameter
- * schemas to Valibot at the boundary, and adapts the Pi `execute()` contract
- * to Flue's `run()` envelope.
+ * schemas to Valibot at the boundary, and converts the common executor
+ * result to Flue's `run()` envelope.
  */
-import type {
-  AgentToolResult,
-  ExtensionToolContext,
-  ToolDefinition as PiToolDefinition,
-} from "@earendil-works/pi-coding-agent";
 import { defineTool, type ToolDefinition as FlueToolDefinition } from "@flue/runtime";
-import { collectDomainToolDefinitions } from "../core/domain-tools.js";
-import { redactSensitiveArguments, redactToolErrorText } from "../core/redact.js";
+import { collectRegisteredGrcTools, type RegisteredGrcTool, type GrcToolResult } from "../core/registry.js";
+import { executeGrcTool } from "../core/tools.js";
 import { jsonSchemaToToolInput } from "./schema.js";
 
-/** The subset of a Pi tool definition the bridge relies on. */
-export type PiBridgeableTool = Pick<
-  PiToolDefinition,
-  "name" | "label" | "description" | "parameters" | "prepareArguments" | "execute"
->;
-
-/** Pi tool results may carry the `isError` flag grclanker's `errorResult()` sets. */
-export type PiBridgeToolResult = AgentToolResult<unknown> & { isError?: boolean };
+export type GrcBridgeableTool = RegisteredGrcTool;
+/** Compatibility names for callers of the original Flue bridge. */
+export type PiBridgeableTool = GrcBridgeableTool;
+export type PiBridgeToolResult = GrcToolResult;
 
 export interface FlueToolRunEnvelope {
   output: string;
   terminate?: boolean;
 }
 
-/** Thrown from `run()` so Flue records a model-visible tool error, matching Pi's `errorResult()` intent. */
+/** Thrown from `run()` so Flue records a model-visible tool error, matching the native error-result intent. */
 export class GrclankerToolError extends Error {
   readonly toolName: string;
   readonly details: unknown;
@@ -43,11 +34,7 @@ export class GrclankerToolError extends Error {
   }
 }
 
-// grclanker's domain tools never read the Pi extension context (they only use
-// `toolCallId` and `params`), so the bridge hands them an inert placeholder.
-const DETACHED_EXTENSION_CONTEXT = Object.freeze({}) as unknown as ExtensionToolContext;
-
-export function renderPiToolContent(content: PiBridgeToolResult["content"]): string {
+export function renderGrcToolContent(content: GrcToolResult["content"]): string {
   return content
     .map((block) => {
       switch (block.type) {
@@ -57,7 +44,8 @@ export function renderPiToolContent(content: PiBridgeToolResult["content"]): str
           return `[image content omitted: ${block.mimeType}]`;
         default: {
           const exhaustive: never = block;
-          throw new Error(`Unhandled Pi tool content block: ${JSON.stringify(exhaustive)}`);
+          void exhaustive;
+          throw new Error("Unsupported native tool content block.");
         }
       }
     })
@@ -65,60 +53,57 @@ export function renderPiToolContent(content: PiBridgeToolResult["content"]): str
     .trim();
 }
 
-export function toFlueToolResult(toolName: string, result: PiBridgeToolResult): FlueToolRunEnvelope {
-  const output = renderPiToolContent(result.content);
+export function toFlueToolResult(toolName: string, result: GrcToolResult): FlueToolRunEnvelope {
+  const output = renderGrcToolContent(result.content);
   if (result.isError) {
     throw new GrclankerToolError(toolName, output || `${toolName} failed without a message.`, result.details);
   }
   return result.terminate ? { output, terminate: true } : { output };
 }
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === "AbortError";
-}
+/** Compatibility export; content formatting belongs to the native GRC contract. */
+export const renderPiToolContent = renderGrcToolContent;
 
-function sanitizedToolResult(tool: PiBridgeableTool, input: unknown, result: PiBridgeToolResult): PiBridgeToolResult {
-  if (result.isError !== true) return result;
-  const rendered = renderPiToolContent(result.content);
-  const text = redactToolErrorText(rendered || `${tool.name} failed without a message.`, input, tool.parameters);
-  return {
-    ...result,
-    content: [{ type: "text", text }],
-    details: redactSensitiveArguments(result.details, tool.parameters),
-  };
-}
-
-export function toFlueTool(tool: PiBridgeableTool): FlueToolDefinition {
+export function toFlueTool(tool: GrcBridgeableTool): FlueToolDefinition {
   const input = jsonSchemaToToolInput(tool.parameters, tool.name, tool.prepareArguments);
   return defineTool({
     name: tool.name,
     description: tool.description,
     input,
     async run({ data, signal, toolCallId }) {
-      let result: PiBridgeToolResult;
-      try {
-        result = (await tool.execute(
-          toolCallId,
-          data,
-          signal,
-          undefined,
-          DETACHED_EXTENSION_CONTEXT,
-        )) as PiBridgeToolResult;
-      } catch (error) {
-        if (signal?.aborted || isAbortError(error)) throw error;
-        const message = error instanceof Error ? error.message : String(error);
-        throw new GrclankerToolError(tool.name, redactToolErrorText(message, data, tool.parameters), undefined);
+      signal?.throwIfAborted();
+      let abortFailure: Error | undefined;
+      // Flue's input pipe already prepared arguments. Core still performs strict
+      // validation and owns execution, error sanitation, metadata, and signals.
+      const preparedTool: RegisteredGrcTool = {
+        ...tool,
+        prepareArguments: undefined,
+        async execute(id, args, executionSignal) {
+          try {
+            return await tool.execute(id, args, executionSignal);
+          } catch (error) {
+            // Flue treats cancellation as control flow; the shared SDK executor
+            // returns error envelopes, so preserve this host's native abort.
+            if (error instanceof Error && error.name === "AbortError") abortFailure = error;
+            throw error;
+          }
+        },
+      };
+      const result = await executeGrcTool(preparedTool, data, { toolCallId, signal });
+      if (result.isError) {
+        signal?.throwIfAborted();
+        if (abortFailure) throw abortFailure;
       }
-      return toFlueToolResult(tool.name, sanitizedToolResult(tool, data, result));
+      return toFlueToolResult(tool.name, result);
     },
   });
 }
 
-/** Every grclanker domain tool (compute-backend wrappers are Pi-specific and excluded). */
-export function collectGrclankerDomainTools(): PiToolDefinition[] {
-  return collectDomainToolDefinitions();
+/** Every native GRC domain tool; each host supplies its own compute tools. */
+export function collectGrclankerDomainTools(): RegisteredGrcTool[] {
+  return collectRegisteredGrcTools();
 }
 
-export function createGrclankerFlueTools(tools: PiBridgeableTool[] = collectGrclankerDomainTools()): FlueToolDefinition[] {
+export function createGrclankerFlueTools(tools: GrcBridgeableTool[] = collectGrclankerDomainTools()): FlueToolDefinition[] {
   return tools.map(toFlueTool);
 }

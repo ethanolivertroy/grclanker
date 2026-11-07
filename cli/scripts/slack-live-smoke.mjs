@@ -1,7 +1,5 @@
 #!/usr/bin/env node
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { resolveLiveSmokeConfiguration } from "./live-smoke-config.mjs";
 
 import {
   SlackApiClient,
@@ -14,14 +12,11 @@ import {
   resolveSlackConfiguration,
 } from "../dist/extensions/grc-tools/slack.js";
 
-const hasCredentials = ["SLACK_USER_TOKEN", "SLACK_TOKEN", "SLACK_BOT_TOKEN", "SLACK_CONFIG_FILE"].some((name) => process.env[name]?.trim())
-  || existsSync(join(homedir(), ".config", "grclanker", "slack.json"));
-if (!hasCredentials) {
-  console.log("Skipping Slack live smoke: set SLACK_USER_TOKEN (or SLACK_TOKEN, or SLACK_BOT_TOKEN), or a config file at SLACK_CONFIG_FILE or ~/.config/grclanker/slack.json, to run.");
-  process.exit(0);
-}
+const authentication = await resolveLiveSmokeConfiguration("Slack", () => resolveSlackConfiguration());
+if (authentication.kind === "unconfigured") process.exit(0);
+const config = authentication.config;
 
-const client = new SlackApiClient(resolveSlackConfiguration());
+const client = new SlackApiClient(config);
 const access = await checkSlackAccess(client);
 console.log(`slack_check_access: ${access.status} (${access.surfaces.filter((surface) => surface.status === "readable").length}/${access.surfaces.length} readable)`);
 

@@ -1,3 +1,4 @@
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
 /**
  * Secure Controls Framework (SCF) tools.
  *
@@ -572,7 +573,7 @@ function missingQueryResult(toolName: string, example: string) {
   );
 }
 
-export function registerScfTools(pi: any): void {
+export function registerScfTools(pi: GrcToolRegistrar): void {
   pi.registerTool({
     name: "scf_search_controls",
     label: "Search SCF controls",

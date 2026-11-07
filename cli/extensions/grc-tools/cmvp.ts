@@ -1,3 +1,4 @@
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
 /**
  * NIST Cryptographic Module Validation Program (CMVP) tools.
  *
@@ -181,7 +182,7 @@ function missingQueryResult(toolName: string) {
   );
 }
 
-export function registerCmvpTools(pi: any): void {
+export function registerCmvpTools(pi: GrcToolRegistrar): void {
   pi.registerTool({
     name: "cmvp_search_modules",
     label: "Search FIPS Validated Modules",

@@ -140,7 +140,7 @@ test("zip bundles are byte-identical regardless of staging mtimes and modes", (t
   assert.deepEqual(formatModes(modes), formatModes(EXPECTED_MODES));
 });
 
-test("bundles ship the Apache-2.0 LICENSE and NOTICE in app/", () => {
+test("bundles ship license files and the source needed to bootstrap atomic builds", () => {
   const workspace = mkdtempSync(join(tmpdir(), "grclanker-archive-license-"));
   const bundle = join(workspace, "bundle");
   const archive = join(workspace, "bundle.tar.gz");
@@ -152,7 +152,7 @@ test("bundles ship the Apache-2.0 LICENSE and NOTICE in app/", () => {
     assert.deepEqual(commands, ["npm", "node"]);
     createArchive(bundle, archive, "tar.gz", { epoch: EPOCH });
     const entries = spawnSync("tar", ["-tzf", archive], { encoding: "utf8" }).stdout.split("\n");
-    for (const name of ["LICENSE", "NOTICE"]) {
+    for (const name of ["LICENSE", "NOTICE", "core/atomic-files.ts"]) {
       assert.ok(entries.includes(`./app/${name}`), `bundle archive is missing app/${name}`);
       const packed = spawnSync("tar", ["-xOzf", archive, `./app/${name}`], { encoding: "utf8" }).stdout;
       assert.equal(packed, readFileSync(join(CLI_DIR, name), "utf8"));

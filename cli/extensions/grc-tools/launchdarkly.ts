@@ -1,3 +1,6 @@
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
+import { ensurePrivateDir, resolveSecureOutputPath, writeSecureTextFile, countFilesRecursively } from "./secure-output.js";
+export { resolveSecureOutputPath };
 /**
  * LaunchDarkly account security inspector tools for grclanker.
  *
@@ -5,16 +8,10 @@
  * coverage across identity, access control, environment governance, flag
  * hygiene, and monitoring integrations. It never mutates the account.
  */
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-} from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { Type } from "typebox";
 import { ToolCallAbortedError, abortableFetch, abortableSleep, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
@@ -998,68 +995,13 @@ function buildRegex(pattern: string | undefined, fallback: string): RegExp {
   }
 }
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
 
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
-  if (
-    relativeTarget === ".."
-    || relativeTarget.startsWith(`..${join("/")}`)
-    || relativeTarget.startsWith("..")
-  ) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
 
-  const pathSegments = relativeTarget.split(/[\\/]+/).filter(Boolean);
-  let currentPath = realBase;
-  for (const segment of pathSegments) {
-    currentPath = join(currentPath, segment);
-    if (!existsSync(currentPath)) break;
-    const currentStat = lstatSync(currentPath);
-    if (currentStat.isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked parent directory: ${currentPath}`);
-    }
-  }
 
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  const realParent = realpathSync(parent);
-  if (lstatSync(realParent).isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
 
-  return resolvedTarget;
-}
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
 
-async function countFilesRecursively(rootDir: string): Promise<number> {
-  let total = 0;
-  const entries = await readdir(rootDir, { withFileTypes: true });
-  for (const entry of entries) {
-    const pathname = join(rootDir, entry.name);
-    if (entry.isDirectory()) {
-      total += await countFilesRecursively(pathname);
-    } else if (entry.isFile()) {
-      total += 1;
-    }
-  }
-  return total;
-}
+
 
 function stripTomlComment(line: string): string {
   let quote: string | undefined;
@@ -5055,7 +4997,7 @@ const projectKeysParam = Type.Optional(Type.String({
   description: "Comma-separated project keys to scope the assessment. Defaults to LAUNCHDARKLY_PROJECTS or every readable project.",
 }));
 
-export function registerLaunchdarklyTools(pi: any): void {
+export function registerLaunchdarklyTools(pi: GrcToolRegistrar): void {
   pi.registerTool({
     name: "launchdarkly_check_access",
     label: "Check LaunchDarkly audit access",

@@ -28,9 +28,10 @@ const NATIVE_RUNNERS = {
 
 test("CI test shards run the test:cli command over every test file", () => {
   const { scripts } = JSON.parse(readFileSync(resolve(REPO_ROOT, "cli", "package.json"), "utf8"));
-  const testCli = /^npm run build && node --test (\S.*)$/.exec(scripts["test:cli"]);
-  assert.ok(testCli, "test:cli changed shape; update the cli-tests shards in ci.yml to match it");
-  assert.equal(testCli[1], JSON.stringify(TEST_FILE_PATTERN), "scripts/test-shards.mjs has to shard the files test:cli runs");
+  assert.equal(scripts["test:cli"], "npm run build && npm run test:unit");
+  const testUnit = /^node --test (\S.*)$/.exec(scripts["test:unit"]);
+  assert.ok(testUnit, "test:unit changed discovery; update the cli-tests shard discovery to match it");
+  assert.equal(testUnit[1], JSON.stringify(TEST_FILE_PATTERN), "scripts/test-shards.mjs has to shard the files test:unit runs");
 
   const job = readWorkflow("ci.yml").jobs["cli-tests"];
   assert.deepEqual(Object.keys(job.strategy.matrix), ["shard"]);
@@ -51,6 +52,21 @@ test("CI test shards run the test:cli command over every test file", () => {
   const pwshCheck = job.steps.find((step) => step.run?.includes("pwsh -NoProfile"));
   assert.ok(pwshCheck && !pwshCheck.if && !pwshCheck["continue-on-error"], "cli-tests has to fail when pwsh is missing");
   assert.ok(runs.indexOf(pwshCheck.run) < runs.indexOf(testStep.run), "cli-tests has to check for pwsh before it runs the tests");
+});
+
+test("CI validators consume one completed CLI build instead of rebuilding in leaf checks", () => {
+  const { scripts } = JSON.parse(readFileSync(resolve(REPO_ROOT, "cli/package.json"), "utf8"));
+  for (const name of ["test:cursor:validate", "check:integration-specs", "check:tool-manifest"]) {
+    assert.match(scripts[name], /^node /, `${name} must consume the completed build`);
+    assert.doesNotMatch(scripts[name], /npm run build|\btsc\b/);
+  }
+  const steps = readWorkflow("ci.yml").jobs.checks.steps;
+  const builds = steps.filter((step) => step["working-directory"] === "cli" && step.run === "npm run build");
+  assert.equal(builds.length, 1);
+  for (const name of ["test:cursor:validate", "check:integration-specs", "check:tool-manifest"]) {
+    const check = steps.find((step) => step.run === `npm run ${name}`);
+    assert.ok(check && steps.indexOf(check) > steps.indexOf(builds[0]), `${name} runs after the shared build`);
+  }
 });
 
 test("the verify job waits on every other CI job", () => {

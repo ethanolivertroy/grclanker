@@ -14,6 +14,7 @@ import {
   assessTenableVulnerabilityManagement,
   checkTenableAccess,
   collectTenableAccessControlData,
+  collectTenableAuditSnapshot,
   collectTenableScanProgramData,
   collectTenableSensorCoverageData,
   collectTenableVulnerabilityData,
@@ -53,6 +54,7 @@ import {
   sweepCheckCompleteness,
 } from "./helpers/spec-conformance.mjs";
 import { assertNoPartialBundleOnWriteFailure, writeFailureTest } from "./helpers/atomic-output.mjs";
+import { CANARY_WINDOW_MIN as LEAK_WINDOW_MIN, secretForms, shortestCanaryWindows as sixWindows, assertNoCanaryWindow, assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 
 // Every assessment in this file feeds the boundary and rule certification at the end.
 const observedDecisionFacts = observeRuntimeDecisionFacts(TENABLE_SPEC);
@@ -78,59 +80,8 @@ writeFileSync(EMPTY_CONFIG_FILE, "");
 const FIXTURE_ACCESS_KEY = "amber-quarry-summit-2026";
 const FIXTURE_SECRET_KEY = "cobalt-meadow-ridge-2026";
 
-// The forms a configured secret can be echoed in: as is, JSON-escaped, URL-encoded, base64, base64url.
-function secretForms(value) {
-  return [...new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value), Buffer.from(value).toString("base64"), Buffer.from(value).toString("base64url")])];
-}
-
-// The window rule (addendum 8): every leak assertion against a planted credential checks
-// the whole value and every window of it from LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters,
-// so a partial echo (the 10-character window JSON.parse quotes, a token cut by a length cap,
-// the head of a base64 form split by a marker) cannot pass. The planted values are alphanumeric
-// and random-looking, and the fixture self-check below proves that no 6-character window of
-// any of them occurs in the fixtures' legitimate text, so every failure is a real leak.
-const LEAK_WINDOW_MIN = 6;
-const LEAK_WINDOW_MAX = 24;
-const leakWindowCache = new Map();
-
-// The whole value plus every window of LEAK_WINDOW_MIN to LEAK_WINDOW_MAX characters, longest
-// first so a failure names the largest fragment that survived, and the shortest windows on
-// their own: a longer window contains its own first LEAK_WINDOW_MIN characters, so every
-// window is absent exactly when the whole value and every shortest window are.
-function leakWindows(canary) {
-  let entry = leakWindowCache.get(canary);
-  if (entry === undefined) {
-    const all = [canary];
-    for (let size = Math.min(LEAK_WINDOW_MAX, canary.length - 1); size >= LEAK_WINDOW_MIN; size -= 1) {
-      for (let index = 0; index + size <= canary.length; index += 1) all.push(canary.slice(index, index + size));
-    }
-    const shortest = Math.min(LEAK_WINDOW_MIN, canary.length);
-    entry = { all: [...new Set(all)], probes: [...new Set(all.filter((window) => window.length === shortest))] };
-    leakWindowCache.set(canary, entry);
-  }
-  return entry;
-}
-
-// Neither the canary nor any window of it from 6 to 24 characters may survive in the text.
-function assertNoWindow(text, canary, label) {
-  const { all, probes } = leakWindows(canary);
-  if (!probes.some((probe) => text.includes(probe))) return;
-  const leaked = all.find((window) => text.includes(window));
-  assert.fail(leaked === canary ? `${label}: ${canary} leaked` : `${label}: window ${leaked} of ${canary} leaked`);
-}
-
-// Every bundle file or zip entry against every planted secret: the shared whole-value scan, then every window.
-function assertNoSecretWindows(contents, secrets, label) {
-  assertSecretsAbsent(assert, contents, secrets, label);
-  for (const [name, text] of contents) {
-    for (const secret of secrets) assertNoWindow(text, secret, `${label} ${name}`);
-  }
-}
-
-// The 6-character windows of a planted value (the value itself when shorter), for the fixture self-check.
-function sixWindows(value) {
-  return leakWindows(value).probes;
-}
+const assertNoWindow = (text, canary, label) => assertNoCanaryWindow(assert, text, canary, label);
+const assertNoSecretWindows = (contents, secrets, label) => assertCanaryWindowsAbsent(assert, contents, secrets, label);
 
 function jsonResponse(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
@@ -1772,6 +1723,82 @@ test("Security Center controls become manual naming the missing URL when not con
   for (const item of allFindings(results).filter((entry) => entry.id.endsWith("-SC"))) {
     assert.notEqual(item.status, "pass", `${item.id} passed on an empty Security Center inventory`);
   }
+});
+
+test("Security Center collection honors the normalized scan window before evaluating a nondefault threshold", async () => {
+  const queries = [];
+  const finished = Math.floor((NOW - 45 * 86_400_000) / 1000);
+  const clients = createTenableClients(vmConfig({ url: "https://security-center.example" }), {
+    fetchImpl: async (url) => {
+      const parsed = new URL(url);
+      if (parsed.pathname === "/rest/scan") return jsonResponse({ error_code: 0, response: [{ id: "scan-1", schedule: { type: "ical" } }] });
+      if (parsed.pathname === "/rest/scanResult") {
+        const startTime = Number(parsed.searchParams.get("startTime"));
+        queries.push(startTime);
+        return jsonResponse({ error_code: 0, response: finished >= startTime ? [{ id: "result-1", status: "Completed", finishTime: String(finished) }] : [] });
+      }
+      assert.fail(`Unexpected Security Center collection request ${parsed.pathname}`);
+    },
+  });
+  for (const [staleScanDays, expectedStatus] of [[90, "pass"], [30, "fail"], [90.9, "pass"]]) {
+    const options = { now: NOW, staleScanDays };
+    const data = await collectTenableScanProgramData(clients, options);
+    assert.equal(queries.at(-1), Math.floor((NOW - Math.trunc(staleScanDays) * 86_400_000) / 1000));
+    assert.equal(assessTenableScanProgram(data, options).findings.find((finding) => finding.id === "TENABLE-02-SC").status, expectedStatus);
+  }
+});
+
+function changingSnapshotClients() {
+  const routes = healthyRoutes();
+  const fallback = routerFetch(routes);
+  const counts = { assets: 0, users: 0 };
+  const clients = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init) => {
+      const key = requestKey(url, init);
+      if (key === "POST /assets/export") return jsonResponse({ export_uuid: `snapshot-${++counts.assets}` });
+      if (/^GET \/assets\/export\/snapshot-\d+\/status$/.test(key)) return jsonResponse({ status: "FINISHED", chunks_available: [1], chunks_failed: [], total_chunks: 1 });
+      if (/^GET \/assets\/export\/snapshot-\d+\/chunks\/1$/.test(key)) {
+        const generation = Number(/snapshot-(\d+)/.exec(key)[1]);
+        return jsonResponse(Array.from({ length: generation + 1 }, (_, index) => ({ ...healthyAssets()[index % 2], id: `snapshot-${generation}-asset-${index}` })));
+      }
+      if (key === "GET /users") {
+        counts.users += 1;
+        return jsonResponse({ users: healthyUsers().map((user) => ({ ...user, username: `snapshot-${counts.users}-${user.username}` })) });
+      }
+      return fallback(url, init);
+    },
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+  });
+  return { clients, counts };
+}
+
+test("the Tenable audit snapshot shares one asset export and user inventory across every category", async () => {
+  const { clients, counts } = changingSnapshotClients();
+  const snapshot = await collectTenableAuditSnapshot(clients, { now: NOW });
+  assert.deepEqual(counts, { assets: 1, users: 1 });
+  for (const data of [snapshot.scanProgram, snapshot.sensorCoverage, snapshot.vulnerabilityManagement]) {
+    assert.equal(data.assetExport, snapshot.shared.assetExport);
+  }
+  for (const data of [snapshot.scanProgram, snapshot.sensorCoverage, snapshot.accessControl, snapshot.vulnerabilityManagement]) {
+    assert.equal(data.users, snapshot.shared.users);
+  }
+  assert.equal(snapshot.access.surfaces.find((surface) => surface.name === "users").count, snapshot.shared.users.data.length);
+});
+
+test("Tenable bundle findings use the exact asset and user observations persisted in raw evidence", async () => {
+  const { clients, counts } = changingSnapshotClients();
+  const bundle = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-one-snapshot-")), { now: NOW });
+  assert.deepEqual(counts, { assets: 1, users: 1 });
+  const readJson = (path) => JSON.parse(readFileSync(join(bundle.outputDir, path), "utf8"));
+  const assets = readJson("core_data/assets_export.json");
+  assert.equal(assets.length, 2);
+  assert.ok(assets.every((asset) => asset.id.startsWith("snapshot-1-")));
+  for (const category of ["scan_program", "sensor_coverage", "vulnerability_management"]) {
+    assert.equal(readJson(`analysis/${category}.json`).summary.exported_assets, assets.length, `${category} must use the bundled asset population`);
+  }
+  assert.ok(readJson("core_data/users.json").every((user) => user.username.startsWith("snapshot-1-")));
+  assert.equal(readJson("metadata.json").generated_at, new Date(NOW).toISOString());
 });
 
 test("exportTenableAuditBundle writes the documented layout, a paired zip, and never overwrites a prior bundle", async () => {

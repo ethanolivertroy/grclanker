@@ -39,11 +39,11 @@ import {
   resolveOciConfiguration,
   resolveSecureOutputPath,
   ruleReachesSensitivePort,
-  scopedStatus,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/oci.js";
 import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
-import { OCI_COMPLETENESS_SOURCES, OCI_SPEC } from "../dist/extensions/grc-tools/oci.spec.js";
+import { OCI_COMPLETENESS_SOURCES, OCI_RUNTIME_FRAMEWORK_MAPPINGS, OCI_SPEC } from "../dist/extensions/grc-tools/oci.spec.js";
+import { checkContract, evaluateCheckVerdict } from "../dist/extensions/grc-tools/spec-model.js";
 import {
   byteDifferentialEnabled,
   prepareByteDifferentialExportRoot,
@@ -409,6 +409,20 @@ function ociFactsByCheck(captures) {
   }
   return facts;
 }
+
+test("OCI findings use canonical verdict rules and mappings across complete, partial, denied, and empty inventories", async () => {
+  for (const [label, client] of [["compliant", compliantClient()], ["partial", partialClient()], ["denied", deniedClient()], ["empty", emptyClient()]]) {
+    const { result, captures } = await captureBatchDecisionFacts(() => runAllAssessments(client));
+    const facts = ociFactsByCheck(captures);
+    const findings = result.flatMap((assessment) => assessment.findings);
+    assert.equal(findings.length, OCI_SPEC.checks.length, label);
+    for (const finding of findings) {
+      assert.ok(facts.has(finding.id), `${label}:${finding.id} captured decision inputs`);
+      assert.equal(finding.status, evaluateCheckVerdict(checkContract(OCI_SPEC, finding.id), facts.get(finding.id)), `${label}:${finding.id} status`);
+      assert.deepEqual(finding.mappings, OCI_RUNTIME_FRAMEWORK_MAPPINGS[finding.id], `${label}:${finding.id} mappings`);
+    }
+  }
+});
 
 test("resolveOciConfiguration prefers explicit arguments over environment and config", () => {
   const resolved = resolveOciConfiguration(
@@ -805,9 +819,6 @@ test("compartment cap withholds pass and records truncation", async () => {
   assert.equal(compute.summary.compartments.compartments_total, 3);
   const collection = await collectAcrossCompartments("x", [ROOT, PROD, APPS], 2, async () => [{ ok: true }]);
   assert.equal(collection.truncated, true);
-  assert.equal(scopedStatus(collection, "pass", "manual"), "warn");
-  assert.equal(scopedStatus({ ...collection, readable: false }, "pass", "manual"), "manual");
-  assert.equal(scopedStatus({ ...collection, items: [] }, "pass", "fail"), "fail");
 });
 
 test("assessOciIdentity flags weak password policy, missing MFA, stale credentials, and broad policies", async () => {

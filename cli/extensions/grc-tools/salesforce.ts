@@ -1,3 +1,6 @@
+import type { GrcToolRegistrar } from "../../core/tool-definition.js";
+import { ensurePrivateDir, resolveSecureOutputPath, writeSecureTextFile, countFilesRecursively } from "./secure-output.js";
+export { resolveSecureOutputPath };
 /**
  * Salesforce security inspector tools for grclanker.
  *
@@ -6,22 +9,15 @@
  * Uses the REST API (SOQL), the Tooling API, and the Metadata API readMetadata
  * call. Nothing in this module mutates the org.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
 import { createSign } from "node:crypto";
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-} from "node:fs";
-import { readdir, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+
+import { basename, join, resolve } from "node:path";
 import { Type } from "typebox";
 import { abortableFetch, abortableSleep, fallbackUnlessAborted, rethrowIfAborted } from "./abort.js";
 import { numberedNames, writeBundleAtomically } from "./atomic-output.js";
 import { readResolverEnvironment, SALESFORCE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { BatchVerdicts, hydrateBatchFrameworkMappings, withIntegrationToolContracts  } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SALESFORCE_SPEC } from "./salesforce.spec.js";
 import { createZipArchive } from "./zip-archive.js";
@@ -468,61 +464,13 @@ function base64Url(input: Buffer | string): string {
   return Buffer.from(input).toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
 }
 
-function ensurePrivateDir(pathname: string): void {
-  mkdirSync(pathname, { recursive: true, mode: 0o700 });
-  const realPath = realpathSync(pathname);
-  const stat = lstatSync(realPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-directory or symlink path: ${pathname}`);
-  }
-}
 
-export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
-  ensurePrivateDir(baseDir);
-  const realBase = realpathSync(baseDir);
-  const resolvedTarget = resolve(realBase, targetDir);
-  const relativeTarget = relative(realBase, resolvedTarget);
-  if (relativeTarget === ".." || relativeTarget.startsWith("..")) {
-    throw new Error(`Refusing to write outside ${realBase}: ${targetDir}`);
-  }
 
-  const pathSegments = relativeTarget.split(/[\\/]+/).filter(Boolean);
-  let currentPath = realBase;
-  for (const segment of pathSegments) {
-    currentPath = join(currentPath, segment);
-    if (!existsSync(currentPath)) break;
-    if (lstatSync(currentPath).isSymbolicLink()) {
-      throw new Error(`Refusing to use symlinked parent directory: ${currentPath}`);
-    }
-  }
 
-  const parent = dirname(resolvedTarget);
-  ensurePrivateDir(parent);
-  if (lstatSync(realpathSync(parent)).isSymbolicLink()) {
-    throw new Error(`Refusing to use symlinked parent directory: ${parent}`);
-  }
-  return resolvedTarget;
-}
 
-async function writeSecureTextFile(rootDir: string, relativePathname: string, content: string): Promise<void> {
-  const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  ensurePrivateDir(dirname(destination));
-  await writeFile(destination, content, { encoding: "utf8", mode: 0o600 });
-}
 
-async function countFilesRecursively(rootDir: string): Promise<number> {
-  let total = 0;
-  const entries = await readdir(rootDir, { withFileTypes: true });
-  for (const entry of entries) {
-    const pathname = join(rootDir, entry.name);
-    if (entry.isDirectory()) {
-      total += await countFilesRecursively(pathname);
-    } else if (entry.isFile()) {
-      total += 1;
-    }
-  }
-  return total;
-}
+
+
 
 const REDACTED = "[REDACTED]";
 const MIN_REMEMBERED_SECRET_LENGTH = 6;
@@ -1894,14 +1842,15 @@ function severityFor(control: number): SalesforceSeverity {
 }
 
 function finding(
-  control: number,
-  status: SalesforceFindingStatus,
+  decisions: BatchVerdicts, control: number,
   summary: string,
   evidence?: JsonRecord,
   manualEvidence?: string,
 ): SalesforceFinding {
-  const definition = controlDefinition(control);
   const id = `SF-${String(control).padStart(2, "0")}`;
+  const status = decisions.status(id);
+  if (status === "info") throw new Error(`${id} returned an unsupported information-only status`);
+  const definition = controlDefinition(control);
   return {
     id,
     control,
@@ -1915,19 +1864,15 @@ function finding(
   };
 }
 
-const SALESFORCE_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
 
-function recordSalesforceDecisionFacts(control: number, facts: Readonly<Record<string, unknown>>): void {
-  const id = `SF-${String(control).padStart(2, "0")}`;
-  const store = SALESFORCE_DECISION_CONTEXT.getStore();
-  if (!store) throw new Error(`${id} decision facts were recorded outside a Salesforce assessment`);
-  store.set(id, facts);
+
+function recordSalesforceDecisionFacts(decisions: BatchVerdicts, control: number, facts: Readonly<Record<string, unknown>>): void {
+  decisions.record(`SF-${String(control).padStart(2, "0")}`, facts);
 }
 
-function manualForUnreadable(control: number, dataset: SalesforceDataset<unknown>, manualEvidence: string, evidence: JsonRecord = {}): SalesforceFinding {
+function manualForUnreadable(decisions: BatchVerdicts, control: number, dataset: SalesforceDataset<unknown>, manualEvidence: string, evidence: JsonRecord = {}): SalesforceFinding {
   return finding(
-    control,
-    "manual",
+    decisions, control,
     `${controlDefinition(control).title} could not be verified because ${unreadableReason(dataset)}.`,
     { ...evidence, dataset: dataset.name, dataset_status: dataset.status, error: dataset.error ?? null },
     manualEvidence,
@@ -1940,15 +1885,9 @@ function partialNote(dataset: SalesforceDataset<JsonRecord[]>): string {
     : "";
 }
 
-function withPartialDowngrade(status: SalesforceFindingStatus, dataset: SalesforceDataset<JsonRecord[]>): SalesforceFindingStatus {
-  if (!dataset.truncated) return status;
-  return status === "pass" ? "warn" : status;
-}
 
-function withUnreadableDowngrade(status: SalesforceFindingStatus, ...datasets: Array<SalesforceDataset<unknown>>): SalesforceFindingStatus {
-  if (datasets.every((dataset) => dataset.status === "ok")) return status;
-  return status === "pass" ? "warn" : status;
-}
+
+
 
 function unreadableNote(notChecked: string, ...datasets: Array<SalesforceDataset<unknown>>): string {
   const unreadable = datasets.filter((dataset) => dataset.status !== "ok");
@@ -2211,7 +2150,8 @@ export async function collectSalesforcePlatformData(client: ReadClient, options:
   return { organization, healthCheck, healthCheckRisks, securitySettings, myDomainSettings, profiles, profileMetadata, instanceUrl };
 }
 
-function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatformData): SalesforceAssessmentResult {
+export function assessSalesforcePlatformData(data: SalesforcePlatformData): SalesforceAssessmentResult {
+  const decisions = new BatchVerdicts(SALESFORCE_SPEC);
   const findings: SalesforceFinding[] = [];
   const settings = data.securitySettings.data ?? {};
   const session = asObject(settings.sessionSettings) ?? {};
@@ -2224,7 +2164,7 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
   const score = asNumber(data.healthCheck.data?.Score);
   const highRisks = risks.filter((risk) => asString(risk.RiskType) === "HIGH_RISK");
   const mediumRisks = risks.filter((risk) => asString(risk.RiskType) === "MEDIUM_RISK");
-  recordSalesforceDecisionFacts(1, {
+  recordSalesforceDecisionFacts(decisions, 1, {
     health_readable: data.healthCheck.status === "ok",
     score_present: score !== undefined,
     risks_readable: data.healthCheckRisks.status === "ok",
@@ -2233,15 +2173,14 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
     high_risk_count: highRisks.length,
   });
   if (data.healthCheck.status !== "ok") {
-    findings.push(manualForUnreadable(1, data.healthCheck, "Setup > Security > Health Check: record the score and export the risk list.", { requires: "View Setup and Configuration, View Health Check" }));
+    findings.push(manualForUnreadable(decisions, 1, data.healthCheck, "Setup > Security > Health Check: record the score and export the risk list.", { requires: "View Setup and Configuration, View Health Check" }));
   } else if (score === undefined) {
-    findings.push(finding(1, "manual", "SecurityHealthCheck returned no Score value; the Health Check page may not have been generated yet.", { record: data.healthCheck.data ?? null }, "Setup > Security > Health Check: open the page so a score is generated, then record it."));
+    findings.push(finding(decisions, 1, "SecurityHealthCheck returned no Score value; the Health Check page may not have been generated yet.", { record: data.healthCheck.data ?? null }, "Setup > Security > Health Check: open the page so a score is generated, then record it."));
   } else {
     const risksReadable = data.healthCheckRisks.status === "ok";
-    const status: SalesforceFindingStatus = !risksReadable ? "manual" : score >= 90 && highRisks.length === 0 ? withPartialDowngrade("pass", data.healthCheckRisks) : score >= 70 ? "warn" : "fail";
+
     findings.push(finding(
-      1,
-      status,
+      decisions, 1,
       !risksReadable
         ? `Health Check score is ${score}, but the per-setting risk list could not be read because ${unreadableReason(data.healthCheckRisks)}.`
         : `Health Check score is ${score} with ${highRisks.length} high-risk and ${mediumRisks.length} medium-risk settings out of ${risks.length} evaluated.${partialNote(data.healthCheckRisks)}`,
@@ -2261,7 +2200,7 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
   const timeoutMinutes = timeoutName ? SESSION_TIMEOUT_MINUTES[timeoutName] : undefined;
   const forceLogout = metadataBoolean(session.forceLogoutOnSessionTimeout);
   const lockToIp = metadataBoolean(session.lockSessionsToIp);
-  recordSalesforceDecisionFacts(2, {
+  recordSalesforceDecisionFacts(decisions, 2, {
     settings_readable: settingsReadable,
     required_fields_present: timeoutMinutes !== undefined && forceLogout !== undefined,
     timeout_minutes: timeoutMinutes,
@@ -2269,15 +2208,15 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
     lock_to_ip: lockToIp,
   });
   if (!settingsReadable) {
-    findings.push(manualForUnreadable(2, data.securitySettings, sessionManual, { requires: "Modify Metadata Through Metadata API Functions or Modify All Data" }));
+    findings.push(manualForUnreadable(decisions, 2, data.securitySettings, sessionManual, { requires: "Modify Metadata Through Metadata API Functions or Modify All Data" }));
   } else {
     const evidence = { session_timeout: timeoutName ?? null, session_timeout_minutes: timeoutMinutes ?? null, force_logout_on_session_timeout: forceLogout ?? null, lock_sessions_to_ip: lockToIp ?? null };
     if (timeoutMinutes === undefined || forceLogout === undefined) {
-      findings.push(finding(2, "manual", `SecuritySettings.sessionSettings did not expose a recognized sessionTimeout (${timeoutName ?? "absent"}) or forceLogoutOnSessionTimeout (${forceLogout ?? "absent"}), so the session policy cannot be confirmed.`, evidence, sessionManual));
+      findings.push(finding(decisions, 2, `SecuritySettings.sessionSettings did not expose a recognized sessionTimeout (${timeoutName ?? "absent"}) or forceLogoutOnSessionTimeout (${forceLogout ?? "absent"}), so the session policy cannot be confirmed.`, evidence, sessionManual));
     } else if (timeoutMinutes <= 120 && forceLogout) {
-      findings.push(finding(2, lockToIp === true ? "pass" : "warn", `Session timeout is ${timeoutMinutes} minutes with forced logout on timeout enabled${lockToIp === true ? " and sessions locked to the originating IP." : "; lockSessionsToIp is not enabled, so hijacked sessions are not IP-bound."}`, evidence));
+      findings.push(finding(decisions, 2, `Session timeout is ${timeoutMinutes} minutes with forced logout on timeout enabled${lockToIp === true ? " and sessions locked to the originating IP." : "; lockSessionsToIp is not enabled, so hijacked sessions are not IP-bound."}`, evidence));
     } else {
-      findings.push(finding(2, "fail", `Session timeout is ${timeoutMinutes} minutes (target <= 120) and forceLogoutOnSessionTimeout is ${forceLogout}.`, evidence));
+      findings.push(finding(decisions, 2, `Session timeout is ${timeoutMinutes} minutes (target <= 120) and forceLogoutOnSessionTimeout is ${forceLogout}.`, evidence));
     }
   }
 
@@ -2295,18 +2234,18 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
       + Number(expirationDays > 90)
       + Number(history < 12)
       + Number(maxAttempts === "NoLimit");
-  recordSalesforceDecisionFacts(3, {
+  recordSalesforceDecisionFacts(decisions, 3, {
     settings_readable: settingsReadable,
     required_fields_present: minimumLength !== undefined && complexity !== undefined && expirationDays !== undefined && history !== undefined,
     gap_count: passwordGapCount,
   });
   if (!settingsReadable) {
-    findings.push(manualForUnreadable(3, data.securitySettings, passwordManual));
+    findings.push(manualForUnreadable(decisions, 3, data.securitySettings, passwordManual));
   } else {
     const lockout = metadataString(passwords.lockoutInterval);
     const evidence = { minimum_password_length: minimumLength ?? null, complexity: complexity ?? null, expiration: expirationName ?? null, history_restriction: history ?? null, max_login_attempts: maxAttempts ?? null, lockout_interval: lockout ?? null };
     if (minimumLength === undefined || complexity === undefined || expirationDays === undefined || history === undefined) {
-      findings.push(finding(3, "manual", "SecuritySettings.passwordPolicies did not expose all of minimumPasswordLength, complexity, expiration, and historyRestriction, so the password policy cannot be confirmed.", evidence, passwordManual));
+      findings.push(finding(decisions, 3, "SecuritySettings.passwordPolicies did not expose all of minimumPasswordLength, complexity, expiration, and historyRestriction, so the password policy cannot be confirmed.", evidence, passwordManual));
     } else {
       const gaps: string[] = [];
       if (minimumLength < 12) gaps.push(`minimum length ${minimumLength} < 12`);
@@ -2314,7 +2253,7 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
       if (expirationDays > 90) gaps.push(`expiration ${expirationName} exceeds 90 days`);
       if (history < 12) gaps.push(`history ${history} < 12`);
       if (maxAttempts === "NoLimit") gaps.push("no lockout after failed attempts");
-      findings.push(finding(3, gaps.length === 0 ? "pass" : gaps.length <= 1 ? "warn" : "fail", gaps.length === 0 ? `Password policy meets the baseline: length ${minimumLength}, complexity ${complexity}, expiration ${expirationName}, history ${history}.` : `Password policy gaps: ${gaps.join("; ")}.`, evidence));
+      findings.push(finding(decisions, 3, gaps.length === 0 ? `Password policy meets the baseline: length ${minimumLength}, complexity ${complexity}, expiration ${expirationName}, history ${history}.` : `Password policy gaps: ${gaps.join("; ")}.`, evidence));
     }
   }
 
@@ -2326,7 +2265,7 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
   const profileView = profileMetadataView(data.profileMetadata);
   const withRanges = profileView.resolved.filter((record) => loginIpRangeCount(record) > 0);
   const withoutRanges = profileView.resolved.filter((record) => loginIpRangeCount(record) === 0);
-  recordSalesforceDecisionFacts(5, {
+  recordSalesforceDecisionFacts(decisions, 5, {
     settings_readable: settingsReadable,
     profiles_readable: data.profiles.status === "ok",
     profile_count: data.profiles.data.length,
@@ -2339,7 +2278,7 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
     enforce_every_request: enforceEveryRequest,
   });
   if (!settingsReadable) {
-    findings.push(manualForUnreadable(5, data.securitySettings, ipManual));
+    findings.push(manualForUnreadable(decisions, 5, data.securitySettings, ipManual));
   } else {
     const orgWide = `${ranges.length} org-wide trusted IP ranges are defined in SecuritySettings.networkAccess and enforceIpRangesEveryRequest=${enforceEveryRequest ?? "absent"}`;
     const view = profileView;
@@ -2357,17 +2296,17 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
       profile_metadata_truncated: whenOk(data.profileMetadata.truncated, data.profileMetadata),
     };
     if (profileIssue) {
-      findings.push(finding(5, "manual", `${orgWide}; per-profile login IP ranges could not be verified because ${profileIssue}.`, evidence, ipManual));
+      findings.push(finding(decisions, 5, `${orgWide}; per-profile login IP ranges could not be verified because ${profileIssue}.`, evidence, ipManual));
     } else if (withRanges.length === 0 && ranges.length === 0) {
-      findings.push(finding(5, "fail", `No login IP restrictions are configured: none of the ${view.resolved.length} sensitive profiles define loginIpRanges and no org-wide trusted IP ranges exist.`, evidence, ipManual));
+      findings.push(finding(decisions, 5, `No login IP restrictions are configured: none of the ${view.resolved.length} sensitive profiles define loginIpRanges and no org-wide trusted IP ranges exist.`, evidence, ipManual));
     } else if (withoutRanges.length === 0 && view.complete && enforceEveryRequest === true) {
-      findings.push(finding(5, "pass", `All ${view.resolved.length} sensitive profiles define login IP ranges, login IP ranges are enforced on every request, and ${ranges.length} org-wide trusted IP ranges are defined.`, evidence));
+      findings.push(finding(decisions, 5, `All ${view.resolved.length} sensitive profiles define login IP ranges, login IP ranges are enforced on every request, and ${ranges.length} org-wide trusted IP ranges are defined.`, evidence));
     } else {
       const gaps: string[] = [];
       if (withoutRanges.length > 0) gaps.push(`${withoutRanges.length}/${view.resolved.length} sensitive profiles have no login IP ranges`);
       if (!view.complete) gaps.push(`${view.unresolved.length} sensitive profiles could not be resolved${data.profileMetadata.truncated ? ` and only ${view.resolved.length} of ${data.profileMetadata.total ?? "?"} were read` : ""}`);
       if (enforceEveryRequest !== true) gaps.push("enforceIpRangesEveryRequest is not enabled");
-      findings.push(finding(5, "warn", `${orgWide}; ${gaps.join("; ")}.`, evidence, ipManual));
+      findings.push(finding(decisions, 5, `${orgWide}; ${gaps.join("; ")}.`, evidence, ipManual));
     }
   }
 
@@ -2377,7 +2316,7 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
   const requireDomainForApi = metadataBoolean(myDomain.doesApiLoginRequireOrgDomain);
   const domainName = metadataString(myDomain.myDomainName);
   const hasMyDomain = Boolean(domainName) || /\.my\.salesforce\.com/i.test(data.instanceUrl ?? "");
-  recordSalesforceDecisionFacts(18, {
+  recordSalesforceDecisionFacts(decisions, 18, {
     readable: data.myDomainSettings.status === "ok",
     has_my_domain: hasMyDomain,
     can_only_login_with_my_domain_url_present: preventLegacyLogin !== undefined,
@@ -2385,17 +2324,17 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
     require_domain_for_api: requireDomainForApi,
   });
   if (data.myDomainSettings.status !== "ok") {
-    findings.push(manualForUnreadable(18, data.myDomainSettings, domainManual, { instance_url: data.instanceUrl ?? null }));
+    findings.push(manualForUnreadable(decisions, 18, data.myDomainSettings, domainManual, { instance_url: data.instanceUrl ?? null }));
   } else {
     const evidence = { my_domain_name: domainName ?? null, instance_url: data.instanceUrl ?? null, can_only_login_with_my_domain_url: preventLegacyLogin ?? null, does_api_login_require_org_domain: requireDomainForApi ?? null, is_sandbox: isSandbox ?? null };
     if (!hasMyDomain) {
-      findings.push(finding(18, "fail", "No My Domain name was exposed by MyDomainSettings and the instance URL is not a My Domain host.", evidence));
+      findings.push(finding(decisions, 18, "No My Domain name was exposed by MyDomainSettings and the instance URL is not a My Domain host.", evidence));
     } else if (preventLegacyLogin === undefined) {
-      findings.push(finding(18, "manual", `My Domain ${domainName ?? data.instanceUrl} is configured, but canOnlyLoginWithMyDomainUrl was not exposed, so the login policy cannot be confirmed.`, evidence, domainManual));
+      findings.push(finding(decisions, 18, `My Domain ${domainName ?? data.instanceUrl} is configured, but canOnlyLoginWithMyDomainUrl was not exposed, so the login policy cannot be confirmed.`, evidence, domainManual));
     } else if (preventLegacyLogin) {
-      findings.push(finding(18, requireDomainForApi === true ? "pass" : "warn", `My Domain ${domainName ?? data.instanceUrl} prevents login from login.salesforce.com${requireDomainForApi === true ? " and requires My Domain for API logins." : "; doesApiLoginRequireOrgDomain is not enabled."}`, evidence));
+      findings.push(finding(decisions, 18, `My Domain ${domainName ?? data.instanceUrl} prevents login from login.salesforce.com${requireDomainForApi === true ? " and requires My Domain for API logins." : "; doesApiLoginRequireOrgDomain is not enabled."}`, evidence));
     } else {
-      findings.push(finding(18, "fail", `My Domain ${domainName ?? data.instanceUrl} still allows login from login.salesforce.com (canOnlyLoginWithMyDomainUrl=false).`, evidence));
+      findings.push(finding(decisions, 18, `My Domain ${domainName ?? data.instanceUrl} still allows login from login.salesforce.com (canOnlyLoginWithMyDomainUrl=false).`, evidence));
     }
   }
 
@@ -2407,7 +2346,7 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
     enable_clickjack_nonsetup_user_headerless: metadataBoolean(session.enableClickjackNonsetupUserHeaderless),
   };
   const clickjackDisabled = Object.entries(clickjackFlags).filter(([, value]) => value === false).map(([key]) => key);
-  recordSalesforceDecisionFacts(19, {
+  recordSalesforceDecisionFacts(decisions, 19, {
     settings_readable: settingsReadable,
     setup_flag: clickjackFlags.enable_clickjack_setup,
     nonsetup_sfdc_flag: clickjackFlags.enable_clickjack_nonsetup_sfdc,
@@ -2416,39 +2355,39 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
     disabled_count: clickjackDisabled.length,
   });
   if (!settingsReadable) {
-    findings.push(manualForUnreadable(19, data.securitySettings, clickjackManual));
+    findings.push(manualForUnreadable(decisions, 19, data.securitySettings, clickjackManual));
   } else {
     const flags = clickjackFlags;
     const values = Object.values(flags);
     const disabled = Object.entries(flags).filter(([, value]) => value === false).map(([key]) => key);
     const missing = Object.entries(flags).filter(([, value]) => value === undefined).map(([key]) => key);
     if (values.every((value) => value === true)) {
-      findings.push(finding(19, "pass", "Clickjack protection is enabled for setup pages, non-setup Salesforce pages, and Visualforce pages with and without headers.", flags));
+      findings.push(finding(decisions, 19, "Clickjack protection is enabled for setup pages, non-setup Salesforce pages, and Visualforce pages with and without headers.", flags));
     } else if (disabled.length > 0) {
-      findings.push(finding(19, disabled.length >= 2 ? "fail" : "warn", `Clickjack protection is disabled for: ${disabled.join(", ")}.`, { ...flags, missing_flags: missing }));
+      findings.push(finding(decisions, 19, `Clickjack protection is disabled for: ${disabled.join(", ")}.`, { ...flags, missing_flags: missing }));
     } else {
-      findings.push(finding(19, "manual", `Clickjack flags were not exposed by SecuritySettings: ${missing.join(", ")}.`, flags, clickjackManual));
+      findings.push(finding(decisions, 19, `Clickjack flags were not exposed by SecuritySettings: ${missing.join(", ")}.`, flags, clickjackManual));
     }
   }
 
   const csrfManual = "Setup > Security > Session Settings > Cross-Site Request Forgery (CSRF) Protection: confirm GET and POST protection are enabled.";
   const csrfGet = metadataBoolean(session.enableCSRFOnGet);
   const csrfPost = metadataBoolean(session.enableCSRFOnPost);
-  recordSalesforceDecisionFacts(20, {
+  recordSalesforceDecisionFacts(decisions, 20, {
     settings_readable: settingsReadable,
     get_enabled: csrfGet,
     post_enabled: csrfPost,
   });
   if (!settingsReadable) {
-    findings.push(manualForUnreadable(20, data.securitySettings, csrfManual));
+    findings.push(manualForUnreadable(decisions, 20, data.securitySettings, csrfManual));
   } else {
     const evidence = { enable_csrf_on_get: csrfGet ?? null, enable_csrf_on_post: csrfPost ?? null };
     if (csrfGet === true && csrfPost === true) {
-      findings.push(finding(20, "pass", "CSRF protection is enabled for GET and POST requests on non-setup pages.", evidence));
+      findings.push(finding(decisions, 20, "CSRF protection is enabled for GET and POST requests on non-setup pages.", evidence));
     } else if (csrfGet === false || csrfPost === false) {
-      findings.push(finding(20, "fail", `CSRF protection is disabled for ${[csrfGet === false ? "GET" : undefined, csrfPost === false ? "POST" : undefined].filter(Boolean).join(" and ")} requests.`, evidence));
+      findings.push(finding(decisions, 20, `CSRF protection is disabled for ${[csrfGet === false ? "GET" : undefined, csrfPost === false ? "POST" : undefined].filter(Boolean).join(" and ")} requests.`, evidence));
     } else {
-      findings.push(finding(20, "manual", "CSRF flags enableCSRFOnGet and enableCSRFOnPost were not exposed by SecuritySettings.", evidence, csrfManual));
+      findings.push(finding(decisions, 20, "CSRF flags enableCSRFOnGet and enableCSRFOnPost were not exposed by SecuritySettings.", evidence, csrfManual));
     }
   }
 
@@ -2472,9 +2411,7 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
   };
 }
 
-export function assessSalesforcePlatformData(data: SalesforcePlatformData): SalesforceAssessmentResult {
-  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforcePlatformDataWithDecisionContext(data));
-}
+
 
 export async function assessSalesforcePlatformSecurity(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {
   return assessSalesforcePlatformData(await collectSalesforcePlatformData(client, options));
@@ -2523,7 +2460,8 @@ function populationIssue(data: SalesforceIdentityData, admins: JsonRecord[]): st
   return undefined;
 }
 
-function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentityData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
+export function assessSalesforceIdentityData(data: SalesforceIdentityData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
+  const decisions = new BatchVerdicts(SALESFORCE_SPEC);
   const findings: SalesforceFinding[] = [];
   const maxAdmins = clampNumber(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 10_000);
   const users = data.users.data;
@@ -2555,7 +2493,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
     active_admins_seen: whenOk(admins.length, data.users, data.profiles),
   };
   const populationManual = (control: number, manualEvidence: string): SalesforceFinding =>
-    finding(control, "manual", `${controlDefinition(control).title} cannot be verified from this credential's view because ${population}.`, populationEvidence, manualEvidence);
+    finding(decisions, control, `${controlDefinition(control).title} cannot be verified from this credential's view because ${population}.`, populationEvidence, manualEvidence);
 
   const mfaManual = "Setup > Identity Verification (Session Settings): confirm 'Require multi-factor authentication (MFA) for all direct UI logins to your org' is enabled; then Setup > Users > (each active user): confirm registered MFA methods.";
   const session = asObject(data.securitySettings.data?.sessionSettings) ?? {};
@@ -2598,7 +2536,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
   const capNote = data.twoFactorMethods.truncated
     ? ` TwoFactorMethodsInfo returned ${data.twoFactorMethods.seen} rows, ${capSignal}, so enrollment coverage is incomplete.`
     : "";
-  recordSalesforceDecisionFacts(4, {
+  recordSalesforceDecisionFacts(decisions, 4, {
     security_settings_readable: data.securitySettings.status === "ok",
     mfa_required: mfaRequired,
     mfa_risk_present: mfaRisk !== undefined,
@@ -2611,33 +2549,29 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
     health_check_risks_readable: data.healthCheckRisks.status === "ok",
   });
   if (data.securitySettings.status !== "ok" && !mfaRisk) {
-    findings.push(finding(4, "manual", `MFA enforcement could not be verified because ${unreadableReason(data.securitySettings)} and Health Check exposed no MFA setting.`, mfaEvidence, mfaManual));
+    findings.push(finding(decisions, 4, `MFA enforcement could not be verified because ${unreadableReason(data.securitySettings)} and Health Check exposed no MFA setting.`, mfaEvidence, mfaManual));
   } else if (mfaRequired === false || mfaRiskMeets === false) {
-    findings.push(finding(4, "fail", `MFA is not required for all direct UI logins (enableMFADirectUILoginOptIn=${mfaRequired ?? "absent"}${mfaRisk ? `, Health Check: ${asString(mfaRisk.Setting)} = ${asString(mfaRisk.OrgValue)}` : ""}).`, mfaEvidence));
+    findings.push(finding(decisions, 4, `MFA is not required for all direct UI logins (enableMFADirectUILoginOptIn=${mfaRequired ?? "absent"}${mfaRisk ? `, Health Check: ${asString(mfaRisk.Setting)} = ${asString(mfaRisk.OrgValue)}` : ""}).`, mfaEvidence));
   } else if (mfaRequired === true || mfaRiskMeets === true) {
     if (data.twoFactorMethods.status !== "ok") {
-      findings.push(finding(4, "manual", `MFA is required for direct UI logins, but per-user enrollment could not be verified because ${unreadableReason(data.twoFactorMethods)}; TwoFactorMethodsInfo requires the Manage MFA in API permission.`, { ...mfaEvidence, requires: "Manage MFA in API" }, mfaManual));
+      findings.push(finding(decisions, 4, `MFA is required for direct UI logins, but per-user enrollment could not be verified because ${unreadableReason(data.twoFactorMethods)}; TwoFactorMethodsInfo requires the Manage MFA in API permission.`, { ...mfaEvidence, requires: "Manage MFA in API" }, mfaManual));
     } else if (population) {
-      findings.push(finding(4, "manual", `MFA is required for direct UI logins, but per-user enrollment cannot be verified because ${population}.`, { ...mfaEvidence, ...populationEvidence }, mfaManual));
+      findings.push(finding(decisions, 4, `MFA is required for direct UI logins, but per-user enrollment cannot be verified because ${population}.`, { ...mfaEvidence, ...populationEvidence }, mfaManual));
     } else if (standardActiveUsers.length === 0) {
-      findings.push(finding(4, "manual", "MFA is required for direct UI logins, but zero active standard users were returned, which indicates a partial user view rather than a compliant org.", mfaEvidence, mfaManual));
+      findings.push(finding(decisions, 4, "MFA is required for direct UI logins, but zero active standard users were returned, which indicates a partial user view rather than a compliant org.", mfaEvidence, mfaManual));
     } else if (unenrolled.length === 0) {
-      const status = withUnreadableDowngrade(
-        withPartialDowngrade(withPartialDowngrade("pass", data.users), data.twoFactorMethods),
-        data.securitySettings,
-        data.healthCheckRisks,
-      );
+      const status = decisions.status("SF-04");
       const sourceNote = unreadableNote("the MFA requirement's second source", data.securitySettings, data.healthCheckRisks);
-      findings.push(finding(4, status, `MFA is required for direct UI logins and all ${standardActiveUsers.length} active standard users have a registered verification method.${partialNote(data.users)}${capNote}${sourceNote}`, mfaEvidence, status === "pass" ? undefined : mfaManual));
+      findings.push(finding(decisions, 4, `MFA is required for direct UI logins and all ${standardActiveUsers.length} active standard users have a registered verification method.${partialNote(data.users)}${capNote}${sourceNote}`, mfaEvidence, status === "pass" ? undefined : mfaManual));
     } else if (!enrollmentComplete) {
       // Visible users without an enrollment row are an absence claim over a partial read: the verdict stops at warn and names nobody.
-      findings.push(finding(4, "warn", `MFA is required for direct UI logins, but some of the ${standardActiveUsers.length} visible active standard users have no registered MFA method among the visible TwoFactorMethodsInfo rows; the read was partial (${enrollmentPartialNotes.join("; ")}), so the unread rows could hold their enrollments and the count and names are withheld.${partialNote(data.users)}${capNote}`, mfaEvidence, mfaManual));
+      findings.push(finding(decisions, 4, `MFA is required for direct UI logins, but some of the ${standardActiveUsers.length} visible active standard users have no registered MFA method among the visible TwoFactorMethodsInfo rows; the read was partial (${enrollmentPartialNotes.join("; ")}), so the unread rows could hold their enrollments and the count and names are withheld.${partialNote(data.users)}${capNote}`, mfaEvidence, mfaManual));
     } else {
-      findings.push(finding(4, unenrolled.length > standardActiveUsers.length / 4 ? "fail" : "warn", `MFA is required for direct UI logins, but ${unenrolled.length}/${standardActiveUsers.length} active standard users have no registered MFA method (SSO-only users may be exempt by design).`, mfaEvidence));
+      findings.push(finding(decisions, 4, `MFA is required for direct UI logins, but ${unenrolled.length}/${standardActiveUsers.length} active standard users have no registered MFA method (SSO-only users may be exempt by design).`, mfaEvidence));
     }
   } else {
     const unreadableSources = [data.securitySettings, data.healthCheckRisks].filter((dataset) => dataset.status !== "ok").map(unreadableReason);
-    findings.push(finding(4, "manual", `Neither SecuritySettings.sessionSettings.enableMFADirectUILoginOptIn nor a Health Check MFA setting exposed a value, so MFA enforcement cannot be confirmed${unreadableSources.length > 0 ? ` (${unreadableSources.join("; ")})` : ""}.`, mfaEvidence, mfaManual));
+    findings.push(finding(decisions, 4, `Neither SecuritySettings.sessionSettings.enableMFADirectUILoginOptIn nor a Health Check MFA setting exposed a value, so MFA enforcement cannot be confirmed${unreadableSources.length > 0 ? ` (${unreadableSources.join("; ")})` : ""}.`, mfaEvidence, mfaManual));
   }
 
   const hoursManual = "Setup > Profiles > (System Administrator and other elevated profiles) > Login Hours: record configured hours or the decision not to restrict them.";
@@ -2649,7 +2583,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
     return hours.bounded.length > 0 && hours.unbounded.length > 0;
   });
   const unrestricted = hoursView.resolved.filter((record) => loginHoursView(record).bounded.length === 0);
-  recordSalesforceDecisionFacts(6, {
+  recordSalesforceDecisionFacts(decisions, 6, {
     profiles_readable: profilesReadable,
     profile_count: profiles.length,
     admin_profile_count: adminProfiles.length,
@@ -2660,7 +2594,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
     complete: hoursView.complete,
   });
   if (hoursIssue) {
-    findings.push(finding(6, "manual", `Login hour restrictions could not be verified because ${hoursIssue}.`, { ...populationEvidence, profile_metadata_status: data.profileMetadata.status, profile_metadata_error: data.profileMetadata.error ?? null }, hoursManual));
+    findings.push(finding(decisions, 6, `Login hour restrictions could not be verified because ${hoursIssue}.`, { ...populationEvidence, profile_metadata_status: data.profileMetadata.status, profile_metadata_error: data.profileMetadata.error ?? null }, hoursManual));
   } else {
     const view = hoursView;
     const evidence = {
@@ -2673,16 +2607,16 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
       profile_metadata_truncated: data.profileMetadata.truncated,
     };
     if (restricted.length === view.resolved.length && view.complete) {
-      findings.push(finding(6, "pass", `All ${view.resolved.length} sensitive profiles (System Administrator and profiles with elevated permissions) restrict login hours on every day of the week.`, evidence));
+      findings.push(finding(decisions, 6, `All ${view.resolved.length} sensitive profiles (System Administrator and profiles with elevated permissions) restrict login hours on every day of the week.`, evidence));
     } else if (restricted.length === 0 && partiallyRestricted.length === 0) {
-      findings.push(finding(6, "fail", `None of the ${view.resolved.length} sensitive profiles read restrict login hours (loginHours absent or covering the full day on every day).${view.complete ? "" : ` ${view.unresolved.length} sensitive profiles could not be resolved.`}`, evidence, hoursManual));
+      findings.push(finding(decisions, 6, `None of the ${view.resolved.length} sensitive profiles read restrict login hours (loginHours absent or covering the full day on every day).${view.complete ? "" : ` ${view.unresolved.length} sensitive profiles could not be resolved.`}`, evidence, hoursManual));
     } else {
       const gaps: string[] = [];
       if (partiallyRestricted.length > 0) gaps.push(`${partiallyRestricted.length} restrict only some days and leave the others open: ${partiallyRestricted.map(loginHoursLabel).join("; ")}`);
       if (unrestricted.length > 0) gaps.push(`${unrestricted.length} restrict no day`);
       if (view.unresolved.length > 0) gaps.push(`${view.unresolved.length} could not be resolved`);
       if (data.profileMetadata.truncated) gaps.push(`only ${view.resolved.length} of ${data.profileMetadata.total ?? "?"} sensitive profiles were read`);
-      findings.push(finding(6, "warn", `${restricted.length}/${view.resolved.length} sensitive profiles restrict login hours on every day of the week; ${gaps.join("; ")}.`, evidence, hoursManual));
+      findings.push(finding(decisions, 6, `${restricted.length}/${view.resolved.length} sensitive profiles restrict login hours on every day of the week; ${gaps.join("; ")}.`, evidence, hoursManual));
     }
   }
 
@@ -2693,7 +2627,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
   const usersOnApiProfiles = activeUsers.filter((user) => asBoolean(profileById.get(asString(user.ProfileId) ?? "")?.PermissionsApiEnabled) === true);
   const ratio = profiles.length > 0 ? apiProfiles.length / profiles.length : 0;
   const inputsComplete = !data.profiles.truncated && !data.users.truncated;
-  recordSalesforceDecisionFacts(7, {
+  recordSalesforceDecisionFacts(decisions, 7, {
     ...populationDecisionFacts,
     complete: inputsComplete,
     api_profile_count: apiProfiles.length,
@@ -2712,15 +2646,15 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
       profiles_truncated: data.profiles.truncated,
       profile_fields_omitted: data.profiles.omittedFields ?? [],
     };
-    const observed: SalesforceFindingStatus = ratio > 0.5 ? "fail" : ratio > 0.25 ? "warn" : "pass";
-    const status: SalesforceFindingStatus = inputsComplete ? observed : "warn";
+
+    const status = decisions.status("SF-07");
     const apiOnlyNote = !apiOnlyFlagAvailable
       ? "PermissionsApiUserOnly is not available in this org, so API Only User profiles could not be identified."
       : inputsComplete || apiOnlyProfiles.length > 0
         ? `${apiOnlyProfiles.length} are API Only User profiles.`
         : "no API Only User profile was among the visible rows, which a partial read cannot confirm.";
     const sampleNote = inputsComplete ? "" : " The ratio is over the visible rows only, so the verdict is capped at warn.";
-    findings.push(finding(7, status, `${apiProfiles.length}/${profiles.length} visible profiles grant API Enabled covering ${usersOnApiProfiles.length} visible active users; ${apiOnlyNote}${partialNote(data.profiles)}${partialNote(data.users)}${sampleNote}`, evidence, status === "pass" ? undefined : apiManual));
+    findings.push(finding(decisions, 7, `${apiProfiles.length}/${profiles.length} visible profiles grant API Enabled covering ${usersOnApiProfiles.length} visible active users; ${apiOnlyNote}${partialNote(data.profiles)}${partialNote(data.users)}${sampleNote}`, evidence, status === "pass" ? undefined : apiManual));
   }
 
   const permSetManual = "Setup > Permission Sets: filter by Modify All Data, View All Data, Manage Users, and Author Apex; export the assignment list and confirm each assignee is justified.";
@@ -2731,7 +2665,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
   const elevatedAssignments = data.assignments.data.filter((assignment) => elevatedIds.has(asString(assignment.PermissionSetId) ?? ""));
   const activeElevatedAssignments = elevatedAssignments.filter((assignment) => asBoolean(asObject(assignment.Assignee)?.IsActive) !== false);
   const assignees = new Set(activeElevatedAssignments.map((assignment) => asString(assignment.AssigneeId) ?? ""));
-  recordSalesforceDecisionFacts(9, {
+  recordSalesforceDecisionFacts(decisions, 9, {
     sets_readable: data.permissionSets.status === "ok",
     ...populationDecisionFacts,
     set_count: permissionSets.length,
@@ -2743,11 +2677,11 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
     max_admins: maxAdmins,
   });
   if (data.permissionSets.status !== "ok") {
-    findings.push(manualForUnreadable(9, data.permissionSets, permSetManual));
+    findings.push(manualForUnreadable(decisions, 9, data.permissionSets, permSetManual));
   } else if (population) {
     findings.push(populationManual(9, permSetManual));
   } else if (permissionSets.length === 0) {
-    findings.push(finding(9, "manual", "Zero permission sets were returned; even orgs without custom permission sets expose standard ones, so this indicates a permission-limited view.", { permission_sets: 0 }, permSetManual));
+    findings.push(finding(decisions, 9, "Zero permission sets were returned; even orgs without custom permission sets expose standard ones, so this indicates a permission-limited view.", { permission_sets: 0 }, permSetManual));
   } else {
     const evidence = {
       permission_sets: permissionSets.length,
@@ -2758,14 +2692,14 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
       permission_sets_truncated: data.permissionSets.truncated,
     };
     if (elevated.length === 0) {
-      const status = withUnreadableDowngrade(withPartialDowngrade("pass", data.permissionSets), data.assignments);
+      const status = decisions.status("SF-09");
       const assignmentNote = unreadableNote("assignment coverage of the permission sets that were read", data.assignments);
-      findings.push(finding(9, status, `None of the ${permissionSets.length} permission sets grant Modify All Data, View All Data, Manage Users, Author Apex, or other elevated permissions.${partialNote(data.permissionSets)}${assignmentNote}`, evidence, status === "pass" ? undefined : permSetManual));
+      findings.push(finding(decisions, 9, `None of the ${permissionSets.length} permission sets grant Modify All Data, View All Data, Manage Users, Author Apex, or other elevated permissions.${partialNote(data.permissionSets)}${assignmentNote}`, evidence, status === "pass" ? undefined : permSetManual));
     } else if (!assignmentsReadable) {
-      findings.push(finding(9, "manual", `${elevated.length} permission sets grant elevated permissions, but assignments could not be read because ${unreadableReason(data.assignments)}.`, evidence, permSetManual));
+      findings.push(finding(decisions, 9, `${elevated.length} permission sets grant elevated permissions, but assignments could not be read because ${unreadableReason(data.assignments)}.`, evidence, permSetManual));
     } else {
-      const status: SalesforceFindingStatus = assignees.size > maxAdmins ? "fail" : assignees.size > 0 ? "warn" : withPartialDowngrade(withPartialDowngrade("pass", data.assignments), data.permissionSets);
-      findings.push(finding(9, status, `${elevated.length} permission sets grant elevated permissions and are assigned to ${assignees.size} distinct active users (threshold ${maxAdmins}).${partialNote(data.permissionSets)}${partialNote(data.assignments)}`, evidence, status === "pass" ? undefined : permSetManual));
+      const status = decisions.status("SF-09");
+      findings.push(finding(decisions, 9, `${elevated.length} permission sets grant elevated permissions and are assigned to ${assignees.size} distinct active users (threshold ${maxAdmins}).${partialNote(data.permissionSets)}${partialNote(data.assignments)}`, evidence, status === "pass" ? undefined : permSetManual));
     }
   }
 
@@ -2777,7 +2711,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
     const lastLogin = asDate(user.LastLoginDate);
     return lastLogin !== undefined && daysBetween(adminNow, lastLogin) > staleDays;
   });
-  recordSalesforceDecisionFacts(10, {
+  recordSalesforceDecisionFacts(decisions, 10, {
     ...populationDecisionFacts,
     complete: !data.users.truncated && !data.profiles.truncated,
     max_admins: maxAdmins,
@@ -2799,8 +2733,8 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
       users_total: data.users.total ?? null,
       profiles_truncated: data.profiles.truncated,
     };
-    const status: SalesforceFindingStatus = admins.length > maxAdmins || staleAdmins.length > 0 ? "fail" : adminsWithoutLogin.length > 0 ? "warn" : withPartialDowngrade(withPartialDowngrade("pass", data.users), data.profiles);
-    findings.push(finding(10, status, `${admins.length} active users hold administrator-class profiles (threshold ${maxAdmins}); ${staleAdmins.length} have not logged in for ${staleDays}+ days and ${adminsWithoutLogin.length} have no LastLoginDate and are not counted as active administrators.${partialNote(data.users)}${partialNote(data.profiles)}`, evidence, status === "pass" ? undefined : adminManual));
+    const status = decisions.status("SF-10");
+    findings.push(finding(decisions, 10, `${admins.length} active users hold administrator-class profiles (threshold ${maxAdmins}); ${staleAdmins.length} have not logged in for ${staleDays}+ days and ${adminsWithoutLogin.length} have no LastLoginDate and are not counted as active administrators.${partialNote(data.users)}${partialNote(data.profiles)}`, evidence, status === "pass" ? undefined : adminManual));
   }
 
   const guestManual = "Setup > Sites and Digital Experiences > (each site) > Public Access Settings: confirm guest profiles have no API access, no View All or Modify All permissions, and object access limited to what the site needs.";
@@ -2810,7 +2744,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
     const profile = profileById.get(asString(user.ProfileId) ?? "");
     return profile !== undefined && (asBoolean(profile.PermissionsApiEnabled) === true || hasElevatedPermission(profile).length > 0);
   });
-  recordSalesforceDecisionFacts(13, {
+  recordSalesforceDecisionFacts(decisions, 13, {
     ...populationDecisionFacts,
     users_complete: !data.users.truncated,
     active_guest_count: activeGuests.length,
@@ -2827,13 +2761,13 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
       users_truncated: data.users.truncated,
     };
     if (data.users.truncated) {
-      findings.push(finding(13, "warn", `Only ${data.users.seen} of ${data.users.total ?? "unknown"} users were read, so guest user coverage is partial; ${activeGuests.length} active guest users were seen.`, evidence, guestManual));
+      findings.push(finding(decisions, 13, `Only ${data.users.seen} of ${data.users.total ?? "unknown"} users were read, so guest user coverage is partial; ${activeGuests.length} active guest users were seen.`, evidence, guestManual));
     } else if (activeGuests.length === 0) {
-      findings.push(finding(13, "pass", `No active guest users exist among the ${users.length} visible users (${admins.length} active administrators seen), so no Sites or Experience Cloud public access is exposed through guest profiles (emptiness is compliant for this control).`, evidence));
+      findings.push(finding(decisions, 13, `No active guest users exist among the ${users.length} visible users (${admins.length} active administrators seen), so no Sites or Experience Cloud public access is exposed through guest profiles (emptiness is compliant for this control).`, evidence));
     } else if (riskyGuests.length > 0) {
-      findings.push(finding(13, "fail", `${riskyGuests.length}/${activeGuests.length} active guest users sit on profiles with API Enabled or elevated data permissions.`, evidence));
+      findings.push(finding(decisions, 13, `${riskyGuests.length}/${activeGuests.length} active guest users sit on profiles with API Enabled or elevated data permissions.`, evidence));
     } else {
-      findings.push(finding(13, "warn", `${activeGuests.length} active guest users exist without API or elevated permissions; object and field access for each public site still needs manual review.`, evidence, guestManual));
+      findings.push(finding(decisions, 13, `${activeGuests.length} active guest users exist without API or elevated permissions; object and field access for each public site still needs manual review.`, evidence, guestManual));
     }
   }
 
@@ -2860,9 +2794,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
   };
 }
 
-export function assessSalesforceIdentityData(data: SalesforceIdentityData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
-  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforceIdentityDataWithDecisionContext(data, options));
-}
+
 
 export async function assessSalesforceIdentityAccess(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {
   return assessSalesforceIdentityData(await collectSalesforceIdentityData(client, options), { ...options, now: options.now ?? client.getNow() });
@@ -2882,7 +2814,8 @@ export async function collectSalesforceDataProtectionData(client: ReadClient, op
 const PUBLIC_OWD_VALUES = /^(Edit|Read|ReadWrite|ReadWriteTransfer|ShowDetails|ShowDetailsInsert|HideDetailsInsert|ControlledByLeadOrContact|ControlledByCampaign)$/;
 const STRICT_OWD_VALUES = /^(None|Private|ControlledByParent|HideDetails)$/;
 
-function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceDataProtectionData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
+export function assessSalesforceDataProtectionData(data: SalesforceDataProtectionData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
+  const decisions = new BatchVerdicts(SALESFORCE_SPEC);
   const findings: SalesforceFinding[] = [];
   const now = options.now ?? new Date();
 
@@ -2894,16 +2827,16 @@ function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceD
     byField.set(key, [...(byField.get(key) ?? []), row]);
   }
   const broad = [...byField.entries()].filter(([, rows]) => rows.length > 5);
-  recordSalesforceDecisionFacts(8, {
+  recordSalesforceDecisionFacts(decisions, 8, {
     readable: data.fieldPermissions.status === "ok",
     complete: data.fieldPermissions.status === "ok" && !data.fieldPermissions.truncated,
     sensitive_field_count: byField.size,
     broad_field_count: broad.length,
   });
   if (data.fieldPermissions.status !== "ok") {
-    findings.push(manualForUnreadable(8, data.fieldPermissions, flsManual));
+    findings.push(manualForUnreadable(decisions, 8, data.fieldPermissions, flsManual));
   } else if (fieldPermissions.length === 0) {
-    findings.push(finding(8, "manual", `No FieldPermissions rows matched the sensitive-name patterns (${SENSITIVE_FIELD_PATTERNS.length} patterns); sensitive fields may use other names, so classification must be confirmed manually.`, { patterns: SENSITIVE_FIELD_PATTERNS }, flsManual));
+    findings.push(finding(decisions, 8, `No FieldPermissions rows matched the sensitive-name patterns (${SENSITIVE_FIELD_PATTERNS.length} patterns); sensitive fields may use other names, so classification must be confirmed manually.`, { patterns: SENSITIVE_FIELD_PATTERNS }, flsManual));
   } else {
     const editable = fieldPermissions.filter((row) => asBoolean(row.PermissionsEdit) === true);
     const evidence = {
@@ -2913,8 +2846,8 @@ function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceD
       broadly_readable_fields: truncateList(broad.map(([field, rows]) => `${field} (${rows.length} grants)`)),
       truncated: data.fieldPermissions.truncated,
     };
-    const status: SalesforceFindingStatus = broad.length > 0 ? "warn" : withPartialDowngrade("pass", data.fieldPermissions);
-    findings.push(finding(8, status, `${byField.size} fields matching sensitive-name patterns carry ${fieldPermissions.length} profile or permission set grants; ${broad.length} fields are readable by more than 5 grants.${partialNote(data.fieldPermissions)}`, evidence, flsManual));
+
+    findings.push(finding(decisions, 8, `${byField.size} fields matching sensitive-name patterns carry ${fieldPermissions.length} profile or permission set grants; ${broad.length} fields are readable by more than 5 grants.${partialNote(data.fieldPermissions)}`, evidence, flsManual));
   }
 
   const sharingManual = "Setup > Security > Sharing Settings: record organization-wide defaults for every standard and custom object, plus the sharing rules that widen access.";
@@ -2924,21 +2857,21 @@ function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceD
   const missing = values.filter((item) => item.value === undefined);
   const open = values.filter((item) => item.value !== undefined && PUBLIC_OWD_VALUES.test(item.value) && !/^(ReadSelect|Read)$/.test(item.key === "DefaultPricebookAccess" ? item.value : ""));
   const strict = values.filter((item) => item.value !== undefined && STRICT_OWD_VALUES.test(item.value));
-  recordSalesforceDecisionFacts(12, {
+  recordSalesforceDecisionFacts(decisions, 12, {
     readable: data.organization.status === "ok" && organization !== undefined,
     default_field_count: owdKeys.length - missing.length,
     open_default_count: open.length,
   });
   if (data.organization.status !== "ok" || !organization) {
-    findings.push(manualForUnreadable(12, data.organization, sharingManual));
+    findings.push(manualForUnreadable(decisions, 12, data.organization, sharingManual));
   } else {
     const evidence = { organization_wide_defaults: Object.fromEntries(values.map((item) => [item.key, item.value ?? null])), open_defaults: open.map((item) => `${item.key}=${item.value}`), strict_defaults: strict.length };
     if (missing.length === owdKeys.length) {
-      findings.push(finding(12, "manual", "Organization returned no Default*Access fields, so organization-wide defaults cannot be read.", evidence, sharingManual));
+      findings.push(finding(decisions, 12, "Organization returned no Default*Access fields, so organization-wide defaults cannot be read.", evidence, sharingManual));
     } else if (open.length === 0) {
-      findings.push(finding(12, "warn", "Standard object organization-wide defaults are Private or Controlled by Parent; custom object defaults and sharing rules are not exposed here and still need manual review.", evidence, sharingManual));
+      findings.push(finding(decisions, 12, "Standard object organization-wide defaults are Private or Controlled by Parent; custom object defaults and sharing rules are not exposed here and still need manual review.", evidence, sharingManual));
     } else {
-      findings.push(finding(12, open.length >= 3 ? "fail" : "warn", `${open.length} standard objects use public organization-wide defaults: ${open.map((item) => `${item.key}=${item.value}`).join(", ")}.`, evidence, sharingManual));
+      findings.push(finding(decisions, 12, `${open.length} standard objects use public organization-wide defaults: ${open.map((item) => `${item.key}=${item.value}`).join(", ")}.`, evidence, sharingManual));
     }
   }
 
@@ -2948,7 +2881,7 @@ function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceD
   const dated = active.filter((secret) => asDate(secret.CreatedDate) !== undefined);
   const undated = active.length - dated.length;
   const oldest = dated.map((secret) => daysBetween(now, asDate(secret.CreatedDate) as Date)).sort((left, right) => right - left)[0];
-  recordSalesforceDecisionFacts(16, {
+  recordSalesforceDecisionFacts(decisions, 16, {
     readable: data.tenantSecrets.status === "ok",
     complete: data.tenantSecrets.status === "ok" && !data.tenantSecrets.truncated,
     secret_count: secrets.length,
@@ -2957,22 +2890,22 @@ function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceD
     oldest_active_age_days: oldest ?? 0,
   });
   if (data.tenantSecrets.status === "forbidden" || data.tenantSecrets.status === "unavailable") {
-    findings.push(finding(16, "manual", `Shield Platform Encryption is not applicable or not visible: ${unreadableReason(data.tenantSecrets)}. This is a not-applicable or scoped-out result, not a pass.`, { dataset_status: data.tenantSecrets.status, error: data.tenantSecrets.error ?? null }, encryptionManual));
+    findings.push(finding(decisions, 16, `Shield Platform Encryption is not applicable or not visible: ${unreadableReason(data.tenantSecrets)}. This is a not-applicable or scoped-out result, not a pass.`, { dataset_status: data.tenantSecrets.status, error: data.tenantSecrets.error ?? null }, encryptionManual));
   } else if (data.tenantSecrets.status !== "ok") {
-    findings.push(manualForUnreadable(16, data.tenantSecrets, encryptionManual));
+    findings.push(manualForUnreadable(decisions, 16, data.tenantSecrets, encryptionManual));
   } else if (truncatedBeforeVisible(data.tenantSecrets)) {
     // Zero visible secrets of a truncated read is an absence claim over the unread rows: manual, with the count unknown.
-    findings.push(finding(16, "manual", `${truncatedBeforeVisibleNote(data.tenantSecrets, "tenant secret", "whether Shield Platform Encryption has active keys")} The verdict is manual (unknown).`, { tenant_secrets: null, tenant_secrets_total: data.tenantSecrets.total ?? null, tenant_secrets_truncated: true, truncation_reason: data.tenantSecrets.truncationReason ?? null }, encryptionManual));
+    findings.push(finding(decisions, 16, `${truncatedBeforeVisibleNote(data.tenantSecrets, "tenant secret", "whether Shield Platform Encryption has active keys")} The verdict is manual (unknown).`, { tenant_secrets: null, tenant_secrets_total: data.tenantSecrets.total ?? null, tenant_secrets_truncated: true, truncation_reason: data.tenantSecrets.truncationReason ?? null }, encryptionManual));
   } else if (secrets.length === 0) {
-    findings.push(finding(16, "fail", "TenantSecret is readable but no tenant secrets exist, so Shield Platform Encryption has no active keys and no fields are encrypted.", { tenant_secrets: 0 }, encryptionManual));
+    findings.push(finding(decisions, 16, "TenantSecret is readable but no tenant secrets exist, so Shield Platform Encryption has no active keys and no fields are encrypted.", { tenant_secrets: 0 }, encryptionManual));
   } else {
     const evidence = { tenant_secrets: secrets.length, active_secrets: active.length, active_types: [...new Set(active.map((secret) => asString(secret.Type) ?? ""))], oldest_active_secret_days: oldest ?? null, active_secrets_without_created_date: undated };
     if (active.length === 0) {
-      findings.push(finding(16, "fail", `${secrets.length} tenant secrets exist but none are Active.`, evidence, encryptionManual));
+      findings.push(finding(decisions, 16, `${secrets.length} tenant secrets exist but none are Active.`, evidence, encryptionManual));
     } else if (undated > 0) {
-      findings.push(finding(16, "warn", `${active.length} active tenant secrets exist but ${undated} have no CreatedDate, so rotation age cannot be confirmed for them.`, evidence, encryptionManual));
+      findings.push(finding(decisions, 16, `${active.length} active tenant secrets exist but ${undated} have no CreatedDate, so rotation age cannot be confirmed for them.`, evidence, encryptionManual));
     } else {
-      findings.push(finding(16, (oldest ?? 0) > 365 ? "warn" : withPartialDowngrade("pass", data.tenantSecrets), `${active.length} active tenant secrets (${evidence.active_types.join(", ")}); oldest active key is ${oldest} days old. Field-level encryption policy still needs manual confirmation.${partialNote(data.tenantSecrets)}`, evidence, encryptionManual));
+      findings.push(finding(decisions, 16, `${active.length} active tenant secrets (${evidence.active_types.join(", ")}); oldest active key is ${oldest} days old. Field-level encryption policy still needs manual confirmation.${partialNote(data.tenantSecrets)}`, evidence, encryptionManual));
     }
   }
 
@@ -2987,7 +2920,7 @@ function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceD
   const unknownSigning = certificates.filter((cert) => asBoolean(cert.OptionsIsCaSigned) === undefined);
   const exportableKeys = certificates.filter((cert) => asBoolean(cert.OptionsIsPrivateKeyExportable) === true);
   const pendingChain = certificates.filter((cert) => asBoolean(cert.OptionsIsUnusable) === true);
-  recordSalesforceDecisionFacts(17, {
+  recordSalesforceDecisionFacts(decisions, 17, {
     readable: data.certificates.status === "ok",
     complete: data.certificates.status === "ok" && !data.certificates.truncated,
     certificate_count: certificates.length,
@@ -2995,9 +2928,9 @@ function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceD
     warning_count: expiring.length + undatedCerts.length + unknownKeySize.length + unknownSigning.length + exportableKeys.length + pendingChain.length,
   });
   if (data.certificates.status !== "ok") {
-    findings.push(manualForUnreadable(17, data.certificates, certManual));
+    findings.push(manualForUnreadable(decisions, 17, data.certificates, certManual));
   } else if (certificates.length === 0) {
-    findings.push(finding(17, "manual", "No certificates were returned from the Certificate object; confirm that SSO, JWT connected apps, and outbound callouts do not rely on unmanaged certificates.", { certificates: 0 }, certManual));
+    findings.push(finding(decisions, 17, "No certificates were returned from the Certificate object; confirm that SSO, JWT connected apps, and outbound callouts do not rely on unmanaged certificates.", { certificates: 0 }, certManual));
   } else {
     const undated = undatedCerts;
     const selfSigned = certificates.filter((cert) => asBoolean(cert.OptionsIsCaSigned) === false);
@@ -3017,12 +2950,12 @@ function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceD
       truncated: data.certificates.truncated,
     };
     const needsReview = expiring.length > 0 || undated.length > 0 || unknownKeySize.length > 0 || unknownSigning.length > 0 || exportableKeys.length > 0 || pendingChain.length > 0;
-    const status: SalesforceFindingStatus = expired.length > 0 || weakKeys.length > 0 ? "fail" : needsReview ? "warn" : withPartialDowngrade("pass", data.certificates);
+    const status = decisions.status("SF-17");
     const signingNote = unknownSigning.length > 0
       ? `OptionsIsCaSigned was not returned for ${unknownSigning.length}, so their signing status needs manual confirmation.`
       : `${selfSigned.length} self-signed and ${certificates.length - selfSigned.length} CA-signed.`;
     const keySizeNote = unknownKeySize.length > 0 ? ` KeySize was not returned for ${unknownKeySize.length}, so they are not counted as compliant.` : "";
-    findings.push(finding(17, status, `${certificates.length} certificates: ${expired.length} expired, ${expiring.length} expiring within ${warningDays} days, ${undated.length} without an expiration date (not counted as valid), ${weakKeys.length} with keys under 2048 bits, ${exportableKeys.length} with exportable private keys, ${pendingChain.length} awaiting a signed chain. ${signingNote}${keySizeNote}${partialNote(data.certificates)}`, evidence, status === "pass" ? undefined : certManual));
+    findings.push(finding(decisions, 17, `${certificates.length} certificates: ${expired.length} expired, ${expiring.length} expiring within ${warningDays} days, ${undated.length} without an expiration date (not counted as valid), ${weakKeys.length} with keys under 2048 bits, ${exportableKeys.length} with exportable private keys, ${pendingChain.length} awaiting a signed chain. ${signingNote}${keySizeNote}${partialNote(data.certificates)}`, evidence, status === "pass" ? undefined : certManual));
   }
 
   return {
@@ -3044,9 +2977,7 @@ function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceD
   };
 }
 
-export function assessSalesforceDataProtectionData(data: SalesforceDataProtectionData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
-  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforceDataProtectionDataWithDecisionContext(data, options));
-}
+
 
 export async function assessSalesforceDataProtection(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {
   return assessSalesforceDataProtectionData(await collectSalesforceDataProtectionData(client, options), { ...options, now: options.now ?? client.getNow() });
@@ -3072,7 +3003,8 @@ function callerPermission(dataset: SalesforceDataset<JsonRecord | undefined>, fi
   return asBoolean(dataset.data[field]);
 }
 
-function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonitoringData): SalesforceAssessmentResult {
+export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): SalesforceAssessmentResult {
+  const decisions = new BatchVerdicts(SALESFORCE_SPEC);
   const findings: SalesforceFinding[] = [];
 
   const appManual = "Setup > Apps > Connected Apps > Manage Connected Apps: for each app record Permitted Users, IP Relaxation, Refresh Token Policy, and OAuth scopes; Setup > Connected Apps OAuth Usage: review apps with active tokens.";
@@ -3105,16 +3037,16 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
   const openApps = apps.filter((app) => asBoolean(app.OptionsAllowAdminApprovedUsersOnly) === false);
   const unknownPolicy = apps.filter((app) => asBoolean(app.OptionsAllowAdminApprovedUsersOnly) === undefined);
   const unboundedRefresh = apps.filter((app) => asNumber(app.RefreshTokenValidityPeriod) === undefined && asBoolean(app.OptionsRefreshTokenValidityMetric) !== true);
-  recordSalesforceDecisionFacts(11, {
+  recordSalesforceDecisionFacts(decisions, 11, {
     readable: data.connectedApplications.status === "ok",
     app_count: apps.length,
     unknown_policy_count: unknownPolicy.length,
     open_app_count: openApps.length,
   });
   if (data.connectedApplications.status !== "ok") {
-    findings.push(manualForUnreadable(11, data.connectedApplications, appManual));
+    findings.push(manualForUnreadable(decisions, 11, data.connectedApplications, appManual));
   } else if (apps.length === 0) {
-    findings.push(finding(11, "manual", `ConnectedApplication returned zero apps; apps without org-managed policies do not appear here, so OAuth usage must be reviewed manually.${tokenViewNote}`, { connected_applications: 0, ...tokenEvidence }, appManual));
+    findings.push(finding(decisions, 11, `ConnectedApplication returned zero apps; apps without org-managed policies do not appear here, so OAuth usage must be reviewed manually.${tokenViewNote}`, { connected_applications: 0, ...tokenEvidence }, appManual));
   } else {
     const tokensByApp = new Map<string, number>();
     for (const token of data.oauthTokens.data) {
@@ -3132,11 +3064,11 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
       connected_applications_truncated: whenOk(data.connectedApplications.truncated, data.connectedApplications),
     };
     if (unknownPolicy.length === apps.length) {
-      findings.push(finding(11, "manual", `${apps.length} connected apps were returned but none exposed OptionsAllowAdminApprovedUsersOnly, so the pre-authorization policy cannot be confirmed.${tokenViewNote}`, evidence, appManual));
+      findings.push(finding(decisions, 11, `${apps.length} connected apps were returned but none exposed OptionsAllowAdminApprovedUsersOnly, so the pre-authorization policy cannot be confirmed.${tokenViewNote}`, evidence, appManual));
     } else if (openApps.length > 0) {
-      findings.push(finding(11, openApps.length > apps.length / 2 ? "fail" : "warn", `${openApps.length}/${apps.length} connected apps allow all users to self-authorize instead of admin pre-approval; ${unboundedRefresh.length} have no refresh token expiry. OAuth scopes are not exposed by SOQL and need manual review.${tokenViewNote}`, evidence, appManual));
+      findings.push(finding(decisions, 11, `${openApps.length}/${apps.length} connected apps allow all users to self-authorize instead of admin pre-approval; ${unboundedRefresh.length} have no refresh token expiry. OAuth scopes are not exposed by SOQL and need manual review.${tokenViewNote}`, evidence, appManual));
     } else {
-      findings.push(finding(11, "warn", `All ${apps.length} connected apps with visible policies require admin pre-approval, but OAuth scopes and IP relaxation are not exposed by SOQL and still need manual review.${partialNote(data.connectedApplications)}${tokenViewNote}`, evidence, appManual));
+      findings.push(finding(decisions, 11, `All ${apps.length} connected apps with visible policies require admin pre-approval, but OAuth scopes and IP relaxation are not exposed by SOQL and still need manual review.${partialNote(data.connectedApplications)}${tokenViewNote}`, evidence, appManual));
     }
   }
 
@@ -3153,7 +3085,7 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
   const countries = [...new Set(logins.map((login) => asString(login.CountryIso)).filter((value): value is string => Boolean(value)))];
   const legacyTls = logins.filter((login) => /TLS 1\.[01]/i.test(asString(login.TlsProtocol) ?? ""));
   const failureRatio = logins.length > 0 ? failed.length / logins.length : 0;
-  recordSalesforceDecisionFacts(14, {
+  recordSalesforceDecisionFacts(decisions, 14, {
     readable: data.loginHistory.status === "ok",
     login_count: logins.length,
     complete: data.loginHistory.status === "ok" && !data.loginHistory.truncated,
@@ -3164,9 +3096,9 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
     undated_count: undatedLogins.length,
   });
   if (data.loginHistory.status !== "ok") {
-    findings.push(manualForUnreadable(14, data.loginHistory, loginManual));
+    findings.push(manualForUnreadable(decisions, 14, data.loginHistory, loginManual));
   } else if (logins.length === 0) {
-    findings.push(finding(14, "manual", `LoginHistory returned zero rows for the last ${data.loginHistoryDays} days, which is implausible for an active org and indicates a permission-limited or empty view.`, { login_rows: 0, window_days: data.loginHistoryDays }, loginManual));
+    findings.push(finding(decisions, 14, `LoginHistory returned zero rows for the last ${data.loginHistoryDays} days, which is implausible for an active org and indicates a permission-limited or empty view.`, { login_rows: 0, window_days: data.loginHistoryDays }, loginManual));
   } else {
     const undated = undatedLogins;
     // Over a truncated read the ratio is a sample and every zero is an absence claim over the unread rows.
@@ -3185,20 +3117,20 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
       seen: data.loginHistory.seen,
       total: data.loginHistory.total ?? null,
     };
-    const observed: SalesforceFindingStatus = bruteForceIps.length > 0 || failureRatio > 0.25 || legacyTls.length > 0 ? "fail" : failureRatio > 0.1 || countries.length > 5 || undated.length > 0 ? "warn" : "pass";
-    const status: SalesforceFindingStatus = complete ? observed : "warn";
+
+    const status = decisions.status("SF-14");
     const countClause = (value: number, label: string): string => (complete || value > 0 ? `${value} ${label}` : `${label}: unknown from the visible rows`);
     const summary = complete
       ? `${logins.length} logins in ${data.loginHistoryDays} days: ${failed.length} failures (${Math.round(failureRatio * 100)}%), ${bruteForceIps.length} sources with 10+ failures, ${countries.length} countries, ${legacyTls.length} legacy TLS logins.`
       : `${logins.length} of ${data.loginHistory.total ?? "an unknown total of"} logins in ${data.loginHistoryDays} days were read: ${failed.length} failures among the visible rows (ratio not stated from a partial read), ${countClause(bruteForceIps.length, "sources with 10+ failures")}, ${countries.length} countries seen, ${countClause(legacyTls.length, "legacy TLS logins")}. The verdict is capped at warn because the unread rows could change it.${partialNote(data.loginHistory)}`;
-    findings.push(finding(14, status, summary, evidence, status === "pass" ? undefined : loginManual));
+    findings.push(finding(decisions, 14, summary, evidence, status === "pass" ? undefined : loginManual));
   }
 
   const auditManual = `Setup > Security > View Setup Audit Trail: download the last ${data.auditTrailDays} days and review permission, profile, admin, session, password, and network access changes.`;
   const trail = data.setupAuditTrail.data;
   const highRisk = trail.filter((row) => HIGH_RISK_AUDIT_SECTIONS.test(asString(row.Section) ?? "") || HIGH_RISK_AUDIT_ACTIONS.test(asString(row.Action) ?? ""));
   const undatedTrail = trail.filter((row) => asDate(row.CreatedDate) === undefined);
-  recordSalesforceDecisionFacts(15, {
+  recordSalesforceDecisionFacts(decisions, 15, {
     audit_readable: data.setupAuditTrail.status === "ok",
     audit_count: trail.length,
     audit_complete: data.setupAuditTrail.status === "ok" && !data.setupAuditTrail.truncated,
@@ -3207,9 +3139,9 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
     event_log_readable: data.eventLogFiles.status === "ok",
   });
   if (data.setupAuditTrail.status !== "ok") {
-    findings.push(manualForUnreadable(15, data.setupAuditTrail, auditManual, { requires: "View Setup and Configuration" }));
+    findings.push(manualForUnreadable(decisions, 15, data.setupAuditTrail, auditManual, { requires: "View Setup and Configuration" }));
   } else if (trail.length === 0) {
-    findings.push(finding(15, "manual", `SetupAuditTrail returned zero rows for the last ${data.auditTrailDays} days; an active org almost always has setup changes, so this indicates a permission-limited view.`, { audit_rows: 0, window_days: data.auditTrailDays }, auditManual));
+    findings.push(finding(decisions, 15, `SetupAuditTrail returned zero rows for the last ${data.auditTrailDays} days; an active org almost always has setup changes, so this indicates a permission-limited view.`, { audit_rows: 0, window_days: data.auditTrailDays }, auditManual));
   } else {
     const undated = undatedTrail;
     const actors = [...new Set(highRisk.map((row) => asString(asObject(row.CreatedBy)?.Username) ?? asString(row.CreatedById) ?? "unknown"))];
@@ -3234,7 +3166,7 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
         : { status: data.eventLogFiles.status, error: data.eventLogFiles.error ?? null },
       truncated: data.setupAuditTrail.truncated,
     };
-    const status: SalesforceFindingStatus = data.setupAuditTrail.truncated || undated.length > 0 || highRisk.length > 0 ? "warn" : withUnreadableDowngrade("pass", data.eventLogFiles);
+    const status = decisions.status("SF-15");
     // The emptiness sentence is stated only from a complete read; a truncated read carries the partial-view clause.
     const eventNote = !eventLogReadable
       ? `was not checked because ${unreadableReason(data.eventLogFiles)}, so the verdict is capped at warn`
@@ -3244,7 +3176,7 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
           ? `exposed no EventLogFile row among the visible rows, which the partial read cannot confirm for the unread rows: the EventLogFile read was truncated before any row was visible (0 of ${data.eventLogFiles.total ?? "an unknown total of"} rows${data.eventLogFiles.truncationReason ? `; ${data.eventLogFiles.truncationReason}` : ""})`
           : `exposed ${data.eventLogFiles.data.length} of ${data.eventLogFiles.total ?? "an unknown total of"} EventLogFile rows in 7 days (the read was truncated${data.eventLogFiles.truncationReason ? `: ${data.eventLogFiles.truncationReason}` : ""}, so the visible rows are not the full set)`;
     const eventManual = eventLogReadable ? "" : " Setup > Event Manager and the EventLogFile browser: confirm Event Monitoring log files are being generated and retained.";
-    findings.push(finding(15, status, `${trail.length} setup changes in ${data.auditTrailDays} days with ${highRisk.length} high-risk security changes by ${actors.length} actors; Event Monitoring ${eventNote}.${partialNote(data.setupAuditTrail)}`, evidence, status === "pass" ? undefined : `${auditManual}${eventManual}`));
+    findings.push(finding(decisions, 15, `${trail.length} setup changes in ${data.auditTrailDays} days with ${highRisk.length} high-risk security changes by ${actors.length} actors; Event Monitoring ${eventNote}.${partialNote(data.setupAuditTrail)}`, evidence, status === "pass" ? undefined : `${auditManual}${eventManual}`));
   }
 
   return {
@@ -3273,9 +3205,7 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
   };
 }
 
-export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): SalesforceAssessmentResult {
-  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforceMonitoringDataWithDecisionContext(data));
-}
+
 
 export async function assessSalesforceMonitoringIntegrations(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {
   return assessSalesforceMonitoringData(await collectSalesforceMonitoringData(client, options));
@@ -3771,7 +3701,7 @@ const assessParams = {
   record_limit: Type.Optional(Type.Number({ description: "Maximum records to read per SOQL query before recording truncation. Defaults to 2000.", default: 2000 })),
 };
 
-export function registerSalesforceTools(pi: any): void {
+export function registerSalesforceTools(pi: GrcToolRegistrar): void {
   pi = withIntegrationToolContracts(pi, SALESFORCE_SPEC);
   pi.registerTool({
     name: "salesforce_check_access",

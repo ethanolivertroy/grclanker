@@ -424,63 +424,88 @@ fallback_instructions() {
   fail "Install aborted."
 }
 
-extract_archive() {
-  local archive_path="$1"
-  local install_dir="$2"
-  local archive_name entries="" entry="" aside_prefix previous_dir="" leftover
+# Stage an immutable version, then atomically switch the command to it. The
+# compatibility install path changes only after the command points at a complete
+# version; a failed activation restores both pointers before removing staging.
+install_archive() (
+  local archive_path="$1" install_dir="$2" entries="" entry=""
+  local parent base versions candidate alias_path launcher_path saved_launcher previous_dir="" previous_version=""
+  local launcher_changed=0 root_changed=0 committed=0
+  [ -n "$install_dir" ] || fail "Refusing to extract: install directory is empty"
+  parent="$(dirname "$install_dir")"
+  base="$(basename "$install_dir")"
+  mkdir -p "$parent" "$BIN_DIR"
+  parent="$(cd "$parent" && pwd -P)"
+  install_dir="$parent/$base"
+  versions="$parent/.$base.versions"
+  mkdir -p "$versions"
+  candidate="$(mktemp -d "$versions/version.XXXXXXXX")"
+  alias_path="$candidate.alias"
+  launcher_path="$BIN_DIR/.grclanker.activate-${candidate##*.}"
+  saved_launcher="$BIN_DIR/.grclanker.previous-${candidate##*.}"
 
-  if [ -z "$install_dir" ]; then
-    fail "Refusing to extract: install directory is empty"
-  fi
+  rollback_install() {
+    local restored=1
+    if [ "$committed" -eq 0 ]; then
+      if [ "$root_changed" -eq 1 ] && ! rm -f "$install_dir"; then restored=0; fi
+      if [ -n "$previous_dir" ]; then
+        if ! mv "$previous_dir" "$install_dir"; then restored=0; warn "Previous install remains at $previous_dir"; fi
+      fi
+      if [ "$launcher_changed" -eq 1 ]; then
+        if [ -e "$saved_launcher" ] || [ -L "$saved_launcher" ]; then
+          if ! mv -f "$saved_launcher" "$BIN_PATH"; then restored=0; warn "Previous launcher remains at $saved_launcher"; fi
+        elif ! rm -f "$BIN_PATH"; then restored=0; fi
+      fi
+      if [ "$restored" -eq 1 ]; then rm -rf "$candidate"; fi
+    fi
+    rm -f "$alias_path" "$launcher_path"
+    if [ "$committed" -eq 1 ] || [ "$restored" -eq 1 ]; then rm -f "$saved_launcher"; fi
+  }
+  trap rollback_install EXIT
 
-  archive_name="$(basename "$archive_path")"
-  # A listing that stops early would skip the check below for every entry it missed.
   if ! entries="$(tar -tzf "$archive_path")"; then
-    fail "Could not list the entries in ${archive_name}, so nothing was installed"
+    fail "Could not list the entries in $(basename "$archive_path"), so nothing was installed"
   fi
-
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
-    case "$entry" in
-      /*) fail "Refusing to extract unsafe archive entry: $entry" ;;
-    esac
-    if printf "%s" "$entry" | grep -Eq '(^|/)\.\.(/|$)'; then
-      fail "Refusing to extract unsafe archive entry: $entry"
-    fi
+    case "$entry" in /*) fail "Refusing to extract unsafe archive entry: $entry" ;; esac
+    if printf "%s" "$entry" | grep -Eq '(^|/)\.\.(/|$)'; then fail "Refusing to extract unsafe archive entry: $entry"; fi
   done <<EOF
 $entries
 EOF
-
-  # Move the previous install aside so a failed extraction can put it back.
-  aside_prefix="$(dirname "$install_dir")/$(basename "$install_dir").old-"
+  if ! tar -xzf "$archive_path" -C "$candidate"; then
+    fail "Could not extract $(basename "$archive_path"); the previous install was left unchanged"
+  fi
+  if [ ! -f "$candidate/grclanker" ] || ! bash "$candidate/grclanker" --help >/dev/null; then
+    fail "Bundle validation failed; the previous install was left unchanged"
+  fi
+  chmod +x "$candidate/grclanker"
+  [ ! -d "$BIN_PATH" ] || fail "Launcher path is a directory: $BIN_PATH"
+  if [ -e "$BIN_PATH" ] || [ -L "$BIN_PATH" ]; then cp -P "$BIN_PATH" "$saved_launcher"; fi
+  ln -s "$candidate" "$alias_path"
+  ln -s "$candidate/grclanker" "$launcher_path"
+  # BIN_PATH names a file, so rename replaces it rather than following a directory.
+  mv -f "$launcher_path" "$BIN_PATH"
+  launcher_changed=1
+  if [ -L "$install_dir" ]; then previous_version="$(readlink "$install_dir")"; fi
   if [ -e "$install_dir" ] || [ -L "$install_dir" ]; then
-    # A leftover with the same name would make mv move the install inside it, so pick an unused name.
-    previous_dir="$install_dir"
-    while [ -e "$previous_dir" ] || [ -L "$previous_dir" ]; do
-      printf -v previous_dir "%s%04x%04x" "$aside_prefix" "$RANDOM" "$RANDOM"
-    done
+    previous_dir="$parent/.$base.previous-${candidate##*.}"
     mv "$install_dir" "$previous_dir"
   fi
-
-  if ! { mkdir -p "$install_dir" && tar -xzf "$archive_path" -C "$install_dir"; }; then
-    if [ -z "$previous_dir" ]; then
-      fail "Could not extract ${archive_name}"
-    fi
-    if rm -rf "$install_dir" && mv "$previous_dir" "$install_dir"; then
-      fail "Could not extract ${archive_name}, so the previous install was restored"
-    fi
-    fail "Could not extract ${archive_name}. The previous install is at ${previous_dir}"
-  fi
-
-  # The new install is complete, so this run's aside can go, along with any an
-  # interrupted earlier run left behind.
-  for leftover in "$aside_prefix"????????; do
-    case "${leftover##*.old-}" in
-      *[!0123456789abcdef]*) continue ;;
-    esac
-    rm -rf "$leftover" || warn "Could not remove the previous install at ${leftover}"
+  mv "$alias_path" "$install_dir"
+  root_changed=1
+  committed=1
+  if [ -n "$previous_dir" ]; then rm -rf "$previous_dir" || warn "Could not remove previous install at $previous_dir"; fi
+  # Retain one prior immutable version for an existing process or a rollback.
+  for entry in "$versions"/version.*; do
+    [ "$entry" = "$candidate" ] || [ "$entry" = "$previous_version" ] || rm -rf "$entry" || warn "Could not remove previous version at $entry"
   done
-}
+  # Retire backup names produced by older installers only after activation.
+  for entry in "$install_dir".old-????????; do
+    case "${entry##*.old-}" in *[!0123456789abcdef]*) continue ;; esac
+    rm -rf "$entry" || warn "Could not remove previous install at $entry"
+  done
+)
 
 checksum_entry_hash() {
   local checksums_path="$1" archive_name="$2" line hash=""
@@ -653,15 +678,13 @@ if verify_checksum "$archive_path" "$ASSET_NAME"; then
 fi
 
 mkdir -p "$BIN_DIR"
-extract_archive "$archive_path" "$INSTALL_DIR"
+install_archive "$archive_path" "$INSTALL_DIR"
 ok "Installed to ${LAVENDER}${INSTALL_DIR}${R}"
 
 if [ -n "$(command -v grclanker 2>/dev/null)" ] && [ "$(command -v grclanker)" != "$BIN_PATH" ]; then
   warn "Another grclanker command is already on PATH: $(command -v grclanker)"
 fi
 
-rm -f "$BIN_PATH"
-ln -s "${INSTALL_DIR}/grclanker" "$BIN_PATH"
 ok "Linked ${LAVENDER}${BIN_PATH}${R}"
 
 if [[ ":$PATH:" != *":${BIN_DIR}:"* ]]; then

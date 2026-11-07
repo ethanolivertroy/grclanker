@@ -1,5 +1,6 @@
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { recoverFileTransactionSync, writeFileAtomicallySync } from "../core/atomic-files.js";
 import { ConfigFileError, readJsonConfig } from "../extensions/grc-tools/hardening/config-file.js";
 import {
   DEFAULT_COMPUTE_BACKEND,
@@ -62,9 +63,15 @@ function assertJsonObject(path: string, value: unknown): Record<string, unknown>
 // object, throws ConfigFileError with a fixed message so a credential on the
 // bad line is not quoted and the caller does not replace the file.
 export function readJson(path: string): Record<string, unknown> {
+  recoverFileTransactionSync(configurationJournalPath(path));
   const result = readJsonConfig(path);
   if (!result.ok) return {};
   return assertJsonObject(path, result.value);
+}
+
+/** Settings and model providers are one recoverable configuration commit. */
+export function configurationJournalPath(memberPath: string): string {
+  return resolve(dirname(memberPath), ".configuration-transaction.json");
 }
 
 export function readModelsConfig(path: string): Record<string, unknown> {
@@ -113,8 +120,7 @@ export function normalizeGrclankerSettings(
     typeof settings.parallelsAutoStart === "boolean" ? settings.parallelsAutoStart : undefined;
   settings.parallelsClonePrefix = normalizeOptionalString(settings.parallelsClonePrefix);
 
-  mkdirSync(dirname(settingsPath), { recursive: true });
-  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
+  writeGrclankerSettings(settingsPath, settings);
 }
 
 export function applyComputeBackendOverride(
@@ -137,6 +143,8 @@ export function writeGrclankerSettings(
   path: string,
   settings: GrclankerSettings,
 ): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(settings, null, 2) + "\n", "utf8");
+  recoverFileTransactionSync(configurationJournalPath(path));
+  const serialized = JSON.stringify(settings, null, 2) + "\n";
+  if (existsSync(path) && readFileSync(path, "utf8") === serialized) return;
+  writeFileAtomicallySync(path, serialized, { mode: 0o600 });
 }

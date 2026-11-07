@@ -1,5 +1,5 @@
 /** Shared domain registration. Agent hosts add their own compute tools and lifecycle hooks. */
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { GrcToolDefinition, GrcToolRegistrar } from "./tool-definition.js";
 import { runToolCall, type ToolCallState } from "../extensions/grc-tools/abort.js";
 import { registerAnsibleTools } from "../extensions/grc-tools/ansible.js";
 import { registerAwsTools } from "../extensions/grc-tools/aws.js";
@@ -47,7 +47,7 @@ import { registerZscalerTools } from "../extensions/grc-tools/zscaler.js";
  * integration by importing its `registerXxxTools` above and inserting it here
  * in alphabetical order; the domain tool count is derived from this list.
  */
-const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
+const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(tools: GrcToolRegistrar) => void> = [
   registerAnsibleTools,
   registerAwsTools,
   registerAzureTools,
@@ -99,15 +99,15 @@ const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
  * committed its output before it returned: the output exists either way, so
  * the call reports where it is.
  */
-function rejectAbortedCalls(tool: ToolDefinition): ToolDefinition {
+function rejectAbortedCalls(tool: GrcToolDefinition): GrcToolDefinition {
   return {
     ...tool,
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
+    async execute(toolCallId, params, signal) {
       signal?.throwIfAborted();
       const call: ToolCallState = { committed: false };
-      let result: Awaited<ReturnType<ToolDefinition["execute"]>>;
+      let result: Awaited<ReturnType<GrcToolDefinition["execute"]>>;
       try {
-        result = await runToolCall(call, () => tool.execute(toolCallId, params, signal, onUpdate, ctx));
+        result = await runToolCall(call, () => tool.execute(toolCallId, params, signal));
       } catch (error) {
         signal?.throwIfAborted();
         throw error;
@@ -118,50 +118,21 @@ function rejectAbortedCalls(tool: ToolDefinition): ToolDefinition {
   };
 }
 
-const LEGACY_TYPEBOX_KIND = Symbol.for("TypeBox.Kind");
-
-/**
- * Pi's tool argument validation coerces mistyped arguments ("7" to 7, 1.5 to
- * 1, 42 to "42") unless the parameter schema is plain JSON Schema, without
- * typebox's non-enumerable `~kind` markers, and carries the
- * `Symbol.for("TypeBox.Kind")` marker of @sinclair/typebox 0.34 schemas.
- * Domain tools reject mistyped arguments that their `prepareArguments` shim
- * leaves in place, so they register their parameters in that form.
- */
-export function disableArgumentCoercion(tool: ToolDefinition): ToolDefinition {
-  const parameters = JSON.parse(JSON.stringify(tool.parameters)) as ToolDefinition["parameters"];
-  return { ...tool, parameters: Object.assign(parameters, { [LEGACY_TYPEBOX_KIND]: "Object" }) };
+/** Register only domain capabilities; hosts adapt execution and rendering themselves. */
+export function registerDomainTools(target: GrcToolRegistrar): number {
+  const tools = collectDomainToolDefinitions();
+  for (const tool of tools) target.registerTool(tool);
+  return tools.length;
 }
 
-export function registerDomainTools(pi: Pick<ExtensionAPI, "registerTool">): number {
-  let count = 0;
-  const counting = new Proxy(pi, {
-    get(target, property) {
-      if (property === "registerTool") {
-        return (tool: ToolDefinition) => {
-          count += 1;
-          return target.registerTool(rejectAbortedCalls(disableArgumentCoercion(tool)));
-        };
-      }
-      const value = Reflect.get(target, property, target) as unknown;
-      return typeof value === "function" ? value.bind(target) : value;
+/** One native contract and one cancellation wrapper for every integration. */
+export function collectDomainToolDefinitions(): GrcToolDefinition[] {
+  const tools: GrcToolDefinition[] = [];
+  const registrar: GrcToolRegistrar = {
+    registerTool(tool) {
+      tools.push(rejectAbortedCalls(tool));
     },
-  });
-
-  for (const register of DOMAIN_TOOL_REGISTRARS) {
-    register(counting as ExtensionAPI);
-  }
-  return count;
-}
-
-/** Collect domain tools directly, without initializing an agent host or compute backend. */
-export function collectDomainToolDefinitions(): ToolDefinition[] {
-  const tools: ToolDefinition[] = [];
-  const registerTool: ExtensionAPI["registerTool"] = (tool) => {
-    // Collection erases each tool's parameter/render generic types; it never
-    // calls the renderers that make the host's registerTool signature invariant.
-    tools.push(tool as unknown as ToolDefinition);
   };
-  registerDomainTools({ registerTool });
+  for (const register of DOMAIN_TOOL_REGISTRARS) register(registrar);
   return tools;
 }

@@ -67,3 +67,11 @@ service-account-*.json
 .dev.vars*
 !.dev.vars.example
 !.env.example
+
+# Interrupted generated snapshots and staged CLI builds
+src/content/docs/docs/.fedramp.snapshot-transaction.json
+src/content/docs/docs/.fedramp.snapshot-transaction.json.lock.sqlite*
+src/content/docs/docs/.fedramp.stage-*/
+cli/.dist.snapshot-transaction.json
+cli/.dist.snapshot-transaction.json.lock.sqlite*
+cli/.dist.stage-*/

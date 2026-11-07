@@ -1,8 +1,9 @@
-import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
+import { prepareGrcToolArguments } from "./arguments.js";
+export { prepareGrcToolArguments } from "./arguments.js";
 import { runWithoutPersistentCaches } from "../extensions/grc-tools/shared.js";
-import { redactToolErrorText } from "./redact.js";
+import { redactToolErrorDetails, redactToolErrorText } from "./redact.js";
 import { isGrcWriteTool } from "./effects.js";
-import { getRegisteredGrcTool, type RegisteredGrcTool } from "./registry.js";
+import { getRegisteredGrcTool, type RegisteredGrcTool, type GrcToolResult } from "./registry.js";
 import { errorEnvelope, type GrcToolEnvelope, toSdkToolResult } from "./results.js";
 
 export interface ExecuteGrcToolOptions {
@@ -17,49 +18,34 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function sanitizeErrorText(tool: RegisteredGrcTool, input: Record<string, unknown>, errorText: string): string {
+function sanitizeErrorText(tool: RegisteredGrcTool, input: unknown, errorText: string): string {
   return redactToolErrorText(errorText, input, tool.parameters);
 }
 
-function safeErrorEnvelope(tool: RegisteredGrcTool, input: Record<string, unknown>, errorText: string): GrcToolEnvelope {
+function safeErrorEnvelope(tool: RegisteredGrcTool, input: unknown, errorText: string): GrcToolEnvelope {
   return errorEnvelope(sanitizeErrorText(tool, input, errorText));
 }
 
 function sanitizeErrorResult(
   tool: RegisteredGrcTool,
-  input: Record<string, unknown>,
-  result: GrcToolEnvelope,
-): GrcToolEnvelope {
+  input: unknown,
+  result: GrcToolResult,
+): GrcToolResult {
   if (result.isError !== true) return result;
   return {
     ...result,
+    ...(result.details === undefined ? {} : { details: redactToolErrorDetails(result.details, input, tool.parameters) }),
     content: result.content.map((entry) =>
       entry.type === "text" ? { ...entry, text: sanitizeErrorText(tool, input, entry.text) } : entry,
     ),
   };
 }
 
-/**
- * Mirror the Pi runtime: run the tool's `prepareArguments` shim, then coerce
- * and validate against the TypeBox schema with Pi's own validator.
- */
-export function prepareGrcToolArguments(tool: RegisteredGrcTool, toolCallId: string, input: unknown): unknown {
-  const prepared = tool.prepareArguments ? tool.prepareArguments(input) : input;
-  const piTool = { name: tool.name, description: tool.description, parameters: tool.parameters } as unknown as Tool;
-  const toolCall: ToolCall = {
-    type: "toolCall",
-    id: toolCallId,
-    name: tool.name,
-    arguments: prepared as ToolCall["arguments"],
-  };
-  return validateToolArguments(piTool, toolCall) as unknown;
-}
-
 export async function executeGrcTool(
   tool: RegisteredGrcTool,
-  input: Record<string, unknown>,
+  input: unknown,
   options: ExecuteGrcToolOptions = {},
-): Promise<GrcToolEnvelope> {
+): Promise<GrcToolResult> {
   const toolCallId = options.toolCallId ?? `grclanker_${tool.name}`;
   let args: unknown;
   try {
@@ -75,7 +61,7 @@ export async function executeGrcTool(
   };
   try {
     const result = options.dryRun === true ? await runWithoutPersistentCaches(run) : await run();
-    return sanitizeErrorResult(tool, input, toSdkToolResult(result));
+    return sanitizeErrorResult(tool, input, result);
   } catch (error) {
     return safeErrorEnvelope(tool, input, `${tool.name} failed: ${describeError(error)}`);
   }
@@ -89,7 +75,7 @@ export interface ExecuteRegisteredGrcToolOptions extends ExecuteGrcToolOptions {
 /** Execute a named domain tool with a default-deny write gate. */
 export async function executeRegisteredGrcTool(
   name: string,
-  input: Record<string, unknown>,
+  input: unknown,
   options: ExecuteRegisteredGrcToolOptions = {},
 ): Promise<GrcToolEnvelope> {
   let tool: RegisteredGrcTool;
@@ -101,5 +87,5 @@ export async function executeRegisteredGrcTool(
   if (isGrcWriteTool(name) && options.allowWrites !== true) {
     return errorEnvelope(`Tool "${name}" requires explicit host authorization for writes.`);
   }
-  return executeGrcTool(tool, input, options);
+  return toSdkToolResult(await executeGrcTool(tool, input, options));
 }

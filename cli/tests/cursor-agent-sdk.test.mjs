@@ -26,7 +26,7 @@ import {
 } from "../dist/core/skills.js";
 import { buildSdkToolConfig, grclankerToolConfig } from "../dist/adapters/cursor-grok/lib/tools.js";
 import { executeGrcTool, prepareGrcToolArguments } from "../dist/core/tools.js";
-import { disableArgumentCoercion } from "../dist/core/domain-tools.js";
+import { disableArgumentCoercion } from "../dist/pi/tool-adapter.js";
 import { clearFedrampCachesForTests } from "../dist/extensions/grc-tools/fedramp-source.js";
 import { clearGrcSharedCachesForTests, persistentCachesEnabled } from "../dist/extensions/grc-tools/shared.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -256,7 +256,7 @@ test("renaming a baseline writer onto a read verb is caught", () => {
   assert.deepEqual(missingBaselineWriters(names), []);
 });
 
-test("buildSdkToolConfig bridges prepareArguments, Pi argument validation, and the result envelope", async () => {
+test("buildSdkToolConfig bridges prepareArguments, native argument validation, and the result envelope", async () => {
   const { tool, calls } = fakeTool();
   const config = buildSdkToolConfig(tool);
 
@@ -285,7 +285,7 @@ test("buildSdkToolConfig bridges prepareArguments, Pi argument validation, and t
   // where a number is declared is rejected before execute runs.
   const rejected = await config.execute({ query: "openssl", limit: "3" }, { toolCallId: "call_3" });
   assert.equal(rejected.isError, true);
-  assert.match(rejected.content[0].text, /limit: must be number/);
+  assert.match(rejected.content[0].text, /limit: (?:must be number|must be of type number)/);
   assert.equal(calls.length, 2);
 });
 
@@ -347,7 +347,7 @@ test("executeGrcTool withholds echoed arguments and credentials from every error
   const invalidEnvelope = JSON.stringify(invalid);
 
   assert.equal(invalid.isError, true);
-  assert.match(invalid.content[0].text, /limit: must be number/);
+  assert.match(invalid.content[0].text, /limit: (?:must be number|must be of type number)/);
   assert.doesNotMatch(invalidEnvelope, /Received arguments:/);
   assert.ok(!invalidEnvelope.includes(credentialSentinel));
   assert.ok(!invalidEnvelope.includes(argumentSentinel));
@@ -559,6 +559,15 @@ test("toSdkToolResult keeps text and image content, drops details, and carries i
     content: [{ type: "text", text: "bad" }],
     isError: true,
   });
+});
+
+test("malformed native results never serialize internal metadata into SDK content", () => {
+  for (const content of [null, undefined, { text: "invalid" }]) {
+    const result = toSdkToolResult({ content, details: { secret: "must-not-reach-model" } });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /invalid content/);
+    assert.doesNotMatch(JSON.stringify(result), /must-not-reach-model|secret/);
+  }
 });
 
 test("grclankerToolConfig uses the current CMVP API default end to end", async () => {

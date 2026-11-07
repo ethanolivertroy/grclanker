@@ -1,3 +1,4 @@
+import { resolveLiveSmokeConfiguration } from "./live-smoke-config.mjs";
 import {
   AzureAuditorClient,
   assessAzureIdentity,
@@ -9,23 +10,11 @@ function log(message) {
   process.stdout.write(`${message}\n`);
 }
 
-function hasConfigHints() {
-  const env = process.env;
-  const hasTenant = Boolean(env.AZURE_TENANT_ID?.trim()) && Boolean(env.AZURE_SUBSCRIPTION_ID?.trim());
-  const hasTokens = Boolean(env.AZURE_GRAPH_TOKEN?.trim()) && Boolean(env.AZURE_MANAGEMENT_TOKEN?.trim() || env.AZURE_ACCESS_TOKEN?.trim());
-  const hasClientCredentials = Boolean(env.AZURE_CLIENT_ID?.trim()) && Boolean(env.AZURE_CLIENT_SECRET?.trim());
-  return hasTenant && (hasTokens || hasClientCredentials);
-}
 
 try {
-  if (!hasConfigHints()) {
-    log(
-      "Skipping live Azure smoke test: set AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID plus either AZURE_GRAPH_TOKEN and AZURE_MANAGEMENT_TOKEN or AZURE_CLIENT_ID and AZURE_CLIENT_SECRET (optionally AZURE_AUTHORITY_HOST).",
-    );
-    process.exit(0);
-  }
-
-  const config = resolveAzureConfiguration({}, process.env, () => undefined);
+  const authentication = await resolveLiveSmokeConfiguration("Azure", () => resolveAzureConfiguration());
+  if (authentication.kind === "unconfigured") process.exit(0);
+  const config = authentication.config;
   const client = new AzureAuditorClient(config);
   const access = await checkAzureAccess(client);
 

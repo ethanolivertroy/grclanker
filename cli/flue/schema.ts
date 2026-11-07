@@ -13,6 +13,7 @@
  */
 import type { ToolInputSchema } from "@flue/runtime";
 import * as v from "valibot";
+import { normalizeOptionalNulls } from "../core/arguments.js";
 
 export type JsonSchemaObject = Record<string, unknown>;
 
@@ -211,43 +212,7 @@ export function jsonSchemaToValibot(schema: unknown): v.GenericSchema {
   return withAnnotations(node, convertNode(node));
 }
 
-const nullAcceptance = new WeakMap<JsonSchemaObject, boolean>();
-
-function acceptsNull(node: JsonSchemaObject): boolean {
-  let accepts = nullAcceptance.get(node);
-  if (accepts === undefined) {
-    accepts = v.is(jsonSchemaToValibot(node), null);
-    nullAcceptance.set(node, accepts);
-  }
-  return accepts;
-}
-
-/** Pi's `normalizeOptionalNulls`, without mutating the caller's value. */
-function withoutOptionalNulls(value: unknown, schema: unknown): unknown {
-  const node = asSchemaObject(schema);
-  if (!node) return value;
-  if (Array.isArray(value)) {
-    const items = node.items;
-    return value.map((item, index) => withoutOptionalNulls(item, Array.isArray(items) ? items[index] : items));
-  }
-  const properties = asSchemaObject(node.properties);
-  if (!properties || !value || typeof value !== "object") return value;
-
-  const required = new Set(asStringArray(node.required));
-  const result: Record<string, unknown> = { ...(value as Record<string, unknown>) };
-  for (const [key, property] of Object.entries(properties)) {
-    if (!(key in result)) continue;
-    const propertyNode = asSchemaObject(property);
-    if (result[key] === null && !required.has(key) && propertyNode && !acceptsNull(propertyNode)) {
-      delete result[key];
-    } else {
-      result[key] = withoutOptionalNulls(result[key], property);
-    }
-  }
-  return result;
-}
-
-function piArgumentsStep(toolName: string, schema: unknown, prepare: PrepareToolArguments | undefined) {
+function grcArgumentsStep(toolName: string, schema: unknown, prepare: PrepareToolArguments | undefined) {
   return v.rawTransform<Record<string, unknown>, unknown>(({ dataset, addIssue }) => {
     let prepared: unknown = dataset.value;
     if (prepare) {
@@ -260,7 +225,7 @@ function piArgumentsStep(toolName: string, schema: unknown, prepare: PrepareTool
         return dataset.value;
       }
     }
-    return withoutOptionalNulls(prepared, schema);
+    return normalizeOptionalNulls(prepared, asSchemaObject(schema) ?? {});
   });
 }
 
@@ -284,7 +249,7 @@ export function jsonSchemaToToolInput(
       `Tool "${toolName}" parameters must be a JSON Schema object (got type "${String(asSchemaObject(schema)?.type)}").`,
     );
   }
-  return v.pipe(v.looseObject({}), piArgumentsStep(toolName, schema, prepareArguments), converted) as ToolInputSchema;
+  return v.pipe(v.looseObject({}), grcArgumentsStep(toolName, schema, prepareArguments), converted) as ToolInputSchema;
 }
 
 /** True when a Valibot schema satisfies Flue's top-level object requirement for tool input. */

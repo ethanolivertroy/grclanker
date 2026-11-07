@@ -6,7 +6,6 @@ import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
-import { disableArgumentCoercion } from "../dist/core/domain-tools.js";
 import { buildGrclankerInstructions } from "../dist/core/instructions.js";
 import { listRegisteredGrcToolNames } from "../dist/core/registry.js";
 import { executeGrcTool, executeRegisteredGrcTool } from "../dist/core/tools.js";
@@ -55,18 +54,18 @@ test("shared runtime loads transitively when provider adapters and SDKs are unav
   assert.doesNotMatch(prompt, /Cursor|agent-sdk/);
 });
 
-test("shared executor validates before execution, redacts failures, and drops internal details", async () => {
+test("shared executor validates before execution and preserves redacted metadata for host adapters", async () => {
   let executions = 0;
-  const tool = disableArgumentCoercion({
+  const tool = {
     name: "sample_check_access",
     label: "Sample",
     description: "A detached tool.",
     parameters: Type.Object({ count: Type.Integer(), api_token: Type.String() }),
     async execute(_id, input) {
       executions += 1;
-      return { content: [{ type: "text", text: `Rejected ${input.api_token}` }], isError: true, details: { api_token: input.api_token } };
+      return { content: [{ type: "text", text: `Rejected ${input.api_token}` }], isError: true, details: { api_token: input.api_token, upstream: { message: `Rejected ${input.api_token}` } } };
     },
-  });
+  };
   const invalid = await executeGrcTool(tool, { count: "4", api_token: "sensitive-test-token" });
   assert.equal(invalid.isError, true);
   assert.equal(executions, 0);
@@ -75,7 +74,7 @@ test("shared executor validates before execution, redacts failures, and drops in
   assert.equal(executions, 1);
   assert.equal(result.isError, true);
   assert.doesNotMatch(JSON.stringify(result), /sensitive-test-token/);
-  assert.equal("details" in result, false);
+  assert.deepEqual(result.details, { api_token: "[redacted]", upstream: { message: "Rejected [redacted]" } });
 });
 
 test("cancelled execution starts neither argument preparation nor tool effects", async () => {
