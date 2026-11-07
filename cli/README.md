@@ -7,6 +7,7 @@ This package contains grclanker's shared GRC implementation and its agent hosts.
 | Pi terminal | [`pi/`](pi/README.md), launched by `index.ts` | Build the shared package, then run `node cli/bin/grclanker.js tools` and `node cli/bin/grclanker.js setup`. |
 | OpenAI Agents SDK | [`adapters/openai-agents/`](adapters/openai-agents/README.md) | Build the shared package, then run `npm --prefix cli run openai-agents:check`. |
 | Codex SDK | [`adapters/codex/`](adapters/codex/README.md) | Build the shared package, then run `npm --prefix cli run codex:install` and `npm --prefix cli run codex:check`. |
+| Claude Agent SDK | [`adapters/claude-agent-sdk/`](adapters/claude-agent-sdk/README.md) | Build the shared package, then run `npm --prefix cli run claude:install` and `npm --prefix cli run claude:check`. |
 | Cursor / Grok Agent SDK | [`adapters/cursor-grok/`](adapters/cursor-grok/README.md) | Build the shared package, then run `npm --prefix cli run cursor:validate`. |
 
 Build the shared package with Git, npm, and Node.js 22.19 or newer. The Codex adapter requires Node.js 22.22 or newer.
@@ -33,6 +34,7 @@ cli/
   adapters/
     openai-agents/          OpenAI Agents SDK adapter and one-shot runner
     codex/                  Codex SDK worker and local MCP server
+    claude-agent-sdk/       Claude Agent SDK options, in-process MCP server, runner
     cursor-grok/            Cursor/Grok project, generated tool definitions, skills
   flue/                     Additional Flue host
   durable/                  Experimental Pi Durable host
@@ -42,7 +44,7 @@ cli/
   tests/                    Native tool, shared code, and host regression tests
 ```
 
-Compiled TypeScript mirrors those directories under `dist/`: shared code is in `dist/core/`, and the TypeScript SDK adapters are in `dist/adapters/`. The Codex `.mjs` worker runs directly from `adapters/codex/` and imports the built core. Tool implementations stay in one place; adapters translate their schemas, results, and host approval behavior rather than duplicating connectors.
+Compiled TypeScript mirrors those directories under `dist/`: shared code is in `dist/core/`, and the TypeScript SDK adapters are in `dist/adapters/`. The Codex and Claude Agent SDK `.mjs` adapters run directly from their folders and import the built core. Tool implementations stay in one place; adapters translate their schemas, results, and host approval behavior rather than duplicating connectors.
 
 Native integrations implement `GrcToolDefinition` from `core/tool-definition.ts`: a schema, an optional argument preparation function, and `execute(callId, args, signal)`. They register through `GrcToolRegistrar`; no agent SDK or terminal context is part of this contract. The common executor validates prepared arguments strictly and redacts errors. Hosts convert the returned content and metadata for their own SDK. Pi's schema compatibility marker is applied only in `pi/tool-adapter.ts`.
 
@@ -64,8 +66,8 @@ Calls require a JSON object on stdin. File-writing tools are denied unless the c
 - Change a host's model, sessions, approvals, or SDK translation in its own adapter folder or `pi/`.
 - Change shared GRC role, workflows, and personas in `.grclanker/`, `prompts/`, and `skills/`.
 
-After adding a native tool, run `npm --prefix cli run sync:cursor-tools` to update the Cursor/Grok project's generated tool definitions, then `npm --prefix cli run sync:tool-manifest`. The checked-in manifest supplies website search, documentation identifier checks, and catalog generation without loading an agent host. OpenAI and Codex select tools from the shared registry. The old `agent-sdk:*` and `sync:agent-sdk-tools` script names remain compatibility aliases for Cursor/Grok; new instructions use `cursor:*` and `sync:cursor-tools`.
+After adding a native tool, run `npm --prefix cli run sync:cursor-tools` to update the Cursor/Grok project's generated tool definitions, then `npm --prefix cli run sync:tool-manifest`. The checked-in manifest supplies website search, documentation identifier checks, and catalog generation without loading an agent host. OpenAI, Codex, and Claude select tools from the shared registry. The old `agent-sdk:*` and `sync:agent-sdk-tools` script names remain compatibility aliases for Cursor/Grok; new instructions use `cursor:*` and `sync:cursor-tools`.
 
-Run `npm --prefix cli run test:cli` for the CLI regression suite, `npm --prefix cli run test:cursor:validate` for the pinned Cursor SDK's discovery/execution smoke test, and `npm --prefix cli run codex:check` for the Codex SDK/MCP offline check after installing its dependencies. These checks do not establish live model or tenant access.
+Run `npm --prefix cli run test:cli` for the CLI regression suite, `npm --prefix cli run test:cursor:validate` for the pinned Cursor SDK's discovery/execution smoke test, `npm --prefix cli run codex:check` for the Codex SDK/MCP offline check, and `npm --prefix cli run claude:check` for the Claude Agent SDK offline check, each after installing its dependencies. These checks do not establish live model or tenant access.
 
 `npm --prefix cli run verify` builds once, runs the unit suite and SDK validation, and checks generated specs and the manifest. Individual validation commands use the existing build. A build compiles into a staging directory and publishes it only after compilation succeeds, preserving the last runnable build on failure.

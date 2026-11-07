@@ -10,7 +10,7 @@ import { loadSpecs } from '../lib/specs';
 export const metadata = pageMetadata({
   title: 'grclanker: Put a Clanker on Your Compliance',
   description:
-    'A GRC engineering assistant with 241 domain tools and independent Pi, OpenAI Agents SDK, Codex SDK, and Cursor / Grok deployment guides. Claude Agent SDK is planned.',
+    'A GRC engineering assistant with 241 domain tools and independent Pi, OpenAI Agents SDK, Codex SDK, Claude Agent SDK, and Cursor / Grok deployment guides.',
   path: '/',
 });
 
@@ -82,9 +82,9 @@ const deploymentCards = [
   },
   {
     label: 'Claude Agent SDK',
-    status: 'Planned',
+    status: 'Source adapter',
     href: '/docs/getting-started/claude-agent-sdk/',
-    description: 'Track the intended Claude integration and the requirements for a supported standalone guide.',
+    description: 'Run Claude with your GRC role, selected native tools over in-process MCP, reviewer subagents, and write approvals.',
   },
 ];
 
@@ -98,7 +98,7 @@ function releaseFacts(integrationSpecCount: number) {
     {
       label: 'Release and source runtimes',
       detail:
-        'The release includes Pi, Flue, and the experimental durable runtime. Source integrations add OpenAI Agents SDK, Codex SDK, and Cursor / Grok Agent SDK. Claude Agent SDK is planned.',
+        'The release includes Pi, Flue, and the experimental durable runtime. Source integrations add OpenAI Agents SDK, Codex SDK, Claude Agent SDK, and Cursor / Grok Agent SDK.',
     },
     {
       label: 'Hardened evidence',
@@ -184,7 +184,7 @@ export default function HomePage() {
               </h1>
               <p className="mx-auto mt-5 max-w-2xl text-base md:text-lg text-subtext1 leading-relaxed italic hero-copy-lede">
                 Your GRC engineering assistant. 241 domain tools. 35 vendor integrations. Choose Pi, OpenAI Agents SDK,
-                Codex SDK, or Cursor / Grok Agent SDK.
+                Codex SDK, Claude Agent SDK, or Cursor / Grok Agent SDK.
               </p>
             </div>
 

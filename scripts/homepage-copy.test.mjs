@@ -22,14 +22,15 @@ test('homepage workflow states match the shipped prompts', () => {
   assert.doesNotMatch(home, /partial, absent/);
 });
 
-test('deployment choices distinguish source integrations and the planned Claude path', () => {
+test('deployment choices list every source integration', () => {
   for (const label of ['Pi Terminal CLI', 'OpenAI Agents SDK', 'Codex SDK', 'Cursor / Grok Agent SDK', 'Claude Agent SDK']) {
     assert.ok(home.includes(`label: '${label}'`), label);
   }
-  assert.match(home, /status: 'Planned'/);
-  assert.match(home, /Source integrations add OpenAI Agents SDK, Codex SDK, and Cursor \/ Grok Agent SDK/);
+  assert.doesNotMatch(home, /status: 'Planned'/);
+  assert.match(home, /Source integrations add OpenAI Agents SDK, Codex SDK, Claude Agent SDK, and Cursor \/ Grok Agent SDK/);
   assert.match(home, /including Flue and the experimental durable runtime/);
-  assert.match(about, /Claude Agent SDK is planned/);
+  assert.match(about, /Codex SDK, Claude Agent SDK, or Cursor \/ Grok Agent SDK/);
+  assert.doesNotMatch(`${home}\n${about}`, /Claude Agent SDK is planned/);
 });
 
 test('the install command stays in the button name', () => {

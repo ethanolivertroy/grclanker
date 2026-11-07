@@ -96,4 +96,4 @@ Read specs/aws-sec-inspector.spec.md, inspect the shipped AWS tools, and propose
 
 grclanker ships 35 integrations, and most have a spec under `specs/`. Use a spec to inspect coverage, plan a change, or seed an independent implementation.
 
-The Pi terminal CLI is the default host. The [deployment chooser](/docs/getting-started/deployment/) also lists the OpenAI Agents SDK, Codex SDK, Cursor / Grok Agent SDK, Flue, and experimental Durable paths, each with its own configuration.
+The Pi terminal CLI is the default host. The [deployment chooser](/docs/getting-started/deployment/) also lists the OpenAI Agents SDK, Codex SDK, Claude Agent SDK, Cursor / Grok Agent SDK, Flue, and experimental Durable paths, each with its own configuration.
