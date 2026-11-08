@@ -21,7 +21,7 @@ npm --prefix cli run build
 npm --prefix cli run claude-api:check
 ```
 
-The check builds the agent and prints its tools without a model request. `node --test tests/claude-api.test.mjs`, run from `cli/` after the build, runs offline coverage: tool adaptation, input validation, error redaction, the write gate, and a real tool runner loop against a local fake Messages API.
+The check builds the agent and prints its tools without a model request. `node --test tests/claude-api*.test.mjs`, run from `cli/` after the build, checks tool adaptation, validation, provider-error redaction, incomplete responses, cancellation, and write approval using local fake Messages APIs.
 
 ## Authenticate and run your first task
 
@@ -90,7 +90,9 @@ Before a structured investigation, audit, assessment, or validation, the agent l
 
 ## Approve file-writing tools
 
-Exports and other writers call `approveWrite` with the exact tool name and arguments inside the tool's `run` function, before anything executes. A declined call returns an error result to the model and writes nothing. The shipped runner shows the call with credential-like values redacted, asks at an interactive terminal one call at a time, and denies writes when there is no terminal. Relative paths resolve against the Node process working directory; use absolute `output_dir`, `workspace_dir`, or `zip_path` values.
+Exports and other writers call `approveWrite` with the exact tool name, arguments, and abort signal inside the tool's `run` function, before anything executes. A declined call returns an error result to the model and writes nothing. The shipped runner shows the call with credential-like values redacted, asks at an interactive terminal one call at a time, and denies writes when there is no terminal. Cancellation stops the approval wait and prevents a late answer from executing the call; an embedding service should use the signal to cancel its approval interface. Relative paths resolve against the Node process working directory; use absolute `output_dir`, `workspace_dir`, or `zip_path` values.
+
+The CLI exits unsuccessfully when a response is refused, interrupted, truncated, or has no final text. Partial output is not a completed assessment. Incomplete auditor or verifier responses are reported as tool errors so the agent can identify missing review evidence. Provider failures report bounded error information without copying raw error bodies into model results or terminal output.
 
 ## Deploy on your infrastructure
 
@@ -99,7 +101,7 @@ Deploy the shared CLI build, its production dependencies, and the GRC assets in 
 ## Troubleshooting and verification
 
 - **`Claude API authentication failed`:** set `ANTHROPIC_API_KEY`, or sign in with `ant auth login`.
-- **A 400 mentioning `fallbacks`:** your account or platform does not accept server-side fallback; rerun with `--no-fallback`.
+- **A request rejected with HTTP 400:** check your model and request settings. If your account or platform does not accept server-side fallback, rerun with `--no-fallback`.
 - **`Unknown grclanker tool`:** check the names with `--list-tools`.
 - **`did not approve`:** a writer was declined. Run at an interactive terminal, or implement `approveWrite`.
 - **Vendor tools report missing access:** an access failure is missing evidence, not a passing control.

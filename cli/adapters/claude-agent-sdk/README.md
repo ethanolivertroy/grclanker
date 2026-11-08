@@ -16,7 +16,7 @@ npm --prefix cli run claude:run -- \
   "Investigate CVE-2024-3400 using KEV and EPSS evidence. Cite sources and explain what still needs organization-specific verification."
 ```
 
-`claude:check` needs no credentials or network. It checks tool selection, the isolation options, and the permission callback; drives the in-process MCP server for discovery, argument validation, the tool allowlist, and the write gate; then runs the real SDK and Claude Code executable against a local fake Messages API that calls a read tool and a writer the operator denies. `node main.mjs --check` prints the tools a configuration exposes without a model request.
+`claude:check` needs no credentials or network. It checks tool selection, the isolation options, and the permission callback; drives the in-process MCP server for discovery, argument validation, the tool allowlist, and the write gate; then runs the real SDK and Claude Code executable against a local fake Messages API. It verifies a read call, denied writes, an approved native write exactly once, denied Explore delegation, and working auditor/verifier delegations with no tools. It also checks changed arguments, replayed approvals, and cancellation through the MCP gate. `node main.mjs --check` prints the tools a configuration exposes without a model request.
 
 The default tools are four public-data lookups: `cmvp_search_modules`, `cmvp_get_module`, `kevs_search`, and `kevs_get_epss`. `--tools` or `GRCLANKER_TOOLS` replaces the selection; `--model` or `GRCLANKER_CLAUDE_MODEL` changes the model (default `claude-opus-5-5`). `--list-tools` lists every registered tool and its effect.
 
@@ -40,7 +40,7 @@ The vendor token needs read access to the organization and repositories. Model c
 | `server.mjs` | In-process MCP server with the shared JSON schemas, workflow and skill loaders, and the write gate |
 | `tools.mjs` | Default tool selection and validation |
 | `main.mjs` | One-shot runner with terminal approval |
-| `check.mjs` | Offline check |
+| `check.mjs`, `check-reliability.mjs`, `check-helpers.mjs` | Offline SDK and MCP regression checks |
 
 To embed it, create `cli/adapters/claude-agent-sdk/example.mjs`:
 
@@ -62,7 +62,7 @@ for await (const message of query({ prompt: "Investigate CVE-2024-3400 and cite 
 
 The options run the SDK in isolation mode: `settingSources: []` loads no user, project, or local Claude settings or CLAUDE.md files, `strictMcpConfig` ignores other MCP configuration, and `skills: []` enables no skills. `tools: ["Agent"]` removes every built-in Claude Code tool (shell, files, web, editing) except the launcher for the auditor and verifier subagents, which themselves have no tools.
 
-Every permission decision goes through the adapter's `canUseTool` callback; there are no `allowedTools` rules. It allows the selected read tools, the loaders, and the subagent launcher, and denies anything else, including a tool from a server that is not the host's in-process server. Exports and other writers call `approveWrite` for each call. An approval is recorded for the exact tool and arguments, and the MCP handler runs the writer only after consuming it, so a writer cannot run without an approval for those arguments. The shipped runner asks at an interactive terminal and denies writes otherwise. Relative output paths resolve against the Node process working directory; use absolute paths for deployment outputs.
+A `PreToolUse` hook restricts the SDK's automatically permitted `Agent` launcher to the auditor and verifier, without worktree or remote isolation. Other built-in subagent types are denied before they start. Native tool permissions go through the adapter's `canUseTool` callback; there are no `allowedTools` rules. It allows the selected read tools and loaders and denies anything else, including a tool from a server that is not the host's in-process server. Exports and other writers call `approveWrite` for each call. An approval is recorded for the exact tool and arguments, and the MCP handler runs the writer only after consuming it, so a writer cannot run without an approval for those arguments. The shipped runner asks at an interactive terminal and denies writes otherwise. Aborting a permission request cancels its prompt and revokes any unconsumed approval; a failed or late approval cannot authorize a call. Relative output paths resolve against the Node process working directory; use absolute paths for deployment outputs.
 
 Sessions are not saved by default. `--persist-session` saves the transcript under `~/.claude/projects/` and prints the session ID; `--resume id` continues it. Transcripts contain tool inputs and results, so treat that directory as evidence storage.
 

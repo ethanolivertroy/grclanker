@@ -9,7 +9,7 @@ Use it when you already work in Claude Code. To embed grclanker in your own appl
 
 ## Prerequisites and installation
 
-You need Git, npm, Node.js 22.19 or newer, and Claude Code installed and signed in. From a fresh checkout:
+You need Git, npm, Node.js 22.19 or newer, and Claude Code installed and signed in. The commands use a POSIX shell. From a fresh checkout:
 
 ```bash
 git clone https://github.com/ethanolivertroy/grclanker.git
@@ -27,11 +27,13 @@ npm --prefix cli run claude-code:check
 From the checkout root:
 
 ```bash
-claude mcp add grclanker -- node "$PWD/cli/adapters/claude-code/mcp-server.mjs"
+claude mcp add --scope local grclanker -- node "$PWD/cli/adapters/claude-code/mcp-server.mjs"
 claude mcp list
 ```
 
-`claude mcp list` should show `grclanker: ... Connected`. Claude Code starts the server for each session. Add `--scope project` to share the registration in the project's `.mcp.json`, or `--scope user` for every project. `claude mcp remove grclanker` removes it.
+`claude mcp list` should show `grclanker: ... Connected`. Claude Code starts the server for each session. Register it once: `mcp add` rejects a name that already exists. If you already registered `grclanker`, use the replacement steps below instead of adding it again.
+
+These examples use `--scope local`, which keeps the registration private to this checkout. Run them from the same checkout root. To share it in the project's `.mcp.json`, use `--scope project`; for every project, use `--scope user`. Keep the same scope on both `mcp remove` and `mcp add`. When moving a registration to a different scope, remove it from its old scope first.
 
 Start `claude` and ask:
 
@@ -51,16 +53,30 @@ Arguments after the script select tools. With none, the server exposes four publ
 
 `GRCLANKER_TOOLS` sets the list when no names are given. Run `node cli/dist/core/cli.js list` to see every tool.
 
+To replace the default selection, exit any running Claude Code session and return to the checkout root. Remove the existing registration, add its replacement, and check the connection:
+
+```bash
+claude mcp remove --scope local grclanker
+claude mcp add --scope local grclanker -- node "$PWD/cli/adapters/claude-code/mcp-server.mjs" kevs_search kevs_get_epss
+claude mcp list
+```
+
+Start `claude` again to use the new selection. The following examples each replace this same registration; they also work directly after the initial registration.
+
 ## Connect a tenant: GitHub example
 
 ```bash
 export GITHUB_ORG='your-organization'
 export GITHUB_TOKEN='your-github-token'
-claude mcp add grclanker -- node "$PWD/cli/adapters/claude-code/mcp-server.mjs" github_check_access github_assess_org_access github_assess_repo_protection
+claude mcp remove --scope local grclanker
+claude mcp add --scope local grclanker -- node "$PWD/cli/adapters/claude-code/mcp-server.mjs" github_check_access github_assess_org_access github_assess_repo_protection
+claude mcp list
 claude
 ```
 
 The server inherits the environment Claude Code starts with, so export vendor credentials before starting `claude`. `claude mcp add --env NAME=value` also works but saves the value in Claude Code's configuration file. Use a token authorized to read the organization and repositories, including SSO authorization when required. Limited permissions produce incomplete assessments.
+
+Removing a registration also removes any `--env` values stored in it. The examples export credentials in the launching shell, so replacing the registration does not require saving secrets in Claude Code's configuration.
 
 ## Role, workflows, and reviewers
 
@@ -80,10 +96,24 @@ The workflows are also MCP prompts, which Claude Code lists as slash commands. E
 
 Exports and other file-writing tools are hidden unless the server is started with `--allow-writes`. A writer named without it stops the server at startup, and a `family_*` pattern skips writers. With `--allow-writes`, writers are marked as not read-only, and Claude Code asks before each call unless you have allowed the tool in your Claude Code permissions. Relative output paths resolve against the server's working directory; use absolute `output_dir`, `workspace_dir`, or `zip_path` values.
 
+Exit Claude Code, then replace the registration from the checkout root to enable the GitHub access check and exporter:
+
+```bash
+export GITHUB_ORG='your-organization'
+export GITHUB_TOKEN='your-github-token'
+claude mcp remove --scope local grclanker
+claude mcp add --scope local grclanker -- node "$PWD/cli/adapters/claude-code/mcp-server.mjs" --allow-writes github_check_access github_export_audit_bundle
+claude mcp list
+claude
+```
+
+Ask Claude to check access, then export a GitHub audit bundle to an absolute output directory. Review the proposed call before approving it. To return to read tools, remove this registration and re-add the read-only selection above without `--allow-writes`.
+
 Claude Code's own tools, such as shell and file access, remain available in the session under your Claude Code permission settings. Review reports, control mappings, and generated artifacts before relying on them. Proposed policies and risk acceptance decisions are drafts for the organization's owners.
 
 ## Troubleshooting
 
 - **`claude mcp list` shows the server as failed:** run the same `node .../mcp-server.mjs ...` command directly. Startup errors such as an unknown tool name or a writer without `--allow-writes` print to stderr.
+- **`MCP server grclanker already exists`:** exit Claude Code and run the matching-scope `mcp remove` command before adding its replacement. Use the scope in which you originally registered it.
 - **`Cannot find module` errors:** run `npm --prefix cli run build` and `npm --prefix cli run claude-code:install`.
 - **Vendor tools report missing access:** the credential was not in the environment Claude Code started with, or it lacks read scope. An access failure is missing evidence, not a passing control.

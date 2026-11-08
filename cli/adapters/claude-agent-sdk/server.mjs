@@ -48,17 +48,24 @@ export function approvalKey(name, input) {
 export class WriteApprovals {
   #pending = new Map();
 
-  grant(name, input) {
+  grant(name, input, signal) {
+    if (signal?.aborted) return;
     const key = approvalKey(name, input);
-    this.#pending.set(key, (this.#pending.get(key) ?? 0) + 1);
+    const pending = this.#pending.get(key) ?? new Set();
+    const token = { revoke: () => {
+      signal?.removeEventListener("abort", token.revoke);
+      pending.delete(token);
+      if (pending.size === 0) this.#pending.delete(key);
+    } };
+    pending.add(token);
+    this.#pending.set(key, pending);
+    signal?.addEventListener("abort", token.revoke, { once: true });
   }
 
   consume(name, input) {
-    const key = approvalKey(name, input);
-    const count = this.#pending.get(key) ?? 0;
-    if (count === 0) return false;
-    if (count === 1) this.#pending.delete(key);
-    else this.#pending.set(key, count - 1);
+    const token = this.#pending.get(approvalKey(name, input))?.values().next().value;
+    if (!token) return false;
+    token.revoke();
     return true;
   }
 }

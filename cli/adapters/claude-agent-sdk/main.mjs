@@ -69,14 +69,15 @@ async function main() {
   // Concurrent write calls can ask at once, and readline does not queue
   // questions; ask one at a time so each answer binds to the call shown.
   let queue = Promise.resolve();
-  const approveWrite = ({ toolName, input }) => {
+  const approveWrite = ({ toolName, input, signal }) => {
     const answer = queue.then(async () => {
+      signal.throwIfAborted();
       stderr.write(`Approval required: ${toolName} ${describeArguments(toolName, input)}\n`);
       if (!terminal) {
         stderr.write("No interactive terminal; write denied.\n");
         return false;
       }
-      return (await terminal.question("Approve this call? [y/N] ")).trim().toLowerCase() === "y";
+      return (await terminal.question("Approve this call? [y/N] ", { signal })).trim().toLowerCase() === "y";
     });
     queue = answer.catch(() => undefined);
     return answer;

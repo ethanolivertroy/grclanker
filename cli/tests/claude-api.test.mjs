@@ -14,6 +14,8 @@ import {
   SERVER_SIDE_FALLBACK_BETA,
 } from "../dist/adapters/claude-api/agent.js";
 import { collectRegisteredGrcTools } from "../dist/core/registry.js";
+import { runRunnableTool } from "@anthropic-ai/sdk/lib/tools/BetaRunnableTool";
+import { assertCanaryWindowsAbsent } from "./helpers/canary-windows.mjs";
 
 const offlineClient = () => new Anthropic({ apiKey: "offline-placeholder-key", baseURL: "http://127.0.0.1:9", maxRetries: 0 });
 
@@ -28,6 +30,37 @@ function fixture(name, execute) {
 }
 
 const toolUse = { id: "toolu_fixture", type: "tool_use", name: "fixture", input: {} };
+
+function message(content, stopReason = "end_turn") {
+  return { id: "msg_fixture", type: "message", role: "assistant", model: "claude-opus-5-5", content, stop_reason: stopReason, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } };
+}
+
+async function withMessagesApi(respond, run) {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    let text = "";
+    for await (const chunk of request) text += chunk;
+    const body = JSON.parse(text);
+    requests.push(body);
+    const reply = await respond(body, requests.length);
+    response.writeHead(reply.status ?? 200, { "content-type": "application/json", ...reply.headers });
+    response.end(typeof reply.body === "string" ? reply.body : JSON.stringify(reply.body));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const client = new Anthropic({ apiKey: "offline-placeholder-key", baseURL: `http://127.0.0.1:${server.address().port}`, maxRetries: 0 });
+  try {
+    return await run(client, requests);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+function toolResult(request, callId) {
+  return request.messages.flatMap((entry) => Array.isArray(entry.content) ? entry.content : [])
+    .find((block) => block.type === "tool_result" && block.tool_use_id === callId);
+}
 
 test("Claude API agent defaults to public-data tools, reviewers, and cached instructions", () => {
   const agent = createGrclankerClaudeApiAgent(offlineClient());
@@ -91,6 +124,135 @@ test("Claude API write tools run only after operator approval", async () => {
   const approved = createClaudeApiGrcTool(native, async () => true);
   assert.deepEqual(await approved.run({ query: "x" }, { toolUse }), [{ type: "text", text: "written" }]);
   assert.equal(calls, 1);
+  for (const value of ["yes", 1, {}, null]) {
+    await assert.rejects(createClaudeApiGrcTool(native, async () => value).run({ query: "x" }, { toolUse }), /did not approve/);
+  }
+  assert.equal(calls, 1, "a JavaScript callback must return exactly true to authorize a write");
+});
+
+test("reviewers mark incomplete responses as errors before the SDK sends them to the parent model", async (t) => {
+  const privateText = "Vg9Km3Qp7Lb2Rt6Hx4Ns8Zc5";
+  const cases = [
+    { reason: "end_turn", success: true },
+    { reason: "stop_sequence", success: true },
+    ...["max_tokens", "model_context_window_exceeded", "pause_turn", "tool_use", "refusal", null, `unknown-${privateText}`].map((reason) => ({ reason, success: false })),
+    { reason: "end_turn", success: false, empty: true },
+  ];
+  for (const scenario of cases) {
+    await t.test(`${scenario.reason ?? "null"}${scenario.empty ? " without text" : ""}`, async () => {
+      const review = scenario.empty ? "  " : scenario.success ? "The cited evidence supports the stated control." : `Unfinished review: ${privateText}`;
+      await withMessagesApi((_body, index) => ({ body: index === 1
+        ? message([{ type: "tool_use", id: "review", name: "verifier", input: { evidence: "Inspect the supplied control citations." } }], "tool_use")
+        : index === 2 ? message([{ type: "text", text: review }], scenario.reason)
+          : message([{ type: "text", text: "Review outcome acknowledged." }]) }), async (client, requests) => {
+        const agent = createGrclankerClaudeApiAgent(client);
+        await client.beta.messages.toolRunner({ ...agent.params, stream: false, max_iterations: 4, messages: [{ role: "user", content: "Verify the audit evidence." }] });
+        assert.equal(requests.length, 3);
+        const result = toolResult(requests[2], "review");
+        assert.ok(result);
+        assert.equal(result.is_error === true, !scenario.success);
+        const rendered = JSON.stringify(result.content);
+        if (scenario.success) assert.match(rendered, /cited evidence supports/);
+        else {
+          assertCanaryWindowsAbsent(assert, rendered, [privateText], "incomplete review result");
+          assert.match(rendered, /declined|before a final answer|no final text/);
+        }
+      });
+    });
+  }
+});
+
+test("reviewer provider failures expose only bounded diagnostics through the real SDK loop", async (t) => {
+  const canary = "Bq6Tv9Mk3Hs7Wp2Lz8Jc4Ry5";
+  for (const scenario of [
+    { name: "provider JSON error", status: 400, body: { type: "error", error: { type: "invalid_request_error", message: `api_key=${canary}` }, request_id: canary } },
+    { name: "malformed successful body", status: 200, body: `private transport body api_key=${canary}` },
+  ]) {
+    await t.test(scenario.name, async () => {
+      await withMessagesApi((_body, index) => index === 2 ? { status: scenario.status, body: scenario.body, headers: { "request-id": canary } } : { body: index === 1
+        ? message([{ type: "tool_use", id: "review-error", name: "auditor", input: { evidence: "Review these citations." } }], "tool_use")
+        : message([{ type: "text", text: "The review service failed; no review is claimed." }]) }, async (client, requests) => {
+        const agent = createGrclankerClaudeApiAgent(client);
+        await client.beta.messages.toolRunner({ ...agent.params, stream: false, max_iterations: 4, messages: [{ role: "user", content: "Audit the supplied evidence." }] });
+        assert.equal(requests.length, 3);
+        const result = toolResult(requests[2], "review-error");
+        assert.equal(result.is_error, true);
+        assertCanaryWindowsAbsent(assert, JSON.stringify(result.content), [canary], "model-visible failure result");
+        assert.match(JSON.stringify(result.content), /Claude API .*failed/);
+      });
+    });
+  }
+  const agent = createGrclankerClaudeApiAgent({ messages: { async create() { throw new Error(`provider endpoint https://private.invalid/?api_key=${canary}`); } } });
+  const result = await runRunnableTool(agent.tools.find((entry) => entry.name === "verifier"), { evidence: "Review these citations." }, { toolUse });
+  assert.equal(result.isError, true);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(result.content), [canary], "model-visible failure result");
+  assert.doesNotMatch(JSON.stringify(result.content), /private\.invalid/);
+});
+
+test("approval failures are bounded error results and never reach the native writer", async () => {
+  const canary = "Fh8Nz4Qw7Xp2Vm6Kr9Lb3Tc5";
+  let nativeCalls = 0;
+  await withMessagesApi((_body, index) => ({ body: index === 1
+    ? message([{ type: "tool_use", id: "approval-error", name: "example_export_bundle", input: { query: "scope" } }], "tool_use")
+    : message([{ type: "text", text: "The export did not run." }]) }), async (client, requests) => {
+    const tool = createClaudeApiGrcTool(fixture("example_export_bundle", async () => { nativeCalls += 1; return { content: [{ type: "text", text: "written" }] }; }), async () => { throw new Error(`api_token=${canary}`); });
+    const agent = createGrclankerClaudeApiAgent(client);
+    await client.beta.messages.toolRunner({ ...agent.params, tools: [tool], stream: false, messages: [{ role: "user", content: "Export the evidence." }] });
+    assert.equal(nativeCalls, 0);
+    assert.equal(requests.length, 2);
+    const result = toolResult(requests[1], "approval-error");
+    assert.equal(result.is_error, true);
+    assertCanaryWindowsAbsent(assert, JSON.stringify(result.content), [canary], "model-visible failure result");
+  });
+});
+
+test("cancelling the real SDK loop interrupts a deferred approval without effects or a continuation", { timeout: 5000 }, async () => {
+  const controller = new AbortController();
+  const canary = "Zr4Hk8Wm2Np6Qv9Lc3Tx7Fb5";
+  let nativeCalls = 0;
+  let beginApproval;
+  let resolveApproval;
+  let approvalSignal;
+  const approvalStarted = new Promise((resolve) => { beginApproval = resolve; });
+  const approval = new Promise((resolve) => { resolveApproval = resolve; });
+  await withMessagesApi(() => ({ body: message([{ type: "tool_use", id: "approval-cancel", name: "example_export_bundle", input: { query: "scope" } }], "tool_use") }), async (client, requests) => {
+    const tool = createClaudeApiGrcTool(fixture("example_export_bundle", async () => { nativeCalls += 1; return { content: [{ type: "text", text: "written" }] }; }), async ({ signal }) => {
+      approvalSignal = signal;
+      beginApproval();
+      return approval;
+    });
+    const agent = createGrclankerClaudeApiAgent(client);
+    const completion = client.beta.messages.toolRunner({ ...agent.params, tools: [tool], stream: false, messages: [{ role: "user", content: "Export the evidence." }] }, { signal: controller.signal })
+      .then((result) => ({ result }), (error) => ({ error }));
+    try {
+      await approvalStarted;
+      assert.ok(approvalSignal);
+      controller.abort(new Error(`operator cancelled api_key=${canary}`));
+      let timer;
+      const outcome = await Promise.race([completion, new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("cancelled approval did not settle promptly")), 1500);
+      })]).finally(() => clearTimeout(timer));
+      assert.ok(outcome.error, "the SDK run must report cancellation");
+      assertCanaryWindowsAbsent(assert, String(outcome.error), [canary], "cancelled SDK run");
+      assert.equal(approvalSignal.aborted, true);
+      assert.equal(nativeCalls, 0);
+      assert.equal(requests.length, 1, "an aborted run must not send a model continuation");
+      resolveApproval(true);
+      await new Promise(setImmediate);
+      assert.equal(nativeCalls, 0, "late approval cannot restart an aborted call");
+      assert.equal(requests.length, 1);
+    } finally {
+      controller.abort();
+      resolveApproval(false);
+      await completion;
+    }
+  });
+  const native = fixture("example_export_bundle", async () => { nativeCalls += 1; return { content: [{ type: "text", text: "written" }] }; });
+  const outcome = await runRunnableTool(createClaudeApiGrcTool(native, async () => { assert.fail("already-aborted calls cannot ask for approval"); }), { query: "scope" }, { toolUse, signal: controller.signal });
+  assert.equal(outcome.isError, true);
+  assertCanaryWindowsAbsent(assert, JSON.stringify(outcome.content), [canary], "cancelled approval result");
+  assert.match(JSON.stringify(outcome.content), /cancelled/);
+  assert.equal(nativeCalls, 0);
 });
 
 test("the SDK tool runner drives a read tool, a declined writer, and the final answer", async () => {

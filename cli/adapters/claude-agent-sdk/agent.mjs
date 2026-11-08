@@ -30,6 +30,39 @@ Write tools pause for per-call human approval before executing; a denied call di
 /** @param {string} name */
 export const mcpToolName = (name) => `${MCP_TOOL_PREFIX}${name}`;
 
+/** Agent is automatically permitted by Claude Code, so enforce reviewer scope in a hook. */
+export async function restrictReviewerAgents(input) {
+  if (input.tool_name !== SUBAGENT_TOOL) return {};
+  if (PERSONA_NAMES.includes(input.tool_input?.subagent_type) && input.tool_input?.isolation === undefined) return {};
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: "Only the auditor and verifier evidence-review agents are enabled, without worktree or remote isolation.",
+    },
+  };
+}
+
+/** Stop waiting immediately when a permission request is cancelled, including a slow UI. */
+async function requestApproval(approveWrite, request) {
+  const { signal } = request;
+  if (signal.aborted) return false;
+  let onAbort;
+  const cancelled = new Promise((resolve) => {
+    onAbort = () => resolve(false);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    const approved = await Promise.race([
+      Promise.resolve().then(() => signal.aborted ? false : approveWrite(request)).catch(() => false),
+      cancelled,
+    ]);
+    return approved === true && !signal.aborted;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 /**
  * Build Claude Agent SDK `query()` options for grclanker.
  *
@@ -67,8 +100,8 @@ export function createGrclankerClaudeOptions(options = {}) {
     }];
   }));
 
-  // Every permission decision goes through this one callback: no allowedTools
-  // rules or settings files can pre-approve a call around it.
+  // Native calls have no allowedTools/settings pre-approvals. Agent itself is
+  // automatically permitted by the SDK; its hook enforces the reviewer scope.
   /** @type {import("@anthropic-ai/claude-agent-sdk").CanUseTool} */
   const canUseTool = async (toolName, input, { signal, mcpServer }) => {
     // Key trust on the server's provenance, not on the tool-name prefix.
@@ -80,12 +113,13 @@ export function createGrclankerClaudeOptions(options = {}) {
       return { behavior: "deny", message: `${toolName} is not enabled in this grclanker deployment.` };
     }
     const approved = options.approveWrite
-      ? await options.approveWrite({ toolName: toolName.slice(MCP_TOOL_PREFIX.length), input, signal })
+      ? await requestApproval(options.approveWrite, { toolName: toolName.slice(MCP_TOOL_PREFIX.length), input, signal })
       : false;
     if (!approved) {
       return { behavior: "deny", message: "The operator did not approve this write; it did not run." };
     }
-    approvals.grant(toolName.slice(MCP_TOOL_PREFIX.length), input);
+    if (signal.aborted) return { behavior: "deny", message: "Write approval was cancelled; it did not run." };
+    approvals.grant(toolName.slice(MCP_TOOL_PREFIX.length), input, signal);
     return { behavior: "allow", updatedInput: input };
   };
 
@@ -97,6 +131,7 @@ export function createGrclankerClaudeOptions(options = {}) {
     strictMcpConfig: true,
     tools: [SUBAGENT_TOOL],
     agents,
+    hooks: { PreToolUse: [{ matcher: SUBAGENT_TOOL, hooks: [restrictReviewerAgents] }] },
     canUseTool,
     permissionMode: "default",
     settingSources: [],
