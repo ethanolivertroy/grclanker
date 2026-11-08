@@ -128,6 +128,12 @@ jobs:
         working-directory: cli/adapters/claude-code
         run: npm run check
 
+      - name: Verify documented Claude Code registration and reconfiguration
+        working-directory: cli
+        env:
+          GRCLANKER_REQUIRE_CLAUDE_CODE_ONBOARDING: "1"
+        run: node --test tests/claude-code-onboarding.test.mjs
+
       - name: Run leak probe
         working-directory: cli
         run: node --test tests/hardening-leak-probe.test.mjs

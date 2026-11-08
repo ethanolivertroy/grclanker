@@ -4,6 +4,7 @@ import type { BetaRunnableTool } from "@anthropic-ai/sdk/lib/tools/BetaRunnableT
 import { ToolError } from "@anthropic-ai/sdk/lib/tools/ToolError";
 import type { BetaToolRunnerParams } from "@anthropic-ai/sdk/lib/tools/BetaToolRunner";
 import type { BetaToolResultContentBlockParam } from "@anthropic-ai/sdk/resources/beta";
+import type { Message } from "@anthropic-ai/sdk/resources/messages";
 import { isGrcWriteTool } from "../../core/effects.js";
 import { buildGrclankerInstructions } from "../../core/instructions.js";
 import { personaAgentConfig, PERSONA_NAMES, type PersonaName } from "../../core/personas.js";
@@ -13,6 +14,8 @@ import { toJsonSchema } from "../../core/schema.js";
 import { bundledSkillConfig, WORKFLOW_NAMES, workflowSkillConfig, type WorkflowName } from "../../core/skills.js";
 import { executeGrcTool } from "../../core/tools.js";
 import { toSdkToolResult } from "../../core/results.js";
+import { unlessAborted } from "../../extensions/grc-tools/abort.js";
+import { claudeApiFailureMessage, claudeCompletionFailure } from "./runtime.js";
 
 type ToolResultContent = BetaToolResultContentBlockParam;
 
@@ -43,6 +46,8 @@ Write tools ask a human operator to approve each call before executing; a declin
 export interface WriteApprovalRequest {
   toolName: string;
   input: Record<string, unknown>;
+  /** Stop the operator prompt when this tool call is cancelled. */
+  signal?: AbortSignal;
 }
 
 export interface GrclankerClaudeApiOptions {
@@ -80,15 +85,30 @@ export function createClaudeApiGrcTool(
         throw new ToolError("Expected a JSON object for the tool arguments.");
       }
       const args = input as Record<string, unknown>;
+      const signal = context?.signal ?? undefined;
       // The gate runs inside run(), so a writer executes only after approval
       // of these exact arguments.
-      if (writes && !(approveWrite && await approveWrite({ toolName: nativeTool.name, input: args }))) {
-        throw new ToolError("The operator did not approve this write; it did not run.");
+      if (writes) {
+        let approved = false;
+        try {
+          signal?.throwIfAborted();
+          if (approveWrite) {
+            approved = await unlessAborted(Promise.resolve().then(() => {
+              signal?.throwIfAborted();
+              return approveWrite({ toolName: nativeTool.name, input: args, ...(signal ? { signal } : {}) });
+            }), signal);
+          }
+          signal?.throwIfAborted();
+        } catch (error) {
+          throw new ToolError(claudeApiFailureMessage(error, signal));
+        }
+        if (approved !== true) throw new ToolError("The operator did not approve this write; it did not run.");
       }
       const envelope = toSdkToolResult(await executeGrcTool(nativeTool, args, {
         toolCallId: context?.toolUse.id,
-        signal: context?.signal ?? undefined,
+        signal,
       }));
+      if (envelope.isError && signal?.aborted) throw new ToolError(claudeApiFailureMessage(undefined, signal));
       const content = toToolResultContent(envelope);
       if (envelope.isError) throw new ToolError(content);
       return content;
@@ -112,15 +132,22 @@ function reviewerTool(client: Anthropic, model: string, name: PersonaName): Beta
     },
     async run({ evidence }, context) {
       if (typeof evidence !== "string" || !evidence.trim()) throw new ToolError("Supply the evidence to review.");
-      const response = await client.messages.create({
-        model,
-        max_tokens: MAX_TOKENS,
-        system,
-        messages: [{ role: "user", content: evidence }],
-      }, { signal: context?.signal ?? undefined });
-      if (response.stop_reason === "refusal") throw new ToolError(`The ${name} review was declined.`);
+      const signal = context?.signal ?? undefined;
+      let response: Message;
+      try {
+        signal?.throwIfAborted();
+        response = await unlessAborted(client.messages.create({
+          model,
+          max_tokens: MAX_TOKENS,
+          system,
+          messages: [{ role: "user", content: evidence }],
+        }, { signal }), signal);
+      } catch (error) {
+        throw new ToolError(claudeApiFailureMessage(error, signal));
+      }
       const text = response.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n").trim();
-      if (!text) throw new ToolError(`The ${name} review returned no text.`);
+      const failure = claudeCompletionFailure(response.stop_reason, text, `${name} review`);
+      if (failure) throw new ToolError(failure);
       return text;
     },
   }) as BetaRunnableTool;

@@ -24,7 +24,7 @@ npm --prefix cli run claude:check
 
 `claude:install` installs the SDK, the MCP SDK, and Zod from the adapter's own lockfile. The SDK adds a platform-specific Claude Code executable of about 280 MB, which is why it is not part of the shared `cli/package.json` install.
 
-`claude:check` needs no credentials and makes no network requests. It checks tool selection, the isolation options, and the permission callback, and drives the in-process MCP server for discovery, argument validation, the tool allowlist, and the write gate. It then runs the real SDK and Claude Code executable against a local fake Messages API that calls a read tool and a writer the operator denies, and confirms that no built-in tools were offered and that the denied writer created nothing.
+`claude:check` needs no credentials or connection to a model provider. It checks tool selection, isolation, input validation, and write approval, then runs the real SDK and its Claude Code executable against a local fake Messages API. The checks exercise reviewer restrictions and approved and denied writes, including the arguments passed to the native tool.
 
 ## Authenticate and run
 
@@ -65,7 +65,7 @@ Use a token authorized to read the organization and repositories, including SSO 
 
 | File | Role |
 | --- | --- |
-| `agent.mjs` | `createGrclankerClaudeOptions()` builds `query()` options: system prompt, MCP server, subagents, and the permission callback |
+| `agent.mjs` | `createGrclankerClaudeOptions()` builds `query()` options: system prompt, MCP server, reviewer restrictions, and the permission callback |
 | `server.mjs` | In-process MCP server listing the selected tools with their shared JSON schemas, plus `grclanker_load_workflow` and `grclanker_load_skill` |
 | `tools.mjs` | Default selection and validation of tool names |
 | `main.mjs` | One-shot runner with terminal approval |
@@ -82,7 +82,7 @@ import { createGrclankerClaudeOptions } from "./agent.mjs";
 const { options } = createGrclankerClaudeOptions({
   toolNames: ["kevs_search", "kevs_get_epss"],
   // Bind this to your authenticated operator; omit it to deny every write.
-  approveWrite: async ({ toolName, input }) => false,
+  approveWrite: async ({ toolName, input, signal }) => false,
 });
 for await (const message of query({ prompt: "Investigate CVE-2024-3400 and cite evidence.", options })) {
   if (message.type === "result") console.log(message.subtype === "success" ? message.result : message.subtype);
@@ -97,11 +97,11 @@ The options run the SDK in isolation mode:
 
 - `settingSources: []` loads no user, project, or local Claude settings and no CLAUDE.md files, so a developer's own allow rules cannot pre-approve calls.
 - `strictMcpConfig: true` ignores `.mcp.json`, plugins, and other MCP configuration. `skills: []` enables no skills.
-- `tools: ["Agent"]` removes every built-in tool except the launcher for the auditor and verifier subagents. Those subagents have no tools and review only the evidence they are given.
+- `tools: ["Agent"]` removes every built-in tool except the subagent launcher. A `PreToolUse` hook permits only the auditor and verifier; built-in subagents such as Explore are denied. The permitted reviewers have no tools and review only the evidence they are given.
 
-Every permission decision goes through the adapter's `canUseTool` callback; there are no `allowedTools` rules. It allows the selected read tools, the loaders, and the subagent launcher, and denies everything else, including a same-named tool from any server other than the host's in-process server.
+The reviewer hook enforces subagent selection before execution, including calls the SDK automatically allows. The `canUseTool` callback handles native tool permissions; there are no `allowedTools` rules. It permits the selected read tools and loaders, requests approval for selected writers, and denies everything else, including a same-named tool from any server other than the host's in-process server.
 
-Exports and other file-writing tools need a human decision for each call. The callback passes the tool name and arguments to `approveWrite`; the shipped runner shows them with credential-like values redacted and asks at an interactive terminal, and denies writes when there is no terminal. An approval is recorded for the exact tool and arguments, and the MCP handler runs a writer only after consuming one, so a writer never runs without approval for those arguments. An embedding service must bind `approveWrite` to its authenticated operator.
+Exports and other file-writing tools need a human decision for each call. The callback passes the tool name, arguments, and abort signal to `approveWrite`; the shipped runner shows the arguments with credential-like values redacted and asks at an interactive terminal, and denies writes when there is no terminal. An aborted SDK permission request stops its pending question and prevents a late approval from authorizing the cancelled call. An approval is recorded for the exact tool and arguments, and the MCP handler consumes it once before executing. An embedding service must bind `approveWrite` to its authenticated operator and use the signal to cancel its approval interface.
 
 Review the final report, control mappings, and any generated artifact before relying on them. Proposed policies and risk acceptance decisions are drafts for the organization's owners.
 

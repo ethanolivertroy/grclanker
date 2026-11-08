@@ -5,6 +5,7 @@ import { classifyGrcToolEffect } from "../../core/effects.js";
 import { getRegisteredGrcTool, listRegisteredGrcToolNames } from "../../core/registry.js";
 import { redactSensitiveArguments } from "../../core/redact.js";
 import { CLAUDE_API_MODEL_ENV_VAR, createGrclankerClaudeApiAgent, type WriteApprovalRequest } from "./agent.js";
+import { claudeApiFailureMessage, claudeCompletionFailure } from "./runtime.js";
 
 const HELP = `Usage: npm --prefix cli run claude-api:run -- [options] "message"
 
@@ -18,6 +19,9 @@ const HELP = `Usage: npm --prefix cli run claude-api:run -- [options] "message"
 Model runs require ANTHROPIC_API_KEY (or an \`ant auth login\` profile). Write calls require
 approval at an interactive terminal.
 `;
+
+/** Diagnostics constructed from local, controlled strings rather than provider responses. */
+class ClaudeApiCliError extends Error {}
 
 function describeArguments(toolName: string, input: unknown): string {
   try {
@@ -47,28 +51,51 @@ async function main() {
     else if (arg === "--no-fallback") serverSideFallback = false;
     else if (arg === "--tools" || arg === "--model") {
       const value = args[++index];
-      if (!value || value.startsWith("--")) throw new Error(`${arg} needs a value.`);
+      if (!value || value.startsWith("--")) throw new ClaudeApiCliError(`${arg} needs a value.`);
       if (arg === "--tools") toolNames = value.split(",").map((name) => name.trim()).filter(Boolean);
       else model = value;
-    } else if (arg.startsWith("--")) throw new Error(`Unknown option: ${arg}`);
+    } else if (arg.startsWith("--")) throw new ClaudeApiCliError("Unknown option; use --help for supported arguments.");
     else messages.push(arg);
   }
   if (list) {
     stdout.write(`${JSON.stringify(listRegisteredGrcToolNames().map((name) => ({ name, effect: classifyGrcToolEffect(name) ?? "write" })), null, 2)}\n`);
     return;
   }
+  if (toolNames?.length === 0) throw new ClaudeApiCliError("Select at least one GRC tool with --tools.");
+  if (toolNames) {
+    const registered = new Set(listRegisteredGrcToolNames());
+    if (toolNames.some((name) => !registered.has(name))) {
+      throw new ClaudeApiCliError("Unknown GRC tool; use --list-tools to choose registered tool names.");
+    }
+  }
 
+  const controller = new AbortController();
   const terminal = stdin.isTTY && stderr.isTTY ? createInterface({ input: stdin, output: stderr }) : undefined;
+  const cancel = (exitCode: number) => {
+    process.exitCode = exitCode;
+    controller.abort();
+    terminal?.close();
+  };
+  const interrupt = () => cancel(130);
+  const terminate = () => cancel(143);
+  const inputClosed = () => {
+    if (!controller.signal.aborted) cancel(1);
+  };
+  process.once("SIGINT", interrupt);
+  process.once("SIGTERM", terminate);
+  terminal?.on("SIGINT", interrupt);
+  terminal?.on("close", inputClosed);
   // Parallel tool calls can ask at once; ask one question at a time.
   let queue: Promise<unknown> = Promise.resolve();
-  const approveWrite = ({ toolName, input }: WriteApprovalRequest) => {
+  const approveWrite = ({ toolName, input, signal = controller.signal }: WriteApprovalRequest) => {
     const answer = queue.then(async () => {
+      signal.throwIfAborted();
       stderr.write(`Approval required: ${toolName} ${describeArguments(toolName, input)}\n`);
       if (!terminal) {
         stderr.write("No interactive terminal; write denied.\n");
         return false;
       }
-      return (await terminal.question("Approve this call? [y/N] ")).trim().toLowerCase() === "y";
+      return (await terminal.question("Approve this call? [y/N] ", { signal })).trim().toLowerCase() === "y";
     });
     queue = answer.catch(() => undefined);
     return answer;
@@ -83,35 +110,30 @@ async function main() {
       return;
     }
     const message = messages.join(" ").trim();
-    if (!message) throw new Error(HELP);
+    if (!message) throw new ClaudeApiCliError(HELP);
 
-    const runner = client.beta.messages.toolRunner({ ...agent.params, stream: false, messages: [{ role: "user", content: message }] });
+    const runner = client.beta.messages.toolRunner({ ...agent.params, stream: false, messages: [{ role: "user", content: message }] }, { signal: controller.signal });
     for await (const turn of runner) {
       for (const block of turn.content) {
         if (block.type === "tool_use") stderr.write(`Tool: ${block.name}\n`);
       }
     }
     const final = await runner.done();
-    if (final.stop_reason === "refusal") {
-      process.exitCode = 1;
-      stderr.write("Claude declined this request.\n");
-      return;
-    }
+    if (controller.signal.aborted) throw new ClaudeApiCliError(claudeApiFailureMessage(undefined, controller.signal));
     const text = final.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n");
+    const failure = claudeCompletionFailure(final.stop_reason, text, "run");
+    if (failure) throw new ClaudeApiCliError(failure);
     stdout.write(`${text}\n`);
-    if (final.stop_reason === "tool_use" || final.stop_reason === "max_tokens" || final.stop_reason === "pause_turn") {
-      process.exitCode = 1;
-      stderr.write(`Run ended before a final answer (${final.stop_reason}).\n`);
-    }
   } finally {
+    process.removeListener("SIGINT", interrupt);
+    process.removeListener("SIGTERM", terminate);
+    terminal?.removeListener("SIGINT", interrupt);
+    terminal?.removeListener("close", inputClosed);
     terminal?.close();
   }
 }
 
 main().catch((error: unknown) => {
-  if (error instanceof Anthropic.AuthenticationError) stderr.write("Claude API authentication failed; set ANTHROPIC_API_KEY.\n");
-  else if (error instanceof Anthropic.RateLimitError) stderr.write("Claude API rate limit reached; retry later.\n");
-  else if (error instanceof Anthropic.APIError) stderr.write(`Claude API error ${error.status ?? ""}: ${error.message}\n`);
-  else stderr.write(`${error instanceof Error ? error.message : "Claude API tool runner failed."}\n`);
-  process.exitCode = 1;
+  stderr.write(`${error instanceof ClaudeApiCliError ? error.message : claudeApiFailureMessage(error)}\n`);
+  if (process.exitCode !== 130 && process.exitCode !== 143) process.exitCode = 1;
 });
