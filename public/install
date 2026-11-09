@@ -469,7 +469,7 @@ install_archive() (
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     case "$entry" in /*) fail "Refusing to extract unsafe archive entry: $entry" ;; esac
-    if printf "%s" "$entry" | grep -Eq '(^|/)\.\.(/|$)'; then fail "Refusing to extract unsafe archive entry: $entry"; fi
+    case "/$entry/" in */../*) fail "Refusing to extract unsafe archive entry: $entry" ;; esac
   done <<EOF
 $entries
 EOF
@@ -744,6 +744,6 @@ tips=(
   "pipe a spec URL straight into your agent's context"
   "grclanker investigate <vendor> to start a deep-dive"
   "specs are markdown: read them, fork them, extend them"
-  "CMVP + KEV + EPSS data stays local, always"
+  "CMVP + KEV + EPSS lookups use public source data"
 )
 printf "\n  ${DIM}Tip: ${tips[$((RANDOM % ${#tips[@]}))]}${R}\n\n"
