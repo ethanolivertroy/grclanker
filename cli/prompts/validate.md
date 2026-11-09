@@ -4,11 +4,15 @@ Subject: $ARGUMENTS
 
 Validate the cryptographic module status of the specified vendor, product, library, or appliance.
 
+Keep catalog evidence separate from deployment evidence. Record the exact query, catalog, and certificate used; a public module record alone does not establish how the subject is deployed.
+
 ## Phase 1: Active Validation
 
 Search active CMVP records:
 1. `cmvp_search_modules`
 2. `cmvp_get_module` for any promising certificate numbers
+
+Searches match one phrase. If a full product/version query returns nothing, retry a broader vendor or module name before concluding that no matching record was found. Distinguish total catalog size, total matches, and records returned.
 
 Report:
 - Certificate number
@@ -31,13 +35,15 @@ Determine whether the subject is:
 - In process
 - Not found
 
+Qualify "Not found" by the queries and catalogs actually read. An empty phrase search does not establish that the vendor has no historical predecessors or validated modules. Report the record's status precisely; in-process is not validated. Do not claim direct supersession between certificates without an explicit source for that relationship.
+
 ## Phase 3: Compliance Interpretation
 
 Map the status to:
 - **SC-13** Cryptographic Protection
 - **SC-12** Key Management
 
-If validation is missing, explain the compliance implication precisely.
+If validation or deployment evidence is missing, identify that gap. Use Unable to Assess for deployment-specific SC-13 or SC-12 outcomes that the available evidence cannot establish. A certificate does not prove approved operating configuration or key-management practices. Do not invent operational checks, product requirements, or effort estimates; proposals need applicable documentation and estimates need stated assumptions.
 
 ## Phase 4: Output
 

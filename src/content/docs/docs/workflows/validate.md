@@ -3,7 +3,7 @@ title: Validate
 description: Answer a narrow FIPS validation question cleanly and directly.
 ---
 
-`/validate` is the narrow rail for "is this module validated or not?" questions. It loads the shipped `cli/prompts/validate.md` prompt.
+`/validate` checks CMVP records for a narrow module-validation question. It loads the shipped `cli/prompts/validate.md` prompt.
 
 ## Use it for
 
@@ -21,21 +21,19 @@ Inside a grclanker session, put the subject after the command:
 
 From the shell, `grclanker validate "<subject>"` opens a session that starts with the same prompt and the subject filled in. The subject is the vendor, product, library, or appliance to check. Run `grclanker validate` on its own to name it in your first message instead.
 
-In the older `v0.0.1` release bundle, text after `/validate` and arguments after `grclanker validate` are dropped. Upgrade to `v0.1.4`, or send the subject in its own message there.
-
 ## What the prompt does
 
 1. Active validation: `cmvp_search_modules`, then `cmvp_get_module` for promising certificate numbers.
-2. Historical and drift check: `cmvp_search_historical` and `cmvp_search_in_process`, to decide whether the subject is actively validated, previously validated but expired, in process, or not found.
-3. Compliance interpretation against SC-13 and SC-12, including the precise implication when validation is missing.
+2. Historical and drift check: `cmvp_search_historical` and `cmvp_search_in_process`, to report the status of matching records. If a phrase search returns no matches, broaden it to the vendor or module name before reporting what was not found in the searched catalogs. An in-process record is not a validation.
+3. Compliance interpretation against SC-13 and SC-12 where the evidence supports it. A certificate establishes the listed module's validation, not that a deployment uses its approved version, operating environment, or configuration. Missing deployment evidence remains Unable to Assess.
 
 ## Output shape
 
 The answer should be short and exact:
 
-- the validation status in one sentence
+- the matching record's validation status, or a query-qualified statement that no record was found
 - evidence: certificate IDs and URLs, with module name, vendor, FIPS standard, overall level, validation date, and sunset date
 - the compliance impact
 - the recommended next step
 
-The prompt forbids claiming a module is FIPS validated unless the certificate record was found.
+The prompt forbids claiming a module is FIPS validated unless the certificate record was found. It also forbids inferring a predecessor or supersession relationship from a shared vendor, module name, or certificate number alone. Recommendations should name the evidence needed next. Ground operational steps in applicable documentation and state assumptions for any effort estimate.

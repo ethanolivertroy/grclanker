@@ -224,6 +224,13 @@ function normalizeRansomwareArgs(args: unknown): RansomwareArgs {
   return {};
 }
 
+function formatEpssProbability(value: string, decimalPlaces: number): string {
+  const probability = parseFloat(value);
+  const percentage = (probability * 100).toFixed(decimalPlaces);
+  // A source probability such as 0.99999 must not become apparent certainty.
+  return probability < 1 && Number(percentage) === 100 ? "<100%" : `${percentage}%`;
+}
+
 function formatKev(vulnerability: KevVulnerability, lookup: EpssLookup): string {
   const epss = lookup.scores.get(vulnerability.cveID);
   const lines = [
@@ -241,11 +248,11 @@ function formatKev(vulnerability: KevVulnerability, lookup: EpssLookup): string 
   }
 
   if (epss) {
-    const score = (parseFloat(epss.epss) * 100).toFixed(1);
+    const score = formatEpssProbability(epss.epss, 1);
     const percentile = (parseFloat(epss.percentile) * 100).toFixed(1);
     const scoreDate = asString(epss.date);
     lines.push(
-      `  EPSS:        ${score}% probability (${percentile}th percentile)` +
+      `  EPSS:        ${score} probability (${percentile}th percentile)` +
         (scoreDate ? `, scored ${scoreDate}` : ""),
     );
   } else if (lookup.unavailable.has(vulnerability.cveID)) {
@@ -471,9 +478,9 @@ export function registerKevsTools(pi: GrcToolRegistrar): void {
             return [cveId, epss.unavailable.has(cveId) ? "Unavailable" : "Not scored", "N/A", ...dateColumn];
           }
 
-          const score = (parseFloat(entry.epss) * 100).toFixed(2);
+          const score = formatEpssProbability(entry.epss, 2);
           const percentile = (parseFloat(entry.percentile) * 100).toFixed(1);
-          return [cveId, `${score}%`, `${percentile}th`, ...dateColumn];
+          return [cveId, score, `${percentile}th`, ...dateColumn];
         });
         const headers = ["CVE ID", "EPSS Score", "Percentile", ...(hasScoreDates ? ["Score Date"] : [])];
         const gapNote = incomplete

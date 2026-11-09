@@ -66,7 +66,7 @@ If evidence is missing, say exactly what is missing and what artifact would clos
 
 ## Phase 3: Control Mapping
 
-Map findings explicitly to the requested framework. At minimum, evaluate:
+Map findings explicitly to the requested framework using retrieved or supplied mapping evidence. Evaluate these controls when they are in scope:
 - **SC-13 / cryptographic protection**
 - **SC-12 / key management**
 - **SI-2 / flaw remediation**
@@ -77,6 +77,8 @@ For each control, classify:
 - Partially Satisfied
 - Not Satisfied
 - Unable to Assess
+
+Missing evidence is not proof of an absent control. Record the artifact needed to assess it. A public CVE does not establish asset exposure, and a certificate does not establish approved deployment or key-management practices. Do not infer supersession or add crosswalks from memory; query again if an exact relationship cannot be traced after compaction.
 
 ## Phase 4: Prioritization
 
@@ -94,6 +96,6 @@ Return:
 1. **Audit summary** — what was assessed and overall posture
 2. **Control-by-control findings** — with evidence
 3. **Critical gaps** — highest-risk issues first
-4. **Remediation plan** — concrete next actions with rough effort
+4. **Remediation plan** — concrete proposed next actions; include rough effort only with enough context and stated assumptions
 
 Do not infer compliance without evidence. Mark unknowns as unknowns.

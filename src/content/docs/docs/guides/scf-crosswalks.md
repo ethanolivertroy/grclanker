@@ -38,6 +38,18 @@ Each request gets up to four attempts, and each attempt times out after 30 secon
 
 Results follow the SCF release the API serves, so mappings and counts can differ from the examples on this page.
 
+## Interpret public lookup evidence
+
+Public lookups establish what a source reports for a query. They do not establish an organization's implementation or compliance:
+
+- A catalog total counts all records in that source. Matching records are the subset for the query, and a result limit can reduce how many matches are returned. Do not report the catalog total as the number of matches.
+- No matches means no matches for the query in the catalog read. Check spelling, ID format, and broader vendor or module names before drawing a conclusion. An unreadable source is missing evidence, not an empty catalog.
+- A crosswalk identifies related requirements. Use the returned framework, release, and control IDs; it does not prove either requirement is satisfied. If the mapping's source is uncertain after compaction or session restoration, retrieve it again.
+- A public CVE record needs affected product and version evidence before it establishes an asset's exposure. An EPSS score estimates exploitation likelihood; it does not verify an organization's patch status.
+- A CMVP certificate covers its listed module and conditions. It does not prove a deployment uses that approved version and configuration, and an in-process record is not a validation. Do not infer certificate supersession from a shared vendor or higher certificate number.
+
+Keep observed facts, missing evidence, assumptions, and proposed actions separate. Missing evidence does not mean a control is absent; use Unable to Assess when implementation evidence is insufficient.
+
 ## Search controls
 
 ```text
@@ -175,10 +187,10 @@ The FedRAMP, SCF, and OSCAL tools chain together. This path starts from a KSI an
 
 ## Troubleshooting
 
-- **A crosswalk lookup returns "No mappings found."** The framework control ID does not match the crosswalk's format. See [Match the control ID format](#match-the-control-id-format).
+- **A crosswalk lookup returns "No mappings found."** The ID may use a different format, or the requested mapping may not exist in this SCF release. Check the framework and [control ID format](#match-the-control-id-format), then report the lookup's scope without inventing a mapping.
 - **"matched multiple SCF frameworks."** Pass one of the listed IDs as `framework`.
 - **"No SCF framework matched."** The name is not in SCF's framework list. SOC 2, for example, appears as Trust Services Criteria (TSC) (2017), so use `TSC` or `general-aicpa-tsc-2017`.
-- **"Fetch failed: ... (404 Not Found)."** The control or evidence request ID does not exist. Search for the control, or check the ID's shape, such as `IAC-15.1` or `E-IAM-07`.
+- **"Fetch failed: ... (404 Not Found)."** The API has no file at the requested path. Search for the control and check the ID's shape, such as `IAC-15.1` or `E-IAM-07`, and the release served by the API.
 - **Any other fetch failure.** The API could not be read, even after the retries described in [Where the data comes from](#where-the-data-comes-from). The tools keep no offline copy, so try again once the network is back.
 - **A control ends with "the evidence request list is incomplete".** The listed evidence requests could not be read. Look each one up with `scf_get_evidence_request` once the API answers again.
 

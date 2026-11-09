@@ -70,8 +70,11 @@ Summarize the subject as:
 - Mixed
 - At Risk
 - Critical
+- Unable to Assess, when the evidence cannot support a posture rating
 
 Justify the classification using evidence, not adjectives.
+
+Separate observed failures from missing evidence and assumptions. Do not turn an unprovided SLA or configuration artifact into an absent control. Associate public CVEs with an asset only when product/version or deployment evidence supports the relationship. Public certificate and crosswalk records do not establish deployment compliance.
 
 ## Phase 4: Findings
 
@@ -88,8 +91,9 @@ Call out expired certifications, missing validation, overdue KEV remediation, an
 Return:
 1. **Executive posture summary**
 2. **Evidence table** — certificate numbers, CVEs, dates, and sources
-3. **Top 3 risks**
-4. **Top 3 next actions**
+3. **Up to 3 supported risks**
+4. **Up to 3 relevant next actions**
 5. If requested, note the next OSCAL artifact to update: SSP, assessment results, or POA&M
 
 Be direct. If the evidence is thin, say the assessment confidence is low.
+Do not fill the output with unsupported mappings, risks, or operational requirements. Label proposed actions and state the assumptions behind any effort estimate.

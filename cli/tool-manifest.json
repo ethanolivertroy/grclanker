@@ -4027,7 +4027,7 @@
           },
           "limit": {
             "type": "number",
-            "description": "Max results to return (default: 10).",
+            "description": "Max results to return (default: 10). Values below 1 use 10; fractions are truncated.",
             "default": 10
           }
         }
@@ -4043,7 +4043,7 @@
           "name": "limit",
           "type": "number",
           "required": false,
-          "description": "Max results to return (default: 10).",
+          "description": "Max results to return (default: 10). Values below 1 use 10; fractions are truncated.",
           "defaultValue": 10
         }
       ],
@@ -4067,7 +4067,7 @@
           },
           "limit": {
             "type": "number",
-            "description": "Max results to return (default: 10).",
+            "description": "Max results to return (default: 10). Values below 1 use 10; fractions are truncated.",
             "default": 10
           }
         }
@@ -4083,7 +4083,7 @@
           "name": "limit",
           "type": "number",
           "required": false,
-          "description": "Max results to return (default: 10).",
+          "description": "Max results to return (default: 10). Values below 1 use 10; fractions are truncated.",
           "defaultValue": 10
         }
       ],
@@ -4107,7 +4107,7 @@
           },
           "limit": {
             "type": "number",
-            "description": "Max results to return (default: 10).",
+            "description": "Max results to return (default: 10). Values below 1 use 10; fractions are truncated.",
             "default": 10
           }
         }
@@ -4123,7 +4123,7 @@
           "name": "limit",
           "type": "number",
           "required": false,
-          "description": "Max results to return (default: 10).",
+          "description": "Max results to return (default: 10). Values below 1 use 10; fractions are truncated.",
           "defaultValue": 10
         }
       ],

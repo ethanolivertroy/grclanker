@@ -14,6 +14,7 @@ const BASE = process.env.CMVP_API_BASE_URL?.trim().replace(/\/+$/, "") || DEFAUL
 
 // 24-hour cache. CMVP data updates weekly via GitHub Actions.
 const TTL = 24 * 60 * 60 * 1000;
+const DEFAULT_SEARCH_LIMIT = 10;
 
 interface CmvpMetadata {
   generated_at: string;
@@ -61,6 +62,36 @@ interface InProcessResponse {
 
 type SearchArgs = { query: string; limit?: number };
 type CertArgs = { cert_number: string };
+
+function searchLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value < 1) return DEFAULT_SEARCH_LIMIT;
+  return Math.trunc(value);
+}
+
+function searchSummary(
+  source: "active" | "historical" | "in_process",
+  query: string,
+  count: number,
+  totalMatches: number,
+  catalogCount: number,
+): string {
+  const catalog = source === "in_process" ? "in-process" : source;
+  const label = source === "active"
+    ? "active FIPS module(s)"
+    : source === "historical"
+      ? "historical module(s)"
+      : "module(s) in the CMVP validation pipeline";
+  const heading = totalMatches === 0
+    ? `No ${catalog} CMVP modules found matching phrase "${query}".`
+    : count < totalMatches
+      ? `Showing ${count} of ${totalMatches} ${label} matching "${query}".`
+      : `Found ${count} ${label} matching "${query}".`;
+  const totals = `Catalog size: ${catalogCount} modules across all vendors; matching this query: ${totalMatches}; returned: ${count}.`;
+  const emptyHint = totalMatches === 0
+    ? "\nNo matches for this phrase do not establish that a module or vendor has no validation history. Try a broader vendor or module name, or an exact certificate number in the active and historical catalogs."
+    : "";
+  return `${heading}\n${totals}${emptyHint}`;
+}
 
 function asString(value: unknown): string | undefined {
   if (typeof value === "string") {
@@ -195,7 +226,7 @@ export function registerCmvpTools(pi: GrcToolRegistrar): void {
       }),
       limit: Type.Optional(
         Type.Number({
-          description: "Max results to return (default: 10).",
+          description: "Max results to return (default: 10). Values below 1 use 10; fractions are truncated.",
           default: 10,
         }),
       ),
@@ -208,24 +239,14 @@ export function registerCmvpTools(pi: GrcToolRegistrar): void {
 
       try {
         const data = await cachedFetch<ModulesResponse>(`${BASE}/modules.json`, TTL, signal);
-        const limit = args.limit ?? 10;
-        const matches = data.modules
-          .filter((module) => matchesQuery(module, args.query))
-          .slice(0, limit);
-
-        if (matches.length === 0) {
-          return textResult(
-            `No active CMVP modules found matching "${args.query}". Try cmvp_search_historical or cmvp_search_in_process.`,
-            { query: args.query, count: 0, source: "active" },
-          );
-        }
-
-        const header =
-          `Found ${matches.length} active FIPS module(s) matching "${args.query}" ` +
-          `(of ${data.metadata.total_modules} total):\n`;
-        return textResult(header + matches.map(formatModule).join("\n\n"), {
+        const allMatches = data.modules.filter((module) => matchesQuery(module, args.query));
+        const matches = allMatches.slice(0, searchLimit(args.limit));
+        const summary = searchSummary("active", args.query, matches.length, allMatches.length, data.metadata.total_modules);
+        return textResult(summary + (matches.length ? `\n\n${matches.map(formatModule).join("\n\n")}` : ""), {
           query: args.query,
           count: matches.length,
+          total_matches: allMatches.length,
+          catalog_count: data.metadata.total_modules,
           source: "active",
         });
       } catch (error) {
@@ -248,7 +269,7 @@ export function registerCmvpTools(pi: GrcToolRegistrar): void {
       }),
       limit: Type.Optional(
         Type.Number({
-          description: "Max results to return (default: 10).",
+          description: "Max results to return (default: 10). Values below 1 use 10; fractions are truncated.",
           default: 10,
         }),
       ),
@@ -265,25 +286,14 @@ export function registerCmvpTools(pi: GrcToolRegistrar): void {
           TTL,
           signal,
         );
-        const limit = args.limit ?? 10;
-        const matches = data.modules
-          .filter((module) => matchesQuery(module, args.query))
-          .slice(0, limit);
-
-        if (matches.length === 0) {
-          return textResult(`No historical CMVP modules found matching "${args.query}".`, {
-            query: args.query,
-            count: 0,
-            source: "historical",
-          });
-        }
-
-        const header =
-          `Found ${matches.length} historical module(s) matching "${args.query}" ` +
-          `(of ${data.metadata.total_historical_modules} total):\n`;
-        return textResult(header + matches.map(formatModule).join("\n\n"), {
+        const allMatches = data.modules.filter((module) => matchesQuery(module, args.query));
+        const matches = allMatches.slice(0, searchLimit(args.limit));
+        const summary = searchSummary("historical", args.query, matches.length, allMatches.length, data.metadata.total_historical_modules);
+        return textResult(summary + (matches.length ? `\n\n${matches.map(formatModule).join("\n\n")}` : ""), {
           query: args.query,
           count: matches.length,
+          total_matches: allMatches.length,
+          catalog_count: data.metadata.total_historical_modules,
           source: "historical",
         });
       } catch (error) {
@@ -306,7 +316,7 @@ export function registerCmvpTools(pi: GrcToolRegistrar): void {
       }),
       limit: Type.Optional(
         Type.Number({
-          description: "Max results to return (default: 10).",
+          description: "Max results to return (default: 10). Values below 1 use 10; fractions are truncated.",
           default: 10,
         }),
       ),
@@ -324,22 +334,13 @@ export function registerCmvpTools(pi: GrcToolRegistrar): void {
           signal,
         );
         const normalizedQuery = args.query.toLowerCase();
-        const limit = args.limit ?? 10;
-        const matches = data.modules_in_process
+        const allMatches = data.modules_in_process
           .filter(
             (module) =>
               module["Module Name"].toLowerCase().includes(normalizedQuery) ||
               module["Vendor Name"].toLowerCase().includes(normalizedQuery),
-          )
-          .slice(0, limit);
-
-        if (matches.length === 0) {
-          return textResult(`No in-process CMVP modules found matching "${args.query}".`, {
-            query: args.query,
-            count: 0,
-            source: "in_process",
-          });
-        }
+          );
+        const matches = allMatches.slice(0, searchLimit(args.limit));
 
         const table = formatTable(
           ["Module", "Vendor", "Standard", "Status"],
@@ -351,12 +352,14 @@ export function registerCmvpTools(pi: GrcToolRegistrar): void {
           ]),
         );
 
+        const summary = searchSummary("in_process", args.query, matches.length, allMatches.length, data.metadata.total_modules_in_process);
         return textResult(
-          `Found ${matches.length} module(s) in the CMVP validation pipeline matching "${args.query}" ` +
-            `(of ${data.metadata.total_modules_in_process} total):\n\n${table}`,
+          summary + (matches.length ? `\n\n${table}` : ""),
           {
             query: args.query,
             count: matches.length,
+            total_matches: allMatches.length,
+            catalog_count: data.metadata.total_modules_in_process,
             source: "in_process",
           },
         );
@@ -408,7 +411,7 @@ export function registerCmvpTools(pi: GrcToolRegistrar): void {
         }
 
         if (!module) {
-          return textResult(`No CMVP module found with certificate #${args.cert_number}.`, {
+          return textResult(`No CMVP module found with certificate #${args.cert_number} in the active or historical catalogs read. This does not establish that the vendor has no other validated modules.`, {
             cert_number: args.cert_number,
             count: 0,
           });
