@@ -93,16 +93,15 @@ const LOCAL_MODEL_PREFERENCES = [
 ] as const;
 const HOSTED_DEFAULTS = {
   openai: "gpt-5.2",
-  anthropic: "claude-sonnet-4-20250514",
+  anthropic: "claude-sonnet-4-6",
   google: "gemini-2.5-pro",
 } as const;
 const HOSTED_MODEL_OPTIONS = {
   openai: ["gpt-5.2", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1"],
   anthropic: [
-    "claude-sonnet-4-20250514",
-    "claude-opus-4-1-20250805",
-    "claude-opus-4-20250514",
-    "claude-3-7-sonnet-20250219",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+    "claude-haiku-4-5",
   ],
   google: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
 } as const;
@@ -862,9 +861,9 @@ export async function runComputeSetup(computeBackend: ComputeBackendKind): Promi
   console.log("Run `grclanker env doctor` and `grclanker env smoke-test` to validate it.");
 }
 
-export async function ensureCliConfigured(): Promise<void> {
+export async function ensureCliConfigured(): Promise<boolean> {
   const settings = readGrclankerSettings(getGrclankerSettingsPath());
-  if (isConfigured(settings)) return;
+  if (isConfigured(settings)) return true;
 
   if (!input.isTTY || !output.isTTY) {
     throw new GrclankerUserError(
@@ -876,7 +875,7 @@ export async function ensureCliConfigured(): Promise<void> {
     );
   }
 
-  await runSetupWizard();
+  return runSetupWizard();
 }
 
 function nonInteractiveSetupHint(): string {
@@ -919,14 +918,15 @@ async function promptModelChoice(settings: GrclankerSettings): Promise<ModelChoi
   }
 }
 
-export async function runSetupWizard(force = true): Promise<void> {
+/** Returns false when the user cancels, so first-run startup can stop cleanly. */
+export async function runSetupWizard(force = true): Promise<boolean> {
   const settingsPath = getGrclankerSettingsPath();
   const modelsPath = getGrclankerModelsPath();
   const settings = readGrclankerSettings(settingsPath);
   const currentComputeBackend = resolveComputeBackend(settings);
 
   if (!force && isConfigured(settings)) {
-    return;
+    return true;
   }
 
   if (!input.isTTY || !output.isTTY) {
@@ -978,8 +978,9 @@ export async function runSetupWizard(force = true): Promise<void> {
   } catch (error) {
     if (error instanceof SetupCancelledError) {
       cancel("Setup cancelled.");
-      return;
+      return false;
     }
     throw error;
   }
+  return true;
 }
