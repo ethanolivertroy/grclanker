@@ -3,7 +3,7 @@ title: "Certification Data Sharing"
 description: "Official Consolidated Rules summary for the CDS FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
+> Generated from the official FedRAMP Consolidated Rules `2026.11.02.01`, last updated upstream on 2026-11-02. [Source details](#source)
 
 The Certification Data Sharing rules allow providers to store and share FedRAMP Certification Data through the platform they choose as long as it follows FedRAMP rules for access, accuracy, and transparency. This helps customers and the public review consistent, current security and compliance information while recognizing that the information usually remains the provider's intellectual property and is not federal information.
 
@@ -189,7 +189,7 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Providers MUST publicly share a detailed list of specific services and their security categories that are included in the cloud service offering using clear feature or service names that align with standard public marketing materials; this list MUST be complete enough for a potential customer to determine which services are and are not included in the FedRAMP Minimum Assessment Scope without requesting access to underlying FedRAMP Certification Data.
 
-Terms: `Certification Data`, `Cloud Service Offering`, `Security Category`
+Terms: `Certification Data`, `Cloud Service Offering`, `Minimum Assessment Scope`, `Security Category`
 
 Affects: Providers
 
@@ -313,6 +313,6 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 ## Source
 
 - Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
-- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `0e98c7dfc99f`.
+- Consolidated Rules version: `2026.11.02.01` · upstream `last_updated`: `2026-11-02`.
 - Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

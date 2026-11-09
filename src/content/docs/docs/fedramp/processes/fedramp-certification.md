@@ -3,7 +3,7 @@ title: "FedRAMP Certification"
 description: "Official Consolidated Rules summary for the FRC FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
+> Generated from the official FedRAMP Consolidated Rules `2026.11.02.01`, last updated upstream on 2026-11-02. [Source details](#source)
 
 This ruleset explains how cloud service offerings obtain and maintain FedRAMP Certification across certification classes and paths.
 
@@ -123,9 +123,11 @@ Affects: Providers
 
 Note: Downgrade paths include moving from D to C, B, or A; C to B or A; or B to A.
 
-FRC-CCL-DNP (Downgrade Notification Period) applies - please DO NOT downgrade Certification Class with providing advance notification to all necessary parties!
+FRC-CCL-DNP (Downgrade Notification Period) applies - please DO NOT downgrade Certification Class without providing advance notification to all necessary parties!
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-11-02: Fixed a typo in the note to clarify that downgrade should not happen WITHOUT providing advance notification.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `FRC-CCL-DNP` SHOULD: Downgrade Notification Period
 
@@ -141,7 +143,7 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 ### `FRC-CCL-UCC` MUST: Upgrading Certification Class
 
-Providers MUST apply for a new FedRAMP Certification to upgrade their Certification Class; all applicable requirements MUST be met in advance.
+Providers MUST apply for a new FedRAMP Certification to upgrade their Certification Class; all applicable requirements to obtain the new FedRAMP Certification MUST be met in advance.
 
 Terms: `Certification Class`
 
@@ -151,7 +153,11 @@ Note: Upgrade paths include moving from A to B, C, or D; B to C or D; and C to D
 
 The preferred path is to incrementally update the implementation and assurance commitments within the current Certification Class until the provider has met all requirements for the target Certification Class, then apply for the new Certification Class.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+All applicable CR26 requirements are based on the obtain deadlines in each CR26 ruleset when applying to obtain a new FedRAMP Certification, even if it is an upgrade. FedRAMP may make case-by-case exceptions based on individual circumstances and critical government need, however, so please contact FedRAMP for guidance when planning an upgrade in 2027.
+
+Updates:
+- 2026-10-31: Updated wording and added a note to more explicitly clarify that upgrading is obtaining a new FedRAMP Certification.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `FRC-CLA-ASF` MUST: Approved Alternative Security Frameworks
 
@@ -214,6 +220,7 @@ Checklist items:
 - Collaborative Continuous Monitoring: CCM-OCR-AVL (Report Availability)
 - Collaborative Continuous Monitoring: CCM-OCR-NRD (Next Report Date)
 - Independent Verification and Validation: IVV-CSX-AIA (Annual Independent Assessments for 20x)
+- Security Decision Record: SDR-CSX-KSI (Key Security Indicators)
 - Key Security Indicators: KSI-CMT-LMC (Logging Changes)
 - Key Security Indicators: KSI-CNA-RNT (Restricting Network Traffic)
 - Key Security Indicators: KSI-CED-RAT (Reviewing All Training)
@@ -222,7 +229,7 @@ Checklist items:
 - Key Security Indicators: KSI-INR-RIR (Reviewing Incident Response Procedures)
 - Key Security Indicators: KSI-SVC-SIN (Securing Information)
 
-Terms: `Artifacts`, `Certification Data`, `Certification Package`, `Certification Path`, `Certification Type`, `FedRAMP Security Inbox`, `Final Incident Report (FIR)`, `Incident`, `Information Resource`, `Initial Incident Report (IIR)`, `Ongoing Certification Report (OCR)`, `Trust Center`, `Validation`, `Verification`, `Vulnerability`, `Vulnerability Detection`, `Vulnerability Response`
+Terms: `Artifacts`, `Certification Data`, `Certification Package`, `Certification Path`, `Certification Type`, `FedRAMP Security Inbox`, `Final Incident Report (FIR)`, `Incident`, `Information Resource`, `Initial Incident Report (IIR)`, `Minimum Assessment Scope`, `Ongoing Certification Report (OCR)`, `Security Decision Record (SDR)`, `Trust Center`, `Validation`, `Verification`, `Vulnerability`, `Vulnerability Detection`, `Vulnerability Response`
 
 Affects: Providers
 
@@ -233,6 +240,7 @@ In general, for each of these FedRAMP requirements, providers should include a s
 Information about how the provider addresses the included Key Security Indicators are required to receive a class A certification even if the provider intends to pursue a Rev 5 Program Certification path in the future.
 
 Updates:
+- 2026-10-31: Added SDR-CSX-KSI to list of requirements because folks need a rule that explains how to document the key security indicators!
 - 2026-07-14: Clarified that providers MUST address the Key Security Indicators even if they intend to pursue a Rev 5 Program Certification path in the future.
 - 2026-07-01: Removed reference to Independent Verification and Validation: IVV-CSF-AIA (Annual Independent Assessments for Rev5); Removed CDS-CSO-AVR (Availability Reporting) since this rule is defined as SHOULD and included in FRC-CLA-RFR (Recommended FedRAMP Rules for Class A)
 - 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -264,7 +272,6 @@ Providers seeking a Class A FedRAMP Certification SHOULD address the following a
 
 Checklist items:
 - Certification Data Sharing: CDS-CSO-AVR (Availability Reporting)
-- Certification Package Overview: CPO-CSF-CPM (Certification Package Maintenance for Rev5)
 - Certification Package Overview: CPO-CSX-CPM (Certification Package Maintenance for 20x)
 - Incident Evaluation and Communication: IEC-CSO-IIR (Initial Incident Report)
 - Incident Evaluation and Communication: IEC-CSO-OIR (Ongoing Incident Reports)
@@ -279,7 +286,9 @@ Terms: `Certification Data`, `Certification Package`, `Drift`, `Incident`, `Init
 
 Affects: Providers
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Updates:
+- 2026-10-31: CPO-CSF-CPM (Certification Package Maintenance for Rev5) was removed.
+- 2026-06-24: Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ### `FRC-CSO-FCP` MUST: FedRAMP Certification Profile
 
@@ -360,7 +369,7 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 Providers SHOULD apply ALL Key Security Indicators to ALL aspects of their cloud service offering that are within the FedRAMP Minimum Assessment Scope.
 
-Terms: `Cloud Service Offering`
+Terms: `Cloud Service Offering`, `Minimum Assessment Scope`
 
 Affects: Providers
 
@@ -457,6 +466,6 @@ Updates:
 ## Source
 
 - Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
-- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `0e98c7dfc99f`.
+- Consolidated Rules version: `2026.11.02.01` · upstream `last_updated`: `2026-11-02`.
 - Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.

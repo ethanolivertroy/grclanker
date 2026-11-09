@@ -3,7 +3,7 @@ title: "Cryptographic Module Use"
 description: "Official Consolidated Rules summary for the CMU FedRAMP process, including applicability and requirements."
 ---
 
-> Generated from the official FedRAMP Consolidated Rules `2026.10.13.01`, last updated upstream on 2026-10-13. [Source details](#source)
+> Generated from the official FedRAMP Consolidated Rules `2026.11.02.01`, last updated upstream on 2026-11-02. [Source details](#source)
 
 The Cryptographic Module Use rules clarify how providers should select and use cryptographic modules. These rules allow risk-based decisions for some services while still encouraging validated cryptographic modules whenever they are technically feasible and reasonable.
 
@@ -72,6 +72,6 @@ Updates:
 ## Source
 
 - Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `4ed99953efa5`.
-- Consolidated Rules version: `2026.10.13.01` · upstream `last_updated`: `2026-10-13`.
+- Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `0e98c7dfc99f`.
+- Consolidated Rules version: `2026.11.02.01` · upstream `last_updated`: `2026-11-02`.
 - Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
