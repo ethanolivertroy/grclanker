@@ -1,6 +1,6 @@
 # grclanker
 
-grclanker is an experimental open source GRC engineering assistant with native tools for evidence collection, control assessments, and risk analysis. Its default terminal host embeds [Pi](https://github.com/earendil-works/pi) 1.4 (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.4.0); source adapters support other agent hosts. The current release is [`v0.1.4`](https://github.com/ethanolivertroy/grclanker/releases/tag/v0.1.4). It is early: minor versions can break before 1.0.
+grclanker is an experimental open source GRC engineering assistant with native tools for evidence collection, control assessments, and risk analysis. Its default terminal host embeds [Pi](https://github.com/earendil-works/pi) 1.4 (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.4.0); source adapters support other agent hosts. The current release is [`v0.1.5`](https://github.com/ethanolivertroy/grclanker/releases/tag/v0.1.5). It is early: minor versions can break before 1.0.
 
 macOS and Linux are the platforms with release bundles. Windows support is best effort. Linux musl hosts, including Alpine, have no bundle. Use a source checkout there.
 
@@ -32,10 +32,10 @@ On Windows PowerShell (best effort):
 powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
 ```
 
-The installer downloads the newest GitHub release bundle, today `v0.1.4`. The bundle includes its own Node.js 24.22.0 runtime. Pin that release on macOS or Linux with:
+The installer downloads the newest GitHub release bundle, currently `v0.1.5`. The bundle includes its own Node.js 24.22.0 runtime. Pin that release on macOS or Linux with:
 
 ```bash
-curl -fsSL https://grclanker.com/install | bash -s -- 0.1.4
+curl -fsSL https://grclanker.com/install | bash -s -- 0.1.5
 ```
 
 An official GitHub download or a `GRCLANKER_RELEASE_BASE_URL` install checks the archive against `SHA256SUMS.txt` and aborts when that file cannot be fetched, has no entry for the archive, the entry is not a SHA-256 digest, the digest does not match, or (the shell installer only) neither `sha256sum` nor `shasum` is available. A custom `GRCLANKER_ASSET_URL` prints a warning and installs without verifying. The [installation guide](https://grclanker.com/docs/getting-started/installation/) has the Windows pin command, the local-archive rules, and the `GRCLANKER_VERSION`, `GRCLANKER_INSTALL_DIR`, and `GRCLANKER_BIN_DIR` overrides.
@@ -78,7 +78,7 @@ ollama pull gemma4
 grclanker setup
 ```
 
-Choose Local-first. Setup uses `http://localhost:11434/v1`. If that endpoint is down, setup stops and prints the commands to start it. If the model you name is not installed, setup offers an installed local model or asks you to pull one. It never switches you to a hosted model. The wizard can also save an explicit hosted provider and model. grclanker then reads the key from `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`, or from a key saved with `/login` in a session. See [Setup](https://grclanker.com/docs/getting-started/setup/).
+Choose Local-first. Setup uses `http://localhost:11434/v1`. If that endpoint is down, setup stops and prints the commands to start it. If the model you name is not installed, setup offers an installed local model or asks you to pull one. It never switches you to a hosted model. The wizard can also save an explicit hosted provider and model; Anthropic defaults to `claude-sonnet-4-6`. grclanker reads the key from `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`, or from a key saved with `/login` in a session. Cancelling setup exits without opening Pi or saving a partial model choice. See [Setup](https://grclanker.com/docs/getting-started/setup/) for the hosted path.
 
 Then:
 
@@ -93,17 +93,19 @@ grclanker investigate "CVE-2021-44228"
 
 Inside a session the same four workflows are slash commands. Guides: [Investigate](https://grclanker.com/docs/workflows/investigate/), [Audit](https://grclanker.com/docs/workflows/audit/), [Assess](https://grclanker.com/docs/workflows/assess/), [Validate](https://grclanker.com/docs/workflows/validate/).
 
-## What ships in v0.1.4
+## What ships in v0.1.5
 
 - 241 domain tools. `grclanker tools` and the [tool catalog](https://grclanker.com/docs/tools/catalog/) list the same set.
 - 7 compute backend tools: `bash`, `read`, `write`, `edit`, `ls`, `find`, and `grep`.
 - 4 workflows, and 2 personas: `auditor` and `verifier`.
 - `grclanker flue run` in the release bundle.
 - `grclanker durable run`, `resume`, and `tui` in the release bundle: the experimental, opt-in [durable runtime](https://grclanker.com/docs/getting-started/durable-runtime/), which can resume a run that crashed or was stopped.
-- A Cursor Agent SDK project, from a source checkout.
-- Runtime state under `~/.grclanker/agent`.
+- Source adapters for OpenAI Agents SDK, Codex SDK, Claude Code, Claude API tool runner, Claude Agent SDK, and Cursor/Grok Agent SDK.
+- Runtime state under `~/.grclanker/agent`. `GRCLANKER_HOME` moves the grclanker configuration and Pi's managed `fd`/`rg` cache together.
 
-[What's New](https://grclanker.com/docs/changelog/) covers `v0.1.4`: 32 integrations and the public data feeds retry rate limits, server errors, and timeouts, and report a read that still fails as unread. Access checks report `failed` and name the setting to fix when a vendor rejects the credentials on every probe, `grclanker --version` and `grclanker --session <id>` work, installers put the previous install back when an upgrade fails, and bundles are tested on their own operating system before release. The tool count is unchanged from `v0.1.3`.
+[What's New](https://grclanker.com/docs/changelog/) covers `v0.1.5`: Pi startup respects cancelled setup, isolates its binary cache, and uses Sonnet 4.6 for new Anthropic setups. CMVP replies distinguish returned results, matches, and catalog coverage, and onboarding separates hosted and local model setup. The tool count is unchanged from `v0.1.4`.
+
+Use full hosted model IDs, such as `claude-sonnet-4-6`; Pi still expands shorthand names through its own model matching. A resumed hosted session restores its saved model. Results still need review against the cited sources, especially where a lookup is incomplete or a compliance mapping needs confirmation.
 
 ### Platform integrations
 

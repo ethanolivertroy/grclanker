@@ -52,6 +52,7 @@ All specs are available as raw markdown. Point your agent at any URL below.
 ## Docs
 
 - [Documentation](https://grclanker.com/docs/): Installation, runtimes, integration guides, workflows, and FedRAMP reference
+- [What's New](https://grclanker.com/docs/changelog/): v0.1.5 release changes, upgrade notes, and earlier releases
 - [Choose a deployment](https://grclanker.com/docs/getting-started/deployment/): GRC engineer host choices, separate configuration, shared source dependencies, and availability
 - [Pi terminal CLI](https://grclanker.com/docs/getting-started/pi-runtime/): Complete terminal setup with local or hosted models
 - [OpenAI Agents SDK](https://grclanker.com/docs/getting-started/openai-agents-sdk/): Self-contained guide to the TypeScript adapter, credentials, tools, approvals, and runner

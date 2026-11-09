@@ -26,6 +26,8 @@ node cli/bin/grclanker.js setup
 
 Choose `Local-first` and `gemma4`. If Ollama already runs as an app or service, change that instance's context setting instead of starting a second server. Setup also supports hosted OpenAI, Anthropic, and Google models. For hosted use, provide `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY` for the selected provider, or use `/login` in a session.
 
+Anthropic setup defaults to `claude-sonnet-4-6`. Use a full model ID: Pi still expands shorthand names through its own matching. New hosted sessions use the configured model, while a resumed session restores its saved model. Cancelling setup exits without launching Pi or persisting a partial model choice.
+
 Run a first task:
 
 ```bash
@@ -34,6 +36,8 @@ node cli/bin/grclanker.js investigate "Check CVE-2024-3400 in the CISA KEV catal
 ```
 
 The workflow opens an interactive session. Public lookups need network access; organization assessments additionally need that vendor's credentials. Settings, stored login credentials, and conversations live under `~/.grclanker/agent`. Exit with `/quit` or Ctrl+D and reopen conversations with `/resume` or the session command printed on exit.
+
+Set `GRCLANKER_HOME` to a separate base directory, or directly to its `.grclanker` directory, to move this state and Pi's managed `fd`/`rg` cache together. The same cache location is used by `grclanker env exec`; env helpers do not require model setup.
 
 The Pi host registers the shared domain tools plus its seven compute tools. Common GRC implementations live in `cli/extensions/grc-tools/`; `cli/core/` contains the domain-only registry and common tool handling used by other hosts. Pi-specific session, setup, and compute behavior belongs here. Pi settings do not configure SDK adapter sessions or their shell/file capabilities.
 
