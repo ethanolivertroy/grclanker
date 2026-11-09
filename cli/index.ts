@@ -1,19 +1,12 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { runComputeDoctor } from "./pi/doctor.js";
-import { runComputeExec, runComputeList, runComputeSmokeTest } from "./pi/env.js";
 import { CLI_HELP } from "./pi/cli-help.js";
-import { launchCli, runCliSetup } from "./pi/launch.js";
+import { configurePiAgentDir, launchCli, runCliSetup } from "./pi/launch.js";
 import { routeCliInvocation } from "./pi/cli-routing.js";
 import { ConfigFileError } from "./extensions/grc-tools/hardening/config-file.js";
 import { GrclankerUserError } from "./pi/setup.js";
 import type { ComputeBackendKind } from "./pi/compute.js";
-import {
-  findRegisteredTool,
-  formatToolCatalogText,
-  formatToolDetailText,
-  getRegisteredToolSummaries,
-} from "./pi/tool-catalog.js";
 
 process.title = "grclanker";
 
@@ -49,6 +42,24 @@ function readCliVersion(): string {
   return packageJson.version ?? "unknown";
 }
 
+function hasEnvHelpFlag(rawArgs: string[]): boolean {
+  for (let index = 0; index < rawArgs.length; index += 1) {
+    const arg = rawArgs[index];
+    if (arg === "--") return false;
+    if (arg === "--help" || arg === "-h") return true;
+    // These options consume the next argument even if it looks like a flag.
+    if (["--backend", "-b", "--compute", "--cwd", "--timeout", "-t"].includes(arg!)) index += 1;
+  }
+  return false;
+}
+
+async function loadComputeCommands(rawArgs?: string[]) {
+  // Help does not use runtime config. Forwarded command arguments still need
+  // the isolated Pi environment before the compute module graph is imported.
+  if (!rawArgs || !hasEnvHelpFlag(rawArgs)) configurePiAgentDir();
+  return import("./pi/env.js");
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const command = args[0];
@@ -70,17 +81,22 @@ async function main() {
   }
 
   if (command === "env" && subcommand === "list") {
+    const { runComputeList } = await loadComputeCommands();
     await runComputeList(args.slice(2));
     return;
   }
 
   if (command === "env" && subcommand === "smoke-test") {
-    await runComputeSmokeTest(args.slice(2));
+    const rawArgs = args.slice(2);
+    const { runComputeSmokeTest } = await loadComputeCommands(rawArgs);
+    await runComputeSmokeTest(rawArgs);
     return;
   }
 
   if (command === "env" && subcommand === "exec") {
-    await runComputeExec(args.slice(2));
+    const rawArgs = args.slice(2);
+    const { runComputeExec } = await loadComputeCommands(rawArgs);
+    await runComputeExec(rawArgs);
     return;
   }
 
@@ -100,6 +116,16 @@ async function main() {
   }
 
   if (command === "tools") {
+    // The catalog and compute helpers load Pi. Keep them out of the startup
+    // graph so launchCli can set its isolated agent directory before Pi caches
+    // paths such as the managed fd/rg binary directory during module evaluation.
+    configurePiAgentDir();
+    const {
+      findRegisteredTool,
+      formatToolCatalogText,
+      formatToolDetailText,
+      getRegisteredToolSummaries,
+    } = await import("./pi/tool-catalog.js");
     const tools = getRegisteredToolSummaries();
     const toolArgs = args.slice(1);
     const asJson = toolArgs.includes("--json");

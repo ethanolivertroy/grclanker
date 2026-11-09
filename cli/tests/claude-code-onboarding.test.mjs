@@ -80,6 +80,12 @@ for (const document of documents) {
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
       DISABLE_TELEMETRY: "1",
     };
+    // The documented commands run inside a Git checkout. Without its own Git
+    // boundary, Claude Code can scope "local" to an ancestor repository (for
+    // example /tmp/.git on a managed VM) instead of this isolated fixture.
+    const initialized = spawnSync("git", ["init", "--quiet"], { cwd: checkout, env, encoding: "utf8", timeout: 30_000 });
+    assert.ifError(initialized.error);
+    assert.equal(initialized.status, 0, `initialize fixture checkout\n${initialized.stdout}\n${initialized.stderr}`);
     const markdown = readFileSync(join(repoRoot, document.path), "utf8");
     const commands = registrationCommands(markdown);
     assert.equal(commands.filter((entry) => entry.operation === "add").length, document.selections.length);
@@ -98,6 +104,7 @@ for (const document of documents) {
       assert.ifError(result.error);
       assert.equal(result.status, 0, `${command}\n${result.stdout}\n${result.stderr}`);
       const configuration = JSON.parse(readFileSync(join(config, ".claude.json"), "utf8"));
+      assert.ok(configuration.projects?.[checkout], `local registration belongs to the checkout; configured projects: ${Object.keys(configuration.projects ?? {}).join(", ")}`);
       const registration = configuration.projects[checkout].mcpServers.grclanker;
       assert.equal(configuration.mcpServers?.grclanker, undefined, "local examples must not create a user-wide registration");
       assert.equal(existsSync(join(checkout, ".mcp.json")), false, "local examples must not create shared project configuration");

@@ -19,6 +19,15 @@ export function SiteHeader() {
     if (menuOpen) panelRef.current?.querySelector('a')?.focus();
   }, [menuOpen]);
 
+  useEffect(() => {
+    setMenuOpen(false);
+  }, [pathname]);
+
+  function openSearch() {
+    setMenuOpen(false);
+    setOpenSearch(true);
+  }
+
   function toggleMenu() {
     setMenuOpen((open) => !open);
   }
@@ -34,7 +43,7 @@ export function SiteHeader() {
       <div className="max-w-content mx-auto px-4 sm:px-6">
         <div className="site-nav-row flex min-h-[4.25rem] items-center justify-between gap-4 py-2">
           <div className="site-nav-brand flex items-center gap-2.5 min-w-0">
-            <Link href="/" className="site-nav-logo flex items-center gap-2 text-text hover:text-blue transition-colors group">
+            <Link href="/" onClick={() => setMenuOpen(false)} className="site-nav-logo flex items-center gap-2 text-text hover:text-blue transition-colors group">
               <RobotLogo />
               <span className="led led-live" />
               <span className="font-bold nav-wordmark">GRCLANKER</span>
@@ -46,7 +55,7 @@ export function SiteHeader() {
           <div className="hidden md:flex items-center gap-4 md:gap-6 text-sm">
             <button
               type="button"
-              onClick={() => setOpenSearch(true)}
+              onClick={openSearch}
               onPointerEnter={preloadSiteSearchDialog}
               onFocus={preloadSiteSearchDialog}
               className="nav-action-btn nav-search-btn"
@@ -59,6 +68,7 @@ export function SiteHeader() {
                 key={link.href}
                 href={link.href}
                 className={isActivePath(link.href, pathname) ? 'nav-link is-active' : 'nav-link'}
+                aria-current={isActivePath(link.href, pathname) ? 'page' : undefined}
               >
                 {link.label}
               </Link>
@@ -76,7 +86,7 @@ export function SiteHeader() {
           <div className="site-nav-mobile-actions flex md:hidden items-center gap-2">
             <button
               type="button"
-              onClick={() => setOpenSearch(true)}
+              onClick={openSearch}
               onPointerEnter={preloadSiteSearchDialog}
               onFocus={preloadSiteSearchDialog}
               className="nav-icon-btn"
@@ -111,7 +121,8 @@ export function SiteHeader() {
               <Link
                 key={link.href}
                 href={link.href}
-                className="site-mobile-nav-link"
+                className={isActivePath(link.href, pathname) ? 'site-mobile-nav-link is-active' : 'site-mobile-nav-link'}
+                aria-current={isActivePath(link.href, pathname) ? 'page' : undefined}
                 onClick={() => setMenuOpen(false)}
               >
                 {link.label}

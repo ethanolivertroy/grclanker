@@ -32,6 +32,7 @@ The same four tools cover the vulnerability step in the [investigate](/docs/work
 | `kevs_check_ransomware` | Catalog entries with known ransomware campaign use, newest first. An optional `vendor` keeps entries whose vendor or product name contains that text | `limit` defaults to 20. A value below 1 uses 20 |
 
 Scores above 10% are usually worth fast triage. That note is part of the `kevs_get_epss` reply.
+If a source probability below 100% would round to 100% at the displayed precision, the tools show `<100%` instead. A high score is an estimate, not certainty that an asset will be exploited.
 
 ## When a feed fails
 

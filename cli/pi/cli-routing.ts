@@ -1,4 +1,4 @@
-import { extractComputeFlag } from "./env.js";
+import { extractComputeFlag } from "./compute-flags.js";
 import type { ComputeBackendKind } from "./compute.js";
 
 export type CliInvocation =

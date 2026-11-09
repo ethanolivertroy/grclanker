@@ -1,6 +1,6 @@
 # GRC engineering hosts and shared code
 
-This package contains grclanker's shared GRC implementation and its agent hosts. Start with the host you want to run; the release installer starts the Pi terminal application.
+This package contains grclanker's shared GRC implementation and its agent hosts. Start with the host you want to run; the release installer starts the Pi terminal application. The `v0.1.5` bundles include the Pi, Flue, and experimental durable runners; SDK adapter guides use a source checkout. `@grclanker/cli` is not published to npm.
 
 | Host | Source | Setup and first check from the repository root |
 | --- | --- | --- |

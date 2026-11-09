@@ -1,99 +1,111 @@
 ---
 title: Quick Start
-description: The shortest path from install to a useful grclanker Pi terminal session.
+description: Install grclanker, choose a hosted or local model, and verify your first Pi terminal response.
 ---
 
-This quick start runs the Pi terminal host. For a different agent host, use its complete guide on [Choose a Deployment](/docs/getting-started/deployment/). For Windows notes, pinned versions, the source install, or skills-only installs, use the [Installation](/docs/getting-started/installation) page.
+This guide runs the Pi terminal host. Use [Choose a Deployment](/docs/getting-started/deployment/) for Claude Code and the SDK hosts, or [Installation](/docs/getting-started/installation/) for source builds, pinned versions, and skills-only installs.
 
 ## 1. Install
+
+On macOS or Linux:
 
 ```bash
 curl -fsSL https://grclanker.com/install | bash
 ```
 
-This installs the newest release bundle, currently `v0.1.4`, with all 241 domain tools, `grclanker tools`, and `grclanker flue run`. To run unreleased changes from `main` instead, [install from source](/docs/getting-started/installation#install-from-source) and `npm link` it so the `grclanker` commands below run that build.
+On Windows PowerShell (best effort):
 
-## 2. Set up a model
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
+```
 
-The recommended first backend is local: Ollama with Gemma 4 on your own machine. A higher-memory Apple Silicon Mac is a strong local target. A 64 GB MacBook is an especially comfortable fit for the experimental local-first path, but it is not a hard requirement.
+The installer fetches `v0.1.5`, with 241 domain tools and its own Node.js runtime. Open a new terminal if the installer added `grclanker` to your `PATH`, then check:
 
-To use a hosted model instead, skip Ollama: run `grclanker setup`, choose `Hosted`, and pick OpenAI, Anthropic, or Google. Your prompts and tool output then go to that provider. grclanker reads the provider's key from `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`, or from a key you store with `/login` inside a session. The [hosted path](/docs/getting-started/setup#hosted-path) on the Setup page lists each provider's default model. Then go to [step 3](#3-start-the-companion).
+```bash
+grclanker --version
+```
 
-For the local path, install Ollama from [ollama.com/download](https://ollama.com/download). The grclanker installer does not install it.
+## 2. Choose a model
 
-If the Ollama app or background service is already running, skip this command. Otherwise start the server in its own terminal and leave it running:
+Choose either path below. Both use the same GRC tools and workflows.
+
+### Hosted: Anthropic, OpenAI, or Google
+
+Run the wizard:
+
+```bash
+grclanker setup
+```
+
+For the Anthropic path, choose **Hosted → Anthropic → claude-sonnet-4-6**. Keep the default host compute backend and bundled skills to start. OpenAI and Google are also available; [Setup](/docs/getting-started/setup/#hosted-path) lists their defaults.
+
+Start a session:
+
+```bash
+grclanker
+```
+
+Run `/login` inside the session and enter your provider's API key. It is saved in your private runtime directory. If you already provide `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY` in the environment, you can skip `/login`.
+
+Hosted models send your prompts and tool results to the selected provider. Model access and API billing belong to that provider; integration credentials are separate.
+
+Continue to [verify a response](#3-verify-a-model-response).
+
+### Local: Ollama + Gemma 4
+
+Install Ollama from [ollama.com/download](https://ollama.com/download). The grclanker installer does not install it. A local model with a large context window needs enough memory; the [Setup guide](/docs/getting-started/setup/#context-length) explains the requirements.
+
+If Ollama is not already serving, start it in its own terminal and leave it running:
 
 ```bash
 OLLAMA_CONTEXT_LENGTH=128000 ollama serve
 ```
 
-grclanker sends about 100k tokens of tool definitions with every request. Unless your GPU has 48 GiB or more, Ollama's default context window (4k or 32k tokens) is too small to hold them, so the variable above raises it. If the app or service is already running, raise its context length setting instead. [Context length](/docs/getting-started/setup#context-length) on the Setup page has the details.
+If the app or background service is already running, raise its context length setting instead. grclanker's tool definitions use about 100k tokens, so a smaller window can prevent tool calls.
 
-Then, in a second terminal:
+In a second terminal:
 
 ```bash
 ollama pull gemma4
 grclanker setup
 ```
 
-Choose `Local-first` when prompted. Setup defaults to the Ollama endpoint at `http://localhost:11434/v1`.
-
-## 3. Start the companion
-
-List the full tool surface first. This prints the catalog and exits without opening a session:
-
-```bash
-grclanker tools
-```
-
-Then open a session:
+Choose **Local-first**, confirm `http://localhost:11434/v1`, and select your installed model. Keep the default host compute backend and bundled skills to start. Then run:
 
 ```bash
 grclanker
 ```
 
-Or open a session with a workflow's instructions preloaded:
+## 3. Verify a model response
 
-```bash
-grclanker investigate
-grclanker audit
-grclanker assess
-grclanker validate
+Check the provider and model shown in the session footer. For the Anthropic path above, it should show `claude-sonnet-4-6`.
+
+Send a small first request:
+
+```text
+Reply exactly READY and do not use tools.
 ```
 
-A workflow command also takes its subject, and a quoted prompt goes straight to the agent:
+A `READY` response verifies that the model can answer with your current credentials or local endpoint. An open terminal UI or a successful `grclanker tools` command alone does not verify model access. If the request fails, check your provider key and model access, or the local endpoint and context window.
+
+## 4. Ask a useful first question
+
+Try a public-data question that needs no vendor credentials:
+
+```text
+Is CVE-2024-3400 in the CISA KEV catalog, and what is its EPSS score? Report the source and retrieval date.
+```
+
+The agent can use `kevs_search` and `kevs_get_epss` to gather the evidence. `kevs_recent` lists recent catalog additions, and `kevs_check_ransomware` checks the catalog's ransomware flag. All four ship in the release bundle. See [KEV / EPSS](/docs/integrations/kevs/) for coverage and limitations.
+
+For a structured investigation, start a new session with the subject included:
 
 ```bash
 grclanker investigate "CVE-2024-3094"
-grclanker "Is CVE-2024-3400 in the CISA KEV catalog?"
 ```
 
-The older `v0.0.1` bundle does not take either form. There, name the vendor, product, CVE, or framework in the session once it opens.
+The other workflows are `audit`, `assess`, and `validate`. Their guides explain the expected evidence and output. Use `grclanker tools` to inspect the full tool catalog before connecting a vendor integration.
 
-Leave a session with `/quit` or Ctrl+D. To reopen an earlier conversation, start `grclanker` and run `/resume`. On exit, grclanker also prints a `grclanker --session <id>` command that reopens the same session. The `v0.1.3` and older bundles reject that command as unknown.
+Leave a session with `/quit` or Ctrl+D. Reopen it with the `grclanker --session <id>` command printed on exit, or use `/resume` inside a session.
 
-## 4. Ask one useful first question
-
-In the session, try:
-
-```text
-Is CVE-2024-3400 in the CISA KEV catalog, and what is its EPSS score?
-```
-
-```text
-Which vulnerabilities were added to the CISA KEV catalog in the last 30 days?
-```
-
-Both are answered by `kevs_search`, `kevs_get_epss`, and `kevs_recent`. `kevs_check_ransomware` is the fourth KEV tool. All four ship in every release bundle. See [KEV / EPSS](/docs/integrations/kevs/).
-
-## 5. Review or extend a shipped integration
-
-This step needs a source checkout, because the release bundle does not include the `specs/` directory. Start `grclanker` from the repository root and ask:
-
-```text
-Read specs/aws-sec-inspector.spec.md, inspect the shipped AWS tools, and propose an extension.
-```
-
-grclanker ships 35 integrations, and most have a spec under `specs/`. Use a spec to inspect coverage, plan a change, or seed an independent implementation.
-
-The Pi terminal CLI is the default host. The [deployment chooser](/docs/getting-started/deployment/) also lists Claude Code, the OpenAI Agents SDK, the Claude API tool runner, the Claude Agent SDK, the Codex SDK, the Cursor / Grok Agent SDK, Flue, and experimental Durable paths, each with its own configuration.
+Next, connect an [integration](/docs/integrations/aws/), choose a [compute backend](/docs/getting-started/compute-backends/), or use a repository [spec as a build input](/docs/specs/using-specs-as-inputs/).

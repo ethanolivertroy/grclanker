@@ -602,38 +602,56 @@ test("a matching official checksum still installs", () => {
   assert.match(result.stdout, /Integrity verified/);
 });
 
-test("archive entries that escape the install directory are refused", () => {
-  const root = mkdtempSync(join(tmpdir(), "grclanker-release-slip-"));
-  const archivePath = resolve(root, "slip.tar.gz");
-  const installDir = resolve(root, "install");
-  const escaped = resolve(root, "escaped.txt");
-  mkdirSync(resolve(root, "public"), { recursive: true });
-  copyFileSync(INSTALL_SCRIPT, resolve(root, "public", "install"));
-  writeArchive(archivePath, {
-    grclanker: "#!/usr/bin/env bash\n",
-    "../escaped.txt": "pwned\n",
-    "nested/../../also-escaped.txt": "pwned\n",
-  });
-  try {
-    const result = spawnSync("bash", [resolve(root, "public", "install"), "9.9.9"], {
-      cwd: root,
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        HOME: resolve(root, "home"),
-        GRCLANKER_ASSET_URL: `file://${archivePath}`,
-        GRCLANKER_BIN_DIR: resolve(root, "bin"),
-        GRCLANKER_INSTALL_DIR: installDir,
-        GRCLANKER_INSTALL_TARGET: "linux-x64",
-      },
+for (const unsafeEntry of ["../escaped.txt", "nested/../../also-escaped.txt", "nested/../inside.txt", "nested/..", "..", "nested//../inside.txt"]) {
+  test(`archive entry ${unsafeEntry} is refused before extraction`, () => {
+    const root = mkdtempSync(join(tmpdir(), "grclanker-release-slip-"));
+    const archivePath = resolve(root, "slip.tar.gz");
+    const installDir = resolve(root, "install");
+    const escaped = resolve(root, "escaped.txt");
+    mkdirSync(resolve(root, "public"), { recursive: true });
+    copyFileSync(INSTALL_SCRIPT, resolve(root, "public", "install"));
+    writeArchive(archivePath, {
+      grclanker: "#!/usr/bin/env bash\n",
+      [unsafeEntry]: "pwned\n",
     });
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /Refusing to extract unsafe archive entry: \.\.\/escaped\.txt/);
-    assert.equal(existsSync(escaped), false);
-    assert.equal(existsSync(resolve(root, "also-escaped.txt")), false);
-    assert.equal(existsSync(installDir), false);
+    try {
+      const result = spawnSync("bash", [resolve(root, "public", "install"), "9.9.9"], {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: resolve(root, "home"),
+          GRCLANKER_ASSET_URL: `file://${archivePath}`,
+          GRCLANKER_BIN_DIR: resolve(root, "bin"),
+          GRCLANKER_INSTALL_DIR: installDir,
+          GRCLANKER_INSTALL_TARGET: "linux-x64",
+        },
+      });
+      assert.notEqual(result.status, 0);
+      assert.ok(result.stderr.includes(`Refusing to extract unsafe archive entry: ${unsafeEntry}`), result.stderr);
+      assert.equal(existsSync(escaped), false);
+      assert.equal(existsSync(resolve(root, "also-escaped.txt")), false);
+      assert.equal(existsSync(installDir), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("archive validation permits dot-containing names that are not parent segments", () => {
+  const name = "grclanker-9.9.9-linux-x64.tar.gz";
+  const stage = stageCheckout([name]);
+  const safeEntries = ["...", "file..txt", "nested/.../file", "nested/..prefix", "nested/suffix..", "space dir/file", "./nested/current.txt"];
+  try {
+    writeArchive(stage.archives[name], {
+      grclanker: "#!/usr/bin/env bash\nprintf 'ok\\n'\n",
+      ...Object.fromEntries(safeEntries.map((entry) => [entry, "safe\n"])),
+    });
+    const { result, installDir } = runStagedInstall(stage);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    for (const entry of safeEntries) assert.equal(readFileSync(resolve(installDir, entry), "utf8"), "safe\n");
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(stage.root, { recursive: true, force: true });
   }
 });
 

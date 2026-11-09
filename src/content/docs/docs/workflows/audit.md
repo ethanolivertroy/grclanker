@@ -21,8 +21,6 @@ Inside a grclanker session, put the scope after the command:
 
 From the shell, `grclanker audit "<scope>"` opens a session that starts with the same prompt and the scope filled in. Run `grclanker audit` on its own to describe the scope in your first message instead.
 
-In the older `v0.0.1` release bundle, text after `/audit` and arguments after `grclanker audit` are dropped. Upgrade to `v0.1.4`, or send the scope in its own message there.
-
 ## What the prompt does
 
 1. Scope lock: confirms the target, the frameworks in scope, the evidence boundary (documentation, live configuration, or both), and the output format.
@@ -33,7 +31,7 @@ In the older `v0.0.1` release bundle, text after `/audit` and arguments after `g
      - For operator-side Google Workspace investigation or raw evidence collection with the `gws` CLI installed, the prompt starts with `gws_ops_check_cli`. It then uses `gws_ops_investigate_alerts`, `gws_ops_trace_admin_activity`, or `gws_ops_review_tokens`, or `gws_ops_collect_evidence_bundle` for a separate operator evidence bundle.
      - Vanta has no assessment tools. A Vanta audit starts with `vanta_check_access`, then uses `vanta_list_audits` and `vanta_export_audit` to pull an offline evidence package.
    - The [`scf_*` tools](/docs/guides/scf-crosswalks/) for control language and crosswalks, and the [`oscal_*` tools](/docs/guides/oscal-workspaces/) when the deliverable must become OSCAL.
-3. Control mapping: at minimum SC-13, SC-12, SI-2, and RA-5, each with one of the four classifications above.
+3. Control mapping: SC-13, SC-12, SI-2, and RA-5 where relevant to the agreed scope, each with one of the four classifications above and a source for the mapping.
 4. Prioritization by exploitability, compliance impact, operational blast radius, and remediation effort, using EPSS and KEV status where vulnerability data exists.
 
 ## Output shape
@@ -43,6 +41,8 @@ The prompt asks for:
 - an audit summary: what was assessed and the overall posture
 - control-by-control findings, each with its evidence
 - critical gaps, highest risk first
-- a remediation plan with concrete next actions and rough effort
+- a remediation plan with concrete next actions and rough effort only when its assumptions can be stated
 
-When evidence is missing, it should say exactly what is missing and which artifact would close the gap. It should mark unknowns as unknowns rather than inferring compliance.
+When evidence is missing, it should say exactly what is missing and which artifact would close the gap. Missing evidence is not proof that a control is absent, and a public CVE match is not proof that an asset runs the affected product and version. Use Unable to Assess when the evidence cannot support a control outcome.
+
+The answer should separate observed facts, assumptions, missing evidence, and proposed actions. Crosswalks identify related requirements, not compliance; mappings and certificate supersession claims need retrieved support. If a source is uncertain after compaction or session restoration, look it up again before repeating the claim.

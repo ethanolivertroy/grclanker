@@ -271,7 +271,7 @@ function loadKevsTools() {
   return tools;
 }
 
-async function withMockedFetch(run) {
+async function withMockedFetch(run, entries = EPSS_ENTRIES) {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
@@ -280,7 +280,7 @@ async function withMockedFetch(run) {
     }
     if (url.hostname === "api.first.org") {
       const cves = (url.searchParams.get("cve") ?? "").split(",");
-      const data = cves.map((cve) => EPSS_ENTRIES[cve]).filter(Boolean);
+      const data = cves.map((cve) => entries[cve]).filter(Boolean);
       return Response.json({ status: "OK", total: data.length, data });
     }
     return new Response("not found", { status: 404, statusText: "Not Found" });
@@ -316,6 +316,28 @@ test("kevs_get_epss keeps the original table when no score date is provided", as
     assert.deepEqual(result.details, { cve_ids: ["CVE-2023-0001"], count: 1 });
   });
 });
+
+for (const { epss, standalone, inline } of [
+  { epss: "0.999990000", standalone: "<100%", inline: "<100%" },
+  { epss: "0.999900000", standalone: "99.99%", inline: "<100%" },
+  { epss: "1.000000000", standalone: "100.00%", inline: "100.0%" },
+]) {
+  test(`EPSS source probability ${epss} is formatted without rounding a value below one to certainty`, async () => {
+    const entries = {
+      "CVE-2024-3400": { ...EPSS_ENTRIES["CVE-2024-3400"], epss, percentile: "1.000000000" },
+    };
+    await withMockedFetch(async (tools) => {
+      const score = await tools.get("kevs_get_epss").execute("score", { cve_ids: ["CVE-2024-3400"] });
+      const row = score.content[0].text.split("\n").find((line) => line.includes("CVE-2024-3400"));
+      assert.ok(row.includes(standalone), row);
+      assert.ok(row.includes("100.0th"), row);
+      assert.deepEqual(score.details.epss_score_dates, { "CVE-2024-3400": "2026-09-27" });
+
+      const search = await tools.get("kevs_search").execute("search", { query: "CVE-2024-3400" });
+      assert.ok(search.content[0].text.includes(`EPSS:        ${inline} probability (100.0th percentile), scored 2026-09-27`));
+    }, entries);
+  });
+}
 
 function datedKev(index, dateAdded, ransomware = "Unknown") {
   const entry = kevEntry(index);

@@ -1,7 +1,43 @@
 ---
 title: What's New
-description: "The grclanker changelog: what shipped in v0.1.4, v0.1.3, v0.1.2, v0.1.1, v0.1.0, and v0.0.1."
+description: "The grclanker changelog: what shipped in v0.1.5, v0.1.4, v0.1.3, v0.1.2, v0.1.1, v0.1.0, and v0.0.1."
 ---
+
+## v0.1.5 (November 8, 2026)
+
+grclanker v0.1.5 improves Pi startup, separates hosted and local onboarding, and makes public-data evidence limits clearer. It also brings the independent source host guides and shared GRC core work since v0.1.4 into a release. The tool surface remains 241 domain tools and 7 compute tools.
+
+### Pi startup and model selection
+
+- Cancelling first-run setup exits without opening Pi or saving a partial model choice. Cancelling an explicit reconfiguration preserves the existing settings.
+- `GRCLANKER_HOME` now controls Pi's managed `fd` and `rg` cache as well as configuration and sessions. Interactive startup, workflow launches, and env helpers initialize Pi with the isolated directory before it caches paths. `env exec` still runs without model setup, and help remains available without reading runtime configuration.
+- New Anthropic setups default to `claude-sonnet-4-6`; the suggested list also includes `claude-opus-4-6` and `claude-haiku-4-5`. New hosted sessions pass the configured model explicitly, so an absent retired dated model follows Pi's custom-ID path instead of silently selecting its provider default. Resumed hosted sessions restore their saved model.
+- Use full model IDs. Pi still applies its normal matching to shorthand names, so `sonnet` can select a different model than `claude-sonnet-4-6`. A retired model ID can still be rejected by the provider; rerun setup to choose an available model.
+
+### Evidence and workflow clarity
+
+- CMVP results separate the number returned, the number matching a query, and the catalog size. Search limits and empty queries are handled consistently, and no-match replies qualify what the lookup establishes.
+- Shared GRC instructions distinguish missing evidence from confirmed absence and require source support for product associations and compliance mappings. Model answers still need review against those sources.
+- EPSS scores below 1 are displayed without rounding them up to 100%.
+- Archive path checks avoid a subprocess for every entry, reducing installer overhead while retaining traversal rejection and rollback checks.
+
+### Hosts and onboarding
+
+- Source deployments now have separate guides for Pi, OpenAI Agents SDK, Codex SDK, Cursor/Grok Agent SDK, Claude Code through MCP, the Claude API tool runner, and Claude Agent SDK. Native GRC tools, strict argument validation, and common result handling live in the shared core. Each host keeps its own credentials, agent loop, sessions, and approval behavior.
+- Claude runtime fixes keep streamed completion, tool writes, and reviewer boundaries explicit. The release installer starts Pi; the SDK and MCP projects still require a source checkout and their documented setup.
+- The website offers macOS/Linux, Windows, and source install tabs with copy feedback and keyboard support, a direct Quick Start link, and separate hosted/local first-run paths. Mobile navigation follows the current page and closes on navigation; single-letter global shortcuts no longer interfere with typing.
+- Pi runtime packages move from 1.3 to 1.4, and the Cursor/Grok source project moves to `@grok/agent-sdk` 0.6.0. The site dependency and sidebar updates reduce unnecessary prefetching and address the previous build-tool advisories.
+
+- CLI dependency overrides pin patched `minimatch` and `@hono/node-server` releases; glob matching, evidence ZIP creation, and static serving retain compatibility coverage.
+
+### Upgrade notes
+
+- Rerun the installer to upgrade; existing settings under `~/.grclanker` are kept. Source users should rerun `npm --prefix cli ci` and rebuild.
+- Existing Anthropic model selections are preserved. Rerun `grclanker setup` to select `claude-sonnet-4-6` explicitly rather than keeping a retired model or a shorthand name.
+- Pi Durable 1.4 migrates its session database to a newer schema. Before opening existing durable sessions, copy `~/.grclanker/durable/sessions/` if you need to return to v0.1.4 or earlier; older releases refuse a database written at a newer schema version.
+- Linux release bundles require glibc. Windows remains best effort. `@grclanker/cli` is not published to npm.
+
+Full history: [v0.1.4...v0.1.5](https://github.com/ethanolivertroy/grclanker/compare/v0.1.4...v0.1.5). [Release notes and bundles](https://github.com/ethanolivertroy/grclanker/releases/tag/v0.1.5).
 
 ## v0.1.4 (October 27, 2026)
 

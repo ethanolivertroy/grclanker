@@ -29,6 +29,11 @@ function resolveExtensionEntrypoint(appRoot: string): string {
   return resolve(appRoot, "extensions", "grc-tools.ts");
 }
 
+/** Set Pi's config root before importing modules that cache paths at load time. */
+export function configurePiAgentDir(agentDir = getGrclankerAgentDir()): void {
+  process.env.GRCLANKER_CODING_AGENT_DIR = agentDir;
+}
+
 export function prepareCliRuntime(appRoot: string): {
   agentDir: string;
   settingsPath: string;
@@ -58,14 +63,19 @@ export function buildCliLaunchArgs(
   agentDir: string,
   settings: GrclankerSettings,
   initialPrompt?: InitialPromptPayload,
+  sessionArgs: string[] = [],
 ): string[] {
   const args: string[] = [];
+  // Pi silently falls back to a provider default when a saved hosted model is
+  // absent from its catalog. An explicit model keeps retired dated IDs on Pi's
+  // custom-ID path; Pi still applies its normal matching to shorthand IDs.
+  // Existing hosted sessions should still restore the model saved in the session.
   if (
-    settings.modelMode === "local" &&
-    typeof settings.defaultProvider === "string" &&
-    typeof settings.defaultModel === "string"
+    (settings.modelMode === "local" || (settings.modelMode === "hosted" && !sessionArgs.includes("--session"))) &&
+    typeof settings.defaultProvider === "string" && settings.defaultProvider.trim() &&
+    typeof settings.defaultModel === "string" && settings.defaultModel.trim()
   ) {
-    args.push("--model", `${settings.defaultProvider}/${settings.defaultModel}`);
+    args.push("--model", `${settings.defaultProvider.trim()}/${settings.defaultModel.trim()}`);
   }
   if (resolveSkillDiscoveryMode(settings) === "bundled-only") {
     args.push("--no-skills");
@@ -91,7 +101,7 @@ export async function launchCli(
 ): Promise<void> {
   const workingDir = process.cwd();
   const { agentDir, settingsPath } = prepareCliRuntime(appRoot);
-  await ensureCliConfigured();
+  if (!await ensureCliConfigured()) return;
   if (compute) {
     process.env[COMPUTE_BACKEND_OVERRIDE_ENV] = compute;
   }
@@ -101,9 +111,9 @@ export async function launchCli(
     : prompt
       ? { kind: "prompt" as const, content: prompt }
       : undefined;
-  const args = [...sessionArgs, ...buildCliLaunchArgs(appRoot, agentDir, settings, initialPrompt)];
+  const args = [...sessionArgs, ...buildCliLaunchArgs(appRoot, agentDir, settings, initialPrompt, sessionArgs)];
 
-  process.env.GRCLANKER_CODING_AGENT_DIR = agentDir;
+  configurePiAgentDir(agentDir);
   process.env.GRCLANKER_COMPUTE_BACKEND = resolveComputeBackend(settings);
   process.env.PI_SKIP_VERSION_CHECK ??= "1";
   process.chdir(workingDir);
