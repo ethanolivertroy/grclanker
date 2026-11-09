@@ -16,7 +16,7 @@ test('homepage workflow states match the shipped prompts', () => {
   assert.match(home, /strong, mixed, at risk, or critical/);
   assert.match(
     home,
-    /actively validated, previously validated but expired, in process, or not found/,
+    /actively validated, previously validated but expired, in process, or not found in the searched catalog/,
   );
   assert.doesNotMatch(home, /unverifiable/);
   assert.doesNotMatch(home, /partial, absent/);
@@ -33,8 +33,9 @@ test('deployment choices list every source integration', () => {
   assert.doesNotMatch(`${home}\n${about}`, /Claude Agent SDK is planned/);
 });
 
-test('the install command stays in the button name', () => {
-  assert.match(install, /aria-label=\{`Copy install command: \$\{command\}`\}/);
+test('the install command stays in the copy button name with visible feedback', () => {
+  assert.match(install, /aria-label=\{`\$\{copied \? 'Copied' : 'Copy'\} install command: \$\{command\}`\}/);
+  assert.match(install, /\{copied \? 'Copied' : 'Copy'\}/);
 });
 
 test('llms.txt raw spec URLs use the published repository', () => {

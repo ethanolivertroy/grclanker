@@ -9,7 +9,7 @@ Run the setup wizard any time you want to configure or reconfigure the companion
 grclanker setup
 ```
 
-On first launch, grclanker runs setup automatically if no model configuration exists yet. Automatic setup needs an interactive terminal. Without one, grclanker exits and asks you to run `grclanker setup` first.
+On first launch, grclanker runs setup automatically if no model configuration exists yet. Automatic setup needs an interactive terminal. Without one, grclanker exits and asks you to run `grclanker setup` first. Cancelling the wizard exits without opening a session or saving a partial model choice.
 
 `grclanker setup` needs a terminal too. To configure a machine without one, write the fields listed under [What the wizard saves](#what-the-wizard-saves) into `~/.grclanker/agent/settings.json` yourself. Local-first also needs the `models.json` provider entry. [Configuration](/docs/getting-started/configuration/) shows both files.
 
@@ -87,15 +87,17 @@ grclanker setup
 Choose `Hosted` and pick one of the current hosted providers:
 
 - `openai` (default model `gpt-5.2`)
-- `anthropic` (default model `claude-sonnet-4-20250514`)
+- `anthropic` (default model `claude-sonnet-4-6`)
 - `google` (default model `gemini-2.5-pro`)
 
-The wizard saves the provider and default model explicitly so the session is not ambiguous.
+The wizard saves the provider and default model explicitly. New hosted sessions pass that pair to Pi; reopening a saved hosted session restores that session's own model. If a previously saved dated model is no longer in Pi's catalog, grclanker passes the requested ID through to the provider instead of silently choosing Pi's provider default. The provider may reject a retired model; rerun setup to choose an available one.
 
 grclanker then uses the credentials the embedded Pi runtime already knows how to read, from either of these:
 
 - The provider's environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`).
 - A key stored with `/login` inside a grclanker session, which lands in `~/.grclanker/agent/auth.json`.
+
+After setup, start `grclanker`, check the model in the footer, and send `Reply exactly READY and do not use tools.` A response verifies model access; opening the terminal UI alone does not. The [Quick Start](/docs/getting-started/quick-start/) walks through the Anthropic path.
 
 ## Compute backend selection
 
@@ -138,8 +140,6 @@ grclanker env smoke-test
 ```
 
 If you need the backend-specific details, use the dedicated [Compute Backends](/docs/getting-started/compute-backends/) guide.
-
-The older `v0.0.1` release bundle predates the Modal and RunPod backends and `setup --compute`. Its wizard offers only `host`, `sandbox-runtime`, `docker`, and `parallels-vm`. Rerun the installer to get `v0.1.4` and the full list.
 
 ## Skill visibility
 

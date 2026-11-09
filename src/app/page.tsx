@@ -4,7 +4,6 @@ import { HeroBrandRail, HeroImageBreak } from '../components/hero-images';
 import { HeroInstall } from '../components/hero-install';
 import { pageMetadata } from '../lib/metadata';
 import { imageSrcSet } from '../lib/responsive-images.mjs';
-import { githubUrl } from '../lib/site';
 import { loadSpecs } from '../lib/specs';
 
 export const metadata = pageMetadata({
@@ -17,7 +16,7 @@ export const metadata = pageMetadata({
 const terminalExamples = [
   {
     command: 'grclanker flue run --message "What is the CMVP certificate for BoringCrypto?"',
-    description: 'Resolve the exact validation record and answer with the cert, standard, and status.',
+    description: 'Find candidate CMVP records, then verify the module, version, environment, and certificate status.',
   },
   {
     command: 'grclanker investigate "CVE-2024-3094"',
@@ -51,7 +50,7 @@ const workflowCards = [
     command: '/validate',
     color: 'text-green',
     description:
-      'Answer the narrow FIPS question: actively validated, previously validated but expired, in process, or not found.',
+      'Report actively validated, previously validated but expired, in process, or not found in the searched catalog, with the matching module and scope.',
   },
 ];
 
@@ -105,7 +104,7 @@ function releaseFacts(integrationSpecCount: number) {
     {
       label: '241 domain tools',
       detail:
-        'Native checks, assessments, and evidence exports cover 35 vendor integrations, plus CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools. The v0.1.4 release bundle carries all of them.',
+        'Native checks, assessments, and evidence exports cover 35 vendor integrations, plus CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools. The v0.1.5 release bundle carries all of them.',
     },
     {
       label: 'Release and source runtimes',
@@ -127,40 +126,40 @@ function releaseFacts(integrationSpecCount: number) {
 
 const whatsNewCards = [
   {
-    label: 'Retries, then fails closed',
+    label: 'Cancel means stop',
     color: 'text-sapphire',
     detail:
-      '32 integrations and the KEV, EPSS, CMVP, SCF, and FedRAMP tools retry rate limits, server errors, and timeouts. A read that still fails is reported as unread, never as empty, though a check can still pass on the reads that succeeded.',
+      'Cancelling first-run setup exits cleanly before opening Pi or downloading its search binaries. Run setup again whenever you are ready.',
   },
   {
-    label: 'Rejected credentials named',
+    label: 'Your model choice stays explicit',
     color: 'text-yellow',
     detail:
-      'When a vendor refuses the credentials on every probe, 29 access checks now report failed instead of a permission gap, and the next step names the variable or setting to fix.',
+      'Anthropic setup defaults to Claude Sonnet 4.6. New hosted sessions pass the saved provider and model to Pi; reopened sessions keep their saved model.',
   },
   {
-    label: 'Smoother first run',
+    label: 'One isolated runtime home',
     color: 'text-peach',
     detail:
-      'grclanker --version prints the version, grclanker --session <id> reopens a session, and a first launch without a terminal exits with a message instead of a stack trace.',
+      'GRCLANKER_HOME now also controls the managed fd and rg binary cache, including the binary directory used by env exec. Settings, sessions, and search tools stay together.',
   },
   {
-    label: 'Failed upgrades roll back',
+    label: 'Claude runtime fixes',
     color: 'text-green',
     detail:
-      'Both installers put the previous install back when extraction fails, and the skills installers keep the installed skill when a download is cut off or wrong.',
+      'Claude adapters handle streamed completion, interrupted tool turns, and write approvals more consistently, with separate boundaries for evidence reviewers.',
   },
   {
-    label: 'Bundles tested on their own OS',
+    label: 'Evidence with its limits',
     color: 'text-mauve',
     detail:
-      'Each of the six release bundles is installed and run on a native macOS, Linux, or Windows runner, and a release gate refuses to publish unless every check passes.',
+      'Workflow guidance keeps a search with no matches distinct from proof of absence, and asks for the module, environment, query scope, and collection gaps behind a conclusion.',
   },
   {
-    label: 'Tools match their docs',
+    label: 'A clearer way to start',
     color: 'text-blue',
     detail:
-      'kevs_search puts an exact CVE ID first, AWS lists the S3 IAM actions a policy needs, and Zendesk ZD-05, LaunchDarkly, and SCF now do what their docs say.',
+      'Platform-specific install commands, visible copy feedback, and separate hosted and local setup steps take you from installation to a first model response.',
   },
 ];
 
@@ -186,17 +185,16 @@ export default function HomePage() {
         </div>
         <div className="absolute inset-0 bg-gradient-to-b from-base/65 via-base/84 to-base pointer-events-none" />
 
-        <div className="relative z-10 max-w-content mx-auto px-6 pt-14 pb-18 md:pt-20 md:pb-24">
+        <div className="relative z-10 max-w-content mx-auto px-6 pt-9 pb-18 md:pt-20 md:pb-24">
           <section className="hero-stack">
             <div className="max-w-4xl text-center hero-copy-block">
-              <h1 className="font-bold text-4xl sm:text-5xl lg:text-6xl text-text leading-tight hero-text-shadow">
+              <h1 className="font-bold text-[1.875rem] sm:text-5xl lg:text-6xl text-text leading-[1.15] hero-text-shadow">
                 Your compliance evidence is scattered.
                 <br />
                 Put a clanker on it.
               </h1>
               <p className="mx-auto mt-5 max-w-2xl text-base md:text-lg text-subtext1 leading-relaxed italic hero-copy-lede">
-                Your GRC engineering assistant. 241 domain tools. 35 vendor integrations. Run it in Pi or Claude Code, or
-                build on the OpenAI, Claude, Codex, or Cursor / Grok SDKs.
+                Gather security evidence and assess controls from your terminal.
               </p>
             </div>
 
@@ -204,16 +202,16 @@ export default function HomePage() {
               <HeroInstall />
 
               <div className="hero-action-row">
-                <Link href="/docs/getting-started/deployment/" className="hero-primary-link">
-                  Choose Your Deployment
+                <Link href="/docs/getting-started/quick-start/" className="hero-primary-link">
+                  Quick Start
                 </Link>
-                <a href={githubUrl} target="_blank" rel="noopener" className="hero-secondary-link">
-                  GitHub
-                </a>
+                <Link href="/docs/getting-started/deployment/" className="hero-secondary-link">
+                  Compare Runtimes
+                </Link>
               </div>
 
               <p className="hero-support-copy">
-                The curl installer ships the v0.1.4 release bundle with all 241 domain tools and its own Node.js runtime.
+                The installer ships the v0.1.5 release bundle with all 241 domain tools and its own Node.js runtime.
                 To run unreleased changes,{' '}
                 <Link href="/docs/getting-started/installation/#install-from-source">build from source</Link> (Node 22.19
                 or newer).
@@ -250,40 +248,14 @@ export default function HomePage() {
       <div className="max-w-content mx-auto px-6 pt-5 pb-8 md:pt-7 md:pb-10 space-y-8">
         <HeroBrandRail />
 
-        <section className="viewscreen rounded-xl scanlines relative overflow-hidden" aria-labelledby="deployment-heading">
-          <div className="relative z-10 p-5 md:p-6">
-            <h2 id="deployment-heading" className="font-semibold text-sm tracking-widest uppercase text-blue">
-              Choose Your GRC Engineer
-            </h2>
-            <p className="text-subtext0 text-sm mt-2 leading-relaxed">
-              Each deployment has its own complete guide, from installation to your first assessment. Connect your
-              evidence sources, map findings to controls, and prioritize the work your organization needs next.
-            </p>
-            <div className="workflow-grid">
-              {deploymentCards.map((item) => (
-                <Link key={item.href} href={item.href} className="workflow-row group focus-visible:outline-2 focus-visible:outline-blue">
-                  <div className="font-mono text-sm text-sapphire group-hover:underline">{item.label}</div>
-                  <div className="text-xs text-subtext1 mt-1">{item.status}</div>
-                  <div className="text-subtext0 text-sm mt-2 leading-relaxed">{item.description}</div>
-                </Link>
-              ))}
-            </div>
-            <p className="text-subtext0 text-sm mt-4">
-              Cursor and Grok use the same SDK package.{' '}
-              <Link href="/docs/getting-started/deployment/" className="text-blue underline underline-offset-2">Compare all runtimes</Link>,
-              including Flue and the experimental durable runtime.
-            </p>
-          </div>
-        </section>
-
         <section className="viewscreen rounded-xl scanlines relative overflow-hidden hero-briefing">
           <div className="relative z-10 p-5 md:p-6">
             <div className="hero-briefing-top">
               <div>
                 <h2 className="font-semibold text-sm tracking-widest uppercase text-blue">What You Ask → What It Does</h2>
-                <p className="text-subtext0 text-sm mt-1 italic">Shipped in v0.1.4, not a roadmap.</p>
+                <p className="text-subtext0 text-sm mt-1 italic">Start with public data, then connect your evidence sources.</p>
               </div>
-              <div className="hero-briefing-version">v0.1.4 // released</div>
+              <div className="hero-briefing-version">v0.1.5 // released</div>
             </div>
 
             <div className="hero-briefing-grid">
@@ -314,17 +286,42 @@ export default function HomePage() {
           </div>
         </section>
 
+        <section className="viewscreen rounded-xl scanlines relative overflow-hidden" aria-labelledby="deployment-heading">
+          <div className="relative z-10 p-5 md:p-6">
+            <h2 id="deployment-heading" className="font-semibold text-sm tracking-widest uppercase text-blue">
+              Choose Your GRC Engineer
+            </h2>
+            <p className="text-subtext0 text-sm mt-2 leading-relaxed">
+              Each deployment has its own complete guide, from installation to your first assessment. Connect your
+              evidence sources, map findings to controls, and prioritize the work your organization needs next.
+            </p>
+            <div className="workflow-grid">
+              {deploymentCards.map((item) => (
+                <Link key={item.href} href={item.href} className="workflow-row group focus-visible:outline-2 focus-visible:outline-blue">
+                  <div className="font-mono text-sm text-sapphire group-hover:underline">{item.label}</div>
+                  <div className="text-xs text-subtext1 mt-1">{item.status}</div>
+                  <div className="text-subtext0 text-sm mt-2 leading-relaxed">{item.description}</div>
+                </Link>
+              ))}
+            </div>
+            <p className="text-subtext0 text-sm mt-4">
+              Cursor and Grok use the same SDK package.{' '}
+              <Link href="/docs/getting-started/deployment/" className="text-blue underline underline-offset-2">Compare all runtimes</Link>,
+              including Flue and the experimental durable runtime.
+            </p>
+          </div>
+        </section>
+
         <section className="viewscreen rounded-xl scanlines relative overflow-hidden" aria-labelledby="whats-new-heading">
           <div className="relative z-10 p-5 md:p-6">
             <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
               <div>
                 <h2 id="whats-new-heading" className="font-semibold text-sm tracking-widest uppercase text-blue">
-                  What's New in v0.1.4
+                  What's New in v0.1.5
                 </h2>
                 <p className="text-subtext0 text-sm mt-1 italic">
-                  Retries rate limits and brief outages, names rejected credentials in 29 access checks, and rolls back a
-                  failed install.
-                  The tool surface is unchanged, and the changelog has upgrade notes for the results that change.
+                  Setup that stops when cancelled, isolated search binaries, explicit hosted models, and clearer
+                  evidence guidance. The tool surface is unchanged.
                 </p>
               </div>
               <Link href="/docs/changelog/" className="spec-action-btn spec-action-btn-primary self-start md:self-auto">

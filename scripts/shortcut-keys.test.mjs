@@ -72,12 +72,12 @@ test('only ? and the search hotkey act while the help dialog is open', () => {
   assert.equal(help.open, false);
 });
 
-test('single keys open search, open help, copy the raw URL, and go home', () => {
+test('single keys open search and help without letter keys copying or navigating', () => {
   const { help, calls, press } = setup();
   assert.equal(press('/').defaultPrevented, true);
-  press('c');
-  press('h');
-  assert.deepEqual(calls, ['search', 'copy', 'home']);
+  assert.equal(press('c').defaultPrevented, false);
+  assert.equal(press('h').defaultPrevented, false);
+  assert.deepEqual(calls, ['search']);
   assert.equal(press('?').defaultPrevented, true);
   assert.equal(help.open, true);
 });

@@ -11,7 +11,7 @@ function matchesHotKey(event, hotKey) {
 }
 
 /**
- * Keydown handler for the site-wide `/`, `?`, `c`, and `h` shortcuts. The search
+ * Keydown handler for the site-wide `/` and `?` shortcuts. The search
  * provider owns its Cmd/Ctrl+K hotkey everywhere except over the help dialog.
  *
  * @param {{
@@ -19,12 +19,10 @@ function matchesHotKey(event, hotKey) {
  *   searchOpen: boolean,
  *   searchHotKey: { key: string | ((event: KeyboardEvent) => boolean) }[],
  *   openSearch: () => void,
- *   copyRawUrl: () => void,
- *   goHome: () => void,
  * }} options
  * @returns {(event: KeyboardEvent) => void}
  */
-export function shortcutHandler({ help, searchOpen, searchHotKey, openSearch, copyRawUrl, goHome }) {
+export function shortcutHandler({ help, searchOpen, searchHotKey, openSearch }) {
   return (event) => {
     if (event.defaultPrevented || searchOpen) return;
     if (help?.open) {
@@ -48,10 +46,6 @@ export function shortcutHandler({ help, searchOpen, searchHotKey, openSearch, co
     } else if (event.key === '?') {
       event.preventDefault();
       help?.showModal();
-    } else if (event.key === 'c') {
-      copyRawUrl();
-    } else if (event.key === 'h') {
-      goHome();
     }
   };
 }

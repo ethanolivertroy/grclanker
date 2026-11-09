@@ -11,6 +11,8 @@ grclanker keeps its runtime state under:
 
 That directory is where settings, local model definitions, stored provider credentials (`auth.json`), themes, bundled agents, and session state live. Set `GRCLANKER_HOME` to move it (see [Environment variables](#environment-variables)).
 
+Pi's managed `fd` and `rg` binaries live in `agent/bin` under the same runtime home. `GRCLANKER_HOME` also controls that cache and the managed binary directory added to `env exec`'s command path.
+
 ## settings.json
 
 Main runtime settings live in:
@@ -42,6 +44,8 @@ Hosted setup:
 - sets `providerKind` to the hosted provider
 - switches `modelMode` to `hosted`
 - removes `providerBaseUrl`
+
+For example, Anthropic setup uses `defaultProvider: "anthropic"` and `defaultModel: "claude-sonnet-4-6"`. New hosted sessions use the saved choice explicitly; reopened hosted sessions retain their session model. See [Setup](/docs/getting-started/setup/#hosted-path) to change providers or replace a retired model ID.
 
 `skillDiscoveryMode` controls whether grclanker stays limited to its bundled GRC skills or also allows Pi-style project skill discovery from `.agents/skills` and related paths. The recommended default is `bundled-only`.
 
