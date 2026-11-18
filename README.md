@@ -1,6 +1,6 @@
 # grclanker
 
-> **Project moved.** grclanker has been integrated into [Open Control Tools](https://github.com/ethanolivertroy/open-ctrl-tools). The monorepo was private at the time of archival. You can still download the [standalone grclanker releases](https://github.com/ethanolivertroy/grclanker/releases) from this repository.
+> **Project moved.** grclanker has been integrated into [Open Control Tools](https://github.com/ethanolivertroy/open-ctrl-tools). You can still download the [standalone grclanker releases](https://github.com/ethanolivertroy/grclanker/releases) from this repository.
 
 grclanker is an experimental open source GRC engineering assistant with native tools for evidence collection, control assessments, and risk analysis. Its default terminal host embeds [Pi](https://github.com/earendil-works/pi) 1.4 (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.4.0); source adapters support other agent hosts. The current release is [`v0.1.5`](https://github.com/ethanolivertroy/grclanker/releases/tag/v0.1.5). It is early: minor versions can break before 1.0.
 
